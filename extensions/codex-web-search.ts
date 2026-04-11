@@ -230,12 +230,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		renderCall(args, theme) {
 			const reasoningEffort = args.reasoning_effort ?? "medium";
-			let text = theme.fg("toolTitle", theme.bold(`web_search (${reasoningEffort})`));
-			text += ` ${theme.fg("accent", JSON.stringify(args.query || ""))}`;
-			if (args.allowed_domains?.length) {
-				text += theme.fg("dim", ` in ${args.allowed_domains.join(", ")}`);
-			}
-			return new Text(text, 0, 0);
+			return new Text(theme.fg("toolTitle", theme.bold(`web_search (${reasoningEffort})`)), 0, 0);
 		},
 		renderResult(result, { expanded, isPartial }, theme) {
 			const answer = result.content
@@ -287,8 +282,8 @@ export default function (pi: ExtensionAPI) {
 						type: "text",
 						text:
 							allowedDomains && allowedDomains.length > 0
-								? `Searching the web for \"${params.query}\" in ${allowedDomains.join(", ")}...`
-								: `Searching the web for \"${params.query}\"...`,
+								? `Searching in ${allowedDomains.join(", ")}...`
+								: "Searching the web...",
 					},
 				],
 				details: {
