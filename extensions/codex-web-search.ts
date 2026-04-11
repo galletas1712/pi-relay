@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { completeSimple, StringEnum, type AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 
 type WebSearchReasoningEffort = "low" | "medium" | "high" | "xhigh";
@@ -37,7 +38,7 @@ const SEARCH_SYSTEM_PROMPT = [
 	"Use the native web_search tool before answering.",
 	"Answer the user's query concisely and factually.",
 	"If the search results are unclear, conflicting, or insufficient, say so plainly.",
-	"Include source URLs when useful.",
+	"Put source URLs in a final section named \"Sources:\", with one URL per line.",
 ].join("\n");
 
 function resolveCurrentCodexModel(ctx: ExtensionContext) {
@@ -178,6 +179,16 @@ function extractSourceUrls(text: string): string[] {
 	return sourceUrls;
 }
 
+function stripSourcesSection(text: string): string {
+	const trimmed = text.trim();
+	const match = /\n+Sources:\s*\n[\s\S]*$/i.exec(trimmed);
+	if (!match) {
+		return trimmed;
+	}
+
+	const answer = trimmed.slice(0, match.index).trim();
+	return answer || trimmed;
+}
 
 function getMissingCodexAuthError(detail?: string): Error {
 	const prefix = "web_search requires pi openai-codex OAuth. Run /login and select OpenAI Codex.";
@@ -211,6 +222,37 @@ export default function (pi: ExtensionAPI) {
 				}),
 			),
 		}),
+		renderResult(result, { expanded, isPartial }, theme) {
+			if (isPartial) {
+				return new Text(theme.fg("warning", "Searching the web..."), 0, 0);
+			}
+
+			const answer = result.content
+				.filter((block): block is { type: "text"; text: string } => block.type === "text")
+				.map((block) => block.text)
+				.join("\n")
+				.trim();
+			const details = result.details as WebSearchToolDetails | undefined;
+			const sourceUrls = details?.sourceUrls ?? [];
+			const answerLines = answer.split("\n");
+			const visibleAnswer = expanded ? answer : answerLines.slice(0, 6).join("\n").trim();
+
+			let text = visibleAnswer || theme.fg("dim", "(no answer text returned)");
+			if (!expanded && answerLines.length > 6) {
+				text += `\n${theme.fg("muted", "...")}`;
+			}
+
+			if (sourceUrls.length > 0) {
+				text += `\n\n${theme.fg("accent", `${sourceUrls.length} source${sourceUrls.length === 1 ? "" : "s"}`)}`;
+				if (expanded) {
+					for (const url of sourceUrls) {
+						text += `\n${theme.fg("dim", url)}`;
+					}
+				}
+			}
+
+			return new Text(text, 0, 0);
+		},
 		async execute(_toolCallId, params: WebSearchToolParams, signal, onUpdate, ctx) {
 			const model = resolveCurrentCodexModel(ctx);
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -282,8 +324,9 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const sourceUrls = extractSourceUrls(rawAnswer);
+			const answer = stripSourcesSection(rawAnswer);
 			return {
-				content: [{ type: "text", text: rawAnswer }],
+				content: [{ type: "text", text: answer }],
 				details: {
 					provider: "openai-codex",
 					model: model.id,
