@@ -161,23 +161,8 @@ function normalizeExtractedUrl(rawUrl: string): string | undefined {
 	}
 }
 
-function extractSourceUrls(text: string): string[] {
-	const sourceUrls: string[] = [];
-	const seen = new Set<string>();
-	const patterns = [/\[[^\]]+\]\((https?:\/\/[^\s)]+)\)/g, /https?:\/\/[^\s<>()]+/g];
-
-	for (const pattern of patterns) {
-		for (const match of text.matchAll(pattern)) {
-			const candidate = normalizeExtractedUrl(match[1] ?? match[0] ?? "");
-			if (!candidate || seen.has(candidate)) {
-				continue;
-			}
-			seen.add(candidate);
-			sourceUrls.push(candidate);
-		}
-	}
-
-	return sourceUrls;
+function hasWebSourcesTag(text: string): boolean {
+	return /<pi-web-sources>[\s\S]*<\/pi-web-sources>/i.test(text);
 }
 
 function extractWebSourceUrls(text: string): string[] {
@@ -201,17 +186,6 @@ function extractWebSourceUrls(text: string): string[] {
 
 function stripWebSourcesTag(text: string): string {
 	return text.replace(/\s*<pi-web-sources>\s*[\s\S]*?<\/pi-web-sources>\s*$/i, "").trim();
-}
-
-function stripSourcesSection(text: string): string {
-	const trimmed = text.trim();
-	const match = /\n+Sources:\s*\n[\s\S]*$/i.exec(trimmed);
-	if (!match) {
-		return trimmed;
-	}
-
-	const answer = trimmed.slice(0, match.index).trim();
-	return answer || trimmed;
 }
 
 function getMissingCodexAuthError(detail?: string): Error {
@@ -347,8 +321,9 @@ export default function (pi: ExtensionAPI) {
 				throw new Error("Codex web search returned no answer text.");
 			}
 
-			const sourceUrls = extractWebSourceUrls(rawAnswer);
-			const answer = stripSourcesSection(stripWebSourcesTag(rawAnswer));
+			const hasSourcesTag = hasWebSourcesTag(rawAnswer);
+			const sourceUrls = hasSourcesTag ? extractWebSourceUrls(rawAnswer) : [];
+			const answer = hasSourcesTag ? stripWebSourcesTag(rawAnswer) : rawAnswer.trim();
 			return {
 				content: [{ type: "text", text: answer }],
 				details: {
@@ -359,7 +334,7 @@ export default function (pi: ExtensionAPI) {
 					reasoningEffort,
 					searchContextSize,
 					serviceTier: "priority",
-					sourceUrls: sourceUrls.length > 0 ? sourceUrls : extractSourceUrls(rawAnswer),
+					sourceUrls,
 				} satisfies WebSearchToolDetails,
 			};
 		},
