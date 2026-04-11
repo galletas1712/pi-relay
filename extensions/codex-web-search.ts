@@ -221,15 +221,15 @@ export default function (pi: ExtensionAPI) {
 			),
 		}),
 		renderResult(result, { expanded, isPartial }, theme) {
-			if (isPartial) {
-				return new Text(theme.fg("warning", "Searching the web..."), 0, 0);
-			}
-
 			const answer = result.content
 				.filter((block): block is { type: "text"; text: string } => block.type === "text")
 				.map((block) => block.text)
 				.join("\n")
 				.trim();
+			if (isPartial) {
+				return new Text(theme.fg("warning", answer || "Searching the web..."), 0, 0);
+			}
+
 			const details = result.details as WebSearchToolDetails | undefined;
 			const sourceUrls = details?.sourceUrls ?? [];
 			const answerLines = answer.split("\n");
