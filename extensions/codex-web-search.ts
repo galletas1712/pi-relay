@@ -38,7 +38,8 @@ const SEARCH_SYSTEM_PROMPT = [
 	"Use the native web_search tool before answering.",
 	"Answer the user's query concisely and factually.",
 	"If the search results are unclear, conflicting, or insufficient, say so plainly.",
-	"Put source URLs in a final section named \"Sources:\", with one URL per line.",
+	"Do not include source URLs in the visible answer.",
+	"After the answer, append a final hidden block exactly named <pi-web-sources> containing one source URL per line and no other text.",
 ].join("\n");
 
 function resolveCurrentCodexModel(ctx: ExtensionContext) {
@@ -177,6 +178,29 @@ function extractSourceUrls(text: string): string[] {
 	}
 
 	return sourceUrls;
+}
+
+function extractWebSourceUrls(text: string): string[] {
+	const match = /<pi-web-sources>\s*([\s\S]*?)\s*<\/pi-web-sources>/i.exec(text);
+	if (!match) {
+		return [];
+	}
+
+	const sourceUrls: string[] = [];
+	const seen = new Set<string>();
+	for (const line of match[1].split(/\r?\n/)) {
+		const candidate = normalizeExtractedUrl(line);
+		if (!candidate || seen.has(candidate)) {
+			continue;
+		}
+		seen.add(candidate);
+		sourceUrls.push(candidate);
+	}
+	return sourceUrls;
+}
+
+function stripWebSourcesTag(text: string): string {
+	return text.replace(/\s*<pi-web-sources>\s*[\s\S]*?<\/pi-web-sources>\s*$/i, "").trim();
 }
 
 function stripSourcesSection(text: string): string {
@@ -323,8 +347,8 @@ export default function (pi: ExtensionAPI) {
 				throw new Error("Codex web search returned no answer text.");
 			}
 
-			const sourceUrls = extractSourceUrls(rawAnswer);
-			const answer = stripSourcesSection(rawAnswer);
+			const sourceUrls = extractWebSourceUrls(rawAnswer);
+			const answer = stripSourcesSection(stripWebSourcesTag(rawAnswer));
 			return {
 				content: [{ type: "text", text: answer }],
 				details: {
@@ -335,7 +359,7 @@ export default function (pi: ExtensionAPI) {
 					reasoningEffort,
 					searchContextSize,
 					serviceTier: "priority",
-					sourceUrls,
+					sourceUrls: sourceUrls.length > 0 ? sourceUrls : extractSourceUrls(rawAnswer),
 				} satisfies WebSearchToolDetails,
 			};
 		},
