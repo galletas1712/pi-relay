@@ -11,7 +11,6 @@ type WebSearchToolParams = {
 	query: string;
 	allowed_domains?: string[];
 	reasoning_effort?: WebSearchReasoningEffort;
-	search_context_size?: WebSearchContextSize;
 };
 
 type WebSearchToolDetails = {
@@ -20,7 +19,6 @@ type WebSearchToolDetails = {
 	query: string;
 	allowedDomains?: string[];
 	reasoningEffort: WebSearchReasoningEffort;
-	searchContextSize: WebSearchContextSize;
 	serviceTier: "priority";
 	sourceUrls: string[];
 };
@@ -161,19 +159,30 @@ function normalizeExtractedUrl(rawUrl: string): string | undefined {
 	}
 }
 
+function getWebSourcesBody(text: string): string | undefined {
+	const openMatch = /<pi-web-sources>/i.exec(text);
+	if (!openMatch) {
+		return undefined;
+	}
+
+	const afterOpen = text.slice(openMatch.index + openMatch[0].length);
+	const closeMatch = /<\/pi-web-sources>/i.exec(afterOpen);
+	return closeMatch ? afterOpen.slice(0, closeMatch.index).trim() : afterOpen.trim();
+}
+
 function hasWebSourcesTag(text: string): boolean {
-	return /<pi-web-sources>[\s\S]*<\/pi-web-sources>/i.test(text);
+	return getWebSourcesBody(text) !== undefined;
 }
 
 function extractWebSourceUrls(text: string): string[] {
-	const match = /<pi-web-sources>\s*([\s\S]*?)\s*<\/pi-web-sources>/i.exec(text);
-	if (!match) {
+	const body = getWebSourcesBody(text);
+	if (body === undefined) {
 		return [];
 	}
 
 	const sourceUrls: string[] = [];
 	const seen = new Set<string>();
-	for (const line of match[1].split(/\r?\n/)) {
+	for (const line of body.split(/\r?\n/)) {
 		const candidate = normalizeExtractedUrl(line);
 		if (!candidate || seen.has(candidate)) {
 			continue;
@@ -185,7 +194,11 @@ function extractWebSourceUrls(text: string): string[] {
 }
 
 function stripWebSourcesTag(text: string): string {
-	return text.replace(/\s*<pi-web-sources>\s*[\s\S]*?<\/pi-web-sources>\s*$/i, "").trim();
+	const openMatch = /<pi-web-sources>/i.exec(text);
+	if (!openMatch) {
+		return text.trim();
+	}
+	return text.slice(0, openMatch.index).trim();
 }
 
 function getMissingCodexAuthError(detail?: string): Error {
@@ -214,12 +227,16 @@ export default function (pi: ExtensionAPI) {
 					description: "Optional reasoning depth for the nested Codex web-search request.",
 				}),
 			),
-			search_context_size: Type.Optional(
-				StringEnum(["low", "medium", "high"] as const, {
-					description: "Optional native Codex web_search search_context_size setting.",
-				}),
-			),
 		}),
+		renderCall(args, theme) {
+			const reasoningEffort = args.reasoning_effort ?? "medium";
+			let text = theme.fg("toolTitle", theme.bold(`web_search (${reasoningEffort})`));
+			text += ` ${theme.fg("accent", JSON.stringify(args.query || ""))}`;
+			if (args.allowed_domains?.length) {
+				text += theme.fg("dim", ` in ${args.allowed_domains.join(", ")}`);
+			}
+			return new Text(text, 0, 0);
+		},
 		renderResult(result, { expanded, isPartial }, theme) {
 			const answer = result.content
 				.filter((block): block is { type: "text"; text: string } => block.type === "text")
@@ -263,15 +280,15 @@ export default function (pi: ExtensionAPI) {
 
 			const allowedDomains = normalizeAllowedDomains(params.allowed_domains);
 			const reasoningEffort = params.reasoning_effort ?? "medium";
-			const searchContextSize = params.search_context_size ?? "high";
+			const searchContextSize: WebSearchContextSize = reasoningEffort === "xhigh" ? "high" : reasoningEffort;
 			onUpdate?.({
 				content: [
 					{
 						type: "text",
 						text:
 							allowedDomains && allowedDomains.length > 0
-								? `Searching the web for \"${params.query}\" in ${allowedDomains.join(", ")} (${reasoningEffort}, ${searchContextSize})...`
-								: `Searching the web for \"${params.query}\" (${reasoningEffort}, ${searchContextSize})...`,
+								? `Searching the web for \"${params.query}\" in ${allowedDomains.join(", ")}...`
+								: `Searching the web for \"${params.query}\"...`,
 					},
 				],
 				details: {
@@ -280,7 +297,6 @@ export default function (pi: ExtensionAPI) {
 					query: params.query,
 					allowedDomains,
 					reasoningEffort,
-					searchContextSize,
 					serviceTier: "priority",
 					sourceUrls: [],
 				} satisfies WebSearchToolDetails,
@@ -332,7 +348,6 @@ export default function (pi: ExtensionAPI) {
 					query: params.query,
 					allowedDomains,
 					reasoningEffort,
-					searchContextSize,
 					serviceTier: "priority",
 					sourceUrls,
 				} satisfies WebSearchToolDetails,
