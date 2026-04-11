@@ -34,13 +34,10 @@ type CodexWebSearchTool = {
 };
 
 const SEARCH_SYSTEM_PROMPT = [
-	"You are a web research helper.",
-	"You must use the native web_search tool before answering.",
+	"Use the native web_search tool before answering.",
 	"Answer the user's query concisely and factually.",
-	"Do not rely on unstated memory when the search results are unclear or conflicting.",
-	"After the answer, include a section exactly named \"Sources:\".",
-	"Under Sources, list the source URLs as markdown bullet links.",
-	"Do not omit the Sources section.",
+	"If the search results are unclear, conflicting, or insufficient, say so plainly.",
+	"Include source URLs when useful.",
 ].join("\n");
 
 function resolveCurrentCodexModel(ctx: ExtensionContext) {
@@ -97,12 +94,12 @@ function normalizeAllowedDomains(rawDomains: string[] | undefined): string[] | u
 }
 
 function buildNestedQuery(query: string, allowedDomains: string[] | undefined): string {
-	const lines = [`Query: ${query.trim()}`];
+	const lines = [query.trim()];
 	if (allowedDomains && allowedDomains.length > 0) {
-		lines.push(`Only use sources from these domains: ${allowedDomains.join(", ")}`);
-		lines.push("If the allowed domains do not contain enough information, say so plainly.");
+		lines.push(`Use only these domains: ${allowedDomains.join(", ")}.`);
+		lines.push("If those domains do not contain enough information, say so plainly.");
 	}
-	return lines.join("\n");
+	return lines.join("\n\n");
 }
 
 function createWebSearchTool(
@@ -181,28 +178,6 @@ function extractSourceUrls(text: string): string[] {
 	return sourceUrls;
 }
 
-function getSourceLabel(url: string): string {
-	try {
-		const parsed = new URL(url);
-		return parsed.hostname || url;
-	} catch {
-		return url;
-	}
-}
-
-function normalizeAnswer(text: string, sourceUrls: string[]): string {
-	const answer = text.trim();
-	if (/(^|\n)Sources:\s*/i.test(answer)) {
-		return answer;
-	}
-
-	if (sourceUrls.length === 0) {
-		return `${answer}\n\nSources:\n- No source URLs were returned.`;
-	}
-
-	const sources = sourceUrls.map((url) => `- [${getSourceLabel(url)}](${url})`).join("\n");
-	return `${answer}\n\nSources:\n${sources}`;
-}
 
 function getMissingCodexAuthError(detail?: string): Error {
 	const prefix = "web_search requires pi openai-codex OAuth. Run /login and select OpenAI Codex.";
@@ -213,9 +188,7 @@ export default function (pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "web_search",
 		label: "Web Search",
-		description:
-			"Search the web using Codex/OpenAI native web search. Returns a concise answer with sources. Optionally restrict results to specific domains and control reasoning depth and search context size.",
-		promptSnippet: "Search the web for current or external information and return an answer with sources.",
+		description: "search the web",
 		promptGuidelines: [
 			"Use this tool when the user needs current information, release notes, docs, or other knowledge outside the repo.",
 			"Prefer this tool over ad-hoc bash or manual browser-style web lookup for normal web research.",
@@ -310,7 +283,7 @@ export default function (pi: ExtensionAPI) {
 
 			const sourceUrls = extractSourceUrls(rawAnswer);
 			return {
-				content: [{ type: "text", text: normalizeAnswer(rawAnswer, sourceUrls) }],
+				content: [{ type: "text", text: rawAnswer }],
 				details: {
 					provider: "openai-codex",
 					model: model.id,
