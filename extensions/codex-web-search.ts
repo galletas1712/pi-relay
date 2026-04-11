@@ -43,14 +43,6 @@ const SEARCH_SYSTEM_PROMPT = [
 	"Do not omit the Sources section.",
 ].join("\n");
 
-function supportsCodexLowVerbosity(modelId: string): boolean {
-	return modelId === "gpt-5.1" || modelId === "gpt-5.2" || modelId === "gpt-5.3-codex" || modelId.startsWith("gpt-5.4");
-}
-
-function omitsCodexReasoningSummary(modelId: string): boolean {
-	return modelId === "gpt-5.3-codex" || modelId.startsWith("gpt-5.4");
-}
-
 function resolveCurrentCodexModel(ctx: ExtensionContext) {
 	if (!ctx.model) {
 		throw new Error("web_search requires an active model in the current pi session.");
@@ -135,7 +127,6 @@ function createWebSearchTool(
 
 function patchCodexPayload(
 	payload: unknown,
-	modelId: string,
 	allowedDomains: string[] | undefined,
 	searchContextSize: WebSearchContextSize,
 ): Record<string, unknown> {
@@ -143,24 +134,6 @@ function patchCodexPayload(
 	body.tools = [createWebSearchTool(allowedDomains, searchContextSize)];
 	body.tool_choice = "auto";
 	body.service_tier = "priority";
-
-	const reasoning =
-		body.reasoning && typeof body.reasoning === "object" ? { ...(body.reasoning as Record<string, unknown>) } : {};
-	if (omitsCodexReasoningSummary(modelId)) {
-		delete reasoning.summary;
-	} else {
-		reasoning.summary = "auto";
-	}
-	body.reasoning = reasoning;
-
-	if (supportsCodexLowVerbosity(modelId)) {
-		const text = body.text && typeof body.text === "object" ? { ...(body.text as Record<string, unknown>) } : {};
-		text.verbosity = "low";
-		body.text = text;
-	} else {
-		delete body.text;
-	}
-
 	return body;
 }
 
@@ -319,7 +292,7 @@ export default function (pi: ExtensionAPI) {
 					transport: "auto",
 					sessionId: buildWebSearchSessionId(ctx, model.id),
 					reasoning: reasoningEffort,
-					onPayload: (payload) => patchCodexPayload(payload, model.id, allowedDomains, searchContextSize),
+					onPayload: (payload) => patchCodexPayload(payload, allowedDomains, searchContextSize),
 				},
 			);
 
