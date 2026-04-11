@@ -9,7 +9,6 @@ type WebSearchContextSize = "low" | "medium" | "high";
 
 type WebSearchToolParams = {
 	query: string;
-	allowed_domains?: string[];
 	reasoning_effort?: WebSearchReasoningEffort;
 };
 
@@ -17,7 +16,6 @@ type WebSearchToolDetails = {
 	provider: "openai-codex";
 	model: string;
 	query: string;
-	allowedDomains?: string[];
 	reasoningEffort: WebSearchReasoningEffort;
 	serviceTier: "priority";
 	sourceUrls: string[];
@@ -27,9 +25,6 @@ type CodexWebSearchTool = {
 	type: "web_search";
 	external_web_access: boolean;
 	search_context_size: WebSearchContextSize;
-	filters?: {
-		allowed_domains: string[];
-	};
 };
 
 const SEARCH_SYSTEM_PROMPT = [
@@ -59,62 +54,11 @@ function buildWebSearchSessionId(ctx: ExtensionContext, modelId: string): string
 	return `web-search-${digest.slice(0, 16)}`;
 }
 
-function normalizeAllowedDomains(rawDomains: string[] | undefined): string[] | undefined {
-	if (!rawDomains || rawDomains.length === 0) {
-		return undefined;
-	}
-
-	const normalizedDomains: string[] = [];
-	const seen = new Set<string>();
-
-	for (const rawDomain of rawDomains) {
-		const trimmed = rawDomain.trim().toLowerCase();
-		if (!trimmed) {
-			continue;
-		}
-
-		let normalized = trimmed;
-		try {
-			const candidate = trimmed.includes("://") ? trimmed : `https://${trimmed}`;
-			normalized = new URL(candidate).hostname.toLowerCase();
-		} catch {
-			normalized = trimmed.replace(/^https?:\/\//, "").split("/")[0]?.trim().toLowerCase() ?? "";
-		}
-
-		normalized = normalized.replace(/\.+$/, "");
-		if (!normalized || seen.has(normalized)) {
-			continue;
-		}
-
-		seen.add(normalized);
-		normalizedDomains.push(normalized);
-	}
-
-	return normalizedDomains.length > 0 ? normalizedDomains : undefined;
+function buildNestedQuery(query: string): string {
+	return query.trim();
 }
 
-function buildNestedQuery(query: string, allowedDomains: string[] | undefined): string {
-	const lines = [query.trim()];
-	if (allowedDomains && allowedDomains.length > 0) {
-		lines.push(`Use only these domains: ${allowedDomains.join(", ")}.`);
-		lines.push("If those domains do not contain enough information, say so plainly.");
-	}
-	return lines.join("\n\n");
-}
-
-function createWebSearchTool(
-	allowedDomains: string[] | undefined,
-	searchContextSize: WebSearchContextSize,
-): CodexWebSearchTool {
-	if (allowedDomains && allowedDomains.length > 0) {
-		return {
-			type: "web_search",
-			external_web_access: true,
-			search_context_size: searchContextSize,
-			filters: { allowed_domains: allowedDomains },
-		};
-	}
-
+function createWebSearchTool(searchContextSize: WebSearchContextSize): CodexWebSearchTool {
 	return {
 		type: "web_search",
 		external_web_access: true,
@@ -122,13 +66,9 @@ function createWebSearchTool(
 	};
 }
 
-function patchCodexPayload(
-	payload: unknown,
-	allowedDomains: string[] | undefined,
-	searchContextSize: WebSearchContextSize,
-): Record<string, unknown> {
+function patchCodexPayload(payload: unknown, searchContextSize: WebSearchContextSize): Record<string, unknown> {
 	const body = { ...(payload as Record<string, unknown>) };
-	body.tools = [createWebSearchTool(allowedDomains, searchContextSize)];
+	body.tools = [createWebSearchTool(searchContextSize)];
 	body.tool_choice = "auto";
 	body.service_tier = "priority";
 	return body;
@@ -217,11 +157,6 @@ export default function (pi: ExtensionAPI) {
 		],
 		parameters: Type.Object({
 			query: Type.String({ minLength: 1, description: "The web search query." }),
-			allowed_domains: Type.Optional(
-				Type.Array(Type.String({ minLength: 1 }), {
-					description: "Optional list of domains to restrict results to, such as react.dev or docs.python.org.",
-				}),
-			),
 			reasoning_effort: Type.Optional(
 				StringEnum(["low", "medium", "high", "xhigh"] as const, {
 					description: "Optional reasoning depth for the nested Codex web-search request.",
@@ -273,24 +208,14 @@ export default function (pi: ExtensionAPI) {
 				throw getMissingCodexAuthError();
 			}
 
-			const allowedDomains = normalizeAllowedDomains(params.allowed_domains);
 			const reasoningEffort = params.reasoning_effort ?? "medium";
 			const searchContextSize: WebSearchContextSize = reasoningEffort === "xhigh" ? "high" : reasoningEffort;
 			onUpdate?.({
-				content: [
-					{
-						type: "text",
-						text:
-							allowedDomains && allowedDomains.length > 0
-								? `Searching in ${allowedDomains.join(", ")}...`
-								: "Searching the web...",
-					},
-				],
+				content: [{ type: "text", text: "Searching the web..." }],
 				details: {
 					provider: "openai-codex",
 					model: model.id,
 					query: params.query,
-					allowedDomains,
 					reasoningEffort,
 					serviceTier: "priority",
 					sourceUrls: [],
@@ -304,7 +229,7 @@ export default function (pi: ExtensionAPI) {
 					messages: [
 						{
 							role: "user",
-							content: [{ type: "text", text: buildNestedQuery(params.query, allowedDomains) }],
+							content: [{ type: "text", text: buildNestedQuery(params.query) }],
 							timestamp: Date.now(),
 						},
 					],
@@ -316,7 +241,7 @@ export default function (pi: ExtensionAPI) {
 					transport: "auto",
 					sessionId: buildWebSearchSessionId(ctx, model.id),
 					reasoning: reasoningEffort,
-					onPayload: (payload) => patchCodexPayload(payload, allowedDomains, searchContextSize),
+					onPayload: (payload) => patchCodexPayload(payload, searchContextSize),
 				},
 			);
 
@@ -341,7 +266,6 @@ export default function (pi: ExtensionAPI) {
 					provider: "openai-codex",
 					model: model.id,
 					query: params.query,
-					allowedDomains,
 					reasoningEffort,
 					serviceTier: "priority",
 					sourceUrls,
