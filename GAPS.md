@@ -83,6 +83,14 @@ The plan includes a global semaphore for concurrent LLM calls across agents. The
 runtime relies on per-agent serial execution from `AgentSession`, but it does not yet add a
 cross-agent concurrency cap.
 
+#### Root idling after child dispatch is still model-sensitive
+
+The Phase 2 prompt guidance now tells the root to batch independent `spawn`/background tool
+calls and then go idle. A live `openai-codex/gpt-5.4` run demonstrated the intended behavior,
+but repeated reruns still sometimes serialize the spawns or keep the root engaged long enough
+that the first child update lands before the root has gone idle. The runtime supports the
+pattern once the model follows it, but prompt guidance alone does not make it deterministic.
+
 ## Phase 3
 
 ### Implemented
