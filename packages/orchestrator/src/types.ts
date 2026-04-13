@@ -1,10 +1,10 @@
-import type { Agent, ThinkingLevel } from "@mariozechner/pi-agent-core";
+import type { Agent, AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
 import type { ImageContent, Model, TextContent } from "@mariozechner/pi-ai";
 import type { AgentSessionEvent, ToolDefinition, ToolInfo } from "@mariozechner/pi-coding-agent";
 
-export type AgentStatus = "created" | "running" | "idle" | "disposed";
+export type AgentStatus = "running" | "idle" | "disposed";
 
-export type AgentCustomType = "agent_report" | "agent_idle" | "agent_directive" | "agent_worklog";
+export type AgentCustomType = "agent_report" | "agent_idle" | "agent_directive" | "agent_worklog" | "agent_roster";
 
 export interface SessionCustomMessage<T = unknown> {
 	customType: string;
@@ -18,10 +18,12 @@ export interface AgentSessionManagerHandle {
 	getSessionDir(): string;
 	getSessionId(): string;
 	getSessionFile(): string | undefined;
+	appendMessage(message: AgentMessage): string;
 }
 
 export interface AgentSessionHandle {
 	agent: Agent;
+	extensionRunner?: { emit(event: { type: "session_shutdown" }): Promise<void> };
 	model: Model<any> | undefined;
 	thinkingLevel: ThinkingLevel;
 	isStreaming: boolean;
@@ -90,6 +92,7 @@ export interface AgentTreeMetadataEntry {
 	createdAt: number;
 	lastStatusChange: number;
 	lastWorklogTurn: number;
+	turnCount?: number;
 }
 
 export interface AgentTreeMetadata {
@@ -112,6 +115,7 @@ export interface AgentRecord {
 	lastWorklogTurn: number;
 	turnCount: number;
 	pendingRestoreIdleNotice: boolean;
+	orphanedPendingToolCallIds: string[];
 	unsubscribe?: () => void;
 }
 

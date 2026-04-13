@@ -4,6 +4,21 @@ import type { Orchestrator } from "./orchestrator.js";
 
 export function createOrchestratorExtension(orchestratorRef: { current?: Orchestrator }): ExtensionFactory {
 	return (pi) => {
+		pi.on("session_start", async (_event, ctx) => {
+			const orchestrator = orchestratorRef.current;
+			if (!orchestrator) {
+				return;
+			}
+
+			if (!orchestrator.consumePendingRootResume(ctx.sessionManager.getSessionId())) {
+				return;
+			}
+
+			queueMicrotask(() => {
+				void pi.sendUserMessage("[Session restored]");
+			});
+		});
+
 		pi.on("before_agent_start", async (event, ctx) => {
 			const orchestrator = orchestratorRef.current;
 			if (!orchestrator) {

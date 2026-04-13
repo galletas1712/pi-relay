@@ -7,14 +7,19 @@ import {
 import type { AgentSessionFactory, AgentSessionFactoryOptions, AgentSessionHandle } from "./types.js";
 
 function resolveBuiltInTools(parentSession: AgentSessionHandle, selectedToolNames: string[] | undefined): unknown[] | undefined {
+	const activeBuiltInNames = new Set(
+		parentSession
+			.getAllTools()
+			.filter((tool) => tool.sourceInfo.source === "builtin")
+			.map((tool) => tool.name),
+	);
+	const inheritedBuiltIns = parentSession.agent.state.tools.filter((tool) => activeBuiltInNames.has(tool.name));
 	if (!selectedToolNames || selectedToolNames.length === 0) {
-		return undefined;
+		return inheritedBuiltIns.map((tool) => tool as unknown);
 	}
 
 	const allowed = new Set(selectedToolNames);
-	return parentSession.agent.state.tools
-		.filter((tool) => allowed.has(tool.name))
-		.map((tool) => tool as unknown);
+	return inheritedBuiltIns.filter((tool) => allowed.has(tool.name)).map((tool) => tool as unknown);
 }
 
 export function createRelaySessionFactory(options: {
@@ -35,6 +40,10 @@ export function createRelaySessionFactory(options: {
 			thinkingLevel: sessionOptions.config.thinkingLevel ?? sessionOptions.parentSession.thinkingLevel,
 			tools: resolveBuiltInTools(sessionOptions.parentSession, sessionOptions.config.tools) as never,
 			customTools: sessionOptions.customTools as ToolDefinition[],
+			sessionStartEvent:
+				sessionOptions.mode === "restore"
+					? { type: "session_start", reason: "resume", previousSessionFile: sessionOptions.sessionFile }
+					: { type: "session_start", reason: "fork", previousSessionFile: sessionOptions.parentSession.sessionFile },
 		});
 
 		return {

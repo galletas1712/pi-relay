@@ -53,7 +53,8 @@ export function createAgentIdleMessage(
 	fromRole: string,
 	lastOutput?: string,
 	errorMessage?: string,
-): SessionCustomMessage<AgentMessageDetails & { lastOutput?: string; errorMessage?: string }> {
+	note?: string,
+): SessionCustomMessage<AgentMessageDetails & { lastOutput?: string; errorMessage?: string; note?: string }> {
 	const lines = [`[${formatSender(fromAgentId, fromRole)} IDLE]`];
 	const truncated = truncate(lastOutput, 300);
 	if (truncated) {
@@ -61,6 +62,9 @@ export function createAgentIdleMessage(
 	}
 	if (errorMessage) {
 		lines.push(`Error: ${errorMessage}`);
+	}
+	if (note) {
+		lines.push(`Note: ${note}`);
 	}
 	if (!truncated && !errorMessage) {
 		lines.push("No final output was captured.");
@@ -74,6 +78,7 @@ export function createAgentIdleMessage(
 			fromRole,
 			lastOutput: truncated,
 			errorMessage,
+			note,
 		},
 	};
 }

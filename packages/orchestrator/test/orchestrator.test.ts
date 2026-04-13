@@ -1,73 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { Orchestrator } from "../src/orchestrator.js";
-import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
-import type { AgentSessionFactoryOptions, AgentSessionHandle } from "../src/types.js";
-
-class FakeSession implements AgentSessionHandle {
-	agent = {
-		state: { tools: [] },
-		onBackgroundToolStart: undefined,
-		onBackgroundToolEnd: undefined,
-		waitForIdle: async () => {},
-		mailbox: { close: () => {} },
-	} as never;
-	model = undefined;
-	thinkingLevel = "off" as const;
-	isStreaming = false;
-	isRetrying = false;
-	isCompacting = false;
-	sessionManager;
-	sessionId;
-	sessionFile;
-	private readonly listeners = new Set<(event: AgentSessionEvent) => void>();
-	readonly sentMessages: Array<{ message: unknown; options: unknown }> = [];
-	readonly prompts: string[] = [];
-	lastAssistantText?: string;
-
-	constructor(id: string) {
-		this.sessionId = id;
-		this.sessionFile = `/tmp/${id}.jsonl`;
-		this.sessionManager = {
-			getCwd: () => "/tmp",
-			getSessionDir: () => "/tmp",
-			getSessionId: () => id,
-			getSessionFile: () => this.sessionFile,
-		};
-	}
-
-	getAllTools() {
-		return [];
-	}
-
-	getLastAssistantText() {
-		return this.lastAssistantText;
-	}
-
-	async bindExtensions() {}
-
-	subscribe(listener: (event: AgentSessionEvent) => void) {
-		this.listeners.add(listener);
-		return () => this.listeners.delete(listener);
-	}
-
-	async sendCustomMessage(message: unknown, options?: unknown) {
-		this.sentMessages.push({ message, options });
-	}
-
-	async prompt(message: string) {
-		this.prompts.push(message);
-	}
-
-	async abort() {}
-
-	dispose() {}
-
-	emit(event: AgentSessionEvent) {
-		for (const listener of this.listeners) {
-			listener(event);
-		}
-	}
-}
+import type { AgentSessionFactoryOptions } from "../src/types.js";
+import { FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
 describe("Orchestrator", () => {
 	it("spawns child sessions through the injected factory", async () => {
@@ -105,6 +39,7 @@ describe("Orchestrator", () => {
 
 		await orchestrator.routeMessage("root", childId, "check src");
 		expect(child.sentMessages).toHaveLength(1);
+		expect(child.sentMessages[0]?.options).toEqual({ triggerTurn: true });
 		await expect(orchestrator.routeMessage(childId, "root", "bad")).rejects.toThrow("not a direct child");
 	});
 
@@ -124,9 +59,96 @@ describe("Orchestrator", () => {
 		});
 
 		child.emit({ type: "agent_end", messages: [] });
-		await Promise.resolve();
-
-		expect(root.sentMessages).toHaveLength(1);
+		await vi.waitFor(() => {
+			expect(root.sentMessages).toHaveLength(1);
+		});
 		expect(root.sentMessages[0]?.options).toEqual({ triggerTurn: true });
+	});
+
+	it("waits for the session run to become idle before finalizing agent_end", async () => {
+		const root = new FakeSession("root-session");
+		let resolveIdle = () => {};
+		const waitForIdle = new Promise<void>((resolve) => {
+			resolveIdle = resolve;
+		});
+		const child = new FakeSession("child-session", {
+			waitForIdle: async () => waitForIdle,
+		});
+		child.lastAssistantText = "finished scanning files";
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect",
+		});
+
+		child.emit({ type: "agent_end", messages: [] });
+		await waitForMicrotasks();
+
+		expect(orchestrator.getRecord(childId).status).toBe("running");
+		expect(root.sentMessages).toHaveLength(0);
+
+		resolveIdle();
+		await vi.waitFor(() => {
+			expect(orchestrator.getRecord(childId).status).toBe("idle");
+		});
+		expect(root.sentMessages[0]?.message.customType).toBe("agent_idle");
+	});
+
+	it("recovers agent status when idle reactivation fails", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		child.sendCustomMessage = vi.fn(async () => {
+			throw new Error("reactivation failed");
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect",
+		});
+		child.emit({ type: "agent_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(orchestrator.getRecord(childId).status).toBe("idle");
+		});
+
+		await orchestrator.routeMessage("root", childId, "continue");
+		expect(orchestrator.getRecord(childId).status).toBe("idle");
+		expect(root.sentMessages).toHaveLength(2);
+		expect(root.sentMessages[1]?.message.customType).toBe("agent_idle");
+	});
+
+	it("delivers child updates as steering while the parent is already running", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		child.lastAssistantText = "done inspecting";
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect",
+		});
+
+		root.isStreaming = true;
+
+		await orchestrator.handleReport(childId, "partial result");
+		expect(root.sentMessages[0]?.options).toEqual({ deliverAs: "steer" });
+		expect(root.sentMessages[0]?.message.customType).toBe("agent_report");
+
+		child.emit({ type: "agent_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(root.sentMessages).toHaveLength(2);
+		});
+		expect(root.sentMessages[1]?.options).toEqual({ deliverAs: "steer" });
+		expect(root.sentMessages[1]?.message.customType).toBe("agent_idle");
 	});
 });

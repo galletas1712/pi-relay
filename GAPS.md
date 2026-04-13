@@ -22,11 +22,16 @@ messages include both the latest tail and the output file path. But the runtime 
 not create the planned session-scoped `tool-output/` files or emit model-visible progress
 mailbox messages between dispatch and completion.
 
-#### Orphan pending annotation is not integrated yet
+#### Orphan pending annotation is restore-scoped, not global
 
-Automatic `[PENDING] -> [TERMINATED]` rewriting was removed because it could mislabel live
-background work. The remaining fork/restore-specific orphan annotation still needs a proper
-integration point.
+Phase 3 restore now records the specific background tool calls that were still pending at
+crash time and rewrites those to `[TERMINATED]` in the restored agent context. But the
+generic `annotateOrphanedPending()` helper in `agent-core` is still not wired into the
+normal runtime or fork pipeline.
+
+The corresponding session/UI transcript still keeps the historical `[PENDING]` entry. The
+model-facing rewrite is correct on restore, but the user-visible transcript is not yet
+rendered as `[TERMINATED]`.
 
 #### Legacy scheduling fields still exist as compatibility shims
 
@@ -65,8 +70,42 @@ current implementation injects them as root `customTools` at session constructio
 mechanism used for children. This keeps the root/child tool wiring uniform, but it diverges
 from the document's extension-specific root setup.
 
+#### Agent message rendering is still preformatted at creation time
+
+The plan split agent-message formatting into `context-transform.ts`. The current runtime
+still formats report/idle/directive/worklog strings eagerly in `messages.ts`, while
+`context-transform.ts` focuses on restore-scoped pending annotations and live roster
+injection.
+
 #### Global LLM concurrency is not limited yet
 
 The plan includes a global semaphore for concurrent LLM calls across agents. The current
 runtime relies on per-agent serial execution from `AgentSession`, but it does not yet add a
 cross-agent concurrency cap.
+
+## Phase 3
+
+### Implemented
+
+- Tree metadata persistence in `tree.json`
+- Live subagent roster injection via `transformContext`
+- Per-agent worklog forks on `turn_end`
+- Ancestor worklog propagation on spawn
+- Session restore for child trees and interrupted tools
+- App startup now resumes the most recent session and restores the tree
+
+### Known Gaps
+
+#### Root restore resumption still uses a synthetic user message
+
+The plan distinguishes between transcripts that can continue directly and transcripts that
+end in an assistant message. The current runtime always resumes the restored root session by
+injecting `[Session restored]` on `session_start`, because the extension API does not expose
+`continue()` directly. This means restore currently adds one extra user turn even when the
+transcript already ended in a continuable non-assistant message.
+
+#### Child session lifecycle still uses generic `fork` and `resume` reasons
+
+The plan sketches dedicated orchestrator-specific startup metadata for spawned and restored
+child sessions. `pi-mono` only exposes the standard `session_start` reasons today, so child
+spawn uses `reason: "fork"` and child restore uses `reason: "resume"` instead.
