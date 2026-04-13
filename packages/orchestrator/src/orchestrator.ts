@@ -369,6 +369,7 @@ export class Orchestrator {
 		await this.deliverMessage(
 			targetAgentId,
 			createAgentDirectiveMessage(fromAgentId, source.role, content),
+			{ waitForTurn: false },
 		);
 	}
 

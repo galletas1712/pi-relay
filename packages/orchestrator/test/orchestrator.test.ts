@@ -158,6 +158,39 @@ describe("Orchestrator", () => {
 		await expect(orchestrator.routeMessage(childId, "root", "bad")).rejects.toThrow("not a direct child");
 	});
 
+	it("does not block message delivery on the child's triggered turn", async () => {
+		const root = new FakeSession("root-session");
+		let resolveChildTurn = () => {};
+		const childTurn = new Promise<void>((resolve) => {
+			resolveChildTurn = resolve;
+		});
+		const child = new FakeSession("child-session");
+		child.sendCustomMessage = vi.fn(async (message, options) => {
+			child.sentMessages.push({ message, options });
+			if ((options as { triggerTurn?: boolean } | undefined)?.triggerTurn) {
+				await childTurn;
+			}
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect",
+		});
+
+		const routePromise = orchestrator.routeMessage("root", childId, "check src");
+		await waitForMicrotasks();
+		await expect(routePromise).resolves.toBeUndefined();
+		expect(child.sentMessages).toHaveLength(1);
+		expect(child.sentMessages[0]?.options).toEqual({ triggerTurn: true });
+		expect(child.sentMessages[0]?.message.customType).toBe("agent_directive");
+
+		resolveChildTurn();
+	});
+
 	it("notifies the parent when a child becomes idle", async () => {
 		const root = new FakeSession("root-session");
 		const child = new FakeSession("child-session");

@@ -28,7 +28,7 @@ export function createMessageTool(runtime: MessageToolRuntime, callingAgentId: s
 				await runtime.routeMessage(callingAgentId, target, params.content);
 			}
 			return {
-				content: [{ type: "text", text: `Message delivered to ${targets.join(", ")}.` }],
+				content: [{ type: "text", text: `Message queued for ${targets.join(", ")}.` }],
 				details: { targets },
 			};
 		},

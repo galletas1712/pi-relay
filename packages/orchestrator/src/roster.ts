@@ -65,6 +65,12 @@ export function buildAgentWidgetLines(
 	if (!active) {
 		return undefined;
 	}
+	const visible = summaries.filter((summary) => summary.id === activeAgentId || summary.status === "running");
+	if (visible.length === 1 && active.id === "root") {
+		return undefined;
+	}
+	const shown = visible.slice(0, maxAgents);
+	const hiddenIdleCount = summaries.length - visible.length;
 
 	const lines = [
 		"Relay Agents",
@@ -72,15 +78,19 @@ export function buildAgentWidgetLines(
 		"Other agents keep running detached when not attached.",
 	];
 
-	for (const summary of summaries.slice(0, maxAgents)) {
+	for (const summary of shown) {
 		const marker = summary.id === activeAgentId ? ">" : " ";
 		lines.push(
 			`${marker} ${"  ".repeat(summary.depth)}${summary.id} · ${formatSummaryStatus(summary)} · ${summary.role}`,
 		);
 	}
 
-	if (summaries.length > maxAgents) {
-		lines.push(`… ${summaries.length - maxAgents} more agents`);
+	if (visible.length > maxAgents) {
+		lines.push(`… ${visible.length - maxAgents} more active agents`);
+	}
+
+	if (hiddenIdleCount > 0) {
+		lines.push(`… ${hiddenIdleCount} idle agent${hiddenIdleCount === 1 ? "" : "s"} hidden`);
 	}
 
 	lines.push("Use /agents to switch");
