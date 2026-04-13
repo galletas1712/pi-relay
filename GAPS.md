@@ -117,3 +117,40 @@ transcript already ended in a continuable non-assistant message.
 The plan sketches dedicated orchestrator-specific startup metadata for spawned and restored
 child sessions. `pi-mono` only exposes the standard `session_start` reasons today, so child
 spawn uses `reason: "fork"` and child restore uses `reason: "resume"` instead.
+
+## Phase 4
+
+### Implemented
+
+- Relay-aware interactive runtime host in `packages/app`
+- `/agents` TUI command for switching between root and child agents
+- Live relay roster widget in the stock coding-agent TUI
+- Safe attach behavior that reuses in-memory child sessions instead of rebuilding the
+  orchestrator around a child session file
+- Upstream TUI patch so attaching to an already-running agent restores loader state, queued
+  input state, live tool completions, and branch-navigation completion state
+- Detached sessions have their extension UI bindings reset to no-op, and attached child exit
+  falls back to the root view automatically
+
+### Known Gaps
+
+#### TUI attach is in-process, not subprocess-based
+
+The later infrastructure plan recommends separate interactive child processes for attachable
+agents. The current implementation keeps all agents in one process and switches the active
+TUI attachment between live in-memory sessions. This is simpler and preserves runtime
+correctness for Phases 1-3, but it is a different attach model than the Phase 5 doc's
+preferred subprocess design.
+
+#### Attach is view switching, not a dedicated multi-pane relay console
+
+The current UI adds a roster widget plus `/agents` switching inside the stock coding-agent
+TUI. It does not yet provide a dedicated relay dashboard, split-pane transcript view, or
+agent tree browser beyond the selector/widget surface.
+
+#### Root-only session-management flows are still the canonical path
+
+When attached to a child, regular prompt submission goes to that child session, but broader
+session-management flows are intentionally blocked with a message that tells the user to
+switch back to root first. There is not yet a dedicated child-local resume/new/fork UX with
+explicit relay semantics.

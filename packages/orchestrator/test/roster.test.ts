@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { buildSubagentRoster } from "../src/roster.js";
+import { buildAgentSelectorOptions, buildAgentWidgetLines, buildSubagentRoster } from "../src/roster.js";
 import { Orchestrator } from "../src/orchestrator.js";
 import { FakeSession } from "./test-helpers.js";
 
@@ -38,5 +38,29 @@ describe("buildSubagentRoster", () => {
 		expect(roster).toContain("## Active Subagents");
 		expect(roster).toContain(`${childId} (running, 1 children): planner`);
 		expect(roster).toContain("Scanning packages/orchestrator");
+	});
+
+	it("builds selector and widget views for the attached agent tree", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		child.lastAssistantText = "Still indexing code paths.";
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "planner",
+			prompt: "inspect",
+		});
+
+		const options = buildAgentSelectorOptions(orchestrator, childId);
+		expect(options.map((option) => option.agentId)).toEqual(["root", childId]);
+		expect(options[1]?.label).toContain(`${childId} [running] planner`);
+
+		const widget = buildAgentWidgetLines(orchestrator, childId);
+		expect(widget[0]).toBe("Relay Agents");
+		expect(widget[1]).toContain(`Attached: ${childId} (planner, running)`);
+		expect(widget.at(-1)).toBe("Use /agents to switch");
 	});
 });

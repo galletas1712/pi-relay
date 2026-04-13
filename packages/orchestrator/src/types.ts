@@ -119,6 +119,17 @@ export interface AgentRecord {
 	unsubscribe?: () => void;
 }
 
+export interface AgentSummary {
+	id: string;
+	parentId: string | null;
+	role: string;
+	status: AgentStatus;
+	depth: number;
+	childCount: number;
+	sessionFile: string | undefined;
+	lastOutput: string | undefined;
+}
+
 export interface AgentSessionFactoryOptions {
 	mode: "spawn" | "restore";
 	agentId: string;

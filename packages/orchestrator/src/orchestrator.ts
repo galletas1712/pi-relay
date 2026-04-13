@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import type { AgentMessage, AgentToolCall } from "@mariozechner/pi-agent-core";
 import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@mariozechner/pi-agent-core";
@@ -56,6 +56,7 @@ export class Orchestrator {
 	private readonly agentsDir: string;
 	private readonly worklogDir: string;
 	private readonly treeFile: string;
+	private readonly changeListeners = new Set<() => void>();
 	private readonly pendingWorklogFork = new Map<string, Promise<void>>();
 	private readonly restoredDisposedEntries = new Map<string, AgentTreeMetadataEntry>();
 	private _isDisposing = false;
@@ -123,6 +124,72 @@ export class Orchestrator {
 		return this.getRecord(agentId).childIds
 			.map((childId) => this.records.get(childId))
 			.filter((record): record is AgentRecord => record !== undefined && record.status !== "disposed");
+	}
+
+	getAgentSummaries(): Array<{
+		id: string;
+		parentId: string | null;
+		role: string;
+		status: AgentRecord["status"];
+		depth: number;
+		childCount: number;
+		sessionFile: string | undefined;
+		lastOutput: string | undefined;
+	}> {
+		const summaries: Array<{
+			id: string;
+			parentId: string | null;
+			role: string;
+			status: AgentRecord["status"];
+			depth: number;
+			childCount: number;
+			sessionFile: string | undefined;
+			lastOutput: string | undefined;
+		}> = [];
+		const visit = (agentId: string, depth: number) => {
+			const record = this.records.get(agentId);
+			if (!record || record.status === "disposed") {
+				return;
+			}
+
+			summaries.push({
+				id: record.id,
+				parentId: record.parentId,
+				role: record.role,
+				status: record.status,
+				depth,
+				childCount: record.childIds.length,
+				sessionFile: record.session.sessionFile,
+				lastOutput: record.session.getLastAssistantText(),
+			});
+
+			for (const childId of record.childIds) {
+				visit(childId, depth + 1);
+			}
+		};
+
+		visit(this.rootAgentId, 0);
+		return summaries;
+	}
+
+	findAgentIdBySessionFile(sessionFile: string): string | undefined {
+		const resolvedSessionFile = resolve(sessionFile);
+		for (const record of this.records.values()) {
+			if (record.status === "disposed" || !record.session.sessionFile) {
+				continue;
+			}
+			if (resolve(record.session.sessionFile) === resolvedSessionFile) {
+				return record.id;
+			}
+		}
+		return undefined;
+	}
+
+	subscribeToChanges(listener: () => void): () => void {
+		this.changeListeners.add(listener);
+		return () => {
+			this.changeListeners.delete(listener);
+		};
 	}
 
 	consumePendingRootResume(sessionId: string): boolean {
@@ -362,6 +429,7 @@ export class Orchestrator {
 		this.records.set(record.id, record);
 		this.sessionIdToAgentId.set(record.session.sessionId, record.id);
 		this.restoredDisposedEntries.delete(record.id);
+		this.notifyChange();
 		void this.persistTree();
 	}
 
@@ -516,7 +584,14 @@ export class Orchestrator {
 		}
 		record.status = status;
 		record.lastStatusChange = Date.now();
+		this.notifyChange();
 		void this.persistTree();
+	}
+
+	private notifyChange(): void {
+		for (const listener of this.changeListeners) {
+			listener();
+		}
 	}
 
 	private createChildTools(agentId: string): ToolDefinition[] {

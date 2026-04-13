@@ -14,6 +14,7 @@ import {
 	createRelaySessionFactory,
 	createSpawnTool,
 } from "@pi-relay/orchestrator";
+import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
 
 export function parseArgs(argv: string[]) {
 	const args = [...argv];
@@ -34,14 +35,18 @@ export function parseArgs(argv: string[]) {
 	return { mode, initialMessage };
 }
 
-export function createRelayRuntimeFactory(agentDir = getAgentDir()): CreateAgentSessionRuntimeFactory {
+export function createRelayRuntimeFactory(
+	agentDir = getAgentDir(),
+	stateRef: RelayRuntimeStateRef = {},
+): CreateAgentSessionRuntimeFactory {
+	const orchestratorUiRef: { cleanup?: () => void; sessionId?: string } = {};
 	return async ({ cwd, sessionManager, sessionStartEvent }) => {
 		const orchestratorRef: { current?: Orchestrator } = {};
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
 			resourceLoaderOptions: {
-				extensionFactories: [createOrchestratorExtension(orchestratorRef)],
+				extensionFactories: [createOrchestratorExtension(orchestratorRef, orchestratorUiRef)],
 			},
 		});
 		const rootToolBridge = {
@@ -76,6 +81,7 @@ export function createRelayRuntimeFactory(agentDir = getAgentDir()): CreateAgent
 			}),
 		});
 		orchestratorRef.current = orchestrator;
+		stateRef.current = { orchestrator };
 		await orchestrator.restore();
 		return {
 			...created,
@@ -98,4 +104,21 @@ export async function createRelayRuntime(options?: {
 		agentDir,
 		sessionManager,
 	});
+}
+
+export async function createRelayInteractiveRuntime(options?: {
+	cwd?: string;
+	agentDir?: string;
+	sessionManager?: SessionManager;
+}) {
+	const cwd = options?.cwd ?? process.cwd();
+	const agentDir = options?.agentDir ?? getAgentDir();
+	const sessionManager = options?.sessionManager ?? SessionManager.continueRecent(cwd);
+	const stateRef: RelayRuntimeStateRef = {};
+	const runtime = await createAgentSessionRuntime(createRelayRuntimeFactory(agentDir, stateRef), {
+		cwd,
+		agentDir,
+		sessionManager,
+	});
+	return new RelayRuntimeHost(runtime, stateRef) as unknown as typeof runtime;
 }
