@@ -191,7 +191,7 @@ Waiting for child and background updates.
 	}, 240_000, 100, "two child idle notifications");
 	report.checks.twoChildIdleNotificationsSeen = idleMessages.length >= 2;
 
-	const settledTree = await waitFor(() => {
+	const childrenSettledTree = await waitFor(() => {
 		const tree = readTree(treeFile);
 		const children = Object.values(tree.agents).filter((entry) => entry.parentId === "root" && entry.status !== "disposed");
 		if (children.length === 2 && children.every((entry) => entry.status === "idle")) {
@@ -200,10 +200,10 @@ Waiting for child and background updates.
 		return false;
 	}, 240_000, 100, "children persisted as idle");
 	report.checks.childrenPersistedIdle = true;
-	report.settledSnapshot = settledTree;
 
-	const finalTree = settledTree;
-	const childEntries = Object.values(finalTree.agents).filter((entry) => entry.parentId === "root" && entry.status !== "disposed");
+	const childEntries = Object.values(childrenSettledTree.agents).filter(
+		(entry) => entry.parentId === "root" && entry.status !== "disposed",
+	);
 	report.childStatuses = Object.fromEntries(childEntries.map((entry) => [entry.id, entry.status]));
 
 	const childContexts = [];
@@ -233,6 +233,7 @@ Waiting for child and background updates.
 	report.checks.childWorklogFilesPopulated = childWorklogs.every((entry) => entry.hasContent);
 
 	await runtime.session.agent.waitForIdle();
+	report.settledSnapshot = readTree(treeFile);
 	await runtime.session.prompt("Summarize in 5 short bullets what the child agents reported and what the background bash returned.");
 	report.finalAssistantText = runtime.session.getLastAssistantText();
 	report.checks.finalSummaryGenerated = Boolean(report.finalAssistantText);
