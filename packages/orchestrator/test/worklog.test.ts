@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Orchestrator } from "../src/orchestrator.js";
-import { buildWorklogPrompt } from "../src/worklog.js";
+import { appendWorklogEntry, buildWorklogPrompt } from "../src/worklog.js";
 import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
 function createWorklogAssistant(content: string) {
@@ -31,7 +31,8 @@ describe("worklog fork", () => {
 
 	it("tells child agents to batch worklog updates instead of sending routine progress", () => {
 		const prompt = buildWorklogPrompt("## Entry — previous");
-		expect(prompt).toContain("Do not use the worklog for step-by-step progress updates or routine status pings.");
+		expect(prompt).toContain('Do not use the worklog for step-by-step progress updates, routine status pings, or "I looked at X" notes.');
+		expect(prompt).toContain("Do not log ordinary file browsing, obvious commands, or temporary hypotheses that did not matter.");
 		expect(prompt).toContain("Batch related findings into one entry instead of emitting one entry per small observation.");
 		expect(prompt).toContain("For short tasks, prefer a single substantial entry near the end.");
 	});
@@ -110,12 +111,36 @@ describe("worklog fork", () => {
 		expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(1);
 	});
 
-	it("waits for ancestor worklog forks before spawning and prepends ancestor worklogs", async () => {
+	it("does not wait for pending ancestor worklog forks and prepends completed worklogs plus recent context", async () => {
 		const sessionDir = createTempDir("pi-relay-worklog-");
 		tempDirs.push(sessionDir);
 		const rootDeferred = Promise.withResolvers<void>();
 		const root = new FakeSession("root-session", {
 			sessionDir,
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "previous question" }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "previous answer" }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
+				{
+					role: "user",
+					content: [{ type: "text", text: "latest question" }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "latest answer" }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
+			],
 			streamFn: vi.fn(async () => {
 				await rootDeferred.promise;
 				return {
@@ -128,6 +153,10 @@ describe("worklog fork", () => {
 			rootSession: root,
 			sessionFactory: vi.fn(async () => ({ session: child })),
 		});
+		const rootRecord = orchestrator.getRecord("root");
+		await appendWorklogEntry(rootRecord.worklogFile, "## Decisions\n- Previous durable summary.", 1);
+		rootRecord.lastWorklogTurn = 1;
+		rootRecord.lastWorklogMessageCount = 2;
 
 		root.emit({ type: "turn_end", messages: [] });
 		const spawnPromise = orchestrator.spawnAgent("root", {
@@ -135,20 +164,57 @@ describe("worklog fork", () => {
 			prompt: "create a restore plan",
 		});
 
-		let settled = false;
-		void spawnPromise.then(() => {
-			settled = true;
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
 		});
-		await waitForMicrotasks();
-		expect(settled).toBe(false);
 
-		rootDeferred.resolve();
 		await spawnPromise;
 
-		expect(child.prompts).toHaveLength(1);
 		expect(child.prompts[0]).toContain("<ancestor-worklog agent=\"root\" role=\"root\">");
-		expect(child.prompts[0]).toContain("Prefer tree.json as the restore source of truth.");
+		expect(child.prompts[0]).toContain("Previous durable summary.");
+		expect(child.prompts[0]).toContain("<ancestor-recent-context agent=\"root\" role=\"root\">");
+		expect(child.prompts[0]).toContain("[User]: latest question");
+		expect(child.prompts[0]).toContain("[Assistant]: latest answer");
 		expect(child.prompts[0]).toContain("create a restore plan");
+		rootDeferred.resolve();
+	});
+
+	it("includes concurrent sibling spawns in each child's initial prompt", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		const gate = Promise.withResolvers<void>();
+		const created = new Map<string, FakeSession>();
+		const root = new FakeSession("root-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async ({ agentId }) => {
+				await gate.promise;
+				const session = new FakeSession(`${agentId}-session`, { sessionDir });
+				created.set(agentId, session);
+				return { session };
+			}),
+		});
+
+		const planSpawn = orchestrator.spawnAgent("root", {
+			role: "planner",
+			prompt: "inspect the backend flow",
+		});
+		const exploreSpawn = orchestrator.spawnAgent("root", {
+			role: "explorer",
+			prompt: "inspect the frontend flow",
+		});
+		await waitForMicrotasks();
+		gate.resolve();
+
+		const [planId, exploreId] = await Promise.all([planSpawn, exploreSpawn]);
+		const planPrompt = created.get(planId)?.prompts[0];
+		const explorePrompt = created.get(exploreId)?.prompts[0];
+		expect(planPrompt).toContain("<parent-sibling-batch parent=\"root\">");
+		expect(planPrompt).toContain(exploreId);
+		expect(planPrompt).toContain("inspect the frontend flow");
+		expect(explorePrompt).toContain("<parent-sibling-batch parent=\"root\">");
+		expect(explorePrompt).toContain(planId);
+		expect(explorePrompt).toContain("inspect the backend flow");
 	});
 
 	it("serializes repeated forks and recovers after a failed worklog turn", async () => {

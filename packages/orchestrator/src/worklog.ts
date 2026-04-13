@@ -7,11 +7,11 @@ import type { Tool } from "@mariozechner/pi-ai";
 export const WORKLOG_UPDATE_TOOL = {
 	name: "worklog_update",
 	description:
-		"Append a new entry to the worklog when you have meaningful new understanding, findings, measurements, or decisions to preserve.",
+		"Append durable knowledge worth preserving for future work, such as insights, measurements, design decisions, or hard-to-reproduce commands.",
 	parameters: Type.Object(
 		{
 			content: Type.String({
-				description: "Markdown worklog entry. Use concise sections and focus on new knowledge only.",
+				description: "Markdown entry with durable knowledge only. Do not use it as a progress log.",
 			}),
 		},
 		{ additionalProperties: false },
@@ -26,15 +26,17 @@ ${lastEntry ?? "(no previous entries)"}
 </last-worklog-entry>
 
 If you have materially NEW knowledge since the last entry, call the worklog_update tool. Include:
-- conceptual understanding you derived from the code or files you inspected
-- concrete discoveries like file paths, APIs, line references, or code patterns
+- conceptual insights you derived from the code, architecture, or behavior
+- concrete findings like APIs, invariants, file paths that matter, line references, or code patterns
 - measurements, counts, or test results
-- corrections to earlier assumptions
+- benchmark results or other performance observations
 - decisions you made and why
+- non-obvious commands worth reusing later, especially if they are hard to reconstruct
 
 Do not repeat the last entry.
 Do not restate inherited context unless you verified or corrected it.
-Do not use the worklog for step-by-step progress updates or routine status pings.
+Do not use the worklog for step-by-step progress updates, routine status pings, or "I looked at X" notes.
+Do not log ordinary file browsing, obvious commands, or temporary hypotheses that did not matter.
 Batch related findings into one entry instead of emitting one entry per small observation.
 For short tasks, prefer a single substantial entry near the end.
 Do not call the tool if nothing meaningful changed.`;

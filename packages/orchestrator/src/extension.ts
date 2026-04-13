@@ -107,14 +107,6 @@ export function createOrchestratorExtension(
 				updateWidget();
 				uiRef.cleanup = orchestrator.subscribeToChanges(updateWidget);
 			}
-
-			if (!orchestrator.consumePendingRootResume(ctx.sessionManager.getSessionId())) {
-				return;
-			}
-
-			queueMicrotask(() => {
-				void pi.sendUserMessage("[Session restored]");
-			});
 		});
 
 		pi.on("before_agent_start", async (event, ctx) => {

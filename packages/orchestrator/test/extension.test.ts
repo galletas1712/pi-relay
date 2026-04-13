@@ -21,13 +21,12 @@ describe("createOrchestratorExtension", () => {
 		return { handlers, commands, sendUserMessage };
 	}
 
-	it("sends the root restore nudge on session_start", async () => {
+	it("does not inject a synthetic restore prompt on session_start", async () => {
 		const root = new FakeSession("root-session");
 		const orchestrator = new Orchestrator({
 			rootSession: root,
 			sessionFactory: vi.fn(),
 		});
-		(orchestrator as { pendingRootResumeSessionId?: string }).pendingRootResumeSessionId = "root-session";
 
 		const { handlers, sendUserMessage } = buildHandlers(orchestrator);
 
@@ -43,7 +42,7 @@ describe("createOrchestratorExtension", () => {
 		);
 		await waitForMicrotasks();
 
-		expect(sendUserMessage).toHaveBeenCalledWith("[Session restored]");
+		expect(sendUserMessage).not.toHaveBeenCalled();
 	});
 
 	it("rewrites the system prompt with role-aware orchestrator guidance", async () => {
@@ -78,9 +77,24 @@ describe("createOrchestratorExtension", () => {
 			"If you need several independent tool calls for the same turn, emit them together in one assistant response",
 		);
 		expect(String(result?.systemPrompt)).toContain(
+			"If you decide to delegate several independent subtasks, emit all of the `spawn` calls in the same assistant response so the children start together.",
+		);
+		expect(String(result?.systemPrompt)).toContain(
 			"Do not produce extra summaries or coordination messages just because a child reported progress.",
 		);
 		expect(String(result?.systemPrompt)).toContain("Prefer one final report near the end over many small status pings.");
+		expect(String(result?.systemPrompt)).toContain(
+			"When you have solid findings, a concrete decision, or a completed result your parent is likely to need, send one concise `report` before finishing.",
+		);
+		expect(String(result?.systemPrompt)).toContain(
+			"Use `report` when the update should change parent behavior now: reprioritize work, redirect a sibling, stop duplicate effort, or react to a blocker/risk.",
+		);
+		expect(String(result?.systemPrompt)).toContain(
+			"Do not rely on `IDLE` to carry your substantive result to your parent.",
+		);
+		expect(String(result?.systemPrompt)).toContain(
+			"If several direct children are still active, wait for the remaining children instead of summarizing each finished child separately",
+		);
 	});
 
 	it("only disposes the orchestrator when the root session shuts down", async () => {
@@ -138,6 +152,7 @@ describe("createOrchestratorExtension", () => {
 			createdAt: Date.now(),
 			lastStatusChange: Date.now(),
 			lastWorklogTurn: 0,
+			lastWorklogMessageCount: 0,
 			turnCount: 0,
 			pendingRestoreIdleNotice: false,
 			orphanedPendingToolCallIds: [],
@@ -191,6 +206,7 @@ describe("createOrchestratorExtension", () => {
 			createdAt: Date.now(),
 			lastStatusChange: Date.now(),
 			lastWorklogTurn: 0,
+			lastWorklogMessageCount: 0,
 			turnCount: 0,
 			pendingRestoreIdleNotice: false,
 			orphanedPendingToolCallIds: [],
@@ -250,7 +266,6 @@ describe("createOrchestratorExtension", () => {
 				refreshWidget = listener;
 				return cleanup;
 			}),
-			consumePendingRootResume: vi.fn(() => false),
 			getAgentIdBySessionId: vi.fn((sessionId: string) => (sessionId === "child-session" ? "child" : "root")),
 			getAgentSummaries: vi.fn(() => summaries),
 		} satisfies Partial<Orchestrator>;

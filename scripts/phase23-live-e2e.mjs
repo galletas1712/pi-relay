@@ -149,10 +149,10 @@ Ticker delegated.`);
 		const tickerChild = Object.values(tree.agents).find(
 			(entry) => entry.parentId === "root" && entry.role === "ticker" && entry.status === "running",
 		);
-		return tree.agents.root?.status === "idle" && tickerChild ? { tree, tickerChild } : false;
-	}, 120_000, 100, "root idle while ticker child runs");
+		return tickerChild ? { tree, tickerChild } : false;
+	}, 120_000, 100, "ticker child running");
 	report.tickerChildId = tickerDispatch.tickerChild.id;
-	report.checks.rootIdleWhileTickerRunning = true;
+	report.checks.rootDispatchReturnedWhileTickerRunning = true;
 
 	await runtime.session.prompt(
 		"Reply with exactly this sentence and nothing else: Root still available.",

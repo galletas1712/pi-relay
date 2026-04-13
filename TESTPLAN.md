@@ -17,7 +17,7 @@
    - `node scripts/phase23-live-e2e.mjs`
 2. The harness should verify:
    - root can delegate a small long-running task to a child agent
-   - root returns to `idle` while that child is still `running`
+   - root remains available for another prompt while that child is still `running`
    - a second root prompt completes while the delegated child is still `running`
    - the delegated child later sends `agent_report` / `agent_idle` back to root after that second prompt
    - root creates a worklog entry before spawning children

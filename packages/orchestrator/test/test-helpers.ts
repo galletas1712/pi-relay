@@ -58,6 +58,7 @@ export class FakeSession implements AgentSessionHandle {
 			convertToLlm?: AgentSessionHandle["agent"]["convertToLlm"];
 			streamFn?: AgentSessionHandle["agent"]["streamFn"];
 			waitForIdle?: AgentSessionHandle["agent"]["waitForIdle"];
+			hasQueuedMessages?: AgentSessionHandle["agent"]["hasQueuedMessages"];
 		},
 	) {
 		this.sessionId = id;
@@ -105,6 +106,7 @@ export class FakeSession implements AgentSessionHandle {
 			transport: "sse",
 			maxRetryDelayMs: undefined,
 			waitForIdle: options?.waitForIdle ?? (async () => {}),
+			hasQueuedMessages: options?.hasQueuedMessages ?? (() => false),
 			mailbox: { close: () => {} },
 			onBackgroundToolStart: undefined,
 			onBackgroundToolEnd: undefined,
