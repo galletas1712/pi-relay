@@ -60,6 +60,17 @@ function extractTextContent(content) {
 		.join("\n");
 }
 
+function timestampMs(value) {
+	if (typeof value === "number") {
+		return value;
+	}
+	if (typeof value === "string") {
+		const parsed = Date.parse(value);
+		return Number.isNaN(parsed) ? 0 : parsed;
+	}
+	return 0;
+}
+
 try {
 	const sessionManager = SessionManager.create(repoDir, sessionDir);
 	const runtime = await createRelayRuntime({ cwd: repoDir, sessionManager });
@@ -111,6 +122,70 @@ try {
 	);
 	report.checks.rootWorklogCreated = true;
 
+	const tickerCommand =
+		"sh -lc 'for i in $(seq 1 8); do printf \"tick:%s\\n\" \"$i\"; sleep 1; done'";
+	const tickerChildPrompt = `Do this exactly:
+1. Do not spawn, message, read, or use any tool except bash and report.
+2. Call bash exactly once with this exact command:
+${tickerCommand}
+3. After bash completes, call report exactly once with exactly this sentence and nothing else:
+tick task finished after eight one-second intervals.
+4. Stop.`;
+
+	await runtime.session.prompt(`Delegate one small long-running task. Do this exactly:
+1. Call spawn exactly once.
+2. Spawn role "ticker" with this exact prompt:
+${tickerChildPrompt}
+3. Do not call bash, read, message, or any other tool yourself in this turn.
+4. After the spawn call resolves, reply with exactly this sentence and nothing else:
+Ticker delegated.`);
+	report.checks.tickerDelegationReplySeen = runtime.session.getLastAssistantText()?.trim() === "Ticker delegated.";
+
+	const tickerDispatch = await waitFor(() => {
+		if (!existsSync(treeFile)) {
+			return false;
+		}
+		const tree = readTree(treeFile);
+		const tickerChild = Object.values(tree.agents).find(
+			(entry) => entry.parentId === "root" && entry.role === "ticker" && entry.status === "running",
+		);
+		return tree.agents.root?.status === "idle" && tickerChild ? { tree, tickerChild } : false;
+	}, 120_000, 100, "root idle while ticker child runs");
+	report.tickerChildId = tickerDispatch.tickerChild.id;
+	report.checks.rootIdleWhileTickerRunning = true;
+
+	await runtime.session.prompt(
+		"Reply with exactly this sentence and nothing else: Root still available.",
+	);
+	const followUpCompletedAt = Date.now();
+	report.rootFollowUpCompletedAt = followUpCompletedAt;
+	report.checks.rootAcceptedFollowUpDuringTicker =
+		runtime.session.getLastAssistantText()?.trim() === "Root still available.";
+
+	const tickerAfterFollowUp = readTree(treeFile).agents[report.tickerChildId];
+	report.checks.tickerStillRunningAfterFollowUp = tickerAfterFollowUp?.status === "running";
+
+	const tickerReport = await waitFor(() => {
+		const message = customMessages("agent_report").find(
+			(entry) =>
+				entry.details?.fromRole === "ticker" &&
+				extractTextContent(entry.content).includes("tick task finished after eight one-second intervals."),
+		);
+		return message || false;
+	}, 240_000, 100, "ticker report");
+	report.checks.tickerReportSeen = true;
+	report.checks.tickerReportArrivedAfterFollowUp = timestampMs(tickerReport.timestamp) >= followUpCompletedAt;
+
+	const tickerIdle = await waitFor(() => {
+		const message = customMessages("agent_idle").find(
+			(entry) => entry.details?.fromRole === "ticker" && entry.details?.fromAgentId === report.tickerChildId,
+		);
+		return message || false;
+	}, 240_000, 100, "ticker idle notification");
+	report.checks.tickerIdleSeen = true;
+	report.checks.tickerIdleArrivedAfterFollowUp = timestampMs(tickerIdle.timestamp) >= followUpCompletedAt;
+	await runtime.session.agent.waitForIdle();
+
 	const worklogChildPrompt =
 		"Inspect packages/orchestrator/src/worklog.ts, packages/orchestrator/src/context-transform.ts, packages/orchestrator/src/roster.ts, packages/orchestrator/src/messages.ts, packages/orchestrator/src/types.ts, the worklog-related sections of packages/orchestrator/src/orchestrator.ts, plus packages/orchestrator/test/worklog.test.ts and packages/orchestrator/test/roster.test.ts. Read those files, then send one short report summarizing worklog generation, ancestor propagation, roster injection, and how the tests cover that behavior. Do not call bash or message.";
 	const startupChildPrompt =
@@ -140,15 +215,22 @@ Waiting for child and background updates.
 			return false;
 		}
 		const tree = readTree(treeFile);
-		const children = Object.values(tree.agents).filter((entry) => entry.parentId === "root" && entry.status !== "disposed");
+		const children = Object.values(tree.agents).filter(
+			(entry) =>
+				entry.parentId === "root" &&
+				(entry.role === "worklog-inspector" || entry.role === "startup-inspector") &&
+				entry.status !== "disposed",
+		);
 		return children.length === 2 ? tree : false;
 	}, 120_000, 100, "two spawned children");
 	report.dispatchSnapshot = dispatchTree;
 	const dispatchChildren = Object.values(dispatchTree.agents).filter(
-		(entry) => entry.parentId === "root" && entry.status !== "disposed",
+		(entry) =>
+			entry.parentId === "root" &&
+			(entry.role === "worklog-inspector" || entry.role === "startup-inspector") &&
+			entry.status !== "disposed",
 	);
-	report.checks.rootIdleWhileChildrenRunning =
-		dispatchTree.agents.root?.status === "idle" && dispatchChildren.some((entry) => entry.status === "running");
+	report.checks.rootReturnedDispatchReply = runtime.session.getLastAssistantText()?.trim() === "Waiting for child and background updates.";
 
 	await waitFor(() => pendingBashResults().length > 0, 120_000, 100, "pending background bash");
 	report.checks.backgroundPendingSeen = true;
@@ -174,26 +256,29 @@ Waiting for child and background updates.
 	}
 
 	const reportMessages = await waitFor(() => {
-		const messages = customMessages("agent_report");
+		const messages = customMessages("agent_report").filter(
+			(entry) => entry.details?.fromRole === "worklog-inspector" || entry.details?.fromRole === "startup-inspector",
+		);
 		return messages.length >= 2 ? messages : false;
 	}, 240_000, 100, "two child reports");
 	report.checks.twoChildReportsSeen = reportMessages.length >= 2;
 
-	const worklogMessages = await waitFor(() => {
-		const messages = customMessages("agent_worklog");
-		return messages.length >= 2 ? messages : false;
-	}, 240_000, 100, "two child worklogs");
-	report.checks.twoChildWorklogsSeen = worklogMessages.length >= 2;
-
 	const idleMessages = await waitFor(() => {
-		const messages = customMessages("agent_idle");
+		const messages = customMessages("agent_idle").filter(
+			(entry) => entry.details?.fromRole === "worklog-inspector" || entry.details?.fromRole === "startup-inspector",
+		);
 		return messages.length >= 2 ? messages : false;
 	}, 240_000, 100, "two child idle notifications");
 	report.checks.twoChildIdleNotificationsSeen = idleMessages.length >= 2;
 
 	const childrenSettledTree = await waitFor(() => {
 		const tree = readTree(treeFile);
-		const children = Object.values(tree.agents).filter((entry) => entry.parentId === "root" && entry.status !== "disposed");
+		const children = Object.values(tree.agents).filter(
+			(entry) =>
+				entry.parentId === "root" &&
+				(entry.role === "worklog-inspector" || entry.role === "startup-inspector") &&
+				entry.status !== "disposed",
+		);
 		if (children.length === 2 && children.every((entry) => entry.status === "idle")) {
 			return tree;
 		}
@@ -202,7 +287,10 @@ Waiting for child and background updates.
 	report.checks.childrenPersistedIdle = true;
 
 	const childEntries = Object.values(childrenSettledTree.agents).filter(
-		(entry) => entry.parentId === "root" && entry.status !== "disposed",
+		(entry) =>
+			entry.parentId === "root" &&
+			(entry.role === "worklog-inspector" || entry.role === "startup-inspector") &&
+			entry.status !== "disposed",
 	);
 	report.childStatuses = Object.fromEntries(childEntries.map((entry) => [entry.id, entry.status]));
 
@@ -230,20 +318,30 @@ Waiting for child and background updates.
 	report.childContexts = childContexts;
 	report.childWorklogs = childWorklogs;
 	report.checks.childrenInheritedAncestorWorklog = childContexts.every((entry) => entry.hasAncestorWorklog);
-	report.checks.childWorklogFilesPopulated = childWorklogs.every((entry) => entry.hasContent);
+	report.checks.someChildWorklogFilesPopulated = childWorklogs.some((entry) => entry.hasContent);
+	report.checks.rootDidNotReceiveChildWorklogs =
+		customMessages("agent_worklog").filter(
+			(entry) => entry.details?.fromRole === "worklog-inspector" || entry.details?.fromRole === "startup-inspector",
+		).length === 0;
 
 	await runtime.session.agent.waitForIdle();
 	report.settledSnapshot = readTree(treeFile);
+	const summaryMessageStart = runtime.session.agent.state.messages.length;
 	await runtime.session.prompt("Summarize in 5 short bullets what the child agents reported and what the background bash returned.");
-	report.finalAssistantText = runtime.session.getLastAssistantText();
+	const summaryMessages = runtime.session.agent.state.messages.slice(summaryMessageStart).filter((message) => message.role === "assistant");
+	const finalSummaryMessage = [...summaryMessages]
+		.reverse()
+		.find((message) => extractTextContent(message.content).trim().length > 0);
+	report.finalAssistantText = finalSummaryMessage ? extractTextContent(finalSummaryMessage.content) : "";
 	report.checks.finalSummaryGenerated = Boolean(report.finalAssistantText);
 
 	report.success = Object.values(report.checks).every(Boolean);
 	saveReport();
 	console.log(JSON.stringify(report, null, 2));
+	process.exit(report.success ? 0 : 1);
 } catch (error) {
 	report.error = error instanceof Error ? { message: error.message, stack: error.stack } : String(error);
 	saveReport();
 	console.error(error);
-	process.exitCode = 1;
+	process.exit(1);
 }

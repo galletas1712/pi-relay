@@ -16,16 +16,20 @@
 1. Use the persisted `openai-codex` OAuth session and run:
    - `node scripts/phase23-live-e2e.mjs`
 2. The harness should verify:
+   - root can delegate a small long-running task to a child agent
+   - root returns to `idle` while that child is still `running`
+   - a second root prompt completes while the delegated child is still `running`
+   - the delegated child later sends `agent_report` / `agent_idle` back to root after that second prompt
    - root creates a worklog entry before spawning children
    - root emits two `spawn` calls plus one background `bash` call in the same dispatch burst
    - root launches one background `bash` with `__background: true`
-   - the root dispatch prompt returns while the root is `idle` and at least one child is still `running`
    - root transcript gets the `[PENDING]` bash result first and the background completion later
    - background completion advertises the combined stdout/stderr output path
-   - both child `agent_report` and `agent_worklog` messages reach the root
+   - child `agent_report` messages reach the root
+   - child worklog files are populated on disk without surfacing live `agent_worklog` messages to the root transcript
    - both child `agent_idle` notifications reach the root
    - child session context includes the inherited root worklog prefix
-   - child worklog files are populated on disk
+   - at least one child writes a persisted worklog entry on disk
    - child `idle` status persists to `tree.json`
    - root can summarize the incoming child/background updates in a later turn
 3. Inspect the JSON report:

@@ -6,10 +6,12 @@ export function createReportTool(runtime: ReportToolRuntime, callingAgentId: str
 	return defineTool({
 		name: "report",
 		label: "Report Progress",
-		description: "Send a progress report to your parent without stopping your own work.",
-		promptSnippet: "Report a useful partial result to your parent agent.",
+		description: "Send a significant progress report to your parent without stopping your own work.",
+		promptSnippet: "Report a significant finding to your parent agent when it cannot wait until the end.",
 		promptGuidelines: [
-			"Use report when your parent would benefit from an intermediate finding before you finish.",
+			"Use report only when your parent would benefit from an intermediate finding before you finish.",
+			"Do not use report for routine status updates or tiny incremental findings.",
+			"Prefer a single final report near the end unless the parent needs an update now.",
 		],
 		parameters: Type.Object(
 			{

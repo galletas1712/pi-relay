@@ -1,4 +1,4 @@
-import type { AgentMessageDetails, AgentWorklogDetails, SessionCustomMessage } from "./types.js";
+import type { AgentMessageDetails, SessionCustomMessage } from "./types.js";
 
 function formatSender(fromAgentId: string, fromRole: string): string {
 	return `Agent ${fromAgentId} (${fromRole})`;
@@ -79,26 +79,6 @@ export function createAgentIdleMessage(
 			lastOutput: truncated,
 			errorMessage,
 			note,
-		},
-	};
-}
-
-export function createAgentWorklogMessage(
-	fromAgentId: string,
-	fromRole: string,
-	content: string,
-	worklogFile: string,
-	turn: number,
-): SessionCustomMessage<AgentWorklogDetails> {
-	return {
-		customType: "agent_worklog",
-		content: `[${formatSender(fromAgentId, fromRole)} WORKLOG]\n${content}`,
-		display: true,
-		details: {
-			fromAgentId,
-			fromRole,
-			worklogFile,
-			turn,
 		},
 	};
 }

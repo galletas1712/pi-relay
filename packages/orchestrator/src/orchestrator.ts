@@ -13,7 +13,6 @@ import {
 	createAgentDirectiveMessage,
 	createAgentIdleMessage,
 	createAgentReportMessage,
-	createAgentWorklogMessage,
 } from "./messages.js";
 import { buildAncestorWorklogPrefix, buildWorklogPrompt, appendWorklogEntry, getLastWorklogEntry, readWorklog, WORKLOG_UPDATE_TOOL } from "./worklog.js";
 import { ToolCallTracker } from "./tool-tracker.js";
@@ -758,15 +757,6 @@ export class Orchestrator {
 		const entry = await appendWorklogEntry(record.worklogFile, args.content, turn);
 		record.lastWorklogTurn = turn;
 		await this.persistTree();
-
-		if (!record.parentId) {
-			return;
-		}
-
-		await this.deliverMessage(
-			record.parentId,
-			createAgentWorklogMessage(record.id, record.role, entry, record.worklogFile, turn),
-		);
 	}
 
 	private appendInterruptedToolResults(session: AgentSessionHandle): string[] {

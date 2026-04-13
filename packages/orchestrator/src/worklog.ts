@@ -19,13 +19,13 @@ export const WORKLOG_UPDATE_TOOL = {
 } satisfies Tool;
 
 export function buildWorklogPrompt(lastEntry: string | undefined): string {
-	return `Your worklog preserves knowledge for downstream consumption. Child agents inherit ancestor worklogs, and parent agents receive your worklog entries as incremental summaries.
+	return `Your worklog preserves knowledge for downstream consumption. Child agents inherit ancestor worklogs, and restored sessions reuse these entries after interruption.
 
 <last-worklog-entry>
 ${lastEntry ?? "(no previous entries)"}
 </last-worklog-entry>
 
-If you have NEW knowledge since the last entry, call the worklog_update tool. Include:
+If you have materially NEW knowledge since the last entry, call the worklog_update tool. Include:
 - conceptual understanding you derived from the code or files you inspected
 - concrete discoveries like file paths, APIs, line references, or code patterns
 - measurements, counts, or test results
@@ -34,6 +34,9 @@ If you have NEW knowledge since the last entry, call the worklog_update tool. In
 
 Do not repeat the last entry.
 Do not restate inherited context unless you verified or corrected it.
+Do not use the worklog for step-by-step progress updates or routine status pings.
+Batch related findings into one entry instead of emitting one entry per small observation.
+For short tasks, prefer a single substantial entry near the end.
 Do not call the tool if nothing meaningful changed.`;
 }
 

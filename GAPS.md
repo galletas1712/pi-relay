@@ -98,6 +98,7 @@ pattern once the model follows it, but prompt guidance alone does not make it de
 - Tree metadata persistence in `tree.json`
 - Live subagent roster injection via `transformContext`
 - Per-agent worklog forks on `turn_end`
+- Worklog forks stay local to the agent/worklog files and ancestor propagation instead of surfacing as live parent transcript messages
 - Ancestor worklog propagation on spawn
 - Session restore for child trees and interrupted tools
 - App startup now resumes the most recent session and restores the tree

@@ -95,9 +95,13 @@ export function createOrchestratorExtension(
 
 					const activeAgentId =
 						orchestrator.getAgentIdBySessionId(ctx.sessionManager.getSessionId()) ?? orchestrator.rootAgentId;
-					ctx.ui.setWidget("relay-agents", buildAgentWidgetLines(orchestrator, activeAgentId), {
-						placement: "belowEditor",
-					});
+					const widgetLines = buildAgentWidgetLines(orchestrator, activeAgentId);
+					if (!widgetLines) {
+						ctx.ui.setWidget("relay-agents", undefined);
+						return;
+					}
+
+					ctx.ui.setWidget("relay-agents", widgetLines, { placement: "belowEditor" });
 				};
 
 				updateWidget();

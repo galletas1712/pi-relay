@@ -1,6 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Orchestrator } from "../src/orchestrator.js";
+import { buildWorklogPrompt } from "../src/worklog.js";
 import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
 function createWorklogAssistant(content: string) {
@@ -26,6 +27,13 @@ describe("worklog fork", () => {
 		for (const dir of tempDirs.splice(0)) {
 			cleanupTempDir(dir);
 		}
+	});
+
+	it("tells child agents to batch worklog updates instead of sending routine progress", () => {
+		const prompt = buildWorklogPrompt("## Entry — previous");
+		expect(prompt).toContain("Do not use the worklog for step-by-step progress updates or routine status pings.");
+		expect(prompt).toContain("Batch related findings into one entry instead of emitting one entry per small observation.");
+		expect(prompt).toContain("For short tasks, prefer a single substantial entry near the end.");
 	});
 
 	it("runs on turn_end via the transform pipeline and leaves agent context untouched", async () => {
@@ -95,8 +103,7 @@ describe("worklog fork", () => {
 
 		const worklogFile = orchestrator.getRecord(childId).worklogFile;
 		expect(await readFile(worklogFile, "utf-8")).toContain("## Findings");
-		expect(root.sentMessages).toHaveLength(1);
-		expect(root.sentMessages[0]?.message.customType).toBe("agent_worklog");
+		expect(root.sentMessages).toHaveLength(0);
 		expect(transformContext).toHaveBeenCalledTimes(1);
 		expect(convertToLlm).toHaveBeenCalledTimes(1);
 		expect(child.agent.state.messages).toEqual(originalMessages);
@@ -197,17 +204,17 @@ describe("worklog fork", () => {
 
 		secondGate.resolve();
 		await vi.waitFor(() => {
-			expect(root.sentMessages).toHaveLength(1);
 			expect(callCount).toBe(3);
 		});
 
 		thirdGate.resolve();
 		await vi.waitFor(() => {
-			expect(root.sentMessages).toHaveLength(2);
+			expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(3);
 		});
 
 		const worklogFile = orchestrator.getRecord(childId).worklogFile;
 		const worklog = await readFile(worklogFile, "utf-8");
+		expect(root.sentMessages).toHaveLength(0);
 		expect(worklog).toContain("Second turn persisted.");
 		expect(worklog).toContain("Third turn persisted.");
 		expect(worklog.indexOf("Second turn persisted.")).toBeLessThan(worklog.indexOf("Third turn persisted."));
@@ -243,7 +250,7 @@ describe("worklog fork", () => {
 			sessionFactory: vi.fn(async () => ({ session: child })),
 		});
 
-		await orchestrator.spawnAgent("root", {
+		const childId = await orchestrator.spawnAgent("root", {
 			role: "explore",
 			prompt: "inspect the orchestrator",
 		});
@@ -263,8 +270,9 @@ describe("worklog fork", () => {
 		transformGate.resolve();
 
 		await vi.waitFor(() => {
-			expect(root.sentMessages).toHaveLength(1);
+			expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(1);
 		});
+		expect(root.sentMessages).toHaveLength(0);
 		expect(Array.isArray(transformedMessages)).toBe(true);
 		expect((transformedMessages as unknown[]).length).toBe(1);
 	});

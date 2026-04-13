@@ -56,11 +56,14 @@ export function buildAgentWidgetLines(
 	orchestrator: Orchestrator,
 	activeAgentId: string,
 	maxAgents = 8,
-): string[] {
+): string[] | undefined {
 	const summaries = orchestrator.getAgentSummaries();
+	if (summaries.length <= 1) {
+		return undefined;
+	}
 	const active = summaries.find((summary) => summary.id === activeAgentId) ?? summaries[0];
 	if (!active) {
-		return [];
+		return undefined;
 	}
 
 	const lines = [

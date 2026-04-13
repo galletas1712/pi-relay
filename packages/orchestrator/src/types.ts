@@ -4,7 +4,7 @@ import type { AgentSessionEvent, ToolDefinition, ToolInfo } from "@mariozechner/
 
 export type AgentStatus = "running" | "idle" | "disposed";
 
-export type AgentCustomType = "agent_report" | "agent_idle" | "agent_directive" | "agent_worklog" | "agent_roster";
+export type AgentCustomType = "agent_report" | "agent_idle" | "agent_directive" | "agent_roster";
 
 export interface SessionCustomMessage<T = unknown> {
 	customType: string;
@@ -64,11 +64,6 @@ export interface OrchestratorConfig {
 export interface AgentMessageDetails {
 	fromAgentId: string;
 	fromRole: string;
-}
-
-export interface AgentWorklogDetails extends AgentMessageDetails {
-	turn: number;
-	worklogFile: string;
 }
 
 export interface ToolCallRecord {

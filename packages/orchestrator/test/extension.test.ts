@@ -80,6 +80,7 @@ describe("createOrchestratorExtension", () => {
 		expect(String(result?.systemPrompt)).toContain(
 			"Do not produce extra summaries or coordination messages just because a child reported progress.",
 		);
+		expect(String(result?.systemPrompt)).toContain("Prefer one final report near the end over many small status pings.");
 	});
 
 	it("only disposes the orchestrator when the root session shuts down", async () => {
@@ -221,6 +222,28 @@ describe("createOrchestratorExtension", () => {
 	it("installs and refreshes the relay widget for the active session", async () => {
 		const cleanup = vi.fn();
 		let refreshWidget: (() => void) | undefined;
+		let summaries = [
+			{
+				id: "root",
+				parentId: null,
+				role: "root",
+				status: "idle",
+				depth: 0,
+				childCount: 1,
+				sessionFile: "/tmp/root.jsonl",
+				lastOutput: "root summary",
+			},
+			{
+				id: "child",
+				parentId: "root",
+				role: "planner",
+				status: "running",
+				depth: 1,
+				childCount: 0,
+				sessionFile: "/tmp/child.jsonl",
+				lastOutput: "child summary",
+			},
+		];
 		const orchestrator = {
 			rootAgentId: "root",
 			subscribeToChanges: vi.fn((listener: () => void) => {
@@ -229,28 +252,7 @@ describe("createOrchestratorExtension", () => {
 			}),
 			consumePendingRootResume: vi.fn(() => false),
 			getAgentIdBySessionId: vi.fn((sessionId: string) => (sessionId === "child-session" ? "child" : "root")),
-			getAgentSummaries: vi.fn(() => [
-				{
-					id: "root",
-					parentId: null,
-					role: "root",
-					status: "idle",
-					depth: 0,
-					childCount: 1,
-					sessionFile: "/tmp/root.jsonl",
-					lastOutput: "root summary",
-				},
-				{
-					id: "child",
-					parentId: "root",
-					role: "planner",
-					status: "running",
-					depth: 1,
-					childCount: 0,
-					sessionFile: "/tmp/child.jsonl",
-					lastOutput: "child summary",
-				},
-			]),
+			getAgentSummaries: vi.fn(() => summaries),
 		} satisfies Partial<Orchestrator>;
 		const uiRef: { cleanup?: () => void; sessionId?: string } = {};
 		const handlers = new Map<string, Function>();
@@ -280,6 +282,9 @@ describe("createOrchestratorExtension", () => {
 
 		refreshWidget?.();
 		expect(setWidget).toHaveBeenCalledTimes(2);
+		summaries = [summaries[0]!];
+		refreshWidget?.();
+		expect(setWidget).toHaveBeenLastCalledWith("relay-agents", undefined);
 
 		await handlers.get("session_shutdown")?.(
 			{ type: "session_shutdown" },

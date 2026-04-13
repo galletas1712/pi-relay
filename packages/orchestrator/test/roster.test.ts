@@ -11,6 +11,7 @@ describe("buildSubagentRoster", () => {
 		});
 
 		expect(buildSubagentRoster(orchestrator, "root")).toBe("");
+		expect(buildAgentWidgetLines(orchestrator, "root")).toBeUndefined();
 	});
 
 	it("renders live child status, activity, and child counts", async () => {
