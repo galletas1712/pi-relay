@@ -1,8 +1,8 @@
 import { readFile } from "node:fs/promises";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Orchestrator } from "../src/orchestrator.js";
-import { appendWorklogEntry, buildWorklogPrompt } from "../src/worklog.js";
-import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
+import { appendWorklogEntry, buildWorklogPrompt, WORKLOG_COMPACTION_TOOL, WORKLOG_UPDATE_TOOL } from "../src/worklog.js";
+import { cleanupTempDir, createTempDir, FakeSession, TEST_MODEL, waitForMicrotasks } from "./test-helpers.js";
 
 function createWorklogAssistant(content: string) {
 	return {
@@ -11,8 +11,24 @@ function createWorklogAssistant(content: string) {
 			{
 				type: "toolCall" as const,
 				id: "worklog-call",
-				name: "worklog_update",
+				name: WORKLOG_UPDATE_TOOL.name,
 				arguments: { content },
+			},
+		],
+		stopReason: "toolUse" as const,
+		timestamp: Date.now(),
+	};
+}
+
+function createWorklogCompactionAssistant(summary: string) {
+	return {
+		role: "assistant" as const,
+		content: [
+			{
+				type: "toolCall" as const,
+				id: "worklog-compaction-call",
+				name: WORKLOG_COMPACTION_TOOL.name,
+				arguments: { summary },
 			},
 		],
 		stopReason: "toolUse" as const,
@@ -177,6 +193,166 @@ describe("worklog fork", () => {
 		expect(child.prompts[0]).toContain("[Assistant]: latest answer");
 		expect(child.prompts[0]).toContain("create a restore plan");
 		rootDeferred.resolve();
+	});
+
+	it("keeps raw worklogs append-only while child spawns inherit the compacted variant", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		const compactingModel = {
+			...TEST_MODEL,
+			contextWindow: 50_000,
+		};
+		let worklogUpdateCount = 0;
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			model: compactingModel,
+			streamFn: vi.fn(async (_model, context) => {
+				const toolName = context.tools?.[0]?.name;
+				if (toolName === WORKLOG_UPDATE_TOOL.name) {
+					worklogUpdateCount += 1;
+					const repeatedBlob =
+						worklogUpdateCount === 1 ? "ALPHA ".repeat(12_500) : "BETA ".repeat(12_500);
+					const marker = worklogUpdateCount === 1 ? "legacy-marker" : "recent-marker";
+					return {
+						result: async () => createWorklogAssistant(`## Findings\n- ${marker}\n- ${repeatedBlob}`),
+					} as never;
+				}
+				if (toolName === WORKLOG_COMPACTION_TOOL.name) {
+					return {
+						result: async () =>
+							createWorklogCompactionAssistant("## Durable Context\n- legacy-marker remains relevant."),
+					} as never;
+				}
+				throw new Error(`Unexpected worklog tool request: ${toolName}`);
+			}),
+		});
+		const grandchild = new FakeSession("grandchild-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi
+				.fn(async () => ({ session: child }))
+				.mockResolvedValueOnce({ session: child })
+				.mockResolvedValueOnce({ session: grandchild }),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "planner",
+			prompt: "inspect the backend flow",
+		});
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(1);
+		});
+
+		child.emit({ type: "turn_end", messages: [] });
+		const rawFile = orchestrator.getRecord(childId).worklogFile;
+		const compactedFile = rawFile.replace(".worklog.md", ".compacted.worklog.md");
+		await vi.waitFor(() => {
+			expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(2);
+		});
+		await vi.waitFor(async () => {
+			const compacted = await readFile(compactedFile, "utf-8");
+			expect(compacted).toContain("## Summary —");
+		});
+
+		const rawWorklog = await readFile(rawFile, "utf-8");
+		const compactedWorklog = await readFile(compactedFile, "utf-8");
+		expect(rawWorklog).toContain("legacy-marker");
+		expect(rawWorklog).toContain("recent-marker");
+		expect(rawWorklog).toContain("ALPHA ALPHA ALPHA ALPHA");
+		expect(rawWorklog).toContain("BETA BETA BETA BETA");
+		expect(compactedWorklog).toContain("legacy-marker remains relevant.");
+		expect(compactedWorklog).toContain("recent-marker");
+		expect(compactedWorklog).toContain("BETA BETA BETA BETA");
+		expect(compactedWorklog).not.toContain("ALPHA ALPHA ALPHA ALPHA");
+
+		await orchestrator.spawnAgent(childId, {
+			role: "inspector",
+			prompt: "check inherited worklog context",
+		});
+
+		expect(grandchild.prompts[0]).toContain("legacy-marker remains relevant.");
+		expect(grandchild.prompts[0]).toContain("recent-marker");
+		expect(grandchild.prompts[0]).toContain("BETA BETA BETA BETA");
+		expect(grandchild.prompts[0]).not.toContain("ALPHA ALPHA ALPHA ALPHA");
+	});
+
+	it("compacts oversized recent ancestor context instead of truncating it", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		const childModel = {
+			...TEST_MODEL,
+			contextWindow: 20_000,
+		};
+		const coveredQuestion = "covered question";
+		const coveredAnswer = "covered answer";
+		const recentQuestion = `recent-overflow-question ${"RECENT ".repeat(14_000)}`;
+		const recentAnswer = "recent-overflow-answer";
+		const root = new FakeSession("root-session", {
+			sessionDir,
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: coveredQuestion }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: coveredAnswer }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
+				{
+					role: "user",
+					content: [{ type: "text", text: recentQuestion }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: recentAnswer }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
+			],
+			streamFn: vi.fn(async (_model, context) => {
+				expect(context.tools?.[0]?.name).toBe(WORKLOG_COMPACTION_TOOL.name);
+				const promptText = (context.messages[0]?.content[0] as { text: string }).text;
+				expect(promptText).toContain("seed-marker");
+				expect(promptText).toContain("recent-overflow-question");
+				return {
+					result: async () =>
+						createWorklogCompactionAssistant(
+							"## Durable Context\n- seed-marker\n- recent-overflow-question",
+						),
+				} as never;
+			}),
+		});
+		const child = new FakeSession("child-session", { sessionDir, model: childModel });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const rootRecord = orchestrator.getRecord("root");
+		await appendWorklogEntry(rootRecord.worklogFile, "## Durable Context\n- seed-marker", 1);
+		rootRecord.lastWorklogTurn = 1;
+		rootRecord.lastWorklogMessageCount = 2;
+
+		await orchestrator.spawnAgent("root", {
+			role: "planner",
+			prompt: "inspect the overflow path",
+		});
+
+		const compactedFile = rootRecord.worklogFile.replace(".worklog.md", ".compacted.worklog.md");
+		const compactedWorklog = await readFile(compactedFile, "utf-8");
+		expect(compactedWorklog).toContain("recent-overflow-question");
+		expect(compactedWorklog).toContain("seed-marker");
+		expect(orchestrator.getRecord("root").lastWorklogMessageCount).toBe(root.agent.state.messages.length);
+		expect(child.prompts[0]).toContain("recent-overflow-question");
+		expect(child.prompts[0]).not.toContain("<ancestor-recent-context");
+		expect(child.prompts[0]).not.toContain("[Truncated to the most recent 4000 characters");
+		expect(child.prompts[0]).not.toContain(recentQuestion);
 	});
 
 	it("includes concurrent sibling spawns in each child's initial prompt", async () => {

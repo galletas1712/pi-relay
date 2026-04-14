@@ -52,6 +52,7 @@ export class FakeSession implements AgentSessionHandle {
 			sessionFile?: string;
 			createSessionFile?: boolean;
 			messages?: AgentMessage[];
+			model?: Model<any>;
 			systemPrompt?: string;
 			tools?: AgentTool<any>[];
 			transformContext?: AgentSessionHandle["agent"]["transformContext"];
@@ -68,6 +69,7 @@ export class FakeSession implements AgentSessionHandle {
 		if (options?.createSessionFile ?? true) {
 			writeFileSync(this.sessionFile, "seed\n", "utf-8");
 		}
+		this.model = options?.model ?? TEST_MODEL;
 
 		this.sessionManager = {
 			getCwd: () => sessionDir,

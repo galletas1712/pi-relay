@@ -4,7 +4,12 @@ import { randomUUID } from "node:crypto";
 import type { AgentMessage, AgentToolCall } from "@mariozechner/pi-agent-core";
 import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@mariozechner/pi-agent-core";
 import { validateToolArguments, type ToolResultMessage, type UserMessage } from "@mariozechner/pi-ai";
-import { serializeConversation, type AgentSessionEvent, type ToolDefinition } from "@mariozechner/pi-coding-agent";
+import {
+	DEFAULT_COMPACTION_SETTINGS,
+	serializeConversation,
+	type AgentSessionEvent,
+	type ToolDefinition,
+} from "@mariozechner/pi-coding-agent";
 import { createAgentContextTransform } from "./context-transform.js";
 import { buildDirectChildRoster } from "./roster.js";
 import { createChildrenTool } from "./tools/children.js";
@@ -17,7 +22,26 @@ import {
 	createAgentIdleMessage,
 	createAgentReportMessage,
 } from "./messages.js";
-import { buildAncestorWorklogPrefix, buildWorklogPrompt, appendWorklogEntry, getLastWorklogEntry, readWorklog, WORKLOG_UPDATE_TOOL } from "./worklog.js";
+import {
+	appendWorklogEntry,
+	appendWorklogSection,
+	buildAncestorWorklogPrefix,
+	buildWorklogCompactionPrompt,
+	buildWorklogPrompt,
+	formatWorklogSummary,
+	getLastWorklogEntry,
+	getWorklogEntries,
+	getWorklogTurn,
+	parseCompactedWorklog,
+	readWorklog,
+	renderCompactedWorklog,
+	selectWorklogEntriesToKeep,
+	shouldCompactText,
+	shouldCompactWorklog,
+	WORKLOG_COMPACTION_SYSTEM_PROMPT,
+	WORKLOG_COMPACTION_TOOL,
+	WORKLOG_UPDATE_TOOL,
+} from "./worklog.js";
 import { ToolCallTracker } from "./tool-tracker.js";
 import {
 	DEFAULT_ORCHESTRATOR_CONFIG,
@@ -53,6 +77,16 @@ interface PendingSpawnDraft {
 	id: string;
 	role: string;
 	prompt: string;
+}
+
+interface SpawnAncestorContext {
+	id: string;
+	role: string;
+	worklogFile: string;
+	compactedWorklogFile: string;
+	lastWorklogMessageCount: number;
+	messages: AgentMessage[];
+	recentContext?: string;
 }
 
 export class Orchestrator {
@@ -731,6 +765,185 @@ export class Orchestrator {
 		return filePath;
 	}
 
+	private getCompactedWorklogFile(agentId: string): string {
+		const filePath = join(this.worklogDir, `${agentId}.compacted.worklog.md`);
+		ensureDir(dirname(filePath));
+		return filePath;
+	}
+
+	private writeWorklogFile(filePath: string, content: string): void {
+		const tempFile = `${filePath}.tmp`;
+		writeFileSync(tempFile, content.trim() ? `${content.trim()}\n` : "", "utf-8");
+		renameSync(tempFile, filePath);
+	}
+
+	private buildStreamOptions(record: AgentRecord): Parameters<AgentRecord["session"]["agent"]["streamFn"]>[2] {
+		return {
+			reasoning: record.session.thinkingLevel === "off" ? undefined : record.session.thinkingLevel,
+			getApiKey: record.session.agent.getApiKey,
+			onPayload: record.session.agent.onPayload,
+			sessionId: record.session.agent.sessionId,
+			thinkingBudgets: record.session.agent.thinkingBudgets,
+			transport: record.session.agent.transport,
+			maxRetryDelayMs: record.session.agent.maxRetryDelayMs,
+		} as Parameters<AgentRecord["session"]["agent"]["streamFn"]>[2];
+	}
+
+	private async ensureCompactedWorklog(record: AgentRecord): Promise<void> {
+		const rawContents = await readWorklog(record.worklogFile);
+		if (!rawContents.trim()) {
+			return;
+		}
+		const summaryTurn = Math.max(record.turnCount, record.lastWorklogTurn);
+
+		const compactedFile = this.getCompactedWorklogFile(record.id);
+		if (
+			!existsSync(compactedFile) ||
+			(existsSync(record.worklogFile) && statSync(record.worklogFile).mtimeMs > statSync(compactedFile).mtimeMs)
+		) {
+			await this.rebuildCompactedWorklog(record, rawContents);
+			return;
+		}
+
+		const compactedContents = await readWorklog(compactedFile);
+		const parsed = parseCompactedWorklog(compactedContents);
+		const compacted = await this.compactWorklogStateUntilFit(record, parsed.summary, parsed.entries, summaryTurn);
+		const nextContents = renderCompactedWorklog(
+			compacted.summary ? formatWorklogSummary(compacted.summary, summaryTurn) : undefined,
+			compacted.entries,
+		);
+		if (nextContents.trim() !== compactedContents.trim()) {
+			this.writeWorklogFile(compactedFile, nextContents);
+		}
+	}
+
+	private async compactWorklogFile(record: AgentRecord, turn: number): Promise<void> {
+		const compactedFile = this.getCompactedWorklogFile(record.id);
+		const compactedContents = await readWorklog(compactedFile);
+		if (!compactedContents.trim()) {
+			return;
+		}
+
+		const parsed = parseCompactedWorklog(compactedContents);
+		const compacted = await this.compactWorklogStateUntilFit(record, parsed.summary, parsed.entries, turn);
+		const nextContents = renderCompactedWorklog(
+			compacted.summary ? formatWorklogSummary(compacted.summary, turn) : undefined,
+			compacted.entries,
+		);
+		if (nextContents.trim() !== compactedContents.trim()) {
+			this.writeWorklogFile(compactedFile, nextContents);
+		}
+	}
+
+	private async rebuildCompactedWorklog(record: AgentRecord, rawContents: string): Promise<void> {
+		const entries = getWorklogEntries(rawContents);
+		const compactedFile = this.getCompactedWorklogFile(record.id);
+		if (entries.length === 0) {
+			this.writeWorklogFile(compactedFile, "");
+			return;
+		}
+
+		let summary: string | undefined;
+		let keptEntries: string[] = [];
+		for (const entry of entries) {
+			keptEntries.push(entry);
+			const turn = getWorklogTurn(entry) ?? record.turnCount;
+			const compacted = await this.compactWorklogStateUntilFit(record, summary, keptEntries, turn);
+			summary = compacted.summary;
+			keptEntries = compacted.entries;
+		}
+
+		this.writeWorklogFile(
+			compactedFile,
+			renderCompactedWorklog(
+				summary ? formatWorklogSummary(summary, Math.max(record.turnCount, record.lastWorklogTurn)) : undefined,
+				keptEntries,
+			),
+		);
+	}
+
+	private async compactWorklogStateUntilFit(
+		record: AgentRecord,
+		summary: string | undefined,
+		entries: string[],
+		turn: number,
+	): Promise<{ summary?: string; entries: string[] }> {
+		if (!record.session.model) {
+			return { summary, entries };
+		}
+
+		let nextSummary = summary;
+		let nextEntries = [...entries];
+		for (let attempt = 0; attempt <= nextEntries.length; attempt += 1) {
+			const rendered = renderCompactedWorklog(
+				nextSummary ? formatWorklogSummary(nextSummary, turn) : undefined,
+				nextEntries,
+			);
+			if (!shouldCompactWorklog(rendered, record.session.model.contextWindow)) {
+				return { summary: nextSummary, entries: nextEntries };
+			}
+
+			const { compactedEntries, keptEntries } = selectWorklogEntriesToKeep(
+				nextEntries,
+				DEFAULT_COMPACTION_SETTINGS.keepRecentTokens,
+			);
+			if (compactedEntries.length === 0) {
+				return { summary: nextSummary, entries: nextEntries };
+			}
+
+			const mergedSummary = await this.generateWorklogCompactionSummary(record, nextSummary, compactedEntries);
+			if (!mergedSummary) {
+				return { summary: nextSummary, entries: nextEntries };
+			}
+
+			nextSummary = mergedSummary;
+			nextEntries = keptEntries;
+		}
+
+		return { summary: nextSummary, entries: nextEntries };
+	}
+
+	private async generateWorklogCompactionSummary(
+		record: AgentRecord,
+		previousSummary: string | undefined,
+		compactedEntries: string[],
+		recentContext?: string,
+	): Promise<string | undefined> {
+		if (!record.session.model) {
+			return undefined;
+		}
+
+		const prompt: UserMessage = {
+			role: "user",
+			content: [{ type: "text", text: buildWorklogCompactionPrompt(previousSummary, compactedEntries, recentContext) }],
+			timestamp: Date.now(),
+		};
+		const stream = await record.session.agent.streamFn(
+			record.session.model,
+			{
+				systemPrompt: WORKLOG_COMPACTION_SYSTEM_PROMPT,
+				messages: [prompt],
+				tools: [WORKLOG_COMPACTION_TOOL],
+			},
+			this.buildStreamOptions(record),
+		);
+		const assistant = await stream.result();
+		if (assistant.stopReason !== "toolUse") {
+			return undefined;
+		}
+
+		const toolCall = assistant.content.find(
+			(content): content is AgentToolCall =>
+				content.type === "toolCall" && content.name === WORKLOG_COMPACTION_TOOL.name,
+		);
+		if (!toolCall) {
+			return undefined;
+		}
+
+		const args = validateToolArguments(WORKLOG_COMPACTION_TOOL, toolCall);
+		return args.summary.trim() || undefined;
+	}
+
 	private getMetadataDepth(metadata: AgentTreeMetadata, agentId: string): number {
 		let depth = 0;
 		let current: AgentTreeMetadataEntry | undefined = metadata.agents[agentId];
@@ -789,43 +1002,63 @@ export class Orchestrator {
 		}
 	}
 
-	private async buildSpawnPrompt(parentId: string, agentId: string, prompt: string): Promise<string> {
-		const ancestors: Array<{
-			id: string;
-			role: string;
-			worklogFile: string;
-			lastWorklogMessageCount: number;
-			messages: AgentMessage[];
-		}> = [];
-		let current: AgentRecord | undefined = this.records.get(parentId);
-		while (current) {
-			ancestors.unshift({
-				id: current.id,
-				role: current.role,
-				worklogFile: current.worklogFile,
-				lastWorklogMessageCount: current.lastWorklogMessageCount,
-				messages: [...current.session.agent.state.messages],
-			});
-			current = current.parentId ? this.records.get(current.parentId) : undefined;
+	private async compactAncestorRecentContext(ancestor: SpawnAncestorContext): Promise<boolean> {
+		if (!ancestor.recentContext) {
+			return false;
 		}
 
+		const record = this.getRecord(ancestor.id);
+		let compactedContents = await readWorklog(ancestor.compactedWorklogFile);
+		if (!compactedContents.trim()) {
+			compactedContents = await readWorklog(ancestor.worklogFile);
+		}
+
+		const parsed = parseCompactedWorklog(compactedContents);
+		const mergedSummary = await this.generateWorklogCompactionSummary(
+			record,
+			parsed.summary,
+			parsed.entries,
+			ancestor.recentContext,
+		);
+		if (!mergedSummary) {
+			return false;
+		}
+
+		const summaryTurn = Math.max(record.turnCount, record.lastWorklogTurn);
+		this.writeWorklogFile(
+			ancestor.compactedWorklogFile,
+			renderCompactedWorklog(formatWorklogSummary(mergedSummary, summaryTurn), []),
+		);
+		if (record.lastWorklogMessageCount < ancestor.messages.length) {
+			record.lastWorklogMessageCount = ancestor.messages.length;
+			await this.persistTree();
+		}
+		return true;
+	}
+
+	private async renderSpawnPrompt(
+		parentId: string,
+		agentId: string,
+		prompt: string,
+		ancestors: SpawnAncestorContext[],
+	): Promise<string> {
 		const sections: string[] = [];
 		for (const ancestor of ancestors) {
 			const worklogSection = await buildAncestorWorklogPrefix([
 				{
 					agentId: ancestor.id,
 					role: ancestor.role,
-					filePath: ancestor.worklogFile,
+					filePath: ancestor.compactedWorklogFile,
+					fallbackFilePath: ancestor.worklogFile,
 				},
 			]);
 			if (worklogSection) {
 				sections.push(worklogSection);
 			}
 
-			const recentContext = await this.serializeRecentAncestorContext(ancestor);
-			if (recentContext) {
+			if (ancestor.recentContext) {
 				sections.push(
-					`<ancestor-recent-context agent="${ancestor.id}" role="${ancestor.role}">\n${recentContext}\n</ancestor-recent-context>`,
+					`<ancestor-recent-context agent="${ancestor.id}" role="${ancestor.role}">\n${ancestor.recentContext}\n</ancestor-recent-context>`,
 				);
 			}
 		}
@@ -839,6 +1072,51 @@ export class Orchestrator {
 			return prompt;
 		}
 		return `${sections.join("\n\n")}\n\n${prompt}`;
+	}
+
+	private async buildSpawnPrompt(parentId: string, agentId: string, prompt: string): Promise<string> {
+		const ancestors: SpawnAncestorContext[] = [];
+		let current: AgentRecord | undefined = this.records.get(parentId);
+		while (current) {
+			await this.ensureCompactedWorklog(current);
+			const messages = [...current.session.agent.state.messages];
+			const ancestor: SpawnAncestorContext = {
+				id: current.id,
+				role: current.role,
+				worklogFile: current.worklogFile,
+				compactedWorklogFile: this.getCompactedWorklogFile(current.id),
+				lastWorklogMessageCount: current.lastWorklogMessageCount,
+				messages,
+			};
+			ancestor.recentContext = await this.serializeRecentAncestorContext(ancestor);
+			ancestors.unshift({
+				...ancestor,
+			});
+			current = current.parentId ? this.records.get(current.parentId) : undefined;
+		}
+
+		let spawnPrompt = await this.renderSpawnPrompt(parentId, agentId, prompt, ancestors);
+		const child = this.getRecord(agentId);
+		if (!child.session.model) {
+			return spawnPrompt;
+		}
+
+		for (const ancestor of ancestors) {
+			if (!shouldCompactText(spawnPrompt, child.session.model.contextWindow)) {
+				break;
+			}
+			if (!ancestor.recentContext) {
+				continue;
+			}
+			if (!(await this.compactAncestorRecentContext(ancestor))) {
+				continue;
+			}
+			ancestor.recentContext = undefined;
+			ancestor.lastWorklogMessageCount = ancestor.messages.length;
+			spawnPrompt = await this.renderSpawnPrompt(parentId, agentId, prompt, ancestors);
+		}
+
+		return spawnPrompt;
 	}
 
 	private scheduleWorklogFork(agentId: string, turn: number, turnMessages: AgentMessage[]): void {
@@ -887,12 +1165,7 @@ export class Orchestrator {
 		if (!serialized) {
 			return undefined;
 		}
-
-		const maxChars = 4_000;
-		if (serialized.length <= maxChars) {
-			return serialized;
-		}
-		return `[Truncated to the most recent ${maxChars} characters of ancestor context]\n${serialized.slice(-maxChars)}`;
+		return serialized;
 	}
 
 	private buildSiblingBatchPrefix(parentId: string, agentId: string): string | undefined {
@@ -956,15 +1229,6 @@ export class Orchestrator {
 			content: [{ type: "text", text: buildWorklogPrompt(lastEntry) }],
 			timestamp: Date.now(),
 		};
-		const streamOptions = {
-			reasoning: record.session.thinkingLevel === "off" ? undefined : record.session.thinkingLevel,
-			getApiKey: record.session.agent.getApiKey,
-			onPayload: record.session.agent.onPayload,
-			sessionId: record.session.agent.sessionId,
-			thinkingBudgets: record.session.agent.thinkingBudgets,
-			transport: record.session.agent.transport,
-			maxRetryDelayMs: record.session.agent.maxRetryDelayMs,
-		} as Parameters<typeof record.session.agent.streamFn>[2];
 		const stream = await record.session.agent.streamFn(
 			record.session.model,
 			{
@@ -972,7 +1236,7 @@ export class Orchestrator {
 				messages: [...contextMessages, prompt],
 				tools: [WORKLOG_UPDATE_TOOL],
 			},
-			streamOptions,
+			this.buildStreamOptions(record),
 		);
 		const assistant = await stream.result();
 		if (assistant.stopReason !== "toolUse") {
@@ -988,9 +1252,23 @@ export class Orchestrator {
 
 		const args = validateToolArguments(WORKLOG_UPDATE_TOOL, toolCall);
 		const entry = await appendWorklogEntry(record.worklogFile, args.content, turn);
+		const compactedWorklogFile = this.getCompactedWorklogFile(record.id);
+		if (existsSync(compactedWorklogFile)) {
+			await appendWorklogSection(compactedWorklogFile, entry);
+		} else {
+			const existingEntryCount = getWorklogEntries(worklogContents).length;
+			if (existingEntryCount === 0) {
+				this.writeWorklogFile(compactedWorklogFile, entry);
+			} else {
+				await this.rebuildCompactedWorklog(record, `${worklogContents.trim()}\n\n${entry}`);
+			}
+		}
 		record.lastWorklogTurn = turn;
 		record.lastWorklogMessageCount = turnMessages.length;
 		await this.persistTree();
+		await this.compactWorklogFile(record, turn).catch(() => {
+			// A failed compacted-worklog update should not discard the raw entry.
+		});
 	}
 
 	private appendInterruptedToolResults(session: AgentSessionHandle): string[] {
