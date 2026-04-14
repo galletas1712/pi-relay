@@ -50,7 +50,10 @@ export function buildAgentSystemPrompt(
 If you need several independent tool calls for the same turn, emit them together in one assistant response instead of waiting for each result before issuing the next call.
 If you decide to delegate several independent subtasks, emit all of the \`spawn\` calls in the same assistant response so the children start together.
 After you spawn children or launch background work, end the turn promptly unless you still need another tool result right now.
-If you have active subagents, watch the subagent roster in your context before interrupting them.
+If you have running subagents, glance at the subagent roster in your context before interrupting them.
+Treat the roster as advisory coordination context only.
+Prefer fresh \`REPORT\` and \`IDLE\` messages over the roster when they disagree.
+Do not restate or audit the roster unless it changes what you should do next.
 If you spawn children, prefer backgrounding your own long-running bash work so their reports and idle notifications can reach you sooner.
 Do not message a child just to tell it to wrap up or go idle. If you have no new direction, let it finish on its own.
 Do not produce extra summaries or coordination messages just because a child reported progress. If no action is needed, stay idle and wait for the next real update or user request.

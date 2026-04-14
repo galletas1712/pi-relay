@@ -14,17 +14,20 @@ function truncate(text: string | undefined, maxLength: number): string {
 }
 
 function formatChildLine(record: AgentRecord): string {
-	const suffix = record.childIds.length > 0 ? `, ${record.childIds.length} children` : "";
-	return `- ${record.id} (${record.status}${suffix}): ${record.role} — ${truncate(record.session.getLastAssistantText(), 100)}`;
+	const suffix =
+		record.childIds.length > 0
+			? `, ${record.childIds.length} child${record.childIds.length === 1 ? "" : "ren"}`
+			: "";
+	return `- ${record.id} (${record.status}${suffix}): ${record.role}`;
 }
 
 export function buildSubagentRoster(orchestrator: Orchestrator, agentId: string): string {
-	const children = orchestrator.getChildrenOf(agentId);
+	const children = orchestrator.getChildrenOf(agentId).filter((child) => child.status === "running");
 	if (children.length === 0) {
 		return "";
 	}
 
-	const lines = ["## Active Subagents", ""];
+	const lines = ["## Running Subagents", ""];
 	for (const child of children) {
 		lines.push(formatChildLine(child));
 	}
