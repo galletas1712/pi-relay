@@ -1,5 +1,5 @@
 import type { ExtensionFactory } from "@mariozechner/pi-coding-agent";
-import { buildAgentSelectorOptions, buildAgentWidgetLines } from "./roster.js";
+import { buildAgentCompletionLabel, buildAgentSelectorOptions, buildAgentWidgetLines } from "./roster.js";
 import { buildAgentSystemPrompt } from "./system-prompt.js";
 import type { Orchestrator } from "./orchestrator.js";
 
@@ -22,7 +22,7 @@ export function createOrchestratorExtension(
 					.filter((summary) => summary.id.toLowerCase().startsWith(lowerPrefix))
 					.map((summary) => ({
 						value: summary.id,
-						label: `${summary.id} (${summary.status})`,
+						label: buildAgentCompletionLabel(summary),
 						description: summary.role,
 					}));
 

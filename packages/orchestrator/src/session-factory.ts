@@ -32,6 +32,9 @@ export function createRelaySessionFactory(options: {
 			sessionOptions.mode === "restore" && sessionOptions.sessionFile
 				? SessionManager.open(sessionOptions.sessionFile, sessionDir)
 				: SessionManager.create(options.services.cwd, sessionDir);
+		if (sessionOptions.mode === "spawn") {
+			sessionManager.ensurePersisted();
+		}
 
 		const created = await createAgentSessionFromServices({
 			services: options.services,

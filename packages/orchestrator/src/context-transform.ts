@@ -1,7 +1,5 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import { isPendingToolResult } from "@mariozechner/pi-agent-core";
-import { buildSubagentRoster } from "./roster.js";
-import { createRosterMessage } from "./messages.js";
 import type { Orchestrator } from "./orchestrator.js";
 
 export function createAgentContextTransform(
@@ -31,20 +29,6 @@ export function createAgentContextTransform(
 								],
 							};
 					});
-		const roster = buildSubagentRoster(orchestrator, agentId);
-		if (!roster) {
-			return annotated;
-		}
-
-		return [
-			...annotated,
-			{
-				role: "custom",
-				customType: "agent_roster",
-				content: createRosterMessage(roster).content,
-				display: false,
-				timestamp: Date.now(),
-			},
-		];
+		return annotated;
 	};
 }

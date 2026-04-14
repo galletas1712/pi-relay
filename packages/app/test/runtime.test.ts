@@ -8,7 +8,9 @@ const getAgentDir = vi.fn(() => "/tmp/agent");
 const createOrchestratorExtension = vi.fn(() => "extension-factory");
 const createRelaySessionFactory = vi.fn(() => "session-factory");
 const createSpawnTool = vi.fn(() => ({ name: "spawn" }));
+const createChildrenTool = vi.fn(() => ({ name: "children" }));
 const createMessageTool = vi.fn(() => ({ name: "message" }));
+const createTerminateTool = vi.fn(() => ({ name: "terminate" }));
 const restore = vi.fn(async () => false);
 
 vi.mock("@mariozechner/pi-coding-agent", () => ({
@@ -25,11 +27,14 @@ vi.mock("@pi-relay/orchestrator", () => ({
 	createOrchestratorExtension,
 	createRelaySessionFactory,
 	createSpawnTool,
+	createChildrenTool,
 	createMessageTool,
+	createTerminateTool,
 	Orchestrator: vi.fn().mockImplementation(() => ({
 		restore,
 		spawnAgent: vi.fn(),
 		routeMessage: vi.fn(),
+		terminateAgent: vi.fn(),
 	})),
 }));
 
@@ -43,7 +48,9 @@ describe("createRelayRuntime", () => {
 		createOrchestratorExtension.mockReset();
 		createRelaySessionFactory.mockReset();
 		createSpawnTool.mockReset();
+		createChildrenTool.mockReset();
 		createMessageTool.mockReset();
+		createTerminateTool.mockReset();
 		restore.mockClear();
 
 		continueRecent.mockReturnValue({

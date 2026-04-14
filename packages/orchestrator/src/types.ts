@@ -3,8 +3,9 @@ import type { ImageContent, Model, TextContent } from "@mariozechner/pi-ai";
 import type { AgentSessionEvent, ToolDefinition, ToolInfo } from "@mariozechner/pi-coding-agent";
 
 export type AgentStatus = "running" | "idle" | "disposed";
+export type AgentDisplayStatus = "starting" | "running" | "waiting" | "idle";
 
-export type AgentCustomType = "agent_report" | "agent_idle" | "agent_directive" | "agent_roster";
+export type AgentCustomType = "agent_report" | "agent_idle" | "agent_directive";
 
 export interface SessionCustomMessage<T = unknown> {
 	customType: string;
@@ -121,6 +122,7 @@ export interface AgentSummary {
 	parentId: string | null;
 	role: string;
 	status: AgentStatus;
+	displayStatus: AgentDisplayStatus;
 	depth: number;
 	childCount: number;
 	sessionFile: string | undefined;
@@ -159,6 +161,14 @@ export interface SpawnToolRuntime {
 
 export interface MessageToolRuntime {
 	routeMessage(fromAgentId: string, targetAgentId: string, content: string): Promise<void>;
+}
+
+export interface ChildrenToolRuntime {
+	describeChildren(agentId: string): Promise<string>;
+}
+
+export interface TerminateToolRuntime {
+	terminateAgent(fromAgentId: string, targetAgentId: string): Promise<void>;
 }
 
 export interface ReportToolRuntime {

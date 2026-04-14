@@ -6,9 +6,12 @@ import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@marioze
 import { validateToolArguments, type ToolResultMessage, type UserMessage } from "@mariozechner/pi-ai";
 import { serializeConversation, type AgentSessionEvent, type ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { createAgentContextTransform } from "./context-transform.js";
+import { buildDirectChildRoster } from "./roster.js";
+import { createChildrenTool } from "./tools/children.js";
 import { createMessageTool } from "./tools/message.js";
 import { createReportTool } from "./tools/report.js";
 import { createSpawnTool } from "./tools/spawn.js";
+import { createTerminateTool } from "./tools/terminate.js";
 import {
 	createAgentDirectiveMessage,
 	createAgentIdleMessage,
@@ -19,6 +22,7 @@ import { ToolCallTracker } from "./tool-tracker.js";
 import {
 	DEFAULT_ORCHESTRATOR_CONFIG,
 	type AgentRecord,
+	type AgentSummary,
 	type AgentTreeMetadata,
 	type AgentTreeMetadataEntry,
 	type AgentSessionFactory,
@@ -132,26 +136,8 @@ export class Orchestrator {
 			.filter((record): record is AgentRecord => record !== undefined && record.status !== "disposed");
 	}
 
-	getAgentSummaries(): Array<{
-		id: string;
-		parentId: string | null;
-		role: string;
-		status: AgentRecord["status"];
-		depth: number;
-		childCount: number;
-		sessionFile: string | undefined;
-		lastOutput: string | undefined;
-	}> {
-		const summaries: Array<{
-			id: string;
-			parentId: string | null;
-			role: string;
-			status: AgentRecord["status"];
-			depth: number;
-			childCount: number;
-			sessionFile: string | undefined;
-			lastOutput: string | undefined;
-		}> = [];
+	getAgentSummaries(): AgentSummary[] {
+		const summaries: AgentSummary[] = [];
 		const visit = (agentId: string, depth: number) => {
 			const record = this.records.get(agentId);
 			if (!record || record.status === "disposed") {
@@ -163,6 +149,7 @@ export class Orchestrator {
 				parentId: record.parentId,
 				role: record.role,
 				status: record.status,
+				displayStatus: this.getDisplayStatus(record),
 				depth,
 				childCount: record.childIds.length,
 				sessionFile: record.session.sessionFile,
@@ -176,6 +163,45 @@ export class Orchestrator {
 
 		visit(this.rootAgentId, 0);
 		return summaries;
+	}
+
+	getDirectChildSummaries(agentId: string): AgentSummary[] {
+		return this.getRecord(agentId).childIds
+			.map((childId) => this.records.get(childId))
+			.filter((record): record is AgentRecord => record !== undefined && record.status !== "disposed")
+			.map((record) => ({
+				id: record.id,
+				parentId: record.parentId,
+				role: record.role,
+				status: record.status,
+				displayStatus: this.getDisplayStatus(record),
+				depth: 1,
+				childCount: record.childIds.length,
+				sessionFile: record.session.sessionFile,
+				lastOutput: record.session.getLastAssistantText(),
+			}));
+	}
+
+	private getDisplayStatus(record: AgentRecord): AgentSummary["displayStatus"] {
+		const sessionBusy =
+			record.reactivating ||
+			record.session.isStreaming ||
+			record.session.isRetrying ||
+			record.session.isCompacting ||
+			record.session.agent.hasQueuedMessages();
+		if (sessionBusy) {
+			return "running";
+		}
+
+		if (this.hasRunningChildren(record.id)) {
+			return "waiting";
+		}
+
+		if (record.status === "running" && record.turnCount === 0) {
+			return "starting";
+		}
+
+		return "idle";
 	}
 
 	findAgentIdBySessionFile(sessionFile: string): string | undefined {
@@ -371,6 +397,19 @@ export class Orchestrator {
 			createAgentDirectiveMessage(fromAgentId, source.role, content),
 			{ waitForTurn: false },
 		);
+	}
+
+	async terminateAgent(fromAgentId: string, targetAgentId: string): Promise<void> {
+		const source = this.getRecord(fromAgentId);
+		if (!source.childIds.includes(targetAgentId)) {
+			throw new Error(`Agent ${targetAgentId} is not a direct child of ${fromAgentId}`);
+		}
+
+		await this.disposeAgent(targetAgentId);
+	}
+
+	async describeChildren(agentId: string): Promise<string> {
+		return buildDirectChildRoster(this, agentId);
 	}
 
 	async handleReport(agentId: string, content: string): Promise<void> {
@@ -677,7 +716,13 @@ export class Orchestrator {
 	}
 
 	private createChildTools(agentId: string): ToolDefinition[] {
-		return [createSpawnTool(this, agentId), createMessageTool(this, agentId), createReportTool(this, agentId)];
+		return [
+			createSpawnTool(this, agentId),
+			createChildrenTool(this, agentId),
+			createMessageTool(this, agentId),
+			createTerminateTool(this, agentId),
+			createReportTool(this, agentId),
+		];
 	}
 
 	private getWorklogFile(agentId: string): string {

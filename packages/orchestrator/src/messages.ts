@@ -63,11 +63,3 @@ export function createAgentIdleMessage(
 		},
 	};
 }
-
-export function createRosterMessage(content: string): SessionCustomMessage {
-	return {
-		customType: "agent_roster",
-		content,
-		display: false,
-	};
-}

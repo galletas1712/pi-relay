@@ -158,6 +158,45 @@ describe("Orchestrator", () => {
 		await expect(orchestrator.routeMessage(childId, "root", "bad")).rejects.toThrow("not a direct child");
 	});
 
+	it("terminates only direct children and cascades through descendants", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		const grandchild = new FakeSession("grandchild-session");
+		const childAbort = vi.spyOn(child, "abort");
+		const childDispose = vi.spyOn(child, "dispose");
+		const grandchildAbort = vi.spyOn(grandchild, "abort");
+		const grandchildDispose = vi.spyOn(grandchild, "dispose");
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi
+				.fn()
+				.mockResolvedValueOnce({ session: child })
+				.mockResolvedValueOnce({ session: grandchild }),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "planner",
+			prompt: "inspect",
+		});
+		const grandchildId = await orchestrator.spawnAgent(childId, {
+			role: "explorer",
+			prompt: "inspect deeper",
+		});
+
+		await expect(orchestrator.terminateAgent("root", grandchildId)).rejects.toThrow("not a direct child");
+
+		await orchestrator.terminateAgent("root", childId);
+
+		expect(childAbort).toHaveBeenCalledTimes(1);
+		expect(childDispose).toHaveBeenCalledTimes(1);
+		expect(grandchildAbort).toHaveBeenCalledTimes(1);
+		expect(grandchildDispose).toHaveBeenCalledTimes(1);
+		expect(orchestrator.getRecord(childId).status).toBe("disposed");
+		expect(orchestrator.getRecord(grandchildId).status).toBe("disposed");
+		expect(orchestrator.getRecord("root").childIds).toEqual([]);
+		expect(orchestrator.getChildrenOf("root")).toEqual([]);
+	});
+
 	it("does not block message delivery on the child's triggered turn", async () => {
 		const root = new FakeSession("root-session");
 		let resolveChildTurn = () => {};

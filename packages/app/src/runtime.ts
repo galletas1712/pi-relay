@@ -8,11 +8,13 @@ import {
 	type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import {
+	createChildrenTool,
 	createMessageTool,
 	createOrchestratorExtension,
 	Orchestrator,
 	createRelaySessionFactory,
 	createSpawnTool,
+	createTerminateTool,
 } from "@pi-relay/orchestrator";
 import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
 
@@ -56,16 +58,30 @@ export function createRelayRuntimeFactory(
 				}
 				return orchestratorRef.current.spawnAgent(parentId, config);
 			},
+			async describeChildren(agentId: string) {
+				if (!orchestratorRef.current) {
+					throw new Error("Orchestrator has not been initialized yet");
+				}
+				return orchestratorRef.current.describeChildren(agentId);
+			},
 			async routeMessage(fromAgentId: string, targetAgentId: string, content: string) {
 				if (!orchestratorRef.current) {
 					throw new Error("Orchestrator has not been initialized yet");
 				}
 				await orchestratorRef.current.routeMessage(fromAgentId, targetAgentId, content);
 			},
+			async terminateAgent(fromAgentId: string, targetAgentId: string) {
+				if (!orchestratorRef.current) {
+					throw new Error("Orchestrator has not been initialized yet");
+				}
+				await orchestratorRef.current.terminateAgent(fromAgentId, targetAgentId);
+			},
 		};
 		const rootTools: ToolDefinition[] = [
 			createSpawnTool(rootToolBridge, "root") as unknown as ToolDefinition,
+			createChildrenTool(rootToolBridge, "root") as unknown as ToolDefinition,
 			createMessageTool(rootToolBridge, "root") as unknown as ToolDefinition,
+			createTerminateTool(rootToolBridge, "root") as unknown as ToolDefinition,
 		];
 		const created = await createAgentSessionFromServices({
 			services,

@@ -134,6 +134,7 @@ describe("createOrchestratorExtension", () => {
 	it("registers an agents command that switches the active TUI attachment", async () => {
 		const root = new FakeSession("root-session");
 		const child = new FakeSession("plan-session");
+		child.isStreaming = true;
 		const orchestrator = new Orchestrator({
 			rootSession: root,
 			sessionFactory: vi.fn(),
@@ -163,7 +164,7 @@ describe("createOrchestratorExtension", () => {
 
 		const switchSession = vi.fn(async () => ({ cancelled: false }));
 		const notify = vi.fn();
-		const select = vi.fn(async () => "  plan-agent [running] planner — child summary");
+		const select = vi.fn(async () => `  \u001b[32m●\u001b[39m plan-agent · planner — child summary`);
 		const { commands } = buildHandlers(orchestrator);
 		const agentsCommand = commands.get("agents") as {
 			handler: (args: string, ctx: unknown) => Promise<void>;
@@ -244,6 +245,7 @@ describe("createOrchestratorExtension", () => {
 				parentId: null,
 				role: "root",
 				status: "idle",
+				displayStatus: "idle",
 				depth: 0,
 				childCount: 1,
 				sessionFile: "/tmp/root.jsonl",
@@ -254,6 +256,7 @@ describe("createOrchestratorExtension", () => {
 				parentId: "root",
 				role: "planner",
 				status: "running",
+				displayStatus: "running",
 				depth: 1,
 				childCount: 0,
 				sessionFile: "/tmp/child.jsonl",
