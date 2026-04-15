@@ -15,7 +15,8 @@
 		"build:app": "cd packages/app && npm run build",
 		"dev": "cd packages/app && npm run dev",
 		"start": "node packages/app/dist/index.js",
-		"test": "npm run test --workspaces --if-present"
+		"test": "npm run test --workspaces --if-present",
+		"test:e2e:live": "node scripts/phase23-live-e2e.mjs"
 	},
 	"devDependencies": {
 		"@types/node": "^22.10.5",

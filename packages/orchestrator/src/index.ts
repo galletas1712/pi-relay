@@ -1,3 +1,13 @@
-// Phase 2: Orchestrator, tools, agent registry, message routing
-// Placeholder — implementation follows the plan in docs/multi-agent-plan/phase-2-orchestrator.md
-export {};
+export * from "./context-transform.js";
+export * from "./extension.js";
+export * from "./messages.js";
+export * from "./orchestrator.js";
+export * from "./roster.js";
+export * from "./session-factory.js";
+export * from "./system-prompt.js";
+export * from "./tool-tracker.js";
+export * from "./tools/message.js";
+export * from "./tools/report.js";
+export * from "./tools/spawn.js";
+export * from "./types.js";
+export * from "./worklog.js";

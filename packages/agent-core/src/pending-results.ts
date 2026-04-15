@@ -146,14 +146,14 @@ export function annotateOrphanedPending(messages: AgentMessage[]): AgentMessage[
 			return message;
 		}
 
-		return {
-			...message,
-			content: [
-				{
-					type: "text" as const,
-					text: `[TERMINATED] ${renderToolTarget(message.toolName, message.details.argsPreview)} did not finish. Re-run it if you still need the result.`,
-				},
-			],
-		};
+			return {
+				...message,
+				content: [
+					{
+						type: "text" as const,
+						text: `[INTERRUPTED] ${renderToolTarget(message.toolName, message.details.argsPreview)} did not finish before the session ended. It may still be running if the process was killed abruptly. Inspect or re-run it if you still need the result.`,
+					},
+				],
+			};
 	});
 }

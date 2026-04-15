@@ -1,49 +1,17 @@
 #!/usr/bin/env node
 
-/**
- * pi-relay entry point
- *
- * Wires the coding-agent SDK with our modified agent-core (workspace override)
- * and starts InteractiveMode (TUI). For Phase 1 testing, this verifies that
- * the base TUI works with our agent-core fork. Later phases add the
- * orchestrator extension for multi-agent coordination.
- */
+import { InteractiveMode, runRpcMode } from "@mariozechner/pi-coding-agent";
+import { createRelayInteractiveRuntime, createRelayRuntime, parseArgs } from "./runtime.js";
 
-import {
-	type CreateAgentSessionRuntimeFactory,
-	createAgentSessionFromServices,
-	createAgentSessionRuntime,
-	createAgentSessionServices,
-	getAgentDir,
-	InteractiveMode,
-	SessionManager,
-} from "@mariozechner/pi-coding-agent";
+const cli = parseArgs(process.argv.slice(2));
 
-const cwd = process.cwd();
-const agentDir = getAgentDir();
-
-const createRuntime: CreateAgentSessionRuntimeFactory = async ({ cwd, sessionManager, sessionStartEvent }) => {
-	const services = await createAgentSessionServices({ cwd });
-	const created = await createAgentSessionFromServices({
-		services,
-		sessionManager,
-		sessionStartEvent,
+if (cli.mode === "rpc") {
+	const runtime = await createRelayRuntime();
+	await runRpcMode(runtime);
+} else {
+	const runtime = await createRelayInteractiveRuntime();
+	const interactiveMode = new InteractiveMode(runtime, {
+		initialMessage: cli.initialMessage,
 	});
-	return {
-		...created,
-		services,
-		diagnostics: services.diagnostics,
-	};
-};
-
-const runtime = await createAgentSessionRuntime(createRuntime, {
-	cwd,
-	agentDir,
-	sessionManager: SessionManager.create(cwd),
-});
-
-const interactiveMode = new InteractiveMode(runtime, {
-	initialMessage: process.argv[2],
-});
-
-await interactiveMode.run();
+	await interactiveMode.run();
+}
