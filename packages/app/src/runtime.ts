@@ -1,11 +1,16 @@
 import {
+	applyPatchTool,
+	bashTool,
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
+	editTool,
 	getAgentDir,
+	readTool,
 	SessionManager,
 	type ToolDefinition,
+	writeTool,
 } from "@mariozechner/pi-coding-agent";
 import {
 	createMessageTool,
@@ -15,6 +20,16 @@ import {
 	createSpawnTool,
 } from "@pi-relay/orchestrator";
 import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
+
+const RELAY_ACTIVE_TOOLS = [readTool, bashTool, editTool, applyPatchTool, writeTool];
+
+const RELAY_APPEND_SYSTEM_PROMPT = `Relay tool usage:
+- Use read instead of cat, head, tail, or sed for reading files.
+- Use apply_patch for multi-file or diff-shaped changes to existing files.
+- Use edit for precise replacements inside one existing file.
+- Use write only for new files or complete rewrites.
+- Do not use bash to read or edit files when dedicated tools are available.
+- After apply_patch succeeds, do not immediately re-read the same file unless you need verification or nearby context.`;
 
 export function parseArgs(argv: string[]) {
 	const args = [...argv];
@@ -46,6 +61,7 @@ export function createRelayRuntimeFactory(
 			cwd,
 			agentDir,
 			resourceLoaderOptions: {
+				appendSystemPrompt: [RELAY_APPEND_SYSTEM_PROMPT],
 				extensionFactories: [createOrchestratorExtension(orchestratorRef, orchestratorUiRef)],
 			},
 		});
@@ -71,6 +87,7 @@ export function createRelayRuntimeFactory(
 			services,
 			sessionManager,
 			sessionStartEvent,
+			tools: RELAY_ACTIVE_TOOLS,
 			customTools: rootTools,
 		});
 		const orchestrator = new Orchestrator({

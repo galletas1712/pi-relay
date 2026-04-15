@@ -5,6 +5,11 @@ const createAgentSessionRuntime = vi.fn();
 const createAgentSessionServices = vi.fn();
 const createAgentSessionFromServices = vi.fn();
 const getAgentDir = vi.fn(() => "/tmp/agent");
+const readTool = { name: "read" };
+const bashTool = { name: "bash" };
+const editTool = { name: "edit" };
+const applyPatchTool = { name: "apply_patch" };
+const writeTool = { name: "write" };
 const createOrchestratorExtension = vi.fn(() => "extension-factory");
 const createRelaySessionFactory = vi.fn(() => "session-factory");
 const createSpawnTool = vi.fn(() => ({ name: "spawn" }));
@@ -19,6 +24,11 @@ vi.mock("@mariozechner/pi-coding-agent", () => ({
 	createAgentSessionServices,
 	createAgentSessionFromServices,
 	getAgentDir,
+	readTool,
+	bashTool,
+	editTool,
+	applyPatchTool,
+	writeTool,
 }));
 
 vi.mock("@pi-relay/orchestrator", () => ({
@@ -85,9 +95,18 @@ describe("createRelayRuntime", () => {
 			expect.objectContaining({
 				cwd: "/tmp/project",
 				agentDir: "/tmp/agent",
+				resourceLoaderOptions: expect.objectContaining({
+					appendSystemPrompt: [
+						expect.stringContaining("Use apply_patch for multi-file or diff-shaped changes to existing files."),
+					],
+				}),
 			}),
 		);
-		expect(createAgentSessionFromServices).toHaveBeenCalledTimes(1);
+		expect(createAgentSessionFromServices).toHaveBeenCalledWith(
+			expect.objectContaining({
+				tools: [readTool, bashTool, editTool, applyPatchTool, writeTool],
+			}),
+		);
 		expect(restore).toHaveBeenCalledTimes(1);
 	});
 });
