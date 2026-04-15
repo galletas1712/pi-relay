@@ -172,6 +172,7 @@ describe("createOrchestratorExtension", () => {
 
 		await agentsCommand.handler("", {
 			switchSession,
+			isIdle: () => true,
 			ui: {
 				notify,
 				select,
@@ -223,6 +224,7 @@ describe("createOrchestratorExtension", () => {
 
 		await agentsCommand.handler("plan-agent", {
 			switchSession,
+			isIdle: () => true,
 			ui: {
 				notify,
 				select: vi.fn(),
@@ -234,6 +236,41 @@ describe("createOrchestratorExtension", () => {
 
 		expect(switchSession).toHaveBeenCalledWith(child.sessionFile);
 		expect(notify).not.toHaveBeenCalled();
+	});
+
+	it("allows /agents during streaming and switches sessions", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "planner",
+			prompt: "inspect",
+		});
+
+		const switchSession = vi.fn(async () => ({ cancelled: false }));
+		const notify = vi.fn();
+		const { commands } = buildHandlers(orchestrator);
+		const agentsCommand = commands.get("agents") as {
+			handler: (args: string, ctx: unknown) => Promise<void>;
+		};
+
+		await agentsCommand.handler(childId, {
+			switchSession,
+			isIdle: () => false,
+			ui: {
+				notify,
+				select: vi.fn(),
+			},
+			sessionManager: {
+				getSessionId: () => "root-session",
+			},
+		});
+
+		expect(switchSession).toHaveBeenCalledWith(child.sessionFile);
+		expect(notify).toHaveBeenCalledWith(`Attached to ${childId} (planner).`, "info");
 	});
 
 	it("installs and refreshes the relay widget for the active session", async () => {

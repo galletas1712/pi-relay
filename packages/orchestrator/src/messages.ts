@@ -36,6 +36,21 @@ export function createAgentDirectiveMessage(
 	};
 }
 
+export function createAgentInterruptedMessage(
+	fromAgentId: string,
+	fromRole: string,
+): SessionCustomMessage<AgentMessageDetails> {
+	return {
+		customType: "agent_interrupted",
+		content: `[${formatSender(fromAgentId, fromRole)} INTERRUPTED]\nThe user interrupted this child directly. The user is managing it.`,
+		display: true,
+		details: {
+			fromAgentId,
+			fromRole,
+		},
+	};
+}
+
 export function createAgentIdleMessage(
 	fromAgentId: string,
 	fromRole: string,

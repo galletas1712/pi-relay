@@ -139,6 +139,64 @@ describe("RelayRuntimeHost", () => {
 		expect(host.getAttachedAgentId()).toBe("root");
 	});
 
+	it("keeps the child attached when aborting from an attached child view", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		let childStatus: "running" | "idle" | "disposed" = "running";
+		let onChange: (() => void) | undefined;
+		const rootAbort = vi.fn(async () => undefined);
+		const childAbort = vi.fn(async () => {
+			childStatus = "idle";
+			onChange?.();
+		});
+		root.abort = rootAbort;
+		child.abort = childAbort;
+		const runtime = {
+			session: root,
+			services: { cwd: root.sessionManager.getCwd() },
+			diagnostics: [],
+			modelFallbackMessage: undefined,
+			switchSession: vi.fn(async () => ({ cancelled: false })),
+			newSession: vi.fn(),
+			fork: vi.fn(),
+			importFromJsonl: vi.fn(),
+			dispose: vi.fn(),
+		} as never;
+		const orchestrator = {
+			rootAgentId: "root",
+			subscribeToChanges: vi.fn((listener: () => void) => {
+				onChange = listener;
+				return () => {
+					onChange = undefined;
+				};
+			}),
+			getRecord: (agentId: string) => {
+				if (agentId === "root") {
+					return { id: "root", status: "idle", session: root };
+				}
+				if (agentId === "child") {
+					return { id: "child", status: childStatus, session: child };
+				}
+				throw new Error(`Unknown agent ${agentId}`);
+			},
+			findAgentIdBySessionFile: (sessionFile: string) => (sessionFile === child.sessionFile ? "child" : undefined),
+		} as never;
+		const host = new RelayRuntimeHost(runtime, {
+			current: { orchestrator },
+		});
+		const changeListener = vi.fn();
+		host.subscribeToSessionChanges(changeListener);
+
+		await host.switchSession(child.sessionFile!);
+		await host.session.abort();
+
+		expect(childAbort).toHaveBeenCalledTimes(1);
+		expect(rootAbort).not.toHaveBeenCalled();
+		expect(host.getAttachedAgentId()).toBe("child");
+		expect(host.session).toBe(child);
+		expect(changeListener).not.toHaveBeenCalled();
+	});
+
 	it("blocks root-level session management while attached to a child", async () => {
 		const root = new FakeSession("root-session");
 		const child = new FakeSession("child-session");
@@ -225,6 +283,57 @@ describe("RelayRuntimeHost", () => {
 
 		expect(setUIContext).toHaveBeenCalledWith(undefined);
 		expect(bindCommandContext).toHaveBeenCalledWith(undefined);
+	});
+
+	it("reports running child progress for the attached agent", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		const runtime = {
+			session: root,
+			services: { cwd: root.sessionManager.getCwd() },
+			diagnostics: [],
+			modelFallbackMessage: undefined,
+			switchSession: vi.fn(async () => ({ cancelled: false })),
+			newSession: vi.fn(),
+			fork: vi.fn(),
+			importFromJsonl: vi.fn(),
+			dispose: vi.fn(),
+		} as never;
+		const orchestrator = {
+			rootAgentId: "root",
+			subscribeToChanges: vi.fn(() => () => {}),
+			getRecord: (agentId: string) => {
+				if (agentId === "root") {
+					return { id: "root", status: "idle", session: root };
+				}
+				if (agentId === "child") {
+					return { id: "child", status: "running", session: child };
+				}
+				throw new Error(`Unknown agent ${agentId}`);
+			},
+			getAgentSummaries: () => [
+				{ id: "root", displayStatus: "idle" },
+				{ id: "child", displayStatus: "waiting" },
+			],
+			getDirectChildSummaries: (agentId: string) =>
+				agentId === "child"
+					? [
+							{ id: "worker-1", role: "worker", displayStatus: "running" },
+							{ id: "worker-2", role: "reviewer", displayStatus: "idle" },
+						]
+					: [],
+			findAgentIdBySessionFile: (sessionFile: string) => (sessionFile === child.sessionFile ? "child" : undefined),
+		} as never;
+		const host = new RelayRuntimeHost(runtime, {
+			current: { orchestrator },
+		});
+
+		await host.switchSession(child.sessionFile!);
+
+		expect(host.getAttachedAgentProgress()).toEqual({
+			displayStatus: "waiting",
+			runningChildren: [{ id: "worker-1", role: "worker", displayStatus: "running" }],
+		});
 	});
 
 	it("notifies listeners when a disposed attached child falls back to root", async () => {

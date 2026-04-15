@@ -14,7 +14,6 @@ import {
 	Orchestrator,
 	createRelaySessionFactory,
 	createSpawnTool,
-	createTerminateTool,
 } from "@pi-relay/orchestrator";
 import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
 
@@ -70,18 +69,11 @@ export function createRelayRuntimeFactory(
 				}
 				await orchestratorRef.current.routeMessage(fromAgentId, targetAgentId, content);
 			},
-			async terminateAgent(fromAgentId: string, targetAgentId: string) {
-				if (!orchestratorRef.current) {
-					throw new Error("Orchestrator has not been initialized yet");
-				}
-				await orchestratorRef.current.terminateAgent(fromAgentId, targetAgentId);
-			},
 		};
 		const rootTools: ToolDefinition[] = [
 			createSpawnTool(rootToolBridge, "root") as unknown as ToolDefinition,
 			createChildrenTool(rootToolBridge, "root") as unknown as ToolDefinition,
 			createMessageTool(rootToolBridge, "root") as unknown as ToolDefinition,
-			createTerminateTool(rootToolBridge, "root") as unknown as ToolDefinition,
 		];
 		const created = await createAgentSessionFromServices({
 			services,

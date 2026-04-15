@@ -39,7 +39,7 @@ describe("buildDirectChildRoster", () => {
 		});
 
 		const roster = buildDirectChildRoster(orchestrator, "root");
-		expect(roster).toContain("## Direct Children");
+		expect(roster).toContain("## Active Children");
 		expect(roster).toContain(`${childId} (waiting, 1 child): planner`);
 		expect(roster).not.toContain("Scanning packages/orchestrator");
 	});
@@ -66,7 +66,9 @@ describe("buildDirectChildRoster", () => {
 		await waitForMicrotasks();
 
 		const roster = buildDirectChildRoster(orchestrator, "root");
+		expect(roster).toContain("## Active Children");
 		expect(roster).toContain(childId);
+		expect(roster).toContain("## Idle Children");
 		expect(roster).toContain(`${siblingId} (idle): explorer`);
 	});
 

@@ -29,10 +29,25 @@ export function buildDirectChildRoster(orchestrator: Orchestrator, agentId: stri
 		return "You have no direct children.";
 	}
 
-	const lines = ["## Direct Children", ""];
-	for (const child of children) {
-		lines.push(formatDirectChildLine(child));
+	const active = children.filter((c) => c.displayStatus !== "idle");
+	const idle = children.filter((c) => c.displayStatus === "idle");
+	const lines: string[] = [];
+
+	if (active.length > 0) {
+		lines.push("## Active Children", "");
+		for (const child of active) {
+			lines.push(formatDirectChildLine(child));
+		}
 	}
+
+	if (idle.length > 0) {
+		if (lines.length > 0) lines.push("");
+		lines.push("## Idle Children", "");
+		for (const child of idle) {
+			lines.push(formatDirectChildLine(child));
+		}
+	}
+
 	return lines.join("\n");
 }
 

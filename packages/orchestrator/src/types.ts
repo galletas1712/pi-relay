@@ -5,7 +5,7 @@ import type { AgentSessionEvent, ToolDefinition, ToolInfo } from "@mariozechner/
 export type AgentStatus = "running" | "idle" | "disposed";
 export type AgentDisplayStatus = "starting" | "running" | "waiting" | "idle";
 
-export type AgentCustomType = "agent_report" | "agent_idle" | "agent_directive";
+export type AgentCustomType = "agent_report" | "agent_idle" | "agent_interrupted" | "agent_directive";
 
 export interface SessionCustomMessage<T = unknown> {
 	customType: string;

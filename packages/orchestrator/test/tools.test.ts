@@ -34,14 +34,14 @@ describe("orchestration tools", () => {
 
 	it("children returns the current direct-child list", async () => {
 		const runtime = {
-			describeChildren: vi.fn(async () => "## Direct Children\n\n- child-a (idle): planner"),
+			describeChildren: vi.fn(async () => "## Idle Children\n\n- child-a (idle): planner"),
 		};
 		const tool = createChildrenTool(runtime, "root");
 		const result = await tool.execute("tool-1", {}, undefined, undefined, {} as never);
 		expect(runtime.describeChildren).toHaveBeenCalledWith("root");
 		expect(result.content[0]).toEqual({
 			type: "text",
-			text: "## Direct Children\n\n- child-a (idle): planner",
+			text: "## Idle Children\n\n- child-a (idle): planner",
 		});
 	});
 

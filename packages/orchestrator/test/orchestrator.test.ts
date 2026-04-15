@@ -23,6 +23,63 @@ describe("Orchestrator", () => {
 		expect(child.prompts).toEqual(["inspect the repo"]);
 	});
 
+	it("waits for the child to start its initial prompt before resolving spawn", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		let releaseStart = () => {};
+		const startGate = new Promise<void>((resolve) => {
+			releaseStart = resolve;
+		});
+		child.prompt = vi.fn(async (message: string) => {
+			child.prompts.push(message);
+			await startGate;
+			child.emit({ type: "agent_start" });
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		let resolved = false;
+		const spawnPromise = orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect the repo",
+		}).then((childId) => {
+			resolved = true;
+			return childId;
+		});
+
+		await waitForMicrotasks();
+		expect(resolved).toBe(false);
+		releaseStart();
+
+		const childId = await spawnPromise;
+		expect(childId).toMatch(/explore-/);
+		expect(child.prompts).toEqual(["inspect the repo"]);
+	});
+
+	it("rolls back the child when the initial prompt fails before startup", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		child.prompt = vi.fn(async (message: string) => {
+			child.prompts.push(message);
+			throw new Error("initial prompt failed");
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		await expect(
+			orchestrator.spawnAgent("root", {
+				role: "explore",
+				prompt: "inspect the repo",
+			}),
+		).rejects.toThrow("initial prompt failed");
+		expect(orchestrator.getRecord("root").childIds).toEqual([]);
+		expect(orchestrator.getChildrenOf("root")).toEqual([]);
+	});
+
 	it("does not count idle children against spawn limits", async () => {
 		const root = new FakeSession("root-session");
 		const firstChild = new FakeSession("first-child-session");
@@ -254,6 +311,32 @@ describe("Orchestrator", () => {
 		expect(String(root.sentMessages[0]?.message.content)).not.toContain("Last output:");
 	});
 
+	it("sends an interrupted message instead of idle when the child was aborted", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session", {
+			messages: [
+				{ role: "assistant", content: [], stopReason: "aborted", timestamp: Date.now() },
+			],
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect",
+		});
+
+		child.emit({ type: "agent_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(root.sentMessages).toHaveLength(1);
+		});
+		expect(root.sentMessages[0]?.message.customType).toBe("agent_interrupted");
+		expect(String(root.sentMessages[0]?.message.content)).toContain("INTERRUPTED");
+		expect(String(root.sentMessages[0]?.message.content)).toContain("user");
+	});
+
 	it("waits for the session run to become idle before finalizing agent_end", async () => {
 		const root = new FakeSession("root-session");
 		let resolveIdle = () => {};
@@ -402,7 +485,7 @@ describe("Orchestrator", () => {
 		await vi.waitFor(() => {
 			expect(root.sentMessages).toHaveLength(1);
 		});
-		expect(root.sentMessages[0]?.options).toBeUndefined();
+		expect(root.sentMessages[0]?.options).toEqual({ deliverAs: "nextTurn" });
 		expect(root.sentMessages[0]?.message.customType).toBe("agent_idle");
 
 		secondChild.emit({ type: "agent_end", messages: [] });

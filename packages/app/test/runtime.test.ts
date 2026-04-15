@@ -10,7 +10,7 @@ const createRelaySessionFactory = vi.fn(() => "session-factory");
 const createSpawnTool = vi.fn(() => ({ name: "spawn" }));
 const createChildrenTool = vi.fn(() => ({ name: "children" }));
 const createMessageTool = vi.fn(() => ({ name: "message" }));
-const createTerminateTool = vi.fn(() => ({ name: "terminate" }));
+
 const restore = vi.fn(async () => false);
 
 vi.mock("@mariozechner/pi-coding-agent", () => ({
@@ -29,12 +29,11 @@ vi.mock("@pi-relay/orchestrator", () => ({
 	createSpawnTool,
 	createChildrenTool,
 	createMessageTool,
-	createTerminateTool,
+
 	Orchestrator: vi.fn().mockImplementation(() => ({
 		restore,
 		spawnAgent: vi.fn(),
 		routeMessage: vi.fn(),
-		terminateAgent: vi.fn(),
 	})),
 }));
 
@@ -50,7 +49,7 @@ describe("createRelayRuntime", () => {
 		createSpawnTool.mockReset();
 		createChildrenTool.mockReset();
 		createMessageTool.mockReset();
-		createTerminateTool.mockReset();
+
 		restore.mockClear();
 
 		continueRecent.mockReturnValue({

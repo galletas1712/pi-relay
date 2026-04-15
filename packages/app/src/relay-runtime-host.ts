@@ -50,6 +50,61 @@ export class RelayRuntimeHost {
 		return this.attachedAgentId;
 	}
 
+	getAttachedAgentProgress():
+		| {
+				displayStatus: "running" | "waiting" | "starting" | "idle";
+				runningChildren: Array<{
+					id: string;
+					role: string;
+					displayStatus: "running" | "waiting" | "starting" | "idle";
+				}>;
+		  }
+		| undefined {
+		const orchestrator = this.stateRef.current?.orchestrator;
+		if (!orchestrator) {
+			return undefined;
+		}
+
+		const attachedAgentId = this.getAttachedRecord().id;
+		const summary = orchestrator.getAgentSummaries().find((entry) => entry.id === attachedAgentId);
+		if (!summary) {
+			return undefined;
+		}
+
+		const runningChildren = orchestrator
+			.getDirectChildSummaries(attachedAgentId)
+			.filter((child) => child.displayStatus !== "idle")
+			.map((child) => ({
+				id: child.id,
+				role: child.role,
+				displayStatus: child.displayStatus,
+			}));
+
+		return {
+			displayStatus: summary.displayStatus,
+			runningChildren,
+		};
+	}
+
+	async terminateRunningChildren(): Promise<void> {
+		const orchestrator = this.stateRef.current?.orchestrator;
+		if (!orchestrator) {
+			return;
+		}
+
+		const attachedAgentId = this.getAttachedRecord().id;
+		const children = orchestrator.getDirectChildSummaries(attachedAgentId);
+		for (const child of children) {
+			if (child.displayStatus !== "idle") {
+				try {
+					await orchestrator.terminateAgent(attachedAgentId, child.id);
+				} catch {
+					// Best-effort termination
+				}
+			}
+		}
+	}
+
 	subscribeToSessionChanges(listener: (change: RelayRuntimeSessionChange) => void): () => void {
 		this.ensureOrchestratorSubscription();
 		this.sessionChangeListeners.add(listener);

@@ -16,10 +16,11 @@ import { createChildrenTool } from "./tools/children.js";
 import { createMessageTool } from "./tools/message.js";
 import { createReportTool } from "./tools/report.js";
 import { createSpawnTool } from "./tools/spawn.js";
-import { createTerminateTool } from "./tools/terminate.js";
+
 import {
 	createAgentDirectiveMessage,
 	createAgentIdleMessage,
+	createAgentInterruptedMessage,
 	createAgentReportMessage,
 } from "./messages.js";
 import {
@@ -56,6 +57,16 @@ import {
 	type SessionCustomMessage,
 	type SpawnConfig,
 } from "./types.js";
+
+const WORKLOG_LLM_TIMEOUT_MS = 60_000;
+
+function withTimeout<T>(value: T | PromiseLike<T>, ms: number): Promise<Awaited<T>> {
+	let timer: ReturnType<typeof setTimeout>;
+	const timeout = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => reject(new Error(`Worklog LLM call timed out after ${ms}ms`)), ms);
+	});
+	return Promise.race([Promise.resolve(value), timeout]).finally(() => clearTimeout(timer));
+}
 
 function slugifyRole(role: string): string {
 	const base = role
@@ -101,6 +112,7 @@ export class Orchestrator {
 	private readonly treeFile: string;
 	private readonly changeListeners = new Set<() => void>();
 	private readonly pendingWorklogFork = new Map<string, Promise<void>>();
+	private readonly pendingFinalization = new Set<string>();
 	private readonly pendingSpawnDrafts = new Map<string, Map<string, PendingSpawnDraft>>();
 	private readonly restoredDisposedEntries = new Map<string, AgentTreeMetadataEntry>();
 	private _isDisposing = false;
@@ -409,15 +421,60 @@ export class Orchestrator {
 			};
 			parent.childIds.push(agentId);
 			this.registerRecord(record);
-			const prompt = await this.buildSpawnPrompt(parentId, agentId, config.prompt);
-			void created.session.prompt(prompt).catch((error) => {
-				void this.handleAgentError(agentId, error);
-			});
 
-			return agentId;
+			try {
+				const prompt = await this.buildSpawnPrompt(parentId, agentId, config.prompt);
+				await this.startSpawnedAgentPrompt(record, prompt);
+				return agentId;
+			} catch (error) {
+				await this.disposeAgent(agentId).catch(() => {
+					// Best-effort cleanup after a failed spawn startup.
+				});
+				throw error;
+			}
 		} finally {
 			this.removePendingSpawnDraft(parentId, agentId);
 		}
+	}
+
+	private async startSpawnedAgentPrompt(record: AgentRecord, prompt: string): Promise<void> {
+		let settled = false;
+		let resolveStarted = () => {};
+		let rejectStarted = (_error: unknown) => {};
+		const started = new Promise<void>((resolve, reject) => {
+			resolveStarted = resolve;
+			rejectStarted = reject;
+		});
+
+		const unsubscribe = record.session.subscribe((event) => {
+			if (settled || event.type !== "agent_start") {
+				return;
+			}
+			settled = true;
+			unsubscribe();
+			resolveStarted();
+		});
+
+		void record.session.prompt(prompt)
+			.then(() => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				unsubscribe();
+				resolveStarted();
+			})
+			.catch((error) => {
+				if (settled) {
+					void this.handleAgentError(record.id, error);
+					return;
+				}
+				settled = true;
+				unsubscribe();
+				rejectStarted(error);
+			});
+
+		await started;
 	}
 
 	async routeMessage(fromAgentId: string, targetAgentId: string, content: string): Promise<void> {
@@ -563,9 +620,24 @@ export class Orchestrator {
 		if (
 			record.session.isStreaming ||
 			record.session.isRetrying ||
-			record.session.isCompacting ||
-			record.session.agent.hasQueuedMessages()
+			record.session.isCompacting
 		) {
+			return;
+		}
+
+		// Drain stranded mailbox messages instead of silently bailing
+		if (record.session.agent.hasQueuedMessages()) {
+			if (!record.reactivating) {
+				record.reactivating = true;
+				this.setStatus(agentId, "running");
+				record.session.agent.continue()
+					.catch(async (error) => {
+						await this.handleAgentError(agentId, error);
+					})
+					.finally(() => {
+						record.reactivating = false;
+					});
+			}
 			return;
 		}
 
@@ -580,11 +652,22 @@ export class Orchestrator {
 			return;
 		}
 
-		await this.deliverIdleMessage(
-			record.parentId,
-			agentId,
-			createAgentIdleMessage(agentId, record.role),
-		);
+		const wasInterrupted = this.wasInterruptedByUser(record);
+		const message = wasInterrupted
+			? createAgentInterruptedMessage(agentId, record.role)
+			: createAgentIdleMessage(agentId, record.role);
+		await this.deliverIdleMessage(record.parentId, agentId, message);
+	}
+
+	private wasInterruptedByUser(record: AgentRecord): boolean {
+		const messages = record.session.agent.state.messages;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const msg = messages[i];
+			if (msg && "role" in msg && msg.role === "assistant") {
+				return (msg as { stopReason?: string }).stopReason === "aborted";
+			}
+		}
+		return false;
 	}
 
 	private async handleAgentError(agentId: string, error: unknown): Promise<void> {
@@ -607,6 +690,10 @@ export class Orchestrator {
 	}
 
 	private scheduleIdleFinalization(agentId: string): void {
+		if (this.pendingFinalization.has(agentId)) {
+			return;
+		}
+		this.pendingFinalization.add(agentId);
 		void Promise.resolve()
 			.then(async () => {
 				const record = this.records.get(agentId);
@@ -619,6 +706,9 @@ export class Orchestrator {
 			})
 			.catch(() => {
 				// Ignore shutdown races and let explicit error/dispose paths own cleanup.
+			})
+			.finally(() => {
+				this.pendingFinalization.delete(agentId);
 			});
 	}
 
@@ -669,7 +759,7 @@ export class Orchestrator {
 
 		if (this.hasRunningChildren(targetAgentId, sourceAgentId)) {
 			try {
-				await target.session.sendCustomMessage(message);
+				await target.session.sendCustomMessage(message, { deliverAs: "nextTurn" });
 			} catch (error) {
 				await this.handleAgentError(targetAgentId, error);
 			}
@@ -690,6 +780,8 @@ export class Orchestrator {
 		}
 
 		this.toolTracker.killAllForAgent(agentId);
+		// Unsubscribe before abort so the agent_end event doesn't trigger finalizeIdle
+		record.unsubscribe?.();
 		await record.session.extensionRunner?.emit({ type: "session_shutdown" });
 		record.session.abortCompaction?.();
 		record.session.abortBranchSummary?.();
@@ -704,7 +796,6 @@ export class Orchestrator {
 			// Ignore shutdown races.
 		}
 		record.session.agent.mailbox.close();
-		record.unsubscribe?.();
 		record.session.dispose();
 
 		if (record.parentId) {
@@ -754,7 +845,6 @@ export class Orchestrator {
 			createSpawnTool(this, agentId),
 			createChildrenTool(this, agentId),
 			createMessageTool(this, agentId),
-			createTerminateTool(this, agentId),
 			createReportTool(this, agentId),
 		];
 	}
@@ -918,16 +1008,19 @@ export class Orchestrator {
 			content: [{ type: "text", text: buildWorklogCompactionPrompt(previousSummary, compactedEntries, recentContext) }],
 			timestamp: Date.now(),
 		};
-		const stream = await record.session.agent.streamFn(
-			record.session.model,
-			{
-				systemPrompt: WORKLOG_COMPACTION_SYSTEM_PROMPT,
-				messages: [prompt],
-				tools: [WORKLOG_COMPACTION_TOOL],
-			},
-			this.buildStreamOptions(record),
+		const stream = await withTimeout(
+			record.session.agent.streamFn(
+				record.session.model,
+				{
+					systemPrompt: WORKLOG_COMPACTION_SYSTEM_PROMPT,
+					messages: [prompt],
+					tools: [WORKLOG_COMPACTION_TOOL],
+				},
+				this.buildStreamOptions(record),
+			),
+			WORKLOG_LLM_TIMEOUT_MS,
 		);
-		const assistant = await stream.result();
+		const assistant = await withTimeout(stream.result(), WORKLOG_LLM_TIMEOUT_MS);
 		if (assistant.stopReason !== "toolUse") {
 			return undefined;
 		}
@@ -1229,16 +1322,19 @@ export class Orchestrator {
 			content: [{ type: "text", text: buildWorklogPrompt(lastEntry) }],
 			timestamp: Date.now(),
 		};
-		const stream = await record.session.agent.streamFn(
-			record.session.model,
-			{
-				systemPrompt: record.session.agent.state.systemPrompt,
-				messages: [...contextMessages, prompt],
-				tools: [WORKLOG_UPDATE_TOOL],
-			},
-			this.buildStreamOptions(record),
+		const stream = await withTimeout(
+			record.session.agent.streamFn(
+				record.session.model,
+				{
+					systemPrompt: record.session.agent.state.systemPrompt,
+					messages: [...contextMessages, prompt],
+					tools: [WORKLOG_UPDATE_TOOL],
+				},
+				this.buildStreamOptions(record),
+			),
+			WORKLOG_LLM_TIMEOUT_MS,
 		);
-		const assistant = await stream.result();
+		const assistant = await withTimeout(stream.result(), WORKLOG_LLM_TIMEOUT_MS);
 		if (assistant.stopReason !== "toolUse") {
 			return;
 		}
