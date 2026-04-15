@@ -21,15 +21,15 @@ export function createAgentContextTransform(
 							return message;
 						}
 
-						return {
-							...message,
-							content: [
-								{
-									type: "text" as const,
-									text: `[TERMINATED] ${message.toolName} did not finish before the session was interrupted. Re-run it if you still need the result.`,
-								},
-							],
-						};
+							return {
+								...message,
+								content: [
+									{
+										type: "text" as const,
+										text: `[INTERRUPTED] ${message.toolName} did not finish before the session ended. It may still be running if the process was killed abruptly. Inspect or re-run it if you still need the result.`,
+									},
+								],
+							};
 					});
 		const roster = buildSubagentRoster(orchestrator, agentId);
 		if (!roster) {

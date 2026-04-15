@@ -25,23 +25,25 @@ mailbox messages between dispatch and completion.
 #### Orphan pending annotation is restore-scoped, not global
 
 Phase 3 restore now records the specific background tool calls that were still pending at
-crash time and rewrites those to `[TERMINATED]` in the restored agent context. But the
+crash time and rewrites those to `[INTERRUPTED]` in the restored agent context. But the
 generic `annotateOrphanedPending()` helper in `agent-core` is still not wired into the
 normal runtime or fork pipeline.
 
 The corresponding session/UI transcript still keeps the historical `[PENDING]` entry. The
 model-facing rewrite is correct on restore, but the user-visible transcript is not yet
-rendered as `[TERMINATED]`.
+rendered as `[INTERRUPTED]`.
 
 #### Legacy scheduling fields still exist as compatibility shims
 
 `steeringMode` and `followUpMode` are still exposed for compatibility with `pi-mono`, even
 though the runtime no longer uses them as real scheduling modes.
 
-#### Downstream teardown wiring is incomplete
+#### Crash-time tool reconciliation is still incomplete
 
-`Agent.dispose()` exists in `agent-core`, but the upstream `pi-mono` session teardown is not
-yet wired through it. That integration remains open.
+Graceful runtime teardown now aborts the root session before disposal and session switches.
+But after a hard crash, restore still has no durable PID/job metadata to distinguish a truly
+dead tool from a detached process that survived the parent. Restore therefore falls back to
+conservative `[INTERRUPTED]` annotations instead of proving liveness or termination.
 
 ## Phase 2
 
@@ -91,6 +93,20 @@ but repeated reruns still sometimes serialize the spawns or keep the root engage
 that the first child update lands before the root has gone idle. The runtime supports the
 pattern once the model follows it, but prompt guidance alone does not make it deterministic.
 
+#### Subagent model/thinking overrides are not exposed through `spawn` yet
+
+`SpawnConfig` and the session factory already support per-child `model` and `thinkingLevel`
+overrides, but the `spawn` tool schema does not expose those fields to the model yet.
+Children therefore inherit the parent's current `model` and `thinkingLevel` unless the
+runtime constructs `SpawnConfig` programmatically.
+
+#### Model/thinking changes are still immediate while a run is active
+
+Changing the session model or thinking level mutates the live session state immediately.
+That means a mid-run model/thinking change is still racy with the in-flight request and any
+follow-on retry/compaction logic that inspects the current session model. The current
+implementation does not yet defer or reject those changes until the session is idle.
+
 ## Phase 3
 
 ### Implemented
@@ -99,19 +115,11 @@ pattern once the model follows it, but prompt guidance alone does not make it de
 - Live subagent roster injection via `transformContext`
 - Per-agent worklog forks on `turn_end`
 - Worklog forks stay local to the agent/worklog files and ancestor propagation instead of surfacing as live parent transcript messages
-- Ancestor worklog propagation on spawn
+- Ancestor spawn inheritance now uses the latest completed worklog plus recent unsummarized transcript tail, so child spawn does not block on in-flight worklog forks
 - Session restore for child trees and interrupted tools
 - App startup now resumes the most recent session and restores the tree
 
 ### Known Gaps
-
-#### Root restore resumption still uses a synthetic user message
-
-The plan distinguishes between transcripts that can continue directly and transcripts that
-end in an assistant message. The current runtime always resumes the restored root session by
-injecting `[Session restored]` on `session_start`, because the extension API does not expose
-`continue()` directly. This means restore currently adds one extra user turn even when the
-transcript already ended in a continuable non-assistant message.
 
 #### Child session lifecycle still uses generic `fork` and `resume` reasons
 

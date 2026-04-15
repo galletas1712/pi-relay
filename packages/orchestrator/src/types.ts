@@ -87,6 +87,7 @@ export interface AgentTreeMetadataEntry {
 	createdAt: number;
 	lastStatusChange: number;
 	lastWorklogTurn: number;
+	lastWorklogMessageCount: number;
 	turnCount?: number;
 }
 
@@ -108,6 +109,7 @@ export interface AgentRecord {
 	createdAt: number;
 	lastStatusChange: number;
 	lastWorklogTurn: number;
+	lastWorklogMessageCount: number;
 	turnCount: number;
 	pendingRestoreIdleNotice: boolean;
 	orphanedPendingToolCallIds: string[];

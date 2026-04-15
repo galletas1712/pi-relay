@@ -119,7 +119,6 @@ describe("session restore", () => {
 		expect(restoredRoot.sentMessages[0]?.message.customType).toBe("agent_idle");
 		expect(restoredRoot.sentMessages[0]?.options).toBeUndefined();
 		expect(String(restoredRoot.sentMessages[0]?.message.content)).toContain("Note: Session restored from interrupted state.");
-		expect(restoredOrchestrator.consumePendingRootResume("root-session")).toBe(true);
 
 		const transformed = await restoredRecord.session.agent.transformContext?.(restoredChild.agent.state.messages);
 		expect(transformed).toBeDefined();
@@ -131,7 +130,7 @@ describe("session restore", () => {
 			throw new Error("Pending tool result missing after restore");
 		}
 		expect(pending.content[0]?.type).toBe("text");
-		expect((pending.content[0] as { text: string }).text).toContain("[TERMINATED]");
+		expect((pending.content[0] as { text: string }).text).toContain("[INTERRUPTED]");
 
 		const transformedRoot = await restoredRoot.agent.transformContext?.(restoredRoot.agent.state.messages);
 		expect(transformedRoot).toBeDefined();
@@ -142,7 +141,7 @@ describe("session restore", () => {
 		if (!rootPending || rootPending.role !== "toolResult") {
 			throw new Error("Root pending tool result missing after restore");
 		}
-		expect((rootPending.content[0] as { text: string }).text).toContain("[TERMINATED]");
+		expect((rootPending.content[0] as { text: string }).text).toContain("[INTERRUPTED]");
 
 		await restoredOrchestrator.routeMessage("root", childId, "continue from the interrupted state");
 		expect(restoredChild.sentMessages).toHaveLength(1);

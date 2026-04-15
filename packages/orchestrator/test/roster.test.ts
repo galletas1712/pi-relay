@@ -1,10 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { buildAgentSelectorOptions, buildAgentWidgetLines, buildSubagentRoster } from "../src/roster.js";
 import { Orchestrator } from "../src/orchestrator.js";
-import { FakeSession } from "./test-helpers.js";
+import { FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
 describe("buildSubagentRoster", () => {
-	it("returns an empty string when an agent has no children", () => {
+	it("returns an empty string when an agent has no running children", () => {
 		const orchestrator = new Orchestrator({
 			rootSession: new FakeSession("root-session"),
 			sessionFactory: vi.fn(),
@@ -14,10 +14,9 @@ describe("buildSubagentRoster", () => {
 		expect(buildAgentWidgetLines(orchestrator, "root")).toBeUndefined();
 	});
 
-	it("renders live child status, activity, and child counts", async () => {
+	it("renders only running child ids, roles, and child counts", async () => {
 		const root = new FakeSession("root-session");
 		const child = new FakeSession("child-session");
-		child.lastAssistantText = "Scanning packages/orchestrator and comparing session restore paths.";
 		const grandchild = new FakeSession("grandchild-session");
 		const sessions = [child, grandchild];
 		const factory = vi.fn(async () => ({ session: sessions.shift()! }));
@@ -36,9 +35,35 @@ describe("buildSubagentRoster", () => {
 		});
 
 		const roster = buildSubagentRoster(orchestrator, "root");
-		expect(roster).toContain("## Active Subagents");
-		expect(roster).toContain(`${childId} (running, 1 children): planner`);
-		expect(roster).toContain("Scanning packages/orchestrator");
+		expect(roster).toContain("## Running Subagents");
+		expect(roster).toContain(`${childId} (running, 1 child): planner`);
+		expect(roster).not.toContain("Scanning packages/orchestrator");
+	});
+
+	it("omits idle children from the model-facing roster", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		const sibling = new FakeSession("sibling-session");
+		const sessions = [child, sibling];
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: sessions.shift()! })),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "planner",
+			prompt: "inspect",
+		});
+		const siblingId = await orchestrator.spawnAgent("root", {
+			role: "explorer",
+			prompt: "inspect more",
+		});
+		sibling.emit({ type: "agent_end" });
+		await waitForMicrotasks();
+
+		const roster = buildSubagentRoster(orchestrator, "root");
+		expect(roster).toContain(childId);
+		expect(roster).not.toContain(siblingId);
 	});
 
 	it("builds selector and widget views for the attached agent tree", async () => {
@@ -63,5 +88,52 @@ describe("buildSubagentRoster", () => {
 		expect(widget[0]).toBe("Relay Agents");
 		expect(widget[1]).toContain(`Attached: ${childId} (planner, running)`);
 		expect(widget.at(-1)).toBe("Use /agents to switch");
+	});
+
+	it("hides idle agents by default in the widget", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		await orchestrator.spawnAgent("root", {
+			role: "planner",
+			prompt: "inspect",
+		});
+		child.emit({ type: "agent_end" });
+		await waitForMicrotasks();
+
+		expect(buildAgentWidgetLines(orchestrator, "root")).toBeUndefined();
+	});
+
+	it("keeps the attached idle child visible while hiding other idle agents", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		const sibling = new FakeSession("sibling-session");
+		const sessions = [child, sibling];
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: sessions.shift()! })),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "planner",
+			prompt: "inspect",
+		});
+		await orchestrator.spawnAgent("root", {
+			role: "explorer",
+			prompt: "inspect more",
+		});
+		child.emit({ type: "agent_end" });
+		sibling.emit({ type: "agent_end" });
+		await waitForMicrotasks();
+
+		const widget = buildAgentWidgetLines(orchestrator, childId);
+		expect(widget?.[0]).toBe("Relay Agents");
+		expect(widget?.some((line) => line.includes(`${childId} · idle · planner`))).toBe(true);
+		expect(widget?.some((line) => line.includes("idle agent"))).toBe(true);
+		expect(widget?.at(-1)).toBe("Use /agents to switch");
 	});
 });

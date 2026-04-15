@@ -4,18 +4,6 @@ function formatSender(fromAgentId: string, fromRole: string): string {
 	return `Agent ${fromAgentId} (${fromRole})`;
 }
 
-function truncate(text: string | undefined, maxLength: number): string | undefined {
-	if (!text) {
-		return undefined;
-	}
-
-	const normalized = text.replace(/\s+/g, " ").trim();
-	if (normalized.length <= maxLength) {
-		return normalized;
-	}
-	return `${normalized.slice(0, maxLength - 3)}...`;
-}
-
 export function createAgentReportMessage(
 	fromAgentId: string,
 	fromRole: string,
@@ -51,23 +39,17 @@ export function createAgentDirectiveMessage(
 export function createAgentIdleMessage(
 	fromAgentId: string,
 	fromRole: string,
-	lastOutput?: string,
-	errorMessage?: string,
-	note?: string,
-): SessionCustomMessage<AgentMessageDetails & { lastOutput?: string; errorMessage?: string; note?: string }> {
-	const lines = [`[${formatSender(fromAgentId, fromRole)} IDLE]`];
-	const truncated = truncate(lastOutput, 300);
-	if (truncated) {
-		lines.push(`Last output: ${truncated}`);
+	options: { errorMessage?: string; note?: string } = {},
+): SessionCustomMessage<AgentMessageDetails & { errorMessage?: string; note?: string }> {
+	const lines = [
+		`[${formatSender(fromAgentId, fromRole)} IDLE]`,
+		"The child is idle and can be reactivated with `message`.",
+	];
+	if (options.errorMessage) {
+		lines.push(`Error: ${options.errorMessage}`);
 	}
-	if (errorMessage) {
-		lines.push(`Error: ${errorMessage}`);
-	}
-	if (note) {
-		lines.push(`Note: ${note}`);
-	}
-	if (!truncated && !errorMessage) {
-		lines.push("No final output was captured.");
+	if (options.note) {
+		lines.push(`Note: ${options.note}`);
 	}
 	return {
 		customType: "agent_idle",
@@ -76,9 +58,8 @@ export function createAgentIdleMessage(
 		details: {
 			fromAgentId,
 			fromRole,
-			lastOutput: truncated,
-			errorMessage,
-			note,
+			errorMessage: options.errorMessage,
+			note: options.note,
 		},
 	};
 }

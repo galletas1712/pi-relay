@@ -14,17 +14,20 @@ function truncate(text: string | undefined, maxLength: number): string {
 }
 
 function formatChildLine(record: AgentRecord): string {
-	const suffix = record.childIds.length > 0 ? `, ${record.childIds.length} children` : "";
-	return `- ${record.id} (${record.status}${suffix}): ${record.role} — ${truncate(record.session.getLastAssistantText(), 100)}`;
+	const suffix =
+		record.childIds.length > 0
+			? `, ${record.childIds.length} child${record.childIds.length === 1 ? "" : "ren"}`
+			: "";
+	return `- ${record.id} (${record.status}${suffix}): ${record.role}`;
 }
 
 export function buildSubagentRoster(orchestrator: Orchestrator, agentId: string): string {
-	const children = orchestrator.getChildrenOf(agentId);
+	const children = orchestrator.getChildrenOf(agentId).filter((child) => child.status === "running");
 	if (children.length === 0) {
 		return "";
 	}
 
-	const lines = ["## Active Subagents", ""];
+	const lines = ["## Running Subagents", ""];
 	for (const child of children) {
 		lines.push(formatChildLine(child));
 	}
@@ -65,6 +68,12 @@ export function buildAgentWidgetLines(
 	if (!active) {
 		return undefined;
 	}
+	const visible = summaries.filter((summary) => summary.id === activeAgentId || summary.status === "running");
+	if (visible.length === 1 && active.id === "root") {
+		return undefined;
+	}
+	const shown = visible.slice(0, maxAgents);
+	const hiddenIdleCount = summaries.length - visible.length;
 
 	const lines = [
 		"Relay Agents",
@@ -72,15 +81,19 @@ export function buildAgentWidgetLines(
 		"Other agents keep running detached when not attached.",
 	];
 
-	for (const summary of summaries.slice(0, maxAgents)) {
+	for (const summary of shown) {
 		const marker = summary.id === activeAgentId ? ">" : " ";
 		lines.push(
 			`${marker} ${"  ".repeat(summary.depth)}${summary.id} · ${formatSummaryStatus(summary)} · ${summary.role}`,
 		);
 	}
 
-	if (summaries.length > maxAgents) {
-		lines.push(`… ${summaries.length - maxAgents} more agents`);
+	if (visible.length > maxAgents) {
+		lines.push(`… ${visible.length - maxAgents} more active agents`);
+	}
+
+	if (hiddenIdleCount > 0) {
+		lines.push(`… ${hiddenIdleCount} idle agent${hiddenIdleCount === 1 ? "" : "s"} hidden`);
 	}
 
 	lines.push("Use /agents to switch");

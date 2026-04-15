@@ -11,6 +11,7 @@ export function createSpawnTool(runtime: SpawnToolRuntime, callingAgentId: strin
 		promptGuidelines: [
 			"Use spawn when a subtask can proceed independently from your current turn.",
 			"Give each child a clear role and a concrete prompt.",
+			"If you need several independent children, emit all spawn calls in the same assistant response.",
 		],
 		parameters: Type.Object(
 			{

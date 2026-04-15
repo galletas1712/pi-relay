@@ -4,7 +4,7 @@ import { randomUUID } from "node:crypto";
 import type { AgentMessage, AgentToolCall } from "@mariozechner/pi-agent-core";
 import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@mariozechner/pi-agent-core";
 import { validateToolArguments, type ToolResultMessage, type UserMessage } from "@mariozechner/pi-ai";
-import type { AgentSessionEvent, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import { serializeConversation, type AgentSessionEvent, type ToolDefinition } from "@mariozechner/pi-coding-agent";
 import { createAgentContextTransform } from "./context-transform.js";
 import { createMessageTool } from "./tools/message.js";
 import { createReportTool } from "./tools/report.js";
@@ -45,6 +45,12 @@ function ensureDir(path: string): void {
 	mkdirSync(path, { recursive: true });
 }
 
+interface PendingSpawnDraft {
+	id: string;
+	role: string;
+	prompt: string;
+}
+
 export class Orchestrator {
 	private readonly records = new Map<string, AgentRecord>();
 	private readonly sessionIdToAgentId = new Map<string, string>();
@@ -57,10 +63,10 @@ export class Orchestrator {
 	private readonly treeFile: string;
 	private readonly changeListeners = new Set<() => void>();
 	private readonly pendingWorklogFork = new Map<string, Promise<void>>();
+	private readonly pendingSpawnDrafts = new Map<string, Map<string, PendingSpawnDraft>>();
 	private readonly restoredDisposedEntries = new Map<string, AgentTreeMetadataEntry>();
 	private _isDisposing = false;
 	private treeWriteChain: Promise<void> = Promise.resolve();
-	private pendingRootResumeSessionId?: string;
 
 	readonly rootAgentId: string;
 
@@ -95,6 +101,7 @@ export class Orchestrator {
 			createdAt: Date.now(),
 			lastStatusChange: Date.now(),
 			lastWorklogTurn: 0,
+			lastWorklogMessageCount: 0,
 			turnCount: 0,
 			pendingRestoreIdleNotice: false,
 			orphanedPendingToolCallIds: [],
@@ -191,14 +198,6 @@ export class Orchestrator {
 		};
 	}
 
-	consumePendingRootResume(sessionId: string): boolean {
-		if (this.pendingRootResumeSessionId !== sessionId) {
-			return false;
-		}
-		this.pendingRootResumeSessionId = undefined;
-		return true;
-	}
-
 	async restore(): Promise<boolean> {
 		if (!existsSync(this.treeFile)) {
 			await this.persistTree();
@@ -217,6 +216,7 @@ export class Orchestrator {
 			rootRecord.role = rootEntry.role;
 			rootRecord.config = rootEntry.spawnConfig;
 			rootRecord.lastWorklogTurn = rootEntry.lastWorklogTurn;
+			rootRecord.lastWorklogMessageCount = rootEntry.lastWorklogMessageCount ?? 0;
 			rootRecord.turnCount = rootEntry.turnCount ?? rootEntry.lastWorklogTurn;
 		}
 		rootRecord.orphanedPendingToolCallIds = this.appendInterruptedToolResults(rootRecord.session);
@@ -264,6 +264,7 @@ export class Orchestrator {
 				createdAt: entry.createdAt,
 				lastStatusChange: Date.now(),
 				lastWorklogTurn: entry.lastWorklogTurn,
+				lastWorklogMessageCount: entry.lastWorklogMessageCount ?? 0,
 				turnCount: entry.turnCount ?? entry.lastWorklogTurn,
 				pendingRestoreIdleNotice: entry.status === "running",
 				orphanedPendingToolCallIds: [],
@@ -291,9 +292,7 @@ export class Orchestrator {
 			const idleMessage = createAgentIdleMessage(
 				record.id,
 				record.role,
-				record.session.getLastAssistantText(),
-				undefined,
-				"Session restored from interrupted state.",
+				{ note: "Session restored from interrupted state." },
 			);
 			if (record.parentId === this.rootAgentId) {
 				await this.getRecord(this.rootAgentId).session.sendCustomMessage(idleMessage);
@@ -301,8 +300,6 @@ export class Orchestrator {
 			}
 			await this.deliverMessage(record.parentId, idleMessage);
 		}
-
-		this.pendingRootResumeSessionId = rootRecord.session.sessionId;
 		await this.persistTree();
 		return true;
 	}
@@ -310,47 +307,57 @@ export class Orchestrator {
 	async spawnAgent(parentId: string, config: SpawnConfig): Promise<string> {
 		const parent = this.getRecord(parentId);
 		this.assertSpawnAllowed(parentId);
-		await this.awaitAncestorWorklogs(parentId);
 
 		const agentId = createAgentId(config.role);
-		const childCustomTools = this.createChildTools(agentId);
-		const created = await this.sessionFactory({
-			mode: "spawn",
-			agentId,
-			parentId,
-			config,
-			customTools: childCustomTools,
-			parentSession: parent.session,
-			sessionDir: this.agentsDir,
-		});
-
-		await created.session.bindExtensions({});
-
-		const record: AgentRecord = {
+		this.addPendingSpawnDraft(parentId, {
 			id: agentId,
-			session: created.session,
-			status: "running",
-			parentId,
-			childIds: [],
 			role: config.role,
-			config,
-			reactivating: false,
-			worklogFile: this.getWorklogFile(agentId),
-			createdAt: Date.now(),
-			lastStatusChange: Date.now(),
-			lastWorklogTurn: 0,
-			turnCount: 0,
-			pendingRestoreIdleNotice: false,
-			orphanedPendingToolCallIds: [],
-		};
-		parent.childIds.push(agentId);
-		this.registerRecord(record);
-		const prompt = await this.buildSpawnPrompt(parentId, config.prompt);
-		void created.session.prompt(prompt).catch((error) => {
-			void this.handleAgentError(agentId, error);
+			prompt: config.prompt,
 		});
 
-		return agentId;
+		try {
+			const childCustomTools = this.createChildTools(agentId);
+			const created = await this.sessionFactory({
+				mode: "spawn",
+				agentId,
+				parentId,
+				config,
+				customTools: childCustomTools,
+				parentSession: parent.session,
+				sessionDir: this.agentsDir,
+			});
+
+			await created.session.bindExtensions({});
+
+			const record: AgentRecord = {
+				id: agentId,
+				session: created.session,
+				status: "running",
+				parentId,
+				childIds: [],
+				role: config.role,
+				config,
+				reactivating: false,
+				worklogFile: this.getWorklogFile(agentId),
+				createdAt: Date.now(),
+				lastStatusChange: Date.now(),
+				lastWorklogTurn: 0,
+				lastWorklogMessageCount: 0,
+				turnCount: 0,
+				pendingRestoreIdleNotice: false,
+				orphanedPendingToolCallIds: [],
+			};
+			parent.childIds.push(agentId);
+			this.registerRecord(record);
+			const prompt = await this.buildSpawnPrompt(parentId, agentId, config.prompt);
+			void created.session.prompt(prompt).catch((error) => {
+				void this.handleAgentError(agentId, error);
+			});
+
+			return agentId;
+		} finally {
+			this.removePendingSpawnDraft(parentId, agentId);
+		}
 	}
 
 	async routeMessage(fromAgentId: string, targetAgentId: string, content: string): Promise<void> {
@@ -362,6 +369,7 @@ export class Orchestrator {
 		await this.deliverMessage(
 			targetAgentId,
 			createAgentDirectiveMessage(fromAgentId, source.role, content),
+			{ waitForTurn: false },
 		);
 	}
 
@@ -374,6 +382,7 @@ export class Orchestrator {
 		await this.deliverMessage(
 			record.parentId,
 			createAgentReportMessage(agentId, record.role, content),
+			{ waitForTurn: false },
 		);
 	}
 
@@ -393,7 +402,9 @@ export class Orchestrator {
 
 	private assertSpawnAllowed(parentId: string): void {
 		const parent = this.getRecord(parentId);
-		if (parent.childIds.length >= this.config.maxChildren) {
+		const activeChildCount = parent.childIds.filter((childId) => this.records.get(childId)?.status === "running").length;
+		const pendingDirectChildren = this.pendingSpawnDrafts.get(parentId)?.size ?? 0;
+		if (activeChildCount + pendingDirectChildren >= this.config.maxChildren) {
 			throw new Error(`Agent ${parentId} already has the maximum number of children`);
 		}
 
@@ -407,7 +418,8 @@ export class Orchestrator {
 			throw new Error(`Spawning from ${parentId} would exceed the maximum agent depth`);
 		}
 
-		const activeAgents = [...this.records.values()].filter((record) => record.status !== "disposed").length;
+		const pendingSpawns = [...this.pendingSpawnDrafts.values()].reduce((total, drafts) => total + drafts.size, 0);
+		const activeAgents = [...this.records.values()].filter((record) => record.status === "running").length + pendingSpawns;
 		if (activeAgents >= this.config.maxActiveAgents) {
 			throw new Error("The orchestrator is already at its active agent limit");
 		}
@@ -460,12 +472,12 @@ export class Orchestrator {
 		}
 
 		if (event.type === "agent_end") {
-			void record.session.agent
-				.waitForIdle()
-				.then(() => this.finalizeIdle(agentId))
-				.catch(() => {
-					// Ignore shutdown races and let explicit error/dispose paths own cleanup.
-				});
+			this.scheduleIdleFinalization(agentId);
+			return;
+		}
+
+		if (event.type === "compaction_end" && !event.willRetry) {
+			this.scheduleIdleFinalization(agentId);
 		}
 	}
 
@@ -475,7 +487,17 @@ export class Orchestrator {
 			return;
 		}
 
-		if (record.session.isStreaming || record.session.isRetrying || record.session.isCompacting) {
+		if (
+			record.session.isStreaming ||
+			record.session.isRetrying ||
+			record.session.isCompacting ||
+			record.session.agent.hasQueuedMessages()
+		) {
+			return;
+		}
+
+		if (this.hasRunningChildren(agentId)) {
+			this.setStatus(agentId, "running");
 			return;
 		}
 
@@ -485,9 +507,10 @@ export class Orchestrator {
 			return;
 		}
 
-		await this.deliverMessage(
+		await this.deliverIdleMessage(
 			record.parentId,
-			createAgentIdleMessage(agentId, record.role, record.session.getLastAssistantText()),
+			agentId,
+			createAgentIdleMessage(agentId, record.role),
 		);
 	}
 
@@ -506,11 +529,31 @@ export class Orchestrator {
 		const errorMessage = error instanceof Error ? error.message : String(error);
 		await this.deliverMessage(
 			record.parentId,
-			createAgentIdleMessage(agentId, record.role, record.session.getLastAssistantText(), errorMessage),
+			createAgentIdleMessage(agentId, record.role, { errorMessage }),
 		);
 	}
 
-	private async deliverMessage(targetAgentId: string, message: SessionCustomMessage): Promise<void> {
+	private scheduleIdleFinalization(agentId: string): void {
+		void Promise.resolve()
+			.then(async () => {
+				const record = this.records.get(agentId);
+				if (!record || record.status === "disposed") {
+					return;
+				}
+
+				await record.session.agent.waitForIdle();
+				await this.finalizeIdle(agentId);
+			})
+			.catch(() => {
+				// Ignore shutdown races and let explicit error/dispose paths own cleanup.
+			});
+	}
+
+	private async deliverMessage(
+		targetAgentId: string,
+		message: SessionCustomMessage,
+		options: { waitForTurn?: boolean } = {},
+	): Promise<void> {
 		const target = this.getRecord(targetAgentId);
 		if (target.status === "disposed") {
 			return;
@@ -520,12 +563,16 @@ export class Orchestrator {
 		if (!targetIsBusy && !target.reactivating) {
 			target.reactivating = true;
 			this.setStatus(targetAgentId, "running");
-			try {
-				await target.session.sendCustomMessage(message, { triggerTurn: true });
-			} catch (error) {
-				await this.handleAgentError(targetAgentId, error);
-			} finally {
-				target.reactivating = false;
+			const reactivation = target.session
+				.sendCustomMessage(message, { triggerTurn: true })
+				.catch(async (error) => {
+					await this.handleAgentError(targetAgentId, error);
+				})
+				.finally(() => {
+					target.reactivating = false;
+				});
+			if (options.waitForTurn ?? true) {
+				await reactivation;
 			}
 			return;
 		}
@@ -535,6 +582,28 @@ export class Orchestrator {
 		} catch (error) {
 			await this.handleAgentError(targetAgentId, error);
 		}
+	}
+
+	private async deliverIdleMessage(
+		targetAgentId: string,
+		sourceAgentId: string,
+		message: SessionCustomMessage,
+	): Promise<void> {
+		const target = this.getRecord(targetAgentId);
+		if (target.status === "disposed") {
+			return;
+		}
+
+		if (this.hasRunningChildren(targetAgentId, sourceAgentId)) {
+			try {
+				await target.session.sendCustomMessage(message);
+			} catch (error) {
+				await this.handleAgentError(targetAgentId, error);
+			}
+			return;
+		}
+
+		await this.deliverMessage(targetAgentId, message);
 	}
 
 	private async disposeAgent(agentId: string): Promise<void> {
@@ -593,6 +662,20 @@ export class Orchestrator {
 		}
 	}
 
+	private hasRunningChildren(agentId: string, excludingAgentId?: string): boolean {
+		const record = this.records.get(agentId);
+		if (!record) {
+			return false;
+		}
+
+		return record.childIds.some((childId) => {
+			if (childId === excludingAgentId) {
+				return false;
+			}
+			return this.records.get(childId)?.status === "running";
+		});
+	}
+
 	private createChildTools(agentId: string): ToolDefinition[] {
 		return [createSpawnTool(this, agentId), createMessageTool(this, agentId), createReportTool(this, agentId)];
 	}
@@ -633,6 +716,7 @@ export class Orchestrator {
 				createdAt: record.createdAt,
 				lastStatusChange: record.lastStatusChange,
 				lastWorklogTurn: record.lastWorklogTurn,
+				lastWorklogMessageCount: record.lastWorklogMessageCount,
 				turnCount: record.turnCount,
 			};
 		}
@@ -660,42 +744,56 @@ export class Orchestrator {
 		}
 	}
 
-	private async awaitAncestorWorklogs(parentId: string): Promise<void> {
-		const ancestorIds: string[] = [];
-		let current: AgentRecord | undefined = this.records.get(parentId);
-		while (current) {
-			ancestorIds.push(current.id);
-			current = current.parentId ? this.records.get(current.parentId) : undefined;
-		}
-
-		await Promise.all(
-			ancestorIds.map(async (agentId) => {
-				try {
-					await this.pendingWorklogFork.get(agentId);
-				} catch {
-					// Ignore best-effort worklog failures when spawning children.
-				}
-			}),
-		);
-	}
-
-	private async buildSpawnPrompt(parentId: string, prompt: string): Promise<string> {
-		const ancestors: Array<{ agentId: string; role: string; filePath: string }> = [];
+	private async buildSpawnPrompt(parentId: string, agentId: string, prompt: string): Promise<string> {
+		const ancestors: Array<{
+			id: string;
+			role: string;
+			worklogFile: string;
+			lastWorklogMessageCount: number;
+			messages: AgentMessage[];
+		}> = [];
 		let current: AgentRecord | undefined = this.records.get(parentId);
 		while (current) {
 			ancestors.unshift({
-				agentId: current.id,
+				id: current.id,
 				role: current.role,
-				filePath: current.worklogFile,
+				worklogFile: current.worklogFile,
+				lastWorklogMessageCount: current.lastWorklogMessageCount,
+				messages: [...current.session.agent.state.messages],
 			});
 			current = current.parentId ? this.records.get(current.parentId) : undefined;
 		}
 
-		const prefix = await buildAncestorWorklogPrefix(ancestors);
-		if (!prefix) {
+		const sections: string[] = [];
+		for (const ancestor of ancestors) {
+			const worklogSection = await buildAncestorWorklogPrefix([
+				{
+					agentId: ancestor.id,
+					role: ancestor.role,
+					filePath: ancestor.worklogFile,
+				},
+			]);
+			if (worklogSection) {
+				sections.push(worklogSection);
+			}
+
+			const recentContext = await this.serializeRecentAncestorContext(ancestor);
+			if (recentContext) {
+				sections.push(
+					`<ancestor-recent-context agent="${ancestor.id}" role="${ancestor.role}">\n${recentContext}\n</ancestor-recent-context>`,
+				);
+			}
+		}
+
+		const siblingBatch = this.buildSiblingBatchPrefix(parentId, agentId);
+		if (siblingBatch) {
+			sections.push(siblingBatch);
+		}
+
+		if (sections.length === 0) {
 			return prompt;
 		}
-		return `${prefix}\n\n${prompt}`;
+		return `${sections.join("\n\n")}\n\n${prompt}`;
 	}
 
 	private scheduleWorklogFork(agentId: string, turn: number, turnMessages: AgentMessage[]): void {
@@ -704,6 +802,96 @@ export class Orchestrator {
 			// Best-effort worklog generation should not poison future turns.
 		});
 		this.pendingWorklogFork.set(agentId, next);
+	}
+
+	private addPendingSpawnDraft(parentId: string, draft: PendingSpawnDraft): void {
+		let drafts = this.pendingSpawnDrafts.get(parentId);
+		if (!drafts) {
+			drafts = new Map();
+			this.pendingSpawnDrafts.set(parentId, drafts);
+		}
+		drafts.set(draft.id, draft);
+	}
+
+	private removePendingSpawnDraft(parentId: string, agentId: string): void {
+		const drafts = this.pendingSpawnDrafts.get(parentId);
+		if (!drafts) {
+			return;
+		}
+		drafts.delete(agentId);
+		if (drafts.size === 0) {
+			this.pendingSpawnDrafts.delete(parentId);
+		}
+	}
+
+	private async serializeRecentAncestorContext(ancestor: {
+		id: string;
+		role: string;
+		lastWorklogMessageCount: number;
+		messages: AgentMessage[];
+	}): Promise<string | undefined> {
+		const startIndex = Math.min(ancestor.lastWorklogMessageCount, ancestor.messages.length);
+		const recentMessages = ancestor.messages.slice(startIndex);
+		if (recentMessages.length === 0) {
+			return undefined;
+		}
+
+		const record = this.getRecord(ancestor.id);
+		const llmMessages = await record.session.agent.convertToLlm(recentMessages);
+		const serialized = serializeConversation(llmMessages).trim();
+		if (!serialized) {
+			return undefined;
+		}
+
+		const maxChars = 4_000;
+		if (serialized.length <= maxChars) {
+			return serialized;
+		}
+		return `[Truncated to the most recent ${maxChars} characters of ancestor context]\n${serialized.slice(-maxChars)}`;
+	}
+
+	private buildSiblingBatchPrefix(parentId: string, agentId: string): string | undefined {
+		const siblings = new Map<string, { role: string; prompt: string; status: string }>();
+		const parent = this.records.get(parentId);
+		for (const childId of parent?.childIds ?? []) {
+			if (childId === agentId) {
+				continue;
+			}
+			const sibling = this.records.get(childId);
+			if (!sibling || sibling.status === "disposed") {
+				continue;
+			}
+			siblings.set(childId, {
+				role: sibling.role,
+				prompt: sibling.config.prompt,
+				status: sibling.status,
+			});
+		}
+
+		for (const draft of this.pendingSpawnDrafts.get(parentId)?.values() ?? []) {
+			if (draft.id === agentId || siblings.has(draft.id)) {
+				continue;
+			}
+			siblings.set(draft.id, {
+				role: draft.role,
+				prompt: draft.prompt,
+				status: "spawning",
+			});
+		}
+
+		if (siblings.size === 0) {
+			return undefined;
+		}
+
+		const lines = [
+			`<parent-sibling-batch parent="${parentId}">`,
+			"Other direct children of your parent are already active or being spawned now. Coordinate through your parent and avoid duplicating their work:",
+		];
+		for (const [siblingId, sibling] of siblings) {
+			lines.push(`- ${siblingId} (${sibling.status}): ${sibling.role} — ${sibling.prompt}`);
+		}
+		lines.push("</parent-sibling-batch>");
+		return lines.join("\n");
 	}
 
 	private async runWorklogFork(agentId: string, turn: number, turnMessages: AgentMessage[]): Promise<void> {
@@ -756,6 +944,7 @@ export class Orchestrator {
 		const args = validateToolArguments(WORKLOG_UPDATE_TOOL, toolCall);
 		const entry = await appendWorklogEntry(record.worklogFile, args.content, turn);
 		record.lastWorklogTurn = turn;
+		record.lastWorklogMessageCount = turnMessages.length;
 		await this.persistTree();
 	}
 
@@ -804,7 +993,7 @@ export class Orchestrator {
 				continue;
 			}
 
-			const text = `[TERMINATED] ${info.toolName} did not produce a result before the session was interrupted. Re-run it if you still need the result.`;
+			const text = `[INTERRUPTED] ${info.toolName} did not produce a result before the session ended. It may still be running if the process was killed abruptly. Inspect or re-run it if you still need the result.`;
 			const terminatedResult: ToolResultMessage = {
 				role: "toolResult",
 				toolCallId,

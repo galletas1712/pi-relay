@@ -63,7 +63,7 @@ describe("pending-results", () => {
 		expect(projected.content.some((block) => block.type === "text" && block.text.includes("done"))).toBe(true);
 	});
 
-	it("annotates orphaned pending results as terminated without mutating completed ones", () => {
+	it("annotates orphaned pending results as interrupted without mutating completed ones", () => {
 		const pending = createPendingToolResult("tool-1", "bash", '{"command":"npm test"}');
 		const completed = createPendingToolResult("tool-2", "bash", '{"command":"npm lint"}');
 		const completion = formatBackgroundToolCompletion({
@@ -83,7 +83,7 @@ describe("pending-results", () => {
 		expect((orphaned as typeof pending).content[0]).toMatchObject({
 			type: "text",
 		});
-		expect(((orphaned as typeof pending).content[0] as { text: string }).text).toContain("[TERMINATED]");
+		expect(((orphaned as typeof pending).content[0] as { text: string }).text).toContain("[INTERRUPTED]");
 		expect(preserved).toBe(completed);
 	});
 });
