@@ -1,16 +1,18 @@
 import {
-	applyPatchTool,
-	bashTool,
+	createApplyPatchToolDefinition,
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
-	editTool,
+	createBashToolDefinition,
+	createEditToolDefinition,
+	createFileAccessTracker,
+	createReadToolDefinition,
+	createWriteToolDefinition,
 	getAgentDir,
-	readTool,
 	SessionManager,
+	type AgentSessionServices,
 	type ToolDefinition,
-	writeTool,
 } from "@mariozechner/pi-coding-agent";
 import {
 	createMessageTool,
@@ -21,7 +23,7 @@ import {
 } from "@pi-relay/orchestrator";
 import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
 
-const RELAY_ACTIVE_TOOLS = [readTool, bashTool, editTool, applyPatchTool, writeTool];
+const RELAY_BASE_TOOL_NAMES = ["read", "bash", "edit", "apply_patch", "write"];
 
 const RELAY_APPEND_SYSTEM_PROMPT = `Relay tool usage:
 - Use read instead of cat, head, tail, or sed for reading files.
@@ -30,6 +32,25 @@ const RELAY_APPEND_SYSTEM_PROMPT = `Relay tool usage:
 - Use write only for new files or complete rewrites.
 - Do not use bash to read or edit files when dedicated tools are available.
 - After apply_patch succeeds, do not immediately re-read the same file unless you need verification or nearby context.`;
+
+function createRelayBaseToolDefinitionsFactory(
+	cwd: string,
+	settingsManager: AgentSessionServices["settingsManager"],
+): () => ToolDefinition<any, any, any>[] {
+	const tracker = createFileAccessTracker();
+
+	return () => {
+		const autoResizeImages = settingsManager.getImageAutoResize();
+		const shellCommandPrefix = settingsManager.getShellCommandPrefix();
+		return [
+			createReadToolDefinition(cwd, { autoResizeImages, tracker }),
+			createBashToolDefinition(cwd, { commandPrefix: shellCommandPrefix }),
+			createEditToolDefinition(cwd, { tracker }),
+			createApplyPatchToolDefinition(cwd, { tracker }),
+			createWriteToolDefinition(cwd, { tracker }),
+		];
+	};
+}
 
 export function parseArgs(argv: string[]) {
 	const args = [...argv];
@@ -83,11 +104,15 @@ export function createRelayRuntimeFactory(
 			createSpawnTool(rootToolBridge, "root") as unknown as ToolDefinition,
 			createMessageTool(rootToolBridge, "root") as unknown as ToolDefinition,
 		];
+		const createSessionBaseToolDefinitionsFactory = () =>
+			createRelayBaseToolDefinitionsFactory(cwd, services.settingsManager);
+		const rootBaseToolDefinitionsFactory = createSessionBaseToolDefinitionsFactory();
 		const created = await createAgentSessionFromServices({
 			services,
 			sessionManager,
 			sessionStartEvent,
-			tools: RELAY_ACTIVE_TOOLS,
+			toolNames: RELAY_BASE_TOOL_NAMES,
+			baseToolDefinitionsFactory: rootBaseToolDefinitionsFactory,
 			customTools: rootTools,
 		});
 		const orchestrator = new Orchestrator({
@@ -95,6 +120,8 @@ export function createRelayRuntimeFactory(
 			sessionFactory: createRelaySessionFactory({
 				services,
 				defaultSessionDir: sessionManager.getSessionDir(),
+				baseToolNames: RELAY_BASE_TOOL_NAMES,
+				createSessionBaseToolDefinitionsFactory,
 			}),
 		});
 		orchestratorRef.current = orchestrator;

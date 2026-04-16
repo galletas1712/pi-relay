@@ -6,25 +6,30 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import type { AgentSessionFactory, AgentSessionFactoryOptions, AgentSessionHandle } from "./types.js";
 
-function resolveBuiltInTools(parentSession: AgentSessionHandle, selectedToolNames: string[] | undefined): unknown[] | undefined {
-	const activeBuiltInNames = new Set(
-		parentSession
-			.getAllTools()
-			.filter((tool) => tool.sourceInfo.source === "builtin")
-			.map((tool) => tool.name),
-	);
-	const inheritedBuiltIns = parentSession.agent.state.tools.filter((tool) => activeBuiltInNames.has(tool.name));
+type BaseToolDefinitionsFactory = () => ToolDefinition[];
+
+function resolveActiveBaseToolNames(
+	parentSession: AgentSessionHandle,
+	baseToolNames: string[],
+	selectedToolNames: string[] | undefined,
+): string[] {
+	const allowedBaseToolNames = new Set(baseToolNames);
+	const inheritedBaseTools = parentSession.agent.state.tools
+		.map((tool) => tool.name)
+		.filter((name) => allowedBaseToolNames.has(name));
 	if (!selectedToolNames || selectedToolNames.length === 0) {
-		return inheritedBuiltIns.map((tool) => tool as unknown);
+		return inheritedBaseTools;
 	}
 
-	const allowed = new Set(selectedToolNames);
-	return inheritedBuiltIns.filter((tool) => allowed.has(tool.name)).map((tool) => tool as unknown);
+	const allowedSelectedNames = new Set(selectedToolNames);
+	return inheritedBaseTools.filter((name) => allowedSelectedNames.has(name));
 }
 
 export function createRelaySessionFactory(options: {
 	services: AgentSessionServices;
 	defaultSessionDir: string;
+	baseToolNames: string[];
+	createSessionBaseToolDefinitionsFactory: () => BaseToolDefinitionsFactory;
 }): AgentSessionFactory {
 	return async (sessionOptions: AgentSessionFactoryOptions) => {
 		const sessionDir = sessionOptions.sessionDir ?? options.defaultSessionDir;
@@ -32,13 +37,19 @@ export function createRelaySessionFactory(options: {
 			sessionOptions.mode === "restore" && sessionOptions.sessionFile
 				? SessionManager.open(sessionOptions.sessionFile, sessionDir)
 				: SessionManager.create(options.services.cwd, sessionDir);
+		const baseToolDefinitionsFactory = options.createSessionBaseToolDefinitionsFactory();
 
 		const created = await createAgentSessionFromServices({
 			services: options.services,
 			sessionManager,
 			model: sessionOptions.config.model ?? sessionOptions.parentSession.model,
 			thinkingLevel: sessionOptions.config.thinkingLevel ?? sessionOptions.parentSession.thinkingLevel,
-			tools: resolveBuiltInTools(sessionOptions.parentSession, sessionOptions.config.tools) as never,
+			toolNames: resolveActiveBaseToolNames(
+				sessionOptions.parentSession,
+				options.baseToolNames,
+				sessionOptions.config.tools,
+			),
+			baseToolDefinitionsFactory,
 			customTools: sessionOptions.customTools as ToolDefinition[],
 			sessionStartEvent:
 				sessionOptions.mode === "restore"
