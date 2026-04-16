@@ -8,6 +8,7 @@ import {
 	type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import {
+	type AgentSessionHandle,
 	createMessageTool,
 	createOrchestratorExtension,
 	Orchestrator,
@@ -15,6 +16,15 @@ import {
 	createSpawnTool,
 } from "@pi-relay/orchestrator";
 import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
+import { createRelayBaseToolDefinitionsFactory, RELAY_BASE_TOOL_NAMES } from "./tools/base-tools.js";
+
+const RELAY_APPEND_SYSTEM_PROMPT = `Relay tool usage:
+- Use read instead of cat, head, tail, or sed for reading files.
+- Use apply_patch for multi-file or diff-shaped changes to existing files.
+- Use edit for precise replacements inside one existing file.
+- Use write only for new files or complete rewrites.
+- Do not use bash to read or edit files when dedicated tools are available.
+- After apply_patch succeeds, do not immediately re-read the same file unless you need verification or nearby context.`;
 
 export function parseArgs(argv: string[]) {
 	const args = [...argv];
@@ -46,6 +56,7 @@ export function createRelayRuntimeFactory(
 			cwd,
 			agentDir,
 			resourceLoaderOptions: {
+				appendSystemPrompt: [RELAY_APPEND_SYSTEM_PROMPT],
 				extensionFactories: [createOrchestratorExtension(orchestratorRef, orchestratorUiRef)],
 			},
 		});
@@ -67,17 +78,24 @@ export function createRelayRuntimeFactory(
 			createSpawnTool(rootToolBridge, "root") as unknown as ToolDefinition,
 			createMessageTool(rootToolBridge, "root") as unknown as ToolDefinition,
 		];
+		const createSessionBaseToolDefinitionsFactory = () =>
+			createRelayBaseToolDefinitionsFactory(cwd, services.settingsManager);
+		const rootBaseToolDefinitionsFactory = createSessionBaseToolDefinitionsFactory();
 		const created = await createAgentSessionFromServices({
 			services,
 			sessionManager,
 			sessionStartEvent,
+			toolNames: [...RELAY_BASE_TOOL_NAMES],
+			baseToolDefinitionsFactory: rootBaseToolDefinitionsFactory,
 			customTools: rootTools,
 		});
 		const orchestrator = new Orchestrator({
-			rootSession: created.session,
+			rootSession: created.session as unknown as AgentSessionHandle,
 			sessionFactory: createRelaySessionFactory({
 				services,
 				defaultSessionDir: sessionManager.getSessionDir(),
+				baseToolNames: [...RELAY_BASE_TOOL_NAMES],
+				createSessionBaseToolDefinitionsFactory,
 			}),
 		});
 		orchestratorRef.current = orchestrator;

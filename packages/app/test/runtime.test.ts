@@ -9,6 +9,9 @@ const createOrchestratorExtension = vi.fn(() => "extension-factory");
 const createRelaySessionFactory = vi.fn(() => "session-factory");
 const createSpawnTool = vi.fn(() => ({ name: "spawn" }));
 const createMessageTool = vi.fn(() => ({ name: "message" }));
+const rootBaseToolDefinitionsFactory = vi.fn(() => [{ name: "read" }]);
+const createRelayBaseToolDefinitionsFactory = vi.fn(() => rootBaseToolDefinitionsFactory);
+const RELAY_BASE_TOOL_NAMES = ["read", "bash", "edit", "apply_patch", "write"];
 const restore = vi.fn(async () => false);
 
 vi.mock("@mariozechner/pi-coding-agent", () => ({
@@ -33,17 +36,24 @@ vi.mock("@pi-relay/orchestrator", () => ({
 	})),
 }));
 
+vi.mock("../src/tools/base-tools.js", () => ({
+	RELAY_BASE_TOOL_NAMES,
+	createRelayBaseToolDefinitionsFactory,
+}));
+
 describe("createRelayRuntime", () => {
 	beforeEach(() => {
 		vi.resetModules();
-		continueRecent.mockReset();
-		createAgentSessionRuntime.mockReset();
-		createAgentSessionServices.mockReset();
-		createAgentSessionFromServices.mockReset();
-		createOrchestratorExtension.mockReset();
-		createRelaySessionFactory.mockReset();
-		createSpawnTool.mockReset();
-		createMessageTool.mockReset();
+		continueRecent.mockClear();
+		createAgentSessionRuntime.mockClear();
+		createAgentSessionServices.mockClear();
+		createAgentSessionFromServices.mockClear();
+		createOrchestratorExtension.mockClear();
+		createRelaySessionFactory.mockClear();
+		createRelayBaseToolDefinitionsFactory.mockClear();
+		createSpawnTool.mockClear();
+		createMessageTool.mockClear();
+		rootBaseToolDefinitionsFactory.mockClear();
 		restore.mockClear();
 
 		continueRecent.mockReturnValue({
@@ -51,6 +61,7 @@ describe("createRelayRuntime", () => {
 		});
 		createAgentSessionServices.mockResolvedValue({
 			diagnostics: [],
+			settingsManager: { marker: "settings-manager" },
 		});
 		createAgentSessionFromServices.mockResolvedValue({
 			session: {
@@ -85,9 +96,28 @@ describe("createRelayRuntime", () => {
 			expect.objectContaining({
 				cwd: "/tmp/project",
 				agentDir: "/tmp/agent",
+				resourceLoaderOptions: expect.objectContaining({
+					appendSystemPrompt: [
+						expect.stringContaining("Use apply_patch for multi-file or diff-shaped changes to existing files."),
+					],
+				}),
 			}),
 		);
-		expect(createAgentSessionFromServices).toHaveBeenCalledTimes(1);
+		expect(createAgentSessionFromServices).toHaveBeenCalledWith(
+			expect.objectContaining({
+				toolNames: RELAY_BASE_TOOL_NAMES,
+				baseToolDefinitionsFactory: rootBaseToolDefinitionsFactory,
+			}),
+		);
+		expect(createRelaySessionFactory).toHaveBeenCalledWith(
+			expect.objectContaining({
+				baseToolNames: RELAY_BASE_TOOL_NAMES,
+				createSessionBaseToolDefinitionsFactory: expect.any(Function),
+			}),
+		);
+		expect(createRelayBaseToolDefinitionsFactory).toHaveBeenCalledWith("/tmp/project", { marker: "settings-manager" });
+		const relayFactoryArgs = createRelaySessionFactory.mock.calls[0]?.[0];
+		expect(relayFactoryArgs.createSessionBaseToolDefinitionsFactory()).toBe(rootBaseToolDefinitionsFactory);
 		expect(restore).toHaveBeenCalledTimes(1);
 	});
 });
