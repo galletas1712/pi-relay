@@ -63,6 +63,14 @@ export interface ProxyStreamOptions extends SimpleStreamOptions {
 	proxyUrl: string;
 }
 
+type ProxyFetchResponse = {
+	ok: boolean;
+	status: number;
+	statusText: string;
+	json(): Promise<unknown>;
+	body: ReadableStream<Uint8Array> | null;
+};
+
 /**
  * Stream function that proxies through a server instead of calling LLM providers directly.
  * The server strips the partial field from delta events to reduce bandwidth.
@@ -118,7 +126,7 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 		}
 
 		try {
-			const response = await fetch(`${options.proxyUrl}/api/stream`, {
+			const response = (await fetch(`${options.proxyUrl}/api/stream`, {
 				method: "POST",
 				headers: {
 					Authorization: `Bearer ${options.authToken}`,
@@ -134,7 +142,7 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 					},
 				}),
 				signal: options.signal,
-			});
+			})) as ProxyFetchResponse;
 
 			if (!response.ok) {
 				let errorMessage = `Proxy error: ${response.status} ${response.statusText}`;
@@ -149,12 +157,17 @@ export function streamProxy(model: Model<any>, context: Context, options: ProxyS
 				throw new Error(errorMessage);
 			}
 
-			reader = response.body!.getReader();
+			if (!response.body) {
+				throw new Error("Proxy response did not include a body");
+			}
+
+			reader = response.body.getReader();
+			const streamReader = reader;
 			const decoder = new TextDecoder();
 			let buffer = "";
 
 			while (true) {
-				const { done, value } = await reader.read();
+				const { done, value } = await streamReader.read();
 				if (done) break;
 
 				if (options.signal?.aborted) {
