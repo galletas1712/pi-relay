@@ -1,17 +1,10 @@
 import {
-	createApplyPatchToolDefinition,
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
 	createAgentSessionRuntime,
 	createAgentSessionServices,
-	createBashToolDefinition,
-	createEditToolDefinition,
-	createFileAccessTracker,
-	createReadToolDefinition,
-	createWriteToolDefinition,
 	getAgentDir,
 	SessionManager,
-	type AgentSessionServices,
 	type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import {
@@ -22,8 +15,7 @@ import {
 	createSpawnTool,
 } from "@pi-relay/orchestrator";
 import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
-
-const RELAY_BASE_TOOL_NAMES = ["read", "bash", "edit", "apply_patch", "write"];
+import { createRelayBaseToolDefinitionsFactory, RELAY_BASE_TOOL_NAMES } from "./tools/base-tools.js";
 
 const RELAY_APPEND_SYSTEM_PROMPT = `Relay tool usage:
 - Use read instead of cat, head, tail, or sed for reading files.
@@ -32,25 +24,6 @@ const RELAY_APPEND_SYSTEM_PROMPT = `Relay tool usage:
 - Use write only for new files or complete rewrites.
 - Do not use bash to read or edit files when dedicated tools are available.
 - After apply_patch succeeds, do not immediately re-read the same file unless you need verification or nearby context.`;
-
-function createRelayBaseToolDefinitionsFactory(
-	cwd: string,
-	settingsManager: AgentSessionServices["settingsManager"],
-): () => ToolDefinition<any, any, any>[] {
-	const tracker = createFileAccessTracker();
-
-	return () => {
-		const autoResizeImages = settingsManager.getImageAutoResize();
-		const shellCommandPrefix = settingsManager.getShellCommandPrefix();
-		return [
-			createReadToolDefinition(cwd, { autoResizeImages, tracker }),
-			createBashToolDefinition(cwd, { commandPrefix: shellCommandPrefix }),
-			createEditToolDefinition(cwd, { tracker }),
-			createApplyPatchToolDefinition(cwd, { tracker }),
-			createWriteToolDefinition(cwd, { tracker }),
-		];
-	};
-}
 
 export function parseArgs(argv: string[]) {
 	const args = [...argv];
