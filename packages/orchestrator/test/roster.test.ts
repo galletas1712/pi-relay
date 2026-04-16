@@ -69,6 +69,7 @@ describe("buildSubagentRoster", () => {
 	it("builds selector and widget views for the attached agent tree", async () => {
 		const root = new FakeSession("root-session");
 		const child = new FakeSession("child-session");
+		child.isStreaming = true;
 		child.lastAssistantText = "Still indexing code paths.";
 		const orchestrator = new Orchestrator({
 			rootSession: root,
@@ -135,5 +136,23 @@ describe("buildSubagentRoster", () => {
 		expect(widget?.some((line) => line.includes(`${childId} · idle · planner`))).toBe(true);
 		expect(widget?.some((line) => line.includes("idle agent"))).toBe(true);
 		expect(widget?.at(-1)).toBe("Use /agents to switch");
+	});
+
+	it("shows the attached root as idle while a child is still running", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		await orchestrator.spawnAgent("root", {
+			role: "planner",
+			prompt: "inspect",
+		});
+
+		const widget = buildAgentWidgetLines(orchestrator, "root");
+		expect(widget?.[1]).toContain("Attached: root (root, idle)");
+		expect(widget?.some((line) => line.includes("> root · idle, 1 child · root"))).toBe(true);
 	});
 });

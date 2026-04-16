@@ -134,6 +134,7 @@ describe("createOrchestratorExtension", () => {
 	it("registers an agents command that switches the active TUI attachment", async () => {
 		const root = new FakeSession("root-session");
 		const child = new FakeSession("plan-session");
+		child.isStreaming = true;
 		const orchestrator = new Orchestrator({
 			rootSession: root,
 			sessionFactory: vi.fn(),

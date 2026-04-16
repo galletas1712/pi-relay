@@ -21,6 +21,26 @@ function formatChildLine(record: AgentRecord): string {
 	return `- ${record.id} (${record.status}${suffix}): ${record.role}`;
 }
 
+function getDisplayStatus(orchestrator: Orchestrator, summary: AgentSummary): AgentSummary["status"] {
+	try {
+		const record = orchestrator.getRecord(summary.id);
+		if (
+			record.session.isStreaming ||
+			record.session.isRetrying ||
+			record.session.isCompacting ||
+			record.reactivating
+		) {
+			return "running";
+		}
+		if (record.status === "disposed") {
+			return "disposed";
+		}
+		return "idle";
+	} catch {
+		return summary.status;
+	}
+}
+
 export function buildSubagentRoster(orchestrator: Orchestrator, agentId: string): string {
 	const children = orchestrator.getChildrenOf(agentId).filter((child) => child.status === "running");
 	if (children.length === 0) {
@@ -34,11 +54,12 @@ export function buildSubagentRoster(orchestrator: Orchestrator, agentId: string)
 	return lines.join("\n");
 }
 
-function formatSummaryStatus(summary: AgentSummary): string {
+function formatSummaryStatus(orchestrator: Orchestrator, summary: AgentSummary): string {
+	const displayStatus = getDisplayStatus(orchestrator, summary);
 	if (summary.childCount === 0) {
-		return summary.status;
+		return displayStatus;
 	}
-	return `${summary.status}, ${summary.childCount} child${summary.childCount === 1 ? "" : "ren"}`;
+	return `${displayStatus}, ${summary.childCount} child${summary.childCount === 1 ? "" : "ren"}`;
 }
 
 export function buildAgentSelectorOptions(
@@ -47,7 +68,7 @@ export function buildAgentSelectorOptions(
 ): Array<{ agentId: string; label: string }> {
 	return orchestrator.getAgentSummaries().map((summary) => {
 		const prefix = `${"  ".repeat(summary.depth)}${summary.id === activeAgentId ? "* " : ""}`;
-		const label = `${prefix}${summary.id} [${summary.status}] ${summary.role} — ${truncate(summary.lastOutput, 80)}`;
+		const label = `${prefix}${summary.id} [${getDisplayStatus(orchestrator, summary)}] ${summary.role} — ${truncate(summary.lastOutput, 80)}`;
 		return {
 			agentId: summary.id,
 			label,
@@ -74,17 +95,18 @@ export function buildAgentWidgetLines(
 	}
 	const shown = visible.slice(0, maxAgents);
 	const hiddenIdleCount = summaries.length - visible.length;
+	const activeDisplayStatus = getDisplayStatus(orchestrator, active);
 
 	const lines = [
 		"Relay Agents",
-		`Attached: ${active.id} (${active.role}, ${active.status})`,
+		`Attached: ${active.id} (${active.role}, ${activeDisplayStatus})`,
 		"Other agents keep running detached when not attached.",
 	];
 
 	for (const summary of shown) {
 		const marker = summary.id === activeAgentId ? ">" : " ";
 		lines.push(
-			`${marker} ${"  ".repeat(summary.depth)}${summary.id} · ${formatSummaryStatus(summary)} · ${summary.role}`,
+			`${marker} ${"  ".repeat(summary.depth)}${summary.id} · ${formatSummaryStatus(orchestrator, summary)} · ${summary.role}`,
 		);
 	}
 
