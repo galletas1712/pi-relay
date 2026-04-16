@@ -630,7 +630,7 @@ export class Orchestrator {
 		} catch {
 			// Ignore shutdown races.
 		}
-		record.session.agent.mailbox.close();
+		record.session.agent.mailbox?.close();
 		record.unsubscribe?.();
 		record.session.dispose();
 

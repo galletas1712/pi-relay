@@ -5,7 +5,7 @@
 	"type": "module",
 	"main": "./dist/index.js",
 	"bin": {
-		"pi-relay": "./dist/index.js"
+		"pi": "./dist/index.js"
 	},
 	"scripts": {
 		"clean": "shx rm -rf dist",

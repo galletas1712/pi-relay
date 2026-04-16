@@ -11,7 +11,7 @@ import {
 import { Mailbox } from "./mailbox.js";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.js";
 import type { MailboxItem } from "./mailbox-types.js";
-import { bgCompletionToLlmMessage } from "./pending-results.js";
+import { bgCompletionToLlmMessage, isBackgroundToolCompletionMessage } from "./pending-results.js";
 import type {
 	AfterToolCallContext,
 	AfterToolCallResult,
@@ -29,9 +29,12 @@ import type {
 } from "./types.js";
 
 function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
-	return messages.flatMap((message) => {
+	const llmMessages: Message[] = [];
+
+	for (const message of messages) {
 		if (message.role === "user" || message.role === "assistant" || message.role === "toolResult") {
-			return [message];
+			llmMessages.push(message);
+			continue;
 		}
 
 		if (
@@ -42,23 +45,28 @@ function defaultConvertToLlm(messages: AgentMessage[]): Message[] {
 			"content" in message &&
 			"timestamp" in message
 		) {
-			if ("customType" in message && message.customType === "bg_tool_completion") {
-				return [bgCompletionToLlmMessage(message)];
+			if (isBackgroundToolCompletionMessage(message)) {
+				llmMessages.push(bgCompletionToLlmMessage(message));
+				continue;
 			}
 
+			const customMessage = message as {
+				content: string | (TextContent | ImageContent)[];
+				timestamp: number;
+			};
 			const content =
-				typeof message.content === "string" ? [{ type: "text" as const, text: message.content }] : message.content;
-			return [
-				{
-					role: "user" as const,
-					content,
-					timestamp: message.timestamp,
-				},
-			];
+				typeof customMessage.content === "string"
+					? [{ type: "text" as const, text: customMessage.content }]
+					: customMessage.content;
+			llmMessages.push({
+				role: "user",
+				content,
+				timestamp: customMessage.timestamp,
+			});
 		}
+	}
 
-		return [];
-	});
+	return llmMessages;
 }
 
 const EMPTY_USAGE = {

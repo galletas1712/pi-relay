@@ -1,16 +1,69 @@
-import type { Agent, AgentMessage, ThinkingLevel } from "@mariozechner/pi-agent-core";
-import type { ImageContent, Model, TextContent } from "@mariozechner/pi-ai";
+import type {
+	AgentMessage,
+	AgentState,
+	BackgroundToolEndContext,
+	BackgroundToolStartContext,
+	StreamFn,
+	ThinkingLevel,
+} from "@mariozechner/pi-agent-core";
+import type { ImageContent, Message, Model, SimpleStreamOptions, TextContent, ThinkingBudgets, Transport } from "@mariozechner/pi-ai";
 import type { AgentSessionEvent, ToolDefinition, ToolInfo } from "@mariozechner/pi-coding-agent";
 
 export type AgentStatus = "running" | "idle" | "disposed";
 
 export type AgentCustomType = "agent_report" | "agent_idle" | "agent_directive" | "agent_roster";
 
+interface RelayCustomMessage<TType extends AgentCustomType, TDetails = unknown> {
+	role: "custom";
+	customType: TType;
+	content: string | (TextContent | ImageContent)[];
+	display: boolean;
+	details?: TDetails;
+	timestamp: number;
+}
+
 export interface SessionCustomMessage<T = unknown> {
 	customType: string;
 	content: string | (TextContent | ImageContent)[];
 	display: boolean;
 	details?: T;
+}
+
+export type AgentReportMessage = RelayCustomMessage<"agent_report", AgentMessageDetails>;
+export type AgentDirectiveMessage = RelayCustomMessage<"agent_directive", AgentMessageDetails>;
+export type AgentIdleMessage = RelayCustomMessage<
+	"agent_idle",
+	AgentMessageDetails & { errorMessage?: string; note?: string }
+>;
+export type AgentRosterMessage = RelayCustomMessage<"agent_roster">;
+
+declare module "@mariozechner/pi-agent-core" {
+	interface CustomAgentMessages {
+		agent_report: AgentReportMessage;
+		agent_directive: AgentDirectiveMessage;
+		agent_idle: AgentIdleMessage;
+		agent_roster: AgentRosterMessage;
+	}
+}
+
+export interface AgentHandle {
+	state: AgentState;
+	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+	onBackgroundToolStart?: (context: BackgroundToolStartContext, signal?: AbortSignal) => Promise<void> | void;
+	onBackgroundToolEnd?: (context: BackgroundToolEndContext, signal?: AbortSignal) => Promise<void> | void;
+	convertToLlm(messages: AgentMessage[]): Message[] | Promise<Message[]>;
+	getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+	onPayload?: SimpleStreamOptions["onPayload"];
+	sessionId?: string;
+	thinkingBudgets?: ThinkingBudgets;
+	transport: Transport;
+	maxRetryDelayMs?: number;
+	streamFn: StreamFn;
+	hasQueuedMessages(): boolean;
+	waitForIdle(): Promise<void>;
+	mailbox?: {
+		close(): void;
+	};
 }
 
 export interface AgentSessionManagerHandle {
@@ -22,7 +75,7 @@ export interface AgentSessionManagerHandle {
 }
 
 export interface AgentSessionHandle {
-	agent: Agent;
+	agent: AgentHandle;
 	extensionRunner?: { emit(event: { type: "session_shutdown" }): Promise<void> };
 	model: Model<any> | undefined;
 	thinkingLevel: ThinkingLevel;

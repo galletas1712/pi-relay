@@ -1,17 +1,34 @@
 #!/usr/bin/env node
 
-import { InteractiveMode, runRpcMode } from "@mariozechner/pi-coding-agent";
-import { createRelayInteractiveRuntime, createRelayRuntime, parseArgs } from "./runtime.js";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 
-const cli = parseArgs(process.argv.slice(2));
-
-if (cli.mode === "rpc") {
-	const runtime = await createRelayRuntime();
-	await runRpcMode(runtime);
-} else {
-	const runtime = await createRelayInteractiveRuntime();
-	const interactiveMode = new InteractiveMode(runtime, {
-		initialMessage: cli.initialMessage,
-	});
-	await interactiveMode.run();
+function hasNodeFlag(flag: string) {
+	if (process.execArgv.includes(flag)) {
+		return true;
+	}
+	const nodeOptions = process.env.NODE_OPTIONS?.split(/\s+/) ?? [];
+	return nodeOptions.includes(flag);
 }
+
+// Keep workspace packages on the root fork dependency graph instead of realpathing into pi-mono.
+if (!hasNodeFlag("--preserve-symlinks")) {
+	const mainPath = fileURLToPath(new URL("./main.js", import.meta.url));
+	const child = spawnSync(
+		process.execPath,
+		["--preserve-symlinks", "--preserve-symlinks-main", ...process.execArgv, mainPath, ...process.argv.slice(2)],
+		{
+			stdio: "inherit",
+			env: process.env,
+		},
+	);
+	if (child.error) {
+		throw child.error;
+	}
+	if (child.signal) {
+		process.kill(process.pid, child.signal);
+	}
+	process.exit(child.status ?? 1);
+}
+
+await import("./main.js");
