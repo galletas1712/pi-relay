@@ -8,6 +8,7 @@ import {
 	type ToolDefinition,
 } from "@mariozechner/pi-coding-agent";
 import {
+	type AgentSessionHandle,
 	createMessageTool,
 	createOrchestratorExtension,
 	Orchestrator,
@@ -84,16 +85,16 @@ export function createRelayRuntimeFactory(
 			services,
 			sessionManager,
 			sessionStartEvent,
-			toolNames: RELAY_BASE_TOOL_NAMES,
+			toolNames: [...RELAY_BASE_TOOL_NAMES],
 			baseToolDefinitionsFactory: rootBaseToolDefinitionsFactory,
 			customTools: rootTools,
 		});
 		const orchestrator = new Orchestrator({
-			rootSession: created.session,
+			rootSession: created.session as unknown as AgentSessionHandle,
 			sessionFactory: createRelaySessionFactory({
 				services,
 				defaultSessionDir: sessionManager.getSessionDir(),
-				baseToolNames: RELAY_BASE_TOOL_NAMES,
+				baseToolNames: [...RELAY_BASE_TOOL_NAMES],
 				createSessionBaseToolDefinitionsFactory,
 			}),
 		});

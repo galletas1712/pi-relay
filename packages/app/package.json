@@ -16,9 +16,12 @@
 	},
 	"dependencies": {
 		"@mariozechner/pi-agent-core": "^0.66.1",
-		"@mariozechner/pi-ai": "^0.66.1",
-		"@mariozechner/pi-coding-agent": "^0.66.1",
-		"@pi-relay/orchestrator": "^0.1.0"
+		"@mariozechner/pi-ai": "^0.67.3",
+		"@mariozechner/pi-coding-agent": "^0.67.3",
+		"@pi-relay/orchestrator": "^0.1.0",
+		"@sinclair/typebox": "^0.34.41",
+		"diff": "^8.0.2",
+		"file-type": "^21.1.1"
 	},
 	"devDependencies": {
 		"@types/node": "^22.10.5",

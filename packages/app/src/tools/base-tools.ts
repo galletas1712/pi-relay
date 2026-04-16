@@ -1,3 +1,4 @@
+import type { AgentSessionServices, ToolDefinition } from "@mariozechner/pi-coding-agent";
 import {
 	createApplyPatchToolDefinition,
 	createBashToolDefinition,
@@ -5,9 +6,7 @@ import {
 	createFileAccessTracker,
 	createReadToolDefinition,
 	createWriteToolDefinition,
-	type AgentSessionServices,
-	type ToolDefinition,
-} from "@mariozechner/pi-coding-agent";
+} from "./index.js";
 
 export const RELAY_BASE_TOOL_NAMES = ["read", "bash", "edit", "apply_patch", "write"] as const;
 
