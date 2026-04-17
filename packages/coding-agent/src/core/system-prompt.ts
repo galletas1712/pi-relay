@@ -5,6 +5,12 @@
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
 
+// Role preamble prepended to every session's system prompt. Pi ships as a
+// Claude Code-compatible CLI, so the same identity line holds regardless of
+// which provider the model happens to route through. Providers must NOT
+// inject this themselves — they transmit whatever core hands them.
+const CLAUDE_CODE_ROLE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
 	customPrompt?: string;
@@ -47,7 +53,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 	const skills = providedSkills ?? [];
 
 	if (customPrompt) {
-		let prompt = customPrompt;
+		let prompt = `${CLAUDE_CODE_ROLE_PREAMBLE}\n\n${customPrompt}`;
 
 		if (appendSection) {
 			prompt += appendSection;
@@ -124,7 +130,9 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 
 	const guidelines = guidelinesList.map((g) => `- ${g}`).join("\n");
 
-	let prompt = `You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+	let prompt = `${CLAUDE_CODE_ROLE_PREAMBLE}
+
+You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
 
 Available tools:
 ${toolsList}

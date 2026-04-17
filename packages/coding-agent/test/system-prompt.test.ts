@@ -69,6 +69,31 @@ describe("buildSystemPrompt", () => {
 		});
 	});
 
+	describe("role preamble", () => {
+		const ROLE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+		test("prepends the Claude Code role preamble to the default prompt", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: ["read"],
+				contextFiles: [],
+				skills: [],
+			});
+
+			expect(prompt.startsWith(`${ROLE_PREAMBLE}\n\n`)).toBe(true);
+		});
+
+		test("prepends the Claude Code role preamble to a customPrompt", () => {
+			const prompt = buildSystemPrompt({
+				customPrompt: "Custom base prompt.",
+				selectedTools: ["read"],
+				contextFiles: [],
+				skills: [],
+			});
+
+			expect(prompt.startsWith(`${ROLE_PREAMBLE}\n\nCustom base prompt.`)).toBe(true);
+		});
+	});
+
 	describe("prompt guidelines", () => {
 		test("appends promptGuidelines to default guidelines", () => {
 			const prompt = buildSystemPrompt({
