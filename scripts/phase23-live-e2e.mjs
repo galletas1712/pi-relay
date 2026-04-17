@@ -2,8 +2,8 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import process from "node:process";
-import { getModel } from "../pi-mono/packages/ai/dist/index.js";
-import { SessionManager } from "../pi-mono/packages/coding-agent/dist/index.js";
+import { getModel } from "../packages/ai/dist/index.js";
+import { SessionManager } from "../packages/coding-agent/dist/index.js";
 import { createRelayRuntime } from "../packages/app/dist/runtime.js";
 
 const repoDir = "/home/schwinns/pi-relay-phase1";
@@ -191,7 +191,7 @@ Ticker delegated.`);
 	const startupChildPrompt =
 		"Inspect packages/orchestrator/src/extension.ts, packages/orchestrator/src/session-factory.ts, packages/orchestrator/src/types.ts, packages/orchestrator/test/extension.test.ts, packages/orchestrator/test/session-restore.test.ts, packages/orchestrator/test/orchestrator.test.ts, packages/app/src/runtime.ts, and packages/app/test/runtime.test.ts. Read those files, then send one short report summarizing startup, session creation, restore wiring, and the test coverage for those paths. Do not call bash or message.";
 	const backgroundCommand =
-		"sh -lc 'sleep 8; printf \"packages: \"; find packages -name \"*.ts\" | wc -l; printf \"pi-mono/packages: \"; find pi-mono/packages -name \"*.ts\" | wc -l'";
+		"sh -lc 'sleep 8; printf \"packages: \"; find packages -name \"*.ts\" | wc -l'";
 
 	await runtime.session.prompt(`Exercise the relay runtime itself. Do this exactly:
 1. Do not read any files yourself.

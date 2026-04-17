@@ -11,7 +11,7 @@ function hasNodeFlag(flag: string) {
 	return nodeOptions.includes(flag);
 }
 
-// Keep workspace packages on the root fork dependency graph instead of realpathing into pi-mono.
+// Preserve workspace symlinks so packages resolve through a single dependency graph.
 if (!hasNodeFlag("--preserve-symlinks")) {
 	const mainPath = fileURLToPath(new URL("./main.js", import.meta.url));
 	const child = spawnSync(

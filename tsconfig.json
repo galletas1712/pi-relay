@@ -3,15 +3,15 @@
 	"compilerOptions": {
 		"noEmit": true,
 		"paths": {
-			"@mariozechner/pi-ai": ["./pi-mono/packages/ai/src/index.ts"],
-			"@mariozechner/pi-ai/*": ["./pi-mono/packages/ai/src/*.ts", "./pi-mono/packages/ai/src/providers/*.ts"],
+			"@mariozechner/pi-ai": ["./packages/ai/src/index.ts"],
+			"@mariozechner/pi-ai/*": ["./packages/ai/src/*.ts", "./packages/ai/src/providers/*.ts"],
 			"@mariozechner/pi-agent-core": ["./packages/agent-core/src/index.ts"],
 			"@mariozechner/pi-agent-core/*": ["./packages/agent-core/src/*"],
-			"@mariozechner/pi-coding-agent": ["./pi-mono/packages/coding-agent/src/index.ts"],
-			"@mariozechner/pi-coding-agent/hooks": ["./pi-mono/packages/coding-agent/src/core/hooks/index.ts"],
-			"@mariozechner/pi-coding-agent/*": ["./pi-mono/packages/coding-agent/src/*"],
-			"@mariozechner/pi-tui": ["./pi-mono/packages/tui/src/index.ts"],
-			"@mariozechner/pi-tui/*": ["./pi-mono/packages/tui/src/*"]
+			"@mariozechner/pi-coding-agent": ["./packages/coding-agent/src/index.ts"],
+			"@mariozechner/pi-coding-agent/hooks": ["./packages/coding-agent/src/core/hooks/index.ts"],
+			"@mariozechner/pi-coding-agent/*": ["./packages/coding-agent/src/*"],
+			"@mariozechner/pi-tui": ["./packages/tui/src/index.ts"],
+			"@mariozechner/pi-tui/*": ["./packages/tui/src/*"]
 		}
 	},
 	"include": ["packages/*/src/**/*", "packages/*/test/**/*"],

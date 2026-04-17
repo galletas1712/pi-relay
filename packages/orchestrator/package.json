@@ -12,9 +12,9 @@
 		"test": "vitest --run"
 	},
 	"dependencies": {
-		"@mariozechner/pi-agent-core": "^0.67.3",
-		"@mariozechner/pi-ai": "^0.67.3",
-		"@mariozechner/pi-coding-agent": "^0.67.3",
+		"@mariozechner/pi-agent-core": "^0.67.5",
+		"@mariozechner/pi-ai": "^0.67.5",
+		"@mariozechner/pi-coding-agent": "^0.67.5",
 		"@sinclair/typebox": "^0.34.40"
 	},
 	"devDependencies": {
