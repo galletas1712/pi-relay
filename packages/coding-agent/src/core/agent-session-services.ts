@@ -36,7 +36,6 @@ export interface CreateAgentSessionServicesOptions {
 	authStorage?: AuthStorage;
 	settingsManager?: SettingsManager;
 	modelRegistry?: ModelRegistry;
-	extensionFlagValues?: Map<string, boolean | string>;
 	resourceLoaderOptions?: Omit<DefaultResourceLoaderOptions, "cwd" | "agentDir" | "settingsManager">;
 }
 
@@ -75,54 +74,6 @@ export interface AgentSessionServices {
 	diagnostics: AgentSessionRuntimeDiagnostic[];
 }
 
-function applyExtensionFlagValues(
-	resourceLoader: ResourceLoader,
-	extensionFlagValues: Map<string, boolean | string> | undefined,
-): AgentSessionRuntimeDiagnostic[] {
-	if (!extensionFlagValues) {
-		return [];
-	}
-
-	const diagnostics: AgentSessionRuntimeDiagnostic[] = [];
-	const extensionsResult = resourceLoader.getExtensions();
-	const registeredFlags = new Map<string, { type: "boolean" | "string" }>();
-	for (const extension of extensionsResult.extensions) {
-		for (const [name, flag] of extension.flags) {
-			registeredFlags.set(name, { type: flag.type });
-		}
-	}
-
-	const unknownFlags: string[] = [];
-	for (const [name, value] of extensionFlagValues) {
-		const flag = registeredFlags.get(name);
-		if (!flag) {
-			unknownFlags.push(name);
-			continue;
-		}
-		if (flag.type === "boolean") {
-			extensionsResult.runtime.flagValues.set(name, true);
-			continue;
-		}
-		if (typeof value === "string") {
-			extensionsResult.runtime.flagValues.set(name, value);
-			continue;
-		}
-		diagnostics.push({
-			type: "error",
-			message: `Extension flag "--${name}" requires a value`,
-		});
-	}
-
-	if (unknownFlags.length > 0) {
-		diagnostics.push({
-			type: "error",
-			message: `Unknown option${unknownFlags.length === 1 ? "" : "s"}: ${unknownFlags.map((name) => `--${name}`).join(", ")}`,
-		});
-	}
-
-	return diagnostics;
-}
-
 /**
  * Create cwd-bound runtime services.
  *
@@ -158,7 +109,6 @@ export async function createAgentSessionServices(
 		}
 	}
 	extensionsResult.runtime.pendingProviderRegistrations = [];
-	diagnostics.push(...applyExtensionFlagValues(resourceLoader, options.extensionFlagValues));
 
 	return {
 		cwd,

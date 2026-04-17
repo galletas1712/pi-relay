@@ -13,7 +13,6 @@ import { createJiti } from "@mariozechner/jiti";
 import * as _bundledPiAgentCore from "@pi-relay/agent-core";
 import * as _bundledPiAi from "@pi-relay/ai";
 import * as _bundledPiAiOauth from "@pi-relay/ai/oauth";
-import type { KeyId } from "@pi-relay/tui";
 import * as _bundledPiTui from "@pi-relay/tui";
 // Static imports of packages that extensions may use.
 // These MUST be static so Bun bundles them into the compiled binary.
@@ -33,9 +32,7 @@ import type {
 	ExtensionFactory,
 	ExtensionRuntime,
 	LoadExtensionsResult,
-	MessageRenderer,
 	ProviderConfig,
-	RegisteredCommand,
 	ToolDefinition,
 } from "./types.js";
 
@@ -134,11 +131,9 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setActiveTools: notInitialized,
 		// registerTool() is valid during extension load; refresh is only needed post-bind.
 		refreshTools: () => {},
-		getCommands: notInitialized,
 		setModel: () => Promise.reject(new Error("Extension runtime not initialized")),
 		getThinkingLevel: notInitialized,
 		setThinkingLevel: notInitialized,
-		flagValues: new Map(),
 		pendingProviderRegistrations: [],
 		// Pre-bind: queue registrations so bindCore() can flush them once the
 		// model registry is available. bindCore() replaces both with direct calls.
@@ -180,44 +175,6 @@ function createExtensionAPI(
 			runtime.refreshTools();
 		},
 
-		registerCommand(name: string, options: Omit<RegisteredCommand, "name" | "sourceInfo">): void {
-			extension.commands.set(name, {
-				name,
-				sourceInfo: extension.sourceInfo,
-				...options,
-			});
-		},
-
-		registerShortcut(
-			shortcut: KeyId,
-			options: {
-				description?: string;
-				handler: (ctx: import("./types.js").ExtensionContext) => Promise<void> | void;
-			},
-		): void {
-			extension.shortcuts.set(shortcut, { shortcut, extensionPath: extension.path, ...options });
-		},
-
-		registerFlag(
-			name: string,
-			options: { description?: string; type: "boolean" | "string"; default?: boolean | string },
-		): void {
-			extension.flags.set(name, { name, extensionPath: extension.path, ...options });
-			if (options.default !== undefined && !runtime.flagValues.has(name)) {
-				runtime.flagValues.set(name, options.default);
-			}
-		},
-
-		registerMessageRenderer<T>(customType: string, renderer: MessageRenderer<T>): void {
-			extension.messageRenderers.set(customType, renderer as MessageRenderer);
-		},
-
-		// Flag access - checks extension registered it, reads from runtime
-		getFlag(name: string): boolean | string | undefined {
-			if (!extension.flags.has(name)) return undefined;
-			return runtime.flagValues.get(name);
-		},
-
 		// Action methods - delegate to shared runtime
 		sendMessage(message, options): void {
 			runtime.sendMessage(message, options);
@@ -257,10 +214,6 @@ function createExtensionAPI(
 
 		setActiveTools(toolNames: string[]): void {
 			runtime.setActiveTools(toolNames);
-		},
-
-		getCommands() {
-			return runtime.getCommands();
 		},
 
 		setModel(model) {
@@ -319,10 +272,6 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		sourceInfo: createSyntheticSourceInfo(extensionPath, { source, baseDir }),
 		handlers: new Map(),
 		tools: new Map(),
-		messageRenderers: new Map(),
-		commands: new Map(),
-		flags: new Map(),
-		shortcuts: new Map(),
 	};
 }
 

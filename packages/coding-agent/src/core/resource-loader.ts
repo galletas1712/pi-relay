@@ -557,9 +557,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 			extension.sourceInfo =
 				this.findSourceInfoForPath(extension.path, undefined, metadataByPath) ??
 				this.getDefaultSourceInfoForPath(extension.path);
-			for (const command of extension.commands.values()) {
-				command.sourceInfo = extension.sourceInfo;
-			}
 			for (const tool of extension.tools.values()) {
 				tool.sourceInfo = extension.sourceInfo;
 			}
@@ -878,13 +875,9 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	private detectExtensionConflicts(extensions: Extension[]): Array<{ path: string; message: string }> {
 		const conflicts: Array<{ path: string; message: string }> = [];
-
-		// Track which extension registered each tool and flag
 		const toolOwners = new Map<string, string>();
-		const flagOwners = new Map<string, string>();
 
 		for (const ext of extensions) {
-			// Check tools
 			for (const toolName of ext.tools.keys()) {
 				const existingOwner = toolOwners.get(toolName);
 				if (existingOwner && existingOwner !== ext.path) {
@@ -894,19 +887,6 @@ export class DefaultResourceLoader implements ResourceLoader {
 					});
 				} else {
 					toolOwners.set(toolName, ext.path);
-				}
-			}
-
-			// Check flags
-			for (const flagName of ext.flags.keys()) {
-				const existingOwner = flagOwners.get(flagName);
-				if (existingOwner && existingOwner !== ext.path) {
-					conflicts.push({
-						path: ext.path,
-						message: `Flag "--${flagName}" conflicts with ${existingOwner}`,
-					});
-				} else {
-					flagOwners.set(flagName, ext.path);
 				}
 			}
 		}

@@ -527,7 +527,6 @@ export async function main(args: string[], options?: MainOptions) {
 			cwd,
 			agentDir,
 			authStorage,
-			extensionFlagValues: parsed.unknownFlags,
 			resourceLoaderOptions: {
 				additionalExtensionPaths: resolvedExtensionPaths,
 				additionalSkillPaths: resolvedSkillPaths,
@@ -600,13 +599,10 @@ export async function main(args: string[], options?: MainOptions) {
 		sessionManager,
 	});
 	const { services, session, modelFallbackMessage } = runtime;
-	const { settingsManager, modelRegistry, resourceLoader } = services;
+	const { settingsManager, modelRegistry } = services;
 
 	if (parsed.help) {
-		const extensionFlags = resourceLoader
-			.getExtensions()
-			.extensions.flatMap((extension) => Array.from(extension.flags.values()));
-		printHelp(extensionFlags);
+		printHelp();
 		process.exit(0);
 	}
 

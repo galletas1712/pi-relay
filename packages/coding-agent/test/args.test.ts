@@ -287,20 +287,9 @@ describe("parseArgs", () => {
 			expect(result.messages).toEqual(["explain this"]);
 		});
 
-		test("captures unknown long flags with string values", () => {
-			const result = parseArgs(["--unknown-flag", "message"]);
-			expect(result.messages).toEqual([]);
-			expect(result.unknownFlags.get("unknown-flag")).toBe("message");
-		});
-
-		test("captures unknown boolean long flags", () => {
+		test("reports unknown long flags as errors", () => {
 			const result = parseArgs(["--unknown-flag"]);
-			expect(result.unknownFlags.get("unknown-flag")).toBe(true);
-		});
-
-		test("captures unknown long flags with equals syntax", () => {
-			const result = parseArgs(["--unknown-flag=value"]);
-			expect(result.unknownFlags.get("unknown-flag")).toBe("value");
+			expect(result.diagnostics.some((d) => d.type === "error" && d.message.includes("--unknown-flag"))).toBe(true);
 		});
 	});
 

@@ -2,7 +2,6 @@
  * Extension system for lifecycle events and custom tools.
  */
 
-export type { SlashCommandInfo, SlashCommandSource } from "../slash-commands.js";
 export type { SourceInfo } from "../source-info.js";
 export {
 	createExtensionRuntime,
@@ -10,14 +9,7 @@ export {
 	loadExtensionFromFactory,
 	loadExtensions,
 } from "./loader.js";
-export type {
-	ExtensionErrorListener,
-	ForkHandler,
-	NavigateTreeHandler,
-	NewSessionHandler,
-	ShutdownHandler,
-	SwitchSessionHandler,
-} from "./runner.js";
+export type { ExtensionErrorListener, ShutdownHandler } from "./runner.js";
 export { ExtensionRunner } from "./runner.js";
 export type {
 	AgentEndEvent,
@@ -26,8 +18,6 @@ export type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	AppendEntryHandler,
-	// App keybindings (for custom editors)
-	AppKeybinding,
 	// Events - Tool (ToolCallEvent types)
 	BashToolCallEvent,
 	BashToolResultEvent,
@@ -52,27 +42,19 @@ export type {
 	ExtensionActions,
 	// API
 	ExtensionAPI,
-	ExtensionCommandContext,
-	ExtensionCommandContextActions,
 	ExtensionContext,
 	ExtensionContextActions,
 	// Errors
 	ExtensionError,
 	ExtensionEvent,
 	ExtensionFactory,
-	ExtensionFlag,
 	ExtensionHandler,
 	// Runtime
 	ExtensionRuntime,
-	ExtensionShortcut,
-	ExtensionUIContext,
-	ExtensionUIDialogOptions,
-	ExtensionWidgetOptions,
 	FindToolCallEvent,
 	FindToolResultEvent,
 	GetActiveToolsHandler,
 	GetAllToolsHandler,
-	GetCommandsHandler,
 	GetThinkingLevelHandler,
 	GrepToolCallEvent,
 	GrepToolResultEvent,
@@ -80,15 +62,11 @@ export type {
 	InputEvent,
 	InputEventResult,
 	InputSource,
-	KeybindingsManager,
 	LoadExtensionsResult,
 	LsToolCallEvent,
 	LsToolResultEvent,
 	// Events - Message
 	MessageEndEvent,
-	// Message Rendering
-	MessageRenderer,
-	MessageRenderOptions,
 	MessageStartEvent,
 	MessageUpdateEvent,
 	ModelSelectEvent,
@@ -98,10 +76,7 @@ export type {
 	ProviderModelConfig,
 	ReadToolCallEvent,
 	ReadToolResultEvent,
-	// Commands
-	RegisteredCommand,
 	RegisteredTool,
-	ResolvedCommand,
 	// Events - Resources
 	ResourcesDiscoverEvent,
 	ResourcesDiscoverResult,
@@ -125,7 +100,6 @@ export type {
 	SetLabelHandler,
 	SetModelHandler,
 	SetThinkingLevelHandler,
-	TerminalInputHandler,
 	// Events - Tool
 	ToolCallEvent,
 	ToolCallEventResult,
@@ -142,10 +116,6 @@ export type {
 	TreePreparation,
 	TurnEndEvent,
 	TurnStartEvent,
-	// Events - User Bash
-	UserBashEvent,
-	UserBashEventResult,
-	WidgetPlacement,
 	WriteToolCallEvent,
 	WriteToolResultEvent,
 } from "./types.js";

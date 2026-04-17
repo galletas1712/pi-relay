@@ -188,12 +188,7 @@ export class RelayRuntimeHost {
 
 	private detachSessionUi(session: AgentSession): void {
 		const relaySession = session as AgentSession & { detachExtensions?: () => void };
-		if (typeof relaySession.detachExtensions === "function") {
-			relaySession.detachExtensions();
-			return;
-		}
-		session.extensionRunner?.setUIContext?.(undefined);
-		session.extensionRunner?.bindCommandContext?.(undefined);
+		relaySession.detachExtensions?.();
 	}
 
 	private async emitBeforeSwitch(sessionPath: string): Promise<boolean> {
