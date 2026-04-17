@@ -1,5 +1,19 @@
 // Core session management
 
+// Client SDK (in-process; future RPC client will implement the same Client interface)
+export {
+	type AuthStatus,
+	type Client,
+	LocalClient,
+	type LocalClientInternals,
+	type ModelInfo,
+	type OpenSessionOptions,
+	type ResumeOptions,
+	type SessionEvent,
+	type SessionHandle,
+	type SessionState,
+	type SessionSummary,
+} from "./client/index.js";
 // Config paths
 export { getAgentDir, VERSION } from "./config.js";
 export {

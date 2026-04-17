@@ -1,4 +1,4 @@
-import { InteractiveMode, runRpcMode } from "@pi-relay/coding-agent";
+import { InteractiveMode, LocalClient, runRpcMode } from "@pi-relay/coding-agent";
 import { createRelayInteractiveRuntime, createRelayRuntime, parseArgs } from "./runtime.js";
 
 const cli = parseArgs(process.argv.slice(2));
@@ -8,7 +8,8 @@ if (cli.mode === "rpc") {
 	await runRpcMode(runtime);
 } else {
 	const runtime = await createRelayInteractiveRuntime();
-	const interactiveMode = new InteractiveMode(runtime, {
+	const client = new LocalClient(runtime);
+	const interactiveMode = new InteractiveMode(client, {
 		initialMessage: cli.initialMessage,
 	});
 	await interactiveMode.run();
