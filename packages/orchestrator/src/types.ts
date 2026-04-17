@@ -7,7 +7,7 @@ import type {
 	ThinkingLevel,
 } from "@pi-relay/agent-core";
 import type { ImageContent, Message, Model, SimpleStreamOptions, TextContent, ThinkingBudgets, Transport } from "@pi-relay/ai";
-import type { AgentSessionEvent, ToolDefinition, ToolInfo } from "@pi-relay/coding-agent";
+import type { AgentSessionEvent, PromptSource, ToolDefinition, ToolInfo } from "@pi-relay/coding-agent";
 
 export type AgentStatus = "running" | "idle" | "disposed";
 
@@ -98,6 +98,7 @@ export interface AgentSessionHandle {
 	abortCompaction?(): void;
 	abortBranchSummary?(): void;
 	dispose(): void;
+	addPromptSource(source: PromptSource): void;
 }
 
 export interface SpawnConfig {
