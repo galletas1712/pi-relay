@@ -1,3 +1,4 @@
+import type { Model } from "@pi-relay/ai";
 import { describe, expect, test } from "vitest";
 import {
 	EnvironmentSource,
@@ -11,9 +12,27 @@ import type { Skill } from "../src/core/skills.js";
 
 const ROLE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude.";
 
-function assembleRole(options: Parameters<typeof RoleSource>[0] = {}): string {
+function modelFor(provider: string): Model<"anthropic-messages"> {
+	return {
+		id: "test-model",
+		name: "Test Model",
+		api: "anthropic-messages",
+		provider,
+		baseUrl: "https://example.test",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128000,
+		maxTokens: 4096,
+	} as Model<"anthropic-messages">;
+}
+
+function assembleRole(
+	options: Parameters<typeof RoleSource>[0] = {},
+	ctxOverrides: Partial<PromptContext> = { model: modelFor("anthropic") },
+): string {
 	const assembly = new PromptAssembly([new RoleSource(options)]);
-	return assembly.assemble(makeCtx()).text;
+	return assembly.assemble(makeCtx(ctxOverrides)).text;
 }
 
 function makeCtx(overrides: Partial<PromptContext> = {}): PromptContext {
@@ -76,14 +95,31 @@ describe("RoleSource", () => {
 	});
 
 	describe("role preamble", () => {
-		test("prepends the Claude Code role preamble to the default prompt", () => {
+		test("prepends the Claude Code role preamble to the default prompt on Anthropic", () => {
 			const prompt = assembleRole({ selectedTools: ["read"] });
 			expect(prompt.startsWith(`${ROLE_PREAMBLE}\n\n`)).toBe(true);
 		});
 
-		test("prepends the Claude Code role preamble to a customPrompt", () => {
+		test("prepends the Claude Code role preamble to a customPrompt on Anthropic", () => {
 			const prompt = assembleRole({ customPrompt: "Custom base prompt.", selectedTools: ["read"] });
 			expect(prompt.startsWith(`${ROLE_PREAMBLE}\n\nCustom base prompt.`)).toBe(true);
+		});
+
+		test.each([
+			["amazon-bedrock"],
+			["google-antigravity"],
+			["openrouter"],
+			["vercel-ai-gateway"],
+			["openai"],
+			["openai-codex"],
+		])("omits the Claude Code role preamble on %s", (provider) => {
+			const prompt = assembleRole({ selectedTools: ["read"] }, { model: modelFor(provider) });
+			expect(prompt).not.toContain(ROLE_PREAMBLE);
+		});
+
+		test("omits the Claude Code role preamble when the context has no model", () => {
+			const prompt = assembleRole({ selectedTools: ["read"] }, {});
+			expect(prompt).not.toContain(ROLE_PREAMBLE);
 		});
 	});
 
@@ -119,7 +155,7 @@ describe("PromptAssembly", () => {
 			new ProjectSource([{ path: "/proj/AGENTS.md", content: "Project rule A" }]),
 			new EnvironmentSource(),
 		]);
-		const prompt = assembly.assemble(makeCtx()).text;
+		const prompt = assembly.assemble(makeCtx({ model: modelFor("anthropic") })).text;
 
 		const roleIdx = prompt.indexOf(ROLE_PREAMBLE);
 		const projectIdx = prompt.indexOf("# Project Context");

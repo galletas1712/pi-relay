@@ -2,9 +2,11 @@ import { getDocsPath, getExamplesPath, getReadmePath } from "../../../config.js"
 import type { PromptContext, PromptFragment, PromptSource } from "../types.js";
 
 /**
- * Pi ships as a Claude Code-compatible CLI, so every session starts with the same
- * identity line regardless of which provider the model routes through. Providers
- * must NOT inject this themselves — they transmit whatever core hands them.
+ * Role preamble we prepend only when talking to the direct Anthropic provider,
+ * matching the original identity-mode behavior that used to live inside the
+ * Anthropic provider itself. Other providers (including Claude-via-Bedrock,
+ * Antigravity, OpenRouter, etc.) get a clean system prompt with no Claude Code
+ * impersonation line.
  */
 const CLAUDE_CODE_ROLE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude.";
 
@@ -27,11 +29,11 @@ export class RoleSource implements PromptSource {
 
 	constructor(private readonly options: RoleSourceOptions = {}) {}
 
-	contribute(_ctx: PromptContext): PromptFragment[] {
+	contribute(ctx: PromptContext): PromptFragment[] {
 		const fragments: PromptFragment[] = [];
-		const body = this.options.customPrompt
-			? `${CLAUDE_CODE_ROLE_PREAMBLE}\n\n${this.options.customPrompt}`
-			: `${CLAUDE_CODE_ROLE_PREAMBLE}\n\n${this.buildDefaultBody()}`;
+		const includePreamble = ctx.model?.provider === "anthropic";
+		const base = this.options.customPrompt ?? this.buildDefaultBody();
+		const body = includePreamble ? `${CLAUDE_CODE_ROLE_PREAMBLE}\n\n${base}` : base;
 
 		fragments.push({
 			section: "role",
