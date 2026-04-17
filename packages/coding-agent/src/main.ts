@@ -10,6 +10,7 @@ import { createInterface } from "node:readline";
 import { type ImageContent, modelsAreEqual } from "@pi-relay/ai";
 import { ProcessTerminal, setKeybindings, TUI } from "@pi-relay/tui";
 import chalk from "chalk";
+import { LocalClient } from "./client/local-client.js";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.js";
 import { processFileArguments } from "./cli/file-processor.js";
 import { buildInitialMessage } from "./cli/initial-message.js";
@@ -674,7 +675,8 @@ export async function main(args: string[], options?: MainOptions) {
 			console.log(chalk.dim(`Model scope: ${modelList} ${chalk.gray("(Ctrl+P to cycle)")}`));
 		}
 
-		const interactiveMode = new InteractiveMode(runtime, {
+		const client = new LocalClient(runtime);
+		const interactiveMode = new InteractiveMode(client, {
 			migratedProviders,
 			modelFallbackMessage,
 			initialMessage,

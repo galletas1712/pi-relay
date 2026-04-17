@@ -46,6 +46,7 @@ import {
 	getUpdateInstruction,
 	VERSION,
 } from "../../config.js";
+import type { LocalClient } from "../../client/local-client.js";
 import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.js";
 import type { AgentSessionRuntime } from "../../core/agent-session-runtime.js";
 import type {
@@ -162,6 +163,7 @@ export interface InteractiveModeOptions {
 }
 
 export class InteractiveMode {
+	private client: LocalClient;
 	private runtimeHost: AgentSessionRuntime;
 	private ui: TUI;
 	private chatContainer: Container;
@@ -278,10 +280,11 @@ export class InteractiveMode {
 	}
 
 	constructor(
-		runtimeHost: AgentSessionRuntime,
+		client: LocalClient,
 		private options: InteractiveModeOptions = {},
 	) {
-		this.runtimeHost = runtimeHost;
+		this.client = client;
+		this.runtimeHost = client.internals.runtime;
 		this.version = VERSION;
 		this.ui = new TUI(new ProcessTerminal(), this.settingsManager.getShowHardwareCursor());
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
