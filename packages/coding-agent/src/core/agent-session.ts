@@ -916,6 +916,7 @@ export class AgentSession {
 			selectedTools: validToolNames,
 			toolSnippets,
 			promptGuidelines,
+			provider: this.agent.state.model?.provider,
 		});
 	}
 

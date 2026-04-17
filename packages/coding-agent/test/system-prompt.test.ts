@@ -69,6 +69,61 @@ describe("buildSystemPrompt", () => {
 		});
 	});
 
+	describe("role preamble", () => {
+		const ROLE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude.";
+
+		test("prepends the Claude Code role preamble to the default prompt on anthropic", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: ["read"],
+				contextFiles: [],
+				skills: [],
+				provider: "anthropic",
+			});
+
+			expect(prompt.startsWith(`${ROLE_PREAMBLE}\n\n`)).toBe(true);
+		});
+
+		test("prepends the Claude Code role preamble to a customPrompt on anthropic", () => {
+			const prompt = buildSystemPrompt({
+				customPrompt: "Custom base prompt.",
+				selectedTools: ["read"],
+				contextFiles: [],
+				skills: [],
+				provider: "anthropic",
+			});
+
+			expect(prompt.startsWith(`${ROLE_PREAMBLE}\n\nCustom base prompt.`)).toBe(true);
+		});
+
+		test.each([
+			["amazon-bedrock"],
+			["google-antigravity"],
+			["openrouter"],
+			["vercel-ai-gateway"],
+			["openai"],
+			["openai-codex"],
+		])("omits the Claude Code role preamble on %s", (provider) => {
+			const prompt = buildSystemPrompt({
+				selectedTools: ["read"],
+				contextFiles: [],
+				skills: [],
+				provider,
+			});
+
+			expect(prompt).not.toContain(ROLE_PREAMBLE);
+		});
+
+		test("omits the Claude Code role preamble when no provider is given", () => {
+			const prompt = buildSystemPrompt({
+				selectedTools: ["read"],
+				contextFiles: [],
+				skills: [],
+			});
+
+			expect(prompt).not.toContain(ROLE_PREAMBLE);
+		});
+	});
+
 	describe("prompt guidelines", () => {
 		test("appends promptGuidelines to default guidelines", () => {
 			const prompt = buildSystemPrompt({

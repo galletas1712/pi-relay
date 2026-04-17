@@ -91,11 +91,16 @@ describe.sequential("Anthropic Claude Code envelope", () => {
 			system?: Array<{ text: string }>;
 			metadata?: { user_id?: string };
 		};
+		// Provider transmits the caller's systemPrompt unchanged; the role preamble
+		// is owned by coding-agent/core (see packages/coding-agent/src/core/system-prompt.ts).
 		expect(params.system?.[0]?.text).toMatch(
 			/^x-anthropic-billing-header: cc_version=2\.1\.75\.[0-9a-f]{3}; cc_entrypoint=cli;$/,
 		);
-		expect(params.system?.[1]?.text).toBe("You are Claude Code, Anthropic's official CLI for Claude.");
-		expect(params.system?.[2]?.text).toBe("Keep replies short.");
+		expect(params.system?.[1]?.text).toBe("Keep replies short.");
+		expect(params.system).toHaveLength(2);
+		for (const block of params.system ?? []) {
+			expect(block.text).not.toContain("You are Claude Code");
+		}
 		const metadata = JSON.parse(params.metadata?.user_id ?? "{}") as Record<string, string>;
 		expect(metadata.session_id).toBe("session-123");
 		expect(metadata.account_uuid).toBe("");
