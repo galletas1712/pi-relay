@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
-import { completeSimple, StringEnum, type AssistantMessage } from "@mariozechner/pi-ai";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { Text } from "@mariozechner/pi-tui";
+import { completeSimple, StringEnum, type AssistantMessage } from "@pi-relay/ai";
+import type { ExtensionAPI, ExtensionContext } from "@pi-relay/coding-agent";
+import { Text } from "@pi-relay/tui";
 import { Type } from "@sinclair/typebox";
 
 type WebSearchReasoningEffort = "low" | "medium" | "high" | "xhigh";

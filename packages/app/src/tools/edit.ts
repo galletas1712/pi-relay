@@ -1,6 +1,6 @@
 import { constants } from "node:fs";
 import { access, readFile, writeFile } from "node:fs/promises";
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ToolDefinition } from "@pi-relay/coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import {
 	applyEditsToNormalizedContent,

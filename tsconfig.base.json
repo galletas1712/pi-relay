@@ -15,8 +15,8 @@
 		"moduleResolution": "Node16",
 		"resolveJsonModule": true,
 		"paths": {
-			"@mariozechner/pi-agent-core": ["./packages/agent-core/dist/index.d.ts"],
-			"@mariozechner/pi-agent-core/*": ["./packages/agent-core/dist/*"]
+			"@pi-relay/agent-core": ["./packages/agent-core/dist/index.d.ts"],
+			"@pi-relay/agent-core/*": ["./packages/agent-core/dist/*"]
 		},
 		"allowImportingTsExtensions": false,
 		"experimentalDecorators": true,

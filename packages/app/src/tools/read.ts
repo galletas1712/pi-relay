@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { access, open, readFile } from "node:fs/promises";
-import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ImageContent, TextContent } from "@pi-relay/ai";
+import type { ToolDefinition } from "@pi-relay/coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import { fileTypeFromBuffer } from "file-type";
 import { type FileAccessTracker, fingerprintFileContent } from "./file-access-tracker.js";

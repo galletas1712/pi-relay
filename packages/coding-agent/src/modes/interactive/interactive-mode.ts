@@ -7,8 +7,8 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, OAuthProviderId } from "@mariozechner/pi-ai";
+import type { AgentMessage } from "@pi-relay/agent-core";
+import type { AssistantMessage, ImageContent, Message, Model, OAuthProviderId } from "@pi-relay/ai";
 import type {
 	AutocompleteItem,
 	EditorComponent,
@@ -19,7 +19,7 @@ import type {
 	OverlayHandle,
 	OverlayOptions,
 	SlashCommand,
-} from "@mariozechner/pi-tui";
+} from "@pi-relay/tui";
 import {
 	CombinedAutocompleteProvider,
 	type Component,
@@ -35,7 +35,7 @@ import {
 	TruncatedText,
 	TUI,
 	visibleWidth,
-} from "@mariozechner/pi-tui";
+} from "@pi-relay/tui";
 import { spawn, spawnSync } from "child_process";
 import {
 	APP_NAME,
@@ -680,7 +680,7 @@ export class InteractiveMode {
 		if (process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE) return undefined;
 
 		try {
-			const response = await fetch("https://registry.npmjs.org/@mariozechner/pi-coding-agent/latest", {
+			const response = await fetch("https://registry.npmjs.org/@pi-relay/coding-agent/latest", {
 				signal: AbortSignal.timeout(10000),
 			});
 			if (!response.ok) return undefined;
@@ -3228,7 +3228,7 @@ export class InteractiveMode {
 	}
 
 	showNewVersionNotification(newVersion: string): void {
-		const action = theme.fg("accent", getUpdateInstruction("@mariozechner/pi-coding-agent"));
+		const action = theme.fg("accent", getUpdateInstruction("@pi-relay/coding-agent"));
 		const updateInstruction = theme.fg("muted", `New version ${newVersion} is available. `) + action;
 		const changelogUrl = theme.fg(
 			"accent",

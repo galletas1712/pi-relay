@@ -1,5 +1,5 @@
-import type { AgentTool } from "@mariozechner/pi-agent-core";
-import { Box, Container, Spacer, Text } from "@mariozechner/pi-tui";
+import type { AgentTool } from "@pi-relay/agent-core";
+import { Box, Container, Spacer, Text } from "@pi-relay/tui";
 import { type Static, Type } from "@sinclair/typebox";
 import { constants } from "fs";
 import { access as fsAccess, readFile as fsReadFile, writeFile as fsWriteFile } from "fs/promises";

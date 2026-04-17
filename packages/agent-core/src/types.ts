@@ -9,7 +9,7 @@ import type {
 	TextContent,
 	Tool,
 	ToolResultMessage,
-} from "@mariozechner/pi-ai";
+} from "@pi-relay/ai";
 import type { Static, TSchema } from "@sinclair/typebox";
 import type { Mailbox } from "./mailbox.js";
 import type { MailboxItem } from "./mailbox-types.js";

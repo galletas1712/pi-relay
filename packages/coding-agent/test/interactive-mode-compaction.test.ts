@@ -1,4 +1,4 @@
-import { Container } from "@mariozechner/pi-tui";
+import { Container } from "@pi-relay/tui";
 import { describe, expect, test, vi } from "vitest";
 import { InteractiveMode } from "../src/modes/interactive/interactive-mode.js";
 

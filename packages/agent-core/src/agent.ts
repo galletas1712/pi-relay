@@ -7,7 +7,7 @@ import {
 	type TextContent,
 	type ThinkingBudgets,
 	type Transport,
-} from "@mariozechner/pi-ai";
+} from "@pi-relay/ai";
 import { Mailbox } from "./mailbox.js";
 import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.js";
 import type { MailboxItem } from "./mailbox-types.js";

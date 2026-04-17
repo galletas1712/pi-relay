@@ -5,9 +5,9 @@ import type {
 	BackgroundToolStartContext,
 	StreamFn,
 	ThinkingLevel,
-} from "@mariozechner/pi-agent-core";
-import type { ImageContent, Message, Model, SimpleStreamOptions, TextContent, ThinkingBudgets, Transport } from "@mariozechner/pi-ai";
-import type { AgentSessionEvent, ToolDefinition, ToolInfo } from "@mariozechner/pi-coding-agent";
+} from "@pi-relay/agent-core";
+import type { ImageContent, Message, Model, SimpleStreamOptions, TextContent, ThinkingBudgets, Transport } from "@pi-relay/ai";
+import type { AgentSessionEvent, ToolDefinition, ToolInfo } from "@pi-relay/coding-agent";
 
 export type AgentStatus = "running" | "idle" | "disposed";
 
@@ -37,7 +37,7 @@ export type AgentIdleMessage = RelayCustomMessage<
 >;
 export type AgentRosterMessage = RelayCustomMessage<"agent_roster">;
 
-declare module "@mariozechner/pi-agent-core" {
+declare module "@pi-relay/agent-core" {
 	interface CustomAgentMessages {
 		agent_report: AgentReportMessage;
 		agent_directive: AgentDirectiveMessage;

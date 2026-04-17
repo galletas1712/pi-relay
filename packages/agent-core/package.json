@@ -1,5 +1,5 @@
 {
-	"name": "@mariozechner/pi-agent-core",
+	"name": "@pi-relay/agent-core",
 	"version": "0.67.100",
 	"description": "Modified agent-core with mailbox and background loop support",
 	"type": "module",
@@ -17,7 +17,7 @@
 		"prepublishOnly": "npm run clean && npm run build"
 	},
 	"dependencies": {
-		"@mariozechner/pi-ai": "^0.67.5"
+		"@pi-relay/ai": "^0.67.5"
 	},
 	"devDependencies": {
 		"@types/node": "^22.10.5",

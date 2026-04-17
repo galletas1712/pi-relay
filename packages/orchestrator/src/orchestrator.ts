@@ -1,10 +1,10 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AgentMessage, AgentToolCall } from "@mariozechner/pi-agent-core";
-import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@mariozechner/pi-agent-core";
-import { validateToolArguments, type ToolResultMessage, type UserMessage } from "@mariozechner/pi-ai";
-import { serializeConversation, type AgentSessionEvent, type ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { AgentMessage, AgentToolCall } from "@pi-relay/agent-core";
+import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@pi-relay/agent-core";
+import { validateToolArguments, type ToolResultMessage, type UserMessage } from "@pi-relay/ai";
+import { serializeConversation, type AgentSessionEvent, type ToolDefinition } from "@pi-relay/coding-agent";
 import { createAgentContextTransform } from "./context-transform.js";
 import { createMessageTool } from "./tools/message.js";
 import { createReportTool } from "./tools/report.js";

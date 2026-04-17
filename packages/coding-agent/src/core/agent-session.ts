@@ -22,15 +22,15 @@ import type {
 	AgentState,
 	AgentTool,
 	ThinkingLevel,
-} from "@mariozechner/pi-agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@mariozechner/pi-ai";
+} from "@pi-relay/agent-core";
+import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@pi-relay/ai";
 import {
 	clampThinkingLevel,
 	getThinkingLevels,
 	isContextOverflow,
 	modelsAreEqual,
 	resetApiProviders,
-} from "@mariozechner/pi-ai";
+} from "@pi-relay/ai";
 import { getDocsPath } from "../config.js";
 import { theme } from "../modes/interactive/theme/theme.js";
 import { stripFrontmatter } from "../utils/frontmatter.js";

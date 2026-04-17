@@ -7,8 +7,8 @@
 
 import { resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { type ImageContent, modelsAreEqual } from "@mariozechner/pi-ai";
-import { ProcessTerminal, setKeybindings, TUI } from "@mariozechner/pi-tui";
+import { type ImageContent, modelsAreEqual } from "@pi-relay/ai";
+import { ProcessTerminal, setKeybindings, TUI } from "@pi-relay/tui";
 import chalk from "chalk";
 import { type Args, type Mode, parseArgs, printHelp } from "./cli/args.js";
 import { processFileArguments } from "./cli/file-processor.js";

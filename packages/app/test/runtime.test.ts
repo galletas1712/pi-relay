@@ -14,7 +14,7 @@ const createRelayBaseToolDefinitionsFactory = vi.fn(() => rootBaseToolDefinition
 const RELAY_BASE_TOOL_NAMES = ["read", "bash", "edit", "apply_patch", "write"];
 const restore = vi.fn(async () => false);
 
-vi.mock("@mariozechner/pi-coding-agent", () => ({
+vi.mock("@pi-relay/coding-agent", () => ({
 	SessionManager: {
 		continueRecent,
 	},

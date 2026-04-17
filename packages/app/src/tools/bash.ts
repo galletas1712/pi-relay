@@ -2,8 +2,8 @@ import { randomBytes } from "node:crypto";
 import { createWriteStream } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
-import { createLocalBashOperations, type BashOperations } from "@mariozechner/pi-coding-agent";
+import type { ToolDefinition } from "@pi-relay/coding-agent";
+import { createLocalBashOperations, type BashOperations } from "@pi-relay/coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateTail } from "./truncate.js";
 

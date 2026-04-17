@@ -1,5 +1,5 @@
 import { resolve } from "node:path";
-import type { AgentSession, AgentSessionRuntime } from "@mariozechner/pi-coding-agent";
+import type { AgentSession, AgentSessionRuntime } from "@pi-relay/coding-agent";
 import type { Orchestrator } from "@pi-relay/orchestrator";
 
 export interface RelayRuntimeStateRef {

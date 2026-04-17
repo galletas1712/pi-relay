@@ -1,4 +1,4 @@
-import type { ImageContent, TextContent, ToolResultMessage, UserMessage } from "@mariozechner/pi-ai";
+import type { ImageContent, TextContent, ToolResultMessage, UserMessage } from "@pi-relay/ai";
 import type { AgentMessage } from "./types.js";
 
 export interface PendingToolResultDetails {
