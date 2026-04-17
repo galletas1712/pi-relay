@@ -156,71 +156,6 @@ Project skill`,
 			expect(theme?.sourcePath).toBe(projectThemePath);
 		});
 
-		it("should keep both extensions loaded when command names collide", async () => {
-			const userExtDir = join(agentDir, "extensions");
-			const projectExtDir = join(cwd, ".pi", "extensions");
-			mkdirSync(userExtDir, { recursive: true });
-			mkdirSync(projectExtDir, { recursive: true });
-
-			writeFileSync(
-				join(projectExtDir, "project.ts"),
-				`export default function(pi) {
-	pi.registerCommand("deploy", {
-		description: "project deploy",
-		handler: async () => {},
-	});
-	pi.registerCommand("project-only", {
-		description: "project only",
-		handler: async () => {},
-	});
-}`,
-			);
-
-			writeFileSync(
-				join(userExtDir, "user.ts"),
-				`export default function(pi) {
-	pi.registerCommand("deploy", {
-		description: "user deploy",
-		handler: async () => {},
-	});
-	pi.registerCommand("user-only", {
-		description: "user only",
-		handler: async () => {},
-	});
-}`,
-			);
-
-			const loader = new DefaultResourceLoader({ cwd, agentDir });
-			await loader.reload();
-
-			const extensionsResult = loader.getExtensions();
-			expect(extensionsResult.extensions).toHaveLength(2);
-			expect(extensionsResult.errors.some((e) => e.error.includes('Command "/deploy" conflicts'))).toBe(false);
-
-			const sessionManager = SessionManager.inMemory();
-			const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
-			const modelRegistry = ModelRegistry.create(authStorage);
-			const runner = new ExtensionRunner(
-				extensionsResult.extensions,
-				extensionsResult.runtime,
-				cwd,
-				sessionManager,
-				modelRegistry,
-			);
-
-			expect(runner.getCommand("deploy:1")?.description).toBe("project deploy");
-			expect(runner.getCommand("deploy:2")?.description).toBe("user deploy");
-			expect(runner.getCommand("project-only")?.description).toBe("project only");
-			expect(runner.getCommand("user-only")?.description).toBe("user only");
-
-			const commands = runner.getRegisteredCommands();
-			expect(commands.map((command) => command.invocationName)).toEqual([
-				"deploy:1",
-				"project-only",
-				"deploy:2",
-				"user-only",
-			]);
-		});
 
 		it("should honor overrides for auto-discovered resources", async () => {
 			const settingsManager = SettingsManager.inMemory();
@@ -504,7 +439,7 @@ export default function(pi: ExtensionAPI) {
 			expect(errors.some((e) => e.error.includes("duplicate-tool") && e.error.includes("conflicts"))).toBe(true);
 		});
 
-		it("should prefer explicit CLI extensions over discovered extensions when commands and tools conflict", async () => {
+		it("should prefer explicit CLI extensions over discovered extensions when tools conflict", async () => {
 			const globalExtDir = join(agentDir, "extensions");
 			mkdirSync(globalExtDir, { recursive: true });
 			const explicitExtPath = join(tempDir, "explicit-extension.ts");
@@ -521,10 +456,6 @@ export default function(pi: ExtensionAPI) {
     parameters: Type.Object({}),
     execute: async () => ({ result: "global" }),
   });
-  pi.registerCommand("deploy", {
-    description: "global command",
-    handler: async () => {},
-  });
 }`,
 			);
 
@@ -539,10 +470,6 @@ export default function(pi: ExtensionAPI) {
     description: "explicit tool",
     parameters: Type.Object({}),
     execute: async () => ({ result: "explicit" }),
-  });
-  pi.registerCommand("deploy", {
-    description: "explicit command",
-    handler: async () => {},
   });
 }`,
 			);
@@ -568,8 +495,6 @@ export default function(pi: ExtensionAPI) {
 				modelRegistry,
 			);
 
-			expect(runner.getCommand("deploy:1")?.description).toBe("explicit command");
-			expect(runner.getCommand("deploy:2")?.description).toBe("global command");
 			expect(runner.getToolDefinition("duplicate-tool")?.description).toBe("explicit tool");
 		});
 	});

@@ -47,6 +47,7 @@ console.log();
 // Example extension file (./my-logging-extension.ts):
 /*
 import type { ExtensionAPI } from "@pi-relay/coding-agent";
+import { Type } from "@sinclair/typebox";
 
 export default function (pi: ExtensionAPI) {
 	pi.on("agent_start", async () => {
@@ -75,14 +76,6 @@ export default function (pi: ExtensionAPI) {
 			content: [{ type: "text", text: \`Processed: \${params.input}\` }],
 			details: {},
 		}),
-	});
-
-	// Register a command
-	pi.registerCommand("mycommand", {
-		description: "Do something",
-		handler: async (args, ctx) => {
-			ctx.ui.notify(\`Command executed with: \${args}\`);
-		},
 	});
 }
 */

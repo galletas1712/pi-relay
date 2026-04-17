@@ -66,29 +66,6 @@ describe("AgentSession queue characterization", () => {
 		}
 	});
 
-	it("dispatches extension commands immediately when prompted while idle", async () => {
-		const commandRuns: string[] = [];
-		const harness = await createHarness({
-			extensionFactories: [
-				(pi) => {
-					pi.registerCommand("testcmd", {
-						description: "Test command",
-						handler: async (args) => {
-							commandRuns.push(args);
-						},
-					});
-				},
-			],
-		});
-		harnesses.push(harness);
-
-		await harness.session.prompt("/testcmd hello world");
-
-		expect(commandRuns).toEqual(["hello world"]);
-		expect(harness.getPendingResponseCount()).toBe(0);
-		expect(harness.session.messages).toEqual([]);
-	});
-
 	it("delivers extension-origin steering messages before the next LLM call", async () => {
 		let extensionApi: ExtensionAPI | undefined;
 		const waiting = await createWaitingHarness({
@@ -384,39 +361,4 @@ describe("AgentSession queue characterization", () => {
 		expect(harness.session.pendingMessageCount).toBe(0);
 	});
 
-	it("throws when queueing an extension command with steer", async () => {
-		const harness = await createHarness({
-			extensionFactories: [
-				(pi) => {
-					pi.registerCommand("testcmd", {
-						description: "Test command",
-						handler: async () => {},
-					});
-				},
-			],
-		});
-		harnesses.push(harness);
-
-		await expect(harness.session.steer("/testcmd queued")).rejects.toThrow(
-			'Extension command "/testcmd" cannot be queued. Use prompt() or execute the command when not streaming.',
-		);
-	});
-
-	it("throws when queueing an extension command with followUp", async () => {
-		const harness = await createHarness({
-			extensionFactories: [
-				(pi) => {
-					pi.registerCommand("testcmd", {
-						description: "Test command",
-						handler: async () => {},
-					});
-				},
-			],
-		});
-		harnesses.push(harness);
-
-		await expect(harness.session.followUp("/testcmd queued")).rejects.toThrow(
-			'Extension command "/testcmd" cannot be queued. Use prompt() or execute the command when not streaming.',
-		);
-	});
 });

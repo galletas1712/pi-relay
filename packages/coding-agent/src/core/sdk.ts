@@ -92,11 +92,8 @@ export interface CreateAgentSessionResult {
 export * from "./agent-session-runtime.js";
 export type {
 	ExtensionAPI,
-	ExtensionCommandContext,
 	ExtensionContext,
 	ExtensionFactory,
-	SlashCommandInfo,
-	SlashCommandSource,
 	ToolDefinition,
 } from "./extensions/index.js";
 export type { PromptTemplate } from "./prompt-templates.js";

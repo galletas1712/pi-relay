@@ -49,7 +49,6 @@ export function createRelayRuntimeFactory(
 	agentDir = getAgentDir(),
 	stateRef: RelayRuntimeStateRef = {},
 ): CreateAgentSessionRuntimeFactory {
-	const orchestratorUiRef: { cleanup?: () => void; sessionId?: string } = {};
 	return async ({ cwd, sessionManager, sessionStartEvent }) => {
 		const orchestratorRef: { current?: Orchestrator } = {};
 		const services = await createAgentSessionServices({
@@ -57,7 +56,7 @@ export function createRelayRuntimeFactory(
 			agentDir,
 			resourceLoaderOptions: {
 				appendSystemPrompt: [RELAY_APPEND_SYSTEM_PROMPT],
-				extensionFactories: [createOrchestratorExtension(orchestratorRef, orchestratorUiRef)],
+				extensionFactories: [createOrchestratorExtension(orchestratorRef)],
 			},
 		});
 		const rootToolBridge = {

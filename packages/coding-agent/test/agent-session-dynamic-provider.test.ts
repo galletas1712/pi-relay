@@ -94,20 +94,16 @@ describe("AgentSession dynamic provider registration", () => {
 		session.dispose();
 	});
 
-	it("applies command-time registerProvider overrides without reload", async () => {
+	it("applies runtime registerProvider overrides without reload", async () => {
+		let extensionApi: import("../src/core/extensions/types.js").ExtensionAPI | undefined;
 		const session = await createSession([
 			(pi) => {
-				pi.registerCommand("use-proxy", {
-					description: "Use proxy",
-					handler: async () => {
-						pi.registerProvider("anthropic", { baseUrl: "http://localhost:8080/command" });
-					},
-				});
+				extensionApi = pi;
 			},
 		]);
 
 		await session.bindExtensions({});
-		await session.prompt("/use-proxy");
+		extensionApi!.registerProvider("anthropic", { baseUrl: "http://localhost:8080/command" });
 
 		expect(session.model?.baseUrl).toBe("http://localhost:8080/command");
 		expect(await capturePromptBaseUrl(session)).toBe("http://localhost:8080/command");

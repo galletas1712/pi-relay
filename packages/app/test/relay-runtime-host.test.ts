@@ -182,51 +182,6 @@ describe("RelayRuntimeHost", () => {
 		);
 	});
 
-	it("clears the detached session UI bindings when attaching to another live agent", async () => {
-		const root = new FakeSession("root-session");
-		const child = new FakeSession("child-session");
-		const setUIContext = vi.fn();
-		const bindCommandContext = vi.fn();
-		root.extensionRunner = {
-			hasHandlers: () => false,
-			setUIContext,
-			bindCommandContext,
-		} as never;
-		const runtime = {
-			session: root,
-			services: { cwd: root.sessionManager.getCwd() },
-			diagnostics: [],
-			modelFallbackMessage: undefined,
-			switchSession: vi.fn(async () => ({ cancelled: false })),
-			newSession: vi.fn(),
-			fork: vi.fn(),
-			importFromJsonl: vi.fn(),
-			dispose: vi.fn(),
-		} as never;
-		const orchestrator = {
-			rootAgentId: "root",
-			subscribeToChanges: vi.fn(() => () => {}),
-			getRecord: (agentId: string) => {
-				if (agentId === "root") {
-					return { id: "root", status: "idle", session: root };
-				}
-				if (agentId === "child") {
-					return { id: "child", status: "running", session: child };
-				}
-				throw new Error(`Unknown agent ${agentId}`);
-			},
-			findAgentIdBySessionFile: (sessionFile: string) => (sessionFile === child.sessionFile ? "child" : undefined),
-		} as never;
-		const host = new RelayRuntimeHost(runtime, {
-			current: { orchestrator },
-		});
-
-		await host.switchSession(child.sessionFile!);
-
-		expect(setUIContext).toHaveBeenCalledWith(undefined);
-		expect(bindCommandContext).toHaveBeenCalledWith(undefined);
-	});
-
 	it("notifies listeners when a disposed attached child falls back to root", async () => {
 		const root = new FakeSession("root-session");
 		const child = new FakeSession("child-session");

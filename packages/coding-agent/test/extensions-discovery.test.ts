@@ -23,7 +23,7 @@ describe("extensions discovery", () => {
 
 	const extensionCode = `
 		export default function(pi) {
-			pi.registerCommand("test", { handler: async () => {} });
+			pi.on("agent_start", async () => {});
 		}
 	`;
 
@@ -164,7 +164,6 @@ describe("extensions discovery", () => {
 		expect(result.errors).toHaveLength(0);
 		expect(result.extensions).toHaveLength(1);
 		expect(result.extensions[0].path).toContain("custom.ts");
-		// Verify the right tool was registered
 		expect(result.extensions[0].tools.has("from-custom")).toBe(true);
 		expect(result.extensions[0].tools.has("from-index")).toBe(false);
 	});
@@ -206,7 +205,6 @@ describe("extensions discovery", () => {
 		fs.mkdirSync(subdir);
 		fs.mkdirSync(nested);
 		fs.writeFileSync(path.join(nested, "index.ts"), extensionCode);
-		// No index.ts or package.json in container/
 
 		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
 
@@ -215,15 +213,12 @@ describe("extensions discovery", () => {
 	});
 
 	it("handles mixed direct files and subdirectories", async () => {
-		// Direct file
 		fs.writeFileSync(path.join(extensionsDir, "direct.ts"), extensionCode);
 
-		// Subdirectory with index
 		const subdir1 = path.join(extensionsDir, "with-index");
 		fs.mkdirSync(subdir1);
 		fs.writeFileSync(path.join(subdir1, "index.ts"), extensionCode);
 
-		// Subdirectory with package.json
 		const subdir2 = path.join(extensionsDir, "with-manifest");
 		fs.mkdirSync(subdir2);
 		fs.writeFileSync(path.join(subdir2, "entry.ts"), extensionCode);
@@ -253,16 +248,6 @@ describe("extensions discovery", () => {
 		expect(result.errors).toHaveLength(0);
 		expect(result.extensions).toHaveLength(1);
 		expect(result.extensions[0].path).toContain("exists.ts");
-	});
-
-	it("loads extensions and registers commands", async () => {
-		fs.writeFileSync(path.join(extensionsDir, "with-command.ts"), extensionCode);
-
-		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
-
-		expect(result.errors).toHaveLength(0);
-		expect(result.extensions).toHaveLength(1);
-		expect(result.extensions[0].commands.has("test")).toBe(true);
 	});
 
 	it("loads extensions and registers tools", async () => {
@@ -298,7 +283,6 @@ describe("extensions discovery", () => {
 	});
 
 	it("resolves dependencies from extension's own node_modules", async () => {
-		// Load extension that has its own package.json and node_modules with 'ms' package
 		const extPath = path.resolve(__dirname, "../examples/extensions/with-deps");
 
 		const result = await discoverAndLoadExtensions([extPath], tempDir, tempDir);
@@ -306,25 +290,7 @@ describe("extensions discovery", () => {
 		expect(result.errors).toHaveLength(0);
 		expect(result.extensions).toHaveLength(1);
 		expect(result.extensions[0].path).toContain("with-deps");
-		// The extension registers a 'parse_duration' tool
 		expect(result.extensions[0].tools.has("parse_duration")).toBe(true);
-	});
-
-	it("registers message renderers", async () => {
-		const extCode = `
-			export default function(pi) {
-				pi.registerMessageRenderer("my-custom-type", (message, options, theme) => {
-					return null; // Use default rendering
-				});
-			}
-		`;
-		fs.writeFileSync(path.join(extensionsDir, "with-renderer.ts"), extCode);
-
-		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
-
-		expect(result.errors).toHaveLength(0);
-		expect(result.extensions).toHaveLength(1);
-		expect(result.extensions[0].messageRenderers.has("my-custom-type")).toBe(true);
 	});
 
 	it("reports error when extension throws during initialization", async () => {
@@ -345,7 +311,7 @@ describe("extensions discovery", () => {
 	it("reports error when extension has no default export", async () => {
 		const extCode = `
 			export function notDefault(pi) {
-				pi.registerCommand("test", { handler: async () => {} });
+				pi.on("agent_start", async () => {});
 			}
 		`;
 		fs.writeFileSync(path.join(extensionsDir, "no-default.ts"), extCode);
@@ -395,51 +361,12 @@ describe("extensions discovery", () => {
 		expect(result.extensions[0].handlers.has("agent_end")).toBe(true);
 	});
 
-	it("loads extension with shortcuts", async () => {
-		const extCode = `
-			export default function(pi) {
-				pi.registerShortcut("ctrl+t", {
-					description: "Test shortcut",
-					handler: async (ctx) => {},
-				});
-			}
-		`;
-		fs.writeFileSync(path.join(extensionsDir, "with-shortcut.ts"), extCode);
-
-		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
-
-		expect(result.errors).toHaveLength(0);
-		expect(result.extensions).toHaveLength(1);
-		expect(result.extensions[0].shortcuts.has("ctrl+t")).toBe(true);
-	});
-
-	it("loads extension with flags", async () => {
-		const extCode = `
-			export default function(pi) {
-				pi.registerFlag("my-flag", {
-					description: "My custom flag",
-					handler: async (value) => {},
-				});
-			}
-		`;
-		fs.writeFileSync(path.join(extensionsDir, "with-flag.ts"), extCode);
-
-		const result = await discoverAndLoadExtensions([], tempDir, tempDir);
-
-		expect(result.errors).toHaveLength(0);
-		expect(result.extensions).toHaveLength(1);
-		expect(result.extensions[0].flags.has("my-flag")).toBe(true);
-	});
-
 	it("loadExtensions only loads explicit paths without discovery", async () => {
-		// Create discoverable extensions (would be found by discoverAndLoadExtensions)
 		fs.writeFileSync(path.join(extensionsDir, "discovered.ts"), extensionCodeWithTool("discovered"));
 
-		// Create explicit extension outside discovery path
 		const explicitPath = path.join(tempDir, "explicit.ts");
 		fs.writeFileSync(explicitPath, extensionCodeWithTool("explicit"));
 
-		// Use loadExtensions directly to skip discovery
 		const { loadExtensions } = await import("../src/core/extensions/loader.js");
 		const result = await loadExtensions([explicitPath], tempDir);
 
@@ -450,10 +377,8 @@ describe("extensions discovery", () => {
 	});
 
 	it("loadExtensions with no paths loads nothing", async () => {
-		// Create discoverable extensions (would be found by discoverAndLoadExtensions)
 		fs.writeFileSync(path.join(extensionsDir, "discovered.ts"), extensionCode);
 
-		// Use loadExtensions directly with empty paths
 		const { loadExtensions } = await import("../src/core/extensions/loader.js");
 		const result = await loadExtensions([], tempDir);
 

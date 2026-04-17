@@ -223,30 +223,6 @@ describe("AgentSession prompt characterization", () => {
 		expect(expandedPrompt).toBe("Review this code: src/index.ts");
 	});
 
-	it("dispatches extension commands without consuming a provider response", async () => {
-		const commandRuns: string[] = [];
-		const harness = await createHarness({
-			extensionFactories: [
-				(pi) => {
-					pi.registerCommand("testcmd", {
-						description: "Test command",
-						handler: async (args) => {
-							commandRuns.push(args);
-						},
-					});
-				},
-			],
-		});
-		harnesses.push(harness);
-		harness.setResponses([fauxAssistantMessage("should stay queued")]);
-
-		await harness.session.prompt("/testcmd hello world");
-
-		expect(commandRuns).toEqual(["hello world"]);
-		expect(harness.session.messages).toEqual([]);
-		expect(harness.getPendingResponseCount()).toBe(1);
-	});
-
 	it("sendUserMessage while idle triggers a turn", async () => {
 		const harness = await createHarness();
 		harnesses.push(harness);
