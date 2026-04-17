@@ -434,7 +434,7 @@ pi --mode rpc
 
 RPC mode uses strict LF-delimited JSONL framing. Clients must split records on `\n` only. Do not use generic line readers like Node `readline`, which also split on Unicode separators inside JSON payloads.
 
-See [docs/rpc.md](docs/rpc.md) for the protocol.
+The wire format is self-documenting via [`src/client/rpc/wire.ts`](src/client/rpc/wire.ts).
 
 ---
 
@@ -482,7 +482,7 @@ pi config                    # Enable/disable package resources
 | (default) | Interactive mode |
 | `-p`, `--print` | Print response and exit |
 | `--mode json` | Output all events as JSON lines (see [docs/json.md](docs/json.md)) |
-| `--mode rpc` | RPC mode for process integration (see [docs/rpc.md](docs/rpc.md)) |
+| `--mode rpc` | RPC mode for process integration (wire format in [`src/client/rpc/wire.ts`](src/client/rpc/wire.ts)) |
 | `--export <in> [out]` | Export session to HTML |
 
 In print mode, pi also reads piped stdin and merges it into the initial prompt:

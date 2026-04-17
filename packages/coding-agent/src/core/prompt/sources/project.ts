@@ -31,7 +31,6 @@ export class ProjectSource implements PromptSource {
 				section: "project",
 				priority: 0,
 				content: lines.join("\n").trimEnd(),
-				cacheable: true,
 				sourceName: this.name,
 			},
 		];
