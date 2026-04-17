@@ -1,7 +1,7 @@
 import { constants } from "node:fs";
 import { access, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import type { ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { ToolDefinition } from "@pi-relay/coding-agent";
 import { type Static, Type } from "@sinclair/typebox";
 import {
 	applyEditsToNormalizedContent,

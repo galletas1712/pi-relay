@@ -2,7 +2,7 @@ import { mkdirSync } from "node:fs";
 import { appendFile, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { Type } from "@sinclair/typebox";
-import type { Tool } from "@mariozechner/pi-ai";
+import type { Tool } from "@pi-relay/ai";
 
 export const WORKLOG_UPDATE_TOOL = {
 	name: "worklog_update",

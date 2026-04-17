@@ -10,7 +10,7 @@ import {
 	streamSimple,
 	type ToolResultMessage,
 	validateToolArguments,
-} from "@mariozechner/pi-ai";
+} from "@pi-relay/ai";
 import type { MailboxItem } from "./mailbox-types.js";
 import { createPendingToolResult, formatBackgroundToolCompletion } from "./pending-results.js";
 import type {

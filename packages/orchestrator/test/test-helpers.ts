@@ -1,9 +1,9 @@
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { AgentMessage, AgentTool } from "@mariozechner/pi-agent-core";
-import type { Message, Model } from "@mariozechner/pi-ai";
-import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
+import type { AgentMessage, AgentTool } from "@pi-relay/agent-core";
+import type { Message, Model } from "@pi-relay/ai";
+import type { AgentSessionEvent } from "@pi-relay/coding-agent";
 import type { AgentSessionHandle, SessionCustomMessage } from "../src/types.js";
 
 export const TEST_MODEL: Model<any> = {

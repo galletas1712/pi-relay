@@ -1,4 +1,4 @@
-import type { ExtensionFactory } from "@mariozechner/pi-coding-agent";
+import type { ExtensionFactory } from "@pi-relay/coding-agent";
 import { buildAgentSelectorOptions, buildAgentWidgetLines } from "./roster.js";
 import { buildAgentSystemPrompt } from "./system-prompt.js";
 import type { Orchestrator } from "./orchestrator.js";

@@ -1,4 +1,4 @@
-import { InteractiveMode, runRpcMode } from "@mariozechner/pi-coding-agent";
+import { InteractiveMode, runRpcMode } from "@pi-relay/coding-agent";
 import { createRelayInteractiveRuntime, createRelayRuntime, parseArgs } from "./runtime.js";
 
 const cli = parseArgs(process.argv.slice(2));

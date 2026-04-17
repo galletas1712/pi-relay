@@ -4,7 +4,7 @@ const createAgentSessionFromServices = vi.fn();
 const createSessionManager = vi.fn();
 const openSessionManager = vi.fn();
 
-vi.mock("@mariozechner/pi-coding-agent", () => ({
+vi.mock("@pi-relay/coding-agent", () => ({
 	createAgentSessionFromServices,
 	SessionManager: {
 		create: createSessionManager,

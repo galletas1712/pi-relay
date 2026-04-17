@@ -1,4 +1,4 @@
-import type { ModelCapabilities } from "@mariozechner/pi-ai";
+import type { ModelCapabilities } from "@pi-relay/ai";
 import { afterEach, describe, expect, it } from "vitest";
 import { createHarness, type Harness } from "./suite/harness.js";
 

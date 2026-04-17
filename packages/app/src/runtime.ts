@@ -6,7 +6,7 @@ import {
 	getAgentDir,
 	SessionManager,
 	type ToolDefinition,
-} from "@mariozechner/pi-coding-agent";
+} from "@pi-relay/coding-agent";
 import {
 	type AgentSessionHandle,
 	createMessageTool,

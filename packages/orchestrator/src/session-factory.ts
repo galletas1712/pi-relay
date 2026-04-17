@@ -3,7 +3,7 @@ import {
 	SessionManager,
 	type AgentSessionServices,
 	type ToolDefinition,
-} from "@mariozechner/pi-coding-agent";
+} from "@pi-relay/coding-agent";
 import type { AgentSessionFactory, AgentSessionFactoryOptions, AgentSessionHandle } from "./types.js";
 
 type BaseToolDefinitionsFactory = () => ToolDefinition[];

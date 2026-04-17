@@ -1,5 +1,5 @@
 import { Type } from "@sinclair/typebox";
-import { defineTool, type ToolDefinition } from "@mariozechner/pi-coding-agent";
+import { defineTool, type ToolDefinition } from "@pi-relay/coding-agent";
 import type { ReportToolRuntime } from "../types.js";
 
 export function createReportTool(runtime: ReportToolRuntime, callingAgentId: string): ToolDefinition {

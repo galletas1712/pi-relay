@@ -1,5 +1,5 @@
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import { isPendingToolResult } from "@mariozechner/pi-agent-core";
+import type { AgentMessage } from "@pi-relay/agent-core";
+import { isPendingToolResult } from "@pi-relay/agent-core";
 import { buildSubagentRoster } from "./roster.js";
 import { createRosterMessage } from "./messages.js";
 import type { Orchestrator } from "./orchestrator.js";

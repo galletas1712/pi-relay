@@ -1,4 +1,4 @@
-import type { AgentSessionServices, ToolDefinition } from "@mariozechner/pi-coding-agent";
+import type { AgentSessionServices, ToolDefinition } from "@pi-relay/coding-agent";
 import {
 	createApplyPatchToolDefinition,
 	createBashToolDefinition,
