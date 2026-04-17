@@ -46,7 +46,6 @@ export interface PromptFragment {
 	readonly section: PromptSection;
 	readonly priority: number;
 	readonly content: string;
-	readonly cacheable: boolean;
 	readonly sourceName: string;
 }
 
@@ -56,14 +55,7 @@ export interface PromptSource {
 	contribute(ctx: PromptContext): PromptFragment[];
 }
 
-export interface AssembledPromptBlock {
-	readonly section: PromptSection;
-	readonly text: string;
-	readonly cacheable: boolean;
-}
-
 export interface AssembledPrompt {
 	readonly sections: ReadonlyMap<PromptSection, readonly PromptFragment[]>;
-	readonly blocks: readonly AssembledPromptBlock[];
 	readonly text: string;
 }

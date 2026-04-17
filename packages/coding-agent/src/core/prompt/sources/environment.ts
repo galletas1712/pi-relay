@@ -19,7 +19,6 @@ export class EnvironmentSource implements PromptSource {
 				section: "environment",
 				priority: 0,
 				content,
-				cacheable: true,
 				sourceName: this.name,
 			},
 		];

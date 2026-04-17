@@ -86,13 +86,6 @@ function getAntigravityHeaders() {
 	};
 }
 
-// Antigravity system instruction (compact version from CLIProxyAPI).
-const ANTIGRAVITY_SYSTEM_INSTRUCTION =
-	"You are Antigravity, a powerful agentic AI coding assistant designed by the Google Deepmind team working on Advanced Agentic Coding." +
-	"You are pair programming with a USER to solve their coding task. The task may require creating a new codebase, modifying or debugging an existing codebase, or simply answering a question." +
-	"**Absolute paths only**" +
-	"**Proactiveness**";
-
 // Counter for generating unique tool call IDs
 let toolCallCounter = 0;
 
@@ -899,9 +892,11 @@ export function buildRequest(
 
 	request.sessionId = options.sessionId;
 
-	// System instruction must be object with parts, not plain string
+	// System instruction must be object with parts, not plain string.
+	// Antigravity expects role: "user" on the system instruction (upstream CLI wire format).
 	if (context.systemPrompt) {
 		request.systemInstruction = {
+			...(isAntigravity ? { role: "user" } : {}),
 			parts: [{ text: sanitizeSurrogates(context.systemPrompt) }],
 		};
 	}
@@ -922,18 +917,6 @@ export function buildRequest(
 				},
 			};
 		}
-	}
-
-	if (isAntigravity) {
-		const existingParts = request.systemInstruction?.parts ?? [];
-		request.systemInstruction = {
-			role: "user",
-			parts: [
-				{ text: ANTIGRAVITY_SYSTEM_INSTRUCTION },
-				{ text: `Please ignore following [ignore]${ANTIGRAVITY_SYSTEM_INSTRUCTION}[/ignore]` },
-				...existingParts,
-			],
-		};
 	}
 
 	return {

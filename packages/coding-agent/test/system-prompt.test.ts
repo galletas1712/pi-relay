@@ -163,15 +163,15 @@ describe("PromptAssembly", () => {
 		expect(assembly.assemble(makeCtx()).text).toBe("");
 	});
 
-	test("blocks expose per-section text and cache hints", () => {
+	test("sections map exposes fragments grouped by section", () => {
 		const assembly = new PromptAssembly([
 			new RoleSource({ selectedTools: ["read"] }),
 			new EnvironmentSource(),
 		]);
-		const { blocks } = assembly.assemble(makeCtx());
-		const sections = blocks.map((block) => block.section);
-		expect(sections).toEqual(["role", "environment"]);
-		expect(blocks.every((block) => block.cacheable)).toBe(true);
+		const { sections } = assembly.assemble(makeCtx());
+		expect(sections.get("role")?.length).toBe(1);
+		expect(sections.get("environment")?.length).toBe(1);
+		expect(sections.get("project")?.length ?? 0).toBe(0);
 	});
 
 	test("environment block reflects the injected date and cwd", () => {

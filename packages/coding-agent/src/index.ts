@@ -38,8 +38,8 @@ export {
 	type SessionStats,
 } from "./core/agent-session.js";
 export {
+	AntigravitySource,
 	type AssembledPrompt,
-	type AssembledPromptBlock,
 	EnvironmentSource,
 	PromptAssembly,
 	type PromptContext,

@@ -67,21 +67,18 @@ export class MultiAgentInstructionsSource implements PromptSource {
 				section: "coordination",
 				priority: 0,
 				content: AGENT_COMMUNICATION,
-				cacheable: true,
 				sourceName: this.name,
 			},
 			{
 				section: "coordination",
 				priority: 10,
 				content: BATCHING_GUIDANCE,
-				cacheable: true,
 				sourceName: this.name,
 			},
 			{
 				section: "coordination",
 				priority: 20,
 				content: roleLine,
-				cacheable: true,
 				sourceName: this.name,
 			},
 		];

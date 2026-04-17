@@ -100,7 +100,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/badlogic/pi-mono.git",
+		"url": "git+https://github.com/galletas1712/pi-relay.git",
 		"directory": "packages/coding-agent"
 	},
 	"engines": {

@@ -6,7 +6,6 @@ function createArgs(messages: string[] = []): Args {
 	return {
 		messages: [...messages],
 		fileArgs: [],
-		unknownFlags: new Map(),
 		diagnostics: [],
 	};
 }

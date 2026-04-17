@@ -19,22 +19,22 @@ function makeCtx(): PromptContext {
 
 describe("BackgroundCapabilitiesSource", () => {
 	it("contributes the background tool description under capabilities", () => {
-		const { blocks } = new PromptAssembly([new BackgroundCapabilitiesSource()]).assemble(makeCtx());
-		expect(blocks).toHaveLength(1);
-		expect(blocks[0].section).toBe("capabilities");
-		expect(blocks[0].text).toContain("## Background Tool Execution");
-		expect(blocks[0].text).toContain("__background");
+		const assembled = new PromptAssembly([new BackgroundCapabilitiesSource()]).assemble(makeCtx());
+		const capabilitiesFragments = assembled.sections.get("capabilities") ?? [];
+		expect(capabilitiesFragments).toHaveLength(1);
+		expect(capabilitiesFragments[0].content).toContain("## Background Tool Execution");
+		expect(assembled.text).toContain("__background");
 	});
 });
 
 describe("MultiAgentInstructionsSource", () => {
 	it("uses the root role line when the agent has no parent", () => {
 		const source = new MultiAgentInstructionsSource({ role: "root", hasParent: false });
-		const { blocks } = new PromptAssembly([source]).assemble(makeCtx());
-		expect(blocks).toHaveLength(1);
-		expect(blocks[0].section).toBe("coordination");
-		expect(blocks[0].text).toContain("You are the root agent. Your current role label is root.");
-		expect(blocks[0].text).toContain("## Agent Communication");
+		const assembled = new PromptAssembly([source]).assemble(makeCtx());
+		const coordinationFragments = assembled.sections.get("coordination") ?? [];
+		expect(coordinationFragments.length).toBeGreaterThan(0);
+		expect(assembled.text).toContain("You are the root agent. Your current role label is root.");
+		expect(assembled.text).toContain("## Agent Communication");
 	});
 
 	it("uses the child role line when the agent has a parent", () => {

@@ -26,7 +26,6 @@ export class BackgroundCapabilitiesSource implements PromptSource {
 				section: "capabilities",
 				priority: 0,
 				content: BACKGROUND_CAPABILITIES,
-				cacheable: true,
 				sourceName: this.name,
 			},
 		];

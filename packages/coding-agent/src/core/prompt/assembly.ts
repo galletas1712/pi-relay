@@ -1,7 +1,6 @@
 import {
 	SECTION_ORDER,
 	type AssembledPrompt,
-	type AssembledPromptBlock,
 	type PromptContext,
 	type PromptFragment,
 	type PromptSection,
@@ -79,23 +78,18 @@ export class PromptAssembly {
 			fragments.sort((left, right) => left.priority - right.priority);
 		}
 
-		const blocks: AssembledPromptBlock[] = [];
+		const sectionTexts: string[] = [];
 		for (const section of SECTION_ORDER) {
 			const fragments = fragmentsBySection.get(section) ?? [];
 			if (fragments.length === 0) {
 				continue;
 			}
-			const text = fragments.map((fragment) => fragment.content).join("\n\n");
-			const cacheable = fragments.every((fragment) => fragment.cacheable);
-			blocks.push({ section, text, cacheable });
+			sectionTexts.push(fragments.map((fragment) => fragment.content).join("\n\n"));
 		}
-
-		const text = blocks.map((block) => block.text).join("\n\n");
 
 		return {
 			sections: fragmentsBySection,
-			blocks,
-			text,
+			text: sectionTexts.join("\n\n"),
 		};
 	}
 }
