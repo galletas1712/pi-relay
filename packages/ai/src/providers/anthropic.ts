@@ -65,7 +65,6 @@ function getCacheControl(
 // Stealth mode: Mimic Claude Code's tool naming exactly
 const claudeCodeVersion = "2.1.75";
 const claudeCodeUserAgent = `claude-cli/${claudeCodeVersion} (external, cli)`;
-const claudeCodePrefix = "You are Claude Code, Anthropic's official CLI for Claude.";
 const attributionFingerprintSalt = "59cf53e54c78";
 const claudeCodeSessionHeader = "X-Claude-Code-Session-Id";
 const clientRequestIdHeader = "x-client-request-id";
@@ -798,11 +797,6 @@ function buildParams(
 				text: claudeCodeHints.attributionHeader,
 			});
 		}
-		params.system.push({
-			type: "text",
-			text: claudeCodePrefix,
-			...(cacheControl ? { cache_control: cacheControl } : {}),
-		});
 		if (context.systemPrompt) {
 			params.system.push({
 				type: "text",

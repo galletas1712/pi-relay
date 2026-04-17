@@ -5,6 +5,13 @@
 import { getDocsPath, getExamplesPath, getReadmePath } from "../config.js";
 import { formatSkillsForPrompt, type Skill } from "./skills.js";
 
+// Role preamble prepended to sessions routed through the direct Anthropic
+// provider, matching the original identity-mode behavior that used to live
+// inside the Anthropic provider itself. Claude models served by Bedrock,
+// Antigravity, OpenRouter, Vercel AI Gateway, etc. go out with a clean
+// system prompt; providers must NOT inject this themselves.
+const CLAUDE_CODE_ROLE_PREAMBLE = "You are Claude Code, Anthropic's official CLI for Claude.";
+
 export interface BuildSystemPromptOptions {
 	/** Custom system prompt (replaces default). */
 	customPrompt?: string;
@@ -22,6 +29,8 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	/** Pre-loaded skills. */
 	skills?: Skill[];
+	/** Selected model's provider id. Only "anthropic" (direct API) receives the Claude Code role preamble. */
+	provider?: string;
 }
 
 /** Build the system prompt with tools, guidelines, and context */
@@ -45,9 +54,11 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 
 	const contextFiles = providedContextFiles ?? [];
 	const skills = providedSkills ?? [];
+	const includePreamble = options.provider === "anthropic";
+	const preamble = includePreamble ? `${CLAUDE_CODE_ROLE_PREAMBLE}\n\n` : "";
 
 	if (customPrompt) {
-		let prompt = customPrompt;
+		let prompt = `${preamble}${customPrompt}`;
 
 		if (appendSection) {
 			prompt += appendSection;
@@ -124,7 +135,7 @@ export function buildSystemPrompt(options: BuildSystemPromptOptions = {}): strin
 
 	const guidelines = guidelinesList.map((g) => `- ${g}`).join("\n");
 
-	let prompt = `You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
+	let prompt = `${preamble}You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.
 
 Available tools:
 ${toolsList}
