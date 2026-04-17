@@ -37,6 +37,22 @@ export {
 	parseSkillBlock,
 	type SessionStats,
 } from "./core/agent-session.js";
+export {
+	type AssembledPrompt,
+	type AssembledPromptBlock,
+	EnvironmentSource,
+	PromptAssembly,
+	type PromptContext,
+	type PromptFragment,
+	type PromptPhase,
+	type PromptSection,
+	type PromptSource,
+	ProjectSource,
+	RoleSource,
+	type RoleSourceOptions,
+	SECTION_ORDER,
+	SkillsSource,
+} from "./core/prompt/index.js";
 // Auth and model registry
 export {
 	type ApiKeyCredential,

@@ -482,4 +482,44 @@ describe("Orchestrator", () => {
 		expect(orchestrator.getRecord(childId).status).toBe("running");
 		expect(root.sentMessages).toHaveLength(0);
 	});
+
+	it("registers background and multi-agent prompt sources on the root session", () => {
+		const root = new FakeSession("root-session");
+		new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(),
+			rootRole: "root",
+		});
+
+		const names = root.promptSources.map((source) => source.name);
+		expect(names).toEqual([
+			"orchestrator.background-capabilities",
+			"orchestrator.multi-agent",
+		]);
+	});
+
+	it("registers prompt sources with hasParent=true on spawned children", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		await orchestrator.spawnAgent("root", {
+			role: "explorer",
+			prompt: "inspect",
+		});
+
+		expect(child.promptSources).toHaveLength(2);
+		const multiAgent = child.promptSources.find((source) => source.name === "orchestrator.multi-agent");
+		const fragments = multiAgent?.contribute({
+			sessionId: child.sessionId,
+			cwd: "/tmp",
+			now: new Date(),
+			toolNames: [],
+		});
+		const text = fragments?.map((fragment) => fragment.content).join("\n");
+		expect(text).toContain("Your role in the current agent tree: explorer.");
+	});
 });

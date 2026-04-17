@@ -82,7 +82,15 @@ import { CURRENT_SESSION_VERSION, getLatestCompactionEntry, type SessionHeader }
 import type { SettingsManager } from "./settings-manager.js";
 import type { SlashCommandInfo } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
-import { buildSystemPrompt } from "./system-prompt.js";
+import {
+	EnvironmentSource,
+	PromptAssembly,
+	ProjectSource,
+	type PromptContext,
+	type PromptSource,
+	RoleSource,
+	SkillsSource,
+} from "./prompt/index.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { createToolDefinitionFromAgentTool, wrapToolDefinition } from "./tools/tool-definition-wrapper.js";
@@ -300,6 +308,10 @@ export class AgentSession {
 
 	// Base system prompt (without extension appends) - used to apply fresh appends each turn
 	private _baseSystemPrompt = "";
+
+	// Extra sources registered by extensions (orchestrator, custom extensions).
+	// These participate in every _rebuildSystemPrompt together with core sources.
+	private _extensionPromptSources: PromptSource[] = [];
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -907,16 +919,45 @@ export class AgentSession {
 		const loadedSkills = this._resourceLoader.getSkills().skills;
 		const loadedContextFiles = this._resourceLoader.getAgentsFiles().agentsFiles;
 
-		return buildSystemPrompt({
+		const assembly = new PromptAssembly([
+			new RoleSource({
+				customPrompt: loaderSystemPrompt,
+				appendSystemPrompt,
+				selectedTools: validToolNames,
+				toolSnippets,
+				promptGuidelines,
+			}),
+			new ProjectSource(loadedContextFiles),
+			new SkillsSource(loadedSkills),
+			new EnvironmentSource(),
+		]);
+		for (const source of this._extensionPromptSources) {
+			assembly.register(source);
+		}
+
+		const ctx: PromptContext = {
+			sessionId: this.sessionManager.getSessionId(),
 			cwd: this._cwd,
-			skills: loadedSkills,
-			contextFiles: loadedContextFiles,
-			customPrompt: loaderSystemPrompt,
-			appendSystemPrompt,
-			selectedTools: validToolNames,
-			toolSnippets,
-			promptGuidelines,
-		});
+			model: this.agent.state.model,
+			now: new Date(),
+			toolNames: validToolNames,
+		};
+
+		return assembly.assemble(ctx).text;
+	}
+
+	/**
+	 * Register an additional PromptSource that participates in system-prompt assembly.
+	 * Called by extensions (e.g., the orchestrator) to contribute their fragments.
+	 * Triggers a rebuild so the new source is reflected immediately.
+	 */
+	addPromptSource(source: PromptSource): void {
+		if (this._extensionPromptSources.some((existing) => existing.name === source.name)) {
+			throw new Error(`PromptSource already registered: ${source.name}`);
+		}
+		this._extensionPromptSources.push(source);
+		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
+		this.agent.state.systemPrompt = this._baseSystemPrompt;
 	}
 
 	// =========================================================================
