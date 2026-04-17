@@ -21,6 +21,10 @@
 			"types": "./dist/client/index.d.ts",
 			"import": "./dist/client/index.js"
 		},
+		"./client/rpc": {
+			"types": "./dist/client/rpc/index.d.ts",
+			"import": "./dist/client/rpc/index.js"
+		},
 		"./hooks": {
 			"types": "./dist/core/hooks/index.d.ts",
 			"import": "./dist/core/hooks/index.js"

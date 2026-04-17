@@ -1,14 +1,24 @@
 // Core session management
 
-// Client SDK (in-process; future RPC client will implement the same Client interface)
+// Client SDK. LocalClient wraps the in-process runtime; RpcClient/RpcServer bridge
+// the same Client interface over newline-delimited JSON on a duplex byte stream.
 export {
 	type AuthStatus,
 	type Client,
+	decodeMessage,
+	encodeMessage,
 	LocalClient,
 	type LocalClientInternals,
+	type MethodMap,
 	type ModelInfo,
+	type NodeIO,
 	type OpenSessionOptions,
 	type ResumeOptions,
+	RpcClient,
+	type RpcErrorPayload,
+	type RpcMessage,
+	type RpcMethod,
+	RpcServer,
 	type SessionEvent,
 	type SessionHandle,
 	type SessionState,
@@ -312,7 +322,6 @@ export {
 	type InteractiveModeOptions,
 	type PrintModeOptions,
 	runPrintMode,
-	runRpcMode,
 } from "./modes/index.js";
 // UI components for extensions
 export {
