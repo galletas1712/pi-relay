@@ -150,6 +150,56 @@ describe("Anthropic model capability hydration", () => {
 		expect(getThinkingLevels(model)).toContain("max");
 	});
 
+	it("injects xhigh for Opus 4.7 even when the capabilities omit it", () => {
+		const model: Model<"anthropic-messages"> = {
+			...getModel("anthropic", "claude-opus-4-7")!,
+			capabilities: {
+				effort: {
+					supported: true,
+					low: { supported: true },
+					medium: { supported: true },
+					high: { supported: true },
+					max: { supported: true },
+					xhigh: null,
+				},
+				thinking: {
+					supported: true,
+					types: {
+						adaptive: { supported: true },
+						enabled: { supported: false },
+					},
+				},
+			} satisfies ModelCapabilities,
+		};
+
+		expect(getThinkingLevels(model)).toEqual(["low", "medium", "high", "xhigh", "max"]);
+	});
+
+	it("does not inject xhigh for other Anthropic adaptive models", () => {
+		const model: Model<"anthropic-messages"> = {
+			...getModel("anthropic", "claude-opus-4-6")!,
+			capabilities: {
+				effort: {
+					supported: true,
+					low: { supported: true },
+					medium: { supported: true },
+					high: { supported: true },
+					max: { supported: true },
+					xhigh: null,
+				},
+				thinking: {
+					supported: true,
+					types: {
+						adaptive: { supported: true },
+						enabled: { supported: false },
+					},
+				},
+			} satisfies ModelCapabilities,
+		};
+
+		expect(getThinkingLevels(model)).not.toContain("xhigh");
+	});
+
 	it("does not expose adaptive effort levels when adaptive thinking is unavailable", () => {
 		const model: Model<"anthropic-messages"> = {
 			...getModel("anthropic", "claude-sonnet-4-5")!,
