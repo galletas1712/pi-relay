@@ -15,9 +15,9 @@
 		"test": "vitest --run"
 	},
 	"dependencies": {
-		"@mariozechner/pi-agent-core": "^0.67.3",
-		"@mariozechner/pi-ai": "^0.67.3",
-		"@mariozechner/pi-coding-agent": "^0.67.3",
+		"@mariozechner/pi-agent-core": "^0.67.5",
+		"@mariozechner/pi-ai": "^0.67.5",
+		"@mariozechner/pi-coding-agent": "^0.67.5",
 		"@pi-relay/orchestrator": "^0.1.0",
 		"@sinclair/typebox": "^0.34.41",
 		"diff": "^8.0.2",

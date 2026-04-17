@@ -3,15 +3,12 @@
 	"private": true,
 	"type": "module",
 	"workspaces": [
-		"packages/*",
-		"pi-mono/packages/ai",
-		"pi-mono/packages/tui",
-		"pi-mono/packages/coding-agent"
+		"packages/*"
 	],
 	"scripts": {
 		"clean": "npm run clean --workspaces --if-present",
-		"build": "cd pi-mono/packages/tui && npm run build && cd ../../.. && cd pi-mono/packages/ai && npm run build && cd ../../.. && cd packages/agent-core && npm run build && cd ../.. && cd pi-mono/packages/coding-agent && npm run build && cd ../../.. && cd packages/orchestrator && npm run build && cd ../.. && cd packages/app && npm run build",
-		"build:deps": "cd pi-mono/packages/tui && npm run build && cd ../../.. && cd pi-mono/packages/ai && npm run build && cd ../../.. && cd packages/agent-core && npm run build && cd ../.. && cd pi-mono/packages/coding-agent && npm run build",
+		"build": "cd packages/tui && npm run build && cd ../.. && cd packages/ai && npm run build && cd ../.. && cd packages/agent-core && npm run build && cd ../.. && cd packages/coding-agent && npm run build && cd ../.. && cd packages/orchestrator && npm run build && cd ../.. && cd packages/app && npm run build",
+		"build:deps": "cd packages/tui && npm run build && cd ../.. && cd packages/ai && npm run build && cd ../.. && cd packages/agent-core && npm run build && cd ../.. && cd packages/coding-agent && npm run build",
 		"build:app": "cd packages/app && npm run build",
 		"dev": "cd packages/app && npm run dev",
 		"start": "node packages/app/dist/index.js",
