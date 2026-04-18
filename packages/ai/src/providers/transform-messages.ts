@@ -96,8 +96,12 @@ export function transformMessages<TApi extends Api>(
 	});
 
 	// Second pass: insert synthetic empty tool results for orphaned tool calls
-	// This preserves thinking signatures and satisfies API requirements
+	// This preserves thinking signatures and satisfies API requirements.
+	// Also drop toolResult messages whose matching assistant tool_use got
+	// filtered out (e.g. dropped aborted/error assistant, cross-model migration)
+	// — otherwise providers like Anthropic return 400 "unexpected tool_use_id".
 	const result: Message[] = [];
+	const keptToolCallIds = new Set<string>();
 	let pendingToolCalls: ToolCall[] = [];
 	let existingToolResultIds = new Set<string>();
 	const insertSyntheticToolResults = () => {
@@ -141,10 +145,18 @@ export function transformMessages<TApi extends Api>(
 			if (toolCalls.length > 0) {
 				pendingToolCalls = toolCalls;
 				existingToolResultIds = new Set();
+				for (const tc of toolCalls) {
+					keptToolCallIds.add(tc.id);
+				}
 			}
 
 			result.push(msg);
 		} else if (msg.role === "toolResult") {
+			if (!keptToolCallIds.has(msg.toolCallId)) {
+				// Orphan: matching assistant tool_use was filtered out upstream.
+				// Dropping here avoids provider-side "unexpected tool_use_id" errors.
+				continue;
+			}
 			existingToolResultIds.add(msg.toolCallId);
 			result.push(msg);
 		} else if (msg.role === "user") {
