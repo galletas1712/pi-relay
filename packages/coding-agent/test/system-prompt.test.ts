@@ -1,6 +1,7 @@
 import type { Model } from "@pi-relay/ai";
 import { describe, expect, test } from "vitest";
 import {
+	AntigravitySource,
 	EnvironmentSource,
 	PromptAssembly,
 	ProjectSource,
@@ -208,6 +209,30 @@ describe("PromptAssembly", () => {
 		const sections = blocks.map((block) => block.section);
 		expect(sections).toEqual(["role", "environment"]);
 		expect(blocks.every((block) => block.cacheable)).toBe(true);
+	});
+
+	test("AntigravitySource injects handshake fragment only for google-antigravity", () => {
+		const assembly = new PromptAssembly([
+			new RoleSource({ selectedTools: ["read"] }),
+			new AntigravitySource(),
+		]);
+
+		const antigravityPrompt = assembly.assemble(makeCtx({ model: modelFor("google-antigravity") })).text;
+		expect(antigravityPrompt).toContain("You are Antigravity");
+		expect(antigravityPrompt).toContain("[ignore]");
+		expect(antigravityPrompt).toContain("[/ignore]");
+		// Fragment lands inside the role section with priority -10, so it sits before the
+		// role preamble / default body.
+		const antigravityIdx = antigravityPrompt.indexOf("You are Antigravity");
+		const pidx = antigravityPrompt.indexOf("expert coding assistant");
+		expect(antigravityIdx).toBeGreaterThanOrEqual(0);
+		expect(pidx).toBeGreaterThan(antigravityIdx);
+
+		const anthropicPrompt = assembly.assemble(makeCtx({ model: modelFor("anthropic") })).text;
+		expect(anthropicPrompt).not.toContain("You are Antigravity");
+
+		const noModelPrompt = assembly.assemble(makeCtx()).text;
+		expect(noModelPrompt).not.toContain("You are Antigravity");
 	});
 
 	test("environment block reflects the injected date and cwd", () => {

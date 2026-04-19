@@ -1,4 +1,5 @@
 export { PromptAssembly } from "./assembly.js";
+export { AntigravitySource } from "./sources/antigravity.js";
 export { EnvironmentSource } from "./sources/environment.js";
 export { ProjectSource, type ContextFile } from "./sources/project.js";
 export { RoleSource, type RoleSourceOptions } from "./sources/role.js";

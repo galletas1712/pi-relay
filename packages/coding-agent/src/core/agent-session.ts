@@ -83,6 +83,7 @@ import type { SettingsManager } from "./settings-manager.js";
 import type { SlashCommandInfo } from "./slash-commands.js";
 import { createSyntheticSourceInfo, type SourceInfo } from "./source-info.js";
 import {
+	AntigravitySource,
 	EnvironmentSource,
 	PromptAssembly,
 	ProjectSource,
@@ -927,6 +928,7 @@ export class AgentSession {
 				toolSnippets,
 				promptGuidelines,
 			}),
+			new AntigravitySource(),
 			new ProjectSource(loadedContextFiles),
 			new SkillsSource(loadedSkills),
 			new EnvironmentSource(),
