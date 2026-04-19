@@ -94,10 +94,17 @@ export class RpcServer {
 		try {
 			message = decodeMessage(line);
 		} catch (err) {
+			// Inbound frame is malformed. Emit an error frame on id: -1 so the
+			// other side has something to diagnose (client-side rejects all
+			// pending calls on its own parse errors, so -1 is fine here).
+			// Include a truncated snippet so wire corruption can be diagnosed.
+			const snippet = line.length > 200 ? `${line.slice(0, 200)}…` : line;
 			this.write({
 				type: "error",
 				id: -1,
-				error: { message: `parse error: ${(err as Error).message}` },
+				error: {
+					message: `parse error: ${(err as Error).message}. Dropped frame: ${snippet}`,
+				},
 			});
 			return;
 		}

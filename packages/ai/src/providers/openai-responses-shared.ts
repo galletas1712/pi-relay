@@ -169,8 +169,13 @@ export function convertResponsesMessages<TApi extends Api>(
 			for (const block of msg.content) {
 				if (block.type === "thinking") {
 					if (block.thinkingSignature) {
-						const reasoningItem = JSON.parse(block.thinkingSignature) as ResponseReasoningItem;
-						output.push(reasoningItem);
+						try {
+							const reasoningItem = JSON.parse(block.thinkingSignature) as ResponseReasoningItem;
+							output.push(reasoningItem);
+						} catch {
+							// Corrupt thinkingSignature — degrade gracefully by dropping the
+							// reasoning block rather than crashing the whole conversion.
+						}
 					}
 				} else if (block.type === "text") {
 					const textBlock = block as TextContent;
