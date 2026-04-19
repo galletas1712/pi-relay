@@ -8,6 +8,7 @@
 
 import type { AssistantMessage, ImageContent } from "@pi-relay/ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.js";
+import { formatCacheLogLine, isCacheStatsEnabled } from "../core/cache-telemetry.js";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../utils/shell.js";
 
@@ -35,6 +36,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
 	let disposed = false;
+	let turnCounter = 0;
 	const signalCleanupHandlers: Array<() => void> = [];
 
 	const disposeRuntime = async (): Promise<void> => {
@@ -112,6 +114,19 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		unsubscribe = session.subscribe((event) => {
 			if (mode === "json") {
 				writeRawStdout(`${JSON.stringify(event)}\n`);
+			}
+			// Dev-only per-turn cache telemetry: emits on every completed assistant
+			// turn. Written to stderr so stdout stays pristine for text-mode piping
+			// and JSON-mode parsing. Gated on PI_SHOW_CACHE_STATS=1.
+			if (
+				isCacheStatsEnabled() &&
+				event.type === "message_end" &&
+				event.message.role === "assistant"
+			) {
+				turnCounter += 1;
+				process.stderr.write(
+					`${formatCacheLogLine({ turn: turnCounter, usage: event.message.usage })}\n`,
+				);
 			}
 		});
 	};

@@ -1,5 +1,6 @@
 import { type Component, truncateToWidth, visibleWidth } from "@pi-relay/tui";
 import type { AgentSession } from "../../../core/agent-session.js";
+import { formatTurnCacheStats, isCacheStatsEnabled } from "../../../core/cache-telemetry.js";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
 import { theme } from "../theme/theme.js";
 
@@ -71,6 +72,11 @@ export class FooterComponent implements Component {
 		let totalCacheRead = 0;
 		let totalCacheWrite = 0;
 		let totalCost = 0;
+		// Per-turn cache telemetry (PR-4): surface the LAST assistant turn's cache
+		// read/write counts so developers can attribute hits to the turn that
+		// produced them. Gated on PI_SHOW_CACHE_STATS=1 at render time.
+		let lastTurnCacheRead = 0;
+		let lastTurnCacheWrite = 0;
 
 		for (const entry of this.session.sessionManager.getEntries()) {
 			if (entry.type === "message" && entry.message.role === "assistant") {
@@ -79,6 +85,8 @@ export class FooterComponent implements Component {
 				totalCacheRead += entry.message.usage.cacheRead;
 				totalCacheWrite += entry.message.usage.cacheWrite;
 				totalCost += entry.message.usage.cost.total;
+				lastTurnCacheRead = entry.message.usage.cacheRead;
+				lastTurnCacheWrite = entry.message.usage.cacheWrite;
 			}
 		}
 
@@ -114,6 +122,12 @@ export class FooterComponent implements Component {
 		if (totalOutput) statsParts.push(`↓${formatTokens(totalOutput)}`);
 		if (totalCacheRead) statsParts.push(`R${formatTokens(totalCacheRead)}`);
 		if (totalCacheWrite) statsParts.push(`W${formatTokens(totalCacheWrite)}`);
+
+		// Per-turn cache delta (dev-only, gated on PI_SHOW_CACHE_STATS=1).
+		if (isCacheStatsEnabled()) {
+			const turnStats = formatTurnCacheStats({ cacheRead: lastTurnCacheRead, cacheWrite: lastTurnCacheWrite });
+			if (turnStats) statsParts.push(turnStats);
+		}
 
 		// Show cost with "(sub)" indicator only for subscription-backed auth.
 		const usingSubscription = state.model ? this.session.modelRegistry.isUsingSubscriptionAuth(state.model) : false;
