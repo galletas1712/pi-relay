@@ -1016,23 +1016,34 @@ function convertMessages(
 		}
 	}
 
-	// Add cache_control to the last user message to cache conversation history
+	// Stamp cache_control on the last two user-role messages to maximize
+	// cache-hit rate across fork/abort/compaction. Prior art: opencode's
+	// packages/opencode/src/provider/transform.ts:216-218 does slice(-2) on
+	// non-system messages for the same reason. The prior turn's msg[-1]
+	// naturally becomes the next turn's msg[-2] cache hit as conversation
+	// grows. Fills the 4th of Anthropic's 4 allowed breakpoints per request.
 	if (cacheControl && params.length > 0) {
-		const lastMessage = params[params.length - 1];
-		if (lastMessage.role === "user") {
-			if (Array.isArray(lastMessage.content)) {
-				const lastBlock = lastMessage.content[lastMessage.content.length - 1];
+		const userIndices: number[] = [];
+		for (let i = params.length - 1; i >= 0 && userIndices.length < 2; i--) {
+			if (params[i].role === "user") {
+				userIndices.push(i);
+			}
+		}
+		for (const idx of userIndices) {
+			const message = params[idx];
+			if (Array.isArray(message.content)) {
+				const lastBlock = message.content[message.content.length - 1];
 				if (
 					lastBlock &&
 					(lastBlock.type === "text" || lastBlock.type === "image" || lastBlock.type === "tool_result")
 				) {
 					(lastBlock as any).cache_control = cacheControl;
 				}
-			} else if (typeof lastMessage.content === "string") {
-				lastMessage.content = [
+			} else if (typeof message.content === "string") {
+				message.content = [
 					{
 						type: "text",
-						text: lastMessage.content,
+						text: message.content,
 						cache_control: cacheControl,
 					},
 				] as any;
