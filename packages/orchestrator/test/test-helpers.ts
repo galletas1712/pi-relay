@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, AgentTool } from "@pi-relay/agent-core";
 import type { Message, Model } from "@pi-relay/ai";
-import type { AgentSessionEvent } from "@pi-relay/coding-agent";
+import type { AgentSessionEvent, PromptSource } from "@pi-relay/coding-agent";
 import type { AgentSessionHandle, SessionCustomMessage } from "../src/types.js";
 
 export const TEST_MODEL: Model<any> = {
@@ -42,6 +42,7 @@ export class FakeSession implements AgentSessionHandle {
 	readonly prompts: string[] = [];
 	readonly appendedSessionMessages: AgentMessage[] = [];
 	readonly boundExtensionCalls: object[] = [];
+	readonly promptSources: PromptSource[] = [];
 	lastAssistantText?: string;
 	private readonly listeners = new Set<(event: AgentSessionEvent) => void>();
 
@@ -139,6 +140,10 @@ export class FakeSession implements AgentSessionHandle {
 	}
 
 	async abort() {}
+
+	addPromptSource(source: PromptSource) {
+		this.promptSources.push(source);
+	}
 
 	dispose() {}
 

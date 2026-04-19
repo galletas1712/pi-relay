@@ -6,6 +6,7 @@ import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@pi-rela
 import { validateToolArguments, type ToolResultMessage, type UserMessage } from "@pi-relay/ai";
 import { serializeConversation, type AgentSessionEvent, type ToolDefinition } from "@pi-relay/coding-agent";
 import { createAgentContextTransform } from "./context-transform.js";
+import { BackgroundCapabilitiesSource, MultiAgentInstructionsSource } from "./prompt/index.js";
 import { createMessageTool } from "./tools/message.js";
 import { createReportTool } from "./tools/report.js";
 import { createSpawnTool } from "./tools/spawn.js";
@@ -437,6 +438,13 @@ export class Orchestrator {
 		record.session.agent.onBackgroundToolEnd = (context) => {
 			this.toolTracker.complete(context.toolCallId, context.status);
 		};
+		record.session.addPromptSource(new BackgroundCapabilitiesSource());
+		record.session.addPromptSource(
+			new MultiAgentInstructionsSource({
+				role: record.role,
+				hasParent: record.parentId !== null,
+			}),
+		);
 		this.records.set(record.id, record);
 		this.sessionIdToAgentId.set(record.session.sessionId, record.id);
 		this.restoredDisposedEntries.delete(record.id);

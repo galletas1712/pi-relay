@@ -45,58 +45,6 @@ describe("createOrchestratorExtension", () => {
 		expect(sendUserMessage).not.toHaveBeenCalled();
 	});
 
-	it("rewrites the system prompt with role-aware orchestrator guidance", async () => {
-		const orchestrator = {
-			getAgentIdBySessionId: vi.fn(() => "child-agent"),
-			getRecord: vi.fn(() => ({
-				role: "runtime-inspector",
-				parentId: "root",
-			})),
-		} satisfies Partial<Orchestrator>;
-		const { handlers } = buildHandlers(orchestrator);
-
-		const beforeAgentStart = handlers.get("before_agent_start");
-		expect(beforeAgentStart).toBeDefined();
-		const result = await beforeAgentStart?.(
-			{ systemPrompt: "Base prompt" },
-			{
-				sessionManager: {
-					getSessionId: () => "child-session",
-				},
-			},
-		);
-
-		expect(result).toEqual(
-			expect.objectContaining({
-				systemPrompt: expect.stringContaining("Some tools support a `__background` parameter."),
-			}),
-		);
-		expect(String(result?.systemPrompt)).toContain("Your role in the current agent tree: runtime-inspector.");
-		expect(String(result?.systemPrompt)).toContain("`spawn`: create a child agent for an independent subtask");
-		expect(String(result?.systemPrompt)).toContain(
-			"If you need several independent tool calls for the same turn, emit them together in one assistant response",
-		);
-		expect(String(result?.systemPrompt)).toContain(
-			"If you decide to delegate several independent subtasks, emit all of the `spawn` calls in the same assistant response so the children start together.",
-		);
-		expect(String(result?.systemPrompt)).toContain(
-			"Do not produce extra summaries or coordination messages just because a child reported progress.",
-		);
-		expect(String(result?.systemPrompt)).toContain("Prefer one final report near the end over many small status pings.");
-		expect(String(result?.systemPrompt)).toContain(
-			"When you have solid findings, a concrete decision, or a completed result your parent is likely to need, send one concise `report` before finishing.",
-		);
-		expect(String(result?.systemPrompt)).toContain(
-			"Use `report` when the update should change parent behavior now: reprioritize work, redirect a sibling, stop duplicate effort, or react to a blocker/risk.",
-		);
-		expect(String(result?.systemPrompt)).toContain(
-			"Do not rely on `IDLE` to carry your substantive result to your parent.",
-		);
-		expect(String(result?.systemPrompt)).toContain(
-			"If several direct children are still active, wait for the remaining children instead of summarizing each finished child separately",
-		);
-	});
-
 	it("only disposes the orchestrator when the root session shuts down", async () => {
 		const dispose = vi.fn(async () => {});
 		const orchestrator = {
