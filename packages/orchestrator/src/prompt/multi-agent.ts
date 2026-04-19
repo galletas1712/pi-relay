@@ -76,8 +76,8 @@ export class MultiAgentInstructionsSource implements PromptSource {
 				sourceName: this.name,
 			},
 			{
-				section: "coordination",
-				priority: 20,
+				section: "role_per_agent",
+				priority: 0,
 				content: roleLine,
 				sourceName: this.name,
 			},
