@@ -276,7 +276,19 @@ export class RpcClient implements Client {
 		let message;
 		try {
 			message = decodeMessage(line);
-		} catch {
+		} catch (err) {
+			// Frame could not be parsed. Rather than silently dropping — which can
+			// strand in-flight RPC promises forever and leave the caller hung with
+			// no observable signal — reject every pending call with a descriptive
+			// error. The client stays alive; subsequent frames process normally.
+			const snippet = line.length > 200 ? `${line.slice(0, 200)}…` : line;
+			const parseErr = new Error(
+				`RPC frame parse error (${(err as Error).message}). Dropped frame: ${snippet}`,
+			);
+			for (const [id, pending] of this.pending) {
+				pending.reject(parseErr);
+				this.pending.delete(id);
+			}
 			return;
 		}
 		if (message.type === "event") {
