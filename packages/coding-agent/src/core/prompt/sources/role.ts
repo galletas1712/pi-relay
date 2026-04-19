@@ -38,7 +38,6 @@ export class RoleSource implements PromptSource {
 			section: "role",
 			priority: 0,
 			content: body,
-			cacheable: true,
 			sourceName: this.name,
 		});
 
@@ -47,7 +46,6 @@ export class RoleSource implements PromptSource {
 				section: "role",
 				priority: 10,
 				content: this.options.appendSystemPrompt,
-				cacheable: true,
 				sourceName: this.name,
 			});
 		}

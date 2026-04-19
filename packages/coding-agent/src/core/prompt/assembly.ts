@@ -1,9 +1,11 @@
 import {
 	SECTION_ORDER,
+	SECTION_RETENTION,
 	type AssembledPrompt,
 	type AssembledPromptBlock,
 	type PromptContext,
 	type PromptFragment,
+	type PromptRetention,
 	type PromptSection,
 	type PromptSource,
 } from "./types.js";
@@ -12,8 +14,8 @@ import {
  * Registers PromptSource instances and assembles a structured system prompt.
  *
  * Fragments emitted by sources are grouped by section, sorted by priority,
- * then concatenated (fragments with two newlines between them, sections with
- * two newlines between them). Source name uniqueness is enforced at register
+ * then coalesced into AssembledPromptBlocks by consecutive-matching retention
+ * tier (per SECTION_RETENTION). Source name uniqueness is enforced at register
  * time — duplicates throw.
  */
 export class PromptAssembly {
@@ -79,15 +81,45 @@ export class PromptAssembly {
 			fragments.sort((left, right) => left.priority - right.priority);
 		}
 
-		const blocks: AssembledPromptBlock[] = [];
+		// Per-section rendered text. Skip empty sections.
+		const renderedSections: Array<{ section: PromptSection; text: string }> = [];
 		for (const section of SECTION_ORDER) {
 			const fragments = fragmentsBySection.get(section) ?? [];
-			if (fragments.length === 0) {
-				continue;
+			if (fragments.length === 0) continue;
+			const text = fragments.map((f) => f.content).join("\n\n");
+			if (text.length === 0) continue;
+			renderedSections.push({ section, text });
+		}
+
+		// Group consecutive sections sharing a retention tier into blocks.
+		const blocks: AssembledPromptBlock[] = [];
+		let currentSections: PromptSection[] = [];
+		let currentTexts: string[] = [];
+		let currentRetention: PromptRetention | null = null;
+		for (const { section, text } of renderedSections) {
+			const retention = SECTION_RETENTION[section];
+			if (retention !== currentRetention) {
+				if (currentSections.length > 0 && currentRetention !== null) {
+					blocks.push({
+						sections: currentSections,
+						retention: currentRetention,
+						text: currentTexts.join("\n\n"),
+					});
+				}
+				currentSections = [section];
+				currentTexts = [text];
+				currentRetention = retention;
+			} else {
+				currentSections.push(section);
+				currentTexts.push(text);
 			}
-			const text = fragments.map((fragment) => fragment.content).join("\n\n");
-			const cacheable = fragments.every((fragment) => fragment.cacheable);
-			blocks.push({ section, text, cacheable });
+		}
+		if (currentSections.length > 0 && currentRetention !== null) {
+			blocks.push({
+				sections: currentSections,
+				retention: currentRetention,
+				text: currentTexts.join("\n\n"),
+			});
 		}
 
 		const text = blocks.map((block) => block.text).join("\n\n");

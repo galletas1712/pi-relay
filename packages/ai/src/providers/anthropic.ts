@@ -35,14 +35,21 @@ import { transformMessages } from "./transform-messages.js";
 
 /**
  * Resolve cache retention preference.
- * Defaults to "short" and uses PI_CACHE_RETENTION for backward compatibility.
+ *
+ * Defaults to "short". `PI_CACHE_RETENTION=none` continues to act as a global
+ * kill switch that disables all `cache_control` stamping, including on
+ * per-block retention tiers supplied via `context.systemBlocks`.
+ *
+ * `PI_CACHE_RETENTION=long` is no longer honored: per-block retention is
+ * authoritative now, so long-TTL writes are driven by individual blocks
+ * declaring `retention: "long"` rather than by a global knob.
  */
 function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
 	if (cacheRetention) {
 		return cacheRetention;
 	}
-	if (typeof process !== "undefined" && process.env.PI_CACHE_RETENTION === "long") {
-		return "long";
+	if (typeof process !== "undefined" && process.env.PI_CACHE_RETENTION === "none") {
+		return "none";
 	}
 	return "short";
 }
@@ -60,6 +67,27 @@ function getCacheControl(
 		retention,
 		cacheControl: { type: "ephemeral", ...(ttl && { ttl }) },
 	};
+}
+
+/**
+ * Resolve per-block `cache_control` for a system-prompt block emitted from
+ * `context.systemBlocks`. Returns undefined when no stamp should be written:
+ *
+ * - Block retention is "none" (per-block opt-out).
+ * - Global `PI_CACHE_RETENTION=none` kill switch is active.
+ *
+ * Long-TTL (1h) is only honored on direct `api.anthropic.com` baseUrls because
+ * Bedrock / Vertex / OpenRouter-style relays don't persist the extended TTL.
+ */
+function cacheControlForBlockRetention(
+	retention: "none" | "short" | "long",
+	baseUrl: string,
+	envRetention: CacheRetention,
+): CacheControlEphemeral | undefined {
+	if (envRetention === "none") return undefined;
+	if (retention === "none") return undefined;
+	const useLongTtl = retention === "long" && baseUrl.includes("api.anthropic.com");
+	return { type: "ephemeral", ...(useLongTtl && { ttl: "1h" as const }) };
 }
 
 // Stealth mode: Mimic Claude Code's tool naming exactly
@@ -781,6 +809,7 @@ function buildParams(
 	options?: AnthropicOptions,
 	claudeCodeHints?: ClaudeCodeHints,
 ): MessageCreateParamsStreaming {
+	const envRetention = resolveCacheRetention(options?.cacheRetention);
 	const { cacheControl } = getCacheControl(model.baseUrl, options?.cacheRetention);
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
@@ -789,23 +818,46 @@ function buildParams(
 		stream: true,
 	};
 
+	const blocks = context.systemBlocks;
+	const hasBlocks = !!blocks && blocks.length > 0;
+
 	if (claudeCodeHints?.identityHeaders || isOAuthToken) {
 		params.system = [];
 		if (claudeCodeHints?.attributionHeader) {
+			// Attribution header MUST remain first and uncached: pi-relay blocks follow.
 			params.system.push({
 				type: "text",
 				text: claudeCodeHints.attributionHeader,
 			});
 		}
-		if (context.systemPrompt) {
+		if (hasBlocks) {
+			for (const block of blocks) {
+				const cc = cacheControlForBlockRetention(block.retention, model.baseUrl, envRetention);
+				params.system.push({
+					type: "text",
+					text: sanitizeSurrogates(block.text),
+					...(cc ? { cache_control: cc } : {}),
+				});
+			}
+		} else if (context.systemPrompt) {
 			params.system.push({
 				type: "text",
 				text: sanitizeSurrogates(context.systemPrompt),
 				...(cacheControl ? { cache_control: cacheControl } : {}),
 			});
 		}
+	} else if (hasBlocks) {
+		// Non-OAuth: emit each retention-tier block as its own text element.
+		params.system = blocks.map((block) => {
+			const cc = cacheControlForBlockRetention(block.retention, model.baseUrl, envRetention);
+			return {
+				type: "text" as const,
+				text: sanitizeSurrogates(block.text),
+				...(cc ? { cache_control: cc } : {}),
+			};
+		});
 	} else if (context.systemPrompt) {
-		// Add cache control to system prompt for non-OAuth tokens
+		// Legacy flat-string fallback for callers that haven't supplied systemBlocks.
 		params.system = [
 			{
 				type: "text",
@@ -821,7 +873,12 @@ function buildParams(
 	}
 
 	if (context.tools) {
-		params.tools = convertTools(context.tools, isOAuthToken, cacheControl);
+		// Tools precede the system prompt in Anthropic's cache-key computation, so
+		// the system breakpoint already covers tools via the cumulative prefix hash.
+		// Stamping a separate `cache_control` on the last tool would consume one of
+		// the 4 per-request breakpoints for no additional capability; better spent
+		// on a second system breakpoint (via systemBlocks) or the message tail.
+		params.tools = convertTools(context.tools, isOAuthToken);
 	}
 
 	// Configure thinking mode: adaptive (Opus 4.6 and Sonnet 4.6),
@@ -1054,14 +1111,10 @@ function convertMessages(
 	return params;
 }
 
-function convertTools(
-	tools: Tool[],
-	isOAuthToken: boolean,
-	cacheControl?: CacheControlEphemeral,
-): Anthropic.Messages.Tool[] {
+function convertTools(tools: Tool[], isOAuthToken: boolean): Anthropic.Messages.Tool[] {
 	if (!tools) return [];
 
-	return tools.map((tool, index) => {
+	return tools.map((tool) => {
 		const schema = tool.parameters as { properties?: unknown; required?: string[] };
 
 		return {
@@ -1072,7 +1125,6 @@ function convertTools(
 				properties: schema.properties ?? {},
 				required: schema.required ?? [],
 			},
-			...(cacheControl && index === tools.length - 1 ? { cache_control: cacheControl } : {}),
 		};
 	});
 }

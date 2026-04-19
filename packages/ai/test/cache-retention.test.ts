@@ -48,27 +48,33 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			},
 		);
 
-		it.skipIf(!process.env.ANTHROPIC_API_KEY)("should use 1h cache TTL when PI_CACHE_RETENTION=long", async () => {
-			process.env.PI_CACHE_RETENTION = "long";
-			const model = getModel("anthropic", "claude-3-5-haiku-20241022");
-			let capturedPayload: any = null;
+		// Note: `PI_CACHE_RETENTION=long` is no longer honored by the Anthropic
+		// provider. Per-block retention is authoritative (see systemBlocks path).
+		// Setting the env var to "long" now silently falls back to default "short"
+		// behavior. `PI_CACHE_RETENTION=none` still works as a global kill switch.
+		it.skipIf(!process.env.ANTHROPIC_API_KEY)(
+			"PI_CACHE_RETENTION=long is now inert on Anthropic (per-block retention is authoritative)",
+			async () => {
+				process.env.PI_CACHE_RETENTION = "long";
+				const model = getModel("anthropic", "claude-3-5-haiku-20241022");
+				let capturedPayload: any = null;
 
-			const s = stream(model, context, {
-				onPayload: (payload) => {
-					capturedPayload = payload;
-				},
-			});
+				const s = stream(model, context, {
+					onPayload: (payload) => {
+						capturedPayload = payload;
+					},
+				});
 
-			// Consume the stream to trigger the request
-			for await (const _ of s) {
-				// Just consume
-			}
+				for await (const _ of s) {
+					// Just consume
+				}
 
-			expect(capturedPayload).not.toBeNull();
-			// System prompt should have cache_control with ttl: "1h"
-			expect(capturedPayload.system).toBeDefined();
-			expect(capturedPayload.system[0].cache_control).toEqual({ type: "ephemeral", ttl: "1h" });
-		});
+				expect(capturedPayload).not.toBeNull();
+				// Expected: default-short cache_control, no ttl.
+				expect(capturedPayload.system).toBeDefined();
+				expect(capturedPayload.system[0].cache_control).toEqual({ type: "ephemeral" });
+			},
+		);
 
 		it("should not add ttl when baseUrl is not api.anthropic.com", async () => {
 			process.env.PI_CACHE_RETENTION = "long";

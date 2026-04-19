@@ -29,7 +29,6 @@ export class SkillsSource implements PromptSource {
 				section: "skills",
 				priority: 0,
 				content: formatted,
-				cacheable: true,
 				sourceName: this.name,
 			},
 		];

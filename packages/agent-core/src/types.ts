@@ -6,6 +6,7 @@ import type {
 	Model,
 	SimpleStreamOptions,
 	streamSimple,
+	SystemBlock,
 	TextContent,
 	Tool,
 	ToolResultMessage,
@@ -249,6 +250,13 @@ export type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessag
 export interface AgentState {
 	/** System prompt sent with each model request. */
 	systemPrompt: string;
+	/**
+	 * Structured system-prompt blocks with per-block retention hints. Mirrors
+	 * `systemPrompt` but carries the PromptAssembly tier information the Anthropic
+	 * provider consumes for multi-block `cache_control`. May be undefined when
+	 * `systemPrompt` was set by an extension that doesn't produce blocks.
+	 */
+	systemBlocks?: readonly SystemBlock[];
 	/** Active model used for future turns. */
 	model: Model<any>;
 	/** Requested reasoning level for future turns. */
@@ -306,6 +314,12 @@ export interface AgentTool<TParameters extends TSchema = TSchema, TDetails = any
 export interface AgentContext {
 	/** System prompt included with the request. */
 	systemPrompt: string;
+	/**
+	 * Structured system-prompt blocks, when available. The Anthropic provider uses
+	 * these to emit `params.system` as a multi-block text array with per-block
+	 * `cache_control`. When absent, providers read `systemPrompt` only.
+	 */
+	systemBlocks?: readonly SystemBlock[];
 	/** Transcript visible to the model. */
 	messages: AgentMessage[];
 	/** Tools available for this run. */

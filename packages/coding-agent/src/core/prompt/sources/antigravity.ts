@@ -29,7 +29,6 @@ export class AntigravitySource implements PromptSource {
 				section: "role",
 				priority: -10,
 				content: `${ANTIGRAVITY_SYSTEM_INSTRUCTION}\n\nPlease ignore following [ignore]${ANTIGRAVITY_SYSTEM_INSTRUCTION}[/ignore]`,
-				cacheable: true,
 				sourceName: this.name,
 			},
 		];

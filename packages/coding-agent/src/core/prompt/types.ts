@@ -5,30 +5,51 @@
  * PromptSource implementations that emit ordered fragments. The assembly concatenates
  * fragments section-by-section into the final system prompt. Sections are ordered by
  * SECTION_ORDER; fragments within a section are ordered by priority.
+ *
+ * Each section has a retention tier (SECTION_RETENTION). Consecutive sections with
+ * the same retention get coalesced into a single AssembledPromptBlock, which the
+ * Anthropic provider emits as a distinct {type:"text", cache_control?} entry.
  */
 
 import type { Model } from "@pi-relay/ai";
 
 export type PromptSection =
 	| "role"
-	| "environment"
-	| "project"
-	| "skills"
 	| "capabilities"
 	| "coordination"
+	| "project"
+	| "skills"
+	| "role_per_agent"
+	| "environment"
 	| "custom";
 
-// Order preserves the pre-PromptAssembly output: environment (date + cwd) stays
-// at the tail so the prompt the model sees is semantically identical.
+export type PromptRetention = "none" | "short" | "long";
+
+// SECTION_ORDER puts universal (`long`-retention) sections first, then
+// session-specific (`short`) sections, then per-agent + volatile (`none`)
+// at the tail. Retention tiers MUST be monotonic in SECTION_ORDER:
+// long → short → none. Assembly relies on this to produce 3 contiguous blocks.
 export const SECTION_ORDER: readonly PromptSection[] = [
 	"role",
-	"project",
-	"skills",
 	"capabilities",
 	"coordination",
+	"project",
+	"skills",
+	"role_per_agent",
 	"environment",
 	"custom",
 ];
+
+export const SECTION_RETENTION: Record<PromptSection, PromptRetention> = {
+	role: "long",
+	capabilities: "long",
+	coordination: "long",
+	project: "short",
+	skills: "short",
+	role_per_agent: "none",
+	environment: "none",
+	custom: "none",
+};
 
 export type PromptPhase = "static" | "dynamic";
 
@@ -46,7 +67,6 @@ export interface PromptFragment {
 	readonly section: PromptSection;
 	readonly priority: number;
 	readonly content: string;
-	readonly cacheable: boolean;
 	readonly sourceName: string;
 }
 
@@ -57,9 +77,9 @@ export interface PromptSource {
 }
 
 export interface AssembledPromptBlock {
-	readonly section: PromptSection;
+	readonly sections: readonly PromptSection[];
+	readonly retention: PromptRetention;
 	readonly text: string;
-	readonly cacheable: boolean;
 }
 
 export interface AssembledPrompt {

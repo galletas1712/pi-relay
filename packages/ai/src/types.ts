@@ -223,8 +223,30 @@ export interface Tool<TParameters extends TSchema = TSchema> {
 	parameters: TParameters;
 }
 
+/**
+ * One text block of an assembled system prompt, carrying a retention tier hint
+ * the Anthropic provider uses to emit per-block `cache_control`.
+ *
+ * - `none`: no `cache_control` stamped on this block.
+ * - `short`: `{type:"ephemeral"}` (5m default TTL).
+ * - `long`: `{type:"ephemeral", ttl:"1h"}` when baseUrl is api.anthropic.com;
+ *   falls back to default ephemeral on proxies/relays that don't honor 1h.
+ *
+ * Non-Anthropic providers ignore `systemBlocks` and read `systemPrompt` instead.
+ */
+export interface SystemBlock {
+	readonly text: string;
+	readonly retention: "none" | "short" | "long";
+}
+
 export interface Context {
 	systemPrompt?: string;
+	/**
+	 * Structured system-prompt blocks with per-block retention hints. When present,
+	 * the Anthropic provider emits `params.system` as a multi-block text array with
+	 * per-block `cache_control`. Other providers keep reading `systemPrompt`.
+	 */
+	systemBlocks?: readonly SystemBlock[];
 	messages: Message[];
 	tools?: Tool[];
 }

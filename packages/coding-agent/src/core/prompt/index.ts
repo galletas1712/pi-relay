@@ -6,11 +6,13 @@ export { RoleSource, type RoleSourceOptions } from "./sources/role.js";
 export { SkillsSource } from "./sources/skills.js";
 export {
 	SECTION_ORDER,
+	SECTION_RETENTION,
 	type AssembledPrompt,
 	type AssembledPromptBlock,
 	type PromptContext,
 	type PromptFragment,
 	type PromptPhase,
+	type PromptRetention,
 	type PromptSection,
 	type PromptSource,
 } from "./types.js";

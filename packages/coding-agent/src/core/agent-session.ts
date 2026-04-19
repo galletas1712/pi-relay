@@ -23,7 +23,14 @@ import type {
 	AgentTool,
 	ThinkingLevel,
 } from "@pi-relay/agent-core";
-import type { AssistantMessage, ImageContent, Message, Model, TextContent } from "@pi-relay/ai";
+import type {
+	AssistantMessage,
+	ImageContent,
+	Message,
+	Model,
+	SystemBlock,
+	TextContent,
+} from "@pi-relay/ai";
 import {
 	clampThinkingLevel,
 	getThinkingLevels,
@@ -309,6 +316,10 @@ export class AgentSession {
 
 	// Base system prompt (without extension appends) - used to apply fresh appends each turn
 	private _baseSystemPrompt = "";
+	// Structured form of _baseSystemPrompt, carrying per-section retention tiers.
+	// Consumed by the Anthropic provider to emit multi-block system messages with
+	// per-block `cache_control`. Other providers ignore it.
+	private _baseSystemBlocks: readonly SystemBlock[] = [];
 
 	// Extra sources registered by extensions (orchestrator, custom extensions).
 	// These participate in every _rebuildSystemPrompt together with core sources.
@@ -817,6 +828,7 @@ export class AgentSession {
 		// Rebuild base system prompt with new tool set
 		this._baseSystemPrompt = this._rebuildSystemPrompt(validToolNames);
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this.agent.state.systemBlocks = this._baseSystemBlocks;
 	}
 
 	/** Whether compaction or branch summarization is currently running */
@@ -945,7 +957,16 @@ export class AgentSession {
 			toolNames: validToolNames,
 		};
 
-		return assembly.assemble(ctx).text;
+		const assembled = assembly.assemble(ctx);
+		// Cache the structured blocks alongside the flat text so providers that
+		// understand retention tiers (Anthropic today) can emit multi-block system
+		// messages. Mapping PromptAssembly's block shape to ai's `SystemBlock`
+		// keeps @pi-relay/ai free of a dependency on the prompt-assembly types.
+		this._baseSystemBlocks = assembled.blocks.map((block) => ({
+			text: block.text,
+			retention: block.retention,
+		}));
+		return assembled.text;
 	}
 
 	/**
@@ -960,6 +981,7 @@ export class AgentSession {
 		this._extensionPromptSources.push(source);
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this.agent.state.systemBlocks = this._baseSystemBlocks;
 	}
 
 	// =========================================================================
@@ -1110,9 +1132,13 @@ export class AgentSession {
 				// Apply extension-modified system prompt, or reset to base
 				if (result?.systemPrompt) {
 					this.agent.state.systemPrompt = result.systemPrompt;
+					// An extension-provided flat string can't be split into retention tiers
+					// safely. Clear blocks so the provider falls back to the single-block path.
+					this.agent.state.systemBlocks = undefined;
 				} else {
 					// Ensure we're using the base prompt (in case previous turn had modifications)
 					this.agent.state.systemPrompt = this._baseSystemPrompt;
+					this.agent.state.systemBlocks = this._baseSystemBlocks;
 				}
 			}
 		} catch (error) {
@@ -2103,6 +2129,7 @@ export class AgentSession {
 		this._resourceLoader.extendResources(extensionPaths);
 		this._baseSystemPrompt = this._rebuildSystemPrompt(this.getActiveToolNames());
 		this.agent.state.systemPrompt = this._baseSystemPrompt;
+		this.agent.state.systemBlocks = this._baseSystemBlocks;
 	}
 
 	private buildExtensionResourcePaths(entries: Array<{ path: string; extensionPath: string }>): Array<{

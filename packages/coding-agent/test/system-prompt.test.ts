@@ -200,15 +200,34 @@ describe("PromptAssembly", () => {
 		expect(assembly.assemble(makeCtx()).text).toBe("");
 	});
 
-	test("blocks expose per-section text and cache hints", () => {
+	test("blocks expose per-section text and retention tiers", () => {
 		const assembly = new PromptAssembly([
 			new RoleSource({ selectedTools: ["read"] }),
 			new EnvironmentSource(),
 		]);
 		const { blocks } = assembly.assemble(makeCtx());
-		const sections = blocks.map((block) => block.section);
-		expect(sections).toEqual(["role", "environment"]);
-		expect(blocks.every((block) => block.cacheable)).toBe(true);
+		// role is retention "long"; environment is retention "none". They land in
+		// separate blocks because their tiers differ.
+		expect(blocks).toHaveLength(2);
+		expect(blocks[0].sections).toEqual(["role"]);
+		expect(blocks[0].retention).toBe("long");
+		expect(blocks[1].sections).toEqual(["environment"]);
+		expect(blocks[1].retention).toBe("none");
+	});
+
+	test("coalesces consecutive sections of the same retention tier into one block", () => {
+		const assembly = new PromptAssembly([
+			new RoleSource({ selectedTools: ["read"] }),
+			new ProjectSource([{ path: "/proj/AGENTS.md", content: "Project rule A" }]),
+			new EnvironmentSource(),
+		]);
+		const { blocks } = assembly.assemble(makeCtx());
+		// role (long) → project (short) → environment (none). Three distinct tiers,
+		// three blocks.
+		expect(blocks.map((b) => b.retention)).toEqual(["long", "short", "none"]);
+		expect(blocks[0].sections).toEqual(["role"]);
+		expect(blocks[1].sections).toEqual(["project"]);
+		expect(blocks[2].sections).toEqual(["environment"]);
 	});
 
 	test("AntigravitySource injects handshake fragment only for google-antigravity", () => {
