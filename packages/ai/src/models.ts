@@ -61,10 +61,17 @@ function getAnthropicAdaptiveThinkingLevels(model: Model<"anthropic-messages">):
 	const effort = model.capabilities?.effort;
 
 	if (adaptiveThinkingSupported && effort?.supported) {
-		return ANTHROPIC_ADAPTIVE_LEVEL_ORDER.filter((level) => {
+		const levels = ANTHROPIC_ADAPTIVE_LEVEL_ORDER.filter((level) => {
 			const capability = effort[level];
 			return capability?.supported === true;
 		});
+		// Opus 4.7 accepts effort=xhigh on the Messages API even though the Models
+		// API does not advertise it in capabilities. Inject it between high and max.
+		if (model.id === "claude-opus-4-7" && !levels.includes("xhigh")) {
+			const maxIndex = levels.indexOf("max");
+			levels.splice(maxIndex >= 0 ? maxIndex : levels.length, 0, "xhigh");
+		}
+		return levels;
 	}
 
 	if (adaptiveThinkingSupported === false) {
