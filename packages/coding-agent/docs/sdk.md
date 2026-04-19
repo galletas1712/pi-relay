@@ -1070,7 +1070,7 @@ const runtime = await createAgentSessionRuntime(createRuntime, {
 await runRpcMode(runtime);
 ```
 
-See [RPC documentation](rpc.md) for the JSON protocol.
+See [RPC wire schema](../src/client/rpc/wire.ts) for the JSON protocol.
 
 ## RPC Mode Alternative
 
@@ -1080,7 +1080,7 @@ For subprocess-based integration without building with the SDK, use the CLI dire
 pi --mode rpc --no-session
 ```
 
-See [RPC documentation](rpc.md) for the JSON protocol.
+See [RPC wire schema](../src/client/rpc/wire.ts) for the JSON protocol.
 
 The SDK is preferred when:
 - You want type safety
