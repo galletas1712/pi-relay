@@ -30,7 +30,7 @@ import type { ExtensionFactory } from "./core/extensions/types.js";
 import { KeybindingsManager } from "./core/keybindings.js";
 import type { ModelRegistry } from "./core/model-registry.js";
 import { resolveCliModel, resolveModelScope, type ScopedModel } from "./core/model-resolver.js";
-import { restoreStdout, takeOverStdout } from "./core/output-guard.js";
+import { flushRawStdout, restoreStdout, takeOverStdout } from "./core/output-guard.js";
 import type { CreateAgentSessionOptions } from "./core/sdk.js";
 import {
 	formatMissingSessionCwdPrompt,
@@ -667,6 +667,12 @@ export async function main(args: string[], options?: MainOptions) {
 		const client = new LocalClient(runtime);
 		const server = new RpcServer(client);
 		await server.listen();
+		// Drain any buffered trailing frames (e.g. final dispose result) before returning
+		// so pipe teardown on process exit cannot truncate the last frame. Matches the
+		// print-mode drain at modes/print-mode.ts:~180. Without this, a truncated JSON
+		// frame produces the exact "Expected double-quoted property name at position N"
+		// error PR #26 hardened against.
+		await flushRawStdout();
 		return;
 	} else if (appMode === "interactive") {
 		if (scopedModels.length > 0 && (parsed.verbose || !settingsManager.getQuietStartup())) {
