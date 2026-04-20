@@ -6,7 +6,7 @@
  */
 
 import type { AgentMessage } from "@pi-relay/agent-core";
-import type { Model } from "@pi-relay/ai";
+import type { Model, Usage } from "@pi-relay/ai";
 import { completeSimple } from "@pi-relay/ai";
 import {
 	convertToLlm,
@@ -62,6 +62,14 @@ export interface CollectEntriesResult {
 	commonAncestorId: string | null;
 }
 
+/**
+ * Callback invoked with the branch-summary assistant usage so callers can
+ * attribute the out-of-band LLM call's tokens/cost to session stats. The
+ * summary itself never lands in the session transcript, so without this hook
+ * the usage would be invisible.
+ */
+export type BranchSummaryOnUsage = (usage: Usage) => void;
+
 export interface GenerateBranchSummaryOptions {
 	/** Model to use for summarization */
 	model: Model<any>;
@@ -77,6 +85,12 @@ export interface GenerateBranchSummaryOptions {
 	replaceInstructions?: boolean;
 	/** Tokens reserved for prompt + LLM response (default 16384) */
 	reserveTokens?: number;
+	/**
+	 * Optional callback invoked with the summary's assistant usage. Fires only
+	 * when the LLM call completed (not aborted) and the response includes a
+	 * populated usage field.
+	 */
+	onUsage?: BranchSummaryOnUsage;
 }
 
 // ============================================================================
@@ -284,7 +298,7 @@ export async function generateBranchSummary(
 	entries: SessionEntry[],
 	options: GenerateBranchSummaryOptions,
 ): Promise<BranchSummaryResult> {
-	const { model, apiKey, headers, signal, customInstructions, replaceInstructions, reserveTokens = 16384 } = options;
+	const { model, apiKey, headers, signal, customInstructions, replaceInstructions, reserveTokens = 16384, onUsage } = options;
 
 	// Token budget = context window minus reserved space for prompt + response
 	const contextWindow = model.contextWindow || 128000;
@@ -326,6 +340,13 @@ export async function generateBranchSummary(
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		{ apiKey, headers, signal, maxTokens: 2048 },
 	);
+
+	// Surface usage for non-aborted responses. Both successful and error
+	// completions may have consumed tokens and should be attributed so the
+	// cost shows up in session stats + telemetry.
+	if (onUsage && response.usage && response.stopReason !== "aborted") {
+		onUsage(response.usage);
+	}
 
 	// Check if aborted or errored
 	if (response.stopReason === "aborted") {

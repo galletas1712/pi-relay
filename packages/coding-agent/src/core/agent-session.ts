@@ -2866,6 +2866,9 @@ export class AgentSession {
 				customInstructions,
 				replaceInstructions,
 				reserveTokens: branchSummarySettings.reserveTokens,
+				// Branch summarization is an out-of-band LLM call; attribute its
+				// tokens/cost to this session so they flow through session stats.
+				onUsage: (usage) => this.addBackgroundUsage(usage, "branch"),
 			});
 			this._branchSummaryAbortController = undefined;
 			if (result.aborted) {
