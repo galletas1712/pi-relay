@@ -310,6 +310,34 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			expect(capturedPayload.prompt_cache_retention).toBeUndefined();
 		});
 
+		it("should omit prompt_cache_key when PI_CACHE_RETENTION=none", async () => {
+			process.env.PI_CACHE_RETENTION = "none";
+			const model = getModel("openai", "gpt-4o-mini");
+			let capturedPayload: any = null;
+
+			const { streamOpenAIResponses } = await import("../src/providers/openai-responses.js");
+
+			try {
+				const s = streamOpenAIResponses(model, context, {
+					apiKey: "fake-key",
+					sessionId: "session-env-none",
+					onPayload: (payload) => {
+						capturedPayload = payload;
+					},
+				});
+
+				for await (const event of s) {
+					if (event.type === "error") break;
+				}
+			} catch {
+				// Expected to fail
+			}
+
+			expect(capturedPayload).not.toBeNull();
+			expect(capturedPayload.prompt_cache_key).toBeUndefined();
+			expect(capturedPayload.prompt_cache_retention).toBeUndefined();
+		});
+
 		it("should set prompt_cache_retention when cacheRetention is long", async () => {
 			const model = getModel("openai", "gpt-4o-mini");
 			let capturedPayload: any = null;
