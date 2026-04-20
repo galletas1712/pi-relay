@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Usage } from "@pi-relay/ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isLikelyTrivialTurn, Orchestrator } from "../src/orchestrator.js";
-import { appendWorklogEntry, buildAncestorWorklogPrefix, buildWorklogPrompt, computeTopicVocabulary, formatWorklogEntry, parseWorklogEntries } from "../src/worklog.js";
+import { appendWorklogEntry, buildAncestorWorklogPrefix, buildWorklogPrompt, computeTopicVocabulary, formatWorklogEntry, parseWorklogEntries, summarizePinnedEntry, updateWorklogEntryPin } from "../src/worklog.js";
 import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
 function createWorklogAssistant(content: string, usage?: Usage) {
@@ -1275,6 +1275,36 @@ describe("buildWorklogPrompt topic vocabulary", () => {
 	});
 });
 
+describe("buildWorklogPrompt currently-pinned section", () => {
+	it("omits the <currently-pinned> section when no pins are provided", () => {
+		const prompt = buildWorklogPrompt(undefined, []);
+		expect(prompt).not.toContain("<currently-pinned>");
+		const empty = buildWorklogPrompt(undefined, [], []);
+		expect(empty).not.toContain("<currently-pinned>");
+	});
+
+	it("lists pinned entry_ids and summaries when provided", () => {
+		const prompt = buildWorklogPrompt(undefined, [], [
+			{ entry_id: "abcd1234", summary: "cache-key order is tools -> system -> messages" },
+			{ entry_id: "11112222", summary: "lastWorklogMessageCount is the hinge" },
+		]);
+		expect(prompt).toContain("<currently-pinned>");
+		expect(prompt).toContain("- abcd1234 — cache-key order is tools -> system -> messages");
+		expect(prompt).toContain("- 11112222 — lastWorklogMessageCount is the hinge");
+	});
+
+	it("summarizePinnedEntry collapses multi-line bodies to a single line and caps at 80 chars", () => {
+		const short = summarizePinnedEntry({ id: "x", iso: "", turn: 0, meta: {}, body: "short body", raw: "" });
+		expect(short).toBe("short body");
+		const multiline = summarizePinnedEntry({ id: "x", iso: "", turn: 0, meta: {}, body: "line 1\n\nline 2", raw: "" });
+		expect(multiline).toBe("line 1 line 2");
+		const longBody = "x".repeat(200);
+		const capped = summarizePinnedEntry({ id: "x", iso: "", turn: 0, meta: {}, body: longBody, raw: "" });
+		expect(capped.length).toBe(80);
+		expect(capped.endsWith("...")).toBe(true);
+	});
+});
+
 describe("worklog fork meta integration", () => {
 	const tempDirs: string[] = [];
 	afterEach(() => {
@@ -1721,5 +1751,770 @@ describe("buildAncestorWorklogPrefix supersession tombstones", () => {
 		// The grandparent's ancestor-worklog wrapper should be skipped since
 		// all of its entries were tombstoned.
 		expect(grandchildPrompt).not.toMatch(/<ancestor-worklog agent="root" role="root">/);
+	});
+});
+
+describe("pinned facts in buildAncestorWorklogPrefix", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	async function writeWorklog(filePath: string, body: string): Promise<void> {
+		const { writeFile, mkdir } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		await mkdir(dirname(filePath), { recursive: true });
+		await writeFile(filePath, body, "utf-8");
+	}
+
+	function entryWithMeta(
+		content: string,
+		turn: number,
+		iso: string,
+		meta: { topics?: string[]; supersedes?: string[]; pin?: boolean } = {},
+	): { text: string; id: string } {
+		const text = formatWorklogEntry(content, turn, { iso, ...meta });
+		const parsed = parseWorklogEntries(text);
+		const id = parsed[0]?.id;
+		if (!id) throw new Error("expected entry_id on structured entry");
+		return { text, id };
+	}
+
+	it("no pins anywhere: no <pinned-facts> block; output identical to PR-5 shape", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const a = entryWithMeta("## A", 1, "2026-09-01T00:00:01.000Z");
+		const b = entryWithMeta("## B", 2, "2026-09-01T00:00:02.000Z");
+		await writeWorklog(filePath, `${a.text}\n\n${b.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).not.toContain("<pinned-facts>");
+		expect(out).toContain(a.text);
+		expect(out).toContain(b.text);
+	});
+
+	it("one pinned entry in parent: <pinned-facts> contains it; non-pinned entries go to <ancestor-worklog>", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const pinned = entryWithMeta("## pinned-body", 1, "2026-09-02T00:00:01.000Z", { pin: true });
+		const ordinary = entryWithMeta("## ordinary-body", 2, "2026-09-02T00:00:02.000Z");
+		await writeWorklog(filePath, `${pinned.text}\n\n${ordinary.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "parent", role: "parent-role", filePath },
+		]);
+		expect(out).toMatch(/<pinned-facts>/);
+		expect(out).toMatch(/<\/pinned-facts>/);
+		// Pinned body is inside the pinned-facts block, NOT in the per-file wrapper.
+		const pinnedFactsIdx = out.indexOf("<pinned-facts>");
+		const pinnedFactsEnd = out.indexOf("</pinned-facts>");
+		const pinnedFactsBlock = out.slice(pinnedFactsIdx, pinnedFactsEnd);
+		expect(pinnedFactsBlock).toContain("## pinned-body");
+		expect(pinnedFactsBlock).toMatch(
+			new RegExp(`<entry agent="parent" role="parent-role" entry_id="${pinned.id}">`),
+		);
+		// Ordinary entry is in the ancestor-worklog wrapper.
+		const wrapperIdx = out.indexOf(`<ancestor-worklog agent="parent"`);
+		expect(wrapperIdx).toBeGreaterThan(pinnedFactsEnd);
+		expect(out.slice(wrapperIdx)).toContain("## ordinary-body");
+		// Sanity: pinned body appears ONCE across the whole output.
+		const matches = out.match(/## pinned-body/g) ?? [];
+		expect(matches).toHaveLength(1);
+	});
+
+	it("multiple pins across ancestors: all appear in <pinned-facts> in ancestor order, then per-file entry order", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const rootFile = `${dir}/root.worklog.md`;
+		const parentFile = `${dir}/parent.worklog.md`;
+
+		// Root: two pins + one plain entry between them.
+		const r1 = entryWithMeta("## root-pin-1", 1, "2026-09-03T00:00:01.000Z", { pin: true });
+		const r2 = entryWithMeta("## root-plain", 2, "2026-09-03T00:00:02.000Z");
+		const r3 = entryWithMeta("## root-pin-2", 3, "2026-09-03T00:00:03.000Z", { pin: true });
+		await writeWorklog(rootFile, `${r1.text}\n\n${r2.text}\n\n${r3.text}\n\n`);
+		// Parent: one pin.
+		const p1 = entryWithMeta("## parent-pin", 1, "2026-09-03T01:00:00.000Z", { pin: true });
+		await writeWorklog(parentFile, `${p1.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "root", role: "root", filePath: rootFile },
+			{ agentId: "parent", role: "parent-role", filePath: parentFile },
+		]);
+
+		const pinnedFactsIdx = out.indexOf("<pinned-facts>");
+		const pinnedFactsEnd = out.indexOf("</pinned-facts>");
+		expect(pinnedFactsIdx).toBeGreaterThanOrEqual(0);
+		const block = out.slice(pinnedFactsIdx, pinnedFactsEnd);
+		// Ancestor order: root-pin-1, root-pin-2, parent-pin.
+		const idx1 = block.indexOf("## root-pin-1");
+		const idx2 = block.indexOf("## root-pin-2");
+		const idx3 = block.indexOf("## parent-pin");
+		expect(idx1).toBeGreaterThanOrEqual(0);
+		expect(idx2).toBeGreaterThan(idx1);
+		expect(idx3).toBeGreaterThan(idx2);
+	});
+
+	it("pinned entry appears ONCE — never duplicated in its <ancestor-worklog> wrapper", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const pinned = entryWithMeta("## unique-pinned-text", 1, "2026-09-04T00:00:01.000Z", { pin: true });
+		await writeWorklog(filePath, `${pinned.text}\n\n`);
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "a", role: "r", filePath },
+		]);
+		const occurrences = out.match(/## unique-pinned-text/g) ?? [];
+		expect(occurrences).toHaveLength(1);
+	});
+
+	it("pinned entry in the tombstone set: pin beats tombstone; entry still appears in <pinned-facts>", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const pinned = entryWithMeta("## pinned-and-tombstoned", 1, "2026-09-05T00:00:01.000Z", { pin: true });
+		// A later entry claims to supersede the pinned one.
+		const supersede = entryWithMeta(
+			"## tries-to-tombstone",
+			2,
+			"2026-09-05T00:00:02.000Z",
+			{ supersedes: [pinned.id] },
+		);
+		await writeWorklog(filePath, `${pinned.text}\n\n${supersede.text}\n\n`);
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "a", role: "r", filePath },
+		]);
+		// Pin beats tombstone — pinned body must be in <pinned-facts>.
+		const pinnedFactsIdx = out.indexOf("<pinned-facts>");
+		const pinnedFactsEnd = out.indexOf("</pinned-facts>");
+		const block = out.slice(pinnedFactsIdx, pinnedFactsEnd);
+		expect(block).toContain("## pinned-and-tombstoned");
+		// And the pinned entry is NOT duplicated in the ancestor-worklog wrapper
+		// (even though it's also not tombstoned there).
+		const wrapperIdx = out.indexOf("<ancestor-worklog");
+		expect(wrapperIdx).toBeGreaterThan(pinnedFactsEnd);
+		const wrapper = out.slice(wrapperIdx);
+		expect(wrapper).not.toContain("## pinned-and-tombstoned");
+		// The superseding entry itself is still visible (it's not tombstoned).
+		expect(wrapper).toContain("## tries-to-tombstone");
+	});
+
+	it("legacy-only file: no <pinned-facts> block (legacy entries have no pin field)", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/legacy.worklog.md`;
+		const legacy =
+			"## Entry — 2026-09-06T00:00:00.000Z (turn 1)\n\n## Legacy body\n- kept.\n\n";
+		await writeWorklog(filePath, legacy);
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "a", role: "r", filePath },
+		]);
+		expect(out).not.toContain("<pinned-facts>");
+		expect(out).toContain("## Legacy body\n- kept.");
+	});
+});
+
+describe("updateWorklogEntryPin", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	async function writeWorklog(filePath: string, body: string): Promise<void> {
+		const { writeFile, mkdir } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		await mkdir(dirname(filePath), { recursive: true });
+		await writeFile(filePath, body, "utf-8");
+	}
+
+	function entryWithMeta(
+		content: string,
+		turn: number,
+		iso: string,
+		meta: { topics?: string[]; supersedes?: string[]; pin?: boolean } = {},
+	): { text: string; id: string } {
+		const text = formatWorklogEntry(content, turn, { iso, ...meta });
+		const parsed = parseWorklogEntries(text);
+		const id = parsed[0]?.id;
+		if (!id) throw new Error("expected entry_id on structured entry");
+		return { text, id };
+	}
+
+	it("flips pin:true → pin:false; returns true; file on disk updated", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/flip.worklog.md`;
+		const p = entryWithMeta("## body-X", 1, "2026-10-01T00:00:01.000Z", { pin: true });
+		await writeWorklog(filePath, `${p.text}\n\n`);
+
+		const result = await updateWorklogEntryPin(filePath, p.id, false);
+		expect(result).toBe(true);
+		const disk = await readFile(filePath, "utf-8");
+		const parsed = parseWorklogEntries(disk);
+		expect(parsed).toHaveLength(1);
+		expect(parsed[0]?.id).toBe(p.id);
+		expect(parsed[0]?.meta.pin).toBe(false);
+		// Body preserved byte-for-byte.
+		expect(parsed[0]?.body).toBe("## body-X");
+	});
+
+	it("flips pin:false → pin:true; round-trip works", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/flip2.worklog.md`;
+		const p = entryWithMeta("## body-Y", 1, "2026-10-02T00:00:01.000Z", { pin: false });
+		await writeWorklog(filePath, `${p.text}\n\n`);
+
+		const r1 = await updateWorklogEntryPin(filePath, p.id, true);
+		expect(r1).toBe(true);
+		const parsed1 = parseWorklogEntries(await readFile(filePath, "utf-8"));
+		expect(parsed1[0]?.meta.pin).toBe(true);
+
+		const r2 = await updateWorklogEntryPin(filePath, p.id, false);
+		expect(r2).toBe(true);
+		const parsed2 = parseWorklogEntries(await readFile(filePath, "utf-8"));
+		expect(parsed2[0]?.meta.pin).toBe(false);
+	});
+
+	it("entry not found: returns false; file untouched", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/miss.worklog.md`;
+		const p = entryWithMeta("## body-Z", 1, "2026-10-03T00:00:01.000Z");
+		await writeWorklog(filePath, `${p.text}\n\n`);
+		const before = await readFile(filePath, "utf-8");
+
+		const result = await updateWorklogEntryPin(filePath, "deadbeef", false);
+		expect(result).toBe(false);
+		const after = await readFile(filePath, "utf-8");
+		expect(after).toBe(before);
+	});
+
+	it("preserves all other meta fields exactly (entry_id, topics, supersedes)", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/preserve.worklog.md`;
+		const p = entryWithMeta("## body", 1, "2026-10-04T00:00:01.000Z", {
+			pin: true,
+			topics: ["alpha", "beta"],
+			supersedes: ["abcd1234", "11112222"],
+		});
+		await writeWorklog(filePath, `${p.text}\n\n`);
+
+		await updateWorklogEntryPin(filePath, p.id, false);
+		const disk = await readFile(filePath, "utf-8");
+		const parsed = parseWorklogEntries(disk);
+		expect(parsed[0]?.id).toBe(p.id);
+		expect(parsed[0]?.meta.topics).toEqual(["alpha", "beta"]);
+		expect(parsed[0]?.meta.supersedes).toEqual(["abcd1234", "11112222"]);
+		expect(parsed[0]?.meta.pin).toBe(false);
+	});
+
+	it("preserves body text exactly in mixed-format files (does not clobber legacy entries)", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/mixed.worklog.md`;
+		const legacy =
+			"## Entry — 2026-10-05T00:00:00.000Z (turn 1)\n\n## Legacy body text\n- line 1\n- line 2\n\n";
+		const structured = entryWithMeta("## Structured body\n\n```ts\ncode();\n```", 2, "2026-10-05T00:00:02.000Z", {
+			pin: true,
+		});
+		await writeWorklog(filePath, `${legacy}${structured.text}\n\n`);
+
+		const result = await updateWorklogEntryPin(filePath, structured.id, false);
+		expect(result).toBe(true);
+		const disk = await readFile(filePath, "utf-8");
+		const parsed = parseWorklogEntries(disk);
+		expect(parsed).toHaveLength(2);
+		expect(parsed[0]?.meta).toEqual({});
+		expect(parsed[0]?.body).toBe("## Legacy body text\n- line 1\n- line 2");
+		expect(parsed[1]?.meta.pin).toBe(false);
+		expect(parsed[1]?.body).toBe("## Structured body\n\n```ts\ncode();\n```");
+	});
+
+	it("leaves no .tmp file after a successful write", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/atomic.worklog.md`;
+		const p = entryWithMeta("## body", 1, "2026-10-06T00:00:01.000Z", { pin: true });
+		await writeWorklog(filePath, `${p.text}\n\n`);
+		await updateWorklogEntryPin(filePath, p.id, false);
+		// The rename-over pattern means there should never be a lingering
+		// .tmp file after completion.
+		const { existsSync } = await import("node:fs");
+		expect(existsSync(`${filePath}.tmp`)).toBe(false);
+		expect(existsSync(filePath)).toBe(true);
+	});
+
+	it("no-op when file does not exist: returns false", async () => {
+		const dir = createTempDir("pi-relay-worklog-pin-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/nope.worklog.md`;
+		const result = await updateWorklogEntryPin(filePath, "abcd1234", false);
+		expect(result).toBe(false);
+	});
+});
+
+describe("pin cap enforcement", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	async function writeWorklog(filePath: string, body: string): Promise<void> {
+		const { writeFile, mkdir } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		await mkdir(dirname(filePath), { recursive: true });
+		await writeFile(filePath, body, "utf-8");
+	}
+
+	function entryWithMeta(
+		content: string,
+		turn: number,
+		iso: string,
+		meta: { topics?: string[]; supersedes?: string[]; pin?: boolean } = {},
+	): { text: string; id: string } {
+		const text = formatWorklogEntry(content, turn, { iso, ...meta });
+		const parsed = parseWorklogEntries(text);
+		const id = parsed[0]?.id;
+		if (!id) throw new Error("expected entry_id on structured entry");
+		return { text, id };
+	}
+
+	function createPinToolCallAssistant(
+		args: Record<string, unknown>,
+	) {
+		return {
+			role: "assistant" as const,
+			content: [
+				{
+					type: "toolCall" as const,
+					id: "worklog-call",
+					name: "worklog_update",
+					arguments: args,
+				},
+			],
+			stopReason: "toolUse" as const,
+			timestamp: Date.now(),
+		};
+	}
+
+	async function setupForkWithPins(
+		sessionDir: string,
+		numExistingPins: number,
+		forkArgs: Record<string, unknown>,
+	) {
+		// Seed the child's worklog with N pinned entries before the fork runs.
+		const root = new FakeSession("root-session", { sessionDir });
+		const streamFn = vi.fn(async () => ({
+			result: async () => createPinToolCallAssistant(forkArgs),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+		const record = orchestrator.getRecord(childId);
+		const pinIds: string[] = [];
+		const seedChunks: string[] = [];
+		for (let i = 0; i < numExistingPins; i++) {
+			const p = entryWithMeta(
+				`## existing-pin-${i}`,
+				i + 1,
+				`2026-11-01T00:00:${String(i).padStart(2, "0")}.000Z`,
+				{ pin: true },
+			);
+			pinIds.push(p.id);
+			seedChunks.push(p.text);
+		}
+		if (seedChunks.length > 0) {
+			await writeWorklog(record.worklogFile, `${seedChunks.join("\n\n")}\n\n`);
+		}
+		return { orchestrator, childId, child, streamFn, pinIds, record };
+	}
+
+	it("writes the 1st through 20th pinned entries without replacesPinnedId", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-cap-");
+		tempDirs.push(sessionDir);
+		// Seed with 19 pins. The fork emits a 20th with pin:true and no
+		// replacesPinnedId — should be accepted (count goes to 20).
+		const { childId, child, streamFn, record } = await setupForkWithPins(sessionDir, 19, {
+			content: "## new-pin-20",
+			pin: true,
+		});
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect((child as unknown as FakeSession).backgroundUsageCalls.length >= 0).toBe(true);
+		});
+		// Wait for worklog write to settle.
+		await vi.waitFor(() => {
+			expect(record.lastWorklogTurn).toBe(1);
+		});
+		const disk = await readFile(record.worklogFile, "utf-8");
+		const parsed = parseWorklogEntries(disk);
+		const livePinCount = parsed.filter((entry) => entry.meta.pin === true).length;
+		expect(livePinCount).toBe(20);
+		expect(parsed[parsed.length - 1]?.body).toBe("## new-pin-20");
+		expect(parsed[parsed.length - 1]?.meta.pin).toBe(true);
+		void childId;
+	});
+
+	it("at the cap (20 pins), rejects a new pin WITHOUT replacesPinnedId; does not emit an entry", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-cap-");
+		tempDirs.push(sessionDir);
+		const { child, streamFn, record } = await setupForkWithPins(sessionDir, 20, {
+			content: "## overflow-pin",
+			pin: true,
+		});
+		const beforeLen = (await readFile(record.worklogFile, "utf-8")).length;
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		// Give the fork a moment to run its rejection logic.
+		await waitForMicrotasks();
+		await waitForMicrotasks();
+
+		const afterLen = (await readFile(record.worklogFile, "utf-8")).length;
+		expect(afterLen).toBe(beforeLen);
+		// Cursor NOT advanced — a rejected write should be retryable on the
+		// next substantive turn once the model includes a valid replacement id.
+		expect(record.lastWorklogTurn).toBe(0);
+	});
+
+	it("at the cap, accepts a new pin WITH a valid replacesPinnedId; new pin appended; replaced pin flipped to false", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-cap-");
+		tempDirs.push(sessionDir);
+		// Precompute the pinned entry ids the way setupForkWithPins does so we
+		// can pass a valid replacesPinnedId into the fork's tool call. The
+		// entryWithMeta helper produces the same id given the same (content,
+		// iso) pair.
+		const targetIso = `2026-11-01T00:00:${String(5).padStart(2, "0")}.000Z`;
+		const targetId = entryWithMeta(`## existing-pin-${5}`, 6, targetIso, { pin: true }).id;
+		const { child, streamFn, pinIds, record } = await setupForkWithPins(sessionDir, 20, {
+			content: "## replacement-pin",
+			pin: true,
+			replacesPinnedId: targetId,
+		});
+		expect(pinIds[5]).toBe(targetId);
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect(record.lastWorklogTurn).toBe(1);
+		});
+
+		const parsed = parseWorklogEntries(await readFile(record.worklogFile, "utf-8"));
+		// The displaced pin is now unpinned.
+		const displaced = parsed.find((entry) => entry.id === targetId);
+		expect(displaced?.meta.pin).toBe(false);
+		// Live pin count stays at 20.
+		const liveCount = parsed.filter((entry) => entry.meta.pin === true).length;
+		expect(liveCount).toBe(20);
+		// The new entry is present and pinned.
+		const newEntry = parsed.find((entry) => entry.body === "## replacement-pin");
+		expect(newEntry?.meta.pin).toBe(true);
+	});
+
+	it("at the cap, rejects a new pin with an invalid replacesPinnedId (not an existing pinned entry)", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-cap-");
+		tempDirs.push(sessionDir);
+		const { child, streamFn, record } = await setupForkWithPins(sessionDir, 20, {
+			content: "## bad-replacement",
+			pin: true,
+			replacesPinnedId: "ffffffff", // not a real pinned id
+		});
+		const beforeLen = (await readFile(record.worklogFile, "utf-8")).length;
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await waitForMicrotasks();
+		await waitForMicrotasks();
+
+		const afterLen = (await readFile(record.worklogFile, "utf-8")).length;
+		expect(afterLen).toBe(beforeLen);
+		expect(record.lastWorklogTurn).toBe(0);
+	});
+
+	it("tombstoned pins don't count toward the cap: 20 pins + 1 tombstoned pin → a new pin writes without replacesPinnedId", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-cap-");
+		tempDirs.push(sessionDir);
+		// Seed with 19 live pins + 1 pinned entry that is tombstoned (its id
+		// appears in another entry's `supersedes`). The tombstoned pin does
+		// NOT count toward the cap, so the incoming 20th pin should succeed
+		// without replacesPinnedId.
+		const root = new FakeSession("root-session", { sessionDir });
+		const streamFn = vi.fn(async () => ({
+			result: async () =>
+				createPinToolCallAssistant({
+					content: "## fresh-pin",
+					pin: true,
+				}),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+		const record = orchestrator.getRecord(childId);
+
+		const pinEntries = Array.from({ length: 19 }, (_, i) =>
+			entryWithMeta(
+				`## live-pin-${i}`,
+				i + 1,
+				`2026-12-01T00:00:${String(i).padStart(2, "0")}.000Z`,
+				{ pin: true },
+			),
+		);
+		const tombstonedPin = entryWithMeta(
+			"## tombstoned-pin",
+			20,
+			"2026-12-01T00:00:30.000Z",
+			{ pin: true },
+		);
+		const superseder = entryWithMeta(
+			"## superseder",
+			21,
+			"2026-12-01T00:00:31.000Z",
+			{ supersedes: [tombstonedPin.id] },
+		);
+		const chunks = [
+			...pinEntries.map((e) => e.text),
+			tombstonedPin.text,
+			superseder.text,
+		];
+		await writeWorklog(record.worklogFile, `${chunks.join("\n\n")}\n\n`);
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect(record.lastWorklogTurn).toBe(1);
+		});
+		const parsed = parseWorklogEntries(await readFile(record.worklogFile, "utf-8"));
+		const newEntry = parsed.find((entry) => entry.body === "## fresh-pin");
+		expect(newEntry?.meta.pin).toBe(true);
+	});
+});
+
+describe("worklog_unpin tool", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	async function writeWorklog(filePath: string, body: string): Promise<void> {
+		const { writeFile, mkdir } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		await mkdir(dirname(filePath), { recursive: true });
+		await writeFile(filePath, body, "utf-8");
+	}
+
+	function entryWithMeta(
+		content: string,
+		turn: number,
+		iso: string,
+		meta: { topics?: string[]; supersedes?: string[]; pin?: boolean } = {},
+	): { text: string; id: string } {
+		const text = formatWorklogEntry(content, turn, { iso, ...meta });
+		const parsed = parseWorklogEntries(text);
+		const id = parsed[0]?.id;
+		if (!id) throw new Error("expected entry_id on structured entry");
+		return { text, id };
+	}
+
+	function createUnpinToolCallAssistant(entry_id: string) {
+		return {
+			role: "assistant" as const,
+			content: [
+				{
+					type: "toolCall" as const,
+					id: "unpin-call",
+					name: "worklog_unpin",
+					arguments: { entry_id },
+				},
+			],
+			stopReason: "toolUse" as const,
+			timestamp: Date.now(),
+		};
+	}
+
+	it("fork calls worklog_unpin on a pinned entry: pin flips to false; lastWorklogMessageCount advances", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-unpin-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		// Seed with two pinned entries.
+		const p1 = entryWithMeta("## keep-pinned", 1, "2026-10-10T00:00:01.000Z", { pin: true });
+		const p2 = entryWithMeta("## target-for-unpin", 2, "2026-10-10T00:00:02.000Z", { pin: true });
+		const streamFn = vi.fn(async () => ({
+			result: async () => createUnpinToolCallAssistant(p2.id),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+		const record = orchestrator.getRecord(childId);
+		await writeWorklog(record.worklogFile, `${p1.text}\n\n${p2.text}\n\n`);
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect(record.lastWorklogTurn).toBe(1);
+		});
+
+		const parsed = parseWorklogEntries(await readFile(record.worklogFile, "utf-8"));
+		const target = parsed.find((entry) => entry.id === p2.id);
+		const kept = parsed.find((entry) => entry.id === p1.id);
+		expect(target?.meta.pin).toBe(false);
+		expect(kept?.meta.pin).toBe(true);
+		// Cursor advances: next fork starts from after this turn.
+		expect(record.lastWorklogMessageCount).toBe(child.agent.state.messages.length);
+	});
+
+	it("fork calls worklog_unpin on an unknown id: no-op on disk; cursor still advances to prevent retry storms", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-unpin-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const p = entryWithMeta("## keep-pinned", 1, "2026-10-11T00:00:01.000Z", { pin: true });
+		const streamFn = vi.fn(async () => ({
+			result: async () => createUnpinToolCallAssistant("deadbeef"),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+		const record = orchestrator.getRecord(childId);
+		await writeWorklog(record.worklogFile, `${p.text}\n\n`);
+		const before = await readFile(record.worklogFile, "utf-8");
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect(record.lastWorklogTurn).toBe(1);
+		});
+
+		const after = await readFile(record.worklogFile, "utf-8");
+		expect(after).toBe(before);
+		expect(record.lastWorklogMessageCount).toBe(child.agent.state.messages.length);
+	});
+
+	it("fork emits BOTH worklog_update and worklog_unpin: first tool call wins; second is logged and ignored", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-unpin-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const p = entryWithMeta("## existing-pin", 1, "2026-10-12T00:00:01.000Z", { pin: true });
+		// Emit worklog_update FIRST, then worklog_unpin as a second tool
+		// call. The update path should take effect; the unpin should be
+		// logged and ignored (pin should remain true after the turn).
+		const streamFn = vi.fn(async () => ({
+			result: async () => ({
+				role: "assistant" as const,
+				content: [
+					{
+						type: "toolCall" as const,
+						id: "call-1",
+						name: "worklog_update",
+						arguments: { content: "## fresh-entry" },
+					},
+					{
+						type: "toolCall" as const,
+						id: "call-2",
+						name: "worklog_unpin",
+						arguments: { entry_id: p.id },
+					},
+				],
+				stopReason: "toolUse" as const,
+				timestamp: Date.now(),
+			}),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+		const record = orchestrator.getRecord(childId);
+		await writeWorklog(record.worklogFile, `${p.text}\n\n`);
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect(record.lastWorklogTurn).toBe(1);
+		});
+
+		const parsed = parseWorklogEntries(await readFile(record.worklogFile, "utf-8"));
+		// The pinned entry's pin remains TRUE — the update path ran, not the unpin.
+		const pinned = parsed.find((entry) => entry.id === p.id);
+		expect(pinned?.meta.pin).toBe(true);
+		// The new entry was appended (update path).
+		expect(parsed.find((entry) => entry.body === "## fresh-entry")).toBeDefined();
 	});
 });

@@ -15,7 +15,7 @@ import {
 	createAgentIdleMessage,
 	createAgentReportMessage,
 } from "./messages.js";
-import { buildAncestorWorklogPrefix, buildWorklogPrompt, appendWorklogEntry, computeTopicVocabulary, getLastWorklogEntry, parseWorklogEntries, readWorklog, WORKLOG_UPDATE_TOOL } from "./worklog.js";
+import { buildAncestorWorklogPrefix, buildWorklogPrompt, appendWorklogEntry, collectLivePinnedEntries, computeTopicVocabulary, getLastWorklogEntry, MAX_PINNED_ENTRIES, parseWorklogEntries, readWorklog, summarizePinnedEntry, updateWorklogEntryPin, WORKLOG_UNPIN_TOOL, WORKLOG_UPDATE_TOOL } from "./worklog.js";
 import { ToolCallTracker } from "./tool-tracker.js";
 import {
 	DEFAULT_ORCHESTRATOR_CONFIG,
@@ -75,6 +75,14 @@ export interface WorklogForkLogEntry {
 	skipped: boolean;
 	skipReason?: string;
 	entryEmitted: boolean;
+	/** entry_id that was unpinned this turn via `worklog_unpin`, if any. */
+	unpinned?: string;
+	/** entry_id of a displaced pin when `replacesPinnedId` was used, if any. */
+	replacedPin?: string;
+	/** Reason a `worklog_update` was rejected (e.g. "pin-cap-reached"), if any. */
+	rejectReason?: string;
+	/** Non-fatal warning surfaced to the log (e.g. "both-tools-called"). */
+	warning?: string;
 }
 
 /**
@@ -1218,12 +1226,38 @@ export class Orchestrator {
 		const contextMessages = await record.session.agent.convertToLlm(deltaMessages);
 		const worklogContents = await readWorklog(record.worklogFile);
 		const lastEntry = getLastWorklogEntry(worklogContents);
+		const parsedEntries = parseWorklogEntries(worklogContents);
 		// Hint the fork at slugs already in use so topic choices stay stable
 		// across entries. Capped at top-30 by count inside computeTopicVocabulary.
-		const topicVocabulary = computeTopicVocabulary(parseWorklogEntries(worklogContents));
+		const topicVocabulary = computeTopicVocabulary(parsedEntries);
+		// Build the tombstone set from this file's entries so the live-pin
+		// count (enforced by the pin cap below) excludes already-superseded
+		// pins. Pinned-but-tombstoned entries still appear in the ancestor
+		// prefix's `<pinned-facts>` block but are not counted for cap purposes.
+		const localTombstones = new Set<string>();
+		for (const parsedEntry of parsedEntries) {
+			const supersedes = Array.isArray(parsedEntry.meta.supersedes)
+				? parsedEntry.meta.supersedes
+				: [];
+			for (const id of supersedes) {
+				if (typeof id === "string" && id.length > 0) {
+					localTombstones.add(id);
+				}
+			}
+		}
+		const livePinnedEntries = collectLivePinnedEntries(parsedEntries, localTombstones);
+		const currentlyPinnedSummaries = livePinnedEntries.map((pinnedEntry) => ({
+			entry_id: pinnedEntry.id ?? "",
+			summary: summarizePinnedEntry(pinnedEntry),
+		}));
 		const prompt: UserMessage = {
 			role: "user",
-			content: [{ type: "text", text: buildWorklogPrompt(lastEntry, topicVocabulary) }],
+			content: [
+				{
+					type: "text",
+					text: buildWorklogPrompt(lastEntry, topicVocabulary, currentlyPinnedSummaries),
+				},
+			],
 			timestamp: Date.now(),
 		};
 		// Use a distinct `sessionId` for the worklog fork so OpenAI-family
@@ -1248,7 +1282,7 @@ export class Orchestrator {
 			{
 				systemPrompt: record.session.agent.state.systemPrompt,
 				messages: [...contextMessages, prompt],
-				tools: [WORKLOG_UPDATE_TOOL],
+				tools: [WORKLOG_UPDATE_TOOL, WORKLOG_UNPIN_TOOL],
 			},
 			streamOptions,
 		);
@@ -1272,10 +1306,17 @@ export class Orchestrator {
 			return;
 		}
 
-		const toolCall = assistant.content.find(
-			(content): content is AgentToolCall => content.type === "toolCall" && content.name === WORKLOG_UPDATE_TOOL.name,
+		// The fork may emit either `worklog_update` or `worklog_unpin` (or,
+		// defensively, both — in which case the FIRST tool call wins and any
+		// subsequent calls are logged and ignored). In practice the model will
+		// choose one path per turn.
+		const toolCalls = assistant.content.filter(
+			(content): content is AgentToolCall => content.type === "toolCall",
 		);
-		if (!toolCall) {
+		const firstToolCall = toolCalls.find(
+			(call) => call.name === WORKLOG_UPDATE_TOOL.name || call.name === WORKLOG_UNPIN_TOOL.name,
+		);
+		if (!firstToolCall) {
 			logWorklogFork({
 				agentId,
 				turn,
@@ -1285,13 +1326,93 @@ export class Orchestrator {
 			});
 			return;
 		}
+		const ignoredToolCalls = toolCalls.filter((call) => call !== firstToolCall);
+		const warning = ignoredToolCalls.length > 0
+			? `both-tools-called:${ignoredToolCalls.map((call) => call.name).join(",")}`
+			: undefined;
 
-		const args = validateToolArguments(WORKLOG_UPDATE_TOOL, toolCall);
+		if (firstToolCall.name === WORKLOG_UNPIN_TOOL.name) {
+			const args = validateToolArguments(WORKLOG_UNPIN_TOOL, firstToolCall);
+			const flipped = await updateWorklogEntryPin(record.worklogFile, args.entry_id, false);
+			// Whether or not the id was present, advance the cursor so the
+			// fork does not re-attempt the same unpin on the next substantive
+			// turn against the same delta.
+			record.lastWorklogTurn = turn;
+			record.lastWorklogMessageCount = turnMessages.length;
+			await this.persistTree();
+			logWorklogFork({
+				agentId,
+				turn,
+				deltaMsgCount: deltaMessages.length,
+				skipped: false,
+				entryEmitted: false,
+				unpinned: flipped ? args.entry_id : undefined,
+				warning,
+			});
+			return;
+		}
+
+		const args = validateToolArguments(WORKLOG_UPDATE_TOOL, firstToolCall);
+
+		// Pin-cap enforcement: if the fork is trying to pin a new entry while
+		// the file already has `MAX_PINNED_ENTRIES` live pins, require the fork
+		// to displace an existing pin via `replacesPinnedId`. Tombstoned pins
+		// do NOT count toward the cap (`livePinnedEntries` filters them out).
+		if (args.pin === true && livePinnedEntries.length >= MAX_PINNED_ENTRIES) {
+			const replaces = typeof args.replacesPinnedId === "string" ? args.replacesPinnedId : undefined;
+			const targetPin = replaces
+				? livePinnedEntries.find((pinned) => pinned.id === replaces)
+				: undefined;
+			if (!targetPin) {
+				const reason = replaces ? "invalid-replaces-pinned-id" : "pin-cap-reached";
+				logWorklogFork({
+					agentId,
+					turn,
+					deltaMsgCount: deltaMessages.length,
+					skipped: false,
+					entryEmitted: false,
+					rejectReason: reason,
+					warning,
+				});
+				// Do NOT advance lastWorklogMessageCount on a rejected write —
+				// the next fork should still see the same delta and can retry
+				// with a valid replacement id.
+				return;
+			}
+			// Displace the chosen pin first so the newly appended pinned entry
+			// keeps the live-pin count at MAX_PINNED_ENTRIES. If the structural
+			// rewrite fails (targetPin must exist because we just found it; a
+			// race with another writer is guarded by `pendingWorklogFork`), we
+			// still proceed to append — the cap may briefly exceed by one, but
+			// the invariant is repaired on the next unpin/displace cycle.
+			await updateWorklogEntryPin(record.worklogFile, targetPin.id ?? "", false);
+			const entry = await appendWorklogEntry(record.worklogFile, args.content, turn, {
+				topics: args.topics,
+				supersedes: args.supersedes,
+				pin: true,
+			});
+			void entry;
+			record.lastWorklogTurn = turn;
+			record.lastWorklogMessageCount = turnMessages.length;
+			await this.persistTree();
+			logWorklogFork({
+				agentId,
+				turn,
+				deltaMsgCount: deltaMessages.length,
+				skipped: false,
+				entryEmitted: true,
+				replacedPin: targetPin.id,
+				warning,
+			});
+			return;
+		}
+
 		const entry = await appendWorklogEntry(record.worklogFile, args.content, turn, {
 			topics: args.topics,
 			supersedes: args.supersedes,
 			pin: args.pin,
 		});
+		void entry;
 		record.lastWorklogTurn = turn;
 		record.lastWorklogMessageCount = turnMessages.length;
 		await this.persistTree();
@@ -1301,6 +1422,7 @@ export class Orchestrator {
 			deltaMsgCount: deltaMessages.length,
 			skipped: false,
 			entryEmitted: true,
+			warning,
 		});
 	}
 
