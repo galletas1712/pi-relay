@@ -1007,7 +1007,25 @@ export class Orchestrator {
 		const transformed = record.session.agent.transformContext
 			? await record.session.agent.transformContext(turnMessages)
 			: turnMessages;
-		const contextMessages = await record.session.agent.convertToLlm(transformed);
+		// Phase 1 (delta-only fork input): only send messages that have arrived
+		// since the last worklog entry. The `<last-worklog-entry>` block inside
+		// `buildWorklogPrompt` already carries prior semantic state, so the fork
+		// does not need the full transcript. On first-ever fork
+		// (`lastWorklogMessageCount === 0`) this falls through to sending
+		// everything, which is the intended bootstrap behavior.
+		//
+		// Additionally, drop everything except `user` and `assistant` messages
+		// from the fork input. Tool-result payloads (often many KB each) and
+		// custom orchestrator messages (agent_roster, agent_directive,
+		// agent_report, agent_idle, background tool completion notifications)
+		// are the bulk of per-turn bytes but add little to the fork's "is there
+		// anything durable to record?" decision — user prompts and assistant
+		// text/thinking/toolCall content are sufficient signal.
+		const deltaStart = Math.min(record.lastWorklogMessageCount, transformed.length);
+		const deltaMessages = transformed
+			.slice(deltaStart)
+			.filter((message) => message.role === "user" || message.role === "assistant");
+		const contextMessages = await record.session.agent.convertToLlm(deltaMessages);
 		const worklogContents = await readWorklog(record.worklogFile);
 		const lastEntry = getLastWorklogEntry(worklogContents);
 		const prompt: UserMessage = {

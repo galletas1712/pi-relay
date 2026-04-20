@@ -68,7 +68,10 @@ describe("worklog fork", () => {
 		const streamFn = vi.fn(async (_model, context) => {
 			expect(context.messages[0]?.role).toBe("user");
 			expect(context.messages[0]?.content[0]?.type).toBe("text");
-			expect((context.messages[0]?.content[0] as { text: string }).text).toBe("converted:2");
+			// transformContext appends a custom message; the fork filter drops
+			// non-user/assistant roles, so only the original 1 user message reaches
+			// convertToLlm.
+			expect((context.messages[0]?.content[0] as { text: string }).text).toBe("converted:1");
 			expect(context.messages[1]?.role).toBe("user");
 			expect((context.messages[1]?.content[0] as { text: string }).text).toContain("<last-worklog-entry>");
 			return {
@@ -111,6 +114,210 @@ describe("worklog fork", () => {
 		expect(convertToLlm).toHaveBeenCalledTimes(1);
 		expect(child.agent.state.messages).toEqual(originalMessages);
 		expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(1);
+	});
+
+	it("sends only the delta since lastWorklogMessageCount to the fork, not the full transcript", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		// Eight pre-existing messages that simulate a prior turn already covered
+		// by a previous worklog entry. After setting lastWorklogMessageCount to
+		// their length, the fork should see ONLY the two new messages appended
+		// below as its context — not all ten.
+		const priorMessages = Array.from({ length: 8 }, (_, i) => ({
+			role: "user" as const,
+			content: [{ type: "text" as const, text: `prior ${i}` }],
+			timestamp: Date.now(),
+		}));
+		const newTurnMessages = [
+			{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: "latest question" }],
+				timestamp: Date.now(),
+			},
+			{
+				role: "assistant" as const,
+				content: [{ type: "text" as const, text: "latest answer" }],
+				stopReason: "stop" as const,
+				timestamp: Date.now(),
+			},
+		];
+		const convertToLlm = vi.fn(async (messages) => [
+			{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: `converted:${messages.length}` }],
+				timestamp: Date.now(),
+			},
+		]);
+		const streamFn = vi.fn(async (_model, context) => {
+			expect(context.messages[0]?.role).toBe("user");
+			expect((context.messages[0]?.content[0] as { text: string }).text).toBe("converted:2");
+			return {
+				result: async () => createWorklogAssistant("## Findings\n- Delta slicing works."),
+			} as never;
+		});
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [...priorMessages, ...newTurnMessages],
+			convertToLlm,
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect",
+		});
+		// Simulate a prior worklog entry that already covered the 8 prior messages.
+		orchestrator.getRecord(childId).lastWorklogMessageCount = priorMessages.length;
+		orchestrator.getRecord(childId).lastWorklogTurn = 1;
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+
+		// Delta of 2 messages was converted, not all 10.
+		expect(convertToLlm).toHaveBeenCalledTimes(1);
+		const convertArg = convertToLlm.mock.calls[0]?.[0] as unknown[];
+		expect(convertArg).toHaveLength(2);
+	});
+
+	it("drops tool-results and custom messages from the fork input, keeping only user and assistant turns", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		const convertToLlm = vi.fn(async (messages) => [
+			{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: `converted:${messages.length}` }],
+				timestamp: Date.now(),
+			},
+		]);
+		const streamFn = vi.fn(async () => ({
+			result: async () => createWorklogAssistant("## Findings\n- Filter works."),
+		}) as never);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{
+					role: "user" as const,
+					content: [{ type: "text" as const, text: "hello" }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant" as const,
+					content: [
+						{
+							type: "toolCall" as const,
+							id: "call-1",
+							name: "read",
+							arguments: { path: "foo" },
+						},
+					],
+					stopReason: "toolUse" as const,
+					timestamp: Date.now(),
+				},
+				{
+					role: "toolResult" as const,
+					toolCallId: "call-1",
+					toolName: "read",
+					content: [{ type: "text" as const, text: "huge tool result" }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "custom" as const,
+					customType: "agent_roster",
+					content: "## Running Subagents\n...",
+					display: false,
+					timestamp: Date.now(),
+				},
+				{
+					role: "custom" as const,
+					customType: "agent_directive",
+					content: "[DIRECTIVE]",
+					display: true,
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant" as const,
+					content: [{ type: "text" as const, text: "final answer" }],
+					stopReason: "stop" as const,
+					timestamp: Date.now(),
+				},
+			],
+			convertToLlm,
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+
+		// Six messages in state; after filter: 1 user + 2 assistant = 3. No
+		// toolResult, no custom messages.
+		const convertArg = convertToLlm.mock.calls[0]?.[0] as Array<{ role: string }>;
+		expect(convertArg).toHaveLength(3);
+		for (const message of convertArg) {
+			expect(["user", "assistant"]).toContain(message.role);
+		}
+	});
+
+	it("falls back to sending everything on the first fork when lastWorklogMessageCount is zero", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const convertToLlm = vi.fn(async (messages) => [
+			{
+				role: "user" as const,
+				content: [{ type: "text" as const, text: `converted:${messages.length}` }],
+				timestamp: Date.now(),
+			},
+		]);
+		const streamFn = vi.fn(async () => ({
+			result: async () => createWorklogAssistant("## First\n- Bootstrap worked."),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{
+					role: "user" as const,
+					content: [{ type: "text" as const, text: "only message" }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant" as const,
+					content: [{ type: "text" as const, text: "ack" }],
+					stopReason: "stop" as const,
+					timestamp: Date.now(),
+				},
+			],
+			convertToLlm,
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect",
+		});
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		const convertArg = convertToLlm.mock.calls[0]?.[0] as unknown[];
+		expect(convertArg).toHaveLength(2);
 	});
 
 	it("does not wait for pending ancestor worklog forks and prepends completed worklogs plus recent context", async () => {
