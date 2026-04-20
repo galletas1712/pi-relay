@@ -47,6 +47,7 @@ import { InteractiveMode, runPrintMode } from "./modes/index.js";
 import { ExtensionSelectorComponent } from "./modes/interactive/components/extension-selector.js";
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.js";
+import { isTruthyEnvFlag } from "./utils/env-flag.js";
 import { isLocalPath } from "./utils/paths.js";
 
 /**
@@ -88,11 +89,6 @@ function reportDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]
 		const prefix = diagnostic.type === "error" ? "Error: " : diagnostic.type === "warning" ? "Warning: " : "";
 		console.error(color(`${prefix}${diagnostic.message}`));
 	}
-}
-
-function isTruthyEnvFlag(value: string | undefined): boolean {
-	if (!value) return false;
-	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
 type AppMode = "interactive" | "print" | "json" | "rpc";

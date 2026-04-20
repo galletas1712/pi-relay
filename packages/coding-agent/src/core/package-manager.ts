@@ -6,6 +6,7 @@ import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import ignore from "ignore";
 import { minimatch } from "minimatch";
 import { CONFIG_DIR_NAME } from "../config.js";
+import { isTruthyEnvFlag } from "../utils/env-flag.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
 import { isLocalPath } from "../utils/paths.js";
 import { isStdoutTakenOver } from "./output-guard.js";
@@ -15,9 +16,7 @@ const NETWORK_TIMEOUT_MS = 10000;
 const UPDATE_CHECK_CONCURRENCY = 4;
 
 function isOfflineModeEnabled(): boolean {
-	const value = process.env.PI_OFFLINE;
-	if (!value) return false;
-	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+	return isTruthyEnvFlag(process.env.PI_OFFLINE);
 }
 
 export interface PathMetadata {

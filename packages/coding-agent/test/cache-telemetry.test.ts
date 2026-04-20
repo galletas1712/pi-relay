@@ -139,15 +139,26 @@ describe("isCacheStatsEnabled", () => {
 		expect(isCacheStatsEnabled()).toBe(false);
 	});
 
-	it("returns true only when env var is exactly '1'", () => {
+	it("returns true when env var is '1'", () => {
 		process.env[CACHE_STATS_ENV_VAR] = "1";
 		expect(isCacheStatsEnabled()).toBe(true);
 	});
 
-	it("treats arbitrary truthy strings as disabled (strict opt-in)", () => {
+	it("accepts conventional truthy strings (case-insensitive)", () => {
 		process.env[CACHE_STATS_ENV_VAR] = "true";
-		expect(isCacheStatsEnabled()).toBe(false);
+		expect(isCacheStatsEnabled()).toBe(true);
 		process.env[CACHE_STATS_ENV_VAR] = "yes";
+		expect(isCacheStatsEnabled()).toBe(true);
+		process.env[CACHE_STATS_ENV_VAR] = "TRUE";
+		expect(isCacheStatsEnabled()).toBe(true);
+	});
+
+	it("treats non-conventional strings as disabled", () => {
+		process.env[CACHE_STATS_ENV_VAR] = "0";
+		expect(isCacheStatsEnabled()).toBe(false);
+		process.env[CACHE_STATS_ENV_VAR] = "maybe";
+		expect(isCacheStatsEnabled()).toBe(false);
+		process.env[CACHE_STATS_ENV_VAR] = "";
 		expect(isCacheStatsEnabled()).toBe(false);
 	});
 });

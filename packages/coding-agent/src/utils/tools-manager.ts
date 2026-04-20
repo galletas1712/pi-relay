@@ -7,15 +7,14 @@ import { join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { APP_NAME, getBinDir } from "../config.js";
+import { isTruthyEnvFlag } from "./env-flag.js";
 
 const TOOLS_DIR = getBinDir();
 const NETWORK_TIMEOUT_MS = 10_000;
 const DOWNLOAD_TIMEOUT_MS = 120_000;
 
 function isOfflineModeEnabled(): boolean {
-	const value = process.env.PI_OFFLINE;
-	if (!value) return false;
-	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
+	return isTruthyEnvFlag(process.env.PI_OFFLINE);
 }
 
 interface ToolConfig {

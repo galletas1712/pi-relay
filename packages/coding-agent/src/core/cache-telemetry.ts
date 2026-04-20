@@ -18,6 +18,7 @@
  */
 
 import type { Usage } from "@pi-relay/ai";
+import { isTruthyEnvFlag } from "../utils/env-flag.js";
 
 /** Env flag that opts a developer into per-turn cache telemetry. */
 export const CACHE_STATS_ENV_VAR = "PI_SHOW_CACHE_STATS";
@@ -25,9 +26,12 @@ export const CACHE_STATS_ENV_VAR = "PI_SHOW_CACHE_STATS";
 /**
  * Returns true when the developer has opted into cache telemetry.
  * Checked via env var (not settings) so it can be toggled per-invocation.
+ * Accepts `"1"`, `"true"`, or `"yes"` (case-insensitive) per the shared
+ * boolean-env-var convention.
  */
 export function isCacheStatsEnabled(): boolean {
-	return typeof process !== "undefined" && process.env[CACHE_STATS_ENV_VAR] === "1";
+	if (typeof process === "undefined") return false;
+	return isTruthyEnvFlag(process.env[CACHE_STATS_ENV_VAR]);
 }
 
 /**

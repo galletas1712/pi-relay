@@ -70,6 +70,7 @@ import type { TruncationResult } from "../../core/tools/truncate.js";
 import { getChangelogPath, getNewEntries, parseChangelog } from "../../utils/changelog.js";
 import { copyToClipboard } from "../../utils/clipboard.js";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.js";
+import { isTruthyEnvFlag } from "../../utils/env-flag.js";
 import { parseGitUrl } from "../../utils/git.js";
 import { killTrackedDetachedChildren } from "../../utils/shell.js";
 import { ensureTool } from "../../utils/tools-manager.js";
@@ -138,11 +139,6 @@ const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING =
 
 function isAnthropicSubscriptionAuthKey(apiKey: string | undefined): boolean {
 	return typeof apiKey === "string" && apiKey.startsWith("sk-ant-oat");
-}
-
-function isTruthyEnvFlag(value: string | undefined): boolean {
-	if (!value) return false;
-	return value === "1" || value.toLowerCase() === "true" || value.toLowerCase() === "yes";
 }
 
 /**
@@ -2350,7 +2346,7 @@ export class InteractiveMode {
 				// when the main loop re-arms getUserInput — see PendingInputBuffer for
 				// the documented cross-session trade-off.
 				this.pendingInputBuffer.push(text);
-				if (process.env.PI_TUI_DEBUG === "1") {
+				if (isTruthyEnvFlag(process.env.PI_TUI_DEBUG)) {
 					const preview = text.length > 40 ? `${text.slice(0, 40)}…` : text;
 					process.stderr.write(
 						`[pi-tui] input queued (session transition in progress): ${JSON.stringify(preview)}\n`,
