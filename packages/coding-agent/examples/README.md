@@ -1,25 +1,24 @@
 # Examples
 
-Example code for pi-coding-agent SDK and extensions.
+Example code for pi-coding-agent SDK.
 
 ## Directories
 
 ### [sdk/](sdk/)
-Programmatic usage via `createAgentSession()`. Shows how to customize models, prompts, tools, extensions, and session management.
+Programmatic usage via `createAgentSession()`. Shows how to customize
+models, prompts, tools, extensions, and session management.
 
-### [extensions/](extensions/)
-Example extensions demonstrating:
-- Lifecycle event handlers (tool interception, safety gates, context modifications)
-- Custom tools (todo lists, questions, subagents, output truncation)
-- Commands and keyboard shortcuts
-- Custom UI (footers, headers, editors, overlays)
-- Git integration (checkpoints, auto-commit)
-- System prompt modifications and custom compaction
-- External integrations (SSH, file watchers, system theme sync)
-- Custom providers (Anthropic with custom streaming, GitLab Duo)
+## Extension examples
+
+Extension examples (lifecycle handlers, custom tools, commands, UI,
+custom providers, etc.) have moved to
+[`packages/extensions/examples/`](../../extensions/examples/). See that
+directory for ~40 categorized examples plus single-file copies of the
+bundled `web_search` tool providers.
 
 ## Documentation
 
 - [SDK Reference](sdk/README.md)
 - [Extensions Documentation](../docs/extensions.md)
+- [Tool-kit / tool provider design](../docs/tool-packages.md)
 - [Skills Documentation](../docs/skills.md)

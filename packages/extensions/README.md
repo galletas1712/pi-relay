@@ -110,12 +110,15 @@ top-level `src/index.ts` invokes.
 Each file is also a complete standalone pi-relay extension — you can copy it
 to `~/.pi/agent/extensions/` and it'll load without this package.
 
-## Reference single-file copies
+## Examples
 
-See the `examples/` directory at the repo root for standalone copies of every
-provider in this pack. They're byte-for-byte identical; the `examples/`
-variants exist so third-party authors can read one self-contained file to
-learn the extension surface.
+See [`./examples/`](./examples/) for a categorized catalogue of ~40 example
+extensions — lifecycle handlers, custom tools, commands, UI, custom
+providers, etc. Single-file copies of this pack's tool providers
+(`codex-web-search.ts`, `perplexity-sonar.ts`) live there too under
+**Provider examples** at the top of
+[`./examples/README.md`](./examples/README.md) as reference
+implementations for authors who want to start from a working file.
 
 ## See also
 
@@ -124,4 +127,4 @@ learn the extension surface.
   on tool-kit (+ `@sinclair/typebox`); this pack depends on
   `@pi-relay/coding-agent` for the `ExtensionAPI` type.
 - `packages/coding-agent/docs/tool-packages.md` — internal design of the
-  interface/provider/binding model and the extension discovery algorithm.
+  interface/provider/tool model and the extension discovery algorithm.

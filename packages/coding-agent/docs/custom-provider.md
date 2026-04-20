@@ -11,9 +11,9 @@ Extensions can register custom model providers via `pi.registerProvider()`. This
 
 See these complete provider examples:
 
-- [`examples/extensions/custom-provider-anthropic/`](../examples/extensions/custom-provider-anthropic/)
-- [`examples/extensions/custom-provider-gitlab-duo/`](../examples/extensions/custom-provider-gitlab-duo/)
-- [`examples/extensions/custom-provider-qwen-cli/`](../examples/extensions/custom-provider-qwen-cli/)
+- [`extensions/examples/custom-provider-anthropic/`](../../extensions/examples/custom-provider-anthropic/)
+- [`extensions/examples/custom-provider-gitlab-duo/`](../../extensions/examples/custom-provider-gitlab-duo/)
+- [`extensions/examples/custom-provider-qwen-cli/`](../../extensions/examples/custom-provider-qwen-cli/)
 
 ## Table of Contents
 

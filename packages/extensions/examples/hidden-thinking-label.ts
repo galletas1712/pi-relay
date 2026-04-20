@@ -5,7 +5,7 @@
  * when thinking blocks are hidden.
  *
  * Usage:
- *   pi --extension examples/extensions/hidden-thinking-label.ts
+ *   pi --extension packages/extensions/examples/hidden-thinking-label.ts
  *
  * Test:
  *   1. Load this extension

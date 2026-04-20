@@ -1,20 +1,37 @@
 # Extension Examples
 
-Example extensions for pi-coding-agent.
+Example extensions for pi-relay. Everything under this directory is
+docs-as-code: files can be loaded directly via `--extension` or copied
+into `~/.pi/agent/extensions/` for auto-discovery. Nothing here is
+auto-loaded by `@pi-relay/extensions` — for the bundled pack see
+[`../src/tools/`](../src/tools/).
 
 ## Usage
 
 ```bash
 # Load an extension with --extension flag
-pi --extension examples/extensions/permission-gate.ts
+pi --extension packages/extensions/examples/permission-gate.ts
 
 # Or copy to extensions directory for auto-discovery
 cp permission-gate.ts ~/.pi/agent/extensions/
 ```
 
-## Examples
+## Provider examples
 
-### Lifecycle & Safety
+Single-file reference implementations of the `web_search` tool providers
+shipped in [`@pi-relay/extensions/src/tools/`](../src/tools/). Copy one
+and adapt it to build your own tool provider:
+
+| File | Description |
+|------|-------------|
+| `codex-web-search.ts` | `web_search` provider backed by the OpenAI Codex web_search API. Piggybacks on the selected Codex model's OAuth; no secret env var. |
+| `perplexity-sonar.ts` | `web_search` provider backed by Perplexity Sonar. Needs `PERPLEXITY_API_KEY`. |
+
+See [`../README.md`](../README.md) for how these providers register and
+[`../../tool-kit/README.md`](../../tool-kit/README.md) for the authoring
+surface (`defineToolProvider`, `ToolInterface`, `ToolsConfig`, …).
+
+## Lifecycle & Safety
 
 | Extension | Description |
 |-----------|-------------|
@@ -24,7 +41,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `dirty-repo-guard.ts` | Prevents session changes with uncommitted git changes |
 | `sandbox/` | OS-level sandboxing using `@anthropic-ai/sandbox-runtime` with per-project config |
 
-### Custom Tools
+## Custom Tools
 
 | Extension | Description |
 |-----------|-------------|
@@ -41,7 +58,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `ssh.ts` | Delegate all tools to a remote machine via SSH using pluggable operations |
 | `subagent/` | Delegate tasks to specialized subagents with isolated context windows |
 
-### Commands & UI
+## Commands & UI
 
 | Extension | Description |
 |-----------|-------------|
@@ -57,7 +74,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `snake.ts` | Snake game with custom UI, keyboard handling, and session persistence |
 | `send-user-message.ts` | Demonstrates `pi.sendUserMessage()` for sending user messages from extensions |
 | `timed-confirm.ts` | Demonstrates AbortSignal for auto-dismissing `ctx.ui.confirm()` and `ctx.ui.select()` dialogs |
-| `rpc-demo.ts` | Exercises all RPC-supported extension UI methods; pair with [`examples/rpc-extension-ui.ts`](../rpc-extension-ui.ts) |
+| `rpc-demo.ts` | Exercises all RPC-supported extension UI methods; pair with an RPC client script that implements the extension UI protocol |
 | `modal-editor.ts` | Custom vim-like modal editor via `ctx.ui.setEditorComponent()` |
 | `rainbow-editor.ts` | Animated rainbow text effect via custom editor |
 | `notify.ts` | Desktop notifications via OSC 777 when agent finishes (Ghostty, iTerm2, WezTerm) |
@@ -73,14 +90,14 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `interactive-shell.ts` | Run interactive commands (vim, htop) with full terminal via `user_bash` hook |
 | `inline-bash.ts` | Expands `!{command}` patterns in prompts via `input` event transformation |
 
-### Git Integration
+## Git Integration
 
 | Extension | Description |
 |-----------|-------------|
 | `git-checkpoint.ts` | Creates git stash checkpoints at each turn for code restoration on fork |
 | `auto-commit-on-exit.ts` | Auto-commits on exit using last assistant message for commit message |
 
-### System Prompt & Compaction
+## System Prompt & Compaction
 
 | Extension | Description |
 |-----------|-------------|
@@ -89,33 +106,33 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `custom-compaction.ts` | Custom compaction that summarizes entire conversation |
 | `trigger-compact.ts` | Triggers compaction when context usage exceeds 100k tokens and adds `/trigger-compact` command |
 
-### System Integration
+## System Integration
 
 | Extension | Description |
 |-----------|-------------|
 | `mac-system-theme.ts` | Syncs pi theme with macOS dark/light mode |
 
-### Resources
+## Resources
 
 | Extension | Description |
 |-----------|-------------|
 | `dynamic-resources/` | Loads skills, prompts, and themes using `resources_discover` |
 
-### Messages & Communication
+## Messages & Communication
 
 | Extension | Description |
 |-----------|-------------|
 | `message-renderer.ts` | Custom message rendering with colors and expandable details via `registerMessageRenderer` |
 | `event-bus.ts` | Inter-extension communication via `pi.events` |
 
-### Session Metadata
+## Session Metadata
 
 | Extension | Description |
 |-----------|-------------|
 | `session-name.ts` | Name sessions for the session selector via `setSessionName` |
 | `bookmark.ts` | Bookmark entries with labels for `/tree` navigation via `setLabel` |
 
-### Custom Providers
+## Custom Providers
 
 | Extension | Description |
 |-----------|-------------|
@@ -123,7 +140,7 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 | `custom-provider-gitlab-duo/` | GitLab Duo provider using pi-ai's built-in Anthropic/OpenAI streaming via proxy |
 | `custom-provider-qwen-cli/` | Qwen CLI provider with OAuth device flow and OpenAI-compatible models |
 
-### External Dependencies
+## External Dependencies
 
 | Extension | Description |
 |-----------|-------------|
@@ -132,7 +149,10 @@ cp permission-gate.ts ~/.pi/agent/extensions/
 
 ## Writing Extensions
 
-See [docs/extensions.md](../../docs/extensions.md) for full documentation.
+See [`../../coding-agent/docs/extensions.md`](../../coding-agent/docs/extensions.md)
+for full documentation and
+[`../../coding-agent/docs/tool-packages.md`](../../coding-agent/docs/tool-packages.md)
+for the tool-provider model specifically.
 
 ```typescript
 import type { ExtensionAPI } from "@pi-relay/coding-agent";
@@ -176,6 +196,7 @@ export default function (pi: ExtensionAPI) {
 ## Key Patterns
 
 **Use StringEnum for string parameters** (required for Google API compatibility):
+
 ```typescript
 import { StringEnum } from "@pi-relay/ai";
 
@@ -187,6 +208,7 @@ action: Type.Union([Type.Literal("list"), Type.Literal("add")])
 ```
 
 **State persistence via details:**
+
 ```typescript
 // Store state in tool result details for proper forking support
 return {
