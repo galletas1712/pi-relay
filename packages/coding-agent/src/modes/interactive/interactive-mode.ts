@@ -3539,6 +3539,8 @@ export class InteractiveMode {
 					autocompleteMaxVisible: this.settingsManager.getAutocompleteMaxVisible(),
 					quietStartup: this.settingsManager.getQuietStartup(),
 					clearOnShrink: this.settingsManager.getClearOnShrink(),
+					cacheRetention: this.settingsManager.getCacheRetention(),
+					showCacheStats: this.settingsManager.getShowCacheStats(),
 				},
 				{
 					onAutoCompactChange: (enabled) => {
@@ -3640,6 +3642,17 @@ export class InteractiveMode {
 					onClearOnShrinkChange: (enabled) => {
 						this.settingsManager.setClearOnShrink(enabled);
 						this.ui.setClearOnShrink(enabled);
+					},
+					onCacheRetentionChange: (retention) => {
+						this.settingsManager.setCacheRetention(retention);
+						// Push the new effective value through to the live Agent so
+						// subsequent streamFn calls pick it up without a session restart.
+						this.session.agent.cacheRetention = this.settingsManager.getCacheRetention();
+					},
+					onShowCacheStatsChange: (enabled) => {
+						this.settingsManager.setShowCacheStats(enabled);
+						// Footer reads the flag on every render; just invalidate to re-show.
+						this.footer.invalidate();
 					},
 					onCancel: () => {
 						done();

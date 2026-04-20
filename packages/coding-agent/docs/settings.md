@@ -158,6 +158,26 @@ When multiple sources specify a session directory, `--session-dir` CLI flag take
 |---------|------|---------|-------------|
 | `markdown.codeBlockIndent` | string | `"  "` | Indentation for code blocks |
 
+### Cache
+
+Persistent preferences for prompt caching and its dev-visible telemetry. See [env-vars.md](env-vars.md#prompt-caching) for the equivalent env-var overrides (`PI_CACHE_RETENTION` and `PI_SHOW_CACHE_STATS`). When set, the env var wins.
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `cache.retention` | string | unset | `"short"` (default 5m TTL), `"long"` (extended TTL where supported — Anthropic 1h, Bedrock 1h, OpenAI Responses / Azure / Codex 24h), or `"none"` (disable caching entirely). |
+| `cache.showStats` | boolean | `false` | Surface per-turn cache read/write tokens in the TUI footer and the `[pi:cache]` stderr log in print mode. |
+
+```json
+{
+  "cache": {
+    "retention": "long",
+    "showStats": true
+  }
+}
+```
+
+Editable via `/settings` in the TUI under `Cache retention` and `Show cache stats`.
+
 ### Resources
 
 These settings define where to load extensions, skills, prompts, and themes from.

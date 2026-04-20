@@ -1,5 +1,5 @@
 import type { ThinkingLevel } from "@pi-relay/agent-core";
-import type { Transport } from "@pi-relay/ai";
+import type { CacheRetention, Transport } from "@pi-relay/ai";
 import {
 	Container,
 	getCapabilities,
@@ -42,6 +42,8 @@ export interface SettingsConfig {
 	autocompleteMaxVisible: number;
 	quietStartup: boolean;
 	clearOnShrink: boolean;
+	cacheRetention: CacheRetention | undefined;
+	showCacheStats: boolean;
 }
 
 export interface SettingsCallbacks {
@@ -66,6 +68,8 @@ export interface SettingsCallbacks {
 	onAutocompleteMaxVisibleChange: (maxVisible: number) => void;
 	onQuietStartupChange: (enabled: boolean) => void;
 	onClearOnShrinkChange: (enabled: boolean) => void;
+	onCacheRetentionChange: (retention: CacheRetention) => void;
+	onShowCacheStatsChange: (enabled: boolean) => void;
 	onCancel: () => void;
 }
 
@@ -353,6 +357,31 @@ export class SettingsSelectorComponent extends Container {
 			values: ["true", "false"],
 		});
 
+		// Cache retention (insert after clear-on-shrink). `undefined` effective
+		// value means "use provider default" — we surface that as "short" so the
+		// picker has a selected state. Cycling writes a concrete value to
+		// settings.json via onCacheRetentionChange.
+		const clearOnShrinkIndex = items.findIndex((item) => item.id === "clear-on-shrink");
+		items.splice(clearOnShrinkIndex + 1, 0, {
+			id: "cache-retention",
+			label: "Cache retention",
+			description:
+				"Prompt cache retention preference. 'short' = default 5m TTL, 'long' = extended TTL where supported (Anthropic 1h, Bedrock 1h, OpenAI Responses/Azure/Codex 24h), 'none' = disable caching entirely. Env var PI_CACHE_RETENTION overrides this setting.",
+			currentValue: config.cacheRetention ?? "short",
+			values: ["short", "long", "none"],
+		});
+
+		// Cache stats toggle (insert after cache-retention)
+		const cacheRetentionIndex = items.findIndex((item) => item.id === "cache-retention");
+		items.splice(cacheRetentionIndex + 1, 0, {
+			id: "show-cache-stats",
+			label: "Show cache stats",
+			description:
+				"Surface per-turn cache read/write tokens in the footer and print-mode stderr. Env var PI_SHOW_CACHE_STATS overrides this setting.",
+			currentValue: config.showCacheStats ? "true" : "false",
+			values: ["true", "false"],
+		});
+
 		// Add borders
 		this.addChild(new DynamicBorder());
 
@@ -417,6 +446,12 @@ export class SettingsSelectorComponent extends Container {
 						break;
 					case "clear-on-shrink":
 						callbacks.onClearOnShrinkChange(newValue === "true");
+						break;
+					case "cache-retention":
+						callbacks.onCacheRetentionChange(newValue as CacheRetention);
+						break;
+					case "show-cache-stats":
+						callbacks.onShowCacheStatsChange(newValue === "true");
 						break;
 				}
 			},

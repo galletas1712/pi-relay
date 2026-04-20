@@ -24,9 +24,11 @@ Most boolean flags accept `1`, `true`, or `yes` (case-insensitive) as "enabled" 
 
 | Variable | Values | Default | Effect |
 |----------|--------|---------|--------|
-| `PI_CACHE_RETENTION` | `none` | unset | Kill switch — disables all prompt-caching `cache_control` / `cachePoint` / `prompt_cache_key` stamps on every supported provider (Anthropic, Bedrock, OpenAI Responses, OpenAI Completions, Azure, Codex). |
-| `PI_CACHE_RETENTION` | `long` | unset | Opt in to extended cache TTL where the provider supports it. Anthropic: 1h on `api.anthropic.com`. Bedrock: 1h cache point. OpenAI Responses / Azure / Codex: `prompt_cache_retention: "24h"`. Chat Completions has no extended-TTL wire field, so `long` is inert there. |
-| `PI_SHOW_CACHE_STATS` | `=1` (strict) | off | Surface per-turn cache read/write tokens. TUI: adds a `Δ R:N W:M` column to the footer. Print mode: emits `[pi:cache] turn=N cacheRead=R cacheWrite=W input=I output=O` to stderr on each assistant `message_end`. |
+| `PI_CACHE_RETENTION` | `none` | unset | Kill switch — disables all prompt-caching `cache_control` / `cachePoint` / `prompt_cache_key` stamps on every supported provider (Anthropic, Bedrock, OpenAI Responses, OpenAI Completions, Azure, Codex). Overrides the persistent `cache.retention` setting when set. |
+| `PI_CACHE_RETENTION` | `long` | unset | Opt in to extended cache TTL where the provider supports it. Anthropic: 1h on `api.anthropic.com`. Bedrock: 1h cache point. OpenAI Responses / Azure / Codex: `prompt_cache_retention: "24h"`. Chat Completions has no extended-TTL wire field, so `long` is inert there. Overrides the persistent `cache.retention` setting when set. |
+| `PI_SHOW_CACHE_STATS` | `1` / `true` / `yes` | off | Surface per-turn cache read/write tokens. TUI: adds a `Δ R:N W:M` column to the footer. Print mode: emits `[pi:cache] turn=N cacheRead=R cacheWrite=W input=I output=O` to stderr on each assistant `message_end`. Overrides the persistent `cache.showStats` setting when set. |
+
+Both flags have persistent `settings.json` equivalents under the `cache.*` key that are configurable via `/settings` in the TUI. See [settings.md](./settings.md#cache). The env var wins whenever it is set to a recognized value.
 
 ## Debug / telemetry
 
