@@ -491,6 +491,12 @@ function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention 
 	if (cacheRetention) {
 		return cacheRetention;
 	}
+	// Global kill-switch: matches every other provider helper (Anthropic, OpenAI Responses,
+	// OpenAI Completions / Azure / Codex). Setting PI_CACHE_RETENTION=none disables cachePoint
+	// stamping on both the system block and the last user message.
+	if (typeof process !== "undefined" && process.env.PI_CACHE_RETENTION === "none") {
+		return "none";
+	}
 	if (typeof process !== "undefined" && process.env.PI_CACHE_RETENTION === "long") {
 		return "long";
 	}

@@ -200,6 +200,47 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 		});
 	});
 
+	describe("Amazon Bedrock Provider", () => {
+		it("should omit cachePoint from system and messages when PI_CACHE_RETENTION=none", async () => {
+			process.env.PI_CACHE_RETENTION = "none";
+
+			const model = getModel("amazon-bedrock", "global.anthropic.claude-sonnet-4-5-20250929-v1:0");
+			let capturedPayload: any = null;
+
+			const { streamBedrock } = await import("../src/providers/amazon-bedrock.js");
+
+			// AbortSignal.abort() short-circuits the SDK request so we never need AWS
+			// credentials; onPayload fires before the network hop.
+			const s = streamBedrock(model, context, {
+				signal: AbortSignal.abort(),
+				onPayload: (payload) => {
+					capturedPayload = payload;
+					return payload;
+				},
+			});
+
+			for await (const event of s) {
+				if (event.type === "error") break;
+			}
+
+			expect(capturedPayload).not.toBeNull();
+			// System block should have no cachePoint entry
+			if (capturedPayload.system) {
+				for (const block of capturedPayload.system) {
+					expect(block.cachePoint).toBeUndefined();
+				}
+			}
+			// No cachePoint in any message content block
+			for (const message of capturedPayload.messages) {
+				if (Array.isArray(message.content)) {
+					for (const block of message.content) {
+						expect(block.cachePoint).toBeUndefined();
+					}
+				}
+			}
+		});
+	});
+
 	describe("OpenAI Responses Provider", () => {
 		it.skipIf(!process.env.OPENAI_API_KEY)(
 			"should not set prompt_cache_retention when PI_CACHE_RETENTION is not set",
