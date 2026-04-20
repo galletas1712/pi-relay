@@ -290,11 +290,10 @@ describe("createOrchestratorExtension", () => {
 		const orchestrator = new Orchestrator({ rootSession: root, sessionFactory: vi.fn() });
 		orchestrator.setForkModel(fakeReasoningModel("gpt-5.4"));
 		orchestrator.setForkThinkingLevel("medium");
-		const setProvider = vi.fn();
+		const setOverride = vi.fn();
 		const clearFork = vi.fn();
 		const settingsManager = {
-			setWorklogForkModelAndProvider: setProvider,
-			setWorklogForkThinkingLevel: vi.fn(),
+			setWorklogForkOverride: setOverride,
 			clearWorklogForkModel: clearFork,
 		} as never;
 		const handlers = new Map<string, Function>();
@@ -326,7 +325,7 @@ describe("createOrchestratorExtension", () => {
 		expect(orchestrator.getForkModel()).toBeUndefined();
 		expect(orchestrator.getForkThinkingLevel()).toBeUndefined();
 		expect(clearFork).toHaveBeenCalledTimes(1);
-		expect(setProvider).not.toHaveBeenCalled();
+		expect(setOverride).not.toHaveBeenCalled();
 		expect(notify).toHaveBeenCalledWith(
 			"Worklog fork: cleared override (will use session model).",
 			"info",
@@ -337,8 +336,7 @@ describe("createOrchestratorExtension", () => {
 		const root = new FakeSession("root-session");
 		const orchestrator = new Orchestrator({ rootSession: root, sessionFactory: vi.fn() });
 		const settingsManager = {
-			setWorklogForkModelAndProvider: vi.fn(),
-			setWorklogForkThinkingLevel: vi.fn(),
+			setWorklogForkOverride: vi.fn(),
 			clearWorklogForkModel: vi.fn(),
 		} as never;
 		const model = fakeReasoningModel("gpt-5.4", "openai");
@@ -370,8 +368,7 @@ describe("createOrchestratorExtension", () => {
 
 		expect(orchestrator.getForkModel()?.id).toBe("gpt-5.4");
 		expect(orchestrator.getForkThinkingLevel()).toBe("medium");
-		expect(settingsManager.setWorklogForkModelAndProvider).toHaveBeenCalledWith("openai", "gpt-5.4");
-		expect(settingsManager.setWorklogForkThinkingLevel).toHaveBeenCalledWith("medium");
+		expect(settingsManager.setWorklogForkOverride).toHaveBeenCalledWith("openai", "gpt-5.4", "medium");
 		expect(notify).toHaveBeenCalledWith("Worklog fork: openai/gpt-5.4 (medium).", "info");
 	});
 
@@ -471,25 +468,53 @@ describe("worklog-model helpers", () => {
 	it("applyForkModelChoice: mirrors choice into orchestrator AND settings", () => {
 		const root = new FakeSession("root-session");
 		const orchestrator = new Orchestrator({ rootSession: root, sessionFactory: vi.fn() });
-		const setProvider = vi.fn();
-		const setLevel = vi.fn();
+		const setOverride = vi.fn();
 		const clearFork = vi.fn();
 		const settings = {
-			setWorklogForkModelAndProvider: setProvider,
-			setWorklogForkThinkingLevel: setLevel,
+			setWorklogForkOverride: setOverride,
 			clearWorklogForkModel: clearFork,
 		} as never;
 		const model = fakeReasoningModel("gpt-5.4");
 		applyForkModelChoice(orchestrator, model, "medium", settings);
 		expect(orchestrator.getForkModel()?.id).toBe("gpt-5.4");
 		expect(orchestrator.getForkThinkingLevel()).toBe("medium");
-		expect(setProvider).toHaveBeenCalledWith("openai", "gpt-5.4");
-		expect(setLevel).toHaveBeenCalledWith("medium");
+		expect(setOverride).toHaveBeenCalledWith("openai", "gpt-5.4", "medium");
 
 		applyForkModelChoice(orchestrator, undefined, undefined, settings);
 		expect(orchestrator.getForkModel()).toBeUndefined();
 		expect(orchestrator.getForkThinkingLevel()).toBeUndefined();
 		expect(clearFork).toHaveBeenCalledTimes(1);
+	});
+
+	it("applyForkModelChoice: clears stale persisted thinking-level when the new model has no level", () => {
+		// Regression: previously `applyForkModelChoice` would only write the
+		// thinking level when it was truthy, leaving an earlier "high"
+		// setting lingering in Settings after the user switched to a
+		// non-reasoning model. The atomic setter must persist
+		// `undefined` explicitly so the old value is cleared.
+		const root = new FakeSession("root-session");
+		const orchestrator = new Orchestrator({ rootSession: root, sessionFactory: vi.fn() });
+		const setOverride = vi.fn();
+		const settings = {
+			setWorklogForkOverride: setOverride,
+			clearWorklogForkModel: vi.fn(),
+		} as never;
+
+		// First: reasoning model with level "high" persists as expected.
+		const reasoning = fakeReasoningModel("gpt-5.4");
+		applyForkModelChoice(orchestrator, reasoning, "high", settings);
+		expect(setOverride).toHaveBeenLastCalledWith("openai", "gpt-5.4", "high");
+
+		// Second: switch to a non-reasoning model (level resolves to
+		// undefined via resolveThinkingLevel). Persisted level MUST be
+		// cleared (explicit undefined), not left at the previous "high".
+		const nonReasoning: ReturnType<typeof fakeReasoningModel> = {
+			...fakeReasoningModel("gpt-3.5"),
+			reasoning: false,
+		};
+		applyForkModelChoice(orchestrator, nonReasoning, undefined, settings);
+		expect(setOverride).toHaveBeenLastCalledWith("openai", "gpt-3.5", undefined);
+		expect(orchestrator.getForkThinkingLevel()).toBeUndefined();
 	});
 
 	it("applyForkModelChoice: works without a settings manager (session-only change)", () => {

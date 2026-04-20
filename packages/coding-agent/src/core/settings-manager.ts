@@ -651,16 +651,22 @@ export class SettingsManager {
 		return this.settings.worklogForkThinkingLevel;
 	}
 
-	setWorklogForkModelAndProvider(provider: string, modelId: string): void {
+	/**
+	 * Atomically persist the full worklog-fork override (provider, model
+	 * id, and thinking level) as a single write. Passing `level ===
+	 * undefined` explicitly clears any previously-persisted thinking
+	 * level so it cannot linger across model switches — important when
+	 * the user switches from a reasoning model ("high") to a
+	 * non-reasoning model (no level applicable).
+	 *
+	 * To clear the whole override use `clearWorklogForkModel` instead.
+	 */
+	setWorklogForkOverride(provider: string, modelId: string, level: string | undefined): void {
 		this.globalSettings.worklogForkProvider = provider;
 		this.globalSettings.worklogForkModel = modelId;
+		this.globalSettings.worklogForkThinkingLevel = level;
 		this.markModified("worklogForkProvider");
 		this.markModified("worklogForkModel");
-		this.save();
-	}
-
-	setWorklogForkThinkingLevel(level: string): void {
-		this.globalSettings.worklogForkThinkingLevel = level;
 		this.markModified("worklogForkThinkingLevel");
 		this.save();
 	}

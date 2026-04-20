@@ -330,13 +330,11 @@ export function applyForkModelChoice(
 		return;
 	}
 	if (model) {
-		settingsManager.setWorklogForkModelAndProvider(model.provider, model.id);
-		if (level) {
-			settingsManager.setWorklogForkThinkingLevel(level);
-		} else {
-			// Clearing the thinking level alone is not a supported operation,
-			// but we can fall back to not persisting anything in that case.
-		}
+		// Atomic write: if `level` is undefined (e.g. the user picked a
+		// non-reasoning model), that `undefined` must be persisted so an
+		// earlier "high" setting from a reasoning model doesn't linger and
+		// get rehydrated on next startup.
+		settingsManager.setWorklogForkOverride(model.provider, model.id, level);
 	} else {
 		settingsManager.clearWorklogForkModel();
 	}

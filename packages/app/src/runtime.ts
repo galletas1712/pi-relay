@@ -121,6 +121,16 @@ export function createRelayRuntimeFactory(
 			const restoredForkModel = getModel(savedForkProvider as never, savedForkModelId as never);
 			if (restoredForkModel) {
 				orchestrator.setForkModel(restoredForkModel);
+			} else {
+				// The persisted worklog fork model is no longer resolvable
+				// (model removed from registry, provider renamed, etc.).
+				// Surface a non-fatal diagnostic so the user sees the
+				// setting was effectively dropped instead of silently
+				// running against the session's main model with no feedback.
+				services.diagnostics.push({
+					type: "warning",
+					message: `Configured worklog fork model '${savedForkProvider}/${savedForkModelId}' is no longer available; falling back to session model. Run /worklog-model to reconfigure.`,
+				});
 			}
 		}
 		const savedForkThinking =
