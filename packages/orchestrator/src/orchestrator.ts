@@ -15,7 +15,7 @@ import {
 	createAgentIdleMessage,
 	createAgentReportMessage,
 } from "./messages.js";
-import { buildAncestorWorklogPrefix, buildWorklogPrompt, appendWorklogEntry, getLastWorklogEntry, readWorklog, WORKLOG_UPDATE_TOOL } from "./worklog.js";
+import { buildAncestorWorklogPrefix, buildWorklogPrompt, appendWorklogEntry, computeTopicVocabulary, getLastWorklogEntry, parseWorklogEntries, readWorklog, WORKLOG_UPDATE_TOOL } from "./worklog.js";
 import { ToolCallTracker } from "./tool-tracker.js";
 import {
 	DEFAULT_ORCHESTRATOR_CONFIG,
@@ -1211,9 +1211,12 @@ export class Orchestrator {
 		const contextMessages = await record.session.agent.convertToLlm(deltaMessages);
 		const worklogContents = await readWorklog(record.worklogFile);
 		const lastEntry = getLastWorklogEntry(worklogContents);
+		// Hint the fork at slugs already in use so topic choices stay stable
+		// across entries. Capped at top-30 by count inside computeTopicVocabulary.
+		const topicVocabulary = computeTopicVocabulary(parseWorklogEntries(worklogContents));
 		const prompt: UserMessage = {
 			role: "user",
-			content: [{ type: "text", text: buildWorklogPrompt(lastEntry) }],
+			content: [{ type: "text", text: buildWorklogPrompt(lastEntry, topicVocabulary) }],
 			timestamp: Date.now(),
 		};
 		// Use a distinct `sessionId` for the worklog fork so OpenAI-family
@@ -1277,7 +1280,11 @@ export class Orchestrator {
 		}
 
 		const args = validateToolArguments(WORKLOG_UPDATE_TOOL, toolCall);
-		const entry = await appendWorklogEntry(record.worklogFile, args.content, turn);
+		const entry = await appendWorklogEntry(record.worklogFile, args.content, turn, {
+			topics: args.topics,
+			supersedes: args.supersedes,
+			pin: args.pin,
+		});
 		record.lastWorklogTurn = turn;
 		record.lastWorklogMessageCount = turnMessages.length;
 		await this.persistTree();

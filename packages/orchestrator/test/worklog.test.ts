@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Usage } from "@pi-relay/ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isLikelyTrivialTurn, Orchestrator } from "../src/orchestrator.js";
-import { appendWorklogEntry, buildWorklogPrompt } from "../src/worklog.js";
+import { appendWorklogEntry, buildWorklogPrompt, computeTopicVocabulary, formatWorklogEntry, parseWorklogEntries } from "../src/worklog.js";
 import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
 function createWorklogAssistant(content: string, usage?: Usage) {
@@ -1060,5 +1060,361 @@ describe("worklog fork gating integration", () => {
 		// Critically, turnCount advanced across both turns.
 		expect(capturedDelta).toBe(2);
 		expect(orchestrator.getRecord(childId).turnCount).toBe(2);
+	});
+});
+
+describe("parseWorklogEntries", () => {
+	it("round-trips: format → parse → reformat yields identical content", () => {
+		const iso = "2026-04-20T12:00:00.000Z";
+		const entry = formatWorklogEntry("## Decisions\n- First finding.", 1, {
+			iso,
+			topics: ["orchestrator/restore"],
+			supersedes: [],
+		});
+		const parsed = parseWorklogEntries(`${entry}\n\n`);
+		expect(parsed).toHaveLength(1);
+		expect(parsed[0]?.raw).toBe(entry);
+		expect(parsed[0]?.body).toBe("## Decisions\n- First finding.");
+		// A second format call with the same (content, iso) and same meta
+		// must yield the same text because entry_id is deterministic.
+		const again = formatWorklogEntry("## Decisions\n- First finding.", 1, {
+			iso,
+			topics: ["orchestrator/restore"],
+			supersedes: [],
+		});
+		expect(again).toBe(entry);
+	});
+
+	it("parses a legacy entry (no meta comment) with meta={}, id undefined, correct body", () => {
+		const legacy = "## Entry — 2026-01-01T00:00:00.000Z (turn 7)\n\n## Findings\n- legacy body text.\n\n";
+		const parsed = parseWorklogEntries(legacy);
+		expect(parsed).toHaveLength(1);
+		expect(parsed[0]?.meta).toEqual({});
+		expect(parsed[0]?.id).toBeUndefined();
+		expect(parsed[0]?.turn).toBe(7);
+		expect(parsed[0]?.iso).toBe("2026-01-01T00:00:00.000Z");
+		expect(parsed[0]?.body).toBe("## Findings\n- legacy body text.");
+	});
+
+	it("parses a mixed file with both legacy and structured entries", () => {
+		const iso = "2026-02-02T02:02:02.000Z";
+		const structured = formatWorklogEntry("## Structured\n- body A.", 2, {
+			iso,
+			topics: ["foo"],
+			supersedes: ["deadbeef"],
+		});
+		const mixed =
+			"## Entry — 2026-01-01T00:00:00.000Z (turn 1)\n\n## Legacy\n- legacy body.\n\n" +
+			`${structured}\n\n`;
+		const parsed = parseWorklogEntries(mixed);
+		expect(parsed).toHaveLength(2);
+		expect(parsed[0]?.meta).toEqual({});
+		expect(parsed[0]?.id).toBeUndefined();
+		expect(parsed[0]?.body).toBe("## Legacy\n- legacy body.");
+		expect(parsed[1]?.id).toBeDefined();
+		expect(parsed[1]?.meta.topics).toEqual(["foo"]);
+		expect(parsed[1]?.meta.supersedes).toEqual(["deadbeef"]);
+		expect(parsed[1]?.body).toBe("## Structured\n- body A.");
+	});
+
+	it("does NOT throw on malformed meta JSON; meta is {} and id undefined", () => {
+		const broken = "## Entry — 2026-03-03T03:03:03.000Z (turn 4) <!-- meta: not-json -->\n\n## Body\n- content.\n\n";
+		const parsed = parseWorklogEntries(broken);
+		expect(parsed).toHaveLength(1);
+		expect(parsed[0]?.meta).toEqual({});
+		expect(parsed[0]?.id).toBeUndefined();
+		expect(parsed[0]?.body).toBe("## Body\n- content.");
+	});
+
+	it("accepts an empty meta object {} with all fields optional", () => {
+		const entry = "## Entry — 2026-03-03T03:03:03.000Z (turn 4) <!-- meta: {} -->\n\n## Body\n- content.\n\n";
+		const parsed = parseWorklogEntries(entry);
+		expect(parsed).toHaveLength(1);
+		expect(parsed[0]?.meta).toEqual({});
+		expect(parsed[0]?.id).toBeUndefined();
+	});
+
+	it("round-trips supersedes and topics exactly", () => {
+		const iso = "2026-04-04T04:04:04.000Z";
+		const entry = formatWorklogEntry("## X", 3, {
+			iso,
+			topics: ["caching/anthropic", "orchestrator/restore"],
+			supersedes: ["abcd1234", "11112222"],
+		});
+		const parsed = parseWorklogEntries(entry);
+		expect(parsed[0]?.meta.topics).toEqual(["caching/anthropic", "orchestrator/restore"]);
+		expect(parsed[0]?.meta.supersedes).toEqual(["abcd1234", "11112222"]);
+	});
+
+	it("computes a deterministic entry_id for the same (content, iso) pair", () => {
+		const iso = "2026-05-05T05:05:05.000Z";
+		const a = formatWorklogEntry("same content", 1, { iso });
+		const b = formatWorklogEntry("same content", 2, { iso });
+		const pa = parseWorklogEntries(a)[0];
+		const pb = parseWorklogEntries(b)[0];
+		expect(pa?.id).toBeDefined();
+		expect(pa?.id).toBe(pb?.id);
+		const c = formatWorklogEntry("different content", 1, { iso });
+		const pc = parseWorklogEntries(c)[0];
+		expect(pc?.id).not.toBe(pa?.id);
+	});
+
+	it("preserves whitespace in a multi-line body with code blocks", () => {
+		const iso = "2026-06-06T06:06:06.000Z";
+		const content = "## Notes\n\n```ts\nfunction f() {\n  return 1;\n}\n```\n\nTrailing line.";
+		const entry = formatWorklogEntry(content, 1, { iso });
+		const parsed = parseWorklogEntries(`${entry}\n\n`);
+		// Body is the original content (format trims leading/trailing
+		// whitespace on write). Parse trims trailing whitespace too.
+		expect(parsed[0]?.body).toBe(content);
+	});
+});
+
+describe("appendWorklogEntry with meta", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	it("writes topics and supersedes into the header comment", async () => {
+		const dir = createTempDir("pi-relay-worklog-meta-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/a.worklog.md`;
+		const returned = await appendWorklogEntry(filePath, "## Content", 5, {
+			topics: ["foo", "bar"],
+			supersedes: ["abcd1234"],
+			pin: false,
+		});
+		const disk = await readFile(filePath, "utf-8");
+		expect(disk).toContain(returned);
+		expect(disk).toMatch(/<!-- meta: \{.*"topics":\["foo","bar"\].*\} -->/);
+		expect(disk).toMatch(/"supersedes":\["abcd1234"\]/);
+		expect(disk).toMatch(/"entry_id":"[0-9a-f]{8}"/);
+		expect(disk).toMatch(/"pin":false/);
+	});
+
+	it("appending to a file without trailing newline does not corrupt format", async () => {
+		const dir = createTempDir("pi-relay-worklog-meta-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/b.worklog.md`;
+		// Seed the file with a legacy entry that is missing its trailing newlines.
+		const { writeFile } = await import("node:fs/promises");
+		await writeFile(filePath, "## Entry — 2026-01-01T00:00:00.000Z (turn 1)\n\nlegacy body", "utf-8");
+		await appendWorklogEntry(filePath, "## New\n- second entry.", 2, { topics: ["t"] });
+		const disk = await readFile(filePath, "utf-8");
+		const parsed = parseWorklogEntries(disk);
+		// Both entries must still parse, with no cross-entry corruption.
+		expect(parsed).toHaveLength(2);
+		expect(parsed[0]?.body).toContain("legacy body");
+		expect(parsed[1]?.body).toBe("## New\n- second entry.");
+		expect(parsed[1]?.meta.topics).toEqual(["t"]);
+	});
+
+	it("returned entry string matches the text persisted on disk", async () => {
+		const dir = createTempDir("pi-relay-worklog-meta-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/c.worklog.md`;
+		const returned = await appendWorklogEntry(filePath, "## A", 9, {
+			topics: ["z"],
+		});
+		const disk = await readFile(filePath, "utf-8");
+		expect(disk.startsWith(returned)).toBe(true);
+		// File must end with a blank-line separator so the next append stays
+		// on its own `## Entry —` line start.
+		expect(disk.endsWith("\n\n")).toBe(true);
+	});
+});
+
+describe("buildWorklogPrompt topic vocabulary", () => {
+	it("omits the <topic-vocabulary> section when no vocabulary is provided", () => {
+		const prompt = buildWorklogPrompt(undefined);
+		expect(prompt).not.toContain("<topic-vocabulary>");
+		// And omits when given an empty array.
+		const empty = buildWorklogPrompt(undefined, []);
+		expect(empty).not.toContain("<topic-vocabulary>");
+	});
+
+	it("lists vocabulary slugs with counts when a small vocabulary is provided", () => {
+		const prompt = buildWorklogPrompt(undefined, [
+			{ slug: "caching/anthropic", count: 4 },
+			{ slug: "orchestrator/restore", count: 2 },
+			{ slug: "worklog/fork", count: 1 },
+		]);
+		expect(prompt).toContain("<topic-vocabulary>");
+		expect(prompt).toContain("- caching/anthropic (4)");
+		expect(prompt).toContain("- orchestrator/restore (2)");
+		expect(prompt).toContain("- worklog/fork (1)");
+	});
+
+	it("caps topic vocabulary via computeTopicVocabulary to the top 30 slugs", () => {
+		// Build 40 entries each with a distinct topic and descending counts so
+		// the sort is deterministic. We expect only the top 30 to survive.
+		const entries = Array.from({ length: 40 }, (_, i) => ({
+			id: `id-${i}`,
+			iso: `2026-01-01T00:00:0${(i % 10)}.000Z`,
+			turn: i,
+			meta: { topics: Array.from({ length: 40 - i }, () => `t${i}`) },
+			body: "",
+			raw: "",
+		}));
+		const vocab = computeTopicVocabulary(entries);
+		expect(vocab).toHaveLength(30);
+		// First element is the highest count.
+		expect(vocab[0]?.slug).toBe("t0");
+		expect(vocab[0]?.count).toBe(40);
+	});
+
+	it("returns empty vocabulary when entries carry no topics (legacy-only file)", () => {
+		const vocab = computeTopicVocabulary([
+			{ id: undefined, iso: "x", turn: 1, meta: {}, body: "", raw: "" },
+			{ id: undefined, iso: "y", turn: 2, meta: {}, body: "", raw: "" },
+		]);
+		expect(vocab).toEqual([]);
+	});
+});
+
+describe("worklog fork meta integration", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	function createToolCallAssistant(args: Record<string, unknown>, usage?: Usage) {
+		return {
+			role: "assistant" as const,
+			content: [
+				{
+					type: "toolCall" as const,
+					id: "worklog-call",
+					name: "worklog_update",
+					arguments: args,
+				},
+			],
+			stopReason: "toolUse" as const,
+			timestamp: Date.now(),
+			...(usage ? { usage } : {}),
+		};
+	}
+
+	it("persists topics from the fork tool call into the worklog header", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-meta-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const streamFn = vi.fn(async () => ({
+			result: async () =>
+				createToolCallAssistant({
+					content: "## Findings\n- topics test.",
+					topics: ["caching/anthropic", "worklog/fork"],
+				}),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(1);
+		});
+
+		const worklogFile = orchestrator.getRecord(childId).worklogFile;
+		const disk = await readFile(worklogFile, "utf-8");
+		const parsed = parseWorklogEntries(disk);
+		expect(parsed).toHaveLength(1);
+		expect(parsed[0]?.meta.topics).toEqual(["caching/anthropic", "worklog/fork"]);
+		expect(parsed[0]?.id).toBeDefined();
+	});
+
+	it("persists supersedes citations from the fork tool call", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-meta-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const streamFn = vi.fn(async () => ({
+			result: async () =>
+				createToolCallAssistant({
+					content: "## Correction\n- supersede prior entry.",
+					supersedes: ["abcd1234"],
+				}),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(1);
+		});
+
+		const worklogFile = orchestrator.getRecord(childId).worklogFile;
+		const disk = await readFile(worklogFile, "utf-8");
+		const parsed = parseWorklogEntries(disk);
+		expect(parsed[0]?.meta.supersedes).toEqual(["abcd1234"]);
+	});
+
+	it("legacy behavior: fork omitting topics/supersedes still yields a valid meta block", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-meta-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const streamFn = vi.fn(async () => ({
+			result: async () =>
+				createToolCallAssistant({
+					content: "## Findings\n- no explicit topics.",
+				}),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(1);
+		});
+
+		const worklogFile = orchestrator.getRecord(childId).worklogFile;
+		const disk = await readFile(worklogFile, "utf-8");
+		const parsed = parseWorklogEntries(disk);
+		expect(parsed).toHaveLength(1);
+		// Omitted fields default to empty arrays / false so downstream
+		// consumers don't need null-checks.
+		expect(parsed[0]?.meta.topics).toEqual([]);
+		expect(parsed[0]?.meta.supersedes).toEqual([]);
+		expect(parsed[0]?.meta.pin).toBe(false);
+		expect(parsed[0]?.id).toBeDefined();
 	});
 });
