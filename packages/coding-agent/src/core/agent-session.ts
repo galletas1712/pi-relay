@@ -1758,7 +1758,9 @@ export class AgentSession {
 				tokensBefore = extensionCompaction.tokensBefore;
 				details = extensionCompaction.details;
 			} else {
-				// Generate compaction result
+				// Generate compaction result. The summarization call is made
+				// out-of-band from the session transcript; attribute its usage
+				// so tokens and cost show up in session stats + telemetry.
 				const result = await compact(
 					preparation,
 					this.model,
@@ -1766,6 +1768,7 @@ export class AgentSession {
 					headers,
 					customInstructions,
 					this._compactionAbortController.signal,
+					(usage, scope) => this.addBackgroundUsage(usage, scope),
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -2022,7 +2025,8 @@ export class AgentSession {
 				tokensBefore = extensionCompaction.tokensBefore;
 				details = extensionCompaction.details;
 			} else {
-				// Generate compaction result
+				// Generate compaction result. Attribute the summarization call's
+				// usage — out-of-band LLM call, otherwise invisible to telemetry.
 				const compactResult = await compact(
 					preparation,
 					this.model,
@@ -2030,6 +2034,7 @@ export class AgentSession {
 					headers,
 					undefined,
 					this._autoCompactionAbortController.signal,
+					(usage, scope) => this.addBackgroundUsage(usage, scope),
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
