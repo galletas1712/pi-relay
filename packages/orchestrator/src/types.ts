@@ -176,6 +176,16 @@ export interface OrchestratorConfig {
 	 * `reasoning.effort` via `normalizeOpenAIReasoning`.
 	 */
 	forkThinkingLevel?: ThinkingLevel;
+	/**
+	 * Maximum allowed age (in `turnCount` delta) of an ancestor's
+	 * `currentFocus` pointer before it is treated as stale and the
+	 * spawn-prompt falls back to the raw `<ancestor-recent-context>` tail.
+	 * A successful `set_focus_pointer` call refreshes the pointer's `turn`
+	 * field; if no fork has emitted one in more than this many turns the
+	 * pointer is assumed outdated. Defaults to
+	 * {@link DEFAULT_MAX_FOCUS_STALENESS_TURNS}.
+	 */
+	maxFocusStalenessTurns?: number;
 }
 
 export interface AgentMessageDetails {
@@ -206,6 +216,14 @@ export interface AgentTreeMetadataEntry {
 	lastWorklogTurn: number;
 	lastWorklogMessageCount: number;
 	turnCount?: number;
+	/**
+	 * Persisted mirror of {@link AgentRecord.currentFocus}. Written on
+	 * successful `set_focus_pointer` tool calls in the worklog fork so
+	 * restore round-trips the pointer. Absent on legacy tree.json files
+	 * written before PR-8; loaded as `undefined` which makes spawn fall
+	 * back to the transcript tail.
+	 */
+	currentFocus?: { content: string; turn: number };
 }
 
 export interface AgentTreeMetadata {
@@ -231,6 +249,15 @@ export interface AgentRecord {
 	pendingRestoreIdleNotice: boolean;
 	orphanedPendingToolCallIds: string[];
 	unsubscribe?: () => void;
+	/**
+	 * Compact "what am I working on right now" pointer emitted by the
+	 * agent's own worklog fork via the `set_focus_pointer` tool. When set
+	 * (and not stale past {@link OrchestratorConfig.maxFocusStalenessTurns}
+	 * turns) the spawn prompt prefers this pointer over the raw
+	 * `<ancestor-recent-context>` tail. Updated in-memory; mirrored to
+	 * {@link AgentTreeMetadataEntry.currentFocus} via `persistTree`.
+	 */
+	currentFocus?: { content: string; turn: number };
 }
 
 export interface AgentSummary {
@@ -287,3 +314,14 @@ export const DEFAULT_ORCHESTRATOR_CONFIG: OrchestratorConfig = {
 	maxChildren: 8,
 	maxActiveAgents: 32,
 };
+
+/**
+ * Default staleness threshold for `AgentRecord.currentFocus`. Measured in
+ * `turnCount` delta. A focus pointer older than this many turns is treated
+ * as outdated and the spawn prompt falls back to the raw
+ * `<ancestor-recent-context>` tail. Chosen to be larger than typical
+ * exploration bursts (a handful of tool-only turns) but small enough that
+ * a pointer stale for many turns doesn't silently mislead child agents
+ * about the parent's current task.
+ */
+export const DEFAULT_MAX_FOCUS_STALENESS_TURNS = 10;

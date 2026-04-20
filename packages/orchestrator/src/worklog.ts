@@ -127,19 +127,69 @@ export const WORKLOG_UNPIN_TOOL = {
 	),
 } satisfies Tool;
 
+/**
+ * Hard cap on the length (in characters) of a focus-pointer's \`content\`
+ * field. Oversize payloads are truncated to this many characters with an
+ * ellipsis marker — the tool deliberately accepts oversize input rather
+ * than rejecting because models are imperfect character counters, but we
+ * clamp aggressively so a runaway pointer never dominates a child's
+ * spawn prompt.
+ */
+export const MAX_FOCUS_POINTER_CHARS = 500;
+
+/**
+ * Tool exposed ONLY to the worklog fork (never to the main agent loop).
+ * Records a short "what am I working on right now" pointer that child
+ * agents inherit in place of the 4KB \`<ancestor-recent-context>\`
+ * transcript tail. Exactly one of \`worklog_update\`, \`worklog_unpin\`, or
+ * \`set_focus_pointer\` is honored per fork turn — the first tool call
+ * wins; any additional calls are logged as warnings and ignored.
+ */
+export const SET_FOCUS_POINTER_TOOL = {
+	name: "set_focus_pointer",
+	description:
+		"Record a short current-focus pointer describing what you're working on RIGHT NOW. Child agents inherit this in place of the raw conversation tail, so keep it to 1–3 sentences that describe the immediate task, relevant files, and any in-flight decisions. Prefer this over worklog_update for ephemeral in-progress context. Only one of worklog_update, worklog_unpin, or set_focus_pointer per turn — choose the most valuable.",
+	parameters: Type.Object(
+		{
+			content: Type.String({
+				description: `1–3 sentences of current focus. Keep under ${MAX_FOCUS_POINTER_CHARS} characters; longer payloads are truncated with an ellipsis.`,
+			}),
+		},
+		{ additionalProperties: false },
+	),
+} satisfies Tool;
+
+/**
+ * Clamp a focus-pointer content string to {@link MAX_FOCUS_POINTER_CHARS}.
+ * Oversize input is truncated (not rejected) and a trailing \`...\` is
+ * appended so callers can see the value was clipped. Returns the exact
+ * string that should be persisted on \`AgentRecord.currentFocus\`.
+ */
+export function clampFocusPointerContent(content: string): { content: string; truncated: boolean } {
+	if (content.length <= MAX_FOCUS_POINTER_CHARS) {
+		return { content, truncated: false };
+	}
+	// Reserve 3 characters for the ellipsis so the final length never
+	// exceeds MAX_FOCUS_POINTER_CHARS.
+	const head = content.slice(0, Math.max(0, MAX_FOCUS_POINTER_CHARS - 3));
+	return { content: `${head}...`, truncated: true };
+}
+
 export function buildWorklogPrompt(
 	lastEntry: string | undefined,
 	topicVocabulary?: Array<{ slug: string; count: number }>,
 	currentlyPinned?: Array<{ entry_id: string; summary: string }>,
+	currentFocus?: { content: string; turn: number },
 ): string {
 	const topicSection = formatTopicVocabularySection(topicVocabulary);
 	const pinnedSection = formatCurrentlyPinnedSection(currentlyPinned);
+	const focusSection = formatCurrentFocusSection(currentFocus);
 	return `Your worklog preserves knowledge for downstream consumption. Child agents inherit ancestor worklogs, and restored sessions reuse these entries after interruption.
 
 <last-worklog-entry>
 ${lastEntry ?? "(no previous entries)"}
 </last-worklog-entry>
-${topicSection}${pinnedSection}
+${topicSection}${pinnedSection}${focusSection}
 If you have materially NEW knowledge since the last entry, call the worklog_update tool. Include:
 - conceptual insights you derived from the code, architecture, or behavior
 - concrete findings like APIs, invariants, file paths that matter, line references, or code patterns
@@ -159,7 +209,13 @@ Do not call the tool if nothing meaningful changed.
 Additional structured fields on the tool:
 - topics: Tag with one or more short slugs (lowercase kebab-case, e.g. \`caching/anthropic\` or \`orchestrator/restore\`). Prefer slugs already used in your prior entries (shown above when available).
 - supersedes: When your new entry corrects or replaces a prior entry (yours or an ancestor's), cite the prior entry_id (shown in the \`<last-worklog-entry>\` header comment, e.g. \`<!-- meta: {"entry_id":"abcd1234",...} -->\`) in supersedes. The system treats a superseded entry as a tombstone — child agents will no longer see it. Use this instead of writing "(supersedes prior entry)" in the body; the machine-readable field is what the system consumes.
-- pin: Mark content as pinned (\`pin: true\`) only when it is a cross-cutting foundational invariant the entire agent tree will keep coming back to — architectural boundaries, persistent configuration, non-obvious system laws. Pins should be rare: at most ${MAX_PINNED_ENTRIES} across a long session. Do NOT pin per-task status, ephemeral measurements, or entries that will obviously become obsolete within a few turns. When a pinned fact becomes outdated, call \`worklog_unpin\` with its \`entry_id\`. When the pin cap is reached, pass \`replacesPinnedId\` in \`worklog_update\` with the entry_id of an existing pin to displace.`;
+- pin: Mark content as pinned (\`pin: true\`) only when it is a cross-cutting foundational invariant the entire agent tree will keep coming back to — architectural boundaries, persistent configuration, non-obvious system laws. Pins should be rare: at most ${MAX_PINNED_ENTRIES} across a long session. Do NOT pin per-task status, ephemeral measurements, or entries that will obviously become obsolete within a few turns. When a pinned fact becomes outdated, call \`worklog_unpin\` with its \`entry_id\`. When the pin cap is reached, pass \`replacesPinnedId\` in \`worklog_update\` with the entry_id of an existing pin to displace.
+
+Focus pointer (set_focus_pointer):
+- Call \`set_focus_pointer({ content })\` when you have no durable insight for \`worklog_update\`, but the agent's current focus has changed — a different task, switched files, a new goal. Child agents inherit this pointer in place of the raw conversation tail.
+- Keep it to 1–3 sentences (≤${MAX_FOCUS_POINTER_CHARS} characters): the immediate task, the relevant files, any in-flight decision. Do NOT restate durable knowledge (use \`worklog_update\` for that).
+- The prior pointer (if any) is shown above in \`<current-focus>\`. Skip re-emitting if nothing material has changed.
+- Per turn, call AT MOST ONE of \`worklog_update\`, \`worklog_unpin\`, or \`set_focus_pointer\` — the first wins, the rest are logged as warnings and ignored. Choose the most valuable; many turns should call none.`;
 }
 
 function formatTopicVocabularySection(
@@ -182,6 +238,17 @@ function formatCurrentlyPinnedSection(
 		({ entry_id, summary }) => `- ${entry_id} — ${summary}`,
 	);
 	return `\n<currently-pinned>\n${lines.join("\n")}\n</currently-pinned>\n`;
+}
+
+function formatCurrentFocusSection(
+	currentFocus: { content: string; turn: number } | undefined,
+): string {
+	if (!currentFocus || !currentFocus.content) {
+		return "";
+	}
+	// Rendered inside the fork prompt so the model sees the prior focus
+	// pointer and can skip re-emitting when nothing material has changed.
+	return `\n<current-focus turn="${currentFocus.turn}">\n${currentFocus.content}\n</current-focus>\n`;
 }
 
 /**

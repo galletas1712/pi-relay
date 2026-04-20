@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Usage } from "@pi-relay/ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isLikelyTrivialTurn, Orchestrator } from "../src/orchestrator.js";
-import { appendWorklogEntry, buildAncestorWorklogPrefix, buildWorklogPrompt, computeTopicVocabulary, formatWorklogEntry, parseWorklogEntries, summarizePinnedEntry, updateWorklogEntryPin } from "../src/worklog.js";
+import { appendWorklogEntry, buildAncestorWorklogPrefix, buildWorklogPrompt, clampFocusPointerContent, computeTopicVocabulary, formatWorklogEntry, MAX_FOCUS_POINTER_CHARS, parseWorklogEntries, SET_FOCUS_POINTER_TOOL, summarizePinnedEntry, updateWorklogEntryPin } from "../src/worklog.js";
 import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
 function createWorklogAssistant(content: string, usage?: Usage) {
@@ -3044,5 +3044,694 @@ describe("SpawnConfig topics end-to-end", () => {
 		expect(prompt).not.toContain("<parent-handoff>");
 		// Sanity: prompt ends with the child's task text.
 		expect(prompt.trim().endsWith("legacy-shaped")).toBe(true);
+	});
+});
+
+describe("set_focus_pointer tool", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	function createFocusToolAssistant(content: string) {
+		return {
+			role: "assistant" as const,
+			content: [
+				{
+					type: "toolCall" as const,
+					id: "focus-call",
+					name: "set_focus_pointer",
+					arguments: { content },
+				},
+			],
+			stopReason: "toolUse" as const,
+			timestamp: Date.now(),
+		};
+	}
+
+	it("exposes set_focus_pointer with a content-only schema and a sensible description", () => {
+		expect(SET_FOCUS_POINTER_TOOL.name).toBe("set_focus_pointer");
+		const params = SET_FOCUS_POINTER_TOOL.parameters as {
+			type: string;
+			properties: Record<string, unknown>;
+			required?: string[];
+			additionalProperties?: boolean;
+		};
+		expect(params.type).toBe("object");
+		expect(Object.keys(params.properties)).toEqual(["content"]);
+		expect(params.additionalProperties).toBe(false);
+	});
+
+	it("clampFocusPointerContent: content <=500 chars passes through unchanged", () => {
+		const s = "x".repeat(500);
+		const out = clampFocusPointerContent(s);
+		expect(out.truncated).toBe(false);
+		expect(out.content).toBe(s);
+		expect(out.content.length).toBe(500);
+	});
+
+	it("clampFocusPointerContent: content >500 chars is truncated with ellipsis to <=500", () => {
+		const s = "x".repeat(1500);
+		const out = clampFocusPointerContent(s);
+		expect(out.truncated).toBe(true);
+		expect(out.content.length).toBeLessThanOrEqual(MAX_FOCUS_POINTER_CHARS);
+		expect(out.content.endsWith("...")).toBe(true);
+	});
+
+	it("fork emits set_focus_pointer: record.currentFocus is populated and persisted to tree.json", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-");
+		tempDirs.push(sessionDir);
+		const streamFn = vi.fn(async () => ({
+			result: async () => createFocusToolAssistant("Working on fork gating; see orchestrator.ts:733."),
+		}) as never);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "work" });
+		const record = orchestrator.getRecord(childId);
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect(record.currentFocus).toBeDefined();
+		});
+		expect(record.currentFocus?.content).toContain("fork gating");
+		expect(record.currentFocus?.turn).toBe(record.turnCount);
+
+		// Persisted to tree.json.
+		const { join } = await import("node:path");
+		const treeFile = join(sessionDir, "root-session", "tree.json");
+		await vi.waitFor(async () => {
+			const content = await readFile(treeFile, "utf-8");
+			const parsed = JSON.parse(content) as {
+				agents: Record<string, { currentFocus?: { content: string; turn: number } }>;
+			};
+			expect(parsed.agents[childId]?.currentFocus?.content).toContain("fork gating");
+		});
+	});
+
+	it("fork emits set_focus_pointer with >500-char content: truncated to 500 with ellipsis", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-");
+		tempDirs.push(sessionDir);
+		const huge = "x".repeat(1200);
+		const streamFn = vi.fn(async () => ({
+			result: async () => createFocusToolAssistant(huge),
+		}) as never);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "work" });
+		const record = orchestrator.getRecord(childId);
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect(record.currentFocus).toBeDefined();
+		});
+		expect(record.currentFocus?.content.length).toBeLessThanOrEqual(MAX_FOCUS_POINTER_CHARS);
+		expect(record.currentFocus?.content.endsWith("...")).toBe(true);
+	});
+
+	it("set_focus_pointer advances lastWorklogMessageCount (prevents retry on same delta)", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-");
+		tempDirs.push(sessionDir);
+		const streamFn = vi.fn(async () => ({
+			result: async () => createFocusToolAssistant("immediate task"),
+		}) as never);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "work" });
+		const record = orchestrator.getRecord(childId);
+		const beforeLen = child.agent.state.messages.length;
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(record.currentFocus).toBeDefined();
+		});
+		expect(record.lastWorklogMessageCount).toBe(beforeLen);
+		expect(record.lastWorklogTurn).toBe(record.turnCount);
+	});
+
+	it("fork emits set_focus_pointer FIRST then worklog_update: focus wins, update is logged and ignored", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-");
+		tempDirs.push(sessionDir);
+		const streamFn = vi.fn(async () => ({
+			result: async () => ({
+				role: "assistant" as const,
+				content: [
+					{ type: "toolCall" as const, id: "call-1", name: "set_focus_pointer", arguments: { content: "focus" } },
+					{ type: "toolCall" as const, id: "call-2", name: "worklog_update", arguments: { content: "## should-not-append" } },
+				],
+				stopReason: "toolUse" as const,
+				timestamp: Date.now(),
+			}),
+		}) as never);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "work" });
+		const record = orchestrator.getRecord(childId);
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(record.currentFocus?.content).toBe("focus");
+		});
+
+		const onDisk = await readFile(record.worklogFile, "utf-8").catch(() => "");
+		expect(onDisk).not.toContain("## should-not-append");
+	});
+
+	it("fork emits worklog_update FIRST then set_focus_pointer: update wins, focus is NOT set", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-");
+		tempDirs.push(sessionDir);
+		const streamFn = vi.fn(async () => ({
+			result: async () => ({
+				role: "assistant" as const,
+				content: [
+					{ type: "toolCall" as const, id: "call-1", name: "worklog_update", arguments: { content: "## durable-finding" } },
+					{ type: "toolCall" as const, id: "call-2", name: "set_focus_pointer", arguments: { content: "focus-loses" } },
+				],
+				stopReason: "toolUse" as const,
+				timestamp: Date.now(),
+			}),
+		}) as never);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "work" });
+		const record = orchestrator.getRecord(childId);
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(record.lastWorklogTurn).toBe(record.turnCount);
+		});
+
+		expect(record.currentFocus).toBeUndefined();
+		const onDisk = await readFile(record.worklogFile, "utf-8");
+		expect(onDisk).toContain("## durable-finding");
+	});
+
+	it("fork emits set_focus_pointer FIRST then worklog_unpin: focus wins, unpin ignored", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-");
+		tempDirs.push(sessionDir);
+		// Seed a pinned entry; the unpin attempt should be ignored.
+		const pinText = formatWorklogEntry("## keep-pinned", 1, {
+			iso: "2026-11-01T00:00:01.000Z",
+			pin: true,
+		});
+		const pinned = parseWorklogEntries(pinText)[0];
+		if (!pinned?.id) throw new Error("expected pinned entry id");
+		const pinId = pinned.id;
+		const streamFn = vi.fn(async () => ({
+			result: async () => ({
+				role: "assistant" as const,
+				content: [
+					{ type: "toolCall" as const, id: "call-1", name: "set_focus_pointer", arguments: { content: "focus-wins" } },
+					{ type: "toolCall" as const, id: "call-2", name: "worklog_unpin", arguments: { entry_id: pinId } },
+				],
+				stopReason: "toolUse" as const,
+				timestamp: Date.now(),
+			}),
+		}) as never);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "work" });
+		const record = orchestrator.getRecord(childId);
+		const { writeFile: wf, mkdir } = await import("node:fs/promises");
+		const { dirname: dn } = await import("node:path");
+		await mkdir(dn(record.worklogFile), { recursive: true });
+		await wf(record.worklogFile, `${pinText}\n\n`, "utf-8");
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(record.currentFocus?.content).toBe("focus-wins");
+		});
+
+		const parsed = parseWorklogEntries(await readFile(record.worklogFile, "utf-8"));
+		const stillPinned = parsed.find((entry) => entry.id === pinId);
+		expect(stillPinned?.meta.pin).toBe(true);
+	});
+
+	it("buildWorklogPrompt surfaces <current-focus> block when currentFocus is set", () => {
+		const prompt = buildWorklogPrompt(
+			undefined,
+			undefined,
+			undefined,
+			{ content: "Implementing PR-8 dispatch branch", turn: 7 },
+		);
+		expect(prompt).toContain("<current-focus turn=\"7\">");
+		expect(prompt).toContain("Implementing PR-8 dispatch branch");
+		expect(prompt).toContain("</current-focus>");
+	});
+
+	it("buildWorklogPrompt omits <current-focus> block when currentFocus is undefined", () => {
+		const prompt = buildWorklogPrompt(undefined);
+		// Narrow: only the block-emission form (with a turn= attr) is what we
+		// want to assert absent. The prompt's trailing guidance legitimately
+		// references `<current-focus>` inside backticks as documentation.
+		expect(prompt).not.toContain("<current-focus turn=");
+	});
+});
+
+describe("buildSpawnPrompt with focus pointer", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	it("parent with fresh currentFocus: child prompt includes <ancestor-focus>, omits <ancestor-recent-context>", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-spawn-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.currentFocus = { content: "Parent working on PR-8 wiring", turn: 5 };
+		rootRec.turnCount = 5;
+
+		await orchestrator.spawnAgent("root", { role: "helper", prompt: "do the thing" });
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).toContain("<ancestor-focus");
+		expect(prompt).toContain("Parent working on PR-8 wiring");
+		expect(prompt).toContain('turn="5"');
+		expect(prompt).not.toContain("<ancestor-recent-context");
+	});
+
+	it("parent with stale currentFocus: falls back to <ancestor-recent-context>, no <ancestor-focus>", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-spawn-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		// Seed messages on root so serializeRecentAncestorContext has content.
+		root.agent.state.messages.push({
+			role: "user",
+			content: [{ type: "text", text: "seed-user" }],
+			timestamp: Date.now(),
+		});
+		root.agent.state.messages.push({
+			role: "assistant",
+			content: [{ type: "text", text: "seed-assistant" }],
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.currentFocus = { content: "stale pointer", turn: 5 };
+		rootRec.turnCount = 20; // age = 15, > default 10 → stale
+
+		await orchestrator.spawnAgent("root", { role: "helper", prompt: "do" });
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).not.toContain("<ancestor-focus");
+		expect(prompt).toContain("<ancestor-recent-context");
+	});
+
+	it("parent with no currentFocus: backward-compat uses <ancestor-recent-context>", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-spawn-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		root.agent.state.messages.push({
+			role: "user",
+			content: [{ type: "text", text: "seed-user" }],
+			timestamp: Date.now(),
+		});
+		root.agent.state.messages.push({
+			role: "assistant",
+			content: [{ type: "text", text: "seed-assistant" }],
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const rootRec = orchestrator.getRecord("root");
+		expect(rootRec.currentFocus).toBeUndefined();
+		rootRec.turnCount = 5;
+
+		await orchestrator.spawnAgent("root", { role: "helper", prompt: "do" });
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).not.toContain("<ancestor-focus");
+		expect(prompt).toContain("<ancestor-recent-context");
+	});
+
+	it("configurable maxFocusStalenessTurns=5: focus at turn 3 of 10 is stale", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-spawn-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		root.agent.state.messages.push({
+			role: "user",
+			content: [{ type: "text", text: "seed-user" }],
+			timestamp: Date.now(),
+		});
+		root.agent.state.messages.push({
+			role: "assistant",
+			content: [{ type: "text", text: "seed-assistant" }],
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+			config: { maxFocusStalenessTurns: 5 },
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.currentFocus = { content: "stale-by-tighter-config", turn: 3 };
+		rootRec.turnCount = 10; // age = 7, > configured 5 → stale
+
+		await orchestrator.spawnAgent("root", { role: "helper", prompt: "do" });
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).not.toContain("<ancestor-focus");
+	});
+
+	it("focus exactly at the staleness boundary is treated as fresh", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-spawn-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.currentFocus = { content: "boundary-focus", turn: 0 };
+		rootRec.turnCount = 10; // age == default max (10) → still fresh (≤)
+
+		await orchestrator.spawnAgent("root", { role: "helper", prompt: "do" });
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).toContain("<ancestor-focus");
+		expect(prompt).toContain("boundary-focus");
+	});
+
+	it("multi-ancestor: root has fresh focus, intermediate has none → root focus + intermediate tail; order preserved (root first)", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-spawn-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const middle = new FakeSession("middle-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "middle-user" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "middle-assistant" }], stopReason: "stop", timestamp: Date.now() },
+			],
+		});
+		const leaf = new FakeSession("leaf-session", { sessionDir });
+		const sessionFactory = vi.fn(async (options: { agentId: string }) => {
+			if (options.agentId.startsWith("middle")) {
+				return { session: middle };
+			}
+			return { session: leaf };
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory,
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.currentFocus = { content: "root-current-task", turn: 1 };
+		rootRec.turnCount = 2;
+
+		const middleId = await orchestrator.spawnAgent("root", { role: "middle", prompt: "keep going" });
+		// Middle record has no focus. Give it some messages so recent-context renders.
+		const middleRec = orchestrator.getRecord(middleId);
+		expect(middleRec.currentFocus).toBeUndefined();
+
+		await orchestrator.spawnAgent(middleId, { role: "leaf", prompt: "do leaf work" });
+		await vi.waitFor(() => {
+			expect(leaf.prompts).toHaveLength(1);
+		});
+		const prompt = leaf.prompts[0] ?? "";
+		expect(prompt).toContain("<ancestor-focus");
+		expect(prompt).toContain("root-current-task");
+		expect(prompt).toContain("<ancestor-recent-context");
+		// Root focus comes before middle recent-context (ancestor order preserved).
+		const focusIdx = prompt.indexOf("<ancestor-focus");
+		const tailIdx = prompt.indexOf("<ancestor-recent-context");
+		expect(focusIdx).toBeLessThan(tailIdx);
+	});
+
+	it("focus with empty content is ignored (falls back to tail)", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-spawn-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		root.agent.state.messages.push({
+			role: "user",
+			content: [{ type: "text", text: "seed-user" }],
+			timestamp: Date.now(),
+		});
+		root.agent.state.messages.push({
+			role: "assistant",
+			content: [{ type: "text", text: "seed-assistant" }],
+			stopReason: "stop",
+			timestamp: Date.now(),
+		});
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.currentFocus = { content: "", turn: 1 };
+		rootRec.turnCount = 2;
+
+		await orchestrator.spawnAgent("root", { role: "helper", prompt: "do" });
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).not.toContain("<ancestor-focus");
+		expect(prompt).toContain("<ancestor-recent-context");
+	});
+});
+
+describe("focus pointer tree.json round-trip", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	it("persists currentFocus to tree.json and reads it back on restore", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-restore-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "helper", prompt: "w" });
+		const record = orchestrator.getRecord(childId);
+		record.currentFocus = { content: "persisted-focus", turn: 4 };
+		record.turnCount = 4;
+
+		// Force a persistTree by touching something the orchestrator will persist.
+		// spawnAgent already persisted tree.json, but we mutated currentFocus after.
+		// The fork path calls persistTree; simulate by firing turn_end with a
+		// no-op fork response (which still records the turn) — simpler: call
+		// persistTree indirectly by spawning another agent.
+		const streamFn = vi.fn(async () => ({
+			result: async () => ({
+				role: "assistant" as const,
+				content: [
+					{ type: "toolCall" as const, id: "c", name: "set_focus_pointer", arguments: { content: "persisted-focus-2" } },
+				],
+				stopReason: "toolUse" as const,
+				timestamp: Date.now(),
+			}),
+		}) as never);
+		child.agent.streamFn = streamFn as never;
+		child.agent.state.messages = [
+			{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+			{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+		];
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(record.currentFocus?.content).toBe("persisted-focus-2");
+		});
+
+		const { join } = await import("node:path");
+		const treeFile = join(sessionDir, "root-session", "tree.json");
+		await vi.waitFor(async () => {
+			const parsed = JSON.parse(await readFile(treeFile, "utf-8")) as {
+				agents: Record<string, { currentFocus?: { content: string; turn: number } }>;
+			};
+			expect(parsed.agents[childId]?.currentFocus?.content).toBe("persisted-focus-2");
+			expect(parsed.agents[childId]?.currentFocus?.turn).toBe(record.currentFocus?.turn);
+		});
+
+		// Now simulate a restore: new orchestrator pointed at the same workspace.
+		const root2 = new FakeSession("root-session", { sessionDir });
+		const restoredChild = new FakeSession("child-session", {
+			sessionDir,
+			sessionFile: child.sessionFile,
+			createSessionFile: false,
+		});
+		const orchestrator2 = new Orchestrator({
+			rootSession: root2,
+			sessionFactory: vi.fn(async () => ({ session: restoredChild })),
+		});
+		const restored = await orchestrator2.restore();
+		expect(restored).toBe(true);
+		const restoredRecord = orchestrator2.getRecord(childId);
+		expect(restoredRecord.currentFocus?.content).toBe("persisted-focus-2");
+		expect(restoredRecord.currentFocus?.turn).toBe(record.currentFocus?.turn);
+	});
+
+	it("legacy tree.json with no currentFocus field loads cleanly (undefined, no crash)", async () => {
+		const sessionDir = createTempDir("pi-relay-focus-restore-");
+		tempDirs.push(sessionDir);
+		// Hand-craft a tree.json without currentFocus fields.
+		const { mkdir, writeFile: wf } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const workspace = join(sessionDir, "root-session");
+		await mkdir(workspace, { recursive: true });
+		const childSessionFile = join(workspace, "agents", "child.jsonl");
+		await mkdir(join(workspace, "agents"), { recursive: true });
+		await wf(childSessionFile, "seed\n", "utf-8");
+		const legacyTree = {
+			sessionId: "root-session",
+			agents: {
+				root: {
+					id: "root",
+					parentId: null,
+					childIds: ["helper-12345678"],
+					role: "root",
+					status: "idle",
+					spawnConfig: { role: "root", prompt: "" },
+					sessionFile: undefined,
+					worklogFile: join(workspace, "worklogs", "root.worklog.md"),
+					createdAt: 1,
+					lastStatusChange: 1,
+					lastWorklogTurn: 0,
+					lastWorklogMessageCount: 0,
+					turnCount: 0,
+				},
+				"helper-12345678": {
+					id: "helper-12345678",
+					parentId: "root",
+					childIds: [],
+					role: "helper",
+					status: "idle",
+					spawnConfig: { role: "helper", prompt: "legacy-shape" },
+					sessionFile: childSessionFile,
+					worklogFile: join(workspace, "worklogs", "helper-12345678.worklog.md"),
+					createdAt: 2,
+					lastStatusChange: 2,
+					lastWorklogTurn: 0,
+					lastWorklogMessageCount: 0,
+					turnCount: 0,
+				},
+			},
+		};
+		await wf(join(workspace, "tree.json"), JSON.stringify(legacyTree, null, 2), "utf-8");
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			sessionFile: childSessionFile,
+			createSessionFile: false,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const restored = await orchestrator.restore();
+		expect(restored).toBe(true);
+		const rootRec = orchestrator.getRecord("root");
+		expect(rootRec.currentFocus).toBeUndefined();
+		const childRec = orchestrator.getRecord("helper-12345678");
+		expect(childRec.currentFocus).toBeUndefined();
 	});
 });

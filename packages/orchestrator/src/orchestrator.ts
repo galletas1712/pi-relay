@@ -15,9 +15,10 @@ import {
 	createAgentIdleMessage,
 	createAgentReportMessage,
 } from "./messages.js";
-import { buildAncestorWorklogPrefix, buildWorklogPrompt, appendWorklogEntry, collectLivePinnedEntries, computeTopicVocabulary, getLastWorklogEntry, MAX_PINNED_ENTRIES, parseWorklogEntries, readWorklog, summarizePinnedEntry, updateWorklogEntryPin, WORKLOG_UNPIN_TOOL, WORKLOG_UPDATE_TOOL } from "./worklog.js";
+import { buildAncestorWorklogPrefix, buildWorklogPrompt, appendWorklogEntry, clampFocusPointerContent, collectLivePinnedEntries, computeTopicVocabulary, getLastWorklogEntry, MAX_PINNED_ENTRIES, parseWorklogEntries, readWorklog, SET_FOCUS_POINTER_TOOL, summarizePinnedEntry, updateWorklogEntryPin, WORKLOG_UNPIN_TOOL, WORKLOG_UPDATE_TOOL } from "./worklog.js";
 import { ToolCallTracker } from "./tool-tracker.js";
 import {
+	DEFAULT_MAX_FOCUS_STALENESS_TURNS,
 	DEFAULT_ORCHESTRATOR_CONFIG,
 	type AgentRecord,
 	type AgentTreeMetadata,
@@ -81,6 +82,10 @@ export interface WorklogForkLogEntry {
 	replacedPin?: string;
 	/** Reason a `worklog_update` was rejected (e.g. "pin-cap-reached"), if any. */
 	rejectReason?: string;
+	/** Whether this turn updated the agent's `currentFocus` pointer via `set_focus_pointer`. */
+	focusUpdated?: boolean;
+	/** Whether the `set_focus_pointer` content was truncated to the 500-char cap. */
+	focusTruncated?: boolean;
 	/** Non-fatal warning surfaced to the log (e.g. "both-tools-called"). */
 	warning?: string;
 }
@@ -234,6 +239,7 @@ export class Orchestrator {
 			turnCount: 0,
 			pendingRestoreIdleNotice: false,
 			orphanedPendingToolCallIds: [],
+			currentFocus: undefined,
 		};
 		this.registerRecord(rootRecord);
 		void this.persistTree();
@@ -479,6 +485,7 @@ export class Orchestrator {
 			rootRecord.lastWorklogTurn = rootEntry.lastWorklogTurn;
 			rootRecord.lastWorklogMessageCount = rootEntry.lastWorklogMessageCount ?? 0;
 			rootRecord.turnCount = rootEntry.turnCount ?? rootEntry.lastWorklogTurn;
+			rootRecord.currentFocus = rootEntry.currentFocus;
 		}
 		rootRecord.orphanedPendingToolCallIds = this.appendInterruptedToolResults(rootRecord.session);
 
@@ -529,6 +536,7 @@ export class Orchestrator {
 				turnCount: entry.turnCount ?? entry.lastWorklogTurn,
 				pendingRestoreIdleNotice: entry.status === "running",
 				orphanedPendingToolCallIds: [],
+				currentFocus: entry.currentFocus,
 			};
 			this.registerRecord(record);
 			record.orphanedPendingToolCallIds = this.appendInterruptedToolResults(record.session);
@@ -607,6 +615,7 @@ export class Orchestrator {
 				turnCount: 0,
 				pendingRestoreIdleNotice: false,
 				orphanedPendingToolCallIds: [],
+				currentFocus: undefined,
 			};
 			parent.childIds.push(agentId);
 			this.registerRecord(record);
@@ -1003,6 +1012,7 @@ export class Orchestrator {
 				lastWorklogTurn: record.lastWorklogTurn,
 				lastWorklogMessageCount: record.lastWorklogMessageCount,
 				turnCount: record.turnCount,
+				currentFocus: record.currentFocus,
 			};
 		}
 		return {
@@ -1035,6 +1045,8 @@ export class Orchestrator {
 			role: string;
 			worklogFile: string;
 			lastWorklogMessageCount: number;
+			turnCount: number;
+			currentFocus: { content: string; turn: number } | undefined;
 			messages: AgentMessage[];
 		}> = [];
 		let current: AgentRecord | undefined = this.records.get(parentId);
@@ -1044,6 +1056,8 @@ export class Orchestrator {
 				role: current.role,
 				worklogFile: current.worklogFile,
 				lastWorklogMessageCount: current.lastWorklogMessageCount,
+				turnCount: current.turnCount,
+				currentFocus: current.currentFocus,
 				messages: [...current.session.agent.state.messages],
 			});
 			current = current.parentId ? this.records.get(current.parentId) : undefined;
@@ -1086,7 +1100,24 @@ export class Orchestrator {
 			sections.push(worklogSection);
 		}
 
+		// Prefer the fork-emitted focus pointer over the raw transcript
+		// tail when it exists AND is not stale. The focus pointer is a
+		// compact fork-authored summary of what the ancestor is working
+		// on RIGHT NOW; the transcript tail is a head-truncated 4KB blob
+		// of recent messages that can leak cross-thread noise. Staleness
+		// is measured in turn delta because the fork decides — per turn —
+		// whether to refresh the pointer; a long run of no-op forks means
+		// the pointer is out of date and the tail has fresher info.
+		const maxFocusStaleness = this.config.maxFocusStalenessTurns ?? DEFAULT_MAX_FOCUS_STALENESS_TURNS;
 		for (const ancestor of ancestors) {
+			const focus = ancestor.currentFocus;
+			const focusAge = focus ? ancestor.turnCount - focus.turn : Number.POSITIVE_INFINITY;
+			if (focus && focusAge <= maxFocusStaleness && focus.content.length > 0) {
+				sections.push(
+					`<ancestor-focus agent="${ancestor.id}" role="${ancestor.role}" turn="${focus.turn}">\n${focus.content}\n</ancestor-focus>`,
+				);
+				continue;
+			}
 			const recentContext = await this.serializeRecentAncestorContext(ancestor);
 			if (recentContext) {
 				sections.push(
@@ -1273,7 +1304,12 @@ export class Orchestrator {
 			content: [
 				{
 					type: "text",
-					text: buildWorklogPrompt(lastEntry, topicVocabulary, currentlyPinnedSummaries),
+					text: buildWorklogPrompt(
+						lastEntry,
+						topicVocabulary,
+						currentlyPinnedSummaries,
+						record.currentFocus,
+					),
 				},
 			],
 			timestamp: Date.now(),
@@ -1300,7 +1336,7 @@ export class Orchestrator {
 			{
 				systemPrompt: record.session.agent.state.systemPrompt,
 				messages: [...contextMessages, prompt],
-				tools: [WORKLOG_UPDATE_TOOL, WORKLOG_UNPIN_TOOL],
+				tools: [WORKLOG_UPDATE_TOOL, WORKLOG_UNPIN_TOOL, SET_FOCUS_POINTER_TOOL],
 			},
 			streamOptions,
 		);
@@ -1324,15 +1360,19 @@ export class Orchestrator {
 			return;
 		}
 
-		// The fork may emit either `worklog_update` or `worklog_unpin` (or,
-		// defensively, both — in which case the FIRST tool call wins and any
-		// subsequent calls are logged and ignored). In practice the model will
-		// choose one path per turn.
+		// The fork may emit at most one of `worklog_update`, `worklog_unpin`,
+		// or `set_focus_pointer` (or, defensively, several — in which case the
+		// FIRST tool call wins and any subsequent calls are logged and ignored).
+		// In practice the model chooses one path per turn, and many turns call
+		// none.
 		const toolCalls = assistant.content.filter(
 			(content): content is AgentToolCall => content.type === "toolCall",
 		);
 		const firstToolCall = toolCalls.find(
-			(call) => call.name === WORKLOG_UPDATE_TOOL.name || call.name === WORKLOG_UNPIN_TOOL.name,
+			(call) =>
+				call.name === WORKLOG_UPDATE_TOOL.name ||
+				call.name === WORKLOG_UNPIN_TOOL.name ||
+				call.name === SET_FOCUS_POINTER_TOOL.name,
 		);
 		if (!firstToolCall) {
 			logWorklogFork({
@@ -1348,6 +1388,30 @@ export class Orchestrator {
 		const warning = ignoredToolCalls.length > 0
 			? `both-tools-called:${ignoredToolCalls.map((call) => call.name).join(",")}`
 			: undefined;
+
+		if (firstToolCall.name === SET_FOCUS_POINTER_TOOL.name) {
+			const args = validateToolArguments(SET_FOCUS_POINTER_TOOL, firstToolCall);
+			const { content: clamped, truncated } = clampFocusPointerContent(args.content);
+			record.currentFocus = { content: clamped, turn };
+			record.lastWorklogTurn = turn;
+			// Advance the delta cursor the same way `worklog_update` does.
+			// Without this the next substantive turn's fork would see the
+			// same delta and could re-emit a redundant focus pointer for
+			// content that hasn't changed.
+			record.lastWorklogMessageCount = turnMessages.length;
+			await this.persistTree();
+			logWorklogFork({
+				agentId,
+				turn,
+				deltaMsgCount: deltaMessages.length,
+				skipped: false,
+				entryEmitted: false,
+				focusUpdated: true,
+				focusTruncated: truncated || undefined,
+				warning,
+			});
+			return;
+		}
 
 		if (firstToolCall.name === WORKLOG_UNPIN_TOOL.name) {
 			const args = validateToolArguments(WORKLOG_UNPIN_TOOL, firstToolCall);
