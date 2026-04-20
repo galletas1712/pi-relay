@@ -54,6 +54,132 @@ interface PendingSpawnDraft {
 	prompt: string;
 }
 
+/**
+ * Result of the pre-fork triviality gate. `skip === true` means do NOT
+ * schedule a worklog fork for this turn; `reason` is a stable identifier
+ * surfaced in debug logs and tests.
+ */
+export interface WorklogForkGateResult {
+	skip: boolean;
+	reason?: string;
+}
+
+/**
+ * Per-fork telemetry shape consumed by `logWorklogFork`. Kept small enough
+ * that a single JSON line is trivially grep-friendly.
+ */
+export interface WorklogForkLogEntry {
+	agentId: string;
+	turn: number;
+	deltaMsgCount: number;
+	skipped: boolean;
+	skipReason?: string;
+	entryEmitted: boolean;
+}
+
+/**
+ * Estimate the size of an assistant thinking block in tokens. The input to
+ * the gate is raw `AgentMessage` content (not a provider response), so we
+ * approximate with character-count / 4 — good enough to distinguish "no
+ * meaningful thinking" from "substantive thinking" for the purposes of
+ * skipping pure tool-chatter turns.
+ */
+function approximateThinkingTokens(message: AgentMessage): number {
+	if (message.role !== "assistant") {
+		return 0;
+	}
+	let chars = 0;
+	for (const content of message.content) {
+		if (content.type === "thinking") {
+			chars += content.thinking.length;
+		}
+	}
+	return Math.ceil(chars / 4);
+}
+
+function assistantHasSubstantiveText(message: AgentMessage): boolean {
+	if (message.role !== "assistant") {
+		return false;
+	}
+	for (const content of message.content) {
+		if (content.type === "text" && content.text.trim().length > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Decide whether a just-completed turn is trivial enough to skip the
+ * worklog fork. The first rule is a HARD GATE: if the delta since
+ * `lastWorklogMessageCount` contains no `assistant` message at all, we
+ * unconditionally skip — there's no new assistant output to mine for
+ * durable knowledge. The remaining rules are additional optional gates on
+ * top of that.
+ *
+ * The function is pure and exported so callers (and tests) can reason
+ * about its decisions without spinning up an orchestrator.
+ */
+export function isLikelyTrivialTurn(
+	record: Pick<AgentRecord, "lastWorklogMessageCount" | "lastWorklogTurn" | "turnCount">,
+	turnMessages: AgentMessage[],
+): WorklogForkGateResult {
+	const start = Math.min(record.lastWorklogMessageCount, turnMessages.length);
+	const delta = turnMessages.slice(start);
+
+	// HARD GATE: a turn with no new assistant message cannot contribute
+	// anything the worklog cares about. Always skip.
+	const hasAssistant = delta.some((message) => message.role === "assistant");
+	if (!hasAssistant) {
+		return { skip: true, reason: "no-new-assistant-message" };
+	}
+
+	// The remaining heuristics are only sensible when the gate above has
+	// already passed.
+
+	// Tool-chatter only: every assistant message in the delta is purely
+	// toolCall content (no text, no substantive thinking). Such turns
+	// rarely carry durable insight — the durable parts land on the
+	// wrap-up turn that contains the reasoned summary.
+	const assistantMessages = delta.filter((message) => message.role === "assistant");
+	const anyTextOrThinking = assistantMessages.some((message) => {
+		if (assistantHasSubstantiveText(message)) {
+			return true;
+		}
+		return approximateThinkingTokens(message) > 50;
+	});
+	if (!anyTextOrThinking) {
+		return { skip: true, reason: "tool-chatter-only" };
+	}
+
+	// Tiny-delta recency gate: very small deltas that come right on the
+	// heels of a just-written entry are almost always non-durable follow-
+	// ups. Wait for more context to accumulate before re-forking.
+	const recentlyWrote = record.lastWorklogTurn > 0 && record.turnCount - record.lastWorklogTurn <= 2;
+	if (delta.length < 2 && recentlyWrote) {
+		return { skip: true, reason: "tiny-delta-after-recent-entry" };
+	}
+
+	return { skip: false };
+}
+
+/**
+ * Debug-logged by setting `PI_RELAY_WORKLOG_DEBUG=1` in the environment.
+ * Emits one JSON line per fork decision (skipped or completed). Kept
+ * deliberately minimal so logs are grep-friendly without pulling in a
+ * logging dependency.
+ */
+function logWorklogFork(entry: WorklogForkLogEntry): void {
+	if (!process.env.PI_RELAY_WORKLOG_DEBUG) {
+		return;
+	}
+	try {
+		console.debug(`[pi:worklog-fork] ${JSON.stringify(entry)}`);
+	} catch {
+		// Never let logging crash the orchestrator.
+	}
+}
+
 export class Orchestrator {
 	private readonly records = new Map<string, AgentRecord>();
 	private readonly sessionIdToAgentId = new Map<string, string>();
@@ -561,7 +687,24 @@ export class Orchestrator {
 
 		if (event.type === "turn_end") {
 			record.turnCount += 1;
-			this.scheduleWorklogFork(agentId, record.turnCount, [...record.session.agent.state.messages]);
+			const turnMessages = [...record.session.agent.state.messages];
+			// Phase 1 (fork gating): skip the fork entirely on trivial turns
+			// before paying the LLM bill. Gating-skipped turns still advance
+			// `turnCount` but do NOT advance `lastWorklogMessageCount`, so the
+			// next non-trivial turn's fork will see the accumulated delta.
+			const gate = isLikelyTrivialTurn(record, turnMessages);
+			if (gate.skip) {
+				logWorklogFork({
+					agentId,
+					turn: record.turnCount,
+					deltaMsgCount: Math.max(0, turnMessages.length - record.lastWorklogMessageCount),
+					skipped: true,
+					skipReason: gate.reason,
+					entryEmitted: false,
+				});
+				return;
+			}
+			this.scheduleWorklogFork(agentId, record.turnCount, turnMessages);
 			return;
 		}
 
@@ -1061,6 +1204,13 @@ export class Orchestrator {
 			record.session.addBackgroundUsage(assistant.usage, "worklog");
 		}
 		if (assistant.stopReason !== "toolUse") {
+			logWorklogFork({
+				agentId,
+				turn,
+				deltaMsgCount: deltaMessages.length,
+				skipped: false,
+				entryEmitted: false,
+			});
 			return;
 		}
 
@@ -1068,6 +1218,13 @@ export class Orchestrator {
 			(content): content is AgentToolCall => content.type === "toolCall" && content.name === WORKLOG_UPDATE_TOOL.name,
 		);
 		if (!toolCall) {
+			logWorklogFork({
+				agentId,
+				turn,
+				deltaMsgCount: deltaMessages.length,
+				skipped: false,
+				entryEmitted: false,
+			});
 			return;
 		}
 
@@ -1076,6 +1233,13 @@ export class Orchestrator {
 		record.lastWorklogTurn = turn;
 		record.lastWorklogMessageCount = turnMessages.length;
 		await this.persistTree();
+		logWorklogFork({
+			agentId,
+			turn,
+			deltaMsgCount: deltaMessages.length,
+			skipped: false,
+			entryEmitted: true,
+		});
 	}
 
 	private appendInterruptedToolResults(session: AgentSessionHandle): string[] {

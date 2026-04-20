@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import type { Usage } from "@pi-relay/ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { Orchestrator } from "../src/orchestrator.js";
+import { isLikelyTrivialTurn, Orchestrator } from "../src/orchestrator.js";
 import { appendWorklogEntry, buildWorklogPrompt } from "../src/worklog.js";
 import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
@@ -69,9 +69,9 @@ describe("worklog fork", () => {
 			expect(context.messages[0]?.role).toBe("user");
 			expect(context.messages[0]?.content[0]?.type).toBe("text");
 			// transformContext appends a custom message; the fork filter drops
-			// non-user/assistant roles, so only the original 1 user message reaches
-			// convertToLlm.
-			expect((context.messages[0]?.content[0] as { text: string }).text).toBe("converted:1");
+			// non-user/assistant roles, so only the user + assistant pair reaches
+			// convertToLlm (the custom transform message is filtered out).
+			expect((context.messages[0]?.content[0] as { text: string }).text).toBe("converted:2");
 			expect(context.messages[1]?.role).toBe("user");
 			expect((context.messages[1]?.content[0] as { text: string }).text).toContain("<last-worklog-entry>");
 			return {
@@ -84,6 +84,12 @@ describe("worklog fork", () => {
 				{
 					role: "user",
 					content: [{ type: "text", text: "Inspect the orchestrator." }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "Looking now." }],
+					stopReason: "stop",
 					timestamp: Date.now(),
 				},
 			],
@@ -464,8 +470,28 @@ describe("worklog fork", () => {
 			prompt: "inspect repeated worklog turns",
 		});
 
+		// Seed one user+assistant pair so each turn_end's gate sees a new
+		// assistant message in the delta and lets the fork fire.
+		const seedTurn = (label: string) => {
+			child.agent.state.messages.push(
+				{
+					role: "user",
+					content: [{ type: "text", text: `q ${label}` }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: `a ${label}` }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
+			);
+		};
+		seedTurn("1");
 		child.emit({ type: "turn_end", messages: [] });
+		seedTurn("2");
 		child.emit({ type: "turn_end", messages: [] });
+		seedTurn("3");
 		child.emit({ type: "turn_end", messages: [] });
 
 		await vi.waitFor(() => {
@@ -510,6 +536,12 @@ describe("worklog fork", () => {
 					content: [{ type: "text", text: "Inspect the orchestrator." }],
 					timestamp: Date.now(),
 				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "Inspecting." }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
 			],
 			transformContext: vi.fn(async (messages) => {
 				transformedMessages = messages;
@@ -549,7 +581,10 @@ describe("worklog fork", () => {
 		});
 		expect(root.sentMessages).toHaveLength(0);
 		expect(Array.isArray(transformedMessages)).toBe(true);
-		expect((transformedMessages as unknown[]).length).toBe(1);
+		// Snapshot was taken before the later custom message was pushed, so the
+		// transform still sees exactly the user+assistant pair that existed at
+		// turn_end time.
+		expect((transformedMessages as unknown[]).length).toBe(2);
 	});
 
 	it("attributes worklog-fork usage to the child session via addBackgroundUsage", async () => {
@@ -573,6 +608,12 @@ describe("worklog fork", () => {
 				{
 					role: "user",
 					content: [{ type: "text", text: "Inspect the orchestrator." }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "Done." }],
+					stopReason: "stop",
 					timestamp: Date.now(),
 				},
 			],
@@ -630,6 +671,12 @@ describe("worklog fork", () => {
 					content: [{ type: "text", text: "Inspect the orchestrator." }],
 					timestamp: Date.now(),
 				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "Ack." }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
 			],
 			streamFn,
 		});
@@ -650,5 +697,259 @@ describe("worklog fork", () => {
 		// Even a worklog fork that produces no worklog update still spent
 		// tokens — they should be attributed, not dropped.
 		expect(child.backgroundUsageCalls).toEqual([{ usage: noToolUsage, scope: "worklog" }]);
+	});
+});
+
+describe("isLikelyTrivialTurn gate", () => {
+	const baseRecord = { lastWorklogMessageCount: 0, lastWorklogTurn: 0, turnCount: 1 };
+
+	it("HARD GATE: skips when the delta contains no assistant message", () => {
+		const result = isLikelyTrivialTurn(baseRecord, [
+			{
+				role: "user",
+				content: [{ type: "text", text: "hi" }],
+				timestamp: Date.now(),
+			},
+		]);
+		expect(result).toEqual({ skip: true, reason: "no-new-assistant-message" });
+	});
+
+	it("HARD GATE: skips when the delta is only an agent_directive delivery", () => {
+		const result = isLikelyTrivialTurn(baseRecord, [
+			{
+				role: "custom",
+				customType: "agent_directive",
+				content: "[DIRECTIVE]",
+				display: true,
+				timestamp: Date.now(),
+			},
+		]);
+		expect(result.skip).toBe(true);
+		expect(result.reason).toBe("no-new-assistant-message");
+	});
+
+	it("HARD GATE: skips when the delta is only tool-results after an older assistant message", () => {
+		// Prior assistant message is BEFORE lastWorklogMessageCount, so it's not
+		// part of the delta. The delta is just the tool-result.
+		const result = isLikelyTrivialTurn(
+			{ lastWorklogMessageCount: 2, lastWorklogTurn: 1, turnCount: 2 },
+			[
+				{
+					role: "user",
+					content: [{ type: "text", text: "earlier q" }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant",
+					content: [
+						{ type: "toolCall", id: "c1", name: "read", arguments: { path: "x" } },
+					],
+					stopReason: "toolUse",
+					timestamp: Date.now(),
+				},
+				{
+					role: "toolResult",
+					toolCallId: "c1",
+					toolName: "read",
+					content: [{ type: "text", text: "huge payload" }],
+					timestamp: Date.now(),
+				},
+			],
+		);
+		expect(result).toEqual({ skip: true, reason: "no-new-assistant-message" });
+	});
+
+	it("skips tool-chatter-only: delta has assistant messages but only toolCall content", () => {
+		const result = isLikelyTrivialTurn(baseRecord, [
+			{
+				role: "user",
+				content: [{ type: "text", text: "q" }],
+				timestamp: Date.now(),
+			},
+			{
+				role: "assistant",
+				content: [
+					{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "ls" } },
+				],
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			},
+		]);
+		expect(result).toEqual({ skip: true, reason: "tool-chatter-only" });
+	});
+
+	it("skips tiny-delta-after-recent-entry: 1-msg delta within 2 turns of last entry", () => {
+		const result = isLikelyTrivialTurn(
+			{ lastWorklogMessageCount: 0, lastWorklogTurn: 5, turnCount: 6 },
+			[
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "ok" }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
+			],
+		);
+		expect(result).toEqual({ skip: true, reason: "tiny-delta-after-recent-entry" });
+	});
+
+	it("does not skip: substantive turn with user + assistant text", () => {
+		const result = isLikelyTrivialTurn(baseRecord, [
+			{
+				role: "user",
+				content: [{ type: "text", text: "what did you learn?" }],
+				timestamp: Date.now(),
+			},
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "Here are the findings." }],
+				stopReason: "stop",
+				timestamp: Date.now(),
+			},
+		]);
+		expect(result).toEqual({ skip: false });
+	});
+
+	it("does not skip: assistant with substantive thinking passes the tool-chatter gate", () => {
+		const result = isLikelyTrivialTurn(baseRecord, [
+			{
+				role: "user",
+				content: [{ type: "text", text: "q" }],
+				timestamp: Date.now(),
+			},
+			{
+				role: "assistant",
+				content: [
+					{ type: "thinking", thinking: "x".repeat(400) },
+					{ type: "toolCall", id: "c1", name: "bash", arguments: { command: "ls" } },
+				],
+				stopReason: "toolUse",
+				timestamp: Date.now(),
+			},
+		]);
+		expect(result).toEqual({ skip: false });
+	});
+});
+
+describe("worklog fork gating integration", () => {
+	const tempDirs: string[] = [];
+
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	it("does not fire the fork on a turn that delivered only an agent_directive", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		const streamFn = vi.fn(async () => ({
+			result: async () => createWorklogAssistant("## should not be written"),
+		}) as never);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{
+					role: "custom",
+					customType: "agent_directive",
+					content: "[DIRECTIVE] something",
+					display: true,
+					timestamp: Date.now(),
+				},
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect",
+		});
+
+		child.emit({ type: "turn_end", messages: [] });
+		await waitForMicrotasks();
+		await waitForMicrotasks();
+		expect(streamFn).not.toHaveBeenCalled();
+		// Gated turn still advances turnCount but MUST NOT advance
+		// lastWorklogMessageCount — so the delta is preserved.
+		expect(orchestrator.getRecord(childId).turnCount).toBe(1);
+		expect(orchestrator.getRecord(childId).lastWorklogMessageCount).toBe(0);
+	});
+
+	it("accumulated delta from a skipped turn is picked up by the next substantive turn", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		let capturedDelta: number | undefined;
+		const convertToLlm = vi.fn(async (messages) => {
+			capturedDelta = messages.length;
+			return [
+				{
+					role: "user" as const,
+					content: [{ type: "text" as const, text: "converted" }],
+					timestamp: Date.now(),
+				},
+			];
+		});
+		const streamFn = vi.fn(async () => ({
+			result: async () => createWorklogAssistant("## Findings\n- Substantive content."),
+		}) as never);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [],
+			convertToLlm,
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect",
+		});
+
+		// Turn 1: trivial — directive only, no assistant. Fork is skipped.
+		child.agent.state.messages.push({
+			role: "custom",
+			customType: "agent_directive",
+			content: "[DIRECTIVE] a",
+			display: true,
+			timestamp: Date.now(),
+		});
+		child.emit({ type: "turn_end", messages: [] });
+		await waitForMicrotasks();
+		expect(streamFn).not.toHaveBeenCalled();
+
+		// Turn 2: substantive — user + assistant. Fork should fire and the
+		// skipped directive from turn 1 must still be in the context delta.
+		child.agent.state.messages.push(
+			{
+				role: "user",
+				content: [{ type: "text", text: "real question" }],
+				timestamp: Date.now(),
+			},
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "real answer" }],
+				stopReason: "stop",
+				timestamp: Date.now(),
+			},
+		);
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(2);
+		});
+		// The fork's convertToLlm saw the role-filtered delta: user +
+		// assistant (the skipped directive is filtered by the role filter).
+		// Critically, turnCount advanced across both turns.
+		expect(capturedDelta).toBe(2);
+		expect(orchestrator.getRecord(childId).turnCount).toBe(2);
 	});
 });
