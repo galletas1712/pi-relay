@@ -4,6 +4,7 @@ import { getEnvApiKey } from "../env-api-keys.js";
 import type {
 	Api,
 	AssistantMessage,
+	CacheRetention,
 	Context,
 	Model,
 	SimpleStreamOptions,
@@ -16,6 +17,22 @@ import { buildBaseOptions, normalizeOpenAIReasoning } from "./simple-options.js"
 
 const DEFAULT_AZURE_API_VERSION = "v1";
 const AZURE_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode", "azure-openai-responses"]);
+
+/**
+ * Resolve cache retention preference. Mirrors `openai-responses.ts`:
+ * defaults to "short", honors an explicit option, and treats
+ * `PI_CACHE_RETENTION=none` as a global kill switch that disables
+ * `prompt_cache_key` emission.
+ */
+function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
+	if (cacheRetention) {
+		return cacheRetention;
+	}
+	if (typeof process !== "undefined" && process.env.PI_CACHE_RETENTION === "none") {
+		return "none";
+	}
+	return "short";
+}
 
 function parseDeploymentNameMap(value: string | undefined): Map<string, string> {
 	const map = new Map<string, string>();
@@ -216,11 +233,12 @@ function buildParams(
 ) {
 	const messages = convertResponsesMessages(model, context, AZURE_TOOL_CALL_PROVIDERS);
 
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 	const params: ResponseCreateParamsStreaming = {
 		model: deploymentName,
 		input: messages,
 		stream: true,
-		prompt_cache_key: options?.sessionId,
+		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
 	};
 
 	if (options?.maxTokens) {

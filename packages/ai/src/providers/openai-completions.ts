@@ -12,6 +12,7 @@ import { getEnvApiKey } from "../env-api-keys.js";
 import { calculateCost } from "../models.js";
 import type {
 	AssistantMessage,
+	CacheRetention,
 	Context,
 	Message,
 	Model,
@@ -50,6 +51,23 @@ function hasToolHistory(messages: Message[]): boolean {
 		}
 	}
 	return false;
+}
+
+/**
+ * Resolve cache retention preference. Mirrors `openai-responses.ts`:
+ * defaults to "short", honors an explicit option, and treats
+ * `PI_CACHE_RETENTION=none` as a global kill switch. `PI_CACHE_RETENTION=long`
+ * is not honored here because the Chat Completions API has no extended-TTL
+ * knob analogous to the Responses API's `prompt_cache_retention`.
+ */
+function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
+	if (cacheRetention) {
+		return cacheRetention;
+	}
+	if (typeof process !== "undefined" && process.env.PI_CACHE_RETENTION === "none") {
+		return "none";
+	}
+	return "short";
 }
 
 export interface OpenAICompletionsOptions extends StreamOptions {
@@ -373,10 +391,12 @@ function buildParams(model: Model<"openai-completions">, context: Context, optio
 	const messages = convertMessages(model, context, compat);
 	maybeAddOpenRouterAnthropicCacheControl(model, messages);
 
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 	const params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
 		model: model.id,
 		messages,
 		stream: true,
+		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
 	};
 
 	if (compat.supportsUsageInStreaming !== false) {
