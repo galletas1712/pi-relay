@@ -6,10 +6,10 @@ import type {
 	StreamFn,
 	ThinkingLevel,
 } from "@pi-relay/agent-core";
-import type { ImageContent, Message, Model, SimpleStreamOptions, TextContent, ThinkingBudgets, Transport } from "@pi-relay/ai";
-import type { AgentSessionEvent, PromptSource, SessionStats, ToolDefinition, ToolInfo } from "@pi-relay/coding-agent";
+import type { ImageContent, Message, Model, SimpleStreamOptions, TextContent, ThinkingBudgets, Transport, Usage } from "@pi-relay/ai";
+import type { AgentSessionEvent, BackgroundUsageScope, PromptSource, SessionStats, ToolDefinition, ToolInfo } from "@pi-relay/coding-agent";
 
-export type { SessionStats };
+export type { BackgroundUsageScope, SessionStats };
 
 /**
  * Aggregated usage stats for an agent plus its subtree.
@@ -109,6 +109,15 @@ export interface AgentSessionHandle {
 	sessionFile: string | undefined;
 	getAllTools(): ToolInfo[];
 	getSessionStats(): SessionStats;
+	/**
+	 * Attribute usage from a background (out-of-band) LLM call — worklog forks,
+	 * compaction summaries, branch/turn-prefix summaries — to this session so
+	 * the tokens/cost flow through `getSessionStats`, the TUI footer, the
+	 * `[pi:cache]` telemetry, and orchestrator subtree aggregation.
+	 *
+	 * Implementations persist only in memory. See `AgentSession.addBackgroundUsage`.
+	 */
+	addBackgroundUsage(usage: Usage, scope?: BackgroundUsageScope): void;
 	getLastAssistantText(): string | undefined;
 	bindExtensions(bindings: object): Promise<void>;
 	subscribe(listener: (event: AgentSessionEvent) => void): () => void;

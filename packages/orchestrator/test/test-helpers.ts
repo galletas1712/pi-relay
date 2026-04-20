@@ -2,8 +2,8 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, AgentTool } from "@pi-relay/agent-core";
-import type { Message, Model } from "@pi-relay/ai";
-import type { AgentSessionEvent, PromptSource, SessionStats } from "@pi-relay/coding-agent";
+import type { Message, Model, Usage } from "@pi-relay/ai";
+import type { AgentSessionEvent, BackgroundUsageScope, PromptSource, SessionStats } from "@pi-relay/coding-agent";
 import type { AgentSessionHandle, SessionCustomMessage } from "../src/types.js";
 
 export const TEST_MODEL: Model<any> = {
@@ -115,6 +115,8 @@ export class FakeSession implements AgentSessionHandle {
 		} as never;
 	}
 
+	readonly backgroundUsageCalls: Array<{ usage: Usage; scope?: BackgroundUsageScope }> = [];
+
 	getAllTools() {
 		return [];
 	}
@@ -133,6 +135,10 @@ export class FakeSession implements AgentSessionHandle {
 				cost: 0,
 			}
 		);
+	}
+
+	addBackgroundUsage(usage: Usage, scope?: BackgroundUsageScope): void {
+		this.backgroundUsageCalls.push({ usage, scope });
 	}
 
 	getLastAssistantText() {
