@@ -8,7 +8,7 @@ import { minimatch } from "minimatch";
 import { CONFIG_DIR_NAME } from "../config.js";
 import { isTruthyEnvFlag } from "../utils/env-flag.js";
 import { type GitSource, parseGitUrl } from "../utils/git.js";
-import { isLocalPath } from "../utils/paths.js";
+import { isLocalPath, looksLikeBarePackageName } from "../utils/paths.js";
 import { isStdoutTakenOver } from "./output-guard.js";
 import type { PackageSource, SettingsManager } from "./settings-manager.js";
 
@@ -1959,9 +1959,27 @@ export class DefaultPackageManager implements PackageManager {
 	): void {
 		if (entries.length === 0) return;
 
-		// Collect all files from plain entries (non-pattern entries)
 		const { plain, patterns } = splitPatterns(entries);
-		const resolvedPlain = plain.map((p) => this.resolvePathFromBase(p, baseDir));
+
+		// Package-name entries are only meaningful for extensions (today) —
+		// skills / prompts / themes don't resolve via node module resolution.
+		// Pass them through as-is so the extension loader can resolve via
+		// `import.meta.resolve` / `createRequire(cwd).resolve(name)` later.
+		const fileEntries: string[] = [];
+		const packageEntries: string[] = [];
+		for (const entry of plain) {
+			if (resourceType === "extensions" && looksLikeBarePackageName(entry)) {
+				packageEntries.push(entry);
+			} else {
+				fileEntries.push(entry);
+			}
+		}
+
+		for (const name of packageEntries) {
+			this.addResource(target, name, metadata, true);
+		}
+
+		const resolvedPlain = fileEntries.map((p) => this.resolvePathFromBase(p, baseDir));
 		const allFiles = this.collectFilesFromPaths(resolvedPlain, resourceType);
 
 		// Determine which files are enabled based on patterns

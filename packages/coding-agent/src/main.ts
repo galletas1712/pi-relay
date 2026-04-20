@@ -48,7 +48,7 @@ import { ExtensionSelectorComponent } from "./modes/interactive/components/exten
 import { initTheme, stopThemeWatcher } from "./modes/interactive/theme/theme.js";
 import { handleConfigCommand, handlePackageCommand } from "./package-manager-cli.js";
 import { isTruthyEnvFlag } from "./utils/env-flag.js";
-import { isLocalPath } from "./utils/paths.js";
+import { isLocalPath, looksLikeBarePackageName } from "./utils/paths.js";
 
 /**
  * Read all content from piped stdin.
@@ -377,7 +377,12 @@ function buildSessionOptions(
 }
 
 function resolveCliPaths(cwd: string, paths: string[] | undefined): string[] | undefined {
-	return paths?.map((value) => (isLocalPath(value) ? resolve(cwd, value) : value));
+	return paths?.map((value) => {
+		// Bare package names are resolved via Node module resolution by the
+		// extension loader, not relative to cwd.
+		if (looksLikeBarePackageName(value)) return value;
+		return isLocalPath(value) ? resolve(cwd, value) : value;
+	});
 }
 
 async function promptForMissingSessionCwd(

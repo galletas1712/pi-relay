@@ -8,7 +8,7 @@ import * as fs from "node:fs";
 import { createRequire } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { createJiti } from "@mariozechner/jiti";
 import * as _bundledPiAgentCore from "@pi-relay/agent-core";
 import * as _bundledPiAi from "@pi-relay/ai";
@@ -122,6 +122,151 @@ function resolvePath(extPath: string, cwd: string): string {
 		return expanded;
 	}
 	return path.resolve(cwd, expanded);
+}
+
+/**
+ * Normalized form for an entry from `settings.extensions` /
+ * `piConfig.extensions` / the `-e` CLI flag. Legacy string entries are
+ * either file paths or bare package names; the object forms are explicit.
+ */
+export type ExtensionEntry = string | { path: string } | { package: string };
+
+interface ResolvedEntry {
+	kind: "file" | "package";
+	/** Absolute filesystem path to the module's entry file (the thing jiti imports). */
+	resolvedPath: string;
+	/** Display / sourceInfo form of the original entry (e.g. `"@pi-relay/extensions"` for package entries). */
+	displayName: string;
+	/** Package name when `kind === "package"`. */
+	packageName?: string;
+}
+
+function looksLikePackageName(value: string): boolean {
+	const trimmed = value.trim();
+	if (!trimmed) return false;
+	if (trimmed.startsWith(".") || trimmed.startsWith("/") || trimmed.startsWith("~")) return false;
+	if (/^[A-Za-z]:[\\/]/.test(trimmed)) return false;
+	if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(trimmed)) return false;
+	if (trimmed.startsWith("@")) {
+		const parts = trimmed.split("/");
+		return parts.length === 2 && parts[0].length >= 2 && parts[1].length >= 1;
+	}
+	return !trimmed.includes("/");
+}
+
+/**
+ * Resolve a single `ExtensionEntry` into a file path (for file entries) or
+ * a Node-resolved entry module path (for package entries).
+ *
+ * Errors (package not found, unreadable path) are returned via the
+ * `ResolvedEntry | { error }` discriminator instead of thrown so the caller
+ * can surface them as per-extension diagnostics without crashing the
+ * session.
+ */
+export function resolveExtensionEntry(
+	entry: ExtensionEntry,
+	cwd: string,
+): ResolvedEntry | { error: string; displayName: string } {
+	let kind: "file" | "package";
+	let value: string;
+	if (typeof entry === "string") {
+		value = entry;
+		kind = looksLikePackageName(value) ? "package" : "file";
+	} else if ("package" in entry) {
+		value = entry.package;
+		kind = "package";
+	} else {
+		value = entry.path;
+		kind = "file";
+	}
+
+	if (kind === "file") {
+		const resolved = resolvePath(value, cwd);
+		return { kind, resolvedPath: resolved, displayName: value };
+	}
+
+	// Package resolution. Try each of these in order:
+	//   1. `import.meta.resolve` anchored at `<cwd>/package.json` — honors ESM
+	//      `exports.import` conditions, symlinked workspaces, and scoped names.
+	//   2. `createRequire(...).resolve(...)` — fallback for CommonJS packages
+	//      or when import.meta.resolve isn't exposed for some reason.
+	//   3. Manual probe of `node_modules/<name>/<main-from-package.json>` —
+	//      covers the workspace-symlink case when Node's resolver can't see
+	//      the package because it has only an `exports` field (no `main`).
+	const anchor = pathToFileURL(path.join(cwd, "package.json")).href;
+	try {
+		const resolvedUrl = import.meta.resolve(value, anchor);
+		const resolvedPath = fileURLToPath(resolvedUrl);
+		return { kind: "package", resolvedPath, displayName: value, packageName: value };
+	} catch {
+		// Fall through to createRequire.
+	}
+
+	let createRequireError: string | undefined;
+	try {
+		const req = createRequire(anchor);
+		const resolvedPath = req.resolve(value);
+		return { kind: "package", resolvedPath, displayName: value, packageName: value };
+	} catch (err) {
+		createRequireError = err instanceof Error ? err.message : String(err);
+	}
+
+	// Manual probe as a last resort. Walk up from cwd looking for
+	// `node_modules/<value>/package.json`, then resolve its `main` /
+	// `exports["."].import` entry.
+	const probed = probeNodeModulesEntry(value, cwd);
+	if (probed) {
+		return { kind: "package", resolvedPath: probed, displayName: value, packageName: value };
+	}
+	return {
+		error: `Could not resolve package "${value}" from ${cwd}: ${createRequireError ?? "not found in node_modules"}`,
+		displayName: value,
+	};
+}
+
+/**
+ * Walk up the directory tree from `startDir` looking for
+ * `node_modules/<pkg>/package.json`, then pick the entry file (prefers
+ * ESM exports `.` + `import`, falls back to `main`, falls back to
+ * `index.js`).
+ */
+function probeNodeModulesEntry(pkgName: string, startDir: string): string | undefined {
+	let dir = startDir;
+	while (true) {
+		const pkgDir = path.join(dir, "node_modules", pkgName);
+		const pkgJson = path.join(pkgDir, "package.json");
+		if (fs.existsSync(pkgJson)) {
+			try {
+				const manifest = JSON.parse(fs.readFileSync(pkgJson, "utf-8"));
+				const exportsField = manifest.exports;
+				if (exportsField && typeof exportsField === "object") {
+					const dotExport = (exportsField as Record<string, unknown>)["."];
+					if (typeof dotExport === "string") {
+						return path.resolve(pkgDir, dotExport);
+					}
+					if (dotExport && typeof dotExport === "object") {
+						const dotObj = dotExport as Record<string, unknown>;
+						const candidate =
+							(typeof dotObj.import === "string" && (dotObj.import as string)) ||
+							(typeof dotObj.default === "string" && (dotObj.default as string)) ||
+							(typeof dotObj.require === "string" && (dotObj.require as string)) ||
+							undefined;
+						if (candidate) return path.resolve(pkgDir, candidate);
+					}
+				}
+				if (typeof manifest.main === "string") {
+					return path.resolve(pkgDir, manifest.main);
+				}
+				const indexJs = path.join(pkgDir, "index.js");
+				if (fs.existsSync(indexJs)) return indexJs;
+			} catch {
+				return undefined;
+			}
+		}
+		const parent = path.dirname(dir);
+		if (parent === dir) return undefined;
+		dir = parent;
+	}
 }
 
 type HandlerFn = (...args: unknown[]) => Promise<unknown>;
@@ -365,27 +510,42 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 }
 
 async function loadExtension(
-	extensionPath: string,
+	entry: ExtensionEntry,
 	cwd: string,
 	eventBus: EventBus,
 	runtime: ExtensionRuntime,
-): Promise<{ extension: Extension | null; error: string | null }> {
-	const resolvedPath = resolvePath(extensionPath, cwd);
+): Promise<{ extension: Extension | null; error: string | null; displayName: string }> {
+	const resolved = resolveExtensionEntry(entry, cwd);
+	if ("error" in resolved) {
+		return { extension: null, error: resolved.error, displayName: resolved.displayName };
+	}
 
 	try {
-		const factory = await loadExtensionModule(resolvedPath);
+		const factory = await loadExtensionModule(resolved.resolvedPath);
 		if (!factory) {
-			return { extension: null, error: `Extension does not export a valid factory function: ${extensionPath}` };
+			return {
+				extension: null,
+				error: `Extension does not export a valid factory function: ${resolved.displayName}`,
+				displayName: resolved.displayName,
+			};
 		}
 
-		const extension = createExtension(extensionPath, resolvedPath);
+		const extension = createExtension(resolved.displayName, resolved.resolvedPath);
+		if (resolved.kind === "package") {
+			// Mark this extension as package-sourced so diagnostics / `/tools`
+			// can distinguish a package entry from a raw file path.
+			extension.sourceInfo = {
+				...extension.sourceInfo,
+				source: "package",
+			};
+		}
 		const api = createExtensionAPI(extension, runtime, cwd, eventBus);
 		await factory(api);
 
-		return { extension, error: null };
+		return { extension, error: null, displayName: resolved.displayName };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
-		return { extension: null, error: `Failed to load extension: ${message}` };
+		return { extension: null, error: `Failed to load extension: ${message}`, displayName: resolved.displayName };
 	}
 }
 
@@ -406,19 +566,28 @@ export async function loadExtensionFromFactory(
 }
 
 /**
- * Load extensions from paths.
+ * Load extensions from a list of entries. Accepts:
+ *   - string (legacy): file path OR bare package name (distinguished
+ *     heuristically).
+ *   - `{ path: "..." }`: always a file path.
+ *   - `{ package: "..." }`: always a package name, resolved via Node module
+ *     resolution anchored at `cwd`.
  */
-export async function loadExtensions(paths: string[], cwd: string, eventBus?: EventBus): Promise<LoadExtensionsResult> {
+export async function loadExtensions(
+	entries: ExtensionEntry[],
+	cwd: string,
+	eventBus?: EventBus,
+): Promise<LoadExtensionsResult> {
 	const extensions: Extension[] = [];
 	const errors: Array<{ path: string; error: string }> = [];
 	const resolvedEventBus = eventBus ?? createEventBus();
 	const runtime = createExtensionRuntime();
 
-	for (const extPath of paths) {
-		const { extension, error } = await loadExtension(extPath, cwd, resolvedEventBus, runtime);
+	for (const entry of entries) {
+		const { extension, error, displayName } = await loadExtension(entry, cwd, resolvedEventBus, runtime);
 
 		if (error) {
-			errors.push({ path: extPath, error });
+			errors.push({ path: displayName, error });
 			continue;
 		}
 
