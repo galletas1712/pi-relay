@@ -2978,29 +2978,46 @@ export class AgentSession {
 
 	/**
 	 * Get session statistics.
+	 *
+	 * Aggregable fields (token counts, cost, message counts) are computed by
+	 * walking `sessionManager.getEntries()` — the full session-file linear
+	 * history — so stats span across compaction boundaries. Using
+	 * `state.messages` would drop pre-compaction history, since compaction
+	 * replaces pre-compaction entries with a summary in `state.messages` but
+	 * retains the original entries in the session file.
+	 *
+	 * Both the local footer walk (`footer.ts`) and the orchestrator's
+	 * subtree aggregation (`Orchestrator.aggregateSubtreeUsage`) now share a
+	 * single source of truth for self-stats.
 	 */
 	getSessionStats(): SessionStats {
-		const state = this.state;
-		const userMessages = state.messages.filter((m) => m.role === "user").length;
-		const assistantMessages = state.messages.filter((m) => m.role === "assistant").length;
-		const toolResults = state.messages.filter((m) => m.role === "toolResult").length;
-
+		let userMessages = 0;
+		let assistantMessages = 0;
+		let toolResults = 0;
 		let toolCalls = 0;
+		let totalMessages = 0;
 		let totalInput = 0;
 		let totalOutput = 0;
 		let totalCacheRead = 0;
 		let totalCacheWrite = 0;
 		let totalCost = 0;
 
-		for (const message of state.messages) {
-			if (message.role === "assistant") {
-				const assistantMsg = message as AssistantMessage;
-				toolCalls += assistantMsg.content.filter((c) => c.type === "toolCall").length;
-				totalInput += assistantMsg.usage.input;
-				totalOutput += assistantMsg.usage.output;
-				totalCacheRead += assistantMsg.usage.cacheRead;
-				totalCacheWrite += assistantMsg.usage.cacheWrite;
-				totalCost += assistantMsg.usage.cost.total;
+		for (const entry of this.sessionManager.getEntries()) {
+			if (entry.type !== "message") continue;
+			const message = entry.message;
+			totalMessages += 1;
+			if (message.role === "user") {
+				userMessages += 1;
+			} else if (message.role === "assistant") {
+				assistantMessages += 1;
+				toolCalls += message.content.filter((c) => c.type === "toolCall").length;
+				totalInput += message.usage.input;
+				totalOutput += message.usage.output;
+				totalCacheRead += message.usage.cacheRead;
+				totalCacheWrite += message.usage.cacheWrite;
+				totalCost += message.usage.cost.total;
+			} else if (message.role === "toolResult") {
+				toolResults += 1;
 			}
 		}
 
@@ -3011,7 +3028,7 @@ export class AgentSession {
 			assistantMessages,
 			toolCalls,
 			toolResults,
-			totalMessages: state.messages.length,
+			totalMessages,
 			tokens: {
 				input: totalInput,
 				output: totalOutput,
