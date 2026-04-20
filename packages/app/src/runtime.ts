@@ -1,3 +1,4 @@
+import { getModel } from "@pi-relay/ai";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -15,6 +16,20 @@ import {
 	createRelaySessionFactory,
 	createSpawnTool,
 } from "@pi-relay/orchestrator";
+
+/**
+ * Default worklog fork model. The worklog fork runs once per agent turn on
+ * a separate off-transcript call to decide whether anything durable was
+ * learned (and, if so, emit a short markdown entry). It does not need the
+ * main loop's full reasoning budget, so default it to GPT-5.4 with medium
+ * reasoning. Operators can override via `OrchestratorConfig.forkModel`.
+ *
+ * Both the provider and model id are resolved through `getModel`; if the
+ * model catalog doesn't know this id (e.g. future renames), we silently
+ * fall back to the parent session's model, preserving the pre-Phase-1
+ * behavior.
+ */
+const DEFAULT_FORK_MODEL = getModel("openai", "gpt-5.4");
 import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
 import { createRelayBaseToolDefinitionsFactory, RELAY_BASE_TOOL_NAMES } from "./tools/base-tools.js";
 
@@ -97,6 +112,9 @@ export function createRelayRuntimeFactory(
 				baseToolNames: [...RELAY_BASE_TOOL_NAMES],
 				createSessionBaseToolDefinitionsFactory,
 			}),
+			config: DEFAULT_FORK_MODEL
+				? { forkModel: DEFAULT_FORK_MODEL, forkThinkingLevel: "medium" }
+				: undefined,
 		});
 		orchestratorRef.current = orchestrator;
 		stateRef.current = { orchestrator };

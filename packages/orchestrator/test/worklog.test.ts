@@ -831,6 +831,116 @@ describe("isLikelyTrivialTurn gate", () => {
 	});
 });
 
+describe("worklog fork model override", () => {
+	const tempDirs: string[] = [];
+
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	it("uses config.forkModel and config.forkThinkingLevel when set, with a distinct :worklog cache key", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		const forkModel = {
+			id: "gpt-5.4",
+			name: "GPT-5.4 (fork)",
+			api: "openai-responses" as const,
+			provider: "openai" as const,
+			baseUrl: "https://api.openai.com/v1",
+			reasoning: true,
+			input: ["text"] as const,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 272_000,
+			maxTokens: 128_000,
+		};
+		const streamFn = vi.fn(async (model, _context, options) => {
+			expect(model).toBe(forkModel);
+			expect(options?.reasoning).toBe("medium");
+			// The fork must carry a distinct sessionId so providers that key
+			// their prompt cache off sessionId don't cross-contaminate
+			// main-loop caches.
+			expect(options?.sessionId).toBe("child-session:worklog");
+			return {
+				result: async () => createWorklogAssistant("## Findings\n- Override wired."),
+			} as never;
+		});
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "q" }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "a" }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+			config: { forkModel: forkModel as never, forkThinkingLevel: "medium" },
+		});
+		await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	it("falls back to the session model and thinkingLevel when forkModel is not configured", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		const streamFn = vi.fn(async (model, _context, options) => {
+			// The child's default FakeSession model is the test TEST_MODEL; no
+			// override configured, so that's what the fork must use.
+			expect(model.id).toBe("gpt-5.4");
+			expect(options?.reasoning).toBe("medium");
+			expect(options?.sessionId).toBe("child-session:worklog");
+			return {
+				result: async () => createWorklogAssistant("## Findings\n- Fallback wired."),
+			} as never;
+		});
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "q" }],
+					timestamp: Date.now(),
+				},
+				{
+					role: "assistant",
+					content: [{ type: "text", text: "a" }],
+					stopReason: "stop",
+					timestamp: Date.now(),
+				},
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		await orchestrator.spawnAgent("root", { role: "explore", prompt: "inspect" });
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+	});
+});
+
 describe("worklog fork gating integration", () => {
 	const tempDirs: string[] = [];
 

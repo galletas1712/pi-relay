@@ -1143,9 +1143,19 @@ export class Orchestrator {
 
 	private async runWorklogFork(agentId: string, turn: number, turnMessages: AgentMessage[]): Promise<void> {
 		const record = this.records.get(agentId);
-		if (!record || record.status === "disposed" || !record.session.model) {
+		if (!record || record.status === "disposed") {
 			return;
 		}
+		// Resolve the fork model and reasoning level. A configured
+		// `forkModel` lets operators route worklog forks to a cheaper model
+		// (e.g. GPT-5.4 medium) than the parent session's main-loop model;
+		// absent that, fall back to the parent's model and thinking level so
+		// behavior matches pre-Phase-1.
+		const forkModel = this.config.forkModel ?? record.session.model;
+		if (!forkModel) {
+			return;
+		}
+		const forkThinkingLevel = this.config.forkThinkingLevel ?? record.session.thinkingLevel;
 
 		const transformed = record.session.agent.transformContext
 			? await record.session.agent.transformContext(turnMessages)
@@ -1176,17 +1186,25 @@ export class Orchestrator {
 			content: [{ type: "text", text: buildWorklogPrompt(lastEntry) }],
 			timestamp: Date.now(),
 		};
+		// Use a distinct `sessionId` for the worklog fork so OpenAI-family
+		// providers emit a separate `prompt_cache_key` for fork calls. This
+		// keeps main-loop and fork caches from cross-contaminating: fork
+		// turns never evict cache entries the main loop is relying on, and
+		// vice versa.
+		const forkSessionId = record.session.agent.sessionId
+			? `${record.session.agent.sessionId}:worklog`
+			: undefined;
 		const streamOptions = {
-			reasoning: record.session.thinkingLevel === "off" ? undefined : record.session.thinkingLevel,
+			reasoning: forkThinkingLevel === "off" ? undefined : forkThinkingLevel,
 			getApiKey: record.session.agent.getApiKey,
 			onPayload: record.session.agent.onPayload,
-			sessionId: record.session.agent.sessionId,
+			sessionId: forkSessionId,
 			thinkingBudgets: record.session.agent.thinkingBudgets,
 			transport: record.session.agent.transport,
 			maxRetryDelayMs: record.session.agent.maxRetryDelayMs,
 		} as Parameters<typeof record.session.agent.streamFn>[2];
 		const stream = await record.session.agent.streamFn(
-			record.session.model,
+			forkModel,
 			{
 				systemPrompt: record.session.agent.state.systemPrompt,
 				messages: [...contextMessages, prompt],
