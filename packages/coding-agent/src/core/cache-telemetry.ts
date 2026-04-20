@@ -47,7 +47,12 @@ export function formatTurnCacheStats(usage: Pick<Usage, "cacheRead" | "cacheWrit
 /**
  * Formats a structured cache-telemetry line for stderr.
  *
- * Shape: `[pi:cache] turn=<N> cacheRead=<R> cacheWrite=<W> input=<I> output=<O>`
+ * Default shape (single-agent): `[pi:cache] turn=<N> cacheRead=<R> cacheWrite=<W> input=<I> output=<O>`
+ *
+ * With `scope` (multi-agent): `[pi:cache] turn=<N> <scope> cacheRead=<R> ...`
+ * where `<scope>` is either `self` (attached agent only) or `tree` (attached
+ * agent plus all descendants). The `scope` token sits immediately after
+ * `turn=<N>` so the tail format stays grep-compatible with single-agent logs.
  *
  * Stable enough to grep; no color codes; single line per turn. Consumed by
  * `print-mode` when `PI_SHOW_CACHE_STATS=1`.
@@ -55,7 +60,99 @@ export function formatTurnCacheStats(usage: Pick<Usage, "cacheRead" | "cacheWrit
 export function formatCacheLogLine(opts: {
 	turn: number;
 	usage: Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite">;
+	scope?: "self" | "tree";
 }): string {
-	const { turn, usage } = opts;
-	return `[pi:cache] turn=${turn} cacheRead=${usage.cacheRead} cacheWrite=${usage.cacheWrite} input=${usage.input} output=${usage.output}`;
+	const { turn, usage, scope } = opts;
+	const scopePart = scope ? ` ${scope}` : "";
+	return `[pi:cache] turn=${turn}${scopePart} cacheRead=${usage.cacheRead} cacheWrite=${usage.cacheWrite} input=${usage.input} output=${usage.output}`;
+}
+
+/**
+ * Compact token-count formatter used by the TUI footer for cumulative cols
+ * (matching the pre-PR format: `1234`, `4.3k`, `12k`, `1.2M`, `12M`).
+ *
+ * Exposed here so the subtree-aware footer renderer and any external tooling
+ * can produce matching strings without duplicating the abbreviation rules.
+ */
+export function formatCompactTokens(count: number): string {
+	if (count < 1000) return count.toString();
+	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
+	if (count < 1000000) return `${Math.round(count / 1000)}k`;
+	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
+	return `${Math.round(count / 1000000)}M`;
+}
+
+/**
+ * Formats the stats portion of the footer for an agent that has descendants.
+ *
+ * Returns an array of tokens meant to be joined with spaces by the caller,
+ * matching the existing footer token layout (`↑N ↓N RN WN self$X · tree$Y`).
+ * When `tree == self` (no descendants or identical totals), returns only the
+ * self-scoped tokens so single-agent output stays untouched.
+ *
+ * Cost strings use 3-decimal precision to match the existing cumulative-cost
+ * format at the footer's `$X.XXX` rendering.
+ */
+export function formatSelfTreeStatsTokens(opts: {
+	self: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+	tree: { input: number; output: number; cacheRead: number; cacheWrite: number; cost: number };
+	/** When true, always include the `tree` column even if tree == self. Defaults to false. */
+	alwaysShowTree?: boolean;
+}): string[] {
+	const { self, tree, alwaysShowTree = false } = opts;
+	const parts: string[] = [];
+	if (self.input) parts.push(`↑${formatCompactTokens(self.input)}`);
+	if (self.output) parts.push(`↓${formatCompactTokens(self.output)}`);
+	if (self.cacheRead) parts.push(`R${formatCompactTokens(self.cacheRead)}`);
+	if (self.cacheWrite) parts.push(`W${formatCompactTokens(self.cacheWrite)}`);
+
+	const showTree =
+		alwaysShowTree ||
+		tree.cost > self.cost ||
+		tree.input > self.input ||
+		tree.output > self.output ||
+		tree.cacheRead > self.cacheRead ||
+		tree.cacheWrite > self.cacheWrite;
+
+	if (!showTree) {
+		return parts;
+	}
+
+	// Append tree token counts inline when they differ from self.
+	const treeTokenParts: string[] = [];
+	if (tree.input !== self.input) treeTokenParts.push(`↑${formatCompactTokens(tree.input)}`);
+	if (tree.output !== self.output) treeTokenParts.push(`↓${formatCompactTokens(tree.output)}`);
+	if (tree.cacheRead !== self.cacheRead) treeTokenParts.push(`R${formatCompactTokens(tree.cacheRead)}`);
+	if (tree.cacheWrite !== self.cacheWrite) treeTokenParts.push(`W${formatCompactTokens(tree.cacheWrite)}`);
+	if (treeTokenParts.length > 0) {
+		parts.push(`tree[${treeTokenParts.join(" ")}]`);
+	}
+
+	return parts;
+}
+
+/**
+ * Formats the cost portion of the footer as either a single `$X.XXX` value
+ * (no descendants) or `self $X.XXX · tree $Y.YYY` (descendants present).
+ *
+ * Returns `undefined` when neither self nor tree has any cost AND `suffix`
+ * isn't provided. Otherwise always returns a string so the caller can append
+ * subscription suffixes. Precision is fixed at 3 decimal places to match the
+ * pre-PR single-cost format.
+ */
+export function formatSelfTreeCost(opts: {
+	selfCost: number;
+	treeCost: number;
+	/** Suffix appended to the cost value, e.g. ` (sub)`. Applied to the self-cost only. */
+	suffix?: string;
+	/** When true, always render `self $X · tree $Y`. Defaults to false. */
+	alwaysShowTree?: boolean;
+}): string | undefined {
+	const { selfCost, treeCost, suffix = "", alwaysShowTree = false } = opts;
+	const showTree = alwaysShowTree || treeCost > selfCost;
+	if (!showTree) {
+		if (!selfCost && !suffix) return undefined;
+		return `$${selfCost.toFixed(3)}${suffix}`;
+	}
+	return `self $${selfCost.toFixed(3)}${suffix} · tree $${treeCost.toFixed(3)}`;
 }

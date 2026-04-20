@@ -27,7 +27,9 @@ import {
 	type OrchestratorConfig,
 	type OrchestratorOptions,
 	type SessionCustomMessage,
+	type SessionStats,
 	type SpawnConfig,
+	type SubtreeUsageStats,
 } from "./types.js";
 
 function slugifyRole(role: string): string {
@@ -177,6 +179,100 @@ export class Orchestrator {
 
 		visit(this.rootAgentId, 0);
 		return summaries;
+	}
+
+	/**
+	 * Aggregate usage stats across the given agent and every descendant in its
+	 * subtree. Returns `undefined` when the agent id is unknown.
+	 *
+	 * Counts and token/cost fields are summed; session-identifying fields
+	 * (`sessionId`, `sessionFile`, `contextUsage`) on the tree aggregate are
+	 * copied from the attached agent's `self` stats since they describe that
+	 * agent specifically.
+	 *
+	 * A visited-set guard protects against pathological cycles in `childIds`;
+	 * the tree is expected to be acyclic by construction.
+	 */
+	aggregateSubtreeUsage(agentId: string): SubtreeUsageStats | undefined {
+		const root = this.records.get(agentId);
+		if (!root) {
+			return undefined;
+		}
+
+		const self = root.session.getSessionStats();
+		const visited = new Set<string>([agentId]);
+		const treeAcc = {
+			userMessages: self.userMessages,
+			assistantMessages: self.assistantMessages,
+			toolCalls: self.toolCalls,
+			toolResults: self.toolResults,
+			totalMessages: self.totalMessages,
+			input: self.tokens.input,
+			output: self.tokens.output,
+			cacheRead: self.tokens.cacheRead,
+			cacheWrite: self.tokens.cacheWrite,
+			totalTokens: self.tokens.total,
+			cost: self.cost,
+		};
+		let descendantCount = 0;
+
+		const visit = (id: string): void => {
+			const record = this.records.get(id);
+			if (!record) {
+				return;
+			}
+			for (const childId of record.childIds) {
+				if (visited.has(childId)) {
+					continue;
+				}
+				const child = this.records.get(childId);
+				if (!child || child.status === "disposed") {
+					continue;
+				}
+				visited.add(childId);
+				descendantCount += 1;
+				const childStats = child.session.getSessionStats();
+				treeAcc.userMessages += childStats.userMessages;
+				treeAcc.assistantMessages += childStats.assistantMessages;
+				treeAcc.toolCalls += childStats.toolCalls;
+				treeAcc.toolResults += childStats.toolResults;
+				treeAcc.totalMessages += childStats.totalMessages;
+				treeAcc.input += childStats.tokens.input;
+				treeAcc.output += childStats.tokens.output;
+				treeAcc.cacheRead += childStats.tokens.cacheRead;
+				treeAcc.cacheWrite += childStats.tokens.cacheWrite;
+				treeAcc.totalTokens += childStats.tokens.total;
+				treeAcc.cost += childStats.cost;
+				visit(childId);
+			}
+		};
+		visit(agentId);
+
+		const tree: SessionStats = {
+			sessionFile: self.sessionFile,
+			sessionId: self.sessionId,
+			userMessages: treeAcc.userMessages,
+			assistantMessages: treeAcc.assistantMessages,
+			toolCalls: treeAcc.toolCalls,
+			toolResults: treeAcc.toolResults,
+			totalMessages: treeAcc.totalMessages,
+			tokens: {
+				input: treeAcc.input,
+				output: treeAcc.output,
+				cacheRead: treeAcc.cacheRead,
+				cacheWrite: treeAcc.cacheWrite,
+				total: treeAcc.totalTokens,
+			},
+			cost: treeAcc.cost,
+			contextUsage: self.contextUsage,
+		};
+
+		return {
+			agentId,
+			hasDescendants: descendantCount > 0,
+			self,
+			tree,
+		};
 	}
 
 	findAgentIdBySessionFile(sessionFile: string): string | undefined {

@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	CACHE_STATS_ENV_VAR,
 	formatCacheLogLine,
+	formatCompactTokens,
+	formatSelfTreeCost,
 	formatTurnCacheStats,
 	isCacheStatsEnabled,
 } from "../src/core/cache-telemetry.js";
@@ -45,6 +47,79 @@ describe("formatCacheLogLine", () => {
 				usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0 },
 			}),
 		).toBe("[pi:cache] turn=1 cacheRead=0 cacheWrite=0 input=100 output=50");
+	});
+
+	it("includes scope token after turn= when scope is provided", () => {
+		expect(
+			formatCacheLogLine({
+				turn: 3,
+				scope: "self",
+				usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0 },
+			}),
+		).toBe("[pi:cache] turn=3 self cacheRead=0 cacheWrite=0 input=100 output=50");
+
+		expect(
+			formatCacheLogLine({
+				turn: 3,
+				scope: "tree",
+				usage: { input: 500, output: 200, cacheRead: 100, cacheWrite: 50 },
+			}),
+		).toBe("[pi:cache] turn=3 tree cacheRead=100 cacheWrite=50 input=500 output=200");
+	});
+});
+
+describe("formatCompactTokens", () => {
+	it("shows raw numbers under 1000", () => {
+		expect(formatCompactTokens(0)).toBe("0");
+		expect(formatCompactTokens(999)).toBe("999");
+	});
+
+	it("uses 1 decimal kilo abbreviation from 1k to 10k", () => {
+		expect(formatCompactTokens(1234)).toBe("1.2k");
+		expect(formatCompactTokens(4321)).toBe("4.3k");
+	});
+
+	it("uses rounded kilo from 10k to 1M", () => {
+		expect(formatCompactTokens(12_345)).toBe("12k");
+		expect(formatCompactTokens(999_499)).toBe("999k");
+	});
+
+	it("uses 1 decimal mega from 1M to 10M", () => {
+		expect(formatCompactTokens(1_200_000)).toBe("1.2M");
+	});
+
+	it("uses rounded mega above 10M", () => {
+		expect(formatCompactTokens(12_345_678)).toBe("12M");
+	});
+});
+
+describe("formatSelfTreeCost", () => {
+	it("returns undefined for zero cost, zero tree, no suffix", () => {
+		expect(formatSelfTreeCost({ selfCost: 0, treeCost: 0 })).toBeUndefined();
+	});
+
+	it("renders single cost when tree == self", () => {
+		expect(formatSelfTreeCost({ selfCost: 0.023, treeCost: 0.023 })).toBe("$0.023");
+	});
+
+	it("appends subscription suffix when tree == self", () => {
+		expect(formatSelfTreeCost({ selfCost: 0, treeCost: 0, suffix: " (sub)" })).toBe("$0.000 (sub)");
+	});
+
+	it("expands to self/tree when tree > self", () => {
+		expect(formatSelfTreeCost({ selfCost: 0.02, treeCost: 0.14 })).toBe("self $0.020 · tree $0.140");
+	});
+
+	it("applies suffix only to the self cost when expanded", () => {
+		expect(formatSelfTreeCost({ selfCost: 0.02, treeCost: 0.14, suffix: " (sub)" })).toBe(
+			"self $0.020 (sub) · tree $0.140",
+		);
+	});
+
+	it("honors alwaysShowTree even when tree == self", () => {
+		expect(formatSelfTreeCost({ selfCost: 0.02, treeCost: 0.02, alwaysShowTree: true })).toBe(
+			"self $0.020 · tree $0.020",
+		);
 	});
 });
 

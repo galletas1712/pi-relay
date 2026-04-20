@@ -78,6 +78,8 @@ describe("ExtensionRunner", () => {
 		getContextUsage: () => undefined,
 		compact: () => {},
 		getSystemPrompt: () => "",
+		setSubtreeUsageProvider: () => {},
+		getSubtreeUsage: () => undefined,
 	};
 
 	describe("shortcut conflicts", () => {

@@ -118,15 +118,49 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			// Dev-only per-turn cache telemetry: emits on every completed assistant
 			// turn. Written to stderr so stdout stays pristine for text-mode piping
 			// and JSON-mode parsing. Gated on PI_SHOW_CACHE_STATS=1.
+			//
+			// When the session's attached agent has descendants (tracked by an
+			// orchestrator-style extension via setSubtreeUsageProvider), emit an
+			// additional `tree` line with subtree-aggregated usage. Single-agent
+			// sessions and agents without descendants stay on the existing format.
 			if (
 				isCacheStatsEnabled() &&
 				event.type === "message_end" &&
 				event.message.role === "assistant"
 			) {
 				turnCounter += 1;
-				process.stderr.write(
-					`${formatCacheLogLine({ turn: turnCounter, usage: event.message.usage })}\n`,
-				);
+				const subtree = session.getSubtreeUsage();
+				const showTree = subtree?.hasDescendants === true;
+				if (showTree && subtree) {
+					process.stderr.write(
+						`${formatCacheLogLine({
+							turn: turnCounter,
+							scope: "self",
+							usage: {
+								input: subtree.self.tokens.input,
+								output: subtree.self.tokens.output,
+								cacheRead: subtree.self.tokens.cacheRead,
+								cacheWrite: subtree.self.tokens.cacheWrite,
+							},
+						})}\n`,
+					);
+					process.stderr.write(
+						`${formatCacheLogLine({
+							turn: turnCounter,
+							scope: "tree",
+							usage: {
+								input: subtree.tree.tokens.input,
+								output: subtree.tree.tokens.output,
+								cacheRead: subtree.tree.tokens.cacheRead,
+								cacheWrite: subtree.tree.tokens.cacheWrite,
+							},
+						})}\n`,
+					);
+				} else {
+					process.stderr.write(
+						`${formatCacheLogLine({ turn: turnCounter, usage: event.message.usage })}\n`,
+					);
+				}
 			}
 		});
 	};

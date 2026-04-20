@@ -30,6 +30,7 @@ import type {
 	ExtensionRuntime,
 	ExtensionShortcut,
 	ExtensionUIContext,
+	FooterSubtreeUsage,
 	InputEvent,
 	InputEventResult,
 	InputSource,
@@ -44,6 +45,7 @@ import type {
 	SessionBeforeForkResult,
 	SessionBeforeSwitchResult,
 	SessionBeforeTreeResult,
+	SubtreeUsageProvider,
 	ToolCallEvent,
 	ToolCallEventResult,
 	ToolResultEvent,
@@ -216,6 +218,8 @@ export class ExtensionRunner {
 	private getContextUsageFn: () => ContextUsage | undefined = () => undefined;
 	private compactFn: (options?: CompactOptions) => void = () => {};
 	private getSystemPromptFn: () => string = () => "";
+	private setSubtreeUsageProviderFn: (provider: SubtreeUsageProvider | undefined) => void = () => {};
+	private getSubtreeUsageFn: () => FooterSubtreeUsage | undefined = () => undefined;
 	private newSessionHandler: NewSessionHandler = async () => ({ cancelled: false });
 	private forkHandler: ForkHandler = async () => ({ cancelled: false });
 	private navigateTreeHandler: NavigateTreeHandler = async () => ({ cancelled: false });
@@ -274,6 +278,8 @@ export class ExtensionRunner {
 		this.getContextUsageFn = contextActions.getContextUsage;
 		this.compactFn = contextActions.compact;
 		this.getSystemPromptFn = contextActions.getSystemPrompt;
+		this.setSubtreeUsageProviderFn = contextActions.setSubtreeUsageProvider;
+		this.getSubtreeUsageFn = contextActions.getSubtreeUsage;
 
 		// Flush provider registrations queued during extension loading
 		for (const { name, config, extensionPath } of this.runtime.pendingProviderRegistrations) {
@@ -551,6 +557,8 @@ export class ExtensionRunner {
 			getContextUsage: () => this.getContextUsageFn(),
 			compact: (options) => this.compactFn(options),
 			getSystemPrompt: () => this.getSystemPromptFn(),
+			setSubtreeUsageProvider: (provider) => this.setSubtreeUsageProviderFn(provider),
+			getSubtreeUsage: () => this.getSubtreeUsageFn(),
 		};
 	}
 

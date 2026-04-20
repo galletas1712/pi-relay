@@ -70,6 +70,7 @@ export type {
 	ExtensionWidgetOptions,
 	FindToolCallEvent,
 	FindToolResultEvent,
+	FooterSubtreeUsage,
 	GetActiveToolsHandler,
 	GetAllToolsHandler,
 	GetCommandsHandler,
@@ -125,6 +126,7 @@ export type {
 	SetLabelHandler,
 	SetModelHandler,
 	SetThinkingLevelHandler,
+	SubtreeUsageProvider,
 	TerminalInputHandler,
 	// Events - Tool
 	ToolCallEvent,

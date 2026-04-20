@@ -1,6 +1,11 @@
 import { type Component, truncateToWidth, visibleWidth } from "@pi-relay/tui";
 import type { AgentSession } from "../../../core/agent-session.js";
-import { formatTurnCacheStats, isCacheStatsEnabled } from "../../../core/cache-telemetry.js";
+import {
+	formatCompactTokens,
+	formatSelfTreeCost,
+	formatTurnCacheStats,
+	isCacheStatsEnabled,
+} from "../../../core/cache-telemetry.js";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
 import { theme } from "../theme/theme.js";
 
@@ -17,14 +22,13 @@ function sanitizeStatusText(text: string): string {
 }
 
 /**
- * Format token counts (similar to web-ui)
+ * Format token counts (similar to web-ui).
+ *
+ * Thin wrapper around `formatCompactTokens` so existing callers and future
+ * footer components share one abbreviation rule set.
  */
 function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	if (count < 10000000) return `${(count / 1000000).toFixed(1)}M`;
-	return `${Math.round(count / 1000000)}M`;
+	return formatCompactTokens(count);
 }
 
 /**
@@ -116,12 +120,48 @@ export class FooterComponent implements Component {
 			pwd = `${pwd} • ${sessionName}`;
 		}
 
+		// Subtree usage (from orchestrator-style extensions). Undefined for
+		// single-agent sessions. When present, the tokens above reflect the
+		// session's local message history — which should match
+		// subtree.self.tokens.* computed by the orchestrator from the same
+		// messages. We still pull the tree-side numbers through the same code
+		// path so aggregation logic is localized to the orchestrator.
+		const subtree = this.session.getSubtreeUsage();
+		const selfInput = subtree?.self.tokens.input ?? totalInput;
+		const selfOutput = subtree?.self.tokens.output ?? totalOutput;
+		const selfCacheRead = subtree?.self.tokens.cacheRead ?? totalCacheRead;
+		const selfCacheWrite = subtree?.self.tokens.cacheWrite ?? totalCacheWrite;
+		const selfCost = subtree?.self.cost ?? totalCost;
+		const showTree = subtree?.hasDescendants === true;
+
 		// Build stats line
-		const statsParts = [];
-		if (totalInput) statsParts.push(`↑${formatTokens(totalInput)}`);
-		if (totalOutput) statsParts.push(`↓${formatTokens(totalOutput)}`);
-		if (totalCacheRead) statsParts.push(`R${formatTokens(totalCacheRead)}`);
-		if (totalCacheWrite) statsParts.push(`W${formatTokens(totalCacheWrite)}`);
+		const statsParts: string[] = [];
+		if (selfInput) statsParts.push(`↑${formatTokens(selfInput)}`);
+		if (selfOutput) statsParts.push(`↓${formatTokens(selfOutput)}`);
+		if (selfCacheRead) statsParts.push(`R${formatTokens(selfCacheRead)}`);
+		if (selfCacheWrite) statsParts.push(`W${formatTokens(selfCacheWrite)}`);
+
+		// When the attached agent has descendants, surface the tree token deltas
+		// inline so the user can see subagent contribution at a glance. Inline
+		// column keeps the footer layout single-line while staying readable.
+		if (showTree && subtree) {
+			const treeTokenParts: string[] = [];
+			if (subtree.tree.tokens.input !== selfInput) {
+				treeTokenParts.push(`↑${formatTokens(subtree.tree.tokens.input)}`);
+			}
+			if (subtree.tree.tokens.output !== selfOutput) {
+				treeTokenParts.push(`↓${formatTokens(subtree.tree.tokens.output)}`);
+			}
+			if (subtree.tree.tokens.cacheRead !== selfCacheRead) {
+				treeTokenParts.push(`R${formatTokens(subtree.tree.tokens.cacheRead)}`);
+			}
+			if (subtree.tree.tokens.cacheWrite !== selfCacheWrite) {
+				treeTokenParts.push(`W${formatTokens(subtree.tree.tokens.cacheWrite)}`);
+			}
+			if (treeTokenParts.length > 0) {
+				statsParts.push(`tree[${treeTokenParts.join(" ")}]`);
+			}
+		}
 
 		// Per-turn cache delta (dev-only, gated on PI_SHOW_CACHE_STATS=1).
 		if (isCacheStatsEnabled()) {
@@ -130,9 +170,19 @@ export class FooterComponent implements Component {
 		}
 
 		// Show cost with "(sub)" indicator only for subscription-backed auth.
+		// When a subtree is present and tree > self, expand cost to `self $X · tree $Y`.
 		const usingSubscription = state.model ? this.session.modelRegistry.isUsingSubscriptionAuth(state.model) : false;
-		if (totalCost || usingSubscription) {
-			const costStr = `$${totalCost.toFixed(3)}${usingSubscription ? " (sub)" : ""}`;
+		const subscriptionSuffix = usingSubscription ? " (sub)" : "";
+		if (showTree && subtree) {
+			const costStr = formatSelfTreeCost({
+				selfCost,
+				treeCost: subtree.tree.cost,
+				suffix: subscriptionSuffix,
+				alwaysShowTree: true,
+			});
+			if (costStr) statsParts.push(costStr);
+		} else if (selfCost || usingSubscription) {
+			const costStr = `$${selfCost.toFixed(3)}${subscriptionSuffix}`;
 			statsParts.push(costStr);
 		}
 

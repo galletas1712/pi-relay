@@ -43,7 +43,7 @@ import type { BashResult } from "../bash-executor.js";
 import type { CompactionPreparation, CompactionResult } from "../compaction/index.js";
 import type { EventBus } from "../event-bus.js";
 import type { ExecOptions, ExecResult } from "../exec.js";
-import type { ReadonlyFooterDataProvider } from "../footer-data-provider.js";
+import type { FooterSubtreeUsage, ReadonlyFooterDataProvider, SubtreeUsageProvider } from "../footer-data-provider.js";
 import type { KeybindingsManager } from "../keybindings.js";
 import type { CustomMessage } from "../messages.js";
 import type { ModelRegistry } from "../model-registry.js";
@@ -75,6 +75,11 @@ import type {
 
 export type { ExecOptions, ExecResult } from "../exec.js";
 export type { AgentToolResult, AgentToolUpdateCallback };
+export type {
+	FooterSubtreeUsage,
+	ReadonlyFooterDataProvider,
+	SubtreeUsageProvider,
+} from "../footer-data-provider.js";
 export type { AppKeybinding, KeybindingsManager } from "../keybindings.js";
 
 // ============================================================================
@@ -291,6 +296,18 @@ export interface ExtensionContext {
 	compact(options?: CompactOptions): void;
 	/** Get the current effective system prompt. */
 	getSystemPrompt(): string;
+	/**
+	 * Register a callback returning subtree-aggregated usage stats for the
+	 * attached agent. Consumed by the TUI footer (“self $X · tree $Y”) and
+	 * print-mode's `[pi:cache]` logs when descendants are present. Pass
+	 * `undefined` to clear (e.g., on orchestrator shutdown).
+	 *
+	 * Available in all modes. In modes without a footer (print / RPC) the
+	 * callback is still read when emitting structured telemetry.
+	 */
+	setSubtreeUsageProvider(provider: SubtreeUsageProvider | undefined): void;
+	/** Current subtree usage snapshot, or undefined when no provider is registered. */
+	getSubtreeUsage(): FooterSubtreeUsage | undefined;
 }
 
 /**
@@ -1392,6 +1409,8 @@ export interface ExtensionContextActions {
 	getContextUsage: () => ContextUsage | undefined;
 	compact: (options?: CompactOptions) => void;
 	getSystemPrompt: () => string;
+	setSubtreeUsageProvider: (provider: SubtreeUsageProvider | undefined) => void;
+	getSubtreeUsage: () => FooterSubtreeUsage | undefined;
 }
 
 /**

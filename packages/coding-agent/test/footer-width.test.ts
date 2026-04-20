@@ -51,6 +51,9 @@ function createSession(options: {
 			getCwd: () => "/tmp/project",
 		},
 		getContextUsage: () => ({ contextWindow: 200_000, percent: 12.3 }),
+		// Single-agent sessions return undefined here; the footer falls back to
+		// self-only stats computed from session message history.
+		getSubtreeUsage: () => undefined,
 		modelRegistry: {
 			isUsingOAuth: () => false,
 		},

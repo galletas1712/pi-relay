@@ -38,6 +38,7 @@ describe("createOrchestratorExtension", () => {
 				sessionManager: {
 					getSessionId: () => "root-session",
 				},
+				setSubtreeUsageProvider: vi.fn(),
 			},
 		);
 		await waitForMicrotasks();
@@ -64,6 +65,7 @@ describe("createOrchestratorExtension", () => {
 				sessionManager: {
 					getSessionId: () => "child-session",
 				},
+				setSubtreeUsageProvider: vi.fn(),
 			},
 		);
 		expect(dispose).not.toHaveBeenCalled();
@@ -74,6 +76,7 @@ describe("createOrchestratorExtension", () => {
 				sessionManager: {
 					getSessionId: () => "root-session",
 				},
+				setSubtreeUsageProvider: vi.fn(),
 			},
 		);
 		expect(dispose).toHaveBeenCalledTimes(1);
@@ -235,6 +238,7 @@ describe("createOrchestratorExtension", () => {
 				hasUI: true,
 				ui: { setWidget },
 				sessionManager: { getSessionId: () => "child-session" },
+				setSubtreeUsageProvider: vi.fn(),
 			},
 		);
 
@@ -254,6 +258,7 @@ describe("createOrchestratorExtension", () => {
 			{ type: "session_shutdown" },
 			{
 				sessionManager: { getSessionId: () => "child-session" },
+				setSubtreeUsageProvider: vi.fn(),
 			},
 		);
 		expect(cleanup).toHaveBeenCalledTimes(1);

@@ -523,3 +523,219 @@ describe("Orchestrator", () => {
 		expect(text).toContain("Your role in the current agent tree: explorer.");
 	});
 });
+
+describe("Orchestrator.aggregateSubtreeUsage", () => {
+	/**
+	 * Builds a SessionStats value on a FakeSession. Only fields the aggregator
+	 * reads are meaningfully populated; everything else is kept at sensible
+	 * defaults so we can assert on exact sums.
+	 */
+	const configureStats = (
+		session: FakeSession,
+		overrides: {
+			userMessages?: number;
+			assistantMessages?: number;
+			toolCalls?: number;
+			toolResults?: number;
+			input?: number;
+			output?: number;
+			cacheRead?: number;
+			cacheWrite?: number;
+			cost?: number;
+		},
+	): void => {
+		const input = overrides.input ?? 0;
+		const output = overrides.output ?? 0;
+		const cacheRead = overrides.cacheRead ?? 0;
+		const cacheWrite = overrides.cacheWrite ?? 0;
+		session.sessionStats = {
+			sessionFile: session.sessionFile,
+			sessionId: session.sessionId,
+			userMessages: overrides.userMessages ?? 0,
+			assistantMessages: overrides.assistantMessages ?? 0,
+			toolCalls: overrides.toolCalls ?? 0,
+			toolResults: overrides.toolResults ?? 0,
+			totalMessages:
+				(overrides.userMessages ?? 0) +
+				(overrides.assistantMessages ?? 0) +
+				(overrides.toolResults ?? 0),
+			tokens: {
+				input,
+				output,
+				cacheRead,
+				cacheWrite,
+				total: input + output + cacheRead + cacheWrite,
+			},
+			cost: overrides.cost ?? 0,
+		};
+	};
+
+	it("returns self == tree for a leaf agent with no descendants", async () => {
+		const root = new FakeSession("root-session");
+		configureStats(root, {
+			userMessages: 2,
+			assistantMessages: 2,
+			input: 1000,
+			output: 200,
+			cacheRead: 500,
+			cacheWrite: 100,
+			cost: 0.015,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(),
+		});
+
+		const result = orchestrator.aggregateSubtreeUsage("root");
+		expect(result).toBeDefined();
+		expect(result?.hasDescendants).toBe(false);
+		expect(result?.agentId).toBe("root");
+		expect(result?.self).toEqual(result?.tree);
+		expect(result?.tree.tokens.input).toBe(1000);
+		expect(result?.tree.cost).toBeCloseTo(0.015);
+	});
+
+	it("returns undefined for unknown agent ids", async () => {
+		const root = new FakeSession("root-session");
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(),
+		});
+		expect(orchestrator.aggregateSubtreeUsage("ghost")).toBeUndefined();
+	});
+
+	it("sums stats across a depth-1 tree (root + two children)", async () => {
+		const root = new FakeSession("root-session");
+		const childA = new FakeSession("child-a-session");
+		const childB = new FakeSession("child-b-session");
+		configureStats(root, { userMessages: 1, assistantMessages: 1, input: 100, output: 20, cost: 0.002 });
+		configureStats(childA, { userMessages: 1, assistantMessages: 2, input: 400, output: 80, cacheRead: 200, cost: 0.008 });
+		configureStats(childB, { userMessages: 1, assistantMessages: 3, input: 700, output: 120, cacheRead: 350, cacheWrite: 40, cost: 0.014 });
+
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi
+				.fn()
+				.mockResolvedValueOnce({ session: childA })
+				.mockResolvedValueOnce({ session: childB }),
+		});
+
+		const idA = await orchestrator.spawnAgent("root", { role: "a", prompt: "" });
+		const idB = await orchestrator.spawnAgent("root", { role: "b", prompt: "" });
+
+		const result = orchestrator.aggregateSubtreeUsage("root");
+		expect(result?.hasDescendants).toBe(true);
+		// self covers only the root agent
+		expect(result?.self.tokens.input).toBe(100);
+		expect(result?.self.cost).toBeCloseTo(0.002);
+		// tree sums root + both children
+		expect(result?.tree.tokens.input).toBe(1200);
+		expect(result?.tree.tokens.output).toBe(220);
+		expect(result?.tree.tokens.cacheRead).toBe(550);
+		expect(result?.tree.tokens.cacheWrite).toBe(40);
+		expect(result?.tree.cost).toBeCloseTo(0.024);
+		expect(result?.tree.userMessages).toBe(3);
+		expect(result?.tree.assistantMessages).toBe(6);
+
+		// Aggregating from a single child shows just that child's self/tree.
+		const childAResult = orchestrator.aggregateSubtreeUsage(idA);
+		expect(childAResult?.hasDescendants).toBe(false);
+		expect(childAResult?.tree.tokens.input).toBe(400);
+
+		// And a different child is summed independently.
+		const childBResult = orchestrator.aggregateSubtreeUsage(idB);
+		expect(childBResult?.tree.tokens.input).toBe(700);
+	});
+
+	it("sums stats across a depth-3 tree", async () => {
+		const root = new FakeSession("root-session");
+		const level1 = new FakeSession("level1-session");
+		const level2 = new FakeSession("level2-session");
+		const level3 = new FakeSession("level3-session");
+		configureStats(root, { input: 100, cost: 0.001 });
+		configureStats(level1, { input: 200, cost: 0.002 });
+		configureStats(level2, { input: 400, cost: 0.004 });
+		configureStats(level3, { input: 800, cost: 0.008 });
+
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi
+				.fn()
+				.mockResolvedValueOnce({ session: level1 })
+				.mockResolvedValueOnce({ session: level2 })
+				.mockResolvedValueOnce({ session: level3 }),
+		});
+
+		const l1 = await orchestrator.spawnAgent("root", { role: "l1", prompt: "" });
+		const l2 = await orchestrator.spawnAgent(l1, { role: "l2", prompt: "" });
+		await orchestrator.spawnAgent(l2, { role: "l3", prompt: "" });
+
+		const rootResult = orchestrator.aggregateSubtreeUsage("root");
+		expect(rootResult?.tree.tokens.input).toBe(1500);
+		expect(rootResult?.tree.cost).toBeCloseTo(0.015);
+
+		// l1 subtree sums l1 + l2 + l3.
+		const l1Result = orchestrator.aggregateSubtreeUsage(l1);
+		expect(l1Result?.tree.tokens.input).toBe(1400);
+		expect(l1Result?.tree.cost).toBeCloseTo(0.014);
+
+		// l2 subtree sums l2 + l3.
+		const l2Result = orchestrator.aggregateSubtreeUsage(l2);
+		expect(l2Result?.tree.tokens.input).toBe(1200);
+		expect(l2Result?.tree.cost).toBeCloseTo(0.012);
+	});
+
+	it("treats zero-stat children as zero-contribution, not as missing", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		configureStats(root, { input: 500, cost: 0.005 });
+		// child's sessionStats unset → FakeSession.getSessionStats returns all-zero stats.
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn().mockResolvedValue({ session: child }),
+		});
+
+		await orchestrator.spawnAgent("root", { role: "lazy", prompt: "" });
+		const result = orchestrator.aggregateSubtreeUsage("root");
+		expect(result?.hasDescendants).toBe(true);
+		expect(result?.tree.tokens.input).toBe(500);
+		expect(result?.tree.cost).toBeCloseTo(0.005);
+	});
+
+	it("skips disposed descendants", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		configureStats(root, { input: 100 });
+		configureStats(child, { input: 10_000, cost: 1.0 });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn().mockResolvedValue({ session: child }),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", { role: "dispose-me", prompt: "" });
+		orchestrator.getRecord(childId).status = "disposed";
+
+		const result = orchestrator.aggregateSubtreeUsage("root");
+		expect(result?.hasDescendants).toBe(false);
+		expect(result?.tree.tokens.input).toBe(100);
+	});
+
+	it("is robust to pathological cycles in childIds", async () => {
+		const root = new FakeSession("root-session");
+		const child = new FakeSession("child-session");
+		configureStats(root, { input: 100 });
+		configureStats(child, { input: 200 });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn().mockResolvedValue({ session: child }),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", { role: "c", prompt: "" });
+		// Fabricate a cycle: child lists root as its own child. Visited-set guard
+		// in the aggregator must prevent infinite recursion.
+		orchestrator.getRecord(childId).childIds.push("root");
+
+		const result = orchestrator.aggregateSubtreeUsage("root");
+		expect(result?.tree.tokens.input).toBe(300);
+	});
+});

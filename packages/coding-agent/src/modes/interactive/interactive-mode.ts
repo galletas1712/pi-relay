@@ -1398,6 +1398,8 @@ export class InteractiveMode {
 				})();
 			},
 			getSystemPrompt: () => this.session.systemPrompt,
+			setSubtreeUsageProvider: (provider) => this.session.setSubtreeUsageProvider(provider),
+			getSubtreeUsage: () => this.session.getSubtreeUsage(),
 		});
 
 		// Set up the extension shortcut handler on the default editor
