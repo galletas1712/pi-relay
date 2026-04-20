@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AgentMessage, AgentTool } from "@pi-relay/agent-core";
 import type { Message, Model } from "@pi-relay/ai";
-import type { AgentSessionEvent, PromptSource } from "@pi-relay/coding-agent";
+import type { AgentSessionEvent, PromptSource, SessionStats } from "@pi-relay/coding-agent";
 import type { AgentSessionHandle, SessionCustomMessage } from "../src/types.js";
 
 export const TEST_MODEL: Model<any> = {
@@ -44,6 +44,7 @@ export class FakeSession implements AgentSessionHandle {
 	readonly boundExtensionCalls: object[] = [];
 	readonly promptSources: PromptSource[] = [];
 	lastAssistantText?: string;
+	sessionStats?: SessionStats;
 	private readonly listeners = new Set<(event: AgentSessionEvent) => void>();
 
 	constructor(
@@ -116,6 +117,22 @@ export class FakeSession implements AgentSessionHandle {
 
 	getAllTools() {
 		return [];
+	}
+
+	getSessionStats(): SessionStats {
+		return (
+			this.sessionStats ?? {
+				sessionFile: this.sessionFile,
+				sessionId: this.sessionId,
+				userMessages: 0,
+				assistantMessages: 0,
+				toolCalls: 0,
+				toolResults: 0,
+				totalMessages: 0,
+				tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				cost: 0,
+			}
+		);
 	}
 
 	getLastAssistantText() {

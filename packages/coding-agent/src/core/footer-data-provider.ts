@@ -1,6 +1,30 @@
 import { type ExecFileException, execFile, spawnSync } from "child_process";
 import { existsSync, type FSWatcher, readFileSync, statSync, unwatchFile, watch, watchFile } from "fs";
 import { dirname, join, resolve } from "path";
+import type { SessionStats } from "./agent-session.js";
+
+/**
+ * Snapshot of usage stats for the attached agent (self) plus the full
+ * subtree rooted at that agent (tree).
+ *
+ * Shape is cross-package: orchestrator extension supplies this via
+ * `ExtensionContext.setSubtreeUsageProvider`, the footer and print-mode
+ * telemetry render it. Structurally identical to `@pi-relay/orchestrator`'s
+ * `SubtreeUsageStats` so we can cross it without an orchestrator dependency
+ * at the coding-agent layer.
+ */
+export interface FooterSubtreeUsage {
+	readonly agentId: string;
+	readonly hasDescendants: boolean;
+	readonly self: SessionStats;
+	readonly tree: SessionStats;
+}
+
+/**
+ * Callable that returns the current subtree usage snapshot, or undefined if
+ * the attached agent is not tracked (e.g., before orchestrator init).
+ */
+export type SubtreeUsageProvider = () => FooterSubtreeUsage | undefined;
 
 type GitPaths = {
 	repoDir: string;

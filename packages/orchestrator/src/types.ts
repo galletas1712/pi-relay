@@ -7,7 +7,29 @@ import type {
 	ThinkingLevel,
 } from "@pi-relay/agent-core";
 import type { ImageContent, Message, Model, SimpleStreamOptions, TextContent, ThinkingBudgets, Transport } from "@pi-relay/ai";
-import type { AgentSessionEvent, PromptSource, ToolDefinition, ToolInfo } from "@pi-relay/coding-agent";
+import type { AgentSessionEvent, PromptSource, SessionStats, ToolDefinition, ToolInfo } from "@pi-relay/coding-agent";
+
+export type { SessionStats };
+
+/**
+ * Aggregated usage stats for an agent plus its subtree.
+ *
+ * `self` reflects only the agent identified by `agentId`; `tree` recursively
+ * sums stats across `self` and every descendant in the orchestrator's record
+ * graph. Both sides share the exact `SessionStats` shape so existing footer
+ * and print-mode formatters can consume either.
+ *
+ * Session-identifying fields on the tree aggregate are carried from `self`:
+ * `sessionId`, `sessionFile`, and `contextUsage` describe the attached agent
+ * only. Counts (`userMessages`, `assistantMessages`, `toolCalls`, `toolResults`,
+ * `totalMessages`), tokens, and `cost` are summed across the subtree.
+ */
+export interface SubtreeUsageStats {
+	agentId: string;
+	hasDescendants: boolean;
+	self: SessionStats;
+	tree: SessionStats;
+}
 
 export type AgentStatus = "running" | "idle" | "disposed";
 
@@ -86,6 +108,7 @@ export interface AgentSessionHandle {
 	sessionId: string;
 	sessionFile: string | undefined;
 	getAllTools(): ToolInfo[];
+	getSessionStats(): SessionStats;
 	getLastAssistantText(): string | undefined;
 	bindExtensions(bindings: object): Promise<void>;
 	subscribe(listener: (event: AgentSessionEvent) => void): () => void;

@@ -82,6 +82,19 @@ export function createOrchestratorExtension(
 				return;
 			}
 
+			// Register subtree-usage provider for the TUI footer and print-mode
+			// telemetry. The callback resolves the attached agent id at each call
+			// so the correct subtree is reported as the user switches agents.
+			const resolveAttachedAgentId = (): string =>
+				orchestrator.getAgentIdBySessionId(ctx.sessionManager.getSessionId()) ?? orchestrator.rootAgentId;
+			ctx.setSubtreeUsageProvider(() => {
+				try {
+					return orchestrator.aggregateSubtreeUsage(resolveAttachedAgentId());
+				} catch {
+					return undefined;
+				}
+			});
+
 			if (ctx.hasUI) {
 				uiRef.cleanup?.();
 				uiRef.cleanup = undefined;
@@ -116,6 +129,9 @@ export function createOrchestratorExtension(
 				uiRef.cleanup = undefined;
 				uiRef.sessionId = undefined;
 			}
+			// Clear subtree-usage provider so post-shutdown renders fall back to
+			// self-only stats. Safe to call even when the orchestrator is gone.
+			ctx.setSubtreeUsageProvider(undefined);
 			if (!orchestrator || orchestrator.isDisposing) {
 				return;
 			}

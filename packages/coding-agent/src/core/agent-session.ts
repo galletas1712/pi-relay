@@ -62,6 +62,7 @@ import {
 	type ExtensionErrorListener,
 	ExtensionRunner,
 	type ExtensionUIContext,
+	type FooterSubtreeUsage,
 	type InputSource,
 	type MessageEndEvent,
 	type MessageStartEvent,
@@ -70,6 +71,7 @@ import {
 	type SessionBeforeTreeResult,
 	type SessionStartEvent,
 	type ShutdownHandler,
+	type SubtreeUsageProvider,
 	type ToolDefinition,
 	type ToolExecutionEndEvent,
 	type ToolExecutionStartEvent,
@@ -304,6 +306,12 @@ export class AgentSession {
 	private _extensionShutdownHandler?: ShutdownHandler;
 	private _extensionErrorListener?: ExtensionErrorListener;
 	private _extensionErrorUnsubscriber?: () => void;
+
+	// Subtree-usage provider, registered by orchestrator-style extensions via
+	// ExtensionContext.setSubtreeUsageProvider. Read by the TUI footer and
+	// print-mode telemetry so users attached to a parent agent can see cumulative
+	// usage across the entire agent subtree. Undefined for single-agent sessions.
+	private _subtreeUsageProvider?: SubtreeUsageProvider;
 
 	// Model registry for API key resolution
 	private _modelRegistry: ModelRegistry;
@@ -2277,6 +2285,10 @@ export class AgentSession {
 					})();
 				},
 				getSystemPrompt: () => this.systemPrompt,
+				setSubtreeUsageProvider: (provider) => {
+					this._subtreeUsageProvider = provider;
+				},
+				getSubtreeUsage: () => this._subtreeUsageProvider?.(),
 			},
 			{
 				registerProvider: (name, config) => {
@@ -2937,6 +2949,31 @@ export class AgentSession {
 				.join("");
 		}
 		return "";
+	}
+
+	/**
+	 * Register a callback returning subtree-aggregated usage stats for the
+	 * attached agent. Typically set by orchestrator-style extensions via
+	 * `ExtensionContext.setSubtreeUsageProvider`; also available to direct
+	 * callers that construct a session without going through the extension
+	 * pipeline. Pass `undefined` to clear.
+	 */
+	setSubtreeUsageProvider(provider: SubtreeUsageProvider | undefined): void {
+		this._subtreeUsageProvider = provider;
+	}
+
+	/**
+	 * Current subtree-aggregated usage for the attached agent, when a provider
+	 * has been registered (typically by the orchestrator extension via
+	 * `ExtensionContext.setSubtreeUsageProvider`). Returns `undefined` for
+	 * single-agent sessions or before the provider is registered.
+	 *
+	 * Both the TUI footer and print-mode telemetry consume this. Consumers
+	 * should treat `undefined` as “show self-only” and not attempt to fabricate
+	 * tree stats from local message history.
+	 */
+	getSubtreeUsage(): FooterSubtreeUsage | undefined {
+		return this._subtreeUsageProvider?.();
 	}
 
 	/**
