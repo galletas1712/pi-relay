@@ -183,6 +183,9 @@ export {
 // Footer data provider (git branch + extension statuses - data not otherwise available to extensions)
 export type { ReadonlyFooterDataProvider } from "./core/footer-data-provider.js";
 export { convertToLlm } from "./core/messages.js";
+// Stdout guard — provided for entry points that run the RpcServer so they can
+// hijack stdout before any console.log and drain trailing frames on shutdown.
+export { flushRawStdout, isStdoutTakenOver, restoreStdout, takeOverStdout } from "./core/output-guard.js";
 export { ModelRegistry } from "./core/model-registry.js";
 export type {
 	PackageManager,
