@@ -50,6 +50,7 @@
 		"@mariozechner/jiti": "^2.6.2",
 		"@pi-relay/agent-core": "^0.67.5",
 		"@pi-relay/ai": "^0.67.5",
+		"@pi-relay/tool-kit": "^0.67.100",
 		"@pi-relay/tui": "^0.67.5",
 		"@silvia-odwyer/photon-node": "^0.3.4",
 		"ajv": "^8.17.1",

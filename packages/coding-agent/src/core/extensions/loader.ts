@@ -13,6 +13,8 @@ import { createJiti } from "@mariozechner/jiti";
 import * as _bundledPiAgentCore from "@pi-relay/agent-core";
 import * as _bundledPiAi from "@pi-relay/ai";
 import * as _bundledPiAiOauth from "@pi-relay/ai/oauth";
+import * as _bundledPiToolKit from "@pi-relay/tool-kit";
+import * as _bundledPiToolKitRender from "@pi-relay/tool-kit/render";
 import type { KeyId } from "@pi-relay/tui";
 import * as _bundledPiTui from "@pi-relay/tui";
 // Static imports of packages that extensions may use.
@@ -27,6 +29,13 @@ import { createEventBus, type EventBus } from "../event-bus.js";
 import type { ExecOptions } from "../exec.js";
 import { execCommand } from "../exec.js";
 import { createSyntheticSourceInfo } from "../source-info.js";
+import { createToolHost } from "../tool-packages/host.js";
+import { defaultToolInterfaceRegistry } from "../tool-packages/interfaces.js";
+import {
+	configureToolsInRegistry,
+	registerToolProviderInExtension,
+} from "../tool-packages/register.js";
+import { ToolRegistry } from "../tool-packages/tools.js";
 import type {
 	Extension,
 	ExtensionAPI,
@@ -46,6 +55,8 @@ const VIRTUAL_MODULES: Record<string, unknown> = {
 	"@pi-relay/tui": _bundledPiTui,
 	"@pi-relay/ai": _bundledPiAi,
 	"@pi-relay/ai/oauth": _bundledPiAiOauth,
+	"@pi-relay/tool-kit": _bundledPiToolKit,
+	"@pi-relay/tool-kit/render": _bundledPiToolKitRender,
 	"@pi-relay/coding-agent": _bundledPiCodingAgent,
 };
 
@@ -80,6 +91,8 @@ function getAliases(): Record<string, string> {
 		"@pi-relay/tui": resolveWorkspaceOrImport("tui/dist/index.js", "@pi-relay/tui"),
 		"@pi-relay/ai": resolveWorkspaceOrImport("ai/dist/index.js", "@pi-relay/ai"),
 		"@pi-relay/ai/oauth": resolveWorkspaceOrImport("ai/dist/oauth.js", "@pi-relay/ai/oauth"),
+		"@pi-relay/tool-kit": resolveWorkspaceOrImport("tool-kit/dist/index.js", "@pi-relay/tool-kit"),
+		"@pi-relay/tool-kit/render": resolveWorkspaceOrImport("tool-kit/dist/render.js", "@pi-relay/tool-kit/render"),
 		"@sinclair/typebox": typeboxRoot,
 	};
 
@@ -122,6 +135,11 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		throw new Error("Extension runtime not initialized. Action methods cannot be called during extension loading.");
 	};
 
+	const toolRegistry = new ToolRegistry({
+		interfaces: defaultToolInterfaceRegistry,
+		hostFactory: (ctx) => createToolHost(ctx),
+	});
+
 	const runtime: ExtensionRuntime = {
 		sendMessage: notInitialized,
 		sendUserMessage: notInitialized,
@@ -140,6 +158,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		setThinkingLevel: notInitialized,
 		flagValues: new Map(),
 		pendingProviderRegistrations: [],
+		toolRegistry,
 		// Pre-bind: queue registrations so bindCore() can flush them once the
 		// model registry is available. bindCore() replaces both with direct calls.
 		registerProvider: (name, config, extensionPath = "<unknown>") => {
@@ -177,6 +196,24 @@ function createExtensionAPI(
 				definition: tool,
 				sourceInfo: extension.sourceInfo,
 			});
+			runtime.refreshTools();
+		},
+
+		registerToolProvider(provider): void {
+			registerToolProviderInExtension(
+				extension,
+				runtime.toolRegistry,
+				// Author-side generics are erased at the registry boundary. The
+				// provider's own execute closure keeps typed config/secrets via
+				// closure capture at author side.
+				provider as unknown as import("@pi-relay/tool-kit").ToolProvider,
+				(message) => console.warn(message),
+			);
+			runtime.refreshTools();
+		},
+
+		configureTools(config): void {
+			configureToolsInRegistry(runtime.toolRegistry, config);
 			runtime.refreshTools();
 		},
 
@@ -323,6 +360,7 @@ function createExtension(extensionPath: string, resolvedPath: string): Extension
 		commands: new Map(),
 		flags: new Map(),
 		shortcuts: new Map(),
+		toolProviders: new Map(),
 	};
 }
 
