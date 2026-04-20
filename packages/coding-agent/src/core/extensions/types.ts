@@ -1053,6 +1053,59 @@ export interface ExtensionAPI {
 		tool: ToolDefinition<TParams, TDetails, TState>,
 	): void;
 
+	/**
+	 * Register a `@pi-relay/tool-kit` `ToolProvider`. The provider's
+	 * `execute(...)` is adapted into a `ToolDefinition` by the shared tool
+	 * resolver. The LLM never sees provider ids — they surface only in
+	 * `pi.configureTools(...)` and diagnostics.
+	 *
+	 * Auto-bind behavior (when `configureTools` doesn't explicitly pick a
+	 * provider for an interface):
+	 *   - 0 providers for an interface  -> nothing is exposed.
+	 *   - 1 provider                   -> LLM sees the bare interface name.
+	 *   - 2+ providers                 -> resolver throws. The user must add
+	 *                                      a `pi.configureTools({...})` entry
+	 *                                      (or a settings file entry) to
+	 *                                      disambiguate.
+	 *
+	 * In this milestone, config defaults come from `provider.defaultConfig`
+	 * and secrets are resolved from `process.env[spec.envVar]`. A later
+	 * milestone adds a `SettingsManager` `tools.<toolName>` namespace, an
+	 * `AuthStorage` mirror, and a `/configure <toolName>` UX.
+	 */
+	registerToolProvider<
+		TConfig = Record<string, never>,
+		TSecrets = Record<string, never>,
+		TParams extends TSchema = TSchema,
+		TDetails = unknown,
+	>(
+		provider: import("@pi-relay/tool-kit").ToolProvider<TConfig, TSecrets, TParams, TDetails>,
+	): void;
+
+	/**
+	 * Merge a user-authored `ToolsConfig` into the shared tool registry. The
+	 * key of each entry is the LLM-visible tool name; the `provider` field
+	 * picks which registered provider backs it.
+	 *
+	 * Multiple calls merge at the tool-name level. Calling this twice with the
+	 * same name but different provider emits a warning and the later call
+	 * wins, so composed extensions (e.g. a pack + a user override) behave
+	 * predictably.
+	 *
+	 * @example
+	 * pi.configureTools({
+	 *   // Single provider for an interface — same as auto-binding, but
+	 *   // explicit.
+	 *   web_search: { provider: "com.perplexity.sonar" },
+	 *   // Two tools for the same interface with different names and different
+	 *   // providers. The LLM sees `bash` and `bash_prod` — never the
+	 *   // provider ids.
+	 *   bash:      { provider: "local" },
+	 *   bash_prod: { provider: "ssh", config: { host: "prod.example.com" } },
+	 * });
+	 */
+	configureTools(config: import("@pi-relay/tool-kit").ToolsConfig): void;
+
 	// =========================================================================
 	// Command, Shortcut, Flag Registration
 	// =========================================================================
@@ -1372,6 +1425,14 @@ export interface ExtensionRuntimeState {
 	 */
 	registerProvider: (name: string, config: ProviderConfig, extensionPath?: string) => void;
 	unregisterProvider: (name: string, extensionPath?: string) => void;
+	/**
+	 * Shared tool registry populated by `pi.registerToolProvider(...)` and
+	 * `pi.configureTools(...)` on any extension. Resolved into
+	 * `ToolDefinition[]` every time the runner aggregates tools. Kept
+	 * type-only to avoid a value-level dependency from this types module
+	 * onto `../tool-packages/tools.ts`.
+	 */
+	toolRegistry: import("../tool-packages/tools.js").ToolRegistry;
 }
 
 /**
@@ -1449,6 +1510,22 @@ export interface Extension {
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;
 	shortcuts: Map<KeyId, ExtensionShortcut>;
+	/**
+	 * Tool providers registered via `pi.registerToolProvider(...)`. Kept here
+	 * for diagnostics (e.g. `/tools`) and so the loader can surface per-
+	 * extension ownership. The actual `ToolDefinition`s the agent runs are
+	 * produced by the shared binding resolver on `ExtensionRuntime`.
+	 *
+	 * Optional so code paths that build a minimal `Extension` by hand keep
+	 * compiling.
+	 */
+	toolProviders?: Map<string, RegisteredToolProvider>;
+}
+
+/** Bookkeeping for a registered tool provider (for diagnostics / `/tools`). */
+export interface RegisteredToolProvider {
+	provider: import("@pi-relay/tool-kit").ToolProvider;
+	sourceInfo: SourceInfo;
 }
 
 /** Result of loading extensions. */

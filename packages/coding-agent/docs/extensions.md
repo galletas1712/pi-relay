@@ -26,7 +26,7 @@ Extensions are TypeScript modules that extend pi's behavior. They can subscribe 
 - External integrations (file watchers, webhooks, CI triggers)
 - Games while you wait (see `snake.ts` example)
 
-See [examples/extensions/](../examples/extensions/) for working implementations.
+See [extensions/examples/](../../extensions/examples/) for working implementations.
 
 ## Table of Contents
 
@@ -733,7 +733,7 @@ pi.on("input", async (event, ctx) => {
 - `transform` - modify text/images, then continue to expansion
 - `handled` - skip agent entirely (first handler to return this wins)
 
-Transforms chain across handlers. See [input-transform.ts](../examples/extensions/input-transform.ts).
+Transforms chain across handlers. See [input-transform.ts](../../extensions/examples/input-transform.ts).
 
 ## ExtensionContext
 
@@ -1024,7 +1024,7 @@ Use `pi.setActiveTools()` to enable or disable tools (including dynamically adde
 
 Use `promptSnippet` to opt a custom tool into a one-line entry in `Available tools`, and `promptGuidelines` to append tool-specific bullets to the default `Guidelines` section when the tool is active.
 
-See [dynamic-tools.ts](../examples/extensions/dynamic-tools.ts) for a full example.
+See [dynamic-tools.ts](../../extensions/examples/dynamic-tools.ts) for a full example.
 
 ```typescript
 import { Type } from "@sinclair/typebox";
@@ -1112,7 +1112,7 @@ pi.sendUserMessage("And then summarize", { deliverAs: "followUp" });
 
 When not streaming, the message is sent immediately and triggers a new turn. When streaming without `deliverAs`, throws an error.
 
-See [send-user-message.ts](../examples/extensions/send-user-message.ts) for a complete example.
+See [send-user-message.ts](../../extensions/examples/send-user-message.ts) for a complete example.
 
 ### pi.appendEntry(customType, data?)
 
@@ -1623,7 +1623,7 @@ Alternatively, use `--no-tools` to start without any built-in tools:
 pi --no-tools -e ./my-extension.ts
 ```
 
-See [examples/extensions/tool-override.ts](../examples/extensions/tool-override.ts) for a complete example that overrides `read` with logging and access control.
+See [extensions/examples/tool-override.ts](../../extensions/examples/tool-override.ts) for a complete example that overrides `read` with logging and access control.
 
 **Rendering:** Built-in renderer inheritance is resolved per slot. Execution override and rendering override are independent. If your override omits `renderCall`, the built-in `renderCall` is used. If your override omits `renderResult`, the built-in `renderResult` is used. If your override omits both, the built-in renderer is used automatically (syntax highlighting, diffs, etc.). This lets you wrap built-in tools for logging or access control without reimplementing the UI.
 
@@ -1687,7 +1687,7 @@ const bashTool = createBashTool(cwd, {
 });
 ```
 
-See [examples/extensions/ssh.ts](../examples/extensions/ssh.ts) for a complete SSH example with `--ssh` flag.
+See [extensions/examples/ssh.ts](../../extensions/examples/ssh.ts) for a complete SSH example with `--ssh` flag.
 
 ### Output Truncation
 
@@ -1739,7 +1739,7 @@ async execute(toolCallId, params, signal, onUpdate, ctx) {
 - Always inform the LLM when output is truncated and where to find the full version
 - Document the truncation limits in your tool's description
 
-See [examples/extensions/truncated-tool.ts](../examples/extensions/truncated-tool.ts) for a complete example wrapping `rg` (ripgrep) with proper truncation.
+See [extensions/examples/truncated-tool.ts](../../extensions/examples/truncated-tool.ts) for a complete example wrapping `rg` (ripgrep) with proper truncation.
 
 ### Multiple Tools
 
@@ -1965,7 +1965,7 @@ if (confirmed) {
 }
 ```
 
-See [examples/extensions/timed-confirm.ts](../examples/extensions/timed-confirm.ts) for complete examples.
+See [extensions/examples/timed-confirm.ts](../../extensions/examples/timed-confirm.ts) for complete examples.
 
 ### Widgets, Status, and Footer
 
@@ -2078,7 +2078,7 @@ const result = await ctx.ui.custom<string | null>(
 );
 ```
 
-See [tui.md](tui.md) for the full `OverlayOptions` API and [overlay-qa-tests.ts](../examples/extensions/overlay-qa-tests.ts) for examples.
+See [tui.md](tui.md) for the full `OverlayOptions` API and [overlay-qa-tests.ts](../../extensions/examples/overlay-qa-tests.ts) for examples.
 
 ### Custom Editor
 
@@ -2204,7 +2204,7 @@ In non-interactive modes, check `ctx.hasUI` before using UI methods.
 
 ## Examples Reference
 
-All examples in [examples/extensions/](../examples/extensions/).
+All examples in [extensions/examples/](../../extensions/examples/).
 
 | Example | Description | Key APIs |
 |---------|-------------|----------|

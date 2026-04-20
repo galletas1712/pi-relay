@@ -8,7 +8,7 @@ import type { ResourceDiagnostic } from "./diagnostics.js";
 
 export type { ResourceCollision, ResourceDiagnostic } from "./diagnostics.js";
 
-import { isLocalPath } from "../utils/paths.js";
+import { isLocalPath, looksLikeBarePackageName } from "../utils/paths.js";
 import { createEventBus, type EventBus } from "./event-bus.js";
 import { createExtensionRuntime, loadExtensionFromFactory, loadExtensions } from "./extensions/loader.js";
 import type { Extension, ExtensionFactory, ExtensionRuntime, LoadExtensionsResult } from "./extensions/types.js";
@@ -408,6 +408,7 @@ export class DefaultResourceLoader implements ResourceLoader {
 		}
 
 		for (const p of this.additionalExtensionPaths) {
+			if (looksLikeBarePackageName(p)) continue;
 			if (isLocalPath(p) && !existsSync(p)) {
 				extensionsResult.errors.push({ path: p, error: `Extension path does not exist: ${p}` });
 			}
@@ -673,6 +674,12 @@ export class DefaultResourceLoader implements ResourceLoader {
 
 	private resolveResourcePath(p: string): string {
 		const trimmed = p.trim();
+		// Bare package names are resolved via Node module resolution by the
+		// extension loader — don't rewrite them to a cwd-relative filesystem
+		// path here.
+		if (looksLikeBarePackageName(trimmed)) {
+			return trimmed;
+		}
 		let expanded = trimmed;
 		if (trimmed === "~") {
 			expanded = homedir();

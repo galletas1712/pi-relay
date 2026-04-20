@@ -10,6 +10,7 @@ import type { ResourceDiagnostic } from "../diagnostics.js";
 import type { KeybindingsConfig } from "../keybindings.js";
 import type { ModelRegistry } from "../model-registry.js";
 import type { SessionManager } from "../session-manager.js";
+import { createSyntheticSourceInfo } from "../source-info.js";
 import type {
 	BeforeAgentStartEvent,
 	BeforeAgentStartEventResult,
@@ -353,7 +354,38 @@ export class ExtensionRunner {
 		return this.extensions.map((e) => e.path);
 	}
 
-	/** Get all registered tools from all extensions (first registration per name wins). */
+	/**
+	 * Resolve the shared tool registry into `ToolDefinition[]`. Errors from
+	 * the resolver (bad `configureTools` entries, unknown provider ids, >=2
+	 * providers implementing the same interface with no explicit entry, ...)
+	 * are surfaced as per-extension diagnostics through `emitError` instead
+	 * of propagating up through `getAllRegisteredTools` / `getToolDefinition`
+	 * and crashing session start. Returns an empty list on failure so the
+	 * session continues with only classic `pi.registerTool(...)` tools.
+	 */
+	private safeResolveProviderTools(): ReturnType<typeof this.runtime.toolRegistry.resolve> {
+		try {
+			return this.runtime.toolRegistry.resolve();
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			const stack = err instanceof Error ? err.stack : undefined;
+			this.emitError({
+				extensionPath: "<tool-registry>",
+				event: "tool_registry_resolve",
+				error: `Tool registry failed to resolve: ${message}`,
+				stack,
+			});
+			return [];
+		}
+	}
+
+	/**
+	 * Get all registered tools from all extensions plus the shared tool
+	 * registry's resolved provider tools. First registration per name wins
+	 * (classic behavior); provider-derived tools lose to explicit
+	 * `pi.registerTool(...)` registrations of the same name so back-compat
+	 * callers stay authoritative.
+	 */
 	getAllRegisteredTools(): RegisteredTool[] {
 		const toolsByName = new Map<string, RegisteredTool>();
 		for (const ext of this.extensions) {
@@ -361,6 +393,14 @@ export class ExtensionRunner {
 				if (!toolsByName.has(tool.definition.name)) {
 					toolsByName.set(tool.definition.name, tool);
 				}
+			}
+		}
+		for (const def of this.safeResolveProviderTools()) {
+			if (!toolsByName.has(def.name)) {
+				toolsByName.set(def.name, {
+					definition: def,
+					sourceInfo: createSyntheticSourceInfo(`<provider:${def.name}>`, { source: "provider" }),
+				});
 			}
 		}
 		return Array.from(toolsByName.values());
@@ -372,6 +412,11 @@ export class ExtensionRunner {
 			const tool = ext.tools.get(toolName);
 			if (tool) {
 				return tool.definition;
+			}
+		}
+		for (const def of this.safeResolveProviderTools()) {
+			if (def.name === toolName) {
+				return def;
 			}
 		}
 		return undefined;
