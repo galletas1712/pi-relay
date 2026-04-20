@@ -89,6 +89,15 @@ export interface Settings {
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: string;
+	/**
+	 * Optional worklog-fork model override. When set, the relay orchestrator
+	 * routes its per-turn worklog fork LLM call to this model instead of the
+	 * session's main model. Unset means "fall back to session model".
+	 * Configured via the `/worklog-model` command.
+	 */
+	worklogForkProvider?: string;
+	worklogForkModel?: string;
+	worklogForkThinkingLevel?: string;
 	transport?: TransportSetting; // default: "sse"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -627,6 +636,42 @@ export class SettingsManager {
 	setDefaultThinkingLevel(level: string): void {
 		this.globalSettings.defaultThinkingLevel = level;
 		this.markModified("defaultThinkingLevel");
+		this.save();
+	}
+
+	getWorklogForkProvider(): string | undefined {
+		return this.settings.worklogForkProvider;
+	}
+
+	getWorklogForkModel(): string | undefined {
+		return this.settings.worklogForkModel;
+	}
+
+	getWorklogForkThinkingLevel(): string | undefined {
+		return this.settings.worklogForkThinkingLevel;
+	}
+
+	setWorklogForkModelAndProvider(provider: string, modelId: string): void {
+		this.globalSettings.worklogForkProvider = provider;
+		this.globalSettings.worklogForkModel = modelId;
+		this.markModified("worklogForkProvider");
+		this.markModified("worklogForkModel");
+		this.save();
+	}
+
+	setWorklogForkThinkingLevel(level: string): void {
+		this.globalSettings.worklogForkThinkingLevel = level;
+		this.markModified("worklogForkThinkingLevel");
+		this.save();
+	}
+
+	clearWorklogForkModel(): void {
+		this.globalSettings.worklogForkProvider = undefined;
+		this.globalSettings.worklogForkModel = undefined;
+		this.globalSettings.worklogForkThinkingLevel = undefined;
+		this.markModified("worklogForkProvider");
+		this.markModified("worklogForkModel");
+		this.markModified("worklogForkThinkingLevel");
 		this.save();
 	}
 

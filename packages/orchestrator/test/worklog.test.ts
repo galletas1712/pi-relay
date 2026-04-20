@@ -701,7 +701,7 @@ describe("worklog fork", () => {
 });
 
 describe("isLikelyTrivialTurn gate", () => {
-	const baseRecord = { lastWorklogMessageCount: 0, lastWorklogTurn: 0, turnCount: 1 };
+	const baseRecord = { lastWorklogMessageCount: 0 };
 
 	it("HARD GATE: skips when the delta contains no assistant message", () => {
 		const result = isLikelyTrivialTurn(baseRecord, [
@@ -778,19 +778,18 @@ describe("isLikelyTrivialTurn gate", () => {
 		expect(result).toEqual({ skip: true, reason: "tool-chatter-only" });
 	});
 
-	it("skips tiny-delta-after-recent-entry: 1-msg delta within 2 turns of last entry", () => {
-		const result = isLikelyTrivialTurn(
-			{ lastWorklogMessageCount: 0, lastWorklogTurn: 5, turnCount: 6 },
-			[
-				{
-					role: "assistant",
-					content: [{ type: "text", text: "ok" }],
-					stopReason: "stop",
-					timestamp: Date.now(),
-				},
-			],
-		);
-		expect(result).toEqual({ skip: true, reason: "tiny-delta-after-recent-entry" });
+	it("does not skip small deltas: a single-message assistant response still fires the fork", () => {
+		// There is no "tiny-delta" gate; any delta containing an assistant
+		// message with substantive text should proceed to the fork.
+		const result = isLikelyTrivialTurn({ lastWorklogMessageCount: 0 }, [
+			{
+				role: "assistant",
+				content: [{ type: "text", text: "ok" }],
+				stopReason: "stop",
+				timestamp: Date.now(),
+			},
+		]);
+		expect(result).toEqual({ skip: false });
 	});
 
 	it("does not skip: substantive turn with user + assistant text", () => {

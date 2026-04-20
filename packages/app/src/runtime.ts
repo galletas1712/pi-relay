@@ -6,6 +6,7 @@ import {
 	createAgentSessionServices,
 	getAgentDir,
 	SessionManager,
+	type SettingsManager as RelaySettingsManager,
 	type ToolDefinition,
 } from "@pi-relay/coding-agent";
 import {
@@ -16,20 +17,6 @@ import {
 	createRelaySessionFactory,
 	createSpawnTool,
 } from "@pi-relay/orchestrator";
-
-/**
- * Default worklog fork model. The worklog fork runs once per agent turn on
- * a separate off-transcript call to decide whether anything durable was
- * learned (and, if so, emit a short markdown entry). It does not need the
- * main loop's full reasoning budget, so default it to GPT-5.4 with medium
- * reasoning. Operators can override via `OrchestratorConfig.forkModel`.
- *
- * Both the provider and model id are resolved through `getModel`; if the
- * model catalog doesn't know this id (e.g. future renames), we silently
- * fall back to the parent session's model, preserving the pre-Phase-1
- * behavior.
- */
-const DEFAULT_FORK_MODEL = getModel("openai", "gpt-5.4");
 import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
 import { createRelayBaseToolDefinitionsFactory, RELAY_BASE_TOOL_NAMES } from "./tools/base-tools.js";
 
@@ -67,14 +54,20 @@ export function createRelayRuntimeFactory(
 	const orchestratorUiRef: { cleanup?: () => void; sessionId?: string } = {};
 	return async ({ cwd, sessionManager, sessionStartEvent }) => {
 		const orchestratorRef: { current?: Orchestrator } = {};
+		const settingsManagerRef: { current?: RelaySettingsManager } = {};
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
 			resourceLoaderOptions: {
 				appendSystemPrompt: [RELAY_APPEND_SYSTEM_PROMPT],
-				extensionFactories: [createOrchestratorExtension(orchestratorRef, orchestratorUiRef)],
+				extensionFactories: [
+					createOrchestratorExtension(orchestratorRef, orchestratorUiRef, {
+						getSettingsManager: () => settingsManagerRef.current,
+					}),
+				],
 			},
 		});
+		settingsManagerRef.current = services.settingsManager;
 		const rootToolBridge = {
 			async spawnAgent(parentId: string, config: Parameters<Orchestrator["spawnAgent"]>[1]) {
 				if (!orchestratorRef.current) {
@@ -112,10 +105,33 @@ export function createRelayRuntimeFactory(
 				baseToolNames: [...RELAY_BASE_TOOL_NAMES],
 				createSessionBaseToolDefinitionsFactory,
 			}),
-			config: DEFAULT_FORK_MODEL
-				? { forkModel: DEFAULT_FORK_MODEL, forkThinkingLevel: "medium" }
-				: undefined,
 		});
+		// Hydrate the worklog-fork model override from persisted settings so
+		// a prior `/worklog-model` choice survives process restarts. If no
+		// choice was saved, the fork falls back to the session's main model.
+		// Guarded with `typeof ... === "function"` so stubbed settings
+		// managers in tests (and older SettingsManager instances that might
+		// not have been updated yet) don't crash startup.
+		const sm = services.settingsManager as Partial<RelaySettingsManager>;
+		const savedForkProvider =
+			typeof sm.getWorklogForkProvider === "function" ? sm.getWorklogForkProvider() : undefined;
+		const savedForkModelId =
+			typeof sm.getWorklogForkModel === "function" ? sm.getWorklogForkModel() : undefined;
+		if (savedForkProvider && savedForkModelId) {
+			const restoredForkModel = getModel(savedForkProvider as never, savedForkModelId as never);
+			if (restoredForkModel) {
+				orchestrator.setForkModel(restoredForkModel);
+			}
+		}
+		const savedForkThinking =
+			typeof sm.getWorklogForkThinkingLevel === "function"
+				? sm.getWorklogForkThinkingLevel()
+				: undefined;
+		if (savedForkThinking) {
+			orchestrator.setForkThinkingLevel(
+				savedForkThinking as Parameters<Orchestrator["setForkThinkingLevel"]>[0],
+			);
+		}
 		orchestratorRef.current = orchestrator;
 		stateRef.current = { orchestrator };
 		await orchestrator.restore();

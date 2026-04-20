@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AgentMessage, AgentToolCall } from "@pi-relay/agent-core";
+import type { AgentMessage, AgentToolCall, ThinkingLevel } from "@pi-relay/agent-core";
 import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@pi-relay/agent-core";
-import { validateToolArguments, type ToolResultMessage, type UserMessage } from "@pi-relay/ai";
+import { validateToolArguments, type Model, type ToolResultMessage, type UserMessage } from "@pi-relay/ai";
 import { serializeConversation, type AgentSessionEvent, type ToolDefinition } from "@pi-relay/coding-agent";
 import { createAgentContextTransform } from "./context-transform.js";
 import { BackgroundCapabilitiesSource, MultiAgentInstructionsSource } from "./prompt/index.js";
@@ -121,7 +121,7 @@ function assistantHasSubstantiveText(message: AgentMessage): boolean {
  * about its decisions without spinning up an orchestrator.
  */
 export function isLikelyTrivialTurn(
-	record: Pick<AgentRecord, "lastWorklogMessageCount" | "lastWorklogTurn" | "turnCount">,
+	record: Pick<AgentRecord, "lastWorklogMessageCount">,
 	turnMessages: AgentMessage[],
 ): WorklogForkGateResult {
 	const start = Math.min(record.lastWorklogMessageCount, turnMessages.length);
@@ -150,14 +150,6 @@ export function isLikelyTrivialTurn(
 	});
 	if (!anyTextOrThinking) {
 		return { skip: true, reason: "tool-chatter-only" };
-	}
-
-	// Tiny-delta recency gate: very small deltas that come right on the
-	// heels of a just-written entry are almost always non-durable follow-
-	// ups. Wait for more context to accumulate before re-forking.
-	const recentlyWrote = record.lastWorklogTurn > 0 && record.turnCount - record.lastWorklogTurn <= 2;
-	if (delta.length < 2 && recentlyWrote) {
-		return { skip: true, reason: "tiny-delta-after-recent-entry" };
 	}
 
 	return { skip: false };
@@ -253,6 +245,44 @@ export class Orchestrator {
 
 	getAgentIdBySessionId(sessionId: string): string | undefined {
 		return this.sessionIdToAgentId.get(sessionId);
+	}
+
+	/**
+	 * Current worklog-fork model override, or `undefined` when the fork
+	 * falls back to the parent session's model.
+	 */
+	getForkModel(): Model<any> | undefined {
+		return this.config.forkModel;
+	}
+
+	/**
+	 * Current worklog-fork thinking level override, or `undefined` when the
+	 * fork falls back to the parent session's thinking level.
+	 */
+	getForkThinkingLevel(): ThinkingLevel | undefined {
+		return this.config.forkThinkingLevel;
+	}
+
+	/**
+	 * Set (or clear) the worklog-fork model override. Takes effect on the
+	 * next fork invocation; no in-flight forks are cancelled. Pass
+	 * `undefined` to clear the override and fall back to the parent
+	 * session's model. The orchestrator does NOT persist this choice —
+	 * the caller is responsible for writing to whatever settings store
+	 * should survive restart.
+	 */
+	setForkModel(model: Model<any> | undefined): void {
+		this.config.forkModel = model;
+		this.notifyChange();
+	}
+
+	/**
+	 * Set (or clear) the worklog-fork thinking level override. Same
+	 * semantics as `setForkModel`: next-fork takes effect, no persistence.
+	 */
+	setForkThinkingLevel(level: ThinkingLevel | undefined): void {
+		this.config.forkThinkingLevel = level;
+		this.notifyChange();
 	}
 
 	getChildrenOf(agentId: string): AgentRecord[] {

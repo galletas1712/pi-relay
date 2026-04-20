@@ -1,10 +1,26 @@
-import type { ExtensionFactory } from "@pi-relay/coding-agent";
+import type { ExtensionCommandContext, ExtensionFactory, SettingsManager } from "@pi-relay/coding-agent";
+import type { ThinkingLevel } from "@pi-relay/agent-core";
+import { getThinkingLevels, type Model } from "@pi-relay/ai";
 import { buildAgentSelectorOptions, buildAgentWidgetLines } from "./roster.js";
 import type { Orchestrator } from "./orchestrator.js";
+
+/**
+ * Optional hooks the host supplies so the orchestrator extension can
+ * persist the user's `/worklog-model` choice across restarts.
+ */
+export interface OrchestratorExtensionOptions {
+	/**
+	 * Returns the active settings manager, or `undefined` if the host does
+	 * not wish to persist the fork-model choice (choice will be
+	 * session-only).
+	 */
+	getSettingsManager?: () => SettingsManager | undefined;
+}
 
 export function createOrchestratorExtension(
 	orchestratorRef: { current?: Orchestrator },
 	uiRef: { cleanup?: () => void; sessionId?: string } = {},
+	options: OrchestratorExtensionOptions = {},
 ): ExtensionFactory {
 	return (pi) => {
 		pi.registerCommand("agents", {
@@ -76,6 +92,83 @@ export function createOrchestratorExtension(
 			},
 		});
 
+		pi.registerCommand("worklog-model", {
+			description:
+				"Select the model used for worklog forks (off-transcript per-turn summary call)",
+			getArgumentCompletions: async (prefix) => {
+				// Argument completions mirror `/model`: fuzzy-ish prefix match on
+				// `provider/id`. We can't consult the ctx.modelRegistry here
+				// because `getArgumentCompletions` has no ctx argument, so we
+				// return null and let the command handler do the picker work.
+				const trimmed = prefix.trim().toLowerCase();
+				// Always surface `none` as a completion so users can clear the
+				// override without opening the picker.
+				if ("none".startsWith(trimmed) || trimmed === "") {
+					return [
+						{
+							value: "none",
+							label: "none",
+							description: "Clear override; fall back to session model",
+						},
+					];
+				}
+				return null;
+			},
+			handler: async (args, ctx) => {
+				const orchestrator = orchestratorRef.current;
+				if (!orchestrator) {
+					ctx.ui.notify("Relay orchestrator is not available yet.", "warning");
+					return;
+				}
+
+				const settingsManager = options.getSettingsManager?.();
+				const trimmed = args.trim();
+
+				// Branch 1: inspect current state.
+				if (trimmed === "" && !ctx.hasUI) {
+					// Print-mode / RPC: no picker available. Show current value.
+					summarizeForkModel(orchestrator, ctx);
+					return;
+				}
+
+				// Branch 2: explicit clear.
+				if (trimmed.toLowerCase() === "none" || trimmed.toLowerCase() === "unset") {
+					applyForkModelChoice(orchestrator, undefined, undefined, settingsManager);
+					ctx.ui.notify("Worklog fork: cleared override (will use session model).", "info");
+					return;
+				}
+
+				// Branch 3: explicit "<modelref>" or "<modelref> <level>".
+				if (trimmed !== "") {
+					const parts = trimmed.split(/\s+/);
+					const modelRef = parts[0] ?? "";
+					const explicitLevel = parts[1];
+					ctx.modelRegistry.refresh();
+					const availableModels = await ctx.modelRegistry.getAvailable();
+					const match = resolveModelByReference(modelRef, availableModels as Model<any>[]);
+					if (!match) {
+						if (!ctx.hasUI) {
+							ctx.ui.notify(`No model matches '${modelRef}'.`, "error");
+							return;
+						}
+						// UI mode: open the picker pre-filtered by the search term.
+						await runForkModelPicker(orchestrator, ctx, settingsManager, modelRef);
+						return;
+					}
+					const resolvedLevel = resolveThinkingLevel(match, explicitLevel);
+					applyForkModelChoice(orchestrator, match, resolvedLevel, settingsManager);
+					ctx.ui.notify(
+						`Worklog fork: ${match.provider}/${match.id}${resolvedLevel ? ` (${resolvedLevel})` : ""}.`,
+						"info",
+					);
+					return;
+				}
+
+				// Branch 4: no argument — open interactive picker.
+				await runForkModelPicker(orchestrator, ctx, settingsManager, undefined);
+			},
+		});
+
 		pi.on("session_start", async (_event, ctx) => {
 			const orchestrator = orchestratorRef.current;
 			if (!orchestrator) {
@@ -144,4 +237,182 @@ export function createOrchestratorExtension(
 			await orchestrator.dispose();
 		});
 	};
+}
+
+/**
+ * Resolve a user-supplied model reference (`provider/id` or bare `id`)
+ * against the list of currently available models. Mirrors the matching
+ * policy used by the main `/model` command: exact canonical match wins;
+ * ambiguous bare-id matches return `undefined` rather than guessing.
+ */
+export function resolveModelByReference(
+	reference: string,
+	availableModels: Model<any>[],
+): Model<any> | undefined {
+	const trimmed = reference.trim();
+	if (!trimmed) {
+		return undefined;
+	}
+	const normalized = trimmed.toLowerCase();
+
+	const canonical = availableModels.filter(
+		(model) => `${model.provider}/${model.id}`.toLowerCase() === normalized,
+	);
+	if (canonical.length === 1) {
+		return canonical[0];
+	}
+	if (canonical.length > 1) {
+		return undefined;
+	}
+
+	const slashIndex = trimmed.indexOf("/");
+	if (slashIndex !== -1) {
+		const provider = trimmed.slice(0, slashIndex).trim().toLowerCase();
+		const modelId = trimmed.slice(slashIndex + 1).trim().toLowerCase();
+		if (provider && modelId) {
+			const providerMatches = availableModels.filter(
+				(model) => model.provider.toLowerCase() === provider && model.id.toLowerCase() === modelId,
+			);
+			if (providerMatches.length === 1) {
+				return providerMatches[0];
+			}
+			if (providerMatches.length > 1) {
+				return undefined;
+			}
+		}
+	}
+
+	const idMatches = availableModels.filter((model) => model.id.toLowerCase() === normalized);
+	return idMatches.length === 1 ? idMatches[0] : undefined;
+}
+
+/**
+ * Validate a requested thinking level against the model's supported set.
+ * If the user asked for a level the model doesn't support (or didn't
+ * specify one), we default to `medium` when available, otherwise the
+ * first supported level, otherwise `undefined` (non-reasoning model).
+ */
+export function resolveThinkingLevel(
+	model: Model<any>,
+	requested: string | undefined,
+): ThinkingLevel | undefined {
+	const supported = getThinkingLevels(model);
+	if (supported.length === 0) {
+		return undefined;
+	}
+	if (requested) {
+		const normalized = requested.toLowerCase();
+		const match = supported.find((level) => level.toLowerCase() === normalized);
+		if (match) {
+			return match as ThinkingLevel;
+		}
+	}
+	if (supported.includes("medium")) {
+		return "medium";
+	}
+	return supported[0] as ThinkingLevel;
+}
+
+/**
+ * Apply the user's fork-model choice to the orchestrator's live config
+ * and, if a SettingsManager is wired in, persist it for future restarts.
+ * Passing `undefined` for both `model` and `level` clears any override.
+ */
+export function applyForkModelChoice(
+	orchestrator: Orchestrator,
+	model: Model<any> | undefined,
+	level: ThinkingLevel | undefined,
+	settingsManager?: SettingsManager,
+): void {
+	orchestrator.setForkModel(model);
+	orchestrator.setForkThinkingLevel(level);
+	if (!settingsManager) {
+		return;
+	}
+	if (model) {
+		settingsManager.setWorklogForkModelAndProvider(model.provider, model.id);
+		if (level) {
+			settingsManager.setWorklogForkThinkingLevel(level);
+		} else {
+			// Clearing the thinking level alone is not a supported operation,
+			// but we can fall back to not persisting anything in that case.
+		}
+	} else {
+		settingsManager.clearWorklogForkModel();
+	}
+}
+
+function summarizeForkModel(
+	orchestrator: Orchestrator,
+	ctx: Pick<ExtensionCommandContext, "ui">,
+): void {
+	const model = orchestrator.getForkModel();
+	const level = orchestrator.getForkThinkingLevel();
+	if (model) {
+		ctx.ui.notify(
+			`Worklog fork override: ${model.provider}/${model.id}${level ? ` (${level})` : ""}.`,
+			"info",
+		);
+	} else {
+		ctx.ui.notify("Worklog fork override: unset (falls back to session model).", "info");
+	}
+}
+
+async function runForkModelPicker(
+	orchestrator: Orchestrator,
+	ctx: ExtensionCommandContext,
+	settingsManager: SettingsManager | undefined,
+	prefilter: string | undefined,
+): Promise<void> {
+	ctx.modelRegistry.refresh();
+	const availableModels = (await ctx.modelRegistry.getAvailable()) as Model<any>[];
+	const options: string[] = [
+		"‹unset› fall back to session model",
+	];
+	const normalizedPrefilter = prefilter?.trim().toLowerCase();
+	const filtered = normalizedPrefilter
+		? availableModels.filter(
+				(model) =>
+					model.id.toLowerCase().includes(normalizedPrefilter) ||
+					model.provider.toLowerCase().includes(normalizedPrefilter),
+			)
+		: availableModels;
+	for (const model of filtered) {
+		options.push(`${model.provider}/${model.id}`);
+	}
+	if (options.length === 1) {
+		ctx.ui.notify("No models match that filter.", "warning");
+		return;
+	}
+	const choice = await ctx.ui.select("Worklog fork model", options);
+	if (!choice) {
+		return;
+	}
+	if (choice.startsWith("‹unset›")) {
+		applyForkModelChoice(orchestrator, undefined, undefined, settingsManager);
+		ctx.ui.notify("Worklog fork: cleared override (will use session model).", "info");
+		return;
+	}
+	const match = resolveModelByReference(choice, availableModels);
+	if (!match) {
+		ctx.ui.notify(`Could not resolve '${choice}'.`, "error");
+		return;
+	}
+	const levels = getThinkingLevels(match);
+	let level: ThinkingLevel | undefined;
+	if (levels.length > 0) {
+		const picked = await ctx.ui.select(
+			`Thinking level for ${match.id}`,
+			[...levels, "‹default›"],
+		);
+		if (!picked) {
+			return;
+		}
+		level = picked.startsWith("‹default›") ? resolveThinkingLevel(match, undefined) : (picked as ThinkingLevel);
+	}
+	applyForkModelChoice(orchestrator, match, level, settingsManager);
+	ctx.ui.notify(
+		`Worklog fork: ${match.provider}/${match.id}${level ? ` (${level})` : ""}.`,
+		"info",
+	);
 }
