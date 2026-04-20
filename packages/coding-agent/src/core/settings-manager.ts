@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.js";
+import { isTruthyEnvFlag } from "../utils/env-flag.js";
 
 export interface CompactionSettings {
 	enabled?: boolean; // default: true
@@ -864,7 +865,7 @@ export class SettingsManager {
 		if (this.settings.terminal?.clearOnShrink !== undefined) {
 			return this.settings.terminal.clearOnShrink;
 		}
-		return process.env.PI_CLEAR_ON_SHRINK === "1";
+		return isTruthyEnvFlag(process.env.PI_CLEAR_ON_SHRINK);
 	}
 
 	setClearOnShrink(enabled: boolean): void {
@@ -935,7 +936,7 @@ export class SettingsManager {
 	}
 
 	getShowHardwareCursor(): boolean {
-		return this.settings.showHardwareCursor ?? process.env.PI_HARDWARE_CURSOR === "1";
+		return this.settings.showHardwareCursor ?? isTruthyEnvFlag(process.env.PI_HARDWARE_CURSOR);
 	}
 
 	setShowHardwareCursor(enabled: boolean): void {

@@ -1,9 +1,11 @@
 /**
  * Central timing instrumentation for startup profiling.
- * Enable with PI_TIMING=1 environment variable.
+ * Enable with PI_TIMING=1 environment variable (also accepts "true"/"yes").
  */
 
-const ENABLED = process.env.PI_TIMING === "1";
+import { isTruthyEnvFlag } from "../utils/env-flag.js";
+
+const ENABLED = isTruthyEnvFlag(process.env.PI_TIMING);
 const timings: Array<{ label: string; ms: number }> = [];
 let lastTime = Date.now();
 
