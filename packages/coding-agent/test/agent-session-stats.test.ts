@@ -276,6 +276,41 @@ describe("AgentSession.getSessionStats", () => {
 		}
 	});
 
+	it("returns a copy that cannot mutate internal state", () => {
+		const { session } = createSession();
+
+		try {
+			const bg: Usage = {
+				input: 100,
+				output: 50,
+				cacheRead: 200,
+				cacheWrite: 10,
+				totalTokens: 360,
+				cost: {
+					input: 0.001,
+					output: 0.002,
+					cacheRead: 0.0002,
+					cacheWrite: 0.0001,
+					total: 0.0033,
+				},
+			};
+			session.addBackgroundUsage(bg, "worklog");
+
+			const snapshot = session.getBackgroundUsage();
+			// Mutate the returned snapshot - must NOT affect internal state.
+			snapshot.input = 999_999;
+			snapshot.cost.total = 999;
+			snapshot.cost.input = 777;
+
+			const fresh = session.getBackgroundUsage();
+			expect(fresh.input).toBe(100);
+			expect(fresh.cost.total).toBeCloseTo(0.0033, 6);
+			expect(fresh.cost.input).toBeCloseTo(0.001, 6);
+		} finally {
+			session.dispose();
+		}
+	});
+
 	it("sums assistant usage across a compaction boundary", () => {
 		// Anchor test for the compaction-invariant contract: walking
 		// sessionManager.getEntries() must include BOTH pre- and post-compaction
