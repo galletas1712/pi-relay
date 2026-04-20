@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { AgentMessage, AgentToolCall, ThinkingLevel } from "@pi-relay/agent-core";
 import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@pi-relay/agent-core";
-import { validateToolArguments, type Model, type ToolResultMessage, type UserMessage } from "@pi-relay/ai";
+import { validateToolArguments, type MessageCacheHints, type Model, type ToolResultMessage, type UserMessage } from "@pi-relay/ai";
 import { serializeConversation, type AgentSessionEvent, type ToolDefinition } from "@pi-relay/coding-agent";
 import { createAgentContextTransform } from "./context-transform.js";
 import { BackgroundCapabilitiesSource, MultiAgentInstructionsSource } from "./prompt/index.js";
@@ -36,6 +36,14 @@ import {
 	type SpawnConfig,
 	type SubtreeUsageStats,
 } from "./types.js";
+
+/**
+ * Minimum stable-prefix byte size below which spawn-prompt cache hints are
+ * suppressed. The provider-side overhead of placing a cache_control breakpoint
+ * can outweigh the benefit for very small prefixes, so sibling spawns whose
+ * shared leading bytes are below this threshold skip the hint entirely.
+ */
+export const MIN_STABLE_SPAWN_PREFIX_BYTES = 1024;
 
 function slugifyRole(role: string): string {
 	const base = role
@@ -601,6 +609,11 @@ export class Orchestrator {
 
 		try {
 			const childCustomTools = this.createChildTools(agentId);
+			// Build the spawn prompt BEFORE creating the session so the computed
+			// `messageCacheHints` can be installed on the new agent's state at
+			// construction time. The child's first stream call then carries the
+			// hints without an extra plumbing hop.
+			const { prompt, cacheHints } = await this.buildSpawnPrompt(parentId, agentId, config);
 			const created = await this.sessionFactory({
 				mode: "spawn",
 				agentId,
@@ -609,6 +622,7 @@ export class Orchestrator {
 				customTools: childCustomTools,
 				parentSession: parent.session,
 				sessionDir: this.agentsDir,
+				spawnCacheHints: cacheHints,
 			});
 
 			await created.session.bindExtensions({});
@@ -635,7 +649,11 @@ export class Orchestrator {
 			};
 			parent.childIds.push(agentId);
 			this.registerRecord(record);
-			const prompt = await this.buildSpawnPrompt(parentId, agentId, config);
+			// Flush tree.json before returning so callers that inspect the file
+			// synchronously after await-ing `spawnAgent` observe the new child.
+			// `registerRecord` fires persistTree as fire-and-forget; we drain the
+			// chain here to make the caller-facing write-then-read ordering hold.
+			await this.persistTree();
 			void created.session.prompt(prompt).catch((error) => {
 				void this.handleAgentError(agentId, error);
 			});
@@ -1061,7 +1079,11 @@ export class Orchestrator {
 		}
 	}
 
-	private async buildSpawnPrompt(parentId: string, agentId: string, config: SpawnConfig): Promise<string> {
+	private async buildSpawnPrompt(
+		parentId: string,
+		agentId: string,
+		config: SpawnConfig,
+	): Promise<{ prompt: string; cacheHints: MessageCacheHints | undefined }> {
 		const ancestors: Array<{
 			id: string;
 			role: string;
@@ -1085,23 +1107,19 @@ export class Orchestrator {
 			current = current.parentId ? this.records.get(current.parentId) : undefined;
 		}
 
-		const sections: string[] = [];
-
-		// Parent-authored handoff goes at the very top of the child's
-		// prompt: it is the most task-critical, parent-chosen context. An
-		// empty-string handoff is treated as absent. PR-10 will revisit
-		// this ordering to optimize cache-stability; for PR-7 task
-		// relevance beats cache.
-		if (typeof config.handoff === "string" && config.handoff.length > 0) {
-			sections.push(`<parent-handoff>\n${config.handoff}\n</parent-handoff>`);
-		}
+		// Prompt layout is ordered most-stable first to maximize Anthropic /
+		// OpenAI-family prefix-cache reuse across sibling spawns from the same
+		// parent at the same turn. Everything up to (and including) the
+		// `<ancestor-focus>` / `<ancestor-recent-context>` blocks is a
+		// byte-stable function of (ancestor set, ancestor state) at spawn time,
+		// so concurrent siblings in a spawn burst produce identical leading
+		// bytes and share cache. Per-child varying sections (`<parent-handoff>`,
+		// `<parent-sibling-batch>`, and the task prompt) come after.
+		const stableSections: string[] = [];
 
 		// Build the ancestor-worklog prefix once across ALL ancestors so
 		// `buildAncestorWorklogPrefix` can apply cross-file supersession
-		// tombstones (a parent entry can tombstone a grandparent entry). This
-		// also clusters the byte-stable worklog blocks at the front of the
-		// prompt ahead of the varying `<ancestor-recent-context>` tails, which
-		// is the shape later PRs (pinned facts, spawn-prefix caching) rely on.
+		// tombstones (a parent entry can tombstone a grandparent entry).
 		//
 		// Topic filter: when the parent passed `topics` on `spawn(...)`,
 		// only ancestor entries whose meta.topics intersect with that set
@@ -1119,44 +1137,64 @@ export class Orchestrator {
 			includeTopics ? { includeTopics } : undefined,
 		);
 		if (worklogSection) {
-			sections.push(worklogSection);
+			stableSections.push(worklogSection);
 		}
 
-		// Prefer the fork-emitted focus pointer over the raw transcript
-		// tail when it exists AND is not stale. The focus pointer is a
-		// compact fork-authored summary of what the ancestor is working
-		// on RIGHT NOW; the transcript tail is a head-truncated 4KB blob
-		// of recent messages that can leak cross-thread noise. Staleness
-		// is measured in turn delta because the fork decides — per turn —
-		// whether to refresh the pointer; a long run of no-op forks means
-		// the pointer is out of date and the tail has fresher info.
+		// Prefer the fork-emitted focus pointer over the raw transcript tail
+		// when it exists AND is not stale. Within a single spawn burst all
+		// siblings observe the same ancestor state, so these blocks are
+		// byte-identical across siblings and stay inside the stable prefix.
 		const maxFocusStaleness = this.config.maxFocusStalenessTurns ?? DEFAULT_MAX_FOCUS_STALENESS_TURNS;
 		for (const ancestor of ancestors) {
 			const focus = ancestor.currentFocus;
 			const focusAge = focus ? ancestor.turnCount - focus.turn : Number.POSITIVE_INFINITY;
 			if (focus && focusAge <= maxFocusStaleness && focus.content.length > 0) {
-				sections.push(
+				stableSections.push(
 					`<ancestor-focus agent="${ancestor.id}" role="${ancestor.role}" turn="${focus.turn}">\n${focus.content}\n</ancestor-focus>`,
 				);
 				continue;
 			}
 			const recentContext = await this.serializeRecentAncestorContext(ancestor);
 			if (recentContext) {
-				sections.push(
+				stableSections.push(
 					`<ancestor-recent-context agent="${ancestor.id}" role="${ancestor.role}">\n${recentContext}\n</ancestor-recent-context>`,
 				);
 			}
 		}
 
-		const siblingBatch = this.buildSiblingBatchPrefix(parentId, agentId);
-		if (siblingBatch) {
-			sections.push(siblingBatch);
+		const varyingSections: string[] = [];
+		// Parent-authored handoff — per-child task context. Positioned after
+		// the stable prefix so siblings hitting the prefix cache don't get
+		// evicted by handoff variance. Empty string treated as absent.
+		if (typeof config.handoff === "string" && config.handoff.length > 0) {
+			varyingSections.push(`<parent-handoff>\n${config.handoff}\n</parent-handoff>`);
 		}
 
-		if (sections.length === 0) {
-			return config.prompt;
+		const siblingBatch = this.buildSiblingBatchPrefix(parentId, agentId);
+		if (siblingBatch) {
+			varyingSections.push(siblingBatch);
 		}
-		return `${sections.join("\n\n")}\n\n${config.prompt}`;
+
+		const stablePrefix = stableSections.join("\n\n");
+		const joinedSections = [...stableSections, ...varyingSections].join("\n\n");
+		const prompt = joinedSections.length === 0
+			? config.prompt
+			: `${joinedSections}\n\n${config.prompt}`;
+
+		// Emit cache hints only when the stable prefix crosses the minimum
+		// useful size. Below that threshold provider cache-write overhead
+		// dominates the potential hit, and the hint does more harm than good.
+		const stablePrefixBytes = Buffer.byteLength(stablePrefix, "utf8");
+		let cacheHints: MessageCacheHints | undefined;
+		if (stablePrefixBytes >= MIN_STABLE_SPAWN_PREFIX_BYTES) {
+			const sha = createHash("sha256").update(stablePrefix).digest("hex").slice(0, 16);
+			cacheHints = {
+				stableUserPrefixBytes: stablePrefixBytes,
+				promptCacheKey: `${parentId}:${sha}`,
+			};
+		}
+
+		return { prompt, cacheHints };
 	}
 
 	private scheduleWorklogFork(agentId: string, turn: number, turnMessages: AgentMessage[]): void {

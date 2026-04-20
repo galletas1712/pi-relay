@@ -275,6 +275,31 @@ export interface Context {
 	systemBlocks?: readonly SystemBlock[];
 	messages: Message[];
 	tools?: Tool[];
+	/**
+	 * Hints for provider-side cache-control placement. Populated by callers that
+	 * want sibling spawns (or repeated calls with a common leading prefix) to
+	 * share prefix-cache state across requests. Providers that don't honor these
+	 * fields silently ignore them.
+	 */
+	messageCacheHints?: MessageCacheHints;
+}
+
+/**
+ * See {@link Context.messageCacheHints}.
+ *
+ * - `stableUserPrefixBytes`: UTF-8 byte count at which to place a
+ *   `cache_control: {type:"ephemeral"}` breakpoint inside the FIRST user
+ *   message. The Anthropic provider splits the first text block at or
+ *   before (on a UTF-8 boundary) that byte offset and stamps the leading
+ *   half.
+ * - `promptCacheKey`: overrides the default session-id-based
+ *   `prompt_cache_key` used by OpenAI-family providers so multiple siblings
+ *   with an identical leading prefix (but different session ids) can share
+ *   the OpenAI prefix cache.
+ */
+export interface MessageCacheHints {
+	stableUserPrefixBytes?: number;
+	promptCacheKey?: string;
 }
 
 /**

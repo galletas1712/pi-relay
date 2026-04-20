@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@pi-relay/agent-core";
-import { clampThinkingLevel, getThinkingLevels, type Message, type Model, streamSimple } from "@pi-relay/ai";
+import { clampThinkingLevel, getThinkingLevels, type Message, type MessageCacheHints, type Model, streamSimple } from "@pi-relay/ai";
 import { getAgentDir, getDocsPath } from "../config.js";
 import { AgentSession } from "./agent-session.js";
 import { AuthStorage } from "./auth-storage.js";
@@ -75,6 +75,14 @@ export interface CreateAgentSessionOptions {
 	settingsManager?: SettingsManager;
 	/** Session start event metadata for extension runtime startup. */
 	sessionStartEvent?: SessionStartEvent;
+	/**
+	 * Optional provider-side cache hints installed on the new session's
+	 * `Agent.state.messageCacheHints`. The agent loop copies them into every
+	 * stream call's {@link Context}. The orchestrator populates this when a
+	 * spawned child inherits a byte-stable leading prefix from its ancestor
+	 * worklog so siblings sharing that prefix hit the provider prefix cache.
+	 */
+	messageCacheHints?: MessageCacheHints;
 }
 
 /** Result from createAgentSession */
@@ -302,6 +310,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			model,
 			thinkingLevel,
 			tools: [],
+			messageCacheHints: options.messageCacheHints,
 		},
 		convertToLlm: convertToLlmWithBlockImages,
 		streamFn: async (model, context, options) => {

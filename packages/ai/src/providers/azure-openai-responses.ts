@@ -234,11 +234,17 @@ function buildParams(
 	const messages = convertResponsesMessages(model, context, AZURE_TOOL_CALL_PROVIDERS);
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	// Honor caller-supplied cache hint so sibling spawns can share the Azure
+	// prefix cache when their stable user-message prefix matches.
+	const promptCacheKey =
+		cacheRetention === "none"
+			? undefined
+			: (context.messageCacheHints?.promptCacheKey ?? options?.sessionId);
 	const params: ResponseCreateParamsStreaming = {
 		model: deploymentName,
 		input: messages,
 		stream: true,
-		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
+		prompt_cache_key: promptCacheKey,
 	};
 
 	if (options?.maxTokens) {

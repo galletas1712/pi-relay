@@ -839,7 +839,7 @@ function buildParams(
 	const { cacheControl } = getCacheControl(model.baseUrl, options?.cacheRetention);
 	const params: MessageCreateParamsStreaming = {
 		model: model.id,
-		messages: convertMessages(context.messages, model, isOAuthToken, cacheControl),
+		messages: convertMessages(context.messages, model, isOAuthToken, cacheControl, context.messageCacheHints?.stableUserPrefixBytes),
 		max_tokens: options?.maxTokens || (model.maxTokens / 3) | 0,
 		stream: true,
 	};
@@ -956,6 +956,85 @@ function buildParams(
 	return params;
 }
 
+// Minimum stable-prefix size below which the split is skipped. Cache-control
+// breakpoints have non-zero provider overhead per-block; a tiny first-half
+// can't recover that, so the caller's hint is ignored when the prefix would
+// be shorter than this threshold.
+const MIN_STABLE_PREFIX_BYTES_FOR_CACHE = 1024;
+
+/**
+ * Snap `bytes` DOWN to the nearest valid UTF-8 boundary inside `text`.
+ *
+ * UTF-8 byte layout:
+ *   - 0xxxxxxx: 1-byte sequence (ASCII)
+ *   - 10xxxxxx: continuation byte (never first byte of a codepoint)
+ *   - 11xxxxxx: leading byte of a multi-byte sequence
+ *
+ * If `bytes` lands on a continuation byte we step back until we find either a
+ * leading byte or the start of buffer. We only ever snap DOWN so the leading
+ * half is guaranteed to be well-formed UTF-8. Returns a clamped value in
+ * `[0, buffer.length]`.
+ */
+function snapDownToUtf8Boundary(buffer: Buffer, bytes: number): number {
+	if (bytes <= 0) return 0;
+	if (bytes >= buffer.length) return buffer.length;
+	let at = bytes;
+	while (at > 0 && (buffer[at] & 0xc0) === 0x80) {
+		at--;
+	}
+	return at;
+}
+
+/**
+ * Given a single text string destined for a `role: "user"` message, return a
+ * two-block `[prefix{cache_control}, suffix]` split at the requested byte
+ * offset, or `undefined` when no split should happen (hint absent, too small,
+ * or falls past the string).
+ */
+function maybeSplitForStablePrefix(
+	text: string,
+	stableUserPrefixBytes: number | undefined,
+): ContentBlockParam[] | undefined {
+	if (!stableUserPrefixBytes || stableUserPrefixBytes < MIN_STABLE_PREFIX_BYTES_FOR_CACHE) {
+		return undefined;
+	}
+	const buffer = Buffer.from(text, "utf8");
+	if (buffer.length <= stableUserPrefixBytes) {
+		return undefined;
+	}
+	const snapped = snapDownToUtf8Boundary(buffer, stableUserPrefixBytes);
+	if (snapped < MIN_STABLE_PREFIX_BYTES_FOR_CACHE) {
+		return undefined;
+	}
+	const prefix = buffer.subarray(0, snapped).toString("utf8");
+	const suffix = buffer.subarray(snapped).toString("utf8");
+	return [
+		{ type: "text", text: prefix, cache_control: { type: "ephemeral" } } as ContentBlockParam,
+		{ type: "text", text: suffix } as ContentBlockParam,
+	];
+}
+
+/**
+ * Variant of {@link maybeSplitForStablePrefix} that mutates an already-built
+ * block list in place. Operates on the FIRST `type: "text"` block; leaves
+ * image/tool-result blocks untouched. No-op when the hint is absent, the
+ * prefix is too small, or the first text block is shorter than the hint.
+ */
+function maybeStampStablePrefixOnBlocks(
+	blocks: ContentBlockParam[],
+	stableUserPrefixBytes: number | undefined,
+): void {
+	if (!stableUserPrefixBytes || stableUserPrefixBytes < MIN_STABLE_PREFIX_BYTES_FOR_CACHE) return;
+	for (let i = 0; i < blocks.length; i++) {
+		const block = blocks[i];
+		if (block.type !== "text") continue;
+		const split = maybeSplitForStablePrefix(block.text, stableUserPrefixBytes);
+		if (!split) return;
+		blocks.splice(i, 1, ...split);
+		return;
+	}
+}
+
 // Normalize tool call IDs to match Anthropic's required pattern and length
 function normalizeToolCallId(id: string): string {
 	return id.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 64);
@@ -966,11 +1045,14 @@ function convertMessages(
 	model: Model<"anthropic-messages">,
 	isOAuthToken: boolean,
 	cacheControl?: CacheControlEphemeral,
+	stableUserPrefixBytes?: number,
 ): MessageParam[] {
 	const params: MessageParam[] = [];
 
 	// Transform messages for cross-provider compatibility
 	const transformedMessages = transformMessages(messages, model, normalizeToolCallId);
+
+	let firstUserMessageEmitted = false;
 
 	for (let i = 0; i < transformedMessages.length; i++) {
 		const msg = transformedMessages[i];
@@ -978,10 +1060,26 @@ function convertMessages(
 		if (msg.role === "user") {
 			if (typeof msg.content === "string") {
 				if (msg.content.trim().length > 0) {
-					params.push({
-						role: "user",
-						content: sanitizeSurrogates(msg.content),
-					});
+					// Honor messageCacheHints.stableUserPrefixBytes on the first emitted
+					// user message: split its single text block at the byte boundary and
+					// stamp cache_control on the leading half. Sibling spawns with an
+					// identical stable prefix then share Anthropic's prefix cache.
+					const sanitized = sanitizeSurrogates(msg.content);
+					const blocks = !firstUserMessageEmitted
+						? maybeSplitForStablePrefix(sanitized, stableUserPrefixBytes)
+						: undefined;
+					if (blocks) {
+						params.push({
+							role: "user",
+							content: blocks,
+						});
+					} else {
+						params.push({
+							role: "user",
+							content: sanitized,
+						});
+					}
+					firstUserMessageEmitted = true;
 				}
 			} else {
 				const blocks: ContentBlockParam[] = msg.content.map((item) => {
@@ -1009,6 +1107,13 @@ function convertMessages(
 					return true;
 				});
 				if (filteredBlocks.length === 0) continue;
+				// Apply the stable-prefix cache breakpoint on the FIRST text block of
+				// the FIRST user message. This parallels the string-content branch
+				// above and only fires when the caller supplied a positive hint.
+				if (!firstUserMessageEmitted) {
+					maybeStampStablePrefixOnBlocks(filteredBlocks, stableUserPrefixBytes);
+					firstUserMessageEmitted = true;
+				}
 				params.push({
 					role: "user",
 					content: filteredBlocks,

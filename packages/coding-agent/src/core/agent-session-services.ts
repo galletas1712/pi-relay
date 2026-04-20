@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import type { ThinkingLevel } from "@pi-relay/agent-core";
-import type { Model } from "@pi-relay/ai";
+import type { MessageCacheHints, Model } from "@pi-relay/ai";
 import { getAgentDir } from "../config.js";
 import { AuthStorage } from "./auth-storage.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
@@ -57,6 +57,8 @@ export interface CreateAgentSessionFromServicesOptions {
 	toolNames?: string[];
 	baseToolDefinitionsFactory?: () => ToolDefinition[];
 	customTools?: ToolDefinition[];
+	/** See {@link CreateAgentSessionOptions.messageCacheHints}. */
+	messageCacheHints?: MessageCacheHints;
 }
 
 /**
@@ -197,5 +199,6 @@ export async function createAgentSessionFromServices(
 		baseToolDefinitionsFactory: options.baseToolDefinitionsFactory,
 		customTools: options.customTools,
 		sessionStartEvent: options.sessionStartEvent,
+		messageCacheHints: options.messageCacheHints,
 	});
 }

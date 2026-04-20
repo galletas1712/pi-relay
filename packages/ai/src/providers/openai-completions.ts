@@ -392,11 +392,17 @@ function buildParams(model: Model<"openai-completions">, context: Context, optio
 	maybeAddOpenRouterAnthropicCacheControl(model, messages);
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	// Honor caller-supplied cache hint so sibling spawns with a shared leading
+	// user-message prefix reuse the prefix cache across sessions.
+	const promptCacheKey =
+		cacheRetention === "none"
+			? undefined
+			: (context.messageCacheHints?.promptCacheKey ?? options?.sessionId);
 	const params: OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming = {
 		model: model.id,
 		messages,
 		stream: true,
-		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
+		prompt_cache_key: promptCacheKey,
 	};
 
 	if (compat.supportsUsageInStreaming !== false) {

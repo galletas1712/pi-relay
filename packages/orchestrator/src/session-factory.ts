@@ -51,6 +51,7 @@ export function createRelaySessionFactory(options: {
 			),
 			baseToolDefinitionsFactory,
 			customTools: sessionOptions.customTools as ToolDefinition[],
+			messageCacheHints: sessionOptions.spawnCacheHints,
 			sessionStartEvent:
 				sessionOptions.mode === "restore"
 					? { type: "session_start", reason: "resume", previousSessionFile: sessionOptions.sessionFile }

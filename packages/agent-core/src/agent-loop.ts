@@ -557,6 +557,7 @@ async function streamAssistantResponse(
 	const llmContext: Context = {
 		systemPrompt: context.systemPrompt,
 		systemBlocks: context.systemBlocks,
+		messageCacheHints: context.messageCacheHints,
 		messages: llmMessages,
 		tools: createAdvertisedTools(context.tools, config.backgroundAllowlist),
 	};

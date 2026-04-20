@@ -331,6 +331,12 @@ function buildRequestBody(
 	});
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	// Honor caller-supplied cache hint so sibling spawns with a shared leading
+	// user-message prefix reuse the prefix cache across sessions.
+	const promptCacheKey =
+		cacheRetention === "none"
+			? undefined
+			: (context.messageCacheHints?.promptCacheKey ?? options?.sessionId);
 	const body: RequestBody = {
 		model: model.id,
 		store: false,
@@ -339,7 +345,7 @@ function buildRequestBody(
 		input: messages,
 		text: { verbosity: options?.textVerbosity || "medium" },
 		include: ["reasoning.encrypted_content"],
-		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
+		prompt_cache_key: promptCacheKey,
 		tool_choice: "auto",
 		parallel_tool_calls: true,
 	};

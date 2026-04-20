@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import type { Usage } from "@pi-relay/ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { isLikelyTrivialTurn, Orchestrator } from "../src/orchestrator.js";
+import { isLikelyTrivialTurn, MIN_STABLE_SPAWN_PREFIX_BYTES, Orchestrator } from "../src/orchestrator.js";
 import { appendWorklogEntry, buildAncestorWorklogPrefix, buildCompactionPrompt, buildWorklogPrompt, clampFocusPointerContent, computeTopicVocabulary, formatCompactionSummary, formatWorklogEntry, getLastCompactionSummary, MAX_FOCUS_POINTER_CHARS, parseWorklogEntries, rewriteWorklogWithSummary, SET_FOCUS_POINTER_TOOL, summarizePinnedEntry, updateWorklogEntryPin, WORKLOG_COMPACT_TOOL } from "../src/worklog.js";
 import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
@@ -2853,7 +2853,7 @@ describe("buildSpawnPrompt handoff", () => {
 		}
 	});
 
-	it("spawn with handoff: child prompt contains <parent-handoff> BEFORE ancestor sections", async () => {
+	it("spawn with handoff: child prompt contains <parent-handoff> AFTER ancestor worklog (stable-prefix ordering)", async () => {
 		const sessionDir = createTempDir("pi-relay-handoff-");
 		tempDirs.push(sessionDir);
 
@@ -2888,11 +2888,15 @@ describe("buildSpawnPrompt handoff", () => {
 		expect(prompt).toContain("<parent-handoff>");
 		expect(prompt).toContain("Key compressed context the child needs.");
 		expect(prompt).toContain("</parent-handoff>");
-		// handoff comes BEFORE the ancestor worklog block.
-		const handoffIdx = prompt.indexOf("<parent-handoff>");
+		// PR-10: handoff is positioned AFTER the byte-stable ancestor cluster
+		// so sibling spawns hitting the prefix cache aren't evicted by per-child
+		// handoff variance. The task prompt (`do the thing`) still comes LAST.
 		const worklogIdx = prompt.indexOf("<ancestor-worklog");
-		expect(handoffIdx).toBeGreaterThanOrEqual(0);
-		expect(worklogIdx).toBeGreaterThan(handoffIdx);
+		const handoffIdx = prompt.indexOf("<parent-handoff>");
+		const promptIdx = prompt.indexOf("do the thing");
+		expect(worklogIdx).toBeGreaterThanOrEqual(0);
+		expect(handoffIdx).toBeGreaterThan(worklogIdx);
+		expect(promptIdx).toBeGreaterThan(handoffIdx);
 	});
 
 	it("spawn without handoff: no <parent-handoff> block", async () => {
@@ -4421,5 +4425,240 @@ describe("rolling worklog compaction", () => {
 		expect(forkPromptText).toContain("<current-summary>");
 		expect(forkPromptText).toContain("condensed body visible to the fork");
 		expect(forkPromptText).toContain("</current-summary>");
+	});
+});
+
+describe("buildSpawnPrompt cache ordering (PR-10)", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	async function seedRootWorklog(orchestrator: Orchestrator, entries: number, bodyBytes: number): Promise<void> {
+		const rootRecord = orchestrator.getRecord("root");
+		const { writeFile, mkdir } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		await mkdir(dirname(rootRecord.worklogFile), { recursive: true });
+		const parts: string[] = [];
+		for (let i = 0; i < entries; i++) {
+			const body = "x".repeat(bodyBytes) + ` entry-${i}`;
+			parts.push(
+				formatWorklogEntry(body, i + 1, {
+					iso: `2026-12-01T00:${String(i + 1).padStart(2, "0")}:00.000Z`,
+				}),
+			);
+		}
+		await writeFile(rootRecord.worklogFile, `${parts.join("\n\n")}\n\n`, "utf-8");
+	}
+
+	it("stable prefix (ancestor-worklog → focus/recent-context) precedes varying sections (handoff → sibling-batch → prompt)", async () => {
+		const sessionDir = createTempDir("pi-relay-pr10-order-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		await seedRootWorklog(orchestrator, 3, 200);
+
+		await orchestrator.spawnAgent("root", {
+			role: "helper",
+			prompt: "UNIQUE-TASK-PROMPT",
+			handoff: "compressed context the child needs",
+		});
+
+		await vi.waitFor(() => expect(child.prompts).toHaveLength(1));
+		const prompt = child.prompts[0] ?? "";
+		const worklogIdx = prompt.indexOf("<ancestor-worklog");
+		const handoffIdx = prompt.indexOf("<parent-handoff>");
+		const promptIdx = prompt.indexOf("UNIQUE-TASK-PROMPT");
+		expect(worklogIdx).toBeGreaterThanOrEqual(0);
+		expect(handoffIdx).toBeGreaterThan(worklogIdx);
+		expect(promptIdx).toBeGreaterThan(handoffIdx);
+	});
+
+	it("no handoff: handoff slot absent, other ordering preserved", async () => {
+		const sessionDir = createTempDir("pi-relay-pr10-noh-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		await seedRootWorklog(orchestrator, 2, 200);
+
+		await orchestrator.spawnAgent("root", { role: "helper", prompt: "ZZZ-TASK" });
+
+		await vi.waitFor(() => expect(child.prompts).toHaveLength(1));
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).not.toContain("<parent-handoff>");
+		const worklogIdx = prompt.indexOf("<ancestor-worklog");
+		const promptIdx = prompt.indexOf("ZZZ-TASK");
+		expect(worklogIdx).toBeGreaterThanOrEqual(0);
+		expect(promptIdx).toBeGreaterThan(worklogIdx);
+	});
+
+	it("stable prefix is byte-identical across sibling spawns from the same burst", async () => {
+		const sessionDir = createTempDir("pi-relay-pr10-siblings-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const childA = new FakeSession("child-a-session", { sessionDir });
+		const childB = new FakeSession("child-b-session", { sessionDir });
+		const childC = new FakeSession("child-c-session", { sessionDir });
+		const queue = [childA, childB, childC];
+		const hintsByAgentId = new Map<string, { stableUserPrefixBytes?: number; promptCacheKey?: string } | undefined>();
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async (opts) => {
+				hintsByAgentId.set(opts.agentId, opts.spawnCacheHints);
+				return { session: queue.shift()! };
+			}),
+		});
+
+		await seedRootWorklog(orchestrator, 5, 400);
+
+		const idA = await orchestrator.spawnAgent("root", {
+			role: "helper-a",
+			prompt: "task A",
+			handoff: "A-specific handoff context",
+		});
+		const idB = await orchestrator.spawnAgent("root", {
+			role: "helper-b",
+			prompt: "task B",
+			handoff: "B-specific handoff context",
+		});
+		const idC = await orchestrator.spawnAgent("root", {
+			role: "helper-c",
+			prompt: "task C",
+			handoff: "C-specific handoff context",
+		});
+
+		await vi.waitFor(() => {
+			expect(childA.prompts).toHaveLength(1);
+			expect(childB.prompts).toHaveLength(1);
+			expect(childC.prompts).toHaveLength(1);
+		});
+
+		const hintsA = hintsByAgentId.get(idA);
+		const hintsB = hintsByAgentId.get(idB);
+		const hintsC = hintsByAgentId.get(idC);
+		expect(hintsA?.stableUserPrefixBytes).toBeDefined();
+		expect(hintsB?.stableUserPrefixBytes).toBe(hintsA?.stableUserPrefixBytes);
+		expect(hintsC?.stableUserPrefixBytes).toBe(hintsA?.stableUserPrefixBytes);
+
+		const bytesPrefix = hintsA!.stableUserPrefixBytes!;
+		const a = Buffer.from(childA.prompts[0] ?? "", "utf8");
+		const b = Buffer.from(childB.prompts[0] ?? "", "utf8");
+		const c = Buffer.from(childC.prompts[0] ?? "", "utf8");
+		expect(a.subarray(0, bytesPrefix).equals(b.subarray(0, bytesPrefix))).toBe(true);
+		expect(a.subarray(0, bytesPrefix).equals(c.subarray(0, bytesPrefix))).toBe(true);
+		// Tail (per-child handoff + task prompt) varies.
+		expect(a.subarray(bytesPrefix).equals(b.subarray(bytesPrefix))).toBe(false);
+
+		// SHA-derived cache keys match across siblings and encode the parent.
+		expect(hintsA?.promptCacheKey).toBeDefined();
+		expect(hintsB?.promptCacheKey).toBe(hintsA?.promptCacheKey);
+		expect(hintsC?.promptCacheKey).toBe(hintsA?.promptCacheKey);
+		expect(hintsA!.promptCacheKey!.startsWith("root:")).toBe(true);
+	});
+
+	it("worklog append between siblings invalidates the shared cache key", async () => {
+		const sessionDir = createTempDir("pi-relay-pr10-drift-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const childA = new FakeSession("child-a-session", { sessionDir });
+		const childB = new FakeSession("child-b-session", { sessionDir });
+		const queue = [childA, childB];
+		const hintsByAgentId = new Map<string, { promptCacheKey?: string } | undefined>();
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async (opts) => {
+				hintsByAgentId.set(opts.agentId, opts.spawnCacheHints);
+				return { session: queue.shift()! };
+			}),
+		});
+
+		await seedRootWorklog(orchestrator, 3, 300);
+
+		const idA = await orchestrator.spawnAgent("root", { role: "helper-a", prompt: "A" });
+
+		const rootRecord = orchestrator.getRecord("root");
+		const { appendFile } = await import("node:fs/promises");
+		const extra = formatWorklogEntry("late-arriving-entry", 99, {
+			iso: "2026-12-01T23:59:59.000Z",
+		});
+		await appendFile(rootRecord.worklogFile, `${extra}\n\n`, "utf-8");
+
+		const idB = await orchestrator.spawnAgent("root", { role: "helper-b", prompt: "B" });
+
+		await vi.waitFor(() => {
+			expect(childA.prompts).toHaveLength(1);
+			expect(childB.prompts).toHaveLength(1);
+		});
+
+		const hintsA = hintsByAgentId.get(idA);
+		const hintsB = hintsByAgentId.get(idB);
+		expect(hintsA?.promptCacheKey).toBeDefined();
+		expect(hintsB?.promptCacheKey).toBeDefined();
+		expect(hintsB?.promptCacheKey).not.toBe(hintsA?.promptCacheKey);
+	});
+
+	it("tiny stable prefix: no cache hints emitted (below MIN_STABLE_SPAWN_PREFIX_BYTES)", async () => {
+		const sessionDir = createTempDir("pi-relay-pr10-small-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const hintsByAgentId = new Map<string, unknown>();
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async (opts) => {
+				hintsByAgentId.set(opts.agentId, opts.spawnCacheHints);
+				return { session: child };
+			}),
+		});
+
+		// No ancestor worklog seeded → stable prefix is empty → no hints.
+		const id = await orchestrator.spawnAgent("root", { role: "helper", prompt: "tiny" });
+
+		await vi.waitFor(() => expect(child.prompts).toHaveLength(1));
+		expect(hintsByAgentId.get(id)).toBeUndefined();
+	});
+
+	it("stable prefix above threshold: hints populated with bytes + cache key", async () => {
+		const sessionDir = createTempDir("pi-relay-pr10-above-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const hintsByAgentId = new Map<string, { stableUserPrefixBytes?: number; promptCacheKey?: string } | undefined>();
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async (opts) => {
+				hintsByAgentId.set(opts.agentId, opts.spawnCacheHints);
+				return { session: child };
+			}),
+		});
+
+		// Seed >> 1KB of ancestor worklog content.
+		await seedRootWorklog(orchestrator, 4, 500);
+
+		const id = await orchestrator.spawnAgent("root", { role: "helper", prompt: "task" });
+		await vi.waitFor(() => expect(child.prompts).toHaveLength(1));
+
+		const hints = hintsByAgentId.get(id);
+		expect(hints).toBeDefined();
+		expect(hints?.stableUserPrefixBytes ?? 0).toBeGreaterThanOrEqual(MIN_STABLE_SPAWN_PREFIX_BYTES);
+		expect(hints?.promptCacheKey).toMatch(/^root:[0-9a-f]{16}$/);
 	});
 });

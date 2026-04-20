@@ -3,6 +3,7 @@ import type {
 	AssistantMessageEvent,
 	ImageContent,
 	Message,
+	MessageCacheHints,
 	Model,
 	SimpleStreamOptions,
 	streamSimple,
@@ -257,6 +258,12 @@ export interface AgentState {
 	 * `systemPrompt` was set by an extension that doesn't produce blocks.
 	 */
 	systemBlocks?: readonly SystemBlock[];
+	/**
+	 * Optional provider-side cache-control hints forwarded to the LLM
+	 * {@link Context.messageCacheHints} on every stream call. Set by the
+	 * orchestrator when a spawned child inherits a byte-stable ancestor prefix.
+	 */
+	messageCacheHints?: MessageCacheHints;
 	/** Active model used for future turns. */
 	model: Model<any>;
 	/** Requested reasoning level for future turns. */
@@ -324,6 +331,13 @@ export interface AgentContext {
 	messages: AgentMessage[];
 	/** Tools available for this run. */
 	tools?: AgentTool<any>[];
+	/**
+	 * Optional provider-side cache-control hints forwarded verbatim to the
+	 * LLM {@link Context.messageCacheHints}. Set by the orchestrator when a
+	 * spawned child inherits a byte-stable ancestor prefix; providers that
+	 * don't honor the hints silently ignore them.
+	 */
+	messageCacheHints?: MessageCacheHints;
 }
 
 /**

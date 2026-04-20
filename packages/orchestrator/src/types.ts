@@ -6,7 +6,7 @@ import type {
 	StreamFn,
 	ThinkingLevel,
 } from "@pi-relay/agent-core";
-import type { ImageContent, Message, Model, SimpleStreamOptions, TextContent, ThinkingBudgets, Transport, Usage } from "@pi-relay/ai";
+import type { ImageContent, Message, MessageCacheHints, Model, SimpleStreamOptions, TextContent, ThinkingBudgets, Transport, Usage } from "@pi-relay/ai";
 import type { AgentSessionEvent, BackgroundUsageScope, PromptSource, SessionStats, ToolDefinition, ToolInfo } from "@pi-relay/coding-agent";
 
 export type { BackgroundUsageScope, SessionStats };
@@ -315,6 +315,16 @@ export interface AgentSessionFactoryOptions {
 	sessionDir?: string;
 	customTools: ToolDefinition[];
 	parentSession: AgentSessionHandle;
+	/**
+	 * Optional provider-side cache hints the orchestrator attaches when the
+	 * child inherits a byte-stable leading prefix from its ancestor worklog.
+	 * Forwarded unchanged to the created `AgentSession` so every stream call
+	 * carries them in its `Context`. Providers that don't honor them silently
+	 * ignore. Restored sessions leave this undefined — the hint depends on
+	 * the exact prefix the child was originally spawned with and can't be
+	 * reconstructed from `tree.json`.
+	 */
+	spawnCacheHints?: MessageCacheHints;
 }
 
 export interface CreatedAgentSession {

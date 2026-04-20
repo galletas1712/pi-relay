@@ -205,11 +205,18 @@ function buildParams(model: Model<"openai-responses">, context: Context, options
 	const messages = convertResponsesMessages(model, context, OPENAI_TOOL_CALL_PROVIDERS);
 
 	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
+	// Honor caller-supplied cache hint when present; otherwise fall back to the
+	// session id. The override lets multiple sessions (e.g. sibling spawns) with
+	// an identical leading prefix share the OpenAI prefix cache.
+	const promptCacheKey =
+		cacheRetention === "none"
+			? undefined
+			: (context.messageCacheHints?.promptCacheKey ?? options?.sessionId);
 	const params: ResponseCreateParamsStreaming = {
 		model: model.id,
 		input: messages,
 		stream: true,
-		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
+		prompt_cache_key: promptCacheKey,
 		prompt_cache_retention: getPromptCacheRetention(model.baseUrl, cacheRetention),
 		store: false,
 	};
