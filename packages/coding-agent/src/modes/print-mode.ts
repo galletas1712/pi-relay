@@ -8,7 +8,7 @@
 
 import type { AssistantMessage, ImageContent } from "@pi-relay/ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.js";
-import { formatCacheLogLine } from "../core/cache-telemetry.js";
+import { formatCacheLogLine, isCacheStatsEnabled } from "../core/cache-telemetry.js";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../utils/shell.js";
 
