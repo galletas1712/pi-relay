@@ -1,10 +1,11 @@
 import { readFile } from "node:fs/promises";
+import type { Usage } from "@pi-relay/ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { Orchestrator } from "../src/orchestrator.js";
 import { appendWorklogEntry, buildWorklogPrompt } from "../src/worklog.js";
 import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
-function createWorklogAssistant(content: string) {
+function createWorklogAssistant(content: string, usage?: Usage) {
 	return {
 		role: "assistant" as const,
 		content: [
@@ -17,6 +18,7 @@ function createWorklogAssistant(content: string) {
 		],
 		stopReason: "toolUse" as const,
 		timestamp: Date.now(),
+		...(usage ? { usage } : {}),
 	};
 }
 
@@ -341,5 +343,105 @@ describe("worklog fork", () => {
 		expect(root.sentMessages).toHaveLength(0);
 		expect(Array.isArray(transformedMessages)).toBe(true);
 		expect((transformedMessages as unknown[]).length).toBe(1);
+	});
+
+	it("attributes worklog-fork usage to the child session via addBackgroundUsage", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const workUsage: Usage = {
+			input: 123,
+			output: 45,
+			cacheRead: 678,
+			cacheWrite: 0,
+			totalTokens: 846,
+			cost: { input: 0.01, output: 0.02, cacheRead: 0.001, cacheWrite: 0, total: 0.031 },
+		};
+		const streamFn = vi.fn(async () => ({
+			result: async () => createWorklogAssistant("## Findings\n- Usage is captured.", workUsage),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "Inspect the orchestrator." }],
+					timestamp: Date.now(),
+				},
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect the orchestrator",
+		});
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await vi.waitFor(() => {
+			expect(orchestrator.getRecord(childId).lastWorklogTurn).toBe(1);
+		});
+		// Usage lands on the CHILD session (the one that owns the worklog), not
+		// the root, so subtree aggregation and the child's footer pick it up.
+		expect(child.backgroundUsageCalls).toHaveLength(1);
+		expect(child.backgroundUsageCalls[0]).toEqual({ usage: workUsage, scope: "worklog" });
+		expect(root.backgroundUsageCalls).toHaveLength(0);
+	});
+
+	it("still records worklog usage when the assistant turn did not produce a tool call", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const noToolUsage: Usage = {
+			input: 500,
+			output: 12,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 512,
+			cost: { input: 0.02, output: 0.001, cacheRead: 0, cacheWrite: 0, total: 0.021 },
+		};
+		const streamFn = vi.fn(async () => ({
+			result: async () => ({
+				role: "assistant" as const,
+				content: [{ type: "text", text: "I have nothing durable to add yet." }],
+				stopReason: "stop" as const,
+				usage: noToolUsage,
+				timestamp: Date.now(),
+			}),
+		}) as never);
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{
+					role: "user",
+					content: [{ type: "text", text: "Inspect the orchestrator." }],
+					timestamp: Date.now(),
+				},
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		await orchestrator.spawnAgent("root", {
+			role: "explore",
+			prompt: "inspect the orchestrator",
+		});
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		await waitForMicrotasks();
+		// Even a worklog fork that produces no worklog update still spent
+		// tokens — they should be attributed, not dropped.
+		expect(child.backgroundUsageCalls).toEqual([{ usage: noToolUsage, scope: "worklog" }]);
 	});
 });

@@ -31,6 +31,8 @@ export {
 	type AgentSessionConfig,
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
+	type BackgroundUsageScope,
+	createEmptyUsage,
 	type ModelCycleResult,
 	type ParsedSkillBlock,
 	type PromptOptions,

@@ -30,6 +30,7 @@ import type {
 	Model,
 	SystemBlock,
 	TextContent,
+	Usage,
 } from "@pi-relay/ai";
 import {
 	clampThinkingLevel,
@@ -155,6 +156,28 @@ export type AgentSessionEvent =
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
 
+/**
+ * Origin of a background (out-of-band) LLM call whose usage is aggregated
+ * into the session's self stats via {@link AgentSession.addBackgroundUsage}.
+ *
+ * These calls do not appear in the session transcript, so their usage would
+ * otherwise be invisible to \`getSessionStats\`, the TUI footer, the
+ * \[pi:cache\] telemetry, and subtree aggregation.
+ */
+export type BackgroundUsageScope = "worklog" | "compaction" | "branch" | "turn-prefix";
+
+/** Allocate a zero-initialized {@link Usage} with a fresh \`cost\` object. */
+export function createEmptyUsage(): Usage {
+	return {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+}
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -277,6 +300,11 @@ export class AgentSession {
 
 	// Branch summarization state
 	private _branchSummaryAbortController: AbortController | undefined = undefined;
+
+	// Aggregated usage from out-of-band LLM calls (worklog forks, compaction,
+	// branch/turn-prefix summaries). In-memory only; never persisted to the
+	// session JSONL. See addBackgroundUsage() for the wire-up rationale.
+	private _backgroundUsage: Usage = createEmptyUsage();
 
 	// Retry state
 	private _retryAbortController: AbortController | undefined = undefined;
@@ -1730,7 +1758,9 @@ export class AgentSession {
 				tokensBefore = extensionCompaction.tokensBefore;
 				details = extensionCompaction.details;
 			} else {
-				// Generate compaction result
+				// Generate compaction result. The summarization call is made
+				// out-of-band from the session transcript; attribute its usage
+				// so tokens and cost show up in session stats + telemetry.
 				const result = await compact(
 					preparation,
 					this.model,
@@ -1738,6 +1768,7 @@ export class AgentSession {
 					headers,
 					customInstructions,
 					this._compactionAbortController.signal,
+					(usage, scope) => this.addBackgroundUsage(usage, scope),
 				);
 				summary = result.summary;
 				firstKeptEntryId = result.firstKeptEntryId;
@@ -1994,7 +2025,8 @@ export class AgentSession {
 				tokensBefore = extensionCompaction.tokensBefore;
 				details = extensionCompaction.details;
 			} else {
-				// Generate compaction result
+				// Generate compaction result. Attribute the summarization call's
+				// usage — out-of-band LLM call, otherwise invisible to telemetry.
 				const compactResult = await compact(
 					preparation,
 					this.model,
@@ -2002,6 +2034,7 @@ export class AgentSession {
 					headers,
 					undefined,
 					this._autoCompactionAbortController.signal,
+					(usage, scope) => this.addBackgroundUsage(usage, scope),
 				);
 				summary = compactResult.summary;
 				firstKeptEntryId = compactResult.firstKeptEntryId;
@@ -2833,6 +2866,9 @@ export class AgentSession {
 				customInstructions,
 				replaceInstructions,
 				reserveTokens: branchSummarySettings.reserveTokens,
+				// Branch summarization is an out-of-band LLM call; attribute its
+				// tokens/cost to this session so they flow through session stats.
+				onUsage: (usage) => this.addBackgroundUsage(usage, "branch"),
 			});
 			this._branchSummaryAbortController = undefined;
 			if (result.aborted) {
@@ -2977,6 +3013,52 @@ export class AgentSession {
 	}
 
 	/**
+	 * Record usage from a background (out-of-band) LLM call into the session's
+	 * self stats. Background calls — worklog forks, compaction summaries,
+	 * branch summaries, turn-prefix summaries — never land in the session
+	 * transcript, so their tokens and cost would otherwise be invisible to
+	 * every consumer of `getSessionStats` (TUI footer, print-mode telemetry,
+	 * subtree aggregation).
+	 *
+	 * The accumulator is in-memory only and resets on process restart. That
+	 * matches the semantic users expect from "what did this runtime cost" and
+	 * keeps the session JSONL schema unchanged.
+	 *
+	 * `scope` is reserved for future per-origin telemetry; today it's carried
+	 * through but not separately surfaced. All scopes sum into the single
+	 * aggregate.
+	 */
+	addBackgroundUsage(usage: Usage, _scope?: BackgroundUsageScope): void {
+		const acc = this._backgroundUsage;
+		acc.input += usage.input ?? 0;
+		acc.output += usage.output ?? 0;
+		acc.cacheRead += usage.cacheRead ?? 0;
+		acc.cacheWrite += usage.cacheWrite ?? 0;
+		if (usage.cacheWrite5m !== undefined) {
+			acc.cacheWrite5m = (acc.cacheWrite5m ?? 0) + usage.cacheWrite5m;
+		}
+		if (usage.cacheWrite1h !== undefined) {
+			acc.cacheWrite1h = (acc.cacheWrite1h ?? 0) + usage.cacheWrite1h;
+		}
+		acc.totalTokens = acc.input + acc.output + acc.cacheRead + acc.cacheWrite;
+		acc.cost.input += usage.cost.input ?? 0;
+		acc.cost.output += usage.cost.output ?? 0;
+		acc.cost.cacheRead += usage.cost.cacheRead ?? 0;
+		acc.cost.cacheWrite += usage.cost.cacheWrite ?? 0;
+		acc.cost.total =
+			acc.cost.input + acc.cost.output + acc.cost.cacheRead + acc.cost.cacheWrite;
+	}
+
+	/**
+	 * Snapshot of the background-usage accumulator. Exposed primarily for
+	 * tests and diagnostics; the footer/print-mode code reads the combined
+	 * value through {@link getSessionStats}.
+	 */
+	getBackgroundUsage(): Usage {
+		return this._backgroundUsage;
+	}
+
+	/**
 	 * Get session statistics.
 	 *
 	 * Aggregable fields (token counts, cost, message counts) are computed by
@@ -2985,6 +3067,12 @@ export class AgentSession {
 	 * `state.messages` would drop pre-compaction history, since compaction
 	 * replaces pre-compaction entries with a summary in `state.messages` but
 	 * retains the original entries in the session file.
+	 *
+	 * Tokens/cost contributed by out-of-band LLM calls (worklog forks,
+	 * compaction/branch/turn-prefix summaries) are added on top of the
+	 * entry-walked totals via {@link _backgroundUsage}. Message counts are
+	 * NOT affected by background usage — the accumulator represents real
+	 * cost but no transcript content.
 	 *
 	 * Both the local footer walk (`footer.ts`) and the orchestrator's
 	 * subtree aggregation (`Orchestrator.aggregateSubtreeUsage`) now share a
@@ -3020,6 +3108,13 @@ export class AgentSession {
 				toolResults += 1;
 			}
 		}
+
+		const bg = this._backgroundUsage;
+		totalInput += bg.input;
+		totalOutput += bg.output;
+		totalCacheRead += bg.cacheRead;
+		totalCacheWrite += bg.cacheWrite;
+		totalCost += bg.cost.total;
 
 		return {
 			sessionFile: this.sessionFile,

@@ -8,6 +8,22 @@
 import type { AgentMessage } from "@pi-relay/agent-core";
 import type { AssistantMessage, Model, Usage } from "@pi-relay/ai";
 import { completeSimple } from "@pi-relay/ai";
+
+/**
+ * Callback invoked with the assistant usage after each out-of-band summarization
+ * call (main compaction summary, turn-prefix summary). Lets the caller fold the
+ * cost of these background LLM calls into session stats/telemetry instead of
+ * dropping the response usage on the floor.
+ *
+ * `scope` identifies which summary the usage came from so callers can attribute
+ * it correctly:
+ * - `"compaction"` — main compaction summary (via {@link generateSummary}).
+ * - `"turn-prefix"` — turn-prefix summary produced in parallel on split turns.
+ *
+ * Callbacks must not throw; compaction proceeds regardless of whether the caller
+ * uses the value.
+ */
+export type CompactionOnUsage = (usage: Usage, scope: "compaction" | "turn-prefix") => void;
 import {
 	convertToLlm,
 	createBranchSummaryMessage,
@@ -526,6 +542,10 @@ Keep each section concise. Preserve exact file paths, function names, and error 
 /**
  * Generate a summary of the conversation using the LLM.
  * If previousSummary is provided, uses the update prompt to merge.
+ *
+ * Callers may supply `onUsage` to observe the assistant usage so it can be
+ * folded into session telemetry (compaction is an out-of-band call whose
+ * tokens otherwise wouldn't reach `getSessionStats`).
  */
 export async function generateSummary(
 	currentMessages: AgentMessage[],
@@ -536,6 +556,7 @@ export async function generateSummary(
 	signal?: AbortSignal,
 	customInstructions?: string,
 	previousSummary?: string,
+	onUsage?: CompactionOnUsage,
 ): Promise<string> {
 	const maxTokens = Math.floor(0.8 * reserveTokens);
 
@@ -574,6 +595,13 @@ export async function generateSummary(
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		completionOptions,
 	);
+
+	// Surface usage even on error paths when present — failed or aborted turns
+	// can still consume tokens. Only aborted responses (stopReason "aborted")
+	// are skipped since providers don't always populate usage for those.
+	if (onUsage && response.usage && response.stopReason !== "aborted") {
+		onUsage(response.usage, "compaction");
+	}
 
 	if (response.stopReason === "error") {
 		throw new Error(`Summarization failed: ${response.errorMessage || "Unknown error"}`);
@@ -711,6 +739,10 @@ Be concise. Focus on what's needed to understand the kept suffix.`;
  *
  * @param preparation - Pre-calculated preparation from prepareCompaction()
  * @param customInstructions - Optional custom focus for the summary
+ * @param onUsage - Optional callback invoked with each summarization call's
+ *   assistant usage. Fires once for normal compaction; twice (in parallel) for
+ *   split-turn compactions — once with scope `"compaction"` and once with
+ *   scope `"turn-prefix"`.
  */
 export async function compact(
 	preparation: CompactionPreparation,
@@ -719,6 +751,7 @@ export async function compact(
 	headers?: Record<string, string>,
 	customInstructions?: string,
 	signal?: AbortSignal,
+	onUsage?: CompactionOnUsage,
 ): Promise<CompactionResult> {
 	const {
 		firstKeptEntryId,
@@ -747,9 +780,10 @@ export async function compact(
 						signal,
 						customInstructions,
 						previousSummary,
+						onUsage,
 					)
 				: Promise.resolve("No prior history."),
-			generateTurnPrefixSummary(turnPrefixMessages, model, settings.reserveTokens, apiKey, headers, signal),
+			generateTurnPrefixSummary(turnPrefixMessages, model, settings.reserveTokens, apiKey, headers, signal, onUsage),
 		]);
 		// Merge into single summary
 		summary = `${historyResult}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult}`;
@@ -764,6 +798,7 @@ export async function compact(
 			signal,
 			customInstructions,
 			previousSummary,
+			onUsage,
 		);
 	}
 
@@ -793,6 +828,7 @@ async function generateTurnPrefixSummary(
 	apiKey: string,
 	headers?: Record<string, string>,
 	signal?: AbortSignal,
+	onUsage?: CompactionOnUsage,
 ): Promise<string> {
 	const maxTokens = Math.floor(0.5 * reserveTokens); // Smaller budget for turn prefix
 	const llmMessages = convertToLlm(messages);
@@ -811,6 +847,10 @@ async function generateTurnPrefixSummary(
 		{ systemPrompt: SUMMARIZATION_SYSTEM_PROMPT, messages: summarizationMessages },
 		{ maxTokens, signal, apiKey, headers },
 	);
+
+	if (onUsage && response.usage && response.stopReason !== "aborted") {
+		onUsage(response.usage, "turn-prefix");
+	}
 
 	if (response.stopReason === "error") {
 		throw new Error(`Turn prefix summarization failed: ${response.errorMessage || "Unknown error"}`);

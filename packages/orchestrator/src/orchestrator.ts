@@ -1034,6 +1034,14 @@ export class Orchestrator {
 			streamOptions,
 		);
 		const assistant = await stream.result();
+		// The worklog fork is its own model turn, paid for out-of-band from the
+		// child's main transcript. Attribute those tokens to the child session
+		// so they flow through getSessionStats, the TUI footer, and subtree
+		// aggregation. Record the usage before any early-return so even turns
+		// that didn't produce a worklog tool call still count.
+		if (assistant.usage) {
+			record.session.addBackgroundUsage(assistant.usage, "worklog");
+		}
 		if (assistant.stopReason !== "toolUse") {
 			return;
 		}
