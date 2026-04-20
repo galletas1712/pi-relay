@@ -434,6 +434,16 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 					output.usage.output = event.message.usage.output_tokens || 0;
 					output.usage.cacheRead = event.message.usage.cache_read_input_tokens || 0;
 					output.usage.cacheWrite = event.message.usage.cache_creation_input_tokens || 0;
+					// Capture the 5m/1h breakdown when present so calculateCost can apply
+					// the correct per-TTL multiplier. Only `message_start.message.usage`
+					// exposes `cache_creation`; `message_delta.usage` (MessageDeltaUsage)
+					// doesn't, which is fine because cache writes happen before generation
+					// begins and these counts are invariant across the stream.
+					const cacheCreation = event.message.usage.cache_creation;
+					if (cacheCreation) {
+						output.usage.cacheWrite5m = cacheCreation.ephemeral_5m_input_tokens || 0;
+						output.usage.cacheWrite1h = cacheCreation.ephemeral_1h_input_tokens || 0;
+					}
 					// Anthropic doesn't provide total_tokens, compute from components
 					output.usage.totalTokens =
 						output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
@@ -574,7 +584,23 @@ export const streamAnthropic: StreamFunction<"anthropic-messages", AnthropicOpti
 						output.usage.cacheRead = event.usage.cache_read_input_tokens;
 					}
 					if (event.usage.cache_creation_input_tokens != null) {
+						const previousCacheWrite = output.usage.cacheWrite;
 						output.usage.cacheWrite = event.usage.cache_creation_input_tokens;
+						// `MessageDeltaUsage` doesn't expose the 5m/1h breakdown. Keep the
+						// ratio captured at message_start; rescale when the aggregate changes
+						// (rare in practice since cache writes are invariant after generation
+						// starts). Preserves correct cost on a path that only receives
+						// message_delta after the initial message_start snapshot.
+						if (
+							output.usage.cacheWrite5m !== undefined &&
+							output.usage.cacheWrite1h !== undefined &&
+							previousCacheWrite > 0 &&
+							output.usage.cacheWrite !== previousCacheWrite
+						) {
+							const scale = output.usage.cacheWrite / previousCacheWrite;
+							output.usage.cacheWrite5m = Math.round(output.usage.cacheWrite5m * scale);
+							output.usage.cacheWrite1h = Math.round(output.usage.cacheWrite1h * scale);
+						}
 					}
 					// Anthropic doesn't provide total_tokens, compute from components
 					output.usage.totalTokens =

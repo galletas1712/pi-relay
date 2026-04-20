@@ -43,11 +43,38 @@ export function getModels<TProvider extends KnownProvider>(
 	return models ? (Array.from(models.values()) as Model<ModelApi<TProvider, keyof (typeof MODELS)[TProvider]>>[]) : [];
 }
 
+/**
+ * Ratio of Anthropic's 1-hour cache-write price to its 5-minute cache-write
+ * price. From the prompt-caching docs: 5m writes bill at 1.25× the base input
+ * rate; 1h writes bill at 2×. 2 / 1.25 = 1.6, and this ratio is uniform across
+ * every active Claude model family (Opus 4.7, Sonnet 4.6, Haiku 4.5, and all
+ * their predecessors we ship pricing for).
+ *
+ * `model.cost.cacheWrite` in the catalog encodes the 5-minute rate, so when a
+ * provider reports a TTL breakdown via `usage.cacheWrite1h`, we bill those
+ * tokens at 1.6× the catalog rate to match actual invoices.
+ */
+const CACHE_WRITE_1H_TO_5M_RATIO = 1.6;
+
 export function calculateCost<TApi extends Api>(model: Model<TApi>, usage: Usage): Usage["cost"] {
 	usage.cost.input = (model.cost.input / 1000000) * usage.input;
 	usage.cost.output = (model.cost.output / 1000000) * usage.output;
 	usage.cost.cacheRead = (model.cost.cacheRead / 1000000) * usage.cacheRead;
-	usage.cost.cacheWrite = (model.cost.cacheWrite / 1000000) * usage.cacheWrite;
+
+	// When the provider reported a 5m/1h breakdown, bill each tier at its own
+	// rate. Otherwise, charge the whole `cacheWrite` aggregate at the 5m rate
+	// (back-compat for providers that don't surface TTL metadata).
+	if (usage.cacheWrite1h !== undefined && usage.cacheWrite1h > 0) {
+		const fiveM =
+			usage.cacheWrite5m !== undefined
+				? usage.cacheWrite5m
+				: Math.max(0, usage.cacheWrite - usage.cacheWrite1h);
+		const effectiveTokens = fiveM + CACHE_WRITE_1H_TO_5M_RATIO * usage.cacheWrite1h;
+		usage.cost.cacheWrite = (model.cost.cacheWrite / 1000000) * effectiveTokens;
+	} else {
+		usage.cost.cacheWrite = (model.cost.cacheWrite / 1000000) * usage.cacheWrite;
+	}
+
 	usage.cost.total = usage.cost.input + usage.cost.output + usage.cost.cacheRead + usage.cost.cacheWrite;
 	return usage.cost;
 }
