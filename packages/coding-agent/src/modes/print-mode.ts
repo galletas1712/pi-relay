@@ -8,7 +8,7 @@
 
 import type { AssistantMessage, ImageContent } from "@pi-relay/ai";
 import type { AgentSessionRuntime } from "../core/agent-session-runtime.js";
-import { formatCacheLogLine, isCacheStatsEnabled } from "../core/cache-telemetry.js";
+import { formatCacheLogLine } from "../core/cache-telemetry.js";
 import { flushRawStdout, writeRawStdout } from "../core/output-guard.js";
 import { killTrackedDetachedChildren } from "../utils/shell.js";
 
@@ -117,14 +117,15 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 			}
 			// Dev-only per-turn cache telemetry: emits on every completed assistant
 			// turn. Written to stderr so stdout stays pristine for text-mode piping
-			// and JSON-mode parsing. Gated on PI_SHOW_CACHE_STATS=1.
+			// and JSON-mode parsing. Gated on the effective show-stats flag
+			// (env `PI_SHOW_CACHE_STATS` with a `settings.cache.showStats` fallback).
 			//
 			// When the session's attached agent has descendants (tracked by an
 			// orchestrator-style extension via setSubtreeUsageProvider), emit an
 			// additional `tree` line with subtree-aggregated usage. Single-agent
 			// sessions and agents without descendants stay on the existing format.
 			if (
-				isCacheStatsEnabled() &&
+				session.settingsManager.getShowCacheStats() &&
 				event.type === "message_end" &&
 				event.message.role === "assistant"
 			) {
