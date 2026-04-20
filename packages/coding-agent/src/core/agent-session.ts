@@ -151,7 +151,20 @@ export type AgentSessionEvent =
 			errorMessage?: string;
 	  }
 	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
-	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string };
+	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| {
+			/**
+			 * Fired by {@link AgentSession.addBackgroundUsage} for each out-of-band
+			 * LLM call (worklog fork, compaction summary, branch summary, turn-prefix
+			 * summary). Consumers (e.g. print-mode dev telemetry) can surface per-call
+			 * cost attribution; the aggregated cost already flows through
+			 * `getSessionStats`. The payload carries the *per-call* usage, not the
+			 * accumulator total.
+			 */
+			type: "background_usage";
+			scope: BackgroundUsageScope;
+			usage: Usage;
+	  };
 
 /** Listener function for agent session events */
 export type AgentSessionEventListener = (event: AgentSessionEvent) => void;
@@ -3028,7 +3041,7 @@ export class AgentSession {
 	 * through but not separately surfaced. All scopes sum into the single
 	 * aggregate.
 	 */
-	addBackgroundUsage(usage: Usage, _scope?: BackgroundUsageScope): void {
+	addBackgroundUsage(usage: Usage, scope?: BackgroundUsageScope): void {
 		const acc = this._backgroundUsage;
 		acc.input += usage.input ?? 0;
 		acc.output += usage.output ?? 0;
@@ -3047,6 +3060,16 @@ export class AgentSession {
 		acc.cost.cacheWrite += usage.cost.cacheWrite ?? 0;
 		acc.cost.total =
 			acc.cost.input + acc.cost.output + acc.cost.cacheRead + acc.cost.cacheWrite;
+
+		// Emit a `background_usage` event so subscribers (print-mode dev
+		// telemetry, future consumers) can surface per-call attribution. The
+		// aggregated cost also flows through `getSessionStats`; this event is
+		// purely additive and carries the *per-call* usage, not the accumulator.
+		// Only emit when a scope is provided — callers that use this method as
+		// a raw accumulator (no attribution) shouldn't spam the event stream.
+		if (scope !== undefined) {
+			this._emit({ type: "background_usage", scope, usage });
+		}
 	}
 
 	/**
