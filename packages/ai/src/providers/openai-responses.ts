@@ -22,10 +22,16 @@ const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"
 /**
  * Resolve cache retention preference.
  * Defaults to "short" and uses PI_CACHE_RETENTION for backward compatibility.
+ * `PI_CACHE_RETENTION=none` acts as a global kill switch, matching the
+ * behavior of the sibling helpers in openai-completions.ts,
+ * azure-openai-responses.ts, and openai-codex-responses.ts.
  */
 function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
 	if (cacheRetention) {
 		return cacheRetention;
+	}
+	if (typeof process !== "undefined" && process.env.PI_CACHE_RETENTION === "none") {
+		return "none";
 	}
 	if (typeof process !== "undefined" && process.env.PI_CACHE_RETENTION === "long") {
 		return "long";
