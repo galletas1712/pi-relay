@@ -3053,9 +3053,12 @@ export class AgentSession {
 	 * Snapshot of the background-usage accumulator. Exposed primarily for
 	 * tests and diagnostics; the footer/print-mode code reads the combined
 	 * value through {@link getSessionStats}.
+	 *
+	 * Returns a deep copy so callers cannot mutate internal state by poking
+	 * at fields on the returned object (including the nested `cost` object).
 	 */
 	getBackgroundUsage(): Usage {
-		return this._backgroundUsage;
+		return structuredClone(this._backgroundUsage);
 	}
 
 	/**
