@@ -101,6 +101,7 @@ import { ToolExecutionComponent } from "./components/tool-execution.js";
 import { TreeSelectorComponent } from "./components/tree-selector.js";
 import { UserMessageComponent } from "./components/user-message.js";
 import { UserMessageSelectorComponent } from "./components/user-message-selector.js";
+import { PendingInputBuffer } from "./pending-input-buffer.js";
 import {
 	getAvailableThemes,
 	getAvailableThemesWithPaths,
@@ -181,6 +182,14 @@ export class InteractiveMode {
 	private version: string;
 	private isInitialized = false;
 	private onInputCallback?: (text: string) => void;
+	/**
+	 * Buffers Enter-submitted text when the main loop is mid-turn and
+	 * `onInputCallback` is unset (e.g. during a `/agents` session switch whose
+	 * `handleRuntimeSessionChange` awaits). Without this, `submitValue()` clears
+	 * the editor text and the onSubmit handler has no else branch, so the input
+	 * is silently dropped. See pending-input-buffer.ts for the full rationale.
+	 */
+	private readonly pendingInputBuffer = new PendingInputBuffer();
 	private loadingAnimation: Loader | undefined = undefined;
 	private pendingWorkingMessage: string | undefined = undefined;
 	private readonly defaultWorkingMessage = "Working...";
@@ -2320,6 +2329,21 @@ export class InteractiveMode {
 
 			if (this.onInputCallback) {
 				this.onInputCallback(text);
+			} else {
+				// The main loop is mid-turn (typically waiting on an async slash command
+				// like `/agents` whose handler awaits `handleRuntimeSessionChange`). The
+				// editor has already cleared `text` via `submitValue()`. Buffer the
+				// submission so the next `getUserInput()` delivers it instead of
+				// silently dropping. Text is delivered to whichever agent is attached
+				// when the main loop re-arms getUserInput — see PendingInputBuffer for
+				// the documented cross-session trade-off.
+				this.pendingInputBuffer.push(text);
+				if (process.env.PI_TUI_DEBUG === "1") {
+					const preview = text.length > 40 ? `${text.slice(0, 40)}…` : text;
+					process.stderr.write(
+						`[pi-tui] input queued (session transition in progress): ${JSON.stringify(preview)}\n`,
+					);
+				}
 			}
 			this.editor.addToHistory?.(text);
 		};
@@ -2926,6 +2950,15 @@ export class InteractiveMode {
 
 	async getUserInput(): Promise<string> {
 		return new Promise((resolve) => {
+			// Replay any input the user submitted while the main loop was mid-turn
+			// (e.g. during a `/agents` session switch). Without this, those submissions
+			// were silently dropped. See pendingInputBuffer docstring for the full
+			// rationale including the cross-session-replay trade-off.
+			const buffered = this.pendingInputBuffer.tryShift();
+			if (buffered !== undefined) {
+				resolve(buffered);
+				return;
+			}
 			this.onInputCallback = (text: string) => {
 				this.onInputCallback = undefined;
 				resolve(text);
