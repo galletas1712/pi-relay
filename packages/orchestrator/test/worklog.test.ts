@@ -2518,3 +2518,531 @@ describe("worklog_unpin tool", () => {
 		expect(parsed.find((entry) => entry.body === "## fresh-entry")).toBeDefined();
 	});
 });
+
+describe("buildAncestorWorklogPrefix topic filtering", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	async function writeWorklog(filePath: string, body: string): Promise<void> {
+		const { writeFile, mkdir } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		await mkdir(dirname(filePath), { recursive: true });
+		await writeFile(filePath, body, "utf-8");
+	}
+
+	function entryWithMeta(
+		content: string,
+		turn: number,
+		iso: string,
+		meta: { topics?: string[]; supersedes?: string[]; pin?: boolean } = {},
+	): { text: string; id: string } {
+		const text = formatWorklogEntry(content, turn, { iso, ...meta });
+		const parsed = parseWorklogEntries(text);
+		const id = parsed[0]?.id;
+		if (!id) throw new Error("expected entry_id on structured entry");
+		return { text, id };
+	}
+
+	it("no includeTopics: all non-pinned non-tombstoned entries present (PR-6 behavior)", async () => {
+		const dir = createTempDir("pi-relay-worklog-topics-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const a = entryWithMeta("## A-foo", 1, "2026-10-01T00:00:01.000Z", { topics: ["foo"] });
+		const b = entryWithMeta("## B-bar", 2, "2026-10-01T00:00:02.000Z", { topics: ["bar"] });
+		await writeWorklog(filePath, `${a.text}\n\n${b.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toContain("## A-foo");
+		expect(out).toContain("## B-bar");
+	});
+
+	it("includeTopics={foo}: entries tagged [foo,bar] are included", async () => {
+		const dir = createTempDir("pi-relay-worklog-topics-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const a = entryWithMeta("## A-foo-bar", 1, "2026-10-02T00:00:01.000Z", { topics: ["foo", "bar"] });
+		await writeWorklog(filePath, `${a.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix(
+			[{ agentId: "x", role: "r", filePath }],
+			{ includeTopics: new Set(["foo"]) },
+		);
+		expect(out).toContain("## A-foo-bar");
+	});
+
+	it("includeTopics={foo}: entries tagged [baz] are excluded", async () => {
+		const dir = createTempDir("pi-relay-worklog-topics-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const a = entryWithMeta("## A-baz", 1, "2026-10-03T00:00:01.000Z", { topics: ["baz"] });
+		await writeWorklog(filePath, `${a.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix(
+			[{ agentId: "x", role: "r", filePath }],
+			{ includeTopics: new Set(["foo"]) },
+		);
+		// Whole-file-filtered: wrapper skipped, entry absent.
+		expect(out).not.toContain("## A-baz");
+		expect(out).not.toMatch(/<ancestor-worklog/);
+	});
+
+	it("includeTopics={foo}: legacy entry (no topics) is included (legacy bypass)", async () => {
+		const dir = createTempDir("pi-relay-worklog-topics-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const legacy = "## Entry — 2026-10-04T00:00:00.000Z (turn 1)\n\n## Legacy body\n- kept under topic filter.\n\n";
+		const tagged = entryWithMeta("## Tagged-baz", 2, "2026-10-04T00:00:02.000Z", { topics: ["baz"] });
+		await writeWorklog(filePath, `${legacy}${tagged.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix(
+			[{ agentId: "x", role: "r", filePath }],
+			{ includeTopics: new Set(["foo"]) },
+		);
+		expect(out).toContain("## Legacy body\n- kept under topic filter.");
+		expect(out).not.toContain("## Tagged-baz");
+	});
+
+	it("includeTopics={foo}: entry with empty topics array is included (legacy bypass)", async () => {
+		const dir = createTempDir("pi-relay-worklog-topics-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		// Structured entry with an explicitly empty topics array.
+		const untagged = entryWithMeta("## Untagged-structured", 1, "2026-10-05T00:00:01.000Z", { topics: [] });
+		await writeWorklog(filePath, `${untagged.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix(
+			[{ agentId: "x", role: "r", filePath }],
+			{ includeTopics: new Set(["foo"]) },
+		);
+		expect(out).toContain("## Untagged-structured");
+	});
+
+	it("pinned entry bypasses topic filter: appears in <pinned-facts> even when tagged with a non-matching topic", async () => {
+		const dir = createTempDir("pi-relay-worklog-topics-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const pinned = entryWithMeta("## pinned-baz", 1, "2026-10-06T00:00:01.000Z", {
+			topics: ["baz"],
+			pin: true,
+		});
+		await writeWorklog(filePath, `${pinned.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix(
+			[{ agentId: "x", role: "r", filePath }],
+			{ includeTopics: new Set(["foo"]) },
+		);
+		const pinnedIdx = out.indexOf("<pinned-facts>");
+		const pinnedEnd = out.indexOf("</pinned-facts>");
+		expect(pinnedIdx).toBeGreaterThanOrEqual(0);
+		const block = out.slice(pinnedIdx, pinnedEnd);
+		expect(block).toContain("## pinned-baz");
+		// And NOT in the per-file wrapper.
+		const wrapperIdx = out.indexOf("<ancestor-worklog");
+		if (wrapperIdx >= 0) {
+			expect(out.slice(wrapperIdx)).not.toContain("## pinned-baz");
+		}
+	});
+
+	it("includeTopics empty set: treated same as undefined, no filtering", async () => {
+		const dir = createTempDir("pi-relay-worklog-topics-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const a = entryWithMeta("## A-bar", 1, "2026-10-07T00:00:01.000Z", { topics: ["bar"] });
+		const b = entryWithMeta("## B-baz", 2, "2026-10-07T00:00:02.000Z", { topics: ["baz"] });
+		await writeWorklog(filePath, `${a.text}\n\n${b.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix(
+			[{ agentId: "x", role: "r", filePath }],
+			{ includeTopics: new Set<string>() },
+		);
+		expect(out).toContain("## A-bar");
+		expect(out).toContain("## B-baz");
+	});
+});
+
+describe("buildAncestorWorklogPrefix tail cap", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	async function writeWorklog(filePath: string, body: string): Promise<void> {
+		const { writeFile, mkdir } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		await mkdir(dirname(filePath), { recursive: true });
+		await writeFile(filePath, body, "utf-8");
+	}
+
+	function entryWithMeta(
+		content: string,
+		turn: number,
+		iso: string,
+		meta: { topics?: string[]; supersedes?: string[]; pin?: boolean } = {},
+	): { text: string; id: string } {
+		const text = formatWorklogEntry(content, turn, { iso, ...meta });
+		const parsed = parseWorklogEntries(text);
+		const id = parsed[0]?.id;
+		if (!id) throw new Error("expected entry_id on structured entry");
+		return { text, id };
+	}
+
+	it("20 small non-pinned entries: capped to 15 most recent; truncation marker present; dropped 5", async () => {
+		const dir = createTempDir("pi-relay-worklog-tail-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const parts: string[] = [];
+		const ids: string[] = [];
+		for (let i = 0; i < 20; i += 1) {
+			const e = entryWithMeta(
+				`## E${String(i).padStart(2, "0")}`,
+				i + 1,
+				`2026-11-01T00:00:${String(i).padStart(2, "0")}.000Z`,
+			);
+			parts.push(e.text);
+			ids.push(e.id);
+		}
+		await writeWorklog(filePath, `${parts.join("\n\n")}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toContain("<!-- truncated: dropped 5 older non-pinned entries -->");
+		// Oldest 5 entries (indices 0..4) should be absent; newest 15 (5..19) present.
+		for (let i = 0; i < 5; i += 1) {
+			expect(out).not.toContain(`## E${String(i).padStart(2, "0")}`);
+		}
+		for (let i = 5; i < 20; i += 1) {
+			expect(out).toContain(`## E${String(i).padStart(2, "0")}`);
+		}
+	});
+
+	it("5 entries with huge bodies: capped by char budget; truncation marker present", async () => {
+		const dir = createTempDir("pi-relay-worklog-tail-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		// Each entry body is 6000 chars, so 5 entries = 30000 chars total >
+		// 20000 budget. Expect the most recent entries kept until char
+		// budget bites.
+		const parts: string[] = [];
+		for (let i = 0; i < 5; i += 1) {
+			const body = `## big-${i}\n${"x".repeat(6000)}`;
+			const e = entryWithMeta(body, i + 1, `2026-11-02T00:00:${String(i).padStart(2, "0")}.000Z`);
+			parts.push(e.text);
+		}
+		await writeWorklog(filePath, `${parts.join("\n\n")}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toMatch(/<!-- truncated: dropped \d+ older non-pinned entries -->/);
+		// The most recent entry must always be present.
+		expect(out).toContain("## big-4");
+		// The oldest must be absent.
+		expect(out).not.toContain("## big-0");
+	});
+
+	it("10 entries + 3 pinned: pins bypass cap; 10 non-pinned kept (<=15), no truncation marker", async () => {
+		const dir = createTempDir("pi-relay-worklog-tail-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const parts: string[] = [];
+		for (let i = 0; i < 3; i += 1) {
+			const e = entryWithMeta(`## pinned-${i}`, i + 1, `2026-11-03T00:00:${String(i).padStart(2, "0")}.000Z`, { pin: true });
+			parts.push(e.text);
+		}
+		for (let i = 0; i < 10; i += 1) {
+			const e = entryWithMeta(`## plain-${i}`, i + 10, `2026-11-03T00:10:${String(i).padStart(2, "0")}.000Z`);
+			parts.push(e.text);
+		}
+		await writeWorklog(filePath, `${parts.join("\n\n")}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).not.toContain("<!-- truncated:");
+		for (let i = 0; i < 3; i += 1) {
+			expect(out).toContain(`## pinned-${i}`);
+		}
+		for (let i = 0; i < 10; i += 1) {
+			expect(out).toContain(`## plain-${i}`);
+		}
+	});
+
+	it("mixed ancestor files (root 10 + parent 10): global 15 cap across files; oldest root entries dropped first", async () => {
+		const dir = createTempDir("pi-relay-worklog-tail-");
+		tempDirs.push(dir);
+		const rootFile = `${dir}/root.worklog.md`;
+		const parentFile = `${dir}/parent.worklog.md`;
+
+		const rootParts: string[] = [];
+		for (let i = 0; i < 10; i += 1) {
+			rootParts.push(
+				entryWithMeta(`## root-${i}`, i + 1, `2026-11-04T00:00:${String(i).padStart(2, "0")}.000Z`).text,
+			);
+		}
+		const parentParts: string[] = [];
+		for (let i = 0; i < 10; i += 1) {
+			parentParts.push(
+				entryWithMeta(`## parent-${i}`, i + 1, `2026-11-04T01:00:${String(i).padStart(2, "0")}.000Z`).text,
+			);
+		}
+		await writeWorklog(rootFile, `${rootParts.join("\n\n")}\n\n`);
+		await writeWorklog(parentFile, `${parentParts.join("\n\n")}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "root", role: "root", filePath: rootFile },
+			{ agentId: "parent", role: "parent-role", filePath: parentFile },
+		]);
+		// 20 entries total, cap 15 → drops 5.
+		expect(out).toContain("<!-- truncated: dropped 5 older non-pinned entries -->");
+		// The 5 dropped entries are the OLDEST — i.e. the first 5 of root
+		// (root-0 .. root-4). Entries from root-5 onward survive along with all
+		// parent entries.
+		for (let i = 0; i < 5; i += 1) {
+			expect(out).not.toContain(`## root-${i}`);
+		}
+		for (let i = 5; i < 10; i += 1) {
+			expect(out).toContain(`## root-${i}`);
+		}
+		for (let i = 0; i < 10; i += 1) {
+			expect(out).toContain(`## parent-${i}`);
+		}
+	});
+
+	it("empty non-pinned list (only pinned entries): no truncation marker", async () => {
+		const dir = createTempDir("pi-relay-worklog-tail-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const p = entryWithMeta("## only-pinned", 1, "2026-11-05T00:00:01.000Z", { pin: true });
+		await writeWorklog(filePath, `${p.text}\n\n`);
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).not.toContain("<!-- truncated:");
+		expect(out).toContain("## only-pinned");
+	});
+
+	it("single entry larger than char budget: kept anyway (no spurious truncation marker)", async () => {
+		const dir = createTempDir("pi-relay-worklog-tail-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/p.worklog.md`;
+		const body = `## huge-single\n${"x".repeat(30_000)}`;
+		const e = entryWithMeta(body, 1, "2026-11-06T00:00:01.000Z");
+		await writeWorklog(filePath, `${e.text}\n\n`);
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toContain("## huge-single");
+		expect(out).not.toContain("<!-- truncated:");
+	});
+});
+
+describe("buildSpawnPrompt handoff", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	it("spawn with handoff: child prompt contains <parent-handoff> BEFORE ancestor sections", async () => {
+		const sessionDir = createTempDir("pi-relay-handoff-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		// Seed root worklog with a structured entry so there's an ancestor
+		// section to compare against.
+		const rootRecord = orchestrator.getRecord("root");
+		const { writeFile, mkdir } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		await mkdir(dirname(rootRecord.worklogFile), { recursive: true });
+		const rootEntry = formatWorklogEntry("## root-ancestor", 1, {
+			iso: "2026-12-01T00:00:01.000Z",
+		});
+		await writeFile(rootRecord.worklogFile, `${rootEntry}\n\n`, "utf-8");
+
+		await orchestrator.spawnAgent("root", {
+			role: "helper",
+			prompt: "do the thing",
+			handoff: "Key compressed context the child needs.",
+		});
+
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).toContain("<parent-handoff>");
+		expect(prompt).toContain("Key compressed context the child needs.");
+		expect(prompt).toContain("</parent-handoff>");
+		// handoff comes BEFORE the ancestor worklog block.
+		const handoffIdx = prompt.indexOf("<parent-handoff>");
+		const worklogIdx = prompt.indexOf("<ancestor-worklog");
+		expect(handoffIdx).toBeGreaterThanOrEqual(0);
+		expect(worklogIdx).toBeGreaterThan(handoffIdx);
+	});
+
+	it("spawn without handoff: no <parent-handoff> block", async () => {
+		const sessionDir = createTempDir("pi-relay-handoff-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		await orchestrator.spawnAgent("root", { role: "helper", prompt: "nothing special" });
+
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).not.toContain("<parent-handoff>");
+	});
+
+	it("spawn with empty-string handoff: treated as absent (no block)", async () => {
+		const sessionDir = createTempDir("pi-relay-handoff-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		await orchestrator.spawnAgent("root", {
+			role: "helper",
+			prompt: "task",
+			handoff: "",
+		});
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		expect(child.prompts[0] ?? "").not.toContain("<parent-handoff>");
+	});
+});
+
+describe("SpawnConfig topics end-to-end", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	it("parent spawns child with topics=['foo']: child sees foo-tagged + legacy, NOT bar-tagged", async () => {
+		const sessionDir = createTempDir("pi-relay-topics-e2e-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		const rootRecord = orchestrator.getRecord("root");
+		const { writeFile, mkdir } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		await mkdir(dirname(rootRecord.worklogFile), { recursive: true });
+		const fooEntry = formatWorklogEntry("## topic-foo-body", 1, {
+			iso: "2026-12-02T00:00:01.000Z",
+			topics: ["foo"],
+		});
+		const barEntry = formatWorklogEntry("## topic-bar-body", 2, {
+			iso: "2026-12-02T00:00:02.000Z",
+			topics: ["bar"],
+		});
+		const legacyEntry = "## Entry — 2026-12-02T00:00:03.000Z (turn 3)\n\n## legacy-body-untagged";
+		await writeFile(
+			rootRecord.worklogFile,
+			`${fooEntry}\n\n${barEntry}\n\n${legacyEntry}\n\n`,
+			"utf-8",
+		);
+
+		await orchestrator.spawnAgent("root", {
+			role: "helper",
+			prompt: "focus",
+			topics: ["foo"],
+		});
+
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).toContain("## topic-foo-body");
+		expect(prompt).not.toContain("## topic-bar-body");
+		// Legacy entry is always included (cannot silently drop history).
+		expect(prompt).toContain("## legacy-body-untagged");
+	});
+
+	it("tree.json round-trips topics and handoff fields on SpawnConfig", async () => {
+		const sessionDir = createTempDir("pi-relay-topics-e2e-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		const childId = await orchestrator.spawnAgent("root", {
+			role: "helper",
+			prompt: "round-trip",
+			topics: ["foo", "bar"],
+			handoff: "compressed-ctx",
+		});
+
+		const { join } = await import("node:path");
+		const treeFile = join(sessionDir, "root-session", "tree.json");
+		await vi.waitFor(async () => {
+			const content = await readFile(treeFile, "utf-8");
+			const parsed = JSON.parse(content) as {
+				agents: Record<
+					string,
+					{ spawnConfig: { role: string; prompt: string; topics?: string[]; handoff?: string } }
+				>;
+			};
+			expect(parsed.agents[childId]?.spawnConfig.topics).toEqual(["foo", "bar"]);
+			expect(parsed.agents[childId]?.spawnConfig.handoff).toBe("compressed-ctx");
+		});
+	});
+
+	it("legacy tree.json (no topics/handoff fields) loads cleanly: undefined treated as no filter / no handoff", async () => {
+		const sessionDir = createTempDir("pi-relay-topics-e2e-");
+		tempDirs.push(sessionDir);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+
+		// Spawn with no topics/handoff — undefined fields — verifies the
+		// filter path treats missing fields as "no filter".
+		await orchestrator.spawnAgent("root", { role: "helper", prompt: "legacy-shaped" });
+		await vi.waitFor(() => {
+			expect(child.prompts).toHaveLength(1);
+		});
+		const prompt = child.prompts[0] ?? "";
+		expect(prompt).not.toContain("<parent-handoff>");
+		// Sanity: prompt ends with the child's task text.
+		expect(prompt.trim().endsWith("legacy-shaped")).toBe(true);
+	});
+});

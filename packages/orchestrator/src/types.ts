@@ -139,6 +139,21 @@ export interface SpawnConfig {
 	tools?: string[];
 	model?: Model<any>;
 	thinkingLevel?: ThinkingLevel;
+	/**
+	 * Optional list of topic slugs the child should focus on. When
+	 * provided, the ancestor-worklog injection filters entries whose
+	 * `meta.topics` intersect with this set. Legacy entries (no topics
+	 * field) and pinned entries bypass the filter. An empty or missing
+	 * array means no topic filtering (pre-PR-7 behavior).
+	 */
+	topics?: string[];
+	/**
+	 * Optional parent-authored handoff context prepended to the child's
+	 * initial prompt inside a `<parent-handoff>` block. Use this when the
+	 * ancestor worklog doesn't yet cover the critical context the child
+	 * needs to start on-task. Empty strings are treated as absent.
+	 */
+	handoff?: string;
 }
 
 export interface OrchestratorConfig {

@@ -20,6 +20,8 @@ You are part of a multi-agent system.
 The root agent has \`spawn\` and \`message\`.
 Child agents have all three tools.
 
+When you \`spawn\`, pass \`topics\` to give the child only the ancestor worklog entries relevant to its task (pinned and legacy entries bypass the filter). Pass \`handoff\` with a short compressed summary when the worklog doesn't yet cover what the child needs; it appears before ancestor content in the child's prompt. Both are optional — omit them to inherit the full worklog.
+
 When you finish a task, stop calling tools and write your answer. Your parent is notified automatically when you become idle.
 Worklog entries are generated from your turns automatically and stored for inheritance and restore.
 

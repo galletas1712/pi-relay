@@ -610,7 +610,7 @@ export class Orchestrator {
 			};
 			parent.childIds.push(agentId);
 			this.registerRecord(record);
-			const prompt = await this.buildSpawnPrompt(parentId, agentId, config.prompt);
+			const prompt = await this.buildSpawnPrompt(parentId, agentId, config);
 			void created.session.prompt(prompt).catch((error) => {
 				void this.handleAgentError(agentId, error);
 			});
@@ -1029,7 +1029,7 @@ export class Orchestrator {
 		}
 	}
 
-	private async buildSpawnPrompt(parentId: string, agentId: string, prompt: string): Promise<string> {
+	private async buildSpawnPrompt(parentId: string, agentId: string, config: SpawnConfig): Promise<string> {
 		const ancestors: Array<{
 			id: string;
 			role: string;
@@ -1051,18 +1051,36 @@ export class Orchestrator {
 
 		const sections: string[] = [];
 
+		// Parent-authored handoff goes at the very top of the child's
+		// prompt: it is the most task-critical, parent-chosen context. An
+		// empty-string handoff is treated as absent. PR-10 will revisit
+		// this ordering to optimize cache-stability; for PR-7 task
+		// relevance beats cache.
+		if (typeof config.handoff === "string" && config.handoff.length > 0) {
+			sections.push(`<parent-handoff>\n${config.handoff}\n</parent-handoff>`);
+		}
+
 		// Build the ancestor-worklog prefix once across ALL ancestors so
 		// `buildAncestorWorklogPrefix` can apply cross-file supersession
 		// tombstones (a parent entry can tombstone a grandparent entry). This
 		// also clusters the byte-stable worklog blocks at the front of the
 		// prompt ahead of the varying `<ancestor-recent-context>` tails, which
 		// is the shape later PRs (pinned facts, spawn-prefix caching) rely on.
+		//
+		// Topic filter: when the parent passed `topics` on `spawn(...)`,
+		// only ancestor entries whose meta.topics intersect with that set
+		// (plus pinned entries and legacy/unlabeled entries) are
+		// injected. An empty list disables the filter so pre-PR-7 spawns
+		// are unchanged.
+		const topicList = Array.isArray(config.topics) ? config.topics.filter((t): t is string => typeof t === "string" && t.length > 0) : [];
+		const includeTopics = topicList.length > 0 ? new Set(topicList) : undefined;
 		const worklogSection = await buildAncestorWorklogPrefix(
 			ancestors.map((ancestor) => ({
 				agentId: ancestor.id,
 				role: ancestor.role,
 				filePath: ancestor.worklogFile,
 			})),
+			includeTopics ? { includeTopics } : undefined,
 		);
 		if (worklogSection) {
 			sections.push(worklogSection);
@@ -1083,9 +1101,9 @@ export class Orchestrator {
 		}
 
 		if (sections.length === 0) {
-			return prompt;
+			return config.prompt;
 		}
-		return `${sections.join("\n\n")}\n\n${prompt}`;
+		return `${sections.join("\n\n")}\n\n${config.prompt}`;
 	}
 
 	private scheduleWorklogFork(agentId: string, turn: number, turnMessages: AgentMessage[]): void {

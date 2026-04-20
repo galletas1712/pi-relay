@@ -437,17 +437,36 @@ export function collectLivePinnedEntries(
 }
 
 /**
+ * Soft upper bound on the count of non-pinned entries emitted across all
+ * ancestor files combined. Pinned entries are NEVER subject to the cap —
+ * they always appear in the `<pinned-facts>` block regardless. The cap is
+ * "soft" in that both a char budget and an entry-count budget are enforced
+ * and whichever bites first wins.
+ */
+export const MAX_ANCESTOR_TAIL_ENTRIES = 15;
+
+/**
+ * Soft upper bound on the total character count of non-pinned entries
+ * emitted across all ancestor files combined. Measured on the re-emitted
+ * `raw` text of each surviving entry. Same semantics as
+ * {@link MAX_ANCESTOR_TAIL_ENTRIES}: pinned entries bypass this cap.
+ */
+export const MAX_ANCESTOR_TAIL_CHARS = 20_000;
+
+/**
  * Build the ancestor-worklog prefix injected into child agent spawns.
  *
  * Output shape (all sections optional; `\n\n`-separated):
  * 1. `<pinned-facts>` containing every live pinned entry across ALL
  *    ancestor files in ancestor order, then per-file entry order. Pinned
- *    entries BYPASS the tombstone filter — a pin is a stronger statement
- *    than a supersession, so the block carries the entry even if some
- *    other entry claimed to supersede it.
- * 2. Per-file `<ancestor-worklog>` wrappers containing entries that are
- *    neither tombstoned nor pinned (pinned entries appear exclusively in
- *    `<pinned-facts>` so the model never sees them twice).
+ *    entries BYPASS the tombstone, topic, and tail-cap filters — a pin is
+ *    a stronger statement than any of those, so the block carries the
+ *    entry regardless.
+ * 2. Optional `<!-- truncated: dropped N older non-pinned entries -->`
+ *    marker when the tail cap dropped entries.
+ * 3. Per-file `<ancestor-worklog>` wrappers containing entries that are
+ *    neither tombstoned, pinned, topic-filtered-out, nor dropped by the
+ *    tail cap.
  *
  * Tombstone semantics: every parsed entry's `meta.supersedes` contributes
  * its ids to a single tombstone set that is unioned across ALL ancestor
@@ -459,10 +478,27 @@ export function collectLivePinnedEntries(
  * Cross-file tombstoning is intentional: if the parent learned that a
  * grandparent fact was wrong, the child should not inherit the wrong fact.
  *
+ * Topic filtering (`options.includeTopics`): when non-empty, a non-pinned
+ * entry is emitted only if its `meta.topics` intersects the set OR it has
+ * no topics at all (legacy / unlabeled entries bypass the filter — never
+ * silently drop history that predates topic tagging). Pinned entries
+ * bypass the filter unconditionally. An undefined or empty set disables
+ * filtering (pre-PR-7 behavior).
+ *
+ * Tail cap ({@link MAX_ANCESTOR_TAIL_ENTRIES} /
+ * {@link MAX_ANCESTOR_TAIL_CHARS}): applied across the combined
+ * non-pinned surviving entries in ancestor order (root first, then
+ * within-file order). The MOST RECENT entries are kept; older entries at
+ * the head of the combined list are dropped. At least one entry is
+ * always kept (the first-kept entry is allowed to exceed the char budget
+ * on its own so tiny worklogs don't spuriously emit a truncation marker).
+ * When truncation happens a comment marker is emitted ahead of the
+ * per-file wrappers so the model knows context was trimmed.
+ *
  * Edge cases:
  * - Legacy entries (no `entry_id`) can never be tombstoned and are never
- *   pinned (pin field absent => not pinned). They always pass through the
- *   per-file section unchanged.
+ *   pinned (pin field absent => not pinned). They pass through the
+ *   per-file section unchanged (subject to tail cap).
  * - Circular supersession (A→B and B→A) collapses both ids into the
  *   tombstone set, so both entries are dropped unless pinned.
  * - `supersedes` citing an unknown entry_id is a no-op.
@@ -470,6 +506,7 @@ export function collectLivePinnedEntries(
  */
 export async function buildAncestorWorklogPrefix(
 	entries: Array<{ agentId: string; role: string; filePath: string }>,
+	options?: { includeTopics?: ReadonlySet<string> },
 ): Promise<string> {
 	// Pass 1: read + parse every file, collect the union of supersedes ids.
 	type FileSection = { agentId: string; role: string; parsed: ParsedWorklogEntry[] };
@@ -528,27 +565,130 @@ export async function buildAncestorWorklogPrefix(
 		sections.push(`<pinned-facts>\n${pinnedBlock}\n</pinned-facts>`);
 	}
 
-	// Pass 2b: drop tombstoned entries AND pinned entries (pinned entries
-	// appear exclusively in `<pinned-facts>` so the model never sees them
-	// twice). Legacy entries (id === undefined) always survive because they
-	// have no stable id for another entry to cite or to be pinned under.
+	// Pass 2b: apply supersession, pin-dedup, and topic filtering per file
+	// to produce each file's candidate surviving list. Tombstoned entries
+	// are dropped (pin beats tombstone — those entries already appeared in
+	// `<pinned-facts>` above and are excluded from the per-file section).
+	// Legacy entries (id === undefined) can never be tombstoned or pinned
+	// and always survive the filter pass.
+	//
+	// Topic filter: an entry passes when `includeTopics` is absent/empty,
+	// OR when its `meta.topics` is empty/missing (legacy/unlabeled — never
+	// silently drop pre-tagging history), OR when topics intersect with
+	// `includeTopics`. Pinned entries already bypassed this filter because
+	// they were emitted in the `<pinned-facts>` block before this pass
+	// runs.
+	const includeTopics =
+		options?.includeTopics && options.includeTopics.size > 0
+			? options.includeTopics
+			: undefined;
+
+	type PerFileSurviving = {
+		agentId: string;
+		role: string;
+		entries: ParsedWorklogEntry[];
+	};
+	const perFileSurviving: PerFileSurviving[] = [];
 	for (const file of parsedPerFile) {
 		if (!file) continue;
 		const surviving = file.parsed.filter((parsedEntry) => {
-			if (parsedEntry.id === undefined) return true;
-			if (pinnedIds.has(parsedEntry.id)) return false;
-			return !tombstones.has(parsedEntry.id);
+			// Pinned entries live only in `<pinned-facts>` — never in the
+			// per-file wrapper.
+			if (parsedEntry.id !== undefined && pinnedIds.has(parsedEntry.id)) {
+				return false;
+			}
+			// Tombstone filter (legacy entries have no id and cannot be
+			// tombstoned).
+			if (parsedEntry.id !== undefined && tombstones.has(parsedEntry.id)) {
+				return false;
+			}
+			// Topic filter. No filter / empty filter => include.
+			if (!includeTopics) return true;
+			const topics = Array.isArray(parsedEntry.meta.topics) ? parsedEntry.meta.topics : [];
+			// Legacy / unlabeled: include (cannot silently drop
+			// history that predates topic tagging).
+			if (topics.length === 0) return true;
+			for (const topic of topics) {
+				if (typeof topic === "string" && includeTopics.has(topic)) {
+					return true;
+				}
+			}
+			return false;
 		});
-		if (surviving.length === 0) {
-			// Whole file filtered out — skip the <ancestor-worklog> wrapper so
-			// we don't emit an empty stanza.
-			continue;
+		perFileSurviving.push({ agentId: file.agentId, role: file.role, entries: surviving });
+	}
+
+	// Pass 2c: apply the global tail cap across the combined non-pinned
+	// surviving entries. We keep the MOST RECENT entries (tail of the
+	// ancestor-ordered list) up to both the entry-count budget and the
+	// char budget; whichever bites first wins. The cap does NOT apply to
+	// pinned entries — those already live in the separate `<pinned-facts>`
+	// block.
+	//
+	// Combined order: root's entries first, then parent's, etc. in
+	// ancestor order; within a file, existing entry order is preserved.
+	// The tail is the end of this combined list, so older entries at the
+	// head of the combined list are dropped first.
+	type FlatEntry = { fileIndex: number; entry: ParsedWorklogEntry };
+	const flat: FlatEntry[] = [];
+	perFileSurviving.forEach((file, fileIndex) => {
+		for (const entry of file.entries) {
+			flat.push({ fileIndex, entry });
 		}
+	});
+
+	const totalNonPinned = flat.length;
+	let kept: FlatEntry[] = flat;
+	if (flat.length > 0) {
+		// Walk from the tail inward accumulating char count until a budget
+		// binds. Entry-count budget caps at MAX_ANCESTOR_TAIL_ENTRIES; char
+		// budget caps at MAX_ANCESTOR_TAIL_CHARS. To keep the guarantee
+		// "always keep at least one entry" (so tiny worklogs with a single
+		// huge entry don't get a spurious truncation marker), we allow the
+		// first-kept entry to exceed the char budget on its own.
+		const picked: FlatEntry[] = [];
+		let charCount = 0;
+		for (let i = flat.length - 1; i >= 0; i -= 1) {
+			if (picked.length >= MAX_ANCESTOR_TAIL_ENTRIES) break;
+			const raw = flat[i]?.entry.raw ?? "";
+			if (picked.length > 0 && charCount + raw.length > MAX_ANCESTOR_TAIL_CHARS) {
+				break;
+			}
+			picked.push(flat[i] as FlatEntry);
+			charCount += raw.length;
+		}
+		picked.reverse();
+		kept = picked;
+	}
+	const droppedCount = totalNonPinned - kept.length;
+	if (droppedCount > 0) {
+		sections.push(
+			`<!-- truncated: dropped ${droppedCount} older non-pinned entries -->`,
+		);
+	}
+
+	// Pass 3: regroup the kept entries back into per-file wrappers,
+	// preserving ancestor order. A file with zero kept entries (because it
+	// was fully tombstoned, fully topic-filtered, or dropped by the tail
+	// cap) has its wrapper skipped.
+	const keptByFile = new Map<number, ParsedWorklogEntry[]>();
+	for (const { fileIndex, entry } of kept) {
+		let bucket = keptByFile.get(fileIndex);
+		if (!bucket) {
+			bucket = [];
+			keptByFile.set(fileIndex, bucket);
+		}
+		bucket.push(entry);
+	}
+	for (let fileIndex = 0; fileIndex < perFileSurviving.length; fileIndex += 1) {
+		const bucket = keptByFile.get(fileIndex);
+		if (!bucket || bucket.length === 0) continue;
+		const file = perFileSurviving[fileIndex] as PerFileSurviving;
 		// Inter-entry whitespace is normalized to exactly one blank line on
 		// re-emit. Individual entries' `raw` bytes are preserved verbatim;
-		// only the glue between adjacent entries is canonicalized. Benign for
-		// legacy files that may have had irregular spacing.
-		const body = surviving.map((parsedEntry) => parsedEntry.raw).join("\n\n");
+		// only the glue between adjacent entries is canonicalized. Benign
+		// for legacy files that may have had irregular spacing.
+		const body = bucket.map((parsedEntry) => parsedEntry.raw).join("\n\n");
 		sections.push(
 			`<ancestor-worklog agent="${file.agentId}" role="${file.role}">\n${body}\n</ancestor-worklog>`,
 		);
