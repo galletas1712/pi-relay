@@ -379,4 +379,133 @@ describe("Cache Retention (PI_CACHE_RETENTION)", () => {
 			expect(capturedPayload.prompt_cache_retention).toBe("24h");
 		});
 	});
+
+	describe("Azure OpenAI Responses Provider", () => {
+		it("should omit prompt_cache_key when PI_CACHE_RETENTION=none", async () => {
+			process.env.PI_CACHE_RETENTION = "none";
+			const baseModel = getModel("azure-openai-responses", "gpt-4o-mini");
+			let capturedPayload: any = null;
+
+			const { streamAzureOpenAIResponses } = await import("../src/providers/azure-openai-responses.js");
+
+			try {
+				const s = streamAzureOpenAIResponses(baseModel, context, {
+					apiKey: "fake-key",
+					sessionId: "session-azure",
+					// Supply an azureBaseUrl so the client can construct without
+					// requiring AZURE_OPENAI_* env vars in the test env.
+					azureBaseUrl: "https://fake-azure.example.com/openai/v1",
+					onPayload: (payload) => {
+						capturedPayload = payload;
+					},
+				});
+
+				for await (const event of s) {
+					if (event.type === "error") break;
+				}
+			} catch {
+				// Expected to fail
+			}
+
+			expect(capturedPayload).not.toBeNull();
+			expect(capturedPayload.prompt_cache_key).toBeUndefined();
+		});
+
+		it("should stamp prompt_cache_key from sessionId by default", async () => {
+			const baseModel = getModel("azure-openai-responses", "gpt-4o-mini");
+			let capturedPayload: any = null;
+
+			const { streamAzureOpenAIResponses } = await import("../src/providers/azure-openai-responses.js");
+
+			try {
+				const s = streamAzureOpenAIResponses(baseModel, context, {
+					apiKey: "fake-key",
+					sessionId: "session-azure",
+					azureBaseUrl: "https://fake-azure.example.com/openai/v1",
+					onPayload: (payload) => {
+						capturedPayload = payload;
+					},
+				});
+
+				for await (const event of s) {
+					if (event.type === "error") break;
+				}
+			} catch {
+				// Expected to fail
+			}
+
+			expect(capturedPayload).not.toBeNull();
+			expect(capturedPayload.prompt_cache_key).toBe("session-azure");
+		});
+	});
+
+	describe("OpenAI Codex Responses Provider", () => {
+		// Codex's streaming entrypoint calls `extractAccountId` on the API key
+		// before `onPayload` fires. The helper base64-decodes the JWT's second
+		// segment and reads `chatgpt_account_id`, so the test needs a minimally
+		// valid JWT (3 dot-separated base64url segments with the expected claim)
+		// to reach the payload-capture hook.
+		const fakeCodexJwt = (() => {
+			const header = Buffer.from(JSON.stringify({ alg: "none", typ: "JWT" })).toString("base64url");
+			const payload = Buffer.from(
+				JSON.stringify({
+					"https://api.openai.com/auth": { chatgpt_account_id: "acct_fake_for_test" },
+				}),
+			).toString("base64url");
+			return `${header}.${payload}.fakesig`;
+		})();
+
+		it("should omit prompt_cache_key when PI_CACHE_RETENTION=none", async () => {
+			process.env.PI_CACHE_RETENTION = "none";
+			const baseModel = getModel("openai-codex", "gpt-5.1");
+			let capturedPayload: any = null;
+
+			const { streamOpenAICodexResponses } = await import("../src/providers/openai-codex-responses.js");
+
+			try {
+				const s = streamOpenAICodexResponses(baseModel, context, {
+					apiKey: fakeCodexJwt,
+					sessionId: "session-codex",
+					onPayload: (payload) => {
+						capturedPayload = payload;
+					},
+				});
+
+				for await (const event of s) {
+					if (event.type === "error") break;
+				}
+			} catch {
+				// Expected to fail at HTTP boundary.
+			}
+
+			expect(capturedPayload).not.toBeNull();
+			expect(capturedPayload.prompt_cache_key).toBeUndefined();
+		});
+
+		it("should stamp prompt_cache_key from sessionId by default", async () => {
+			const baseModel = getModel("openai-codex", "gpt-5.1");
+			let capturedPayload: any = null;
+
+			const { streamOpenAICodexResponses } = await import("../src/providers/openai-codex-responses.js");
+
+			try {
+				const s = streamOpenAICodexResponses(baseModel, context, {
+					apiKey: fakeCodexJwt,
+					sessionId: "session-codex",
+					onPayload: (payload) => {
+						capturedPayload = payload;
+					},
+				});
+
+				for await (const event of s) {
+					if (event.type === "error") break;
+				}
+			} catch {
+				// Expected to fail at HTTP boundary.
+			}
+
+			expect(capturedPayload).not.toBeNull();
+			expect(capturedPayload.prompt_cache_key).toBe("session-codex");
+		});
+	});
 });

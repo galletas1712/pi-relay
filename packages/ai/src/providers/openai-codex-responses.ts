@@ -24,6 +24,7 @@ import { getEnvApiKey } from "../env-api-keys.js";
 import type {
 	Api,
 	AssistantMessage,
+	CacheRetention,
 	Context,
 	Model,
 	SimpleStreamOptions,
@@ -44,6 +45,22 @@ const JWT_CLAIM_PATH = "https://api.openai.com/auth" as const;
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 const CODEX_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
+
+/**
+ * Resolve cache retention preference. Mirrors `openai-responses.ts`:
+ * defaults to "short", honors an explicit option, and treats
+ * `PI_CACHE_RETENTION=none` as a global kill switch that disables
+ * `prompt_cache_key` emission.
+ */
+function resolveCacheRetention(cacheRetention?: CacheRetention): CacheRetention {
+	if (cacheRetention) {
+		return cacheRetention;
+	}
+	if (typeof process !== "undefined" && process.env.PI_CACHE_RETENTION === "none") {
+		return "none";
+	}
+	return "short";
+}
 
 const CODEX_RESPONSE_STATUSES = new Set<CodexResponseStatus>([
 	"completed",
@@ -313,6 +330,7 @@ function buildRequestBody(
 		includeSystemPrompt: false,
 	});
 
+	const cacheRetention = resolveCacheRetention(options?.cacheRetention);
 	const body: RequestBody = {
 		model: model.id,
 		store: false,
@@ -321,7 +339,7 @@ function buildRequestBody(
 		input: messages,
 		text: { verbosity: options?.textVerbosity || "medium" },
 		include: ["reasoning.encrypted_content"],
-		prompt_cache_key: options?.sessionId,
+		prompt_cache_key: cacheRetention === "none" ? undefined : options?.sessionId,
 		tool_choice: "auto",
 		parallel_tool_calls: true,
 	};
