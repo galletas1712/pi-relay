@@ -1,7 +1,12 @@
 import { Agent } from "@pi-relay/agent-core";
 import { type AssistantMessage, getModel, type Usage } from "@pi-relay/ai";
 import { describe, expect, it } from "vitest";
-import { AgentSession, createEmptyUsage } from "../src/core/agent-session.js";
+import {
+	AgentSession,
+	createEmptyUsage,
+	type AgentSessionEvent,
+	type BackgroundUsageScope,
+} from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
 import { SessionManager } from "../src/core/session-manager.js";
@@ -306,6 +311,65 @@ describe("AgentSession.getSessionStats", () => {
 			expect(fresh.input).toBe(100);
 			expect(fresh.cost.total).toBeCloseTo(0.0033, 6);
 			expect(fresh.cost.input).toBeCloseTo(0.001, 6);
+		} finally {
+			session.dispose();
+		}
+	});
+
+	it("emits background_usage events with scope for each attributed add", () => {
+		const { session } = createSession();
+		try {
+			const captured: Array<{ scope: BackgroundUsageScope; usage: Usage }> = [];
+			const unsubscribe = session.subscribe((event: AgentSessionEvent) => {
+				if (event.type === "background_usage") {
+					captured.push({ scope: event.scope, usage: event.usage });
+				}
+			});
+
+			const worklogUsage: Usage = {
+				input: 200, output: 80, cacheRead: 300, cacheWrite: 20,
+				totalTokens: 600,
+				cost: { input: 0.001, output: 0.001, cacheRead: 0, cacheWrite: 0.0001, total: 0.0021 },
+			};
+			const compactionUsage: Usage = {
+				input: 4000, output: 300, cacheRead: 0, cacheWrite: 4000,
+				totalTokens: 8300,
+				cost: { input: 0.01, output: 0.004, cacheRead: 0, cacheWrite: 0.008, total: 0.022 },
+			};
+
+			session.addBackgroundUsage(worklogUsage, "worklog");
+			session.addBackgroundUsage(compactionUsage, "compaction");
+
+			expect(captured).toHaveLength(2);
+			expect(captured[0].scope).toBe("worklog");
+			expect(captured[0].usage.input).toBe(200);
+			expect(captured[1].scope).toBe("compaction");
+			expect(captured[1].usage.input).toBe(4000);
+
+			unsubscribe();
+		} finally {
+			session.dispose();
+		}
+	});
+
+	it("suppresses background_usage events when scope is omitted", () => {
+		// Scopeless adds (e.g., tests using the method as a raw accumulator)
+		// should not spam the event stream; consumers have no attribution to
+		// surface. The aggregate still updates via getBackgroundUsage().
+		const { session } = createSession();
+		try {
+			const captured: AgentSessionEvent[] = [];
+			const unsubscribe = session.subscribe((event) => {
+				if (event.type === "background_usage") captured.push(event);
+			});
+			session.addBackgroundUsage({
+				input: 10, output: 5, cacheRead: 0, cacheWrite: 0,
+				totalTokens: 15,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			});
+			expect(captured).toHaveLength(0);
+			expect(session.getBackgroundUsage().input).toBe(10);
+			unsubscribe();
 		} finally {
 			session.dispose();
 		}

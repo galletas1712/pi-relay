@@ -49,22 +49,46 @@ export function formatTurnCacheStats(usage: Pick<Usage, "cacheRead" | "cacheWrit
 }
 
 /**
+ * Scope tag for structured cache-telemetry lines. Values:
+ *
+ * - `self` — attached agent only (multi-agent per-turn aggregate).
+ * - `tree` — attached agent plus all live descendants (multi-agent per-turn).
+ * - `worklog` | `compaction` | `branch` | `turn-prefix` — per-background-call
+ *   attribution for out-of-band LLM calls whose usage would otherwise not
+ *   appear in the per-turn aggregate. Emitted at the moment the background
+ *   call completes; useful for attributing cost to the specific out-of-band
+ *   path that produced it.
+ *
+ * The union mirrors {@link BackgroundUsageScope} (from `agent-session.ts`)
+ * plus the two per-turn scopes. `cache-telemetry.ts` cannot import from
+ * `agent-session.ts` (imports would become cyclic) so the union is duplicated
+ * here as the string-literal authority for formatting.
+ */
+export type CacheLogScope = "self" | "tree" | "worklog" | "compaction" | "branch" | "turn-prefix";
+
+/**
  * Formats a structured cache-telemetry line for stderr.
  *
  * Default shape (single-agent): `[pi:cache] turn=<N> cacheRead=<R> cacheWrite=<W> input=<I> output=<O>`
  *
- * With `scope` (multi-agent): `[pi:cache] turn=<N> <scope> cacheRead=<R> ...`
- * where `<scope>` is either `self` (attached agent only) or `tree` (attached
- * agent plus all descendants). The `scope` token sits immediately after
- * `turn=<N>` so the tail format stays grep-compatible with single-agent logs.
+ * With `scope`: `[pi:cache] turn=<N> <scope> cacheRead=<R> ...` where
+ * `<scope>` is one of the values in {@link CacheLogScope}. The `scope` token
+ * sits immediately after `turn=<N>` so the tail format stays grep-compatible
+ * with single-agent logs.
  *
- * Stable enough to grep; no color codes; single line per turn. Consumed by
- * `print-mode` when `PI_SHOW_CACHE_STATS=1`.
+ * For background-call lines (`worklog`/`compaction`/`branch`/`turn-prefix`)
+ * the `turn` value is the session's current turn count at emission time.
+ * Background calls do not have their own turn number; reusing the session
+ * turn lets devs correlate a background cost to the turn that triggered it
+ * (e.g., a worklog fork fires after the main turn completes).
+ *
+ * Stable enough to grep; no color codes; single line per emission. Consumed
+ * by `print-mode` when `PI_SHOW_CACHE_STATS=1`.
  */
 export function formatCacheLogLine(opts: {
 	turn: number;
 	usage: Pick<Usage, "input" | "output" | "cacheRead" | "cacheWrite">;
-	scope?: "self" | "tree";
+	scope?: CacheLogScope;
 }): string {
 	const { turn, usage, scope } = opts;
 	const scopePart = scope ? ` ${scope}` : "";
