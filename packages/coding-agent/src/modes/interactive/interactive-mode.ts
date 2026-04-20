@@ -689,7 +689,7 @@ export class InteractiveMode {
 	 * Check npm registry for a newer version.
 	 */
 	private async checkForNewVersion(): Promise<string | undefined> {
-		if (process.env.PI_SKIP_VERSION_CHECK || process.env.PI_OFFLINE) return undefined;
+		if (process.env.PI_SKIP_VERSION_CHECK || isTruthyEnvFlag(process.env.PI_OFFLINE)) return undefined;
 
 		try {
 			const response = await fetch("https://registry.npmjs.org/@pi-relay/coding-agent/latest", {
@@ -711,7 +711,7 @@ export class InteractiveMode {
 	}
 
 	private async checkForPackageUpdates(): Promise<string[]> {
-		if (process.env.PI_OFFLINE) {
+		if (isTruthyEnvFlag(process.env.PI_OFFLINE)) {
 			return [];
 		}
 
@@ -807,7 +807,7 @@ export class InteractiveMode {
 	}
 
 	private reportInstallTelemetry(version: string): void {
-		if (process.env.PI_OFFLINE) {
+		if (isTruthyEnvFlag(process.env.PI_OFFLINE)) {
 			return;
 		}
 

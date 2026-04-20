@@ -597,8 +597,11 @@ pi --thinking high "Solve this complex problem"
 | `PI_PACKAGE_DIR` | Override package directory (useful for Nix/Guix where store paths tokenize poorly) |
 | `PI_SKIP_VERSION_CHECK` | Skip version check at startup |
 | `PI_TELEMETRY` | Override install telemetry. Use `1`/`true`/`yes` to enable or `0`/`false`/`no` to disable |
-| `PI_CACHE_RETENTION` | Set to `long` for extended prompt cache (Anthropic: 1h, OpenAI: 24h) |
+| `PI_CACHE_RETENTION` | Set to `long` for extended prompt cache (Anthropic: 1h, OpenAI: 24h). Set to `none` to disable all prompt caching. |
+| `PI_SHOW_CACHE_STATS` | Set to `1` to show per-turn cache read/write tokens in the TUI footer and stderr. |
 | `VISUAL`, `EDITOR` | External editor for Ctrl+G |
+
+See [docs/env-vars.md](./docs/env-vars.md) for the full list, including debug/telemetry flags and provider-specific knobs.
 
 ---
 
