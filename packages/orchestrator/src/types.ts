@@ -186,6 +186,26 @@ export interface OrchestratorConfig {
 	 * {@link DEFAULT_MAX_FOCUS_STALENESS_TURNS}.
 	 */
 	maxFocusStalenessTurns?: number;
+	/**
+	 * Minimum worklog file size (in bytes) before a rolling compaction
+	 * fork is eligible to run. The check uses `statSync` on the worklog
+	 * file so cost is negligible. Falls back to
+	 * {@link DEFAULT_COMPACTION_SIZE_THRESHOLD_BYTES} when unset.
+	 */
+	compactionSizeThresholdBytes?: number;
+	/**
+	 * Minimum number of turns that must elapse between compactions for
+	 * the same agent. Counted as `record.turnCount - record.lastCompactionTurn`.
+	 * Falls back to {@link DEFAULT_COMPACTION_MIN_TURNS} when unset.
+	 */
+	compactionMinTurns?: number;
+	/**
+	 * Count of most-recent entries that are preserved verbatim (never
+	 * sent to the compaction LLM). Pinned entries are also preserved
+	 * verbatim; they are independent of this knob. Falls back to
+	 * {@link DEFAULT_COMPACTION_KEEP_RECENT} when unset.
+	 */
+	compactionKeepRecent?: number;
 }
 
 export interface AgentMessageDetails {
@@ -224,6 +244,14 @@ export interface AgentTreeMetadataEntry {
 	 * back to the transcript tail.
 	 */
 	currentFocus?: { content: string; turn: number };
+	/**
+	 * Persisted mirror of {@link AgentRecord.lastCompactionTurn}. Written
+	 * by `runWorklogCompaction` after a successful rewrite so restore
+	 * round-trips the back-off counter. Absent on legacy tree.json files
+	 * written before PR-9; loaded as `0` which allows the next threshold
+	 * check to re-evaluate eligibility.
+	 */
+	lastCompactionTurn?: number;
 }
 
 export interface AgentTreeMetadata {
@@ -249,6 +277,13 @@ export interface AgentRecord {
 	pendingRestoreIdleNotice: boolean;
 	orphanedPendingToolCallIds: string[];
 	unsubscribe?: () => void;
+	/**
+	 * Turn number at which this agent's worklog was last compacted (or 0
+	 * if never). Combined with {@link OrchestratorConfig.compactionMinTurns}
+	 * to back off compactions so we don't re-compact on every turn when
+	 * the file happens to remain over the size threshold.
+	 */
+	lastCompactionTurn: number;
 	/**
 	 * Compact "what am I working on right now" pointer emitted by the
 	 * agent's own worklog fork via the `set_focus_pointer` tool. When set
@@ -325,3 +360,35 @@ export const DEFAULT_ORCHESTRATOR_CONFIG: OrchestratorConfig = {
  * about the parent's current task.
  */
 export const DEFAULT_MAX_FOCUS_STALENESS_TURNS = 10;
+
+/**
+ * Default minimum worklog size (bytes) before a rolling compaction is
+ * eligible. Chosen so typical short sessions never compact — the cost is
+ * paid only when a worklog has accumulated substantial durable content.
+ * Measured against a single agent's worklog file size (not subtree total).
+ */
+export const DEFAULT_COMPACTION_SIZE_THRESHOLD_BYTES = 200 * 1024;
+
+/**
+ * Default minimum turn delta between compactions for the same agent.
+ * Prevents a chronically oversized worklog from triggering a compaction
+ * on every turn; once the model picks up substantial new context the
+ * next compaction collapses it.
+ */
+export const DEFAULT_COMPACTION_MIN_TURNS = 30;
+
+/**
+ * Default count of most-recent entries preserved verbatim through
+ * compaction. Chosen to comfortably cover a task's active working-set
+ * window so an in-flight investigation is never summarized out from
+ * under the agent before it concludes.
+ */
+export const DEFAULT_COMPACTION_KEEP_RECENT = 20;
+
+/**
+ * Lower bound on the count of older (non-pinned, non-recent) entries
+ * required before compaction runs. Running the LLM on a handful of
+ * entries rarely produces a win; below this threshold we skip and
+ * bump `lastCompactionTurn` so we don't re-check on every turn.
+ */
+export const MIN_OLDER_ENTRIES_FOR_COMPACTION = 10;

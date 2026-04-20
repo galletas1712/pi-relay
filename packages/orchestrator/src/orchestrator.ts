@@ -15,11 +15,15 @@ import {
 	createAgentIdleMessage,
 	createAgentReportMessage,
 } from "./messages.js";
-import { buildAncestorWorklogPrefix, buildWorklogPrompt, appendWorklogEntry, clampFocusPointerContent, collectLivePinnedEntries, computeTopicVocabulary, getLastWorklogEntry, MAX_PINNED_ENTRIES, parseWorklogEntries, readWorklog, SET_FOCUS_POINTER_TOOL, summarizePinnedEntry, updateWorklogEntryPin, WORKLOG_UNPIN_TOOL, WORKLOG_UPDATE_TOOL } from "./worklog.js";
+import { buildAncestorWorklogPrefix, buildCompactionPrompt, buildWorklogPrompt, appendWorklogEntry, clampFocusPointerContent, collectLivePinnedEntries, computeTopicVocabulary, formatCompactionSummary, getLastCompactionSummary, getLastWorklogEntry, MAX_PINNED_ENTRIES, parseWorklogEntries, readWorklog, rewriteWorklogWithSummary, SET_FOCUS_POINTER_TOOL, summarizePinnedEntry, updateWorklogEntryPin, WORKLOG_COMPACT_TOOL, WORKLOG_UNPIN_TOOL, WORKLOG_UPDATE_TOOL } from "./worklog.js";
 import { ToolCallTracker } from "./tool-tracker.js";
 import {
+	DEFAULT_COMPACTION_KEEP_RECENT,
+	DEFAULT_COMPACTION_MIN_TURNS,
+	DEFAULT_COMPACTION_SIZE_THRESHOLD_BYTES,
 	DEFAULT_MAX_FOCUS_STALENESS_TURNS,
 	DEFAULT_ORCHESTRATOR_CONFIG,
+	MIN_OLDER_ENTRIES_FOR_COMPACTION,
 	type AgentRecord,
 	type AgentTreeMetadata,
 	type AgentTreeMetadataEntry,
@@ -197,6 +201,14 @@ export class Orchestrator {
 	private readonly treeFile: string;
 	private readonly changeListeners = new Set<() => void>();
 	private readonly pendingWorklogFork = new Map<string, Promise<void>>();
+	/**
+	 * Per-agent in-flight compaction guard. A compaction is chained on
+	 * {@link pendingWorklogFork} so it never races the per-turn fork, but
+	 * we also need a boolean to answer "is a compaction pending?" without
+	 * awaiting the chain — used by {@link shouldCompactWorklog} to avoid
+	 * double-scheduling while the first compaction is still running.
+	 */
+	private readonly pendingWorklogCompaction = new Set<string>();
 	private readonly pendingSpawnDrafts = new Map<string, Map<string, PendingSpawnDraft>>();
 	private readonly restoredDisposedEntries = new Map<string, AgentTreeMetadataEntry>();
 	private _isDisposing = false;
@@ -239,6 +251,7 @@ export class Orchestrator {
 			turnCount: 0,
 			pendingRestoreIdleNotice: false,
 			orphanedPendingToolCallIds: [],
+			lastCompactionTurn: 0,
 			currentFocus: undefined,
 		};
 		this.registerRecord(rootRecord);
@@ -486,6 +499,7 @@ export class Orchestrator {
 			rootRecord.lastWorklogMessageCount = rootEntry.lastWorklogMessageCount ?? 0;
 			rootRecord.turnCount = rootEntry.turnCount ?? rootEntry.lastWorklogTurn;
 			rootRecord.currentFocus = rootEntry.currentFocus;
+			rootRecord.lastCompactionTurn = rootEntry.lastCompactionTurn ?? 0;
 		}
 		rootRecord.orphanedPendingToolCallIds = this.appendInterruptedToolResults(rootRecord.session);
 
@@ -536,6 +550,7 @@ export class Orchestrator {
 				turnCount: entry.turnCount ?? entry.lastWorklogTurn,
 				pendingRestoreIdleNotice: entry.status === "running",
 				orphanedPendingToolCallIds: [],
+				lastCompactionTurn: entry.lastCompactionTurn ?? 0,
 				currentFocus: entry.currentFocus,
 			};
 			this.registerRecord(record);
@@ -615,6 +630,7 @@ export class Orchestrator {
 				turnCount: 0,
 				pendingRestoreIdleNotice: false,
 				orphanedPendingToolCallIds: [],
+				lastCompactionTurn: 0,
 				currentFocus: undefined,
 			};
 			parent.childIds.push(agentId);
@@ -749,9 +765,14 @@ export class Orchestrator {
 					skipReason: gate.reason,
 					entryEmitted: false,
 				});
+				// Compaction is an orthogonal decision (based on file size +
+				// turn-delta since last compaction, not on the current turn's
+				// content), so it can still fire on fork-gated turns.
+				this.maybeScheduleWorklogCompaction(agentId);
 				return;
 			}
 			this.scheduleWorklogFork(agentId, record.turnCount, turnMessages);
+			this.maybeScheduleWorklogCompaction(agentId);
 			return;
 		}
 
@@ -1013,6 +1034,7 @@ export class Orchestrator {
 				lastWorklogMessageCount: record.lastWorklogMessageCount,
 				turnCount: record.turnCount,
 				currentFocus: record.currentFocus,
+				lastCompactionTurn: record.lastCompactionTurn,
 			};
 		}
 		return {
@@ -1299,6 +1321,11 @@ export class Orchestrator {
 			entry_id: pinnedEntry.id ?? "",
 			summary: summarizePinnedEntry(pinnedEntry),
 		}));
+		// Surface the current compaction summary (if any) so the fork
+		// doesn't try to re-derive content that has already been distilled.
+		// The summary body is the text the compaction LLM produced; the
+		// header line is stripped to keep the fork's prompt focused.
+		const priorCompactionSummary = getLastCompactionSummary(worklogContents);
 		const prompt: UserMessage = {
 			role: "user",
 			content: [
@@ -1309,6 +1336,7 @@ export class Orchestrator {
 						topicVocabulary,
 						currentlyPinnedSummaries,
 						record.currentFocus,
+						priorCompactionSummary?.body,
 					),
 				},
 			],
@@ -1506,6 +1534,236 @@ export class Orchestrator {
 			entryEmitted: true,
 			warning,
 		});
+	}
+
+	private maybeScheduleWorklogCompaction(agentId: string): void {
+		const record = this.records.get(agentId);
+		if (!record || record.status === "disposed") return;
+		if (this.pendingWorklogCompaction.has(agentId)) return;
+		if (!this.shouldCompactWorklog(record)) return;
+		this.scheduleWorklogCompaction(agentId);
+	}
+
+	/**
+	 * Rolling compaction eligibility gate. Runs synchronously with a cheap
+	 * `statSync` on the worklog file — intentionally NOT async so the
+	 * turn_end hot path doesn't take a dispatch round-trip just to decide
+	 * "not yet". Returns `false` for every reason to back off:
+	 *
+	 * - File missing or empty.
+	 * - File size below the configured threshold.
+	 * - Turn delta since last compaction below the configured minimum.
+	 * - A compaction for this agent is already in-flight.
+	 */
+	private shouldCompactWorklog(record: AgentRecord): boolean {
+		if (this.pendingWorklogCompaction.has(record.id)) return false;
+		const threshold = this.config.compactionSizeThresholdBytes ?? DEFAULT_COMPACTION_SIZE_THRESHOLD_BYTES;
+		const minTurns = this.config.compactionMinTurns ?? DEFAULT_COMPACTION_MIN_TURNS;
+		const sinceLast = record.turnCount - (record.lastCompactionTurn ?? 0);
+		if (sinceLast < minTurns) return false;
+		let size = 0;
+		try {
+			size = statSync(record.worklogFile).size;
+		} catch {
+			return false;
+		}
+		if (size < threshold) return false;
+		return true;
+	}
+
+	/**
+	 * Schedule a compaction on this agent's existing
+	 * {@link pendingWorklogFork} chain so that the rewrite NEVER races with
+	 * the per-turn worklog fork. Both operations touch the same file; the
+	 * chain is the single source of truth for "who holds the write lock".
+	 */
+	private scheduleWorklogCompaction(agentId: string): void {
+		const previous = this.pendingWorklogFork.get(agentId) ?? Promise.resolve();
+		this.pendingWorklogCompaction.add(agentId);
+		const next = previous
+			.then(() => this.runWorklogCompaction(agentId))
+			.catch(() => {
+				// Best-effort compaction should not poison future turns.
+			})
+			.finally(() => {
+				this.pendingWorklogCompaction.delete(agentId);
+			});
+		this.pendingWorklogFork.set(agentId, next);
+	}
+
+	/**
+	 * Run a single compaction pass for the given agent. Off-transcript; the
+	 * rewritten file is built from the current on-disk content plus a
+	 * summary produced by a dedicated LLM call using the configured
+	 * {@link OrchestratorConfig.forkModel} (or the parent session's model
+	 * when unset). The write is atomic via `rewriteWorklogWithSummary`.
+	 *
+	 * Invariants preserved across the rewrite:
+	 * - Pinned entries (live `pin: true`, any position) stay verbatim.
+	 * - The most-recent {@link OrchestratorConfig.compactionKeepRecent}
+	 *   entries (non-pinned, chronological) stay verbatim.
+	 * - A tombstone cited in any surviving entry's `supersedes` continues
+	 *   to function after the rewrite (tombstoned entries are filtered out
+	 *   of the set sent to the LLM and dropped from the rewritten file).
+	 * - {@link AgentRecord.lastWorklogMessageCount} is NEVER touched — only
+	 *   {@link runWorklogFork}'s `worklog_update`/`set_focus_pointer`/
+	 *   `worklog_unpin` paths advance it.
+	 *
+	 * Error semantics: any failure advances
+	 * {@link AgentRecord.lastCompactionTurn} anyway so a chronically
+	 * failing LLM doesn't trigger a retry storm. The on-disk file is left
+	 * unchanged on error.
+	 */
+	private async runWorklogCompaction(agentId: string): Promise<void> {
+		const record = this.records.get(agentId);
+		if (!record || record.status === "disposed") return;
+		const keepRecent = this.config.compactionKeepRecent ?? DEFAULT_COMPACTION_KEEP_RECENT;
+		const turnAtStart = record.turnCount;
+
+		const content = await readWorklog(record.worklogFile);
+		if (!content.trim()) {
+			record.lastCompactionTurn = turnAtStart;
+			await this.persistTree();
+			return;
+		}
+		const parsed = parseWorklogEntries(content);
+		const priorSummary = getLastCompactionSummary(content);
+
+		// Partition entries into three groups:
+		//   pinned: meta.pin === true, any position — preserved verbatim.
+		//   recent: the last `keepRecent` non-pinned entries — preserved verbatim.
+		//   older:  the remainder — sent to the LLM for compaction.
+		// Tombstoned entries are dropped from the "older" set before the LLM
+		// sees them (pre-filter for free information), but are preserved
+		// in the pinned/recent groups if they happen to fall there (their
+		// supersedes pointers continue to tombstone ancestors at read-time).
+		const localTombstones = new Set<string>();
+		for (const entry of parsed) {
+			const supersedes = Array.isArray(entry.meta.supersedes) ? entry.meta.supersedes : [];
+			for (const id of supersedes) {
+				if (typeof id === "string" && id.length > 0) localTombstones.add(id);
+			}
+		}
+
+		const pinned: typeof parsed = [];
+		const nonPinned: typeof parsed = [];
+		for (const entry of parsed) {
+			if (entry.meta.pin === true && entry.id !== undefined) {
+				pinned.push(entry);
+			} else {
+				nonPinned.push(entry);
+			}
+		}
+		const sliceAt = Math.max(0, nonPinned.length - keepRecent);
+		const olderAll = nonPinned.slice(0, sliceAt);
+		const recent = nonPinned.slice(sliceAt);
+		const older = olderAll.filter((entry) => {
+			if (entry.id === undefined) return true;
+			return !localTombstones.has(entry.id);
+		});
+
+		if (older.length < MIN_OLDER_ENTRIES_FOR_COMPACTION) {
+			// Not enough older entries to justify an LLM call. Bump
+			// lastCompactionTurn anyway so we back off and don't re-check
+			// on every subsequent turn until the file grows more.
+			record.lastCompactionTurn = turnAtStart;
+			await this.persistTree();
+			return;
+		}
+
+		const forkModel = this.config.forkModel ?? record.session.model;
+		if (!forkModel) {
+			record.lastCompactionTurn = turnAtStart;
+			await this.persistTree();
+			return;
+		}
+		const forkThinkingLevel = this.config.forkThinkingLevel ?? record.session.thinkingLevel;
+
+		const promptMessage: UserMessage = {
+			role: "user",
+			content: [{ type: "text", text: buildCompactionPrompt(older) }],
+			timestamp: Date.now(),
+		};
+		const forkSessionId = record.session.agent.sessionId
+			? `${record.session.agent.sessionId}:worklog`
+			: undefined;
+		const streamOptions = {
+			reasoning: forkThinkingLevel === "off" ? undefined : forkThinkingLevel,
+			getApiKey: record.session.agent.getApiKey,
+			onPayload: record.session.agent.onPayload,
+			sessionId: forkSessionId,
+			thinkingBudgets: record.session.agent.thinkingBudgets,
+			transport: record.session.agent.transport,
+			maxRetryDelayMs: record.session.agent.maxRetryDelayMs,
+		} as Parameters<typeof record.session.agent.streamFn>[2];
+
+		let assistant: Awaited<ReturnType<Awaited<ReturnType<typeof record.session.agent.streamFn>>["result"]>>;
+		try {
+			const stream = await record.session.agent.streamFn(
+				forkModel,
+				{
+					systemPrompt: record.session.agent.state.systemPrompt,
+					messages: [promptMessage],
+					tools: [WORKLOG_COMPACT_TOOL],
+				},
+				streamOptions,
+			);
+			assistant = await stream.result();
+		} catch {
+			// Advance back-off counter on error so we don't thrash on a
+			// chronically failing LLM. The file is left unchanged.
+			record.lastCompactionTurn = turnAtStart;
+			await this.persistTree();
+			return;
+		}
+
+		if (assistant.usage) {
+			record.session.addBackgroundUsage(assistant.usage, "worklog");
+		}
+		if (assistant.stopReason !== "toolUse") {
+			record.lastCompactionTurn = turnAtStart;
+			await this.persistTree();
+			return;
+		}
+		const toolCall = assistant.content.find(
+			(c): c is AgentToolCall => c.type === "toolCall" && c.name === WORKLOG_COMPACT_TOOL.name,
+		);
+		if (!toolCall) {
+			record.lastCompactionTurn = turnAtStart;
+			await this.persistTree();
+			return;
+		}
+		const args = validateToolArguments(WORKLOG_COMPACT_TOOL, toolCall);
+		const summaryText = (args.summary ?? "").trim();
+		if (!summaryText) {
+			record.lastCompactionTurn = turnAtStart;
+			await this.persistTree();
+			return;
+		}
+
+		// Compose the rewritten file:
+		//   1. New `## Summary —` block.
+		//   2. Pinned entries in original order.
+		//   3. The last `keepRecent` non-pinned entries in original order.
+		//
+		// The prior summary (if any) is replaced — its content was sent to
+		// the LLM concatenated with `older`'s bodies via the
+		// `<current-summary>` fork-prompt hint the next turn (no; see below).
+		// For PR-9 the prior summary is rolled into the new one IMPLICITLY:
+		// callers fold it into `older` before the LLM call so a second
+		// compaction doesn't silently drop it.
+		//
+		// Here we pass only `older` (which starts fresh from parsed entries,
+		// excluding the now-stale prior summary) — the fork sees it via the
+		// `<current-summary>` block on the next per-turn fork.
+		const upToTurn = older.length > 0 ? (older[older.length - 1]?.turn ?? 0) : 0;
+		const summaryBlock = formatCompactionSummary(summaryText, upToTurn, {
+			compactedCount: older.length,
+		});
+		await rewriteWorklogWithSummary(record.worklogFile, [...pinned, ...recent], summaryBlock);
+		record.lastCompactionTurn = turnAtStart;
+		await this.persistTree();
+		void priorSummary; // reserved for future carry-over logic
 	}
 
 	private appendInterruptedToolResults(session: AgentSessionHandle): string[] {

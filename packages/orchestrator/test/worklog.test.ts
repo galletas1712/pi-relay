@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Usage } from "@pi-relay/ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isLikelyTrivialTurn, Orchestrator } from "../src/orchestrator.js";
-import { appendWorklogEntry, buildAncestorWorklogPrefix, buildWorklogPrompt, clampFocusPointerContent, computeTopicVocabulary, formatWorklogEntry, MAX_FOCUS_POINTER_CHARS, parseWorklogEntries, SET_FOCUS_POINTER_TOOL, summarizePinnedEntry, updateWorklogEntryPin } from "../src/worklog.js";
+import { appendWorklogEntry, buildAncestorWorklogPrefix, buildCompactionPrompt, buildWorklogPrompt, clampFocusPointerContent, computeTopicVocabulary, formatCompactionSummary, formatWorklogEntry, getLastCompactionSummary, MAX_FOCUS_POINTER_CHARS, parseWorklogEntries, rewriteWorklogWithSummary, SET_FOCUS_POINTER_TOOL, summarizePinnedEntry, updateWorklogEntryPin, WORKLOG_COMPACT_TOOL } from "../src/worklog.js";
 import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
 function createWorklogAssistant(content: string, usage?: Usage) {
@@ -3733,5 +3733,693 @@ describe("focus pointer tree.json round-trip", () => {
 		expect(rootRec.currentFocus).toBeUndefined();
 		const childRec = orchestrator.getRecord("helper-12345678");
 		expect(childRec.currentFocus).toBeUndefined();
+	});
+});
+
+// -----------------------------------------------------------------------------
+// PR-9: rolling worklog compaction
+// -----------------------------------------------------------------------------
+
+function createCompactAssistant(summary: string, usage?: Usage) {
+	return {
+		role: "assistant" as const,
+		content: [
+			{
+				type: "toolCall" as const,
+				id: "compact-call",
+				name: "compact_worklog",
+				arguments: { summary },
+			},
+		],
+		stopReason: "toolUse" as const,
+		timestamp: Date.now(),
+		...(usage ? { usage } : {}),
+	};
+}
+
+async function seedWorklogWithEntries(
+	filePath: string,
+	count: number,
+	options?: { pinIndexes?: number[]; isoBase?: string; topicsPerEntry?: (i: number) => string[] },
+): Promise<void> {
+	const { mkdir, writeFile: wf } = await import("node:fs/promises");
+	const { dirname: dn } = await import("node:path");
+	await mkdir(dn(filePath), { recursive: true });
+	const pinSet = new Set(options?.pinIndexes ?? []);
+	const isoBase = options?.isoBase ?? "2026-11-01T00:00:00.000Z";
+	const topicsPerEntry = options?.topicsPerEntry ?? (() => []);
+	const chunks: string[] = [];
+	for (let i = 0; i < count; i += 1) {
+		// Vary seconds so entry_ids are unique even for identical bodies.
+		const iso = new Date(new Date(isoBase).getTime() + i * 1000).toISOString();
+		const entry = formatWorklogEntry(`## Finding ${i}\n- body ${i}`, i + 1, {
+			iso,
+			pin: pinSet.has(i),
+			topics: topicsPerEntry(i),
+		});
+		chunks.push(entry);
+	}
+	await wf(filePath, chunks.join("\n\n") + "\n\n", "utf-8");
+}
+
+describe("shouldCompactWorklog gating", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	it("returns false when the worklog file does not exist", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-gate-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: new FakeSession("c", { sessionDir }) })),
+			config: { compactionSizeThresholdBytes: 10, compactionMinTurns: 1 },
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.turnCount = 50;
+		rootRec.lastCompactionTurn = 0;
+		// File doesn't exist — gate returns false.
+		const shouldCompact = (orchestrator as unknown as { shouldCompactWorklog(r: typeof rootRec): boolean }).shouldCompactWorklog(rootRec);
+		expect(shouldCompact).toBe(false);
+		await orchestrator.dispose();
+	});
+
+	it("returns false when file is below the size threshold", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-gate-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: new FakeSession("c", { sessionDir }) })),
+			config: { compactionSizeThresholdBytes: 10_000, compactionMinTurns: 1 },
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.turnCount = 50;
+		rootRec.lastCompactionTurn = 0;
+		await seedWorklogWithEntries(rootRec.worklogFile, 3);
+		const shouldCompact = (orchestrator as unknown as { shouldCompactWorklog(r: typeof rootRec): boolean }).shouldCompactWorklog(rootRec);
+		expect(shouldCompact).toBe(false);
+		await orchestrator.dispose();
+	});
+
+	it("returns false when turn delta since lastCompactionTurn is below minimum", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-gate-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: new FakeSession("c", { sessionDir }) })),
+			config: { compactionSizeThresholdBytes: 10, compactionMinTurns: 30 },
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.turnCount = 25;
+		rootRec.lastCompactionTurn = 0;
+		await seedWorklogWithEntries(rootRec.worklogFile, 15);
+		const shouldCompact = (orchestrator as unknown as { shouldCompactWorklog(r: typeof rootRec): boolean }).shouldCompactWorklog(rootRec);
+		expect(shouldCompact).toBe(false);
+		await orchestrator.dispose();
+	});
+
+	it("returns true when file is large AND enough turns have elapsed", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-gate-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: new FakeSession("c", { sessionDir }) })),
+			config: { compactionSizeThresholdBytes: 100, compactionMinTurns: 10 },
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.turnCount = 50;
+		rootRec.lastCompactionTurn = 0;
+		await seedWorklogWithEntries(rootRec.worklogFile, 40);
+		const shouldCompact = (orchestrator as unknown as { shouldCompactWorklog(r: typeof rootRec): boolean }).shouldCompactWorklog(rootRec);
+		expect(shouldCompact).toBe(true);
+		await orchestrator.dispose();
+	});
+
+	it("returns false when a compaction is already pending for the agent", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-gate-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: new FakeSession("c", { sessionDir }) })),
+			config: { compactionSizeThresholdBytes: 100, compactionMinTurns: 5 },
+		});
+		const rootRec = orchestrator.getRecord("root");
+		rootRec.turnCount = 50;
+		rootRec.lastCompactionTurn = 0;
+		await seedWorklogWithEntries(rootRec.worklogFile, 40);
+		// Seed the pending set directly.
+		(orchestrator as unknown as { pendingWorklogCompaction: Set<string> }).pendingWorklogCompaction.add(rootRec.id);
+		const shouldCompact = (orchestrator as unknown as { shouldCompactWorklog(r: typeof rootRec): boolean }).shouldCompactWorklog(rootRec);
+		expect(shouldCompact).toBe(false);
+		await orchestrator.dispose();
+	});
+});
+
+describe("rolling worklog compaction", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	it("compacts older entries into a summary and preserves pins + recent tail verbatim", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-");
+		tempDirs.push(sessionDir);
+		const streamFn = vi.fn(async (_model, context) => {
+			const lastMessage = context.messages[context.messages.length - 1];
+			const text = (lastMessage?.content?.[0] as { text?: string })?.text ?? "";
+			if (text.startsWith("Compact the following")) {
+				return {
+					result: async () => createCompactAssistant("## Compacted\n- synthetic summary of older entries"),
+				} as never;
+			}
+			// Per-turn fork: no tool call so the file on disk (our seed) is
+			// the exact input to the compaction call.
+			return {
+				result: async () => ({
+					role: "assistant" as const,
+					content: [{ type: "text" as const, text: "no update" }],
+					stopReason: "stop" as const,
+					timestamp: Date.now(),
+				}),
+			} as never;
+		});
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+			config: {
+				compactionSizeThresholdBytes: 10,
+				compactionMinTurns: 1,
+				compactionKeepRecent: 5,
+			},
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "work" });
+		const record = orchestrator.getRecord(childId);
+		// Seed a worklog: entries 0..29 with pins at indexes 3 and 7.
+		await seedWorklogWithEntries(record.worklogFile, 30, { pinIndexes: [3, 7] });
+		record.turnCount = 40;
+		record.lastCompactionTurn = 0;
+
+		// Trigger turn_end → fork runs (records a bogus worklog_update) and
+		// compaction is scheduled on the same chain.
+		child.emit({ type: "turn_end", messages: [] });
+
+		// Wait for both: the per-turn fork call AND the compaction call.
+		await vi.waitFor(
+			() => {
+				expect(streamFn).toHaveBeenCalledTimes(2);
+			},
+			{ timeout: 5000 },
+		);
+		// And wait for the compaction rewrite to land.
+		await vi.waitFor(async () => {
+			const final = await readFile(record.worklogFile, "utf-8");
+			expect(final).toContain("## Summary —");
+		});
+		const finalContent = await readFile(record.worklogFile, "utf-8");
+		// Summary header at the top.
+		expect(finalContent.indexOf("## Summary —")).toBeGreaterThanOrEqual(0);
+		expect(finalContent.indexOf("## Summary —")).toBeLessThan(finalContent.indexOf("## Entry —"));
+		expect(finalContent).toContain("synthetic summary of older entries");
+		// Pinned entries preserved verbatim.
+		const parsed = parseWorklogEntries(finalContent);
+		const pinnedSurvivors = parsed.filter((e) => e.meta.pin === true);
+		expect(pinnedSurvivors).toHaveLength(2);
+		expect(pinnedSurvivors.map((e) => e.body).sort()).toEqual(
+			["## Finding 3\n- body 3", "## Finding 7\n- body 7"].sort(),
+		);
+		// Recent-K non-pinned survivors present verbatim.
+		const nonPinnedSurvivors = parsed.filter((e) => e.meta.pin !== true);
+		expect(nonPinnedSurvivors.length).toBe(5);
+		expect(nonPinnedSurvivors.map((e) => e.body)).toEqual([
+			"## Finding 25\n- body 25",
+			"## Finding 26\n- body 26",
+			"## Finding 27\n- body 27",
+			"## Finding 28\n- body 28",
+			"## Finding 29\n- body 29",
+		]);
+		// lastCompactionTurn advanced; lastWorklogMessageCount untouched is
+		// tested separately by the "error path advances lastCompactionTurn"
+		// case.
+		expect(record.lastCompactionTurn).toBeGreaterThanOrEqual(40);
+	}, 10_000);
+
+	it("drops tombstoned older entries from the LLM input (pre-filter)", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-");
+		tempDirs.push(sessionDir);
+		let compactionPromptSeen: string | undefined;
+		const streamFn = vi.fn(async (_model, context) => {
+			const lastMessage = context.messages[context.messages.length - 1];
+			const text = (lastMessage?.content?.[0] as { text?: string })?.text ?? "";
+			if (text.startsWith("Compact the following")) {
+				compactionPromptSeen = text;
+				return {
+					result: async () => createCompactAssistant("## Compacted\n- summary"),
+				} as never;
+			}
+			return {
+				result: async () => createWorklogAssistant("## Finding\n- durable."),
+			} as never;
+		});
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+			config: {
+				compactionSizeThresholdBytes: 10,
+				compactionMinTurns: 1,
+				compactionKeepRecent: 3,
+			},
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "w" });
+		const record = orchestrator.getRecord(childId);
+		// Build a worklog where entry #5 supersedes entry #2.
+		const { writeFile: wf } = await import("node:fs/promises");
+		const { mkdir } = await import("node:fs/promises");
+		const { dirname: dn } = await import("node:path");
+		await mkdir(dn(record.worklogFile), { recursive: true });
+		const base = new Date("2026-11-01T00:00:00.000Z").getTime();
+		const entries: string[] = [];
+		const ids: (string | undefined)[] = [];
+		for (let i = 0; i < 20; i += 1) {
+			const iso = new Date(base + i * 1000).toISOString();
+			const entry = formatWorklogEntry(`## Finding ${i}\n- body ${i}`, i + 1, { iso });
+			const parsed = parseWorklogEntries(entry);
+			ids.push(parsed[0]?.id);
+			entries.push(entry);
+		}
+		// Rewrite entry #5 with supersedes of entry #2.
+		const iso5 = new Date(base + 5 * 1000).toISOString();
+		const superEntry = formatWorklogEntry(`## Finding 5 supersedes 2\n- body 5`, 6, {
+			iso: iso5,
+			supersedes: ids[2] ? [ids[2]] : [],
+		});
+		entries[5] = superEntry;
+		await wf(record.worklogFile, entries.join("\n\n") + "\n\n", "utf-8");
+		record.turnCount = 40;
+		record.lastCompactionTurn = 0;
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(compactionPromptSeen).toBeDefined();
+		});
+		// Entry #2 should NOT appear in the compaction prompt (pre-filtered
+		// out as a tombstone).
+		const body2Id = ids[2];
+		if (body2Id) {
+			expect(compactionPromptSeen).not.toContain(`entry_id=${body2Id}`);
+		}
+		// Superseding entry #5 (id of index 5's rewritten entry) IS in the
+		// prompt — it's older than the last K.
+		const superParsed = parseWorklogEntries(entries[5] ?? "");
+		const superId = superParsed[0]?.id;
+		if (superId) {
+			expect(compactionPromptSeen).toContain(`entry_id=${superId}`);
+		}
+	}, 10_000);
+
+	it("error path advances lastCompactionTurn and leaves the file untouched", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-");
+		tempDirs.push(sessionDir);
+		const streamFn = vi.fn(async (_model, context) => {
+			const lastMessage = context.messages[context.messages.length - 1];
+			const text = (lastMessage?.content?.[0] as { text?: string })?.text ?? "";
+			if (text.startsWith("Compact the following")) {
+				throw new Error("simulated compaction LLM failure");
+			}
+			// Per-turn fork: return `stop` (no toolCall) so nothing is appended
+			// to the worklog. This isolates the test to the compaction error.
+			return {
+				result: async () => ({
+					role: "assistant" as const,
+					content: [{ type: "text" as const, text: "no update" }],
+					stopReason: "stop" as const,
+					timestamp: Date.now(),
+				}),
+			} as never;
+		});
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+			config: {
+				compactionSizeThresholdBytes: 10,
+				compactionMinTurns: 1,
+				compactionKeepRecent: 5,
+			},
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "w" });
+		const record = orchestrator.getRecord(childId);
+		await seedWorklogWithEntries(record.worklogFile, 20);
+		const before = await readFile(record.worklogFile, "utf-8");
+		record.turnCount = 40;
+		record.lastCompactionTurn = 0;
+
+		child.emit({ type: "turn_end", messages: [] });
+		// Wait for both LLM calls (per-turn + compaction-that-errored).
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(2);
+		});
+		// lastCompactionTurn advanced to back off.
+		await vi.waitFor(() => {
+			expect(record.lastCompactionTurn).toBeGreaterThanOrEqual(40);
+		});
+		// File content unchanged.
+		const after = await readFile(record.worklogFile, "utf-8");
+		expect(after).toBe(before);
+	}, 10_000);
+
+	it("skips (without LLM call) when older-entry count is below the minimum threshold", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-");
+		tempDirs.push(sessionDir);
+		let compactionSeen = false;
+		const streamFn = vi.fn(async (_model, context) => {
+			const lastMessage = context.messages[context.messages.length - 1];
+			const text = (lastMessage?.content?.[0] as { text?: string })?.text ?? "";
+			if (text.startsWith("Compact the following")) {
+				compactionSeen = true;
+				return {
+					result: async () => createCompactAssistant("## Compacted\n- unused"),
+				} as never;
+			}
+			return {
+				result: async () => createWorklogAssistant("## durable"),
+			} as never;
+		});
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+			config: {
+				compactionSizeThresholdBytes: 10,
+				compactionMinTurns: 1,
+				compactionKeepRecent: 10,
+			},
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "w" });
+		const record = orchestrator.getRecord(childId);
+		// 12 entries; keepRecent=10 means only 2 older — below
+		// MIN_OLDER_ENTRIES_FOR_COMPACTION = 10 → skip LLM.
+		await seedWorklogWithEntries(record.worklogFile, 12);
+		record.turnCount = 40;
+		record.lastCompactionTurn = 0;
+
+		child.emit({ type: "turn_end", messages: [] });
+		// Only the per-turn fork call, not the compaction call.
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(1);
+		});
+		// Give the compaction chain a microtask window to run its short path.
+		await waitForMicrotasks();
+		await waitForMicrotasks();
+		expect(compactionSeen).toBe(false);
+		// Yet lastCompactionTurn still advanced (back-off on skipped path).
+		expect(record.lastCompactionTurn).toBeGreaterThanOrEqual(40);
+	}, 10_000);
+
+	it("persists lastCompactionTurn across tree.json round-trip", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-");
+		tempDirs.push(sessionDir);
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "helper", prompt: "w" });
+		orchestrator.getRecord(childId).lastCompactionTurn = 42;
+		orchestrator.getRecord(childId).turnCount = 42;
+		// Force a persist via something that already triggers it.
+		orchestrator.getRecord(childId).currentFocus = { content: "x", turn: 42 };
+		// Trigger persistTree through setForkModel (which calls notifyChange
+		// + persistTree is called from setStatus etc.). Simplest: call
+		// persistTree directly through the private API.
+		await (orchestrator as unknown as { persistTree(): Promise<void> }).persistTree();
+
+		const { join } = await import("node:path");
+		const treeFile = join(sessionDir, "root-session", "tree.json");
+		const content = await readFile(treeFile, "utf-8");
+		const parsed = JSON.parse(content) as {
+			agents: Record<string, { lastCompactionTurn?: number }>;
+		};
+		expect(parsed.agents[childId]?.lastCompactionTurn).toBe(42);
+
+		// Restore: new orchestrator reads it back.
+		const root2 = new FakeSession("root-session", { sessionDir });
+		const restoredChild = new FakeSession("child-session", {
+			sessionDir,
+			sessionFile: child.sessionFile,
+			createSessionFile: false,
+		});
+		const orchestrator2 = new Orchestrator({
+			rootSession: root2,
+			sessionFactory: vi.fn(async () => ({ session: restoredChild })),
+		});
+		const restored = await orchestrator2.restore();
+		expect(restored).toBe(true);
+		const restoredRec = orchestrator2.getRecord(childId);
+		expect(restoredRec.lastCompactionTurn).toBe(42);
+	});
+
+	it("legacy tree.json without lastCompactionTurn loads as 0", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-");
+		tempDirs.push(sessionDir);
+		// Hand-craft a legacy-shape tree.json.
+		const { mkdir, writeFile: wf } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const workspace = join(sessionDir, "root-session");
+		await mkdir(workspace, { recursive: true });
+		const childSessionFile = join(workspace, "agents", "child.jsonl");
+		await mkdir(join(workspace, "agents"), { recursive: true });
+		await wf(childSessionFile, "seed\n", "utf-8");
+		const legacyTree = {
+			sessionId: "root-session",
+			agents: {
+				root: {
+					id: "root",
+					parentId: null,
+					childIds: ["helper-deadbeef"],
+					role: "root",
+					status: "idle",
+					spawnConfig: { role: "root", prompt: "" },
+					sessionFile: undefined,
+					worklogFile: join(workspace, "worklogs", "root.worklog.md"),
+					createdAt: 1,
+					lastStatusChange: 1,
+					lastWorklogTurn: 0,
+					lastWorklogMessageCount: 0,
+					turnCount: 0,
+				},
+				"helper-deadbeef": {
+					id: "helper-deadbeef",
+					parentId: "root",
+					childIds: [],
+					role: "helper",
+					status: "idle",
+					spawnConfig: { role: "helper", prompt: "legacy" },
+					sessionFile: childSessionFile,
+					worklogFile: join(workspace, "worklogs", "helper-deadbeef.worklog.md"),
+					createdAt: 2,
+					lastStatusChange: 2,
+					lastWorklogTurn: 0,
+					lastWorklogMessageCount: 0,
+					turnCount: 0,
+				},
+			},
+		};
+		await wf(join(workspace, "tree.json"), JSON.stringify(legacyTree, null, 2), "utf-8");
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			sessionFile: childSessionFile,
+			createSessionFile: false,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const restored = await orchestrator.restore();
+		expect(restored).toBe(true);
+		expect(orchestrator.getRecord("root").lastCompactionTurn).toBe(0);
+		expect(orchestrator.getRecord("helper-deadbeef").lastCompactionTurn).toBe(0);
+	});
+
+	it("attributes compaction usage via addBackgroundUsage('worklog')", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-");
+		tempDirs.push(sessionDir);
+		const compactionUsage: Usage = { inputTokens: 100, outputTokens: 50, cacheReadTokens: 0, cacheWriteTokens: 0 };
+		const streamFn = vi.fn(async (_model, context) => {
+			const lastMessage = context.messages[context.messages.length - 1];
+			const text = (lastMessage?.content?.[0] as { text?: string })?.text ?? "";
+			if (text.startsWith("Compact the following")) {
+				return {
+					result: async () => createCompactAssistant("## Compacted\n- summary", compactionUsage),
+				} as never;
+			}
+			return {
+				result: async () => createWorklogAssistant("## durable"),
+			} as never;
+		});
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+			config: {
+				compactionSizeThresholdBytes: 10,
+				compactionMinTurns: 1,
+				compactionKeepRecent: 5,
+			},
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "w" });
+		const record = orchestrator.getRecord(childId);
+		await seedWorklogWithEntries(record.worklogFile, 30);
+		record.turnCount = 40;
+		record.lastCompactionTurn = 0;
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(streamFn).toHaveBeenCalledTimes(2);
+		});
+		await vi.waitFor(() => {
+			const match = child.backgroundUsageCalls.find((call) => call.usage === compactionUsage);
+			expect(match).toBeDefined();
+			expect(match?.scope).toBe("worklog");
+		});
+	}, 10_000);
+
+	it("ancestor worklog prefix surfaces the compaction summary at the top of per-file wrapper", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-");
+		tempDirs.push(sessionDir);
+		const { mkdir, writeFile: wf } = await import("node:fs/promises");
+		const { dirname: dn } = await import("node:path");
+		// Build a worklog that already has a summary block + two entries.
+		const summaryBlock = formatCompactionSummary(
+			"## Rolled-up\n- Prior findings condensed here.",
+			10,
+			{ iso: "2026-11-01T00:00:00.000Z", compactedCount: 5 },
+		);
+		const entry1 = formatWorklogEntry("## Entry 1\n- one", 11, { iso: "2026-11-01T00:05:00.000Z" });
+		const entry2 = formatWorklogEntry("## Entry 2\n- two", 12, { iso: "2026-11-01T00:06:00.000Z" });
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const rootWorklog = orchestrator.getRecord("root").worklogFile;
+		await mkdir(dn(rootWorklog), { recursive: true });
+		await wf(rootWorklog, `${summaryBlock}\n\n${entry1}\n\n${entry2}\n\n`, "utf-8");
+
+		const prefix = await buildAncestorWorklogPrefix([
+			{ agentId: "root", role: "root", filePath: rootWorklog },
+		]);
+		expect(prefix).toContain("<ancestor-worklog");
+		expect(prefix).toContain("## Summary —");
+		// Summary must appear BEFORE the entries within the wrapper.
+		const idxSum = prefix.indexOf("## Summary —");
+		const idxEntry1 = prefix.indexOf("## Entry — 2026-11-01T00:05:00.000Z");
+		expect(idxSum).toBeGreaterThan(-1);
+		expect(idxEntry1).toBeGreaterThan(-1);
+		expect(idxSum).toBeLessThan(idxEntry1);
+		expect(prefix).toContain("Prior findings condensed here.");
+	});
+
+	it("fork prompt surfaces <current-summary> block when a compaction summary exists", async () => {
+		const sessionDir = createTempDir("pi-relay-compact-");
+		tempDirs.push(sessionDir);
+		let forkPromptText: string | undefined;
+		const streamFn = vi.fn(async (_model, context) => {
+			const lastMessage = context.messages[context.messages.length - 1];
+			const text = (lastMessage?.content?.[0] as { text?: string })?.text ?? "";
+			forkPromptText = text;
+			return {
+				result: async () => createWorklogAssistant("## durable"),
+			} as never;
+		});
+		const root = new FakeSession("root-session", { sessionDir });
+		const child = new FakeSession("child-session", {
+			sessionDir,
+			messages: [
+				{ role: "user", content: [{ type: "text", text: "q" }], timestamp: Date.now() },
+				{ role: "assistant", content: [{ type: "text", text: "a" }], stopReason: "stop", timestamp: Date.now() },
+			],
+			streamFn,
+		});
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi.fn(async () => ({ session: child })),
+		});
+		const childId = await orchestrator.spawnAgent("root", { role: "explore", prompt: "w" });
+		const record = orchestrator.getRecord(childId);
+		// Seed the child's worklog with a summary + a single entry.
+		const summaryBlock = formatCompactionSummary(
+			"## Earlier-findings\n- condensed body visible to the fork",
+			3,
+			{ iso: "2026-11-01T00:00:00.000Z", compactedCount: 3 },
+		);
+		const entry = formatWorklogEntry("## Latest\n- new", 4, { iso: "2026-11-01T00:05:00.000Z" });
+		const { writeFile: wf, mkdir } = await import("node:fs/promises");
+		const { dirname: dn } = await import("node:path");
+		await mkdir(dn(record.worklogFile), { recursive: true });
+		await wf(record.worklogFile, `${summaryBlock}\n\n${entry}\n\n`, "utf-8");
+
+		child.emit({ type: "turn_end", messages: [] });
+		await vi.waitFor(() => {
+			expect(forkPromptText).toBeDefined();
+		});
+		expect(forkPromptText).toContain("<current-summary>");
+		expect(forkPromptText).toContain("condensed body visible to the fork");
+		expect(forkPromptText).toContain("</current-summary>");
 	});
 });

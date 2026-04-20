@@ -175,18 +175,43 @@ export function clampFocusPointerContent(content: string): { content: string; tr
 	return { content: `${head}...`, truncated: true };
 }
 
+/**
+ * Tool exposed ONLY to the out-of-band compaction fork (never to the main
+ * agent loop nor to the per-turn worklog fork). Collapses a batch of
+ * older worklog entries into a single compact summary so the worklog
+ * file doesn't grow unbounded. The compaction fork hands the model a
+ * concrete list of older entries and asks it to produce a dense summary
+ * that preserves file:line references, API names, measurements, and
+ * concrete commands verbatim.
+ */
+export const WORKLOG_COMPACT_TOOL = {
+	name: "compact_worklog",
+	description:
+		"Emit a single compact summary of the older worklog entries provided below. PRESERVE verbatim: file paths, line numbers, API names, measurements, concrete commands, symbol names. DO NOT paraphrase code references. Group related entries; drop stale status updates; keep durable insights.",
+	parameters: Type.Object(
+		{
+			summary: Type.String({
+				description:
+					"Markdown summary. Use ## subsection headers for logical groupings. Preserve file:line refs, symbol names, API names, and concrete commands verbatim from the source entries. Aim for 1/5 to 1/10 the original size.",
+			}),
+		},
+		{ additionalProperties: false },
+	),
+} satisfies Tool;
+
 export function buildWorklogPrompt(
 	lastEntry: string | undefined,
 	topicVocabulary?: Array<{ slug: string; count: number }>,
 	currentlyPinned?: Array<{ entry_id: string; summary: string }>,
 	currentFocus?: { content: string; turn: number },
+	currentSummary?: string,
 ): string {
 	const topicSection = formatTopicVocabularySection(topicVocabulary);
 	const pinnedSection = formatCurrentlyPinnedSection(currentlyPinned);
 	const focusSection = formatCurrentFocusSection(currentFocus);
+	const summarySection = formatCurrentSummarySection(currentSummary);
 	return `Your worklog preserves knowledge for downstream consumption. Child agents inherit ancestor worklogs, and restored sessions reuse these entries after interruption.
-
-<last-worklog-entry>
+${summarySection}<last-worklog-entry>
 ${lastEntry ?? "(no previous entries)"}
 </last-worklog-entry>
 ${topicSection}${pinnedSection}${focusSection}
@@ -249,6 +274,16 @@ function formatCurrentFocusSection(
 	// Rendered inside the fork prompt so the model sees the prior focus
 	// pointer and can skip re-emitting when nothing material has changed.
 	return `\n<current-focus turn="${currentFocus.turn}">\n${currentFocus.content}\n</current-focus>\n`;
+}
+
+function formatCurrentSummarySection(currentSummary: string | undefined): string {
+	if (!currentSummary || currentSummary.length === 0) {
+		return "";
+	}
+	// Rendered inside the fork prompt so the model sees the current
+	// compaction summary and does not attempt to re-summarize content
+	// that has already been distilled.
+	return `\n<current-summary>\n${currentSummary}\n</current-summary>\n`;
 }
 
 /**
@@ -381,6 +416,173 @@ export async function updateWorklogEntryPin(
 function reserializeEntry(entry: ParsedWorklogEntry, meta: WorklogEntryMeta): string {
 	const metaComment = `<!-- meta: ${serializeMeta(meta)} -->`;
 	return `## Entry — ${entry.iso} (turn ${entry.turn}) ${metaComment}\n\n${entry.body}`;
+}
+
+/**
+ * Header shape for compaction summaries:
+ *   `## Summary — <iso> (compacted up to turn N) <!-- meta: {"entry_id":"...","compactedCount":K} -->`
+ *
+ * Lives at the TOP of a worklog file, above all `## Entry —` headers, so
+ * it doesn't get captured by `ENTRY_BOUNDARY_REGEX` (which anchors on
+ * `## Entry —`). `getLastWorklogEntry` and `parseWorklogEntries` both
+ * ignore it; `getLastCompactionSummary` extracts it by looking for the
+ * first-ever `## Summary —` line and reading everything up to the next
+ * `## Entry —` or end of file.
+ */
+const SUMMARY_HEADER_REGEX =
+	/^## Summary —\s+(?<iso>\S+)\s+\(compacted up to turn\s+(?<upTo>-?\d+)\)(?:\s+<!--\s*meta:\s*(?<meta>.*?)\s*-->)?\s*$/m;
+
+export interface CompactionSummaryMeta {
+	entry_id?: string;
+	compactedCount?: number;
+}
+
+export interface ParsedCompactionSummary {
+	/** ISO timestamp the summary was written. */
+	iso: string;
+	/** Turn number of the last original entry collapsed into this summary. */
+	upToTurn: number;
+	/** Parsed header meta, or `{}` if absent/invalid. */
+	meta: CompactionSummaryMeta;
+	/** Summary body (everything after the header, before the first `## Entry —`), trimmed. */
+	body: string;
+	/** Full summary block including header, preserving original bytes. */
+	raw: string;
+}
+
+/**
+ * Extract the most recent compaction summary from a worklog file's raw
+ * content. Returns `undefined` for files without a summary (the common
+ * case — every pre-PR-9 worklog file). When present the summary always
+ * lives at the top of the file above all `## Entry —` headers.
+ *
+ * Defensive against malformed headers: returns `undefined` rather than
+ * throwing when the `## Summary —` line can't be parsed.
+ */
+export function getLastCompactionSummary(content: string): ParsedCompactionSummary | undefined {
+	if (!content) return undefined;
+	const summaryIndex = content.indexOf("## Summary —");
+	if (summaryIndex < 0) return undefined;
+	// Find the end of the summary block: the first `## Entry —` header at a
+	// line start, or end-of-file. Use indexOf + newline check because the
+	// `## Entry —` token could legitimately appear inside a code block in
+	// the summary body; we require it to start a line.
+	let endIndex = content.length;
+	const entryIndex = content.indexOf("\n## Entry —", summaryIndex);
+	if (entryIndex >= 0) {
+		endIndex = entryIndex;
+	}
+	const block = content.slice(summaryIndex, endIndex).trim();
+	const firstNewline = block.indexOf("\n");
+	const headerLine = firstNewline === -1 ? block : block.slice(0, firstNewline);
+	const body = firstNewline === -1 ? "" : block.slice(firstNewline + 1).trim();
+	const headerMatch = SUMMARY_HEADER_REGEX.exec(headerLine);
+	if (!headerMatch || !headerMatch.groups) return undefined;
+	const iso = headerMatch.groups.iso ?? "";
+	const upToTurn = Number.parseInt(headerMatch.groups.upTo ?? "0", 10);
+	const metaJson = headerMatch.groups.meta;
+	let meta: CompactionSummaryMeta = {};
+	if (metaJson !== undefined && metaJson.length > 0) {
+		try {
+			const parsed = JSON.parse(metaJson);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				meta = parsed as CompactionSummaryMeta;
+			}
+		} catch {
+			// Malformed meta: keep meta = {}, never throw.
+		}
+	}
+	return {
+		iso,
+		upToTurn: Number.isFinite(upToTurn) ? upToTurn : 0,
+		meta,
+		body,
+		raw: block,
+	};
+}
+
+/**
+ * Format a compaction-summary header line + body exactly how the
+ * compaction path writes it to disk.
+ */
+export function formatCompactionSummary(
+	summary: string,
+	upToTurn: number,
+	options?: { iso?: string; compactedCount?: number },
+): string {
+	const trimmed = summary.trim();
+	const iso = options?.iso ?? new Date().toISOString();
+	const meta: CompactionSummaryMeta = {
+		entry_id: computeEntryId(trimmed, iso),
+		compactedCount: options?.compactedCount ?? 0,
+	};
+	const metaComment = `<!-- meta: ${serializeMeta(meta as WorklogEntryMeta)} -->`;
+	return `## Summary — ${iso} (compacted up to turn ${upToTurn}) ${metaComment}\n\n${trimmed}`;
+}
+
+/**
+ * Build the prompt handed to the compaction LLM. Lists each older entry
+ * with its header + body so the model sees entry boundaries, and
+ * explicitly instructs verbatim preservation of file:line refs, API
+ * names, measurements, and commands.
+ */
+export function buildCompactionPrompt(olderEntries: ParsedWorklogEntry[]): string {
+	const body = olderEntries
+		.map((entry) => {
+			const idLabel = entry.id ?? "legacy";
+			return `## Entry — ${entry.iso} (turn ${entry.turn}) entry_id=${idLabel}\n${entry.body}`;
+		})
+		.join("\n\n---\n\n");
+	return `Compact the following ${olderEntries.length} older worklog entries into a single dense summary via the compact_worklog tool.
+
+Rules:
+- Preserve file:line references, API names, measurements, and concrete commands verbatim.
+- DO NOT paraphrase code references.
+- Group related findings under \`##\` subsection headers.
+- Drop progress pings, superseded conclusions, and temporary hypotheses.
+- Aim for 1/5 to 1/10 the original size. Concise but complete.
+- If an entry states an invariant, preserve it word-for-word.
+
+<older-entries>
+${body}
+</older-entries>`;
+}
+
+/**
+ * Atomically rewrite a worklog file with (optionally) a new summary
+ * block at the top, followed by a list of entries verbatim via their
+ * `raw` bytes. The entries list should already be in the desired final
+ * order; typical layout is: pinned entries (in original order) then the
+ * most-recent-K preserved entries.
+ *
+ * Summary is omitted when `summary` is `undefined`. Preserves tombstone
+ * trails: if the caller passes tombstoned entries through, they survive
+ * on disk and continue to function as supersession pointers when the
+ * file is re-parsed.
+ *
+ * Concurrency: same precondition as `updateWorklogEntryPin` — callers
+ * MUST serialize writes to the same `filePath` externally. The
+ * orchestrator enforces this via its per-agent `pendingWorklogFork`
+ * promise chain so append, pin-rewrite, and compaction never race.
+ */
+export async function rewriteWorklogWithSummary(
+	filePath: string,
+	entries: ParsedWorklogEntry[],
+	summary: string | undefined,
+): Promise<void> {
+	const parts: string[] = [];
+	if (summary) {
+		parts.push(summary);
+	}
+	for (const entry of entries) {
+		parts.push(entry.raw);
+	}
+	const joined = parts.join("\n\n");
+	const final = joined.endsWith("\n") ? `${joined}\n` : `${joined}\n\n`;
+	mkdirSync(dirname(filePath), { recursive: true });
+	const tempFile = `${filePath}.tmp`;
+	await writeFile(tempFile, final, "utf-8");
+	renameSync(tempFile, filePath);
 }
 
 export async function readWorklog(filePath: string): Promise<string> {
@@ -576,7 +778,12 @@ export async function buildAncestorWorklogPrefix(
 	options?: { includeTopics?: ReadonlySet<string> },
 ): Promise<string> {
 	// Pass 1: read + parse every file, collect the union of supersedes ids.
-	type FileSection = { agentId: string; role: string; parsed: ParsedWorklogEntry[] };
+	type FileSection = {
+		agentId: string;
+		role: string;
+		parsed: ParsedWorklogEntry[];
+		summary: ParsedCompactionSummary | undefined;
+	};
 	const parsedPerFile: Array<FileSection | null> = [];
 	const tombstones = new Set<string>();
 	for (const entry of entries) {
@@ -586,6 +793,7 @@ export async function buildAncestorWorklogPrefix(
 			continue;
 		}
 		const parsed = parseWorklogEntries(content);
+		const summary = getLastCompactionSummary(content);
 		for (const parsedEntry of parsed) {
 			const supersedes = Array.isArray(parsedEntry.meta.supersedes)
 				? parsedEntry.meta.supersedes
@@ -596,7 +804,7 @@ export async function buildAncestorWorklogPrefix(
 				}
 			}
 		}
-		parsedPerFile.push({ agentId: entry.agentId, role: entry.role, parsed });
+		parsedPerFile.push({ agentId: entry.agentId, role: entry.role, parsed, summary });
 	}
 
 	// Pass 2a: collect pinned entries across all ancestors. Pinned entries
@@ -654,6 +862,7 @@ export async function buildAncestorWorklogPrefix(
 		agentId: string;
 		role: string;
 		entries: ParsedWorklogEntry[];
+		summary: ParsedCompactionSummary | undefined;
 	};
 	const perFileSurviving: PerFileSurviving[] = [];
 	for (const file of parsedPerFile) {
@@ -682,7 +891,7 @@ export async function buildAncestorWorklogPrefix(
 			}
 			return false;
 		});
-		perFileSurviving.push({ agentId: file.agentId, role: file.role, entries: surviving });
+		perFileSurviving.push({ agentId: file.agentId, role: file.role, entries: surviving, summary: file.summary });
 	}
 
 	// Pass 2c: apply the global tail cap across the combined non-pinned
@@ -748,14 +957,31 @@ export async function buildAncestorWorklogPrefix(
 		bucket.push(entry);
 	}
 	for (let fileIndex = 0; fileIndex < perFileSurviving.length; fileIndex += 1) {
+		const file = perFileSurviving[fileIndex] as PerFileSurviving | undefined;
+		if (!file) continue;
 		const bucket = keptByFile.get(fileIndex);
-		if (!bucket || bucket.length === 0) continue;
-		const file = perFileSurviving[fileIndex] as PerFileSurviving;
+		const hasEntries = bucket !== undefined && bucket.length > 0;
+		const hasSummary = file.summary !== undefined;
+		if (!hasEntries && !hasSummary) continue;
 		// Inter-entry whitespace is normalized to exactly one blank line on
 		// re-emit. Individual entries' `raw` bytes are preserved verbatim;
 		// only the glue between adjacent entries is canonicalized. Benign
 		// for legacy files that may have had irregular spacing.
-		const body = bucket.map((parsedEntry) => parsedEntry.raw).join("\n\n");
+		//
+		// Compaction summaries (if any) are emitted at the top of the
+		// per-file `<ancestor-worklog>` wrapper so each ancestor's file
+		// remains self-contained: summary first, then surviving entries.
+		// This preserves PR-10's cache-stable-prefix goals (each file's
+		// content is a deterministic function of its on-disk state) and
+		// keeps the spawn-prompt structure flat.
+		const partsForFile: string[] = [];
+		if (file.summary) {
+			partsForFile.push(file.summary.raw);
+		}
+		if (hasEntries) {
+			partsForFile.push((bucket as ParsedWorklogEntry[]).map((parsedEntry) => parsedEntry.raw).join("\n\n"));
+		}
+		const body = partsForFile.join("\n\n");
 		sections.push(
 			`<ancestor-worklog agent="${file.agentId}" role="${file.role}">\n${body}\n</ancestor-worklog>`,
 		);
