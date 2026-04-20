@@ -389,6 +389,28 @@ function handleMetadata(
 		output.usage.output = event.usage.outputTokens || 0;
 		output.usage.cacheRead = event.usage.cacheReadInputTokens || 0;
 		output.usage.cacheWrite = event.usage.cacheWriteInputTokens || 0;
+		// Capture the 5m/1h breakdown when the Converse API surfaces it via
+		// `cacheDetails[]` (same shape as Anthropic's `cache_creation` object).
+		// Lets `calculateCost` apply the correct per-TTL multiplier instead of
+		// billing all writes at the 5m rate (~37.5% under-report on 1h writes).
+		const cacheDetails = (event.usage as { cacheDetails?: Array<{ ttl?: string; inputTokens?: number }> })
+			.cacheDetails;
+		if (cacheDetails && cacheDetails.length > 0) {
+			let fiveM = 0;
+			let oneH = 0;
+			for (const detail of cacheDetails) {
+				const tokens = detail.inputTokens || 0;
+				if (detail.ttl === "1h") {
+					oneH += tokens;
+				} else {
+					// Default bucket covers "5m" and any future/unknown TTL values,
+					// ensuring the sum matches the aggregate even on SDK drift.
+					fiveM += tokens;
+				}
+			}
+			output.usage.cacheWrite5m = fiveM;
+			output.usage.cacheWrite1h = oneH;
+		}
 		output.usage.totalTokens = event.usage.totalTokens || output.usage.input + output.usage.output;
 		calculateCost(model, output.usage);
 	}

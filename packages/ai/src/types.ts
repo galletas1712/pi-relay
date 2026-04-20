@@ -171,7 +171,33 @@ export interface Usage {
 	input: number;
 	output: number;
 	cacheRead: number;
+	/**
+	 * Total tokens written to cache (sum of 5m and 1h TTL writes when a
+	 * breakdown is available via `cacheWrite5m` / `cacheWrite1h`).
+	 */
 	cacheWrite: number;
+	/**
+	 * Tokens written to cache with the default 5-minute TTL.
+	 *
+	 * Optional because most providers report cache writes as a single aggregate.
+	 * Anthropic's `/messages` API exposes the 5m/1h breakdown via
+	 * `usage.cache_creation.ephemeral_5m_input_tokens`; AWS Bedrock exposes it
+	 * via `usage.cacheDetails[]`. When neither breakdown is available, leave
+	 * this field undefined and `calculateCost` falls back to billing the entire
+	 * `cacheWrite` aggregate at the 5-minute rate.
+	 *
+	 * Invariant when set: `cacheWrite === (cacheWrite5m ?? 0) + (cacheWrite1h ?? 0)`.
+	 */
+	cacheWrite5m?: number;
+	/**
+	 * Tokens written to cache with the extended 1-hour TTL. Optional; see
+	 * {@link cacheWrite5m} for breakdown semantics.
+	 *
+	 * 1-hour writes bill at a higher rate than 5-minute writes (2× vs 1.25×
+	 * the base input rate on Anthropic). `calculateCost` applies the correct
+	 * multiplier when this field is set.
+	 */
+	cacheWrite1h?: number;
 	totalTokens: number;
 	cost: {
 		input: number;
