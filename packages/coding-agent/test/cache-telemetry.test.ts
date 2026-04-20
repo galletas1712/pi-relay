@@ -185,7 +185,7 @@ describe("isCacheStatsEnabled", () => {
 		}
 	});
 
-	it("returns false when the env var is unset", () => {
+	it("returns false when the env var is unset and no setting is passed", () => {
 		delete process.env[CACHE_STATS_ENV_VAR];
 		expect(isCacheStatsEnabled()).toBe(false);
 	});
@@ -204,12 +204,34 @@ describe("isCacheStatsEnabled", () => {
 		expect(isCacheStatsEnabled()).toBe(true);
 	});
 
-	it("treats non-conventional strings as disabled", () => {
+	it("treats non-conventional strings as disabled (env wins over setting)", () => {
 		process.env[CACHE_STATS_ENV_VAR] = "0";
-		expect(isCacheStatsEnabled()).toBe(false);
+		expect(isCacheStatsEnabled(true)).toBe(false);
 		process.env[CACHE_STATS_ENV_VAR] = "maybe";
-		expect(isCacheStatsEnabled()).toBe(false);
+		expect(isCacheStatsEnabled(true)).toBe(false);
+	});
+
+	it("treats env=\"\" as unset and falls through to the setting", () => {
 		process.env[CACHE_STATS_ENV_VAR] = "";
+		expect(isCacheStatsEnabled(true)).toBe(true);
+		expect(isCacheStatsEnabled(false)).toBe(false);
 		expect(isCacheStatsEnabled()).toBe(false);
+	});
+
+	it("falls through to the setting when env is unset", () => {
+		delete process.env[CACHE_STATS_ENV_VAR];
+		expect(isCacheStatsEnabled(true)).toBe(true);
+		expect(isCacheStatsEnabled(false)).toBe(false);
+		expect(isCacheStatsEnabled(undefined)).toBe(false);
+	});
+
+	it("env=1 wins over setting=false", () => {
+		process.env[CACHE_STATS_ENV_VAR] = "1";
+		expect(isCacheStatsEnabled(false)).toBe(true);
+	});
+
+	it("env=0 wins over setting=true", () => {
+		process.env[CACHE_STATS_ENV_VAR] = "0";
+		expect(isCacheStatsEnabled(true)).toBe(false);
 	});
 });

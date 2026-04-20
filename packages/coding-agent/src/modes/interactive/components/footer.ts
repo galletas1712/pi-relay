@@ -4,7 +4,6 @@ import {
 	formatCompactTokens,
 	formatSelfTreeCost,
 	formatTurnCacheStats,
-	isCacheStatsEnabled,
 } from "../../../core/cache-telemetry.js";
 import type { ReadonlyFooterDataProvider } from "../../../core/footer-data-provider.js";
 import { theme } from "../theme/theme.js";
@@ -164,8 +163,11 @@ export class FooterComponent implements Component {
 			}
 		}
 
-		// Per-turn cache delta (dev-only, gated on PI_SHOW_CACHE_STATS=1).
-		if (isCacheStatsEnabled()) {
+		// Per-turn cache delta (dev-only, gated on PI_SHOW_CACHE_STATS=1 or
+		// the persistent `settings.cache.showStats` setting, env taking
+		// precedence). `getShowCacheStats()` already layers env over setting
+		// so we just check the effective flag here.
+		if (this.session.settingsManager.getShowCacheStats()) {
 			const turnStats = formatTurnCacheStats({ cacheRead: lastTurnCacheRead, cacheWrite: lastTurnCacheWrite });
 			if (turnStats) statsParts.push(turnStats);
 		}

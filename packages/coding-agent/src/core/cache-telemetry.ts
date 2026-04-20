@@ -25,13 +25,26 @@ export const CACHE_STATS_ENV_VAR = "PI_SHOW_CACHE_STATS";
 
 /**
  * Returns true when the developer has opted into cache telemetry.
- * Checked via env var (not settings) so it can be toggled per-invocation.
- * Accepts `"1"`, `"true"`, or `"yes"` (case-insensitive) per the shared
- * boolean-env-var convention.
+ *
+ * Precedence mirrors `SettingsManager.getShowCacheStats`:
+ *   - Env var `PI_SHOW_CACHE_STATS` wins when set to a non-empty value. Uses
+ *     the shared `isTruthyEnvFlag` convention (`1`, `true`, `yes`
+ *     case-insensitively as "enabled"; anything else disabled).
+ *   - Otherwise falls through to the caller-supplied `settingsShowStats`.
+ *   - Otherwise `false`.
+ *
+ * The optional `settingsShowStats` argument lets footer/print-mode surface the
+ * persistent setting without duplicating the precedence rules at every call
+ * site. Callers that don't have access to settings (or that want env-only
+ * gating) can omit it and get the pre-settings behavior.
  */
-export function isCacheStatsEnabled(): boolean {
-	if (typeof process === "undefined") return false;
-	return isTruthyEnvFlag(process.env[CACHE_STATS_ENV_VAR]);
+export function isCacheStatsEnabled(settingsShowStats?: boolean): boolean {
+	if (typeof process === "undefined") return settingsShowStats ?? false;
+	const envValue = process.env[CACHE_STATS_ENV_VAR];
+	if (envValue !== undefined && envValue !== "") {
+		return isTruthyEnvFlag(envValue);
+	}
+	return settingsShowStats ?? false;
 }
 
 /**

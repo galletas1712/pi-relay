@@ -50,12 +50,19 @@ function createSession(options: {
 			getSessionName: () => options.sessionName,
 			getCwd: () => "/tmp/project",
 		},
+		settingsManager: {
+			// Stub: footer only calls getShowCacheStats to gate the per-turn
+			// cache-delta column. Returning false keeps the existing width
+			// assertions unchanged.
+			getShowCacheStats: () => false,
+		},
 		getContextUsage: () => ({ contextWindow: 200_000, percent: 12.3 }),
 		// Single-agent sessions return undefined here; the footer falls back to
 		// self-only stats computed from session message history.
 		getSubtreeUsage: () => undefined,
 		modelRegistry: {
 			isUsingOAuth: () => false,
+			isUsingSubscriptionAuth: () => false,
 		},
 	};
 

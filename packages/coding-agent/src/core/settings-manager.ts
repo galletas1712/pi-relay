@@ -1,4 +1,4 @@
-import type { Transport } from "@pi-relay/ai";
+import type { CacheRetention, Transport } from "@pi-relay/ai";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
@@ -42,6 +42,29 @@ export interface ThinkingBudgetsSettings {
 
 export interface MarkdownSettings {
 	codeBlockIndent?: string; // default: "  "
+}
+
+export interface CacheSettings {
+	/**
+	 * Persistent default for prompt cache retention. Values:
+	 *   - "none": disable all prompt caching across every supported provider
+	 *   - "short": default (5m TTL where supported) — equivalent to unset
+	 *   - "long": extended TTL where the provider supports it (Anthropic 1h,
+	 *     Bedrock 1h, OpenAI Responses / Azure / Codex 24h). Chat Completions
+	 *     has no extended-TTL wire field, so "long" is inert there.
+	 *
+	 * Env override: `PI_CACHE_RETENTION` takes precedence when set.
+	 * `PI_CACHE_RETENTION=none` acts as a global kill-switch.
+	 */
+	retention?: CacheRetention;
+	/**
+	 * Surface per-turn cache read/write tokens in the TUI footer and the
+	 * `[pi:cache]` stderr log emitted by print mode.
+	 *
+	 * Env override: `PI_SHOW_CACHE_STATS` takes precedence when set (accepts
+	 * `1`, `true`, or `yes` case-insensitively).
+	 */
+	showStats?: boolean;
 }
 
 export type TransportSetting = Transport;
@@ -96,6 +119,7 @@ export interface Settings {
 	autocompleteMaxVisible?: number; // Max visible items in autocomplete dropdown (default: 5)
 	showHardwareCursor?: boolean; // Show terminal cursor while still positioning it for IME
 	markdown?: MarkdownSettings;
+	cache?: CacheSettings;
 	sessionDir?: string; // Custom session storage directory (same format as --session-dir CLI flag)
 }
 
@@ -967,5 +991,60 @@ export class SettingsManager {
 
 	getCodeBlockIndent(): string {
 		return this.settings.markdown?.codeBlockIndent ?? "  ";
+	}
+
+	/**
+	 * Effective cache retention for the current session.
+	 *
+	 * Precedence: env `PI_CACHE_RETENTION` (when set to `none`/`short`/`long`)
+	 * wins; otherwise `settings.cache.retention`; otherwise `undefined` so the
+	 * provider applies its default.
+	 *
+	 * Returning `undefined` instead of `"short"` keeps the value provider-agnostic
+	 * — the provider already treats missing option + unset env as "short".
+	 */
+	getCacheRetention(): CacheRetention | undefined {
+		const envValue = process.env.PI_CACHE_RETENTION;
+		if (envValue === "none" || envValue === "short" || envValue === "long") {
+			return envValue;
+		}
+		return this.settings.cache?.retention;
+	}
+
+	setCacheRetention(retention: CacheRetention | undefined): void {
+		if (!this.globalSettings.cache) {
+			this.globalSettings.cache = {};
+		}
+		if (retention === undefined) {
+			delete this.globalSettings.cache.retention;
+		} else {
+			this.globalSettings.cache.retention = retention;
+		}
+		this.markModified("cache", "retention");
+		this.save();
+	}
+
+	/**
+	 * Whether per-turn cache stats should be surfaced.
+	 *
+	 * Precedence: env `PI_SHOW_CACHE_STATS` (truthy per the shared convention)
+	 * wins whenever it's set to a recognized truthy/falsy value; otherwise the
+	 * persistent `settings.cache.showStats`; otherwise `false`.
+	 */
+	getShowCacheStats(): boolean {
+		const envValue = process.env.PI_SHOW_CACHE_STATS;
+		if (envValue !== undefined && envValue !== "") {
+			return isTruthyEnvFlag(envValue);
+		}
+		return this.settings.cache?.showStats ?? false;
+	}
+
+	setShowCacheStats(enabled: boolean): void {
+		if (!this.globalSettings.cache) {
+			this.globalSettings.cache = {};
+		}
+		this.globalSettings.cache.showStats = enabled;
+		this.markModified("cache", "showStats");
+		this.save();
 	}
 }

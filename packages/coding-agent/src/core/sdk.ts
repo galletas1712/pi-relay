@@ -333,6 +333,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		transport: settingsManager.getTransport(),
 		thinkingBudgets: settingsManager.getThinkingBudgets(),
 		maxRetryDelayMs: settingsManager.getRetrySettings().maxDelayMs,
+		// Effective cache retention: env override > persistent setting > undefined
+		// (which lets each provider apply its own default).
+		cacheRetention: settingsManager.getCacheRetention(),
 	});
 
 	// Restore messages if session has existing data
