@@ -162,6 +162,31 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 					);
 				}
 			}
+
+			// Dev-only per-background-call cache telemetry. Fires when an
+			// out-of-band LLM call (worklog fork, compaction summary, branch
+			// summary, turn-prefix summary) records its usage via
+			// AgentSession.addBackgroundUsage. The aggregated totals already flow
+			// through the per-turn `self`/`tree` lines above; this line provides
+			// per-call attribution so devs can see which background path a given
+			// cache read/write came from. Same stderr + PI_SHOW_CACHE_STATS=1
+			// gating as the per-turn lines. `turn=` uses the session's current
+			// turn counter so devs can correlate background calls to the turn
+			// that triggered them (worklog forks fire after the main turn).
+			if (isCacheStatsEnabled() && event.type === "background_usage") {
+				process.stderr.write(
+					`${formatCacheLogLine({
+						turn: turnCounter,
+						scope: event.scope,
+						usage: {
+							input: event.usage.input,
+							output: event.usage.output,
+							cacheRead: event.usage.cacheRead,
+							cacheWrite: event.usage.cacheWrite,
+						},
+					})}\n`,
+				);
+			}
 		});
 	};
 
