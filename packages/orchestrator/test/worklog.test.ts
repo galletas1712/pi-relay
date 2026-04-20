@@ -1650,4 +1650,76 @@ describe("buildAncestorWorklogPrefix supersession tombstones", () => {
 		]);
 		expect(out).toContain(a.text);
 	});
+
+	// Production call-site regression: buildSpawnPrompt used to call
+	// buildAncestorWorklogPrefix once per ancestor, so cross-file tombstoning
+	// collapsed to single-file (ineffective). This test spawns grandparent →
+	// parent → child via the real Orchestrator so any regression to per-file
+	// calls will resurrect the grandparent entry in the grandchild's prompt.
+	it("grandchild spawn prompt: parent tombstones grandparent entry end-to-end", async () => {
+		const sessionDir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(sessionDir);
+
+		const gpIso = "2026-08-01T00:00:01.000Z";
+		const gpEntry = entryWithMeta("## gp-fact-body", 1, gpIso);
+
+		const root = new FakeSession("root-session", { sessionDir });
+		const parent = new FakeSession("parent-session", { sessionDir });
+		const grandchild = new FakeSession("grandchild-session", { sessionDir });
+		const orchestrator = new Orchestrator({
+			rootSession: root,
+			sessionFactory: vi
+				.fn()
+				.mockResolvedValueOnce({ session: parent })
+				.mockResolvedValueOnce({ session: grandchild }),
+		});
+
+		// Seed root (grandparent) worklog with a single structured entry.
+		const rootRecord = orchestrator.getRecord("root");
+		await writeWorklog(rootRecord.worklogFile, `${gpEntry.text}\n\n`);
+
+		// Spawn parent first (so the parent record exists and gets a
+		// worklog file path we can seed). Note: writing to the parent's
+		// worklog AFTER spawnAgent resolves is fine — the grandchild spawn
+		// below is the one whose buildSpawnPrompt reads ancestor files.
+		const parentId = await orchestrator.spawnAgent("root", {
+			role: "parent-role",
+			prompt: "parent task",
+		});
+
+		// Seed parent worklog with an entry that supersedes the grandparent's.
+		const parentRecord = orchestrator.getRecord(parentId);
+		const parentEntry = entryWithMeta(
+			"## parent-correction-body",
+			1,
+			"2026-08-02T00:00:01.000Z",
+			{ supersedes: [gpEntry.id] },
+		);
+		await writeWorklog(parentRecord.worklogFile, `${parentEntry.text}\n\n`);
+
+		// Now spawn the grandchild from the parent. buildSpawnPrompt walks
+		// ancestors [root, parent] and should tombstone the grandparent entry.
+		await orchestrator.spawnAgent(parentId, {
+			role: "grandchild-role",
+			prompt: "grandchild task",
+		});
+
+		await vi.waitFor(() => {
+			expect(grandchild.prompts).toHaveLength(1);
+		});
+
+		const grandchildPrompt = grandchild.prompts[0] ?? "";
+		expect(grandchildPrompt).not.toContain("## gp-fact-body");
+		expect(grandchildPrompt).toContain("## parent-correction-body");
+		// Both ancestor-worklog wrappers still rendered: the grandparent file
+		// parsed to zero surviving entries (its wrapper should be skipped),
+		// so only the parent's wrapper should appear. The parent's wrapper
+		// must be present.
+		expect(grandchildPrompt).toMatch(
+			new RegExp(`<ancestor-worklog agent="${parentId}" role="parent-role">`),
+		);
+		// The grandparent's ancestor-worklog wrapper should be skipped since
+		// all of its entries were tombstoned.
+		expect(grandchildPrompt).not.toMatch(/<ancestor-worklog agent="root" role="root">/);
+	});
 });

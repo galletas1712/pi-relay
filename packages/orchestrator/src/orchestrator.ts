@@ -1042,18 +1042,25 @@ export class Orchestrator {
 		}
 
 		const sections: string[] = [];
-		for (const ancestor of ancestors) {
-			const worklogSection = await buildAncestorWorklogPrefix([
-				{
-					agentId: ancestor.id,
-					role: ancestor.role,
-					filePath: ancestor.worklogFile,
-				},
-			]);
-			if (worklogSection) {
-				sections.push(worklogSection);
-			}
 
+		// Build the ancestor-worklog prefix once across ALL ancestors so
+		// `buildAncestorWorklogPrefix` can apply cross-file supersession
+		// tombstones (a parent entry can tombstone a grandparent entry). This
+		// also clusters the byte-stable worklog blocks at the front of the
+		// prompt ahead of the varying `<ancestor-recent-context>` tails, which
+		// is the shape later PRs (pinned facts, spawn-prefix caching) rely on.
+		const worklogSection = await buildAncestorWorklogPrefix(
+			ancestors.map((ancestor) => ({
+				agentId: ancestor.id,
+				role: ancestor.role,
+				filePath: ancestor.worklogFile,
+			})),
+		);
+		if (worklogSection) {
+			sections.push(worklogSection);
+		}
+
+		for (const ancestor of ancestors) {
 			const recentContext = await this.serializeRecentAncestorContext(ancestor);
 			if (recentContext) {
 				sections.push(

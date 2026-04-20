@@ -361,6 +361,10 @@ export async function buildAncestorWorklogPrefix(
 			// we don't emit an empty stanza.
 			continue;
 		}
+		// Inter-entry whitespace is normalized to exactly one blank line on
+		// re-emit. Individual entries' `raw` bytes are preserved verbatim;
+		// only the glue between adjacent entries is canonicalized. Benign for
+		// legacy files that may have had irregular spacing.
 		const body = surviving.map((parsedEntry) => parsedEntry.raw).join("\n\n");
 		sections.push(
 			`<ancestor-worklog agent="${file.agentId}" role="${file.role}">\n${body}\n</ancestor-worklog>`,
