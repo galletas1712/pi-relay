@@ -66,6 +66,57 @@ describe("formatCacheLogLine", () => {
 			}),
 		).toBe("[pi:cache] turn=3 tree cacheRead=100 cacheWrite=50 input=500 output=200");
 	});
+
+	it("formats background-scope lines (worklog / compaction / branch / turn-prefix)", () => {
+		expect(
+			formatCacheLogLine({
+				turn: 5,
+				scope: "worklog",
+				usage: { input: 200, output: 80, cacheRead: 300, cacheWrite: 20 },
+			}),
+		).toBe("[pi:cache] turn=5 worklog cacheRead=300 cacheWrite=20 input=200 output=80");
+
+		expect(
+			formatCacheLogLine({
+				turn: 7,
+				scope: "compaction",
+				usage: { input: 4000, output: 300, cacheRead: 0, cacheWrite: 4000 },
+			}),
+		).toBe("[pi:cache] turn=7 compaction cacheRead=0 cacheWrite=4000 input=4000 output=300");
+
+		expect(
+			formatCacheLogLine({
+				turn: 7,
+				scope: "turn-prefix",
+				usage: { input: 1500, output: 150, cacheRead: 0, cacheWrite: 1500 },
+			}),
+		).toBe("[pi:cache] turn=7 turn-prefix cacheRead=0 cacheWrite=1500 input=1500 output=150");
+
+		expect(
+			formatCacheLogLine({
+				turn: 12,
+				scope: "branch",
+				usage: { input: 900, output: 120, cacheRead: 50, cacheWrite: 900 },
+			}),
+		).toBe("[pi:cache] turn=12 branch cacheRead=50 cacheWrite=900 input=900 output=120");
+	});
+
+	it("places scope token immediately after turn= for background scopes (grep invariant)", () => {
+		// The tail format (cacheRead= ... output=...) must match the single-agent
+		// default format so grep-based aggregation scripts continue to work.
+		const defaultLine = formatCacheLogLine({
+			turn: 1,
+			usage: { input: 10, output: 20, cacheRead: 30, cacheWrite: 40 },
+		});
+		const worklogLine = formatCacheLogLine({
+			turn: 1,
+			scope: "worklog",
+			usage: { input: 10, output: 20, cacheRead: 30, cacheWrite: 40 },
+		});
+		const defaultTail = defaultLine.replace(/^\[pi:cache\] turn=\d+/, "");
+		const worklogTail = worklogLine.replace(/^\[pi:cache\] turn=\d+ worklog/, "");
+		expect(worklogTail).toBe(defaultTail);
+	});
 });
 
 describe("formatCompactTokens", () => {
