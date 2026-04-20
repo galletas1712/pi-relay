@@ -121,11 +121,12 @@ export class FooterComponent implements Component {
 		}
 
 		// Subtree usage (from orchestrator-style extensions). Undefined for
-		// single-agent sessions. When present, the tokens above reflect the
-		// session's local message history — which should match
-		// subtree.self.tokens.* computed by the orchestrator from the same
-		// messages. We still pull the tree-side numbers through the same code
-		// path so aggregation logic is localized to the orchestrator.
+		// single-agent sessions. When present, subtree.self.tokens.* is equal
+		// to the local walk above because both read from
+		// sessionManager.getEntries() via getSessionStats(); we still route the
+		// self numbers through the subtree provider so aggregation logic stays
+		// localized to the orchestrator and the tree-side numbers come from
+		// the same source of truth.
 		const subtree = this.session.getSubtreeUsage();
 		const selfInput = subtree?.self.tokens.input ?? totalInput;
 		const selfOutput = subtree?.self.tokens.output ?? totalOutput;

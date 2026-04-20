@@ -109,7 +109,11 @@ describe("AgentSession.getSessionStats", () => {
 			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
-			expect(stats.tokens.input).toBe(195_000);
+			// Token totals are cumulative over the full session file (including
+			// pre-compaction assistants), so both response1 (180k) and response2
+			// (195k) contribute. Context usage is separate and reports unknown
+			// immediately after compaction until the next assistant response.
+			expect(stats.tokens.input).toBe(180_000 + 195_000);
 			expect(stats.contextUsage).toBeDefined();
 			expect(stats.contextUsage?.tokens).toBeNull();
 			expect(stats.contextUsage?.percent).toBeNull();
@@ -132,10 +136,42 @@ describe("AgentSession.getSessionStats", () => {
 			syncAgentMessages(session, sessionManager);
 
 			const stats = session.getSessionStats();
-			expect(stats.tokens.input).toBe(220_000);
+			// Cumulative across compaction: response1 (180k) + response2 (195k) +
+			// response3 (25k) = 400k.
+			expect(stats.tokens.input).toBe(180_000 + 195_000 + 25_000);
 			expect(stats.contextUsage).toBeDefined();
 			expect(stats.contextUsage?.tokens).toBe(25_000);
 			expect(stats.contextUsage?.percent).toBe((25_000 / model.contextWindow) * 100);
+		} finally {
+			session.dispose();
+		}
+	});
+
+	it("sums assistant usage across a compaction boundary", () => {
+		// Anchor test for the compaction-invariant contract: walking
+		// sessionManager.getEntries() must include BOTH pre- and post-compaction
+		// assistant messages. state.messages (post-compaction) would drop the
+		// pre-compaction assistants and produce a silent undercount.
+		const { session, sessionManager } = createSession();
+
+		try {
+			sessionManager.appendMessage(createUserMessage("q1", 1));
+			sessionManager.appendMessage(createAssistantMessage("a1", 100, 2));
+			sessionManager.appendMessage(createUserMessage("q2", 3));
+			sessionManager.appendMessage(createAssistantMessage("a2", 200, 4));
+			const keptUserId = sessionManager.appendMessage(createUserMessage("q3", 5));
+			sessionManager.appendMessage(createAssistantMessage("a3", 300, 6));
+			sessionManager.appendCompaction("summary", keptUserId, 600);
+			sessionManager.appendMessage(createUserMessage("q4", 7));
+			sessionManager.appendMessage(createAssistantMessage("a4", 50, 8));
+			syncAgentMessages(session, sessionManager);
+
+			const stats = session.getSessionStats();
+			// All four assistants (100 + 200 + 300 + 50) contribute to cumulative tokens.
+			expect(stats.tokens.input).toBe(100 + 200 + 300 + 50);
+			expect(stats.tokens.total).toBe(100 + 200 + 300 + 50);
+			expect(stats.assistantMessages).toBe(4);
+			expect(stats.userMessages).toBe(4);
 		} finally {
 			session.dispose();
 		}
