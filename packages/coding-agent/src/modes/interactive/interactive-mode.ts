@@ -2319,6 +2319,16 @@ export class InteractiveMode {
 				this.editor.setText("");
 				await this.session.prompt(text, { streamingBehavior: "steer" });
 				this.updatePendingMessagesDisplay();
+				// Surface a prominent status line in addition to the compact
+				// `Steering:` row in the pending-messages container. Users reported
+				// misreading the compact indicator as "Enter did nothing."
+				const { steering, followUp } = this.getAllQueuedMessages();
+				const pendingCount = steering.length + followUp.length;
+				this.showStatus(
+					pendingCount === 1
+						? "Queued as steer (1 pending)"
+						: `Queued as steer (${pendingCount} pending)`,
+				);
 				this.ui.requestRender();
 				return;
 			}
