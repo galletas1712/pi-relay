@@ -120,7 +120,7 @@ Do not call the tool if nothing meaningful changed.
 
 Additional structured fields on the tool:
 - topics: Tag with one or more short slugs (lowercase kebab-case, e.g. \`caching/anthropic\` or \`orchestrator/restore\`). Prefer slugs already used in your prior entries (shown above when available).
-- supersedes: If your entry corrects or replaces an earlier entry, cite its entry_id (shown in the \`<last-worklog-entry>\` header comment, e.g. \`<!-- meta: {"entry_id":"abcd1234",...} -->\`) in supersedes.
+- supersedes: When your new entry corrects or replaces a prior entry (yours or an ancestor's), cite the prior entry_id (shown in the \`<last-worklog-entry>\` header comment, e.g. \`<!-- meta: {"entry_id":"abcd1234",...} -->\`) in supersedes. The system treats a superseded entry as a tombstone — child agents will no longer see it. Use this instead of writing "(supersedes prior entry)" in the body; the machine-readable field is what the system consumes.
 - pin: Leave as false unless the entry is explicitly foundational (a cross-cutting invariant). Full pin semantics ship later; pins should be rare.`;
 }
 
@@ -297,17 +297,74 @@ export function computeTopicVocabulary(
 	return ranked.slice(0, limit);
 }
 
+/**
+ * Build the ancestor-worklog prefix injected into child agent spawns, with
+ * superseded entries filtered out.
+ *
+ * Tombstone semantics: every parsed entry's `meta.supersedes` contributes its
+ * ids to a single tombstone set that is unioned across ALL ancestor files in
+ * this call. Any entry whose `meta.entry_id` appears in that set is dropped
+ * at read time. The file on disk is not modified — the tombstone is applied
+ * only to child-visible context, which preserves the audit trail.
+ *
+ * Cross-file tombstoning is intentional: if the parent learned that a
+ * grandparent fact was wrong, the child should not inherit the wrong fact.
+ *
+ * Edge cases:
+ * - Legacy entries (no `entry_id`) can never be tombstoned — there is no
+ *   stable id to target. They always pass through.
+ * - Circular supersession (A→B and B→A) collapses both ids into the tombstone
+ *   set, so both entries are dropped. Rare but correct.
+ * - `supersedes` citing an unknown entry_id (including forward references
+ *   after a future compaction pass) is a no-op: no surviving entry has that
+ *   id, so nothing is dropped.
+ */
 export async function buildAncestorWorklogPrefix(
 	entries: Array<{ agentId: string; role: string; filePath: string }>,
 ): Promise<string> {
-	const sections: string[] = [];
+	// Pass 1: read + parse every file, collect the union of supersedes ids.
+	type FileSection = { agentId: string; role: string; parsed: ParsedWorklogEntry[] };
+	const parsedPerFile: Array<FileSection | null> = [];
+	const tombstones = new Set<string>();
 	for (const entry of entries) {
 		const content = await readWorklog(entry.filePath);
 		if (!content.trim()) {
+			parsedPerFile.push(null);
 			continue;
 		}
+		const parsed = parseWorklogEntries(content);
+		for (const parsedEntry of parsed) {
+			const supersedes = Array.isArray(parsedEntry.meta.supersedes)
+				? parsedEntry.meta.supersedes
+				: [];
+			for (const id of supersedes) {
+				if (typeof id === "string" && id.length > 0) {
+					tombstones.add(id);
+				}
+			}
+		}
+		parsedPerFile.push({ agentId: entry.agentId, role: entry.role, parsed });
+	}
 
-		sections.push(`<ancestor-worklog agent="${entry.agentId}" role="${entry.role}">\n${content.trim()}\n</ancestor-worklog>`);
+	// Pass 2: drop tombstoned entries and re-emit each file. Legacy entries
+	// (id === undefined) always survive because they have no stable id for
+	// another entry to cite.
+	const sections: string[] = [];
+	for (const file of parsedPerFile) {
+		if (!file) continue;
+		const surviving = file.parsed.filter((parsedEntry) => {
+			if (parsedEntry.id === undefined) return true;
+			return !tombstones.has(parsedEntry.id);
+		});
+		if (surviving.length === 0) {
+			// Whole file filtered out — skip the <ancestor-worklog> wrapper so
+			// we don't emit an empty stanza.
+			continue;
+		}
+		const body = surviving.map((parsedEntry) => parsedEntry.raw).join("\n\n");
+		sections.push(
+			`<ancestor-worklog agent="${file.agentId}" role="${file.role}">\n${body}\n</ancestor-worklog>`,
+		);
 	}
 
 	return sections.join("\n\n");

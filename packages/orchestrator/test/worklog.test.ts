@@ -2,7 +2,7 @@ import { readFile } from "node:fs/promises";
 import type { Usage } from "@pi-relay/ai";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { isLikelyTrivialTurn, Orchestrator } from "../src/orchestrator.js";
-import { appendWorklogEntry, buildWorklogPrompt, computeTopicVocabulary, formatWorklogEntry, parseWorklogEntries } from "../src/worklog.js";
+import { appendWorklogEntry, buildAncestorWorklogPrefix, buildWorklogPrompt, computeTopicVocabulary, formatWorklogEntry, parseWorklogEntries } from "../src/worklog.js";
 import { cleanupTempDir, createTempDir, FakeSession, waitForMicrotasks } from "./test-helpers.js";
 
 function createWorklogAssistant(content: string, usage?: Usage) {
@@ -1416,5 +1416,238 @@ describe("worklog fork meta integration", () => {
 		expect(parsed[0]?.meta.supersedes).toEqual([]);
 		expect(parsed[0]?.meta.pin).toBe(false);
 		expect(parsed[0]?.id).toBeDefined();
+	});
+});
+
+describe("buildAncestorWorklogPrefix supersession tombstones", () => {
+	const tempDirs: string[] = [];
+	afterEach(() => {
+		for (const dir of tempDirs.splice(0)) {
+			cleanupTempDir(dir);
+		}
+	});
+
+	async function writeWorklog(filePath: string, body: string): Promise<void> {
+		const { writeFile, mkdir } = await import("node:fs/promises");
+		const { dirname } = await import("node:path");
+		await mkdir(dirname(filePath), { recursive: true });
+		await writeFile(filePath, body, "utf-8");
+	}
+
+	function entryWithMeta(
+		content: string,
+		turn: number,
+		iso: string,
+		meta: { topics?: string[]; supersedes?: string[]; pin?: boolean } = {},
+	): { text: string; id: string } {
+		const text = formatWorklogEntry(content, turn, { iso, ...meta });
+		const parsed = parseWorklogEntries(text);
+		const id = parsed[0]?.id;
+		if (!id) throw new Error("expected entry_id on structured entry");
+		return { text, id };
+	}
+
+	it("chain A→B→C: A supersedes B, B supersedes C. Only A survives.", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/a.worklog.md`;
+		// Write entries in file order C, B, A so A is newest. A supersedes B,
+		// B supersedes C. Tombstone set = {B.id, C.id}. Only A survives.
+		const c = entryWithMeta("## C", 1, "2026-01-01T00:00:01.000Z");
+		const b = entryWithMeta("## B", 2, "2026-01-01T00:00:02.000Z", { supersedes: [c.id] });
+		const a = entryWithMeta("## A", 3, "2026-01-01T00:00:03.000Z", { supersedes: [b.id] });
+		await writeWorklog(filePath, `${c.text}\n\n${b.text}\n\n${a.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toContain(a.text);
+		expect(out).not.toContain(b.text);
+		expect(out).not.toContain(c.text);
+	});
+
+	it("single supersede: B supersedes A. Only B survives.", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/single.worklog.md`;
+		const a = entryWithMeta("## A-body", 1, "2026-02-01T00:00:01.000Z");
+		const b = entryWithMeta("## B-body", 2, "2026-02-01T00:00:02.000Z", { supersedes: [a.id] });
+		await writeWorklog(filePath, `${a.text}\n\n${b.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toContain(b.text);
+		expect(out).not.toContain("## A-body");
+	});
+
+	it("supersedes citing an unknown entry_id: no-op, all entries survive", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/unknown.worklog.md`;
+		const a = entryWithMeta("## A", 1, "2026-03-01T00:00:01.000Z");
+		const b = entryWithMeta("## B", 2, "2026-03-01T00:00:02.000Z", {
+			supersedes: ["deadbeef"],
+		});
+		await writeWorklog(filePath, `${a.text}\n\n${b.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toContain(a.text);
+		expect(out).toContain(b.text);
+	});
+
+	it("legacy file (no meta on any entry): filter is a no-op, all survive", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/legacy.worklog.md`;
+		const legacy =
+			"## Entry — 2026-01-01T00:00:00.000Z (turn 1)\n\n## L1\n- legacy one.\n\n" +
+			"## Entry — 2026-01-01T00:00:01.000Z (turn 2)\n\n## L2\n- legacy two.\n\n";
+		await writeWorklog(filePath, legacy);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toContain("## L1\n- legacy one.");
+		expect(out).toContain("## L2\n- legacy two.");
+		// Wrapper is present.
+		expect(out).toMatch(/<ancestor-worklog agent="x" role="r">/);
+	});
+
+	it("mixed file: structured entry supersedes legacy entry → legacy survives because it has no entry_id", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/mixed.worklog.md`;
+		// Legacy entry has no id, so even if a structured entry claims to
+		// supersede "some-id", the legacy entry can never match the
+		// tombstone set.
+		const legacy = "## Entry — 2026-04-01T00:00:00.000Z (turn 1)\n\n## Legacy body\n- kept.\n\n";
+		const structured = entryWithMeta("## S", 2, "2026-04-01T00:00:02.000Z", {
+			supersedes: ["ffff0000"], // arbitrary; legacy entry has no id so is unaffected
+		});
+		await writeWorklog(filePath, `${legacy}${structured.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toContain("## Legacy body\n- kept.");
+		expect(out).toContain(structured.text);
+	});
+
+	it("cross-file: parent worklog supersedes a grandparent entry → grandparent entry tombstoned", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const grandparentFile = `${dir}/gp.worklog.md`;
+		const parentFile = `${dir}/p.worklog.md`;
+
+		const gpEntry = entryWithMeta("## grandparent-fact", 1, "2026-05-01T00:00:01.000Z");
+		const gpKept = entryWithMeta("## grandparent-other", 2, "2026-05-01T00:00:02.000Z");
+		await writeWorklog(grandparentFile, `${gpEntry.text}\n\n${gpKept.text}\n\n`);
+
+		const parentEntry = entryWithMeta("## parent-correction", 1, "2026-05-02T00:00:01.000Z", {
+			supersedes: [gpEntry.id],
+		});
+		await writeWorklog(parentFile, `${parentEntry.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "gp", role: "grandparent", filePath: grandparentFile },
+			{ agentId: "p", role: "parent", filePath: parentFile },
+		]);
+		expect(out).not.toContain("## grandparent-fact");
+		expect(out).toContain("## grandparent-other");
+		expect(out).toContain("## parent-correction");
+		// Both wrappers still emitted (grandparent still has a surviving entry).
+		expect(out).toMatch(/<ancestor-worklog agent="gp"/);
+		expect(out).toMatch(/<ancestor-worklog agent="p"/);
+	});
+
+	it("cross-file: a file whose every entry is tombstoned gets its wrapper skipped", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const gpFile = `${dir}/gp.worklog.md`;
+		const pFile = `${dir}/p.worklog.md`;
+		const only = entryWithMeta("## only", 1, "2026-05-03T00:00:01.000Z");
+		await writeWorklog(gpFile, `${only.text}\n\n`);
+		const correction = entryWithMeta("## correction", 1, "2026-05-03T00:00:02.000Z", {
+			supersedes: [only.id],
+		});
+		await writeWorklog(pFile, `${correction.text}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "gp", role: "grandparent", filePath: gpFile },
+			{ agentId: "p", role: "parent", filePath: pFile },
+		]);
+		expect(out).not.toMatch(/<ancestor-worklog agent="gp"/);
+		expect(out).toMatch(/<ancestor-worklog agent="p"/);
+	});
+
+	it("circular supersede (A supersedes B, B supersedes A): both tombstoned", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/circular.worklog.md`;
+		// Construct the supersedes references after we know both ids. Since
+		// entry_id is SHA1(content+iso), we can compute one id first, then
+		// reference it. To actually create a cycle we need both entries to
+		// cite each other's ids — which means we need to know B's id before
+		// writing A. Workaround: write A with a placeholder, parse, then
+		// rewrite. Simpler: manually construct entries with chosen ids by
+		// varying content until both reference each other. Instead, construct
+		// the file contents directly with hand-crafted meta.
+		const isoA = "2026-06-01T00:00:01.000Z";
+		const isoB = "2026-06-01T00:00:02.000Z";
+		const idA = "aaaa1111";
+		const idB = "bbbb2222";
+		// Neither id will be the real SHA1 of content/iso — but
+		// parseWorklogEntries reads meta.entry_id from the JSON, not by
+		// recomputing. So handcrafted ids work.
+		const remainderId = "cccc3333";
+		const entryA = `## Entry — ${isoA} (turn 1) <!-- meta: ${JSON.stringify({ entry_id: idA, topics: [], supersedes: [idB], pin: false })} -->\n\n## A-body`;
+		const entryB = `## Entry — ${isoB} (turn 2) <!-- meta: ${JSON.stringify({ entry_id: idB, topics: [], supersedes: [idA], pin: false })} -->\n\n## B-body`;
+		const entryC = `## Entry — 2026-06-01T00:00:03.000Z (turn 3) <!-- meta: ${JSON.stringify({ entry_id: remainderId, topics: [], supersedes: [], pin: false })} -->\n\n## C-body`;
+		await writeWorklog(filePath, `${entryA}\n\n${entryB}\n\n${entryC}\n\n`);
+
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).not.toContain("## A-body");
+		expect(out).not.toContain("## B-body");
+		expect(out).toContain("## C-body");
+	});
+
+	it("empty worklog: returns empty string, no crash", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/empty.worklog.md`;
+		await writeWorklog(filePath, "");
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toBe("");
+	});
+
+	it("nonexistent worklog file: returns empty string, no crash", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/nope.worklog.md`;
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toBe("");
+	});
+
+	it("entry_id referenced in supersedes but not present anywhere: no-op, no crash", async () => {
+		const dir = createTempDir("pi-relay-worklog-ts-");
+		tempDirs.push(dir);
+		const filePath = `${dir}/orphan-ref.worklog.md`;
+		const a = entryWithMeta("## A", 1, "2026-07-01T00:00:01.000Z", {
+			supersedes: ["00001111", "22223333"],
+		});
+		await writeWorklog(filePath, `${a.text}\n\n`);
+		const out = await buildAncestorWorklogPrefix([
+			{ agentId: "x", role: "r", filePath },
+		]);
+		expect(out).toContain(a.text);
 	});
 });
