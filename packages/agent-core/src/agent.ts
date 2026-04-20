@@ -1,4 +1,5 @@
 import {
+	type CacheRetention,
 	type ImageContent,
 	type Message,
 	type Model,
@@ -149,6 +150,14 @@ export interface AgentOptions {
 	transport?: Transport;
 	maxRetryDelayMs?: number;
 	backgroundAllowlist?: readonly string[];
+	/**
+	 * Default prompt cache retention forwarded to the stream function on every
+	 * turn. Provider `resolveCacheRetention` treats an explicit option as
+	 * higher-precedence than its env-var fallback, so setting this here makes
+	 * the resolved preference flow through as if the caller passed it
+	 * per-request. Leave undefined to defer entirely to each provider's default.
+	 */
+	cacheRetention?: CacheRetention;
 }
 
 type ActiveRun = {
@@ -196,6 +205,8 @@ export class Agent {
 	public maxRetryDelayMs?: number;
 	/** Tool names that can honor `__background: true`. */
 	public backgroundAllowlist: string[];
+	/** Default prompt cache retention forwarded to the stream function. */
+	public cacheRetention?: CacheRetention;
 
 	constructor(options: AgentOptions = {}) {
 		this._state = createMutableAgentState(options.initialState);
@@ -216,6 +227,7 @@ export class Agent {
 		this.transport = options.transport ?? "sse";
 		this.maxRetryDelayMs = options.maxRetryDelayMs;
 		this.backgroundAllowlist = [...(options.backgroundAllowlist ?? ["bash"])];
+		this.cacheRetention = options.cacheRetention;
 	}
 
 	/**
@@ -437,6 +449,7 @@ export class Agent {
 			model: this._state.model,
 			reasoning: this._state.thinkingLevel === "off" ? undefined : this._state.thinkingLevel,
 			sessionId: this.sessionId,
+			cacheRetention: this.cacheRetention,
 			onPayload: this.onPayload,
 			transport: this.transport,
 			thinkingBudgets: this.thinkingBudgets,
