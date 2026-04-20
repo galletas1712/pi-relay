@@ -1,9 +1,9 @@
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync, renameSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
-import type { AgentMessage, AgentToolCall } from "@pi-relay/agent-core";
+import type { AgentMessage, AgentToolCall, ThinkingLevel } from "@pi-relay/agent-core";
 import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@pi-relay/agent-core";
-import { validateToolArguments, type ToolResultMessage, type UserMessage } from "@pi-relay/ai";
+import { validateToolArguments, type Model, type ToolResultMessage, type UserMessage } from "@pi-relay/ai";
 import { serializeConversation, type AgentSessionEvent, type ToolDefinition } from "@pi-relay/coding-agent";
 import { createAgentContextTransform } from "./context-transform.js";
 import { BackgroundCapabilitiesSource, MultiAgentInstructionsSource } from "./prompt/index.js";
@@ -52,6 +52,124 @@ interface PendingSpawnDraft {
 	id: string;
 	role: string;
 	prompt: string;
+}
+
+/**
+ * Result of the pre-fork triviality gate. `skip === true` means do NOT
+ * schedule a worklog fork for this turn; `reason` is a stable identifier
+ * surfaced in debug logs and tests.
+ */
+export interface WorklogForkGateResult {
+	skip: boolean;
+	reason?: string;
+}
+
+/**
+ * Per-fork telemetry shape consumed by `logWorklogFork`. Kept small enough
+ * that a single JSON line is trivially grep-friendly.
+ */
+export interface WorklogForkLogEntry {
+	agentId: string;
+	turn: number;
+	deltaMsgCount: number;
+	skipped: boolean;
+	skipReason?: string;
+	entryEmitted: boolean;
+}
+
+/**
+ * Estimate the size of an assistant thinking block in tokens. The input to
+ * the gate is raw `AgentMessage` content (not a provider response), so we
+ * approximate with character-count / 4 — good enough to distinguish "no
+ * meaningful thinking" from "substantive thinking" for the purposes of
+ * skipping pure tool-chatter turns.
+ */
+function approximateThinkingTokens(message: AgentMessage): number {
+	if (message.role !== "assistant") {
+		return 0;
+	}
+	let chars = 0;
+	for (const content of message.content) {
+		if (content.type === "thinking") {
+			chars += content.thinking.length;
+		}
+	}
+	return Math.ceil(chars / 4);
+}
+
+function assistantHasSubstantiveText(message: AgentMessage): boolean {
+	if (message.role !== "assistant") {
+		return false;
+	}
+	for (const content of message.content) {
+		if (content.type === "text" && content.text.trim().length > 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/**
+ * Decide whether a just-completed turn is trivial enough to skip the
+ * worklog fork. The first rule is a HARD GATE: if the delta since
+ * `lastWorklogMessageCount` contains no `assistant` message at all, we
+ * unconditionally skip — there's no new assistant output to mine for
+ * durable knowledge. The remaining rules are additional optional gates on
+ * top of that.
+ *
+ * The function is pure and exported so callers (and tests) can reason
+ * about its decisions without spinning up an orchestrator.
+ */
+export function isLikelyTrivialTurn(
+	record: Pick<AgentRecord, "lastWorklogMessageCount">,
+	turnMessages: AgentMessage[],
+): WorklogForkGateResult {
+	const start = Math.min(record.lastWorklogMessageCount, turnMessages.length);
+	const delta = turnMessages.slice(start);
+
+	// HARD GATE: a turn with no new assistant message cannot contribute
+	// anything the worklog cares about. Always skip.
+	const hasAssistant = delta.some((message) => message.role === "assistant");
+	if (!hasAssistant) {
+		return { skip: true, reason: "no-new-assistant-message" };
+	}
+
+	// The remaining heuristics are only sensible when the gate above has
+	// already passed.
+
+	// Tool-chatter only: every assistant message in the delta is purely
+	// toolCall content (no text, no substantive thinking). Such turns
+	// rarely carry durable insight — the durable parts land on the
+	// wrap-up turn that contains the reasoned summary.
+	const assistantMessages = delta.filter((message) => message.role === "assistant");
+	const anyTextOrThinking = assistantMessages.some((message) => {
+		if (assistantHasSubstantiveText(message)) {
+			return true;
+		}
+		return approximateThinkingTokens(message) > 50;
+	});
+	if (!anyTextOrThinking) {
+		return { skip: true, reason: "tool-chatter-only" };
+	}
+
+	return { skip: false };
+}
+
+/**
+ * Debug-logged by setting `PI_RELAY_WORKLOG_DEBUG=1` in the environment.
+ * Emits one JSON line per fork decision (skipped or completed). Kept
+ * deliberately minimal so logs are grep-friendly without pulling in a
+ * logging dependency.
+ */
+function logWorklogFork(entry: WorklogForkLogEntry): void {
+	if (!process.env.PI_RELAY_WORKLOG_DEBUG) {
+		return;
+	}
+	try {
+		console.debug(`[pi:worklog-fork] ${JSON.stringify(entry)}`);
+	} catch {
+		// Never let logging crash the orchestrator.
+	}
 }
 
 export class Orchestrator {
@@ -127,6 +245,44 @@ export class Orchestrator {
 
 	getAgentIdBySessionId(sessionId: string): string | undefined {
 		return this.sessionIdToAgentId.get(sessionId);
+	}
+
+	/**
+	 * Current worklog-fork model override, or `undefined` when the fork
+	 * falls back to the parent session's model.
+	 */
+	getForkModel(): Model<any> | undefined {
+		return this.config.forkModel;
+	}
+
+	/**
+	 * Current worklog-fork thinking level override, or `undefined` when the
+	 * fork falls back to the parent session's thinking level.
+	 */
+	getForkThinkingLevel(): ThinkingLevel | undefined {
+		return this.config.forkThinkingLevel;
+	}
+
+	/**
+	 * Set (or clear) the worklog-fork model override. Takes effect on the
+	 * next fork invocation; no in-flight forks are cancelled. Pass
+	 * `undefined` to clear the override and fall back to the parent
+	 * session's model. The orchestrator does NOT persist this choice —
+	 * the caller is responsible for writing to whatever settings store
+	 * should survive restart.
+	 */
+	setForkModel(model: Model<any> | undefined): void {
+		this.config.forkModel = model;
+		this.notifyChange();
+	}
+
+	/**
+	 * Set (or clear) the worklog-fork thinking level override. Same
+	 * semantics as `setForkModel`: next-fork takes effect, no persistence.
+	 */
+	setForkThinkingLevel(level: ThinkingLevel | undefined): void {
+		this.config.forkThinkingLevel = level;
+		this.notifyChange();
 	}
 
 	getChildrenOf(agentId: string): AgentRecord[] {
@@ -561,7 +717,24 @@ export class Orchestrator {
 
 		if (event.type === "turn_end") {
 			record.turnCount += 1;
-			this.scheduleWorklogFork(agentId, record.turnCount, [...record.session.agent.state.messages]);
+			const turnMessages = [...record.session.agent.state.messages];
+			// Phase 1 (fork gating): skip the fork entirely on trivial turns
+			// before paying the LLM bill. Gating-skipped turns still advance
+			// `turnCount` but do NOT advance `lastWorklogMessageCount`, so the
+			// next non-trivial turn's fork will see the accumulated delta.
+			const gate = isLikelyTrivialTurn(record, turnMessages);
+			if (gate.skip) {
+				logWorklogFork({
+					agentId,
+					turn: record.turnCount,
+					deltaMsgCount: Math.max(0, turnMessages.length - record.lastWorklogMessageCount),
+					skipped: true,
+					skipReason: gate.reason,
+					entryEmitted: false,
+				});
+				return;
+			}
+			this.scheduleWorklogFork(agentId, record.turnCount, turnMessages);
 			return;
 		}
 
@@ -1000,14 +1173,42 @@ export class Orchestrator {
 
 	private async runWorklogFork(agentId: string, turn: number, turnMessages: AgentMessage[]): Promise<void> {
 		const record = this.records.get(agentId);
-		if (!record || record.status === "disposed" || !record.session.model) {
+		if (!record || record.status === "disposed") {
 			return;
 		}
+		// Resolve the fork model and reasoning level. A configured
+		// `forkModel` lets operators route worklog forks to a cheaper model
+		// (e.g. GPT-5.4 medium) than the parent session's main-loop model;
+		// absent that, fall back to the parent's model and thinking level so
+		// behavior matches pre-Phase-1.
+		const forkModel = this.config.forkModel ?? record.session.model;
+		if (!forkModel) {
+			return;
+		}
+		const forkThinkingLevel = this.config.forkThinkingLevel ?? record.session.thinkingLevel;
 
 		const transformed = record.session.agent.transformContext
 			? await record.session.agent.transformContext(turnMessages)
 			: turnMessages;
-		const contextMessages = await record.session.agent.convertToLlm(transformed);
+		// Phase 1 (delta-only fork input): only send messages that have arrived
+		// since the last worklog entry. The `<last-worklog-entry>` block inside
+		// `buildWorklogPrompt` already carries prior semantic state, so the fork
+		// does not need the full transcript. On first-ever fork
+		// (`lastWorklogMessageCount === 0`) this falls through to sending
+		// everything, which is the intended bootstrap behavior.
+		//
+		// Additionally, drop everything except `user` and `assistant` messages
+		// from the fork input. Tool-result payloads (often many KB each) and
+		// custom orchestrator messages (agent_roster, agent_directive,
+		// agent_report, agent_idle, background tool completion notifications)
+		// are the bulk of per-turn bytes but add little to the fork's "is there
+		// anything durable to record?" decision — user prompts and assistant
+		// text/thinking/toolCall content are sufficient signal.
+		const deltaStart = Math.min(record.lastWorklogMessageCount, transformed.length);
+		const deltaMessages = transformed
+			.slice(deltaStart)
+			.filter((message) => message.role === "user" || message.role === "assistant");
+		const contextMessages = await record.session.agent.convertToLlm(deltaMessages);
 		const worklogContents = await readWorklog(record.worklogFile);
 		const lastEntry = getLastWorklogEntry(worklogContents);
 		const prompt: UserMessage = {
@@ -1015,17 +1216,25 @@ export class Orchestrator {
 			content: [{ type: "text", text: buildWorklogPrompt(lastEntry) }],
 			timestamp: Date.now(),
 		};
+		// Use a distinct `sessionId` for the worklog fork so OpenAI-family
+		// providers emit a separate `prompt_cache_key` for fork calls. This
+		// keeps main-loop and fork caches from cross-contaminating: fork
+		// turns never evict cache entries the main loop is relying on, and
+		// vice versa.
+		const forkSessionId = record.session.agent.sessionId
+			? `${record.session.agent.sessionId}:worklog`
+			: undefined;
 		const streamOptions = {
-			reasoning: record.session.thinkingLevel === "off" ? undefined : record.session.thinkingLevel,
+			reasoning: forkThinkingLevel === "off" ? undefined : forkThinkingLevel,
 			getApiKey: record.session.agent.getApiKey,
 			onPayload: record.session.agent.onPayload,
-			sessionId: record.session.agent.sessionId,
+			sessionId: forkSessionId,
 			thinkingBudgets: record.session.agent.thinkingBudgets,
 			transport: record.session.agent.transport,
 			maxRetryDelayMs: record.session.agent.maxRetryDelayMs,
 		} as Parameters<typeof record.session.agent.streamFn>[2];
 		const stream = await record.session.agent.streamFn(
-			record.session.model,
+			forkModel,
 			{
 				systemPrompt: record.session.agent.state.systemPrompt,
 				messages: [...contextMessages, prompt],
@@ -1043,6 +1252,13 @@ export class Orchestrator {
 			record.session.addBackgroundUsage(assistant.usage, "worklog");
 		}
 		if (assistant.stopReason !== "toolUse") {
+			logWorklogFork({
+				agentId,
+				turn,
+				deltaMsgCount: deltaMessages.length,
+				skipped: false,
+				entryEmitted: false,
+			});
 			return;
 		}
 
@@ -1050,6 +1266,13 @@ export class Orchestrator {
 			(content): content is AgentToolCall => content.type === "toolCall" && content.name === WORKLOG_UPDATE_TOOL.name,
 		);
 		if (!toolCall) {
+			logWorklogFork({
+				agentId,
+				turn,
+				deltaMsgCount: deltaMessages.length,
+				skipped: false,
+				entryEmitted: false,
+			});
 			return;
 		}
 
@@ -1058,6 +1281,13 @@ export class Orchestrator {
 		record.lastWorklogTurn = turn;
 		record.lastWorklogMessageCount = turnMessages.length;
 		await this.persistTree();
+		logWorklogFork({
+			agentId,
+			turn,
+			deltaMsgCount: deltaMessages.length,
+			skipped: false,
+			entryEmitted: true,
+		});
 	}
 
 	private appendInterruptedToolResults(session: AgentSessionHandle): string[] {

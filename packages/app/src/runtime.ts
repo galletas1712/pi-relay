@@ -1,3 +1,4 @@
+import { getModel } from "@pi-relay/ai";
 import {
 	type CreateAgentSessionRuntimeFactory,
 	createAgentSessionFromServices,
@@ -5,6 +6,7 @@ import {
 	createAgentSessionServices,
 	getAgentDir,
 	SessionManager,
+	type SettingsManager as RelaySettingsManager,
 	type ToolDefinition,
 } from "@pi-relay/coding-agent";
 import {
@@ -52,14 +54,20 @@ export function createRelayRuntimeFactory(
 	const orchestratorUiRef: { cleanup?: () => void; sessionId?: string } = {};
 	return async ({ cwd, sessionManager, sessionStartEvent }) => {
 		const orchestratorRef: { current?: Orchestrator } = {};
+		const settingsManagerRef: { current?: RelaySettingsManager } = {};
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
 			resourceLoaderOptions: {
 				appendSystemPrompt: [RELAY_APPEND_SYSTEM_PROMPT],
-				extensionFactories: [createOrchestratorExtension(orchestratorRef, orchestratorUiRef)],
+				extensionFactories: [
+					createOrchestratorExtension(orchestratorRef, orchestratorUiRef, {
+						getSettingsManager: () => settingsManagerRef.current,
+					}),
+				],
 			},
 		});
+		settingsManagerRef.current = services.settingsManager;
 		const rootToolBridge = {
 			async spawnAgent(parentId: string, config: Parameters<Orchestrator["spawnAgent"]>[1]) {
 				if (!orchestratorRef.current) {
@@ -98,6 +106,42 @@ export function createRelayRuntimeFactory(
 				createSessionBaseToolDefinitionsFactory,
 			}),
 		});
+		// Hydrate the worklog-fork model override from persisted settings so
+		// a prior `/worklog-model` choice survives process restarts. If no
+		// choice was saved, the fork falls back to the session's main model.
+		// Guarded with `typeof ... === "function"` so stubbed settings
+		// managers in tests (and older SettingsManager instances that might
+		// not have been updated yet) don't crash startup.
+		const sm = services.settingsManager as Partial<RelaySettingsManager>;
+		const savedForkProvider =
+			typeof sm.getWorklogForkProvider === "function" ? sm.getWorklogForkProvider() : undefined;
+		const savedForkModelId =
+			typeof sm.getWorklogForkModel === "function" ? sm.getWorklogForkModel() : undefined;
+		if (savedForkProvider && savedForkModelId) {
+			const restoredForkModel = getModel(savedForkProvider as never, savedForkModelId as never);
+			if (restoredForkModel) {
+				orchestrator.setForkModel(restoredForkModel);
+			} else {
+				// The persisted worklog fork model is no longer resolvable
+				// (model removed from registry, provider renamed, etc.).
+				// Surface a non-fatal diagnostic so the user sees the
+				// setting was effectively dropped instead of silently
+				// running against the session's main model with no feedback.
+				services.diagnostics.push({
+					type: "warning",
+					message: `Configured worklog fork model '${savedForkProvider}/${savedForkModelId}' is no longer available; falling back to session model. Run /worklog-model to reconfigure.`,
+				});
+			}
+		}
+		const savedForkThinking =
+			typeof sm.getWorklogForkThinkingLevel === "function"
+				? sm.getWorklogForkThinkingLevel()
+				: undefined;
+		if (savedForkThinking) {
+			orchestrator.setForkThinkingLevel(
+				savedForkThinking as Parameters<Orchestrator["setForkThinkingLevel"]>[0],
+			);
+		}
 		orchestratorRef.current = orchestrator;
 		stateRef.current = { orchestrator };
 		await orchestrator.restore();

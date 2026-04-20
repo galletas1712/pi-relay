@@ -89,6 +89,15 @@ export interface Settings {
 	defaultProvider?: string;
 	defaultModel?: string;
 	defaultThinkingLevel?: string;
+	/**
+	 * Optional worklog-fork model override. When set, the relay orchestrator
+	 * routes its per-turn worklog fork LLM call to this model instead of the
+	 * session's main model. Unset means "fall back to session model".
+	 * Configured via the `/worklog-model` command.
+	 */
+	worklogForkProvider?: string;
+	worklogForkModel?: string;
+	worklogForkThinkingLevel?: string;
 	transport?: TransportSetting; // default: "sse"
 	steeringMode?: "all" | "one-at-a-time";
 	followUpMode?: "all" | "one-at-a-time";
@@ -627,6 +636,48 @@ export class SettingsManager {
 	setDefaultThinkingLevel(level: string): void {
 		this.globalSettings.defaultThinkingLevel = level;
 		this.markModified("defaultThinkingLevel");
+		this.save();
+	}
+
+	getWorklogForkProvider(): string | undefined {
+		return this.settings.worklogForkProvider;
+	}
+
+	getWorklogForkModel(): string | undefined {
+		return this.settings.worklogForkModel;
+	}
+
+	getWorklogForkThinkingLevel(): string | undefined {
+		return this.settings.worklogForkThinkingLevel;
+	}
+
+	/**
+	 * Atomically persist the full worklog-fork override (provider, model
+	 * id, and thinking level) as a single write. Passing `level ===
+	 * undefined` explicitly clears any previously-persisted thinking
+	 * level so it cannot linger across model switches — important when
+	 * the user switches from a reasoning model ("high") to a
+	 * non-reasoning model (no level applicable).
+	 *
+	 * To clear the whole override use `clearWorklogForkModel` instead.
+	 */
+	setWorklogForkOverride(provider: string, modelId: string, level: string | undefined): void {
+		this.globalSettings.worklogForkProvider = provider;
+		this.globalSettings.worklogForkModel = modelId;
+		this.globalSettings.worklogForkThinkingLevel = level;
+		this.markModified("worklogForkProvider");
+		this.markModified("worklogForkModel");
+		this.markModified("worklogForkThinkingLevel");
+		this.save();
+	}
+
+	clearWorklogForkModel(): void {
+		this.globalSettings.worklogForkProvider = undefined;
+		this.globalSettings.worklogForkModel = undefined;
+		this.globalSettings.worklogForkThinkingLevel = undefined;
+		this.markModified("worklogForkProvider");
+		this.markModified("worklogForkModel");
+		this.markModified("worklogForkThinkingLevel");
 		this.save();
 	}
 

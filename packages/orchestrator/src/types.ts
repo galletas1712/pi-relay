@@ -145,6 +145,22 @@ export interface OrchestratorConfig {
 	maxDepth: number;
 	maxChildren: number;
 	maxActiveAgents: number;
+	/**
+	 * Optional override for the model used by worklog forks. The worklog
+	 * fork is a short, off-transcript LLM call whose job is to decide
+	 * whether the last turn produced anything durable and, if so, emit a
+	 * short markdown entry. It tolerates a cheaper/smaller model than the
+	 * main agent loop. When unset, forks fall back to the parent session's
+	 * `model`, preserving pre-existing behavior.
+	 */
+	forkModel?: Model<any>;
+	/**
+	 * Optional override for the reasoning effort / thinking level of the
+	 * worklog fork. Unset falls back to the parent session's
+	 * `thinkingLevel`. For OpenAI-family reasoning models this is mapped to
+	 * `reasoning.effort` via `normalizeOpenAIReasoning`.
+	 */
+	forkThinkingLevel?: ThinkingLevel;
 }
 
 export interface AgentMessageDetails {
