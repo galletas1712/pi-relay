@@ -142,6 +142,67 @@ describe("relay runtime orchestrator bridge lifecycle", () => {
 		expect(stateRef.current?.orchestratorController?.shadowActive).toBe(true);
 	});
 
+	it("continues rebuilding when the previous shadow controller fails to stop", async () => {
+		const { createRelayRuntimeFactory } = await import("../src/runtime.js");
+		const firstController = {
+			start: vi.fn(async () => undefined),
+			flush: vi.fn(async () => undefined),
+			stop: vi.fn(async () => {
+				throw new Error("stop failed during rebuild");
+			}),
+		};
+		const secondController = {
+			start: vi.fn(async () => undefined),
+			flush: vi.fn(async () => undefined),
+			stop: vi.fn(async () => undefined),
+		};
+		const bridgeFactory = vi
+			.fn()
+			.mockResolvedValueOnce(firstController)
+			.mockResolvedValueOnce(secondController);
+		const stateRef: {
+			current?: {
+				orchestratorController?: {
+					shadowActive?: boolean;
+				};
+			};
+		} = {};
+
+		const factory = createRelayRuntimeFactory("/tmp/agent", stateRef as never, {
+			env: {
+				PI_RELAY_ORCH_ENGINE: "rust-shadow",
+			},
+			orchestratorBridgeFactory: bridgeFactory,
+		});
+
+		const firstResult = await factory({
+			cwd: "/tmp/project",
+			sessionManager: {
+				getSessionDir: () => "/tmp/sessions",
+			},
+		} as never);
+
+		await expect(
+			factory({
+				cwd: "/tmp/project",
+				sessionManager: {
+					getSessionDir: () => "/tmp/sessions",
+				},
+			} as never),
+		).resolves.toMatchObject({
+			services: expect.any(Object),
+		});
+
+		expect(firstController.stop).toHaveBeenCalledTimes(1);
+		expect(secondController.start).toHaveBeenCalledTimes(1);
+		expect(firstResult.diagnostics).toContainEqual({
+			type: "warning",
+			message:
+				"Failed to stop the Rust orchestrator bridge cleanly for PI_RELAY_ORCH_ENGINE=rust-shadow: stop failed during rebuild. TypeScript remains authoritative.",
+		});
+		expect(stateRef.current?.orchestratorController?.shadowActive).toBe(true);
+	});
+
 	it("stops the active shadow controller when the runtime is disposed", async () => {
 		const { createRelayRuntime } = await import("../src/runtime.js");
 		const controller = {
@@ -165,5 +226,35 @@ describe("relay runtime orchestrator bridge lifecycle", () => {
 		expect(controller.start).toHaveBeenCalledTimes(1);
 		expect(controller.stop).toHaveBeenCalledTimes(1);
 		expect(runtimeDispose).toHaveBeenCalledTimes(1);
+	});
+
+	it("still disposes the authoritative runtime when shadow controller stop fails", async () => {
+		const { createRelayRuntime } = await import("../src/runtime.js");
+		const controller = {
+			start: vi.fn(async () => undefined),
+			flush: vi.fn(async () => undefined),
+			stop: vi.fn(async () => {
+				throw new Error("stop failed during dispose");
+			}),
+		};
+
+		const runtime = await createRelayRuntime({
+			cwd: "/tmp/project",
+			agentDir: "/tmp/agent",
+			env: {
+				PI_RELAY_ORCH_ENGINE: "rust-shadow",
+			},
+			orchestratorBridgeFactory: async () => controller,
+		});
+
+		await expect(runtime.dispose()).resolves.toBeUndefined();
+
+		expect(controller.stop).toHaveBeenCalledTimes(1);
+		expect(runtimeDispose).toHaveBeenCalledTimes(1);
+		expect(runtime.diagnostics).toContainEqual({
+			type: "warning",
+			message:
+				"Failed to stop the Rust orchestrator bridge cleanly for PI_RELAY_ORCH_ENGINE=rust-shadow: stop failed during dispose. TypeScript remains authoritative.",
+		});
 	});
 });

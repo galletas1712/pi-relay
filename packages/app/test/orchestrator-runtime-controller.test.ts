@@ -32,6 +32,33 @@ describe("createRelayOrchestratorRuntimeController", () => {
 		expect(diagnostics).toEqual([]);
 	});
 
+	it("treats shadow bridge stop failures as warnings", async () => {
+		const diagnostics: Array<{ type: "info" | "warning" | "error"; message: string }> = [];
+		const controller = {
+			start: vi.fn(async () => undefined),
+			flush: vi.fn(async () => undefined),
+			stop: vi.fn(async () => {
+				throw new Error("stop failed");
+			}),
+		};
+
+		const runtimeController = await createRelayOrchestratorRuntimeController({
+			orchestrator: { rootAgentId: "root" } as never,
+			engineMode: "rust-shadow",
+			diagnostics,
+			bridgeFactory: async () => controller,
+		});
+
+		await expect(runtimeController.stop()).resolves.toBeUndefined();
+		expect(diagnostics).toEqual([
+			{
+				type: "warning",
+				message:
+					"Failed to stop the Rust orchestrator bridge cleanly for PI_RELAY_ORCH_ENGINE=rust-shadow: stop failed. TypeScript remains authoritative.",
+			},
+		]);
+	});
+
 	it("records bridge events and disconnects as runtime diagnostics", async () => {
 		const diagnostics: Array<{ type: "info" | "warning" | "error"; message: string }> = [];
 		let onEvent: ((event: any) => void) | undefined;

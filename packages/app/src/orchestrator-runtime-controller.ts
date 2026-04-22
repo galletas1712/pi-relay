@@ -48,6 +48,13 @@ function formatError(error: unknown): string {
 	return String(error);
 }
 
+function formatBridgeStopFailureMessage(
+	engineMode: RelayOrchestratorBridgeMode,
+	error: unknown,
+): string {
+	return `Failed to stop the Rust orchestrator bridge cleanly for PI_RELAY_ORCH_ENGINE=${engineMode}: ${formatError(error)}. TypeScript remains authoritative.`;
+}
+
 function formatBridgeEventMessage(event: RelayCoreBridgeEvent): string {
 	if (event.type === "diagnostic") {
 		return `Rust orchestrator bridge: ${event.message}`;
@@ -145,14 +152,18 @@ export async function createRelayOrchestratorRuntimeController(options: {
 					return;
 				}
 				stopped = true;
-				await controller.stop();
+				try {
+					await controller.stop();
+				} catch (error) {
+					pushDiagnostic(diagnostics, "warning", formatBridgeStopFailureMessage(engineMode, error));
+				}
 			},
 		};
 	} catch (error) {
 		try {
 			await controller?.stop();
-		} catch {
-			// best-effort cleanup only
+		} catch (stopError) {
+			pushDiagnostic(diagnostics, "warning", formatBridgeStopFailureMessage(engineMode, stopError));
 		}
 		pushDiagnostic(
 			diagnostics,
@@ -166,5 +177,10 @@ export async function createRelayOrchestratorRuntimeController(options: {
 export async function stopRelayOrchestratorRuntimeController(
 	controller: RelayOrchestratorRuntimeController | undefined,
 ): Promise<void> {
-	await controller?.stop();
+	try {
+		await controller?.stop();
+	} catch {
+		// Controllers should already translate stop failures into diagnostics,
+		// but shutdown/rebuild must remain best-effort even if one escapes.
+	}
 }

@@ -102,7 +102,7 @@ describe("relay-core bridge lifecycle", () => {
 				},
 				"init",
 			),
-		).rejects.toThrow("relay-core bridge client is closed");
+		).rejects.toThrow("relay-core bridge closed its input stream");
 	});
 
 	it("cleans up source subscriptions and stops syncing changes after stop", async () => {
