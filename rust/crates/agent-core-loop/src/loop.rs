@@ -133,12 +133,10 @@ impl AgentCoreLoop {
     }
 
     fn resume_model_if_ready(&mut self) -> bool {
-        let turn_id = match &self.state {
-            AgentState::ReadyToContinue { turn_id } => *turn_id,
-            _ => return false,
+        let Some(turn_id) = self.state.resume_model() else {
+            return false;
         };
 
-        self.state = AgentState::RunningModel { turn_id };
         self.enqueue_action(AgentAction::RequestModel { turn_id });
         true
     }
@@ -168,7 +166,8 @@ impl AgentCoreLoop {
         self.last_turn_id = self.last_turn_id.next();
         let turn_id = self.last_turn_id;
         let user_message = self.create_user_message(input);
-        self.state = AgentState::RunningModel { turn_id };
+        let started = self.state.start_turn(turn_id);
+        debug_assert!(started, "start_turn called while turn is already active");
 
         self.append_event(AgentEvent::TurnStarted { turn_id });
         self.append_event(AgentEvent::UserMessage(user_message));
@@ -201,7 +200,8 @@ impl AgentCoreLoop {
 
         let mut tool_calls = assistant.tool_calls().cloned();
         let Some(first_tool_call) = tool_calls.next() else {
-            self.state = AgentState::Idle;
+            let finished = self.state.finish_model_turn(turn_id);
+            debug_assert!(finished, "assistant message consumed outside model state");
             self.append_event(AgentEvent::TurnFinished {
                 turn_id,
                 outcome: TurnOutcome::Graceful,
@@ -218,10 +218,10 @@ impl AgentCoreLoop {
     }
 
     fn start_tool_call(&mut self, turn_id: TurnId, tool_call: ToolCall) {
-        self.state = AgentState::RunningTool {
-            turn_id,
-            tool_call: tool_call.clone(),
-        };
+        if !self.state.start_tool(turn_id, tool_call.clone()) {
+            return;
+        }
+
         self.append_event(AgentEvent::ToolCallStarted {
             turn_id,
             tool_call: tool_call.clone(),
@@ -230,22 +230,11 @@ impl AgentCoreLoop {
     }
 
     fn on_tool_result(&mut self, turn_id: TurnId, result: ToolResultMessage) {
-        let running_tool_call = match &self.state {
-            AgentState::RunningTool {
-                turn_id: active_turn_id,
-                tool_call,
-            } if *active_turn_id == turn_id => tool_call.clone(),
-            _ => return,
-        };
-
-        if running_tool_call.id != result.tool_call_id
-            || running_tool_call.tool_name != result.tool_name
-        {
+        if !self.state.finish_tool(turn_id, &result) {
             return;
         }
 
         self.append_event(AgentEvent::ToolResult(result));
-        self.state = AgentState::ReadyToContinue { turn_id };
     }
 
     fn handle_interrupt(&mut self) -> bool {
@@ -255,40 +244,28 @@ impl AgentCoreLoop {
 
         self.interrupt_requested = false;
 
-        match self.state.clone() {
-            AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => false,
-            AgentState::ReadyToContinue { turn_id } => {
-                self.state = AgentState::Interrupted;
-                self.append_event(AgentEvent::TurnFinished {
-                    turn_id,
-                    outcome: TurnOutcome::Interrupted,
-                });
-                true
-            }
-            AgentState::RunningModel { turn_id } => {
-                self.state = AgentState::Interrupted;
+        let Some(interrupted) = self.state.interrupt() else {
+            return false;
+        };
 
-                self.append_event(AgentEvent::TurnFinished {
-                    turn_id,
-                    outcome: TurnOutcome::Interrupted,
-                });
-                self.enqueue_action(AgentAction::CancelActive { turn_id });
-                true
-            }
-            AgentState::RunningTool { turn_id, tool_call } => {
-                self.state = AgentState::Interrupted;
-
-                let interrupted =
-                    ToolResultMessage::interrupted(tool_call.id, tool_call.tool_name.clone());
-                self.append_event(AgentEvent::ToolResult(interrupted));
-                self.append_event(AgentEvent::TurnFinished {
-                    turn_id,
-                    outcome: TurnOutcome::Interrupted,
-                });
-                self.enqueue_action(AgentAction::CancelActive { turn_id });
-                true
-            }
+        if let Some(tool_call) = interrupted.tool_call {
+            let interrupted_tool_result =
+                ToolResultMessage::interrupted(tool_call.id, tool_call.tool_name);
+            self.append_event(AgentEvent::ToolResult(interrupted_tool_result));
         }
+
+        self.append_event(AgentEvent::TurnFinished {
+            turn_id: interrupted.turn_id,
+            outcome: TurnOutcome::Interrupted,
+        });
+
+        if interrupted.cancel_active {
+            self.enqueue_action(AgentAction::CancelActive {
+                turn_id: interrupted.turn_id,
+            });
+        }
+
+        true
     }
 
     fn create_user_message(&mut self, input: UserInput) -> UserMessage {
