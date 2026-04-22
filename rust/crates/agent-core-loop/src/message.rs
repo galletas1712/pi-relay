@@ -62,6 +62,7 @@ pub enum ToolResultStatus {
     Success,
     Error,
     Interrupted,
+    Crashed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,6 +80,15 @@ impl ToolResultMessage {
             tool_name: tool_name.into(),
             output: "interrupted".to_string(),
             status: ToolResultStatus::Interrupted,
+        }
+    }
+
+    pub fn crashed(tool_call_id: ToolCallId, tool_name: impl Into<String>) -> Self {
+        Self {
+            tool_call_id,
+            tool_name: tool_name.into(),
+            output: "crashed before tool result was recorded".to_string(),
+            status: ToolResultStatus::Crashed,
         }
     }
 }
