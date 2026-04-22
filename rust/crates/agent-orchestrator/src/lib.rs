@@ -2,7 +2,7 @@
 
 use std::collections::BTreeMap;
 
-use agent_core::{AgentAction, AgentInput, Transcript};
+use agent_core::{AgentInput, Transcript};
 use agent_session::{
     AgentSession, CompactionPlan, CompactionSettings, ExternalWork, SessionBoundaryError,
     SessionLog,
@@ -50,12 +50,9 @@ impl AgentOrchestrator {
             .ok_or(OrchestratorError::SessionNotFound)
     }
 
-    pub fn send(
-        &mut self,
-        id: &str,
-        input: AgentInput,
-    ) -> Result<Vec<AgentAction>, OrchestratorError> {
-        Ok(self.session_mut(id)?.handle_input(input))
+    pub fn enqueue_input(&mut self, id: &str, input: AgentInput) -> Result<(), OrchestratorError> {
+        self.session_mut(id)?.core_mut().enqueue_input(input);
+        Ok(())
     }
 
     pub fn replace_session_transcript(
@@ -159,20 +156,25 @@ mod tests {
             .spawn_session("root", AgentSession::new())
             .expect("new session should be inserted");
 
-        let actions = orchestrator
-            .send("root", AgentInput::FollowUp("hello".to_string()))
+        orchestrator
+            .enqueue_input("root", AgentInput::FollowUp("hello".to_string()))
             .expect("session should exist");
 
         assert_eq!(
-            actions,
-            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
+            orchestrator
+                .session("root")
+                .expect("session should exist")
+                .core()
+                .mailbox
+                .follow_up_len(),
+            1
         );
     }
 
     #[test]
     fn orchestrator_delegates_transcript_replacement_to_session_boundary() {
         let mut orchestrator = AgentOrchestrator::new();
-        let transcript = Transcript::from_records_raw(vec![
+        let transcript = Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
             TranscriptRecord::UserMessage("compacted".to_string()),
             TranscriptRecord::TurnFinished {
@@ -201,7 +203,7 @@ mod tests {
     #[test]
     fn orchestrator_delegates_rewind_fork_and_compaction_to_session_boundaries() {
         let mut orchestrator = AgentOrchestrator::new();
-        let session = AgentSession::from_transcript(Transcript::from_records_raw(vec![
+        let session = AgentSession::from_transcript(Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
             TranscriptRecord::UserMessage("first user message".to_string()),
             TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),

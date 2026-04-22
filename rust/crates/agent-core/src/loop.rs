@@ -57,23 +57,7 @@ impl AgentCoreLoop {
         self.action_outbox.drain(..).collect()
     }
 
-    pub fn pending_action_len(&self) -> usize {
-        self.action_outbox.len()
-    }
-
-    pub fn has_pending_actions(&self) -> bool {
-        !self.action_outbox.is_empty()
-    }
-
-    pub fn is_at_turn_boundary(&self) -> bool {
-        self.state == AgentState::Idle && self.transcript.is_turn_boundary()
-    }
-
-    pub fn is_core_quiescent(&self) -> bool {
-        self.is_at_turn_boundary() && self.mailbox.is_empty() && self.action_outbox.is_empty()
-    }
-
-    pub fn drive(&mut self) {
+    pub(crate) fn drive(&mut self) {
         loop {
             let next_turn_id = self.last_turn_id.next();
             let Some(event) = self.mailbox.next_event(&self.state, next_turn_id) else {

@@ -343,7 +343,7 @@ fn materialize_context(path: &[SessionEntry]) -> SessionContext {
     }
 
     SessionContext {
-        transcript: Transcript::from_records_raw(records),
+        transcript: Transcript::from_records(records),
         compaction,
         branch_summaries,
     }

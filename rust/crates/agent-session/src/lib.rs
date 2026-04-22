@@ -1,14 +1,9 @@
 #![forbid(unsafe_code)]
 
-mod runner;
 mod session_log;
 
-use agent_core::{
-    AgentAction, AgentCoreLoop, AgentInput, AgentState, Transcript, TranscriptCheckpoint,
-    TranscriptRecord,
-};
+use agent_core::{AgentCoreLoop, AgentState, Transcript, TranscriptRecord};
 
-pub use crate::runner::{AgentInputHandle, AgentInputReceiver, AgentRunner};
 pub use crate::session_log::{
     BranchSummaryEntry, CompactionEntry, CompactionPlan, CompactionSettings, SessionContext,
     SessionEntry, SessionEntryKind, SessionLog, SessionLogError,
@@ -23,17 +18,17 @@ pub use crate::session_log::{
 pub struct AgentSession {
     core: AgentCoreLoop,
     log: SessionLog,
-    synced_checkpoint: TranscriptCheckpoint,
+    synced_record_len: usize,
 }
 
 impl Default for AgentSession {
     fn default() -> Self {
         let core = AgentCoreLoop::new();
-        let synced_checkpoint = core.transcript.checkpoint();
+        let synced_record_len = core.transcript.records().len();
         Self {
             core,
             log: SessionLog::new(),
-            synced_checkpoint,
+            synced_record_len,
         }
     }
 }
@@ -53,11 +48,11 @@ impl AgentSession {
 
     pub fn from_core(core: AgentCoreLoop) -> Self {
         let log = SessionLog::from_transcript(&core.transcript);
-        let synced_checkpoint = core.transcript.checkpoint();
+        let synced_record_len = core.transcript.records().len();
         Self {
             core,
             log,
-            synced_checkpoint,
+            synced_record_len,
         }
     }
 
@@ -68,11 +63,11 @@ impl AgentSession {
 
         let context = log.context();
         let core = AgentCoreLoop::from_transcript(context.transcript);
-        let synced_checkpoint = core.transcript.checkpoint();
+        let synced_record_len = core.transcript.records().len();
         Ok(Self {
             core,
             log,
-            synced_checkpoint,
+            synced_record_len,
         })
     }
 
@@ -96,39 +91,15 @@ impl AgentSession {
         self.log.context()
     }
 
-    pub fn checkpoint(&self) -> TranscriptCheckpoint {
-        self.core.transcript.checkpoint()
-    }
-
-    pub fn boundary_checkpoint(&self) -> Option<TranscriptCheckpoint> {
-        self.core.transcript.boundary_checkpoint()
-    }
-
-    pub fn enqueue_input(&mut self, input: AgentInput) {
-        self.core.enqueue_input(input);
-    }
-
-    pub fn drive(&mut self) {
-        self.core.drive();
+    pub fn sync_transcript_from_core(&mut self) {
         self.sync_log_from_core();
-    }
-
-    pub fn drain_actions(&mut self) -> Vec<AgentAction> {
-        self.core.drain_actions()
-    }
-
-    pub fn handle_input(&mut self, input: AgentInput) -> Vec<AgentAction> {
-        self.enqueue_input(input);
-        self.drive();
-        self.drain_actions()
     }
 
     pub fn quiescence(&self, external_work: ExternalWork) -> SessionQuiescence {
         SessionQuiescence {
             core_idle: self.core.state == AgentState::Idle,
             durable_turn_boundary: self.core.transcript.is_turn_boundary(),
-            mailbox_empty: self.core.mailbox.is_empty(),
-            action_outbox_empty: !self.core.has_pending_actions(),
+            mailbox_empty: self.core.mailbox.total_len() == 0,
             external_work_empty: external_work.is_empty(),
         }
     }
@@ -158,7 +129,7 @@ impl AgentSession {
         let previous =
             std::mem::replace(&mut self.core, AgentCoreLoop::from_transcript(replacement));
         self.log = SessionLog::from_transcript(&self.core.transcript);
-        self.synced_checkpoint = self.core.transcript.checkpoint();
+        self.synced_record_len = self.core.transcript.records().len();
         Ok(previous.transcript)
     }
 
@@ -249,18 +220,20 @@ impl AgentSession {
     fn rehydrate_core_from_log(&mut self) {
         let context = self.log.context();
         self.core = AgentCoreLoop::from_transcript(context.transcript);
-        self.synced_checkpoint = self.core.transcript.checkpoint();
+        self.synced_record_len = self.core.transcript.records().len();
     }
 
     fn sync_log_from_core(&mut self) {
-        let Some(records) = self.core.transcript.records_since(self.synced_checkpoint) else {
+        let records = self.core.transcript.records();
+        if self.synced_record_len > records.len() {
             self.log = SessionLog::from_transcript(&self.core.transcript);
-            self.synced_checkpoint = self.core.transcript.checkpoint();
+            self.synced_record_len = records.len();
             return;
-        };
+        }
 
-        self.log.append_transcript_records(records.iter().cloned());
-        self.synced_checkpoint = self.core.transcript.checkpoint();
+        self.log
+            .append_transcript_records(records[self.synced_record_len..].iter().cloned());
+        self.synced_record_len = records.len();
     }
 }
 
@@ -288,7 +261,6 @@ pub struct SessionQuiescence {
     pub core_idle: bool,
     pub durable_turn_boundary: bool,
     pub mailbox_empty: bool,
-    pub action_outbox_empty: bool,
     pub external_work_empty: bool,
 }
 
@@ -297,7 +269,6 @@ impl SessionQuiescence {
         self.core_idle
             && self.durable_turn_boundary
             && self.mailbox_empty
-            && self.action_outbox_empty
             && self.external_work_empty
     }
 }
@@ -315,7 +286,7 @@ mod tests {
     use agent_core::{AssistantItem, AssistantMessage, TurnId, TurnOutcome};
 
     fn finished_transcript(input: &str) -> Transcript {
-        Transcript::from_records_raw(vec![
+        Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
             TranscriptRecord::UserMessage(input.to_string()),
             TranscriptRecord::TurnFinished {
@@ -329,12 +300,9 @@ mod tests {
     fn quiescence_requires_idle_core_empty_queues_and_no_external_work() {
         let mut session = AgentSession::new();
 
-        let actions = session.handle_input(AgentInput::FollowUp("hello".to_string()));
-
-        assert_eq!(
-            actions,
-            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
-        );
+        session
+            .core_mut()
+            .enqueue_input(agent_core::AgentInput::FollowUp("hello".to_string()));
         assert!(!session.is_quiescent(ExternalWork::NONE));
         assert!(!session
             .quiescence(ExternalWork {
@@ -342,32 +310,21 @@ mod tests {
                 ..ExternalWork::NONE
             })
             .is_quiescent());
-
-        let actions = session.handle_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: AssistantMessage {
-                items: vec![AssistantItem::Text("hi".to_string())],
-            },
-        });
-
-        assert!(actions.is_empty());
-        assert!(session.is_quiescent(ExternalWork::NONE));
     }
 
     #[test]
     fn transcript_replacement_is_only_allowed_at_quiescent_boundaries() {
         let mut session = AgentSession::new();
-        session.handle_input(AgentInput::FollowUp("hello".to_string()));
+        session
+            .core_mut()
+            .enqueue_input(agent_core::AgentInput::FollowUp("hello".to_string()));
 
         let busy = session
             .replace_transcript_at_boundary(finished_transcript("compact"), ExternalWork::NONE)
             .expect_err("running sessions cannot be compacted");
         assert!(matches!(busy, SessionBoundaryError::Busy(_)));
 
-        session.handle_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: AssistantMessage { items: Vec::new() },
-        });
+        let mut session = AgentSession::from_transcript(finished_transcript("hello"));
 
         let old = session
             .replace_transcript_at_boundary(finished_transcript("compact"), ExternalWork::NONE)
@@ -382,21 +339,16 @@ mod tests {
 
     #[test]
     fn session_log_tracks_core_turn_records() {
-        let mut session = AgentSession::new();
-        session.handle_input(AgentInput::FollowUp("hello".to_string()));
-        session.handle_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: AssistantMessage { items: Vec::new() },
-        });
+        let session = AgentSession::from_transcript(finished_transcript("hello"));
 
-        assert_eq!(session.session_log().entries().len(), 4);
+        assert_eq!(session.session_log().entries().len(), 3);
         assert!(session.session_log().is_turn_boundary());
         assert_eq!(session.model_context().transcript.last_turn_id(), TurnId(1));
     }
 
     #[test]
     fn compaction_requires_quiescence_and_keeps_a_turn_boundary_suffix() {
-        let mut session = AgentSession::from_transcript(Transcript::from_records_raw(vec![
+        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
             TranscriptRecord::UserMessage("first user message".to_string()),
             TranscriptRecord::AssistantMessage(AssistantMessage {
@@ -448,7 +400,7 @@ mod tests {
 
     #[test]
     fn rewind_and_fork_only_accept_turn_finished_entries() {
-        let mut session = AgentSession::from_transcript(Transcript::from_records_raw(vec![
+        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
             TranscriptRecord::UserMessage("first".to_string()),
             TranscriptRecord::TurnFinished {
