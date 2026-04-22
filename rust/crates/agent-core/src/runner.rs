@@ -1,0 +1,186 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
+use futures_core::Stream;
+
+use crate::action::AgentAction;
+use crate::core_loop::AgentCoreLoop;
+use crate::event::AgentInput;
+
+#[derive(Debug, Clone)]
+pub struct AgentInputHandle {
+    inputs: UnboundedSender<AgentInput>,
+}
+
+impl AgentInputHandle {
+    /// Create the input side of an agent run loop.
+    ///
+    /// The handle is cloneable so orchestrator, model, and tool tasks can all
+    /// enqueue completions or user input back into the same core loop.
+    pub fn channel() -> (Self, AgentInputReceiver) {
+        let (inputs, input_rx) = unbounded();
+        (Self { inputs }, AgentInputReceiver { inputs: input_rx })
+    }
+
+    pub fn enqueue_input(&self, input: AgentInput) -> Result<(), AgentInput> {
+        self.inputs
+            .unbounded_send(input)
+            .map_err(|error| error.into_inner())
+    }
+}
+
+/// Receive side of the agent input queue.
+pub struct AgentInputReceiver {
+    inputs: UnboundedReceiver<AgentInput>,
+}
+
+/// Async integration shell around the pure AgentCoreLoop.
+///
+/// AgentRunner owns the proactive run loop: it receives inputs, drives the
+/// core until quiescent, and forwards requested actions to the registered
+/// action handler.
+pub struct AgentRunner<HandleAction> {
+    core: AgentCoreLoop,
+    inputs: AgentInputReceiver,
+    handle_action: HandleAction,
+}
+
+impl<HandleAction> AgentRunner<HandleAction> {
+    pub fn new(
+        core: AgentCoreLoop,
+        inputs: AgentInputReceiver,
+        handle_action: HandleAction,
+    ) -> Self {
+        Self {
+            core,
+            inputs,
+            handle_action,
+        }
+    }
+
+    pub fn core(&self) -> &AgentCoreLoop {
+        &self.core
+    }
+
+    pub fn core_mut(&mut self) -> &mut AgentCoreLoop {
+        &mut self.core
+    }
+}
+
+impl<HandleAction, HandleActionFuture> AgentRunner<HandleAction>
+where
+    HandleAction: FnMut(AgentAction) -> HandleActionFuture,
+    HandleActionFuture: Future<Output = ()>,
+{
+    pub async fn run(&mut self) {
+        self.drive_and_flush_actions().await;
+
+        while let Some(input) = next_input(&mut self.inputs.inputs).await {
+            self.core.enqueue_input(input);
+            self.drive_and_flush_actions().await;
+        }
+    }
+
+    async fn drive_and_flush_actions(&mut self) {
+        self.core.drive();
+
+        for action in self.core.drain_actions() {
+            (self.handle_action)(action).await;
+        }
+    }
+}
+
+struct NextInput<'a, InputStream> {
+    inputs: &'a mut InputStream,
+}
+
+fn next_input<InputStream>(inputs: &mut InputStream) -> NextInput<'_, InputStream>
+where
+    InputStream: Stream + Unpin,
+{
+    NextInput { inputs }
+}
+
+impl<InputStream> Future for NextInput<'_, InputStream>
+where
+    InputStream: Stream + Unpin,
+{
+    type Output = Option<InputStream::Item>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        Pin::new(&mut *self.inputs).poll_next(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::future::{ready, Future};
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    use crate::ids::TurnId;
+    use crate::message::{AssistantItem, AssistantMessage};
+    use crate::state::AgentState;
+    use crate::transcript::{TranscriptRecord, TurnOutcome};
+
+    fn block_on_ready<F: Future>(future: F) -> F::Output {
+        let mut future = Box::pin(future);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+
+        loop {
+            if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+                return output;
+            }
+        }
+    }
+
+    #[test]
+    fn runner_registers_handler_and_drives_enqueued_inputs() {
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let recorded_actions = actions.clone();
+        let assistant = AssistantMessage {
+            items: vec![AssistantItem::Text("hi".to_string())],
+        };
+        let (input_handle, input_rx) = AgentInputHandle::channel();
+        let mut runner = AgentRunner::new(AgentCoreLoop::new(), input_rx, move |action| {
+            recorded_actions.borrow_mut().push(action);
+            ready(())
+        });
+
+        input_handle
+            .enqueue_input(AgentInput::FollowUp("hello".to_string()))
+            .expect("runner should accept user input");
+        input_handle
+            .enqueue_input(AgentInput::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant: assistant.clone(),
+            })
+            .expect("runner should accept model completion");
+        drop(input_handle);
+
+        block_on_ready(runner.run());
+
+        assert_eq!(
+            actions.borrow().as_slice(),
+            &[AgentAction::RequestModel { turn_id: TurnId(1) }]
+        );
+        assert_eq!(
+            runner.core().transcript.records(),
+            &[
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage("hello".to_string()),
+                TranscriptRecord::AssistantMessage(assistant),
+                TranscriptRecord::TurnFinished {
+                    turn_id: TurnId(1),
+                    outcome: TurnOutcome::Graceful,
+                },
+            ]
+        );
+        assert_eq!(runner.core().state, AgentState::Idle);
+    }
+}
