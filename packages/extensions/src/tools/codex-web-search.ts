@@ -23,7 +23,7 @@
 
 import { createHash } from "node:crypto";
 import { type Api, type AssistantMessage, completeSimple, type Model, StringEnum } from "@pi-relay/ai";
-import type { ExtensionAPI } from "@pi-relay/coding-agent";
+import type { ExtensionAPI } from "@pi-relay/extension-api";
 import { defineToolProvider, type ToolCallContext, type ToolHost } from "@pi-relay/tool-kit";
 import { Text } from "@pi-relay/tool-kit/render";
 import { Type } from "@sinclair/typebox";

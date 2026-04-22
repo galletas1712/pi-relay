@@ -32,7 +32,7 @@
  *   adapter throws ToolConfigMissingError at call time.
  */
 
-import type { ExtensionAPI } from "@pi-relay/coding-agent";
+import type { ExtensionAPI } from "@pi-relay/extension-api";
 import { defineToolProvider, type ToolCallContext } from "@pi-relay/tool-kit";
 import { Text } from "@pi-relay/tool-kit/render";
 import { Type } from "@sinclair/typebox";

@@ -125,6 +125,8 @@ implementations for authors who want to start from a working file.
 - `@pi-relay/tool-kit` — the author-facing types (`ToolInterface`,
   `ToolProvider`, `ToolsConfig`, `ToolCallContext`, ...). Authors only depend
   on tool-kit (+ `@sinclair/typebox`); this pack depends on
-  `@pi-relay/coding-agent` for the `ExtensionAPI` type.
+  `@pi-relay/extension-api` for extension authoring types, while
+  `@pi-relay/coding-agent` remains the runtime host and source of broader
+  helpers when needed.
 - `packages/coding-agent/docs/tool-packages.md` — internal design of the
   interface/provider/tool model and the extension discovery algorithm.

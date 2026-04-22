@@ -36,12 +36,15 @@ The main entry of this package is **TUI-free** and has **no dependency on
 ## Install
 
 ```bash
-npm install @pi-relay/tool-kit @sinclair/typebox
+npm install @pi-relay/tool-kit @pi-relay/extension-api @sinclair/typebox
 ```
 
 `@pi-relay/tui` is declared as an **optional peer dependency** used only by
 the `@pi-relay/tool-kit/render` subpath. If your provider doesn't need a
 custom renderer, you can skip it.
+
+If your provider is packaged as a pi-relay extension, import `ExtensionAPI`
+from `@pi-relay/extension-api`.
 
 ## Minimal example
 
@@ -49,7 +52,7 @@ custom renderer, you can skip it.
 // my-provider.ts
 import { defineToolProvider, type ToolCallContext } from "@pi-relay/tool-kit";
 import { Type } from "@sinclair/typebox";
-import type { ExtensionAPI } from "@pi-relay/coding-agent";
+import type { ExtensionAPI } from "@pi-relay/extension-api";
 
 interface Config {
   endpoint: string;

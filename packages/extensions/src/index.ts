@@ -20,7 +20,7 @@
  * `src/<type>/` and is wired in here. Today only `src/tools/` exists.
  */
 
-import type { ExtensionAPI } from "@pi-relay/coding-agent";
+import type { ExtensionAPI } from "@pi-relay/extension-api";
 import { registerAllTools } from "./tools/index.js";
 
 /**

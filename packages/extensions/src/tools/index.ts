@@ -11,7 +11,7 @@
  *     as in the `examples/` directory at the repo root).
  */
 
-import type { ExtensionAPI } from "@pi-relay/coding-agent";
+import type { ExtensionAPI } from "@pi-relay/extension-api";
 import registerCodexWebSearch from "./codex-web-search.js";
 import registerPerplexitySonar from "./perplexity-sonar.js";
 

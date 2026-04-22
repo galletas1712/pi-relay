@@ -1,7 +1,7 @@
 {
-	"name": "@pi-relay/extensions",
+	"name": "@pi-relay/extension-api",
 	"version": "0.67.100",
-	"description": "First-party extension pack for pi-relay: bundled tool providers, and space reserved for future extension types (TUI, commands, hooks).",
+	"description": "Lightweight extension authoring surface for pi-relay",
 	"type": "module",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
@@ -9,10 +9,6 @@
 		".": {
 			"types": "./dist/index.d.ts",
 			"import": "./dist/index.js"
-		},
-		"./tools": {
-			"types": "./dist/tools/index.d.ts",
-			"import": "./dist/tools/index.js"
 		}
 	},
 	"files": [
@@ -26,12 +22,6 @@
 		"test": "vitest --run",
 		"prepublishOnly": "npm run clean && npm run build"
 	},
-	"dependencies": {
-		"@pi-relay/ai": "^0.67.5",
-		"@pi-relay/extension-api": "^0.67.100",
-		"@pi-relay/tool-kit": "^0.67.100",
-		"@sinclair/typebox": "^0.34.41"
-	},
 	"peerDependencies": {
 		"@pi-relay/coding-agent": "^0.67.5"
 	},
@@ -42,15 +32,15 @@
 	},
 	"keywords": [
 		"pi-relay",
-		"tools",
-		"extensions"
+		"extensions",
+		"sdk"
 	],
 	"author": "Mario Zechner",
 	"license": "MIT",
 	"repository": {
 		"type": "git",
 		"url": "git+https://github.com/galletas1712/pi-relay.git",
-		"directory": "packages/extensions"
+		"directory": "packages/extension-api"
 	},
 	"engines": {
 		"node": ">=20.0.0"
