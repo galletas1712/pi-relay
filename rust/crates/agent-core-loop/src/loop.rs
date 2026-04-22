@@ -1,86 +1,12 @@
-use std::collections::VecDeque;
-
 use crate::event::{AgentAction, AgentEvent, TurnOutcome};
 use crate::ids::TurnId;
 use crate::mailbox::{Mailbox, MailboxEvent};
 use crate::message::{
     AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, UserInput, UserMessage,
 };
+use crate::runtime::{ActionOutbox, InterruptLatch, TurnCursor};
+use crate::state::{AgentState, AgentStateStep};
 use crate::transcript::Transcript;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentState {
-    Idle,
-    // The last completed turn ended via interrupt.
-    Interrupted,
-    // The last completed turn was synthesized as crashed during recovery.
-    Crashed,
-    RunningModel {
-        turn_id: TurnId,
-    },
-    RunningTool {
-        turn_id: TurnId,
-        tool_call: ToolCall,
-    },
-    // Internal transition point after a tool result. The next step is either
-    // another queued tool call or a model request.
-    ReadyToContinue {
-        turn_id: TurnId,
-    },
-}
-
-impl Default for AgentState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentStateStep {
-    ConsumeEvent,
-    DropEvent,
-    Wait,
-}
-
-impl AgentState {
-    fn step(&self, event: &MailboxEvent) -> AgentStateStep {
-        let Some(active_turn_id) = self.active_turn_id() else {
-            return AgentStateStep::DropEvent;
-        };
-
-        if event.turn_id() != active_turn_id {
-            return AgentStateStep::DropEvent;
-        }
-
-        match (self, event) {
-            (AgentState::RunningModel { .. }, MailboxEvent::AssistantMessage { .. }) => {
-                AgentStateStep::ConsumeEvent
-            }
-            (
-                AgentState::RunningTool { tool_call, .. },
-                MailboxEvent::ToolResult { result, .. },
-            ) if tool_call.id == result.tool_call_id && tool_call.tool_name == result.tool_name => {
-                AgentStateStep::ConsumeEvent
-            }
-            (AgentState::ReadyToContinue { .. }, MailboxEvent::ToolCallReady { .. }) => {
-                AgentStateStep::ConsumeEvent
-            }
-            (AgentState::RunningTool { .. }, MailboxEvent::ToolCallReady { .. }) => {
-                AgentStateStep::Wait
-            }
-            _ => AgentStateStep::DropEvent,
-        }
-    }
-
-    fn active_turn_id(&self) -> Option<TurnId> {
-        match self {
-            AgentState::RunningModel { turn_id }
-            | AgentState::RunningTool { turn_id, .. }
-            | AgentState::ReadyToContinue { turn_id } => Some(*turn_id),
-            AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => None,
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentInput {
@@ -92,12 +18,12 @@ pub enum AgentInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCoreLoop {
-    pub mailbox: Mailbox,
-    pub transcript: Transcript,
-    pub state: AgentState,
-    pub last_turn_id: TurnId,
-    action_outbox: VecDeque<AgentAction>,
-    interrupt_requested: bool,
+    mailbox: Mailbox,
+    transcript: Transcript,
+    state: AgentState,
+    turns: TurnCursor,
+    actions: ActionOutbox,
+    interrupt: InterruptLatch,
 }
 
 impl Default for AgentCoreLoop {
@@ -106,9 +32,9 @@ impl Default for AgentCoreLoop {
             mailbox: Mailbox::default(),
             transcript: Transcript::new(),
             state: AgentState::Idle,
-            last_turn_id: TurnId::default(),
-            action_outbox: VecDeque::new(),
-            interrupt_requested: false,
+            turns: TurnCursor::default(),
+            actions: ActionOutbox::default(),
+            interrupt: InterruptLatch::default(),
         }
     }
 }
@@ -123,31 +49,43 @@ impl AgentCoreLoop {
     }
 
     pub fn from_transcript(transcript: Transcript) -> Self {
-        let last_turn_id = transcript.last_turn_id();
-        let state = Self::state_from_transcript(&transcript);
+        let turns = TurnCursor::from_last(transcript.last_turn_id());
+        let state = AgentState::from_tail_outcome(transcript.tail_outcome());
 
         Self {
             mailbox: Mailbox::default(),
             transcript,
             state,
-            last_turn_id,
-            action_outbox: VecDeque::new(),
-            interrupt_requested: false,
+            turns,
+            actions: ActionOutbox::default(),
+            interrupt: InterruptLatch::default(),
         }
     }
 
-    fn state_from_transcript(transcript: &Transcript) -> AgentState {
-        match transcript.tail_outcome() {
-            Some(TurnOutcome::Interrupted) => AgentState::Interrupted,
-            Some(TurnOutcome::Crashed) => AgentState::Crashed,
-            Some(TurnOutcome::Graceful) | None => AgentState::Idle,
-        }
+    pub fn mailbox(&self) -> &Mailbox {
+        &self.mailbox
+    }
+
+    pub fn transcript(&self) -> &Transcript {
+        &self.transcript
+    }
+
+    pub fn into_transcript(self) -> Transcript {
+        self.transcript
+    }
+
+    pub fn state(&self) -> &AgentState {
+        &self.state
+    }
+
+    pub fn last_turn_id(&self) -> TurnId {
+        self.turns.last()
     }
 
     pub fn on_input(&mut self, input: AgentInput) {
         match input {
             AgentInput::Interrupt => {
-                self.interrupt_requested = true;
+                self.interrupt.request();
             }
             AgentInput::Steer(input) => {
                 self.mailbox.push_steer(input);
@@ -165,7 +103,7 @@ impl AgentCoreLoop {
     }
 
     pub fn drain_actions(&mut self) -> Vec<AgentAction> {
-        self.action_outbox.drain(..).collect()
+        self.actions.drain()
     }
 
     pub fn compact_transcript(&self) -> Vec<CompactMessage> {
@@ -214,9 +152,8 @@ impl AgentCoreLoop {
     }
 
     fn resume_model_if_ready(&mut self) -> bool {
-        let turn_id = match &self.state {
-            AgentState::ReadyToContinue { turn_id } => *turn_id,
-            _ => return false,
+        let Some(turn_id) = self.state.ready_turn_id() else {
+            return false;
         };
 
         self.state = AgentState::RunningModel { turn_id };
@@ -225,18 +162,16 @@ impl AgentCoreLoop {
     }
 
     fn start_next_turn(&mut self) -> bool {
-        match &self.state {
-            AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => {
-                let Some(input) = self.mailbox.pop_user_input() else {
-                    return false;
-                };
-                self.start_turn(input);
-                true
-            }
-            AgentState::RunningModel { .. }
-            | AgentState::RunningTool { .. }
-            | AgentState::ReadyToContinue { .. } => false,
+        if !self.state.can_start_turn() {
+            return false;
         }
+
+        let Some(input) = self.mailbox.pop_user_input() else {
+            return false;
+        };
+
+        self.start_turn(input);
+        true
     }
 
     fn pop_event(&mut self) -> MailboxEvent {
@@ -246,8 +181,7 @@ impl AgentCoreLoop {
     }
 
     fn start_turn(&mut self, input: UserInput) {
-        self.last_turn_id = self.last_turn_id.next();
-        let turn_id = self.last_turn_id;
+        let turn_id = self.turns.allocate();
         let user_message = self.create_user_message(input);
         self.state = AgentState::RunningModel { turn_id };
 
@@ -330,11 +264,9 @@ impl AgentCoreLoop {
     }
 
     fn handle_interrupt(&mut self) -> bool {
-        if !self.interrupt_requested {
+        if !self.interrupt.take() {
             return false;
         }
-
-        self.interrupt_requested = false;
 
         match self.state.clone() {
             AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => false,
@@ -381,7 +313,7 @@ impl AgentCoreLoop {
     }
 
     fn enqueue_action(&mut self, action: AgentAction) {
-        self.action_outbox.push_back(action);
+        self.actions.push(action);
     }
 }
 
@@ -420,7 +352,7 @@ mod tests {
         loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
 
         assert_eq!(
-            loop_state.transcript.events(),
+            loop_state.transcript().events(),
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
@@ -433,8 +365,8 @@ mod tests {
             vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
         assert_eq!(
-            loop_state.state,
-            AgentState::RunningModel { turn_id: TurnId(1) }
+            loop_state.state(),
+            &AgentState::RunningModel { turn_id: TurnId(1) }
         );
     }
 
@@ -457,7 +389,7 @@ mod tests {
         }));
 
         assert_eq!(
-            loop_state.transcript.events(),
+            loop_state.transcript().events(),
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
@@ -478,8 +410,8 @@ mod tests {
             }]
         );
         assert_eq!(
-            loop_state.state,
-            AgentState::RunningTool {
+            loop_state.state(),
+            &AgentState::RunningTool {
                 turn_id: TurnId(1),
                 tool_call,
             }
@@ -508,7 +440,7 @@ mod tests {
         }));
 
         assert_eq!(
-            loop_state.transcript.events().last(),
+            loop_state.transcript().events().last(),
             Some(&AgentEvent::ToolResult(result))
         );
         assert_eq!(
@@ -516,8 +448,8 @@ mod tests {
             vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
         assert_eq!(
-            loop_state.state,
-            AgentState::RunningModel { turn_id: TurnId(1) }
+            loop_state.state(),
+            &AgentState::RunningModel { turn_id: TurnId(1) }
         );
     }
 
@@ -547,14 +479,14 @@ mod tests {
         }));
 
         assert_eq!(
-            loop_state.transcript.events().last(),
+            loop_state.transcript().events().last(),
             Some(&AgentEvent::ToolCallStarted {
                 turn_id: TurnId(1),
                 tool_call: second.clone(),
             })
         );
         assert_eq!(
-            loop_state.transcript.events()[4],
+            loop_state.transcript().events()[4],
             AgentEvent::ToolResult(first_result)
         );
         assert_eq!(
@@ -565,8 +497,8 @@ mod tests {
             }]
         );
         assert_eq!(
-            loop_state.state,
-            AgentState::RunningTool {
+            loop_state.state(),
+            &AgentState::RunningTool {
                 turn_id: TurnId(1),
                 tool_call: second,
             }
@@ -595,7 +527,7 @@ mod tests {
         loop_state.on_input(AgentInput::Interrupt);
 
         assert_eq!(
-            loop_state.transcript.events(),
+            loop_state.transcript().events(),
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
@@ -627,8 +559,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            loop_state.state,
-            AgentState::RunningModel { turn_id: TurnId(2) }
+            loop_state.state(),
+            &AgentState::RunningModel { turn_id: TurnId(2) }
         );
     }
 
@@ -641,7 +573,7 @@ mod tests {
         loop_state.on_input(AgentInput::Interrupt);
 
         assert_eq!(
-            loop_state.transcript.events(),
+            loop_state.transcript().events(),
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
@@ -657,7 +589,7 @@ mod tests {
             loop_state.drain_actions(),
             vec![AgentAction::CancelActive { turn_id: TurnId(1) }]
         );
-        assert_eq!(loop_state.state, AgentState::Interrupted);
+        assert_eq!(loop_state.state(), &AgentState::Interrupted);
     }
 
     #[test]
@@ -674,9 +606,9 @@ mod tests {
             assistant: stale_assistant,
         }));
 
-        assert_eq!(loop_state.transcript.events().len(), 3);
+        assert_eq!(loop_state.transcript().events().len(), 3);
         assert!(loop_state.drain_actions().is_empty());
-        assert_eq!(loop_state.state, AgentState::Interrupted);
+        assert_eq!(loop_state.state(), &AgentState::Interrupted);
     }
 
     #[test]
@@ -714,7 +646,7 @@ mod tests {
         let loop_state = AgentCoreLoop::from_events(transcript);
 
         assert_eq!(
-            loop_state.transcript.events(),
+            loop_state.transcript().events(),
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(7) },
                 AgentEvent::UserMessage(UserMessage {
@@ -726,8 +658,8 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(loop_state.state, AgentState::Crashed);
-        assert_eq!(loop_state.last_turn_id, TurnId(7));
+        assert_eq!(loop_state.state(), &AgentState::Crashed);
+        assert_eq!(loop_state.last_turn_id(), TurnId(7));
     }
 
     #[test]
@@ -745,8 +677,8 @@ mod tests {
 
         let loop_state = AgentCoreLoop::from_events(transcript.clone());
 
-        assert_eq!(loop_state.transcript.events(), transcript.as_slice());
-        assert_eq!(loop_state.state, AgentState::Idle);
-        assert_eq!(loop_state.last_turn_id, TurnId(2));
+        assert_eq!(loop_state.transcript().events(), transcript.as_slice());
+        assert_eq!(loop_state.state(), &AgentState::Idle);
+        assert_eq!(loop_state.last_turn_id(), TurnId(2));
     }
 }
