@@ -194,53 +194,49 @@ impl AgentCoreLoop {
         let Some(event) = self.mailbox.front_event().cloned() else {
             return false;
         };
+        let Some(active_turn_id) = self.active_turn_id() else {
+            let _ = self.pop_event();
+            return true;
+        };
+
+        if event.turn_id() != active_turn_id {
+            let _ = self.pop_event();
+            return true;
+        }
 
         match (&self.phase, event) {
-            (
-                Phase::RunningModel {
-                    turn_id: active_turn_id,
-                },
-                MailboxEvent::AssistantMessage { turn_id, .. },
-            ) if *active_turn_id == turn_id => {
+            (Phase::RunningModel { .. }, MailboxEvent::AssistantMessage { .. }) => {
                 let event = self.pop_event();
                 self.handle_mailbox_event(event);
                 true
             }
-            (
-                Phase::RunningTool {
-                    turn_id: active_turn_id,
-                    tool_call,
-                },
-                MailboxEvent::ToolResult { turn_id, result },
-            ) if *active_turn_id == turn_id
-                && tool_call.id == result.tool_call_id
-                && tool_call.tool_name == result.tool_name =>
+            (Phase::RunningTool { tool_call, .. }, MailboxEvent::ToolResult { result, .. })
+                if tool_call.id == result.tool_call_id
+                    && tool_call.tool_name == result.tool_name =>
             {
                 let event = self.pop_event();
                 self.handle_mailbox_event(event);
                 true
             }
-            (
-                Phase::ReadyToContinue {
-                    turn_id: active_turn_id,
-                },
-                MailboxEvent::ToolCallReady { turn_id, .. },
-            ) if *active_turn_id == turn_id => {
+            (Phase::ReadyToContinue { .. }, MailboxEvent::ToolCallReady { .. }) => {
                 let event = self.pop_event();
                 self.handle_mailbox_event(event);
                 true
             }
-            (
-                Phase::RunningTool {
-                    turn_id: active_turn_id,
-                    ..
-                },
-                MailboxEvent::ToolCallReady { turn_id, .. },
-            ) if *active_turn_id == turn_id => false,
+            (Phase::RunningTool { .. }, MailboxEvent::ToolCallReady { .. }) => false,
             _ => {
                 let _ = self.pop_event();
                 true
             }
+        }
+    }
+
+    fn active_turn_id(&self) -> Option<TurnId> {
+        match &self.phase {
+            Phase::RunningModel { turn_id }
+            | Phase::RunningTool { turn_id, .. }
+            | Phase::ReadyToContinue { turn_id } => Some(*turn_id),
+            Phase::Idle | Phase::Interrupted | Phase::Crashed => None,
         }
     }
 

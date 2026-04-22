@@ -19,6 +19,16 @@ pub enum MailboxEvent {
     },
 }
 
+impl MailboxEvent {
+    pub fn turn_id(&self) -> TurnId {
+        match self {
+            MailboxEvent::AssistantMessage { turn_id, .. }
+            | MailboxEvent::ToolCallReady { turn_id, .. }
+            | MailboxEvent::ToolResult { turn_id, .. } => *turn_id,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MailboxEntry {
     Event(MailboxEvent),
