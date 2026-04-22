@@ -1,74 +1,47 @@
 use std::collections::VecDeque;
 
+use crate::event::AgentEvent;
 use crate::ids::TurnId;
-use crate::message::{AssistantMessage, ToolCall, ToolResultMessage, UserInput};
+use crate::message::{ToolCall, UserInput};
+use crate::state::AgentState;
 
-/// Volatile notification sent into the loop by model/tool execution.
+/// Volatile prioritized queues feeding the live agent FSM.
 ///
-/// Notifications are queued in the mailbox and are lost on process death. They
-/// are not durable transcript records and are not hook lifecycle events.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MailboxNotification {
-    AssistantMessage {
-        turn_id: TurnId,
-        assistant: AssistantMessage,
-    },
-    ToolResult {
-        turn_id: TurnId,
-        result: ToolResultMessage,
-    },
-}
-
-impl MailboxNotification {
-    pub fn turn_id(&self) -> TurnId {
-        match self {
-            MailboxNotification::AssistantMessage { turn_id, .. }
-            | MailboxNotification::ToolResult { turn_id, .. } => *turn_id,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MailboxEntry {
-    Notification(MailboxNotification),
-    ToolCall(ToolCall),
-    UserInput(UserInput),
-}
-
+/// Mailbox contents are intentionally not durable: if the process dies, session
+/// recovery is driven from TranscriptRecords instead.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Mailbox {
-    notifications: VecDeque<MailboxNotification>,
+    notifications: VecDeque<AgentEvent>,
     tool_calls: VecDeque<ToolCall>,
     steer: VecDeque<UserInput>,
     follow_up: VecDeque<UserInput>,
+    interrupt_requested: bool,
 }
 
 impl Mailbox {
-    pub fn push_notification_front(&mut self, notification: MailboxNotification) {
+    pub(crate) fn push_notification_front(&mut self, notification: AgentEvent) {
         self.notifications.push_front(notification);
     }
 
-    pub fn push_notification_back(&mut self, notification: MailboxNotification) {
+    #[cfg(test)]
+    pub(crate) fn push_notification_back(&mut self, notification: AgentEvent) {
         self.notifications.push_back(notification);
     }
 
-    pub fn front_notification(&self) -> Option<&MailboxNotification> {
-        self.notifications.front()
+    pub(crate) fn request_interrupt(&mut self) {
+        self.interrupt_requested = true;
     }
 
-    pub fn pop_notification(&mut self) -> Option<MailboxNotification> {
-        self.notifications.pop_front()
-    }
-
-    pub fn push_tool_call(&mut self, tool_call: ToolCall) {
+    pub(crate) fn push_tool_call(&mut self, tool_call: ToolCall) {
         self.tool_calls.push_back(tool_call);
     }
 
-    pub fn pop_tool_call(&mut self) -> Option<ToolCall> {
+    #[cfg(test)]
+    pub(crate) fn pop_tool_call(&mut self) -> Option<ToolCall> {
         self.tool_calls.pop_front()
     }
 
-    pub fn clear_tool_calls(&mut self) {
+    pub(crate) fn clear_tool_calls(&mut self) {
         self.tool_calls.clear();
     }
 
@@ -86,23 +59,40 @@ impl Mailbox {
             .or_else(|| self.follow_up.pop_front())
     }
 
-    pub fn front_next(&self) -> Option<MailboxEntry> {
-        self.notifications
-            .front()
-            .cloned()
-            .map(MailboxEntry::Notification)
-            .or_else(|| self.tool_calls.front().cloned().map(MailboxEntry::ToolCall))
-            .or_else(|| self.steer.front().cloned().map(MailboxEntry::UserInput))
-            .or_else(|| self.follow_up.front().cloned().map(MailboxEntry::UserInput))
-    }
+    pub(crate) fn next_event(
+        &mut self,
+        state: &AgentState,
+        next_turn_id: TurnId,
+    ) -> Option<AgentEvent> {
+        if self.interrupt_requested {
+            self.interrupt_requested = false;
+            if matches!(
+                state,
+                AgentState::RunningModel { .. }
+                    | AgentState::RunningTool { .. }
+                    | AgentState::ReadyToContinue { .. }
+            ) {
+                return Some(AgentEvent::Interrupt);
+            }
+        }
 
-    pub fn pop_next(&mut self) -> Option<MailboxEntry> {
-        self.notifications
-            .pop_front()
-            .map(MailboxEntry::Notification)
-            .or_else(|| self.tool_calls.pop_front().map(MailboxEntry::ToolCall))
-            .or_else(|| self.steer.pop_front().map(MailboxEntry::UserInput))
-            .or_else(|| self.follow_up.pop_front().map(MailboxEntry::UserInput))
+        if let Some(notification) = self.notifications.pop_front() {
+            return Some(notification);
+        }
+
+        match state {
+            AgentState::ReadyToContinue { .. } => match self.tool_calls.pop_front() {
+                Some(tool_call) => Some(AgentEvent::ToolReady(tool_call)),
+                None => Some(AgentEvent::ContinueModel),
+            },
+            AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => {
+                self.pop_user_input().map(|input| AgentEvent::StartTurn {
+                    turn_id: next_turn_id,
+                    input,
+                })
+            }
+            AgentState::RunningModel { .. } | AgentState::RunningTool { .. } => None,
+        }
     }
 
     pub fn notification_len(&self) -> usize {
@@ -129,8 +119,9 @@ impl Mailbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::AgentEvent;
     use crate::ids::ToolCallId;
-    use crate::message::ToolResultStatus;
+    use crate::message::{AssistantMessage, ToolResultMessage, ToolResultStatus};
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
         ToolCall {
@@ -152,11 +143,11 @@ mod tests {
     #[test]
     fn notification_queue_behaves_like_a_deque() {
         let mut mailbox = Mailbox::default();
-        let later = MailboxNotification::ToolResult {
+        let later = AgentEvent::ToolCompleted {
             turn_id: TurnId(1),
             result: tool_result(2, "read"),
         };
-        let now = MailboxNotification::AssistantMessage {
+        let now = AgentEvent::ModelCompleted {
             turn_id: TurnId(1),
             assistant: AssistantMessage { items: Vec::new() },
         };
@@ -164,10 +155,10 @@ mod tests {
         mailbox.push_notification_back(later.clone());
         mailbox.push_notification_front(now.clone());
 
-        assert_eq!(mailbox.front_notification(), Some(&now));
-        assert_eq!(mailbox.pop_notification(), Some(now));
-        assert_eq!(mailbox.pop_notification(), Some(later));
-        assert_eq!(mailbox.pop_notification(), None);
+        let state = AgentState::RunningModel { turn_id: TurnId(1) };
+        assert_eq!(mailbox.next_event(&state, TurnId(99)), Some(now));
+        assert_eq!(mailbox.next_event(&state, TurnId(99)), Some(later));
+        assert_eq!(mailbox.next_event(&state, TurnId(99)), None);
     }
 
     #[test]
@@ -197,37 +188,58 @@ mod tests {
     }
 
     #[test]
-    fn priority_order_is_notification_then_tool_call_then_steer_then_follow_up() {
+    fn priority_order_is_interrupt_then_notification_then_tool_call_then_steer_then_follow_up() {
         let mut mailbox = Mailbox::default();
         mailbox.push_follow_up(UserInput::from("follow-up"));
         mailbox.push_steer(UserInput::from("steer"));
-        let tool_call = tool_call(7, "read");
-        mailbox.push_tool_call(tool_call.clone());
-        mailbox.push_notification_back(MailboxNotification::ToolResult {
+        let queued_tool_call = tool_call(7, "read");
+        mailbox.push_tool_call(queued_tool_call.clone());
+        mailbox.push_notification_back(AgentEvent::ToolCompleted {
             turn_id: TurnId(1),
             result: tool_result(9, "bash"),
         });
+        mailbox.request_interrupt();
 
         assert!(matches!(
-            mailbox.front_next(),
-            Some(MailboxEntry::Notification(
-                MailboxNotification::ToolResult { .. }
-            ))
+            mailbox.next_event(
+                &AgentState::RunningTool {
+                    turn_id: TurnId(1),
+                    tool_call: tool_call(9, "bash")
+                },
+                TurnId(99)
+            ),
+            Some(AgentEvent::Interrupt)
         ));
         assert!(matches!(
-            mailbox.pop_next(),
-            Some(MailboxEntry::Notification(
-                MailboxNotification::ToolResult { .. }
-            ))
+            mailbox.next_event(
+                &AgentState::RunningTool {
+                    turn_id: TurnId(1),
+                    tool_call: tool_call(9, "bash")
+                },
+                TurnId(99)
+            ),
+            Some(AgentEvent::ToolCompleted { .. })
         ));
-        assert_eq!(mailbox.pop_next(), Some(MailboxEntry::ToolCall(tool_call)));
         assert_eq!(
-            mailbox.pop_next(),
-            Some(MailboxEntry::UserInput(UserInput::from("steer")))
+            mailbox.next_event(
+                &AgentState::ReadyToContinue { turn_id: TurnId(1) },
+                TurnId(99)
+            ),
+            Some(AgentEvent::ToolReady(queued_tool_call))
         );
         assert_eq!(
-            mailbox.pop_next(),
-            Some(MailboxEntry::UserInput(UserInput::from("follow-up")))
+            mailbox.next_event(&AgentState::Idle, TurnId(2)),
+            Some(AgentEvent::StartTurn {
+                turn_id: TurnId(2),
+                input: UserInput::from("steer")
+            })
+        );
+        assert_eq!(
+            mailbox.next_event(&AgentState::Idle, TurnId(3)),
+            Some(AgentEvent::StartTurn {
+                turn_id: TurnId(3),
+                input: UserInput::from("follow-up")
+            })
         );
     }
 }
