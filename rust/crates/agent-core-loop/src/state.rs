@@ -74,24 +74,13 @@ impl AgentState {
         }
     }
 
-    pub(crate) fn active_turn_id(&self) -> Option<TurnId> {
+    fn active_turn_id(&self) -> Option<TurnId> {
         match self {
             Self::RunningModel { turn_id }
             | Self::RunningTool { turn_id, .. }
             | Self::ReadyToContinue { turn_id } => Some(*turn_id),
             Self::Idle | Self::Interrupted | Self::Crashed => None,
         }
-    }
-
-    pub(crate) fn ready_turn_id(&self) -> Option<TurnId> {
-        match self {
-            Self::ReadyToContinue { turn_id } => Some(*turn_id),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn can_start_turn(&self) -> bool {
-        matches!(self, Self::Idle | Self::Interrupted | Self::Crashed)
     }
 }
 
