@@ -1,33 +1,13 @@
 use std::collections::VecDeque;
 
 use crate::action::AgentAction;
-use crate::event::AgentEvent;
+use crate::event::AgentInput;
 use crate::ids::TurnId;
 use crate::mailbox::Mailbox;
-use crate::message::{AssistantMessage, CompactMessage, ToolResultMessage};
-use crate::state::{AgentState, AgentTransition};
+use crate::message::CompactMessage;
+use crate::state::AgentState;
 use crate::transcript::Transcript;
-use crate::transcript_record::TranscriptRecord;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentInput {
-    // User asked to stop the active model/tool work.
-    Interrupt,
-    // High-priority user input. Runs before queued follow-up work.
-    Steer(String),
-    // Normal-priority user input for the next available turn.
-    FollowUp(String),
-    // Volatile model completion delivered by the orchestrator.
-    ModelCompleted {
-        turn_id: TurnId,
-        assistant: AssistantMessage,
-    },
-    // Volatile tool completion delivered by the orchestrator.
-    ToolCompleted {
-        turn_id: TurnId,
-        result: ToolResultMessage,
-    },
-}
+use crate::transcript_record::{TranscriptRecord, TurnOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCoreLoop {
@@ -61,7 +41,11 @@ impl AgentCoreLoop {
 
     pub fn from_transcript(transcript: Transcript) -> Self {
         let last_turn_id = transcript.last_turn_id();
-        let state = AgentState::from_tail_outcome(transcript.tail_outcome());
+        let state = match transcript.tail_outcome() {
+            Some(TurnOutcome::Interrupted) => AgentState::Interrupted,
+            Some(TurnOutcome::Crashed) => AgentState::Crashed,
+            Some(TurnOutcome::Graceful) | None => AgentState::Idle,
+        };
 
         Self {
             mailbox: Mailbox::default(),
@@ -73,28 +57,7 @@ impl AgentCoreLoop {
     }
 
     pub fn on_input(&mut self, input: AgentInput) {
-        match input {
-            AgentInput::Interrupt => {
-                self.mailbox.request_interrupt();
-            }
-            AgentInput::Steer(input) => {
-                self.mailbox.push_steer(input);
-            }
-            AgentInput::FollowUp(input) => {
-                self.mailbox.push_follow_up(input);
-            }
-            AgentInput::ModelCompleted { turn_id, assistant } => {
-                // External completions should preempt queued future work for the current turn.
-                self.mailbox
-                    .push_notification_front(AgentEvent::ModelCompleted { turn_id, assistant });
-            }
-            AgentInput::ToolCompleted { turn_id, result } => {
-                // External completions should preempt queued future work for the current turn.
-                self.mailbox
-                    .push_notification_front(AgentEvent::ToolCompleted { turn_id, result });
-            }
-        }
-
+        self.mailbox.push_input(input);
         self.drive();
     }
 
@@ -113,31 +76,35 @@ impl AgentCoreLoop {
                 return;
             };
 
-            let started_turn_id = match &event {
-                AgentEvent::StartTurn { turn_id, .. } => Some(*turn_id),
-                AgentEvent::Interrupt
-                | AgentEvent::ModelCompleted { .. }
-                | AgentEvent::ToolCompleted { .. }
-                | AgentEvent::ContinueModel => None,
-            };
-            let transition = self.state.step(event);
-            if transition.is_empty() {
+            let (records, actions) = self.state.step(event);
+            if records.is_empty() && actions.is_empty() {
                 continue;
             }
 
-            if let Some(turn_id) = started_turn_id {
+            if let Some(turn_id) = started_turn_id(&records) {
                 self.last_turn_id = turn_id;
             }
-            self.apply_transition(transition);
+            self.apply_transition(records, actions);
         }
     }
 
-    fn apply_transition(&mut self, transition: AgentTransition) {
-        for record in transition.records {
+    fn apply_transition(&mut self, records: Vec<TranscriptRecord>, actions: Vec<AgentAction>) {
+        for record in records {
             self.transcript.append(record);
         }
-        self.action_outbox.extend(transition.actions);
+        self.action_outbox.extend(actions);
     }
+}
+
+fn started_turn_id(records: &[TranscriptRecord]) -> Option<TurnId> {
+    records.iter().find_map(|record| match record {
+        TranscriptRecord::TurnStarted { turn_id } => Some(*turn_id),
+        TranscriptRecord::UserMessage(_)
+        | TranscriptRecord::AssistantMessage(_)
+        | TranscriptRecord::ToolCallStarted { .. }
+        | TranscriptRecord::ToolResult(_)
+        | TranscriptRecord::TurnFinished { .. } => None,
+    })
 }
 
 #[cfg(test)]
@@ -145,7 +112,9 @@ mod tests {
     use super::*;
     use crate::action::AgentAction;
     use crate::ids::ToolCallId;
-    use crate::message::{AssistantItem, ToolCall, ToolResultStatus};
+    use crate::message::{
+        AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
+    };
     use crate::transcript_record::{TranscriptRecord, TurnOutcome};
 
     fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {

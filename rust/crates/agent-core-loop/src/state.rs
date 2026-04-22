@@ -33,28 +33,8 @@ impl Default for AgentState {
     }
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct AgentTransition {
-    pub(crate) records: Vec<TranscriptRecord>,
-    pub(crate) actions: Vec<AgentAction>,
-}
-
-impl AgentTransition {
-    pub(crate) fn is_empty(&self) -> bool {
-        self.records.is_empty() && self.actions.is_empty()
-    }
-}
-
 impl AgentState {
-    pub(crate) fn from_tail_outcome(outcome: Option<TurnOutcome>) -> Self {
-        match outcome {
-            Some(TurnOutcome::Interrupted) => Self::Interrupted,
-            Some(TurnOutcome::Crashed) => Self::Crashed,
-            Some(TurnOutcome::Graceful) | None => Self::Idle,
-        }
-    }
-
-    pub(crate) fn step(&mut self, event: AgentEvent) -> AgentTransition {
+    pub(crate) fn step(&mut self, event: AgentEvent) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         match event {
             AgentEvent::Interrupt => self.on_interrupt(),
             AgentEvent::StartTurn { turn_id, input } => self.on_start_turn(turn_id, input),
@@ -68,21 +48,25 @@ impl AgentState {
         }
     }
 
-    fn on_start_turn(&mut self, turn_id: TurnId, input: String) -> AgentTransition {
+    fn on_start_turn(
+        &mut self,
+        turn_id: TurnId,
+        input: String,
+    ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         match self {
             Self::Idle | Self::Interrupted | Self::Crashed => {
                 *self = Self::RunningModel { turn_id };
-                AgentTransition {
-                    records: vec![
+                (
+                    vec![
                         TranscriptRecord::TurnStarted { turn_id },
                         TranscriptRecord::UserMessage(input),
                     ],
-                    actions: vec![AgentAction::RequestModel { turn_id }],
-                }
+                    vec![AgentAction::RequestModel { turn_id }],
+                )
             }
             Self::RunningModel { .. }
             | Self::RunningTools { .. }
-            | Self::ReadyToContinue { .. } => AgentTransition::default(),
+            | Self::ReadyToContinue { .. } => empty_transition(),
         }
     }
 
@@ -90,27 +74,25 @@ impl AgentState {
         &mut self,
         turn_id: TurnId,
         assistant: AssistantMessage,
-    ) -> AgentTransition {
+    ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         if !matches!(
             self,
             Self::RunningModel { turn_id: active_turn_id } if *active_turn_id == turn_id
         ) {
-            return AgentTransition::default();
+            return empty_transition();
         }
 
-        let mut transition = AgentTransition {
-            records: vec![TranscriptRecord::AssistantMessage(assistant.clone())],
-            ..AgentTransition::default()
-        };
+        let mut records = vec![TranscriptRecord::AssistantMessage(assistant.clone())];
+        let mut actions = Vec::new();
 
         let tool_calls: Vec<ToolCall> = assistant.tool_calls().cloned().collect();
         if tool_calls.is_empty() {
             *self = Self::Idle;
-            transition.records.push(TranscriptRecord::TurnFinished {
+            records.push(TranscriptRecord::TurnFinished {
                 turn_id,
                 outcome: TurnOutcome::Graceful,
             });
-            return transition;
+            return (records, actions);
         }
 
         *self = Self::RunningTools {
@@ -120,18 +102,20 @@ impl AgentState {
             next_result_index: 0,
         };
         for tool_call in tool_calls {
-            transition.records.push(TranscriptRecord::ToolCallStarted {
+            records.push(TranscriptRecord::ToolCallStarted {
                 turn_id,
                 tool_call: tool_call.clone(),
             });
-            transition
-                .actions
-                .push(AgentAction::RequestTool { turn_id, tool_call });
+            actions.push(AgentAction::RequestTool { turn_id, tool_call });
         }
-        transition
+        (records, actions)
     }
 
-    fn on_tool_completed(&mut self, turn_id: TurnId, result: ToolResultMessage) -> AgentTransition {
+    fn on_tool_completed(
+        &mut self,
+        turn_id: TurnId,
+        result: ToolResultMessage,
+    ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         let Self::RunningTools {
             turn_id: active_turn_id,
             tool_calls,
@@ -139,21 +123,21 @@ impl AgentState {
             next_result_index,
         } = self
         else {
-            return AgentTransition::default();
+            return empty_transition();
         };
 
         if *active_turn_id != turn_id {
-            return AgentTransition::default();
+            return empty_transition();
         }
 
         let Some(result_index) = tool_calls.iter().position(|tool_call| {
             tool_call.id == result.tool_call_id && tool_call.tool_name == result.tool_name
         }) else {
-            return AgentTransition::default();
+            return empty_transition();
         };
 
         if result_index < *next_result_index || completed_results[result_index].is_some() {
-            return AgentTransition::default();
+            return empty_transition();
         }
 
         completed_results[result_index] = Some(result);
@@ -172,47 +156,41 @@ impl AgentState {
             *self = Self::ReadyToContinue { turn_id };
         }
 
-        AgentTransition {
-            records,
-            actions: Vec::new(),
-        }
+        (records, Vec::new())
     }
 
-    fn on_continue_model(&mut self) -> AgentTransition {
+    fn on_continue_model(&mut self) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         let Self::ReadyToContinue { turn_id } = self else {
-            return AgentTransition::default();
+            return empty_transition();
         };
         let turn_id = *turn_id;
 
         *self = Self::RunningModel { turn_id };
-        AgentTransition {
-            actions: vec![AgentAction::RequestModel { turn_id }],
-            ..AgentTransition::default()
-        }
+        (Vec::new(), vec![AgentAction::RequestModel { turn_id }])
     }
 
-    fn on_interrupt(&mut self) -> AgentTransition {
+    fn on_interrupt(&mut self) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         match self.clone() {
-            Self::Idle | Self::Interrupted | Self::Crashed => AgentTransition::default(),
+            Self::Idle | Self::Interrupted | Self::Crashed => empty_transition(),
             Self::ReadyToContinue { turn_id } => {
                 *self = Self::Interrupted;
-                AgentTransition {
-                    records: vec![TranscriptRecord::TurnFinished {
+                (
+                    vec![TranscriptRecord::TurnFinished {
                         turn_id,
                         outcome: TurnOutcome::Interrupted,
                     }],
-                    actions: Vec::new(),
-                }
+                    Vec::new(),
+                )
             }
             Self::RunningModel { turn_id } => {
                 *self = Self::Interrupted;
-                AgentTransition {
-                    records: vec![TranscriptRecord::TurnFinished {
+                (
+                    vec![TranscriptRecord::TurnFinished {
                         turn_id,
                         outcome: TurnOutcome::Interrupted,
                     }],
-                    actions: vec![AgentAction::CancelTurn { turn_id }],
-                }
+                    vec![AgentAction::CancelTurn { turn_id }],
+                )
             }
             Self::RunningTools {
                 turn_id,
@@ -233,13 +211,14 @@ impl AgentState {
                     turn_id,
                     outcome: TurnOutcome::Interrupted,
                 });
-                AgentTransition {
-                    records,
-                    actions: vec![AgentAction::CancelTurn { turn_id }],
-                }
+                (records, vec![AgentAction::CancelTurn { turn_id }])
             }
         }
     }
+}
+
+fn empty_transition() -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
+    (Vec::new(), Vec::new())
 }
 
 #[cfg(test)]
@@ -265,6 +244,10 @@ mod tests {
         }
     }
 
+    fn transition_is_empty((records, actions): &(Vec<TranscriptRecord>, Vec<AgentAction>)) -> bool {
+        records.is_empty() && actions.is_empty()
+    }
+
     #[test]
     fn terminal_states_ignore_late_model_completions() {
         let event = AgentEvent::ModelCompleted {
@@ -276,9 +259,9 @@ mod tests {
         let mut interrupted = AgentState::Interrupted;
         let mut crashed = AgentState::Crashed;
 
-        assert!(idle.step(event.clone()).is_empty());
-        assert!(interrupted.step(event.clone()).is_empty());
-        assert!(crashed.step(event).is_empty());
+        assert!(transition_is_empty(&idle.step(event.clone())));
+        assert!(transition_is_empty(&interrupted.step(event.clone())));
+        assert!(transition_is_empty(&crashed.step(event)));
         assert_eq!(idle, AgentState::Idle);
         assert_eq!(interrupted, AgentState::Interrupted);
         assert_eq!(crashed, AgentState::Crashed);
@@ -297,14 +280,13 @@ mod tests {
             assistant,
         };
 
-        assert!(AgentState::RunningModel { turn_id: TurnId(2) }
-            .step(stale)
-            .is_empty());
+        let mut stale_state = AgentState::RunningModel { turn_id: TurnId(2) };
+        assert!(transition_is_empty(&stale_state.step(stale)));
 
-        let transition = state.step(matching);
+        let (records, _) = state.step(matching);
         assert_eq!(state, AgentState::Idle);
         assert_eq!(
-            transition.records,
+            records,
             vec![
                 TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
                 TranscriptRecord::TurnFinished {
@@ -332,12 +314,12 @@ mod tests {
             result: tool_result(1, "read"),
         };
 
-        assert!(state.clone().step(wrong_tool).is_empty());
+        assert!(transition_is_empty(&state.clone().step(wrong_tool)));
 
-        let transition = state.step(result);
+        let (records, _) = state.step(result);
         assert_eq!(state, AgentState::ReadyToContinue { turn_id: TurnId(1) });
         assert_eq!(
-            transition.records,
+            records,
             vec![TranscriptRecord::ToolResult(tool_result(1, "bash"))]
         );
     }
@@ -348,17 +330,17 @@ mod tests {
         let first_tool = tool_call(1, "bash");
         let second_tool = tool_call(2, "read");
 
-        let start = state.step(AgentEvent::StartTurn {
+        let (_, actions) = state.step(AgentEvent::StartTurn {
             turn_id: TurnId(1),
             input: "hello".to_string(),
         });
         assert_eq!(state, AgentState::RunningModel { turn_id: TurnId(1) });
         assert_eq!(
-            start.actions,
+            actions,
             vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
 
-        let model = state.step(AgentEvent::ModelCompleted {
+        let (_, actions) = state.step(AgentEvent::ModelCompleted {
             turn_id: TurnId(1),
             assistant: AssistantMessage {
                 items: vec![
@@ -377,7 +359,7 @@ mod tests {
             }
         );
         assert_eq!(
-            model.actions,
+            actions,
             vec![
                 AgentAction::RequestTool {
                     turn_id: TurnId(1),
@@ -394,7 +376,7 @@ mod tests {
             turn_id: TurnId(1),
             result: tool_result(2, "read"),
         });
-        assert!(second_tool_first.is_empty());
+        assert!(transition_is_empty(&second_tool_first));
         assert_eq!(
             state,
             AgentState::RunningTools {
@@ -405,23 +387,23 @@ mod tests {
             }
         );
 
-        let first_tool_second = state.step(AgentEvent::ToolCompleted {
+        let (records, _) = state.step(AgentEvent::ToolCompleted {
             turn_id: TurnId(1),
             result: tool_result(1, "bash"),
         });
         assert_eq!(state, AgentState::ReadyToContinue { turn_id: TurnId(1) });
         assert_eq!(
-            first_tool_second.records,
+            records,
             vec![
                 TranscriptRecord::ToolResult(tool_result(1, "bash")),
                 TranscriptRecord::ToolResult(tool_result(2, "read")),
             ]
         );
 
-        let resume = state.step(AgentEvent::ContinueModel);
+        let (_, actions) = state.step(AgentEvent::ContinueModel);
         assert_eq!(state, AgentState::RunningModel { turn_id: TurnId(1) });
         assert_eq!(
-            resume.actions,
+            actions,
             vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
     }
@@ -435,11 +417,11 @@ mod tests {
             next_result_index: 0,
         };
 
-        let transition = state.step(AgentEvent::Interrupt);
+        let (records, actions) = state.step(AgentEvent::Interrupt);
 
         assert_eq!(state, AgentState::Interrupted);
         assert_eq!(
-            transition.records,
+            records,
             vec![
                 TranscriptRecord::ToolResult(crate::message::ToolResultMessage::interrupted(
                     ToolCallId(1),
@@ -452,7 +434,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            transition.actions,
+            actions,
             vec![AgentAction::CancelTurn { turn_id: TurnId(3) }]
         );
     }

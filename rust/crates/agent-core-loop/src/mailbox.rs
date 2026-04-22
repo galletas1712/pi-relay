@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, AgentInput};
 use crate::ids::TurnId;
 use crate::state::AgentState;
 
@@ -17,7 +17,23 @@ pub struct Mailbox {
 }
 
 impl Mailbox {
-    pub(crate) fn push_notification_front(&mut self, notification: AgentEvent) {
+    pub(crate) fn push_input(&mut self, input: AgentInput) {
+        match input {
+            AgentInput::Interrupt => self.request_interrupt(),
+            AgentInput::Steer(input) => self.push_steer(input),
+            AgentInput::FollowUp(input) => self.push_follow_up(input),
+            AgentInput::ModelCompleted { turn_id, assistant } => {
+                // External completions should preempt queued future work for the current turn.
+                self.push_notification_front(AgentEvent::ModelCompleted { turn_id, assistant });
+            }
+            AgentInput::ToolCompleted { turn_id, result } => {
+                // External completions should preempt queued future work for the current turn.
+                self.push_notification_front(AgentEvent::ToolCompleted { turn_id, result });
+            }
+        }
+    }
+
+    fn push_notification_front(&mut self, notification: AgentEvent) {
         self.notifications.push_front(notification);
     }
 
@@ -26,7 +42,7 @@ impl Mailbox {
         self.notifications.push_back(notification);
     }
 
-    pub(crate) fn request_interrupt(&mut self) {
+    fn request_interrupt(&mut self) {
         self.interrupt_requested = true;
     }
 
