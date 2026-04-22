@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const getModel = vi.fn();
 const create = vi.fn();
 const continueRecent = vi.fn();
 const createAgentSessionRuntime = vi.fn();
@@ -14,6 +15,10 @@ const rootBaseToolDefinitionsFactory = vi.fn(() => [{ name: "read" }]);
 const createRelayBaseToolDefinitionsFactory = vi.fn(() => rootBaseToolDefinitionsFactory);
 const RELAY_BASE_TOOL_NAMES = ["read", "bash", "edit", "apply_patch", "write"];
 const restore = vi.fn(async () => false);
+
+vi.mock("@pi-relay/ai", () => ({
+	getModel,
+}));
 
 vi.mock("@pi-relay/coding-agent", () => ({
 	SessionManager: {
@@ -48,6 +53,7 @@ vi.mock("../src/tools/base-tools.js", () => ({
 describe("createRelayRuntime", () => {
 	beforeEach(() => {
 		vi.resetModules();
+		getModel.mockClear();
 		create.mockClear();
 		continueRecent.mockClear();
 		createAgentSessionRuntime.mockClear();
@@ -61,6 +67,7 @@ describe("createRelayRuntime", () => {
 		rootBaseToolDefinitionsFactory.mockClear();
 		restore.mockClear();
 
+		getModel.mockReturnValue(undefined);
 		create.mockReturnValue({
 			getSessionDir: () => "/tmp/sessions",
 		});
@@ -140,5 +147,65 @@ describe("createRelayRuntime", () => {
 		expect(create).toHaveBeenCalledWith("/tmp/project");
 		expect(continueRecent).not.toHaveBeenCalled();
 		expect(createAgentSessionRuntime).toHaveBeenCalledTimes(1);
+	});
+
+	it("records the selected engine modes on the runtime state ref", async () => {
+		const { createRelayRuntimeFactory } = await import("../src/runtime.js");
+		const stateRef: {
+			current?: {
+				engineConfig?: {
+					orchestrator: string;
+					session: string;
+				};
+			};
+		} = {};
+		const factory = createRelayRuntimeFactory("/tmp/agent", stateRef as never);
+
+		await factory({
+			cwd: "/tmp/project",
+			sessionManager: {
+				getSessionDir: () => "/tmp/sessions",
+			},
+		} as never);
+
+		expect(stateRef.current?.engineConfig).toEqual({
+			orchestrator: "legacy",
+			session: "legacy",
+		});
+	});
+});
+
+describe("resolveRelayRuntimeEngineConfig", () => {
+	it("defaults both engines to legacy when the env is unset", async () => {
+		const { resolveRelayRuntimeEngineConfig } = await import("../src/runtime.js");
+
+		expect(resolveRelayRuntimeEngineConfig({})).toEqual({
+			orchestrator: "legacy",
+			session: "legacy",
+		});
+	});
+
+	it("accepts the planned migration engine modes", async () => {
+		const { resolveRelayRuntimeEngineConfig } = await import("../src/runtime.js");
+
+		expect(
+			resolveRelayRuntimeEngineConfig({
+				PI_RELAY_ORCH_ENGINE: "rust-shadow",
+				PI_RELAY_SESSION_ENGINE: "ts-core",
+			}),
+		).toEqual({
+			orchestrator: "rust-shadow",
+			session: "ts-core",
+		});
+	});
+
+	it("rejects unknown engine mode values early", async () => {
+		const { resolveRelayRuntimeEngineConfig } = await import("../src/runtime.js");
+
+		expect(() =>
+			resolveRelayRuntimeEngineConfig({
+				PI_RELAY_ORCH_ENGINE: "future-experiment",
+			}),
+		).toThrow(/Invalid PI_RELAY_ORCH_ENGINE/);
 	});
 });
