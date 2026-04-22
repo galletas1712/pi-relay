@@ -5,6 +5,10 @@ import type { Orchestrator } from "@pi-relay/orchestrator";
 export interface RelayRuntimeStateRef {
 	current?: {
 		orchestrator: Orchestrator;
+		engineConfig?: {
+			orchestrator: "legacy" | "ts-core" | "rust-shadow" | "rust";
+			session: "legacy" | "ts-core" | "rust-shadow" | "rust";
+		};
 	};
 }
 

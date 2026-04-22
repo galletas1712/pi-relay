@@ -28,6 +28,53 @@ const RELAY_APPEND_SYSTEM_PROMPT = `Relay tool usage:
 - Do not use bash to read or edit files when dedicated tools are available.
 - After apply_patch succeeds, do not immediately re-read the same file unless you need verification or nearby context.`;
 
+export const RELAY_RUNTIME_ENGINE_MODES = ["legacy", "ts-core", "rust-shadow", "rust"] as const;
+
+export type RelayRuntimeEngineMode = (typeof RELAY_RUNTIME_ENGINE_MODES)[number];
+
+export interface RelayRuntimeEngineConfig {
+	orchestrator: RelayRuntimeEngineMode;
+	session: RelayRuntimeEngineMode;
+}
+
+export const DEFAULT_RELAY_RUNTIME_ENGINE_CONFIG: Readonly<RelayRuntimeEngineConfig> = {
+	orchestrator: "legacy",
+	session: "legacy",
+};
+
+function parseRelayRuntimeEngineMode(
+	envName: "PI_RELAY_ORCH_ENGINE" | "PI_RELAY_SESSION_ENGINE",
+	value: string | undefined,
+	fallback: RelayRuntimeEngineMode,
+): RelayRuntimeEngineMode {
+	if (!value) {
+		return fallback;
+	}
+
+	if ((RELAY_RUNTIME_ENGINE_MODES as readonly string[]).includes(value)) {
+		return value as RelayRuntimeEngineMode;
+	}
+
+	throw new Error(
+		`Invalid ${envName}=${JSON.stringify(value)}. Expected one of: ${RELAY_RUNTIME_ENGINE_MODES.join(", ")}.`,
+	);
+}
+
+export function resolveRelayRuntimeEngineConfig(env: NodeJS.ProcessEnv = process.env): RelayRuntimeEngineConfig {
+	return {
+		orchestrator: parseRelayRuntimeEngineMode(
+			"PI_RELAY_ORCH_ENGINE",
+			env.PI_RELAY_ORCH_ENGINE,
+			DEFAULT_RELAY_RUNTIME_ENGINE_CONFIG.orchestrator,
+		),
+		session: parseRelayRuntimeEngineMode(
+			"PI_RELAY_SESSION_ENGINE",
+			env.PI_RELAY_SESSION_ENGINE,
+			DEFAULT_RELAY_RUNTIME_ENGINE_CONFIG.session,
+		),
+	};
+}
+
 export function parseArgs(argv: string[]) {
 	const args = [...argv];
 	let mode: "interactive" | "rpc" = "interactive";
@@ -51,6 +98,7 @@ export function createRelayRuntimeFactory(
 	agentDir = getAgentDir(),
 	stateRef: RelayRuntimeStateRef = {},
 ): CreateAgentSessionRuntimeFactory {
+	const engineConfig = resolveRelayRuntimeEngineConfig();
 	const orchestratorUiRef: { cleanup?: () => void; sessionId?: string } = {};
 	return async ({ cwd, sessionManager, sessionStartEvent }) => {
 		const orchestratorRef: { current?: Orchestrator } = {};
@@ -143,7 +191,7 @@ export function createRelayRuntimeFactory(
 			);
 		}
 		orchestratorRef.current = orchestrator;
-		stateRef.current = { orchestrator };
+		stateRef.current = { orchestrator, engineConfig };
 		await orchestrator.restore();
 		return {
 			...created,
