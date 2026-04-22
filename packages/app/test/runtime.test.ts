@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
+const create = vi.fn();
 const continueRecent = vi.fn();
 const createAgentSessionRuntime = vi.fn();
 const createAgentSessionServices = vi.fn();
@@ -16,6 +17,7 @@ const restore = vi.fn(async () => false);
 
 vi.mock("@pi-relay/coding-agent", () => ({
 	SessionManager: {
+		create,
 		continueRecent,
 	},
 	createAgentSessionRuntime,
@@ -30,9 +32,11 @@ vi.mock("@pi-relay/orchestrator", () => ({
 	createSpawnTool,
 	createMessageTool,
 	Orchestrator: vi.fn().mockImplementation(() => ({
+		rootAgentId: "root",
 		restore,
 		spawnAgent: vi.fn(),
 		routeMessage: vi.fn(),
+		subscribeToChanges: vi.fn(() => () => {}),
 	})),
 }));
 
@@ -44,6 +48,7 @@ vi.mock("../src/tools/base-tools.js", () => ({
 describe("createRelayRuntime", () => {
 	beforeEach(() => {
 		vi.resetModules();
+		create.mockClear();
 		continueRecent.mockClear();
 		createAgentSessionRuntime.mockClear();
 		createAgentSessionServices.mockClear();
@@ -56,6 +61,9 @@ describe("createRelayRuntime", () => {
 		rootBaseToolDefinitionsFactory.mockClear();
 		restore.mockClear();
 
+		create.mockReturnValue({
+			getSessionDir: () => "/tmp/sessions",
+		});
 		continueRecent.mockReturnValue({
 			getSessionDir: () => "/tmp/sessions",
 		});
@@ -119,5 +127,18 @@ describe("createRelayRuntime", () => {
 		const relayFactoryArgs = createRelaySessionFactory.mock.calls[0]?.[0];
 		expect(relayFactoryArgs.createSessionBaseToolDefinitionsFactory()).toBe(rootBaseToolDefinitionsFactory);
 		expect(restore).toHaveBeenCalledTimes(1);
+	});
+
+	it("starts a fresh session for interactive runtime startup", async () => {
+		const { createRelayInteractiveRuntime } = await import("../src/runtime.js");
+
+		await createRelayInteractiveRuntime({
+			cwd: "/tmp/project",
+			agentDir: "/tmp/agent",
+		});
+
+		expect(create).toHaveBeenCalledWith("/tmp/project");
+		expect(continueRecent).not.toHaveBeenCalled();
+		expect(createAgentSessionRuntime).toHaveBeenCalledTimes(1);
 	});
 });

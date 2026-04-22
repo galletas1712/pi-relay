@@ -175,7 +175,7 @@ export async function createRelayInteractiveRuntime(options?: {
 }) {
 	const cwd = options?.cwd ?? process.cwd();
 	const agentDir = options?.agentDir ?? getAgentDir();
-	const sessionManager = options?.sessionManager ?? SessionManager.continueRecent(cwd);
+	const sessionManager = options?.sessionManager ?? SessionManager.create(cwd);
 	const stateRef: RelayRuntimeStateRef = {};
 	const runtime = await createAgentSessionRuntime(createRelayRuntimeFactory(agentDir, stateRef), {
 		cwd,
