@@ -3,6 +3,7 @@ import type { ThinkingLevel } from "@pi-relay/agent-core";
 import type { Model } from "@pi-relay/ai";
 import { getAgentDir } from "../config.js";
 import { AuthStorage } from "./auth-storage.js";
+import type { AgentSessionRuntimeDiagnosticLike } from "./agent-session.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
@@ -59,6 +60,7 @@ export interface CreateAgentSessionFromServicesOptions {
 	baseToolDefinitionsFactory?: () => ToolDefinition[];
 	customTools?: ToolDefinition[];
 	sessionShadowController?: SessionShadowBridgeController;
+	runtimeDiagnosticReporter?: (diagnostic: AgentSessionRuntimeDiagnosticLike) => void;
 }
 
 /**
@@ -199,6 +201,8 @@ export async function createAgentSessionFromServices(
 		baseToolDefinitionsFactory: options.baseToolDefinitionsFactory,
 		customTools: options.customTools,
 		sessionShadowController: options.sessionShadowController,
+		runtimeDiagnosticReporter:
+			options.runtimeDiagnosticReporter ?? ((diagnostic) => options.services.diagnostics.push(diagnostic)),
 		sessionStartEvent: options.sessionStartEvent,
 	});
 }

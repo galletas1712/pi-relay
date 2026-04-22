@@ -198,6 +198,11 @@ export function createEmptyUsage(): Usage {
 // Types
 // ============================================================================
 
+export interface AgentSessionRuntimeDiagnosticLike {
+	type: "info" | "warning" | "error";
+	message: string;
+}
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -228,6 +233,8 @@ export interface AgentSessionConfig {
 	sessionStartEvent?: SessionStartEvent;
 	/** Optional shadow bridge mirroring session-core commands without changing local authority. */
 	sessionShadowController?: SessionShadowBridgeController;
+	/** Optional reporter for non-fatal runtime diagnostics such as shadow bridge failures. */
+	runtimeDiagnosticReporter?: (diagnostic: AgentSessionRuntimeDiagnosticLike) => void;
 }
 
 export interface ExtensionBindings {
@@ -385,6 +392,7 @@ export class AgentSession {
 	// Extra sources registered by extensions (orchestrator, custom extensions).
 	// These participate in every _rebuildSystemPrompt together with core sources.
 	private _extensionPromptSources: PromptSource[] = [];
+	private _runtimeDiagnosticReporter?: (diagnostic: AgentSessionRuntimeDiagnosticLike) => void;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -401,6 +409,7 @@ export class AgentSession {
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
 		this._sessionShadowController = config.sessionShadowController;
+		this._runtimeDiagnosticReporter = config.runtimeDiagnosticReporter;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -411,7 +420,10 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
-		this._startSessionShadow();
+	}
+
+	async initialize(): Promise<void> {
+		await this._startSessionShadow();
 	}
 
 	/** Model registry for API key resolution and model discovery */
@@ -523,27 +535,69 @@ export class AgentSession {
 		});
 	}
 
-	private _dispatchSessionCore(command: SessionCoreCommand): void {
+	private async _dispatchSessionCore(command: SessionCoreCommand): Promise<void> {
 		this._sessionCore.dispatch(command);
-		if (this._sessionShadowController) {
-			void Promise.resolve(this._sessionShadowController.dispatch(command)).catch(() => undefined);
-		}
+		await this._forwardSessionShadowCommand(command);
 	}
 
-	private _startSessionShadow(): void {
-		if (!this._sessionShadowController) {
+	private async _forwardSessionShadowCommand(command: SessionCoreCommand): Promise<void> {
+		const controller = this._sessionShadowController;
+		if (!controller) {
 			return;
 		}
 
-		void Promise.resolve(this._sessionShadowController.start(this._sessionCore.getState())).catch(() => undefined);
+		try {
+			await controller.dispatch(command);
+		} catch (error) {
+			await this._handleSessionShadowFailure(
+				`Failed to mirror session-core command ${JSON.stringify(command.type)} to the session shadow bridge`,
+				error,
+			);
+		}
 	}
 
-	private _stopSessionShadow(): void {
-		if (!this._sessionShadowController) {
+	private async _startSessionShadow(): Promise<void> {
+		const controller = this._sessionShadowController;
+		if (!controller) {
 			return;
 		}
 
-		void Promise.resolve(this._sessionShadowController.stop()).catch(() => undefined);
+		try {
+			await controller.start(this._sessionCore.getState());
+		} catch (error) {
+			await this._handleSessionShadowFailure("Failed to start the session shadow bridge", error);
+		}
+	}
+
+	private async _stopSessionShadow(context = "Failed to stop the session shadow bridge cleanly"): Promise<void> {
+		const controller = this._sessionShadowController;
+		this._sessionShadowController = undefined;
+		if (!controller) {
+			return;
+		}
+
+		try {
+			await controller.stop();
+		} catch (error) {
+			this._reportRuntimeDiagnostic("warning", context, error);
+		}
+	}
+
+	private async _handleSessionShadowFailure(context: string, error: unknown): Promise<void> {
+		this._reportRuntimeDiagnostic("warning", `${context}. Continuing without session shadow mirroring`, error);
+		await this._stopSessionShadow("Failed to tear down the session shadow bridge after an earlier error");
+	}
+
+	private _reportRuntimeDiagnostic(
+		type: AgentSessionRuntimeDiagnosticLike["type"],
+		message: string,
+		error?: unknown,
+	): void {
+		const detail = error instanceof Error ? error.message : error !== undefined ? String(error) : undefined;
+		this._runtimeDiagnosticReporter?.({
+			type,
+			message: detail ? `${message}: ${detail}` : message,
+		});
 	}
 
 	// Track last assistant message for auto-compaction check
@@ -608,14 +662,14 @@ export class AgentSession {
 				const steeringIndex = this._steeringMessages.indexOf(messageText);
 				if (steeringIndex !== -1) {
 					this._steeringMessages.splice(steeringIndex, 1);
-					this._dispatchSessionCore(SessionCoreCommands.consumeUserMessage(messageText));
+					await this._dispatchSessionCore(SessionCoreCommands.consumeUserMessage(messageText));
 					this._emitQueueUpdate();
 				} else {
 					// Check follow-up queue
 					const followUpIndex = this._followUpMessages.indexOf(messageText);
 					if (followUpIndex !== -1) {
 						this._followUpMessages.splice(followUpIndex, 1);
-						this._dispatchSessionCore(SessionCoreCommands.consumeUserMessage(messageText));
+						await this._dispatchSessionCore(SessionCoreCommands.consumeUserMessage(messageText));
 						this._emitQueueUpdate();
 					}
 				}
@@ -832,10 +886,10 @@ export class AgentSession {
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
-	dispose(): void {
+	async dispose(): Promise<void> {
 		this._disconnectFromAgent();
 		this._eventListeners = [];
-		this._stopSessionShadow();
+		await this._stopSessionShadow();
 	}
 
 	// =========================================================================
@@ -1362,7 +1416,7 @@ export class AgentSession {
 	 */
 	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
 		this._steeringMessages.push(text);
-		this._dispatchSessionCore(SessionCoreCommands.enqueueSteering(text));
+		await this._dispatchSessionCore(SessionCoreCommands.enqueueSteering(text));
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
@@ -1380,7 +1434,7 @@ export class AgentSession {
 	 */
 	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
 		this._followUpMessages.push(text);
-		this._dispatchSessionCore(SessionCoreCommands.enqueueFollowUp(text));
+		await this._dispatchSessionCore(SessionCoreCommands.enqueueFollowUp(text));
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
@@ -1508,7 +1562,7 @@ export class AgentSession {
 		const followUp = [...this._followUpMessages];
 		this._steeringMessages = [];
 		this._followUpMessages = [];
-		this._dispatchSessionCore(SessionCoreCommands.clearQueues());
+		void this._dispatchSessionCore(SessionCoreCommands.clearQueues());
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };

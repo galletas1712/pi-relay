@@ -2,7 +2,7 @@ import { join } from "node:path";
 import { Agent, type AgentMessage, type ThinkingLevel } from "@pi-relay/agent-core";
 import { clampThinkingLevel, getThinkingLevels, type Message, type Model, streamSimple } from "@pi-relay/ai";
 import { getAgentDir, getDocsPath } from "../config.js";
-import { AgentSession } from "./agent-session.js";
+import { AgentSession, type AgentSessionRuntimeDiagnosticLike } from "./agent-session.js";
 import { AuthStorage } from "./auth-storage.js";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.js";
 import type { ExtensionRunner, LoadExtensionsResult, SessionStartEvent, ToolDefinition } from "./extensions/index.js";
@@ -73,6 +73,8 @@ export interface CreateAgentSessionOptions {
 	sessionManager?: SessionManager;
 	/** Optional shadow bridge that mirrors session-core commands without changing local authority. */
 	sessionShadowController?: SessionShadowBridgeController;
+	/** Optional reporter for non-fatal runtime diagnostics such as shadow bridge failures. */
+	runtimeDiagnosticReporter?: (diagnostic: AgentSessionRuntimeDiagnosticLike) => void;
 
 	/** Settings manager. Default: SettingsManager.create(cwd, agentDir) */
 	settingsManager?: SettingsManager;
@@ -369,7 +371,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
 		sessionShadowController: options.sessionShadowController,
+		runtimeDiagnosticReporter: options.runtimeDiagnosticReporter,
 	});
+	await session.initialize();
 	const extensionsResult = resourceLoader.getExtensions();
 
 	return {

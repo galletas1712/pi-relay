@@ -8,7 +8,9 @@ import {
 	type SessionShadowBridgeMessage,
 } from "../../src/core/session-shadow/codec.js";
 
-function createRecordingBridge() {
+function createRecordingBridge(
+	onCall?: (message: Extract<SessionShadowBridgeMessage, { type: "call" }>) => SessionShadowBridgeMessage | undefined,
+) {
 	const input = new PassThrough();
 	const output = new PassThrough();
 	const sent: SessionShadowBridgeMessage[] = [];
@@ -23,15 +25,18 @@ function createRecordingBridge() {
 			const message = decodeSessionShadowBridgeMessage(line);
 			sent.push(message);
 			if (message.type === "call") {
+				const response = onCall?.(message);
 				input.write(
-					encodeSessionShadowBridgeMessage({
-						type: "result",
-						id: message.id,
-						value: {
-							acceptedCommand: message.command.kind,
-							acceptedAt: "2026-04-22T00:00:00.000Z",
+					encodeSessionShadowBridgeMessage(
+						response ?? {
+							type: "result",
+							id: message.id,
+							value: {
+								acceptedCommand: message.command.kind,
+								acceptedAt: "2026-04-22T00:00:00.000Z",
+							},
 						},
-					}),
+					),
 				);
 			}
 		}
@@ -142,5 +147,66 @@ describe("session-core shadow bridge client", () => {
 		});
 
 		bridge.client.close();
+	});
+
+	it("allows init retry after a failed handshake and blocks dispatch until sync succeeds", async () => {
+		let failHello = true;
+		const bridge = createRecordingBridge((message) => {
+			if (failHello && message.command.kind === "hello") {
+				failHello = false;
+				return {
+					type: "error",
+					id: message.id,
+					error: {
+						message: "hello failed",
+					},
+				};
+			}
+			return undefined;
+		});
+		const controller = attachSessionShadowBridge(bridge.client);
+
+		await expect(
+			controller.start({
+				runState: "idle",
+				queue: {
+					steering: [],
+					followUp: [],
+				},
+			}),
+		).rejects.toThrow("hello failed");
+
+		await expect(
+			controller.dispatch({
+				type: "queue/enqueue-follow-up",
+				text: "after tools",
+			}),
+		).rejects.toThrow("has not completed initial sync");
+
+		await controller.start({
+			runState: "idle",
+			queue: {
+				steering: [],
+				followUp: [],
+			},
+		});
+		await controller.dispatch({
+			type: "queue/enqueue-follow-up",
+			text: "after tools",
+		});
+		await controller.flush();
+
+		expect(
+			bridge.sent.filter(
+				(message) => message.type === "call" && message.command.kind === "hello",
+			),
+		).toHaveLength(2);
+		expect(
+			bridge.sent.filter(
+				(message) => message.type === "call" && message.command.kind === "dispatch",
+			),
+		).toHaveLength(1);
+
+		await controller.stop();
 	});
 });

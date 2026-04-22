@@ -112,7 +112,7 @@ export class AgentSessionRuntime {
 
 	private async teardownCurrent(): Promise<void> {
 		await emitSessionShutdownEvent(this.session.extensionRunner);
-		this.session.dispose();
+		await this.session.dispose();
 	}
 
 	private apply(result: CreateAgentSessionRuntimeResult): void {
@@ -286,7 +286,7 @@ export class AgentSessionRuntime {
 
 	async dispose(): Promise<void> {
 		await emitSessionShutdownEvent(this.session.extensionRunner);
-		this.session.dispose();
+		await this.session.dispose();
 	}
 }
 

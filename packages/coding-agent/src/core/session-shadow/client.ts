@@ -213,15 +213,18 @@ export class SessionShadowBridgeClient {
 }
 
 export function attachSessionShadowBridge(client: SessionShadowBridgeClient): SessionShadowBridgeController {
-	let started = false;
-	let stopped = false;
+	type BridgeState = "idle" | "starting" | "running" | "stopping" | "stopped";
+
+	let state: BridgeState = "idle";
+	let synced = false;
+	let startPromise: Promise<void> | undefined;
 	let queue: Promise<void> = Promise.resolve();
 
 	const enqueue = (operation: () => Promise<void>): Promise<void> => {
 		queue = queue
 			.catch(() => undefined)
 			.then(async () => {
-				if (stopped) {
+				if (state === "stopped") {
 					return;
 				}
 				await operation();
@@ -231,20 +234,49 @@ export function attachSessionShadowBridge(client: SessionShadowBridgeClient): Se
 
 	return {
 		async start(initialState) {
-			if (started) {
-				await queue.catch(() => undefined);
+			if (state === "running") {
+				await queue;
 				return;
 			}
-			started = true;
-			await enqueue(async () => {
+			if (state === "starting") {
+				await startPromise;
+				return;
+			}
+			if (state === "stopping" || state === "stopped") {
+				throw new Error("session-core shadow bridge is stopping or already stopped");
+			}
+
+			state = "starting";
+			startPromise = enqueue(async () => {
 				await client.hello();
 				await client.syncState(createSessionShadowSnapshot(initialState), "init");
-			});
+			})
+				.then(() => {
+					synced = true;
+					if (state === "starting") {
+						state = "running";
+					}
+				})
+				.catch((error) => {
+					synced = false;
+					if (state === "starting") {
+						state = "idle";
+					}
+					throw error;
+				})
+				.finally(() => {
+					startPromise = undefined;
+				});
+
+			await startPromise;
 		},
 
 		async dispatch(command) {
-			if (!started) {
-				throw new Error("session-core shadow bridge has not been started");
+			if (state === "starting" && startPromise) {
+				await startPromise;
+			}
+			if (state !== "running" || !synced) {
+				throw new Error("session-core shadow bridge has not completed initial sync");
 			}
 			await enqueue(async () => {
 				await client.dispatch(command);
@@ -252,21 +284,26 @@ export function attachSessionShadowBridge(client: SessionShadowBridgeClient): Se
 		},
 
 		async flush() {
-			await queue.catch(() => undefined);
+			await queue;
 		},
 
 		async stop() {
-			if (stopped) {
+			if (state === "stopped") {
 				return;
 			}
-			stopped = true;
+
+			state = "stopping";
+			await startPromise?.catch(() => undefined);
+			const shouldDispose = synced;
+			synced = false;
 			await queue.catch(() => undefined);
 			try {
-				if (started) {
+				if (shouldDispose) {
 					await client.dispose();
 				}
 			} finally {
 				client.close();
+				state = "stopped";
 			}
 		},
 	};

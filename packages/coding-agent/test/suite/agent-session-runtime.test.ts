@@ -161,6 +161,87 @@ describe("AgentSessionRuntime characterization", () => {
 		}
 	});
 
+	it("reports a diagnostic and keeps local queueing alive when session shadow startup fails", async () => {
+		const controller: SessionShadowBridgeController = {
+			start: vi.fn(async () => {
+				throw new Error("shadow hello failed");
+			}),
+			dispatch: vi.fn(async () => undefined),
+			flush: vi.fn(async () => undefined),
+			stop: vi.fn(async () => undefined),
+		};
+		const { runtime, faux, tempDir } = await createRuntimeForTest(() => {}, {
+			sessionShadowController: controller,
+		});
+
+		cleanups.pop();
+
+		expect(runtime.diagnostics).toContainEqual(
+			expect.objectContaining({
+				type: "warning",
+				message: expect.stringContaining("Failed to start the session shadow bridge"),
+			}),
+		);
+
+		await runtime.session.followUp("after tools");
+
+		expect(runtime.session.getFollowUpMessages()).toEqual(["after tools"]);
+		expect(controller.dispatch).not.toHaveBeenCalled();
+
+		await runtime.dispose();
+
+		faux.unregister();
+		if (existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("awaits session shadow shutdown during runtime disposal", async () => {
+		let resolveStop: (() => void) | undefined;
+		let disposed = false;
+		const controller: SessionShadowBridgeController = {
+			start: vi.fn(async () => undefined),
+			dispatch: vi.fn(async () => undefined),
+			flush: vi.fn(async () => undefined),
+			stop: vi.fn(
+				() =>
+					new Promise<void>((resolve) => {
+						resolveStop = () => {
+							disposed = true;
+							resolve();
+						};
+					}),
+			),
+		};
+		const { runtime, faux, tempDir } = await createRuntimeForTest(() => {}, {
+			sessionShadowController: controller,
+		});
+
+		cleanups.pop();
+
+		let finished = false;
+		const disposePromise = runtime.dispose().then(() => {
+			finished = true;
+		});
+
+		await vi.waitFor(() => {
+			expect(controller.stop).toHaveBeenCalledTimes(1);
+		});
+		await Promise.resolve();
+		expect(finished).toBe(false);
+
+		resolveStop?.();
+		await disposePromise;
+
+		expect(disposed).toBe(true);
+		expect(finished).toBe(true);
+
+		faux.unregister();
+		if (existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
 		const events: RecordedSessionEvent[] = [];
 		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {
