@@ -1,7 +1,6 @@
 #![forbid(unsafe_code)]
 
 mod runner;
-mod session_log;
 
 use agent_core::{
     AgentAction, AgentCoreLoop, AgentInput, AgentState, Transcript, TranscriptCheckpoint,
@@ -9,10 +8,6 @@ use agent_core::{
 };
 
 pub use crate::runner::{AgentInputHandle, AgentInputReceiver, AgentRunner};
-pub use crate::session_log::{
-    BranchSummaryEntry, CompactionEntry, CompactionPlan, CompactionSettings, SessionContext,
-    SessionEntry, SessionEntryKind, SessionLog, SessionLogError,
-};
 
 /// Session shell around the pure core loop.
 ///
@@ -22,18 +17,12 @@ pub use crate::session_log::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSession {
     core: AgentCoreLoop,
-    log: SessionLog,
-    synced_checkpoint: TranscriptCheckpoint,
 }
 
 impl Default for AgentSession {
     fn default() -> Self {
-        let core = AgentCoreLoop::new();
-        let synced_checkpoint = core.transcript.checkpoint();
         Self {
-            core,
-            log: SessionLog::new(),
-            synced_checkpoint,
+            core: AgentCoreLoop::new(),
         }
     }
 }
@@ -52,28 +41,7 @@ impl AgentSession {
     }
 
     pub fn from_core(core: AgentCoreLoop) -> Self {
-        let log = SessionLog::from_transcript(&core.transcript);
-        let synced_checkpoint = core.transcript.checkpoint();
-        Self {
-            core,
-            log,
-            synced_checkpoint,
-        }
-    }
-
-    pub fn from_session_log(log: SessionLog) -> Result<Self, SessionBoundaryError> {
-        if !log.is_turn_boundary() {
-            return Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary));
-        }
-
-        let context = log.context();
-        let core = AgentCoreLoop::from_transcript(context.transcript);
-        let synced_checkpoint = core.transcript.checkpoint();
-        Ok(Self {
-            core,
-            log,
-            synced_checkpoint,
-        })
+        Self { core }
     }
 
     pub fn core(&self) -> &AgentCoreLoop {
@@ -86,14 +54,6 @@ impl AgentSession {
 
     pub fn transcript(&self) -> &Transcript {
         &self.core.transcript
-    }
-
-    pub fn session_log(&self) -> &SessionLog {
-        &self.log
-    }
-
-    pub fn model_context(&self) -> SessionContext {
-        self.log.context()
     }
 
     pub fn checkpoint(&self) -> TranscriptCheckpoint {
@@ -110,7 +70,6 @@ impl AgentSession {
 
     pub fn drive(&mut self) {
         self.core.drive();
-        self.sync_log_from_core();
     }
 
     pub fn drain_actions(&mut self) -> Vec<AgentAction> {
@@ -157,110 +116,7 @@ impl AgentSession {
 
         let previous =
             std::mem::replace(&mut self.core, AgentCoreLoop::from_transcript(replacement));
-        self.log = SessionLog::from_transcript(&self.core.transcript);
-        self.synced_checkpoint = self.core.transcript.checkpoint();
         Ok(previous.transcript)
-    }
-
-    pub fn prepare_compaction(
-        &self,
-        settings: CompactionSettings,
-        external_work: ExternalWork,
-    ) -> Result<Option<CompactionPlan>, SessionBoundaryError> {
-        let quiescence = self.quiescence(external_work);
-        if !quiescence.is_quiescent() {
-            return Err(SessionBoundaryError::Busy(quiescence));
-        }
-        if !self.log.is_turn_boundary() {
-            return Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary));
-        }
-        Ok(self.log.prepare_compaction(settings))
-    }
-
-    pub fn compact_at_boundary(
-        &mut self,
-        plan: &CompactionPlan,
-        summary: impl Into<String>,
-        external_work: ExternalWork,
-    ) -> Result<(), SessionBoundaryError> {
-        let quiescence = self.quiescence(external_work);
-        if !quiescence.is_quiescent() {
-            return Err(SessionBoundaryError::Busy(quiescence));
-        }
-        if !self.log.contains_entry(&plan.first_kept_entry_id) {
-            return Err(SessionBoundaryError::Log(SessionLogError::EntryNotFound));
-        }
-        if self.log.leaf_id() != plan.leaf_id.as_deref()
-            || self.log.entries().len() != plan.entry_count
-        {
-            return Err(SessionBoundaryError::Log(SessionLogError::StalePlan));
-        }
-        if !self.log.is_turn_boundary() {
-            return Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary));
-        }
-
-        self.log.append_compaction(
-            summary,
-            plan.first_kept_entry_id.clone(),
-            plan.tokens_before,
-        );
-        self.rehydrate_core_from_log();
-        Ok(())
-    }
-
-    pub fn rewind_to_turn_boundary(
-        &mut self,
-        leaf_id: Option<&str>,
-        external_work: ExternalWork,
-    ) -> Result<(), SessionBoundaryError> {
-        let quiescence = self.quiescence(external_work);
-        if !quiescence.is_quiescent() {
-            return Err(SessionBoundaryError::Busy(quiescence));
-        }
-
-        match leaf_id {
-            Some(leaf_id) => self
-                .log
-                .branch_at_turn_boundary(leaf_id)
-                .map_err(SessionBoundaryError::Log)?,
-            None => self.log.reset_leaf(),
-        }
-        self.rehydrate_core_from_log();
-        Ok(())
-    }
-
-    pub fn fork_at_turn_boundary(
-        &self,
-        leaf_id: Option<&str>,
-        external_work: ExternalWork,
-    ) -> Result<Self, SessionBoundaryError> {
-        let quiescence = self.quiescence(external_work);
-        if !quiescence.is_quiescent() {
-            return Err(SessionBoundaryError::Busy(quiescence));
-        }
-
-        let log = self
-            .log
-            .create_branched_log_at_turn_boundary(leaf_id)
-            .map_err(SessionBoundaryError::Log)?;
-        Self::from_session_log(log)
-    }
-
-    fn rehydrate_core_from_log(&mut self) {
-        let context = self.log.context();
-        self.core = AgentCoreLoop::from_transcript(context.transcript);
-        self.synced_checkpoint = self.core.transcript.checkpoint();
-    }
-
-    fn sync_log_from_core(&mut self) {
-        let Some(records) = self.core.transcript.records_since(self.synced_checkpoint) else {
-            self.log = SessionLog::from_transcript(&self.core.transcript);
-            self.synced_checkpoint = self.core.transcript.checkpoint();
-            return;
-        };
-
-        self.log.append_transcript_records(records.iter().cloned());
-        self.synced_checkpoint = self.core.transcript.checkpoint();
     }
 }
 
@@ -306,7 +162,6 @@ impl SessionQuiescence {
 pub enum SessionBoundaryError {
     Busy(SessionQuiescence),
     ReplacementNotAtBoundary,
-    Log(SessionLogError),
 }
 
 #[cfg(test)]
@@ -378,112 +233,5 @@ mod tests {
             session.transcript().records()[1],
             TranscriptRecord::UserMessage("compact".to_string())
         );
-    }
-
-    #[test]
-    fn session_log_tracks_core_turn_records() {
-        let mut session = AgentSession::new();
-        session.handle_input(AgentInput::FollowUp("hello".to_string()));
-        session.handle_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: AssistantMessage { items: Vec::new() },
-        });
-
-        assert_eq!(session.session_log().entries().len(), 4);
-        assert!(session.session_log().is_turn_boundary());
-        assert_eq!(session.model_context().transcript.last_turn_id(), TurnId(1));
-    }
-
-    #[test]
-    fn compaction_requires_quiescence_and_keeps_a_turn_boundary_suffix() {
-        let mut session = AgentSession::from_transcript(Transcript::from_records_raw(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("first user message".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage {
-                items: vec![AssistantItem::Text("first answer".to_string())],
-            }),
-            TranscriptRecord::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage("second user message".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage {
-                items: vec![AssistantItem::Text("second answer".to_string())],
-            }),
-            TranscriptRecord::TurnFinished {
-                turn_id: TurnId(2),
-                outcome: TurnOutcome::Graceful,
-            },
-        ]));
-
-        let plan = session
-            .prepare_compaction(
-                CompactionSettings {
-                    keep_recent_tokens: 1,
-                },
-                ExternalWork::NONE,
-            )
-            .expect("session is quiescent")
-            .expect("old turn should be compactable");
-
-        session
-            .compact_at_boundary(&plan, "summary", ExternalWork::NONE)
-            .expect("quiescent boundary can compact");
-
-        let context = session.model_context();
-        assert_eq!(
-            context
-                .compaction
-                .as_ref()
-                .map(|entry| entry.summary.as_str()),
-            Some("summary")
-        );
-        assert_eq!(session.transcript().last_turn_id(), TurnId(2));
-        assert!(matches!(
-            session.transcript().records().first(),
-            Some(TranscriptRecord::TurnStarted { turn_id: TurnId(2) })
-        ));
-    }
-
-    #[test]
-    fn rewind_and_fork_only_accept_turn_finished_entries() {
-        let mut session = AgentSession::from_transcript(Transcript::from_records_raw(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("first".to_string()),
-            TranscriptRecord::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage("second".to_string()),
-            TranscriptRecord::TurnFinished {
-                turn_id: TurnId(2),
-                outcome: TurnOutcome::Graceful,
-            },
-        ]));
-        let mid_turn_id = session.session_log().entries()[1].id.clone();
-        let turn_one_end_id = session.session_log().entries()[2].id.clone();
-
-        assert_eq!(
-            session.rewind_to_turn_boundary(Some(&mid_turn_id), ExternalWork::NONE),
-            Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary))
-        );
-        assert_eq!(
-            session
-                .fork_at_turn_boundary(Some(&mid_turn_id), ExternalWork::NONE)
-                .map(|_| ()),
-            Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary))
-        );
-
-        session
-            .rewind_to_turn_boundary(Some(&turn_one_end_id), ExternalWork::NONE)
-            .expect("turn end is a valid rewind point");
-        assert_eq!(session.transcript().last_turn_id(), TurnId(1));
-
-        let fork = session
-            .fork_at_turn_boundary(Some(&turn_one_end_id), ExternalWork::NONE)
-            .expect("turn end is a valid fork point");
-        assert_eq!(fork.transcript().last_turn_id(), TurnId(1));
     }
 }

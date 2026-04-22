@@ -3,10 +3,7 @@
 use std::collections::BTreeMap;
 
 use agent_core::{AgentAction, AgentInput, Transcript};
-use agent_session::{
-    AgentSession, CompactionPlan, CompactionSettings, ExternalWork, SessionBoundaryError,
-    SessionLog,
-};
+use agent_session::{AgentSession, ExternalWork, SessionBoundaryError};
 
 /// Thin multi-session coordinator.
 ///
@@ -69,70 +66,6 @@ impl AgentOrchestrator {
             .map_err(OrchestratorError::Boundary)
     }
 
-    pub fn prepare_session_compaction(
-        &self,
-        id: &str,
-        settings: CompactionSettings,
-        external_work: ExternalWork,
-    ) -> Result<Option<CompactionPlan>, OrchestratorError> {
-        self.session(id)?
-            .prepare_compaction(settings, external_work)
-            .map_err(OrchestratorError::Boundary)
-    }
-
-    pub fn compact_session_at_boundary(
-        &mut self,
-        id: &str,
-        plan: &CompactionPlan,
-        summary: impl Into<String>,
-        external_work: ExternalWork,
-    ) -> Result<(), OrchestratorError> {
-        self.session_mut(id)?
-            .compact_at_boundary(plan, summary, external_work)
-            .map_err(OrchestratorError::Boundary)
-    }
-
-    pub fn rewind_session_to_turn_boundary(
-        &mut self,
-        id: &str,
-        leaf_id: Option<&str>,
-        external_work: ExternalWork,
-    ) -> Result<(), OrchestratorError> {
-        self.session_mut(id)?
-            .rewind_to_turn_boundary(leaf_id, external_work)
-            .map_err(OrchestratorError::Boundary)
-    }
-
-    pub fn fork_session_at_turn_boundary(
-        &mut self,
-        source_id: &str,
-        new_id: impl Into<String>,
-        leaf_id: Option<&str>,
-        external_work: ExternalWork,
-    ) -> Result<(), OrchestratorError> {
-        let new_id = new_id.into();
-        if self.sessions.contains_key(&new_id) {
-            return Err(OrchestratorError::SessionAlreadyExists);
-        }
-
-        let fork = self
-            .session(source_id)?
-            .fork_at_turn_boundary(leaf_id, external_work)
-            .map_err(OrchestratorError::Boundary)?;
-        self.sessions.insert(new_id, fork);
-        Ok(())
-    }
-
-    pub fn replace_session_from_log(
-        &mut self,
-        id: &str,
-        log: SessionLog,
-    ) -> Result<(), OrchestratorError> {
-        let session = AgentSession::from_session_log(log).map_err(OrchestratorError::Boundary)?;
-        *self.session_mut(id)? = session;
-        Ok(())
-    }
-
     pub fn remove_session(&mut self, id: &str) -> Result<AgentSession, OrchestratorError> {
         self.sessions
             .remove(id)
@@ -150,7 +83,7 @@ pub enum OrchestratorError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{AssistantMessage, TranscriptRecord, TurnId, TurnOutcome};
+    use agent_core::{TranscriptRecord, TurnId, TurnOutcome};
 
     #[test]
     fn orchestrator_routes_input_to_sessions() {
@@ -195,84 +128,6 @@ mod tests {
                 .transcript()
                 .last_turn_id(),
             TurnId(1)
-        );
-    }
-
-    #[test]
-    fn orchestrator_delegates_rewind_fork_and_compaction_to_session_boundaries() {
-        let mut orchestrator = AgentOrchestrator::new();
-        let session = AgentSession::from_transcript(Transcript::from_records_raw(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("first user message".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            TranscriptRecord::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage("second user message".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            TranscriptRecord::TurnFinished {
-                turn_id: TurnId(2),
-                outcome: TurnOutcome::Graceful,
-            },
-        ]));
-        let mid_turn_id = session.session_log().entries()[1].id.clone();
-        let turn_one_end_id = session.session_log().entries()[3].id.clone();
-
-        orchestrator
-            .spawn_session("root", session)
-            .expect("new session should be inserted");
-        assert!(matches!(
-            orchestrator.rewind_session_to_turn_boundary(
-                "root",
-                Some(&mid_turn_id),
-                ExternalWork::NONE
-            ),
-            Err(OrchestratorError::Boundary(SessionBoundaryError::Log(
-                agent_session::SessionLogError::NotTurnBoundary
-            )))
-        ));
-
-        orchestrator
-            .fork_session_at_turn_boundary(
-                "root",
-                "fork",
-                Some(&turn_one_end_id),
-                ExternalWork::NONE,
-            )
-            .expect("turn boundary fork should be inserted");
-        assert_eq!(
-            orchestrator
-                .session("fork")
-                .expect("fork should exist")
-                .transcript()
-                .last_turn_id(),
-            TurnId(1)
-        );
-
-        let plan = orchestrator
-            .prepare_session_compaction(
-                "root",
-                CompactionSettings {
-                    keep_recent_tokens: 1,
-                },
-                ExternalWork::NONE,
-            )
-            .expect("session should exist")
-            .expect("old turn should be compactable");
-        orchestrator
-            .compact_session_at_boundary("root", &plan, "summary", ExternalWork::NONE)
-            .expect("root can compact at boundary");
-        assert_eq!(
-            orchestrator
-                .session("root")
-                .expect("root should exist")
-                .model_context()
-                .compaction
-                .as_ref()
-                .map(|entry| entry.summary.as_str()),
-            Some("summary")
         );
     }
 }
