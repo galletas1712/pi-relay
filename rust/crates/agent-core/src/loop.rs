@@ -6,8 +6,7 @@ use crate::ids::TurnId;
 use crate::mailbox::Mailbox;
 use crate::message::CompactMessage;
 use crate::state::AgentState;
-use crate::transcript::Transcript;
-use crate::transcript_record::{TranscriptRecord, TurnOutcome};
+use crate::transcript::{Transcript, TranscriptRecord, TurnOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCoreLoop {
@@ -114,7 +113,6 @@ mod tests {
     use crate::message::{
         AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
     };
-    use crate::transcript_record::{TranscriptRecord, TurnOutcome};
 
     fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {
         AssistantMessage { items }

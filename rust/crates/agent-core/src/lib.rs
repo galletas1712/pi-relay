@@ -10,7 +10,6 @@ mod message;
 mod runner;
 mod state;
 mod transcript;
-mod transcript_record;
 
 pub use crate::action::AgentAction;
 pub use crate::core_loop::AgentCoreLoop;
@@ -22,5 +21,4 @@ pub use crate::message::{
 };
 pub use crate::runner::{AgentInputHandle, AgentInputReceiver, AgentRunner};
 pub use crate::state::AgentState;
-pub use crate::transcript::Transcript;
-pub use crate::transcript_record::{TranscriptRecord, TurnOutcome};
+pub use crate::transcript::{Transcript, TranscriptRecord, TurnOutcome};

@@ -1,5 +1,5 @@
 [package]
-name = "agent-core-loop"
+name = "agent-core"
 version = "0.1.0"
 edition = "2021"
 publish = false

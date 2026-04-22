@@ -1,6 +1,48 @@
 use crate::ids::{ToolCallId, TurnId};
-use crate::message::{CompactMessage, ToolCall, ToolResultMessage};
-use crate::transcript_record::{TranscriptRecord, TurnOutcome};
+use crate::message::{AssistantMessage, CompactMessage, ToolCall, ToolResultMessage};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Graceful,
+    Interrupted,
+    Crashed,
+}
+
+/// Durable append-only session record.
+///
+/// These records are persisted, replayed, compacted, forked, and rewound. They
+/// are not hook/lifecycle events; hooks should attach to a separate lifecycle
+/// notification stream derived while the loop is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptRecord {
+    TurnStarted {
+        turn_id: TurnId,
+    },
+    UserMessage(String),
+    AssistantMessage(AssistantMessage),
+    ToolCallStarted {
+        turn_id: TurnId,
+        tool_call: ToolCall,
+    },
+    ToolResult(ToolResultMessage),
+    TurnFinished {
+        turn_id: TurnId,
+        outcome: TurnOutcome,
+    },
+}
+
+impl TranscriptRecord {
+    pub fn turn_id(&self) -> Option<TurnId> {
+        match self {
+            TranscriptRecord::TurnStarted { turn_id }
+            | TranscriptRecord::ToolCallStarted { turn_id, .. }
+            | TranscriptRecord::TurnFinished { turn_id, .. } => Some(*turn_id),
+            TranscriptRecord::UserMessage(_)
+            | TranscriptRecord::AssistantMessage(_)
+            | TranscriptRecord::ToolResult(_) => None,
+        }
+    }
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Transcript {
