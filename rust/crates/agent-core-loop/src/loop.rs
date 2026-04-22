@@ -12,6 +12,8 @@ pub enum Phase {
     Idle,
     // The last completed turn ended via interrupt.
     Interrupted,
+    // The last completed turn was synthesized as crashed during recovery.
+    Crashed,
     RunningModel {
         turn_id: TurnId,
     },
@@ -118,7 +120,7 @@ impl AgentCoreLoop {
         if let Some(turn_id) = open_turn {
             transcript.push(AgentEvent::TurnFinished {
                 turn_id,
-                outcome: TurnOutcome::Interrupted,
+                outcome: TurnOutcome::Crashed,
             });
             last_turn_id = last_turn_id.max(turn_id);
         }
@@ -128,6 +130,10 @@ impl AgentCoreLoop {
                 outcome: TurnOutcome::Interrupted,
                 ..
             }) => Phase::Interrupted,
+            Some(AgentEvent::TurnFinished {
+                outcome: TurnOutcome::Crashed,
+                ..
+            }) => Phase::Crashed,
             _ => Phase::Idle,
         };
 
@@ -256,7 +262,7 @@ impl AgentCoreLoop {
         }
 
         match &self.phase {
-            Phase::Idle | Phase::Interrupted => {
+            Phase::Idle | Phase::Interrupted | Phase::Crashed => {
                 let Some(input) = self.mailbox.pop_next() else {
                     return;
                 };
@@ -276,7 +282,7 @@ impl AgentCoreLoop {
 
     fn handle_interrupt(&mut self) -> bool {
         match self.phase.clone() {
-            Phase::Idle | Phase::Interrupted => false,
+            Phase::Idle | Phase::Interrupted | Phase::Crashed => false,
             Phase::RunningModel { turn_id } => {
                 self.phase = Phase::Interrupted;
                 self.pending_tool_calls.clear();
@@ -694,7 +700,7 @@ mod tests {
     }
 
     #[test]
-    fn rehydrating_an_incomplete_transcript_patches_an_interrupted_finish() {
+    fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
         let transcript = vec![
             AgentEvent::TurnStarted { turn_id: TurnId(7) },
             AgentEvent::UserMessage(UserMessage {
@@ -715,11 +721,11 @@ mod tests {
                 }),
                 AgentEvent::TurnFinished {
                     turn_id: TurnId(7),
-                    outcome: TurnOutcome::Interrupted,
+                    outcome: TurnOutcome::Crashed,
                 },
             ]
         );
-        assert_eq!(loop_state.phase, Phase::Interrupted);
+        assert_eq!(loop_state.phase, Phase::Crashed);
         assert_eq!(loop_state.last_turn_id, TurnId(7));
     }
 

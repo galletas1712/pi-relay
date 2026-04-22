@@ -5,6 +5,7 @@ use crate::message::{AssistantMessage, ToolCall, ToolResultMessage, UserMessage}
 pub enum TurnOutcome {
     Graceful,
     Interrupted,
+    Crashed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
