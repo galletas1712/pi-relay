@@ -4,7 +4,18 @@ import { randomUUID } from "node:crypto";
 import type { AgentMessage, AgentToolCall, ThinkingLevel } from "@pi-relay/agent-core";
 import { isBackgroundToolCompletionMessage, isPendingToolResult } from "@pi-relay/agent-core";
 import { validateToolArguments, type Model, type ToolResultMessage, type UserMessage } from "@pi-relay/ai";
+import type { OrchestratorPendingSpawnDraft } from "@pi-relay/agent-protocol";
 import { serializeConversation, type AgentSessionEvent, type ToolDefinition } from "@pi-relay/coding-agent";
+import {
+	aggregateUsageTotals,
+	buildAgentSummaries,
+	buildSiblingBatchEntries,
+	createOrchestratorCoreState,
+	evaluateSpawnAllowance,
+	getAgentDepth,
+	hasRunningChildren as coreHasRunningChildren,
+	toTreeSnapshot,
+} from "@pi-relay/orchestrator-core";
 import { createAgentContextTransform } from "./context-transform.js";
 import { BackgroundCapabilitiesSource, MultiAgentInstructionsSource } from "./prompt/index.js";
 import { createMessageTool } from "./tools/message.js";
@@ -48,11 +59,7 @@ function ensureDir(path: string): void {
 	mkdirSync(path, { recursive: true });
 }
 
-interface PendingSpawnDraft {
-	id: string;
-	role: string;
-	prompt: string;
-}
+type PendingSpawnDraft = OrchestratorPendingSpawnDraft;
 
 /**
  * Result of the pre-fork triviality gate. `skip === true` means do NOT
@@ -301,40 +308,14 @@ export class Orchestrator {
 		sessionFile: string | undefined;
 		lastOutput: string | undefined;
 	}> {
-		const summaries: Array<{
-			id: string;
-			parentId: string | null;
-			role: string;
-			status: AgentRecord["status"];
-			depth: number;
-			childCount: number;
-			sessionFile: string | undefined;
-			lastOutput: string | undefined;
-		}> = [];
-		const visit = (agentId: string, depth: number) => {
-			const record = this.records.get(agentId);
-			if (!record || record.status === "disposed") {
-				return;
-			}
-
-			summaries.push({
-				id: record.id,
-				parentId: record.parentId,
-				role: record.role,
-				status: record.status,
-				depth,
-				childCount: record.childIds.length,
-				sessionFile: record.session.sessionFile,
-				lastOutput: record.session.getLastAssistantText(),
-			});
-
-			for (const childId of record.childIds) {
-				visit(childId, depth + 1);
-			}
-		};
-
-		visit(this.rootAgentId, 0);
-		return summaries;
+		return buildAgentSummaries(this.buildCoreState(), this.rootAgentId).map((summary) => {
+			const record = this.records.get(summary.id);
+			return {
+				...summary,
+				sessionFile: record?.session.sessionFile,
+				lastOutput: record?.session.getLastAssistantText(),
+			};
+		});
 	}
 
 	/**
@@ -350,76 +331,31 @@ export class Orchestrator {
 	 * the tree is expected to be acyclic by construction.
 	 */
 	aggregateSubtreeUsage(agentId: string): SubtreeUsageStats | undefined {
-		const root = this.records.get(agentId);
-		if (!root) {
+		const statsByAgentId = Object.fromEntries(
+			[...this.records.values()].map((record) => [record.id, record.session.getSessionStats()]),
+		) as Record<string, SessionStats>;
+		const aggregate = aggregateUsageTotals(this.buildCoreState(), agentId, statsByAgentId);
+		if (!aggregate) {
 			return undefined;
 		}
 
-		const self = root.session.getSessionStats();
-		const visited = new Set<string>([agentId]);
-		const treeAcc = {
-			userMessages: self.userMessages,
-			assistantMessages: self.assistantMessages,
-			toolCalls: self.toolCalls,
-			toolResults: self.toolResults,
-			totalMessages: self.totalMessages,
-			input: self.tokens.input,
-			output: self.tokens.output,
-			cacheRead: self.tokens.cacheRead,
-			cacheWrite: self.tokens.cacheWrite,
-			totalTokens: self.tokens.total,
-			cost: self.cost,
-		};
-		let descendantCount = 0;
-
-		const visit = (id: string): void => {
-			const record = this.records.get(id);
-			if (!record) {
-				return;
-			}
-			for (const childId of record.childIds) {
-				if (visited.has(childId)) {
-					continue;
-				}
-				const child = this.records.get(childId);
-				if (!child || child.status === "disposed") {
-					continue;
-				}
-				visited.add(childId);
-				descendantCount += 1;
-				const childStats = child.session.getSessionStats();
-				treeAcc.userMessages += childStats.userMessages;
-				treeAcc.assistantMessages += childStats.assistantMessages;
-				treeAcc.toolCalls += childStats.toolCalls;
-				treeAcc.toolResults += childStats.toolResults;
-				treeAcc.totalMessages += childStats.totalMessages;
-				treeAcc.input += childStats.tokens.input;
-				treeAcc.output += childStats.tokens.output;
-				treeAcc.cacheRead += childStats.tokens.cacheRead;
-				treeAcc.cacheWrite += childStats.tokens.cacheWrite;
-				treeAcc.totalTokens += childStats.tokens.total;
-				treeAcc.cost += childStats.cost;
-				visit(childId);
-			}
-		};
-		visit(agentId);
-
+		const { self, totals, descendantCount } = aggregate;
 		const tree: SessionStats = {
 			sessionFile: self.sessionFile,
 			sessionId: self.sessionId,
-			userMessages: treeAcc.userMessages,
-			assistantMessages: treeAcc.assistantMessages,
-			toolCalls: treeAcc.toolCalls,
-			toolResults: treeAcc.toolResults,
-			totalMessages: treeAcc.totalMessages,
+			userMessages: totals.userMessages,
+			assistantMessages: totals.assistantMessages,
+			toolCalls: totals.toolCalls,
+			toolResults: totals.toolResults,
+			totalMessages: totals.totalMessages,
 			tokens: {
-				input: treeAcc.input,
-				output: treeAcc.output,
-				cacheRead: treeAcc.cacheRead,
-				cacheWrite: treeAcc.cacheWrite,
-				total: treeAcc.totalTokens,
+				input: totals.input,
+				output: totals.output,
+				cacheRead: totals.cacheRead,
+				cacheWrite: totals.cacheWrite,
+				total: totals.totalTokens,
 			},
-			cost: treeAcc.cost,
+			cost: totals.cost,
 			contextUsage: self.contextUsage,
 		};
 
@@ -654,27 +590,18 @@ export class Orchestrator {
 	}
 
 	private assertSpawnAllowed(parentId: string): void {
-		const parent = this.getRecord(parentId);
-		const activeChildCount = parent.childIds.filter((childId) => this.records.get(childId)?.status === "running").length;
-		const pendingDirectChildren = this.pendingSpawnDrafts.get(parentId)?.size ?? 0;
-		if (activeChildCount + pendingDirectChildren >= this.config.maxChildren) {
-			throw new Error(`Agent ${parentId} already has the maximum number of children`);
-		}
-
-		let depth = 0;
-		let current: AgentRecord | undefined = parent;
-		while (current) {
-			depth++;
-			current = current.parentId ? this.records.get(current.parentId) : undefined;
-		}
-		if (depth >= this.config.maxDepth) {
-			throw new Error(`Spawning from ${parentId} would exceed the maximum agent depth`);
-		}
-
-		const pendingSpawns = [...this.pendingSpawnDrafts.values()].reduce((total, drafts) => total + drafts.size, 0);
-		const activeAgents = [...this.records.values()].filter((record) => record.status === "running").length + pendingSpawns;
-		if (activeAgents >= this.config.maxActiveAgents) {
-			throw new Error("The orchestrator is already at its active agent limit");
+		const allowance = evaluateSpawnAllowance(this.buildCoreState(), parentId, this.config);
+		switch (allowance.reason) {
+			case "missing-parent":
+				throw new Error(`Unknown agent: ${parentId}`);
+			case "max-children":
+				throw new Error(`Agent ${parentId} already has the maximum number of children`);
+			case "max-depth":
+				throw new Error(`Spawning from ${parentId} would exceed the maximum agent depth`);
+			case "max-active-agents":
+				throw new Error("The orchestrator is already at its active agent limit");
+			default:
+				return;
 		}
 	}
 
@@ -940,17 +867,7 @@ export class Orchestrator {
 	}
 
 	private hasRunningChildren(agentId: string, excludingAgentId?: string): boolean {
-		const record = this.records.get(agentId);
-		if (!record) {
-			return false;
-		}
-
-		return record.childIds.some((childId) => {
-			if (childId === excludingAgentId) {
-				return false;
-			}
-			return this.records.get(childId)?.status === "running";
-		});
+		return coreHasRunningChildren(this.buildCoreState(), agentId, excludingAgentId);
 	}
 
 	private createChildTools(agentId: string): ToolDefinition[] {
@@ -964,20 +881,19 @@ export class Orchestrator {
 	}
 
 	private getMetadataDepth(metadata: AgentTreeMetadata, agentId: string): number {
-		let depth = 0;
-		let current: AgentTreeMetadataEntry | undefined = metadata.agents[agentId];
-		while (current) {
-			depth++;
-			current = current.parentId ? metadata.agents[current.parentId] : undefined;
-		}
-		return depth;
+		return getAgentDepth(createOrchestratorCoreState(metadata), agentId);
 	}
 
 	private snapshotTree(): AgentTreeMetadata {
+		return toTreeSnapshot(this.buildCoreState());
+	}
+
+	private buildCoreState() {
 		const agents: Record<string, AgentTreeMetadataEntry> = {};
 		for (const [agentId, entry] of this.restoredDisposedEntries) {
 			agents[agentId] = {
 				...entry,
+				childIds: [...entry.childIds],
 			};
 		}
 		for (const record of this.records.values()) {
@@ -997,10 +913,19 @@ export class Orchestrator {
 				turnCount: record.turnCount,
 			};
 		}
-		return {
-			sessionId: this.getRecord(this.rootAgentId).session.sessionId,
-			agents,
-		};
+
+		const pendingSpawnDrafts: Record<string, OrchestratorPendingSpawnDraft[]> = {};
+		for (const [parentId, drafts] of this.pendingSpawnDrafts) {
+			pendingSpawnDrafts[parentId] = [...drafts.values()].map((draft) => ({ ...draft }));
+		}
+
+		return createOrchestratorCoreState(
+			{
+				sessionId: this.getRecord(this.rootAgentId).session.sessionId,
+				agents,
+			},
+			pendingSpawnDrafts,
+		);
 	}
 
 	private persistTree(): Promise<void> {
@@ -1128,35 +1053,8 @@ export class Orchestrator {
 	}
 
 	private buildSiblingBatchPrefix(parentId: string, agentId: string): string | undefined {
-		const siblings = new Map<string, { role: string; prompt: string; status: string }>();
-		const parent = this.records.get(parentId);
-		for (const childId of parent?.childIds ?? []) {
-			if (childId === agentId) {
-				continue;
-			}
-			const sibling = this.records.get(childId);
-			if (!sibling || sibling.status === "disposed") {
-				continue;
-			}
-			siblings.set(childId, {
-				role: sibling.role,
-				prompt: sibling.config.prompt,
-				status: sibling.status,
-			});
-		}
-
-		for (const draft of this.pendingSpawnDrafts.get(parentId)?.values() ?? []) {
-			if (draft.id === agentId || siblings.has(draft.id)) {
-				continue;
-			}
-			siblings.set(draft.id, {
-				role: draft.role,
-				prompt: draft.prompt,
-				status: "spawning",
-			});
-		}
-
-		if (siblings.size === 0) {
+		const siblings = buildSiblingBatchEntries(this.buildCoreState(), parentId, agentId);
+		if (siblings.length === 0) {
 			return undefined;
 		}
 
@@ -1164,8 +1062,8 @@ export class Orchestrator {
 			`<parent-sibling-batch parent="${parentId}">`,
 			"Other direct children of your parent are already active or being spawned now. Coordinate through your parent and avoid duplicating their work:",
 		];
-		for (const [siblingId, sibling] of siblings) {
-			lines.push(`- ${siblingId} (${sibling.status}): ${sibling.role} — ${sibling.prompt}`);
+		for (const sibling of siblings) {
+			lines.push(`- ${sibling.id} (${sibling.status}): ${sibling.role} — ${sibling.prompt}`);
 		}
 		lines.push("</parent-sibling-batch>");
 		return lines.join("\n");

@@ -13,8 +13,10 @@
 	},
 	"dependencies": {
 		"@pi-relay/agent-core": "^0.67.5",
+		"@pi-relay/agent-protocol": "^0.1.0",
 		"@pi-relay/ai": "^0.67.5",
 		"@pi-relay/coding-agent": "^0.67.5",
+		"@pi-relay/orchestrator-core": "^0.1.0",
 		"@sinclair/typebox": "^0.34.40"
 	},
 	"devDependencies": {

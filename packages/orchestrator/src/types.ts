@@ -7,6 +7,7 @@ import type {
 	ThinkingLevel,
 } from "@pi-relay/agent-core";
 import type { ImageContent, Message, Model, SimpleStreamOptions, TextContent, ThinkingBudgets, Transport, Usage } from "@pi-relay/ai";
+import type { OrchestratorAgentSnapshot, OrchestratorAgentStatus, OrchestratorTreeSnapshot } from "@pi-relay/agent-protocol";
 import type { AgentSessionEvent, BackgroundUsageScope, PromptSource, SessionStats, ToolDefinition, ToolInfo } from "@pi-relay/coding-agent";
 
 export type { BackgroundUsageScope, SessionStats };
@@ -31,7 +32,7 @@ export interface SubtreeUsageStats {
 	tree: SessionStats;
 }
 
-export type AgentStatus = "running" | "idle" | "disposed";
+export type AgentStatus = OrchestratorAgentStatus;
 
 export type AgentCustomType = "agent_report" | "agent_idle" | "agent_directive" | "agent_roster";
 
@@ -177,26 +178,9 @@ export interface ToolCallRecord {
 	status: "running" | "completed" | "aborted" | "timed_out";
 }
 
-export interface AgentTreeMetadataEntry {
-	id: string;
-	parentId: string | null;
-	childIds: string[];
-	role: string;
-	status: AgentStatus;
-	spawnConfig: SpawnConfig;
-	sessionFile: string | undefined;
-	worklogFile: string;
-	createdAt: number;
-	lastStatusChange: number;
-	lastWorklogTurn: number;
-	lastWorklogMessageCount: number;
-	turnCount?: number;
-}
+export type AgentTreeMetadataEntry = OrchestratorAgentSnapshot<SpawnConfig>;
 
-export interface AgentTreeMetadata {
-	sessionId: string;
-	agents: Record<string, AgentTreeMetadataEntry>;
-}
+export type AgentTreeMetadata = OrchestratorTreeSnapshot<SpawnConfig>;
 
 export interface AgentRecord {
 	id: string;

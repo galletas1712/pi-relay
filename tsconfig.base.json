@@ -16,7 +16,11 @@
 		"resolveJsonModule": true,
 		"paths": {
 			"@pi-relay/agent-core": ["./packages/agent-core/dist/index.d.ts"],
-			"@pi-relay/agent-core/*": ["./packages/agent-core/dist/*"]
+			"@pi-relay/agent-core/*": ["./packages/agent-core/dist/*"],
+			"@pi-relay/agent-protocol": ["./packages/agent-protocol/dist/index.d.ts"],
+			"@pi-relay/agent-protocol/*": ["./packages/agent-protocol/dist/*"],
+			"@pi-relay/orchestrator-core": ["./packages/orchestrator-core/dist/index.d.ts"],
+			"@pi-relay/orchestrator-core/*": ["./packages/orchestrator-core/dist/*"]
 		},
 		"allowImportingTsExtensions": false,
 		"experimentalDecorators": true,

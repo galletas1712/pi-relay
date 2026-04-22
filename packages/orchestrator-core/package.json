@@ -1,0 +1,26 @@
+{
+  "name": "@pi-relay/orchestrator-core",
+  "version": "0.1.0",
+  "description": "Pure orchestrator core state, reducer, and selectors",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "clean": "shx rm -rf dist",
+    "build": "tsgo -p tsconfig.build.json",
+    "dev": "tsgo -p tsconfig.build.json --watch --preserveWatchOutput",
+    "test": "vitest --run"
+  },
+  "dependencies": {
+    "@pi-relay/agent-protocol": "^0.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.5",
+    "shx": "^0.4.0",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}
