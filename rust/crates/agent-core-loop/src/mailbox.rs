@@ -140,7 +140,7 @@ impl Mailbox {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::EventId;
+    use crate::ids::ToolCallId;
     use crate::message::ToolResultStatus;
 
     #[test]
@@ -152,8 +152,7 @@ mod tests {
                 MailboxItem::Event(MailboxEvent::ToolResult {
                     turn_id: TurnId(1),
                     result: ToolResultMessage {
-                        id: EventId(1),
-                        tool_call_id: EventId(2),
+                        tool_call_id: ToolCallId(2),
                         tool_name: "bash".to_string(),
                         output: "ok".to_string(),
                         status: ToolResultStatus::Success,
@@ -179,8 +178,7 @@ mod tests {
             Some(MailboxItem::Event(MailboxEvent::ToolResult {
                 turn_id: TurnId(1),
                 result: ToolResultMessage {
-                    id: EventId(1),
-                    tool_call_id: EventId(2),
+                    tool_call_id: ToolCallId(2),
                     tool_name: "bash".to_string(),
                     output: "ok".to_string(),
                     status: ToolResultStatus::Success,
@@ -192,8 +190,7 @@ mod tests {
             Some(MailboxItem::Event(MailboxEvent::ToolResult {
                 turn_id: TurnId(1),
                 result: ToolResultMessage {
-                    id: EventId(1),
-                    tool_call_id: EventId(2),
+                    tool_call_id: ToolCallId(2),
                     tool_name: "bash".to_string(),
                     output: "ok".to_string(),
                     status: ToolResultStatus::Success,
@@ -231,7 +228,7 @@ mod tests {
                 MailboxItem::Event(MailboxEvent::ToolCallReady {
                     turn_id: TurnId(1),
                     tool_call: ToolCall {
-                        id: EventId(9),
+                        id: ToolCallId(9),
                         tool_name: "bash".to_string(),
                         args_json: "{}".to_string(),
                     },
@@ -266,7 +263,7 @@ mod tests {
                 MailboxItem::Event(MailboxEvent::ToolCallReady {
                     turn_id: TurnId(1),
                     tool_call: ToolCall {
-                        id: EventId(2),
+                        id: ToolCallId(2),
                         tool_name: "read".to_string(),
                         args_json: "{}".to_string(),
                     },
@@ -278,10 +275,7 @@ mod tests {
                 MailboxQueue::Event,
                 MailboxItem::Event(MailboxEvent::AssistantMessage {
                     turn_id: TurnId(1),
-                    assistant: AssistantMessage {
-                        id: EventId(1),
-                        items: Vec::new(),
-                    },
+                    assistant: AssistantMessage { items: Vec::new() },
                 }),
             )
             .unwrap();
@@ -290,10 +284,7 @@ mod tests {
             mailbox.front(MailboxQueue::Event),
             Some(MailboxItem::Event(MailboxEvent::AssistantMessage {
                 turn_id: TurnId(1),
-                assistant: AssistantMessage {
-                    id: EventId(1),
-                    items: Vec::new(),
-                },
+                assistant: AssistantMessage { items: Vec::new() },
             }))
         );
     }

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::event::{AgentAction, AgentEvent, TurnOutcome};
-use crate::ids::{EventId, TurnId};
+use crate::ids::TurnId;
 use crate::mailbox::{Mailbox, MailboxEvent, MailboxItem, MailboxQueue};
 use crate::message::{
     AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, UserInput, UserMessage,
@@ -54,7 +54,6 @@ pub struct AgentCoreLoop {
     pub phase: Phase,
     pub last_turn_id: TurnId,
     action_outbox: VecDeque<AgentAction>,
-    next_event_id: EventId,
     interrupt_requested: bool,
 }
 
@@ -66,7 +65,6 @@ impl Default for AgentCoreLoop {
             phase: Phase::Idle,
             last_turn_id: TurnId::default(),
             action_outbox: VecDeque::new(),
-            next_event_id: EventId::first(),
             interrupt_requested: false,
         }
     }
@@ -80,7 +78,6 @@ impl AgentCoreLoop {
     pub fn from_transcript(mut transcript: Vec<AgentEvent>) -> Self {
         let mut last_turn_id = TurnId::default();
         let mut open_turn = None;
-        let mut max_event_id = 0_u64;
 
         for event in &transcript {
             match event {
@@ -88,22 +85,11 @@ impl AgentCoreLoop {
                     last_turn_id = last_turn_id.max(*turn_id);
                     open_turn = Some(*turn_id);
                 }
-                AgentEvent::UserMessage(message) => {
-                    max_event_id = max_event_id.max(message.id.0);
-                }
-                AgentEvent::AssistantMessage(message) => {
-                    max_event_id = max_event_id.max(message.id.0);
-                    for tool_call in message.tool_calls() {
-                        max_event_id = max_event_id.max(tool_call.id.0);
-                    }
-                }
-                AgentEvent::ToolCallStarted { turn_id, tool_call } => {
+                AgentEvent::UserMessage(_)
+                | AgentEvent::AssistantMessage(_)
+                | AgentEvent::ToolResult(_) => {}
+                AgentEvent::ToolCallStarted { turn_id, .. } => {
                     last_turn_id = last_turn_id.max(*turn_id);
-                    max_event_id = max_event_id.max(tool_call.id.0);
-                }
-                AgentEvent::ToolResult(result) => {
-                    max_event_id = max_event_id.max(result.id.0);
-                    max_event_id = max_event_id.max(result.tool_call_id.0);
                 }
                 AgentEvent::TurnFinished { turn_id, .. } => {
                     last_turn_id = last_turn_id.max(*turn_id);
@@ -134,18 +120,12 @@ impl AgentCoreLoop {
             _ => Phase::Idle,
         };
 
-        let next_event_id = match max_event_id {
-            0 => EventId::first(),
-            value => EventId(value + 1),
-        };
-
         Self {
             mailbox: Mailbox::default(),
             transcript,
             phase,
             last_turn_id,
             action_outbox: VecDeque::new(),
-            next_event_id,
             interrupt_requested: false,
         }
     }
@@ -424,11 +404,8 @@ impl AgentCoreLoop {
             Phase::RunningTool { turn_id, tool_call } => {
                 self.phase = Phase::Interrupted;
 
-                let interrupted = ToolResultMessage::interrupted(
-                    EventId::take_next(&mut self.next_event_id),
-                    tool_call.id,
-                    tool_call.tool_name.clone(),
-                );
+                let interrupted =
+                    ToolResultMessage::interrupted(tool_call.id, tool_call.tool_name.clone());
                 self.append_event(AgentEvent::ToolResult(interrupted));
                 self.append_event(AgentEvent::TurnFinished {
                     turn_id,
@@ -441,10 +418,7 @@ impl AgentCoreLoop {
     }
 
     fn create_user_message(&mut self, input: UserInput) -> UserMessage {
-        UserMessage {
-            id: EventId::take_next(&mut self.next_event_id),
-            text: input.text,
-        }
+        UserMessage { text: input.text }
     }
 
     fn append_event(&mut self, event: AgentEvent) {
@@ -460,27 +434,23 @@ impl AgentCoreLoop {
 mod tests {
     use super::*;
     use crate::event::{AgentAction, AgentEvent, TurnOutcome};
+    use crate::ids::ToolCallId;
     use crate::message::AssistantItem;
 
-    fn assistant_message(id: EventId, items: Vec<AssistantItem>) -> AssistantMessage {
-        AssistantMessage { id, items }
+    fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {
+        AssistantMessage { items }
     }
 
-    fn tool_call(loop_state: &mut AgentCoreLoop, name: &str) -> ToolCall {
+    fn tool_call(next_tool_call_id: &mut ToolCallId, name: &str) -> ToolCall {
         ToolCall {
-            id: EventId::take_next(&mut loop_state.next_event_id),
+            id: ToolCallId::take_next(next_tool_call_id),
             tool_name: name.to_string(),
             args_json: "{}".to_string(),
         }
     }
 
-    fn successful_tool_result(
-        loop_state: &mut AgentCoreLoop,
-        tool_call_id: EventId,
-        tool_name: &str,
-    ) -> ToolResultMessage {
+    fn successful_tool_result(tool_call_id: ToolCallId, tool_name: &str) -> ToolResultMessage {
         ToolResultMessage {
-            id: EventId::take_next(&mut loop_state.next_event_id),
             tool_call_id,
             tool_name: tool_name.to_string(),
             output: "ok".to_string(),
@@ -499,7 +469,6 @@ mod tests {
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
-                    id: EventId(1),
                     text: "hello".to_string(),
                 }),
             ]
@@ -514,17 +483,15 @@ mod tests {
     #[test]
     fn model_completion_with_a_tool_call_appends_assistant_and_starts_the_tool() {
         let mut loop_state = AgentCoreLoop::new();
+        let mut next_tool_call_id = ToolCallId::first();
         loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
         loop_state.drain_actions();
 
-        let tool_call = tool_call(&mut loop_state, "bash");
-        let assistant = assistant_message(
-            EventId::take_next(&mut loop_state.next_event_id),
-            vec![
-                AssistantItem::Text("Let me inspect that.".to_string()),
-                AssistantItem::ToolCall(tool_call.clone()),
-            ],
-        );
+        let tool_call = tool_call(&mut next_tool_call_id, "bash");
+        let assistant = assistant_message(vec![
+            AssistantItem::Text("Let me inspect that.".to_string()),
+            AssistantItem::ToolCall(tool_call.clone()),
+        ]);
 
         loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
             turn_id: TurnId(1),
@@ -536,7 +503,6 @@ mod tests {
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
-                    id: EventId(1),
                     text: "hello".to_string(),
                 }),
                 AgentEvent::AssistantMessage(assistant.clone()),
@@ -565,21 +531,19 @@ mod tests {
     #[test]
     fn tool_completion_appends_a_result_and_resumes_the_model() {
         let mut loop_state = AgentCoreLoop::new();
+        let mut next_tool_call_id = ToolCallId::first();
         loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
         loop_state.drain_actions();
 
-        let tool_call = tool_call(&mut loop_state, "bash");
-        let assistant = assistant_message(
-            EventId::take_next(&mut loop_state.next_event_id),
-            vec![AssistantItem::ToolCall(tool_call.clone())],
-        );
+        let tool_call = tool_call(&mut next_tool_call_id, "bash");
+        let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
         loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
             turn_id: TurnId(1),
             assistant,
         }));
         loop_state.drain_actions();
 
-        let result = successful_tool_result(&mut loop_state, tool_call.id, "bash");
+        let result = successful_tool_result(tool_call.id, "bash");
         loop_state.on_input(AgentInput::Event(MailboxEvent::ToolResult {
             turn_id: TurnId(1),
             result: result.clone(),
@@ -599,25 +563,23 @@ mod tests {
     #[test]
     fn multiple_tool_calls_run_before_the_model_resumes() {
         let mut loop_state = AgentCoreLoop::new();
+        let mut next_tool_call_id = ToolCallId::first();
         loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
         loop_state.drain_actions();
 
-        let first = tool_call(&mut loop_state, "bash");
-        let second = tool_call(&mut loop_state, "read");
-        let assistant = assistant_message(
-            EventId::take_next(&mut loop_state.next_event_id),
-            vec![
-                AssistantItem::ToolCall(first.clone()),
-                AssistantItem::ToolCall(second.clone()),
-            ],
-        );
+        let first = tool_call(&mut next_tool_call_id, "bash");
+        let second = tool_call(&mut next_tool_call_id, "read");
+        let assistant = assistant_message(vec![
+            AssistantItem::ToolCall(first.clone()),
+            AssistantItem::ToolCall(second.clone()),
+        ]);
         loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
             turn_id: TurnId(1),
             assistant,
         }));
         loop_state.drain_actions();
 
-        let first_result = successful_tool_result(&mut loop_state, first.id, "bash");
+        let first_result = successful_tool_result(first.id, "bash");
         loop_state.on_input(AgentInput::Event(MailboxEvent::ToolResult {
             turn_id: TurnId(1),
             result: first_result.clone(),
@@ -653,14 +615,12 @@ mod tests {
     #[test]
     fn interrupting_a_running_tool_closes_the_turn_and_starts_queued_steer_work() {
         let mut loop_state = AgentCoreLoop::new();
+        let mut next_tool_call_id = ToolCallId::first();
         loop_state.on_input(AgentInput::FollowUp(UserInput::from("initial")));
         loop_state.drain_actions();
 
-        let tool_call = tool_call(&mut loop_state, "bash");
-        let assistant = assistant_message(
-            EventId::take_next(&mut loop_state.next_event_id),
-            vec![AssistantItem::ToolCall(tool_call.clone())],
-        );
+        let tool_call = tool_call(&mut next_tool_call_id, "bash");
+        let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
         loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
             turn_id: TurnId(1),
             assistant,
@@ -678,29 +638,22 @@ mod tests {
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
-                    id: EventId(1),
                     text: "initial".to_string(),
                 }),
-                AgentEvent::AssistantMessage(assistant_message(
-                    EventId(3),
-                    vec![AssistantItem::ToolCall(tool_call.clone())],
-                )),
+                AgentEvent::AssistantMessage(assistant_message(vec![AssistantItem::ToolCall(
+                    tool_call.clone(),
+                )])),
                 AgentEvent::ToolCallStarted {
                     turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
-                AgentEvent::ToolResult(ToolResultMessage::interrupted(
-                    EventId(4),
-                    tool_call.id,
-                    "bash",
-                )),
+                AgentEvent::ToolResult(ToolResultMessage::interrupted(tool_call.id, "bash")),
                 AgentEvent::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Interrupted,
                 },
                 AgentEvent::TurnStarted { turn_id: TurnId(2) },
                 AgentEvent::UserMessage(UserMessage {
-                    id: EventId(5),
                     text: "urgent".to_string(),
                 }),
             ]
@@ -728,7 +681,6 @@ mod tests {
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
-                    id: EventId(1),
                     text: "hello".to_string(),
                 }),
                 AgentEvent::TurnFinished {
@@ -752,10 +704,7 @@ mod tests {
         loop_state.on_input(AgentInput::Interrupt);
         loop_state.drain_actions();
 
-        let stale_assistant = assistant_message(
-            EventId::take_next(&mut loop_state.next_event_id),
-            vec![AssistantItem::Text("stale".to_string())],
-        );
+        let stale_assistant = assistant_message(vec![AssistantItem::Text("stale".to_string())]);
         loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
             turn_id: TurnId(1),
             assistant: stale_assistant,
@@ -772,10 +721,7 @@ mod tests {
         loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
         loop_state.drain_actions();
 
-        let assistant = assistant_message(
-            EventId::take_next(&mut loop_state.next_event_id),
-            vec![AssistantItem::Text("hi".to_string())],
-        );
+        let assistant = assistant_message(vec![AssistantItem::Text("hi".to_string())]);
         loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
             turn_id: TurnId(1),
             assistant: assistant.clone(),
@@ -785,7 +731,6 @@ mod tests {
             loop_state.compact_transcript(),
             vec![
                 CompactMessage::User(UserMessage {
-                    id: EventId(1),
                     text: "hello".to_string(),
                 }),
                 CompactMessage::Assistant(assistant),
@@ -798,7 +743,6 @@ mod tests {
         let transcript = vec![
             AgentEvent::TurnStarted { turn_id: TurnId(7) },
             AgentEvent::UserMessage(UserMessage {
-                id: EventId(1),
                 text: "hello".to_string(),
             }),
         ];
@@ -810,7 +754,6 @@ mod tests {
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(7) },
                 AgentEvent::UserMessage(UserMessage {
-                    id: EventId(1),
                     text: "hello".to_string(),
                 }),
                 AgentEvent::TurnFinished {
@@ -828,7 +771,6 @@ mod tests {
         let transcript = vec![
             AgentEvent::TurnStarted { turn_id: TurnId(2) },
             AgentEvent::UserMessage(UserMessage {
-                id: EventId(3),
                 text: "hello".to_string(),
             }),
             AgentEvent::TurnFinished {

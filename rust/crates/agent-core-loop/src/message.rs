@@ -1,4 +1,4 @@
-use crate::ids::EventId;
+use crate::ids::ToolCallId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactMessage {
@@ -27,13 +27,11 @@ impl From<String> for UserInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserMessage {
-    pub id: EventId,
     pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantMessage {
-    pub id: EventId,
     pub items: Vec<AssistantItem>,
 }
 
@@ -54,7 +52,7 @@ pub enum AssistantItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
-    pub id: EventId,
+    pub id: ToolCallId,
     pub tool_name: String,
     pub args_json: String,
 }
@@ -68,17 +66,15 @@ pub enum ToolResultStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultMessage {
-    pub id: EventId,
-    pub tool_call_id: EventId,
+    pub tool_call_id: ToolCallId,
     pub tool_name: String,
     pub output: String,
     pub status: ToolResultStatus,
 }
 
 impl ToolResultMessage {
-    pub fn interrupted(id: EventId, tool_call_id: EventId, tool_name: impl Into<String>) -> Self {
+    pub fn interrupted(tool_call_id: ToolCallId, tool_name: impl Into<String>) -> Self {
         Self {
-            id,
             tool_call_id,
             tool_name: tool_name.into(),
             output: "interrupted".to_string(),

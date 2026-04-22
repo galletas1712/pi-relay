@@ -8,9 +8,9 @@ impl TurnId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EventId(pub u64);
+pub struct ToolCallId(pub u64);
 
-impl EventId {
+impl ToolCallId {
     pub fn first() -> Self {
         Self(1)
     }
