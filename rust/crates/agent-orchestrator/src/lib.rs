@@ -51,7 +51,7 @@ impl AgentOrchestrator {
     }
 
     pub fn enqueue_input(&mut self, id: &str, input: AgentInput) -> Result<(), OrchestratorError> {
-        self.session_mut(id)?.core_mut().enqueue_input(input);
+        self.session_mut(id)?.enqueue_input(input);
         Ok(())
     }
 
@@ -160,15 +160,10 @@ mod tests {
             .enqueue_input("root", AgentInput::FollowUp("hello".to_string()))
             .expect("session should exist");
 
-        assert_eq!(
-            orchestrator
-                .session("root")
-                .expect("session should exist")
-                .core()
-                .mailbox
-                .follow_up_len(),
-            1
-        );
+        assert!(orchestrator
+            .session("root")
+            .expect("session should exist")
+            .has_pending_work());
     }
 
     #[test]

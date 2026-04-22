@@ -3,7 +3,7 @@
 mod session_log;
 mod transcript;
 
-use agent_core::{AgentCoreLoop, AgentState};
+use agent_core::AgentCoreLoop;
 
 pub use crate::session_log::{
     BranchSummaryEntry, CompactionEntry, CompactionPlan, CompactionSettings, SessionContext,
@@ -12,7 +12,7 @@ pub use crate::session_log::{
 pub use crate::transcript::Transcript;
 
 // Re-export record types so downstream callers have a single import home.
-pub use agent_core::{TranscriptRecord, TurnOutcome};
+pub use agent_core::{AgentInput, TranscriptRecord, TurnId, TurnOutcome};
 
 /// Session shell around the pure core loop.
 ///
@@ -36,7 +36,7 @@ impl Default for AgentSession {
 impl AgentSession {
     pub fn new() -> Self {
         Self {
-            core: AgentCoreLoop::resume_at_boundary(agent_core::TurnId::default()),
+            core: AgentCoreLoop::resume_at_boundary(TurnId::default()),
             log: SessionLog::new(),
         }
     }
@@ -67,12 +67,28 @@ impl AgentSession {
         })
     }
 
-    pub fn core(&self) -> &AgentCoreLoop {
-        &self.core
+    /// Enqueue a new input into the underlying core loop.
+    ///
+    /// This is the only supported way to feed the core from outside the
+    /// session; the core itself is not exposed so log absorption in `drive`
+    /// cannot be bypassed.
+    pub fn enqueue_input(&mut self, input: AgentInput) {
+        self.core.enqueue_input(input);
     }
 
-    pub fn core_mut(&mut self) -> &mut AgentCoreLoop {
-        &mut self.core
+    /// The most recent turn id observed by the core loop.
+    pub fn last_turn_id(&self) -> TurnId {
+        self.core.last_turn_id()
+    }
+
+    /// True when the core loop is between turns and has no in-flight work.
+    pub fn is_idle(&self) -> bool {
+        self.core.is_idle()
+    }
+
+    /// True when the core loop's mailbox still has queued inputs.
+    pub fn has_pending_work(&self) -> bool {
+        self.core.has_pending_work()
     }
 
     /// Materialized view of the session history derived from the log.
@@ -98,9 +114,9 @@ impl AgentSession {
 
     pub fn quiescence(&self, external_work: ExternalWork) -> SessionQuiescence {
         SessionQuiescence {
-            core_idle: self.core.state == AgentState::Idle,
+            core_idle: self.core.is_idle(),
             durable_turn_boundary: self.log.is_turn_boundary(),
-            mailbox_empty: self.core.mailbox.total_len() == 0,
+            mailbox_empty: !self.core.has_pending_work(),
             external_work_empty: external_work.is_empty(),
         }
     }
@@ -294,9 +310,7 @@ mod tests {
     fn quiescence_requires_idle_core_empty_queues_and_no_external_work() {
         let mut session = AgentSession::new();
 
-        session
-            .core_mut()
-            .enqueue_input(agent_core::AgentInput::FollowUp("hello".to_string()));
+        session.enqueue_input(AgentInput::FollowUp("hello".to_string()));
         assert!(!session.is_quiescent(ExternalWork::NONE));
         assert!(!session
             .quiescence(ExternalWork {
@@ -309,9 +323,7 @@ mod tests {
     #[test]
     fn transcript_replacement_is_only_allowed_at_quiescent_boundaries() {
         let mut session = AgentSession::new();
-        session
-            .core_mut()
-            .enqueue_input(agent_core::AgentInput::FollowUp("hello".to_string()));
+        session.enqueue_input(AgentInput::FollowUp("hello".to_string()));
 
         let busy = session
             .replace_transcript_at_boundary(finished_transcript("compact"), ExternalWork::NONE)
@@ -347,16 +359,12 @@ mod tests {
             items: vec![AssistantItem::Text("hi".to_string())],
         };
 
-        session
-            .core_mut()
-            .enqueue_input(agent_core::AgentInput::FollowUp("hello".to_string()));
+        session.enqueue_input(AgentInput::FollowUp("hello".to_string()));
         session.drive();
-        session
-            .core_mut()
-            .enqueue_input(agent_core::AgentInput::ModelCompleted {
-                turn_id: TurnId(1),
-                assistant: assistant.clone(),
-            });
+        session.enqueue_input(AgentInput::ModelCompleted {
+            turn_id: TurnId(1),
+            assistant: assistant.clone(),
+        });
         session.drive();
 
         assert_eq!(
@@ -371,8 +379,9 @@ mod tests {
                 },
             ]
         );
-        // drain happens inside `drive`; the core no longer holds a record buffer.
-        assert!(session.core_mut().drain_records().is_empty());
+        // Driving again absorbs nothing new; the core buffer was drained.
+        session.drive();
+        assert_eq!(session.transcript().records().len(), 4);
     }
 
     #[test]
@@ -488,8 +497,8 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(session.core().state, agent_core::AgentState::Idle);
-        assert_eq!(session.core().last_turn_id, TurnId(7));
+        assert!(session.is_idle());
+        assert_eq!(session.last_turn_id(), TurnId(7));
     }
 
     #[test]
@@ -506,7 +515,7 @@ mod tests {
         let session = AgentSession::from_records(transcript.clone());
 
         assert_eq!(session.transcript().records(), transcript.as_slice());
-        assert_eq!(session.core().state, agent_core::AgentState::Idle);
-        assert_eq!(session.core().last_turn_id, TurnId(2));
+        assert!(session.is_idle());
+        assert_eq!(session.last_turn_id(), TurnId(2));
     }
 }

@@ -9,9 +9,9 @@ use crate::state::AgentState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCoreLoop {
-    pub mailbox: Mailbox,
-    pub state: AgentState,
-    pub last_turn_id: TurnId,
+    mailbox: Mailbox,
+    state: AgentState,
+    last_turn_id: TurnId,
     action_outbox: VecDeque<AgentAction>,
     record_outbox: VecDeque<TranscriptRecord>,
 }
@@ -49,6 +49,27 @@ impl AgentCoreLoop {
 
     pub fn enqueue_input(&mut self, input: AgentInput) {
         self.mailbox.push_input(input);
+    }
+
+    /// True when the core is between turns and has no in-flight model/tool work.
+    ///
+    /// Exposed so callers can observe liveness without reaching into the
+    /// underlying `AgentState` enum, which is a private implementation detail.
+    pub fn is_idle(&self) -> bool {
+        self.state == AgentState::Idle
+    }
+
+    /// True when the mailbox still has queued inputs waiting to be processed.
+    ///
+    /// Exposed so callers can observe liveness without reaching into the
+    /// underlying `Mailbox`, which is a private implementation detail.
+    pub fn has_pending_work(&self) -> bool {
+        self.mailbox.total_len() > 0
+    }
+
+    /// The most recent turn id observed by the core.
+    pub fn last_turn_id(&self) -> TurnId {
+        self.last_turn_id
     }
 
     pub fn drain_actions(&mut self) -> Vec<AgentAction> {

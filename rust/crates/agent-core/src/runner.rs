@@ -136,7 +136,6 @@ mod tests {
     use crate::ids::TurnId;
     use crate::message::{AssistantItem, AssistantMessage};
     use crate::record::TurnOutcome;
-    use crate::state::AgentState;
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
@@ -202,6 +201,6 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(runner.core().state, AgentState::Idle);
+        assert!(runner.core().is_idle());
     }
 }

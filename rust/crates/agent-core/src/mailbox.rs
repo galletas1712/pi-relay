@@ -91,19 +91,12 @@ impl Mailbox {
         }
     }
 
-    pub fn notification_len(&self) -> usize {
-        self.notifications.len()
-    }
-
-    pub fn steer_len(&self) -> usize {
+    #[cfg(test)]
+    pub(crate) fn steer_len(&self) -> usize {
         self.steer.len()
     }
 
-    pub fn follow_up_len(&self) -> usize {
-        self.follow_up.len()
-    }
-
-    pub fn total_len(&self) -> usize {
+    pub(crate) fn total_len(&self) -> usize {
         self.notifications.len() + self.steer.len() + self.follow_up.len()
     }
 }
