@@ -17,13 +17,14 @@ import { readdir, readFile, stat } from "fs/promises";
 import { join, resolve } from "path";
 import { v7 as uuidv7 } from "uuid";
 import { getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.js";
+import { type BashExecutionMessage, type CustomMessage } from "./messages.js";
 import {
-	type BashExecutionMessage,
-	type CustomMessage,
-	createBranchSummaryMessage,
-	createCompactionSummaryMessage,
-	createCustomMessage,
-} from "./messages.js";
+	buildSessionContext as buildSessionContextFromTree,
+	buildSessionTree,
+	getLatestSessionName,
+	getSessionBranch,
+	getSessionChildren,
+} from "./session-tree.js";
 
 export const CURRENT_SESSION_VERSION = 3;
 
@@ -307,119 +308,13 @@ export function getLatestCompactionEntry(entries: SessionEntry[]): CompactionEnt
 	return null;
 }
 
-/**
- * Build the session context from entries using tree traversal.
- * If leafId is provided, walks from that entry to root.
- * Handles compaction and branch summaries along the path.
- */
-export function buildSessionContext(
-	entries: SessionEntry[],
-	leafId?: string | null,
-	byId?: Map<string, SessionEntry>,
-): SessionContext {
-	// Build uuid index if not available
-	if (!byId) {
-		byId = new Map<string, SessionEntry>();
-		for (const entry of entries) {
-			byId.set(entry.id, entry);
-		}
-	}
-
-	// Find leaf
-	let leaf: SessionEntry | undefined;
-	if (leafId === null) {
-		// Explicitly null - return no messages (navigated to before first entry)
-		return { messages: [], thinkingLevel: "off", model: null };
-	}
-	if (leafId) {
-		leaf = byId.get(leafId);
-	}
-	if (!leaf) {
-		// Fallback to last entry (when leafId is undefined)
-		leaf = entries[entries.length - 1];
-	}
-
-	if (!leaf) {
-		return { messages: [], thinkingLevel: "off", model: null };
-	}
-
-	// Walk from leaf to root, collecting path
-	const path: SessionEntry[] = [];
-	let current: SessionEntry | undefined = leaf;
-	while (current) {
-		path.unshift(current);
-		current = current.parentId ? byId.get(current.parentId) : undefined;
-	}
-
-	// Extract settings and find compaction
-	let thinkingLevel = "off";
-	let model: { provider: string; modelId: string } | null = null;
-	let compaction: CompactionEntry | null = null;
-
-	for (const entry of path) {
-		if (entry.type === "thinking_level_change") {
-			thinkingLevel = entry.thinkingLevel;
-		} else if (entry.type === "model_change") {
-			model = { provider: entry.provider, modelId: entry.modelId };
-		} else if (entry.type === "message" && entry.message.role === "assistant") {
-			model = { provider: entry.message.provider, modelId: entry.message.model };
-		} else if (entry.type === "compaction") {
-			compaction = entry;
-		}
-	}
-
-	// Build messages and collect corresponding entries
-	// When there's a compaction, we need to:
-	// 1. Emit summary first (entry = compaction)
-	// 2. Emit kept messages (from firstKeptEntryId up to compaction)
-	// 3. Emit messages after compaction
-	const messages: AgentMessage[] = [];
-
-	const appendMessage = (entry: SessionEntry) => {
-		if (entry.type === "message") {
-			messages.push(entry.message);
-		} else if (entry.type === "custom_message") {
-			messages.push(
-				createCustomMessage(entry.customType, entry.content, entry.display, entry.details, entry.timestamp),
-			);
-		} else if (entry.type === "branch_summary" && entry.summary) {
-			messages.push(createBranchSummaryMessage(entry.summary, entry.fromId, entry.timestamp));
-		}
-	};
-
-	if (compaction) {
-		// Emit summary first
-		messages.push(createCompactionSummaryMessage(compaction.summary, compaction.tokensBefore, compaction.timestamp));
-
-		// Find compaction index in path
-		const compactionIdx = path.findIndex((e) => e.type === "compaction" && e.id === compaction.id);
-
-		// Emit kept messages (before compaction, starting from firstKeptEntryId)
-		let foundFirstKept = false;
-		for (let i = 0; i < compactionIdx; i++) {
-			const entry = path[i];
-			if (entry.id === compaction.firstKeptEntryId) {
-				foundFirstKept = true;
-			}
-			if (foundFirstKept) {
-				appendMessage(entry);
-			}
-		}
-
-		// Emit messages after compaction
-		for (let i = compactionIdx + 1; i < path.length; i++) {
-			const entry = path[i];
-			appendMessage(entry);
-		}
-	} else {
-		// No compaction - emit all messages, handle branch summaries and custom messages
-		for (const entry of path) {
-			appendMessage(entry);
-		}
-	}
-
-	return { messages, thinkingLevel, model };
-}
+export {
+	buildSessionContextFromTree as buildSessionContext,
+	buildSessionTree,
+	getLatestSessionName,
+	getSessionBranch,
+	getSessionChildren,
+};
 
 /**
  * Compute the default session directory for a cwd.
@@ -569,15 +464,9 @@ async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
 		let messageCount = 0;
 		let firstMessage = "";
 		const allMessages: string[] = [];
-		let name: string | undefined;
+		const name = getLatestSessionName(entries);
 
 		for (const entry of entries) {
-			// Extract session name (use latest, including explicit clears)
-			if (entry.type === "session_info") {
-				const infoEntry = entry as SessionInfoEntry;
-				name = infoEntry.name?.trim() || undefined;
-			}
-
 			if (entry.type !== "message") continue;
 			messageCount++;
 
@@ -922,16 +811,7 @@ export class SessionManager {
 
 	/** Get the current session name from the latest session_info entry, if any. */
 	getSessionName(): string | undefined {
-		// Walk entries in reverse to find the latest session_info entry.
-		// Empty names explicitly clear the session title.
-		const entries = this.getEntries();
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const entry = entries[i];
-			if (entry.type === "session_info") {
-				return entry.name?.trim() || undefined;
-			}
-		}
-		return undefined;
+		return getLatestSessionName(this.getEntries());
 	}
 
 	/**
@@ -982,13 +862,7 @@ export class SessionManager {
 	 * Get all direct children of an entry.
 	 */
 	getChildren(parentId: string): SessionEntry[] {
-		const children: SessionEntry[] = [];
-		for (const entry of this.byId.values()) {
-			if (entry.parentId === parentId) {
-				children.push(entry);
-			}
-		}
-		return children;
+		return getSessionChildren(this.byId, parentId);
 	}
 
 	/**
@@ -1032,14 +906,7 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
-		const path: SessionEntry[] = [];
-		const startId = fromId ?? this.leafId;
-		let current = startId ? this.byId.get(startId) : undefined;
-		while (current) {
-			path.unshift(current);
-			current = current.parentId ? this.byId.get(current.parentId) : undefined;
-		}
-		return path;
+		return getSessionBranch(this.byId, fromId ?? this.leafId);
 	}
 
 	/**
@@ -1047,7 +914,7 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.leafId, this.byId);
+		return buildSessionContextFromTree(this.getEntries(), this.leafId, this.byId);
 	}
 
 	/**
@@ -1073,43 +940,7 @@ export class SessionManager {
 	 * Orphaned entries (broken parent chain) are also returned as roots.
 	 */
 	getTree(): SessionTreeNode[] {
-		const entries = this.getEntries();
-		const nodeMap = new Map<string, SessionTreeNode>();
-		const roots: SessionTreeNode[] = [];
-
-		// Create nodes with resolved labels
-		for (const entry of entries) {
-			const label = this.labelsById.get(entry.id);
-			const labelTimestamp = this.labelTimestampsById.get(entry.id);
-			nodeMap.set(entry.id, { entry, children: [], label, labelTimestamp });
-		}
-
-		// Build tree
-		for (const entry of entries) {
-			const node = nodeMap.get(entry.id)!;
-			if (entry.parentId === null || entry.parentId === entry.id) {
-				roots.push(node);
-			} else {
-				const parent = nodeMap.get(entry.parentId);
-				if (parent) {
-					parent.children.push(node);
-				} else {
-					// Orphan - treat as root
-					roots.push(node);
-				}
-			}
-		}
-
-		// Sort children by timestamp (oldest first, newest at bottom)
-		// Use iterative approach to avoid stack overflow on deep trees
-		const stack: SessionTreeNode[] = [...roots];
-		while (stack.length > 0) {
-			const node = stack.pop()!;
-			node.children.sort((a, b) => new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime());
-			stack.push(...node.children);
-		}
-
-		return roots;
+		return buildSessionTree(this.getEntries(), this.labelsById, this.labelTimestampsById);
 	}
 
 	// =========================================================================
