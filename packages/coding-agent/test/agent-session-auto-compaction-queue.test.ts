@@ -163,7 +163,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			{ deliverAs: "steer" },
 		);
 
-		expect(session.agent.hasQueuedMessages()).toBe(true);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
 
 		resolveCompaction?.({
 			summary: "compacted",
@@ -211,7 +211,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			{ deliverAs: "steer" },
 		);
 
-		expect(session.agent.hasQueuedMessages()).toBe(true);
+		expect(session.agent.hasQueuedMessages()).toBe(false);
 
 		resolveCompaction?.({
 			summary: "compacted",

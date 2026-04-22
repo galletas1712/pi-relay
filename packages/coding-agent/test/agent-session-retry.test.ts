@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { Agent, type AgentEvent, type AgentTool } from "@pi-relay/agent-core";
 import { type AssistantMessage, type AssistantMessageEvent, EventStream, getModel } from "@pi-relay/ai";
 import { Type } from "@sinclair/typebox";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
@@ -314,5 +314,87 @@ describe("AgentSession retry", () => {
 		// A follow-up prompt must work (no "Agent is already processing" error)
 		await session.prompt("Follow-up");
 		expect(callCount).toBe(4);
+	});
+
+	it("resumes queued custom messages after retries are exhausted", async () => {
+		let callCount = 0;
+
+		const model = getModel("anthropic", "claude-sonnet-4-5")!;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: "Test", tools: [] },
+			streamFn: () => {
+				callCount++;
+				const stream = new MockAssistantStream();
+				queueMicrotask(() => {
+					if (callCount <= 2) {
+						const msg = createAssistantMessage("", {
+							stopReason: "error",
+							errorMessage: "overloaded_error",
+						});
+						stream.push({ type: "start", partial: msg });
+						stream.push({ type: "error", reason: "error", error: msg });
+						return;
+					}
+
+					const msg = createAssistantMessage("Processed queued idle message");
+					stream.push({ type: "start", partial: msg });
+					stream.push({ type: "done", reason: "stop", message: msg });
+				});
+				return stream;
+			},
+		});
+
+		const sessionManager = SessionManager.inMemory();
+		const settingsManager = SettingsManager.create(tempDir, tempDir);
+		const authStorage = AuthStorage.create(join(tempDir, "auth.json"));
+		const modelRegistry = ModelRegistry.create(authStorage, tempDir);
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		settingsManager.applyOverrides({ retry: { enabled: true, maxRetries: 1, baseDelayMs: 50 } });
+
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settingsManager,
+			cwd: tempDir,
+			modelRegistry,
+			resourceLoader: createTestResourceLoader(),
+		});
+
+		let resolveRetryStart = () => {};
+		const retryStarted = new Promise<void>((resolve) => {
+			resolveRetryStart = resolve;
+		});
+		session.subscribe((event) => {
+			if (event.type === "auto_retry_start") {
+				resolveRetryStart();
+			}
+		});
+
+		const promptPromise = session.prompt("Test");
+		await retryStarted;
+		expect(session.isRetrying).toBe(true);
+
+		await session.sendCustomMessage(
+			{
+				customType: "agent_idle",
+				content: [{ type: "text", text: "IDLE" }],
+				display: true,
+				details: { fromAgentId: "child-1" },
+			},
+			{ deliverAs: "steer" },
+		);
+
+		expect(session.agent.hasQueuedMessages()).toBe(false);
+
+		await promptPromise;
+		await vi.waitFor(() => {
+			expect(callCount).toBe(3);
+		});
+
+		expect(session.messages.some((message) => message.role === "custom" && message.customType === "agent_idle")).toBe(
+			true,
+		);
+		expect(session.getLastAssistantText()).toBe("Processed queued idle message");
 	});
 });

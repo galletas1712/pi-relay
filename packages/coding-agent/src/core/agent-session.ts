@@ -305,6 +305,8 @@ export class AgentSession {
 	private _followUpMessages: string[] = [];
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	private _pendingNextTurnMessages: CustomMessage[] = [];
+	/** Custom messages deferred until retry/compaction finishes, then re-enqueued. */
+	private _deferredCustomMessages: Array<{ message: CustomMessage; queueMode: "steer" | "followUp" }> = [];
 
 	// Compaction state
 	private _compactionAbortController: AbortController | undefined = undefined;
@@ -324,6 +326,7 @@ export class AgentSession {
 	private _retryAttempt = 0;
 	private _retryPromise: Promise<void> | undefined = undefined;
 	private _retryResolve: (() => void) | undefined = undefined;
+	private _queuedMessageResumeTimer: ReturnType<typeof setTimeout> | undefined = undefined;
 
 	// Bash execution state
 	private _bashAbortController: AbortController | undefined = undefined;
@@ -645,6 +648,10 @@ export class AgentSession {
 
 			this._resolveRetry();
 			await this._checkCompaction(msg);
+
+			if (this._deferredCustomMessages.length > 0 && !this.isRetrying && !this.isCompacting) {
+				this._scheduleQueuedMessageResume();
+			}
 		}
 	}
 
@@ -795,6 +802,10 @@ export class AgentSession {
 	 */
 	dispose(): void {
 		this._disconnectFromAgent();
+		if (this._queuedMessageResumeTimer) {
+			clearTimeout(this._queuedMessageResumeTimer);
+			this._queuedMessageResumeTimer = undefined;
+		}
 		this._eventListeners = [];
 	}
 
@@ -833,11 +844,37 @@ export class AgentSession {
 	}
 
 	private _scheduleQueuedMessageResume(delayMs = 100): void {
-		if (!this.agent.hasQueuedMessages()) {
+		if ((!this.agent.hasQueuedMessages() && this._deferredCustomMessages.length === 0) || this._queuedMessageResumeTimer) {
 			return;
 		}
 
-		setTimeout(() => {
+		this._queuedMessageResumeTimer = setTimeout(() => {
+			this._queuedMessageResumeTimer = undefined;
+			if (
+				(this._deferredCustomMessages.length === 0 && !this.agent.hasQueuedMessages()) ||
+				this.isStreaming ||
+				this.isRetrying ||
+				this.isCompacting
+			) {
+				return;
+			}
+
+			if (this._deferredCustomMessages.length > 0) {
+				const deferred = [...this._deferredCustomMessages];
+				this._deferredCustomMessages = [];
+				for (const { message, queueMode } of deferred) {
+					if (queueMode === "followUp") {
+						this.agent.followUp(message);
+					} else {
+						this.agent.steer(message);
+					}
+				}
+			}
+
+			if (!this.agent.hasQueuedMessages()) {
+				return;
+			}
+
 			this.agent.continue().catch(() => {});
 		}, delayMs);
 	}
@@ -1372,7 +1409,8 @@ export class AgentSession {
 	 * Send a custom message to the session. Creates a CustomMessageEntry.
 	 *
 	 * Handles three cases:
-	 * - Streaming / retry / compaction with deliverAs: queues message, processed when the next turn runs
+	 * - Streaming with deliverAs: queues directly on the active agent mailbox
+	 * - Retry / compaction with deliverAs: defers until post-turn processing finishes, then re-enqueues
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
@@ -1392,10 +1430,12 @@ export class AgentSession {
 			details: message.details,
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
-		const queueMode = options?.deliverAs ?? "steer";
+		const queueMode: "steer" | "followUp" = options?.deliverAs === "followUp" ? "followUp" : "steer";
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
-		} else if (this.isStreaming || ((this.isRetrying || this.isCompacting) && options?.deliverAs !== undefined)) {
+		} else if ((this.isRetrying || this.isCompacting) && options?.deliverAs !== undefined) {
+			this._deferredCustomMessages.push({ message: appMessage, queueMode });
+		} else if (this.isStreaming) {
 			if (queueMode === "followUp") {
 				this.agent.followUp(appMessage);
 			} else {
@@ -1853,7 +1893,7 @@ export class AgentSession {
 		} finally {
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
-			if (shouldResumeQueuedMessages || this.agent.hasQueuedMessages()) {
+			if (shouldResumeQueuedMessages || this.agent.hasQueuedMessages() || this._deferredCustomMessages.length > 0) {
 				this._scheduleQueuedMessageResume();
 			}
 		}
@@ -2118,7 +2158,7 @@ export class AgentSession {
 				setTimeout(() => {
 					this.agent.continue().catch(() => {});
 				}, 100);
-			} else if (this.agent.hasQueuedMessages()) {
+			} else if (this.agent.hasQueuedMessages() || this._deferredCustomMessages.length > 0) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
 				// Kick the loop so queued messages are actually delivered.
 				this._scheduleQueuedMessageResume();
