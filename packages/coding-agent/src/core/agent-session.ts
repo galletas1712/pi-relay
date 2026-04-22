@@ -832,6 +832,16 @@ export class AgentSession {
 		return this._retryAttempt;
 	}
 
+	private _scheduleQueuedMessageResume(delayMs = 100): void {
+		if (!this.agent.hasQueuedMessages()) {
+			return;
+		}
+
+		setTimeout(() => {
+			this.agent.continue().catch(() => {});
+		}, delayMs);
+	}
+
 	/**
 	 * Get the names of currently active tools.
 	 * Returns the names of tools currently set on the agent.
@@ -1362,7 +1372,7 @@ export class AgentSession {
 	 * Send a custom message to the session. Creates a CustomMessageEntry.
 	 *
 	 * Handles three cases:
-	 * - Streaming: queues message, processed when loop pulls from queue
+	 * - Streaming / retry / compaction with deliverAs: queues message, processed when the next turn runs
 	 * - Not streaming + triggerTurn: appends to state/session, starts new turn
 	 * - Not streaming + no trigger: appends to state/session, no turn
 	 *
@@ -1382,10 +1392,11 @@ export class AgentSession {
 			details: message.details,
 			timestamp: Date.now(),
 		} satisfies CustomMessage<T>;
+		const queueMode = options?.deliverAs ?? "steer";
 		if (options?.deliverAs === "nextTurn") {
 			this._pendingNextTurnMessages.push(appMessage);
-		} else if (this.isStreaming) {
-			if (options?.deliverAs === "followUp") {
+		} else if (this.isStreaming || ((this.isRetrying || this.isCompacting) && options?.deliverAs !== undefined)) {
+			if (queueMode === "followUp") {
 				this.agent.followUp(appMessage);
 			} else {
 				this.agent.steer(appMessage);
@@ -1712,6 +1723,7 @@ export class AgentSession {
 	 * @param customInstructions Optional instructions for the compaction summary
 	 */
 	async compact(customInstructions?: string): Promise<CompactionResult> {
+		let shouldResumeQueuedMessages = false;
 		this._disconnectFromAgent();
 		await this.abort();
 		this._compactionAbortController = new AbortController();
@@ -1824,6 +1836,7 @@ export class AgentSession {
 				aborted: false,
 				willRetry: false,
 			});
+			shouldResumeQueuedMessages = this.agent.hasQueuedMessages();
 			return compactionResult;
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
@@ -1840,6 +1853,9 @@ export class AgentSession {
 		} finally {
 			this._compactionAbortController = undefined;
 			this._reconnectToAgent();
+			if (shouldResumeQueuedMessages || this.agent.hasQueuedMessages()) {
+				this._scheduleQueuedMessageResume();
+			}
 		}
 	}
 
@@ -2105,9 +2121,7 @@ export class AgentSession {
 			} else if (this.agent.hasQueuedMessages()) {
 				// Auto-compaction can complete while follow-up/steering/custom messages are waiting.
 				// Kick the loop so queued messages are actually delivered.
-				setTimeout(() => {
-					this.agent.continue().catch(() => {});
-				}, 100);
+				this._scheduleQueuedMessageResume();
 			}
 		} catch (error) {
 			const errorMessage = error instanceof Error ? error.message : "compaction failed";

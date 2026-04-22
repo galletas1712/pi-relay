@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { Agent } from "@pi-relay/agent-core";
 import { type AssistantMessage, getModel } from "@pi-relay/ai";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as compactionModule from "../src/core/compaction/index.js";
 import { AgentSession } from "../src/core/agent-session.js";
 import { AuthStorage } from "../src/core/auth-storage.js";
 import { ModelRegistry } from "../src/core/model-registry.js";
@@ -118,6 +119,108 @@ describe("AgentSession auto-compaction queue resume", () => {
 		)._runAutoCompaction.bind(session);
 
 		await runAutoCompaction("threshold", false);
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("queues custom steer messages that arrive during auto-compaction and resumes afterwards", async () => {
+		let resolveCompaction: ((value: {
+			summary: string;
+			firstKeptEntryId: string;
+			tokensBefore: number;
+			details: Record<string, never>;
+		}) => void) | undefined;
+		const compactionStarted = new Promise<void>((resolve) => {
+			vi.spyOn(compactionModule, "compact").mockImplementationOnce(async () => {
+				resolve();
+				return await new Promise((innerResolve) => {
+					resolveCompaction = innerResolve;
+				});
+			});
+		});
+
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		const runAutoCompaction = (
+			session as unknown as {
+				_runAutoCompaction: (reason: "overflow" | "threshold", willRetry: boolean) => Promise<void>;
+			}
+		)._runAutoCompaction.bind(session);
+
+		const compactionPromise = runAutoCompaction("threshold", false);
+		await compactionStarted;
+
+		expect(session.isCompacting).toBe(true);
+
+		await session.sendCustomMessage(
+			{
+				customType: "agent_report",
+				content: [{ type: "text", text: "REPORT" }],
+				display: true,
+				details: { fromAgentId: "child-1" },
+			},
+			{ deliverAs: "steer" },
+		);
+
+		expect(session.agent.hasQueuedMessages()).toBe(true);
+
+		resolveCompaction?.({
+			summary: "compacted",
+			firstKeptEntryId: "entry-1",
+			tokensBefore: 100,
+			details: {},
+		});
+
+		await compactionPromise;
+		await vi.advanceTimersByTimeAsync(100);
+
+		expect(continueSpy).toHaveBeenCalledTimes(1);
+	});
+
+	it("queues custom steer messages that arrive during manual compaction and resumes afterwards", async () => {
+		let resolveCompaction: ((value: {
+			summary: string;
+			firstKeptEntryId: string;
+			tokensBefore: number;
+			details: Record<string, never>;
+		}) => void) | undefined;
+		const compactionStarted = new Promise<void>((resolve) => {
+			vi.spyOn(compactionModule, "compact").mockImplementationOnce(async () => {
+				resolve();
+				return await new Promise((innerResolve) => {
+					resolveCompaction = innerResolve;
+				});
+			});
+		});
+
+		const continueSpy = vi.spyOn(session.agent, "continue").mockResolvedValue();
+
+		const compactionPromise = session.compact();
+		await compactionStarted;
+
+		expect(session.isCompacting).toBe(true);
+
+		await session.sendCustomMessage(
+			{
+				customType: "agent_idle",
+				content: [{ type: "text", text: "IDLE" }],
+				display: true,
+				details: { fromAgentId: "child-1" },
+			},
+			{ deliverAs: "steer" },
+		);
+
+		expect(session.agent.hasQueuedMessages()).toBe(true);
+
+		resolveCompaction?.({
+			summary: "compacted",
+			firstKeptEntryId: "entry-1",
+			tokensBefore: 100,
+			details: {},
+		});
+
+		await compactionPromise;
 		await vi.advanceTimersByTimeAsync(100);
 
 		expect(continueSpy).toHaveBeenCalledTimes(1);
