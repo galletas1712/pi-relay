@@ -31,13 +31,6 @@ impl Default for AgentState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MailboxNotificationDecision {
-    Consume,
-    Drop,
-    Wait,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InterruptedTurn {
     pub(crate) turn_id: TurnId,
@@ -54,35 +47,24 @@ impl AgentState {
         }
     }
 
-    pub(crate) fn decide_mailbox_notification(
-        &self,
-        notification: &MailboxNotification,
-    ) -> MailboxNotificationDecision {
+    pub(crate) fn validate_mailbox_notification(&self, notification: &MailboxNotification) -> bool {
         let Some(active_turn_id) = self.active_turn_id() else {
-            return MailboxNotificationDecision::Drop;
+            return false;
         };
 
         if notification.turn_id() != active_turn_id {
-            return MailboxNotificationDecision::Drop;
+            return false;
         }
 
         match (self, notification) {
-            (Self::RunningModel { .. }, MailboxNotification::AssistantMessage { .. }) => {
-                MailboxNotificationDecision::Consume
-            }
+            (Self::RunningModel { .. }, MailboxNotification::AssistantMessage { .. }) => true,
             (
                 Self::RunningTool { tool_call, .. },
                 MailboxNotification::ToolResult { result, .. },
             ) if tool_call.id == result.tool_call_id && tool_call.tool_name == result.tool_name => {
-                MailboxNotificationDecision::Consume
+                true
             }
-            (Self::ReadyToContinue { .. }, MailboxNotification::ToolCallReady { .. }) => {
-                MailboxNotificationDecision::Consume
-            }
-            (Self::RunningTool { .. }, MailboxNotification::ToolCallReady { .. }) => {
-                MailboxNotificationDecision::Wait
-            }
-            _ => MailboxNotificationDecision::Drop,
+            _ => false,
         }
     }
 
@@ -221,18 +203,9 @@ mod tests {
             assistant: AssistantMessage { items: Vec::new() },
         };
 
-        assert_eq!(
-            AgentState::Idle.decide_mailbox_notification(&notification),
-            MailboxNotificationDecision::Drop
-        );
-        assert_eq!(
-            AgentState::Interrupted.decide_mailbox_notification(&notification),
-            MailboxNotificationDecision::Drop
-        );
-        assert_eq!(
-            AgentState::Crashed.decide_mailbox_notification(&notification),
-            MailboxNotificationDecision::Drop
-        );
+        assert!(!AgentState::Idle.validate_mailbox_notification(&notification));
+        assert!(!AgentState::Interrupted.validate_mailbox_notification(&notification));
+        assert!(!AgentState::Crashed.validate_mailbox_notification(&notification));
     }
 
     #[test]
@@ -247,18 +220,12 @@ mod tests {
             assistant: AssistantMessage { items: Vec::new() },
         };
 
-        assert_eq!(
-            state.decide_mailbox_notification(&matching),
-            MailboxNotificationDecision::Consume
-        );
-        assert_eq!(
-            state.decide_mailbox_notification(&stale),
-            MailboxNotificationDecision::Drop
-        );
+        assert!(state.validate_mailbox_notification(&matching));
+        assert!(!state.validate_mailbox_notification(&stale));
     }
 
     #[test]
-    fn running_tool_consumes_matching_result_and_waits_on_future_tool_calls() {
+    fn running_tool_consumes_only_matching_tool_results() {
         let state = AgentState::RunningTool {
             turn_id: TurnId(1),
             tool_call: tool_call("bash"),
@@ -267,19 +234,13 @@ mod tests {
             turn_id: TurnId(1),
             result: tool_result("bash"),
         };
-        let future_tool = MailboxNotification::ToolCallReady {
+        let wrong_tool = MailboxNotification::ToolResult {
             turn_id: TurnId(1),
-            tool_call: tool_call("read"),
+            result: tool_result("read"),
         };
 
-        assert_eq!(
-            state.decide_mailbox_notification(&result),
-            MailboxNotificationDecision::Consume
-        );
-        assert_eq!(
-            state.decide_mailbox_notification(&future_tool),
-            MailboxNotificationDecision::Wait
-        );
+        assert!(state.validate_mailbox_notification(&result));
+        assert!(!state.validate_mailbox_notification(&wrong_tool));
     }
 
     #[test]

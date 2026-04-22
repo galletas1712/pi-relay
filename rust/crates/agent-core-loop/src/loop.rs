@@ -6,7 +6,7 @@ use crate::mailbox::{Mailbox, MailboxNotification};
 use crate::message::{
     AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, UserInput, UserMessage,
 };
-use crate::state::{AgentState, MailboxNotificationDecision};
+use crate::state::AgentState;
 use crate::transcript::Transcript;
 use crate::transcript_record::{TranscriptRecord, TurnOutcome};
 
@@ -106,6 +106,10 @@ impl AgentCoreLoop {
                 continue;
             }
 
+            if self.start_queued_tool_if_ready() {
+                continue;
+            }
+
             if self.resume_model_if_ready() {
                 continue;
             }
@@ -123,18 +127,37 @@ impl AgentCoreLoop {
             return false;
         };
 
-        match self.state.decide_mailbox_notification(&notification) {
-            MailboxNotificationDecision::Consume => {
-                let notification = self.pop_notification();
-                self.handle_mailbox_notification(notification);
-                true
-            }
-            MailboxNotificationDecision::Drop => {
-                let _ = self.pop_notification();
-                true
-            }
-            MailboxNotificationDecision::Wait => false,
+        if !self.state.validate_mailbox_notification(&notification) {
+            let _ = self.pop_notification();
+            return true;
         }
+
+        let notification = self.pop_notification();
+        self.handle_mailbox_notification(notification);
+        true
+    }
+
+    fn start_queued_tool_if_ready(&mut self) -> bool {
+        let AgentState::ReadyToContinue { turn_id } = &self.state else {
+            return false;
+        };
+        let turn_id = *turn_id;
+
+        let Some((queued_turn_id, tool_call)) = self.mailbox.pop_tool_call() else {
+            return false;
+        };
+
+        debug_assert_eq!(
+            queued_turn_id, turn_id,
+            "queued tool call belonged to a different turn"
+        );
+
+        if queued_turn_id != turn_id {
+            return true;
+        }
+
+        self.start_tool_call(turn_id, tool_call);
+        true
     }
 
     fn resume_model_if_ready(&mut self) -> bool {
@@ -168,6 +191,7 @@ impl AgentCoreLoop {
     }
 
     fn start_turn(&mut self, input: UserInput) {
+        self.mailbox.clear_tool_calls();
         self.last_turn_id = self.last_turn_id.next();
         let turn_id = self.last_turn_id;
         let user_message = self.create_user_message(input);
@@ -183,9 +207,6 @@ impl AgentCoreLoop {
         match notification {
             MailboxNotification::AssistantMessage { turn_id, assistant } => {
                 self.on_assistant_message(turn_id, assistant);
-            }
-            MailboxNotification::ToolCallReady { turn_id, tool_call } => {
-                self.start_tool_call(turn_id, tool_call);
             }
             MailboxNotification::ToolResult { turn_id, result } => {
                 self.on_tool_result(turn_id, result);
@@ -205,6 +226,7 @@ impl AgentCoreLoop {
 
         let mut tool_calls = assistant.tool_calls().cloned();
         let Some(first_tool_call) = tool_calls.next() else {
+            self.mailbox.clear_tool_calls();
             let finished = self.state.finish_model_turn(turn_id);
             debug_assert!(finished, "assistant message consumed outside model state");
             self.append_record(TranscriptRecord::TurnFinished {
@@ -215,8 +237,7 @@ impl AgentCoreLoop {
         };
 
         for tool_call in tool_calls {
-            self.mailbox
-                .push_notification_back(MailboxNotification::ToolCallReady { turn_id, tool_call });
+            self.mailbox.push_tool_call(turn_id, tool_call);
         }
 
         self.start_tool_call(turn_id, first_tool_call);
@@ -252,6 +273,8 @@ impl AgentCoreLoop {
         let Some(interrupted) = self.state.interrupt() else {
             return false;
         };
+
+        self.mailbox.clear_tool_calls();
 
         if let Some(tool_call) = interrupted.tool_call {
             let interrupted_tool_result =
