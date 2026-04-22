@@ -11,7 +11,8 @@ import {
 } from "@pi-relay/coding-agent";
 import type { RelayRuntimeEngineMode, RelayRuntimeNoticeStore, RelaySessionShadowState } from "./relay-runtime-host.js";
 
-const SESSION_CORE_HOST_SHUTDOWN_TIMEOUT_MS = 1_000;
+export const SESSION_CORE_HOST_SHUTDOWN_TIMEOUT_MS = 1_000;
+export const SESSION_CORE_HOST_FORCE_KILL_TIMEOUT_MS = 1_000;
 const MAX_CAPTURED_STDERR_LINES = 20;
 
 export interface CreateRelaySessionShadowControllerOptions {
@@ -114,19 +115,47 @@ function applyShadowEvent(
 	}
 }
 
-async function stopChildProcess(child: ChildProcessWithoutNullStreams, closePromise: Promise<void>): Promise<void> {
-	const closedBeforeTimeout = await Promise.race([
-		closePromise.then(() => true),
-		delay(SESSION_CORE_HOST_SHUTDOWN_TIMEOUT_MS).then(() => false),
-	]);
-	if (closedBeforeTimeout) {
-		return;
+type StopChildProcessResult = "closed" | "sigterm" | "sigkill" | "timed_out";
+
+async function stopChildProcess(
+	child: ChildProcessWithoutNullStreams,
+	closePromise: Promise<void>,
+): Promise<StopChildProcessResult> {
+	const waitForClose = async (timeoutMs: number): Promise<boolean> => {
+		return Promise.race([closePromise.then(() => true), delay(timeoutMs).then(() => false)]);
+	};
+
+	const tryKill = (signal: NodeJS.Signals): void => {
+		if (child.exitCode !== null || child.signalCode !== null) {
+			return;
+		}
+
+		try {
+			child.kill(signal);
+		} catch {
+			// Best-effort shutdown only.
+		}
+	};
+
+	if (await waitForClose(SESSION_CORE_HOST_SHUTDOWN_TIMEOUT_MS)) {
+		return "closed";
 	}
 
-	if (child.exitCode === null && child.signalCode === null) {
-		child.kill();
+	tryKill("SIGTERM");
+	if (await waitForClose(SESSION_CORE_HOST_SHUTDOWN_TIMEOUT_MS)) {
+		return "sigterm";
 	}
-	await closePromise;
+
+	tryKill("SIGKILL");
+	if (await waitForClose(SESSION_CORE_HOST_FORCE_KILL_TIMEOUT_MS)) {
+		return "sigkill";
+	}
+
+	child.stdin.destroy();
+	child.stdout.destroy();
+	child.stderr.destroy();
+	child.unref?.();
+	return "timed_out";
 }
 
 export function createRelaySessionShadowController(
@@ -196,7 +225,7 @@ export function createRelaySessionShadowController(
 	let disconnectReported = false;
 
 	const closePromise = new Promise<void>((resolveClose) => {
-		child.once("close", (code, signal) => {
+		child.once("close", (code: number | null, signal: NodeJS.Signals | null) => {
 			detachStderr();
 			if (!stopped && !disconnectReported) {
 				const suffix = stderrLines.length > 0 ? ` Stderr: ${stderrLines.join(" | ")}` : "";
@@ -211,7 +240,7 @@ export function createRelaySessionShadowController(
 		});
 	});
 
-	child.once("error", (error) => {
+	child.once("error", (error: Error) => {
 		if (stopped || disconnectReported) {
 			return;
 		}
@@ -223,7 +252,7 @@ export function createRelaySessionShadowController(
 	});
 
 	const observingClient = SessionShadowBridgeClient.fromChildProcess(child, {
-		onEvent: (event) => applyShadowEvent(event, diagnostics, noticeStore, state),
+		onEvent: (event: SessionShadowBridgeEvent) => applyShadowEvent(event, diagnostics, noticeStore, state),
 		onDisconnect: () => {
 			if (stopped) {
 				return;
@@ -235,7 +264,7 @@ export function createRelaySessionShadowController(
 	const observingBridge = attachSessionShadowBridge(observingClient);
 
 	return {
-		async start(initialState) {
+		async start(initialState: Parameters<SessionShadowBridgeController["start"]>[0]) {
 			if (stopped || disconnectReported) {
 				return;
 			}
@@ -253,7 +282,7 @@ export function createRelaySessionShadowController(
 			}
 		},
 
-		async dispatch(command) {
+		async dispatch(command: Parameters<SessionShadowBridgeController["dispatch"]>[0]) {
 			if (stopped || disconnectReported) {
 				return;
 			}
@@ -300,7 +329,22 @@ export function createRelaySessionShadowController(
 					}
 				} finally {
 					observingClient.close();
-					await stopChildProcess(child, closePromise);
+					const stopResult = await stopChildProcess(child, closePromise);
+					if (stopResult === "sigkill") {
+						pushDiagnostic(
+							diagnostics,
+							noticeStore,
+							"warning",
+							"Session-core shadow host ignored SIGTERM during shutdown; escalated to SIGKILL to avoid blocking TypeScript runtime teardown.",
+						);
+					} else if (stopResult === "timed_out") {
+						pushDiagnostic(
+							diagnostics,
+							noticeStore,
+							"warning",
+							"Session-core shadow host did not emit a close event after shutdown escalation; detaching from the process so TypeScript runtime teardown cannot block forever.",
+						);
+					}
 				}
 			})();
 			return stopPromise;

@@ -10,7 +10,11 @@ import {
 	type SessionShadowBridgeMessage,
 } from "../../coding-agent/src/core/session-shadow/codec.js";
 import { createRelayRuntimeNoticeStore, type RelaySessionShadowState } from "../src/relay-runtime-host.js";
-import { createRelaySessionShadowController } from "../src/session-shadow-runtime.js";
+import {
+	createRelaySessionShadowController,
+	SESSION_CORE_HOST_FORCE_KILL_TIMEOUT_MS,
+	SESSION_CORE_HOST_SHUTDOWN_TIMEOUT_MS,
+} from "../src/session-shadow-runtime.js";
 
 vi.mock("@pi-relay/coding-agent", async () => import("../../coding-agent/src/core/session-shadow/index.js"));
 
@@ -22,9 +26,18 @@ class FakeSessionShadowChild extends EventEmitter {
 	signalCode: NodeJS.Signals | null = null;
 	killed = false;
 	readonly sent: SessionShadowBridgeMessage[] = [];
+	readonly killSignals: NodeJS.Signals[] = [];
+	private readonly closeOnDispose: boolean;
+	private readonly killBehaviors: Array<"ignore" | "close">;
+	private killAttempt = 0;
 
-	constructor() {
+	constructor(options?: {
+		closeOnDispose?: boolean;
+		killBehaviors?: Array<"ignore" | "close">;
+	}) {
 		super();
+		this.closeOnDispose = options?.closeOnDispose ?? true;
+		this.killBehaviors = options?.killBehaviors ?? ["close"];
 		this.stdin.on("data", (chunk) => {
 			const lines = Buffer.from(chunk).toString("utf8").split("\n").filter(Boolean);
 			for (const line of lines) {
@@ -45,7 +58,7 @@ class FakeSessionShadowChild extends EventEmitter {
 					}),
 				);
 
-				if (frame.command.kind === "dispose") {
+				if (frame.command.kind === "dispose" && this.closeOnDispose) {
 					this.exitCode = 0;
 					queueMicrotask(() => {
 						this.stdout.end();
@@ -56,11 +69,18 @@ class FakeSessionShadowChild extends EventEmitter {
 		});
 	}
 
-	kill = vi.fn(() => {
+	kill = vi.fn((signal: NodeJS.Signals = "SIGTERM") => {
 		this.killed = true;
-		this.signalCode = "SIGTERM";
-		this.stdout.end();
-		this.emit("close", null, "SIGTERM");
+		this.killSignals.push(signal);
+		const behavior = this.killBehaviors[this.killAttempt] ?? this.killBehaviors[this.killBehaviors.length - 1] ?? "close";
+		this.killAttempt += 1;
+		if (behavior === "close") {
+			queueMicrotask(() => {
+				this.signalCode = signal;
+				this.stdout.end();
+				this.emit("close", null, signal);
+			});
+		}
 		return true;
 	});
 }
@@ -69,6 +89,7 @@ describe("createRelaySessionShadowController", () => {
 	const tempDirs: string[] = [];
 
 	afterEach(() => {
+		vi.useRealTimers();
 		while (tempDirs.length > 0) {
 			const dir = tempDirs.pop();
 			if (dir) {
@@ -187,5 +208,103 @@ describe("createRelaySessionShadowController", () => {
 				kind: "dispose",
 			},
 		});
+	});
+
+	it("escalates to SIGKILL when the host ignores the first shutdown signal", async () => {
+		vi.useFakeTimers();
+		const diagnostics: Array<{ type: "info" | "warning" | "error"; message: string }> = [];
+		const state: RelaySessionShadowState = {
+			requestedMode: "rust-shadow" as const,
+			effectiveMode: "disabled" as const,
+			authority: "ts" as const,
+			status: "disabled" as const,
+		};
+		const child = new FakeSessionShadowChild({
+			closeOnDispose: false,
+			killBehaviors: ["ignore", "close"],
+		});
+		const controller = createRelaySessionShadowController(
+			{
+				engineMode: "rust-shadow",
+				diagnostics,
+				noticeStore: createRelayRuntimeNoticeStore(),
+				state,
+			},
+			{
+				resolveRustWorkspaceDir: () => createRustDir(),
+				spawnHost: () => child as never,
+			},
+		);
+
+		await controller?.start({
+			runState: "idle",
+			queue: {
+				steering: [],
+				followUp: [],
+			},
+		});
+
+		const stopPromise = controller?.stop();
+		await vi.advanceTimersByTimeAsync(SESSION_CORE_HOST_SHUTDOWN_TIMEOUT_MS * 2 + SESSION_CORE_HOST_FORCE_KILL_TIMEOUT_MS);
+		await stopPromise;
+
+		expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(diagnostics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "warning",
+					message: expect.stringContaining("escalated to SIGKILL"),
+				}),
+			]),
+		);
+	});
+
+	it("stops waiting after SIGKILL if the host never emits close", async () => {
+		vi.useFakeTimers();
+		const diagnostics: Array<{ type: "info" | "warning" | "error"; message: string }> = [];
+		const state: RelaySessionShadowState = {
+			requestedMode: "rust-shadow" as const,
+			effectiveMode: "disabled" as const,
+			authority: "ts" as const,
+			status: "disabled" as const,
+		};
+		const child = new FakeSessionShadowChild({
+			closeOnDispose: false,
+			killBehaviors: ["ignore", "ignore"],
+		});
+		const controller = createRelaySessionShadowController(
+			{
+				engineMode: "rust-shadow",
+				diagnostics,
+				noticeStore: createRelayRuntimeNoticeStore(),
+				state,
+			},
+			{
+				resolveRustWorkspaceDir: () => createRustDir(),
+				spawnHost: () => child as never,
+			},
+		);
+
+		await controller?.start({
+			runState: "idle",
+			queue: {
+				steering: [],
+				followUp: [],
+			},
+		});
+
+		const stopPromise = controller?.stop();
+		await vi.advanceTimersByTimeAsync(SESSION_CORE_HOST_SHUTDOWN_TIMEOUT_MS * 2 + SESSION_CORE_HOST_FORCE_KILL_TIMEOUT_MS);
+		await stopPromise;
+
+		expect(child.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(diagnostics).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					type: "warning",
+					message: expect.stringContaining("did not emit a close event"),
+				}),
+			]),
+		);
 	});
 });
