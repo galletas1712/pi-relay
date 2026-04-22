@@ -1,4 +1,6 @@
-use agent_protocol::{BridgeAck, BridgeCommand, ShadowSyncReason};
+use agent_protocol::{
+	BridgeAck, BridgeCommand, BridgeError, ShadowSyncReason, RELAY_CORE_BRIDGE_PROTOCOL_VERSION,
+};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use agent_protocol::OrchestratorShadowSnapshot;
@@ -17,17 +19,22 @@ pub enum CoreEffect {
 	CoreDisposed,
 }
 
-pub fn apply_command(state: &mut OrchestratorCoreState, command: &BridgeCommand) -> (BridgeAck, Vec<CoreEffect>) {
+pub fn apply_command(
+	state: &mut OrchestratorCoreState,
+	command: &BridgeCommand,
+) -> Result<(BridgeAck, Vec<CoreEffect>), BridgeError> {
 	match command {
-		BridgeCommand::Hello { .. } => {
+		BridgeCommand::Hello { protocol_version, .. } => {
+			ensure_protocol_version(command.kind(), *protocol_version)?;
 			state.initialized = true;
-			(ack(command.kind()), Vec::new())
+			Ok((ack(command.kind()), Vec::new()))
 		}
 		BridgeCommand::SyncSnapshot { reason, snapshot } => {
+			ensure_protocol_version(command.kind(), snapshot.protocol_version)?;
 			state.initialized = true;
 			state.sync_count += 1;
 			state.last_snapshot = Some(snapshot.clone());
-			(
+			Ok((
 				ack(command.kind()),
 				vec![CoreEffect::SnapshotUpdated {
 					reason: match reason {
@@ -36,13 +43,26 @@ pub fn apply_command(state: &mut OrchestratorCoreState, command: &BridgeCommand)
 					},
 					agent_count: snapshot.agents.len(),
 				}],
-			)
+			))
 		}
 		BridgeCommand::Dispose { .. } => {
 			state.disposed = true;
-			(ack(command.kind()), vec![CoreEffect::CoreDisposed])
+			Ok((ack(command.kind()), vec![CoreEffect::CoreDisposed]))
 		}
 	}
+}
+
+fn ensure_protocol_version(command: &str, protocol_version: u32) -> Result<(), BridgeError> {
+	if protocol_version == RELAY_CORE_BRIDGE_PROTOCOL_VERSION {
+		return Ok(());
+	}
+
+	Err(BridgeError {
+		message: format!(
+			"relay-core bridge protocol mismatch for {command}: expected v{RELAY_CORE_BRIDGE_PROTOCOL_VERSION}, got v{protocol_version}"
+		),
+		data: None,
+	})
 }
 
 fn ack(command: &str) -> BridgeAck {
@@ -87,11 +107,62 @@ mod tests {
 			},
 		};
 
-		let (_ack, effects) = apply_command(&mut state, &command);
+		let (_ack, effects) = apply_command(&mut state, &command).expect("accept matching protocol version");
 
 		assert!(state.initialized);
 		assert_eq!(state.sync_count, 1);
 		assert_eq!(state.last_snapshot.as_ref().map(|snapshot| snapshot.root_agent_id.as_str()), Some("root"));
 		assert_eq!(effects, vec![CoreEffect::SnapshotUpdated { reason: "init", agent_count: 1 }]);
+	}
+
+	#[test]
+	fn rejects_mismatched_hello_protocol_versions() {
+		let mut state = OrchestratorCoreState::default();
+		let error = apply_command(
+			&mut state,
+			&BridgeCommand::Hello {
+				protocol_version: RELAY_CORE_BRIDGE_PROTOCOL_VERSION + 1,
+				mode: agent_protocol::RelayCoreBridgeMode::Shadow,
+			},
+		)
+		.expect_err("reject mismatched protocol version");
+
+		assert_eq!(
+			error.message,
+			format!(
+				"relay-core bridge protocol mismatch for hello: expected v{RELAY_CORE_BRIDGE_PROTOCOL_VERSION}, got v{}",
+				RELAY_CORE_BRIDGE_PROTOCOL_VERSION + 1,
+			),
+		);
+		assert!(!state.initialized);
+	}
+
+	#[test]
+	fn rejects_mismatched_snapshot_protocol_versions_before_mutating_state() {
+		let mut state = OrchestratorCoreState::default();
+		let error = apply_command(
+			&mut state,
+			&BridgeCommand::SyncSnapshot {
+				reason: ShadowSyncReason::Change,
+				snapshot: OrchestratorShadowSnapshot {
+					protocol_version: RELAY_CORE_BRIDGE_PROTOCOL_VERSION + 7,
+					root_agent_id: "root".to_string(),
+					generated_at: "2026-04-22T00:00:00.000Z".to_string(),
+					agents: Vec::new(),
+				},
+			},
+		)
+		.expect_err("reject mismatched snapshot protocol version");
+
+		assert_eq!(
+			error.message,
+			format!(
+				"relay-core bridge protocol mismatch for sync_snapshot: expected v{RELAY_CORE_BRIDGE_PROTOCOL_VERSION}, got v{}",
+				RELAY_CORE_BRIDGE_PROTOCOL_VERSION + 7,
+			),
+		);
+		assert!(!state.initialized);
+		assert_eq!(state.sync_count, 0);
+		assert!(state.last_snapshot.is_none());
 	}
 }

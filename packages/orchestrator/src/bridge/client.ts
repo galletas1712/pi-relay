@@ -29,6 +29,17 @@ interface PendingBridgeCall {
 	reject: (reason: unknown) => void;
 }
 
+class RelayCoreBridgeClosedError extends Error {
+	constructor(message = "relay-core bridge client is closed") {
+		super(message);
+		this.name = "RelayCoreBridgeClosedError";
+	}
+}
+
+function isRelayCoreBridgeClosedError(error: unknown): error is RelayCoreBridgeClosedError {
+	return error instanceof RelayCoreBridgeClosedError;
+}
+
 export interface OrchestratorShadowBridgeController {
 	start(): Promise<void>;
 	flush(): Promise<void>;
@@ -91,10 +102,11 @@ export class RelayCoreBridgeClient {
 	private readonly io: RelayCoreBridgeIO;
 	private readonly options: RelayCoreBridgeClientOptions;
 	private readonly handleInputEnd = () => {
-		this.close(new Error("relay-core bridge closed its input stream"));
+		this.close(new RelayCoreBridgeClosedError("relay-core bridge closed its input stream"));
 	};
 	private detachInput?: () => void;
 	private closed = false;
+	private disconnectReason: Error | undefined;
 	private nextId = 1;
 
 	constructor(io: RelayCoreBridgeIO, options: RelayCoreBridgeClientOptions = {}) {
@@ -149,12 +161,14 @@ export class RelayCoreBridgeClient {
 		if (this.closed) {
 			return;
 		}
+		const closeReason = reason ?? new RelayCoreBridgeClosedError();
 		this.closed = true;
+		this.disconnectReason = closeReason;
 		this.detachInput?.();
 		this.detachInput = undefined;
 		this.io.input.off("end", this.handleInputEnd);
 		for (const pending of this.pending.values()) {
-			pending.reject(reason ?? new Error("relay-core bridge client closed"));
+			pending.reject(closeReason);
 		}
 		this.pending.clear();
 		this.options.onDisconnect?.();
@@ -162,7 +176,7 @@ export class RelayCoreBridgeClient {
 
 	private async call(command: RelayCoreBridgeCommand): Promise<RelayCoreBridgeAck> {
 		if (this.closed) {
-			throw new Error("relay-core bridge client is closed");
+			throw this.disconnectReason ?? new RelayCoreBridgeClosedError();
 		}
 		const id = this.nextId++;
 		const message: RelayCoreBridgeCallMessage = {
@@ -276,10 +290,20 @@ export function attachOrchestratorShadowBridge(
 			stopped = true;
 			unsubscribe?.();
 			unsubscribe = undefined;
-			await queue.catch(() => undefined);
+			await queue.catch((error) => {
+				if (!isRelayCoreBridgeClosedError(error)) {
+					throw error;
+				}
+			});
 			try {
 				if (started) {
-					await client.dispose();
+					try {
+						await client.dispose();
+					} catch (error) {
+						if (!isRelayCoreBridgeClosedError(error)) {
+							throw error;
+						}
+					}
 				}
 			} finally {
 				client.close();

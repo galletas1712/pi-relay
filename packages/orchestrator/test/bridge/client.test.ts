@@ -16,6 +16,7 @@ function createRecordingBridge() {
 	const output = new PassThrough();
 	const sent: RelayCoreBridgeMessage[] = [];
 	const onEvent = vi.fn();
+	const onDisconnect = vi.fn();
 
 	output.on("data", (chunk) => {
 		const lines = Buffer.from(chunk).toString("utf8").split("\n").filter(Boolean);
@@ -38,11 +39,12 @@ function createRecordingBridge() {
 	});
 
 	return {
-		client: new RelayCoreBridgeClient({ input, output }, { onEvent }),
+		client: new RelayCoreBridgeClient({ input, output }, { onEvent, onDisconnect }),
 		input,
 		output,
 		sent,
 		onEvent,
+		onDisconnect,
 	};
 }
 
@@ -187,5 +189,32 @@ describe("relay-core bridge client", () => {
 		});
 
 		bridge.client.close();
+	});
+
+	it("stops cleanly after the remote bridge disconnects", async () => {
+		const shadowSource = createShadowSource();
+		const bridge = createRecordingBridge();
+		const controller = attachOrchestratorShadowBridge(shadowSource.source, bridge.client);
+
+		await controller.start();
+		bridge.input.end();
+
+		await vi.waitFor(() => {
+			expect(bridge.onDisconnect).toHaveBeenCalledTimes(1);
+		});
+
+		await expect(controller.stop()).resolves.toBeUndefined();
+		await expect(controller.stop()).resolves.toBeUndefined();
+	});
+
+	it("stops cleanly after the client is already closed locally", async () => {
+		const shadowSource = createShadowSource();
+		const bridge = createRecordingBridge();
+		const controller = attachOrchestratorShadowBridge(shadowSource.source, bridge.client);
+
+		await controller.start();
+		bridge.client.close();
+
+		await expect(controller.stop()).resolves.toBeUndefined();
 	});
 });
