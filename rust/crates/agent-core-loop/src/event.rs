@@ -38,3 +38,9 @@ pub enum AgentAction {
         turn_id: TurnId,
     },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentOutput {
+    Event(AgentEvent),
+    Action(AgentAction),
+}
