@@ -58,8 +58,8 @@ pub struct AgentCoreLoop {
     pub phase: Phase,
     pub epoch: Epoch,
     pending_tool_calls: VecDeque<ToolCall>,
-    next_message_id: u64,
-    next_tool_call_id: u64,
+    next_message_id: MessageId,
+    next_tool_call_id: ToolCallId,
 }
 
 impl Default for AgentCoreLoop {
@@ -70,8 +70,8 @@ impl Default for AgentCoreLoop {
             phase: Phase::Idle,
             epoch: Epoch::default(),
             pending_tool_calls: VecDeque::new(),
-            next_message_id: 1,
-            next_tool_call_id: 1,
+            next_message_id: MessageId::first(),
+            next_tool_call_id: ToolCallId::first(),
         }
     }
 }
@@ -79,18 +79,6 @@ impl Default for AgentCoreLoop {
 impl AgentCoreLoop {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn alloc_message_id(&mut self) -> MessageId {
-        let id = MessageId(self.next_message_id);
-        self.next_message_id += 1;
-        id
-    }
-
-    pub fn alloc_tool_call_id(&mut self) -> ToolCallId {
-        let id = ToolCallId(self.next_tool_call_id);
-        self.next_tool_call_id += 1;
-        id
     }
 
     pub fn on_signal(&mut self, signal: LoopSignal) -> CoreTransition {
@@ -253,7 +241,7 @@ impl AgentCoreLoop {
             } => {
                 self.phase = Phase::Idle;
                 self.pending_tool_calls.clear();
-                let message_id = self.alloc_message_id();
+                let message_id = MessageId::take_next(&mut self.next_message_id);
                 let interrupted =
                     ToolResultMessage::interrupted(message_id, call_id, tool_name.clone());
                 self.transcript.push(CoreMessage::ToolResult(interrupted));
@@ -278,7 +266,7 @@ impl AgentCoreLoop {
 
     fn create_user_message(&mut self, input: UserInput) -> UserMessage {
         UserMessage {
-            id: self.alloc_message_id(),
+            id: MessageId::take_next(&mut self.next_message_id),
             text: input.text,
         }
     }
@@ -296,14 +284,14 @@ mod tests {
 
     fn text_assistant(loop_state: &mut AgentCoreLoop, text: &str) -> AssistantMessage {
         assistant_message(
-            loop_state.alloc_message_id(),
+            MessageId::take_next(&mut loop_state.next_message_id),
             vec![AssistantItem::Text(text.to_string())],
         )
     }
 
     fn tool_call(loop_state: &mut AgentCoreLoop, name: &str) -> ToolCall {
         ToolCall {
-            call_id: loop_state.alloc_tool_call_id(),
+            call_id: ToolCallId::take_next(&mut loop_state.next_tool_call_id),
             tool_name: name.to_string(),
             args_json: "{}".to_string(),
         }
@@ -315,7 +303,7 @@ mod tests {
         tool_name: &str,
     ) -> ToolResultMessage {
         ToolResultMessage {
-            id: loop_state.alloc_message_id(),
+            id: MessageId::take_next(&mut loop_state.next_message_id),
             call_id,
             tool_name: tool_name.to_string(),
             output: "ok".to_string(),
@@ -356,7 +344,7 @@ mod tests {
         )));
         let tool_call = tool_call(&mut loop_state, "bash");
         let assistant = assistant_message(
-            loop_state.alloc_message_id(),
+            MessageId::take_next(&mut loop_state.next_message_id),
             vec![
                 AssistantItem::Text("Let me inspect that.".to_string()),
                 AssistantItem::ToolCall(tool_call.clone()),
@@ -404,7 +392,7 @@ mod tests {
         )));
         let tool_call = tool_call(&mut loop_state, "bash");
         let assistant = assistant_message(
-            loop_state.alloc_message_id(),
+            MessageId::take_next(&mut loop_state.next_message_id),
             vec![AssistantItem::ToolCall(tool_call.clone())],
         );
         loop_state.on_signal(LoopSignal::ModelCompleted {
@@ -446,7 +434,7 @@ mod tests {
         let first = tool_call(&mut loop_state, "bash");
         let second = tool_call(&mut loop_state, "read");
         let assistant = assistant_message(
-            loop_state.alloc_message_id(),
+            MessageId::take_next(&mut loop_state.next_message_id),
             vec![
                 AssistantItem::ToolCall(first.clone()),
                 AssistantItem::ToolCall(second.clone()),
@@ -501,7 +489,7 @@ mod tests {
         )));
         let tool_call = tool_call(&mut loop_state, "bash");
         let assistant = assistant_message(
-            loop_state.alloc_message_id(),
+            MessageId::take_next(&mut loop_state.next_message_id),
             vec![AssistantItem::ToolCall(tool_call.clone())],
         );
         loop_state.on_signal(LoopSignal::ModelCompleted {
@@ -582,7 +570,7 @@ mod tests {
         let first = tool_call(&mut loop_state, "bash");
         let second = tool_call(&mut loop_state, "read");
         let assistant = assistant_message(
-            loop_state.alloc_message_id(),
+            MessageId::take_next(&mut loop_state.next_message_id),
             vec![
                 AssistantItem::ToolCall(first.clone()),
                 AssistantItem::ToolCall(second.clone()),
