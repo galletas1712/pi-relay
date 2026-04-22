@@ -35,6 +35,53 @@ impl Default for AgentState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentStateStep {
+    ConsumeEvent,
+    DropEvent,
+    Wait,
+}
+
+impl AgentState {
+    fn step(&self, event: &MailboxEvent) -> AgentStateStep {
+        let Some(active_turn_id) = self.active_turn_id() else {
+            return AgentStateStep::DropEvent;
+        };
+
+        if event.turn_id() != active_turn_id {
+            return AgentStateStep::DropEvent;
+        }
+
+        match (self, event) {
+            (AgentState::RunningModel { .. }, MailboxEvent::AssistantMessage { .. }) => {
+                AgentStateStep::ConsumeEvent
+            }
+            (
+                AgentState::RunningTool { tool_call, .. },
+                MailboxEvent::ToolResult { result, .. },
+            ) if tool_call.id == result.tool_call_id && tool_call.tool_name == result.tool_name => {
+                AgentStateStep::ConsumeEvent
+            }
+            (AgentState::ReadyToContinue { .. }, MailboxEvent::ToolCallReady { .. }) => {
+                AgentStateStep::ConsumeEvent
+            }
+            (AgentState::RunningTool { .. }, MailboxEvent::ToolCallReady { .. }) => {
+                AgentStateStep::Wait
+            }
+            _ => AgentStateStep::DropEvent,
+        }
+    }
+
+    fn active_turn_id(&self) -> Option<TurnId> {
+        match self {
+            AgentState::RunningModel { turn_id }
+            | AgentState::RunningTool { turn_id, .. }
+            | AgentState::ReadyToContinue { turn_id } => Some(*turn_id),
+            AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentInput {
     Interrupt,
@@ -151,49 +198,18 @@ impl AgentCoreLoop {
         let Some(event) = self.mailbox.front_event().cloned() else {
             return false;
         };
-        let Some(active_turn_id) = self.active_turn_id() else {
-            let _ = self.pop_event();
-            return true;
-        };
 
-        if event.turn_id() != active_turn_id {
-            let _ = self.pop_event();
-            return true;
-        }
-
-        match (&self.state, event) {
-            (AgentState::RunningModel { .. }, MailboxEvent::AssistantMessage { .. }) => {
+        match self.state.step(&event) {
+            AgentStateStep::ConsumeEvent => {
                 let event = self.pop_event();
                 self.handle_mailbox_event(event);
                 true
             }
-            (
-                AgentState::RunningTool { tool_call, .. },
-                MailboxEvent::ToolResult { result, .. },
-            ) if tool_call.id == result.tool_call_id && tool_call.tool_name == result.tool_name => {
-                let event = self.pop_event();
-                self.handle_mailbox_event(event);
-                true
-            }
-            (AgentState::ReadyToContinue { .. }, MailboxEvent::ToolCallReady { .. }) => {
-                let event = self.pop_event();
-                self.handle_mailbox_event(event);
-                true
-            }
-            (AgentState::RunningTool { .. }, MailboxEvent::ToolCallReady { .. }) => false,
-            _ => {
+            AgentStateStep::DropEvent => {
                 let _ = self.pop_event();
                 true
             }
-        }
-    }
-
-    fn active_turn_id(&self) -> Option<TurnId> {
-        match &self.state {
-            AgentState::RunningModel { turn_id }
-            | AgentState::RunningTool { turn_id, .. }
-            | AgentState::ReadyToContinue { turn_id } => Some(*turn_id),
-            AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => None,
+            AgentStateStep::Wait => false,
         }
     }
 
