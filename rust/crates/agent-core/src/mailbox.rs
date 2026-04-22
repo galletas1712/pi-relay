@@ -106,6 +106,10 @@ impl Mailbox {
     pub fn total_len(&self) -> usize {
         self.notifications.len() + self.steer.len() + self.follow_up.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.total_len() == 0 && !self.interrupt_requested
+    }
 }
 
 #[cfg(test)]

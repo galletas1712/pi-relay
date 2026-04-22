@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/agent-core"]
+members = [
+    "crates/agent-core",
+    "crates/agent-session",
+    "crates/agent-orchestrator",
+]
 resolver = "2"
 
 [workspace.package]

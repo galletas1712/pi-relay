@@ -1,0 +1,10 @@
+[package]
+name = "agent-session"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agent-core = { path = "../agent-core" }
+futures-channel = "0.3"
+futures-core = "0.3"
