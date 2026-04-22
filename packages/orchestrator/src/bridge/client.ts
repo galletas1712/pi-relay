@@ -21,7 +21,7 @@ export interface RelayCoreBridgeIO {
 
 export interface RelayCoreBridgeClientOptions {
 	onEvent?: (event: RelayCoreBridgeEvent) => void;
-	onDisconnect?: () => void;
+	onDisconnect?: (reason?: Error) => void;
 }
 
 interface PendingBridgeCall {
@@ -36,14 +36,14 @@ class RelayCoreBridgeClosedError extends Error {
 	}
 }
 
-function isRelayCoreBridgeClosedError(error: unknown): error is RelayCoreBridgeClosedError {
-	return error instanceof RelayCoreBridgeClosedError;
-}
-
 export interface OrchestratorShadowBridgeController {
 	start(): Promise<void>;
 	flush(): Promise<void>;
 	stop(): Promise<void>;
+}
+
+export interface OrchestratorShadowBridgeControllerOptions {
+	onDisconnect?: (reason?: Error) => void;
 }
 
 type OrchestratorShadowSource = {
@@ -97,10 +97,18 @@ function createRemoteError(message: RelayCoreBridgeMessage & { type: "error" }):
 	return error;
 }
 
+function toError(reason: unknown, fallback: string): Error {
+	if (reason instanceof Error) {
+		return reason;
+	}
+	return new Error(reason === undefined ? fallback : String(reason));
+}
+
 export class RelayCoreBridgeClient {
 	private readonly pending = new Map<number, PendingBridgeCall>();
+	private readonly eventListeners = new Set<(event: RelayCoreBridgeEvent) => void>();
+	private readonly disconnectListeners = new Set<(reason?: Error) => void>();
 	private readonly io: RelayCoreBridgeIO;
-	private readonly options: RelayCoreBridgeClientOptions;
 	private readonly handleInputEnd = () => {
 		this.close(new RelayCoreBridgeClosedError("relay-core bridge closed its input stream"));
 	};
@@ -111,7 +119,12 @@ export class RelayCoreBridgeClient {
 
 	constructor(io: RelayCoreBridgeIO, options: RelayCoreBridgeClientOptions = {}) {
 		this.io = io;
-		this.options = options;
+		if (options.onEvent) {
+			this.eventListeners.add(options.onEvent);
+		}
+		if (options.onDisconnect) {
+			this.disconnectListeners.add(options.onDisconnect);
+		}
 		this.detachInput = readLines(this.io.input, (line) => {
 			if (line.trim().length === 0) {
 				return;
@@ -157,6 +170,24 @@ export class RelayCoreBridgeClient {
 		return this.call({ kind: "dispose" });
 	}
 
+	get isClosed(): boolean {
+		return this.closed;
+	}
+
+	subscribeToEvents(listener: (event: RelayCoreBridgeEvent) => void): () => void {
+		this.eventListeners.add(listener);
+		return () => {
+			this.eventListeners.delete(listener);
+		};
+	}
+
+	subscribeToDisconnect(listener: (reason?: Error) => void): () => void {
+		this.disconnectListeners.add(listener);
+		return () => {
+			this.disconnectListeners.delete(listener);
+		};
+	}
+
 	close(reason?: Error): void {
 		if (this.closed) {
 			return;
@@ -171,7 +202,9 @@ export class RelayCoreBridgeClient {
 			pending.reject(closeReason);
 		}
 		this.pending.clear();
-		this.options.onDisconnect?.();
+		for (const listener of this.disconnectListeners) {
+			listener(closeReason);
+		}
 	}
 
 	private async call(command: RelayCoreBridgeCommand): Promise<RelayCoreBridgeAck> {
@@ -203,7 +236,9 @@ export class RelayCoreBridgeClient {
 		}
 
 		if (message.type === "event") {
-			this.options.onEvent?.(message.event);
+			for (const listener of this.eventListeners) {
+				listener(message.event);
+			}
 			return;
 		}
 
@@ -240,17 +275,39 @@ export function createOrchestratorShadowSnapshot(
 export function attachOrchestratorShadowBridge(
 	orchestrator: OrchestratorShadowSource,
 	client: RelayCoreBridgeClient,
+	options: OrchestratorShadowBridgeControllerOptions = {},
 ): OrchestratorShadowBridgeController {
 	let started = false;
 	let stopped = false;
+	let disconnected = false;
 	let unsubscribe: (() => void) | undefined;
+	let detachDisconnectListener: (() => void) | undefined;
 	let queue: Promise<void> = Promise.resolve();
+
+	const handleDisconnect = (reason?: Error) => {
+		if (disconnected) {
+			return;
+		}
+		disconnected = true;
+		unsubscribe?.();
+		unsubscribe = undefined;
+		options.onDisconnect?.(reason);
+	};
+
+	const closeBridge = (reason: unknown, fallbackMessage: string) => {
+		const error = toError(reason, fallbackMessage);
+		if (client.isClosed) {
+			handleDisconnect(error);
+			return;
+		}
+		client.close(error);
+	};
 
 	const enqueue = (operation: () => Promise<void>): Promise<void> => {
 		queue = queue
 			.catch(() => undefined)
 			.then(async () => {
-				if (stopped) {
+				if (stopped || disconnected) {
 					return;
 				}
 				await operation();
@@ -269,8 +326,15 @@ export function attachOrchestratorShadowBridge(
 				return;
 			}
 			started = true;
+			detachDisconnectListener = client.subscribeToDisconnect(handleDisconnect);
+			if (client.isClosed) {
+				closeBridge(undefined, "relay-core bridge client is closed");
+				return;
+			}
 			unsubscribe = orchestrator.subscribeToChanges(() => {
-				void sync("change");
+				void sync("change").catch((error) => {
+					closeBridge(error, "relay-core bridge change sync failed");
+				});
 			});
 
 			await enqueue(async () => {
@@ -288,21 +352,17 @@ export function attachOrchestratorShadowBridge(
 				return;
 			}
 			stopped = true;
+			detachDisconnectListener?.();
+			detachDisconnectListener = undefined;
 			unsubscribe?.();
 			unsubscribe = undefined;
-			await queue.catch((error) => {
-				if (!isRelayCoreBridgeClosedError(error)) {
-					throw error;
-				}
-			});
+			await queue.catch(() => undefined);
 			try {
-				if (started) {
+				if (started && !client.isClosed) {
 					try {
 						await client.dispose();
 					} catch (error) {
-						if (!isRelayCoreBridgeClosedError(error)) {
-							throw error;
-						}
+						closeBridge(error, "relay-core bridge dispose failed");
 					}
 				}
 			} finally {

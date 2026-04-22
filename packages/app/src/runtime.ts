@@ -17,6 +17,11 @@ import {
 	createRelaySessionFactory,
 	createSpawnTool,
 } from "@pi-relay/orchestrator";
+import {
+	createRelayOrchestratorRuntimeController,
+	stopRelayOrchestratorRuntimeController,
+	type RelayOrchestratorBridgeFactory,
+} from "./orchestrator-runtime-controller.js";
 import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
 import { createRelayBaseToolDefinitionsFactory, RELAY_BASE_TOOL_NAMES } from "./tools/base-tools.js";
 
@@ -27,6 +32,64 @@ const RELAY_APPEND_SYSTEM_PROMPT = `Relay tool usage:
 - Use write only for new files or complete rewrites.
 - Do not use bash to read or edit files when dedicated tools are available.
 - After apply_patch succeeds, do not immediately re-read the same file unless you need verification or nearby context.`;
+
+export const RELAY_RUNTIME_ENGINE_MODES = ["legacy", "ts-core", "rust-shadow", "rust"] as const;
+
+export type RelayRuntimeEngineMode = (typeof RELAY_RUNTIME_ENGINE_MODES)[number];
+
+export interface RelayRuntimeEngineConfig {
+	orchestrator: RelayRuntimeEngineMode;
+	session: RelayRuntimeEngineMode;
+}
+
+export interface RelayRuntimeFactoryOptions {
+	env?: NodeJS.ProcessEnv;
+	orchestratorBridgeFactory?: RelayOrchestratorBridgeFactory;
+}
+
+export interface CreateRelayRuntimeOptions extends RelayRuntimeFactoryOptions {
+	cwd?: string;
+	agentDir?: string;
+	sessionManager?: SessionManager;
+}
+
+export const DEFAULT_RELAY_RUNTIME_ENGINE_CONFIG: Readonly<RelayRuntimeEngineConfig> = {
+	orchestrator: "legacy",
+	session: "legacy",
+};
+
+function parseRelayRuntimeEngineMode(
+	envName: "PI_RELAY_ORCH_ENGINE" | "PI_RELAY_SESSION_ENGINE",
+	value: string | undefined,
+	fallback: RelayRuntimeEngineMode,
+): RelayRuntimeEngineMode {
+	if (!value) {
+		return fallback;
+	}
+
+	if ((RELAY_RUNTIME_ENGINE_MODES as readonly string[]).includes(value)) {
+		return value as RelayRuntimeEngineMode;
+	}
+
+	throw new Error(
+		`Invalid ${envName}=${JSON.stringify(value)}. Expected one of: ${RELAY_RUNTIME_ENGINE_MODES.join(", ")}.`,
+	);
+}
+
+export function resolveRelayRuntimeEngineConfig(env: NodeJS.ProcessEnv = process.env): RelayRuntimeEngineConfig {
+	return {
+		orchestrator: parseRelayRuntimeEngineMode(
+			"PI_RELAY_ORCH_ENGINE",
+			env.PI_RELAY_ORCH_ENGINE,
+			DEFAULT_RELAY_RUNTIME_ENGINE_CONFIG.orchestrator,
+		),
+		session: parseRelayRuntimeEngineMode(
+			"PI_RELAY_SESSION_ENGINE",
+			env.PI_RELAY_SESSION_ENGINE,
+			DEFAULT_RELAY_RUNTIME_ENGINE_CONFIG.session,
+		),
+	};
+}
 
 export function parseArgs(argv: string[]) {
 	const args = [...argv];
@@ -50,9 +113,14 @@ export function parseArgs(argv: string[]) {
 export function createRelayRuntimeFactory(
 	agentDir = getAgentDir(),
 	stateRef: RelayRuntimeStateRef = {},
+	options: RelayRuntimeFactoryOptions = {},
 ): CreateAgentSessionRuntimeFactory {
+	const engineConfig = resolveRelayRuntimeEngineConfig(options.env ?? process.env);
 	const orchestratorUiRef: { cleanup?: () => void; sessionId?: string } = {};
 	return async ({ cwd, sessionManager, sessionStartEvent }) => {
+		const previousState = stateRef.current;
+		stateRef.current = undefined;
+		await stopRelayOrchestratorRuntimeController(previousState?.orchestratorController);
 		const orchestratorRef: { current?: Orchestrator } = {};
 		const settingsManagerRef: { current?: RelaySettingsManager } = {};
 		const services = await createAgentSessionServices({
@@ -143,8 +211,14 @@ export function createRelayRuntimeFactory(
 			);
 		}
 		orchestratorRef.current = orchestrator;
-		stateRef.current = { orchestrator };
 		await orchestrator.restore();
+		const orchestratorController = await createRelayOrchestratorRuntimeController({
+			orchestrator,
+			engineMode: engineConfig.orchestrator,
+			diagnostics: services.diagnostics,
+			bridgeFactory: options.orchestratorBridgeFactory,
+		});
+		stateRef.current = { orchestrator, engineConfig, orchestratorController };
 		return {
 			...created,
 			services,
@@ -153,34 +227,64 @@ export function createRelayRuntimeFactory(
 	};
 }
 
-export async function createRelayRuntime(options?: {
-	cwd?: string;
-	agentDir?: string;
-	sessionManager?: SessionManager;
-}) {
+function wrapRelayRuntimeLifecycle<T extends Awaited<ReturnType<typeof createAgentSessionRuntime>>>(
+	runtime: T,
+	stateRef: RelayRuntimeStateRef,
+): T {
+	let disposePromise: Promise<void> | undefined;
+	return new Proxy(runtime, {
+		get(target, property, receiver) {
+			if (property === "dispose") {
+				return async () => {
+					if (!disposePromise) {
+						disposePromise = (async () => {
+							const currentState = stateRef.current;
+							stateRef.current = undefined;
+							try {
+								await stopRelayOrchestratorRuntimeController(currentState?.orchestratorController);
+							} finally {
+								await target.dispose();
+							}
+						})();
+					}
+					return disposePromise;
+				};
+			}
+
+			const value = Reflect.get(target, property, receiver);
+			if (typeof value === "function") {
+				return (value as Function).bind(target);
+			}
+			return value;
+		},
+	}) as T;
+}
+
+export async function createRelayRuntime(options?: CreateRelayRuntimeOptions) {
 	const cwd = options?.cwd ?? process.cwd();
 	const agentDir = options?.agentDir ?? getAgentDir();
 	const sessionManager = options?.sessionManager ?? SessionManager.continueRecent(cwd);
-	return createAgentSessionRuntime(createRelayRuntimeFactory(agentDir), {
+	const stateRef: RelayRuntimeStateRef = {};
+	const runtime = await createAgentSessionRuntime(createRelayRuntimeFactory(agentDir, stateRef, options), {
 		cwd,
 		agentDir,
 		sessionManager,
 	});
+	return wrapRelayRuntimeLifecycle(runtime, stateRef);
 }
 
-export async function createRelayInteractiveRuntime(options?: {
-	cwd?: string;
-	agentDir?: string;
-	sessionManager?: SessionManager;
-}) {
+export async function createRelayInteractiveRuntime(options?: CreateRelayRuntimeOptions) {
 	const cwd = options?.cwd ?? process.cwd();
 	const agentDir = options?.agentDir ?? getAgentDir();
 	const sessionManager = options?.sessionManager ?? SessionManager.create(cwd);
 	const stateRef: RelayRuntimeStateRef = {};
-	const runtime = await createAgentSessionRuntime(createRelayRuntimeFactory(agentDir, stateRef), {
-		cwd,
-		agentDir,
-		sessionManager,
-	});
+	const runtime = wrapRelayRuntimeLifecycle(
+		await createAgentSessionRuntime(createRelayRuntimeFactory(agentDir, stateRef, options), {
+			cwd,
+			agentDir,
+			sessionManager,
+		}),
+		stateRef,
+	);
 	return new RelayRuntimeHost(runtime, stateRef) as unknown as typeof runtime;
 }

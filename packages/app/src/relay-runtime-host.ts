@@ -1,10 +1,16 @@
 import { resolve } from "node:path";
 import type { AgentSession, AgentSessionRuntime } from "@pi-relay/coding-agent";
 import type { Orchestrator } from "@pi-relay/orchestrator";
+import type { RelayOrchestratorRuntimeController } from "./orchestrator-runtime-controller.js";
 
 export interface RelayRuntimeStateRef {
 	current?: {
 		orchestrator: Orchestrator;
+		engineConfig?: {
+			orchestrator: "legacy" | "ts-core" | "rust-shadow" | "rust";
+			session: "legacy" | "ts-core" | "rust-shadow" | "rust";
+		};
+		orchestratorController?: RelayOrchestratorRuntimeController;
 	};
 }
 
