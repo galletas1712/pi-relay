@@ -1,10 +1,9 @@
 use crate::ids::EventId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CoreMessage {
+pub enum CompactMessage {
     User(UserMessage),
     Assistant(AssistantMessage),
-    ToolResult(ToolResultMessage),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

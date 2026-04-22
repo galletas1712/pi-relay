@@ -8,10 +8,10 @@ mod mailbox;
 mod message;
 
 pub use crate::core_loop::{AgentCoreLoop, AgentInput, AgentNotification, Phase};
-pub use crate::event::{AgentAction, AgentEvent, AgentOutput};
+pub use crate::event::{AgentAction, AgentEvent, TurnOutcome};
 pub use crate::ids::{EventId, TurnId};
 pub use crate::mailbox::{Mailbox, MailboxCommand};
 pub use crate::message::{
-    AssistantItem, AssistantMessage, CoreMessage, ToolCall, ToolResultMessage, ToolResultStatus,
+    AssistantItem, AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, ToolResultStatus,
     UserInput, UserMessage,
 };

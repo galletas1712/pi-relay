@@ -1,27 +1,27 @@
-use crate::ids::{EventId, TurnId};
-use crate::message::{ToolCall, ToolResultStatus};
+use crate::ids::TurnId;
+use crate::message::{AssistantMessage, ToolCall, ToolResultMessage, UserMessage};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnOutcome {
+    Graceful,
+    Interrupted,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
     TurnStarted {
         turn_id: TurnId,
     },
+    UserMessage(UserMessage),
+    AssistantMessage(AssistantMessage),
     ToolCallStarted {
         turn_id: TurnId,
-        tool_call_id: EventId,
-        tool_name: String,
+        tool_call: ToolCall,
     },
-    ToolCallFinished {
-        turn_id: TurnId,
-        tool_call_id: EventId,
-        tool_name: String,
-        status: ToolResultStatus,
-    },
-    Interrupted {
-        turn_id: TurnId,
-    },
+    ToolResult(ToolResultMessage),
     TurnFinished {
         turn_id: TurnId,
+        outcome: TurnOutcome,
     },
 }
 
@@ -37,10 +37,4 @@ pub enum AgentAction {
     CancelActive {
         turn_id: TurnId,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentOutput {
-    Event(AgentEvent),
-    Action(AgentAction),
 }
