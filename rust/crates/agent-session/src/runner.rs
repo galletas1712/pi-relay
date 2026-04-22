@@ -5,9 +5,9 @@ use std::task::{Context, Poll};
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 
-use crate::action::AgentAction;
-use crate::core_loop::AgentCoreLoop;
-use crate::event::AgentInput;
+use agent_core::{AgentAction, AgentInput};
+
+use crate::AgentSession;
 
 #[derive(Debug, Clone)]
 pub struct AgentInputHandle {
@@ -15,10 +15,10 @@ pub struct AgentInputHandle {
 }
 
 impl AgentInputHandle {
-    /// Create the input side of an agent run loop.
+    /// Create the input side of an agent session run loop.
     ///
     /// The handle is cloneable so orchestrator, model, and tool tasks can all
-    /// enqueue completions or user input back into the same core loop.
+    /// enqueue completions or user input back into the same session.
     pub fn channel() -> (Self, AgentInputReceiver) {
         let (inputs, input_rx) = unbounded();
         (Self { inputs }, AgentInputReceiver { inputs: input_rx })
@@ -36,36 +36,36 @@ pub struct AgentInputReceiver {
     inputs: UnboundedReceiver<AgentInput>,
 }
 
-/// Async integration shell around the pure AgentCoreLoop.
+/// Async integration shell around an AgentSession.
 ///
 /// AgentRunner owns the proactive run loop: it receives inputs, drives the
-/// core until quiescent, and forwards requested actions to the registered
+/// session until stable, and forwards requested actions to the registered
 /// action handler.
 pub struct AgentRunner<HandleAction> {
-    core: AgentCoreLoop,
+    session: AgentSession,
     inputs: AgentInputReceiver,
     handle_action: HandleAction,
 }
 
 impl<HandleAction> AgentRunner<HandleAction> {
     pub fn new(
-        core: AgentCoreLoop,
+        session: AgentSession,
         inputs: AgentInputReceiver,
         handle_action: HandleAction,
     ) -> Self {
         Self {
-            core,
+            session,
             inputs,
             handle_action,
         }
     }
 
-    pub fn core(&self) -> &AgentCoreLoop {
-        &self.core
+    pub fn session(&self) -> &AgentSession {
+        &self.session
     }
 
-    pub fn core_mut(&mut self) -> &mut AgentCoreLoop {
-        &mut self.core
+    pub fn session_mut(&mut self) -> &mut AgentSession {
+        &mut self.session
     }
 }
 
@@ -78,15 +78,15 @@ where
         self.drive_and_flush_actions().await;
 
         while let Some(input) = next_input(&mut self.inputs.inputs).await {
-            self.core.enqueue_input(input);
+            self.session.enqueue_input(input);
             self.drive_and_flush_actions().await;
         }
     }
 
     async fn drive_and_flush_actions(&mut self) {
-        self.core.drive();
+        self.session.drive();
 
-        for action in self.core.drain_actions() {
+        for action in self.session.drain_actions() {
             (self.handle_action)(action).await;
         }
     }
@@ -122,10 +122,10 @@ mod tests {
     use std::rc::Rc;
     use std::task::{Context, Poll, Waker};
 
-    use crate::ids::TurnId;
-    use crate::message::{AssistantItem, AssistantMessage};
-    use crate::state::AgentState;
-    use crate::transcript::{TranscriptRecord, TurnOutcome};
+    use agent_core::{
+        AgentAction, AgentInput, AgentState, AssistantItem, AssistantMessage, TranscriptRecord,
+        TurnId, TurnOutcome,
+    };
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
@@ -147,7 +147,7 @@ mod tests {
             items: vec![AssistantItem::Text("hi".to_string())],
         };
         let (input_handle, input_rx) = AgentInputHandle::channel();
-        let mut runner = AgentRunner::new(AgentCoreLoop::new(), input_rx, move |action| {
+        let mut runner = AgentRunner::new(AgentSession::new(), input_rx, move |action| {
             recorded_actions.borrow_mut().push(action);
             ready(())
         });
@@ -170,7 +170,7 @@ mod tests {
             &[AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
         assert_eq!(
-            runner.core().transcript.records(),
+            runner.session().transcript().records(),
             &[
                 TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
                 TranscriptRecord::UserMessage("hello".to_string()),
@@ -181,6 +181,6 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(runner.core().state, AgentState::Idle);
+        assert_eq!(runner.session().core().state, AgentState::Idle);
     }
 }
