@@ -5,10 +5,9 @@ use std::task::{Context, Poll};
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 
-use crate::action::AgentAction;
-use crate::core_loop::AgentCoreLoop;
-use crate::event::AgentInput;
-use crate::record::TranscriptRecord;
+use agent_core::{AgentAction, AgentInput};
+
+use crate::AgentSession;
 
 #[derive(Debug, Clone)]
 pub struct AgentInputHandle {
@@ -19,7 +18,7 @@ impl AgentInputHandle {
     /// Create the input side of an agent run loop.
     ///
     /// The handle is cloneable so orchestrator, model, and tool tasks can all
-    /// enqueue completions or user input back into the same core loop.
+    /// enqueue completions or user input back into the same session.
     pub fn channel() -> (Self, AgentInputReceiver) {
         let (inputs, input_rx) = unbounded();
         (Self { inputs }, AgentInputReceiver { inputs: input_rx })
@@ -37,67 +36,58 @@ pub struct AgentInputReceiver {
     inputs: UnboundedReceiver<AgentInput>,
 }
 
-/// Async integration shell around the pure AgentCoreLoop.
+/// Async integration shell around `AgentSession`.
 ///
 /// AgentRunner owns the proactive run loop: it receives inputs, drives the
-/// core until quiescent, and forwards produced records and requested actions
-/// to the registered handlers. Records flow first so observers see durable
-/// transcript updates before any side effects are triggered.
-pub struct AgentRunner<HandleRecord, HandleAction> {
-    core: AgentCoreLoop,
+/// session until quiescent, and forwards any requested actions to the
+/// registered handler. Records flow automatically into the session log via
+/// `AgentSession::drive`, so callers observing durable history read it off
+/// the session's transcript rather than through a record callback.
+pub struct AgentRunner<HandleAction> {
+    session: AgentSession,
     inputs: AgentInputReceiver,
-    handle_record: HandleRecord,
     handle_action: HandleAction,
 }
 
-impl<HandleRecord, HandleAction> AgentRunner<HandleRecord, HandleAction> {
+impl<HandleAction> AgentRunner<HandleAction> {
     pub fn new(
-        core: AgentCoreLoop,
+        session: AgentSession,
         inputs: AgentInputReceiver,
-        handle_record: HandleRecord,
         handle_action: HandleAction,
     ) -> Self {
         Self {
-            core,
+            session,
             inputs,
-            handle_record,
             handle_action,
         }
     }
 
-    pub fn core(&self) -> &AgentCoreLoop {
-        &self.core
+    pub fn session(&self) -> &AgentSession {
+        &self.session
     }
 
-    pub fn core_mut(&mut self) -> &mut AgentCoreLoop {
-        &mut self.core
+    pub fn session_mut(&mut self) -> &mut AgentSession {
+        &mut self.session
     }
 }
 
-impl<HandleRecord, HandleRecordFuture, HandleAction, HandleActionFuture>
-    AgentRunner<HandleRecord, HandleAction>
+impl<HandleAction, HandleActionFuture> AgentRunner<HandleAction>
 where
-    HandleRecord: FnMut(TranscriptRecord) -> HandleRecordFuture,
-    HandleRecordFuture: Future<Output = ()>,
     HandleAction: FnMut(AgentAction) -> HandleActionFuture,
     HandleActionFuture: Future<Output = ()>,
 {
     pub async fn run(&mut self) {
-        self.drive_and_flush().await;
+        self.drive_and_flush_actions().await;
 
         while let Some(input) = next_input(&mut self.inputs.inputs).await {
-            self.core.enqueue_input(input);
-            self.drive_and_flush().await;
+            self.session.enqueue_input(input);
+            self.drive_and_flush_actions().await;
         }
     }
 
-    async fn drive_and_flush(&mut self) {
-        self.core.drive();
-
-        for record in self.core.drain_records() {
-            (self.handle_record)(record).await;
-        }
-        for action in self.core.drain_actions() {
+    async fn drive_and_flush_actions(&mut self) {
+        self.session.drive();
+        for action in self.session.drain_actions() {
             (self.handle_action)(action).await;
         }
     }
@@ -133,9 +123,7 @@ mod tests {
     use std::rc::Rc;
     use std::task::{Context, Poll, Waker};
 
-    use crate::ids::TurnId;
-    use crate::message::{AssistantItem, AssistantMessage};
-    use crate::record::TurnOutcome;
+    use agent_core::{AssistantItem, AssistantMessage, TranscriptRecord, TurnId, TurnOutcome};
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
@@ -151,26 +139,16 @@ mod tests {
 
     #[test]
     fn runner_registers_handler_and_drives_enqueued_inputs() {
-        let records = Rc::new(RefCell::new(Vec::new()));
-        let recorded_records = records.clone();
         let actions = Rc::new(RefCell::new(Vec::new()));
         let recorded_actions = actions.clone();
         let assistant = AssistantMessage {
             items: vec![AssistantItem::Text("hi".to_string())],
         };
         let (input_handle, input_rx) = AgentInputHandle::channel();
-        let mut runner = AgentRunner::new(
-            AgentCoreLoop::new(),
-            input_rx,
-            move |record| {
-                recorded_records.borrow_mut().push(record);
-                ready(())
-            },
-            move |action| {
-                recorded_actions.borrow_mut().push(action);
-                ready(())
-            },
-        );
+        let mut runner = AgentRunner::new(AgentSession::new(), input_rx, move |action| {
+            recorded_actions.borrow_mut().push(action);
+            ready(())
+        });
 
         input_handle
             .enqueue_input(AgentInput::FollowUp("hello".to_string()))
@@ -190,7 +168,7 @@ mod tests {
             &[AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
         assert_eq!(
-            records.borrow().as_slice(),
+            runner.session().transcript().records(),
             &[
                 TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
                 TranscriptRecord::UserMessage("hello".to_string()),
@@ -201,6 +179,6 @@ mod tests {
                 },
             ]
         );
-        assert!(runner.core().is_idle());
+        assert!(runner.session().is_idle());
     }
 }

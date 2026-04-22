@@ -6,3 +6,5 @@ publish = false
 
 [dependencies]
 agent-core = { path = "../agent-core" }
+futures-channel = "0.3"
+futures-core = "0.3"

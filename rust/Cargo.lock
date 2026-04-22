@@ -5,10 +5,6 @@ version = 4
 [[package]]
 name = "agent-core"
 version = "0.1.0"
-dependencies = [
- "futures-channel",
- "futures-core",
-]
 
 [[package]]
 name = "agent-orchestrator"
@@ -23,6 +19,8 @@ name = "agent-session"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "futures-channel",
+ "futures-core",
 ]
 
 [[package]]

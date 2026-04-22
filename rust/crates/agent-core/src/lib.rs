@@ -8,7 +8,6 @@ mod ids;
 mod mailbox;
 mod message;
 mod record;
-mod runner;
 mod state;
 
 pub use crate::action::AgentAction;
@@ -19,7 +18,6 @@ pub use crate::message::{
     AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
 };
 pub use crate::record::{TranscriptRecord, TurnOutcome};
-pub use crate::runner::{AgentInputHandle, AgentInputReceiver, AgentRunner};
 
 // `AgentState` and `Mailbox` are intentionally not re-exported: they are
 // implementation details of the core loop. Callers observe liveness via

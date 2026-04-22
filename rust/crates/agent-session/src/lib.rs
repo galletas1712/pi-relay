@@ -1,18 +1,20 @@
 #![forbid(unsafe_code)]
 
+mod runner;
 mod session_log;
 mod transcript;
 
 use agent_core::AgentCoreLoop;
 
+pub use crate::runner::{AgentInputHandle, AgentInputReceiver, AgentRunner};
 pub use crate::session_log::{
     CompactionPlan, CompactionSettings, InjectedKind, InjectedMessage, SessionContext,
     SessionEntry, SessionEntryKind, SessionLog, SessionLogError,
 };
 pub use crate::transcript::Transcript;
 
-// Re-export record types so downstream callers have a single import home.
-pub use agent_core::{AgentInput, TranscriptRecord, TurnId, TurnOutcome};
+// Re-export core-owned types so downstream callers have a single import home.
+pub use agent_core::{AgentAction, AgentInput, TranscriptRecord, TurnId, TurnOutcome};
 
 /// Session shell around the pure core loop.
 ///
@@ -110,6 +112,15 @@ impl AgentSession {
     pub fn drive(&mut self) {
         self.core.drive();
         self.absorb_core_records();
+    }
+
+    /// Drain pending actions the core produced during the last `drive`.
+    ///
+    /// Exposed so the async runner can flush actions to its handler without
+    /// reaching into the core. Records are absorbed into the log inside
+    /// `drive`, so there is no analogous `drain_records` on the session.
+    pub fn drain_actions(&mut self) -> Vec<AgentAction> {
+        self.core.drain_actions()
     }
 
     pub fn quiescence(&self, external_work: ExternalWork) -> SessionQuiescence {
