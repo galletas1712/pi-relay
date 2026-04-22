@@ -8,10 +8,6 @@ use crate::transcript::{TranscriptRecord, TurnOutcome};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentState {
     Idle,
-    // The last completed turn ended via interrupt.
-    Interrupted,
-    // The last completed turn was synthesized as crashed during recovery.
-    Crashed,
     RunningModel {
         turn_id: TurnId,
     },
@@ -54,7 +50,7 @@ impl AgentState {
         input: String,
     ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         match self {
-            Self::Idle | Self::Interrupted | Self::Crashed => {
+            Self::Idle => {
                 *self = Self::RunningModel { turn_id };
                 (
                     vec![
@@ -171,9 +167,9 @@ impl AgentState {
 
     fn on_interrupt(&mut self) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         match self.clone() {
-            Self::Idle | Self::Interrupted | Self::Crashed => empty_transition(),
+            Self::Idle => empty_transition(),
             Self::ReadyToContinue { turn_id } => {
-                *self = Self::Interrupted;
+                *self = Self::Idle;
                 (
                     vec![TranscriptRecord::TurnFinished {
                         turn_id,
@@ -183,7 +179,7 @@ impl AgentState {
                 )
             }
             Self::RunningModel { turn_id } => {
-                *self = Self::Interrupted;
+                *self = Self::Idle;
                 (
                     vec![TranscriptRecord::TurnFinished {
                         turn_id,
@@ -198,7 +194,7 @@ impl AgentState {
                 completed_results,
                 next_result_index,
             } => {
-                *self = Self::Interrupted;
+                *self = Self::Idle;
                 let mut records = Vec::new();
                 for (index, tool_call) in tool_calls.into_iter().enumerate().skip(next_result_index)
                 {
@@ -249,22 +245,16 @@ mod tests {
     }
 
     #[test]
-    fn terminal_states_ignore_late_model_completions() {
+    fn idle_ignores_late_model_completions() {
         let event = AgentEvent::ModelCompleted {
             turn_id: TurnId(1),
             assistant: AssistantMessage { items: Vec::new() },
         };
 
         let mut idle = AgentState::Idle;
-        let mut interrupted = AgentState::Interrupted;
-        let mut crashed = AgentState::Crashed;
 
-        assert!(transition_is_empty(&idle.step(event.clone())));
-        assert!(transition_is_empty(&interrupted.step(event.clone())));
-        assert!(transition_is_empty(&crashed.step(event)));
+        assert!(transition_is_empty(&idle.step(event)));
         assert_eq!(idle, AgentState::Idle);
-        assert_eq!(interrupted, AgentState::Interrupted);
-        assert_eq!(crashed, AgentState::Crashed);
     }
 
     #[test]
@@ -419,7 +409,7 @@ mod tests {
 
         let (records, actions) = state.step(AgentEvent::Interrupt);
 
-        assert_eq!(state, AgentState::Interrupted);
+        assert_eq!(state, AgentState::Idle);
         assert_eq!(
             records,
             vec![

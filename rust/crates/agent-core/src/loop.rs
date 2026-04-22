@@ -4,9 +4,8 @@ use crate::action::AgentAction;
 use crate::event::AgentInput;
 use crate::ids::TurnId;
 use crate::mailbox::Mailbox;
-use crate::message::CompactMessage;
 use crate::state::AgentState;
-use crate::transcript::{Transcript, TranscriptRecord, TurnOutcome};
+use crate::transcript::{Transcript, TranscriptRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCoreLoop {
@@ -40,16 +39,11 @@ impl AgentCoreLoop {
 
     pub fn from_transcript(transcript: Transcript) -> Self {
         let last_turn_id = transcript.last_turn_id();
-        let state = match transcript.tail_outcome() {
-            Some(TurnOutcome::Interrupted) => AgentState::Interrupted,
-            Some(TurnOutcome::Crashed) => AgentState::Crashed,
-            Some(TurnOutcome::Graceful) | None => AgentState::Idle,
-        };
 
         Self {
             mailbox: Mailbox::default(),
             transcript,
-            state,
+            state: AgentState::Idle,
             last_turn_id,
             action_outbox: VecDeque::new(),
         }
@@ -61,10 +55,6 @@ impl AgentCoreLoop {
 
     pub fn drain_actions(&mut self) -> Vec<AgentAction> {
         self.action_outbox.drain(..).collect()
-    }
-
-    pub fn compact_transcript(&self) -> Vec<CompactMessage> {
-        self.transcript.compact()
     }
 
     pub(crate) fn drive(&mut self) {
@@ -113,6 +103,7 @@ mod tests {
     use crate::message::{
         AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
     };
+    use crate::transcript::TurnOutcome;
 
     fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {
         AssistantMessage { items }
@@ -464,7 +455,7 @@ mod tests {
             loop_state.drain_actions(),
             vec![AgentAction::CancelTurn { turn_id: TurnId(1) }]
         );
-        assert_eq!(loop_state.state, AgentState::Interrupted);
+        assert_eq!(loop_state.state, AgentState::Idle);
     }
 
     #[test]
@@ -490,7 +481,7 @@ mod tests {
             loop_state.drain_actions(),
             vec![AgentAction::CancelTurn { turn_id: TurnId(1) }]
         );
-        assert_eq!(loop_state.state, AgentState::Interrupted);
+        assert_eq!(loop_state.state, AgentState::Idle);
     }
 
     #[test]
@@ -512,31 +503,7 @@ mod tests {
 
         assert_eq!(loop_state.transcript.records().len(), 3);
         assert!(loop_state.drain_actions().is_empty());
-        assert_eq!(loop_state.state, AgentState::Interrupted);
-    }
-
-    #[test]
-    fn compact_transcript_filters_to_user_and_assistant_messages() {
-        let mut loop_state = AgentCoreLoop::new();
-        drive_input(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
-        loop_state.drain_actions();
-
-        let assistant = assistant_message(vec![AssistantItem::Text("hi".to_string())]);
-        drive_input(
-            &mut loop_state,
-            AgentInput::ModelCompleted {
-                turn_id: TurnId(1),
-                assistant: assistant.clone(),
-            },
-        );
-
-        assert_eq!(
-            loop_state.compact_transcript(),
-            vec![
-                CompactMessage::User("hello".to_string()),
-                CompactMessage::Assistant(assistant),
-            ]
-        );
+        assert_eq!(loop_state.state, AgentState::Idle);
     }
 
     #[test]
@@ -559,7 +526,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(loop_state.state, AgentState::Crashed);
+        assert_eq!(loop_state.state, AgentState::Idle);
         assert_eq!(loop_state.last_turn_id, TurnId(7));
     }
 

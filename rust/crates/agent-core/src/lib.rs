@@ -17,7 +17,7 @@ pub use crate::event::AgentInput;
 pub use crate::ids::{ToolCallId, TurnId};
 pub use crate::mailbox::Mailbox;
 pub use crate::message::{
-    AssistantItem, AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, ToolResultStatus,
+    AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
 };
 pub use crate::runner::{AgentInputHandle, AgentInputReceiver, AgentRunner};
 pub use crate::state::AgentState;

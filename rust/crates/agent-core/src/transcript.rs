@@ -1,5 +1,5 @@
 use crate::ids::{ToolCallId, TurnId};
-use crate::message::{AssistantMessage, CompactMessage, ToolCall, ToolResultMessage};
+use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnOutcome {
@@ -105,24 +105,6 @@ impl Transcript {
             Some(TranscriptRecord::TurnFinished { outcome, .. }) => Some(*outcome),
             _ => None,
         }
-    }
-
-    pub fn compact(&self) -> Vec<CompactMessage> {
-        self.records
-            .iter()
-            .filter_map(|record| match record {
-                TranscriptRecord::UserMessage(message) => {
-                    Some(CompactMessage::User(message.clone()))
-                }
-                TranscriptRecord::AssistantMessage(message) => {
-                    Some(CompactMessage::Assistant(message.clone()))
-                }
-                TranscriptRecord::TurnStarted { .. }
-                | TranscriptRecord::ToolCallStarted { .. }
-                | TranscriptRecord::ToolResult(_)
-                | TranscriptRecord::TurnFinished { .. } => None,
-            })
-            .collect()
     }
 
     fn patch_crashed_tail(records: &mut Vec<TranscriptRecord>) {

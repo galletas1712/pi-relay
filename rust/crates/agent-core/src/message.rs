@@ -1,12 +1,6 @@
 use crate::ids::ToolCallId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompactMessage {
-    User(String),
-    Assistant(AssistantMessage),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantMessage {
     pub items: Vec<AssistantItem>,
 }

@@ -83,12 +83,10 @@ impl Mailbox {
 
         match state {
             AgentState::ReadyToContinue { .. } => Some(AgentEvent::ContinueModel),
-            AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => {
-                self.pop_user_input().map(|input| AgentEvent::StartTurn {
-                    turn_id: next_turn_id,
-                    input,
-                })
-            }
+            AgentState::Idle => self.pop_user_input().map(|input| AgentEvent::StartTurn {
+                turn_id: next_turn_id,
+                input,
+            }),
             AgentState::RunningModel { .. } | AgentState::RunningTools { .. } => None,
         }
     }
