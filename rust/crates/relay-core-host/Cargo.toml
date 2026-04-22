@@ -1,0 +1,10 @@
+[package]
+name = "relay-core-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+orchestrator-core = { path = "../orchestrator-core" }
+serde_json.workspace = true
