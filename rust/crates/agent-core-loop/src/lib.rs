@@ -6,6 +6,7 @@ mod event;
 mod ids;
 mod mailbox;
 mod message;
+mod transcript;
 
 pub use crate::core_loop::{AgentCoreLoop, AgentInput, Phase};
 pub use crate::event::{AgentAction, AgentEvent, TurnOutcome};
@@ -15,3 +16,4 @@ pub use crate::message::{
     AssistantItem, AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, ToolResultStatus,
     UserInput, UserMessage,
 };
+pub use crate::transcript::Transcript;

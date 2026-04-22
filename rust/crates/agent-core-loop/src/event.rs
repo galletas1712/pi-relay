@@ -26,6 +26,19 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    pub fn turn_id(&self) -> Option<TurnId> {
+        match self {
+            AgentEvent::TurnStarted { turn_id }
+            | AgentEvent::ToolCallStarted { turn_id, .. }
+            | AgentEvent::TurnFinished { turn_id, .. } => Some(*turn_id),
+            AgentEvent::UserMessage(_)
+            | AgentEvent::AssistantMessage(_)
+            | AgentEvent::ToolResult(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAction {
     RequestModel {

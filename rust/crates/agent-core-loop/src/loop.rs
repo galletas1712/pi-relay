@@ -6,6 +6,7 @@ use crate::mailbox::{Mailbox, MailboxEvent};
 use crate::message::{
     AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, UserInput, UserMessage,
 };
+use crate::transcript::Transcript;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
@@ -45,10 +46,7 @@ pub enum AgentInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCoreLoop {
     pub mailbox: Mailbox,
-    // Canonical append-only session log.
-    // TODO: Add first-class compaction, rewind/fork, and resume APIs on top of
-    // this log instead of relying on direct transcript manipulation.
-    pub transcript: Vec<AgentEvent>,
+    pub transcript: Transcript,
     pub phase: Phase,
     pub last_turn_id: TurnId,
     action_outbox: VecDeque<AgentAction>,
@@ -59,7 +57,7 @@ impl Default for AgentCoreLoop {
     fn default() -> Self {
         Self {
             mailbox: Mailbox::default(),
-            transcript: Vec::new(),
+            transcript: Transcript::new(),
             phase: Phase::Idle,
             last_turn_id: TurnId::default(),
             action_outbox: VecDeque::new(),
@@ -73,50 +71,13 @@ impl AgentCoreLoop {
         Self::default()
     }
 
-    pub fn from_transcript(mut transcript: Vec<AgentEvent>) -> Self {
-        let mut last_turn_id = TurnId::default();
-        let mut open_turn = None;
+    pub fn from_events(events: Vec<AgentEvent>) -> Self {
+        Self::from_transcript(Transcript::from_events(events))
+    }
 
-        for event in &transcript {
-            match event {
-                AgentEvent::TurnStarted { turn_id } => {
-                    last_turn_id = *turn_id;
-                    open_turn = Some(*turn_id);
-                }
-                AgentEvent::UserMessage(_)
-                | AgentEvent::AssistantMessage(_)
-                | AgentEvent::ToolResult(_) => {}
-                AgentEvent::ToolCallStarted { turn_id, .. } => {
-                    last_turn_id = *turn_id;
-                }
-                AgentEvent::TurnFinished { turn_id, .. } => {
-                    last_turn_id = *turn_id;
-                    if open_turn == Some(*turn_id) {
-                        open_turn = None;
-                    }
-                }
-            }
-        }
-
-        if let Some(turn_id) = open_turn {
-            transcript.push(AgentEvent::TurnFinished {
-                turn_id,
-                outcome: TurnOutcome::Crashed,
-            });
-            last_turn_id = turn_id;
-        }
-
-        let phase = match transcript.last() {
-            Some(AgentEvent::TurnFinished {
-                outcome: TurnOutcome::Interrupted,
-                ..
-            }) => Phase::Interrupted,
-            Some(AgentEvent::TurnFinished {
-                outcome: TurnOutcome::Crashed,
-                ..
-            }) => Phase::Crashed,
-            _ => Phase::Idle,
-        };
+    pub fn from_transcript(transcript: Transcript) -> Self {
+        let last_turn_id = transcript.last_turn_id();
+        let phase = Self::phase_from_transcript(&transcript);
 
         Self {
             mailbox: Mailbox::default(),
@@ -125,6 +86,14 @@ impl AgentCoreLoop {
             last_turn_id,
             action_outbox: VecDeque::new(),
             interrupt_requested: false,
+        }
+    }
+
+    fn phase_from_transcript(transcript: &Transcript) -> Phase {
+        match transcript.tail_outcome() {
+            Some(TurnOutcome::Interrupted) => Phase::Interrupted,
+            Some(TurnOutcome::Crashed) => Phase::Crashed,
+            Some(TurnOutcome::Graceful) | None => Phase::Idle,
         }
     }
 
@@ -153,19 +122,7 @@ impl AgentCoreLoop {
     }
 
     pub fn compact_transcript(&self) -> Vec<CompactMessage> {
-        self.transcript
-            .iter()
-            .filter_map(|event| match event {
-                AgentEvent::UserMessage(message) => Some(CompactMessage::User(message.clone())),
-                AgentEvent::AssistantMessage(message) => {
-                    Some(CompactMessage::Assistant(message.clone()))
-                }
-                AgentEvent::TurnStarted { .. }
-                | AgentEvent::ToolCallStarted { .. }
-                | AgentEvent::ToolResult(_)
-                | AgentEvent::TurnFinished { .. } => None,
-            })
-            .collect()
+        self.transcript.compact()
     }
 
     fn drive(&mut self) {
@@ -404,7 +361,7 @@ impl AgentCoreLoop {
     }
 
     fn append_event(&mut self, event: AgentEvent) {
-        self.transcript.push(event);
+        self.transcript.append(event);
     }
 
     fn enqueue_action(&mut self, action: AgentAction) {
@@ -447,7 +404,7 @@ mod tests {
         loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
 
         assert_eq!(
-            loop_state.transcript,
+            loop_state.transcript.events(),
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
@@ -481,7 +438,7 @@ mod tests {
         }));
 
         assert_eq!(
-            loop_state.transcript,
+            loop_state.transcript.events(),
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
@@ -532,7 +489,7 @@ mod tests {
         }));
 
         assert_eq!(
-            loop_state.transcript.last(),
+            loop_state.transcript.events().last(),
             Some(&AgentEvent::ToolResult(result))
         );
         assert_eq!(
@@ -568,14 +525,14 @@ mod tests {
         }));
 
         assert_eq!(
-            loop_state.transcript.last(),
+            loop_state.transcript.events().last(),
             Some(&AgentEvent::ToolCallStarted {
                 turn_id: TurnId(1),
                 tool_call: second.clone(),
             })
         );
         assert_eq!(
-            loop_state.transcript[4],
+            loop_state.transcript.events()[4],
             AgentEvent::ToolResult(first_result)
         );
         assert_eq!(
@@ -616,7 +573,7 @@ mod tests {
         loop_state.on_input(AgentInput::Interrupt);
 
         assert_eq!(
-            loop_state.transcript,
+            loop_state.transcript.events(),
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
@@ -659,7 +616,7 @@ mod tests {
         loop_state.on_input(AgentInput::Interrupt);
 
         assert_eq!(
-            loop_state.transcript,
+            loop_state.transcript.events(),
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(1) },
                 AgentEvent::UserMessage(UserMessage {
@@ -692,7 +649,7 @@ mod tests {
             assistant: stale_assistant,
         }));
 
-        assert_eq!(loop_state.transcript.len(), 3);
+        assert_eq!(loop_state.transcript.events().len(), 3);
         assert!(loop_state.drain_actions().is_empty());
         assert_eq!(loop_state.phase, Phase::Interrupted);
     }
@@ -729,10 +686,10 @@ mod tests {
             }),
         ];
 
-        let loop_state = AgentCoreLoop::from_transcript(transcript);
+        let loop_state = AgentCoreLoop::from_events(transcript);
 
         assert_eq!(
-            loop_state.transcript,
+            loop_state.transcript.events(),
             vec![
                 AgentEvent::TurnStarted { turn_id: TurnId(7) },
                 AgentEvent::UserMessage(UserMessage {
@@ -761,9 +718,9 @@ mod tests {
             },
         ];
 
-        let loop_state = AgentCoreLoop::from_transcript(transcript.clone());
+        let loop_state = AgentCoreLoop::from_events(transcript.clone());
 
-        assert_eq!(loop_state.transcript, transcript);
+        assert_eq!(loop_state.transcript.events(), transcript.as_slice());
         assert_eq!(loop_state.phase, Phase::Idle);
         assert_eq!(loop_state.last_turn_id, TurnId(2));
     }
