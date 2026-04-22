@@ -143,18 +143,9 @@ impl AgentCoreLoop {
         };
         let turn_id = *turn_id;
 
-        let Some((queued_turn_id, tool_call)) = self.mailbox.pop_tool_call() else {
+        let Some(tool_call) = self.mailbox.pop_tool_call() else {
             return false;
         };
-
-        debug_assert_eq!(
-            queued_turn_id, turn_id,
-            "queued tool call belonged to a different turn"
-        );
-
-        if queued_turn_id != turn_id {
-            return true;
-        }
 
         self.start_tool_call(turn_id, tool_call);
         true
@@ -237,7 +228,7 @@ impl AgentCoreLoop {
         };
 
         for tool_call in tool_calls {
-            self.mailbox.push_tool_call(turn_id, tool_call);
+            self.mailbox.push_tool_call(tool_call);
         }
 
         self.start_tool_call(turn_id, first_tool_call);
