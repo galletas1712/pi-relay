@@ -80,17 +80,17 @@ impl AgentCoreLoop {
         for event in &transcript {
             match event {
                 AgentEvent::TurnStarted { turn_id } => {
-                    last_turn_id = last_turn_id.max(*turn_id);
+                    last_turn_id = *turn_id;
                     open_turn = Some(*turn_id);
                 }
                 AgentEvent::UserMessage(_)
                 | AgentEvent::AssistantMessage(_)
                 | AgentEvent::ToolResult(_) => {}
                 AgentEvent::ToolCallStarted { turn_id, .. } => {
-                    last_turn_id = last_turn_id.max(*turn_id);
+                    last_turn_id = *turn_id;
                 }
                 AgentEvent::TurnFinished { turn_id, .. } => {
-                    last_turn_id = last_turn_id.max(*turn_id);
+                    last_turn_id = *turn_id;
                     if open_turn == Some(*turn_id) {
                         open_turn = None;
                     }
@@ -103,7 +103,7 @@ impl AgentCoreLoop {
                 turn_id,
                 outcome: TurnOutcome::Crashed,
             });
-            last_turn_id = last_turn_id.max(turn_id);
+            last_turn_id = turn_id;
         }
 
         let phase = match transcript.last() {
