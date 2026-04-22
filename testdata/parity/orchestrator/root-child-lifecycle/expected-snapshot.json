@@ -1,0 +1,41 @@
+{
+  "sessionId": "root-session",
+  "agents": {
+    "root": {
+      "id": "root",
+      "parentId": null,
+      "childIds": ["child-a"],
+      "role": "root",
+      "status": "running",
+      "spawnConfig": {
+        "role": "root",
+        "prompt": "coordinate the tree"
+      },
+      "sessionFile": "2026-04-22T04-00-00_root-session.jsonl",
+      "worklogFile": "root.worklog.md",
+      "createdAt": 1700000000000,
+      "lastStatusChange": 1700000000000,
+      "lastWorklogTurn": 0,
+      "lastWorklogMessageCount": 0,
+      "turnCount": 1
+    },
+    "child-a": {
+      "id": "child-a",
+      "parentId": "root",
+      "childIds": [],
+      "role": "researcher",
+      "status": "running",
+      "spawnConfig": {
+        "role": "researcher",
+        "prompt": "inspect child status"
+      },
+      "sessionFile": "2026-04-22T04-00-05_child-a.jsonl",
+      "worklogFile": "child-a.worklog.md",
+      "createdAt": 1700000000500,
+      "lastStatusChange": 1700000000500,
+      "lastWorklogTurn": 0,
+      "lastWorklogMessageCount": 0,
+      "turnCount": 0
+    }
+  }
+}

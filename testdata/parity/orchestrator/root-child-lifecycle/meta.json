@@ -1,0 +1,10 @@
+{
+  "id": "root-child-lifecycle",
+  "title": "Root child lifecycle replay",
+  "surface": "orchestrator",
+  "source": "phase-02-sample",
+  "description": "Hydrate a root agent, reserve a pending spawn, attach a child, and normalize path noise during parity replay.",
+  "normalization": {
+    "pathFields": ["sessionFile", "worklogFile"]
+  }
+}
