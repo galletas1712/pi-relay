@@ -7,9 +7,9 @@ mod event;
 mod ids;
 mod mailbox;
 mod message;
+mod record;
 mod runner;
 mod state;
-mod transcript;
 
 pub use crate::action::AgentAction;
 pub use crate::core_loop::AgentCoreLoop;
@@ -19,6 +19,6 @@ pub use crate::mailbox::Mailbox;
 pub use crate::message::{
     AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
 };
+pub use crate::record::{TranscriptRecord, TurnOutcome};
 pub use crate::runner::{AgentInputHandle, AgentInputReceiver, AgentRunner};
 pub use crate::state::AgentState;
-pub use crate::transcript::{Transcript, TranscriptRecord, TurnOutcome};

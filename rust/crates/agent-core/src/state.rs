@@ -2,7 +2,7 @@ use crate::action::AgentAction;
 use crate::event::AgentEvent;
 use crate::ids::TurnId;
 use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
-use crate::transcript::{TranscriptRecord, TurnOutcome};
+use crate::record::{TranscriptRecord, TurnOutcome};
 
 // Live control state only. Durable session history lives in Transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]

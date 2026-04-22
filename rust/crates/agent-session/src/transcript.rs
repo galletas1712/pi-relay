@@ -1,54 +1,13 @@
-use crate::ids::{ToolCallId, TurnId};
-use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
+use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptRecord, TurnId, TurnOutcome};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnOutcome {
-    Graceful,
-    Interrupted,
-    Crashed,
-}
-
-/// Durable append-only session record.
+/// Materialized session history.
 ///
-/// These records are persisted, replayed, compacted, forked, and rewound. They
-/// are not hook/lifecycle events; hooks should attach to a separate lifecycle
-/// notification stream derived while the loop is running.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TranscriptRecord {
-    TurnStarted {
-        turn_id: TurnId,
-    },
-    UserMessage(String),
-    AssistantMessage(AssistantMessage),
-    ToolCallStarted {
-        turn_id: TurnId,
-        tool_call: ToolCall,
-    },
-    ToolResult(ToolResultMessage),
-    TurnFinished {
-        turn_id: TurnId,
-        outcome: TurnOutcome,
-    },
-}
-
-impl TranscriptRecord {
-    pub fn turn_id(&self) -> Option<TurnId> {
-        match self {
-            TranscriptRecord::TurnStarted { turn_id }
-            | TranscriptRecord::ToolCallStarted { turn_id, .. }
-            | TranscriptRecord::TurnFinished { turn_id, .. } => Some(*turn_id),
-            TranscriptRecord::UserMessage(_)
-            | TranscriptRecord::AssistantMessage(_)
-            | TranscriptRecord::ToolResult(_) => None,
-        }
-    }
-}
-
+/// The session log is the canonical store; `Transcript` is a derived view over
+/// a record sequence. The session rebuilds one whenever it needs to feed the
+/// core loop or model context a contiguous ordered history, and uses the same
+/// type to rehydrate crashed sessions through `from_records`.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Transcript {
-    // Canonical append-only session log.
-    // TODO: Add richer compaction, rewind/fork, and resume APIs on top of this
-    // log. Boundary prefixes and crash-tail patching are the first primitives.
     records: Vec<TranscriptRecord>,
 }
 
@@ -193,9 +152,7 @@ impl From<Vec<TranscriptRecord>> for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{
-        AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
-    };
+    use agent_core::{AssistantItem, AssistantMessage, ToolResultStatus};
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
         ToolCall {

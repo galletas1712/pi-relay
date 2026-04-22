@@ -1,58 +1,56 @@
 #![forbid(unsafe_code)]
 
 mod session_log;
+mod transcript;
 
-use agent_core::{AgentCoreLoop, AgentState, Transcript, TranscriptRecord};
+use agent_core::{AgentCoreLoop, AgentState};
 
 pub use crate::session_log::{
     BranchSummaryEntry, CompactionEntry, CompactionPlan, CompactionSettings, SessionContext,
     SessionEntry, SessionEntryKind, SessionLog, SessionLogError,
 };
+pub use crate::transcript::Transcript;
+
+// Re-export record types so downstream callers have a single import home.
+pub use agent_core::{TranscriptRecord, TurnOutcome};
 
 /// Session shell around the pure core loop.
 ///
 /// `agent-core` owns deterministic state transitions. `agent-session` owns the
 /// boundary where durable transcript state can be safely replaced, forked,
-/// rewound, or resumed after consulting external model/tool work.
+/// rewound, or resumed after consulting external model/tool work. The session
+/// log is the sole owner of durable records; the core only buffers records
+/// produced in the current run until the session absorbs them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSession {
     core: AgentCoreLoop,
     log: SessionLog,
-    synced_record_len: usize,
 }
 
 impl Default for AgentSession {
     fn default() -> Self {
-        let core = AgentCoreLoop::new();
-        let synced_record_len = core.transcript.records().len();
-        Self {
-            core,
-            log: SessionLog::new(),
-            synced_record_len,
-        }
+        Self::new()
     }
 }
 
 impl AgentSession {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            core: AgentCoreLoop::resume_at_boundary(agent_core::TurnId::default()),
+            log: SessionLog::new(),
+        }
     }
 
     pub fn from_records(records: Vec<TranscriptRecord>) -> Self {
-        Self::from_core(AgentCoreLoop::from_records(records))
+        Self::from_transcript(Transcript::from_records(records))
     }
 
     pub fn from_transcript(transcript: Transcript) -> Self {
-        Self::from_core(AgentCoreLoop::from_transcript(transcript))
-    }
-
-    pub fn from_core(core: AgentCoreLoop) -> Self {
-        let log = SessionLog::from_transcript(&core.transcript);
-        let synced_record_len = core.transcript.records().len();
+        let last_turn_id = transcript.last_turn_id();
+        let log = SessionLog::from_transcript(&transcript);
         Self {
-            core,
+            core: AgentCoreLoop::resume_at_boundary(last_turn_id),
             log,
-            synced_record_len,
         }
     }
 
@@ -62,12 +60,10 @@ impl AgentSession {
         }
 
         let context = log.context();
-        let core = AgentCoreLoop::from_transcript(context.transcript);
-        let synced_record_len = core.transcript.records().len();
+        let last_turn_id = context.transcript.last_turn_id();
         Ok(Self {
-            core,
+            core: AgentCoreLoop::resume_at_boundary(last_turn_id),
             log,
-            synced_record_len,
         })
     }
 
@@ -79,8 +75,9 @@ impl AgentSession {
         &mut self.core
     }
 
-    pub fn transcript(&self) -> &Transcript {
-        &self.core.transcript
+    /// Materialized view of the session history derived from the log.
+    pub fn transcript(&self) -> Transcript {
+        self.log.context().transcript
     }
 
     pub fn session_log(&self) -> &SessionLog {
@@ -91,14 +88,18 @@ impl AgentSession {
         self.log.context()
     }
 
-    pub fn sync_transcript_from_core(&mut self) {
-        self.sync_log_from_core();
+    /// Drive the core to quiescence and append any records it emitted to the
+    /// session log. This is the only supported way to advance a session; the
+    /// log remains the sole owner of durable history.
+    pub fn drive(&mut self) {
+        self.core.drive();
+        self.absorb_core_records();
     }
 
     pub fn quiescence(&self, external_work: ExternalWork) -> SessionQuiescence {
         SessionQuiescence {
             core_idle: self.core.state == AgentState::Idle,
-            durable_turn_boundary: self.core.transcript.is_turn_boundary(),
+            durable_turn_boundary: self.log.is_turn_boundary(),
             mailbox_empty: self.core.mailbox.total_len() == 0,
             external_work_empty: external_work.is_empty(),
         }
@@ -126,11 +127,10 @@ impl AgentSession {
             return Err(SessionBoundaryError::ReplacementNotAtBoundary);
         }
 
-        let previous =
-            std::mem::replace(&mut self.core, AgentCoreLoop::from_transcript(replacement));
-        self.log = SessionLog::from_transcript(&self.core.transcript);
-        self.synced_record_len = self.core.transcript.records().len();
-        Ok(previous.transcript)
+        let previous = self.log.context().transcript;
+        self.log = SessionLog::from_transcript(&replacement);
+        self.rehydrate_core_from_log();
+        Ok(previous)
     }
 
     pub fn prepare_compaction(
@@ -217,23 +217,17 @@ impl AgentSession {
         Self::from_session_log(log)
     }
 
-    fn rehydrate_core_from_log(&mut self) {
-        let context = self.log.context();
-        self.core = AgentCoreLoop::from_transcript(context.transcript);
-        self.synced_record_len = self.core.transcript.records().len();
-    }
-
-    fn sync_log_from_core(&mut self) {
-        let records = self.core.transcript.records();
-        if self.synced_record_len > records.len() {
-            self.log = SessionLog::from_transcript(&self.core.transcript);
-            self.synced_record_len = records.len();
+    fn absorb_core_records(&mut self) {
+        let records = self.core.drain_records();
+        if records.is_empty() {
             return;
         }
+        self.log.append_transcript_records(records);
+    }
 
-        self.log
-            .append_transcript_records(records[self.synced_record_len..].iter().cloned());
-        self.synced_record_len = records.len();
+    fn rehydrate_core_from_log(&mut self) {
+        let last_turn_id = self.log.context().transcript.last_turn_id();
+        self.core = AgentCoreLoop::resume_at_boundary(last_turn_id);
     }
 }
 
@@ -347,6 +341,41 @@ mod tests {
     }
 
     #[test]
+    fn drive_absorbs_core_records_into_the_session_log() {
+        let mut session = AgentSession::new();
+        let assistant = AssistantMessage {
+            items: vec![AssistantItem::Text("hi".to_string())],
+        };
+
+        session
+            .core_mut()
+            .enqueue_input(agent_core::AgentInput::FollowUp("hello".to_string()));
+        session.drive();
+        session
+            .core_mut()
+            .enqueue_input(agent_core::AgentInput::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant: assistant.clone(),
+            });
+        session.drive();
+
+        assert_eq!(
+            session.transcript().records(),
+            &[
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage("hello".to_string()),
+                TranscriptRecord::AssistantMessage(assistant),
+                TranscriptRecord::TurnFinished {
+                    turn_id: TurnId(1),
+                    outcome: TurnOutcome::Graceful,
+                },
+            ]
+        );
+        // drain happens inside `drive`; the core no longer holds a record buffer.
+        assert!(session.core_mut().drain_records().is_empty());
+    }
+
+    #[test]
     fn compaction_requires_quiescence_and_keeps_a_turn_boundary_suffix() {
         let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
@@ -437,5 +466,47 @@ mod tests {
             .fork_at_turn_boundary(Some(&turn_one_end_id), ExternalWork::NONE)
             .expect("turn end is a valid fork point");
         assert_eq!(fork.transcript().last_turn_id(), TurnId(1));
+    }
+
+    #[test]
+    fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
+        let transcript = vec![
+            TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
+            TranscriptRecord::UserMessage("hello".to_string()),
+        ];
+
+        let session = AgentSession::from_records(transcript);
+
+        assert_eq!(
+            session.transcript().records(),
+            &[
+                TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
+                TranscriptRecord::UserMessage("hello".to_string()),
+                TranscriptRecord::TurnFinished {
+                    turn_id: TurnId(7),
+                    outcome: TurnOutcome::Crashed,
+                },
+            ]
+        );
+        assert_eq!(session.core().state, agent_core::AgentState::Idle);
+        assert_eq!(session.core().last_turn_id, TurnId(7));
+    }
+
+    #[test]
+    fn rehydrating_a_graceful_boundary_restores_idle_state() {
+        let transcript = vec![
+            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
+            TranscriptRecord::UserMessage("hello".to_string()),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(2),
+                outcome: TurnOutcome::Graceful,
+            },
+        ];
+
+        let session = AgentSession::from_records(transcript.clone());
+
+        assert_eq!(session.transcript().records(), transcript.as_slice());
+        assert_eq!(session.core().state, agent_core::AgentState::Idle);
+        assert_eq!(session.core().last_turn_id, TurnId(2));
     }
 }

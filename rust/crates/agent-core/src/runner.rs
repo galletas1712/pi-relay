@@ -8,6 +8,7 @@ use futures_core::Stream;
 use crate::action::AgentAction;
 use crate::core_loop::AgentCoreLoop;
 use crate::event::AgentInput;
+use crate::record::TranscriptRecord;
 
 #[derive(Debug, Clone)]
 pub struct AgentInputHandle {
@@ -39,23 +40,27 @@ pub struct AgentInputReceiver {
 /// Async integration shell around the pure AgentCoreLoop.
 ///
 /// AgentRunner owns the proactive run loop: it receives inputs, drives the
-/// core until quiescent, and forwards requested actions to the registered
-/// action handler.
-pub struct AgentRunner<HandleAction> {
+/// core until quiescent, and forwards produced records and requested actions
+/// to the registered handlers. Records flow first so observers see durable
+/// transcript updates before any side effects are triggered.
+pub struct AgentRunner<HandleRecord, HandleAction> {
     core: AgentCoreLoop,
     inputs: AgentInputReceiver,
+    handle_record: HandleRecord,
     handle_action: HandleAction,
 }
 
-impl<HandleAction> AgentRunner<HandleAction> {
+impl<HandleRecord, HandleAction> AgentRunner<HandleRecord, HandleAction> {
     pub fn new(
         core: AgentCoreLoop,
         inputs: AgentInputReceiver,
+        handle_record: HandleRecord,
         handle_action: HandleAction,
     ) -> Self {
         Self {
             core,
             inputs,
+            handle_record,
             handle_action,
         }
     }
@@ -69,23 +74,29 @@ impl<HandleAction> AgentRunner<HandleAction> {
     }
 }
 
-impl<HandleAction, HandleActionFuture> AgentRunner<HandleAction>
+impl<HandleRecord, HandleRecordFuture, HandleAction, HandleActionFuture>
+    AgentRunner<HandleRecord, HandleAction>
 where
+    HandleRecord: FnMut(TranscriptRecord) -> HandleRecordFuture,
+    HandleRecordFuture: Future<Output = ()>,
     HandleAction: FnMut(AgentAction) -> HandleActionFuture,
     HandleActionFuture: Future<Output = ()>,
 {
     pub async fn run(&mut self) {
-        self.drive_and_flush_actions().await;
+        self.drive_and_flush().await;
 
         while let Some(input) = next_input(&mut self.inputs.inputs).await {
             self.core.enqueue_input(input);
-            self.drive_and_flush_actions().await;
+            self.drive_and_flush().await;
         }
     }
 
-    async fn drive_and_flush_actions(&mut self) {
+    async fn drive_and_flush(&mut self) {
         self.core.drive();
 
+        for record in self.core.drain_records() {
+            (self.handle_record)(record).await;
+        }
         for action in self.core.drain_actions() {
             (self.handle_action)(action).await;
         }
@@ -124,8 +135,8 @@ mod tests {
 
     use crate::ids::TurnId;
     use crate::message::{AssistantItem, AssistantMessage};
+    use crate::record::TurnOutcome;
     use crate::state::AgentState;
-    use crate::transcript::{TranscriptRecord, TurnOutcome};
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
@@ -141,16 +152,26 @@ mod tests {
 
     #[test]
     fn runner_registers_handler_and_drives_enqueued_inputs() {
+        let records = Rc::new(RefCell::new(Vec::new()));
+        let recorded_records = records.clone();
         let actions = Rc::new(RefCell::new(Vec::new()));
         let recorded_actions = actions.clone();
         let assistant = AssistantMessage {
             items: vec![AssistantItem::Text("hi".to_string())],
         };
         let (input_handle, input_rx) = AgentInputHandle::channel();
-        let mut runner = AgentRunner::new(AgentCoreLoop::new(), input_rx, move |action| {
-            recorded_actions.borrow_mut().push(action);
-            ready(())
-        });
+        let mut runner = AgentRunner::new(
+            AgentCoreLoop::new(),
+            input_rx,
+            move |record| {
+                recorded_records.borrow_mut().push(record);
+                ready(())
+            },
+            move |action| {
+                recorded_actions.borrow_mut().push(action);
+                ready(())
+            },
+        );
 
         input_handle
             .enqueue_input(AgentInput::FollowUp("hello".to_string()))
@@ -170,7 +191,7 @@ mod tests {
             &[AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
         assert_eq!(
-            runner.core().transcript.records(),
+            records.borrow().as_slice(),
             &[
                 TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
                 TranscriptRecord::UserMessage("hello".to_string()),

@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_core::{AssistantItem, Transcript, TranscriptRecord};
+use agent_core::{AssistantItem, TranscriptRecord};
+
+use crate::transcript::Transcript;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEntry {

@@ -2,10 +2,10 @@
 
 use std::collections::BTreeMap;
 
-use agent_core::{AgentInput, Transcript};
+use agent_core::AgentInput;
 use agent_session::{
     AgentSession, CompactionPlan, CompactionSettings, ExternalWork, SessionBoundaryError,
-    SessionLog,
+    SessionLog, Transcript,
 };
 
 /// Thin multi-session coordinator.
