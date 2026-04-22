@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use crate::event::{AgentAction, AgentEvent, TurnOutcome};
 use crate::ids::TurnId;
-use crate::mailbox::{Mailbox, MailboxEvent, MailboxItem, MailboxQueue};
+use crate::mailbox::{Mailbox, MailboxEvent};
 use crate::message::{
     AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, UserInput, UserMessage,
 };
@@ -21,6 +21,11 @@ pub enum Phase {
         turn_id: TurnId,
         tool_call: ToolCall,
     },
+    // Internal transition point after a tool result. The next step is either
+    // another queued tool call or a model request.
+    ReadyToContinue {
+        turn_id: TurnId,
+    },
 }
 
 impl Default for Phase {
@@ -35,13 +40,6 @@ pub enum AgentInput {
     Steer(UserInput),
     FollowUp(UserInput),
     Event(MailboxEvent),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EventDisposition {
-    ProcessNow,
-    Drop,
-    Wait,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,20 +134,14 @@ impl AgentCoreLoop {
                 self.interrupt_requested = true;
             }
             AgentInput::Steer(input) => {
-                self.mailbox
-                    .push_back(MailboxQueue::Steer, MailboxItem::UserInput(input))
-                    .expect("steer input must match the steer queue");
+                self.mailbox.push_steer(input);
             }
             AgentInput::FollowUp(input) => {
-                self.mailbox
-                    .push_back(MailboxQueue::FollowUp, MailboxItem::UserInput(input))
-                    .expect("follow-up input must match the follow-up queue");
+                self.mailbox.push_follow_up(input);
             }
             AgentInput::Event(event) => {
                 // External completions should preempt queued future work for the current turn.
-                self.mailbox
-                    .push_front(MailboxQueue::Event, MailboxItem::Event(event))
-                    .expect("events must match the event queue");
+                self.mailbox.push_event_front(event);
             }
         }
 
@@ -182,30 +174,106 @@ impl AgentCoreLoop {
                 continue;
             }
 
-            match self.classify_front_event() {
-                Some(EventDisposition::ProcessNow) => {
-                    let event = self.pop_front_event();
-                    self.handle_mailbox_event(event);
-                    continue;
-                }
-                Some(EventDisposition::Drop) => {
-                    let _ = self.pop_front_event();
-                    continue;
-                }
-                Some(EventDisposition::Wait) => return,
-                None => {}
+            if self.consume_ready_event() {
+                continue;
             }
 
-            match &self.phase {
-                Phase::Idle | Phase::Interrupted | Phase::Crashed => {
-                    let Some(input) = self.pop_next_user_input() else {
-                        return;
-                    };
-                    self.start_turn(input);
-                }
-                Phase::RunningModel { .. } | Phase::RunningTool { .. } => return,
+            if self.resume_model_if_ready() {
+                continue;
+            }
+
+            if self.start_next_turn() {
+                continue;
+            }
+
+            return;
+        }
+    }
+
+    fn consume_ready_event(&mut self) -> bool {
+        let Some(event) = self.mailbox.front_event().cloned() else {
+            return false;
+        };
+
+        match (&self.phase, event) {
+            (
+                Phase::RunningModel {
+                    turn_id: active_turn_id,
+                },
+                MailboxEvent::AssistantMessage { turn_id, .. },
+            ) if *active_turn_id == turn_id => {
+                let event = self.pop_event();
+                self.handle_mailbox_event(event);
+                true
+            }
+            (
+                Phase::RunningTool {
+                    turn_id: active_turn_id,
+                    tool_call,
+                },
+                MailboxEvent::ToolResult { turn_id, result },
+            ) if *active_turn_id == turn_id
+                && tool_call.id == result.tool_call_id
+                && tool_call.tool_name == result.tool_name =>
+            {
+                let event = self.pop_event();
+                self.handle_mailbox_event(event);
+                true
+            }
+            (
+                Phase::ReadyToContinue {
+                    turn_id: active_turn_id,
+                },
+                MailboxEvent::ToolCallReady { turn_id, .. },
+            ) if *active_turn_id == turn_id => {
+                let event = self.pop_event();
+                self.handle_mailbox_event(event);
+                true
+            }
+            (
+                Phase::RunningTool {
+                    turn_id: active_turn_id,
+                    ..
+                },
+                MailboxEvent::ToolCallReady { turn_id, .. },
+            ) if *active_turn_id == turn_id => false,
+            _ => {
+                let _ = self.pop_event();
+                true
             }
         }
+    }
+
+    fn resume_model_if_ready(&mut self) -> bool {
+        let turn_id = match &self.phase {
+            Phase::ReadyToContinue { turn_id } => *turn_id,
+            _ => return false,
+        };
+
+        self.phase = Phase::RunningModel { turn_id };
+        self.enqueue_action(AgentAction::RequestModel { turn_id });
+        true
+    }
+
+    fn start_next_turn(&mut self) -> bool {
+        match &self.phase {
+            Phase::Idle | Phase::Interrupted | Phase::Crashed => {
+                let Some(input) = self.mailbox.pop_user_input() else {
+                    return false;
+                };
+                self.start_turn(input);
+                true
+            }
+            Phase::RunningModel { .. }
+            | Phase::RunningTool { .. }
+            | Phase::ReadyToContinue { .. } => false,
+        }
+    }
+
+    fn pop_event(&mut self) -> MailboxEvent {
+        self.mailbox
+            .pop_event()
+            .expect("front event disappeared before it could be consumed")
     }
 
     fn start_turn(&mut self, input: UserInput) {
@@ -255,11 +323,7 @@ impl AgentCoreLoop {
 
         for tool_call in tool_calls {
             self.mailbox
-                .push_back(
-                    MailboxQueue::Event,
-                    MailboxItem::Event(MailboxEvent::ToolCallReady { turn_id, tool_call }),
-                )
-                .expect("tool continuations must match the event queue");
+                .push_event_back(MailboxEvent::ToolCallReady { turn_id, tool_call });
         }
 
         self.start_tool_call(turn_id, first_tool_call);
@@ -293,93 +357,7 @@ impl AgentCoreLoop {
         }
 
         self.append_event(AgentEvent::ToolResult(result));
-
-        if let Some(tool_call) = self.pop_next_ready_tool_call(turn_id) {
-            self.start_tool_call(turn_id, tool_call);
-            return;
-        }
-
-        self.phase = Phase::RunningModel { turn_id };
-        self.enqueue_action(AgentAction::RequestModel { turn_id });
-    }
-
-    fn pop_next_ready_tool_call(&mut self, turn_id: TurnId) -> Option<ToolCall> {
-        loop {
-            let Some(MailboxItem::Event(event)) = self.mailbox.front(MailboxQueue::Event) else {
-                return None;
-            };
-
-            match event {
-                MailboxEvent::ToolCallReady {
-                    turn_id: ready_turn_id,
-                    tool_call: _,
-                } if ready_turn_id == turn_id => {
-                    let Some(MailboxItem::Event(MailboxEvent::ToolCallReady { tool_call, .. })) =
-                        self.mailbox.pop_front(MailboxQueue::Event)
-                    else {
-                        unreachable!("event queue front changed during tool lookup");
-                    };
-                    return Some(tool_call);
-                }
-                _ => {
-                    let _ = self.mailbox.pop_front(MailboxQueue::Event);
-                }
-            }
-        }
-    }
-
-    fn classify_front_event(&self) -> Option<EventDisposition> {
-        let Some(MailboxItem::Event(event)) = self.mailbox.front(MailboxQueue::Event) else {
-            return None;
-        };
-
-        Some(match (&self.phase, event) {
-            (
-                Phase::RunningModel {
-                    turn_id: active_turn_id,
-                },
-                MailboxEvent::AssistantMessage { turn_id, .. },
-            ) if *active_turn_id == turn_id => EventDisposition::ProcessNow,
-            (
-                Phase::RunningTool {
-                    turn_id: active_turn_id,
-                    tool_call,
-                },
-                MailboxEvent::ToolResult { turn_id, result },
-            ) if *active_turn_id == turn_id
-                && tool_call.id == result.tool_call_id
-                && tool_call.tool_name == result.tool_name =>
-            {
-                EventDisposition::ProcessNow
-            }
-            (
-                Phase::RunningTool {
-                    turn_id: active_turn_id,
-                    ..
-                },
-                MailboxEvent::ToolCallReady { turn_id, .. },
-            ) if *active_turn_id == turn_id => EventDisposition::Wait,
-            _ => EventDisposition::Drop,
-        })
-    }
-
-    fn pop_front_event(&mut self) -> MailboxEvent {
-        let Some(MailboxItem::Event(event)) = self.mailbox.pop_front(MailboxQueue::Event) else {
-            unreachable!("expected an event at the front of the event queue");
-        };
-        event
-    }
-
-    fn pop_next_user_input(&mut self) -> Option<UserInput> {
-        if let Some(MailboxItem::UserInput(input)) = self.mailbox.pop_front(MailboxQueue::Steer) {
-            return Some(input);
-        }
-
-        let Some(MailboxItem::UserInput(input)) = self.mailbox.pop_front(MailboxQueue::FollowUp)
-        else {
-            return None;
-        };
-        Some(input)
+        self.phase = Phase::ReadyToContinue { turn_id };
     }
 
     fn handle_interrupt(&mut self) -> bool {
@@ -391,6 +369,14 @@ impl AgentCoreLoop {
 
         match self.phase.clone() {
             Phase::Idle | Phase::Interrupted | Phase::Crashed => false,
+            Phase::ReadyToContinue { turn_id } => {
+                self.phase = Phase::Interrupted;
+                self.append_event(AgentEvent::TurnFinished {
+                    turn_id,
+                    outcome: TurnOutcome::Interrupted,
+                });
+                true
+            }
             Phase::RunningModel { turn_id } => {
                 self.phase = Phase::Interrupted;
 
