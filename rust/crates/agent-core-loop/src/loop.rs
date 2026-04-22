@@ -4,7 +4,7 @@ use crate::action::AgentAction;
 use crate::event::AgentEvent;
 use crate::ids::TurnId;
 use crate::mailbox::Mailbox;
-use crate::message::{AssistantMessage, CompactMessage, ToolResultMessage, UserInput};
+use crate::message::{AssistantMessage, CompactMessage, ToolResultMessage};
 use crate::state::{AgentState, AgentTransition};
 use crate::transcript::Transcript;
 use crate::transcript_record::TranscriptRecord;
@@ -14,9 +14,9 @@ pub enum AgentInput {
     // User asked to stop the active model/tool work.
     Interrupt,
     // High-priority user input. Runs before queued follow-up work.
-    Steer(UserInput),
+    Steer(String),
     // Normal-priority user input for the next available turn.
-    FollowUp(UserInput),
+    FollowUp(String),
     // Volatile model completion delivered by the orchestrator.
     ModelCompleted {
         turn_id: TurnId,
@@ -145,7 +145,7 @@ mod tests {
     use super::*;
     use crate::action::AgentAction;
     use crate::ids::ToolCallId;
-    use crate::message::{AssistantItem, ToolCall, UserMessage};
+    use crate::message::{AssistantItem, ToolCall, ToolResultStatus};
     use crate::transcript_record::{TranscriptRecord, TurnOutcome};
 
     fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {
@@ -165,7 +165,7 @@ mod tests {
             tool_call_id,
             tool_name: tool_name.to_string(),
             output: "ok".to_string(),
-            status: crate::message::ToolResultStatus::Success,
+            status: ToolResultStatus::Success,
         }
     }
 
@@ -173,15 +173,13 @@ mod tests {
     fn starting_a_turn_appends_boundary_events_and_requests_the_model() {
         let mut loop_state = AgentCoreLoop::new();
 
-        loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
+        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
 
         assert_eq!(
             loop_state.transcript.records(),
             vec![
                 TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage(UserMessage {
-                    text: "hello".to_string(),
-                }),
+                TranscriptRecord::UserMessage("hello".to_string()),
             ]
         );
         assert_eq!(
@@ -198,7 +196,7 @@ mod tests {
     fn model_completion_with_a_tool_call_appends_assistant_and_starts_the_tool() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
+        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
@@ -216,9 +214,7 @@ mod tests {
             loop_state.transcript.records(),
             vec![
                 TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage(UserMessage {
-                    text: "hello".to_string(),
-                }),
+                TranscriptRecord::UserMessage("hello".to_string()),
                 TranscriptRecord::AssistantMessage(assistant.clone()),
                 TranscriptRecord::ToolCallStarted {
                     turn_id: TurnId(1),
@@ -248,7 +244,7 @@ mod tests {
     fn tool_completion_appends_a_result_and_resumes_the_model() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
+        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
@@ -283,7 +279,7 @@ mod tests {
     fn multiple_tool_calls_run_in_parallel_and_results_are_recorded_in_source_order() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
+        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
 
         let first = tool_call(&mut next_tool_call_id, "bash");
@@ -323,7 +319,7 @@ mod tests {
             turn_id: TurnId(1),
             result: second_result.clone(),
         });
-        loop_state.on_input(AgentInput::Steer(UserInput::from("urgent")));
+        loop_state.on_input(AgentInput::Steer("urgent".to_string()));
 
         assert_eq!(
             loop_state.transcript.records().last(),
@@ -374,7 +370,7 @@ mod tests {
     fn interrupting_a_running_tool_closes_the_turn_and_starts_queued_steer_work() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        loop_state.on_input(AgentInput::FollowUp(UserInput::from("initial")));
+        loop_state.on_input(AgentInput::FollowUp("initial".to_string()));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
@@ -385,7 +381,7 @@ mod tests {
         });
         loop_state.drain_actions();
 
-        loop_state.on_input(AgentInput::Steer(UserInput::from("urgent")));
+        loop_state.on_input(AgentInput::Steer("urgent".to_string()));
 
         assert!(loop_state.drain_actions().is_empty());
 
@@ -395,9 +391,7 @@ mod tests {
             loop_state.transcript.records(),
             vec![
                 TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage(UserMessage {
-                    text: "initial".to_string(),
-                }),
+                TranscriptRecord::UserMessage("initial".to_string()),
                 TranscriptRecord::AssistantMessage(assistant_message(vec![
                     AssistantItem::ToolCall(tool_call.clone(),)
                 ])),
@@ -411,9 +405,7 @@ mod tests {
                     outcome: TurnOutcome::Interrupted,
                 },
                 TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-                TranscriptRecord::UserMessage(UserMessage {
-                    text: "urgent".to_string(),
-                }),
+                TranscriptRecord::UserMessage("urgent".to_string()),
             ]
         );
         assert_eq!(
@@ -433,7 +425,7 @@ mod tests {
     fn interrupting_parallel_tools_cancels_the_turn_and_records_unfinished_tools() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        loop_state.on_input(AgentInput::FollowUp(UserInput::from("initial")));
+        loop_state.on_input(AgentInput::FollowUp("initial".to_string()));
         loop_state.drain_actions();
 
         let first = tool_call(&mut next_tool_call_id, "bash");
@@ -480,7 +472,7 @@ mod tests {
     #[test]
     fn interrupting_a_running_model_without_queued_work_finishes_interrupted() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
+        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
 
         loop_state.on_input(AgentInput::Interrupt);
@@ -489,9 +481,7 @@ mod tests {
             loop_state.transcript.records(),
             vec![
                 TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage(UserMessage {
-                    text: "hello".to_string(),
-                }),
+                TranscriptRecord::UserMessage("hello".to_string()),
                 TranscriptRecord::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Interrupted,
@@ -508,7 +498,7 @@ mod tests {
     #[test]
     fn stale_completions_are_ignored_after_an_interrupt() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
+        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
         loop_state.on_input(AgentInput::Interrupt);
         loop_state.drain_actions();
@@ -527,7 +517,7 @@ mod tests {
     #[test]
     fn compact_transcript_filters_to_user_and_assistant_messages() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
+        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
 
         let assistant = assistant_message(vec![AssistantItem::Text("hi".to_string())]);
@@ -539,9 +529,7 @@ mod tests {
         assert_eq!(
             loop_state.compact_transcript(),
             vec![
-                CompactMessage::User(UserMessage {
-                    text: "hello".to_string(),
-                }),
+                CompactMessage::User("hello".to_string()),
                 CompactMessage::Assistant(assistant),
             ]
         );
@@ -551,9 +539,7 @@ mod tests {
     fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
         let transcript = vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
-            TranscriptRecord::UserMessage(UserMessage {
-                text: "hello".to_string(),
-            }),
+            TranscriptRecord::UserMessage("hello".to_string()),
         ];
 
         let loop_state = AgentCoreLoop::from_records(transcript);
@@ -562,9 +548,7 @@ mod tests {
             loop_state.transcript.records(),
             vec![
                 TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
-                TranscriptRecord::UserMessage(UserMessage {
-                    text: "hello".to_string(),
-                }),
+                TranscriptRecord::UserMessage("hello".to_string()),
                 TranscriptRecord::TurnFinished {
                     turn_id: TurnId(7),
                     outcome: TurnOutcome::Crashed,
@@ -579,9 +563,7 @@ mod tests {
     fn rehydrating_a_graceful_boundary_restores_idle_state() {
         let transcript = vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage(UserMessage {
-                text: "hello".to_string(),
-            }),
+            TranscriptRecord::UserMessage("hello".to_string()),
             TranscriptRecord::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,

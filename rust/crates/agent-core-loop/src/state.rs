@@ -1,7 +1,7 @@
 use crate::action::AgentAction;
 use crate::event::AgentEvent;
 use crate::ids::TurnId;
-use crate::message::{ToolCall, ToolResultMessage, UserMessage};
+use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
 use crate::transcript_record::{TranscriptRecord, TurnOutcome};
 
 // Live control state only. Durable session history lives in Transcript.
@@ -68,18 +68,14 @@ impl AgentState {
         }
     }
 
-    fn on_start_turn(
-        &mut self,
-        turn_id: TurnId,
-        input: crate::message::UserInput,
-    ) -> AgentTransition {
+    fn on_start_turn(&mut self, turn_id: TurnId, input: String) -> AgentTransition {
         match self {
             Self::Idle | Self::Interrupted | Self::Crashed => {
                 *self = Self::RunningModel { turn_id };
                 AgentTransition {
                     records: vec![
                         TranscriptRecord::TurnStarted { turn_id },
-                        TranscriptRecord::UserMessage(UserMessage { text: input.text }),
+                        TranscriptRecord::UserMessage(input),
                     ],
                     actions: vec![AgentAction::RequestModel { turn_id }],
                 }
@@ -93,7 +89,7 @@ impl AgentState {
     fn on_model_completed(
         &mut self,
         turn_id: TurnId,
-        assistant: crate::message::AssistantMessage,
+        assistant: AssistantMessage,
     ) -> AgentTransition {
         if !matches!(
             self,
@@ -250,9 +246,7 @@ impl AgentState {
 mod tests {
     use super::*;
     use crate::ids::ToolCallId;
-    use crate::message::{
-        AssistantItem, AssistantMessage, ToolResultMessage, ToolResultStatus, UserInput,
-    };
+    use crate::message::{AssistantItem, AssistantMessage, ToolResultMessage, ToolResultStatus};
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
         ToolCall {
@@ -356,7 +350,7 @@ mod tests {
 
         let start = state.step(AgentEvent::StartTurn {
             turn_id: TurnId(1),
-            input: UserInput::from("hello"),
+            input: "hello".to_string(),
         });
         assert_eq!(state, AgentState::RunningModel { turn_id: TurnId(1) });
         assert_eq!(

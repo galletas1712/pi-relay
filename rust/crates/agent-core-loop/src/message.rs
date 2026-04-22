@@ -2,32 +2,8 @@ use crate::ids::ToolCallId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompactMessage {
-    User(UserMessage),
+    User(String),
     Assistant(AssistantMessage),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserInput {
-    pub text: String,
-}
-
-impl From<&str> for UserInput {
-    fn from(value: &str) -> Self {
-        Self {
-            text: value.to_string(),
-        }
-    }
-}
-
-impl From<String> for UserInput {
-    fn from(value: String) -> Self {
-        Self { text: value }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserMessage {
-    pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

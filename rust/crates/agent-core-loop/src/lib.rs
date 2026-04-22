@@ -17,7 +17,6 @@ pub use crate::ids::{ToolCallId, TurnId};
 pub use crate::mailbox::Mailbox;
 pub use crate::message::{
     AssistantItem, AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, ToolResultStatus,
-    UserInput, UserMessage,
 };
 pub use crate::state::AgentState;
 pub use crate::transcript::Transcript;

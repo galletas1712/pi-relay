@@ -1,5 +1,5 @@
 use crate::ids::TurnId;
-use crate::message::{AssistantMessage, ToolResultMessage, UserInput};
+use crate::message::{AssistantMessage, ToolResultMessage};
 
 /// Runtime input to the live agent FSM.
 ///
@@ -10,7 +10,7 @@ pub(crate) enum AgentEvent {
     Interrupt,
     StartTurn {
         turn_id: TurnId,
-        input: UserInput,
+        input: String,
     },
     ModelCompleted {
         turn_id: TurnId,

@@ -2,7 +2,6 @@ use std::collections::VecDeque;
 
 use crate::event::AgentEvent;
 use crate::ids::TurnId;
-use crate::message::UserInput;
 use crate::state::AgentState;
 
 /// Volatile prioritized queues feeding the live agent FSM.
@@ -12,8 +11,8 @@ use crate::state::AgentState;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Mailbox {
     notifications: VecDeque<AgentEvent>,
-    steer: VecDeque<UserInput>,
-    follow_up: VecDeque<UserInput>,
+    steer: VecDeque<String>,
+    follow_up: VecDeque<String>,
     interrupt_requested: bool,
 }
 
@@ -23,7 +22,7 @@ impl Mailbox {
     }
 
     #[cfg(test)]
-    pub(crate) fn push_notification_back(&mut self, notification: AgentEvent) {
+    fn push_notification_back(&mut self, notification: AgentEvent) {
         self.notifications.push_back(notification);
     }
 
@@ -31,15 +30,15 @@ impl Mailbox {
         self.interrupt_requested = true;
     }
 
-    pub fn push_steer(&mut self, input: UserInput) {
-        self.steer.push_back(input);
+    pub fn push_steer(&mut self, input: impl Into<String>) {
+        self.steer.push_back(input.into());
     }
 
-    pub fn push_follow_up(&mut self, input: UserInput) {
-        self.follow_up.push_back(input);
+    pub fn push_follow_up(&mut self, input: impl Into<String>) {
+        self.follow_up.push_back(input.into());
     }
 
-    pub fn pop_user_input(&mut self) -> Option<UserInput> {
+    pub fn pop_user_input(&mut self) -> Option<String> {
         self.steer
             .pop_front()
             .or_else(|| self.follow_up.pop_front())
@@ -135,19 +134,19 @@ mod tests {
     #[test]
     fn user_input_prefers_steer_before_follow_up() {
         let mut mailbox = Mailbox::default();
-        mailbox.push_follow_up(UserInput::from("follow-up"));
-        mailbox.push_steer(UserInput::from("steer"));
+        mailbox.push_follow_up("follow-up");
+        mailbox.push_steer("steer");
 
-        assert_eq!(mailbox.pop_user_input(), Some(UserInput::from("steer")));
-        assert_eq!(mailbox.pop_user_input(), Some(UserInput::from("follow-up")));
+        assert_eq!(mailbox.pop_user_input(), Some("steer".to_string()));
+        assert_eq!(mailbox.pop_user_input(), Some("follow-up".to_string()));
         assert_eq!(mailbox.pop_user_input(), None);
     }
 
     #[test]
     fn priority_order_is_interrupt_then_notification_then_steer_then_follow_up() {
         let mut mailbox = Mailbox::default();
-        mailbox.push_follow_up(UserInput::from("follow-up"));
-        mailbox.push_steer(UserInput::from("steer"));
+        mailbox.push_follow_up("follow-up");
+        mailbox.push_steer("steer");
         mailbox.push_notification_back(AgentEvent::ToolCompleted {
             turn_id: TurnId(1),
             result: tool_result(9, "bash"),
@@ -189,14 +188,14 @@ mod tests {
             mailbox.next_event(&AgentState::Idle, TurnId(2)),
             Some(AgentEvent::StartTurn {
                 turn_id: TurnId(2),
-                input: UserInput::from("steer")
+                input: "steer".to_string()
             })
         );
         assert_eq!(
             mailbox.next_event(&AgentState::Idle, TurnId(3)),
             Some(AgentEvent::StartTurn {
                 turn_id: TurnId(3),
-                input: UserInput::from("follow-up")
+                input: "follow-up".to_string()
             })
         );
     }

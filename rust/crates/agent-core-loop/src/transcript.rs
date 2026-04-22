@@ -170,7 +170,7 @@ impl From<Vec<TranscriptRecord>> for Transcript {
 mod tests {
     use super::*;
     use crate::message::{
-        AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus, UserMessage,
+        AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
     };
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
@@ -199,17 +199,13 @@ mod tests {
     fn boundary_prefix_requires_a_finished_turn() {
         let transcript = Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage(UserMessage {
-                text: "hello".to_string(),
-            }),
+            TranscriptRecord::UserMessage("hello".to_string()),
             TranscriptRecord::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
             TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage(UserMessage {
-                text: "next".to_string(),
-            }),
+            TranscriptRecord::UserMessage("next".to_string()),
         ]);
 
         let prefix = transcript
@@ -227,9 +223,7 @@ mod tests {
 
         let transcript = Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
-            TranscriptRecord::UserMessage(UserMessage {
-                text: "hello".to_string(),
-            }),
+            TranscriptRecord::UserMessage("hello".to_string()),
             TranscriptRecord::AssistantMessage(AssistantMessage {
                 items: vec![
                     AssistantItem::ToolCall(first.clone()),
@@ -266,9 +260,7 @@ mod tests {
 
         let transcript = Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(8) },
-            TranscriptRecord::UserMessage(UserMessage {
-                text: "hello".to_string(),
-            }),
+            TranscriptRecord::UserMessage("hello".to_string()),
             TranscriptRecord::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
             }),

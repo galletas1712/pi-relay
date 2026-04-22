@@ -1,5 +1,5 @@
 use crate::ids::TurnId;
-use crate::message::{AssistantMessage, ToolCall, ToolResultMessage, UserMessage};
+use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TurnOutcome {
@@ -18,7 +18,7 @@ pub enum TranscriptRecord {
     TurnStarted {
         turn_id: TurnId,
     },
-    UserMessage(UserMessage),
+    UserMessage(String),
     AssistantMessage(AssistantMessage),
     ToolCallStarted {
         turn_id: TurnId,
