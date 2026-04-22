@@ -8,8 +8,13 @@ pub enum TurnOutcome {
     Crashed,
 }
 
+/// Durable append-only session record.
+///
+/// These records are persisted, replayed, compacted, forked, and rewound. They
+/// are not hook/lifecycle events; hooks should attach to a separate lifecycle
+/// notification stream derived while the loop is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentEvent {
+pub enum TranscriptRecord {
     TurnStarted {
         turn_id: TurnId,
     },
@@ -26,29 +31,15 @@ pub enum AgentEvent {
     },
 }
 
-impl AgentEvent {
+impl TranscriptRecord {
     pub fn turn_id(&self) -> Option<TurnId> {
         match self {
-            AgentEvent::TurnStarted { turn_id }
-            | AgentEvent::ToolCallStarted { turn_id, .. }
-            | AgentEvent::TurnFinished { turn_id, .. } => Some(*turn_id),
-            AgentEvent::UserMessage(_)
-            | AgentEvent::AssistantMessage(_)
-            | AgentEvent::ToolResult(_) => None,
+            TranscriptRecord::TurnStarted { turn_id }
+            | TranscriptRecord::ToolCallStarted { turn_id, .. }
+            | TranscriptRecord::TurnFinished { turn_id, .. } => Some(*turn_id),
+            TranscriptRecord::UserMessage(_)
+            | TranscriptRecord::AssistantMessage(_)
+            | TranscriptRecord::ToolResult(_) => None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AgentAction {
-    RequestModel {
-        turn_id: TurnId,
-    },
-    RequestTool {
-        turn_id: TurnId,
-        tool_call: ToolCall,
-    },
-    CancelActive {
-        turn_id: TurnId,
-    },
 }

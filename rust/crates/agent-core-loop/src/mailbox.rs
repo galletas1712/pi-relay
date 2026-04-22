@@ -3,8 +3,13 @@ use std::collections::VecDeque;
 use crate::ids::TurnId;
 use crate::message::{AssistantMessage, ToolCall, ToolResultMessage, UserInput};
 
+/// Volatile notification sent into the loop by model/tool execution or by the
+/// loop itself to sequence already-discovered tool calls.
+///
+/// Notifications are queued in the mailbox and are lost on process death. They
+/// are not durable transcript records and are not hook lifecycle events.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MailboxEvent {
+pub enum MailboxNotification {
     AssistantMessage {
         turn_id: TurnId,
         assistant: AssistantMessage,
@@ -19,44 +24,44 @@ pub enum MailboxEvent {
     },
 }
 
-impl MailboxEvent {
+impl MailboxNotification {
     pub fn turn_id(&self) -> TurnId {
         match self {
-            MailboxEvent::AssistantMessage { turn_id, .. }
-            | MailboxEvent::ToolCallReady { turn_id, .. }
-            | MailboxEvent::ToolResult { turn_id, .. } => *turn_id,
+            MailboxNotification::AssistantMessage { turn_id, .. }
+            | MailboxNotification::ToolCallReady { turn_id, .. }
+            | MailboxNotification::ToolResult { turn_id, .. } => *turn_id,
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MailboxEntry {
-    Event(MailboxEvent),
+    Notification(MailboxNotification),
     UserInput(UserInput),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Mailbox {
-    events: VecDeque<MailboxEvent>,
+    notifications: VecDeque<MailboxNotification>,
     steer: VecDeque<UserInput>,
     follow_up: VecDeque<UserInput>,
 }
 
 impl Mailbox {
-    pub fn push_event_front(&mut self, event: MailboxEvent) {
-        self.events.push_front(event);
+    pub fn push_notification_front(&mut self, notification: MailboxNotification) {
+        self.notifications.push_front(notification);
     }
 
-    pub fn push_event_back(&mut self, event: MailboxEvent) {
-        self.events.push_back(event);
+    pub fn push_notification_back(&mut self, notification: MailboxNotification) {
+        self.notifications.push_back(notification);
     }
 
-    pub fn front_event(&self) -> Option<&MailboxEvent> {
-        self.events.front()
+    pub fn front_notification(&self) -> Option<&MailboxNotification> {
+        self.notifications.front()
     }
 
-    pub fn pop_event(&mut self) -> Option<MailboxEvent> {
-        self.events.pop_front()
+    pub fn pop_notification(&mut self) -> Option<MailboxNotification> {
+        self.notifications.pop_front()
     }
 
     pub fn push_steer(&mut self, input: UserInput) {
@@ -74,24 +79,24 @@ impl Mailbox {
     }
 
     pub fn front_next(&self) -> Option<MailboxEntry> {
-        self.events
+        self.notifications
             .front()
             .cloned()
-            .map(MailboxEntry::Event)
+            .map(MailboxEntry::Notification)
             .or_else(|| self.steer.front().cloned().map(MailboxEntry::UserInput))
             .or_else(|| self.follow_up.front().cloned().map(MailboxEntry::UserInput))
     }
 
     pub fn pop_next(&mut self) -> Option<MailboxEntry> {
-        self.events
+        self.notifications
             .pop_front()
-            .map(MailboxEntry::Event)
+            .map(MailboxEntry::Notification)
             .or_else(|| self.steer.pop_front().map(MailboxEntry::UserInput))
             .or_else(|| self.follow_up.pop_front().map(MailboxEntry::UserInput))
     }
 
-    pub fn event_len(&self) -> usize {
-        self.events.len()
+    pub fn notification_len(&self) -> usize {
+        self.notifications.len()
     }
 
     pub fn steer_len(&self) -> usize {
@@ -103,7 +108,7 @@ impl Mailbox {
     }
 
     pub fn total_len(&self) -> usize {
-        self.events.len() + self.steer.len() + self.follow_up.len()
+        self.notifications.len() + self.steer.len() + self.follow_up.len()
     }
 }
 
@@ -131,24 +136,24 @@ mod tests {
     }
 
     #[test]
-    fn event_queue_behaves_like_a_deque() {
+    fn notification_queue_behaves_like_a_deque() {
         let mut mailbox = Mailbox::default();
-        let later = MailboxEvent::ToolCallReady {
+        let later = MailboxNotification::ToolCallReady {
             turn_id: TurnId(1),
             tool_call: tool_call(2, "read"),
         };
-        let now = MailboxEvent::AssistantMessage {
+        let now = MailboxNotification::AssistantMessage {
             turn_id: TurnId(1),
             assistant: AssistantMessage { items: Vec::new() },
         };
 
-        mailbox.push_event_back(later.clone());
-        mailbox.push_event_front(now.clone());
+        mailbox.push_notification_back(later.clone());
+        mailbox.push_notification_front(now.clone());
 
-        assert_eq!(mailbox.front_event(), Some(&now));
-        assert_eq!(mailbox.pop_event(), Some(now));
-        assert_eq!(mailbox.pop_event(), Some(later));
-        assert_eq!(mailbox.pop_event(), None);
+        assert_eq!(mailbox.front_notification(), Some(&now));
+        assert_eq!(mailbox.pop_notification(), Some(now));
+        assert_eq!(mailbox.pop_notification(), Some(later));
+        assert_eq!(mailbox.pop_notification(), None);
     }
 
     #[test]
@@ -163,22 +168,26 @@ mod tests {
     }
 
     #[test]
-    fn priority_order_is_event_then_steer_then_follow_up() {
+    fn priority_order_is_notification_then_steer_then_follow_up() {
         let mut mailbox = Mailbox::default();
         mailbox.push_follow_up(UserInput::from("follow-up"));
         mailbox.push_steer(UserInput::from("steer"));
-        mailbox.push_event_back(MailboxEvent::ToolResult {
+        mailbox.push_notification_back(MailboxNotification::ToolResult {
             turn_id: TurnId(1),
             result: tool_result(9, "bash"),
         });
 
         assert!(matches!(
             mailbox.front_next(),
-            Some(MailboxEntry::Event(MailboxEvent::ToolResult { .. }))
+            Some(MailboxEntry::Notification(
+                MailboxNotification::ToolResult { .. }
+            ))
         ));
         assert!(matches!(
             mailbox.pop_next(),
-            Some(MailboxEntry::Event(MailboxEvent::ToolResult { .. }))
+            Some(MailboxEntry::Notification(
+                MailboxNotification::ToolResult { .. }
+            ))
         ));
         assert_eq!(
             mailbox.pop_next(),

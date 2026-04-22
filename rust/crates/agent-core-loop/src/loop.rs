@@ -1,20 +1,25 @@
 use std::collections::VecDeque;
 
-use crate::event::{AgentAction, AgentEvent, TurnOutcome};
+use crate::action::AgentAction;
 use crate::ids::TurnId;
-use crate::mailbox::{Mailbox, MailboxEvent};
+use crate::mailbox::{Mailbox, MailboxNotification};
 use crate::message::{
     AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, UserInput, UserMessage,
 };
-use crate::state::{AgentState, MailboxEventDecision};
+use crate::state::{AgentState, MailboxNotificationDecision};
 use crate::transcript::Transcript;
+use crate::transcript_record::{TranscriptRecord, TurnOutcome};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentInput {
+    // User asked to stop the active model/tool work.
     Interrupt,
+    // High-priority user input. Runs before queued follow-up work.
     Steer(UserInput),
+    // Normal-priority user input for the next available turn.
     FollowUp(UserInput),
-    Event(MailboxEvent),
+    // Volatile model/tool completion delivered by the orchestrator.
+    Notification(MailboxNotification),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,8 +50,8 @@ impl AgentCoreLoop {
         Self::default()
     }
 
-    pub fn from_events(events: Vec<AgentEvent>) -> Self {
-        Self::from_transcript(Transcript::from_events(events))
+    pub fn from_records(records: Vec<TranscriptRecord>) -> Self {
+        Self::from_transcript(Transcript::from_records(records))
     }
 
     pub fn from_transcript(transcript: Transcript) -> Self {
@@ -74,9 +79,9 @@ impl AgentCoreLoop {
             AgentInput::FollowUp(input) => {
                 self.mailbox.push_follow_up(input);
             }
-            AgentInput::Event(event) => {
+            AgentInput::Notification(notification) => {
                 // External completions should preempt queued future work for the current turn.
-                self.mailbox.push_event_front(event);
+                self.mailbox.push_notification_front(notification);
             }
         }
 
@@ -97,7 +102,7 @@ impl AgentCoreLoop {
                 continue;
             }
 
-            if self.consume_ready_event() {
+            if self.consume_ready_notification() {
                 continue;
             }
 
@@ -113,22 +118,22 @@ impl AgentCoreLoop {
         }
     }
 
-    fn consume_ready_event(&mut self) -> bool {
-        let Some(event) = self.mailbox.front_event().cloned() else {
+    fn consume_ready_notification(&mut self) -> bool {
+        let Some(notification) = self.mailbox.front_notification().cloned() else {
             return false;
         };
 
-        match self.state.decide_mailbox_event(&event) {
-            MailboxEventDecision::Consume => {
-                let event = self.pop_event();
-                self.handle_mailbox_event(event);
+        match self.state.decide_mailbox_notification(&notification) {
+            MailboxNotificationDecision::Consume => {
+                let notification = self.pop_notification();
+                self.handle_mailbox_notification(notification);
                 true
             }
-            MailboxEventDecision::Drop => {
-                let _ = self.pop_event();
+            MailboxNotificationDecision::Drop => {
+                let _ = self.pop_notification();
                 true
             }
-            MailboxEventDecision::Wait => false,
+            MailboxNotificationDecision::Wait => false,
         }
     }
 
@@ -156,10 +161,10 @@ impl AgentCoreLoop {
         }
     }
 
-    fn pop_event(&mut self) -> MailboxEvent {
+    fn pop_notification(&mut self) -> MailboxNotification {
         self.mailbox
-            .pop_event()
-            .expect("front event disappeared before it could be consumed")
+            .pop_notification()
+            .expect("front notification disappeared before it could be consumed")
     }
 
     fn start_turn(&mut self, input: UserInput) {
@@ -169,20 +174,20 @@ impl AgentCoreLoop {
         let started = self.state.start_turn(turn_id);
         debug_assert!(started, "start_turn called while turn is already active");
 
-        self.append_event(AgentEvent::TurnStarted { turn_id });
-        self.append_event(AgentEvent::UserMessage(user_message));
+        self.append_record(TranscriptRecord::TurnStarted { turn_id });
+        self.append_record(TranscriptRecord::UserMessage(user_message));
         self.enqueue_action(AgentAction::RequestModel { turn_id });
     }
 
-    fn handle_mailbox_event(&mut self, event: MailboxEvent) {
-        match event {
-            MailboxEvent::AssistantMessage { turn_id, assistant } => {
+    fn handle_mailbox_notification(&mut self, notification: MailboxNotification) {
+        match notification {
+            MailboxNotification::AssistantMessage { turn_id, assistant } => {
                 self.on_assistant_message(turn_id, assistant);
             }
-            MailboxEvent::ToolCallReady { turn_id, tool_call } => {
+            MailboxNotification::ToolCallReady { turn_id, tool_call } => {
                 self.start_tool_call(turn_id, tool_call);
             }
-            MailboxEvent::ToolResult { turn_id, result } => {
+            MailboxNotification::ToolResult { turn_id, result } => {
                 self.on_tool_result(turn_id, result);
             }
         }
@@ -196,13 +201,13 @@ impl AgentCoreLoop {
             return;
         }
 
-        self.append_event(AgentEvent::AssistantMessage(assistant.clone()));
+        self.append_record(TranscriptRecord::AssistantMessage(assistant.clone()));
 
         let mut tool_calls = assistant.tool_calls().cloned();
         let Some(first_tool_call) = tool_calls.next() else {
             let finished = self.state.finish_model_turn(turn_id);
             debug_assert!(finished, "assistant message consumed outside model state");
-            self.append_event(AgentEvent::TurnFinished {
+            self.append_record(TranscriptRecord::TurnFinished {
                 turn_id,
                 outcome: TurnOutcome::Graceful,
             });
@@ -211,7 +216,7 @@ impl AgentCoreLoop {
 
         for tool_call in tool_calls {
             self.mailbox
-                .push_event_back(MailboxEvent::ToolCallReady { turn_id, tool_call });
+                .push_notification_back(MailboxNotification::ToolCallReady { turn_id, tool_call });
         }
 
         self.start_tool_call(turn_id, first_tool_call);
@@ -222,7 +227,7 @@ impl AgentCoreLoop {
             return;
         }
 
-        self.append_event(AgentEvent::ToolCallStarted {
+        self.append_record(TranscriptRecord::ToolCallStarted {
             turn_id,
             tool_call: tool_call.clone(),
         });
@@ -234,7 +239,7 @@ impl AgentCoreLoop {
             return;
         }
 
-        self.append_event(AgentEvent::ToolResult(result));
+        self.append_record(TranscriptRecord::ToolResult(result));
     }
 
     fn handle_interrupt(&mut self) -> bool {
@@ -251,10 +256,10 @@ impl AgentCoreLoop {
         if let Some(tool_call) = interrupted.tool_call {
             let interrupted_tool_result =
                 ToolResultMessage::interrupted(tool_call.id, tool_call.tool_name);
-            self.append_event(AgentEvent::ToolResult(interrupted_tool_result));
+            self.append_record(TranscriptRecord::ToolResult(interrupted_tool_result));
         }
 
-        self.append_event(AgentEvent::TurnFinished {
+        self.append_record(TranscriptRecord::TurnFinished {
             turn_id: interrupted.turn_id,
             outcome: TurnOutcome::Interrupted,
         });
@@ -272,8 +277,8 @@ impl AgentCoreLoop {
         UserMessage { text: input.text }
     }
 
-    fn append_event(&mut self, event: AgentEvent) {
-        self.transcript.append(event);
+    fn append_record(&mut self, record: TranscriptRecord) {
+        self.transcript.append(record);
     }
 
     fn enqueue_action(&mut self, action: AgentAction) {
@@ -284,9 +289,10 @@ impl AgentCoreLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::event::{AgentAction, AgentEvent, TurnOutcome};
+    use crate::action::AgentAction;
     use crate::ids::ToolCallId;
     use crate::message::AssistantItem;
+    use crate::transcript_record::{TranscriptRecord, TurnOutcome};
 
     fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {
         AssistantMessage { items }
@@ -316,10 +322,10 @@ mod tests {
         loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
 
         assert_eq!(
-            loop_state.transcript.events(),
+            loop_state.transcript.records(),
             vec![
-                AgentEvent::TurnStarted { turn_id: TurnId(1) },
-                AgentEvent::UserMessage(UserMessage {
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage(UserMessage {
                     text: "hello".to_string(),
                 }),
             ]
@@ -347,20 +353,22 @@ mod tests {
             AssistantItem::ToolCall(tool_call.clone()),
         ]);
 
-        loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
-            turn_id: TurnId(1),
-            assistant: assistant.clone(),
-        }));
+        loop_state.on_input(AgentInput::Notification(
+            MailboxNotification::AssistantMessage {
+                turn_id: TurnId(1),
+                assistant: assistant.clone(),
+            },
+        ));
 
         assert_eq!(
-            loop_state.transcript.events(),
+            loop_state.transcript.records(),
             vec![
-                AgentEvent::TurnStarted { turn_id: TurnId(1) },
-                AgentEvent::UserMessage(UserMessage {
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage(UserMessage {
                     text: "hello".to_string(),
                 }),
-                AgentEvent::AssistantMessage(assistant.clone()),
-                AgentEvent::ToolCallStarted {
+                TranscriptRecord::AssistantMessage(assistant.clone()),
+                TranscriptRecord::ToolCallStarted {
                     turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
@@ -391,21 +399,23 @@ mod tests {
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
         let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
-        loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
-            turn_id: TurnId(1),
-            assistant,
-        }));
+        loop_state.on_input(AgentInput::Notification(
+            MailboxNotification::AssistantMessage {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        ));
         loop_state.drain_actions();
 
         let result = successful_tool_result(tool_call.id, "bash");
-        loop_state.on_input(AgentInput::Event(MailboxEvent::ToolResult {
+        loop_state.on_input(AgentInput::Notification(MailboxNotification::ToolResult {
             turn_id: TurnId(1),
             result: result.clone(),
         }));
 
         assert_eq!(
-            loop_state.transcript.events().last(),
-            Some(&AgentEvent::ToolResult(result))
+            loop_state.transcript.records().last(),
+            Some(&TranscriptRecord::ToolResult(result))
         );
         assert_eq!(
             loop_state.drain_actions(),
@@ -430,28 +440,30 @@ mod tests {
             AssistantItem::ToolCall(first.clone()),
             AssistantItem::ToolCall(second.clone()),
         ]);
-        loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
-            turn_id: TurnId(1),
-            assistant,
-        }));
+        loop_state.on_input(AgentInput::Notification(
+            MailboxNotification::AssistantMessage {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        ));
         loop_state.drain_actions();
 
         let first_result = successful_tool_result(first.id, "bash");
-        loop_state.on_input(AgentInput::Event(MailboxEvent::ToolResult {
+        loop_state.on_input(AgentInput::Notification(MailboxNotification::ToolResult {
             turn_id: TurnId(1),
             result: first_result.clone(),
         }));
 
         assert_eq!(
-            loop_state.transcript.events().last(),
-            Some(&AgentEvent::ToolCallStarted {
+            loop_state.transcript.records().last(),
+            Some(&TranscriptRecord::ToolCallStarted {
                 turn_id: TurnId(1),
                 tool_call: second.clone(),
             })
         );
         assert_eq!(
-            loop_state.transcript.events()[4],
-            AgentEvent::ToolResult(first_result)
+            loop_state.transcript.records()[4],
+            TranscriptRecord::ToolResult(first_result)
         );
         assert_eq!(
             loop_state.drain_actions(),
@@ -478,10 +490,12 @@ mod tests {
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
         let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
-        loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
-            turn_id: TurnId(1),
-            assistant,
-        }));
+        loop_state.on_input(AgentInput::Notification(
+            MailboxNotification::AssistantMessage {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        ));
         loop_state.drain_actions();
 
         loop_state.on_input(AgentInput::Steer(UserInput::from("urgent")));
@@ -491,26 +505,26 @@ mod tests {
         loop_state.on_input(AgentInput::Interrupt);
 
         assert_eq!(
-            loop_state.transcript.events(),
+            loop_state.transcript.records(),
             vec![
-                AgentEvent::TurnStarted { turn_id: TurnId(1) },
-                AgentEvent::UserMessage(UserMessage {
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage(UserMessage {
                     text: "initial".to_string(),
                 }),
-                AgentEvent::AssistantMessage(assistant_message(vec![AssistantItem::ToolCall(
-                    tool_call.clone(),
-                )])),
-                AgentEvent::ToolCallStarted {
+                TranscriptRecord::AssistantMessage(assistant_message(vec![
+                    AssistantItem::ToolCall(tool_call.clone(),)
+                ])),
+                TranscriptRecord::ToolCallStarted {
                     turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
-                AgentEvent::ToolResult(ToolResultMessage::interrupted(tool_call.id, "bash")),
-                AgentEvent::TurnFinished {
+                TranscriptRecord::ToolResult(ToolResultMessage::interrupted(tool_call.id, "bash")),
+                TranscriptRecord::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Interrupted,
                 },
-                AgentEvent::TurnStarted { turn_id: TurnId(2) },
-                AgentEvent::UserMessage(UserMessage {
+                TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
+                TranscriptRecord::UserMessage(UserMessage {
                     text: "urgent".to_string(),
                 }),
             ]
@@ -537,13 +551,13 @@ mod tests {
         loop_state.on_input(AgentInput::Interrupt);
 
         assert_eq!(
-            loop_state.transcript.events(),
+            loop_state.transcript.records(),
             vec![
-                AgentEvent::TurnStarted { turn_id: TurnId(1) },
-                AgentEvent::UserMessage(UserMessage {
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage(UserMessage {
                     text: "hello".to_string(),
                 }),
-                AgentEvent::TurnFinished {
+                TranscriptRecord::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Interrupted,
                 },
@@ -565,12 +579,14 @@ mod tests {
         loop_state.drain_actions();
 
         let stale_assistant = assistant_message(vec![AssistantItem::Text("stale".to_string())]);
-        loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
-            turn_id: TurnId(1),
-            assistant: stale_assistant,
-        }));
+        loop_state.on_input(AgentInput::Notification(
+            MailboxNotification::AssistantMessage {
+                turn_id: TurnId(1),
+                assistant: stale_assistant,
+            },
+        ));
 
-        assert_eq!(loop_state.transcript.events().len(), 3);
+        assert_eq!(loop_state.transcript.records().len(), 3);
         assert!(loop_state.drain_actions().is_empty());
         assert_eq!(loop_state.state, AgentState::Interrupted);
     }
@@ -582,10 +598,12 @@ mod tests {
         loop_state.drain_actions();
 
         let assistant = assistant_message(vec![AssistantItem::Text("hi".to_string())]);
-        loop_state.on_input(AgentInput::Event(MailboxEvent::AssistantMessage {
-            turn_id: TurnId(1),
-            assistant: assistant.clone(),
-        }));
+        loop_state.on_input(AgentInput::Notification(
+            MailboxNotification::AssistantMessage {
+                turn_id: TurnId(1),
+                assistant: assistant.clone(),
+            },
+        ));
 
         assert_eq!(
             loop_state.compact_transcript(),
@@ -601,22 +619,22 @@ mod tests {
     #[test]
     fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
         let transcript = vec![
-            AgentEvent::TurnStarted { turn_id: TurnId(7) },
-            AgentEvent::UserMessage(UserMessage {
+            TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
+            TranscriptRecord::UserMessage(UserMessage {
                 text: "hello".to_string(),
             }),
         ];
 
-        let loop_state = AgentCoreLoop::from_events(transcript);
+        let loop_state = AgentCoreLoop::from_records(transcript);
 
         assert_eq!(
-            loop_state.transcript.events(),
+            loop_state.transcript.records(),
             vec![
-                AgentEvent::TurnStarted { turn_id: TurnId(7) },
-                AgentEvent::UserMessage(UserMessage {
+                TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
+                TranscriptRecord::UserMessage(UserMessage {
                     text: "hello".to_string(),
                 }),
-                AgentEvent::TurnFinished {
+                TranscriptRecord::TurnFinished {
                     turn_id: TurnId(7),
                     outcome: TurnOutcome::Crashed,
                 },
@@ -629,19 +647,19 @@ mod tests {
     #[test]
     fn rehydrating_a_graceful_boundary_restores_idle_state() {
         let transcript = vec![
-            AgentEvent::TurnStarted { turn_id: TurnId(2) },
-            AgentEvent::UserMessage(UserMessage {
+            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
+            TranscriptRecord::UserMessage(UserMessage {
                 text: "hello".to_string(),
             }),
-            AgentEvent::TurnFinished {
+            TranscriptRecord::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             },
         ];
 
-        let loop_state = AgentCoreLoop::from_events(transcript.clone());
+        let loop_state = AgentCoreLoop::from_records(transcript.clone());
 
-        assert_eq!(loop_state.transcript.events(), transcript.as_slice());
+        assert_eq!(loop_state.transcript.records(), transcript.as_slice());
         assert_eq!(loop_state.state, AgentState::Idle);
         assert_eq!(loop_state.last_turn_id, TurnId(2));
     }

@@ -1,7 +1,7 @@
-use crate::event::TurnOutcome;
 use crate::ids::TurnId;
-use crate::mailbox::MailboxEvent;
+use crate::mailbox::MailboxNotification;
 use crate::message::{ToolCall, ToolResultMessage};
+use crate::transcript_record::TurnOutcome;
 
 // Live control state only. Durable session history lives in Transcript.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,7 +32,7 @@ impl Default for AgentState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum MailboxEventDecision {
+pub(crate) enum MailboxNotificationDecision {
     Consume,
     Drop,
     Wait,
@@ -54,32 +54,35 @@ impl AgentState {
         }
     }
 
-    pub(crate) fn decide_mailbox_event(&self, event: &MailboxEvent) -> MailboxEventDecision {
+    pub(crate) fn decide_mailbox_notification(
+        &self,
+        notification: &MailboxNotification,
+    ) -> MailboxNotificationDecision {
         let Some(active_turn_id) = self.active_turn_id() else {
-            return MailboxEventDecision::Drop;
+            return MailboxNotificationDecision::Drop;
         };
 
-        if event.turn_id() != active_turn_id {
-            return MailboxEventDecision::Drop;
+        if notification.turn_id() != active_turn_id {
+            return MailboxNotificationDecision::Drop;
         }
 
-        match (self, event) {
-            (Self::RunningModel { .. }, MailboxEvent::AssistantMessage { .. }) => {
-                MailboxEventDecision::Consume
+        match (self, notification) {
+            (Self::RunningModel { .. }, MailboxNotification::AssistantMessage { .. }) => {
+                MailboxNotificationDecision::Consume
             }
-            (Self::RunningTool { tool_call, .. }, MailboxEvent::ToolResult { result, .. })
-                if tool_call.id == result.tool_call_id
-                    && tool_call.tool_name == result.tool_name =>
-            {
-                MailboxEventDecision::Consume
+            (
+                Self::RunningTool { tool_call, .. },
+                MailboxNotification::ToolResult { result, .. },
+            ) if tool_call.id == result.tool_call_id && tool_call.tool_name == result.tool_name => {
+                MailboxNotificationDecision::Consume
             }
-            (Self::ReadyToContinue { .. }, MailboxEvent::ToolCallReady { .. }) => {
-                MailboxEventDecision::Consume
+            (Self::ReadyToContinue { .. }, MailboxNotification::ToolCallReady { .. }) => {
+                MailboxNotificationDecision::Consume
             }
-            (Self::RunningTool { .. }, MailboxEvent::ToolCallReady { .. }) => {
-                MailboxEventDecision::Wait
+            (Self::RunningTool { .. }, MailboxNotification::ToolCallReady { .. }) => {
+                MailboxNotificationDecision::Wait
             }
-            _ => MailboxEventDecision::Drop,
+            _ => MailboxNotificationDecision::Drop,
         }
     }
 
@@ -212,45 +215,45 @@ mod tests {
     }
 
     #[test]
-    fn terminal_states_drop_late_events() {
-        let event = MailboxEvent::AssistantMessage {
+    fn terminal_states_drop_late_notifications() {
+        let notification = MailboxNotification::AssistantMessage {
             turn_id: TurnId(1),
             assistant: AssistantMessage { items: Vec::new() },
         };
 
         assert_eq!(
-            AgentState::Idle.decide_mailbox_event(&event),
-            MailboxEventDecision::Drop
+            AgentState::Idle.decide_mailbox_notification(&notification),
+            MailboxNotificationDecision::Drop
         );
         assert_eq!(
-            AgentState::Interrupted.decide_mailbox_event(&event),
-            MailboxEventDecision::Drop
+            AgentState::Interrupted.decide_mailbox_notification(&notification),
+            MailboxNotificationDecision::Drop
         );
         assert_eq!(
-            AgentState::Crashed.decide_mailbox_event(&event),
-            MailboxEventDecision::Drop
+            AgentState::Crashed.decide_mailbox_notification(&notification),
+            MailboxNotificationDecision::Drop
         );
     }
 
     #[test]
-    fn running_model_consumes_only_matching_assistant_events() {
+    fn running_model_consumes_only_matching_assistant_notifications() {
         let state = AgentState::RunningModel { turn_id: TurnId(2) };
-        let matching = MailboxEvent::AssistantMessage {
+        let matching = MailboxNotification::AssistantMessage {
             turn_id: TurnId(2),
             assistant: AssistantMessage { items: Vec::new() },
         };
-        let stale = MailboxEvent::AssistantMessage {
+        let stale = MailboxNotification::AssistantMessage {
             turn_id: TurnId(1),
             assistant: AssistantMessage { items: Vec::new() },
         };
 
         assert_eq!(
-            state.decide_mailbox_event(&matching),
-            MailboxEventDecision::Consume
+            state.decide_mailbox_notification(&matching),
+            MailboxNotificationDecision::Consume
         );
         assert_eq!(
-            state.decide_mailbox_event(&stale),
-            MailboxEventDecision::Drop
+            state.decide_mailbox_notification(&stale),
+            MailboxNotificationDecision::Drop
         );
     }
 
@@ -260,22 +263,22 @@ mod tests {
             turn_id: TurnId(1),
             tool_call: tool_call("bash"),
         };
-        let result = MailboxEvent::ToolResult {
+        let result = MailboxNotification::ToolResult {
             turn_id: TurnId(1),
             result: tool_result("bash"),
         };
-        let future_tool = MailboxEvent::ToolCallReady {
+        let future_tool = MailboxNotification::ToolCallReady {
             turn_id: TurnId(1),
             tool_call: tool_call("read"),
         };
 
         assert_eq!(
-            state.decide_mailbox_event(&result),
-            MailboxEventDecision::Consume
+            state.decide_mailbox_notification(&result),
+            MailboxNotificationDecision::Consume
         );
         assert_eq!(
-            state.decide_mailbox_event(&future_tool),
-            MailboxEventDecision::Wait
+            state.decide_mailbox_notification(&future_tool),
+            MailboxNotificationDecision::Wait
         );
     }
 
