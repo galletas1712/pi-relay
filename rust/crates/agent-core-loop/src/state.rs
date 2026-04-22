@@ -215,7 +215,7 @@ impl AgentState {
                         turn_id,
                         outcome: TurnOutcome::Interrupted,
                     }],
-                    actions: vec![AgentAction::CancelActive { turn_id }],
+                    actions: vec![AgentAction::CancelTurn { turn_id }],
                 }
             }
             Self::RunningTools {
@@ -239,7 +239,7 @@ impl AgentState {
                 });
                 AgentTransition {
                     records,
-                    actions: vec![AgentAction::CancelActive { turn_id }],
+                    actions: vec![AgentAction::CancelTurn { turn_id }],
                 }
             }
         }
@@ -459,7 +459,7 @@ mod tests {
         );
         assert_eq!(
             transition.actions,
-            vec![AgentAction::CancelActive { turn_id: TurnId(3) }]
+            vec![AgentAction::CancelTurn { turn_id: TurnId(3) }]
         );
     }
 }

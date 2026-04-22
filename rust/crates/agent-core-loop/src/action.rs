@@ -13,7 +13,11 @@ pub enum AgentAction {
         turn_id: TurnId,
         tool_call: ToolCall,
     },
-    CancelActive {
+    /// Cancel all active model/tool work for the turn.
+    ///
+    /// For parallel tool execution, the orchestrator should fan this out to
+    /// every running tool handle associated with `turn_id`.
+    CancelTurn {
         turn_id: TurnId,
     },
 }

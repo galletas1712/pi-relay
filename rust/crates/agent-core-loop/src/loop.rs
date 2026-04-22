@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(
             loop_state.drain_actions(),
             vec![
-                AgentAction::CancelActive { turn_id: TurnId(1) },
+                AgentAction::CancelTurn { turn_id: TurnId(1) },
                 AgentAction::RequestModel { turn_id: TurnId(2) },
             ]
         );
@@ -427,6 +427,54 @@ mod tests {
             loop_state.state,
             AgentState::RunningModel { turn_id: TurnId(2) }
         );
+    }
+
+    #[test]
+    fn interrupting_parallel_tools_cancels_the_turn_and_records_unfinished_tools() {
+        let mut loop_state = AgentCoreLoop::new();
+        let mut next_tool_call_id = ToolCallId::first();
+        loop_state.on_input(AgentInput::FollowUp(UserInput::from("initial")));
+        loop_state.drain_actions();
+
+        let first = tool_call(&mut next_tool_call_id, "bash");
+        let second = tool_call(&mut next_tool_call_id, "read");
+        let assistant = assistant_message(vec![
+            AssistantItem::ToolCall(first.clone()),
+            AssistantItem::ToolCall(second.clone()),
+        ]);
+        loop_state.on_input(AgentInput::ModelCompleted {
+            turn_id: TurnId(1),
+            assistant,
+        });
+        loop_state.drain_actions();
+
+        let second_result = successful_tool_result(second.id, "read");
+        loop_state.on_input(AgentInput::ToolCompleted {
+            turn_id: TurnId(1),
+            result: second_result.clone(),
+        });
+        loop_state.on_input(AgentInput::Interrupt);
+
+        assert_eq!(
+            loop_state.transcript.records().last(),
+            Some(&TranscriptRecord::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Interrupted,
+            })
+        );
+        assert_eq!(
+            loop_state.transcript.records()[5],
+            TranscriptRecord::ToolResult(ToolResultMessage::interrupted(first.id, "bash"))
+        );
+        assert_eq!(
+            loop_state.transcript.records()[6],
+            TranscriptRecord::ToolResult(second_result)
+        );
+        assert_eq!(
+            loop_state.drain_actions(),
+            vec![AgentAction::CancelTurn { turn_id: TurnId(1) }]
+        );
+        assert_eq!(loop_state.state, AgentState::Interrupted);
     }
 
     #[test]
@@ -452,7 +500,7 @@ mod tests {
         );
         assert_eq!(
             loop_state.drain_actions(),
-            vec![AgentAction::CancelActive { turn_id: TurnId(1) }]
+            vec![AgentAction::CancelTurn { turn_id: TurnId(1) }]
         );
         assert_eq!(loop_state.state, AgentState::Interrupted);
     }
