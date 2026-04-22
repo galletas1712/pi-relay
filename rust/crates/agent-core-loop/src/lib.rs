@@ -8,7 +8,7 @@ mod mailbox;
 mod message;
 mod transcript;
 
-pub use crate::core_loop::{AgentCoreLoop, AgentInput, Phase};
+pub use crate::core_loop::{AgentCoreLoop, AgentInput, AgentState};
 pub use crate::event::{AgentAction, AgentEvent, TurnOutcome};
 pub use crate::ids::{ToolCallId, TurnId};
 pub use crate::mailbox::{Mailbox, MailboxEntry, MailboxEvent};

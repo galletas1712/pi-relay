@@ -9,7 +9,7 @@ use crate::message::{
 use crate::transcript::Transcript;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Phase {
+pub enum AgentState {
     Idle,
     // The last completed turn ended via interrupt.
     Interrupted,
@@ -29,7 +29,7 @@ pub enum Phase {
     },
 }
 
-impl Default for Phase {
+impl Default for AgentState {
     fn default() -> Self {
         Self::Idle
     }
@@ -47,7 +47,7 @@ pub enum AgentInput {
 pub struct AgentCoreLoop {
     pub mailbox: Mailbox,
     pub transcript: Transcript,
-    pub phase: Phase,
+    pub state: AgentState,
     pub last_turn_id: TurnId,
     action_outbox: VecDeque<AgentAction>,
     interrupt_requested: bool,
@@ -58,7 +58,7 @@ impl Default for AgentCoreLoop {
         Self {
             mailbox: Mailbox::default(),
             transcript: Transcript::new(),
-            phase: Phase::Idle,
+            state: AgentState::Idle,
             last_turn_id: TurnId::default(),
             action_outbox: VecDeque::new(),
             interrupt_requested: false,
@@ -77,23 +77,23 @@ impl AgentCoreLoop {
 
     pub fn from_transcript(transcript: Transcript) -> Self {
         let last_turn_id = transcript.last_turn_id();
-        let phase = Self::phase_from_transcript(&transcript);
+        let state = Self::state_from_transcript(&transcript);
 
         Self {
             mailbox: Mailbox::default(),
             transcript,
-            phase,
+            state,
             last_turn_id,
             action_outbox: VecDeque::new(),
             interrupt_requested: false,
         }
     }
 
-    fn phase_from_transcript(transcript: &Transcript) -> Phase {
+    fn state_from_transcript(transcript: &Transcript) -> AgentState {
         match transcript.tail_outcome() {
-            Some(TurnOutcome::Interrupted) => Phase::Interrupted,
-            Some(TurnOutcome::Crashed) => Phase::Crashed,
-            Some(TurnOutcome::Graceful) | None => Phase::Idle,
+            Some(TurnOutcome::Interrupted) => AgentState::Interrupted,
+            Some(TurnOutcome::Crashed) => AgentState::Crashed,
+            Some(TurnOutcome::Graceful) | None => AgentState::Idle,
         }
     }
 
@@ -161,26 +161,26 @@ impl AgentCoreLoop {
             return true;
         }
 
-        match (&self.phase, event) {
-            (Phase::RunningModel { .. }, MailboxEvent::AssistantMessage { .. }) => {
+        match (&self.state, event) {
+            (AgentState::RunningModel { .. }, MailboxEvent::AssistantMessage { .. }) => {
                 let event = self.pop_event();
                 self.handle_mailbox_event(event);
                 true
             }
-            (Phase::RunningTool { tool_call, .. }, MailboxEvent::ToolResult { result, .. })
-                if tool_call.id == result.tool_call_id
-                    && tool_call.tool_name == result.tool_name =>
-            {
+            (
+                AgentState::RunningTool { tool_call, .. },
+                MailboxEvent::ToolResult { result, .. },
+            ) if tool_call.id == result.tool_call_id && tool_call.tool_name == result.tool_name => {
                 let event = self.pop_event();
                 self.handle_mailbox_event(event);
                 true
             }
-            (Phase::ReadyToContinue { .. }, MailboxEvent::ToolCallReady { .. }) => {
+            (AgentState::ReadyToContinue { .. }, MailboxEvent::ToolCallReady { .. }) => {
                 let event = self.pop_event();
                 self.handle_mailbox_event(event);
                 true
             }
-            (Phase::RunningTool { .. }, MailboxEvent::ToolCallReady { .. }) => false,
+            (AgentState::RunningTool { .. }, MailboxEvent::ToolCallReady { .. }) => false,
             _ => {
                 let _ = self.pop_event();
                 true
@@ -189,37 +189,37 @@ impl AgentCoreLoop {
     }
 
     fn active_turn_id(&self) -> Option<TurnId> {
-        match &self.phase {
-            Phase::RunningModel { turn_id }
-            | Phase::RunningTool { turn_id, .. }
-            | Phase::ReadyToContinue { turn_id } => Some(*turn_id),
-            Phase::Idle | Phase::Interrupted | Phase::Crashed => None,
+        match &self.state {
+            AgentState::RunningModel { turn_id }
+            | AgentState::RunningTool { turn_id, .. }
+            | AgentState::ReadyToContinue { turn_id } => Some(*turn_id),
+            AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => None,
         }
     }
 
     fn resume_model_if_ready(&mut self) -> bool {
-        let turn_id = match &self.phase {
-            Phase::ReadyToContinue { turn_id } => *turn_id,
+        let turn_id = match &self.state {
+            AgentState::ReadyToContinue { turn_id } => *turn_id,
             _ => return false,
         };
 
-        self.phase = Phase::RunningModel { turn_id };
+        self.state = AgentState::RunningModel { turn_id };
         self.enqueue_action(AgentAction::RequestModel { turn_id });
         true
     }
 
     fn start_next_turn(&mut self) -> bool {
-        match &self.phase {
-            Phase::Idle | Phase::Interrupted | Phase::Crashed => {
+        match &self.state {
+            AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => {
                 let Some(input) = self.mailbox.pop_user_input() else {
                     return false;
                 };
                 self.start_turn(input);
                 true
             }
-            Phase::RunningModel { .. }
-            | Phase::RunningTool { .. }
-            | Phase::ReadyToContinue { .. } => false,
+            AgentState::RunningModel { .. }
+            | AgentState::RunningTool { .. }
+            | AgentState::ReadyToContinue { .. } => false,
         }
     }
 
@@ -233,7 +233,7 @@ impl AgentCoreLoop {
         self.last_turn_id = self.last_turn_id.next();
         let turn_id = self.last_turn_id;
         let user_message = self.create_user_message(input);
-        self.phase = Phase::RunningModel { turn_id };
+        self.state = AgentState::RunningModel { turn_id };
 
         self.append_event(AgentEvent::TurnStarted { turn_id });
         self.append_event(AgentEvent::UserMessage(user_message));
@@ -256,8 +256,8 @@ impl AgentCoreLoop {
 
     fn on_assistant_message(&mut self, turn_id: TurnId, assistant: AssistantMessage) {
         if !matches!(
-            &self.phase,
-            Phase::RunningModel { turn_id: active_turn_id } if *active_turn_id == turn_id
+            &self.state,
+            AgentState::RunningModel { turn_id: active_turn_id } if *active_turn_id == turn_id
         ) {
             return;
         }
@@ -266,7 +266,7 @@ impl AgentCoreLoop {
 
         let mut tool_calls = assistant.tool_calls().cloned();
         let Some(first_tool_call) = tool_calls.next() else {
-            self.phase = Phase::Idle;
+            self.state = AgentState::Idle;
             self.append_event(AgentEvent::TurnFinished {
                 turn_id,
                 outcome: TurnOutcome::Graceful,
@@ -283,7 +283,7 @@ impl AgentCoreLoop {
     }
 
     fn start_tool_call(&mut self, turn_id: TurnId, tool_call: ToolCall) {
-        self.phase = Phase::RunningTool {
+        self.state = AgentState::RunningTool {
             turn_id,
             tool_call: tool_call.clone(),
         };
@@ -295,8 +295,8 @@ impl AgentCoreLoop {
     }
 
     fn on_tool_result(&mut self, turn_id: TurnId, result: ToolResultMessage) {
-        let running_tool_call = match &self.phase {
-            Phase::RunningTool {
+        let running_tool_call = match &self.state {
+            AgentState::RunningTool {
                 turn_id: active_turn_id,
                 tool_call,
             } if *active_turn_id == turn_id => tool_call.clone(),
@@ -310,7 +310,7 @@ impl AgentCoreLoop {
         }
 
         self.append_event(AgentEvent::ToolResult(result));
-        self.phase = Phase::ReadyToContinue { turn_id };
+        self.state = AgentState::ReadyToContinue { turn_id };
     }
 
     fn handle_interrupt(&mut self) -> bool {
@@ -320,18 +320,18 @@ impl AgentCoreLoop {
 
         self.interrupt_requested = false;
 
-        match self.phase.clone() {
-            Phase::Idle | Phase::Interrupted | Phase::Crashed => false,
-            Phase::ReadyToContinue { turn_id } => {
-                self.phase = Phase::Interrupted;
+        match self.state.clone() {
+            AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => false,
+            AgentState::ReadyToContinue { turn_id } => {
+                self.state = AgentState::Interrupted;
                 self.append_event(AgentEvent::TurnFinished {
                     turn_id,
                     outcome: TurnOutcome::Interrupted,
                 });
                 true
             }
-            Phase::RunningModel { turn_id } => {
-                self.phase = Phase::Interrupted;
+            AgentState::RunningModel { turn_id } => {
+                self.state = AgentState::Interrupted;
 
                 self.append_event(AgentEvent::TurnFinished {
                     turn_id,
@@ -340,8 +340,8 @@ impl AgentCoreLoop {
                 self.enqueue_action(AgentAction::CancelActive { turn_id });
                 true
             }
-            Phase::RunningTool { turn_id, tool_call } => {
-                self.phase = Phase::Interrupted;
+            AgentState::RunningTool { turn_id, tool_call } => {
+                self.state = AgentState::Interrupted;
 
                 let interrupted =
                     ToolResultMessage::interrupted(tool_call.id, tool_call.tool_name.clone());
@@ -416,7 +416,10 @@ mod tests {
             loop_state.drain_actions(),
             vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
-        assert_eq!(loop_state.phase, Phase::RunningModel { turn_id: TurnId(1) });
+        assert_eq!(
+            loop_state.state,
+            AgentState::RunningModel { turn_id: TurnId(1) }
+        );
     }
 
     #[test]
@@ -459,8 +462,8 @@ mod tests {
             }]
         );
         assert_eq!(
-            loop_state.phase,
-            Phase::RunningTool {
+            loop_state.state,
+            AgentState::RunningTool {
                 turn_id: TurnId(1),
                 tool_call,
             }
@@ -496,7 +499,10 @@ mod tests {
             loop_state.drain_actions(),
             vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
-        assert_eq!(loop_state.phase, Phase::RunningModel { turn_id: TurnId(1) });
+        assert_eq!(
+            loop_state.state,
+            AgentState::RunningModel { turn_id: TurnId(1) }
+        );
     }
 
     #[test]
@@ -543,8 +549,8 @@ mod tests {
             }]
         );
         assert_eq!(
-            loop_state.phase,
-            Phase::RunningTool {
+            loop_state.state,
+            AgentState::RunningTool {
                 turn_id: TurnId(1),
                 tool_call: second,
             }
@@ -604,7 +610,10 @@ mod tests {
                 AgentAction::RequestModel { turn_id: TurnId(2) },
             ]
         );
-        assert_eq!(loop_state.phase, Phase::RunningModel { turn_id: TurnId(2) });
+        assert_eq!(
+            loop_state.state,
+            AgentState::RunningModel { turn_id: TurnId(2) }
+        );
     }
 
     #[test]
@@ -632,7 +641,7 @@ mod tests {
             loop_state.drain_actions(),
             vec![AgentAction::CancelActive { turn_id: TurnId(1) }]
         );
-        assert_eq!(loop_state.phase, Phase::Interrupted);
+        assert_eq!(loop_state.state, AgentState::Interrupted);
     }
 
     #[test]
@@ -651,7 +660,7 @@ mod tests {
 
         assert_eq!(loop_state.transcript.events().len(), 3);
         assert!(loop_state.drain_actions().is_empty());
-        assert_eq!(loop_state.phase, Phase::Interrupted);
+        assert_eq!(loop_state.state, AgentState::Interrupted);
     }
 
     #[test]
@@ -701,7 +710,7 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(loop_state.phase, Phase::Crashed);
+        assert_eq!(loop_state.state, AgentState::Crashed);
         assert_eq!(loop_state.last_turn_id, TurnId(7));
     }
 
@@ -721,7 +730,7 @@ mod tests {
         let loop_state = AgentCoreLoop::from_events(transcript.clone());
 
         assert_eq!(loop_state.transcript.events(), transcript.as_slice());
-        assert_eq!(loop_state.phase, Phase::Idle);
+        assert_eq!(loop_state.state, AgentState::Idle);
         assert_eq!(loop_state.last_turn_id, TurnId(2));
     }
 }
