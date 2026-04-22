@@ -5,14 +5,16 @@ use crate::message::UserInput;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MailboxCommand {
     Interrupt,
+    // `Steer` is urgent user input: it drains before follow-up work.
     Steer(UserInput),
+    // `FollowUp` is normal queued work and only runs once steer work is drained.
     FollowUp(UserInput),
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Mailbox {
-    p0: VecDeque<UserInput>,
-    p1: VecDeque<UserInput>,
+    steer: VecDeque<UserInput>,
+    follow_up: VecDeque<UserInput>,
     interrupt: bool,
 }
 
@@ -23,16 +25,16 @@ impl Mailbox {
                 self.interrupt = true;
             }
             MailboxCommand::Steer(input) => {
-                self.p0.push_back(input);
+                self.steer.push_back(input);
             }
             MailboxCommand::FollowUp(input) => {
-                self.p1.push_back(input);
+                self.follow_up.push_back(input);
             }
         }
     }
 
-    pub fn push_front_p0(&mut self, input: UserInput) {
-        self.p0.push_front(input);
+    pub fn push_front_steer(&mut self, input: UserInput) {
+        self.steer.push_front(input);
     }
 
     pub fn take_interrupt(&mut self) -> bool {
@@ -42,19 +44,21 @@ impl Mailbox {
     }
 
     pub fn pop_next(&mut self) -> Option<UserInput> {
-        self.p0.pop_front().or_else(|| self.p1.pop_front())
+        self.steer
+            .pop_front()
+            .or_else(|| self.follow_up.pop_front())
     }
 
-    pub fn steering_len(&self) -> usize {
-        self.p0.len()
+    pub fn steer_len(&self) -> usize {
+        self.steer.len()
     }
 
     pub fn follow_up_len(&self) -> usize {
-        self.p1.len()
+        self.follow_up.len()
     }
 
     pub fn pending_count(&self) -> usize {
-        self.p0.len() + self.p1.len()
+        self.steer.len() + self.follow_up.len()
     }
 
     pub fn interrupt_pending(&self) -> bool {
@@ -71,7 +75,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pop_next_prefers_steering_before_follow_up() {
+    fn pop_next_prefers_steer_before_follow_up() {
         let mut mailbox = Mailbox::default();
         mailbox.push(MailboxCommand::FollowUp("later".into()));
         mailbox.push(MailboxCommand::Steer("now".into()));
@@ -95,10 +99,10 @@ mod tests {
     }
 
     #[test]
-    fn push_front_p0_requeues_a_high_priority_follow_up() {
+    fn push_front_steer_requeues_high_priority_work() {
         let mut mailbox = Mailbox::default();
         mailbox.push(MailboxCommand::Steer("second".into()));
-        mailbox.push_front_p0("first".into());
+        mailbox.push_front_steer("first".into());
 
         assert_eq!(mailbox.pop_next(), Some(UserInput::from("first")));
         assert_eq!(mailbox.pop_next(), Some(UserInput::from("second")));
