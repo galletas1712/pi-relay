@@ -56,9 +56,8 @@ impl AgentCoreLoop {
         }
     }
 
-    pub fn on_input(&mut self, input: AgentInput) {
+    pub fn enqueue_input(&mut self, input: AgentInput) {
         self.mailbox.push_input(input);
-        self.drive();
     }
 
     pub fn drain_actions(&mut self) -> Vec<AgentAction> {
@@ -69,7 +68,7 @@ impl AgentCoreLoop {
         self.transcript.compact()
     }
 
-    fn drive(&mut self) {
+    pub(crate) fn drive(&mut self) {
         loop {
             let next_turn_id = self.last_turn_id.next();
             let Some(event) = self.mailbox.next_event(&self.state, next_turn_id) else {
@@ -138,11 +137,16 @@ mod tests {
         }
     }
 
+    fn drive_input(loop_state: &mut AgentCoreLoop, input: AgentInput) {
+        loop_state.enqueue_input(input);
+        loop_state.drive();
+    }
+
     #[test]
     fn starting_a_turn_appends_boundary_events_and_requests_the_model() {
         let mut loop_state = AgentCoreLoop::new();
 
-        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
+        drive_input(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
 
         assert_eq!(
             loop_state.transcript.records(),
@@ -165,7 +169,7 @@ mod tests {
     fn model_completion_with_a_tool_call_appends_assistant_and_starts_the_tool() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
+        drive_input(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
@@ -174,10 +178,13 @@ mod tests {
             AssistantItem::ToolCall(tool_call.clone()),
         ]);
 
-        loop_state.on_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: assistant.clone(),
-        });
+        drive_input(
+            &mut loop_state,
+            AgentInput::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant: assistant.clone(),
+            },
+        );
 
         assert_eq!(
             loop_state.transcript.records(),
@@ -213,22 +220,28 @@ mod tests {
     fn tool_completion_appends_a_result_and_resumes_the_model() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
+        drive_input(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
         let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
-        loop_state.on_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant,
-        });
+        drive_input(
+            &mut loop_state,
+            AgentInput::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        );
         loop_state.drain_actions();
 
         let result = successful_tool_result(tool_call.id, "bash");
-        loop_state.on_input(AgentInput::ToolCompleted {
-            turn_id: TurnId(1),
-            result: result.clone(),
-        });
+        drive_input(
+            &mut loop_state,
+            AgentInput::ToolCompleted {
+                turn_id: TurnId(1),
+                result: result.clone(),
+            },
+        );
 
         assert_eq!(
             loop_state.transcript.records().last(),
@@ -248,7 +261,7 @@ mod tests {
     fn multiple_tool_calls_run_in_parallel_and_results_are_recorded_in_source_order() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
+        drive_input(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
 
         let first = tool_call(&mut next_tool_call_id, "bash");
@@ -257,10 +270,13 @@ mod tests {
             AssistantItem::ToolCall(first.clone()),
             AssistantItem::ToolCall(second.clone()),
         ]);
-        loop_state.on_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant,
-        });
+        drive_input(
+            &mut loop_state,
+            AgentInput::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        );
 
         assert_eq!(
             loop_state.drain_actions(),
@@ -284,11 +300,14 @@ mod tests {
         );
 
         let second_result = successful_tool_result(second.id, "read");
-        loop_state.on_input(AgentInput::ToolCompleted {
-            turn_id: TurnId(1),
-            result: second_result.clone(),
-        });
-        loop_state.on_input(AgentInput::Steer("urgent".to_string()));
+        drive_input(
+            &mut loop_state,
+            AgentInput::ToolCompleted {
+                turn_id: TurnId(1),
+                result: second_result.clone(),
+            },
+        );
+        drive_input(&mut loop_state, AgentInput::Steer("urgent".to_string()));
 
         assert_eq!(
             loop_state.transcript.records().last(),
@@ -307,10 +326,13 @@ mod tests {
         ));
 
         let first_result = successful_tool_result(first.id, "bash");
-        loop_state.on_input(AgentInput::ToolCompleted {
-            turn_id: TurnId(1),
-            result: first_result.clone(),
-        });
+        drive_input(
+            &mut loop_state,
+            AgentInput::ToolCompleted {
+                turn_id: TurnId(1),
+                result: first_result.clone(),
+            },
+        );
 
         assert_eq!(
             loop_state.transcript.records().last(),
@@ -339,22 +361,25 @@ mod tests {
     fn interrupting_a_running_tool_closes_the_turn_and_starts_queued_steer_work() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        loop_state.on_input(AgentInput::FollowUp("initial".to_string()));
+        drive_input(&mut loop_state, AgentInput::FollowUp("initial".to_string()));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
         let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
-        loop_state.on_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant,
-        });
+        drive_input(
+            &mut loop_state,
+            AgentInput::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        );
         loop_state.drain_actions();
 
-        loop_state.on_input(AgentInput::Steer("urgent".to_string()));
+        drive_input(&mut loop_state, AgentInput::Steer("urgent".to_string()));
 
         assert!(loop_state.drain_actions().is_empty());
 
-        loop_state.on_input(AgentInput::Interrupt);
+        drive_input(&mut loop_state, AgentInput::Interrupt);
 
         assert_eq!(
             loop_state.transcript.records(),
@@ -394,7 +419,7 @@ mod tests {
     fn interrupting_parallel_tools_cancels_the_turn_and_records_unfinished_tools() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        loop_state.on_input(AgentInput::FollowUp("initial".to_string()));
+        drive_input(&mut loop_state, AgentInput::FollowUp("initial".to_string()));
         loop_state.drain_actions();
 
         let first = tool_call(&mut next_tool_call_id, "bash");
@@ -403,18 +428,24 @@ mod tests {
             AssistantItem::ToolCall(first.clone()),
             AssistantItem::ToolCall(second.clone()),
         ]);
-        loop_state.on_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant,
-        });
+        drive_input(
+            &mut loop_state,
+            AgentInput::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        );
         loop_state.drain_actions();
 
         let second_result = successful_tool_result(second.id, "read");
-        loop_state.on_input(AgentInput::ToolCompleted {
-            turn_id: TurnId(1),
-            result: second_result.clone(),
-        });
-        loop_state.on_input(AgentInput::Interrupt);
+        drive_input(
+            &mut loop_state,
+            AgentInput::ToolCompleted {
+                turn_id: TurnId(1),
+                result: second_result.clone(),
+            },
+        );
+        drive_input(&mut loop_state, AgentInput::Interrupt);
 
         assert_eq!(
             loop_state.transcript.records().last(),
@@ -441,10 +472,10 @@ mod tests {
     #[test]
     fn interrupting_a_running_model_without_queued_work_finishes_interrupted() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
+        drive_input(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
 
-        loop_state.on_input(AgentInput::Interrupt);
+        drive_input(&mut loop_state, AgentInput::Interrupt);
 
         assert_eq!(
             loop_state.transcript.records(),
@@ -467,16 +498,19 @@ mod tests {
     #[test]
     fn stale_completions_are_ignored_after_an_interrupt() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
+        drive_input(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
-        loop_state.on_input(AgentInput::Interrupt);
+        drive_input(&mut loop_state, AgentInput::Interrupt);
         loop_state.drain_actions();
 
         let stale_assistant = assistant_message(vec![AssistantItem::Text("stale".to_string())]);
-        loop_state.on_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: stale_assistant,
-        });
+        drive_input(
+            &mut loop_state,
+            AgentInput::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant: stale_assistant,
+            },
+        );
 
         assert_eq!(loop_state.transcript.records().len(), 3);
         assert!(loop_state.drain_actions().is_empty());
@@ -486,14 +520,17 @@ mod tests {
     #[test]
     fn compact_transcript_filters_to_user_and_assistant_messages() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_input(AgentInput::FollowUp("hello".to_string()));
+        drive_input(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
         loop_state.drain_actions();
 
         let assistant = assistant_message(vec![AssistantItem::Text("hi".to_string())]);
-        loop_state.on_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: assistant.clone(),
-        });
+        drive_input(
+            &mut loop_state,
+            AgentInput::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant: assistant.clone(),
+            },
+        );
 
         assert_eq!(
             loop_state.compact_transcript(),
