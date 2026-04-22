@@ -102,6 +102,8 @@ import {
 	RoleSource,
 	SkillsSource,
 } from "./prompt/index.js";
+import { SessionCoreCommands, type SessionCoreCommand } from "./session-core/commands.js";
+import { createSessionCoreInterpreter, type SessionCoreInterpreter } from "./session-core/interpreter.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { createToolDefinitionFromAgentTool, wrapToolDefinition } from "./tools/tool-definition-wrapper.js";
@@ -299,6 +301,12 @@ export class AgentSession {
 	private _eventListeners: AgentSessionEventListener[] = [];
 	private _agentEventQueue: Promise<void> = Promise.resolve();
 
+	/**
+	 * Extracted pure session-core seam. For now it owns queued-message state only;
+	 * later milestones can move more session lifecycle transitions behind this
+	 * interpreter without changing the AgentSession host surface.
+	 */
+	private _sessionCore: SessionCoreInterpreter = createSessionCoreInterpreter();
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
@@ -509,6 +517,10 @@ export class AgentSession {
 		});
 	}
 
+	private _dispatchSessionCore(command: SessionCoreCommand): void {
+		this._sessionCore.dispatch(command);
+	}
+
 	// Track last assistant message for auto-compaction check
 	private _lastAssistantMessage: AssistantMessage | undefined = undefined;
 
@@ -571,12 +583,14 @@ export class AgentSession {
 				const steeringIndex = this._steeringMessages.indexOf(messageText);
 				if (steeringIndex !== -1) {
 					this._steeringMessages.splice(steeringIndex, 1);
+					this._dispatchSessionCore(SessionCoreCommands.consumeUserMessage(messageText));
 					this._emitQueueUpdate();
 				} else {
 					// Check follow-up queue
 					const followUpIndex = this._followUpMessages.indexOf(messageText);
 					if (followUpIndex !== -1) {
 						this._followUpMessages.splice(followUpIndex, 1);
+						this._dispatchSessionCore(SessionCoreCommands.consumeUserMessage(messageText));
 						this._emitQueueUpdate();
 					}
 				}
@@ -1322,6 +1336,7 @@ export class AgentSession {
 	 */
 	private async _queueSteer(text: string, images?: ImageContent[]): Promise<void> {
 		this._steeringMessages.push(text);
+		this._dispatchSessionCore(SessionCoreCommands.enqueueSteering(text));
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
@@ -1339,6 +1354,7 @@ export class AgentSession {
 	 */
 	private async _queueFollowUp(text: string, images?: ImageContent[]): Promise<void> {
 		this._followUpMessages.push(text);
+		this._dispatchSessionCore(SessionCoreCommands.enqueueFollowUp(text));
 		this._emitQueueUpdate();
 		const content: (TextContent | ImageContent)[] = [{ type: "text", text }];
 		if (images) {
@@ -1466,6 +1482,7 @@ export class AgentSession {
 		const followUp = [...this._followUpMessages];
 		this._steeringMessages = [];
 		this._followUpMessages = [];
+		this._dispatchSessionCore(SessionCoreCommands.clearQueues());
 		this.agent.clearAllQueues();
 		this._emitQueueUpdate();
 		return { steering, followUp };
