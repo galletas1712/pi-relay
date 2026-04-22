@@ -1,36 +1,36 @@
-use crate::ids::{Epoch, ToolCallId};
+use crate::ids::{EventId, TurnId};
 use crate::message::{ToolCall, ToolResultStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LoopAction {
     TurnStarted {
-        epoch: Epoch,
+        turn_id: TurnId,
     },
     ToolCallStarted {
-        epoch: Epoch,
-        call_id: ToolCallId,
+        turn_id: TurnId,
+        tool_call_id: EventId,
         tool_name: String,
     },
     ToolCallFinished {
-        epoch: Epoch,
-        call_id: ToolCallId,
+        turn_id: TurnId,
+        tool_call_id: EventId,
         tool_name: String,
         status: ToolResultStatus,
     },
     Interrupted {
-        epoch: Epoch,
+        turn_id: TurnId,
     },
     TurnFinished {
-        epoch: Epoch,
+        turn_id: TurnId,
     },
     RequestModel {
-        epoch: Epoch,
+        turn_id: TurnId,
     },
     RequestTool {
-        epoch: Epoch,
+        turn_id: TurnId,
         tool_call: ToolCall,
     },
     CancelActive {
-        epoch: Epoch,
+        turn_id: TurnId,
     },
 }

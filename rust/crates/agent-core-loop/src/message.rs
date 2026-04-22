@@ -1,4 +1,4 @@
-use crate::ids::{MessageId, ToolCallId};
+use crate::ids::EventId;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CoreMessage {
@@ -28,13 +28,13 @@ impl From<String> for UserInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserMessage {
-    pub id: MessageId,
+    pub id: EventId,
     pub text: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AssistantMessage {
-    pub id: MessageId,
+    pub id: EventId,
     pub items: Vec<AssistantItem>,
 }
 
@@ -55,7 +55,7 @@ pub enum AssistantItem {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolCall {
-    pub call_id: ToolCallId,
+    pub id: EventId,
     pub tool_name: String,
     pub args_json: String,
 }
@@ -69,18 +69,18 @@ pub enum ToolResultStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolResultMessage {
-    pub id: MessageId,
-    pub call_id: ToolCallId,
+    pub id: EventId,
+    pub tool_call_id: EventId,
     pub tool_name: String,
     pub output: String,
     pub status: ToolResultStatus,
 }
 
 impl ToolResultMessage {
-    pub fn interrupted(id: MessageId, call_id: ToolCallId, tool_name: impl Into<String>) -> Self {
+    pub fn interrupted(id: EventId, tool_call_id: EventId, tool_name: impl Into<String>) -> Self {
         Self {
             id,
-            call_id,
+            tool_call_id,
             tool_name: tool_name.into(),
             output: "interrupted".to_string(),
             status: ToolResultStatus::Interrupted,

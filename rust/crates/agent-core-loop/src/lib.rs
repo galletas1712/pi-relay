@@ -9,7 +9,7 @@ mod message;
 
 pub use crate::core_loop::{AgentCoreLoop, CoreTransition, LoopSignal, Phase};
 pub use crate::event::LoopAction;
-pub use crate::ids::{Epoch, MessageId, ToolCallId};
+pub use crate::ids::{EventId, TurnId};
 pub use crate::mailbox::{Mailbox, MailboxCommand};
 pub use crate::message::{
     AssistantItem, AssistantMessage, CoreMessage, ToolCall, ToolResultMessage, ToolResultStatus,

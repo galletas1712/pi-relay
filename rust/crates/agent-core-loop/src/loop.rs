@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use crate::event::LoopAction;
-use crate::ids::{Epoch, MessageId, ToolCallId};
+use crate::ids::{EventId, TurnId};
 use crate::mailbox::{Mailbox, MailboxCommand};
 use crate::message::{
     AssistantMessage, CoreMessage, ToolCall, ToolResultMessage, ToolResultStatus, UserInput,
@@ -22,12 +22,14 @@ impl CoreTransition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Phase {
     Idle,
+    // The last turn ended via interrupt; the next queued input starts a fresh turn.
+    Interrupted,
     RunningModel {
-        epoch: Epoch,
+        turn_id: TurnId,
     },
     RunningTool {
-        epoch: Epoch,
-        call_id: ToolCallId,
+        turn_id: TurnId,
+        tool_call_id: EventId,
         tool_name: String,
     },
 }
@@ -42,11 +44,11 @@ impl Default for Phase {
 pub enum LoopSignal {
     Mailbox(MailboxCommand),
     ModelCompleted {
-        epoch: Epoch,
+        turn_id: TurnId,
         assistant: AssistantMessage,
     },
     ToolCompleted {
-        epoch: Epoch,
+        turn_id: TurnId,
         result: ToolResultMessage,
     },
 }
@@ -56,10 +58,9 @@ pub struct AgentCoreLoop {
     pub mailbox: Mailbox,
     pub transcript: Vec<CoreMessage>,
     pub phase: Phase,
-    pub epoch: Epoch,
+    pub last_turn_id: TurnId,
     pending_tool_calls: VecDeque<ToolCall>,
-    next_message_id: MessageId,
-    next_tool_call_id: ToolCallId,
+    next_event_id: EventId,
 }
 
 impl Default for AgentCoreLoop {
@@ -68,10 +69,9 @@ impl Default for AgentCoreLoop {
             mailbox: Mailbox::default(),
             transcript: Vec::new(),
             phase: Phase::Idle,
-            epoch: Epoch::default(),
+            last_turn_id: TurnId::default(),
             pending_tool_calls: VecDeque::new(),
-            next_message_id: MessageId::first(),
-            next_tool_call_id: ToolCallId::first(),
+            next_event_id: EventId::first(),
         }
     }
 }
@@ -87,17 +87,23 @@ impl AgentCoreLoop {
                 self.mailbox.push(command);
                 self.drive()
             }
-            LoopSignal::ModelCompleted { epoch, assistant } => {
-                self.on_model_completed(epoch, assistant)
+            LoopSignal::ModelCompleted { turn_id, assistant } => {
+                self.on_model_completed(turn_id, assistant)
             }
-            LoopSignal::ToolCompleted { epoch, result } => self.on_tool_completed(epoch, result),
+            LoopSignal::ToolCompleted { turn_id, result } => {
+                self.on_tool_completed(turn_id, result)
+            }
         }
     }
 
-    fn on_model_completed(&mut self, epoch: Epoch, assistant: AssistantMessage) -> CoreTransition {
+    fn on_model_completed(
+        &mut self,
+        turn_id: TurnId,
+        assistant: AssistantMessage,
+    ) -> CoreTransition {
         if !matches!(
             &self.phase,
-            Phase::RunningModel { epoch: active_epoch } if *active_epoch == epoch
+            Phase::RunningModel { turn_id: active_turn_id } if *active_turn_id == turn_id
         ) {
             return CoreTransition::default();
         }
@@ -108,41 +114,41 @@ impl AgentCoreLoop {
 
         if let Some(tool_call) = self.pending_tool_calls.pop_front() {
             self.phase = Phase::RunningTool {
-                epoch,
-                call_id: tool_call.call_id,
+                turn_id,
+                tool_call_id: tool_call.id,
                 tool_name: tool_call.tool_name.clone(),
             };
             return CoreTransition {
                 actions: vec![
                     LoopAction::ToolCallStarted {
-                        epoch,
-                        call_id: tool_call.call_id,
+                        turn_id,
+                        tool_call_id: tool_call.id,
                         tool_name: tool_call.tool_name.clone(),
                     },
-                    LoopAction::RequestTool { epoch, tool_call },
+                    LoopAction::RequestTool { turn_id, tool_call },
                 ],
             };
         }
 
         self.phase = Phase::Idle;
         let mut transition = CoreTransition {
-            actions: vec![LoopAction::TurnFinished { epoch }],
+            actions: vec![LoopAction::TurnFinished { turn_id }],
         };
         transition.extend(self.drive());
         transition
     }
 
-    fn on_tool_completed(&mut self, epoch: Epoch, result: ToolResultMessage) -> CoreTransition {
+    fn on_tool_completed(&mut self, turn_id: TurnId, result: ToolResultMessage) -> CoreTransition {
         let running = match &self.phase {
             Phase::RunningTool {
-                epoch: active_epoch,
-                call_id,
+                turn_id: active_turn_id,
+                tool_call_id,
                 tool_name,
-            } if *active_epoch == epoch => (*call_id, tool_name.clone()),
+            } if *active_turn_id == turn_id => (*tool_call_id, tool_name.clone()),
             _ => return CoreTransition::default(),
         };
 
-        if running.0 != result.call_id || running.1 != result.tool_name {
+        if running.0 != result.tool_call_id || running.1 != result.tool_name {
             return CoreTransition::default();
         }
 
@@ -151,38 +157,38 @@ impl AgentCoreLoop {
 
         if let Some(tool_call) = self.pending_tool_calls.pop_front() {
             self.phase = Phase::RunningTool {
-                epoch,
-                call_id: tool_call.call_id,
+                turn_id,
+                tool_call_id: tool_call.id,
                 tool_name: tool_call.tool_name.clone(),
             };
             return CoreTransition {
                 actions: vec![
                     LoopAction::ToolCallFinished {
-                        epoch,
-                        call_id: result.call_id,
+                        turn_id,
+                        tool_call_id: result.tool_call_id,
                         tool_name: result.tool_name,
                         status: result.status,
                     },
                     LoopAction::ToolCallStarted {
-                        epoch,
-                        call_id: tool_call.call_id,
+                        turn_id,
+                        tool_call_id: tool_call.id,
                         tool_name: tool_call.tool_name.clone(),
                     },
-                    LoopAction::RequestTool { epoch, tool_call },
+                    LoopAction::RequestTool { turn_id, tool_call },
                 ],
             };
         }
 
-        self.phase = Phase::RunningModel { epoch };
+        self.phase = Phase::RunningModel { turn_id };
         CoreTransition {
             actions: vec![
                 LoopAction::ToolCallFinished {
-                    epoch,
-                    call_id: result.call_id,
+                    turn_id,
+                    tool_call_id: result.tool_call_id,
                     tool_name: result.tool_name,
                     status: result.status,
                 },
-                LoopAction::RequestModel { epoch },
+                LoopAction::RequestModel { turn_id },
             ],
         }
     }
@@ -196,21 +202,21 @@ impl AgentCoreLoop {
         }
 
         match &self.phase {
-            Phase::Idle => {
+            Phase::Idle | Phase::Interrupted => {
                 let Some(input) = self.mailbox.pop_next() else {
                     return CoreTransition::default();
                 };
 
-                self.epoch = self.epoch.next();
-                let epoch = self.epoch;
+                self.last_turn_id = self.last_turn_id.next();
+                let turn_id = self.last_turn_id;
                 let user_message = self.create_user_message(input);
                 self.transcript.push(CoreMessage::User(user_message));
-                self.phase = Phase::RunningModel { epoch };
+                self.phase = Phase::RunningModel { turn_id };
 
                 CoreTransition {
                     actions: vec![
-                        LoopAction::TurnStarted { epoch },
-                        LoopAction::RequestModel { epoch },
+                        LoopAction::TurnStarted { turn_id },
+                        LoopAction::RequestModel { turn_id },
                     ],
                 }
             }
@@ -220,42 +226,42 @@ impl AgentCoreLoop {
 
     fn handle_interrupt(&mut self) -> CoreTransition {
         match self.phase.clone() {
-            Phase::Idle => CoreTransition::default(),
-            Phase::RunningModel { epoch } => {
-                self.phase = Phase::Idle;
+            Phase::Idle | Phase::Interrupted => CoreTransition::default(),
+            Phase::RunningModel { turn_id } => {
+                self.phase = Phase::Interrupted;
                 self.pending_tool_calls.clear();
 
                 let mut transition = CoreTransition {
                     actions: vec![
-                        LoopAction::Interrupted { epoch },
-                        LoopAction::CancelActive { epoch },
+                        LoopAction::Interrupted { turn_id },
+                        LoopAction::CancelActive { turn_id },
                     ],
                 };
                 transition.extend(self.drive());
                 transition
             }
             Phase::RunningTool {
-                epoch,
-                call_id,
+                turn_id,
+                tool_call_id,
                 tool_name,
             } => {
-                self.phase = Phase::Idle;
+                self.phase = Phase::Interrupted;
                 self.pending_tool_calls.clear();
-                let message_id = MessageId::take_next(&mut self.next_message_id);
+                let message_id = EventId::take_next(&mut self.next_event_id);
                 let interrupted =
-                    ToolResultMessage::interrupted(message_id, call_id, tool_name.clone());
+                    ToolResultMessage::interrupted(message_id, tool_call_id, tool_name.clone());
                 self.transcript.push(CoreMessage::ToolResult(interrupted));
 
                 let mut transition = CoreTransition {
                     actions: vec![
-                        LoopAction::Interrupted { epoch },
+                        LoopAction::Interrupted { turn_id },
                         LoopAction::ToolCallFinished {
-                            epoch,
-                            call_id,
+                            turn_id,
+                            tool_call_id,
                             tool_name,
                             status: ToolResultStatus::Interrupted,
                         },
-                        LoopAction::CancelActive { epoch },
+                        LoopAction::CancelActive { turn_id },
                     ],
                 };
                 transition.extend(self.drive());
@@ -266,7 +272,7 @@ impl AgentCoreLoop {
 
     fn create_user_message(&mut self, input: UserInput) -> UserMessage {
         UserMessage {
-            id: MessageId::take_next(&mut self.next_message_id),
+            id: EventId::take_next(&mut self.next_event_id),
             text: input.text,
         }
     }
@@ -278,20 +284,20 @@ mod tests {
     use crate::message::AssistantItem;
     use crate::message::UserInput;
 
-    fn assistant_message(id: MessageId, items: Vec<AssistantItem>) -> AssistantMessage {
+    fn assistant_message(id: EventId, items: Vec<AssistantItem>) -> AssistantMessage {
         AssistantMessage { id, items }
     }
 
     fn text_assistant(loop_state: &mut AgentCoreLoop, text: &str) -> AssistantMessage {
         assistant_message(
-            MessageId::take_next(&mut loop_state.next_message_id),
+            EventId::take_next(&mut loop_state.next_event_id),
             vec![AssistantItem::Text(text.to_string())],
         )
     }
 
     fn tool_call(loop_state: &mut AgentCoreLoop, name: &str) -> ToolCall {
         ToolCall {
-            call_id: ToolCallId::take_next(&mut loop_state.next_tool_call_id),
+            id: EventId::take_next(&mut loop_state.next_event_id),
             tool_name: name.to_string(),
             args_json: "{}".to_string(),
         }
@@ -299,12 +305,12 @@ mod tests {
 
     fn successful_tool_result(
         loop_state: &mut AgentCoreLoop,
-        call_id: ToolCallId,
+        tool_call_id: EventId,
         tool_name: &str,
     ) -> ToolResultMessage {
         ToolResultMessage {
-            id: MessageId::take_next(&mut loop_state.next_message_id),
-            call_id,
+            id: EventId::take_next(&mut loop_state.next_event_id),
+            tool_call_id,
             tool_name: tool_name.to_string(),
             output: "ok".to_string(),
             status: ToolResultStatus::Success,
@@ -322,18 +328,18 @@ mod tests {
         assert_eq!(
             transition.actions,
             vec![
-                LoopAction::TurnStarted { epoch: Epoch(1) },
-                LoopAction::RequestModel { epoch: Epoch(1) },
+                LoopAction::TurnStarted { turn_id: TurnId(1) },
+                LoopAction::RequestModel { turn_id: TurnId(1) },
             ]
         );
         assert_eq!(
             loop_state.transcript,
             vec![CoreMessage::User(UserMessage {
-                id: MessageId(1),
+                id: EventId(1),
                 text: "hello".to_string(),
             })]
         );
-        assert_eq!(loop_state.phase, Phase::RunningModel { epoch: Epoch(1) });
+        assert_eq!(loop_state.phase, Phase::RunningModel { turn_id: TurnId(1) });
     }
 
     #[test]
@@ -344,7 +350,7 @@ mod tests {
         )));
         let tool_call = tool_call(&mut loop_state, "bash");
         let assistant = assistant_message(
-            MessageId::take_next(&mut loop_state.next_message_id),
+            EventId::take_next(&mut loop_state.next_event_id),
             vec![
                 AssistantItem::Text("Let me inspect that.".to_string()),
                 AssistantItem::ToolCall(tool_call.clone()),
@@ -352,7 +358,7 @@ mod tests {
         );
 
         let transition = loop_state.on_signal(LoopSignal::ModelCompleted {
-            epoch: Epoch(1),
+            turn_id: TurnId(1),
             assistant: assistant.clone(),
         });
 
@@ -360,12 +366,12 @@ mod tests {
             transition.actions,
             vec![
                 LoopAction::ToolCallStarted {
-                    epoch: Epoch(1),
-                    call_id: tool_call.call_id,
+                    turn_id: TurnId(1),
+                    tool_call_id: tool_call.id,
                     tool_name: "bash".to_string(),
                 },
                 LoopAction::RequestTool {
-                    epoch: Epoch(1),
+                    turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
             ]
@@ -373,8 +379,8 @@ mod tests {
         assert_eq!(
             loop_state.phase,
             Phase::RunningTool {
-                epoch: Epoch(1),
-                call_id: tool_call.call_id,
+                turn_id: TurnId(1),
+                tool_call_id: tool_call.id,
                 tool_name: "bash".to_string(),
             }
         );
@@ -392,17 +398,17 @@ mod tests {
         )));
         let tool_call = tool_call(&mut loop_state, "bash");
         let assistant = assistant_message(
-            MessageId::take_next(&mut loop_state.next_message_id),
+            EventId::take_next(&mut loop_state.next_event_id),
             vec![AssistantItem::ToolCall(tool_call.clone())],
         );
         loop_state.on_signal(LoopSignal::ModelCompleted {
-            epoch: Epoch(1),
+            turn_id: TurnId(1),
             assistant,
         });
-        let result = successful_tool_result(&mut loop_state, tool_call.call_id, "bash");
+        let result = successful_tool_result(&mut loop_state, tool_call.id, "bash");
 
         let transition = loop_state.on_signal(LoopSignal::ToolCompleted {
-            epoch: Epoch(1),
+            turn_id: TurnId(1),
             result: result.clone(),
         });
 
@@ -410,15 +416,15 @@ mod tests {
             transition.actions,
             vec![
                 LoopAction::ToolCallFinished {
-                    epoch: Epoch(1),
-                    call_id: tool_call.call_id,
+                    turn_id: TurnId(1),
+                    tool_call_id: tool_call.id,
                     tool_name: "bash".to_string(),
                     status: ToolResultStatus::Success,
                 },
-                LoopAction::RequestModel { epoch: Epoch(1) },
+                LoopAction::RequestModel { turn_id: TurnId(1) },
             ]
         );
-        assert_eq!(loop_state.phase, Phase::RunningModel { epoch: Epoch(1) });
+        assert_eq!(loop_state.phase, Phase::RunningModel { turn_id: TurnId(1) });
         assert_eq!(
             loop_state.transcript.last(),
             Some(&CoreMessage::ToolResult(result))
@@ -434,20 +440,20 @@ mod tests {
         let first = tool_call(&mut loop_state, "bash");
         let second = tool_call(&mut loop_state, "read");
         let assistant = assistant_message(
-            MessageId::take_next(&mut loop_state.next_message_id),
+            EventId::take_next(&mut loop_state.next_event_id),
             vec![
                 AssistantItem::ToolCall(first.clone()),
                 AssistantItem::ToolCall(second.clone()),
             ],
         );
         loop_state.on_signal(LoopSignal::ModelCompleted {
-            epoch: Epoch(1),
+            turn_id: TurnId(1),
             assistant,
         });
 
-        let first_result = successful_tool_result(&mut loop_state, first.call_id, "bash");
+        let first_result = successful_tool_result(&mut loop_state, first.id, "bash");
         let transition = loop_state.on_signal(LoopSignal::ToolCompleted {
-            epoch: Epoch(1),
+            turn_id: TurnId(1),
             result: first_result,
         });
 
@@ -455,18 +461,18 @@ mod tests {
             transition.actions,
             vec![
                 LoopAction::ToolCallFinished {
-                    epoch: Epoch(1),
-                    call_id: first.call_id,
+                    turn_id: TurnId(1),
+                    tool_call_id: first.id,
                     tool_name: "bash".to_string(),
                     status: ToolResultStatus::Success,
                 },
                 LoopAction::ToolCallStarted {
-                    epoch: Epoch(1),
-                    call_id: second.call_id,
+                    turn_id: TurnId(1),
+                    tool_call_id: second.id,
                     tool_name: "read".to_string(),
                 },
                 LoopAction::RequestTool {
-                    epoch: Epoch(1),
+                    turn_id: TurnId(1),
                     tool_call: second.clone(),
                 },
             ]
@@ -474,8 +480,8 @@ mod tests {
         assert_eq!(
             loop_state.phase,
             Phase::RunningTool {
-                epoch: Epoch(1),
-                call_id: second.call_id,
+                turn_id: TurnId(1),
+                tool_call_id: second.id,
                 tool_name: "read".to_string(),
             }
         );
@@ -489,11 +495,11 @@ mod tests {
         )));
         let tool_call = tool_call(&mut loop_state, "bash");
         let assistant = assistant_message(
-            MessageId::take_next(&mut loop_state.next_message_id),
+            EventId::take_next(&mut loop_state.next_event_id),
             vec![AssistantItem::ToolCall(tool_call.clone())],
         );
         loop_state.on_signal(LoopSignal::ModelCompleted {
-            epoch: Epoch(1),
+            turn_id: TurnId(1),
             assistant,
         });
         loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::Steer(UserInput::from(
@@ -505,41 +511,60 @@ mod tests {
         assert_eq!(
             transition.actions,
             vec![
-                LoopAction::Interrupted { epoch: Epoch(1) },
+                LoopAction::Interrupted { turn_id: TurnId(1) },
                 LoopAction::ToolCallFinished {
-                    epoch: Epoch(1),
-                    call_id: tool_call.call_id,
+                    turn_id: TurnId(1),
+                    tool_call_id: tool_call.id,
                     tool_name: "bash".to_string(),
                     status: ToolResultStatus::Interrupted,
                 },
-                LoopAction::CancelActive { epoch: Epoch(1) },
-                LoopAction::TurnStarted { epoch: Epoch(2) },
-                LoopAction::RequestModel { epoch: Epoch(2) },
+                LoopAction::CancelActive { turn_id: TurnId(1) },
+                LoopAction::TurnStarted { turn_id: TurnId(2) },
+                LoopAction::RequestModel { turn_id: TurnId(2) },
             ]
         );
-        assert_eq!(loop_state.phase, Phase::RunningModel { epoch: Epoch(2) });
+        assert_eq!(loop_state.phase, Phase::RunningModel { turn_id: TurnId(2) });
         assert_eq!(
             loop_state.transcript,
             vec![
                 CoreMessage::User(UserMessage {
-                    id: MessageId(1),
+                    id: EventId(1),
                     text: "initial".to_string(),
                 }),
                 CoreMessage::Assistant(assistant_message(
-                    MessageId(2),
+                    EventId(3),
                     vec![AssistantItem::ToolCall(tool_call.clone())],
                 )),
                 CoreMessage::ToolResult(ToolResultMessage::interrupted(
-                    MessageId(3),
-                    tool_call.call_id,
+                    EventId(4),
+                    tool_call.id,
                     "bash",
                 )),
                 CoreMessage::User(UserMessage {
-                    id: MessageId(4),
+                    id: EventId(5),
                     text: "urgent".to_string(),
                 }),
             ]
         );
+    }
+
+    #[test]
+    fn interrupting_a_running_model_without_queued_work_leaves_interrupted_phase() {
+        let mut loop_state = AgentCoreLoop::new();
+        loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::FollowUp(
+            UserInput::from("hello"),
+        )));
+
+        let transition = loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::Interrupt));
+
+        assert_eq!(
+            transition.actions,
+            vec![
+                LoopAction::Interrupted { turn_id: TurnId(1) },
+                LoopAction::CancelActive { turn_id: TurnId(1) },
+            ]
+        );
+        assert_eq!(loop_state.phase, Phase::Interrupted);
     }
 
     #[test]
@@ -552,13 +577,13 @@ mod tests {
 
         let stale_assistant = text_assistant(&mut loop_state, "stale");
         let transition = loop_state.on_signal(LoopSignal::ModelCompleted {
-            epoch: Epoch(1),
+            turn_id: TurnId(1),
             assistant: stale_assistant,
         });
 
         assert_eq!(transition, CoreTransition::default());
         assert_eq!(loop_state.transcript.len(), 1);
-        assert_eq!(loop_state.phase, Phase::Idle);
+        assert_eq!(loop_state.phase, Phase::Interrupted);
     }
 
     #[test]
@@ -570,25 +595,25 @@ mod tests {
         let first = tool_call(&mut loop_state, "bash");
         let second = tool_call(&mut loop_state, "read");
         let assistant = assistant_message(
-            MessageId::take_next(&mut loop_state.next_message_id),
+            EventId::take_next(&mut loop_state.next_event_id),
             vec![
                 AssistantItem::ToolCall(first.clone()),
                 AssistantItem::ToolCall(second.clone()),
             ],
         );
         loop_state.on_signal(LoopSignal::ModelCompleted {
-            epoch: Epoch(1),
+            turn_id: TurnId(1),
             assistant,
         });
-        let first_result = successful_tool_result(&mut loop_state, first.call_id, "bash");
+        let first_result = successful_tool_result(&mut loop_state, first.id, "bash");
         loop_state.on_signal(LoopSignal::ToolCompleted {
-            epoch: Epoch(1),
+            turn_id: TurnId(1),
             result: first_result,
         });
 
-        let stale_result = successful_tool_result(&mut loop_state, first.call_id, "bash");
+        let stale_result = successful_tool_result(&mut loop_state, first.id, "bash");
         let transition = loop_state.on_signal(LoopSignal::ToolCompleted {
-            epoch: Epoch(1),
+            turn_id: TurnId(1),
             result: stale_result,
         });
 
@@ -596,8 +621,8 @@ mod tests {
         assert_eq!(
             loop_state.phase,
             Phase::RunningTool {
-                epoch: Epoch(1),
-                call_id: second.call_id,
+                turn_id: TurnId(1),
+                tool_call_id: second.id,
                 tool_name: "read".to_string(),
             }
         );
