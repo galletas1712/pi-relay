@@ -2,7 +2,7 @@ use crate::ids::{EventId, TurnId};
 use crate::message::{ToolCall, ToolResultStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoopAction {
+pub enum AgentEvent {
     TurnStarted {
         turn_id: TurnId,
     },
@@ -23,6 +23,10 @@ pub enum LoopAction {
     TurnFinished {
         turn_id: TurnId,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentAction {
     RequestModel {
         turn_id: TurnId,
     },

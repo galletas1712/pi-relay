@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use crate::event::LoopAction;
+use crate::event::{AgentAction, AgentEvent};
 use crate::ids::{EventId, TurnId};
 use crate::mailbox::{Mailbox, MailboxCommand};
 use crate::message::{
@@ -10,12 +10,18 @@ use crate::message::{
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CoreTransition {
-    pub actions: Vec<LoopAction>,
+    pub events: Vec<AgentEvent>,
+    pub actions: Vec<AgentAction>,
 }
 
 impl CoreTransition {
     fn extend(&mut self, other: CoreTransition) {
+        self.events.extend(other.events);
         self.actions.extend(other.actions);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.events.is_empty() && self.actions.is_empty()
     }
 }
 
@@ -41,8 +47,7 @@ impl Default for Phase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LoopSignal {
-    Mailbox(MailboxCommand),
+pub enum AgentNotification {
     ModelCompleted {
         turn_id: TurnId,
         assistant: AssistantMessage,
@@ -51,6 +56,12 @@ pub enum LoopSignal {
         turn_id: TurnId,
         result: ToolResultMessage,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentInput {
+    Command(MailboxCommand),
+    Notification(AgentNotification),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,18 +92,20 @@ impl AgentCoreLoop {
         Self::default()
     }
 
-    pub fn on_signal(&mut self, signal: LoopSignal) -> CoreTransition {
-        match signal {
-            LoopSignal::Mailbox(command) => {
+    pub fn on_input(&mut self, input: AgentInput) -> CoreTransition {
+        match input {
+            AgentInput::Command(command) => {
                 self.mailbox.push(command);
                 self.drive()
             }
-            LoopSignal::ModelCompleted { turn_id, assistant } => {
-                self.on_model_completed(turn_id, assistant)
-            }
-            LoopSignal::ToolCompleted { turn_id, result } => {
-                self.on_tool_completed(turn_id, result)
-            }
+            AgentInput::Notification(notification) => match notification {
+                AgentNotification::ModelCompleted { turn_id, assistant } => {
+                    self.on_model_completed(turn_id, assistant)
+                }
+                AgentNotification::ToolCompleted { turn_id, result } => {
+                    self.on_tool_completed(turn_id, result)
+                }
+            },
         }
     }
 
@@ -119,20 +132,19 @@ impl AgentCoreLoop {
                 tool_name: tool_call.tool_name.clone(),
             };
             return CoreTransition {
-                actions: vec![
-                    LoopAction::ToolCallStarted {
-                        turn_id,
-                        tool_call_id: tool_call.id,
-                        tool_name: tool_call.tool_name.clone(),
-                    },
-                    LoopAction::RequestTool { turn_id, tool_call },
-                ],
+                events: vec![AgentEvent::ToolCallStarted {
+                    turn_id,
+                    tool_call_id: tool_call.id,
+                    tool_name: tool_call.tool_name.clone(),
+                }],
+                actions: vec![AgentAction::RequestTool { turn_id, tool_call }],
             };
         }
 
         self.phase = Phase::Idle;
         let mut transition = CoreTransition {
-            actions: vec![LoopAction::TurnFinished { turn_id }],
+            events: vec![AgentEvent::TurnFinished { turn_id }],
+            actions: Vec::new(),
         };
         transition.extend(self.drive());
         transition
@@ -162,41 +174,39 @@ impl AgentCoreLoop {
                 tool_name: tool_call.tool_name.clone(),
             };
             return CoreTransition {
-                actions: vec![
-                    LoopAction::ToolCallFinished {
+                events: vec![
+                    AgentEvent::ToolCallFinished {
                         turn_id,
                         tool_call_id: result.tool_call_id,
                         tool_name: result.tool_name,
                         status: result.status,
                     },
-                    LoopAction::ToolCallStarted {
+                    AgentEvent::ToolCallStarted {
                         turn_id,
                         tool_call_id: tool_call.id,
                         tool_name: tool_call.tool_name.clone(),
                     },
-                    LoopAction::RequestTool { turn_id, tool_call },
                 ],
+                actions: vec![AgentAction::RequestTool { turn_id, tool_call }],
             };
         }
 
         self.phase = Phase::RunningModel { turn_id };
         CoreTransition {
-            actions: vec![
-                LoopAction::ToolCallFinished {
-                    turn_id,
-                    tool_call_id: result.tool_call_id,
-                    tool_name: result.tool_name,
-                    status: result.status,
-                },
-                LoopAction::RequestModel { turn_id },
-            ],
+            events: vec![AgentEvent::ToolCallFinished {
+                turn_id,
+                tool_call_id: result.tool_call_id,
+                tool_name: result.tool_name,
+                status: result.status,
+            }],
+            actions: vec![AgentAction::RequestModel { turn_id }],
         }
     }
 
     fn drive(&mut self) -> CoreTransition {
         if self.mailbox.take_interrupt() {
             let interrupt_transition = self.handle_interrupt();
-            if !interrupt_transition.actions.is_empty() {
+            if !interrupt_transition.is_empty() {
                 return interrupt_transition;
             }
         }
@@ -214,10 +224,8 @@ impl AgentCoreLoop {
                 self.phase = Phase::RunningModel { turn_id };
 
                 CoreTransition {
-                    actions: vec![
-                        LoopAction::TurnStarted { turn_id },
-                        LoopAction::RequestModel { turn_id },
-                    ],
+                    events: vec![AgentEvent::TurnStarted { turn_id }],
+                    actions: vec![AgentAction::RequestModel { turn_id }],
                 }
             }
             Phase::RunningModel { .. } | Phase::RunningTool { .. } => CoreTransition::default(),
@@ -232,10 +240,8 @@ impl AgentCoreLoop {
                 self.pending_tool_calls.clear();
 
                 let mut transition = CoreTransition {
-                    actions: vec![
-                        LoopAction::Interrupted { turn_id },
-                        LoopAction::CancelActive { turn_id },
-                    ],
+                    events: vec![AgentEvent::Interrupted { turn_id }],
+                    actions: vec![AgentAction::CancelActive { turn_id }],
                 };
                 transition.extend(self.drive());
                 transition
@@ -253,16 +259,16 @@ impl AgentCoreLoop {
                 self.transcript.push(CoreMessage::ToolResult(interrupted));
 
                 let mut transition = CoreTransition {
-                    actions: vec![
-                        LoopAction::Interrupted { turn_id },
-                        LoopAction::ToolCallFinished {
+                    events: vec![
+                        AgentEvent::Interrupted { turn_id },
+                        AgentEvent::ToolCallFinished {
                             turn_id,
                             tool_call_id,
                             tool_name,
                             status: ToolResultStatus::Interrupted,
                         },
-                        LoopAction::CancelActive { turn_id },
                     ],
+                    actions: vec![AgentAction::CancelActive { turn_id }],
                 };
                 transition.extend(self.drive());
                 transition
@@ -281,6 +287,7 @@ impl AgentCoreLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::{AgentAction, AgentEvent};
     use crate::message::AssistantItem;
     use crate::message::UserInput;
 
@@ -321,16 +328,17 @@ mod tests {
     fn starting_a_turn_commits_the_user_message_and_requests_the_model() {
         let mut loop_state = AgentCoreLoop::new();
 
-        let transition = loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::FollowUp(
+        let transition = loop_state.on_input(AgentInput::Command(MailboxCommand::FollowUp(
             UserInput::from("hello"),
         )));
 
         assert_eq!(
+            transition.events,
+            vec![AgentEvent::TurnStarted { turn_id: TurnId(1) }]
+        );
+        assert_eq!(
             transition.actions,
-            vec![
-                LoopAction::TurnStarted { turn_id: TurnId(1) },
-                LoopAction::RequestModel { turn_id: TurnId(1) },
-            ]
+            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
         assert_eq!(
             loop_state.transcript,
@@ -345,7 +353,7 @@ mod tests {
     #[test]
     fn model_completion_with_a_tool_call_requests_the_tool() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::FollowUp(
+        loop_state.on_input(AgentInput::Command(MailboxCommand::FollowUp(
             UserInput::from("hello"),
         )));
         let tool_call = tool_call(&mut loop_state, "bash");
@@ -357,24 +365,27 @@ mod tests {
             ],
         );
 
-        let transition = loop_state.on_signal(LoopSignal::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: assistant.clone(),
-        });
+        let transition = loop_state.on_input(AgentInput::Notification(
+            AgentNotification::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant: assistant.clone(),
+            },
+        ));
 
         assert_eq!(
+            transition.events,
+            vec![AgentEvent::ToolCallStarted {
+                turn_id: TurnId(1),
+                tool_call_id: tool_call.id,
+                tool_name: "bash".to_string(),
+            }]
+        );
+        assert_eq!(
             transition.actions,
-            vec![
-                LoopAction::ToolCallStarted {
-                    turn_id: TurnId(1),
-                    tool_call_id: tool_call.id,
-                    tool_name: "bash".to_string(),
-                },
-                LoopAction::RequestTool {
-                    turn_id: TurnId(1),
-                    tool_call: tool_call.clone(),
-                },
-            ]
+            vec![AgentAction::RequestTool {
+                turn_id: TurnId(1),
+                tool_call: tool_call.clone(),
+            }]
         );
         assert_eq!(
             loop_state.phase,
@@ -393,7 +404,7 @@ mod tests {
     #[test]
     fn tool_completion_appends_a_tool_result_and_resumes_the_model() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::FollowUp(
+        loop_state.on_input(AgentInput::Command(MailboxCommand::FollowUp(
             UserInput::from("hello"),
         )));
         let tool_call = tool_call(&mut loop_state, "bash");
@@ -401,28 +412,32 @@ mod tests {
             EventId::take_next(&mut loop_state.next_event_id),
             vec![AssistantItem::ToolCall(tool_call.clone())],
         );
-        loop_state.on_signal(LoopSignal::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant,
-        });
+        loop_state.on_input(AgentInput::Notification(
+            AgentNotification::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        ));
         let result = successful_tool_result(&mut loop_state, tool_call.id, "bash");
 
-        let transition = loop_state.on_signal(LoopSignal::ToolCompleted {
-            turn_id: TurnId(1),
-            result: result.clone(),
-        });
+        let transition =
+            loop_state.on_input(AgentInput::Notification(AgentNotification::ToolCompleted {
+                turn_id: TurnId(1),
+                result: result.clone(),
+            }));
 
         assert_eq!(
+            transition.events,
+            vec![AgentEvent::ToolCallFinished {
+                turn_id: TurnId(1),
+                tool_call_id: tool_call.id,
+                tool_name: "bash".to_string(),
+                status: ToolResultStatus::Success,
+            }]
+        );
+        assert_eq!(
             transition.actions,
-            vec![
-                LoopAction::ToolCallFinished {
-                    turn_id: TurnId(1),
-                    tool_call_id: tool_call.id,
-                    tool_name: "bash".to_string(),
-                    status: ToolResultStatus::Success,
-                },
-                LoopAction::RequestModel { turn_id: TurnId(1) },
-            ]
+            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
         );
         assert_eq!(loop_state.phase, Phase::RunningModel { turn_id: TurnId(1) });
         assert_eq!(
@@ -434,7 +449,7 @@ mod tests {
     #[test]
     fn multiple_tool_calls_run_before_the_model_resumes() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::FollowUp(
+        loop_state.on_input(AgentInput::Command(MailboxCommand::FollowUp(
             UserInput::from("hello"),
         )));
         let first = tool_call(&mut loop_state, "bash");
@@ -446,36 +461,42 @@ mod tests {
                 AssistantItem::ToolCall(second.clone()),
             ],
         );
-        loop_state.on_signal(LoopSignal::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant,
-        });
+        loop_state.on_input(AgentInput::Notification(
+            AgentNotification::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        ));
 
         let first_result = successful_tool_result(&mut loop_state, first.id, "bash");
-        let transition = loop_state.on_signal(LoopSignal::ToolCompleted {
-            turn_id: TurnId(1),
-            result: first_result,
-        });
+        let transition =
+            loop_state.on_input(AgentInput::Notification(AgentNotification::ToolCompleted {
+                turn_id: TurnId(1),
+                result: first_result,
+            }));
 
         assert_eq!(
-            transition.actions,
+            transition.events,
             vec![
-                LoopAction::ToolCallFinished {
+                AgentEvent::ToolCallFinished {
                     turn_id: TurnId(1),
                     tool_call_id: first.id,
                     tool_name: "bash".to_string(),
                     status: ToolResultStatus::Success,
                 },
-                LoopAction::ToolCallStarted {
+                AgentEvent::ToolCallStarted {
                     turn_id: TurnId(1),
                     tool_call_id: second.id,
                     tool_name: "read".to_string(),
                 },
-                LoopAction::RequestTool {
-                    turn_id: TurnId(1),
-                    tool_call: second.clone(),
-                },
             ]
+        );
+        assert_eq!(
+            transition.actions,
+            vec![AgentAction::RequestTool {
+                turn_id: TurnId(1),
+                tool_call: second.clone(),
+            }]
         );
         assert_eq!(
             loop_state.phase,
@@ -490,7 +511,7 @@ mod tests {
     #[test]
     fn interrupting_a_running_tool_closes_the_transcript_and_starts_queued_steering_work() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::FollowUp(
+        loop_state.on_input(AgentInput::Command(MailboxCommand::FollowUp(
             UserInput::from("initial"),
         )));
         let tool_call = tool_call(&mut loop_state, "bash");
@@ -498,29 +519,36 @@ mod tests {
             EventId::take_next(&mut loop_state.next_event_id),
             vec![AssistantItem::ToolCall(tool_call.clone())],
         );
-        loop_state.on_signal(LoopSignal::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant,
-        });
-        loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::Steer(UserInput::from(
+        loop_state.on_input(AgentInput::Notification(
+            AgentNotification::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        ));
+        loop_state.on_input(AgentInput::Command(MailboxCommand::Steer(UserInput::from(
             "urgent",
         ))));
 
-        let transition = loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::Interrupt));
+        let transition = loop_state.on_input(AgentInput::Command(MailboxCommand::Interrupt));
 
         assert_eq!(
-            transition.actions,
+            transition.events,
             vec![
-                LoopAction::Interrupted { turn_id: TurnId(1) },
-                LoopAction::ToolCallFinished {
+                AgentEvent::Interrupted { turn_id: TurnId(1) },
+                AgentEvent::ToolCallFinished {
                     turn_id: TurnId(1),
                     tool_call_id: tool_call.id,
                     tool_name: "bash".to_string(),
                     status: ToolResultStatus::Interrupted,
                 },
-                LoopAction::CancelActive { turn_id: TurnId(1) },
-                LoopAction::TurnStarted { turn_id: TurnId(2) },
-                LoopAction::RequestModel { turn_id: TurnId(2) },
+                AgentEvent::TurnStarted { turn_id: TurnId(2) },
+            ]
+        );
+        assert_eq!(
+            transition.actions,
+            vec![
+                AgentAction::CancelActive { turn_id: TurnId(1) },
+                AgentAction::RequestModel { turn_id: TurnId(2) },
             ]
         );
         assert_eq!(loop_state.phase, Phase::RunningModel { turn_id: TurnId(2) });
@@ -551,18 +579,19 @@ mod tests {
     #[test]
     fn interrupting_a_running_model_without_queued_work_leaves_interrupted_phase() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::FollowUp(
+        loop_state.on_input(AgentInput::Command(MailboxCommand::FollowUp(
             UserInput::from("hello"),
         )));
 
-        let transition = loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::Interrupt));
+        let transition = loop_state.on_input(AgentInput::Command(MailboxCommand::Interrupt));
 
         assert_eq!(
+            transition.events,
+            vec![AgentEvent::Interrupted { turn_id: TurnId(1) }]
+        );
+        assert_eq!(
             transition.actions,
-            vec![
-                LoopAction::Interrupted { turn_id: TurnId(1) },
-                LoopAction::CancelActive { turn_id: TurnId(1) },
-            ]
+            vec![AgentAction::CancelActive { turn_id: TurnId(1) }]
         );
         assert_eq!(loop_state.phase, Phase::Interrupted);
     }
@@ -570,16 +599,18 @@ mod tests {
     #[test]
     fn stale_model_completion_is_ignored_after_an_interrupt() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::FollowUp(
+        loop_state.on_input(AgentInput::Command(MailboxCommand::FollowUp(
             UserInput::from("hello"),
         )));
-        loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::Interrupt));
+        loop_state.on_input(AgentInput::Command(MailboxCommand::Interrupt));
 
         let stale_assistant = text_assistant(&mut loop_state, "stale");
-        let transition = loop_state.on_signal(LoopSignal::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: stale_assistant,
-        });
+        let transition = loop_state.on_input(AgentInput::Notification(
+            AgentNotification::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant: stale_assistant,
+            },
+        ));
 
         assert_eq!(transition, CoreTransition::default());
         assert_eq!(loop_state.transcript.len(), 1);
@@ -589,7 +620,7 @@ mod tests {
     #[test]
     fn stale_tool_completion_is_ignored_once_the_active_call_changes() {
         let mut loop_state = AgentCoreLoop::new();
-        loop_state.on_signal(LoopSignal::Mailbox(MailboxCommand::FollowUp(
+        loop_state.on_input(AgentInput::Command(MailboxCommand::FollowUp(
             UserInput::from("hello"),
         )));
         let first = tool_call(&mut loop_state, "bash");
@@ -601,21 +632,24 @@ mod tests {
                 AssistantItem::ToolCall(second.clone()),
             ],
         );
-        loop_state.on_signal(LoopSignal::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant,
-        });
+        loop_state.on_input(AgentInput::Notification(
+            AgentNotification::ModelCompleted {
+                turn_id: TurnId(1),
+                assistant,
+            },
+        ));
         let first_result = successful_tool_result(&mut loop_state, first.id, "bash");
-        loop_state.on_signal(LoopSignal::ToolCompleted {
+        loop_state.on_input(AgentInput::Notification(AgentNotification::ToolCompleted {
             turn_id: TurnId(1),
             result: first_result,
-        });
+        }));
 
         let stale_result = successful_tool_result(&mut loop_state, first.id, "bash");
-        let transition = loop_state.on_signal(LoopSignal::ToolCompleted {
-            turn_id: TurnId(1),
-            result: stale_result,
-        });
+        let transition =
+            loop_state.on_input(AgentInput::Notification(AgentNotification::ToolCompleted {
+                turn_id: TurnId(1),
+                result: stale_result,
+            }));
 
         assert_eq!(transition, CoreTransition::default());
         assert_eq!(
