@@ -6,7 +6,7 @@ use crate::mailbox::{Mailbox, MailboxEvent};
 use crate::message::{
     AssistantMessage, CompactMessage, ToolCall, ToolResultMessage, UserInput, UserMessage,
 };
-use crate::state::{AgentState, AgentStateStep};
+use crate::state::{AgentState, MailboxEventDecision};
 use crate::transcript::Transcript;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,17 +118,17 @@ impl AgentCoreLoop {
             return false;
         };
 
-        match self.state.step(&event) {
-            AgentStateStep::ConsumeEvent => {
+        match self.state.decide_mailbox_event(&event) {
+            MailboxEventDecision::Consume => {
                 let event = self.pop_event();
                 self.handle_mailbox_event(event);
                 true
             }
-            AgentStateStep::DropEvent => {
+            MailboxEventDecision::Drop => {
                 let _ = self.pop_event();
                 true
             }
-            AgentStateStep::Wait => false,
+            MailboxEventDecision::Wait => false,
         }
     }
 

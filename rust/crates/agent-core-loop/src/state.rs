@@ -32,9 +32,9 @@ impl Default for AgentState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentStateStep {
-    ConsumeEvent,
-    DropEvent,
+pub(crate) enum MailboxEventDecision {
+    Consume,
+    Drop,
     Wait,
 }
 
@@ -54,30 +54,32 @@ impl AgentState {
         }
     }
 
-    pub(crate) fn step(&self, event: &MailboxEvent) -> AgentStateStep {
+    pub(crate) fn decide_mailbox_event(&self, event: &MailboxEvent) -> MailboxEventDecision {
         let Some(active_turn_id) = self.active_turn_id() else {
-            return AgentStateStep::DropEvent;
+            return MailboxEventDecision::Drop;
         };
 
         if event.turn_id() != active_turn_id {
-            return AgentStateStep::DropEvent;
+            return MailboxEventDecision::Drop;
         }
 
         match (self, event) {
             (Self::RunningModel { .. }, MailboxEvent::AssistantMessage { .. }) => {
-                AgentStateStep::ConsumeEvent
+                MailboxEventDecision::Consume
             }
             (Self::RunningTool { tool_call, .. }, MailboxEvent::ToolResult { result, .. })
                 if tool_call.id == result.tool_call_id
                     && tool_call.tool_name == result.tool_name =>
             {
-                AgentStateStep::ConsumeEvent
+                MailboxEventDecision::Consume
             }
             (Self::ReadyToContinue { .. }, MailboxEvent::ToolCallReady { .. }) => {
-                AgentStateStep::ConsumeEvent
+                MailboxEventDecision::Consume
             }
-            (Self::RunningTool { .. }, MailboxEvent::ToolCallReady { .. }) => AgentStateStep::Wait,
-            _ => AgentStateStep::DropEvent,
+            (Self::RunningTool { .. }, MailboxEvent::ToolCallReady { .. }) => {
+                MailboxEventDecision::Wait
+            }
+            _ => MailboxEventDecision::Drop,
         }
     }
 
@@ -216,12 +218,18 @@ mod tests {
             assistant: AssistantMessage { items: Vec::new() },
         };
 
-        assert_eq!(AgentState::Idle.step(&event), AgentStateStep::DropEvent);
         assert_eq!(
-            AgentState::Interrupted.step(&event),
-            AgentStateStep::DropEvent
+            AgentState::Idle.decide_mailbox_event(&event),
+            MailboxEventDecision::Drop
         );
-        assert_eq!(AgentState::Crashed.step(&event), AgentStateStep::DropEvent);
+        assert_eq!(
+            AgentState::Interrupted.decide_mailbox_event(&event),
+            MailboxEventDecision::Drop
+        );
+        assert_eq!(
+            AgentState::Crashed.decide_mailbox_event(&event),
+            MailboxEventDecision::Drop
+        );
     }
 
     #[test]
@@ -236,8 +244,14 @@ mod tests {
             assistant: AssistantMessage { items: Vec::new() },
         };
 
-        assert_eq!(state.step(&matching), AgentStateStep::ConsumeEvent);
-        assert_eq!(state.step(&stale), AgentStateStep::DropEvent);
+        assert_eq!(
+            state.decide_mailbox_event(&matching),
+            MailboxEventDecision::Consume
+        );
+        assert_eq!(
+            state.decide_mailbox_event(&stale),
+            MailboxEventDecision::Drop
+        );
     }
 
     #[test]
@@ -255,8 +269,14 @@ mod tests {
             tool_call: tool_call("read"),
         };
 
-        assert_eq!(state.step(&result), AgentStateStep::ConsumeEvent);
-        assert_eq!(state.step(&future_tool), AgentStateStep::Wait);
+        assert_eq!(
+            state.decide_mailbox_event(&result),
+            MailboxEventDecision::Consume
+        );
+        assert_eq!(
+            state.decide_mailbox_event(&future_tool),
+            MailboxEventDecision::Wait
+        );
     }
 
     #[test]
