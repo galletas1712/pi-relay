@@ -1,3 +1,4 @@
+export * from "./bridge/index.js";
 export * from "./context-transform.js";
 export * from "./extension.js";
 export * from "./messages.js";
