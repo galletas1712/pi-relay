@@ -2,13 +2,63 @@ import { resolve } from "node:path";
 import type { AgentSession, AgentSessionRuntime } from "@pi-relay/coding-agent";
 import type { Orchestrator } from "@pi-relay/orchestrator";
 
+export type RelayRuntimeEngineMode = "legacy" | "ts-core" | "rust-shadow" | "rust";
+
+export interface RelayRuntimeNotice {
+	level: "info" | "warning" | "error";
+	message: string;
+	source: "session-shadow";
+	timestamp: string;
+}
+
+export interface RelayRuntimeNoticeStore {
+	push(notice: Omit<RelayRuntimeNotice, "timestamp"> & { timestamp?: string }): void;
+	drain(): RelayRuntimeNotice[];
+	subscribe(listener: (notice: RelayRuntimeNotice) => void): () => void;
+}
+
+export interface RelaySessionShadowState {
+	requestedMode: RelayRuntimeEngineMode;
+	effectiveMode: "disabled" | "shadow";
+	authority: "ts";
+	status: "disabled" | "starting" | "running" | "disconnected" | "stopped";
+	lastError?: string;
+}
+
+export function createRelayRuntimeNoticeStore(): RelayRuntimeNoticeStore {
+	const buffered: RelayRuntimeNotice[] = [];
+	const listeners = new Set<(notice: RelayRuntimeNotice) => void>();
+
+	return {
+		push(notice) {
+			const stamped: RelayRuntimeNotice = {
+				...notice,
+				timestamp: notice.timestamp ?? new Date().toISOString(),
+			};
+			buffered.push(stamped);
+			for (const listener of listeners) {
+				listener(stamped);
+			}
+		},
+		drain() {
+			return buffered.splice(0, buffered.length);
+		},
+		subscribe(listener) {
+			listeners.add(listener);
+			return () => listeners.delete(listener);
+		},
+	};
+}
+
 export interface RelayRuntimeStateRef {
 	current?: {
 		orchestrator: Orchestrator;
 		engineConfig?: {
-			orchestrator: "legacy" | "ts-core" | "rust-shadow" | "rust";
-			session: "legacy" | "ts-core" | "rust-shadow" | "rust";
+			orchestrator: RelayRuntimeEngineMode;
+			session: RelayRuntimeEngineMode;
 		};
+		runtimeNoticeStore?: RelayRuntimeNoticeStore;
+		sessionShadow?: RelaySessionShadowState;
 	};
 }
 
@@ -46,6 +96,10 @@ export class RelayRuntimeHost {
 		return this.rootRuntime.modelFallbackMessage;
 	}
 
+	get sessionShadow(): RelaySessionShadowState | undefined {
+		return this.stateRef.current?.sessionShadow;
+	}
+
 	get session(): AgentSession {
 		return this.getAttachedRecord().session as unknown as AgentSession;
 	}
@@ -54,12 +108,20 @@ export class RelayRuntimeHost {
 		return this.attachedAgentId;
 	}
 
+	consumeRuntimeNotices(): RelayRuntimeNotice[] {
+		return this.stateRef.current?.runtimeNoticeStore?.drain() ?? [];
+	}
+
 	subscribeToSessionChanges(listener: (change: RelayRuntimeSessionChange) => void): () => void {
 		this.ensureOrchestratorSubscription();
 		this.sessionChangeListeners.add(listener);
 		return () => {
 			this.sessionChangeListeners.delete(listener);
 		};
+	}
+
+	subscribeToRuntimeNotices(listener: (notice: RelayRuntimeNotice) => void): () => void {
+		return this.stateRef.current?.runtimeNoticeStore?.subscribe(listener) ?? (() => {});
 	}
 
 	async switchSession(

@@ -26,6 +26,28 @@ export interface PrintModeOptions {
 	initialImages?: ImageContent[];
 }
 
+interface RuntimeNoticeLike {
+	level: "info" | "warning" | "error";
+	message: string;
+}
+
+interface RuntimeNoticeHost {
+	consumeRuntimeNotices(): RuntimeNoticeLike[];
+	subscribeToRuntimeNotices(listener: (notice: RuntimeNoticeLike) => void): () => void;
+}
+
+function hasRuntimeNoticeHost(runtimeHost: AgentSessionRuntime): runtimeHost is AgentSessionRuntime & RuntimeNoticeHost {
+	return (
+		typeof (runtimeHost as Partial<RuntimeNoticeHost>).consumeRuntimeNotices === "function" &&
+		typeof (runtimeHost as Partial<RuntimeNoticeHost>).subscribeToRuntimeNotices === "function"
+	);
+}
+
+function printRuntimeNotice(notice: RuntimeNoticeLike): void {
+	const prefix = notice.level === "error" ? "Error" : notice.level === "warning" ? "Warning" : "Info";
+	process.stderr.write(`${prefix}: ${notice.message}\n`);
+}
+
 /**
  * Run in print (single-shot) mode.
  * Sends prompts to the agent and outputs the result.
@@ -35,6 +57,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	let exitCode = 0;
 	let session = runtimeHost.session;
 	let unsubscribe: (() => void) | undefined;
+	let runtimeNoticeUnsubscribe: (() => void) | undefined;
 	let disposed = false;
 	let turnCounter = 0;
 	const signalCleanupHandlers: Array<() => void> = [];
@@ -43,6 +66,7 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 		if (disposed) return;
 		disposed = true;
 		unsubscribe?.();
+		runtimeNoticeUnsubscribe?.();
 		await runtimeHost.dispose();
 	};
 
@@ -65,6 +89,14 @@ export async function runPrintMode(runtimeHost: AgentSessionRuntime, options: Pr
 	};
 
 	registerSignalHandlers();
+	if (hasRuntimeNoticeHost(runtimeHost)) {
+		runtimeNoticeUnsubscribe = runtimeHost.subscribeToRuntimeNotices((notice) => {
+			printRuntimeNotice(notice);
+		});
+		for (const notice of runtimeHost.consumeRuntimeNotices()) {
+			printRuntimeNotice(notice);
+		}
+	}
 
 	const rebindSession = async (): Promise<void> => {
 		session = runtimeHost.session;

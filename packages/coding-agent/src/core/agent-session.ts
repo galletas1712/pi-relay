@@ -311,6 +311,7 @@ export class AgentSession {
 	 */
 	private _sessionCore: SessionCoreInterpreter = createSessionCoreInterpreter();
 	private _sessionShadowController?: SessionShadowBridgeController;
+	private _sessionShadowStopPromise?: Promise<void>;
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
@@ -538,12 +539,16 @@ export class AgentSession {
 		void Promise.resolve(this._sessionShadowController.start(this._sessionCore.getState())).catch(() => undefined);
 	}
 
-	private _stopSessionShadow(): void {
+	private _stopSessionShadow(): Promise<void> {
 		if (!this._sessionShadowController) {
-			return;
+			return Promise.resolve();
 		}
 
-		void Promise.resolve(this._sessionShadowController.stop()).catch(() => undefined);
+		if (!this._sessionShadowStopPromise) {
+			this._sessionShadowStopPromise = Promise.resolve(this._sessionShadowController.stop()).catch(() => undefined);
+		}
+
+		return this._sessionShadowStopPromise;
 	}
 
 	// Track last assistant message for auto-compaction check
@@ -829,13 +834,24 @@ export class AgentSession {
 	}
 
 	/**
+	 * Await best-effort shutdown of the optional session shadow controller.
+	 *
+	 * Runtime replacement paths use this to avoid leaving the shadow bridge
+	 * process running after the authoritative TypeScript session has already
+	 * been torn down.
+	 */
+	async stopSessionShadow(): Promise<void> {
+		await this._stopSessionShadow();
+	}
+
+	/**
 	 * Remove all listeners and disconnect from agent.
 	 * Call this when completely done with the session.
 	 */
 	dispose(): void {
 		this._disconnectFromAgent();
 		this._eventListeners = [];
-		this._stopSessionShadow();
+		void this._stopSessionShadow();
 	}
 
 	// =========================================================================

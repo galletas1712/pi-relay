@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { FakeSession } from "../../orchestrator/test/test-helpers.js";
-import { RelayRuntimeHost } from "../src/relay-runtime-host.js";
+import { createRelayRuntimeNoticeStore, RelayRuntimeHost } from "../src/relay-runtime-host.js";
 
 describe("RelayRuntimeHost", () => {
 	it("attaches to a live child session instead of rebuilding the root runtime", async () => {
@@ -278,5 +278,60 @@ describe("RelayRuntimeHost", () => {
 			message: "Attached agent exited; returned to root.",
 			reason: "fallback",
 		});
+	});
+
+	it("buffers runtime notices and streams them to subscribers", () => {
+		const root = new FakeSession("root-session");
+		const noticeStore = createRelayRuntimeNoticeStore();
+		const runtime = {
+			session: root,
+			services: { cwd: root.sessionManager.getCwd() },
+			diagnostics: [],
+			modelFallbackMessage: undefined,
+			switchSession: vi.fn(async () => ({ cancelled: false })),
+			newSession: vi.fn(),
+			fork: vi.fn(),
+			importFromJsonl: vi.fn(),
+			dispose: vi.fn(),
+		} as never;
+		const orchestrator = {
+			rootAgentId: "root",
+			subscribeToChanges: vi.fn(() => () => {}),
+			getRecord: () => ({ id: "root", status: "idle", session: root }),
+			findAgentIdBySessionFile: () => undefined,
+		} as never;
+		const host = new RelayRuntimeHost(runtime, {
+			current: { orchestrator, runtimeNoticeStore: noticeStore },
+		});
+
+		noticeStore.push({
+			level: "warning",
+			message: "shadow disconnected",
+			source: "session-shadow",
+		});
+
+		expect(host.consumeRuntimeNotices()).toEqual([
+			expect.objectContaining({
+				level: "warning",
+				message: "shadow disconnected",
+				source: "session-shadow",
+			}),
+		]);
+
+		const listener = vi.fn();
+		const unsubscribe = host.subscribeToRuntimeNotices(listener);
+		noticeStore.push({
+			level: "error",
+			message: "shadow crashed",
+			source: "session-shadow",
+		});
+
+		expect(listener).toHaveBeenCalledWith(
+			expect.objectContaining({
+				level: "error",
+				message: "shadow crashed",
+			}),
+		);
+		unsubscribe();
 	});
 });

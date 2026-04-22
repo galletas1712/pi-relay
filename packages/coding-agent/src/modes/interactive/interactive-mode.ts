@@ -159,6 +159,23 @@ export interface InteractiveModeOptions {
 	verbose?: boolean;
 }
 
+interface RuntimeNoticeLike {
+	level: "info" | "warning" | "error";
+	message: string;
+}
+
+interface RuntimeNoticeHost {
+	consumeRuntimeNotices(): RuntimeNoticeLike[];
+	subscribeToRuntimeNotices(listener: (notice: RuntimeNoticeLike) => void): () => void;
+}
+
+function hasRuntimeNoticeHost(runtimeHost: AgentSessionRuntime): runtimeHost is AgentSessionRuntime & RuntimeNoticeHost {
+	return (
+		typeof (runtimeHost as Partial<RuntimeNoticeHost>).consumeRuntimeNotices === "function" &&
+		typeof (runtimeHost as Partial<RuntimeNoticeHost>).subscribeToRuntimeNotices === "function"
+	);
+}
+
 export class InteractiveMode {
 	private client: LocalClient;
 	private runtimeHost: AgentSessionRuntime;
@@ -220,6 +237,7 @@ export class InteractiveMode {
 
 	// Agent subscription unsubscribe function
 	private unsubscribe?: () => void;
+	private runtimeNoticeUnsubscribe?: () => void;
 	private signalCleanupHandlers: Array<() => void> = [];
 
 	// Track if editor is in bash mode (text starts with !)
@@ -608,6 +626,8 @@ export class InteractiveMode {
 	 */
 	async run(): Promise<void> {
 		await this.init();
+		this.bindRuntimeNotices();
+		this.flushRuntimeNotices();
 
 		// Start version check asynchronously
 		this.checkForNewVersion().then((newVersion) => {
@@ -1338,9 +1358,40 @@ export class InteractiveMode {
 		this.applyRuntimeSettings();
 		await this.bindCurrentSessionExtensions();
 		this.subscribeToAgent();
+		this.flushRuntimeNotices();
 		await this.updateAvailableProviderCount();
 		this.updateEditorBorderColor();
 		this.updateTerminalTitle();
+	}
+
+	private bindRuntimeNotices(): void {
+		if (!hasRuntimeNoticeHost(this.runtimeHost)) {
+			return;
+		}
+
+		this.runtimeNoticeUnsubscribe?.();
+		this.runtimeNoticeUnsubscribe = this.runtimeHost.subscribeToRuntimeNotices((notice) => {
+			this.showRuntimeNotice(notice);
+		});
+	}
+
+	private flushRuntimeNotices(): void {
+		if (!hasRuntimeNoticeHost(this.runtimeHost)) {
+			return;
+		}
+
+		for (const notice of this.runtimeHost.consumeRuntimeNotices()) {
+			this.showRuntimeNotice(notice);
+		}
+	}
+
+	private showRuntimeNotice(notice: RuntimeNoticeLike): void {
+		if (notice.level === "error") {
+			this.showError(notice.message);
+			return;
+		}
+
+		this.showWarning(notice.message);
 	}
 
 	private async handleFatalRuntimeError(prefix: string, error: unknown): Promise<never> {
@@ -4890,6 +4941,8 @@ export class InteractiveMode {
 
 	stop(): void {
 		this.unregisterSignalHandlers();
+		this.runtimeNoticeUnsubscribe?.();
+		this.runtimeNoticeUnsubscribe = undefined;
 		if (this.loadingAnimation) {
 			this.loadingAnimation.stop();
 			this.loadingAnimation = undefined;

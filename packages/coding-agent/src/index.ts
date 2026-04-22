@@ -202,6 +202,36 @@ export type {
 export { DefaultPackageManager } from "./core/package-manager.js";
 export type { ResourceCollision, ResourceDiagnostic, ResourceLoader } from "./core/resource-loader.js";
 export { DefaultResourceLoader, loadProjectContextFiles } from "./core/resource-loader.js";
+export {
+	attachSessionShadowBridge,
+	createSessionShadowSnapshot,
+	decodeSessionShadowBridgeMessage,
+	encodeSessionShadowBridgeMessage,
+	SESSION_CORE_BRIDGE_PROTOCOL_VERSION,
+	SessionShadowBridgeClient,
+	type SessionShadowBridgeAck,
+	type SessionShadowBridgeCallMessage,
+	type SessionShadowBridgeClientOptions,
+	type SessionShadowBridgeCommand,
+	type SessionShadowBridgeController,
+	type SessionShadowBridgeError,
+	type SessionShadowBridgeErrorMessage,
+	type SessionShadowBridgeEvent,
+	type SessionShadowBridgeEventMessage,
+	type SessionShadowBridgeIO,
+	type SessionShadowBridgeMessage,
+	type SessionShadowBridgeMode,
+	type SessionShadowBridgeResultMessage,
+	type SessionShadowCommandAppliedEvent,
+	type SessionShadowDiagnosticEvent,
+	type SessionShadowDispatchCommand,
+	type SessionShadowDisposeCommand,
+	type SessionShadowHelloCommand,
+	type SessionShadowSnapshot,
+	type SessionShadowStateSyncedEvent,
+	type SessionShadowSyncReason,
+	type SessionShadowSyncStateCommand,
+} from "./core/session-shadow/index.js";
 // SDK for programmatic usage
 export {
 	AgentSessionRuntime,

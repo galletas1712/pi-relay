@@ -13,6 +13,7 @@ const createSpawnTool = vi.fn(() => ({ name: "spawn" }));
 const createMessageTool = vi.fn(() => ({ name: "message" }));
 const rootBaseToolDefinitionsFactory = vi.fn(() => [{ name: "read" }]);
 const createRelayBaseToolDefinitionsFactory = vi.fn(() => rootBaseToolDefinitionsFactory);
+const createRelaySessionShadowController = vi.fn();
 const RELAY_BASE_TOOL_NAMES = ["read", "bash", "edit", "apply_patch", "write"];
 const restore = vi.fn(async () => false);
 
@@ -50,6 +51,10 @@ vi.mock("../src/tools/base-tools.js", () => ({
 	createRelayBaseToolDefinitionsFactory,
 }));
 
+vi.mock("../src/session-shadow-runtime.js", () => ({
+	createRelaySessionShadowController,
+}));
+
 describe("createRelayRuntime", () => {
 	beforeEach(() => {
 		vi.resetModules();
@@ -62,6 +67,7 @@ describe("createRelayRuntime", () => {
 		createOrchestratorExtension.mockClear();
 		createRelaySessionFactory.mockClear();
 		createRelayBaseToolDefinitionsFactory.mockClear();
+		createRelaySessionShadowController.mockClear();
 		createSpawnTool.mockClear();
 		createMessageTool.mockClear();
 		rootBaseToolDefinitionsFactory.mockClear();
@@ -95,6 +101,7 @@ describe("createRelayRuntime", () => {
 				diagnostics: result.diagnostics,
 			};
 		});
+		createRelaySessionShadowController.mockReturnValue(undefined);
 	});
 
 	it("continues the recent session and restores the orchestrator tree before returning", async () => {
@@ -172,6 +179,84 @@ describe("createRelayRuntime", () => {
 			orchestrator: "legacy",
 			session: "legacy",
 		});
+	});
+
+	it("creates a session shadow controller when the session engine requests shadow mode", async () => {
+		const controller = {
+			start: vi.fn(async () => undefined),
+			dispatch: vi.fn(async () => undefined),
+			flush: vi.fn(async () => undefined),
+			stop: vi.fn(async () => undefined),
+		};
+		createRelaySessionShadowController.mockReturnValue(controller);
+		const previousEngine = process.env.PI_RELAY_SESSION_ENGINE;
+		process.env.PI_RELAY_SESSION_ENGINE = "rust-shadow";
+
+		try {
+			const { createRelayRuntimeFactory } = await import("../src/runtime.js");
+			const stateRef: {
+				current?: {
+					sessionShadow?: {
+						requestedMode: string;
+					};
+				};
+			} = {};
+			const factory = createRelayRuntimeFactory("/tmp/agent", stateRef as never);
+
+			await factory({
+				cwd: "/tmp/project",
+				sessionManager: {
+					getSessionDir: () => "/tmp/sessions",
+				},
+			} as never);
+
+			expect(createRelaySessionShadowController).toHaveBeenCalledWith(
+				expect.objectContaining({
+					engineMode: "rust-shadow",
+					diagnostics: expect.any(Array),
+				}),
+			);
+			expect(createAgentSessionFromServices).toHaveBeenCalledWith(
+				expect.objectContaining({
+					sessionShadowController: controller,
+				}),
+			);
+			expect(stateRef.current?.sessionShadow?.requestedMode).toBe("rust-shadow");
+		} finally {
+			if (previousEngine === undefined) {
+				delete process.env.PI_RELAY_SESSION_ENGINE;
+			} else {
+				process.env.PI_RELAY_SESSION_ENGINE = previousEngine;
+			}
+		}
+	});
+
+	it("cleans up the session shadow when orchestrator restore fails", async () => {
+		const stopSessionShadow = vi.fn(async () => undefined);
+		const dispose = vi.fn();
+		createAgentSessionFromServices.mockResolvedValue({
+			session: {
+				sessionId: "root-session",
+				stopSessionShadow,
+				dispose,
+			},
+		});
+		restore.mockRejectedValueOnce(new Error("restore failed"));
+
+		const { createRelayRuntimeFactory } = await import("../src/runtime.js");
+		const factory = createRelayRuntimeFactory("/tmp/agent");
+
+		await expect(
+			factory({
+				cwd: "/tmp/project",
+				sessionManager: {
+					getSessionDir: () => "/tmp/sessions",
+				},
+			} as never),
+		).rejects.toThrow("restore failed");
+
+		expect(stopSessionShadow).toHaveBeenCalledTimes(1);
+		expect(dispose).toHaveBeenCalledTimes(1);
 	});
 });
 

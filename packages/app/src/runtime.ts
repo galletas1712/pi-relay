@@ -17,7 +17,13 @@ import {
 	createRelaySessionFactory,
 	createSpawnTool,
 } from "@pi-relay/orchestrator";
-import { RelayRuntimeHost, type RelayRuntimeStateRef } from "./relay-runtime-host.js";
+import {
+	createRelayRuntimeNoticeStore,
+	RelayRuntimeHost,
+	type RelayRuntimeStateRef,
+	type RelaySessionShadowState,
+} from "./relay-runtime-host.js";
+import { createRelaySessionShadowController } from "./session-shadow-runtime.js";
 import { createRelayBaseToolDefinitionsFactory, RELAY_BASE_TOOL_NAMES } from "./tools/base-tools.js";
 
 const RELAY_APPEND_SYSTEM_PROMPT = `Relay tool usage:
@@ -100,9 +106,16 @@ export function createRelayRuntimeFactory(
 ): CreateAgentSessionRuntimeFactory {
 	const engineConfig = resolveRelayRuntimeEngineConfig();
 	const orchestratorUiRef: { cleanup?: () => void; sessionId?: string } = {};
+	const runtimeNoticeStore = stateRef.current?.runtimeNoticeStore ?? createRelayRuntimeNoticeStore();
 	return async ({ cwd, sessionManager, sessionStartEvent }) => {
 		const orchestratorRef: { current?: Orchestrator } = {};
 		const settingsManagerRef: { current?: RelaySettingsManager } = {};
+		const sessionShadowState: RelaySessionShadowState = {
+			requestedMode: engineConfig.session,
+			effectiveMode: "disabled",
+			authority: "ts",
+			status: "disabled",
+		};
 		const services = await createAgentSessionServices({
 			cwd,
 			agentDir,
@@ -116,6 +129,12 @@ export function createRelayRuntimeFactory(
 			},
 		});
 		settingsManagerRef.current = services.settingsManager;
+		const sessionShadowController = createRelaySessionShadowController({
+			engineMode: engineConfig.session,
+			diagnostics: services.diagnostics,
+			noticeStore: runtimeNoticeStore,
+			state: sessionShadowState,
+		});
 		const rootToolBridge = {
 			async spawnAgent(parentId: string, config: Parameters<Orchestrator["spawnAgent"]>[1]) {
 				if (!orchestratorRef.current) {
@@ -137,14 +156,21 @@ export function createRelayRuntimeFactory(
 		const createSessionBaseToolDefinitionsFactory = () =>
 			createRelayBaseToolDefinitionsFactory(cwd, services.settingsManager);
 		const rootBaseToolDefinitionsFactory = createSessionBaseToolDefinitionsFactory();
-		const created = await createAgentSessionFromServices({
-			services,
-			sessionManager,
-			sessionStartEvent,
-			toolNames: [...RELAY_BASE_TOOL_NAMES],
-			baseToolDefinitionsFactory: rootBaseToolDefinitionsFactory,
-			customTools: rootTools,
-		});
+		let created: Awaited<ReturnType<typeof createAgentSessionFromServices>>;
+		try {
+			created = await createAgentSessionFromServices({
+				services,
+				sessionManager,
+				sessionStartEvent,
+				toolNames: [...RELAY_BASE_TOOL_NAMES],
+				baseToolDefinitionsFactory: rootBaseToolDefinitionsFactory,
+				customTools: rootTools,
+				sessionShadowController,
+			});
+		} catch (error) {
+			await sessionShadowController?.stop();
+			throw error;
+		}
 		const orchestrator = new Orchestrator({
 			rootSession: created.session as unknown as AgentSessionHandle,
 			sessionFactory: createRelaySessionFactory({
@@ -191,8 +217,19 @@ export function createRelayRuntimeFactory(
 			);
 		}
 		orchestratorRef.current = orchestrator;
-		stateRef.current = { orchestrator, engineConfig };
-		await orchestrator.restore();
+		stateRef.current = {
+			orchestrator,
+			engineConfig,
+			runtimeNoticeStore,
+			sessionShadow: sessionShadowState,
+		};
+		try {
+			await orchestrator.restore();
+		} catch (error) {
+			await created.session.stopSessionShadow();
+			created.session.dispose();
+			throw error;
+		}
 		return {
 			...created,
 			services,

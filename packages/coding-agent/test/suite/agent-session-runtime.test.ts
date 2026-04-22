@@ -161,6 +161,44 @@ describe("AgentSessionRuntime characterization", () => {
 		}
 	});
 
+	it("awaits session shadow shutdown before resolving runtime.dispose()", async () => {
+		let releaseStop: (() => void) | undefined;
+		const stopPromise = new Promise<void>((resolve) => {
+			releaseStop = resolve;
+		});
+		const controller: SessionShadowBridgeController = {
+			start: vi.fn(async () => undefined),
+			dispatch: vi.fn(async () => undefined),
+			flush: vi.fn(async () => undefined),
+			stop: vi.fn(async () => stopPromise),
+		};
+		const { runtime, faux, tempDir } = await createRuntimeForTest(() => {}, {
+			sessionShadowController: controller,
+		});
+
+		cleanups.pop();
+		const disposePromise = runtime.dispose();
+		await vi.waitFor(() => {
+			expect(controller.stop).toHaveBeenCalledTimes(1);
+		});
+
+		let settled = false;
+		void disposePromise.then(() => {
+			settled = true;
+		});
+		await Promise.resolve();
+		expect(settled).toBe(false);
+
+		releaseStop?.();
+		await disposePromise;
+		expect(settled).toBe(true);
+
+		faux.unregister();
+		if (existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
 		const events: RecordedSessionEvent[] = [];
 		const { runtime } = await createRuntimeForTest((pi: ExtensionAPI) => {
