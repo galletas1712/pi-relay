@@ -1,5 +1,5 @@
 use crate::ids::TurnId;
-use crate::message::{AssistantMessage, ToolCall, ToolResultMessage, UserInput};
+use crate::message::{AssistantMessage, ToolResultMessage, UserInput};
 
 /// Runtime input to the live agent FSM.
 ///
@@ -16,7 +16,6 @@ pub(crate) enum AgentEvent {
         turn_id: TurnId,
         assistant: AssistantMessage,
     },
-    ToolReady(ToolCall),
     ToolCompleted {
         turn_id: TurnId,
         result: ToolResultMessage,

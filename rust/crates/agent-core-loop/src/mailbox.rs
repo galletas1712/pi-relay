@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 
 use crate::event::AgentEvent;
 use crate::ids::TurnId;
-use crate::message::{ToolCall, UserInput};
+use crate::message::UserInput;
 use crate::state::AgentState;
 
 /// Volatile prioritized queues feeding the live agent FSM.
@@ -12,7 +12,6 @@ use crate::state::AgentState;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Mailbox {
     notifications: VecDeque<AgentEvent>,
-    tool_calls: VecDeque<ToolCall>,
     steer: VecDeque<UserInput>,
     follow_up: VecDeque<UserInput>,
     interrupt_requested: bool,
@@ -30,19 +29,6 @@ impl Mailbox {
 
     pub(crate) fn request_interrupt(&mut self) {
         self.interrupt_requested = true;
-    }
-
-    pub(crate) fn push_tool_call(&mut self, tool_call: ToolCall) {
-        self.tool_calls.push_back(tool_call);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pop_tool_call(&mut self) -> Option<ToolCall> {
-        self.tool_calls.pop_front()
-    }
-
-    pub(crate) fn clear_tool_calls(&mut self) {
-        self.tool_calls.clear();
     }
 
     pub fn push_steer(&mut self, input: UserInput) {
@@ -69,7 +55,7 @@ impl Mailbox {
             if matches!(
                 state,
                 AgentState::RunningModel { .. }
-                    | AgentState::RunningTool { .. }
+                    | AgentState::RunningTools { .. }
                     | AgentState::ReadyToContinue { .. }
             ) {
                 return Some(AgentEvent::Interrupt);
@@ -81,26 +67,19 @@ impl Mailbox {
         }
 
         match state {
-            AgentState::ReadyToContinue { .. } => match self.tool_calls.pop_front() {
-                Some(tool_call) => Some(AgentEvent::ToolReady(tool_call)),
-                None => Some(AgentEvent::ContinueModel),
-            },
+            AgentState::ReadyToContinue { .. } => Some(AgentEvent::ContinueModel),
             AgentState::Idle | AgentState::Interrupted | AgentState::Crashed => {
                 self.pop_user_input().map(|input| AgentEvent::StartTurn {
                     turn_id: next_turn_id,
                     input,
                 })
             }
-            AgentState::RunningModel { .. } | AgentState::RunningTool { .. } => None,
+            AgentState::RunningModel { .. } | AgentState::RunningTools { .. } => None,
         }
     }
 
     pub fn notification_len(&self) -> usize {
         self.notifications.len()
-    }
-
-    pub fn tool_call_len(&self) -> usize {
-        self.tool_calls.len()
     }
 
     pub fn steer_len(&self) -> usize {
@@ -112,7 +91,7 @@ impl Mailbox {
     }
 
     pub fn total_len(&self) -> usize {
-        self.notifications.len() + self.tool_calls.len() + self.steer.len() + self.follow_up.len()
+        self.notifications.len() + self.steer.len() + self.follow_up.len()
     }
 }
 
@@ -122,14 +101,6 @@ mod tests {
     use crate::event::AgentEvent;
     use crate::ids::ToolCallId;
     use crate::message::{AssistantMessage, ToolResultMessage, ToolResultStatus};
-
-    fn tool_call(id: u64, name: &str) -> ToolCall {
-        ToolCall {
-            id: ToolCallId(id),
-            tool_name: name.to_string(),
-            args_json: "{}".to_string(),
-        }
-    }
 
     fn tool_result(id: u64, name: &str) -> ToolResultMessage {
         ToolResultMessage {
@@ -162,21 +133,6 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_queue_behaves_like_a_deque() {
-        let mut mailbox = Mailbox::default();
-        let first = tool_call(1, "bash");
-        let second = tool_call(2, "read");
-
-        mailbox.push_tool_call(first.clone());
-        mailbox.push_tool_call(second.clone());
-
-        assert_eq!(mailbox.tool_call_len(), 2);
-        assert_eq!(mailbox.pop_tool_call(), Some(first));
-        assert_eq!(mailbox.pop_tool_call(), Some(second));
-        assert_eq!(mailbox.pop_tool_call(), None);
-    }
-
-    #[test]
     fn user_input_prefers_steer_before_follow_up() {
         let mut mailbox = Mailbox::default();
         mailbox.push_follow_up(UserInput::from("follow-up"));
@@ -188,12 +144,10 @@ mod tests {
     }
 
     #[test]
-    fn priority_order_is_interrupt_then_notification_then_tool_call_then_steer_then_follow_up() {
+    fn priority_order_is_interrupt_then_notification_then_steer_then_follow_up() {
         let mut mailbox = Mailbox::default();
         mailbox.push_follow_up(UserInput::from("follow-up"));
         mailbox.push_steer(UserInput::from("steer"));
-        let queued_tool_call = tool_call(7, "read");
-        mailbox.push_tool_call(queued_tool_call.clone());
         mailbox.push_notification_back(AgentEvent::ToolCompleted {
             turn_id: TurnId(1),
             result: tool_result(9, "bash"),
@@ -202,9 +156,11 @@ mod tests {
 
         assert!(matches!(
             mailbox.next_event(
-                &AgentState::RunningTool {
+                &AgentState::RunningTools {
                     turn_id: TurnId(1),
-                    tool_call: tool_call(9, "bash")
+                    tool_calls: Vec::new(),
+                    completed_results: Vec::new(),
+                    next_result_index: 0,
                 },
                 TurnId(99)
             ),
@@ -212,9 +168,11 @@ mod tests {
         ));
         assert!(matches!(
             mailbox.next_event(
-                &AgentState::RunningTool {
+                &AgentState::RunningTools {
                     turn_id: TurnId(1),
-                    tool_call: tool_call(9, "bash")
+                    tool_calls: Vec::new(),
+                    completed_results: Vec::new(),
+                    next_result_index: 0,
                 },
                 TurnId(99)
             ),
@@ -225,7 +183,7 @@ mod tests {
                 &AgentState::ReadyToContinue { turn_id: TurnId(1) },
                 TurnId(99)
             ),
-            Some(AgentEvent::ToolReady(queued_tool_call))
+            Some(AgentEvent::ContinueModel)
         );
         assert_eq!(
             mailbox.next_event(&AgentState::Idle, TurnId(2)),

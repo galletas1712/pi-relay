@@ -117,7 +117,6 @@ impl AgentCoreLoop {
                 AgentEvent::StartTurn { turn_id, .. } => Some(*turn_id),
                 AgentEvent::Interrupt
                 | AgentEvent::ModelCompleted { .. }
-                | AgentEvent::ToolReady(_)
                 | AgentEvent::ToolCompleted { .. }
                 | AgentEvent::ContinueModel => None,
             };
@@ -138,13 +137,6 @@ impl AgentCoreLoop {
             self.transcript.append(record);
         }
         self.action_outbox.extend(transition.actions);
-
-        if transition.clear_tool_calls {
-            self.mailbox.clear_tool_calls();
-        }
-        for tool_call in transition.queued_tool_calls {
-            self.mailbox.push_tool_call(tool_call);
-        }
     }
 }
 
@@ -243,9 +235,11 @@ mod tests {
         );
         assert_eq!(
             loop_state.state,
-            AgentState::RunningTool {
+            AgentState::RunningTools {
                 turn_id: TurnId(1),
-                tool_call,
+                tool_calls: vec![tool_call],
+                completed_results: vec![None],
+                next_result_index: 0,
             }
         );
     }
@@ -286,7 +280,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_tool_calls_run_before_the_model_resumes() {
+    fn multiple_tool_calls_run_in_parallel_and_results_are_recorded_in_source_order() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
         loop_state.on_input(AgentInput::FollowUp(UserInput::from("hello")));
@@ -302,7 +296,50 @@ mod tests {
             turn_id: TurnId(1),
             assistant,
         });
-        loop_state.drain_actions();
+
+        assert_eq!(
+            loop_state.drain_actions(),
+            vec![
+                AgentAction::RequestTool {
+                    turn_id: TurnId(1),
+                    tool_call: first.clone(),
+                },
+                AgentAction::RequestTool {
+                    turn_id: TurnId(1),
+                    tool_call: second.clone(),
+                },
+            ]
+        );
+        assert_eq!(
+            loop_state.transcript.records().last(),
+            Some(&TranscriptRecord::ToolCallStarted {
+                turn_id: TurnId(1),
+                tool_call: second.clone(),
+            })
+        );
+
+        let second_result = successful_tool_result(second.id, "read");
+        loop_state.on_input(AgentInput::ToolCompleted {
+            turn_id: TurnId(1),
+            result: second_result.clone(),
+        });
+        loop_state.on_input(AgentInput::Steer(UserInput::from("urgent")));
+
+        assert_eq!(
+            loop_state.transcript.records().last(),
+            Some(&TranscriptRecord::ToolCallStarted {
+                turn_id: TurnId(1),
+                tool_call: second.clone(),
+            })
+        );
+        assert!(loop_state.drain_actions().is_empty());
+        assert!(matches!(
+            loop_state.state,
+            AgentState::RunningTools {
+                next_result_index: 0,
+                ..
+            }
+        ));
 
         let first_result = successful_tool_result(first.id, "bash");
         loop_state.on_input(AgentInput::ToolCompleted {
@@ -312,28 +349,24 @@ mod tests {
 
         assert_eq!(
             loop_state.transcript.records().last(),
-            Some(&TranscriptRecord::ToolCallStarted {
-                turn_id: TurnId(1),
-                tool_call: second.clone(),
-            })
+            Some(&TranscriptRecord::ToolResult(second_result.clone()))
         );
         assert_eq!(
-            loop_state.transcript.records()[4],
+            loop_state.transcript.records()[5],
             TranscriptRecord::ToolResult(first_result)
         );
         assert_eq!(
-            loop_state.drain_actions(),
-            vec![AgentAction::RequestTool {
-                turn_id: TurnId(1),
-                tool_call: second.clone(),
-            }]
+            loop_state.transcript.records()[6],
+            TranscriptRecord::ToolResult(second_result)
         );
         assert_eq!(
+            loop_state.drain_actions(),
+            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
+        );
+        assert_eq!(loop_state.mailbox.steer_len(), 1);
+        assert_eq!(
             loop_state.state,
-            AgentState::RunningTool {
-                turn_id: TurnId(1),
-                tool_call: second,
-            }
+            AgentState::RunningModel { turn_id: TurnId(1) }
         );
     }
 
