@@ -16,28 +16,54 @@ pub struct SessionEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEntryKind {
     Transcript(TranscriptRecord),
-    Compaction(CompactionEntry),
-    BranchSummary(BranchSummaryEntry),
+    Injected(InjectedMessage),
+}
+
+/// A summary-style message appended to the session log at a boundary and
+/// surfaced to the model on the next turn. Carries an `InjectedKind` tag that
+/// identifies the boundary it was appended at (e.g. compaction, branch merge)
+/// alongside any kind-specific metadata needed to anchor the injection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InjectedMessage {
+    pub kind: InjectedKind,
+    pub content: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompactionEntry {
-    pub summary: String,
-    pub first_kept_entry_id: String,
-    pub tokens_before: usize,
+pub enum InjectedKind {
+    CompactionSummary {
+        first_kept_entry_id: String,
+        tokens_before: usize,
+    },
+    BranchSummary {
+        from_id: Option<String>,
+    },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BranchSummaryEntry {
-    pub from_id: Option<String>,
-    pub summary: String,
-}
-
+/// Materialized view of a session log path: the transcript the model sees plus
+/// any injected messages (compaction summaries, branch summaries) that sit on
+/// the active branch from the latest compaction forward.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionContext {
     pub transcript: Transcript,
-    pub compaction: Option<CompactionEntry>,
-    pub branch_summaries: Vec<BranchSummaryEntry>,
+    pub injections: Vec<InjectedMessage>,
+}
+
+impl SessionContext {
+    /// Latest compaction summary on the active branch, if any. Used by callers
+    /// that need to anchor the "everything before this" boundary.
+    pub fn latest_compaction(&self) -> Option<&InjectedMessage> {
+        self.injections
+            .iter()
+            .rev()
+            .find(|msg| matches!(msg.kind, InjectedKind::CompactionSummary { .. }))
+    }
+
+    pub fn branch_summaries(&self) -> impl Iterator<Item = &InjectedMessage> {
+        self.injections
+            .iter()
+            .filter(|msg| matches!(msg.kind, InjectedKind::BranchSummary { .. }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,9 +129,7 @@ impl SessionLog {
 
         match &entry.kind {
             SessionEntryKind::Transcript(TranscriptRecord::TurnFinished { .. }) => true,
-            SessionEntryKind::Compaction(_) | SessionEntryKind::BranchSummary(_) => {
-                self.is_turn_boundary_leaf(entry.parent_id.as_deref())
-            }
+            SessionEntryKind::Injected(_) => self.is_turn_boundary_leaf(entry.parent_id.as_deref()),
             SessionEntryKind::Transcript(
                 TranscriptRecord::TurnStarted { .. }
                 | TranscriptRecord::UserMessage(_)
@@ -136,10 +160,12 @@ impl SessionLog {
         first_kept_entry_id: impl Into<String>,
         tokens_before: usize,
     ) -> String {
-        self.append_kind(SessionEntryKind::Compaction(CompactionEntry {
-            summary: summary.into(),
-            first_kept_entry_id: first_kept_entry_id.into(),
-            tokens_before,
+        self.append_kind(SessionEntryKind::Injected(InjectedMessage {
+            kind: InjectedKind::CompactionSummary {
+                first_kept_entry_id: first_kept_entry_id.into(),
+                tokens_before,
+            },
+            content: summary.into(),
         }))
     }
 
@@ -148,9 +174,9 @@ impl SessionLog {
         from_id: Option<String>,
         summary: impl Into<String>,
     ) -> String {
-        self.append_kind(SessionEntryKind::BranchSummary(BranchSummaryEntry {
-            from_id,
-            summary: summary.into(),
+        self.append_kind(SessionEntryKind::Injected(InjectedMessage {
+            kind: InjectedKind::BranchSummary { from_id },
+            content: summary.into(),
         }))
     }
 
@@ -236,24 +262,43 @@ impl SessionLog {
         let path = self.branch_entries(None);
         if matches!(
             path.last().map(|entry| &entry.kind),
-            Some(SessionEntryKind::Compaction(_))
+            Some(SessionEntryKind::Injected(InjectedMessage {
+                kind: InjectedKind::CompactionSummary { .. },
+                ..
+            }))
         ) {
             return None;
         }
 
-        let previous_compaction_index = path
-            .iter()
-            .rposition(|entry| matches!(entry.kind, SessionEntryKind::Compaction(_)));
+        let previous_compaction_index = path.iter().rposition(|entry| {
+            matches!(
+                &entry.kind,
+                SessionEntryKind::Injected(InjectedMessage {
+                    kind: InjectedKind::CompactionSummary { .. },
+                    ..
+                })
+            )
+        });
         let previous_compaction =
             previous_compaction_index.and_then(|index| match &path[index].kind {
-                SessionEntryKind::Compaction(compaction) => Some(compaction.clone()),
-                SessionEntryKind::Transcript(_) | SessionEntryKind::BranchSummary(_) => None,
+                SessionEntryKind::Injected(
+                    msg @ InjectedMessage {
+                        kind: InjectedKind::CompactionSummary { .. },
+                        ..
+                    },
+                ) => Some(msg.clone()),
+                _ => None,
             });
         let boundary_start = previous_compaction
             .as_ref()
-            .and_then(|compaction| {
-                path.iter()
-                    .position(|entry| entry.id == compaction.first_kept_entry_id)
+            .and_then(|msg| match &msg.kind {
+                InjectedKind::CompactionSummary {
+                    first_kept_entry_id,
+                    ..
+                } => path
+                    .iter()
+                    .position(|entry| entry.id == *first_kept_entry_id),
+                _ => None,
             })
             .or_else(|| previous_compaction_index.map(|index| index + 1))
             .unwrap_or(0);
@@ -277,7 +322,7 @@ impl SessionLog {
             records_to_summarize,
             records_to_keep,
             tokens_before,
-            previous_summary: previous_compaction.map(|compaction| compaction.summary),
+            previous_summary: previous_compaction.map(|msg| msg.content),
             leaf_id: self.leaf_id.clone(),
             entry_count: self.entries.len(),
         })
@@ -311,57 +356,52 @@ pub enum SessionLogError {
 }
 
 fn materialize_context(path: &[SessionEntry]) -> SessionContext {
-    let latest_compaction_index = path
-        .iter()
-        .rposition(|entry| matches!(entry.kind, SessionEntryKind::Compaction(_)));
-    let mut compaction = None;
+    let latest_compaction_index = path.iter().rposition(|entry| {
+        matches!(
+            &entry.kind,
+            SessionEntryKind::Injected(InjectedMessage {
+                kind: InjectedKind::CompactionSummary { .. },
+                ..
+            })
+        )
+    });
+
+    let start = match latest_compaction_index {
+        Some(index) => {
+            // Everything strictly before the latest compaction is replaced by
+            // its summary. Anchor the kept suffix at `first_kept_entry_id`; the
+            // compaction entry itself falls into the kept range so the summary
+            // is surfaced via `injections`.
+            let SessionEntryKind::Injected(msg) = &path[index].kind else {
+                unreachable!()
+            };
+            let InjectedKind::CompactionSummary {
+                first_kept_entry_id,
+                ..
+            } = &msg.kind
+            else {
+                unreachable!()
+            };
+            path.iter()
+                .position(|entry| &entry.id == first_kept_entry_id)
+                .unwrap_or(index + 1)
+        }
+        None => 0,
+    };
+
     let mut records = Vec::new();
-    let mut branch_summaries = Vec::new();
+    let mut injections = Vec::new();
 
-    if let Some(compaction_index) = latest_compaction_index {
-        let latest_compaction = match &path[compaction_index].kind {
-            SessionEntryKind::Compaction(compaction) => compaction.clone(),
-            SessionEntryKind::Transcript(_) | SessionEntryKind::BranchSummary(_) => unreachable!(),
-        };
-        let first_kept_index = path
-            .iter()
-            .position(|entry| entry.id == latest_compaction.first_kept_entry_id)
-            .unwrap_or(compaction_index + 1);
-
-        compaction = Some(latest_compaction);
-        collect_context_entries(
-            path.get(first_kept_index..compaction_index)
-                .unwrap_or_default(),
-            &mut records,
-            &mut branch_summaries,
-        );
-        collect_context_entries(
-            path.get(compaction_index + 1..).unwrap_or_default(),
-            &mut records,
-            &mut branch_summaries,
-        );
-    } else {
-        collect_context_entries(path, &mut records, &mut branch_summaries);
+    for entry in &path[start..] {
+        match &entry.kind {
+            SessionEntryKind::Transcript(record) => records.push(record.clone()),
+            SessionEntryKind::Injected(msg) => injections.push(msg.clone()),
+        }
     }
 
     SessionContext {
         transcript: Transcript::from_records(records),
-        compaction,
-        branch_summaries,
-    }
-}
-
-fn collect_context_entries(
-    entries: &[SessionEntry],
-    records: &mut Vec<TranscriptRecord>,
-    branch_summaries: &mut Vec<BranchSummaryEntry>,
-) {
-    for entry in entries {
-        match &entry.kind {
-            SessionEntryKind::Transcript(record) => records.push(record.clone()),
-            SessionEntryKind::BranchSummary(summary) => branch_summaries.push(summary.clone()),
-            SessionEntryKind::Compaction(_) => {}
-        }
+        injections,
     }
 }
 
@@ -370,7 +410,7 @@ fn transcript_records_in(entries: &[SessionEntry]) -> Vec<TranscriptRecord> {
         .iter()
         .filter_map(|entry| match &entry.kind {
             SessionEntryKind::Transcript(record) => Some(record.clone()),
-            SessionEntryKind::Compaction(_) | SessionEntryKind::BranchSummary(_) => None,
+            SessionEntryKind::Injected(_) => None,
         })
         .collect()
 }
@@ -528,10 +568,7 @@ mod tests {
 
         let context = log.context();
         assert_eq!(
-            context
-                .compaction
-                .as_ref()
-                .map(|entry| entry.summary.as_str()),
+            context.latest_compaction().map(|msg| msg.content.as_str()),
             Some("summary")
         );
         assert_eq!(context.transcript.last_turn_id(), TurnId(2));

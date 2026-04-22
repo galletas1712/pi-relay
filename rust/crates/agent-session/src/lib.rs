@@ -6,7 +6,7 @@ mod transcript;
 use agent_core::AgentCoreLoop;
 
 pub use crate::session_log::{
-    BranchSummaryEntry, CompactionEntry, CompactionPlan, CompactionSettings, SessionContext,
+    CompactionPlan, CompactionSettings, InjectedKind, InjectedMessage, SessionContext,
     SessionEntry, SessionEntryKind, SessionLog, SessionLogError,
 };
 pub use crate::transcript::Transcript;
@@ -423,10 +423,7 @@ mod tests {
 
         let context = session.model_context();
         assert_eq!(
-            context
-                .compaction
-                .as_ref()
-                .map(|entry| entry.summary.as_str()),
+            context.latest_compaction().map(|msg| msg.content.as_str()),
             Some("summary")
         );
         assert_eq!(session.transcript().last_turn_id(), TurnId(2));

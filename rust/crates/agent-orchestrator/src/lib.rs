@@ -266,9 +266,8 @@ mod tests {
                 .session("root")
                 .expect("root should exist")
                 .model_context()
-                .compaction
-                .as_ref()
-                .map(|entry| entry.summary.as_str()),
+                .latest_compaction()
+                .map(|msg| msg.content.as_str()),
             Some("summary")
         );
     }
