@@ -11,6 +11,7 @@ import { ModelRegistry } from "./model-registry.js";
 import { findInitialModel } from "./model-resolver.js";
 import type { ResourceLoader } from "./resource-loader.js";
 import { DefaultResourceLoader } from "./resource-loader.js";
+import type { SessionShadowBridgeController } from "./session-shadow/client.js";
 import { getDefaultSessionDir, SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
 import { time } from "./timings.js";
@@ -70,6 +71,8 @@ export interface CreateAgentSessionOptions {
 
 	/** Session manager. Default: SessionManager.create(cwd) */
 	sessionManager?: SessionManager;
+	/** Optional shadow bridge that mirrors session-core commands without changing local authority. */
+	sessionShadowController?: SessionShadowBridgeController;
 
 	/** Settings manager. Default: SettingsManager.create(cwd, agentDir) */
 	settingsManager?: SettingsManager;
@@ -365,6 +368,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		baseToolDefinitionsFactory: options.baseToolDefinitionsFactory,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,
+		sessionShadowController: options.sessionShadowController,
 	});
 	const extensionsResult = resourceLoader.getExtensions();
 

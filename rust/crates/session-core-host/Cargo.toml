@@ -1,0 +1,10 @@
+[package]
+name = "session-core-host"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agent-protocol = { path = "../agent-protocol" }
+session-core = { path = "../session-core" }
+serde_json.workspace = true

@@ -104,6 +104,7 @@ import {
 } from "./prompt/index.js";
 import { SessionCoreCommands, type SessionCoreCommand } from "./session-core/commands.js";
 import { createSessionCoreInterpreter, type SessionCoreInterpreter } from "./session-core/interpreter.js";
+import type { SessionShadowBridgeController } from "./session-shadow/client.js";
 import { type BashOperations, createLocalBashOperations } from "./tools/bash.js";
 import { createAllToolDefinitions } from "./tools/index.js";
 import { createToolDefinitionFromAgentTool, wrapToolDefinition } from "./tools/tool-definition-wrapper.js";
@@ -225,6 +226,8 @@ export interface AgentSessionConfig {
 	extensionRunnerRef?: { current?: ExtensionRunner };
 	/** Session start event metadata emitted when extensions bind to this runtime. */
 	sessionStartEvent?: SessionStartEvent;
+	/** Optional shadow bridge mirroring session-core commands without changing local authority. */
+	sessionShadowController?: SessionShadowBridgeController;
 }
 
 export interface ExtensionBindings {
@@ -307,6 +310,7 @@ export class AgentSession {
 	 * interpreter without changing the AgentSession host surface.
 	 */
 	private _sessionCore: SessionCoreInterpreter = createSessionCoreInterpreter();
+	private _sessionShadowController?: SessionShadowBridgeController;
 	/** Tracks pending steering messages for UI display. Removed when delivered. */
 	private _steeringMessages: string[] = [];
 	/** Tracks pending follow-up messages for UI display. Removed when delivered. */
@@ -396,6 +400,7 @@ export class AgentSession {
 		this._baseToolDefinitionsFactory = config.baseToolDefinitionsFactory;
 		this._baseToolsOverride = config.baseToolsOverride;
 		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._sessionShadowController = config.sessionShadowController;
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -406,6 +411,7 @@ export class AgentSession {
 			activeToolNames: this._initialActiveToolNames,
 			includeAllExtensionTools: true,
 		});
+		this._startSessionShadow();
 	}
 
 	/** Model registry for API key resolution and model discovery */
@@ -519,6 +525,25 @@ export class AgentSession {
 
 	private _dispatchSessionCore(command: SessionCoreCommand): void {
 		this._sessionCore.dispatch(command);
+		if (this._sessionShadowController) {
+			void Promise.resolve(this._sessionShadowController.dispatch(command)).catch(() => undefined);
+		}
+	}
+
+	private _startSessionShadow(): void {
+		if (!this._sessionShadowController) {
+			return;
+		}
+
+		void Promise.resolve(this._sessionShadowController.start(this._sessionCore.getState())).catch(() => undefined);
+	}
+
+	private _stopSessionShadow(): void {
+		if (!this._sessionShadowController) {
+			return;
+		}
+
+		void Promise.resolve(this._sessionShadowController.stop()).catch(() => undefined);
 	}
 
 	// Track last assistant message for auto-compaction check
@@ -810,6 +835,7 @@ export class AgentSession {
 	dispose(): void {
 		this._disconnectFromAgent();
 		this._eventListeners = [];
+		this._stopSessionShadow();
 	}
 
 	// =========================================================================

@@ -10,6 +10,7 @@ import {
 	createAgentSessionServices,
 } from "../../src/core/agent-session-runtime.js";
 import { AuthStorage } from "../../src/core/auth-storage.js";
+import type { SessionShadowBridgeController } from "../../src/core/session-shadow/client.js";
 import { SessionManager } from "../../src/core/session-manager.js";
 import type {
 	ExtensionAPI,
@@ -33,7 +34,12 @@ describe("AgentSessionRuntime characterization", () => {
 
 	async function createRuntimeForTest(
 		extensionFactory: ExtensionFactory,
-		options?: { cwd?: string; bootstrapModel?: boolean; bootstrapThinkingLevel?: boolean },
+		options?: {
+			cwd?: string;
+			bootstrapModel?: boolean;
+			bootstrapThinkingLevel?: boolean;
+			sessionShadowController?: SessionShadowBridgeController;
+		},
 	) {
 		const tempDir =
 			options?.cwd ?? join(tmpdir(), `pi-runtime-suite-${Date.now()}-${Math.random().toString(36).slice(2)}`);
@@ -93,6 +99,7 @@ describe("AgentSessionRuntime characterization", () => {
 					sessionStartEvent,
 					model: runtimeOptions.model,
 					thinkingLevel: runtimeOptions.thinkingLevel,
+					sessionShadowController: options?.sessionShadowController,
 				})),
 				services,
 				diagnostics: services.diagnostics,
@@ -115,6 +122,44 @@ describe("AgentSessionRuntime characterization", () => {
 
 		return { runtime, faux, tempDir };
 	}
+
+	it("starts and forwards commands to an optional session shadow controller", async () => {
+		const controller: SessionShadowBridgeController = {
+			start: vi.fn(async () => undefined),
+			dispatch: vi.fn(async () => undefined),
+			flush: vi.fn(async () => undefined),
+			stop: vi.fn(async () => undefined),
+		};
+		const { runtime, faux, tempDir } = await createRuntimeForTest(() => {}, {
+			sessionShadowController: controller,
+		});
+
+		cleanups.pop();
+
+		expect(controller.start).toHaveBeenCalledWith({
+			runState: "idle",
+			queue: {
+				steering: [],
+				followUp: [],
+			},
+		});
+
+		await runtime.session.followUp("after tools");
+
+		expect(runtime.session.getFollowUpMessages()).toEqual(["after tools"]);
+		expect(controller.dispatch).toHaveBeenCalledWith({
+			type: "queue/enqueue-follow-up",
+			text: "after tools",
+		});
+
+		await runtime.dispose();
+		expect(controller.stop).toHaveBeenCalledTimes(1);
+
+		faux.unregister();
+		if (existsSync(tempDir)) {
+			rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
 
 	it("emits session_before_switch and session_start for new and resume flows", async () => {
 		const events: RecordedSessionEvent[] = [];

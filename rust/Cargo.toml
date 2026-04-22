@@ -3,6 +3,8 @@ members = [
 	"crates/agent-protocol",
 	"crates/orchestrator-core",
 	"crates/relay-core-host",
+	"crates/session-core",
+	"crates/session-core-host",
 ]
 resolver = "2"
 

@@ -6,6 +6,7 @@ import { AuthStorage } from "./auth-storage.js";
 import type { SessionStartEvent, ToolDefinition } from "./extensions/index.js";
 import { ModelRegistry } from "./model-registry.js";
 import { DefaultResourceLoader, type DefaultResourceLoaderOptions, type ResourceLoader } from "./resource-loader.js";
+import type { SessionShadowBridgeController } from "./session-shadow/client.js";
 import { type CreateAgentSessionResult, createAgentSession } from "./sdk.js";
 import type { SessionManager } from "./session-manager.js";
 import { SettingsManager } from "./settings-manager.js";
@@ -57,6 +58,7 @@ export interface CreateAgentSessionFromServicesOptions {
 	toolNames?: string[];
 	baseToolDefinitionsFactory?: () => ToolDefinition[];
 	customTools?: ToolDefinition[];
+	sessionShadowController?: SessionShadowBridgeController;
 }
 
 /**
@@ -196,6 +198,7 @@ export async function createAgentSessionFromServices(
 		toolNames: options.toolNames,
 		baseToolDefinitionsFactory: options.baseToolDefinitionsFactory,
 		customTools: options.customTools,
+		sessionShadowController: options.sessionShadowController,
 		sessionStartEvent: options.sessionStartEvent,
 	});
 }
