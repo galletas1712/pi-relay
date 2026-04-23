@@ -277,6 +277,44 @@ mod tests {
     }
 
     #[test]
+    fn queued_completions_preserve_arrival_order() {
+        let mut loop_state = AgentCoreLoop::new();
+        let mut next_tool_call_id = ToolCallId::first();
+        drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
+        loop_state.drain_actions();
+
+        let tool_call = tool_call(&mut next_tool_call_id, "bash");
+        let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
+        let result = successful_tool_result(tool_call.id, "bash");
+
+        loop_state.enqueue_input(AgentInput::ModelCompleted {
+            turn_id: TurnId(1),
+            assistant,
+        });
+        loop_state.enqueue_input(AgentInput::ToolCompleted {
+            turn_id: TurnId(1),
+            result: result.clone(),
+        });
+        loop_state.drive();
+
+        let records = loop_state.drain_records();
+        let expected_result_record = TranscriptRecord::ToolResult(result);
+        assert!(records
+            .iter()
+            .any(|record| record == &expected_result_record));
+        assert_eq!(
+            loop_state.drain_actions(),
+            vec![
+                AgentAction::RequestTool {
+                    turn_id: TurnId(1),
+                    tool_call,
+                },
+                AgentAction::RequestModel { turn_id: TurnId(1) },
+            ]
+        );
+    }
+
+    #[test]
     fn multiple_tool_calls_run_in_parallel_and_results_are_recorded_in_source_order() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();

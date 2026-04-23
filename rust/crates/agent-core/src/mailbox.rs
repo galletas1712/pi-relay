@@ -58,21 +58,23 @@ impl Mailbox {
                 });
             }
             AgentInput::ModelCompleted { turn_id, assistant } => {
-                // External completions should preempt queued future work for the current turn.
-                self.push_notification_front(AgentEvent::ModelCompleted { turn_id, assistant });
+                // External completions preempt queued user work, but preserve
+                // arrival order relative to other completions.
+                self.push_notification_back(AgentEvent::ModelCompleted { turn_id, assistant });
             }
             AgentInput::ToolCompleted { turn_id, result } => {
-                // External completions should preempt queued future work for the current turn.
-                self.push_notification_front(AgentEvent::ToolCompleted { turn_id, result });
+                // External completions preempt queued user work, but preserve
+                // arrival order relative to other completions.
+                self.push_notification_back(AgentEvent::ToolCompleted { turn_id, result });
             }
         }
     }
 
+    #[cfg(test)]
     fn push_notification_front(&mut self, notification: AgentEvent) {
         self.notifications.push_front(notification);
     }
 
-    #[cfg(test)]
     fn push_notification_back(&mut self, notification: AgentEvent) {
         self.notifications.push_back(notification);
     }

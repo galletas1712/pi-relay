@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use agent_core::{AgentAction, AgentCoreLoop, AgentInput, TranscriptRecord, TurnId};
 
 use crate::action_queue::ActionQueue;
@@ -16,6 +18,7 @@ pub struct AgentSession {
     pub(crate) core: AgentCoreLoop,
     pub(crate) context: Context,
     action_queue: ActionQueue,
+    action_outbox: VecDeque<AgentAction>,
 }
 
 impl Default for AgentSession {
@@ -30,11 +33,12 @@ impl AgentSession {
             core: AgentCoreLoop::resume_at_boundary(TurnId::default()),
             context: Context::new(),
             action_queue: ActionQueue::new(),
+            action_outbox: VecDeque::new(),
         }
     }
 
     pub fn from_records(records: Vec<TranscriptRecord>) -> Self {
-        Self::from_transcript(Transcript::from_records(records))
+        Self::from_transcript(Transcript::from_records_recovering_crashed_tail(records))
     }
 
     pub fn from_transcript(transcript: Transcript) -> Self {
@@ -44,6 +48,7 @@ impl AgentSession {
             core: AgentCoreLoop::resume_at_boundary(last_turn_id),
             context,
             action_queue: ActionQueue::new(),
+            action_outbox: VecDeque::new(),
         }
     }
 
@@ -58,6 +63,7 @@ impl AgentSession {
             core: AgentCoreLoop::resume_at_boundary(last_turn_id),
             context,
             action_queue: ActionQueue::new(),
+            action_outbox: VecDeque::new(),
         })
     }
 
@@ -72,6 +78,7 @@ impl AgentSession {
     /// pending entry, e.g. after an interrupt) are removed with no effect.
     pub fn enqueue_input(&mut self, input: AgentInput) {
         self.action_queue.record_input(&input);
+        self.drop_completed_action_from_outbox(&input);
         self.core.enqueue_input(input);
     }
 
@@ -107,6 +114,7 @@ impl AgentSession {
     pub fn drive(&mut self) {
         self.core.drive();
         self.absorb_core_records();
+        self.absorb_core_actions();
     }
 
     /// Drain every queued user input (Steer then FollowUp) from the
@@ -122,18 +130,14 @@ impl AgentSession {
 
     /// Drain pending actions the core produced during the last `drive`.
     ///
-    /// Each drained `RequestModel` / `RequestTool` is recorded in the
-    /// session's internal action queue so `can_edit_history` can block
-    /// until the matching completion comes back via `enqueue_input`.
-    /// `CancelTurn` clears every pending action for the cancelled turn — the
-    /// orchestrator will not deliver completions for cancelled work.
+    /// Actions are recorded in the session's internal action queue during
+    /// `drive`, so `can_edit_history` does not depend on when callers drain
+    /// the observable outbox.
     ///
     /// Records are absorbed into the context inside `drive`, so there is no
     /// analogous `drain_records` on the session.
     pub fn drain_actions(&mut self) -> Vec<AgentAction> {
-        let actions = self.core.drain_actions();
-        self.action_queue.record_drained(&actions);
-        actions
+        self.action_outbox.drain(..).collect()
     }
 
     /// True when the session's history can be edited: core idle, context at a
@@ -196,6 +200,65 @@ impl AgentSession {
         self.context.append_transcript_records(records);
     }
 
+    fn absorb_core_actions(&mut self) {
+        let actions = self.core.drain_actions();
+        if actions.is_empty() {
+            return;
+        }
+        self.action_queue.record_drained(&actions);
+        for action in actions {
+            if let AgentAction::CancelTurn { turn_id } = action {
+                self.action_outbox.retain(|queued| {
+                    !matches!(
+                        queued,
+                        AgentAction::RequestModel {
+                            turn_id: queued_turn_id,
+                        } | AgentAction::RequestTool {
+                            turn_id: queued_turn_id,
+                            ..
+                        } if *queued_turn_id == turn_id
+                    )
+                });
+            }
+            self.action_outbox.push_back(action);
+        }
+    }
+
+    fn drop_completed_action_from_outbox(&mut self, input: &AgentInput) {
+        let position = self
+            .action_outbox
+            .iter()
+            .position(|action| match (action, input) {
+                (
+                    AgentAction::RequestModel {
+                        turn_id: action_turn_id,
+                    },
+                    AgentInput::ModelCompleted {
+                        turn_id: input_turn_id,
+                        ..
+                    },
+                ) => action_turn_id == input_turn_id,
+                (
+                    AgentAction::RequestTool {
+                        turn_id: action_turn_id,
+                        tool_call,
+                    },
+                    AgentInput::ToolCompleted {
+                        turn_id: input_turn_id,
+                        result,
+                    },
+                ) => {
+                    action_turn_id == input_turn_id
+                        && tool_call.id == result.tool_call_id
+                        && tool_call.tool_name == result.tool_name
+                }
+                _ => false,
+            });
+        if let Some(position) = position {
+            self.action_outbox.remove(position);
+        }
+    }
+
     pub(crate) fn rehydrate_core_from_context(&mut self) {
         let last_turn_id = self.context.transcript().last_turn_id();
         self.core = AgentCoreLoop::resume_at_boundary(last_turn_id);
@@ -203,6 +266,7 @@ impl AgentSession {
         // longer driving; reset the queue so a rehydrated session does not
         // block edits forever.
         self.action_queue.clear();
+        self.action_outbox.clear();
     }
 }
 
@@ -406,6 +470,22 @@ mod tests {
     }
 
     #[test]
+    fn live_transcript_keeps_open_turns_open() {
+        let mut session = AgentSession::new();
+
+        session.enqueue_input(AgentInput::follow_up("hello"));
+        session.drive();
+
+        assert_eq!(
+            session.transcript().records(),
+            &[
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage("hello".to_string()),
+            ]
+        );
+    }
+
+    #[test]
     fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
         let transcript = vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
@@ -464,6 +544,23 @@ mod tests {
             assistant: AssistantMessage { items: Vec::new() },
         });
         session.drive();
+        assert!(session.can_edit_history(PendingWork::NONE));
+    }
+
+    #[test]
+    fn late_action_drain_does_not_leave_completed_request_pending() {
+        let mut session = AgentSession::new();
+        session.enqueue_input(AgentInput::follow_up("hi"));
+        session.drive();
+
+        session.enqueue_input(AgentInput::ModelCompleted {
+            turn_id: TurnId(1),
+            assistant: AssistantMessage { items: Vec::new() },
+        });
+        session.drive();
+
+        let late_actions = session.drain_actions();
+        assert!(late_actions.is_empty());
         assert!(session.can_edit_history(PendingWork::NONE));
     }
 

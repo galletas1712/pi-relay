@@ -19,7 +19,11 @@ impl Transcript {
         Self::default()
     }
 
-    pub fn from_records(mut records: Vec<TranscriptRecord>) -> Self {
+    pub fn from_records(records: Vec<TranscriptRecord>) -> Self {
+        Self { records }
+    }
+
+    pub fn from_records_recovering_crashed_tail(mut records: Vec<TranscriptRecord>) -> Self {
         Self::patch_crashed_tail(&mut records);
         Self { records }
     }
@@ -257,7 +261,7 @@ mod tests {
         let first = tool_call(1, "bash");
         let second = tool_call(2, "read");
 
-        let transcript = Transcript::from_records(vec![
+        let transcript = Transcript::from_records_recovering_crashed_tail(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
             TranscriptRecord::UserMessage("hello".to_string()),
             TranscriptRecord::AssistantMessage(AssistantMessage {
@@ -294,7 +298,7 @@ mod tests {
     fn crashed_tail_patches_assistant_tool_calls_even_without_start_records() {
         let tool_call = tool_call(1, "bash");
 
-        let transcript = Transcript::from_records(vec![
+        let transcript = Transcript::from_records_recovering_crashed_tail(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(8) },
             TranscriptRecord::UserMessage("hello".to_string()),
             TranscriptRecord::AssistantMessage(AssistantMessage {
