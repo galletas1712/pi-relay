@@ -1,8 +1,10 @@
+use std::collections::BTreeMap;
+
 use crate::action::AgentAction;
-use crate::event::AgentEvent;
+use crate::event::{AgentEvent, TurnOrigin};
 use crate::ids::TurnId;
 use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
-use crate::record::{TranscriptRecord, TurnOutcome};
+use crate::record::{CustomMessage, TranscriptRecord, TurnOutcome};
 
 // Live control state only. Durable session history lives in Transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -28,7 +30,11 @@ impl AgentState {
     pub(crate) fn step(&mut self, event: AgentEvent) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         match event {
             AgentEvent::Interrupt => self.on_interrupt(),
-            AgentEvent::StartTurn { turn_id, input } => self.on_start_turn(turn_id, input),
+            AgentEvent::StartTurn {
+                turn_id,
+                input,
+                origin,
+            } => self.on_start_turn(turn_id, input, origin),
             AgentEvent::ModelCompleted { turn_id, assistant } => {
                 self.on_model_completed(turn_id, assistant)
             }
@@ -43,15 +49,25 @@ impl AgentState {
         &mut self,
         turn_id: TurnId,
         input: String,
+        origin: Option<TurnOrigin>,
     ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         match self {
             Self::Idle => {
                 *self = Self::RunningModel { turn_id };
+                let first_record = match origin {
+                    None => TranscriptRecord::UserMessage(input),
+                    Some(TurnOrigin { from, kind }) => {
+                        let mut metadata = BTreeMap::new();
+                        metadata.insert("from".to_string(), from);
+                        TranscriptRecord::Custom(CustomMessage {
+                            kind,
+                            content: input,
+                            metadata,
+                        })
+                    }
+                };
                 (
-                    vec![
-                        TranscriptRecord::TurnStarted { turn_id },
-                        TranscriptRecord::UserMessage(input),
-                    ],
+                    vec![TranscriptRecord::TurnStarted { turn_id }, first_record],
                     vec![AgentAction::RequestModel { turn_id }],
                 )
             }
@@ -318,6 +334,7 @@ mod tests {
         let (_, actions) = state.step(AgentEvent::StartTurn {
             turn_id: TurnId(1),
             input: "hello".to_string(),
+            origin: None,
         });
         assert_eq!(state, AgentState::RunningModel { turn_id: TurnId(1) });
         assert_eq!(

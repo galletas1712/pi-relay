@@ -1,27 +1,28 @@
 use crate::ids::TurnId;
 use crate::message::{AssistantMessage, ToolResultMessage};
 
+/// External input to the live agent FSM.
+///
+/// **Invariant (for `Steer` and `FollowUp`):** `from.is_some() == kind.is_some()`.
+/// Either both `None` (input came from the human user or unknown origin —
+/// same thing at the core layer) or both `Some` (input was injected by another
+/// session, e.g. a parent directive or a child report). The core crate is
+/// oblivious to what a session id *is*, and to what specific `kind` strings
+/// mean — both are opaque tags that ride along with the content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentInput {
     // User asked to stop the active model/tool work.
     Interrupt,
     // High-priority input. Runs before queued follow-up work.
-    //
-    // `from = None` means the input came from the human user (or unknown
-    // origin — same thing at the core layer). `from = Some(session_id)` means
-    // the input came from another session (e.g. a parent directive). The
-    // core crate is oblivious to what a session id *is* — it's just a tag
-    // that rides along.
     Steer {
         from: Option<String>,
+        kind: Option<String>,
         content: String,
     },
     // Normal-priority input for the next available turn.
-    //
-    // Same `from` semantics as `Steer`. A child report arrives to its parent
-    // as `FollowUp { from: Some(child_id), .. }`.
     FollowUp {
         from: Option<String>,
+        kind: Option<String>,
         content: String,
     },
     // Volatile model completion delivered by the orchestrator.
@@ -41,6 +42,7 @@ impl AgentInput {
     pub fn steer(content: impl Into<String>) -> Self {
         Self::Steer {
             from: None,
+            kind: None,
             content: content.into(),
         }
     }
@@ -49,22 +51,40 @@ impl AgentInput {
     pub fn follow_up(content: impl Into<String>) -> Self {
         Self::FollowUp {
             from: None,
+            kind: None,
             content: content.into(),
         }
     }
 
-    /// Steer input tagged as coming from the given session.
-    pub fn steer_from(from: impl Into<String>, content: impl Into<String>) -> Self {
+    /// Steer input tagged as coming from the given session with the given kind.
+    ///
+    /// Used for agent-routed injections (e.g. parent directives); see
+    /// `agent-orchestrator` for the well-known kind constants.
+    pub fn steer_tagged(
+        from: impl Into<String>,
+        kind: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         Self::Steer {
             from: Some(from.into()),
+            kind: Some(kind.into()),
             content: content.into(),
         }
     }
 
-    /// Follow-up input tagged as coming from the given session.
-    pub fn follow_up_from(from: impl Into<String>, content: impl Into<String>) -> Self {
+    /// Follow-up input tagged as coming from the given session with the given
+    /// kind.
+    ///
+    /// Used for agent-routed injections (e.g. child reports); see
+    /// `agent-orchestrator` for the well-known kind constants.
+    pub fn follow_up_tagged(
+        from: impl Into<String>,
+        kind: impl Into<String>,
+        content: impl Into<String>,
+    ) -> Self {
         Self::FollowUp {
             from: Some(from.into()),
+            kind: Some(kind.into()),
             content: content.into(),
         }
     }
@@ -80,6 +100,7 @@ pub(crate) enum AgentEvent {
     StartTurn {
         turn_id: TurnId,
         input: String,
+        origin: Option<TurnOrigin>,
     },
     ModelCompleted {
         turn_id: TurnId,
@@ -90,4 +111,15 @@ pub(crate) enum AgentEvent {
         result: ToolResultMessage,
     },
     ContinueModel,
+}
+
+/// Origin tag attached to a turn that was started from an agent-routed input
+/// (e.g. a parent directive or a child report) rather than from a human user.
+///
+/// Present iff the originating `AgentInput::Steer`/`FollowUp` carried both a
+/// `from` and a `kind` — the paired-invariant enforced on `AgentInput`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TurnOrigin {
+    pub from: String,
+    pub kind: String,
 }

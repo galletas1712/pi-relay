@@ -125,12 +125,14 @@ fn started_turn_id(records: &[TranscriptRecord]) -> Option<TurnId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
+
     use crate::action::AgentAction;
     use crate::ids::ToolCallId;
     use crate::message::{
         AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
     };
-    use crate::record::TurnOutcome;
+    use crate::record::{CustomMessage, TurnOutcome};
 
     fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {
         AssistantMessage { items }
@@ -501,6 +503,50 @@ mod tests {
             vec![AgentAction::CancelTurn { turn_id: TurnId(1) }]
         );
         assert_eq!(loop_state.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn idle_turn_from_tagged_input_produces_custom_transcript_entry() {
+        let mut loop_state = AgentCoreLoop::new();
+
+        let records = drive_collect(
+            &mut loop_state,
+            AgentInput::steer_tagged("parent-session", "agent_directive", "please do X"),
+        );
+
+        let mut expected_metadata = BTreeMap::new();
+        expected_metadata.insert("from".to_string(), "parent-session".to_string());
+
+        assert_eq!(
+            records,
+            vec![
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::Custom(CustomMessage {
+                    kind: "agent_directive".to_string(),
+                    content: "please do X".to_string(),
+                    metadata: expected_metadata,
+                }),
+            ]
+        );
+        assert_eq!(
+            loop_state.drain_actions(),
+            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
+        );
+    }
+
+    #[test]
+    fn idle_turn_from_untagged_input_produces_user_message() {
+        let mut loop_state = AgentCoreLoop::new();
+
+        let records = drive_collect(&mut loop_state, AgentInput::steer("human steer"));
+
+        assert_eq!(
+            records,
+            vec![
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage("human steer".to_string()),
+            ]
+        );
     }
 
     #[test]

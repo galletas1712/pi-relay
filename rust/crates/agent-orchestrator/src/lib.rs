@@ -15,6 +15,16 @@ use agent_session::AgentSession;
 
 pub use crate::registry::{RegistryError, RouteError, SessionId, SessionRegistry};
 
+/// Well-known `CustomMessage::kind` tag for parent->child directives routed via
+/// `AgentOrchestrator::send_message`. Stored on the child's transcript as the
+/// `kind` of the `Custom` entry that opens the directive's turn.
+pub const KIND_AGENT_DIRECTIVE: &str = "agent_directive";
+
+/// Well-known `CustomMessage::kind` tag for child->parent reports routed via
+/// `AgentOrchestrator::send_report`. Stored on the parent's transcript as the
+/// `kind` of the `Custom` entry that opens the report's turn.
+pub const KIND_AGENT_REPORT: &str = "agent_report";
+
 /// Composition struct for the agent runtime.
 ///
 /// Today this owns only the session registry. As `ModelProvider`,
@@ -41,9 +51,11 @@ impl AgentOrchestrator {
     /// Fire-and-forget: route a Steer from a parent session to one of its
     /// direct children.
     ///
-    /// Enqueues `AgentInput::Steer { from: Some(from), content }` on the
-    /// target's mailbox. The `from` tag rides along so the target can
-    /// distinguish parent directives from human user input.
+    /// Enqueues `AgentInput::Steer { from: Some(from), kind:
+    /// Some(KIND_AGENT_DIRECTIVE), content }` on the target's mailbox. The
+    /// `from` and `kind` tags ride along so the target's FSM materialises a
+    /// `TranscriptRecord::Custom { kind: "agent_directive", metadata: {"from":
+    /// ...} }` at turn start instead of a plain `UserMessage`.
     ///
     /// Validates that `to` is a direct child of `from` in the spawn tree;
     /// routing to an unrelated or descendant session returns
@@ -68,15 +80,22 @@ impl AgentOrchestrator {
             .registry
             .get_mut(to)
             .expect("contains check above guarantees target exists");
-        target.enqueue_input(AgentInput::steer_from(from.clone(), content));
+        target.enqueue_input(AgentInput::steer_tagged(
+            from.clone(),
+            KIND_AGENT_DIRECTIVE,
+            content,
+        ));
         Ok(())
     }
 
     /// Fire-and-forget: route a FollowUp report from a child session to its
     /// spawn parent.
     ///
-    /// Enqueues `AgentInput::FollowUp { from: Some(from), content }` on the
-    /// parent's mailbox. The `from` tag identifies the originating child.
+    /// Enqueues `AgentInput::FollowUp { from: Some(from), kind:
+    /// Some(KIND_AGENT_REPORT), content }` on the parent's mailbox. The `from`
+    /// and `kind` tags ride along so the parent's FSM materialises a
+    /// `TranscriptRecord::Custom { kind: "agent_report", metadata: {"from":
+    /// ...} }` at turn start instead of a plain `UserMessage`.
     ///
     /// Validates that `from` has a registered spawn parent; an orphan
     /// sender returns `RouteError::NoParent`.
@@ -93,7 +112,11 @@ impl AgentOrchestrator {
             .registry
             .get_mut(&parent)
             .expect("registered spawn parent must be in the registry");
-        target.enqueue_input(AgentInput::follow_up_from(from.clone(), content));
+        target.enqueue_input(AgentInput::follow_up_tagged(
+            from.clone(),
+            KIND_AGENT_REPORT,
+            content,
+        ));
         Ok(())
     }
 }
@@ -287,6 +310,7 @@ mod tests {
             drained,
             vec![AgentInput::Steer {
                 from: Some("A".to_string()),
+                kind: Some(KIND_AGENT_DIRECTIVE.to_string()),
                 content: "do X".to_string(),
             }]
         );
@@ -345,8 +369,59 @@ mod tests {
             drained,
             vec![AgentInput::FollowUp {
                 from: Some("B".to_string()),
+                kind: Some(KIND_AGENT_REPORT.to_string()),
                 content: "found X".to_string(),
             }]
+        );
+    }
+
+    #[test]
+    fn send_report_results_in_custom_agent_report_entry_in_parent_transcript() {
+        use agent_core::CustomMessage;
+
+        let mut orchestrator = orchestrator_with_parent_and_child();
+
+        // Send a report from B up to A, then drive A's mailbox so it starts a
+        // turn from the queued follow-up. The parent transcript should open
+        // the new turn with a Custom{kind=agent_report} entry — not a plain
+        // UserMessage.
+        orchestrator
+            .send_report(&"B".to_string(), "child is done".to_string())
+            .expect("B -> A is a valid child->parent route");
+
+        let parent = orchestrator
+            .registry_mut()
+            .get_mut("A")
+            .expect("parent exists");
+        parent.drive();
+
+        let records = parent.transcript().records().to_vec();
+        let custom = records
+            .iter()
+            .find_map(|r| match r {
+                TranscriptRecord::Custom(cm) => Some(cm),
+                _ => None,
+            })
+            .expect("parent transcript should contain a Custom entry from the report");
+
+        let mut expected_metadata = std::collections::BTreeMap::new();
+        expected_metadata.insert("from".to_string(), "B".to_string());
+        assert_eq!(
+            custom,
+            &CustomMessage {
+                kind: KIND_AGENT_REPORT.to_string(),
+                content: "child is done".to_string(),
+                metadata: expected_metadata,
+            }
+        );
+
+        // And make sure we did NOT ALSO append a plain UserMessage for the
+        // report.
+        assert!(
+            !records
+                .iter()
+                .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "child is done")),
+            "report should not show up as a UserMessage",
         );
     }
 
