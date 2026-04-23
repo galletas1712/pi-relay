@@ -136,112 +136,20 @@ impl AgentSession {
         self.quiescence(external_work).is_quiescent()
     }
 
-    /// Replace the durable transcript only at a fully quiescent session boundary.
+    /// Validate quiescence once; return a view that permits boundary ops.
     ///
-    /// This is the primitive session compaction should use after it has produced
-    /// a provider-safe replacement transcript. The mailbox and action outbox are
-    /// required to be empty so volatile queued work is not silently migrated.
-    pub fn replace_transcript_at_boundary(
+    /// The returned `SessionBoundary` is the only surface for compact, rewind,
+    /// fork, and replace_transcript — the guard ran once here, so individual
+    /// ops do not repeat it.
+    pub fn boundary(
         &mut self,
-        replacement: Transcript,
         external_work: ExternalWork,
-    ) -> Result<Transcript, SessionBoundaryError> {
+    ) -> Result<SessionBoundary<'_>, SessionBoundaryError> {
         let quiescence = self.quiescence(external_work);
         if !quiescence.is_quiescent() {
             return Err(SessionBoundaryError::Busy(quiescence));
         }
-        if !replacement.is_turn_boundary() {
-            return Err(SessionBoundaryError::ReplacementNotAtBoundary);
-        }
-
-        let previous = self.log.context().transcript;
-        self.log = SessionLog::from_transcript(&replacement);
-        self.rehydrate_core_from_log();
-        Ok(previous)
-    }
-
-    pub fn prepare_compaction(
-        &self,
-        settings: CompactionSettings,
-        external_work: ExternalWork,
-    ) -> Result<Option<CompactionPlan>, SessionBoundaryError> {
-        let quiescence = self.quiescence(external_work);
-        if !quiescence.is_quiescent() {
-            return Err(SessionBoundaryError::Busy(quiescence));
-        }
-        if !self.log.is_turn_boundary() {
-            return Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary));
-        }
-        Ok(self.log.prepare_compaction(settings))
-    }
-
-    pub fn compact_at_boundary(
-        &mut self,
-        plan: &CompactionPlan,
-        summary: impl Into<String>,
-        external_work: ExternalWork,
-    ) -> Result<(), SessionBoundaryError> {
-        let quiescence = self.quiescence(external_work);
-        if !quiescence.is_quiescent() {
-            return Err(SessionBoundaryError::Busy(quiescence));
-        }
-        if !self.log.contains_entry(&plan.first_kept_entry_id) {
-            return Err(SessionBoundaryError::Log(SessionLogError::EntryNotFound));
-        }
-        if self.log.leaf_id() != plan.leaf_id.as_deref()
-            || self.log.entries().len() != plan.entry_count
-        {
-            return Err(SessionBoundaryError::Log(SessionLogError::StalePlan));
-        }
-        if !self.log.is_turn_boundary() {
-            return Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary));
-        }
-
-        self.log.append_compaction(
-            summary,
-            plan.first_kept_entry_id.clone(),
-            plan.tokens_before,
-        );
-        self.rehydrate_core_from_log();
-        Ok(())
-    }
-
-    pub fn rewind_to_turn_boundary(
-        &mut self,
-        leaf_id: Option<&str>,
-        external_work: ExternalWork,
-    ) -> Result<(), SessionBoundaryError> {
-        let quiescence = self.quiescence(external_work);
-        if !quiescence.is_quiescent() {
-            return Err(SessionBoundaryError::Busy(quiescence));
-        }
-
-        match leaf_id {
-            Some(leaf_id) => self
-                .log
-                .branch_at_turn_boundary(leaf_id)
-                .map_err(SessionBoundaryError::Log)?,
-            None => self.log.reset_leaf(),
-        }
-        self.rehydrate_core_from_log();
-        Ok(())
-    }
-
-    pub fn fork_at_turn_boundary(
-        &self,
-        leaf_id: Option<&str>,
-        external_work: ExternalWork,
-    ) -> Result<Self, SessionBoundaryError> {
-        let quiescence = self.quiescence(external_work);
-        if !quiescence.is_quiescent() {
-            return Err(SessionBoundaryError::Busy(quiescence));
-        }
-
-        let log = self
-            .log
-            .create_branched_log_at_turn_boundary(leaf_id)
-            .map_err(SessionBoundaryError::Log)?;
-        Self::from_session_log(log)
+        Ok(SessionBoundary { session: self })
     }
 
     fn absorb_core_records(&mut self) {
@@ -255,6 +163,96 @@ impl AgentSession {
     fn rehydrate_core_from_log(&mut self) {
         let last_turn_id = self.log.context().transcript.last_turn_id();
         self.core = AgentCoreLoop::resume_at_boundary(last_turn_id);
+    }
+}
+
+/// Proven-quiescent borrow of an `AgentSession` that permits boundary ops.
+///
+/// Obtained via [`AgentSession::boundary`]. Each op validates only its own
+/// preconditions (plan staleness, entry-not-found, not-at-boundary for the
+/// replacement, etc.); the mailbox / outbox / external-work check happened
+/// once when the view was created.
+pub struct SessionBoundary<'a> {
+    session: &'a mut AgentSession,
+}
+
+impl SessionBoundary<'_> {
+    /// Plan a compaction against the current log. Returns `None` when no
+    /// entries are old enough to evict under `settings`.
+    pub fn prepare_compaction(&self, settings: CompactionSettings) -> Option<CompactionPlan> {
+        self.session.log.prepare_compaction(settings)
+    }
+
+    /// Replace the durable transcript with `replacement`.
+    ///
+    /// `replacement` must itself be at a turn boundary. Returns the previous
+    /// transcript so callers can persist it out-of-band if needed.
+    pub fn replace_transcript(
+        &mut self,
+        replacement: Transcript,
+    ) -> Result<Transcript, SessionBoundaryError> {
+        if !replacement.is_turn_boundary() {
+            return Err(SessionBoundaryError::ReplacementNotAtBoundary);
+        }
+
+        let previous = self.session.log.context().transcript;
+        self.session.log = SessionLog::from_transcript(&replacement);
+        self.session.rehydrate_core_from_log();
+        Ok(previous)
+    }
+
+    /// Apply a previously prepared compaction, appending `summary` as the new
+    /// compaction entry and dropping history before `plan.first_kept_entry_id`.
+    pub fn compact(
+        &mut self,
+        plan: &CompactionPlan,
+        summary: impl Into<String>,
+    ) -> Result<(), SessionBoundaryError> {
+        let log = &self.session.log;
+        if !log.contains_entry(&plan.first_kept_entry_id) {
+            return Err(SessionBoundaryError::Log(SessionLogError::EntryNotFound));
+        }
+        if log.leaf_id() != plan.leaf_id.as_deref() || log.entries().len() != plan.entry_count {
+            return Err(SessionBoundaryError::Log(SessionLogError::StalePlan));
+        }
+        if !log.is_turn_boundary() {
+            return Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary));
+        }
+
+        self.session.log.append_compaction(
+            summary,
+            plan.first_kept_entry_id.clone(),
+            plan.tokens_before,
+        );
+        self.session.rehydrate_core_from_log();
+        Ok(())
+    }
+
+    /// Rewind the durable leaf to `leaf_id`, or reset to the root when `None`.
+    /// `leaf_id` must point at a `TurnFinished` entry.
+    pub fn rewind(&mut self, leaf_id: Option<&str>) -> Result<(), SessionBoundaryError> {
+        match leaf_id {
+            Some(leaf_id) => self
+                .session
+                .log
+                .branch_at_turn_boundary(leaf_id)
+                .map_err(SessionBoundaryError::Log)?,
+            None => self.session.log.reset_leaf(),
+        }
+        self.session.rehydrate_core_from_log();
+        Ok(())
+    }
+
+    /// Produce an unregistered `AgentSession` whose log branches from
+    /// `leaf_id` (or the root when `None`). The source session is unchanged;
+    /// the caller is responsible for registering the fork if desired.
+    pub fn fork(&self, leaf_id: Option<&str>) -> Result<AgentSession, SessionBoundaryError> {
+        let log = self
+            .session
+            .log
+            .create_branched_log_at_turn_boundary(leaf_id)
+            .map_err(SessionBoundaryError::Log)?;
+        AgentSession::from_session_log(log)
     }
 }
 
@@ -337,14 +335,17 @@ mod tests {
         session.enqueue_input(AgentInput::FollowUp("hello".to_string()));
 
         let busy = session
-            .replace_transcript_at_boundary(finished_transcript("compact"), ExternalWork::NONE)
-            .expect_err("running sessions cannot be compacted");
+            .boundary(ExternalWork::NONE)
+            .err()
+            .expect("running sessions cannot open a boundary");
         assert!(matches!(busy, SessionBoundaryError::Busy(_)));
 
         let mut session = AgentSession::from_transcript(finished_transcript("hello"));
 
         let old = session
-            .replace_transcript_at_boundary(finished_transcript("compact"), ExternalWork::NONE)
+            .boundary(ExternalWork::NONE)
+            .expect("idle boundary opens")
+            .replace_transcript(finished_transcript("compact"))
             .expect("idle boundary can swap transcript");
 
         assert_eq!(old.last_turn_id(), TurnId(1));
@@ -419,17 +420,17 @@ mod tests {
         ]));
 
         let plan = session
-            .prepare_compaction(
-                CompactionSettings {
-                    keep_recent_tokens: 1,
-                },
-                ExternalWork::NONE,
-            )
+            .boundary(ExternalWork::NONE)
             .expect("session is quiescent")
+            .prepare_compaction(CompactionSettings {
+                keep_recent_tokens: 1,
+            })
             .expect("old turn should be compactable");
 
         session
-            .compact_at_boundary(&plan, "summary", ExternalWork::NONE)
+            .boundary(ExternalWork::NONE)
+            .expect("session is still quiescent")
+            .compact(&plan, "summary")
             .expect("quiescent boundary can compact");
 
         let context = session.model_context();
@@ -464,23 +465,32 @@ mod tests {
         let turn_one_end_id = session.session_log().entries()[2].id.clone();
 
         assert_eq!(
-            session.rewind_to_turn_boundary(Some(&mid_turn_id), ExternalWork::NONE),
+            session
+                .boundary(ExternalWork::NONE)
+                .expect("session is quiescent")
+                .rewind(Some(&mid_turn_id)),
             Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary))
         );
         assert_eq!(
             session
-                .fork_at_turn_boundary(Some(&mid_turn_id), ExternalWork::NONE)
+                .boundary(ExternalWork::NONE)
+                .expect("session is quiescent")
+                .fork(Some(&mid_turn_id))
                 .map(|_| ()),
             Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary))
         );
 
         session
-            .rewind_to_turn_boundary(Some(&turn_one_end_id), ExternalWork::NONE)
+            .boundary(ExternalWork::NONE)
+            .expect("session is quiescent")
+            .rewind(Some(&turn_one_end_id))
             .expect("turn end is a valid rewind point");
         assert_eq!(session.transcript().last_turn_id(), TurnId(1));
 
         let fork = session
-            .fork_at_turn_boundary(Some(&turn_one_end_id), ExternalWork::NONE)
+            .boundary(ExternalWork::NONE)
+            .expect("session is quiescent")
+            .fork(Some(&turn_one_end_id))
             .expect("turn end is a valid fork point");
         assert_eq!(fork.transcript().last_turn_id(), TurnId(1));
     }
