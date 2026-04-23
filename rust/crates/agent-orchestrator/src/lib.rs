@@ -43,7 +43,7 @@ mod tests {
     use super::*;
     use agent_core::{AgentInput, AssistantMessage, TranscriptRecord, TurnId, TurnOutcome};
     use agent_session::{
-        CompactionSettings, ExternalWork, SessionBoundaryError, SessionLogError, Transcript,
+        CompactionSettings, HistoryEditError, PendingWork, SessionLogError, Transcript,
     };
 
     #[test]
@@ -68,7 +68,7 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_delegates_transcript_replacement_to_session_boundary() {
+    fn orchestrator_delegates_transcript_replacement_to_session_history_edit() {
         let mut orchestrator = AgentOrchestrator::new();
         let transcript = Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
@@ -87,7 +87,7 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .boundary(ExternalWork::NONE)
+            .edit_history(PendingWork::NONE)
             .expect("idle empty session is quiescent")
             .replace_transcript(transcript)
             .expect("idle empty session can replace transcript");
@@ -104,7 +104,7 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_delegates_rewind_fork_and_compaction_to_session_boundaries() {
+    fn orchestrator_delegates_rewind_fork_and_compaction_to_session_history_edits() {
         let mut orchestrator = AgentOrchestrator::new();
         let session = AgentSession::from_transcript(Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
@@ -134,19 +134,19 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .boundary(ExternalWork::NONE)
+            .edit_history(PendingWork::NONE)
             .expect("session is quiescent")
             .rewind(Some(&mid_turn_id));
         assert!(matches!(
             rewind_err,
-            Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary))
+            Err(HistoryEditError::Log(SessionLogError::NotTurnBoundary))
         ));
 
         let fork = orchestrator
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .boundary(ExternalWork::NONE)
+            .edit_history(PendingWork::NONE)
             .expect("session is quiescent")
             .fork(Some(&turn_one_end_id))
             .expect("turn boundary fork should succeed");
@@ -172,7 +172,7 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .boundary(ExternalWork::NONE)
+            .edit_history(PendingWork::NONE)
             .expect("session is quiescent")
             .prepare_compaction(CompactionSettings {
                 keep_recent_tokens: 1,
@@ -182,10 +182,10 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .boundary(ExternalWork::NONE)
+            .edit_history(PendingWork::NONE)
             .expect("session is quiescent")
             .compact(&plan, "summary")
-            .expect("root can compact at boundary");
+            .expect("root can compact at turn boundary");
         assert_eq!(
             orchestrator
                 .registry()

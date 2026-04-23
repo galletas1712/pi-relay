@@ -1,13 +1,13 @@
 use agent_core::{AgentAction, AgentCoreLoop, AgentInput, TranscriptRecord, TurnId};
 
-use crate::boundary::{ExternalWork, SessionBoundary, SessionBoundaryError};
+use crate::history_edit::{HistoryEditError, PendingWork, SessionHistoryEdit};
 use crate::session_log::{SessionLog, SessionLogError};
 use crate::transcript::Transcript;
 
 /// Session shell around the pure core loop.
 ///
 /// `agent-core` owns deterministic state transitions. `agent-session` owns the
-/// boundary where durable transcript state can be safely replaced, forked,
+/// point at which the session's history can be safely replaced, forked,
 /// rewound, or resumed after consulting external model/tool work. The session
 /// log is the sole owner of durable records; the core only buffers records
 /// produced in the current run until the session absorbs them.
@@ -44,9 +44,9 @@ impl AgentSession {
         }
     }
 
-    pub fn from_session_log(log: SessionLog) -> Result<Self, SessionBoundaryError> {
+    pub fn from_session_log(log: SessionLog) -> Result<Self, HistoryEditError> {
         if !log.is_turn_boundary() {
-            return Err(SessionBoundaryError::Log(SessionLogError::NotTurnBoundary));
+            return Err(HistoryEditError::Log(SessionLogError::NotTurnBoundary));
         }
 
         let transcript = log.context();
@@ -109,29 +109,29 @@ impl AgentSession {
         self.core.drain_actions()
     }
 
-    /// True when a boundary can be opened: core idle, log at a turn boundary,
-    /// mailbox empty, no external work.
-    pub fn at_boundary(&self, external_work: ExternalWork) -> bool {
+    /// True when the session's history can be edited: core idle, log at a
+    /// turn boundary, mailbox empty, no pending work.
+    pub fn can_edit_history(&self, pending: PendingWork) -> bool {
         self.core.is_idle()
             && self.log.is_turn_boundary()
             && !self.core.has_pending_work()
-            && external_work.is_empty()
+            && pending.is_empty()
     }
 
-    /// Validate boundary preconditions once; return a view that permits
-    /// boundary ops.
+    /// Validate the precondition once; return a view that permits editing the
+    /// session's history.
     ///
-    /// The returned `SessionBoundary` is the only surface for compact,
+    /// The returned `SessionHistoryEdit` is the only surface for compact,
     /// rewind, fork, and replace_transcript — the guard ran once here, so
     /// individual ops do not repeat it.
-    pub fn boundary(
+    pub fn edit_history(
         &mut self,
-        work: ExternalWork,
-    ) -> Result<SessionBoundary<'_>, SessionBoundaryError> {
-        if self.at_boundary(work) {
-            Ok(SessionBoundary::new(self))
+        pending: PendingWork,
+    ) -> Result<SessionHistoryEdit<'_>, HistoryEditError> {
+        if self.can_edit_history(pending) {
+            Ok(SessionHistoryEdit::new(self))
         } else {
-            Err(SessionBoundaryError::Busy)
+            Err(HistoryEditError::Busy)
         }
     }
 
@@ -166,14 +166,14 @@ mod tests {
     }
 
     #[test]
-    fn at_boundary_requires_idle_core_empty_queues_and_no_external_work() {
+    fn can_edit_history_requires_idle_core_empty_queues_and_no_pending_work() {
         let mut session = AgentSession::new();
 
         session.enqueue_input(AgentInput::FollowUp("hello".to_string()));
-        assert!(!session.at_boundary(ExternalWork::NONE));
-        assert!(!session.at_boundary(ExternalWork {
+        assert!(!session.can_edit_history(PendingWork::NONE));
+        assert!(!session.can_edit_history(PendingWork {
             model_requests: 1,
-            ..ExternalWork::NONE
+            ..PendingWork::NONE
         }));
     }
 
