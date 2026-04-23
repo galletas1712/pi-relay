@@ -406,4 +406,17 @@ mod tests {
         assert_eq!(transcript.records().len(), 5);
         assert!(log.is_turn_boundary());
     }
+
+    #[test]
+    fn fork_at_custom_tail_is_a_valid_turn_boundary() {
+        let mut log = SessionLog::new();
+        log.append_transcript_records(turn(1, "hi", "done"));
+        let custom_id = log.append_branch_summary("note", None);
+
+        assert!(log.is_turn_boundary());
+        let forked = log
+            .create_branched_log_at_turn_boundary(Some(&custom_id))
+            .expect("Custom tail should be a valid fork boundary");
+        assert_eq!(forked.leaf_id(), Some(custom_id.as_str()));
+    }
 }

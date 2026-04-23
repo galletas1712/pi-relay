@@ -350,6 +350,31 @@ mod tests {
     }
 
     #[test]
+    fn can_edit_history_walks_past_multiple_custom_entries() {
+        use crate::session_log::{branch_summary, compaction_summary};
+
+        // A log whose leaf is a run of back-to-back Custom entries after a
+        // TurnFinished is still at a turn boundary; can_edit_history must
+        // see through the Custom tail to the underlying TurnFinished.
+        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
+            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+            TranscriptRecord::UserMessage("hi".to_string()),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+        ]));
+        session.log.append_custom(branch_summary("a", None));
+        session
+            .log
+            .append_custom(compaction_summary("b", "does-not-matter", 0));
+        session.log.append_custom(branch_summary("c", None));
+
+        assert!(session.session_log().is_turn_boundary());
+        assert!(session.can_edit_history(PendingWork::NONE));
+    }
+
+    #[test]
     fn cancel_turn_clears_pending_actions_for_that_turn() {
         let mut session = AgentSession::new();
         session.enqueue_input(AgentInput::FollowUp("hi".to_string()));

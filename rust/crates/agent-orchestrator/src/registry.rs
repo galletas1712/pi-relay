@@ -69,10 +69,15 @@ impl<S> SessionRegistry<S> {
     }
 
     pub fn remove(&mut self, id: &str) -> Result<S, RegistryError> {
+        if !self.sessions.contains_key(id) {
+            return Err(RegistryError::SessionNotFound);
+        }
+        // Refuse with extant children — the spawn tree must stay consistent.
+        if self.spawn_parents.values().any(|parent| parent == id) {
+            return Err(RegistryError::HasChildren);
+        }
         self.spawn_parents.remove(id);
-        self.sessions
-            .remove(id)
-            .ok_or(RegistryError::SessionNotFound)
+        Ok(self.sessions.remove(id).expect("contains_key check above"))
     }
 
     pub fn contains(&self, id: &str) -> bool {
@@ -108,6 +113,8 @@ pub enum RegistryError {
     SessionAlreadyExists,
     SessionNotFound,
     ParentNotFound,
+    /// Session has extant children in the spawn tree; remove them first.
+    HasChildren,
 }
 
 #[cfg(test)]
@@ -130,5 +137,23 @@ mod tests {
             registry.spawn_child("orphan", (), "missing"),
             Err(RegistryError::ParentNotFound)
         ));
+    }
+
+    #[test]
+    fn registry_refuses_to_remove_a_session_with_extant_children() {
+        let mut registry: SessionRegistry<()> = SessionRegistry::new();
+        registry.spawn("root", ()).unwrap();
+        registry.spawn_child("child", (), "root").unwrap();
+
+        assert_eq!(registry.remove("root"), Err(RegistryError::HasChildren));
+        // Root is still in the registry, and so is the child.
+        assert!(registry.contains("root"));
+        assert!(registry.contains("child"));
+
+        // Remove the child first; now root can be removed.
+        registry.remove("child").expect("child has no descendants");
+        registry
+            .remove("root")
+            .expect("root now has no descendants");
     }
 }
