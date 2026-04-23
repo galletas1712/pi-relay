@@ -108,7 +108,8 @@ fn started_turn_id(records: &[TranscriptRecord]) -> Option<TurnId> {
         | TranscriptRecord::AssistantMessage(_)
         | TranscriptRecord::ToolCallStarted { .. }
         | TranscriptRecord::ToolResult(_)
-        | TranscriptRecord::TurnFinished { .. } => None,
+        | TranscriptRecord::TurnFinished { .. }
+        | TranscriptRecord::Custom(_) => None,
     })
 }
 

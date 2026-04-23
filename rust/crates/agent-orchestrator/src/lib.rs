@@ -191,9 +191,8 @@ mod tests {
                 .registry()
                 .get("root")
                 .expect("root should exist")
-                .model_context()
-                .latest_compaction()
-                .map(|msg| msg.content.as_str()),
+                .transcript()
+                .latest_compaction_summary(),
             Some("summary")
         );
     }

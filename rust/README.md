@@ -23,12 +23,15 @@ the full layer stack including the future control-plane and view layers.
 
 ## Status
 
-PR #63 lands the session/orchestrator crates and the data-model
-abstractions. Downstream PRs add (in rough order): SessionStore,
-ControlPlane, SessionEvent stream, ModelProvider, Tool/ToolRegistry,
-Compactor, UsageLedger, multi-agent primitives (spawn/report/idle),
-AgentWorklogStore, PromptAssembly, daemon + remote control plane,
-distributed sessions. See the architecture doc's sequencing table.
+These crates land the session-layer abstractions: a pure deterministic FSM in
+`agent-core`, durable DAG-structured session history in `agent-session`, and a
+thin composition struct in `agent-orchestrator`. Downstream work adds (in rough
+order): `SessionStore` (pluggable storage), `ControlPlane` (view/control split),
+`SessionEvent` stream (observability), `ModelProvider`, `Tool`/`ToolRegistry`,
+`Compactor` (auto-compaction executor), `UsageLedger`, multi-agent primitives
+(spawn/report/idle), `AgentWorklogStore`, `PromptAssembly`, daemon +
+`RemoteControlPlane`, and distributed session processes. See the
+[architecture doc](docs/architecture.md) for the full sequencing.
 
 ## Design docs
 

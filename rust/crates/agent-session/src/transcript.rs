@@ -1,5 +1,7 @@
 use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptRecord, TurnId, TurnOutcome};
 
+use crate::session_log::{KIND_BRANCH_SUMMARY, KIND_COMPACTION_SUMMARY};
+
 /// Materialized session history.
 ///
 /// The session log is the canonical store; `Transcript` is a derived view over
@@ -30,10 +32,36 @@ impl Transcript {
     }
 
     pub fn is_turn_boundary(&self) -> bool {
-        matches!(
-            self.records.last(),
-            None | Some(TranscriptRecord::TurnFinished { .. })
-        )
+        for record in self.records.iter().rev() {
+            match record {
+                TranscriptRecord::TurnFinished { .. } => return true,
+                TranscriptRecord::Custom(_) => continue,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Latest compaction summary on the transcript, if any. Returns the
+    /// `content` string of the closest `TranscriptRecord::Custom` with the
+    /// well-known `compaction_summary` kind.
+    pub fn latest_compaction_summary(&self) -> Option<&str> {
+        self.records.iter().rev().find_map(|r| match r {
+            TranscriptRecord::Custom(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
+                Some(cm.content.as_str())
+            }
+            _ => None,
+        })
+    }
+
+    /// Iterate over branch-summary `content` strings in transcript order.
+    pub fn branch_summaries(&self) -> impl Iterator<Item = &str> + '_ {
+        self.records.iter().filter_map(|r| match r {
+            TranscriptRecord::Custom(cm) if cm.kind == KIND_BRANCH_SUMMARY => {
+                Some(cm.content.as_str())
+            }
+            _ => None,
+        })
     }
 
     pub fn boundary_prefix(&self, len: usize) -> Option<Self> {
@@ -86,7 +114,10 @@ impl Transcript {
             .find_map(|(index, record)| match record {
                 TranscriptRecord::TurnStarted { turn_id } => Some(Some((*turn_id, index))),
                 TranscriptRecord::TurnFinished { .. } => Some(None),
-                TranscriptRecord::UserMessage(_)
+                // Custom records live strictly between turns; they don't
+                // participate in crash-tail patching. Keep looking backward.
+                TranscriptRecord::Custom(_)
+                | TranscriptRecord::UserMessage(_)
                 | TranscriptRecord::AssistantMessage(_)
                 | TranscriptRecord::ToolCallStarted { .. }
                 | TranscriptRecord::ToolResult(_) => None,
@@ -109,7 +140,8 @@ impl Transcript {
                 TranscriptRecord::TurnStarted { .. }
                 | TranscriptRecord::UserMessage(_)
                 | TranscriptRecord::ToolCallStarted { .. }
-                | TranscriptRecord::TurnFinished { .. } => {}
+                | TranscriptRecord::TurnFinished { .. }
+                | TranscriptRecord::Custom(_) => {}
             }
         }
 
@@ -152,6 +184,7 @@ impl From<Vec<TranscriptRecord>> for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session_log::{branch_summary, compaction_summary};
     use agent_core::{AssistantItem, AssistantMessage, ToolResultStatus};
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
@@ -174,6 +207,26 @@ mod tests {
     #[test]
     fn empty_transcript_is_a_turn_boundary() {
         assert!(Transcript::new().is_turn_boundary());
+    }
+
+    #[test]
+    fn turn_boundary_walks_past_custom_records() {
+        let transcript = Transcript::from_records(vec![
+            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+            TranscriptRecord::UserMessage("hi".to_string()),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+            TranscriptRecord::Custom(compaction_summary("summary", "some_id", 100)),
+            TranscriptRecord::Custom(branch_summary("branch note", None)),
+        ]);
+        assert!(transcript.is_turn_boundary());
+        assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
+        assert_eq!(
+            transcript.branch_summaries().collect::<Vec<_>>(),
+            vec!["branch note"]
+        );
     }
 
     #[test]

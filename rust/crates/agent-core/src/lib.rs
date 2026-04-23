@@ -25,7 +25,7 @@ pub use crate::ids::{ToolCallId, TurnId};
 pub use crate::message::{
     AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
 };
-pub use crate::record::{TranscriptRecord, TurnOutcome};
+pub use crate::record::{CustomMessage, TranscriptRecord, TurnOutcome};
 
 // `AgentState` and `Mailbox` are intentionally not re-exported: they are
 // implementation details of the core loop. Callers observe liveness via
