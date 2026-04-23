@@ -43,7 +43,7 @@ mod tests {
     use super::*;
     use agent_core::{AgentInput, AssistantMessage, TranscriptRecord, TurnId, TurnOutcome};
     use agent_session::{
-        CompactionSettings, HistoryEditError, PendingWork, SessionLogError, Transcript,
+        CompactionSettings, ContextError, HistoryEditError, PendingWork, Transcript,
     };
 
     #[test]
@@ -122,8 +122,8 @@ mod tests {
                 outcome: TurnOutcome::Graceful,
             },
         ]));
-        let mid_turn_id = session.session_log().entries()[1].id.clone();
-        let turn_one_end_id = session.session_log().entries()[3].id.clone();
+        let mid_turn_id = session.context().entries()[1].id.clone();
+        let turn_one_end_id = session.context().entries()[3].id.clone();
 
         orchestrator
             .registry_mut()
@@ -139,7 +139,7 @@ mod tests {
             .rewind(Some(&mid_turn_id));
         assert!(matches!(
             rewind_err,
-            Err(HistoryEditError::Log(SessionLogError::NotTurnBoundary))
+            Err(HistoryEditError::Context(ContextError::NotTurnBoundary))
         ));
 
         let fork = orchestrator

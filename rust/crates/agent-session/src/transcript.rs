@@ -1,10 +1,10 @@
 use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptRecord, TurnId, TurnOutcome};
 
-use crate::session_log::{KIND_BRANCH_SUMMARY, KIND_COMPACTION_SUMMARY};
+use crate::context::{KIND_BRANCH_SUMMARY, KIND_COMPACTION_SUMMARY};
 
 /// Materialized session history.
 ///
-/// The session log is the canonical store; `Transcript` is a derived view over
+/// The `Context` is the canonical store; `Transcript` is a derived view over
 /// a record sequence. The session rebuilds one whenever it needs to feed the
 /// core loop or model context a contiguous ordered history, and uses the same
 /// type to rehydrate crashed sessions through `from_records`.
@@ -184,7 +184,7 @@ impl From<Vec<TranscriptRecord>> for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session_log::{branch_summary, compaction_summary};
+    use crate::context::{branch_summary, compaction_summary};
     use agent_core::{AssistantItem, AssistantMessage, ToolResultStatus};
 
     fn tool_call(id: u64, name: &str) -> ToolCall {

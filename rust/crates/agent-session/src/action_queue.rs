@@ -1,17 +1,22 @@
-use std::collections::HashSet;
+use std::collections::VecDeque;
 
 use agent_core::{AgentAction, AgentInput, ToolCallId, TurnId};
 
 /// Tracks drained `RequestModel` / `RequestTool` actions the session is
-/// waiting to hear back about.
+/// waiting to hear back about, in FIFO insertion order.
 ///
-/// `record_drained` adds inserts for `RequestModel` / `RequestTool` in a
-/// drained action batch, and clears everything for a `CancelTurn`'s turn id.
+/// `record_drained` pushes an entry for each `RequestModel` / `RequestTool` in
+/// a drained action batch, and clears everything for a `CancelTurn`'s turn id.
 /// `record_input` removes the matching key when a `ModelCompleted` /
-/// `ToolCompleted` arrives. Stale completions (no matching key) are no-ops.
+/// `ToolCompleted` arrives; removal preserves the relative order of the
+/// remaining entries. Stale completions (no matching key) are no-ops.
+///
+/// Duplicates are kept: if the same key is recorded twice, both are held in
+/// FIFO position. Callers that care about "once per drain" should rely on
+/// the drain semantics rather than this type deduplicating.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct PendingActions {
-    entries: HashSet<PendingActionKey>,
+pub(crate) struct ActionQueue {
+    entries: VecDeque<PendingActionKey>,
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -26,7 +31,7 @@ enum PendingActionKind {
     Tool { tool_call_id: ToolCallId },
 }
 
-impl PendingActions {
+impl ActionQueue {
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -43,13 +48,13 @@ impl PendingActions {
         for action in actions {
             match action {
                 AgentAction::RequestModel { turn_id } => {
-                    self.entries.insert(PendingActionKey {
+                    self.entries.push_back(PendingActionKey {
                         turn_id: *turn_id,
                         kind: PendingActionKind::Model,
                     });
                 }
                 AgentAction::RequestTool { turn_id, tool_call } => {
-                    self.entries.insert(PendingActionKey {
+                    self.entries.push_back(PendingActionKey {
                         turn_id: *turn_id,
                         kind: PendingActionKind::Tool {
                             tool_call_id: tool_call.id,
@@ -64,22 +69,24 @@ impl PendingActions {
     }
 
     pub(crate) fn record_input(&mut self, input: &AgentInput) {
-        match input {
-            AgentInput::ModelCompleted { turn_id, .. } => {
-                self.entries.remove(&PendingActionKey {
-                    turn_id: *turn_id,
-                    kind: PendingActionKind::Model,
-                });
-            }
-            AgentInput::ToolCompleted { turn_id, result } => {
-                self.entries.remove(&PendingActionKey {
-                    turn_id: *turn_id,
-                    kind: PendingActionKind::Tool {
-                        tool_call_id: result.tool_call_id,
-                    },
-                });
-            }
-            _ => {}
+        let target = match input {
+            AgentInput::ModelCompleted { turn_id, .. } => Some(PendingActionKey {
+                turn_id: *turn_id,
+                kind: PendingActionKind::Model,
+            }),
+            AgentInput::ToolCompleted { turn_id, result } => Some(PendingActionKey {
+                turn_id: *turn_id,
+                kind: PendingActionKind::Tool {
+                    tool_call_id: result.tool_call_id,
+                },
+            }),
+            _ => None,
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if let Some(position) = self.entries.iter().position(|k| *k == target) {
+            self.entries.remove(position);
         }
     }
 }
@@ -108,16 +115,16 @@ mod tests {
 
     #[test]
     fn record_drained_inserts_model_and_tool_actions() {
-        let mut pa = PendingActions::new();
-        pa.record_drained(&[model_request(1), tool_request(1, 1), tool_request(1, 2)]);
-        assert!(!pa.is_empty());
+        let mut q = ActionQueue::new();
+        q.record_drained(&[model_request(1), tool_request(1, 1), tool_request(1, 2)]);
+        assert!(!q.is_empty());
     }
 
     #[test]
     fn record_input_removes_matching_completion() {
-        let mut pa = PendingActions::new();
-        pa.record_drained(&[model_request(1), tool_request(1, 1)]);
-        pa.record_input(&AgentInput::ToolCompleted {
+        let mut q = ActionQueue::new();
+        q.record_drained(&[model_request(1), tool_request(1, 1)]);
+        q.record_input(&AgentInput::ToolCompleted {
             turn_id: TurnId(1),
             result: ToolResultMessage {
                 tool_call_id: ToolCallId(1),
@@ -126,43 +133,51 @@ mod tests {
                 status: ToolResultStatus::Success,
             },
         });
-        assert!(!pa.is_empty()); // model still pending
-        pa.record_input(&AgentInput::ModelCompleted {
+        assert!(!q.is_empty()); // model still pending
+        q.record_input(&AgentInput::ModelCompleted {
             turn_id: TurnId(1),
             assistant: agent_core::AssistantMessage { items: Vec::new() },
         });
-        assert!(pa.is_empty());
+        assert!(q.is_empty());
     }
 
     #[test]
     fn stale_completion_is_a_no_op() {
-        let mut pa = PendingActions::new();
-        pa.record_input(&AgentInput::ModelCompleted {
+        let mut q = ActionQueue::new();
+        q.record_input(&AgentInput::ModelCompleted {
             turn_id: TurnId(99),
             assistant: agent_core::AssistantMessage { items: Vec::new() },
         });
-        assert!(pa.is_empty());
+        assert!(q.is_empty());
     }
 
     #[test]
     fn cancel_turn_clears_pending_actions_for_that_turn_only() {
-        let mut pa = PendingActions::new();
-        pa.record_drained(&[model_request(1), tool_request(1, 1), model_request(2)]);
-        pa.record_drained(&[AgentAction::CancelTurn { turn_id: TurnId(1) }]);
+        let mut q = ActionQueue::new();
+        q.record_drained(&[model_request(1), tool_request(1, 1), model_request(2)]);
+        q.record_drained(&[AgentAction::CancelTurn { turn_id: TurnId(1) }]);
         // Turn 2 survives.
-        assert!(!pa.is_empty());
-        pa.record_input(&AgentInput::ModelCompleted {
+        assert!(!q.is_empty());
+        q.record_input(&AgentInput::ModelCompleted {
             turn_id: TurnId(2),
             assistant: agent_core::AssistantMessage { items: Vec::new() },
         });
-        assert!(pa.is_empty());
+        assert!(q.is_empty());
     }
 
     #[test]
-    fn clear_empties_the_set() {
-        let mut pa = PendingActions::new();
-        pa.record_drained(&[model_request(1)]);
-        pa.clear();
-        assert!(pa.is_empty());
+    fn clear_empties_the_queue() {
+        let mut q = ActionQueue::new();
+        q.record_drained(&[model_request(1)]);
+        q.clear();
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn record_drained_preserves_insertion_order_across_duplicates() {
+        let mut q = ActionQueue::new();
+        q.record_drained(&[model_request(1), model_request(1), tool_request(1, 1)]);
+        // Two model entries plus one tool entry; neither is deduplicated.
+        assert_eq!(q.entries.len(), 3);
     }
 }

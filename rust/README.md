@@ -10,7 +10,7 @@ deep dives.
 | Crate | What it owns |
 |---|---|
 | `agent-core` | Pure deterministic FSM for agent turns. Emits TranscriptRecord events and AgentAction side-effects. No I/O. Internals (`AgentState`, `Mailbox`) are private. |
-| `agent-session` | Durable session history atop the core FSM. Owns the SessionLog (DAG of entries with branch-aware navigation), the materialized Transcript view, the AgentRunner, and history-edit operations (compact, rewind, fork, replace_transcript) behind a SessionHistoryEdit view type. |
+| `agent-session` | Durable session history atop the core FSM. Owns the Context (DAG of entries with branch-aware navigation), the materialized Transcript view, the AgentRunner, and history-edit operations (compact, rewind, fork, replace_transcript) behind a ContextEdit view type. |
 | `agent-orchestrator` | Composition struct for the runtime. Currently owns a SessionRegistry that tracks session identity and spawn relationships. Grows as ModelProvider, ToolRegistry, UsageLedger, AgentWorklogStore land. |
 
 ## Layer discipline
