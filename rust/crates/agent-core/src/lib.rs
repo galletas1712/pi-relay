@@ -1,3 +1,11 @@
+//! Deterministic FSM kernel for agent turns.
+//!
+//! Accepts `AgentInput` on a priority mailbox and produces two drained
+//! outputs per transition: `TranscriptRecord`s (durable events) and
+//! `AgentAction`s (requests for the outside world to perform — model
+//! calls, tool executions, cancellations). No I/O; internals are
+//! private. See `rust/docs/architecture.md` for the full layer stack.
+
 #![forbid(unsafe_code)]
 
 mod action;

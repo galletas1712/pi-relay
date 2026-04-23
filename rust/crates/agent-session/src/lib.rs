@@ -1,3 +1,13 @@
+//! Durable session history and async runner atop the core FSM.
+//!
+//! `AgentSession` owns an `AgentCoreLoop` and a `SessionLog` (append-only
+//! DAG of entries with branch-aware navigation). It is the sole owner of
+//! durable records — every transcript record flows from the core into
+//! the log via `session.drive()`. Boundary operations (compact, rewind,
+//! fork, replace_transcript) live behind `SessionBoundary<'_>`, obtained
+//! via `session.boundary(external_work)?`. See `rust/docs/architecture.md`
+//! for the full design.
+
 #![forbid(unsafe_code)]
 
 mod runner;

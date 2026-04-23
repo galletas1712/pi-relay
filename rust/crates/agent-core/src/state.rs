@@ -5,8 +5,9 @@ use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
 use crate::record::{TranscriptRecord, TurnOutcome};
 
 // Live control state only. Durable session history lives in Transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AgentState {
+    #[default]
     Idle,
     RunningModel {
         turn_id: TurnId,
@@ -21,12 +22,6 @@ pub enum AgentState {
     ReadyToContinue {
         turn_id: TurnId,
     },
-}
-
-impl Default for AgentState {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl AgentState {

@@ -1,3 +1,11 @@
+//! Composition struct for the agent runtime.
+//!
+//! Currently owns a `SessionRegistry` that tracks session identity and
+//! parent-child spawn relationships. The `ControlPlane` trait, model
+//! provider, tool registry, usage ledger, and worklog store will join as
+//! peer fields in later PRs. See `rust/docs/architecture.md` for the
+//! feature roadmap and PR sequencing.
+
 #![forbid(unsafe_code)]
 
 mod registry;
