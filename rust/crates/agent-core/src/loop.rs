@@ -80,6 +80,15 @@ impl AgentCoreLoop {
         self.record_outbox.drain(..).collect()
     }
 
+    /// Drain every queued user input (Steer then FollowUp) from the mailbox
+    /// without advancing the FSM. Preserves the `from` tag each input was
+    /// enqueued with. Notifications and the interrupt flag are untouched.
+    ///
+    /// Primarily intended for tests and for orchestrator introspection.
+    pub fn drain_pending_inputs(&mut self) -> Vec<AgentInput> {
+        self.mailbox.drain_pending_inputs()
+    }
+
     pub fn drive(&mut self) {
         loop {
             let next_turn_id = self.last_turn_id.next();
@@ -157,7 +166,7 @@ mod tests {
     fn starting_a_turn_appends_boundary_events_and_requests_the_model() {
         let mut loop_state = AgentCoreLoop::new();
 
-        let records = drive_collect(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
+        let records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
 
         assert_eq!(
             records,
@@ -180,7 +189,7 @@ mod tests {
     fn model_completion_with_a_tool_call_appends_assistant_and_starts_the_tool() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        let mut records = drive_collect(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
+        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
@@ -231,7 +240,7 @@ mod tests {
     fn tool_completion_appends_a_result_and_resumes_the_model() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        drive_collect(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
+        drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
@@ -269,7 +278,7 @@ mod tests {
     fn multiple_tool_calls_run_in_parallel_and_results_are_recorded_in_source_order() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        let mut records = drive_collect(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
+        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
         loop_state.drain_actions();
 
         let first = tool_call(&mut next_tool_call_id, "bash");
@@ -315,10 +324,7 @@ mod tests {
                 result: second_result.clone(),
             },
         ));
-        records.extend(drive_collect(
-            &mut loop_state,
-            AgentInput::Steer("urgent".to_string()),
-        ));
+        records.extend(drive_collect(&mut loop_state, AgentInput::steer("urgent")));
 
         assert_eq!(
             records.last(),
@@ -366,8 +372,7 @@ mod tests {
     fn interrupting_a_running_tool_closes_the_turn_and_starts_queued_steer_work() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        let mut records =
-            drive_collect(&mut loop_state, AgentInput::FollowUp("initial".to_string()));
+        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("initial"));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
@@ -381,10 +386,7 @@ mod tests {
         ));
         loop_state.drain_actions();
 
-        records.extend(drive_collect(
-            &mut loop_state,
-            AgentInput::Steer("urgent".to_string()),
-        ));
+        records.extend(drive_collect(&mut loop_state, AgentInput::steer("urgent")));
 
         assert!(loop_state.drain_actions().is_empty());
 
@@ -428,8 +430,7 @@ mod tests {
     fn interrupting_parallel_tools_cancels_the_turn_and_records_unfinished_tools() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        let mut records =
-            drive_collect(&mut loop_state, AgentInput::FollowUp("initial".to_string()));
+        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("initial"));
         loop_state.drain_actions();
 
         let first = tool_call(&mut next_tool_call_id, "bash");
@@ -479,7 +480,7 @@ mod tests {
     #[test]
     fn interrupting_a_running_model_without_queued_work_finishes_interrupted() {
         let mut loop_state = AgentCoreLoop::new();
-        let mut records = drive_collect(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
+        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
         loop_state.drain_actions();
 
         records.extend(drive_collect(&mut loop_state, AgentInput::Interrupt));
@@ -505,7 +506,7 @@ mod tests {
     #[test]
     fn stale_completions_are_ignored_after_an_interrupt() {
         let mut loop_state = AgentCoreLoop::new();
-        let mut records = drive_collect(&mut loop_state, AgentInput::FollowUp("hello".to_string()));
+        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
         loop_state.drain_actions();
         records.extend(drive_collect(&mut loop_state, AgentInput::Interrupt));
         loop_state.drain_actions();

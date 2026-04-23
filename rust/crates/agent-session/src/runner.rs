@@ -151,7 +151,7 @@ mod tests {
         });
 
         input_handle
-            .enqueue_input(AgentInput::FollowUp("hello".to_string()))
+            .enqueue_input(AgentInput::follow_up("hello"))
             .expect("runner should accept user input");
         input_handle
             .enqueue_input(AgentInput::ModelCompleted {

@@ -4,6 +4,17 @@ use crate::event::{AgentEvent, AgentInput};
 use crate::ids::TurnId;
 use crate::state::AgentState;
 
+/// A queued user input plus its optional sender tag.
+///
+/// `from = None` means the input came from the human user (or unknown
+/// origin — same thing at the core layer). `from = Some(session_id)` means
+/// it came from another session (e.g. a parent directive or a child report).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UserInputEntry {
+    pub(crate) from: Option<String>,
+    pub(crate) content: String,
+}
+
 /// Volatile prioritized queues feeding the live agent FSM.
 ///
 /// Mailbox contents are intentionally not durable: if the process dies, session
@@ -11,8 +22,8 @@ use crate::state::AgentState;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Mailbox {
     notifications: VecDeque<AgentEvent>,
-    steer: VecDeque<String>,
-    follow_up: VecDeque<String>,
+    steer: VecDeque<UserInputEntry>,
+    follow_up: VecDeque<UserInputEntry>,
     interrupt_requested: bool,
 }
 
@@ -20,8 +31,12 @@ impl Mailbox {
     pub(crate) fn push_input(&mut self, input: AgentInput) {
         match input {
             AgentInput::Interrupt => self.request_interrupt(),
-            AgentInput::Steer(input) => self.push_steer(input),
-            AgentInput::FollowUp(input) => self.push_follow_up(input),
+            AgentInput::Steer { from, content } => {
+                self.steer.push_back(UserInputEntry { from, content });
+            }
+            AgentInput::FollowUp { from, content } => {
+                self.follow_up.push_back(UserInputEntry { from, content });
+            }
             AgentInput::ModelCompleted { turn_id, assistant } => {
                 // External completions should preempt queued future work for the current turn.
                 self.push_notification_front(AgentEvent::ModelCompleted { turn_id, assistant });
@@ -46,18 +61,45 @@ impl Mailbox {
         self.interrupt_requested = true;
     }
 
-    pub fn push_steer(&mut self, input: impl Into<String>) {
-        self.steer.push_back(input.into());
+    #[cfg(test)]
+    fn push_steer(&mut self, input: impl Into<String>) {
+        self.steer.push_back(UserInputEntry {
+            from: None,
+            content: input.into(),
+        });
     }
 
-    pub fn push_follow_up(&mut self, input: impl Into<String>) {
-        self.follow_up.push_back(input.into());
+    #[cfg(test)]
+    fn push_follow_up(&mut self, input: impl Into<String>) {
+        self.follow_up.push_back(UserInputEntry {
+            from: None,
+            content: input.into(),
+        });
     }
 
     pub fn pop_user_input(&mut self) -> Option<String> {
         self.steer
             .pop_front()
             .or_else(|| self.follow_up.pop_front())
+            .map(|entry| entry.content)
+    }
+
+    /// Drain every queued user input as reconstructed `AgentInput` values,
+    /// preserving priority order (steer before follow-up) and the `from`
+    /// tag each entry was enqueued with.
+    ///
+    /// Notifications and interrupt state are left untouched.
+    pub(crate) fn drain_pending_inputs(&mut self) -> Vec<AgentInput> {
+        let mut drained = Vec::with_capacity(self.steer.len() + self.follow_up.len());
+        drained.extend(self.steer.drain(..).map(|entry| AgentInput::Steer {
+            from: entry.from,
+            content: entry.content,
+        }));
+        drained.extend(self.follow_up.drain(..).map(|entry| AgentInput::FollowUp {
+            from: entry.from,
+            content: entry.content,
+        }));
+        drained
     }
 
     pub(crate) fn next_event(

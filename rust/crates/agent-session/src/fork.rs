@@ -322,7 +322,7 @@ mod tests {
     #[test]
     fn transcript_replacement_is_only_allowed_at_turn_boundary() {
         let mut session = AgentSession::new();
-        session.enqueue_input(AgentInput::FollowUp("hello".to_string()));
+        session.enqueue_input(AgentInput::follow_up("hello"));
 
         let busy = session
             .edit_history(PendingWork::NONE)
@@ -543,7 +543,7 @@ mod tests {
         );
 
         // Drive a real fourth turn through the core loop.
-        session.enqueue_input(AgentInput::FollowUp("fourth user message".to_string()));
+        session.enqueue_input(AgentInput::follow_up("fourth user message"));
         session.drive();
         session.drain_actions();
         session.enqueue_input(AgentInput::ModelCompleted {

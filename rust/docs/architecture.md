@@ -92,11 +92,16 @@ enum AgentAction {
 // What the outside world feeds the FSM:
 enum AgentInput {
     Interrupt,
-    Steer(String),
-    FollowUp(String),
+    Steer    { from: Option<SessionId>, content: String },
+    FollowUp { from: Option<SessionId>, content: String },
     ModelCompleted { turn_id, assistant },
-    ToolCompleted { turn_id, result },
+    ToolCompleted  { turn_id, result },
 }
+// `from = None` means the input came from the human user (or unknown
+// origin); `from = Some(session_id)` means it came from another session
+// (e.g. a parent directive routed via `send_message`, or a child report
+// routed via `send_report`). The core crate stays oblivious to what a
+// session id *is* — it's just a tag that rides along.
 ```
 
 Every one of these serializes. The FSM never holds non-POD state beyond these.
@@ -311,6 +316,12 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 4. SpawnTool returns `ok({ child_id })` immediately. Parent turn continues.
 
 Model stays identical between parent and child (prefix-cache preservation). Differentiation happens via tool registry + injected context, not via model change.
+
+### Multi-agent routing primitives
+
+**Status**: landed.
+
+`AgentOrchestrator::send_message(from, to, content)` and `send_report(from, content)` are the orchestrator-level routing primitives, both fire-and-forget. `send_message` validates that `to` is a direct child of `from` in the spawn tree and enqueues `AgentInput::Steer { from: Some(from), content }` on the child's mailbox; `send_report` validates that `from` has a spawn parent and enqueues `AgentInput::FollowUp { from: Some(from), content }` on the parent's mailbox. In both cases the `from` tag propagates into the target's mailbox so the receiver can distinguish cross-session traffic from human user input. Invalid routes surface as `RouteError::{SenderNotFound, TargetNotFound, NotAChild, NoParent}`. These primitives back the `message` and `report` tools (TS parity: `packages/orchestrator/src/tools/{message,report}.ts`).
 
 ### Report (tool)
 

@@ -109,6 +109,17 @@ impl AgentSession {
         self.absorb_core_records();
     }
 
+    /// Drain every queued user input (Steer then FollowUp) from the
+    /// underlying core mailbox without advancing the session. Preserves the
+    /// `from` tag each input was enqueued with.
+    ///
+    /// Notifications (model/tool completions) and the interrupt flag are
+    /// untouched. Primarily intended for tests and for orchestrator-level
+    /// introspection of routing.
+    pub fn drain_pending_inputs(&mut self) -> Vec<AgentInput> {
+        self.core.drain_pending_inputs()
+    }
+
     /// Drain pending actions the core produced during the last `drive`.
     ///
     /// Each drained `RequestModel` / `RequestTool` is recorded in the
@@ -195,7 +206,7 @@ mod tests {
     fn can_edit_history_requires_idle_core_empty_queues_and_no_pending_work() {
         let mut session = AgentSession::new();
 
-        session.enqueue_input(AgentInput::FollowUp("hello".to_string()));
+        session.enqueue_input(AgentInput::follow_up("hello"));
         assert!(!session.can_edit_history(PendingWork::NONE));
         assert!(!session.can_edit_history(PendingWork {
             background_tasks: 1,
@@ -218,7 +229,7 @@ mod tests {
             items: vec![AssistantItem::Text("hi".to_string())],
         };
 
-        session.enqueue_input(AgentInput::FollowUp("hello".to_string()));
+        session.enqueue_input(AgentInput::follow_up("hello"));
         session.drive();
         session.enqueue_input(AgentInput::ModelCompleted {
             turn_id: TurnId(1),
@@ -288,7 +299,7 @@ mod tests {
     #[test]
     fn session_blocks_edit_history_until_drained_model_action_completes() {
         let mut session = AgentSession::new();
-        session.enqueue_input(AgentInput::FollowUp("hi".to_string()));
+        session.enqueue_input(AgentInput::follow_up("hi"));
         session.drive();
         let actions = session.drain_actions();
         assert!(matches!(
@@ -308,7 +319,7 @@ mod tests {
     #[test]
     fn session_blocks_edit_history_while_tool_actions_in_flight() {
         let mut session = AgentSession::new();
-        session.enqueue_input(AgentInput::FollowUp("go".to_string()));
+        session.enqueue_input(AgentInput::follow_up("go"));
         session.drive();
         session.drain_actions();
 
@@ -375,7 +386,7 @@ mod tests {
     #[test]
     fn cancel_turn_clears_pending_actions_for_that_turn() {
         let mut session = AgentSession::new();
-        session.enqueue_input(AgentInput::FollowUp("hi".to_string()));
+        session.enqueue_input(AgentInput::follow_up("hi"));
         session.drive();
         session.drain_actions();
 

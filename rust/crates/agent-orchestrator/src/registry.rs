@@ -117,6 +117,20 @@ pub enum RegistryError {
     HasChildren,
 }
 
+/// Errors returned by orchestrator routing primitives
+/// (`AgentOrchestrator::send_message` / `send_report`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteError {
+    /// The `from` session isn't in the registry.
+    SenderNotFound,
+    /// The `to` session isn't in the registry.
+    TargetNotFound,
+    /// The `to` session isn't a direct child of `from`. `send_message` only.
+    NotAChild,
+    /// The `from` session has no spawn parent. `send_report` only.
+    NoParent,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
