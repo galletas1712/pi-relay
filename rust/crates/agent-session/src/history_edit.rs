@@ -55,21 +55,17 @@ impl<'a> SessionHistoryEdit<'a> {
         plan: &CompactionPlan,
         summary: impl Into<String>,
     ) -> Result<(), HistoryEditError> {
-        let log = &self.session.log;
-        if !log.contains_entry(&plan.first_kept_entry_id) {
-            return Err(HistoryEditError::Log(SessionLogError::EntryNotFound));
-        }
-        if log.leaf_id() != plan.leaf_id.as_deref() || log.entries().len() != plan.entry_count {
-            return Err(HistoryEditError::Log(SessionLogError::StalePlan));
-        }
-        if !log.is_turn_boundary() {
-            return Err(HistoryEditError::Log(SessionLogError::NotTurnBoundary));
-        }
+        self.session
+            .log
+            .validate_plan_matches(plan)
+            .map_err(HistoryEditError::Log)?;
 
         // Find the pre-cut parent (the entry immediately before first_kept).
-        let first_kept = log
+        let first_kept = self
+            .session
+            .log
             .get_entry(&plan.first_kept_entry_id)
-            .expect("contains_entry check above guarantees the entry exists");
+            .expect("validate_plan_matches guarantees the entry exists");
         let pre_cut_parent_id = first_kept.parent_id.clone();
 
         // Navigate the leaf to the pre-cut boundary.

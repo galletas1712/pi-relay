@@ -30,6 +30,7 @@ use self::entry::is_compaction_summary;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct SessionLog {
     entries: Vec<SessionEntry>,
+    by_id: HashMap<String, usize>,
     leaf_id: Option<String>,
     next_id: u64,
 }
@@ -57,7 +58,7 @@ impl SessionLog {
     }
 
     pub fn contains_entry(&self, id: &str) -> bool {
-        self.entries.iter().any(|entry| entry.id == id)
+        self.by_id.contains_key(id)
     }
 
     pub fn is_turn_boundary(&self) -> bool {
@@ -68,22 +69,46 @@ impl SessionLog {
     /// `TurnFinished` entry directly, or the empty-log sentinel). `Custom`
     /// entries are transparent — they live between turns, so the check walks
     /// past them to find the underlying `TurnFinished`.
-    pub fn is_turn_boundary_leaf(&self, leaf_id: Option<&str>) -> bool {
-        let Some(leaf_id) = leaf_id else {
-            return true;
-        };
-        let Some(entry) = self.get_entry(leaf_id) else {
-            return false;
-        };
-        match &entry.record {
-            TranscriptRecord::TurnFinished { .. } => true,
-            TranscriptRecord::Custom(_) => self.is_turn_boundary_leaf(entry.parent_id.as_deref()),
-            _ => false,
+    pub fn is_turn_boundary_leaf<'a>(&'a self, leaf_id: Option<&'a str>) -> bool {
+        let mut cursor = leaf_id;
+        loop {
+            let Some(id) = cursor else {
+                return true;
+            };
+            let Some(entry) = self.get_entry(id) else {
+                return false;
+            };
+            match &entry.record {
+                TranscriptRecord::TurnFinished { .. } => return true,
+                TranscriptRecord::Custom(_) => {
+                    cursor = entry.parent_id.as_deref();
+                }
+                _ => return false,
+            }
         }
     }
 
     pub fn get_entry(&self, id: &str) -> Option<&SessionEntry> {
-        self.entries.iter().find(|entry| entry.id == id)
+        self.by_id.get(id).and_then(|&i| self.entries.get(i))
+    }
+
+    /// Validate that a `CompactionPlan` still matches the log's current shape.
+    ///
+    /// Returns `EntryNotFound` if `plan.first_kept_entry_id` no longer exists,
+    /// `StalePlan` if the log's leaf or entry count has drifted from the
+    /// plan's fingerprint, or `NotTurnBoundary` if the current leaf isn't at
+    /// a turn boundary.
+    pub fn validate_plan_matches(&self, plan: &CompactionPlan) -> Result<(), SessionLogError> {
+        if !self.contains_entry(&plan.first_kept_entry_id) {
+            return Err(SessionLogError::EntryNotFound);
+        }
+        if self.leaf_id() != plan.leaf_id.as_deref() || self.entries.len() != plan.entry_count {
+            return Err(SessionLogError::StalePlan);
+        }
+        if !self.is_turn_boundary() {
+            return Err(SessionLogError::NotTurnBoundary);
+        }
+        Ok(())
     }
 
     pub fn append_transcript_records(
@@ -148,22 +173,19 @@ impl SessionLog {
     }
 
     pub fn branch_entries(&self, leaf_id: Option<&str>) -> Vec<SessionEntry> {
-        let by_id: HashMap<&str, &SessionEntry> = self
-            .entries
-            .iter()
-            .map(|entry| (entry.id.as_str(), entry))
-            .collect();
         let mut path = Vec::new();
         let mut current = leaf_id
             .or(self.leaf_id.as_deref())
-            .and_then(|id| by_id.get(id).copied());
+            .and_then(|id| self.by_id.get(id))
+            .and_then(|&i| self.entries.get(i));
 
         while let Some(entry) = current {
             path.push(entry.clone());
             current = entry
                 .parent_id
                 .as_deref()
-                .and_then(|parent_id| by_id.get(parent_id).copied());
+                .and_then(|parent_id| self.by_id.get(parent_id))
+                .and_then(|&i| self.entries.get(i));
         }
 
         path.reverse();
@@ -176,9 +198,15 @@ impl SessionLog {
         }
 
         let entries = self.branch_entries(Some(leaf_id));
+        let by_id = entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.id.clone(), i))
+            .collect();
         Ok(Self {
             leaf_id: Some(leaf_id.to_string()),
             next_id: next_id_after(&entries),
+            by_id,
             entries,
         })
     }
@@ -251,15 +279,20 @@ impl SessionLog {
     }
 
     fn append_record(&mut self, record: TranscriptRecord) -> String {
-        let id = self.allocate_id();
         let entry = SessionEntry {
-            id: id.clone(),
+            id: self.allocate_id(),
             parent_id: self.leaf_id.clone(),
             timestamp_ms: now_ms(),
             record,
         };
-        self.entries.push(entry);
+        self.append_entry(entry)
+    }
+
+    fn append_entry(&mut self, entry: SessionEntry) -> String {
+        let id = entry.id.clone();
+        self.by_id.insert(id.clone(), self.entries.len());
         self.leaf_id = Some(id.clone());
+        self.entries.push(entry);
         id
     }
 
