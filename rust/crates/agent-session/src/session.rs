@@ -1,4 +1,6 @@
-use agent_core::{AgentAction, AgentCoreLoop, AgentInput, TranscriptRecord, TurnId};
+use std::collections::HashSet;
+
+use agent_core::{AgentAction, AgentCoreLoop, AgentInput, ToolCallId, TranscriptRecord, TurnId};
 
 use crate::history_edit::{HistoryEditError, PendingWork, SessionHistoryEdit};
 use crate::session_log::{SessionLog, SessionLogError};
@@ -15,6 +17,23 @@ use crate::transcript::Transcript;
 pub struct AgentSession {
     pub(crate) core: AgentCoreLoop,
     pub(crate) log: SessionLog,
+    pending_actions: HashSet<PendingActionKey>,
+}
+
+/// Key into the session's pending-action set: `(turn_id, kind)` where `kind`
+/// distinguishes a model request from a tool request (the tool request also
+/// carries the tool-call id so multiple parallel tools on the same turn are
+/// tracked independently).
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct PendingActionKey {
+    turn_id: TurnId,
+    kind: PendingActionKind,
+}
+
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum PendingActionKind {
+    Model,
+    Tool { tool_call_id: ToolCallId },
 }
 
 impl Default for AgentSession {
@@ -28,6 +47,7 @@ impl AgentSession {
         Self {
             core: AgentCoreLoop::resume_at_boundary(TurnId::default()),
             log: SessionLog::new(),
+            pending_actions: HashSet::new(),
         }
     }
 
@@ -41,6 +61,7 @@ impl AgentSession {
         Self {
             core: AgentCoreLoop::resume_at_boundary(last_turn_id),
             log,
+            pending_actions: HashSet::new(),
         }
     }
 
@@ -54,6 +75,7 @@ impl AgentSession {
         Ok(Self {
             core: AgentCoreLoop::resume_at_boundary(last_turn_id),
             log,
+            pending_actions: HashSet::new(),
         })
     }
 
@@ -62,7 +84,28 @@ impl AgentSession {
     /// This is the only supported way to feed the core from outside the
     /// session; the core itself is not exposed so log absorption in `drive`
     /// cannot be bypassed.
+    ///
+    /// `ModelCompleted` / `ToolCompleted` clear the matching entry from the
+    /// session's internal pending-action set. Stale completions (no matching
+    /// pending entry, e.g. after an interrupt) are removed with no effect.
     pub fn enqueue_input(&mut self, input: AgentInput) {
+        match &input {
+            AgentInput::ModelCompleted { turn_id, .. } => {
+                self.pending_actions.remove(&PendingActionKey {
+                    turn_id: *turn_id,
+                    kind: PendingActionKind::Model,
+                });
+            }
+            AgentInput::ToolCompleted { turn_id, result } => {
+                self.pending_actions.remove(&PendingActionKey {
+                    turn_id: *turn_id,
+                    kind: PendingActionKind::Tool {
+                        tool_call_id: result.tool_call_id,
+                    },
+                });
+            }
+            _ => {}
+        }
         self.core.enqueue_input(input);
     }
 
@@ -102,19 +145,48 @@ impl AgentSession {
 
     /// Drain pending actions the core produced during the last `drive`.
     ///
-    /// Exposed so the async runner can flush actions to its handler without
-    /// reaching into the core. Records are absorbed into the log inside
-    /// `drive`, so there is no analogous `drain_records` on the session.
+    /// Each drained `RequestModel` / `RequestTool` is recorded in the
+    /// session's internal pending-action set so `can_edit_history` can block
+    /// until the matching completion comes back via `enqueue_input`.
+    /// `CancelTurn` clears every pending action for the cancelled turn — the
+    /// orchestrator will not deliver completions for cancelled work.
+    ///
+    /// Records are absorbed into the log inside `drive`, so there is no
+    /// analogous `drain_records` on the session.
     pub fn drain_actions(&mut self) -> Vec<AgentAction> {
-        self.core.drain_actions()
+        let actions = self.core.drain_actions();
+        for action in &actions {
+            match action {
+                AgentAction::RequestModel { turn_id } => {
+                    self.pending_actions.insert(PendingActionKey {
+                        turn_id: *turn_id,
+                        kind: PendingActionKind::Model,
+                    });
+                }
+                AgentAction::RequestTool { turn_id, tool_call } => {
+                    self.pending_actions.insert(PendingActionKey {
+                        turn_id: *turn_id,
+                        kind: PendingActionKind::Tool {
+                            tool_call_id: tool_call.id,
+                        },
+                    });
+                }
+                AgentAction::CancelTurn { turn_id } => {
+                    self.pending_actions.retain(|k| k.turn_id != *turn_id);
+                }
+            }
+        }
+        actions
     }
 
     /// True when the session's history can be edited: core idle, log at a
-    /// turn boundary, mailbox empty, no pending work.
+    /// turn boundary, mailbox empty, no in-flight drained actions, and no
+    /// caller-tracked background work.
     pub fn can_edit_history(&self, pending: PendingWork) -> bool {
         self.core.is_idle()
             && self.log.is_turn_boundary()
             && !self.core.has_pending_work()
+            && self.pending_actions.is_empty()
             && pending.is_empty()
     }
 
@@ -146,13 +218,20 @@ impl AgentSession {
     pub(crate) fn rehydrate_core_from_log(&mut self) {
         let last_turn_id = self.log.context().last_turn_id();
         self.core = AgentCoreLoop::resume_at_boundary(last_turn_id);
+        // Any actions tracked as pending belong to a prior run we're no
+        // longer driving; reset the set so a rehydrated session does not
+        // block edits forever.
+        self.pending_actions.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{AssistantItem, AssistantMessage, TurnId, TurnOutcome};
+    use agent_core::{
+        AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage, ToolResultStatus,
+        TurnId, TurnOutcome,
+    };
 
     fn finished_transcript(input: &str) -> Transcript {
         Transcript::from_records(vec![
@@ -172,8 +251,7 @@ mod tests {
         session.enqueue_input(AgentInput::FollowUp("hello".to_string()));
         assert!(!session.can_edit_history(PendingWork::NONE));
         assert!(!session.can_edit_history(PendingWork {
-            model_requests: 1,
-            ..PendingWork::NONE
+            background_tasks: 1,
         }));
     }
 
@@ -258,5 +336,85 @@ mod tests {
         assert_eq!(session.transcript().records(), transcript.as_slice());
         assert!(session.is_idle());
         assert_eq!(session.last_turn_id(), TurnId(2));
+    }
+
+    #[test]
+    fn session_blocks_edit_history_until_drained_model_action_completes() {
+        let mut session = AgentSession::new();
+        session.enqueue_input(AgentInput::FollowUp("hi".to_string()));
+        session.drive();
+        let actions = session.drain_actions();
+        assert!(matches!(
+            actions.as_slice(),
+            [AgentAction::RequestModel { .. }]
+        ));
+        assert!(!session.can_edit_history(PendingWork::NONE));
+
+        session.enqueue_input(AgentInput::ModelCompleted {
+            turn_id: TurnId(1),
+            assistant: AssistantMessage { items: Vec::new() },
+        });
+        session.drive();
+        assert!(session.can_edit_history(PendingWork::NONE));
+    }
+
+    #[test]
+    fn session_blocks_edit_history_while_tool_actions_in_flight() {
+        let mut session = AgentSession::new();
+        session.enqueue_input(AgentInput::FollowUp("go".to_string()));
+        session.drive();
+        session.drain_actions();
+
+        let tool_call = ToolCall {
+            id: ToolCallId(1),
+            tool_name: "bash".to_string(),
+            args_json: "{}".to_string(),
+        };
+        session.enqueue_input(AgentInput::ModelCompleted {
+            turn_id: TurnId(1),
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call.clone())],
+            },
+        });
+        session.drive();
+        session.drain_actions();
+        assert!(!session.can_edit_history(PendingWork::NONE));
+
+        session.enqueue_input(AgentInput::ToolCompleted {
+            turn_id: TurnId(1),
+            result: ToolResultMessage {
+                tool_call_id: ToolCallId(1),
+                tool_name: "bash".to_string(),
+                output: "ok".to_string(),
+                status: ToolResultStatus::Success,
+            },
+        });
+        session.drive();
+        // A second model request fires after the tool completes; the session
+        // is still waiting on that completion, so edits remain blocked.
+        assert!(!session.can_edit_history(PendingWork::NONE));
+        session.drain_actions();
+        session.enqueue_input(AgentInput::ModelCompleted {
+            turn_id: TurnId(1),
+            assistant: AssistantMessage { items: Vec::new() },
+        });
+        session.drive();
+        assert!(session.can_edit_history(PendingWork::NONE));
+    }
+
+    #[test]
+    fn cancel_turn_clears_pending_actions_for_that_turn() {
+        let mut session = AgentSession::new();
+        session.enqueue_input(AgentInput::FollowUp("hi".to_string()));
+        session.drive();
+        session.drain_actions();
+
+        session.enqueue_input(AgentInput::Interrupt);
+        session.drive();
+        let actions = session.drain_actions();
+        assert!(actions
+            .iter()
+            .any(|a| matches!(a, AgentAction::CancelTurn { .. })));
+        assert!(session.can_edit_history(PendingWork::NONE));
     }
 }

@@ -97,26 +97,22 @@ impl<'a> SessionHistoryEdit<'a> {
     }
 }
 
-/// Tally of work pending outside the session (model calls in flight, tool
-/// executions, background tasks). Callers supply this when opening a
-/// history-edit view so the session can refuse to edit its history while any
-/// of those are still pending.
+/// Caller-tracked work the session cannot observe (worklog forks, background
+/// summarization calls, etc.). The session tracks its own in-flight model and
+/// tool requests internally via the pending-action set, so those are not
+/// represented here.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct PendingWork {
-    pub model_requests: usize,
-    pub tool_requests: usize,
     pub background_tasks: usize,
 }
 
 impl PendingWork {
     pub const NONE: Self = Self {
-        model_requests: 0,
-        tool_requests: 0,
         background_tasks: 0,
     };
 
     pub fn is_empty(self) -> bool {
-        self.model_requests == 0 && self.tool_requests == 0 && self.background_tasks == 0
+        self.background_tasks == 0
     }
 }
 
