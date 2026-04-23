@@ -41,7 +41,7 @@ Feature-specific design docs go deeper in their own files:
                      ▼
 ┌──────────────────────────────────────────────┐
 │ 3. Session — AgentSession, Context,          │
-│    ContextEdit, AgentRunner.                 │
+│    ContextEdit trait + ops, AgentRunner.     │
 │    One per agent. Sole owner of durable log. │
 └──────────────────────────────────────────────┘
                      ▲
@@ -176,8 +176,8 @@ Already landed in PR #62 + #63 refactors.
 
 Partially landed in PR #63; decomposition planned.
 
-- **`AgentSession`** — owns `AgentCoreLoop` + `Context`. The session is the sole owner of durable records. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `transcript`, `drain_actions`.
-- **`ContextEdit<'a>`** — a view over a quiescent `AgentSession` that permits edits to the durable history. Obtained via `session.edit_history(pending)`. Methods: `prepare_compaction`, `compact`, `rewind`, `fork`, `replace_transcript`. `fork` returns an unregistered `AgentSession` value for callers to configure and register.
+- **`AgentSession`** — owns `AgentCoreLoop` + `Context`. The session is the sole owner of durable records. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `transcript`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `ContextEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
+- **`ContextEdit` trait + op structs** — each history-editing operation is its own struct (`Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`) that implements `ContextEdit { type Output; fn apply(self, &mut Context) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Compaction planning is a pure query on `Context` (`context.prepare_compaction(settings)`), not a trait op. `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
 - **`Context`** — DAG of `SessionEntry`s with a leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
 - **`Transcript`** — materialized view of the current branch's records, with crash-tail patching for resume.
 - **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans actions to the handler. Records auto-flow into the log; the runner does not expose them directly.
@@ -289,22 +289,22 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 **Status**: data model landed (PR #63); executor pending.
 
-- `ContextEdit::prepare_compaction` produces a `CompactionPlan` (which turns to summarize, which to keep).
+- `context.prepare_compaction(settings)` produces a `CompactionPlan` (which turns to summarize, which to keep).
 - `Compactor::summarize(plan)` calls a `ModelProvider` to generate the summary string.
-- `ContextEdit::compact(plan, summary)` appends an `InjectedMessage { CompactionSummary {..} }` to the log.
+- `session.edit(pending, Compact { plan, summary })` appends an `InjectedMessage { CompactionSummary {..} }` to the log.
 - Orchestrator observes `SessionEvent::TurnFinished` and checks thresholds; if tripped, drives the compaction pipeline.
 
 ### Rewind
 
 **Status**: landed (PR #63).
 
-- `ContextEdit::rewind(Some(leaf))` moves the log's leaf pointer; the core is rehydrated from the new materialized view.
+- `session.edit(pending, Rewind { leaf_id: Some(leaf) })` moves the log's leaf pointer; the core is rehydrated from the new materialized view.
 
 ### Fork (as primitive)
 
 **Status**: landed (PR #63).
 
-- `ContextEdit::fork(Some(leaf))` returns an unregistered `AgentSession` with a copy of the ancestor path. Caller configures it (tool registry, initial injections, initial input) and registers it via `SessionRegistry`.
+- `session.fork(pending, Some(leaf))` returns an unregistered `AgentSession` with a copy of the ancestor path. Caller configures it (tool registry, initial injections, initial input) and registers it via `SessionRegistry`.
 
 ### Spawn (tool)
 
@@ -312,7 +312,7 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 1. Parent agent's LLM emits `tool_call: spawn(prompt, tools, …)`.
 2. `SpawnTool::execute` calls `orchestrator.spawn_child(parent_id, request)`.
-3. Orchestrator: allocate child_id → `parent.edit_history(pending)?.fork(leaf)?` → configure child's tool registry + append `SpawnBrief` injection + enqueue initial FollowUp → `registry.insert(child_id, child, parent=parent_id)` → start child's `AgentRunner` task.
+3. Orchestrator: allocate child_id → `parent.fork(pending, leaf)?` → configure child's tool registry + append `SpawnBrief` injection + enqueue initial FollowUp → `registry.insert(child_id, child, parent=parent_id)` → start child's `AgentRunner` task.
 4. SpawnTool returns `ok({ child_id })` immediately. Parent turn continues.
 
 Model stays identical between parent and child (prefix-cache preservation). Differentiation happens via tool registry + injected context, not via model change.
@@ -373,7 +373,7 @@ Each row is one landable PR. Later PRs depend on their predecessors.
 | # | PR | What it adds | Unlocks |
 |---|---|---|---|
 | 1 | **#63 (current)** | `agent-session`, `agent-orchestrator` crates + Transcript unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
-| 2 | Session decomposition | `ContextEdit<'a>` + `SessionRegistry<S>` + orchestrator becomes composition struct | clean target for registry-level features |
+| 2 | Session decomposition | `ContextEdit` trait + op structs + `SessionRegistry<S>` + orchestrator becomes composition struct | clean target for registry-level features |
 | 3 | `SessionStore` | trait + in-memory + JSONL-file impls + wire into `AgentSession` | durable restart; resume-from-file; pluggable backends |
 | 4 | `ControlPlane` trait | trait definition + `LocalControlPlane` impl + view-layer adapter | view/control separation; future daemon |
 | 5 | `SessionEvent` stream | event bus + subscription on `AgentSession`; durable events mirror log writes | observers (TUI, ledger, idle watcher) |
@@ -403,7 +403,7 @@ These are documented here so the PRs that implement them stick to the intended s
 
 The session being compacted is frozen for the entire flow: `prepare → summarize → compact`. While frozen, the session queues incoming inputs (tool completions, child reports, steer, follow-up) and does not acknowledge them to the FSM until the flow completes or aborts. Tool calls the session had in flight when the flow started continue to run externally and their results queue; they're replayed to the FSM once compaction finishes.
 
-This closes the liveness hole where repeated appends during an async summarize call starve the compaction plan's staleness fingerprint. The `Compactor` PR lands the mechanism (likely a `SessionPhase::EditingHistory { queued_inputs }` on `AgentSession` with `begin_history_edit` / `commit_history_edit` / `abort_history_edit` transitions); `ContextEdit` becomes a witness type over the edit phase rather than holding `&mut self` across await.
+This closes the liveness hole where repeated appends during an async summarize call starve the compaction plan's staleness fingerprint. The `Compactor` PR lands the mechanism (likely a `SessionPhase::EditingHistory { queued_inputs }` on `AgentSession` with `begin_history_edit` / `commit_history_edit` / `abort_history_edit` transitions); the `ContextEdit` trait's `apply` becomes a witness over the edit phase rather than holding `&mut self` across await.
 
 **Parents can compact while children are still running.** Children are separate sessions with separate logs; a parent's compaction has no effect on any descendant.
 
@@ -411,7 +411,7 @@ This closes the liveness hole where repeated appends during an async summarize c
 
 When a child emits `report(content)`, the orchestrator does **not** open `edit_history` on the parent. Instead the report enters the parent's mailbox as an `AgentInput` variant (probably `InjectMessage(CustomMessage)` or similar, priority near `Steer`). The parent's FSM materializes it as a `TranscriptRecord::Custom` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to `agent_idle` notifications.
 
-This keeps `edit_history` for genuine structural edits (compact, rewind, fork, replace_transcript) and removes the `entry_count`-churning source of compaction plan staleness.
+This keeps `AgentSession::edit`/`fork` for genuine structural edits (compact, rewind, fork, replace_transcript) and removes the `entry_count`-churning source of compaction plan staleness.
 
 ### Spawn is fire-and-forget and creates a fresh session
 
@@ -425,7 +425,7 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 7. Non-goals
 
-- No support for session transcripts that aren't at turn boundaries during structural ops. Compaction/rewind/fork always require a quiescent turn boundary. Enforced by `ContextEdit`.
+- No support for session transcripts that aren't at turn boundaries during structural ops. Compaction/rewind/fork always require a quiescent turn boundary. Enforced by `AgentSession::edit`/`fork`'s quiescence check.
 - No speculative abstraction for "hooks" that don't have concrete use cases. When extensions land, their API grows out of what concrete consumers need, not ahead of them.
 - No speculative support for non-Anthropic-shaped providers beyond what `ModelProvider` naturally allows. Any provider that fits `messages + tools → assistant with tool_calls` works; we don't pre-bake support for genuinely different paradigms (e.g. step-wise agent protocols) until we have one.
 - No back-compat with the TS session format *as a byte format* — the JSONL backend may use the same layout for cross-implementation convenience, but we don't pin wire-format compatibility as a hard constraint.
@@ -435,7 +435,7 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 8. Principles in tension (explicit trade-offs)
 
-**Clean boundaries vs. API ergonomics.** The `session.edit_history(pending)?.compact(plan, summary)?` call chain is 3 identifiers where TS has a single `session.compactAtBoundary(plan, summary, work)`. Accepting the verbosity because it encodes which operations are history-edit-only in the type system.
+**Clean boundaries vs. API ergonomics.** The `session.edit(pending, Compact { plan, summary })?` form is 3 identifiers where TS has a single `session.compactAtBoundary(plan, summary, work)`. Accepting the verbosity because it encodes which operations are history-edit-only in the type system.
 
 **Distributed-ready API vs. sync simplicity.** `ControlPlane` is async + fallible even when called in-process. Paying this for day-1 local use to keep daemon-day migration trivial.
 

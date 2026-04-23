@@ -3,24 +3,28 @@
 //! `AgentSession` owns an `AgentCoreLoop` and a `Context` (append-only DAG
 //! of entries with branch-aware navigation). It is the sole owner of durable
 //! records — every transcript record flows from the core into the context via
-//! `session.drive()`. History-edit operations (compact, rewind, fork,
-//! replace_transcript) live behind `ContextEdit<'_>`, obtained via
-//! `session.edit_history(pending)?`. See `rust/docs/architecture.md`.
+//! `session.drive()`. History-edit operations are individual op structs
+//! (`Compact`, `Rewind`, `ReplaceTranscript`) that implement the `ContextEdit`
+//! trait; `session.edit(pending, op)` runs the quiescence check once and
+//! dispatches to the op. `session.fork(pending, leaf)` stays as a direct
+//! method because it produces a new session rather than mutating in place.
+//! See `rust/docs/architecture.md`.
 
 #![forbid(unsafe_code)]
 
 mod action_queue;
 mod context;
-mod fork;
 mod runner;
 mod session;
 mod transcript;
 
+pub use crate::context::compaction::compaction_summary;
+pub use crate::context::rewind::branch_summary;
 pub use crate::context::{
-    branch_summary, compaction_summary, Context, ContextEdit, ContextError, HistoryEditError,
-    PendingWork, SessionEntry, KIND_BRANCH_SUMMARY, KIND_COMPACTION_SUMMARY,
+    Compact, CompactionPlan, CompactionSettings, Context, ContextEdit, ContextError,
+    HistoryEditError, PendingWork, ReplaceTranscript, Rewind, SessionEntry, KIND_BRANCH_SUMMARY,
+    KIND_COMPACTION_SUMMARY,
 };
-pub use crate::fork::{CompactionPlan, CompactionSettings};
 pub use crate::runner::{AgentInputHandle, AgentInputReceiver, AgentRunner};
 pub use crate::session::AgentSession;
 pub use crate::transcript::Transcript;

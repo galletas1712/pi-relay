@@ -1,6 +1,7 @@
 use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptRecord, TurnId, TurnOutcome};
 
-use crate::context::{KIND_BRANCH_SUMMARY, KIND_COMPACTION_SUMMARY};
+use crate::context::compaction::KIND_COMPACTION_SUMMARY;
+use crate::context::rewind::KIND_BRANCH_SUMMARY;
 
 /// Materialized session history.
 ///
@@ -184,7 +185,8 @@ impl From<Vec<TranscriptRecord>> for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{branch_summary, compaction_summary};
+    use crate::context::compaction::compaction_summary;
+    use crate::context::rewind::branch_summary;
     use agent_core::{AssistantItem, AssistantMessage, ToolResultStatus};
 
     fn tool_call(id: u64, name: &str) -> ToolCall {

@@ -147,21 +147,45 @@ impl AgentSession {
             && pending.is_empty()
     }
 
-    /// Validate the precondition once; return a view that permits editing the
-    /// session's history.
+    /// Apply a `ContextEdit` operation (`Compact`, `Rewind`,
+    /// `ReplaceTranscript`) to this session's context.
     ///
-    /// The returned `ContextEdit` is the only surface for compact, rewind,
-    /// fork, and replace_transcript — the guard ran once here, so individual
-    /// ops do not repeat it.
-    pub fn edit_history(
+    /// The quiescence check runs once here; the op's `apply` then mutates the
+    /// context directly. On success the core loop is rehydrated from the new
+    /// context so the next `drive` resumes from the correct turn id.
+    pub fn edit<E: ContextEdit>(
         &mut self,
         pending: PendingWork,
-    ) -> Result<ContextEdit<'_>, HistoryEditError> {
-        if self.can_edit_history(pending) {
-            Ok(ContextEdit::new(self))
-        } else {
-            Err(HistoryEditError::Busy)
+        edit: E,
+    ) -> Result<E::Output, HistoryEditError> {
+        if !self.can_edit_history(pending) {
+            return Err(HistoryEditError::Busy);
         }
+        let output = edit.apply(&mut self.context)?;
+        self.rehydrate_core_from_context();
+        Ok(output)
+    }
+
+    /// Produce an unregistered `AgentSession` whose context branches from
+    /// `leaf_id` (or the root when `None`). The source session is unchanged;
+    /// the caller is responsible for registering the fork if desired.
+    ///
+    /// Fork stays as a direct method rather than a `ContextEdit` impl because
+    /// it reads the context and produces a new session rather than mutating
+    /// the source in place.
+    pub fn fork(
+        &mut self,
+        pending: PendingWork,
+        leaf_id: Option<&str>,
+    ) -> Result<AgentSession, HistoryEditError> {
+        if !self.can_edit_history(pending) {
+            return Err(HistoryEditError::Busy);
+        }
+        let context = self
+            .context
+            .create_branched_context_at_turn_boundary(leaf_id)
+            .map_err(HistoryEditError::Context)?;
+        AgentSession::from_context(context)
     }
 
     fn absorb_core_records(&mut self) {
@@ -185,7 +209,9 @@ impl AgentSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{branch_summary, compaction_summary};
+    use crate::context::compaction::compaction_summary;
+    use crate::context::rewind::branch_summary;
+    use crate::context::{Compact, CompactionSettings, ReplaceTranscript, Rewind};
     use agent_core::{
         AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage, ToolResultStatus,
         TurnId, TurnOutcome,
@@ -200,6 +226,131 @@ mod tests {
                 outcome: TurnOutcome::Graceful,
             },
         ])
+    }
+
+    #[test]
+    fn transcript_replacement_is_only_allowed_at_turn_boundary() {
+        let mut session = AgentSession::new();
+        session.enqueue_input(AgentInput::follow_up("hello"));
+
+        let busy = session
+            .edit(
+                PendingWork::NONE,
+                ReplaceTranscript {
+                    replacement: finished_transcript("compact"),
+                },
+            )
+            .expect_err("running sessions cannot edit history");
+        assert_eq!(busy, HistoryEditError::Busy);
+
+        let mut session = AgentSession::from_transcript(finished_transcript("hello"));
+
+        let old = session
+            .edit(
+                PendingWork::NONE,
+                ReplaceTranscript {
+                    replacement: finished_transcript("compact"),
+                },
+            )
+            .expect("idle session can swap transcript");
+
+        assert_eq!(old.last_turn_id(), TurnId(1));
+        assert_eq!(
+            session.transcript().records()[1],
+            TranscriptRecord::UserMessage("compact".to_string())
+        );
+    }
+
+    #[test]
+    fn rewind_and_fork_only_accept_turn_finished_entries() {
+        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
+            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+            TranscriptRecord::UserMessage("first".to_string()),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
+            TranscriptRecord::UserMessage("second".to_string()),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(2),
+                outcome: TurnOutcome::Graceful,
+            },
+        ]));
+        let mid_turn_id = session.context().entries()[1].id.clone();
+        let turn_one_end_id = session.context().entries()[2].id.clone();
+
+        assert_eq!(
+            session.edit(
+                PendingWork::NONE,
+                Rewind {
+                    leaf_id: Some(mid_turn_id.clone())
+                }
+            ),
+            Err(HistoryEditError::Context(ContextError::NotTurnBoundary))
+        );
+        assert_eq!(
+            session
+                .fork(PendingWork::NONE, Some(&mid_turn_id))
+                .map(|_| ()),
+            Err(HistoryEditError::Context(ContextError::NotTurnBoundary))
+        );
+
+        session
+            .edit(
+                PendingWork::NONE,
+                Rewind {
+                    leaf_id: Some(turn_one_end_id.clone()),
+                },
+            )
+            .expect("turn end is a valid rewind point");
+        assert_eq!(session.transcript().last_turn_id(), TurnId(1));
+
+        let fork = session
+            .fork(PendingWork::NONE, Some(&turn_one_end_id))
+            .expect("turn end is a valid fork point");
+        assert_eq!(fork.transcript().last_turn_id(), TurnId(1));
+    }
+
+    #[test]
+    fn compact_op_compacts_via_context_edit_dispatch() {
+        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
+            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+            TranscriptRecord::UserMessage("first".to_string()),
+            TranscriptRecord::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("ok".to_string())],
+            }),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
+            TranscriptRecord::UserMessage("second".to_string()),
+            TranscriptRecord::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("ok2".to_string())],
+            }),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(2),
+                outcome: TurnOutcome::Graceful,
+            },
+        ]));
+
+        let plan = session
+            .context()
+            .prepare_compaction(CompactionSettings {
+                keep_recent_tokens: 1,
+            })
+            .expect("old turn should be compactable");
+        session
+            .edit(
+                PendingWork::NONE,
+                Compact {
+                    plan,
+                    summary: "s".to_string(),
+                },
+            )
+            .expect("compact should apply");
+        assert_eq!(session.transcript().latest_compaction_summary(), Some("s"));
     }
 
     #[test]

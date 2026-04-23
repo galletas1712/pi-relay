@@ -4,9 +4,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agent_core::{CustomMessage, TranscriptRecord};
 use uuid::Uuid;
 
-use crate::fork::CompactionPlan;
-use crate::session::AgentSession;
 use crate::transcript::Transcript;
+
+pub mod compaction;
+pub mod edit;
+pub mod replace;
+pub mod rewind;
+
+pub use self::compaction::{Compact, CompactionPlan, CompactionSettings, KIND_COMPACTION_SUMMARY};
+pub use self::edit::{ContextEdit, HistoryEditError, PendingWork};
+pub use self::replace::ReplaceTranscript;
+pub use self::rewind::{Rewind, KIND_BRANCH_SUMMARY};
 
 /// DAG entry holding a single `TranscriptRecord`. The DAG is append-only; new
 /// entries attach as children of `parent_id`. The context tracks the
@@ -17,49 +25,6 @@ pub struct SessionEntry {
     pub parent_id: Option<String>,
     pub timestamp_ms: u128,
     pub record: TranscriptRecord,
-}
-
-/// Well-known `CustomMessage::kind` for compaction summaries.
-pub const KIND_COMPACTION_SUMMARY: &str = "compaction_summary";
-
-/// Well-known `CustomMessage::kind` for branch summaries.
-pub const KIND_BRANCH_SUMMARY: &str = "branch_summary";
-
-/// Build a `CustomMessage` tagged as a compaction summary with the standard
-/// `first_kept_entry_id` + `tokens_before` metadata.
-pub fn compaction_summary(
-    content: impl Into<String>,
-    first_kept_entry_id: impl Into<String>,
-    tokens_before: usize,
-) -> CustomMessage {
-    CustomMessage::new(KIND_COMPACTION_SUMMARY, content)
-        .with_metadata("first_kept_entry_id", first_kept_entry_id)
-        .with_metadata("tokens_before", tokens_before.to_string())
-}
-
-/// Build a `CustomMessage` tagged as a branch summary with optional `from_id`
-/// anchor metadata.
-pub fn branch_summary(content: impl Into<String>, from_id: Option<String>) -> CustomMessage {
-    let mut msg = CustomMessage::new(KIND_BRANCH_SUMMARY, content);
-    if let Some(from) = from_id {
-        msg = msg.with_metadata("from_id", from);
-    }
-    msg
-}
-
-/// True if the record is a `Custom` with kind = `compaction_summary`.
-pub(crate) fn is_compaction_summary(record: &TranscriptRecord) -> bool {
-    matches!(record, TranscriptRecord::Custom(cm) if cm.kind == KIND_COMPACTION_SUMMARY)
-}
-
-/// Pull the `first_kept_entry_id` metadata off a compaction summary record.
-pub(crate) fn compaction_first_kept_entry_id(record: &TranscriptRecord) -> Option<&str> {
-    match record {
-        TranscriptRecord::Custom(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
-            cm.metadata.get("first_kept_entry_id").map(|s| s.as_str())
-        }
-        _ => None,
-    }
 }
 
 /// Append-only branching log of session records — the durable session context.
@@ -130,26 +95,6 @@ impl Context {
         self.by_id.get(id).and_then(|&i| self.entries.get(i))
     }
 
-    /// Validate that a `CompactionPlan` still matches the context's current
-    /// shape.
-    ///
-    /// Returns `EntryNotFound` if `plan.first_kept_entry_id` no longer exists,
-    /// `StalePlan` if the context's leaf or entry count has drifted from the
-    /// plan's fingerprint, or `NotTurnBoundary` if the current leaf isn't at
-    /// a turn boundary.
-    pub fn validate_plan_matches(&self, plan: &CompactionPlan) -> Result<(), ContextError> {
-        if !self.contains_entry(&plan.first_kept_entry_id) {
-            return Err(ContextError::EntryNotFound);
-        }
-        if self.leaf_id() != plan.leaf_id.as_deref() || self.entries.len() != plan.entry_count {
-            return Err(ContextError::StalePlan);
-        }
-        if !self.is_turn_boundary() {
-            return Err(ContextError::NotTurnBoundary);
-        }
-        Ok(())
-    }
-
     pub fn append_transcript_records(
         &mut self,
         records: impl IntoIterator<Item = TranscriptRecord>,
@@ -163,29 +108,6 @@ impl Context {
     /// Append a `TranscriptRecord::Custom(custom)` entry and return its id.
     pub fn append_custom(&mut self, custom: CustomMessage) -> String {
         self.append_record(TranscriptRecord::Custom(custom))
-    }
-
-    /// Convenience wrapper that appends a compaction-summary Custom entry.
-    pub fn append_compaction_summary(
-        &mut self,
-        content: impl Into<String>,
-        first_kept_entry_id: impl Into<String>,
-        tokens_before: usize,
-    ) -> String {
-        self.append_custom(compaction_summary(
-            content,
-            first_kept_entry_id,
-            tokens_before,
-        ))
-    }
-
-    /// Convenience wrapper that appends a branch-summary Custom entry.
-    pub fn append_branch_summary(
-        &mut self,
-        content: impl Into<String>,
-        from_id: Option<String>,
-    ) -> String {
-        self.append_custom(branch_summary(content, from_id))
     }
 
     pub fn branch(&mut self, entry_id: &str) -> Result<(), ContextError> {
@@ -269,10 +191,10 @@ impl Context {
     /// branch already matches the model's semantic view (CompSum followed by
     /// the kept records re-appended as its descendants), so materialization
     /// is a plain slice starting at the latest CompSum entry. See
-    /// `fork::materialize_context` for details.
+    /// `compaction::materialize_context` for details.
     pub fn transcript(&self) -> Transcript {
         let path = self.branch_entries(None);
-        crate::fork::materialize_context(&path)
+        self::compaction::materialize_context(&path)
     }
 
     pub(crate) fn append_record(&mut self, record: TranscriptRecord) -> String {
@@ -308,58 +230,11 @@ fn now_ms() -> u128 {
         .unwrap_or_default()
 }
 
-/// Proven-safe borrow of an `AgentSession` that permits editing the session's
-/// history.
-///
-/// Obtained via [`AgentSession::edit_history`]. Each op validates only its own
-/// preconditions (plan staleness, entry-not-found, replacement not at a turn
-/// boundary, etc.); the mailbox / outbox / pending-work check happened once
-/// when the view was created. Method bodies live in `fork.rs`.
-pub struct ContextEdit<'a> {
-    pub(crate) session: &'a mut AgentSession,
-}
-
-impl<'a> ContextEdit<'a> {
-    pub(crate) fn new(session: &'a mut AgentSession) -> Self {
-        Self { session }
-    }
-}
-
-/// Caller-tracked work the session cannot observe (worklog forks, background
-/// summarization calls, etc.). The session tracks its own in-flight model and
-/// tool requests internally via the action queue, so those are not represented
-/// here.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct PendingWork {
-    pub background_tasks: usize,
-}
-
-impl PendingWork {
-    pub const NONE: Self = Self {
-        background_tasks: 0,
-    };
-
-    pub fn is_empty(self) -> bool {
-        self.background_tasks == 0
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoryEditError {
-    /// The session cannot currently edit its history (core still running,
-    /// durable leaf mid-turn, mailbox non-empty, or pending work outstanding).
-    Busy,
-    /// A transcript supplied to `replace_transcript` did not itself end at a
-    /// turn boundary.
-    ReplacementNotAtTurnBoundary,
-    /// An underlying context error: entry not found, not at a turn boundary,
-    /// or a stale compaction plan.
-    Context(ContextError),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::compaction::compaction_summary;
+    use crate::context::rewind::branch_summary;
     use agent_core::{AssistantItem, AssistantMessage, TurnId, TurnOutcome};
 
     fn turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptRecord> {
@@ -416,7 +291,7 @@ mod tests {
 
         ctx.branch_at_turn_boundary(&first_ids[3])
             .expect("T1 boundary is a valid fork point");
-        ctx.append_compaction_summary("summary", second_ids[0].clone(), 100);
+        ctx.append_custom(compaction_summary("summary", second_ids[0].clone(), 100));
         ctx.append_transcript_records(kept_records);
 
         let transcript = ctx.transcript();
@@ -438,7 +313,7 @@ mod tests {
     fn fork_at_custom_tail_is_a_valid_turn_boundary() {
         let mut ctx = Context::new();
         ctx.append_transcript_records(turn(1, "hi", "done"));
-        let custom_id = ctx.append_branch_summary("note", None);
+        let custom_id = ctx.append_custom(branch_summary("note", None));
 
         assert!(ctx.is_turn_boundary());
         let forked = ctx

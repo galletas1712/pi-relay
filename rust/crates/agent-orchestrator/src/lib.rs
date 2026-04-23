@@ -126,7 +126,8 @@ mod tests {
     use super::*;
     use agent_core::{AgentInput, AssistantMessage, TranscriptRecord, TurnId, TurnOutcome};
     use agent_session::{
-        CompactionSettings, ContextError, HistoryEditError, PendingWork, Transcript,
+        Compact, CompactionSettings, ContextError, HistoryEditError, PendingWork,
+        ReplaceTranscript, Rewind, Transcript,
     };
 
     #[test]
@@ -170,9 +171,12 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit_history(PendingWork::NONE)
-            .expect("idle empty session is quiescent")
-            .replace_transcript(transcript)
+            .edit(
+                PendingWork::NONE,
+                ReplaceTranscript {
+                    replacement: transcript,
+                },
+            )
             .expect("idle empty session can replace transcript");
 
         assert_eq!(
@@ -217,9 +221,12 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit_history(PendingWork::NONE)
-            .expect("session is quiescent")
-            .rewind(Some(&mid_turn_id));
+            .edit(
+                PendingWork::NONE,
+                Rewind {
+                    leaf_id: Some(mid_turn_id.clone()),
+                },
+            );
         assert!(matches!(
             rewind_err,
             Err(HistoryEditError::Context(ContextError::NotTurnBoundary))
@@ -229,9 +236,7 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit_history(PendingWork::NONE)
-            .expect("session is quiescent")
-            .fork(Some(&turn_one_end_id))
+            .fork(PendingWork::NONE, Some(&turn_one_end_id))
             .expect("turn boundary fork should succeed");
         orchestrator
             .registry_mut()
@@ -252,11 +257,10 @@ mod tests {
         );
 
         let plan = orchestrator
-            .registry_mut()
-            .get_mut("root")
+            .registry()
+            .get("root")
             .expect("session should exist")
-            .edit_history(PendingWork::NONE)
-            .expect("session is quiescent")
+            .context()
             .prepare_compaction(CompactionSettings {
                 keep_recent_tokens: 1,
             })
@@ -265,9 +269,13 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit_history(PendingWork::NONE)
-            .expect("session is quiescent")
-            .compact(&plan, "summary")
+            .edit(
+                PendingWork::NONE,
+                Compact {
+                    plan,
+                    summary: "summary".to_string(),
+                },
+            )
             .expect("root can compact at turn boundary");
         assert_eq!(
             orchestrator
