@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::{CustomMessage, TranscriptRecord};
+use uuid::Uuid;
 
 use crate::transcript::Transcript;
 
@@ -32,15 +33,11 @@ pub struct SessionLog {
     entries: Vec<SessionEntry>,
     by_id: HashMap<String, usize>,
     leaf_id: Option<String>,
-    next_id: u64,
 }
 
 impl SessionLog {
     pub fn new() -> Self {
-        Self {
-            next_id: 1,
-            ..Self::default()
-        }
+        Self::default()
     }
 
     pub fn from_transcript(transcript: &Transcript) -> Self {
@@ -205,7 +202,6 @@ impl SessionLog {
             .collect();
         Ok(Self {
             leaf_id: Some(leaf_id.to_string()),
-            next_id: next_id_after(&entries),
             by_id,
             entries,
         })
@@ -280,7 +276,7 @@ impl SessionLog {
 
     fn append_record(&mut self, record: TranscriptRecord) -> String {
         let entry = SessionEntry {
-            id: self.allocate_id(),
+            id: Uuid::new_v4().to_string(),
             parent_id: self.leaf_id.clone(),
             timestamp_ms: now_ms(),
             record,
@@ -295,12 +291,6 @@ impl SessionLog {
         self.entries.push(entry);
         id
     }
-
-    fn allocate_id(&mut self) -> String {
-        let id = format!("{:016x}", self.next_id);
-        self.next_id += 1;
-        id
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -308,15 +298,6 @@ pub enum SessionLogError {
     EntryNotFound,
     NotTurnBoundary,
     StalePlan,
-}
-
-fn next_id_after(entries: &[SessionEntry]) -> u64 {
-    entries
-        .iter()
-        .filter_map(|entry| u64::from_str_radix(&entry.id, 16).ok())
-        .max()
-        .unwrap_or(0)
-        + 1
 }
 
 fn now_ms() -> u128 {
