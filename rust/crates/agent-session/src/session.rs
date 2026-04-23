@@ -1,8 +1,7 @@
-use std::collections::HashSet;
-
-use agent_core::{AgentAction, AgentCoreLoop, AgentInput, ToolCallId, TranscriptRecord, TurnId};
+use agent_core::{AgentAction, AgentCoreLoop, AgentInput, TranscriptRecord, TurnId};
 
 use crate::history_edit::{HistoryEditError, PendingWork, SessionHistoryEdit};
+use crate::pending_actions::PendingActions;
 use crate::session_log::{SessionLog, SessionLogError};
 use crate::transcript::Transcript;
 
@@ -17,23 +16,7 @@ use crate::transcript::Transcript;
 pub struct AgentSession {
     pub(crate) core: AgentCoreLoop,
     pub(crate) log: SessionLog,
-    pending_actions: HashSet<PendingActionKey>,
-}
-
-/// Key into the session's pending-action set: `(turn_id, kind)` where `kind`
-/// distinguishes a model request from a tool request (the tool request also
-/// carries the tool-call id so multiple parallel tools on the same turn are
-/// tracked independently).
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-struct PendingActionKey {
-    turn_id: TurnId,
-    kind: PendingActionKind,
-}
-
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum PendingActionKind {
-    Model,
-    Tool { tool_call_id: ToolCallId },
+    pending_actions: PendingActions,
 }
 
 impl Default for AgentSession {
@@ -47,7 +30,7 @@ impl AgentSession {
         Self {
             core: AgentCoreLoop::resume_at_boundary(TurnId::default()),
             log: SessionLog::new(),
-            pending_actions: HashSet::new(),
+            pending_actions: PendingActions::new(),
         }
     }
 
@@ -61,7 +44,7 @@ impl AgentSession {
         Self {
             core: AgentCoreLoop::resume_at_boundary(last_turn_id),
             log,
-            pending_actions: HashSet::new(),
+            pending_actions: PendingActions::new(),
         }
     }
 
@@ -75,7 +58,7 @@ impl AgentSession {
         Ok(Self {
             core: AgentCoreLoop::resume_at_boundary(last_turn_id),
             log,
-            pending_actions: HashSet::new(),
+            pending_actions: PendingActions::new(),
         })
     }
 
@@ -89,23 +72,7 @@ impl AgentSession {
     /// session's internal pending-action set. Stale completions (no matching
     /// pending entry, e.g. after an interrupt) are removed with no effect.
     pub fn enqueue_input(&mut self, input: AgentInput) {
-        match &input {
-            AgentInput::ModelCompleted { turn_id, .. } => {
-                self.pending_actions.remove(&PendingActionKey {
-                    turn_id: *turn_id,
-                    kind: PendingActionKind::Model,
-                });
-            }
-            AgentInput::ToolCompleted { turn_id, result } => {
-                self.pending_actions.remove(&PendingActionKey {
-                    turn_id: *turn_id,
-                    kind: PendingActionKind::Tool {
-                        tool_call_id: result.tool_call_id,
-                    },
-                });
-            }
-            _ => {}
-        }
+        self.pending_actions.record_input(&input);
         self.core.enqueue_input(input);
     }
 
@@ -155,27 +122,7 @@ impl AgentSession {
     /// analogous `drain_records` on the session.
     pub fn drain_actions(&mut self) -> Vec<AgentAction> {
         let actions = self.core.drain_actions();
-        for action in &actions {
-            match action {
-                AgentAction::RequestModel { turn_id } => {
-                    self.pending_actions.insert(PendingActionKey {
-                        turn_id: *turn_id,
-                        kind: PendingActionKind::Model,
-                    });
-                }
-                AgentAction::RequestTool { turn_id, tool_call } => {
-                    self.pending_actions.insert(PendingActionKey {
-                        turn_id: *turn_id,
-                        kind: PendingActionKind::Tool {
-                            tool_call_id: tool_call.id,
-                        },
-                    });
-                }
-                AgentAction::CancelTurn { turn_id } => {
-                    self.pending_actions.retain(|k| k.turn_id != *turn_id);
-                }
-            }
-        }
+        self.pending_actions.record_drained(&actions);
         actions
     }
 

@@ -10,6 +10,7 @@
 #![forbid(unsafe_code)]
 
 mod history_edit;
+mod pending_actions;
 mod runner;
 mod session;
 mod session_log;
