@@ -42,8 +42,14 @@ impl<'a> SessionHistoryEdit<'a> {
         Ok(previous)
     }
 
-    /// Apply a previously prepared compaction, appending `summary` as the new
-    /// compaction entry and dropping history before `plan.first_kept_entry_id`.
+    /// Apply a previously prepared compaction using the fork-based strategy:
+    /// navigate the durable leaf back to the pre-cut boundary (parent of
+    /// `first_kept_entry_id`), append `summary` there as a new branch, then
+    /// re-append copies of the kept records as descendants of the summary.
+    ///
+    /// The new branch's chronological order (summary, then kept records) *is*
+    /// the model's semantic view. The pre-compaction entries stay in the log
+    /// as an orphaned branch so the audit trail is preserved.
     pub fn compact(
         &mut self,
         plan: &CompactionPlan,
@@ -60,11 +66,34 @@ impl<'a> SessionHistoryEdit<'a> {
             return Err(HistoryEditError::Log(SessionLogError::NotTurnBoundary));
         }
 
+        // Find the pre-cut parent (the entry immediately before first_kept).
+        let first_kept = log
+            .get_entry(&plan.first_kept_entry_id)
+            .expect("contains_entry check above guarantees the entry exists");
+        let pre_cut_parent_id = first_kept.parent_id.clone();
+
+        // Navigate the leaf to the pre-cut boundary.
+        match pre_cut_parent_id.as_deref() {
+            Some(id) => self
+                .session
+                .log
+                .branch_at_turn_boundary(id)
+                .map_err(HistoryEditError::Log)?,
+            None => self.session.log.reset_leaf(),
+        }
+
+        // Append the compaction summary on the new branch.
         self.session.log.append_compaction_summary(
             summary,
             plan.first_kept_entry_id.clone(),
             plan.tokens_before,
         );
+
+        // Re-append copies of the kept records as descendants of the summary.
+        self.session
+            .log
+            .append_transcript_records(plan.records_to_keep.iter().cloned());
+
         self.session.rehydrate_core_from_log();
         Ok(())
     }
@@ -217,6 +246,181 @@ mod tests {
             transcript.records().first(),
             Some(TranscriptRecord::Custom(_))
         ));
+        // T1's records are no longer visible in the materialized view; the
+        // old branch lives on as an orphan in the full log entries.
+        let has_first_user = transcript
+            .records()
+            .iter()
+            .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "first user message"));
+        assert!(!has_first_user);
+    }
+
+    #[test]
+    fn fork_based_compaction_creates_new_branch_with_summary_then_kept_records() {
+        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
+            // turn 1
+            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+            TranscriptRecord::UserMessage("first".to_string()),
+            TranscriptRecord::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("ok1".to_string())],
+            }),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+            // turn 2
+            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
+            TranscriptRecord::UserMessage("second".to_string()),
+            TranscriptRecord::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("ok2".to_string())],
+            }),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(2),
+                outcome: TurnOutcome::Graceful,
+            },
+        ]));
+
+        let entries_before = session.session_log().entries().len();
+        let plan = session
+            .edit_history(PendingWork::NONE)
+            .expect("session can edit history")
+            .prepare_compaction(CompactionSettings {
+                keep_recent_tokens: 1,
+            })
+            .expect("old turn should be compactable");
+        session
+            .edit_history(PendingWork::NONE)
+            .expect("session can still edit history")
+            .compact(&plan, "summary")
+            .expect("history edit can compact");
+
+        // Log grew by: 1 (CompSum) + 4 (re-appended turn 2 records) = 5.
+        assert_eq!(
+            session.session_log().entries().len(),
+            entries_before + 5,
+            "fork-based compaction should add 1 summary + the kept records as new log entries"
+        );
+
+        // Materialized transcript: [CompSum, TurnStarted(2), UserMessage,
+        // AssistantMessage, TurnFinished(2)].
+        let transcript = session.transcript();
+        let records = transcript.records();
+        assert!(matches!(
+            records.first(),
+            Some(TranscriptRecord::Custom(cm)) if cm.kind == crate::session_log::KIND_COMPACTION_SUMMARY
+        ));
+        assert_eq!(records.len(), 5);
+        assert_eq!(transcript.last_turn_id(), TurnId(2));
+        assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
+
+        // Turn 1 records are gone from the materialized view.
+        let has_first = records
+            .iter()
+            .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "first"));
+        assert!(!has_first);
+    }
+
+    #[test]
+    fn sequential_compactions_fork_from_the_prior_summary_on_the_active_branch() {
+        fn turn(id: u64, user: &str, answer: &str) -> Vec<TranscriptRecord> {
+            vec![
+                TranscriptRecord::TurnStarted {
+                    turn_id: TurnId(id),
+                },
+                TranscriptRecord::UserMessage(user.to_string()),
+                TranscriptRecord::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::Text(answer.to_string())],
+                }),
+                TranscriptRecord::TurnFinished {
+                    turn_id: TurnId(id),
+                    outcome: TurnOutcome::Graceful,
+                },
+            ]
+        }
+        // Three turns up front; long enough content that keep_recent_tokens=1
+        // will summarize T1 and T2 on the first pass (keeping T3), then a
+        // fourth turn runs, and the second pass summarizes T3 (keeping T4).
+        let mut records = Vec::new();
+        records.extend(turn(1, "first user message", "first assistant answer"));
+        records.extend(turn(2, "second user message", "second assistant answer"));
+        records.extend(turn(3, "third user message", "third assistant answer"));
+        let mut session = AgentSession::from_transcript(Transcript::from_records(records));
+
+        // First compaction.
+        let plan = session
+            .edit_history(PendingWork::NONE)
+            .expect("session can edit history")
+            .prepare_compaction(CompactionSettings {
+                keep_recent_tokens: 1,
+            })
+            .expect("old turns should be compactable");
+        session
+            .edit_history(PendingWork::NONE)
+            .expect("session can still edit history")
+            .compact(&plan, "first summary")
+            .expect("first compaction should apply");
+        assert_eq!(
+            session.transcript().latest_compaction_summary(),
+            Some("first summary")
+        );
+
+        // Drive a real fourth turn through the core loop. This appends T4's
+        // records as descendants of the first-compaction branch (no stale
+        // id bookkeeping involved; the log is the same log).
+        session.enqueue_input(AgentInput::FollowUp("fourth user message".to_string()));
+        session.drive();
+        session.drain_actions();
+        session.enqueue_input(AgentInput::ModelCompleted {
+            turn_id: session.last_turn_id(),
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::Text("fourth assistant answer".to_string())],
+            },
+        });
+        session.drive();
+        assert!(session.is_idle());
+
+        // Second compaction: boundary_start_index correctly steps past the
+        // first summary (whose `first_kept_entry_id` anchor still resolves
+        // on the active branch), so T3 is eligible to be summarized while
+        // T4 remains as the recent tail.
+        let plan2 = session
+            .edit_history(PendingWork::NONE)
+            .expect("session can edit history")
+            .prepare_compaction(CompactionSettings {
+                keep_recent_tokens: 1,
+            })
+            .expect("T3 is compactable past the first summary on the active branch");
+        session
+            .edit_history(PendingWork::NONE)
+            .expect("session can still edit history")
+            .compact(&plan2, "second summary")
+            .expect("second compaction should apply");
+
+        let transcript = session.transcript();
+        assert_eq!(
+            transcript.latest_compaction_summary(),
+            Some("second summary")
+        );
+        // Only the latest CompSum is visible on the materialized active
+        // branch (the slice starts at the latest CompSum).
+        let summary_count = transcript
+            .records()
+            .iter()
+            .filter(|r| matches!(r, TranscriptRecord::Custom(cm) if cm.kind == crate::session_log::KIND_COMPACTION_SUMMARY))
+            .count();
+        assert_eq!(summary_count, 1);
+        // T3 is gone from the materialized view; T4 remains as the recent
+        // tail.
+        let has_third = transcript
+            .records()
+            .iter()
+            .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "third user message"));
+        assert!(!has_third);
+        let has_fourth = transcript
+            .records()
+            .iter()
+            .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "fourth user message"));
+        assert!(has_fourth);
     }
 
     #[test]

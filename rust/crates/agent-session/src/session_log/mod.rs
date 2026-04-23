@@ -197,9 +197,13 @@ impl SessionLog {
         }
     }
 
-    /// Materialize the active branch into a `Transcript`. The latest
-    /// compaction summary (if any) is inlined ahead of the kept suffix; see
-    /// `context::materialize_context` for the ordering rationale.
+    /// Materialize the active branch into a `Transcript`.
+    ///
+    /// Under fork-based compaction the chronological order on the active
+    /// branch already matches the model's semantic view (CompSum followed by
+    /// the kept records re-appended as its descendants), so materialization
+    /// is a plain slice starting at the latest CompSum entry. See
+    /// `context::materialize_context` for details.
     pub fn context(&self) -> Transcript {
         let path = self.branch_entries(None);
         materialize_context(&path)
@@ -355,19 +359,28 @@ mod tests {
     }
 
     #[test]
-    fn context_applies_latest_compaction_summary_and_kept_suffix() {
+    fn context_starts_at_the_latest_compaction_summary_on_the_active_branch() {
+        // Simulate a fork-based compaction manually at the log level: append
+        // two turns, navigate back to the T1 boundary, append a CompSum
+        // there, then re-append T2's records as descendants. The active
+        // branch is now [T1 records..., CompSum, T2 records...]; the
+        // materialized view should start at CompSum.
         let mut log = SessionLog::new();
-        log.append_transcript_records(turn(1, "first", "done"));
-        let kept_ids = log.append_transcript_records(turn(2, "second", "done"));
+        let first_ids = log.append_transcript_records(turn(1, "first", "done"));
+        let second_ids = log.append_transcript_records(turn(2, "second", "done"));
+        let kept_records = second_ids
+            .iter()
+            .map(|id| log.get_entry(id).expect("kept id exists").record.clone())
+            .collect::<Vec<_>>();
 
-        log.append_compaction_summary("summary", kept_ids[0].clone(), 100);
+        log.branch_at_turn_boundary(&first_ids[3])
+            .expect("T1 boundary is a valid fork point");
+        log.append_compaction_summary("summary", second_ids[0].clone(), 100);
+        log.append_transcript_records(kept_records);
 
         let transcript = log.context();
         assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
         assert_eq!(transcript.last_turn_id(), TurnId(2));
-        // After reordering the summary precedes the kept suffix: record[0]
-        // is the Custom summary, record[1] is the first kept record
-        // (TurnStarted for turn 2).
         assert!(matches!(
             transcript.records()[0],
             TranscriptRecord::Custom(_)
@@ -376,6 +389,7 @@ mod tests {
             transcript.records()[1],
             TranscriptRecord::TurnStarted { turn_id: TurnId(2) }
         ));
+        assert_eq!(transcript.records().len(), 5);
         assert!(log.is_turn_boundary());
     }
 }
