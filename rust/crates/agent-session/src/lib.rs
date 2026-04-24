@@ -25,11 +25,12 @@ pub use crate::context::{
     HistoryEditError, PendingWork, ReplaceTranscript, Rewind, SessionEntry, KIND_BRANCH_SUMMARY,
     KIND_COMPACTION_SUMMARY,
 };
-pub use crate::runner::{AgentInputHandle, AgentInputReceiver, AgentRunner};
+pub use crate::runner::{AgentInputHandle, AgentInputHandleError, AgentInputReceiver, AgentRunner};
 pub use crate::session::AgentSession;
 pub use crate::transcript::Transcript;
 
 // Re-export core-owned types so downstream callers have a single import home.
 pub use agent_core::{
-    AgentAction, AgentInput, CustomMessage, TranscriptRecord, TurnId, TurnOutcome,
+    ActionId, AgentAction, AgentInput, AgentInputError, CustomMessage, ToolCallId,
+    TranscriptRecord, TurnId, TurnOutcome,
 };

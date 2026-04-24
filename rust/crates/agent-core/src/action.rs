@@ -1,4 +1,4 @@
-use crate::ids::TurnId;
+use crate::ids::{ActionId, TurnId};
 use crate::message::ToolCall;
 
 /// Side effects requested by the core loop.
@@ -7,9 +7,11 @@ use crate::message::ToolCall;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentAction {
     RequestModel {
+        action_id: ActionId,
         turn_id: TurnId,
     },
     RequestTool {
+        action_id: ActionId,
         turn_id: TurnId,
         tool_call: ToolCall,
     },
@@ -17,7 +19,5 @@ pub enum AgentAction {
     ///
     /// For parallel tool execution, the orchestrator should fan this out to
     /// every running tool handle associated with `turn_id`.
-    CancelTurn {
-        turn_id: TurnId,
-    },
+    CancelTurn { turn_id: TurnId },
 }

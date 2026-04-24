@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use crate::action::AgentAction;
-use crate::event::AgentInput;
-use crate::ids::TurnId;
+use crate::event::{AgentInput, AgentInputError};
+use crate::ids::{ActionId, TurnId};
 use crate::mailbox::Mailbox;
 use crate::record::TranscriptRecord;
 use crate::state::AgentState;
@@ -12,6 +12,7 @@ pub struct AgentCoreLoop {
     mailbox: Mailbox,
     state: AgentState,
     last_turn_id: TurnId,
+    next_action_id: ActionId,
     action_outbox: VecDeque<AgentAction>,
     record_outbox: VecDeque<TranscriptRecord>,
 }
@@ -22,6 +23,7 @@ impl Default for AgentCoreLoop {
             mailbox: Mailbox::default(),
             state: AgentState::Idle,
             last_turn_id: TurnId::default(),
+            next_action_id: ActionId::first(),
             action_outbox: VecDeque::new(),
             record_outbox: VecDeque::new(),
         }
@@ -38,17 +40,25 @@ impl AgentCoreLoop {
     /// Callers own durable history; the core itself no longer buffers records.
     /// The session derives `last_turn_id` from its log before calling this.
     pub fn resume_at_boundary(last_turn_id: TurnId) -> Self {
+        Self::resume_at_boundary_with_next_action_id(last_turn_id, ActionId::first())
+    }
+
+    pub fn resume_at_boundary_with_next_action_id(
+        last_turn_id: TurnId,
+        next_action_id: ActionId,
+    ) -> Self {
         Self {
             mailbox: Mailbox::default(),
             state: AgentState::Idle,
             last_turn_id,
+            next_action_id,
             action_outbox: VecDeque::new(),
             record_outbox: VecDeque::new(),
         }
     }
 
-    pub fn enqueue_input(&mut self, input: AgentInput) {
-        self.mailbox.push_input(input);
+    pub fn enqueue_input(&mut self, input: AgentInput) -> Result<(), AgentInputError> {
+        self.mailbox.push_input(input)
     }
 
     /// True when the core is between turns and has no in-flight model/tool work.
@@ -70,6 +80,10 @@ impl AgentCoreLoop {
     /// The most recent turn id observed by the core.
     pub fn last_turn_id(&self) -> TurnId {
         self.last_turn_id
+    }
+
+    pub fn next_action_id(&self) -> ActionId {
+        self.next_action_id
     }
 
     pub fn drain_actions(&mut self) -> Vec<AgentAction> {
@@ -96,7 +110,7 @@ impl AgentCoreLoop {
                 return;
             };
 
-            let (records, actions) = self.state.step(event);
+            let (records, actions) = self.state.step(event, &mut self.next_action_id);
             if records.is_empty() && actions.is_empty() {
                 continue;
             }
@@ -128,7 +142,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::action::AgentAction;
-    use crate::ids::ToolCallId;
+    use crate::ids::{ActionId, ToolCallId};
     use crate::message::{
         AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
     };
@@ -159,7 +173,9 @@ mod tests {
     /// that cycle. Tests accumulate these into a running transcript so they can
     /// assert the same shape they used to read off `loop_state.transcript`.
     fn drive_collect(loop_state: &mut AgentCoreLoop, input: AgentInput) -> Vec<TranscriptRecord> {
-        loop_state.enqueue_input(input);
+        loop_state
+            .enqueue_input(input)
+            .expect("test inputs should be valid");
         loop_state.drive();
         loop_state.drain_records()
     }
@@ -179,11 +195,17 @@ mod tests {
         );
         assert_eq!(
             loop_state.drain_actions(),
-            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
+            vec![AgentAction::RequestModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(1)
+            }]
         );
         assert_eq!(
             loop_state.state,
-            AgentState::RunningModel { turn_id: TurnId(1) }
+            AgentState::RunningModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(1)
+            }
         );
     }
 
@@ -203,6 +225,7 @@ mod tests {
         records.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
+                action_id: ActionId(1),
                 turn_id: TurnId(1),
                 assistant: assistant.clone(),
             },
@@ -223,6 +246,7 @@ mod tests {
         assert_eq!(
             loop_state.drain_actions(),
             vec![AgentAction::RequestTool {
+                action_id: ActionId(2),
                 turn_id: TurnId(1),
                 tool_call: tool_call.clone(),
             }]
@@ -232,6 +256,7 @@ mod tests {
             AgentState::RunningTools {
                 turn_id: TurnId(1),
                 tool_calls: vec![tool_call],
+                tool_action_ids: vec![ActionId(2)],
                 completed_results: vec![None],
                 next_result_index: 0,
             }
@@ -250,6 +275,7 @@ mod tests {
         drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
+                action_id: ActionId(1),
                 turn_id: TurnId(1),
                 assistant,
             },
@@ -260,6 +286,7 @@ mod tests {
         let records = drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
+                action_id: ActionId(2),
                 turn_id: TurnId(1),
                 result: result.clone(),
             },
@@ -268,11 +295,17 @@ mod tests {
         assert_eq!(records.last(), Some(&TranscriptRecord::ToolResult(result)));
         assert_eq!(
             loop_state.drain_actions(),
-            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
+            vec![AgentAction::RequestModel {
+                action_id: ActionId(3),
+                turn_id: TurnId(1)
+            }]
         );
         assert_eq!(
             loop_state.state,
-            AgentState::RunningModel { turn_id: TurnId(1) }
+            AgentState::RunningModel {
+                action_id: ActionId(3),
+                turn_id: TurnId(1)
+            }
         );
     }
 
@@ -287,14 +320,20 @@ mod tests {
         let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
         let result = successful_tool_result(tool_call.id, "bash");
 
-        loop_state.enqueue_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant,
-        });
-        loop_state.enqueue_input(AgentInput::ToolCompleted {
-            turn_id: TurnId(1),
-            result: result.clone(),
-        });
+        loop_state
+            .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                assistant,
+            })
+            .expect("matching model completion is valid");
+        loop_state
+            .enqueue_input(AgentInput::ToolCompleted {
+                action_id: ActionId(2),
+                turn_id: TurnId(1),
+                result: result.clone(),
+            })
+            .expect("matching tool completion is valid");
         loop_state.drive();
 
         let records = loop_state.drain_records();
@@ -306,10 +345,14 @@ mod tests {
             loop_state.drain_actions(),
             vec![
                 AgentAction::RequestTool {
+                    action_id: ActionId(2),
                     turn_id: TurnId(1),
                     tool_call,
                 },
-                AgentAction::RequestModel { turn_id: TurnId(1) },
+                AgentAction::RequestModel {
+                    action_id: ActionId(3),
+                    turn_id: TurnId(1)
+                },
             ]
         );
     }
@@ -330,6 +373,7 @@ mod tests {
         records.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
+                action_id: ActionId(1),
                 turn_id: TurnId(1),
                 assistant,
             },
@@ -339,10 +383,12 @@ mod tests {
             loop_state.drain_actions(),
             vec![
                 AgentAction::RequestTool {
+                    action_id: ActionId(2),
                     turn_id: TurnId(1),
                     tool_call: first.clone(),
                 },
                 AgentAction::RequestTool {
+                    action_id: ActionId(3),
                     turn_id: TurnId(1),
                     tool_call: second.clone(),
                 },
@@ -360,6 +406,7 @@ mod tests {
         records.extend(drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
+                action_id: ActionId(3),
                 turn_id: TurnId(1),
                 result: second_result.clone(),
             },
@@ -386,6 +433,7 @@ mod tests {
         records.extend(drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
+                action_id: ActionId(2),
                 turn_id: TurnId(1),
                 result: first_result.clone(),
             },
@@ -399,12 +447,18 @@ mod tests {
         assert_eq!(records[6], TranscriptRecord::ToolResult(second_result));
         assert_eq!(
             loop_state.drain_actions(),
-            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
+            vec![AgentAction::RequestModel {
+                action_id: ActionId(4),
+                turn_id: TurnId(1)
+            }]
         );
         assert_eq!(loop_state.mailbox.steer_len(), 1);
         assert_eq!(
             loop_state.state,
-            AgentState::RunningModel { turn_id: TurnId(1) }
+            AgentState::RunningModel {
+                action_id: ActionId(4),
+                turn_id: TurnId(1)
+            }
         );
     }
 
@@ -420,6 +474,7 @@ mod tests {
         records.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
+                action_id: ActionId(1),
                 turn_id: TurnId(1),
                 assistant,
             },
@@ -457,12 +512,18 @@ mod tests {
             loop_state.drain_actions(),
             vec![
                 AgentAction::CancelTurn { turn_id: TurnId(1) },
-                AgentAction::RequestModel { turn_id: TurnId(2) },
+                AgentAction::RequestModel {
+                    action_id: ActionId(3),
+                    turn_id: TurnId(2)
+                },
             ]
         );
         assert_eq!(
             loop_state.state,
-            AgentState::RunningModel { turn_id: TurnId(2) }
+            AgentState::RunningModel {
+                action_id: ActionId(3),
+                turn_id: TurnId(2)
+            }
         );
     }
 
@@ -482,6 +543,7 @@ mod tests {
         records.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
+                action_id: ActionId(1),
                 turn_id: TurnId(1),
                 assistant,
             },
@@ -492,6 +554,7 @@ mod tests {
         records.extend(drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
+                action_id: ActionId(3),
                 turn_id: TurnId(1),
                 result: second_result.clone(),
             },
@@ -568,7 +631,10 @@ mod tests {
         );
         assert_eq!(
             loop_state.drain_actions(),
-            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
+            vec![AgentAction::RequestModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(1)
+            }]
         );
     }
 
@@ -599,6 +665,7 @@ mod tests {
         records.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
+                action_id: ActionId(1),
                 turn_id: TurnId(1),
                 assistant: stale_assistant,
             },

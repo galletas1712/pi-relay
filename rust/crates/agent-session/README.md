@@ -19,7 +19,7 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 **Composition types**
 - `AgentSession` — core loop + context + action queue, the unit of agent state.
 - `AgentRunner` — async wrapper that drives a session off an input channel.
-- `AgentInputHandle`, `AgentInputReceiver` — sender/receiver pair for the runner's input channel.
+- `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — sender/receiver pair for the runner's input channel.
 
 **Durable state**
 - `Context` — append-only DAG of `SessionEntry`.
@@ -39,20 +39,21 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 - `KIND_BRANCH_SUMMARY = "branch_summary"` + `branch_summary(content, from_id)` builder.
 
 **Re-exports from `agent-core`** (so callers have a single import home)
-- `AgentInput`, `AgentAction`, `TranscriptRecord`, `TurnId`, `CustomMessage`, `TurnOutcome`.
+- `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptRecord`, `TurnId`, `ActionId`, `ToolCallId`, `CustomMessage`, `TurnOutcome`.
 
 ### Drive cycle
 
 ```rust
-session.enqueue_input(AgentInput::follow_up("hello"));
+session.enqueue_input(AgentInput::follow_up("hello"))?;
 session.drive();
 let actions = session.drain_actions();
 // caller executes actions out-of-band, feeds results back:
-session.enqueue_input(AgentInput::ModelCompleted { turn_id, assistant });
+let AgentAction::RequestModel { action_id, turn_id } = actions[0] else { unreachable!() };
+session.enqueue_input(AgentInput::ModelCompleted { action_id, turn_id, assistant })?;
 session.drive();
 ```
 
-`drain_actions` records every `RequestModel` / `RequestTool` into the internal action queue; `enqueue_input` clears the matching key when the corresponding completion arrives. `CancelTurn` clears every entry for that turn id.
+`drive` records every produced `RequestModel` / `RequestTool` into the internal action queue before callers drain the observable action outbox. `enqueue_input` validates the input and clears the matching key when the corresponding completion arrives. `CancelTurn` clears every entry for that turn id.
 
 ### History edits
 
@@ -80,7 +81,7 @@ let forked: AgentSession = session.fork(pending, Some(&leaf_id))?;
 | `src/session.rs` | `AgentSession` composition, `drive`, `enqueue_input`, `drain_actions`, `can_edit_history`, `edit`, `fork`, `rehydrate_core_from_context`. |
 | `src/action_queue.rs` | Private `ActionQueue` (FIFO `VecDeque<PendingActionKey>`) + `record_drained` / `record_input`. |
 | `src/transcript.rs` | `Transcript` read-only view: `is_turn_boundary`, `latest_compaction_summary`, `branch_summaries`, crashed-tail patching. |
-| `src/runner.rs` | `AgentRunner`, `AgentInputHandle`, `AgentInputReceiver` — async shell over `AgentSession`. |
+| `src/runner.rs` | `AgentRunner`, `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — async shell over `AgentSession`. |
 | `src/context/mod.rs` | `Context` DAG, `SessionEntry`, leaf navigation, `is_turn_boundary`, `ContextError`. No kind-specific knowledge. |
 | `src/context/edit.rs` | `ContextEdit` trait, `PendingWork`, `HistoryEditError`. |
 | `src/context/compaction.rs` | `Compact` op, `CompactionPlan`, `CompactionSettings`, `prepare_compaction`, `validate_plan_matches`, `materialize_context`, `KIND_COMPACTION_SUMMARY`, `compaction_summary`. |
@@ -95,9 +96,10 @@ let forked: AgentSession = session.fork(pending, Some(&leaf_id))?;
   ├── context: Context          (append-only DAG of SessionEntry)
   └── action_queue: ActionQueue (FIFO: drained-but-not-yet-reported actions)
 
- drive()       ─► core.drive()           → drain records → append to context
- drain_actions ─► core.drain_actions()   → action_queue.record_drained(..)
- enqueue_input ─► action_queue.record_input(..) → core.enqueue_input(..)
+ drive()       ─► core.drive() → drain records → append to context
+              └► drain actions → action_queue.record_drained(..) → action outbox
+ drain_actions ─► drain observable action outbox
+ enqueue_input ─► validate → action_queue.record_input(..) → core.enqueue_input(..)
  edit(op)      ─► can_edit_history? → op.apply(&mut context) → rehydrate core
 ```
 
@@ -160,11 +162,11 @@ Op outputs:
 | `Rewind { leaf_id }` | `()` | `Some(id)` → `branch_at_turn_boundary(id)`; `None` → `reset_leaf()`. |
 | `ReplaceTranscript { replacement }` | `Transcript` | Swaps the whole context for one built from `replacement`; returns the previous transcript. |
 
-Core rehydration (`rehydrate_core_from_context`) runs *after* `apply` succeeds. It lives in `AgentSession::edit`, not the trait, because `apply` sees only `&mut Context` and can't touch the core loop. Rehydration rebuilds `AgentCoreLoop::resume_at_boundary(last_turn_id)` and clears the action queue (any keys left belong to the pre-edit run).
+Core rehydration (`rehydrate_core_from_context`) runs *after* `apply` succeeds. It lives in `AgentSession::edit`, not the trait, because `apply` sees only `&mut Context` and can't touch the core loop. Rehydration rebuilds the core at the current `last_turn_id` while preserving the next `ActionId`, then clears the action queue and observable action outbox (any keys left belong to the pre-edit run).
 
 ### `ActionQueue` semantics
 
-Private to the crate. `PendingActionKey { turn_id: TurnId, kind: Model | Tool { tool_call_id } }` lives in a `VecDeque` in FIFO insertion order. `record_drained(&[AgentAction])` pushes one entry per `RequestModel` / `RequestTool` and clears entries for a given `turn_id` on `CancelTurn`. `record_input(&AgentInput)` removes the matching key on `ModelCompleted` / `ToolCompleted`; removal is by key, not necessarily from the head, and preserves order among the survivors. Duplicates are kept — FIFO with no dedup. Stale completions (no matching key) are silent no-ops.
+Private to the crate. `PendingActionKey { action_id: ActionId, turn_id: TurnId, kind: Model | Tool }` lives in a `VecDeque` in FIFO insertion order. `record_drained(&[AgentAction])` pushes one entry per `RequestModel` / `RequestTool` and clears entries for a given `turn_id` on `CancelTurn`. `record_input(&AgentInput)` removes the matching key on `ModelCompleted` / `ToolCompleted`; removal is by key, not necessarily from the head, and preserves order among the survivors. Duplicates are kept — FIFO with no dedup. Stale completions (no matching key) are silent no-ops.
 
 `is_empty() == true` ⇒ no in-flight actions ⇒ `can_edit_history` clears that check.
 
@@ -176,13 +178,13 @@ Each `KIND_*` constant and its builder (`compaction_summary`, `branch_summary`) 
 
 ### `AgentRunner` (async wrapper)
 
-`AgentRunner` is the only async surface in the crate — the core loop itself is fully sync. It owns an `AgentSession` plus an `AgentInputReceiver` (the receive side of a `futures_channel::mpsc::unbounded` channel) plus a `FnMut(AgentAction) -> impl Future<Output = ()>` action handler. `run()` drives the session to quiescence, flushes drained actions through the handler, then loops awaiting the next input, enqueuing it, and repeating. `AgentInputHandle::channel()` hands back the matching sender; the handle is `Clone`, so orchestrator, model, and tool tasks can all enqueue inputs back into the same session.
+`AgentRunner` is the only async surface in the crate — the core loop itself is fully sync. It owns an `AgentSession` plus an `AgentInputReceiver` (the receive side of a `futures_channel::mpsc::unbounded` channel) plus a `FnMut(AgentAction) -> impl Future<Output = ()>` action handler. `run()` drives the session to quiescence, flushes drained actions through the handler, then loops awaiting the next input, enqueuing it, and repeating. `AgentInputHandle::channel()` hands back the matching sender; the handle is `Clone`, so orchestrator, model, and tool tasks can all enqueue inputs back into the same session. The handle validates `AgentInput` before sending; invalid inputs return `AgentInputHandleError::Invalid` immediately.
 
 Records are observed off the session's transcript (`runner.session().transcript()`); there is no record callback.
 
 ## Relationship to other crates
 
-- **Upstream** `agent-core` — provides `AgentCoreLoop`, `AgentInput`, `AgentAction`, `TranscriptRecord`, `TurnId`, `TurnOutcome`, `CustomMessage`, and the message/tool-call vocabulary. `agent-session` re-exports these so downstream has a single import path.
+- **Upstream** `agent-core` — provides `AgentCoreLoop`, `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptRecord`, `TurnId`, `ActionId`, `TurnOutcome`, `CustomMessage`, and the message/tool-call vocabulary. `agent-session` re-exports these so downstream has a single import path.
 - **Downstream** `agent-orchestrator` — owns a `SessionRegistry<AgentSession>` keyed by `SessionId`, routes parent/child messages and reports, and delegates every history edit to `session.edit(pending, op)` / `session.fork(pending, leaf)`. It never reaches into `Context` internals directly; it calls `session.context().prepare_compaction(..)` as a pure query and lets the session dispatch the resulting op.
 
 For cross-cutting context (control plane, cost aggregation, worklog forks, multi-agent spawn/report), see `rust/docs/architecture.md`.

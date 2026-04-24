@@ -298,7 +298,8 @@ mod tests {
     use crate::context::edit::PendingWork;
     use crate::session::AgentSession;
     use agent_core::{
-        AgentInput, AssistantItem, AssistantMessage, TranscriptRecord, TurnId, TurnOutcome,
+        ActionId, AgentInput, AssistantItem, AssistantMessage, TranscriptRecord, TurnId,
+        TurnOutcome,
     };
 
     #[test]
@@ -508,15 +509,20 @@ mod tests {
         );
 
         // Drive a real fourth turn through the core loop.
-        session.enqueue_input(AgentInput::follow_up("fourth user message"));
+        session
+            .enqueue_input(AgentInput::follow_up("fourth user message"))
+            .expect("plain follow-up is valid");
         session.drive();
         session.drain_actions();
-        session.enqueue_input(AgentInput::ModelCompleted {
-            turn_id: session.last_turn_id(),
-            assistant: AssistantMessage {
-                items: vec![AssistantItem::Text("fourth assistant answer".to_string())],
-            },
-        });
+        session
+            .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(1),
+                turn_id: session.last_turn_id(),
+                assistant: AssistantMessage {
+                    items: vec![AssistantItem::Text("fourth assistant answer".to_string())],
+                },
+            })
+            .expect("matching model completion is valid");
         session.drive();
         assert!(session.is_idle());
 

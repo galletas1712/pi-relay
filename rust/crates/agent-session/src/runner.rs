@@ -1,3 +1,4 @@
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -5,7 +6,7 @@ use std::task::{Context, Poll};
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 
-use agent_core::{AgentAction, AgentInput};
+use agent_core::{AgentAction, AgentInput, AgentInputError};
 
 use crate::AgentSession;
 
@@ -24,10 +25,35 @@ impl AgentInputHandle {
         (Self { inputs }, AgentInputReceiver { inputs: input_rx })
     }
 
-    pub fn enqueue_input(&self, input: AgentInput) -> Result<(), AgentInput> {
+    pub fn enqueue_input(&self, input: AgentInput) -> Result<(), AgentInputHandleError> {
+        input.validate().map_err(AgentInputHandleError::Invalid)?;
         self.inputs
             .unbounded_send(input)
-            .map_err(|error| error.into_inner())
+            .map_err(|error| AgentInputHandleError::Closed(error.into_inner()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentInputHandleError {
+    Invalid(AgentInputError),
+    Closed(AgentInput),
+}
+
+impl fmt::Display for AgentInputHandleError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Invalid(error) => write!(f, "invalid agent input: {error}"),
+            Self::Closed(_) => write!(f, "agent input channel is closed"),
+        }
+    }
+}
+
+impl std::error::Error for AgentInputHandleError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Invalid(error) => Some(error),
+            Self::Closed(_) => None,
+        }
     }
 }
 
@@ -80,7 +106,9 @@ where
         self.drive_and_flush_actions().await;
 
         while let Some(input) = next_input(&mut self.inputs.inputs).await {
-            self.session.enqueue_input(input);
+            if self.session.enqueue_input(input).is_err() {
+                continue;
+            }
             self.drive_and_flush_actions().await;
         }
     }
@@ -123,7 +151,9 @@ mod tests {
     use std::rc::Rc;
     use std::task::{Context, Poll, Waker};
 
-    use agent_core::{AssistantItem, AssistantMessage, TranscriptRecord, TurnId, TurnOutcome};
+    use agent_core::{
+        ActionId, AssistantItem, AssistantMessage, TranscriptRecord, TurnId, TurnOutcome,
+    };
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
         let mut future = Box::pin(future);
@@ -155,6 +185,7 @@ mod tests {
             .expect("runner should accept user input");
         input_handle
             .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(1),
                 turn_id: TurnId(1),
                 assistant: assistant.clone(),
             })
@@ -165,7 +196,10 @@ mod tests {
 
         assert_eq!(
             actions.borrow().as_slice(),
-            &[AgentAction::RequestModel { turn_id: TurnId(1) }]
+            &[AgentAction::RequestModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(1)
+            }]
         );
         assert_eq!(
             runner.session().transcript().records(),
@@ -180,5 +214,25 @@ mod tests {
             ]
         );
         assert!(runner.session().is_idle());
+    }
+
+    #[test]
+    fn input_handle_rejects_invalid_inputs_before_queueing() {
+        let (input_handle, mut input_rx) = AgentInputHandle::channel();
+
+        let error = input_handle
+            .enqueue_input(AgentInput::FollowUp {
+                from: None,
+                kind: Some("child_report".to_string()),
+                content: "half tagged".to_string(),
+            })
+            .expect_err("invalid input should be rejected before channel send");
+
+        assert_eq!(
+            error,
+            AgentInputHandleError::Invalid(AgentInputError::UnpairedOriginTags)
+        );
+        drop(input_handle);
+        assert!(block_on_ready(next_input(&mut input_rx.inputs)).is_none());
     }
 }

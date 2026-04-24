@@ -1,4 +1,6 @@
-use crate::ids::TurnId;
+use std::fmt;
+
+use crate::ids::{ActionId, TurnId};
 use crate::message::{AssistantMessage, ToolResultMessage};
 
 /// External input to the live agent FSM.
@@ -27,11 +29,13 @@ pub enum AgentInput {
     },
     // Volatile model completion delivered by the orchestrator.
     ModelCompleted {
+        action_id: ActionId,
         turn_id: TurnId,
         assistant: AssistantMessage,
     },
     // Volatile tool completion delivered by the orchestrator.
     ToolCompleted {
+        action_id: ActionId,
         turn_id: TurnId,
         result: ToolResultMessage,
     },
@@ -88,7 +92,37 @@ impl AgentInput {
             content: content.into(),
         }
     }
+
+    pub fn validate(&self) -> Result<(), AgentInputError> {
+        match self {
+            AgentInput::Steer { from, kind, .. } | AgentInput::FollowUp { from, kind, .. } => {
+                if from.is_some() == kind.is_some() {
+                    Ok(())
+                } else {
+                    Err(AgentInputError::UnpairedOriginTags)
+                }
+            }
+            AgentInput::Interrupt
+            | AgentInput::ModelCompleted { .. }
+            | AgentInput::ToolCompleted { .. } => Ok(()),
+        }
+    }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentInputError {
+    UnpairedOriginTags,
+}
+
+impl fmt::Display for AgentInputError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnpairedOriginTags => write!(f, "from and kind tags must be paired"),
+        }
+    }
+}
+
+impl std::error::Error for AgentInputError {}
 
 /// Runtime input to the live agent FSM.
 ///
@@ -103,10 +137,12 @@ pub(crate) enum AgentEvent {
         origin: Option<TurnOrigin>,
     },
     ModelCompleted {
+        action_id: ActionId,
         turn_id: TurnId,
         assistant: AssistantMessage,
     },
     ToolCompleted {
+        action_id: ActionId,
         turn_id: TurnId,
         result: ToolResultMessage,
     },

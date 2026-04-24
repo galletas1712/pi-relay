@@ -80,11 +80,13 @@ impl AgentOrchestrator {
             .registry
             .get_mut(to)
             .expect("contains check above guarantees target exists");
-        target.enqueue_input(AgentInput::steer_tagged(
-            from.clone(),
-            KIND_AGENT_DIRECTIVE,
-            content,
-        ));
+        target
+            .enqueue_input(AgentInput::steer_tagged(
+                from.clone(),
+                KIND_AGENT_DIRECTIVE,
+                content,
+            ))
+            .expect("orchestrator constructs valid tagged steer input");
         Ok(())
     }
 
@@ -112,11 +114,13 @@ impl AgentOrchestrator {
             .registry
             .get_mut(&parent)
             .expect("registered spawn parent must be in the registry");
-        target.enqueue_input(AgentInput::follow_up_tagged(
-            from.clone(),
-            KIND_AGENT_REPORT,
-            content,
-        ));
+        target
+            .enqueue_input(AgentInput::follow_up_tagged(
+                from.clone(),
+                KIND_AGENT_REPORT,
+                content,
+            ))
+            .expect("orchestrator constructs valid tagged follow-up input");
         Ok(())
     }
 }
@@ -142,7 +146,8 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .enqueue_input(AgentInput::follow_up("hello"));
+            .enqueue_input(AgentInput::follow_up("hello"))
+            .expect("plain follow-up is valid");
 
         assert!(orchestrator
             .registry()

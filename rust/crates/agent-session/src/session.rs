@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 
-use agent_core::{AgentAction, AgentCoreLoop, AgentInput, TranscriptRecord, TurnId};
+use agent_core::{
+    AgentAction, AgentCoreLoop, AgentInput, AgentInputError, TranscriptRecord, TurnId,
+};
 
 use crate::action_queue::ActionQueue;
 use crate::context::{Context, ContextEdit, ContextError, HistoryEditError, PendingWork};
@@ -76,10 +78,11 @@ impl AgentSession {
     /// `ModelCompleted` / `ToolCompleted` clear the matching entry from the
     /// session's internal action queue. Stale completions (no matching
     /// pending entry, e.g. after an interrupt) are removed with no effect.
-    pub fn enqueue_input(&mut self, input: AgentInput) {
+    pub fn enqueue_input(&mut self, input: AgentInput) -> Result<(), AgentInputError> {
+        input.validate()?;
         self.action_queue.record_input(&input);
         self.drop_completed_action_from_outbox(&input);
-        self.core.enqueue_input(input);
+        self.core.enqueue_input(input)
     }
 
     /// The most recent turn id observed by the core loop.
@@ -213,6 +216,7 @@ impl AgentSession {
                         queued,
                         AgentAction::RequestModel {
                             turn_id: queued_turn_id,
+                            ..
                         } | AgentAction::RequestTool {
                             turn_id: queued_turn_id,
                             ..
@@ -231,24 +235,29 @@ impl AgentSession {
             .position(|action| match (action, input) {
                 (
                     AgentAction::RequestModel {
+                        action_id: action_action_id,
                         turn_id: action_turn_id,
                     },
                     AgentInput::ModelCompleted {
+                        action_id: input_action_id,
                         turn_id: input_turn_id,
                         ..
                     },
-                ) => action_turn_id == input_turn_id,
+                ) => action_action_id == input_action_id && action_turn_id == input_turn_id,
                 (
                     AgentAction::RequestTool {
+                        action_id: action_action_id,
                         turn_id: action_turn_id,
                         tool_call,
                     },
                     AgentInput::ToolCompleted {
+                        action_id: input_action_id,
                         turn_id: input_turn_id,
                         result,
                     },
                 ) => {
-                    action_turn_id == input_turn_id
+                    action_action_id == input_action_id
+                        && action_turn_id == input_turn_id
                         && tool_call.id == result.tool_call_id
                         && tool_call.tool_name == result.tool_name
                 }
@@ -261,7 +270,9 @@ impl AgentSession {
 
     pub(crate) fn rehydrate_core_from_context(&mut self) {
         let last_turn_id = self.context.transcript().last_turn_id();
-        self.core = AgentCoreLoop::resume_at_boundary(last_turn_id);
+        let next_action_id = self.core.next_action_id();
+        self.core =
+            AgentCoreLoop::resume_at_boundary_with_next_action_id(last_turn_id, next_action_id);
         // Any actions tracked as pending belong to a prior run we're no
         // longer driving; reset the queue so a rehydrated session does not
         // block edits forever.
@@ -277,8 +288,8 @@ mod tests {
     use crate::context::rewind::branch_summary;
     use crate::context::{Compact, CompactionSettings, ReplaceTranscript, Rewind};
     use agent_core::{
-        AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage, ToolResultStatus,
-        TurnId, TurnOutcome,
+        ActionId, AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage,
+        ToolResultStatus, TurnId, TurnOutcome,
     };
 
     fn finished_transcript(input: &str) -> Transcript {
@@ -295,7 +306,9 @@ mod tests {
     #[test]
     fn transcript_replacement_is_only_allowed_at_turn_boundary() {
         let mut session = AgentSession::new();
-        session.enqueue_input(AgentInput::follow_up("hello"));
+        session
+            .enqueue_input(AgentInput::follow_up("hello"))
+            .expect("plain follow-up is valid");
 
         let busy = session
             .edit(
@@ -421,7 +434,9 @@ mod tests {
     fn can_edit_history_requires_idle_core_empty_queues_and_no_pending_work() {
         let mut session = AgentSession::new();
 
-        session.enqueue_input(AgentInput::follow_up("hello"));
+        session
+            .enqueue_input(AgentInput::follow_up("hello"))
+            .expect("plain follow-up is valid");
         assert!(!session.can_edit_history(PendingWork::NONE));
         assert!(!session.can_edit_history(PendingWork {
             background_tasks: 1,
@@ -444,12 +459,17 @@ mod tests {
             items: vec![AssistantItem::Text("hi".to_string())],
         };
 
-        session.enqueue_input(AgentInput::follow_up("hello"));
+        session
+            .enqueue_input(AgentInput::follow_up("hello"))
+            .expect("plain follow-up is valid");
         session.drive();
-        session.enqueue_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: assistant.clone(),
-        });
+        session
+            .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                assistant: assistant.clone(),
+            })
+            .expect("matching model completion is valid");
         session.drive();
 
         assert_eq!(
@@ -473,7 +493,9 @@ mod tests {
     fn live_transcript_keeps_open_turns_open() {
         let mut session = AgentSession::new();
 
-        session.enqueue_input(AgentInput::follow_up("hello"));
+        session
+            .enqueue_input(AgentInput::follow_up("hello"))
+            .expect("plain follow-up is valid");
         session.drive();
 
         assert_eq!(
@@ -530,7 +552,9 @@ mod tests {
     #[test]
     fn session_blocks_edit_history_until_drained_model_action_completes() {
         let mut session = AgentSession::new();
-        session.enqueue_input(AgentInput::follow_up("hi"));
+        session
+            .enqueue_input(AgentInput::follow_up("hi"))
+            .expect("plain follow-up is valid");
         session.drive();
         let actions = session.drain_actions();
         assert!(matches!(
@@ -539,10 +563,13 @@ mod tests {
         ));
         assert!(!session.can_edit_history(PendingWork::NONE));
 
-        session.enqueue_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: AssistantMessage { items: Vec::new() },
-        });
+        session
+            .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                assistant: AssistantMessage { items: Vec::new() },
+            })
+            .expect("matching model completion is valid");
         session.drive();
         assert!(session.can_edit_history(PendingWork::NONE));
     }
@@ -550,13 +577,18 @@ mod tests {
     #[test]
     fn late_action_drain_does_not_leave_completed_request_pending() {
         let mut session = AgentSession::new();
-        session.enqueue_input(AgentInput::follow_up("hi"));
+        session
+            .enqueue_input(AgentInput::follow_up("hi"))
+            .expect("plain follow-up is valid");
         session.drive();
 
-        session.enqueue_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: AssistantMessage { items: Vec::new() },
-        });
+        session
+            .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                assistant: AssistantMessage { items: Vec::new() },
+            })
+            .expect("matching model completion is valid");
         session.drive();
 
         let late_actions = session.drain_actions();
@@ -565,9 +597,118 @@ mod tests {
     }
 
     #[test]
+    fn stale_completion_after_history_edit_cannot_attach_to_reused_turn_id() {
+        let mut session = AgentSession::from_transcript(finished_transcript("first"));
+        let turn_one_end_id = session.context().entries()[2].id.clone();
+
+        session
+            .enqueue_input(AgentInput::follow_up("old second"))
+            .expect("plain follow-up is valid");
+        session.drive();
+        assert_eq!(
+            session.drain_actions(),
+            vec![AgentAction::RequestModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(2),
+            }]
+        );
+        session
+            .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(1),
+                turn_id: TurnId(2),
+                assistant: AssistantMessage {
+                    items: vec![AssistantItem::Text("old response".to_string())],
+                },
+            })
+            .expect("matching model completion is valid");
+        session.drive();
+        assert!(session.can_edit_history(PendingWork::NONE));
+
+        session
+            .edit(
+                PendingWork::NONE,
+                Rewind {
+                    leaf_id: Some(turn_one_end_id),
+                },
+            )
+            .expect("completed history can rewind to turn one");
+        session
+            .enqueue_input(AgentInput::follow_up("new second"))
+            .expect("plain follow-up is valid");
+        session.drive();
+        assert_eq!(
+            session.drain_actions(),
+            vec![AgentAction::RequestModel {
+                action_id: ActionId(2),
+                turn_id: TurnId(2),
+            }]
+        );
+
+        session
+            .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(1),
+                turn_id: TurnId(2),
+                assistant: AssistantMessage {
+                    items: vec![AssistantItem::Text("stale old response".to_string())],
+                },
+            })
+            .expect("well-formed stale completion is valid input");
+        session.drive();
+        assert_eq!(
+            session.transcript().records(),
+            &[
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage("first".to_string()),
+                TranscriptRecord::TurnFinished {
+                    turn_id: TurnId(1),
+                    outcome: TurnOutcome::Graceful,
+                },
+                TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
+                TranscriptRecord::UserMessage("new second".to_string()),
+            ]
+        );
+        assert!(!session.can_edit_history(PendingWork::NONE));
+
+        session
+            .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(2),
+                turn_id: TurnId(2),
+                assistant: AssistantMessage {
+                    items: vec![AssistantItem::Text("new response".to_string())],
+                },
+            })
+            .expect("matching model completion is valid");
+        session.drive();
+        assert_eq!(
+            session.transcript().records().last(),
+            Some(&TranscriptRecord::TurnFinished {
+                turn_id: TurnId(2),
+                outcome: TurnOutcome::Graceful,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_origin_tags_are_rejected_without_mutating_session_state() {
+        let mut session = AgentSession::new();
+        let result = session.enqueue_input(AgentInput::Steer {
+            from: Some("parent".to_string()),
+            kind: None,
+            content: "half tagged".to_string(),
+        });
+
+        assert_eq!(result, Err(AgentInputError::UnpairedOriginTags));
+        session.drive();
+        assert!(session.transcript().records().is_empty());
+        assert!(session.can_edit_history(PendingWork::NONE));
+    }
+
+    #[test]
     fn session_blocks_edit_history_while_tool_actions_in_flight() {
         let mut session = AgentSession::new();
-        session.enqueue_input(AgentInput::follow_up("go"));
+        session
+            .enqueue_input(AgentInput::follow_up("go"))
+            .expect("plain follow-up is valid");
         session.drive();
         session.drain_actions();
 
@@ -576,34 +717,43 @@ mod tests {
             tool_name: "bash".to_string(),
             args_json: "{}".to_string(),
         };
-        session.enqueue_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: AssistantMessage {
-                items: vec![AssistantItem::ToolCall(tool_call.clone())],
-            },
-        });
+        session
+            .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                assistant: AssistantMessage {
+                    items: vec![AssistantItem::ToolCall(tool_call.clone())],
+                },
+            })
+            .expect("matching model completion is valid");
         session.drive();
         session.drain_actions();
         assert!(!session.can_edit_history(PendingWork::NONE));
 
-        session.enqueue_input(AgentInput::ToolCompleted {
-            turn_id: TurnId(1),
-            result: ToolResultMessage {
-                tool_call_id: ToolCallId(1),
-                tool_name: "bash".to_string(),
-                output: "ok".to_string(),
-                status: ToolResultStatus::Success,
-            },
-        });
+        session
+            .enqueue_input(AgentInput::ToolCompleted {
+                action_id: ActionId(2),
+                turn_id: TurnId(1),
+                result: ToolResultMessage {
+                    tool_call_id: ToolCallId(1),
+                    tool_name: "bash".to_string(),
+                    output: "ok".to_string(),
+                    status: ToolResultStatus::Success,
+                },
+            })
+            .expect("matching tool completion is valid");
         session.drive();
         // A second model request fires after the tool completes; the session
         // is still waiting on that completion, so edits remain blocked.
         assert!(!session.can_edit_history(PendingWork::NONE));
         session.drain_actions();
-        session.enqueue_input(AgentInput::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: AssistantMessage { items: Vec::new() },
-        });
+        session
+            .enqueue_input(AgentInput::ModelCompleted {
+                action_id: ActionId(3),
+                turn_id: TurnId(1),
+                assistant: AssistantMessage { items: Vec::new() },
+            })
+            .expect("matching model completion is valid");
         session.drive();
         assert!(session.can_edit_history(PendingWork::NONE));
     }
@@ -634,11 +784,15 @@ mod tests {
     #[test]
     fn cancel_turn_clears_pending_actions_for_that_turn() {
         let mut session = AgentSession::new();
-        session.enqueue_input(AgentInput::follow_up("hi"));
+        session
+            .enqueue_input(AgentInput::follow_up("hi"))
+            .expect("plain follow-up is valid");
         session.drive();
         session.drain_actions();
 
-        session.enqueue_input(AgentInput::Interrupt);
+        session
+            .enqueue_input(AgentInput::Interrupt)
+            .expect("interrupt is valid");
         session.drive();
         let actions = session.drain_actions();
         assert!(actions

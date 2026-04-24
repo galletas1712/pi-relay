@@ -32,7 +32,8 @@ pub struct Mailbox {
 }
 
 impl Mailbox {
-    pub(crate) fn push_input(&mut self, input: AgentInput) {
+    pub(crate) fn push_input(&mut self, input: AgentInput) -> Result<(), crate::AgentInputError> {
+        input.validate()?;
         match input {
             AgentInput::Interrupt => self.request_interrupt(),
             AgentInput::Steer {
@@ -57,17 +58,34 @@ impl Mailbox {
                     content,
                 });
             }
-            AgentInput::ModelCompleted { turn_id, assistant } => {
+            AgentInput::ModelCompleted {
+                action_id,
+                turn_id,
+                assistant,
+            } => {
                 // External completions preempt queued user work, but preserve
                 // arrival order relative to other completions.
-                self.push_notification_back(AgentEvent::ModelCompleted { turn_id, assistant });
+                self.push_notification_back(AgentEvent::ModelCompleted {
+                    action_id,
+                    turn_id,
+                    assistant,
+                });
             }
-            AgentInput::ToolCompleted { turn_id, result } => {
+            AgentInput::ToolCompleted {
+                action_id,
+                turn_id,
+                result,
+            } => {
                 // External completions preempt queued user work, but preserve
                 // arrival order relative to other completions.
-                self.push_notification_back(AgentEvent::ToolCompleted { turn_id, result });
+                self.push_notification_back(AgentEvent::ToolCompleted {
+                    action_id,
+                    turn_id,
+                    result,
+                });
             }
         }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -181,7 +199,7 @@ impl Mailbox {
 mod tests {
     use super::*;
     use crate::event::AgentEvent;
-    use crate::ids::ToolCallId;
+    use crate::ids::{ActionId, ToolCallId};
     use crate::message::{AssistantMessage, ToolResultMessage, ToolResultStatus};
 
     fn tool_result(id: u64, name: &str) -> ToolResultMessage {
@@ -197,10 +215,12 @@ mod tests {
     fn notification_queue_behaves_like_a_deque() {
         let mut mailbox = Mailbox::default();
         let later = AgentEvent::ToolCompleted {
+            action_id: ActionId(2),
             turn_id: TurnId(1),
             result: tool_result(2, "read"),
         };
         let now = AgentEvent::ModelCompleted {
+            action_id: ActionId(1),
             turn_id: TurnId(1),
             assistant: AssistantMessage { items: Vec::new() },
         };
@@ -208,7 +228,10 @@ mod tests {
         mailbox.push_notification_back(later.clone());
         mailbox.push_notification_front(now.clone());
 
-        let state = AgentState::RunningModel { turn_id: TurnId(1) };
+        let state = AgentState::RunningModel {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+        };
         assert_eq!(mailbox.next_event(&state, TurnId(99)), Some(now));
         assert_eq!(mailbox.next_event(&state, TurnId(99)), Some(later));
         assert_eq!(mailbox.next_event(&state, TurnId(99)), None);
@@ -237,6 +260,7 @@ mod tests {
         mailbox.push_follow_up("follow-up");
         mailbox.push_steer("steer");
         mailbox.push_notification_back(AgentEvent::ToolCompleted {
+            action_id: ActionId(1),
             turn_id: TurnId(1),
             result: tool_result(9, "bash"),
         });
@@ -247,6 +271,7 @@ mod tests {
                 &AgentState::RunningTools {
                     turn_id: TurnId(1),
                     tool_calls: Vec::new(),
+                    tool_action_ids: Vec::new(),
                     completed_results: Vec::new(),
                     next_result_index: 0,
                 },
@@ -259,6 +284,7 @@ mod tests {
                 &AgentState::RunningTools {
                     turn_id: TurnId(1),
                     tool_calls: Vec::new(),
+                    tool_action_ids: Vec::new(),
                     completed_results: Vec::new(),
                     next_result_index: 0,
                 },
@@ -294,11 +320,13 @@ mod tests {
     #[test]
     fn tagged_steer_surfaces_turn_origin_on_next_event() {
         let mut mailbox = Mailbox::default();
-        mailbox.push_input(AgentInput::steer_tagged(
-            "parent",
-            "agent_directive",
-            "do X",
-        ));
+        mailbox
+            .push_input(AgentInput::steer_tagged(
+                "parent",
+                "agent_directive",
+                "do X",
+            ))
+            .expect("test input should be valid");
 
         let event = mailbox
             .next_event(&AgentState::Idle, TurnId(1))
@@ -320,7 +348,9 @@ mod tests {
     #[test]
     fn untagged_steer_surfaces_without_origin() {
         let mut mailbox = Mailbox::default();
-        mailbox.push_input(AgentInput::steer("plain"));
+        mailbox
+            .push_input(AgentInput::steer("plain"))
+            .expect("test input should be valid");
 
         let event = mailbox
             .next_event(&AgentState::Idle, TurnId(1))

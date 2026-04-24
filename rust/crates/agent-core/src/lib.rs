@@ -20,8 +20,8 @@ mod state;
 
 pub use crate::action::AgentAction;
 pub use crate::core_loop::AgentCoreLoop;
-pub use crate::event::AgentInput;
-pub use crate::ids::{ToolCallId, TurnId};
+pub use crate::event::{AgentInput, AgentInputError};
+pub use crate::ids::{ActionId, ToolCallId, TurnId};
 pub use crate::message::{
     AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
 };

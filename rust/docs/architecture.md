@@ -49,8 +49,8 @@ Feature-specific design docs go deeper in their own files:
                      ▼
 ┌──────────────────────────────────────────────┐
 │ 2. Core — AgentCoreLoop, Mailbox, AgentState.│
-│    Pure FSM. No I/O, no allocation of IDs    │
-│    beyond TurnId.                            │
+│    Pure FSM. No I/O, allocates only TurnId   │
+│    and ActionId.                             │
 └──────────────────────────────────────────────┘
                      ▲
                      │  produces records & actions
@@ -84,24 +84,22 @@ enum TranscriptRecord {
 
 // What the FSM requests the outside world do:
 enum AgentAction {
-    RequestModel { turn_id },
-    RequestTool { turn_id, tool_call },
+    RequestModel { action_id, turn_id },
+    RequestTool { action_id, turn_id, tool_call },
     CancelTurn { turn_id },
 }
 
 // What the outside world feeds the FSM:
 enum AgentInput {
     Interrupt,
-    Steer    { from: Option<SessionId>, content: String },
-    FollowUp { from: Option<SessionId>, content: String },
-    ModelCompleted { turn_id, assistant },
-    ToolCompleted  { turn_id, result },
+    Steer    { from: Option<SessionId>, kind: Option<String>, content: String },
+    FollowUp { from: Option<SessionId>, kind: Option<String>, content: String },
+    ModelCompleted { action_id, turn_id, assistant },
+    ToolCompleted  { action_id, turn_id, result },
 }
-// `from = None` means the input came from the human user (or unknown
-// origin); `from = Some(session_id)` means it came from another session
-// (e.g. a parent directive routed via `send_message`, or a child report
-// routed via `send_report`). The core crate stays oblivious to what a
-// session id *is* — it's just a tag that rides along.
+// `from` and `kind` are either both None (human/unknown origin) or both
+// Some (agent-routed input such as a parent directive or child report).
+// `action_id` must be copied from the matching RequestModel / RequestTool.
 ```
 
 Every one of these serializes. The FSM never holds non-POD state beyond these.
