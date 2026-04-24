@@ -1,7 +1,6 @@
 use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptRecord, TurnId, TurnOutcome};
 
 use crate::context::compaction::KIND_COMPACTION_SUMMARY;
-use crate::context::rewind::KIND_BRANCH_SUMMARY;
 
 /// Materialized session history.
 ///
@@ -53,16 +52,6 @@ impl Transcript {
     pub fn latest_compaction_summary(&self) -> Option<&str> {
         self.records.iter().rev().find_map(|r| match r {
             TranscriptRecord::Custom(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
-                Some(cm.content.as_str())
-            }
-            _ => None,
-        })
-    }
-
-    /// Iterate over branch-summary `content` strings in transcript order.
-    pub fn branch_summaries(&self) -> impl Iterator<Item = &str> + '_ {
-        self.records.iter().filter_map(|r| match r {
-            TranscriptRecord::Custom(cm) if cm.kind == KIND_BRANCH_SUMMARY => {
                 Some(cm.content.as_str())
             }
             _ => None,
@@ -190,8 +179,7 @@ impl From<Vec<TranscriptRecord>> for Transcript {
 mod tests {
     use super::*;
     use crate::context::compaction::compaction_summary;
-    use crate::context::rewind::branch_summary;
-    use agent_core::{AssistantItem, AssistantMessage, ToolResultStatus};
+    use agent_core::{AssistantItem, AssistantMessage, CustomMessage, ToolResultStatus};
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
         ToolCall {
@@ -225,14 +213,10 @@ mod tests {
                 outcome: TurnOutcome::Graceful,
             },
             TranscriptRecord::Custom(compaction_summary("summary", "some_id", 100)),
-            TranscriptRecord::Custom(branch_summary("branch note", None)),
+            TranscriptRecord::Custom(CustomMessage::new("note", "branch note")),
         ]);
         assert!(transcript.is_turn_boundary());
         assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
-        assert_eq!(
-            transcript.branch_summaries().collect::<Vec<_>>(),
-            vec!["branch note"]
-        );
     }
 
     #[test]

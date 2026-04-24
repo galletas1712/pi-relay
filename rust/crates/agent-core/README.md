@@ -176,7 +176,7 @@ All three are pure requests. `agent-core` never performs the underlying I/O and 
 - `ToolCallStarted { turn_id, tool_call }` — emitted per tool call when the assistant's message is processed, alongside a `RequestTool` action.
 - `ToolResult(ToolResultMessage)` — a completed tool result, emitted in assistant-declared order (late results are buffered by `completed_results` until the preceding ones arrive).
 - `TurnFinished { turn_id, outcome }` — closes the turn with `TurnOutcome::Graceful`, `Interrupted`, or `Crashed`.
-- `Custom(CustomMessage)` — the open extension point. `agent-core` **produces** this variant only in one case: when a tagged `Steer` / `FollowUp` starts a turn at `Idle`, the opening entry is a `Custom` instead of a `UserMessage`. Downstream layers (compaction summaries and branch summaries in `agent-session`, future multi-agent spawn briefs / child reports) append their own `Custom` entries with their own kinds. The core defines the variant and the shape; it knows nothing about specific kind strings.
+- `Custom(CustomMessage)` — the open extension point. `agent-core` **produces** this variant only in one case: when a tagged `Steer` / `FollowUp` starts a turn at `Idle`, the opening entry is a `Custom` instead of a `UserMessage`. Downstream layers (compaction summaries in `agent-session`, future multi-agent spawn briefs / child reports) append their own `Custom` entries with their own kinds. The core defines the variant and the shape; it knows nothing about specific kind strings.
 
 `TranscriptRecord::turn_id()` returns the turn id for variants that carry one (`TurnStarted`, `ToolCallStarted`, `TurnFinished`) and `None` otherwise.
 
@@ -188,5 +188,5 @@ All three are pure requests. `agent-core` never performs the underlying I/O and 
 - **No tool execution.** `RequestTool` is a request; the caller runs the tool and feeds back a `ToolResultMessage`.
 - **No model provider abstraction.** The core does not know what a model is or how to call one; it just accepts `ModelCompleted { action_id, assistant, .. }` and moves on.
 - **No multi-agent awareness or routing.** Inter-session routing, session registries, spawn/report semantics, and worklog triggers all live in `agent-orchestrator` / `agent-session`. The core's only concession to multi-agent existence is that `AgentInput::Steer` / `FollowUp` carry optional `from` / `kind` tags, which it propagates into `Custom` records opaquely.
-- **No knowledge of specific `Custom` kinds.** Kind strings like `compaction_summary` or `branch_summary` are defined in the session layer, not here.
+- **No knowledge of specific `Custom` kinds.** Kind strings like `compaction_summary` are defined in the session layer, not here.
 - **No provider/workspace ID allocation.** The core mints `TurnId` and `ActionId` only. `ToolCallId` values arrive from outside via the `ToolCall` structs the model produced; the core does not mint them.

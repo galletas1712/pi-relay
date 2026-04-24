@@ -285,11 +285,10 @@ impl AgentSession {
 mod tests {
     use super::*;
     use crate::context::compaction::compaction_summary;
-    use crate::context::rewind::branch_summary;
     use crate::context::{Compact, CompactionSettings, ReplaceTranscript, Rewind};
     use agent_core::{
-        ActionId, AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage,
-        ToolResultStatus, TurnId, TurnOutcome,
+        ActionId, AssistantItem, AssistantMessage, CustomMessage, ToolCall, ToolCallId,
+        ToolResultMessage, ToolResultStatus, TurnId, TurnOutcome,
     };
 
     fn finished_transcript(input: &str) -> Transcript {
@@ -771,11 +770,15 @@ mod tests {
                 outcome: TurnOutcome::Graceful,
             },
         ]));
-        session.context.append_custom(branch_summary("a", None));
+        session
+            .context
+            .append_custom(CustomMessage::new("note", "a"));
         session
             .context
             .append_custom(compaction_summary("b", "does-not-matter", 0));
-        session.context.append_custom(branch_summary("c", None));
+        session
+            .context
+            .append_custom(CustomMessage::new("note", "c"));
 
         assert!(session.context().is_turn_boundary());
         assert!(session.can_edit_history(PendingWork::NONE));

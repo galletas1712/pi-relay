@@ -1,6 +1,10 @@
 use agent_core::{CustomMessage, TranscriptRecord};
 
 use crate::context::edit::{ContextEdit, HistoryEditError};
+use crate::context::summary::{
+    estimate_record_tokens, estimate_records_tokens, summary_span_plan_from_indices,
+    transcript_records_in, SummarizeSpan, SummarySpanPlan,
+};
 use crate::context::{Context, ContextError, SessionEntry};
 use crate::transcript::Transcript;
 
@@ -41,16 +45,17 @@ pub struct CompactionSettings {
 
 /// Describes a compaction the caller may apply to a session context.
 ///
-/// A plan captures everything needed to turn a summary string back into a
-/// durable compaction entry: the anchor (`first_kept_entry_id`), the records
-/// the summary replaces (`records_to_summarize`), the surviving suffix
-/// (`records_to_keep`), the pre-compaction token estimate (`tokens_before`),
-/// and the immediate previous summary to thread through when summarizing.
-/// `leaf_id` + `entry_count` are staleness-check hooks: the boundary
-/// operation refuses to apply a plan if the context's shape has changed since
-/// the plan was prepared.
+/// A plan captures a prefix-oriented summary policy on top of the generic
+/// `SummarizeSpan` edit: the span to replace (`summary_span`), the first
+/// surviving entry (`first_kept_entry_id`), the records the summarizer should
+/// read (`records_to_summarize`), the surviving suffix (`records_to_keep`),
+/// the pre-compaction token estimate (`tokens_before`), and the immediate
+/// previous summary to thread through when summarizing. `leaf_id` +
+/// `entry_count` are staleness-check hooks: the operation refuses to apply a
+/// plan if the context's shape has changed since the plan was prepared.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionPlan {
+    pub summary_span: SummarySpanPlan,
     pub first_kept_entry_id: String,
     pub records_to_summarize: Vec<TranscriptRecord>,
     pub records_to_keep: Vec<TranscriptRecord>,
@@ -73,7 +78,7 @@ impl Context {
             return None;
         }
 
-        let (boundary_start, previous_entry) = boundary_start_index(&path);
+        let (boundary_start, previous_entry, span_start) = boundary_start_index(&path);
         let previous_summary = previous_entry.and_then(|entry| match &entry.record {
             TranscriptRecord::Custom(cm) => Some(cm.content.clone()),
             _ => None,
@@ -87,6 +92,8 @@ impl Context {
         }
 
         let first_kept_entry = path.get(cut_index)?;
+        let span_last_index = cut_index.checked_sub(1)?;
+        let summary_span = summary_span_plan_from_indices(self, &path, span_start, span_last_index);
         let records_to_summarize = transcript_records_in(&path[boundary_start..cut_index]);
         if records_to_summarize.is_empty() {
             return None;
@@ -94,6 +101,7 @@ impl Context {
         let records_to_keep = transcript_records_in(&path[cut_index..]);
 
         Some(CompactionPlan {
+            summary_span,
             first_kept_entry_id: first_kept_entry.id.clone(),
             records_to_summarize,
             records_to_keep,
@@ -115,6 +123,7 @@ impl Context {
         if !self.contains_entry(&plan.first_kept_entry_id) {
             return Err(ContextError::EntryNotFound);
         }
+        self.validate_summary_span_plan(&plan.summary_span)?;
         if self.leaf_id() != plan.leaf_id.as_deref() || self.entries().len() != plan.entry_count {
             return Err(ContextError::StalePlan);
         }
@@ -127,13 +136,8 @@ impl Context {
 
 /// A prepared compaction operation.
 ///
-/// Applies via the fork-based strategy: navigate the durable leaf back to the
-/// pre-cut boundary (parent of `plan.first_kept_entry_id`), append a
-/// compaction summary there as a new branch, then re-append copies of the
-/// kept records as descendants of the summary.
-///
-/// The new branch's chronological order (summary, then kept records) *is*
-/// the model's semantic view. The pre-compaction entries stay in the
+/// Applies by converting the compaction plan into a generic `SummarizeSpan`
+/// edit with a `compaction_summary` record. The replaced prefix stays in the
 /// context as an orphaned branch so the audit trail is preserved.
 pub struct Compact {
     pub plan: CompactionPlan,
@@ -147,51 +151,29 @@ impl ContextEdit for Compact {
         ctx.validate_plan_matches(&self.plan)
             .map_err(HistoryEditError::Context)?;
 
-        // Find the pre-cut parent (the entry immediately before first_kept).
-        let first_kept = ctx
-            .get_entry(&self.plan.first_kept_entry_id)
-            .expect("validate_plan_matches guarantees the entry exists");
-        let pre_cut_parent_id = first_kept.parent_id.clone();
+        let CompactionPlan {
+            summary_span,
+            first_kept_entry_id,
+            tokens_before,
+            ..
+        } = self.plan;
 
-        // Navigate the leaf to the pre-cut boundary.
-        match pre_cut_parent_id.as_deref() {
-            Some(id) => ctx
-                .branch_at_turn_boundary(id)
-                .map_err(HistoryEditError::Context)?,
-            None => ctx.reset_leaf(),
+        SummarizeSpan {
+            plan: summary_span,
+            summary: compaction_summary(self.summary, first_kept_entry_id, tokens_before),
         }
-
-        // Append the compaction summary on the new branch.
-        ctx.append_custom(compaction_summary(
-            self.summary,
-            self.plan.first_kept_entry_id.clone(),
-            self.plan.tokens_before,
-        ));
-
-        // Re-append copies of the kept records as descendants of the summary.
-        ctx.append_transcript_records(self.plan.records_to_keep.iter().cloned());
-        Ok(())
+        .apply(ctx)
     }
 }
 
 /// Materialize the model-visible transcript for a session-context path.
 ///
-/// Under fork-based compaction the materialized order is identical to the
-/// chronological order on the active branch: when `Compact` applied, it forked
-/// the leaf at the pre-cut boundary, appended the compaction summary on the
-/// new branch, and re-appended the kept records as descendants of the
-/// summary. The entries past the latest compaction summary on this path are
-/// therefore already in the exact order the model should see them.
-///
-/// So this materialization is a plain slice: find the latest `CompSum` on the
-/// path (if any) and take records from there to the leaf. With no compaction
-/// on the path, take the whole path.
+/// Summary-span edits rebuild the active branch in its model-visible order:
+/// prefix before the summarized span, the summary record, then copies of the
+/// suffix after the summarized span. Materialization is therefore the full
+/// active path.
 pub(crate) fn materialize_context(path: &[SessionEntry]) -> Transcript {
-    let start = path
-        .iter()
-        .rposition(|e| is_compaction_summary(&e.record))
-        .unwrap_or(0);
-    let records = path[start..].iter().map(|e| e.record.clone()).collect();
+    let records = path.iter().map(|e| e.record.clone()).collect();
     Transcript::from_records(records)
 }
 
@@ -200,7 +182,7 @@ pub(crate) fn materialize_context(path: &[SessionEntry]) -> Transcript {
 /// If a previous compaction exists on the active branch, we skip everything up
 /// to and including its `first_kept_entry_id` — records before that were
 /// already evicted under the earlier summary.
-fn boundary_start_index(path: &[SessionEntry]) -> (usize, Option<&SessionEntry>) {
+fn boundary_start_index(path: &[SessionEntry]) -> (usize, Option<&SessionEntry>, usize) {
     let previous_compaction_index = path
         .iter()
         .rposition(|entry| is_compaction_summary(&entry.record));
@@ -212,8 +194,9 @@ fn boundary_start_index(path: &[SessionEntry]) -> (usize, Option<&SessionEntry>)
             .unwrap_or(0),
         None => 0,
     };
+    let span_start = previous_compaction_index.unwrap_or(start);
     let previous_entry = previous_compaction_index.map(|i| &path[i]);
-    (start, previous_entry)
+    (start, previous_entry, span_start)
 }
 
 fn find_boundary_cut_index(
@@ -224,11 +207,6 @@ fn find_boundary_cut_index(
     let mut accumulated_tokens = 0;
 
     for index in (boundary_start..path.len()).rev() {
-        // Custom entries live between turns; they don't count toward the
-        // keep-recent window, and the cut must land on a turn boundary.
-        if matches!(path[index].record, TranscriptRecord::Custom(_)) {
-            continue;
-        }
         accumulated_tokens += estimate_record_tokens(&path[index].record);
         if accumulated_tokens >= keep_recent_tokens {
             return turn_start_at_or_before(path, index, boundary_start);
@@ -251,55 +229,14 @@ fn turn_start_at_or_before(
     Some(boundary_start)
 }
 
-fn transcript_records_in(entries: &[SessionEntry]) -> Vec<TranscriptRecord> {
-    entries
-        .iter()
-        .filter_map(|entry| match &entry.record {
-            // Custom records are appended between turns; they are not part of
-            // the raw-model transcript the summarizer replays.
-            TranscriptRecord::Custom(_) => None,
-            other => Some(other.clone()),
-        })
-        .collect()
-}
-
-fn estimate_records_tokens(records: &[TranscriptRecord]) -> usize {
-    records.iter().map(estimate_record_tokens).sum()
-}
-
-fn estimate_record_tokens(record: &TranscriptRecord) -> usize {
-    use agent_core::AssistantItem;
-
-    let chars = match record {
-        TranscriptRecord::TurnStarted { .. } | TranscriptRecord::TurnFinished { .. } => 0,
-        TranscriptRecord::UserMessage(content) => content.len(),
-        TranscriptRecord::AssistantMessage(message) => message
-            .items
-            .iter()
-            .map(|item| match item {
-                AssistantItem::Text(text) => text.len(),
-                AssistantItem::ToolCall(tool_call) => {
-                    tool_call.tool_name.len() + tool_call.args_json.len()
-                }
-            })
-            .sum(),
-        TranscriptRecord::ToolCallStarted { tool_call, .. } => {
-            tool_call.tool_name.len() + tool_call.args_json.len()
-        }
-        TranscriptRecord::ToolResult(result) => result.tool_name.len() + result.output.len(),
-        TranscriptRecord::Custom(cm) => cm.content.len(),
-    };
-    chars.div_ceil(4)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::edit::PendingWork;
     use crate::session::AgentSession;
     use agent_core::{
-        ActionId, AgentInput, AssistantItem, AssistantMessage, TranscriptRecord, TurnId,
-        TurnOutcome,
+        ActionId, AgentInput, AssistantItem, AssistantMessage, CustomMessage, TranscriptRecord,
+        TurnId, TurnOutcome,
     };
 
     #[test]
@@ -394,6 +331,51 @@ mod tests {
             .iter()
             .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "first user message"));
         assert!(!has_first_user);
+    }
+
+    #[test]
+    fn compaction_plan_keeps_model_visible_custom_records() {
+        let mut ctx = Context::new();
+        ctx.append_transcript_records(vec![
+            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+            TranscriptRecord::Custom(CustomMessage::new("agent_directive", "do first")),
+            TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
+            TranscriptRecord::Custom(CustomMessage::new("agent_report", "second report")),
+            TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(2),
+                outcome: TurnOutcome::Graceful,
+            },
+        ]);
+
+        let plan = ctx
+            .prepare_compaction(CompactionSettings {
+                keep_recent_tokens: 1,
+            })
+            .expect("first turn should be compactable");
+
+        assert!(plan.records_to_summarize.iter().any(
+            |record| matches!(record, TranscriptRecord::Custom(cm) if cm.kind == "agent_directive")
+        ));
+        assert!(plan.records_to_keep.iter().any(
+            |record| matches!(record, TranscriptRecord::Custom(cm) if cm.kind == "agent_report")
+        ));
+
+        Compact {
+            plan,
+            summary: "summary".to_string(),
+        }
+        .apply(&mut ctx)
+        .expect("compaction should apply");
+
+        assert!(ctx.transcript().records().iter().any(
+            |record| matches!(record, TranscriptRecord::Custom(cm) if cm.kind == "agent_report")
+        ));
     }
 
     #[test]

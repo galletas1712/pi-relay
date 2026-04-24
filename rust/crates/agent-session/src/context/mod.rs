@@ -10,11 +10,13 @@ pub mod compaction;
 pub mod edit;
 pub mod replace;
 pub mod rewind;
+pub mod summary;
 
 pub use self::compaction::{Compact, CompactionPlan, CompactionSettings, KIND_COMPACTION_SUMMARY};
 pub use self::edit::{ContextEdit, HistoryEditError, PendingWork};
 pub use self::replace::ReplaceTranscript;
-pub use self::rewind::{Rewind, KIND_BRANCH_SUMMARY};
+pub use self::rewind::Rewind;
+pub use self::summary::{SummarizeSpan, SummarySpanPlan};
 
 /// DAG entry holding a single `TranscriptRecord`. The DAG is append-only; new
 /// entries attach as children of `parent_id`. The context tracks the
@@ -187,11 +189,9 @@ impl Context {
 
     /// Materialize the active branch into a `Transcript`.
     ///
-    /// Under fork-based compaction the chronological order on the active
-    /// branch already matches the model's semantic view (CompSum followed by
-    /// the kept records re-appended as its descendants), so materialization
-    /// is a plain slice starting at the latest CompSum entry. See
-    /// `compaction::materialize_context` for details.
+    /// Summary-span edits rebuild the active branch in model-visible order,
+    /// so materialization is a plain full-path view. See
+    /// `compaction::materialize_context` for the tiny adapter.
     pub fn transcript(&self) -> Transcript {
         let path = self.branch_entries(None);
         self::compaction::materialize_context(&path)
@@ -219,6 +219,7 @@ impl Context {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextError {
     EntryNotFound,
+    InvalidSpan,
     NotTurnBoundary,
     StalePlan,
 }
@@ -234,8 +235,7 @@ fn now_ms() -> u128 {
 mod tests {
     use super::*;
     use crate::context::compaction::compaction_summary;
-    use crate::context::rewind::branch_summary;
-    use agent_core::{AssistantItem, AssistantMessage, TurnId, TurnOutcome};
+    use agent_core::{AssistantItem, AssistantMessage, CustomMessage, TurnId, TurnOutcome};
 
     fn turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptRecord> {
         vec![
@@ -275,12 +275,12 @@ mod tests {
     }
 
     #[test]
-    fn transcript_starts_at_the_latest_compaction_summary_on_the_active_branch() {
-        // Simulate a fork-based compaction manually at the context level:
-        // append two turns, navigate back to the T1 boundary, append a
-        // CompSum there, then re-append T2's records as descendants. The
-        // active branch is now [T1 records..., CompSum, T2 records...]; the
-        // materialized view should start at CompSum.
+    fn transcript_materializes_the_full_active_branch_after_a_summary() {
+        // Simulate a summary-span edit manually at the context level: append
+        // two turns, navigate back to the T1 boundary, append a summary there,
+        // then re-append T2's records as descendants. The active branch is now
+        // [T1 records..., summary, T2 records...], and the materialized view is
+        // that full active path.
         let mut ctx = Context::new();
         let first_ids = ctx.append_transcript_records(turn(1, "first", "done"));
         let second_ids = ctx.append_transcript_records(turn(2, "second", "done"));
@@ -298,14 +298,14 @@ mod tests {
         assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
         assert_eq!(transcript.last_turn_id(), TurnId(2));
         assert!(matches!(
-            transcript.records()[0],
+            transcript.records()[4],
             TranscriptRecord::Custom(_)
         ));
         assert!(matches!(
-            transcript.records()[1],
+            transcript.records()[5],
             TranscriptRecord::TurnStarted { turn_id: TurnId(2) }
         ));
-        assert_eq!(transcript.records().len(), 5);
+        assert_eq!(transcript.records().len(), 9);
         assert!(ctx.is_turn_boundary());
     }
 
@@ -313,7 +313,7 @@ mod tests {
     fn fork_at_custom_tail_is_a_valid_turn_boundary() {
         let mut ctx = Context::new();
         ctx.append_transcript_records(turn(1, "hi", "done"));
-        let custom_id = ctx.append_custom(branch_summary("note", None));
+        let custom_id = ctx.append_custom(CustomMessage::new("note", "note"));
 
         assert!(ctx.is_turn_boundary());
         let forked = ctx

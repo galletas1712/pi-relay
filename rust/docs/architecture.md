@@ -119,7 +119,6 @@ struct InjectedMessage {
 
 enum InjectedKind {
     CompactionSummary { first_kept_entry_id, tokens_before },
-    BranchSummary     { from_id },
 
     // Multi-agent (added with spawn/report/idle):
     SpawnBrief        { from: SessionId },
@@ -175,7 +174,7 @@ Already landed in PR #62 + #63 refactors.
 Partially landed in PR #63; decomposition planned.
 
 - **`AgentSession`** — owns `AgentCoreLoop` + `Context`. The session is the sole owner of durable records. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `transcript`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `ContextEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
-- **`ContextEdit` trait + op structs** — each history-editing operation is its own struct (`Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`) that implements `ContextEdit { type Output; fn apply(self, &mut Context) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Compaction planning is a pure query on `Context` (`context.prepare_compaction(settings)`), not a trait op. `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
+- **`ContextEdit` trait + op structs** — each history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`) that implements `ContextEdit { type Output; fn apply(self, &mut Context) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `Context` (`context.prepare_summary_span(first, last)`); prefix compaction is policy on top (`context.prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
 - **`Context`** — DAG of `SessionEntry`s with a leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
 - **`Transcript`** — materialized view of the current branch's records, with crash-tail patching for resume.
 - **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans actions to the handler. Records auto-flow into the log; the runner does not expose them directly.
@@ -287,9 +286,10 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 **Status**: data model landed (PR #63); executor pending.
 
-- `context.prepare_compaction(settings)` produces a `CompactionPlan` (which turns to summarize, which to keep).
+- `context.prepare_summary_span(first, last)` is the generic primitive: replace a contiguous active-branch span with a summary and replay the suffix.
+- `context.prepare_compaction(settings)` produces a `CompactionPlan` as prefix-compaction policy on top of that primitive.
 - `Compactor::summarize(plan)` calls a `ModelProvider` to generate the summary string.
-- `session.edit(pending, Compact { plan, summary })` appends an `InjectedMessage { CompactionSummary {..} }` to the log.
+- `session.edit(pending, Compact { plan, summary })` applies the prepared summary span with a `compaction_summary` record.
 - Orchestrator observes `SessionEvent::TurnFinished` and checks thresholds; if tripped, drives the compaction pipeline.
 
 ### Rewind
@@ -433,11 +433,11 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 8. Principles in tension (explicit trade-offs)
 
-**Clean boundaries vs. API ergonomics.** The `session.edit(pending, Compact { plan, summary })?` form is 3 identifiers where TS has a single `session.compactAtBoundary(plan, summary, work)`. Accepting the verbosity because it encodes which operations are history-edit-only in the type system.
+**Clean boundaries vs. API ergonomics.** The `session.edit(pending, SummarizeSpan { plan, summary })?` form is more verbose than a single `session.compactAtBoundary(plan, summary, work)` helper. Accepting the verbosity because it encodes which operations are history-edit-only in the type system.
 
 **Distributed-ready API vs. sync simplicity.** `ControlPlane` is async + fallible even when called in-process. Paying this for day-1 local use to keep daemon-day migration trivial.
 
-**Two tracking layers (log DAG + registry tree).** Not a duplication — the log DAG tracks intra-session branching (rewinds, branch-summaries); the registry tracks inter-session spawn relationships. Use distinct terminology in code (`previous_entry_id` vs. `spawn_parent`) to reinforce.
+**Two tracking layers (log DAG + registry tree).** Not a duplication — the log DAG tracks intra-session branching and summary-span rewrites; the registry tracks inter-session spawn relationships. Use distinct terminology in code (`previous_entry_id` vs. `spawn_parent`) to reinforce.
 
 **Unified `InjectedMessage` vs. per-kind entry types.** Unified. Every "summary / note / report injected at a boundary" is one enum variant with a kind tag. TS has 3+ entry types for this; we have 1 + extensible tag. New kinds don't require new materialization branches.
 

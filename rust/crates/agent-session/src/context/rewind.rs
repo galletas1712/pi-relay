@@ -1,20 +1,5 @@
-use agent_core::CustomMessage;
-
 use crate::context::edit::{ContextEdit, HistoryEditError};
 use crate::context::Context;
-
-/// Well-known `CustomMessage::kind` for branch summaries.
-pub const KIND_BRANCH_SUMMARY: &str = "branch_summary";
-
-/// Build a `CustomMessage` tagged as a branch summary with optional `from_id`
-/// anchor metadata.
-pub fn branch_summary(content: impl Into<String>, from_id: Option<String>) -> CustomMessage {
-    let mut msg = CustomMessage::new(KIND_BRANCH_SUMMARY, content);
-    if let Some(from) = from_id {
-        msg = msg.with_metadata("from_id", from);
-    }
-    msg
-}
 
 /// A rewind operation.
 ///

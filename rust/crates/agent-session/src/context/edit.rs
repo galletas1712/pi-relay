@@ -2,10 +2,11 @@ use crate::context::{Context, ContextError};
 
 /// Operations that mutate a quiescent `Context`.
 ///
-/// Each history-editing operation is its own struct (`Compact`, `Rewind`,
-/// `ReplaceTranscript`) implementing this trait. The caller obtains the right
-/// to edit via [`crate::AgentSession::edit`], which runs the quiescence check
-/// once and then dispatches to [`ContextEdit::apply`] on the provided op.
+/// Each history-editing operation is its own struct (`SummarizeSpan`,
+/// `Compact`, `Rewind`, `ReplaceTranscript`) implementing this trait. The
+/// caller obtains the right to edit via [`crate::AgentSession::edit`], which
+/// runs the quiescence check once and then dispatches to
+/// [`ContextEdit::apply`] on the provided op.
 ///
 /// `apply` takes `&mut Context` directly — op impls do not see the
 /// `AgentSession`. Core-loop rehydration happens once in `AgentSession::edit`
@@ -44,7 +45,7 @@ pub enum HistoryEditError {
     /// A transcript supplied to `ReplaceTranscript` did not itself end at a
     /// turn boundary.
     ReplacementNotAtTurnBoundary,
-    /// An underlying context error: entry not found, not at a turn boundary,
-    /// or a stale compaction plan.
+    /// An underlying context error: entry not found, invalid summary span,
+    /// not at a turn boundary, or a stale edit plan.
     Context(ContextError),
 }

@@ -6,7 +6,7 @@ Durable session context and async run-loop wrapper around the `agent-core` FSM k
 
 `agent-session` is the layer that turns the pure `AgentCoreLoop` FSM into a stateful, editable session. An `AgentSession` owns three things: the core loop (deterministic state machine), a `Context` (append-only DAG of `SessionEntry` nodes — the durable transcript), and an `ActionQueue` (FIFO of model/tool requests the session has handed out but hasn't heard back about). `session.drive()` is the only supported way to advance the FSM; it runs the core to quiescence and absorbs every freshly-produced `TranscriptRecord` into the context, which is the sole owner of durable history.
 
-The crate also owns the *edit* surface: `Compact`, `Rewind`, and `ReplaceTranscript` are individual op structs that implement the `ContextEdit` trait. `AgentSession::edit` runs the quiescence gate (`can_edit_history`) once, dispatches to the op, then rehydrates the core loop from the new context. `AgentSession::fork` is a direct method rather than a `ContextEdit` impl because it produces a new session instead of mutating the source.
+The crate also owns the *edit* surface: `SummarizeSpan`, `Compact`, `Rewind`, and `ReplaceTranscript` are individual op structs that implement the `ContextEdit` trait. `AgentSession::edit` runs the quiescence gate (`can_edit_history`) once, dispatches to the op, then rehydrates the core loop from the new context. `AgentSession::fork` is a direct method rather than a `ContextEdit` impl because it produces a new session instead of mutating the source.
 
 `AgentRunner` is the async I/O shell. Inputs arrive via a cloneable `AgentInputHandle`; the runner calls `drive` in a loop and forwards each drained `AgentAction` to a caller-supplied handler.
 
@@ -25,18 +25,18 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 - `Context` — append-only DAG of `SessionEntry`.
 - `SessionEntry` — `{ id, parent_id, timestamp_ms, record }`.
 - `Transcript` — read-only materialized view derived from a record slice.
-- `ContextError` — `EntryNotFound`, `NotTurnBoundary`, `StalePlan`.
+- `ContextError` — `EntryNotFound`, `InvalidSpan`, `NotTurnBoundary`, `StalePlan`.
 
 **Edit ops and support types**
 - `ContextEdit` — trait every op implements.
-- `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`.
+- `SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`.
 - `PendingWork { background_tasks: usize }` — caller-declared invisible work.
 - `HistoryEditError` — `Busy`, `ReplacementNotAtTurnBoundary`, `Context(ContextError)`.
-- `CompactionPlan`, `CompactionSettings` — produced by `Context::prepare_compaction`.
+- `SummarySpanPlan` — produced by `Context::prepare_summary_span`.
+- `CompactionPlan`, `CompactionSettings` — prefix-compaction policy produced by `Context::prepare_compaction`.
 
 **Well-known Custom kinds**
 - `KIND_COMPACTION_SUMMARY = "compaction_summary"` + `compaction_summary(content, first_kept_entry_id, tokens_before)` builder.
-- `KIND_BRANCH_SUMMARY = "branch_summary"` + `branch_summary(content, from_id)` builder.
 
 **Re-exports from `agent-core`** (so callers have a single import home)
 - `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptRecord`, `TurnId`, `ActionId`, `ToolCallId`, `CustomMessage`, `TurnOutcome`.
@@ -60,8 +60,10 @@ session.drive();
 ```rust
 // Pure query: no mutation, safe to call any time.
 let plan = session.context().prepare_compaction(settings);
+let span = session.context().prepare_summary_span(first_id, last_id)?;
 
 // Mutating ops flow through AgentSession::edit. The quiescence gate runs once.
+session.edit(pending, SummarizeSpan { plan: span, summary })?;       // Output = ()
 session.edit(pending, Compact { plan, summary })?;                   // Output = ()
 session.edit(pending, Rewind { leaf_id: Some(id) })?;                // Output = ()
 let previous = session.edit(pending, ReplaceTranscript { replacement })?;
@@ -80,12 +82,13 @@ let forked: AgentSession = session.fork(pending, Some(&leaf_id))?;
 | `src/lib.rs` | Module declarations + public re-exports (including `agent-core` passthroughs). |
 | `src/session.rs` | `AgentSession` composition, `drive`, `enqueue_input`, `drain_actions`, `can_edit_history`, `edit`, `fork`, `rehydrate_core_from_context`. |
 | `src/action_queue.rs` | Private `ActionQueue` (FIFO `VecDeque<PendingActionKey>`) + `record_drained` / `record_input`. |
-| `src/transcript.rs` | `Transcript` read-only view: `is_turn_boundary`, `latest_compaction_summary`, `branch_summaries`, crashed-tail patching. |
+| `src/transcript.rs` | `Transcript` read-only view: `is_turn_boundary`, `latest_compaction_summary`, crashed-tail patching. |
 | `src/runner.rs` | `AgentRunner`, `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — async shell over `AgentSession`. |
 | `src/context/mod.rs` | `Context` DAG, `SessionEntry`, leaf navigation, `is_turn_boundary`, `ContextError`. No kind-specific knowledge. |
 | `src/context/edit.rs` | `ContextEdit` trait, `PendingWork`, `HistoryEditError`. |
+| `src/context/summary.rs` | `SummarizeSpan` op, `SummarySpanPlan`, `prepare_summary_span`, span-boundary validation. |
 | `src/context/compaction.rs` | `Compact` op, `CompactionPlan`, `CompactionSettings`, `prepare_compaction`, `validate_plan_matches`, `materialize_context`, `KIND_COMPACTION_SUMMARY`, `compaction_summary`. |
-| `src/context/rewind.rs` | `Rewind` op, `KIND_BRANCH_SUMMARY`, `branch_summary`. |
+| `src/context/rewind.rs` | `Rewind` op. |
 | `src/context/replace.rs` | `ReplaceTranscript` op (returns previous `Transcript`). |
 
 ### Composition diagram
@@ -112,25 +115,25 @@ All three components are load-bearing:
 
 Each `SessionEntry` has a `String id` (UUID v4), an `Option<String> parent_id`, a `timestamp_ms`, and one `TranscriptRecord`. Entries sit in a `Vec<SessionEntry>` with a `HashMap<String, usize>` side-index for O(1) lookup by id. The context tracks an `Option<String> leaf_id` — the active branch head. `append_record` attaches a new child under `leaf_id` and advances the pointer. `branch(id)` / `branch_at_turn_boundary(id)` reparent the leaf onto an existing entry; subsequent appends then grow a new branch off that node. Nothing is ever deleted.
 
-`transcript()` walks from the current leaf back to the root via `parent_id`, reverses, and hands the record sequence to `compaction::materialize_context`, which starts the slice at the most recent `KIND_COMPACTION_SUMMARY` on the path (if any).
+`transcript()` walks from the current leaf back to the root via `parent_id`, reverses, and hands the record sequence to `compaction::materialize_context`. Summary-span edits rebuild the active branch in model-visible order, so materialization is the full active path.
 
-Fork-based compaction in pictures:
+Summary-span replacement in pictures:
 
 ```
 Initial branch:
-  E0 ── E1 ── E2 ── E3 ── E4
-                          ▲
-                          leaf
+  E0 ── E1 ── E2 ── E3 ── E4 ── E5
+                                ▲
+                                leaf
 
-After Compact with plan.first_kept_entry_id = E3:
-  E0 ── E1 ── E2 ── E3 ── E4            (abandoned; still in DAG)
-              \
-               Esum ── E3' ── E4'
-                              ▲
-                              leaf (new branch)
+After SummarizeSpan over E2..E3:
+  E0 ── E1 ── E2 ── E3 ── E4 ── E5      (abandoned suffix; still in DAG)
+          \
+           Esum ── E4' ── E5'
+                         ▲
+                         leaf (new branch)
 ```
 
-`Esum` is a `Custom` entry with `kind = KIND_COMPACTION_SUMMARY`; `E3'` / `E4'` are re-appended copies of the kept records as descendants of `Esum`. The old E3/E4 stay in `entries()` as an orphaned branch for audit. The materialized transcript starts at `Esum`.
+`Esum` is a caller-provided `Custom` summary entry; `E4'` / `E5'` are re-appended copies of the suffix records as descendants of `Esum`. The old span and suffix stay in `entries()` as an orphaned branch for audit. `Compact` is a prefix-oriented policy wrapper over this primitive.
 
 ### `ContextEdit` trait + `PendingWork`
 
@@ -158,7 +161,8 @@ Op outputs:
 
 | Op | `Output` | Summary |
 | --- | --- | --- |
-| `Compact { plan, summary }` | `()` | Validates plan freshness, forks at the pre-cut boundary, appends `Esum`, re-appends the kept records. |
+| `SummarizeSpan { plan, summary }` | `()` | Validates a contiguous active-branch span, replaces it with a summary, re-appends the suffix. |
+| `Compact { plan, summary }` | `()` | Prefix-compaction wrapper that summarizes old context through `SummarizeSpan`. |
 | `Rewind { leaf_id }` | `()` | `Some(id)` → `branch_at_turn_boundary(id)`; `None` → `reset_leaf()`. |
 | `ReplaceTranscript { replacement }` | `Transcript` | Swaps the whole context for one built from `replacement`; returns the previous transcript. |
 
@@ -172,9 +176,9 @@ Private to the crate. `PendingActionKey { action_id: ActionId, turn_id: TurnId, 
 
 ### Kind-free `context/mod.rs` + operation-local `KIND_*` constants
 
-`context/mod.rs` owns the DAG primitives — `Context`, `SessionEntry`, `append_record`, `branch`, `is_turn_boundary_leaf` — and knows about exactly one record variant semantically: `TranscriptRecord::Custom` is treated as transparent for turn-boundary walks. It knows nothing about `"compaction_summary"` or `"branch_summary"` specifically.
+`context/mod.rs` owns the DAG primitives — `Context`, `SessionEntry`, `append_record`, `branch`, `is_turn_boundary_leaf` — and knows about exactly one record variant semantically: `TranscriptRecord::Custom` is treated as transparent for turn-boundary walks. It knows nothing about `"compaction_summary"` specifically.
 
-Each `KIND_*` constant and its builder (`compaction_summary`, `branch_summary`) lives in the file for the op that produces it (`context/compaction.rs`, `context/rewind.rs`). This keeps the DAG code decoupled from any specific higher-level semantics: new edit ops with new `Custom` kinds can land without touching `mod.rs`.
+The `KIND_COMPACTION_SUMMARY` constant and its builder live in `context/compaction.rs`, the file for the policy that produces it. This keeps the DAG code decoupled from higher-level semantics: new edit ops with new `Custom` kinds can land without touching `mod.rs`.
 
 ### `AgentRunner` (async wrapper)
 
