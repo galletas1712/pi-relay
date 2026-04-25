@@ -1,6 +1,6 @@
 use agent_core::TranscriptRecord;
 
-use crate::action::OneShotModelRequestId;
+use crate::action::StatelessModelRequestId;
 use crate::context::summary::estimate_records_tokens;
 use crate::context::{CompactionPlan, CompactionSettings, Context};
 
@@ -20,10 +20,10 @@ impl AutoCompactionSettings {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OneShotModelRequest {
+pub struct StatelessModelRequest {
     pub instructions: String,
     pub input: Vec<ModelContentBlock>,
-    pub output: OneShotModelOutputSpec,
+    pub output: StatelessModelOutputSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,23 +39,23 @@ pub enum ImageInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OneShotModelOutputSpec {
+pub enum StatelessModelOutputSpec {
     Text,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OneShotModelOutput {
+pub enum StatelessModelOutput {
     Text(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingOneShot {
-    pub(crate) request_id: OneShotModelRequestId,
-    pub(crate) kind: PendingOneShotKind,
+pub(crate) struct PendingStatelessModel {
+    pub(crate) request_id: StatelessModelRequestId,
+    pub(crate) kind: PendingStatelessModelKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PendingOneShotKind {
+pub(crate) enum PendingStatelessModelKind {
     Compaction {
         plan: CompactionPlan,
         held_model_action: agent_core::AgentAction,
@@ -75,7 +75,7 @@ pub(crate) fn prepare_auto_compaction(
     })
 }
 
-pub(crate) fn compaction_request(plan: &CompactionPlan) -> OneShotModelRequest {
+pub(crate) fn compaction_request(plan: &CompactionPlan) -> StatelessModelRequest {
     let mut input = Vec::new();
     if let Some(previous_summary) = &plan.previous_summary {
         input.push(ModelContentBlock::Text {
@@ -89,7 +89,7 @@ pub(crate) fn compaction_request(plan: &CompactionPlan) -> OneShotModelRequest {
         text: format_records("Recent context that will be kept", &plan.records_to_keep),
     });
 
-    OneShotModelRequest {
+    StatelessModelRequest {
         instructions: concat!(
             "Summarize the context that will be replaced. Preserve durable facts, ",
             "decisions, constraints, open tasks, tool results, and user intent. ",
@@ -98,7 +98,7 @@ pub(crate) fn compaction_request(plan: &CompactionPlan) -> OneShotModelRequest {
         )
         .to_string(),
         input,
-        output: OneShotModelOutputSpec::Text,
+        output: StatelessModelOutputSpec::Text,
     }
 }
 

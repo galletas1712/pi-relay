@@ -35,7 +35,7 @@ pub enum SessionActionKind {
     Model,
     Tool,
     TurnCancellation,
-    OneShotModel,
+    ModelStateless,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

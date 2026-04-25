@@ -4,10 +4,11 @@ use agent_core::{
     AgentAction, AgentCoreLoop, AgentInput, AgentInputError, TranscriptRecord, TurnId,
 };
 
-use crate::action::{OneShotModelRequestId, SessionAction};
+use crate::action::{SessionAction, StatelessModelRequestId};
 use crate::action_queue::ActionQueue;
 use crate::auto_compaction::{
-    self, AutoCompactionSettings, OneShotModelOutput, PendingOneShot, PendingOneShotKind,
+    self, AutoCompactionSettings, PendingStatelessModel, PendingStatelessModelKind,
+    StatelessModelOutput,
 };
 use crate::context::compaction::compaction_summary;
 use crate::context::{
@@ -32,8 +33,8 @@ pub struct AgentSession {
     action_outbox: VecDeque<SessionAction>,
     event_outbox: VecDeque<SessionEvent>,
     auto_compaction: Option<AutoCompactionSettings>,
-    pending_one_shot: Option<PendingOneShot>,
-    next_one_shot_request_id: OneShotModelRequestId,
+    pending_stateless_model: Option<PendingStatelessModel>,
+    next_stateless_model_request_id: StatelessModelRequestId,
 }
 
 impl Default for AgentSession {
@@ -51,8 +52,8 @@ impl AgentSession {
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
             auto_compaction: None,
-            pending_one_shot: None,
-            next_one_shot_request_id: OneShotModelRequestId::first(),
+            pending_stateless_model: None,
+            next_stateless_model_request_id: StatelessModelRequestId::first(),
         }
     }
 
@@ -83,8 +84,8 @@ impl AgentSession {
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
             auto_compaction: None,
-            pending_one_shot: None,
-            next_one_shot_request_id: OneShotModelRequestId::first(),
+            pending_stateless_model: None,
+            next_stateless_model_request_id: StatelessModelRequestId::first(),
         }
     }
 
@@ -102,8 +103,8 @@ impl AgentSession {
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
             auto_compaction: None,
-            pending_one_shot: None,
-            next_one_shot_request_id: OneShotModelRequestId::first(),
+            pending_stateless_model: None,
+            next_stateless_model_request_id: StatelessModelRequestId::first(),
         })
     }
 
@@ -130,12 +131,12 @@ impl AgentSession {
             SessionInput::Agent(input) => self
                 .enqueue_agent_input(input)
                 .map_err(SessionInputError::Agent),
-            SessionInput::OneShotModelCompleted { request_id, output } => {
-                self.complete_one_shot_model(request_id, output);
+            SessionInput::ModelStatelessCompleted { request_id, output } => {
+                self.complete_stateless_model(request_id, output);
                 Ok(())
             }
-            SessionInput::OneShotModelFailed { request_id, error } => {
-                self.fail_one_shot_model(request_id, error);
+            SessionInput::ModelStatelessFailed { request_id, error } => {
+                self.fail_stateless_model(request_id, error);
                 Ok(())
             }
         }
@@ -144,8 +145,8 @@ impl AgentSession {
     fn enqueue_agent_input(&mut self, input: AgentInput) -> Result<(), AgentInputError> {
         input.validate()?;
         if matches!(input, AgentInput::Interrupt) {
-            self.clear_pending_one_shot("interrupted");
-        } else if self.pending_one_shot.is_some()
+            self.clear_pending_stateless_model("interrupted");
+        } else if self.pending_stateless_model.is_some()
             && matches!(
                 input,
                 AgentInput::ModelCompleted { .. } | AgentInput::ToolCompleted { .. }
@@ -231,7 +232,7 @@ impl AgentSession {
             && self.context.is_turn_boundary()
             && !self.core.has_pending_work()
             && self.action_queue.is_empty()
-            && self.pending_one_shot.is_none()
+            && self.pending_stateless_model.is_none()
             && pending.is_empty()
     }
 
@@ -311,7 +312,7 @@ impl AgentSession {
             }
             AgentAction::RequestTool { .. } => self.expose_agent_action(action),
             AgentAction::CancelTurn { turn_id } => {
-                self.clear_pending_one_shot_for_turn(turn_id);
+                self.clear_pending_stateless_model_for_turn(turn_id);
                 self.remove_actions_for_turn(turn_id);
                 self.expose_agent_action(AgentAction::CancelTurn { turn_id });
             }
@@ -319,7 +320,7 @@ impl AgentSession {
     }
 
     fn maybe_start_auto_compaction(&mut self, held_model_action: AgentAction) -> bool {
-        if self.pending_one_shot.is_some() {
+        if self.pending_stateless_model.is_some() {
             return false;
         }
         let Some(settings) = self.auto_compaction else {
@@ -329,16 +330,17 @@ impl AgentSession {
             return false;
         };
 
-        let request_id = OneShotModelRequestId::take_next(&mut self.next_one_shot_request_id);
+        let request_id =
+            StatelessModelRequestId::take_next(&mut self.next_stateless_model_request_id);
         let request = auto_compaction::compaction_request(&plan);
-        self.pending_one_shot = Some(PendingOneShot {
+        self.pending_stateless_model = Some(PendingStatelessModel {
             request_id,
-            kind: PendingOneShotKind::Compaction {
+            kind: PendingStatelessModelKind::Compaction {
                 plan,
                 held_model_action,
             },
         });
-        self.push_session_action(SessionAction::RequestOneShotModel {
+        self.push_session_action(SessionAction::RequestModelStateless {
             request_id,
             request,
         });
@@ -358,29 +360,29 @@ impl AgentSession {
         self.action_outbox.push_back(action);
     }
 
-    fn complete_one_shot_model(
+    fn complete_stateless_model(
         &mut self,
-        request_id: OneShotModelRequestId,
-        output: OneShotModelOutput,
+        request_id: StatelessModelRequestId,
+        output: StatelessModelOutput,
     ) {
-        let Some(pending) = self.take_matching_one_shot(request_id) else {
+        let Some(pending) = self.take_matching_stateless_model(request_id) else {
             return;
         };
 
         self.event_outbox.push_back(SessionEvent::ActionCompleted {
-            kind: SessionActionKind::OneShotModel,
+            kind: SessionActionKind::ModelStateless,
             id: request_id.0.to_string(),
         });
 
         match pending.kind {
-            PendingOneShotKind::Compaction {
+            PendingStatelessModelKind::Compaction {
                 plan,
                 held_model_action,
             } => {
-                let OneShotModelOutput::Text(summary) = output;
+                let StatelessModelOutput::Text(summary) = output;
                 if let Err(error) = self.apply_pending_compaction(plan, summary) {
                     self.event_outbox.push_back(SessionEvent::ActionFailed {
-                        kind: SessionActionKind::OneShotModel,
+                        kind: SessionActionKind::ModelStateless,
                         id: request_id.0.to_string(),
                         error: format!("{error:?}"),
                     });
@@ -394,41 +396,41 @@ impl AgentSession {
         }
     }
 
-    fn fail_one_shot_model(&mut self, request_id: OneShotModelRequestId, error: String) {
-        let Some(pending) = self.take_matching_one_shot(request_id) else {
+    fn fail_stateless_model(&mut self, request_id: StatelessModelRequestId, error: String) {
+        let Some(pending) = self.take_matching_stateless_model(request_id) else {
             return;
         };
         self.event_outbox.push_back(SessionEvent::ActionFailed {
-            kind: SessionActionKind::OneShotModel,
+            kind: SessionActionKind::ModelStateless,
             id: request_id.0.to_string(),
             error,
         });
         match pending.kind {
-            PendingOneShotKind::Compaction {
+            PendingStatelessModelKind::Compaction {
                 held_model_action, ..
             } => self.expose_agent_action(held_model_action),
         }
     }
 
-    fn take_matching_one_shot(
+    fn take_matching_stateless_model(
         &mut self,
-        request_id: OneShotModelRequestId,
-    ) -> Option<PendingOneShot> {
+        request_id: StatelessModelRequestId,
+    ) -> Option<PendingStatelessModel> {
         if self
-            .pending_one_shot
+            .pending_stateless_model
             .as_ref()
             .is_some_and(|pending| pending.request_id == request_id)
         {
             self.action_outbox.retain(|action| {
                 !matches!(
                     action,
-                    SessionAction::RequestOneShotModel {
+                    SessionAction::RequestModelStateless {
                         request_id: queued_request_id,
                         ..
                     } if *queued_request_id == request_id
                 )
             });
-            return self.pending_one_shot.take();
+            return self.pending_stateless_model.take();
         }
         None
     }
@@ -447,42 +449,45 @@ impl AgentSession {
         .apply(&mut self.context)
     }
 
-    fn clear_pending_one_shot(&mut self, error: &str) {
-        let Some(pending) = self.pending_one_shot.take() else {
+    fn clear_pending_stateless_model(&mut self, error: &str) {
+        let Some(pending) = self.pending_stateless_model.take() else {
             return;
         };
         let request_id = pending.request_id;
         self.action_outbox.retain(|action| {
             !matches!(
                 action,
-                SessionAction::RequestOneShotModel {
+                SessionAction::RequestModelStateless {
                     request_id: queued_request_id,
                     ..
                 } if *queued_request_id == request_id
             )
         });
         self.event_outbox.push_back(SessionEvent::ActionFailed {
-            kind: SessionActionKind::OneShotModel,
+            kind: SessionActionKind::ModelStateless,
             id: request_id.0.to_string(),
             error: error.to_string(),
         });
     }
 
-    fn clear_pending_one_shot_for_turn(&mut self, turn_id: TurnId) {
-        let clear = self.pending_one_shot.as_ref().is_some_and(|pending| {
-            matches!(
-                &pending.kind,
-                PendingOneShotKind::Compaction {
-                    held_model_action: AgentAction::RequestModel {
-                        turn_id: held_turn_id,
+    fn clear_pending_stateless_model_for_turn(&mut self, turn_id: TurnId) {
+        let clear = self
+            .pending_stateless_model
+            .as_ref()
+            .is_some_and(|pending| {
+                matches!(
+                    &pending.kind,
+                    PendingStatelessModelKind::Compaction {
+                        held_model_action: AgentAction::RequestModel {
+                            turn_id: held_turn_id,
+                            ..
+                        },
                         ..
-                    },
-                    ..
-                } if *held_turn_id == turn_id
-            )
-        });
+                    } if *held_turn_id == turn_id
+                )
+            });
         if clear {
-            self.clear_pending_one_shot("turn cancelled");
+            self.clear_pending_stateless_model("turn cancelled");
         }
     }
 
@@ -569,14 +574,14 @@ impl AgentSession {
         // block edits forever.
         self.action_queue.clear();
         self.action_outbox.clear();
-        self.pending_one_shot = None;
+        self.pending_stateless_model = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auto_compaction::OneShotModelOutput;
+    use crate::auto_compaction::StatelessModelOutput;
     use crate::context::compaction::compaction_summary;
     use crate::context::{Compact, CompactionSettings, ReplaceTranscript, Rewind};
     use agent_core::{
@@ -899,7 +904,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_compaction_requests_one_shot_model_before_releasing_model_request() {
+    fn auto_compaction_requests_stateless_model_before_releasing_model_request() {
         let mut session = session_with_compactable_history();
         session
             .enqueue_input(AgentInput::follow_up("third user message"))
@@ -907,12 +912,12 @@ mod tests {
         session.drive();
 
         let actions = session.drain_actions();
-        let [SessionAction::RequestOneShotModel {
+        let [SessionAction::RequestModelStateless {
             request_id,
             request,
         }] = actions.as_slice()
         else {
-            panic!("expected one-shot compaction request, got {actions:?}");
+            panic!("expected stateless model compaction request, got {actions:?}");
         };
         assert!(request.input.iter().any(|block| {
             matches!(
@@ -939,7 +944,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             SessionEvent::ActionRequested {
-                action: SessionAction::RequestOneShotModel { .. }
+                action: SessionAction::RequestModelStateless { .. }
             }
         )));
         assert!(!events.iter().any(|event| matches!(
@@ -951,11 +956,11 @@ mod tests {
         )));
 
         session
-            .enqueue_session_input(SessionInput::OneShotModelCompleted {
+            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
                 request_id: *request_id,
-                output: OneShotModelOutput::Text("summary text".to_string()),
+                output: StatelessModelOutput::Text("summary text".to_string()),
             })
-            .expect("one-shot completion should be accepted");
+            .expect("stateless model completion should be accepted");
 
         assert_eq!(
             session.drain_actions(),
@@ -977,7 +982,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             SessionEvent::ActionCompleted {
-                kind: SessionActionKind::OneShotModel,
+                kind: SessionActionKind::ModelStateless,
                 ..
             }
         )));
@@ -999,23 +1004,23 @@ mod tests {
     }
 
     #[test]
-    fn failed_one_shot_compaction_releases_model_request_without_editing_context() {
+    fn failed_stateless_model_compaction_releases_model_request_without_editing_context() {
         let mut session = session_with_compactable_history();
         session
             .enqueue_input(AgentInput::follow_up("third user message"))
             .expect("plain follow-up is valid");
         session.drive();
         let actions = session.drain_actions();
-        let [SessionAction::RequestOneShotModel { request_id, .. }] = actions.as_slice() else {
-            panic!("expected one-shot compaction request, got {actions:?}");
+        let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
+            panic!("expected stateless model compaction request, got {actions:?}");
         };
 
         session
-            .enqueue_session_input(SessionInput::OneShotModelFailed {
+            .enqueue_session_input(SessionInput::ModelStatelessFailed {
                 request_id: *request_id,
                 error: "no summary".to_string(),
             })
-            .expect("one-shot failure should be accepted");
+            .expect("stateless model failure should be accepted");
 
         assert_eq!(
             session.drain_actions(),
@@ -1028,7 +1033,7 @@ mod tests {
         assert!(session.drain_events().iter().any(|event| matches!(
             event,
             SessionEvent::ActionFailed {
-                kind: SessionActionKind::OneShotModel,
+                kind: SessionActionKind::ModelStateless,
                 error,
                 ..
             } if error == "no summary"
@@ -1036,33 +1041,33 @@ mod tests {
     }
 
     #[test]
-    fn stale_one_shot_completion_does_not_unblock_pending_compaction() {
+    fn stale_stateless_model_completion_does_not_unblock_pending_compaction() {
         let mut session = session_with_compactable_history();
         session
             .enqueue_input(AgentInput::follow_up("third user message"))
             .expect("plain follow-up is valid");
         session.drive();
         let actions = session.drain_actions();
-        let [SessionAction::RequestOneShotModel { request_id, .. }] = actions.as_slice() else {
-            panic!("expected one-shot compaction request, got {actions:?}");
+        let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
+            panic!("expected stateless model compaction request, got {actions:?}");
         };
 
         session
-            .enqueue_session_input(SessionInput::OneShotModelCompleted {
-                request_id: OneShotModelRequestId(99),
-                output: OneShotModelOutput::Text("wrong".to_string()),
+            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
+                request_id: StatelessModelRequestId(99),
+                output: StatelessModelOutput::Text("wrong".to_string()),
             })
-            .expect("stale one-shot completion should be accepted and ignored");
+            .expect("stale stateless model completion should be accepted and ignored");
         assert!(session.drain_actions().is_empty());
         assert_eq!(session.transcript().latest_compaction_summary(), None);
         assert!(!session.can_edit_history(PendingWork::NONE));
 
         session
-            .enqueue_session_input(SessionInput::OneShotModelCompleted {
+            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
                 request_id: *request_id,
-                output: OneShotModelOutput::Text("right".to_string()),
+                output: StatelessModelOutput::Text("right".to_string()),
             })
-            .expect("matching one-shot completion should be accepted");
+            .expect("matching stateless model completion should be accepted");
         assert!(matches!(
             session.drain_actions().as_slice(),
             [SessionAction::RequestModel { .. }]

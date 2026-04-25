@@ -23,10 +23,10 @@ mod runner;
 mod session;
 mod transcript;
 
-pub use crate::action::{OneShotModelRequestId, SessionAction};
+pub use crate::action::{SessionAction, StatelessModelRequestId};
 pub use crate::auto_compaction::{
-    AutoCompactionSettings, ImageInput, ModelContentBlock, OneShotModelOutput,
-    OneShotModelOutputSpec, OneShotModelRequest,
+    AutoCompactionSettings, ImageInput, ModelContentBlock, StatelessModelOutput,
+    StatelessModelOutputSpec, StatelessModelRequest,
 };
 pub use crate::context::compaction::compaction_summary;
 pub use crate::context::{

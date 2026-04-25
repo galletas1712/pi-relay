@@ -2,22 +2,22 @@ use std::fmt;
 
 use agent_core::{AgentInput, AgentInputError};
 
-use crate::action::OneShotModelRequestId;
-use crate::auto_compaction::OneShotModelOutput;
+use crate::action::StatelessModelRequestId;
+use crate::auto_compaction::StatelessModelOutput;
 
 /// External input to a live `AgentSession`.
 ///
-/// Core inputs continue to feed the turn FSM. One-shot completions feed
+/// Core inputs continue to feed the turn FSM. Stateless model completions feed
 /// session-owned side work such as auto-compaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionInput {
     Agent(AgentInput),
-    OneShotModelCompleted {
-        request_id: OneShotModelRequestId,
-        output: OneShotModelOutput,
+    ModelStatelessCompleted {
+        request_id: StatelessModelRequestId,
+        output: StatelessModelOutput,
     },
-    OneShotModelFailed {
-        request_id: OneShotModelRequestId,
+    ModelStatelessFailed {
+        request_id: StatelessModelRequestId,
         error: String,
     },
 }
@@ -32,7 +32,7 @@ impl SessionInput {
     pub fn validate(&self) -> Result<(), SessionInputError> {
         match self {
             Self::Agent(input) => input.validate().map_err(SessionInputError::Agent),
-            Self::OneShotModelCompleted { .. } | Self::OneShotModelFailed { .. } => Ok(()),
+            Self::ModelStatelessCompleted { .. } | Self::ModelStatelessFailed { .. } => Ok(()),
         }
     }
 }

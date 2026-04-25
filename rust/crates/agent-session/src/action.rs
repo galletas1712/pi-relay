@@ -1,11 +1,11 @@
 use agent_core::{ActionId, AgentAction, ToolCall, TurnId};
 
-use crate::auto_compaction::OneShotModelRequest;
+use crate::auto_compaction::StatelessModelRequest;
 
 /// Session-level work requested by `AgentSession`.
 ///
 /// Model/tool/turn-cancel actions are produced by `agent-core` and surfaced
-/// here with the same correlation ids. One-shot model work is owned by the
+/// here with the same correlation ids. Stateless model work is owned by the
 /// session layer and bypasses the turn FSM while still flowing through the
 /// same action/completion boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,9 +22,9 @@ pub enum SessionAction {
     CancelTurn {
         turn_id: TurnId,
     },
-    RequestOneShotModel {
-        request_id: OneShotModelRequestId,
-        request: OneShotModelRequest,
+    RequestModelStateless {
+        request_id: StatelessModelRequestId,
+        request: StatelessModelRequest,
     },
 }
 
@@ -49,9 +49,9 @@ impl From<AgentAction> for SessionAction {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct OneShotModelRequestId(pub u64);
+pub struct StatelessModelRequestId(pub u64);
 
-impl OneShotModelRequestId {
+impl StatelessModelRequestId {
     pub fn first() -> Self {
         Self(1)
     }
