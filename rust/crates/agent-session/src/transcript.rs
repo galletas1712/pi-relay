@@ -7,7 +7,7 @@ use crate::context::compaction::KIND_COMPACTION_SUMMARY;
 /// The `Context` is the canonical store; `Transcript` is a derived view over
 /// a record sequence. The session rebuilds one whenever it needs to feed the
 /// core loop or model context a contiguous ordered history, and uses the same
-/// type to rehydrate crashed sessions through `from_records`.
+/// type to rehydrate crashed sessions through explicit crash-tail recovery.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Transcript {
     records: Vec<TranscriptRecord>,

@@ -1,6 +1,7 @@
-use agent_core::{ActionId, AgentAction, ToolCall, TurnId};
+use agent_core::{ActionId, ToolCall, TurnId};
 
 use crate::auto_compaction::StatelessModelRequest;
+use crate::transcript::Transcript;
 
 /// Session-level work requested by `AgentSession`.
 ///
@@ -13,6 +14,7 @@ pub enum SessionAction {
     RequestModel {
         action_id: ActionId,
         turn_id: TurnId,
+        transcript: Transcript,
     },
     RequestTool {
         action_id: ActionId,
@@ -26,26 +28,6 @@ pub enum SessionAction {
         request_id: StatelessModelRequestId,
         request: StatelessModelRequest,
     },
-}
-
-impl From<AgentAction> for SessionAction {
-    fn from(action: AgentAction) -> Self {
-        match action {
-            AgentAction::RequestModel { action_id, turn_id } => {
-                Self::RequestModel { action_id, turn_id }
-            }
-            AgentAction::RequestTool {
-                action_id,
-                turn_id,
-                tool_call,
-            } => Self::RequestTool {
-                action_id,
-                turn_id,
-                tool_call,
-            },
-            AgentAction::CancelTurn { turn_id } => Self::CancelTurn { turn_id },
-        }
-    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

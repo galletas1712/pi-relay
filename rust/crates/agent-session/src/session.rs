@@ -218,8 +218,10 @@ impl AgentSession {
     /// Drain pending actions the core produced during the last `drive`.
     ///
     /// Actions are recorded in the session's internal action queue during
-    /// `drive`, so `can_edit_history` does not depend on when callers drain
-    /// the observable outbox.
+    /// `drive`, so model/tool completions can clear pending work even if the
+    /// caller drains the observable outbox later. History edits still require
+    /// the observable outbox itself to be empty, so callers cannot drop an
+    /// undrained cancellation action by editing first.
     ///
     /// Records are absorbed into the context inside `drive`, so there is no
     /// analogous `drain_records` on the session.
@@ -233,12 +235,13 @@ impl AgentSession {
 
     /// True when the session's history can be edited: core idle, context at a
     /// turn boundary, mailbox empty, no in-flight drained actions, and no
-    /// caller-tracked background work.
+    /// undrained observable actions or caller-tracked background work.
     pub fn can_edit_history(&self, pending: PendingWork) -> bool {
         self.core.is_idle()
             && self.context.is_turn_boundary()
             && !self.core.has_pending_work()
             && self.action_queue.is_empty()
+            && self.action_outbox.is_empty()
             && self.pending_stateless_model.is_none()
             && pending.is_empty()
     }
@@ -357,7 +360,24 @@ impl AgentSession {
     fn expose_agent_action(&mut self, action: AgentAction) {
         self.action_queue
             .record_drained(std::slice::from_ref(&action));
-        self.push_session_action(SessionAction::from(action));
+        let session_action = match action {
+            AgentAction::RequestModel { action_id, turn_id } => SessionAction::RequestModel {
+                action_id,
+                turn_id,
+                transcript: self.transcript(),
+            },
+            AgentAction::RequestTool {
+                action_id,
+                turn_id,
+                tool_call,
+            } => SessionAction::RequestTool {
+                action_id,
+                turn_id,
+                tool_call,
+            },
+            AgentAction::CancelTurn { turn_id } => SessionAction::CancelTurn { turn_id },
+        };
+        self.push_session_action(session_action);
     }
 
     fn push_session_action(&mut self, action: SessionAction) {
@@ -522,6 +542,7 @@ impl AgentSession {
                     SessionAction::RequestModel {
                         action_id: action_action_id,
                         turn_id: action_turn_id,
+                        ..
                     },
                     AgentInput::ModelCompleted {
                         action_id: input_action_id,
@@ -635,6 +656,26 @@ mod tests {
                 outcome: TurnOutcome::Graceful,
             },
         ]
+    }
+
+    fn assert_single_request_model(
+        actions: Vec<SessionAction>,
+        expected_action_id: ActionId,
+        expected_turn_id: TurnId,
+    ) -> Transcript {
+        let [SessionAction::RequestModel {
+            action_id,
+            turn_id,
+            transcript,
+        }] = actions.as_slice()
+        else {
+            panic!("expected one RequestModel action, got {actions:?}");
+        };
+        assert_eq!(
+            (*action_id, *turn_id),
+            (expected_action_id, expected_turn_id)
+        );
+        transcript.clone()
     }
 
     fn session_with_compactable_history() -> AgentSession {
@@ -961,13 +1002,7 @@ mod tests {
             .enqueue_input(AgentInput::follow_up("hi"))
             .expect("plain follow-up is valid");
         session.drive();
-        assert_eq!(
-            session.drain_actions(),
-            vec![SessionAction::RequestModel {
-                action_id: ActionId(1),
-                turn_id: TurnId(1),
-            }]
-        );
+        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
 
         session
             .enqueue_input(AgentInput::ModelFailed {
@@ -1059,13 +1094,9 @@ mod tests {
             })
             .expect("stateless model completion should be accepted");
 
-        assert_eq!(
-            session.drain_actions(),
-            vec![SessionAction::RequestModel {
-                action_id: ActionId(1),
-                turn_id: TurnId(3),
-            }]
-        );
+        let request_transcript =
+            assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
+        assert_eq!(request_transcript, session.transcript());
         assert_eq!(
             session.transcript().latest_compaction_summary(),
             Some("summary text")
@@ -1094,7 +1125,8 @@ mod tests {
             SessionEvent::ActionRequested {
                 action: SessionAction::RequestModel {
                     action_id: ActionId(1),
-                    turn_id: TurnId(3)
+                    turn_id: TurnId(3),
+                    ..
                 }
             }
         )));
@@ -1119,13 +1151,9 @@ mod tests {
             })
             .expect("stateless model failure should be accepted");
 
-        assert_eq!(
-            session.drain_actions(),
-            vec![SessionAction::RequestModel {
-                action_id: ActionId(1),
-                turn_id: TurnId(3),
-            }]
-        );
+        let request_transcript =
+            assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
+        assert_eq!(request_transcript, session.transcript());
         assert_eq!(session.transcript().latest_compaction_summary(), None);
         assert!(session.drain_events().iter().any(|event| matches!(
             event,
@@ -1206,13 +1234,7 @@ mod tests {
             .enqueue_input(AgentInput::follow_up("old second"))
             .expect("plain follow-up is valid");
         session.drive();
-        assert_eq!(
-            session.drain_actions(),
-            vec![SessionAction::RequestModel {
-                action_id: ActionId(1),
-                turn_id: TurnId(2),
-            }]
-        );
+        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(2));
         session
             .enqueue_input(AgentInput::ModelCompleted {
                 action_id: ActionId(1),
@@ -1237,13 +1259,7 @@ mod tests {
             .enqueue_input(AgentInput::follow_up("new second"))
             .expect("plain follow-up is valid");
         session.drive();
-        assert_eq!(
-            session.drain_actions(),
-            vec![SessionAction::RequestModel {
-                action_id: ActionId(2),
-                turn_id: TurnId(2),
-            }]
-        );
+        assert_single_request_model(session.drain_actions(), ActionId(2), TurnId(2));
 
         session
             .enqueue_input(AgentInput::ModelCompleted {
@@ -1399,6 +1415,7 @@ mod tests {
             .enqueue_input(AgentInput::Interrupt)
             .expect("interrupt is valid");
         session.drive();
+        assert!(!session.can_edit_history(PendingWork::NONE));
         let actions = session.drain_actions();
         assert!(actions
             .iter()

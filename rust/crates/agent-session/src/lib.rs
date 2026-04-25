@@ -36,14 +36,13 @@ pub use crate::context::{
 };
 pub use crate::event::{ContextEditKind, SessionActionKind, SessionEvent};
 pub use crate::input::{SessionInput, SessionInputError};
-pub use crate::runner::{
-    AgentInputHandle, AgentInputHandleError, AgentInputReceiver, AgentRunner, SessionActionEnvelope,
-};
+pub use crate::runner::{AgentInputHandle, AgentInputHandleError, AgentInputReceiver, AgentRunner};
 pub use crate::session::AgentSession;
 pub use crate::transcript::Transcript;
 
 // Re-export core-owned types so downstream callers have a single import home.
 pub use agent_core::{
-    ActionId, AgentAction, AgentInput, AgentInputError, InjectedMessage, ToolCallId,
-    TranscriptRecord, TurnId, TurnOutcome,
+    ActionId, AgentAction, AgentInput, AgentInputError, AssistantItem, AssistantMessage,
+    InjectedMessage, ToolCall, ToolCallId, ToolResultMessage, ToolResultStatus, TranscriptRecord,
+    TurnId, TurnOutcome,
 };

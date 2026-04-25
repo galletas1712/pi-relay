@@ -165,8 +165,9 @@ Partially landed in PR #63; decomposition planned.
 - **`AgentSession`** — owns `AgentCoreLoop` + `Context`. The session is the sole owner of durable records. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `transcript`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `ContextEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
 - **`ContextEdit` trait + op structs** — each history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`) that implements `ContextEdit { type Output; fn apply(self, &mut Context) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `Context` (`context.prepare_summary_span(first, last)`); prefix compaction is policy on top (`context.prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
 - **`Context`** — DAG of `SessionEntry`s with a leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
-- **`Transcript`** — materialized view of the current branch's records, with crash-tail patching for resume.
-- **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans actions to the handler. Records auto-flow into the log; the runner does not expose them directly.
+- **`Transcript`** — materialized view of the current branch's records. Live transcripts preserve open turns; resume paths explicitly crash-recover any open tail.
+- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, transcript }` includes the transcript snapshot visible when the model request was made; tool and cancel actions carry only the ids/payloads needed to execute them. Session-owned stateless model requests are used for compaction side work.
+- **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans `SessionAction`s to the handler. Records auto-flow into the log; the runner does not expose them directly.
 - **`SessionStore` trait** (PR #65) — pluggable durable storage. Default `JsonlFileSessionStore`; `InMemorySessionStore` for tests. Swappable for `SqliteSessionStore` later.
 
 ### Layer 4 — Control plane (`agent-orchestrator` crate and new traits)
@@ -299,16 +300,16 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 1. Parent agent's LLM emits `tool_call: spawn(prompt, tools, …)`.
 2. `SpawnTool::execute` calls `orchestrator.spawn_child(parent_id, request)`.
-3. Orchestrator: allocate child_id → `parent.fork(pending, leaf)?` → configure child's tool registry + append `SpawnBrief` injection + enqueue initial FollowUp → `registry.insert(child_id, child, parent=parent_id)` → start child's `AgentRunner` task.
+3. Orchestrator: allocate child_id → construct a fresh `AgentSession` → configure the child's model/tool registry → append the requested spawn brief and optional worklog/context injections → enqueue the initial `FollowUp` → `registry.insert(child_id, child, parent=parent_id)` → start the child's `AgentRunner` task.
 4. SpawnTool returns `ok({ child_id })` immediately. Parent turn continues.
 
-Model stays identical between parent and child (prefix-cache preservation). Differentiation happens via tool registry + injected context, not via model change.
+The child is not a context fork of the parent. Model, tools, and inherited context are spawn-request policy: callers can keep them identical for delegation or choose a narrower/different setup for review, verification, or isolated sub-work.
 
 ### Multi-agent routing primitives
 
 **Status**: landed.
 
-`AgentOrchestrator::send_message(from, to, content)` and `send_report(from, content)` are the orchestrator-level routing primitives, both fire-and-forget. `send_message` validates that `to` is a direct child of `from` in the spawn tree and enqueues `AgentInput::Steer { from: Some(from), content }` on the child's mailbox; `send_report` validates that `from` has a spawn parent and enqueues `AgentInput::FollowUp { from: Some(from), content }` on the parent's mailbox. In both cases the `from` tag propagates into the target's mailbox so the receiver can distinguish cross-session traffic from human user input. Invalid routes surface as `RouteError::{SenderNotFound, TargetNotFound, NotAChild, NoParent}`. These primitives back the `message` and `report` tools (TS parity: `packages/orchestrator/src/tools/{message,report}.ts`).
+`AgentOrchestrator::send_message(from, to, content)` and `send_report(from, content)` are the orchestrator-level routing primitives, both fire-and-forget. `send_message` validates that `to` is a direct child of `from` in the spawn tree and enqueues `AgentInput::steer_tagged(from, KIND_AGENT_DIRECTIVE, content)` on the child's mailbox; `send_report` validates that `from` has a spawn parent and enqueues `AgentInput::follow_up_tagged(from, KIND_AGENT_REPORT, content)` on the parent's mailbox. In both cases the paired `from` + `kind` tags propagate into the target's mailbox so the receiver materializes cross-session traffic as a typed `TranscriptRecord::Injected` rather than human user input. Invalid routes surface as `RouteError::{SenderNotFound, TargetNotFound, NotAChild, NoParent}`. These primitives back the `message` and `report` tools (TS parity: `packages/orchestrator/src/tools/{message,report}.ts`).
 
 ### Report (tool)
 
@@ -396,7 +397,7 @@ This closes the liveness hole where repeated appends during an async summarize c
 
 ### Child reports are mailbox inputs, not history edits
 
-When a child emits `report(content)`, the orchestrator does **not** open `edit_history` on the parent. Instead the report enters the parent's mailbox as an `AgentInput` variant (probably `InjectMessage(InjectedMessage)` or similar, priority near `Steer`). The parent's FSM materializes it as a `TranscriptRecord::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to `agent_idle` notifications.
+When a child emits `report(content)`, the orchestrator does **not** open `edit_history` on the parent. Instead the report enters the parent's mailbox as a tagged `AgentInput::FollowUp` via `follow_up_tagged(from, KIND_AGENT_REPORT, content)`. The parent's FSM materializes it as a `TranscriptRecord::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to future agent-visible notifications: use tagged mailbox input for messages that should become model-visible context, and keep purely live signals as `SessionEvent`s.
 
 This keeps `AgentSession::edit`/`fork` for genuine structural edits (compact, rewind, fork, replace_transcript) and removes the `entry_count`-churning source of compaction plan staleness.
 

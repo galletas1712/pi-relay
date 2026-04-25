@@ -19,9 +19,8 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 **Composition types**
 - `AgentSession` — core loop + context + action queue, the unit of agent state.
 - `AgentRunner` — async wrapper that drives a session off an input channel.
-- `SessionActionEnvelope` — action plus the transcript snapshot visible when the action was requested.
 - `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — sender/receiver pair for the runner's input channel.
-- `SessionAction` — model/tool/cancel actions plus session-owned `RequestModelStateless`.
+- `SessionAction` — model/tool/cancel actions plus session-owned `RequestModelStateless`. `RequestModel` carries the transcript snapshot visible when the model request was made.
 - `SessionInput`, `SessionInputError` — core inputs plus stateless model completions/failures.
 - `SessionEvent` — ephemeral live activity (`RecordAppended`, `ActionRequested`, `ActionCompleted`, `ActionFailed`, `ContextEdited`).
 
@@ -46,6 +45,7 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 
 **Re-exports from `agent-core`** (so callers have a single import home)
 - `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptRecord`, `TurnId`, `ActionId`, `ToolCallId`, `InjectedMessage`, `TurnOutcome`.
+- `AssistantMessage`, `AssistantItem`, `ToolCall`, `ToolResultMessage`, `ToolResultStatus`.
 
 ### Drive cycle
 
@@ -54,8 +54,9 @@ session.enqueue_input(AgentInput::follow_up("hello"))?;
 session.drive();
 let actions = session.drain_actions();
 // caller executes actions out-of-band, feeds results back:
-let SessionAction::RequestModel { action_id, turn_id } = actions[0] else { unreachable!() };
-session.enqueue_input(AgentInput::ModelCompleted { action_id, turn_id, assistant })?;
+let SessionAction::RequestModel { action_id, turn_id, transcript } = &actions[0] else { unreachable!() };
+let provider_request = build_provider_request(transcript);
+session.enqueue_input(AgentInput::ModelCompleted { action_id: *action_id, turn_id: *turn_id, assistant })?;
 session.drive();
 ```
 
@@ -171,11 +172,12 @@ can_edit_history(pending) :=
     && context.is_turn_boundary()
     && !core.has_pending_work()
     && action_queue.is_empty()
+    && action_outbox.is_empty()
     && pending_stateless_model.is_none()
     && pending.is_empty()
 ```
 
-The first four checks cover state the session can see. `PendingWork { background_tasks: usize }` is the counter for *invisible* work the caller is tracking on its own — worklog forks, background summarization calls — that must also finish before history is safe to touch. `PendingWork::NONE` is the zero value.
+The session-owned checks cover state the session can see, including undrained observable actions such as `CancelTurn` that the harness still needs to execute. `PendingWork { background_tasks: usize }` is the counter for *invisible* work the caller is tracking on its own — worklog forks, background summarization calls — that must also finish before history is safe to touch. `PendingWork::NONE` is the zero value.
 
 Op outputs:
 
@@ -186,7 +188,7 @@ Op outputs:
 | `Rewind { leaf_id }` | `()` | `Some(id)` → `branch_at_turn_boundary(id)`; `None` → `reset_leaf()`. |
 | `ReplaceTranscript { replacement }` | `Transcript` | Swaps the whole context for one built from `replacement`; returns the previous transcript. |
 
-Core rehydration (`rehydrate_core_from_context`) runs *after* `apply` succeeds. It lives in `AgentSession::edit`, not the trait, because `apply` sees only `&mut Context` and can't touch the core loop. Rehydration rebuilds the core at the current `last_turn_id` while preserving the next `ActionId`, then clears the action queue and observable action outbox (any keys left belong to the pre-edit run).
+Core rehydration (`rehydrate_core_from_context`) runs *after* `apply` succeeds. It lives in `AgentSession::edit`, not the trait, because `apply` sees only `&mut Context` and can't touch the core loop. Rehydration rebuilds the core at the current `last_turn_id` while preserving the next `ActionId`, then defensively clears pre-edit action bookkeeping. The quiescence gate requires the observable action outbox to be empty before an edit starts, so callers cannot drop an undrained `CancelTurn`.
 
 ### `ActionQueue` semantics
 
@@ -202,7 +204,7 @@ The `KIND_COMPACTION_SUMMARY` constant and its builder live in `context/compacti
 
 ### `AgentRunner` (async wrapper)
 
-`AgentRunner` is the only async surface in the crate — the core loop itself is fully sync. It owns an `AgentSession` plus an `AgentInputReceiver` (the receive side of a `futures_channel::mpsc::unbounded` channel) plus a `FnMut(SessionActionEnvelope) -> impl Future<Output = ()>` action handler. `SessionActionEnvelope` carries the action and a transcript snapshot from the moment the action was requested, so a model handler can build the provider request without maintaining a parallel event mirror. `run()` drives the session to quiescence, flushes drained actions through the handler, then loops awaiting the next `SessionInput`, enqueuing it, and repeating. `AgentInputHandle::channel()` hands back the matching sender; the handle is `Clone`, so orchestrator, model, tool, and stateless model tasks can all enqueue inputs back into the same session. The handle validates `SessionInput` before sending; invalid inputs return `AgentInputHandleError::Invalid` immediately.
+`AgentRunner` is the only async surface in the crate — the core loop itself is fully sync. It owns an `AgentSession` plus an `AgentInputReceiver` (the receive side of a `futures_channel::mpsc::unbounded` channel) plus a `FnMut(SessionAction) -> impl Future<Output = ()>` action handler. `run()` drives the session to quiescence, flushes drained actions through the handler, then loops awaiting the next `SessionInput`, enqueuing it, and repeating. `RequestModel` actions include the transcript snapshot from the moment the model request was made, so a model handler can build the provider request without maintaining a parallel event mirror. The action handler is a dispatch hook: it should register or spawn long-running model/tool work and return promptly, then enqueue completion/failure later through an `AgentInputHandle`. Awaiting the provider/tool call inline will intentionally block this simple runner from processing further inputs. `AgentInputHandle::channel()` hands back the matching sender; the handle is `Clone`, so orchestrator, model, tool, and stateless model tasks can all enqueue inputs back into the same session. The handle validates `SessionInput` before sending; invalid inputs return `AgentInputHandleError::Invalid` immediately.
 
 Records are observed off the session's transcript (`runner.session().transcript()`); there is no record callback.
 
