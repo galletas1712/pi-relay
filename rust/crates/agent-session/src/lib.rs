@@ -2,7 +2,7 @@
 //!
 //! `AgentSession` owns an `AgentCoreLoop` and a `TranscriptStore` (append-only
 //! forest of entries with branch-aware navigation). It is the sole owner of
-//! durable context items — every item flows from the core into the store via
+//! durable transcript items — every item flows from the core into the store via
 //! `session.drive()`. History-edit operations are individual op structs
 //! (`SummarizeSpan`, `Compact`, `Rewind`, `ReplaceModelContext`) that implement
 //! the `HistoryEdit` trait; `session.edit(pending, op)` runs the quiescence
@@ -35,13 +35,13 @@ pub use crate::runner::{AgentInputHandle, AgentInputHandleError, AgentInputRecei
 pub use crate::session::AgentSession;
 pub use crate::transcript_store::{
     compaction_summary, Compact, CompactionPlan, CompactionSettings, HistoryEdit, HistoryEditError,
-    PendingWork, ReplaceModelContext, Rewind, SummarizeSpan, SummarySpanPlan, TranscriptEntry,
-    TranscriptStore, TranscriptStoreError, KIND_COMPACTION_SUMMARY,
+    PendingWork, ReplaceModelContext, Rewind, SummarizeSpan, SummarySpanPlan,
+    TranscriptStorageNode, TranscriptStore, TranscriptStoreError, KIND_COMPACTION_SUMMARY,
 };
 
 // Re-export core-owned types so downstream callers have a single import home.
 pub use agent_core::{
     ActionId, AgentAction, AgentInput, AgentInputError, AssistantItem, AssistantMessage,
-    ContextItem, InjectedMessage, ToolCall, ToolCallId, ToolResultMessage, ToolResultStatus,
+    InjectedMessage, ToolCall, ToolCallId, ToolResultMessage, ToolResultStatus, TranscriptItem,
     TurnId, TurnOutcome,
 };

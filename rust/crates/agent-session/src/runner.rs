@@ -73,7 +73,7 @@ pub struct AgentInputReceiver {
 /// session until quiescent, and forwards any requested actions to the
 /// registered handler. Records flow automatically into the session log via
 /// `AgentSession::drive`, so callers observing durable history read it off
-/// the session's model_context rather than through a record callback.
+/// the session's model_context rather than through a item callback.
 ///
 /// Action handlers are dispatch hooks, not long-running workers. A handler may
 /// register or spawn model/tool work and enqueue the eventual completion
@@ -191,7 +191,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use agent_core::{
-        ActionId, AgentInput, AssistantItem, AssistantMessage, ContextItem, TurnId, TurnOutcome,
+        ActionId, AgentInput, AssistantItem, AssistantMessage, TranscriptItem, TurnId, TurnOutcome,
     };
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
@@ -243,19 +243,19 @@ mod tests {
         };
         assert_eq!((*action_id, *turn_id), (ActionId(1), TurnId(1)));
         assert_eq!(
-            model_context.records(),
+            model_context.transcript_items(),
             &[
-                ContextItem::TurnStarted { turn_id: TurnId(1) },
-                ContextItem::UserMessage("hello".to_string()),
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage("hello".to_string()),
             ]
         );
         assert_eq!(
-            runner.session().model_context().records(),
+            runner.session().model_context().transcript_items(),
             &[
-                ContextItem::TurnStarted { turn_id: TurnId(1) },
-                ContextItem::UserMessage("hello".to_string()),
-                ContextItem::AssistantMessage(assistant),
-                ContextItem::TurnFinished {
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::AssistantMessage(assistant),
+                TranscriptItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Graceful,
                 },
@@ -286,8 +286,8 @@ mod tests {
                     model_context,
                 } = action
                 {
-                    assert!(model_context.records().iter().any(
-                        |record| matches!(record, ContextItem::UserMessage(text) if text == "hello")
+                    assert!(model_context.transcript_items().iter().any(
+                        |item| matches!(item, TranscriptItem::UserMessage(text) if text == "hello")
                     ));
                     if let Some(handle) = captured_completion_handle.borrow_mut().take() {
                         handle
@@ -312,12 +312,12 @@ mod tests {
 
         assert_eq!(actions.borrow().len(), 1);
         assert_eq!(
-            runner.session().model_context().records(),
+            runner.session().model_context().transcript_items(),
             &[
-                ContextItem::TurnStarted { turn_id: TurnId(1) },
-                ContextItem::UserMessage("hello".to_string()),
-                ContextItem::AssistantMessage(assistant),
-                ContextItem::TurnFinished {
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::AssistantMessage(assistant),
+                TranscriptItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Graceful,
                 },
@@ -359,8 +359,8 @@ mod tests {
             .any(|action| matches!(action, SessionAction::RequestModel { .. })));
         assert!(events.borrow().iter().any(|event| matches!(
             event,
-            SessionEvent::RecordAppended {
-                record: ContextItem::UserMessage(text),
+            SessionEvent::TranscriptItemAppended {
+                item: TranscriptItem::UserMessage(text),
                 ..
             } if text == "hello"
         )));

@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_core::{ContextItem, InjectedMessage};
+use agent_core::{InjectedMessage, TranscriptItem};
 use uuid::Uuid;
 
 use crate::model_context::ModelContext;
@@ -19,29 +19,29 @@ pub use self::ops::replace_model_context::ReplaceModelContext;
 pub use self::ops::rewind::Rewind;
 pub use self::span::{SummarizeSpan, SummarySpanPlan};
 
-/// Durable transcript entry holding one model-visible context item.
+/// Durable transcript storage node holding one model-visible transcript item.
 ///
 /// Entries form a forest: each entry has at most one parent, while a parent may
 /// have many children. A session points at one leaf and materializes model
 /// context by walking parents from that leaf back to a root.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TranscriptEntry {
+pub struct TranscriptStorageNode {
     pub id: String,
     pub parent_id: Option<String>,
     pub timestamp_ms: u128,
-    pub record: ContextItem,
+    pub item: TranscriptItem,
 }
 
 /// Append-only transcript forest plus one active session leaf.
 ///
-/// Each `TranscriptEntry` holds a single `ContextItem` plus a parent
+/// Each `TranscriptStorageNode` holds a single `TranscriptItem` plus a parent
 /// pointer. The store keeps direct indexes by entry id, parent id, and current
 /// leaves so future registry/storage layers can discover sibling paths and
 /// common ancestors quickly. The active leaf is the one path this session is
 /// currently using.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TranscriptStore {
-    entries_by_id: HashMap<String, TranscriptEntry>,
+    entries_by_id: HashMap<String, TranscriptStorageNode>,
     parent_by_id: HashMap<String, Option<String>>,
     children_by_parent: HashMap<Option<String>, Vec<String>>,
     leaf_ids: BTreeSet<String>,
@@ -56,7 +56,7 @@ impl TranscriptStore {
 
     pub fn from_model_context(transcript: &ModelContext) -> Self {
         let mut ctx = Self::new();
-        ctx.append_context_items(transcript.records().iter().cloned());
+        ctx.append_transcript_items(transcript.transcript_items().iter().cloned());
         ctx
     }
 
@@ -65,7 +65,7 @@ impl TranscriptStore {
     /// This is an owned snapshot because the store indexes entries by id
     /// internally. Future persistence code can serialize this vector together
     /// with `leaf_id()`.
-    pub fn entries(&self) -> Vec<TranscriptEntry> {
+    pub fn entries(&self) -> Vec<TranscriptStorageNode> {
         self.insertion_order
             .iter()
             .filter_map(|id| self.entries_by_id.get(id).cloned())
@@ -121,9 +121,9 @@ impl TranscriptStore {
             let Some(entry) = self.get_entry(id) else {
                 return false;
             };
-            match &entry.record {
-                ContextItem::TurnFinished { .. } => return true,
-                ContextItem::Injected(_) => {
+            match &entry.item {
+                TranscriptItem::TurnFinished { .. } => return true,
+                TranscriptItem::Injected(_) => {
                     cursor = entry.parent_id.as_deref();
                 }
                 _ => return false,
@@ -131,23 +131,23 @@ impl TranscriptStore {
         }
     }
 
-    pub fn get_entry(&self, id: &str) -> Option<&TranscriptEntry> {
+    pub fn get_entry(&self, id: &str) -> Option<&TranscriptStorageNode> {
         self.entries_by_id.get(id)
     }
 
-    pub fn append_context_items(
+    pub fn append_transcript_items(
         &mut self,
-        records: impl IntoIterator<Item = ContextItem>,
+        items: impl IntoIterator<Item = TranscriptItem>,
     ) -> Vec<String> {
-        records
+        items
             .into_iter()
-            .map(|record| self.append_record(record))
+            .map(|item| self.append_transcript_item(item))
             .collect()
     }
 
-    /// Append a `ContextItem::Injected(injected)` entry and return its id.
+    /// Append a `TranscriptItem::Injected(injected)` entry and return its id.
     pub fn append_injected(&mut self, injected: InjectedMessage) -> String {
-        self.append_record(ContextItem::Injected(injected))
+        self.append_transcript_item(TranscriptItem::Injected(injected))
     }
 
     pub fn branch(&mut self, entry_id: &str) -> Result<(), TranscriptStoreError> {
@@ -173,7 +173,7 @@ impl TranscriptStore {
         self.active_leaf_id = None;
     }
 
-    pub fn branch_entries(&self, leaf_id: Option<&str>) -> Vec<TranscriptEntry> {
+    pub fn branch_entries(&self, leaf_id: Option<&str>) -> Vec<TranscriptStorageNode> {
         let mut path = Vec::new();
         let mut current = leaf_id
             .or(self.active_leaf_id.as_deref())
@@ -219,26 +219,26 @@ impl TranscriptStore {
     /// Materialize the active branch into a `ModelContext`.
     ///
     /// Summary-span edits rebuild the active branch in model-visible order:
-    /// prefix before the summarized span, the summary record, then copies of
+    /// prefix before the summarized span, the summary item, then copies of
     /// the suffix after the summarized span. Materialization is therefore the
     /// full active path.
     pub fn model_context(&self) -> ModelContext {
         let path = self.branch_entries(None);
-        let records = path.into_iter().map(|e| e.record).collect();
-        ModelContext::from_records(records)
+        let items = path.into_iter().map(|entry| entry.item).collect();
+        ModelContext::from_transcript_items(items)
     }
 
-    pub(crate) fn append_record(&mut self, record: ContextItem) -> String {
-        let entry = TranscriptEntry {
+    pub(crate) fn append_transcript_item(&mut self, item: TranscriptItem) -> String {
+        let entry = TranscriptStorageNode {
             id: Uuid::new_v4().to_string(),
             parent_id: self.active_leaf_id.clone(),
             timestamp_ms: now_ms(),
-            record,
+            item,
         };
         self.append_entry(entry)
     }
 
-    fn append_entry(&mut self, entry: TranscriptEntry) -> String {
+    fn append_entry(&mut self, entry: TranscriptStorageNode) -> String {
         let id = entry.id.clone();
         let parent_id = entry.parent_id.clone();
         self.parent_by_id.insert(id.clone(), parent_id.clone());
@@ -256,7 +256,7 @@ impl TranscriptStore {
         id
     }
 
-    fn from_entries(entries: Vec<TranscriptEntry>, active_leaf_id: Option<String>) -> Self {
+    fn from_entries(entries: Vec<TranscriptStorageNode>, active_leaf_id: Option<String>) -> Self {
         let mut ctx = Self::new();
         for entry in entries {
             ctx.append_entry(entry);
@@ -287,16 +287,16 @@ mod tests {
     use crate::transcript_store::compaction_summary;
     use agent_core::{AssistantItem, AssistantMessage, InjectedMessage, TurnId, TurnOutcome};
 
-    fn turn(turn_id: u64, user: &str, assistant: &str) -> Vec<ContextItem> {
+    fn turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptItem> {
         vec![
-            ContextItem::TurnStarted {
+            TranscriptItem::TurnStarted {
                 turn_id: TurnId(turn_id),
             },
-            ContextItem::UserMessage(user.to_string()),
-            ContextItem::AssistantMessage(AssistantMessage {
+            TranscriptItem::UserMessage(user.to_string()),
+            TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text(assistant.to_string())],
             }),
-            ContextItem::TurnFinished {
+            TranscriptItem::TurnFinished {
                 turn_id: TurnId(turn_id),
                 outcome: TurnOutcome::Graceful,
             },
@@ -306,33 +306,33 @@ mod tests {
     #[test]
     fn context_tracks_a_branch_path_from_the_active_leaf() {
         let mut ctx = TranscriptStore::new();
-        let first_ids = ctx.append_context_items(turn(1, "first", "done"));
-        ctx.append_context_items(turn(2, "second", "done"));
+        let first_ids = ctx.append_transcript_items(turn(1, "first", "done"));
+        ctx.append_transcript_items(turn(2, "second", "done"));
 
         ctx.branch(&first_ids[3]).expect("turn one should exist");
-        ctx.append_context_items(turn(3, "alternate", "done"));
+        ctx.append_transcript_items(turn(3, "alternate", "done"));
 
         let transcript = ctx.model_context();
         assert_eq!(transcript.last_turn_id(), TurnId(3));
         assert_eq!(
-            transcript.records()[1],
-            ContextItem::UserMessage("first".to_string())
+            transcript.transcript_items()[1],
+            TranscriptItem::UserMessage("first".to_string())
         );
         assert_eq!(
-            transcript.records()[5],
-            ContextItem::UserMessage("alternate".to_string())
+            transcript.transcript_items()[5],
+            TranscriptItem::UserMessage("alternate".to_string())
         );
     }
 
     #[test]
     fn context_indexes_children_and_leaves_for_alternate_paths() {
         let mut ctx = TranscriptStore::new();
-        let first_ids = ctx.append_context_items(turn(1, "first", "done"));
-        let original_second_ids = ctx.append_context_items(turn(2, "second", "done"));
+        let first_ids = ctx.append_transcript_items(turn(1, "first", "done"));
+        let original_second_ids = ctx.append_transcript_items(turn(2, "second", "done"));
 
         ctx.branch_at_turn_boundary(&first_ids[3])
             .expect("T1 boundary is a valid fork point");
-        let alternate_second_ids = ctx.append_context_items(turn(3, "alternate", "done"));
+        let alternate_second_ids = ctx.append_transcript_items(turn(3, "alternate", "done"));
 
         let children = ctx.child_ids(Some(&first_ids[3]));
         assert!(children.contains(&original_second_ids[0].as_str()));
@@ -351,38 +351,41 @@ mod tests {
     fn transcript_materializes_the_full_active_branch_after_a_summary() {
         // Simulate a summary-span edit manually at the context level: append
         // two turns, navigate back to the T1 boundary, append a summary there,
-        // then re-append T2's records as descendants. The active branch is now
-        // [T1 records..., summary, T2 records...], and the materialized view is
+        // then re-append T2's items as descendants. The active branch is now
+        // [T1 items..., summary, T2 items...], and the materialized view is
         // that full active path.
         let mut ctx = TranscriptStore::new();
-        let first_ids = ctx.append_context_items(turn(1, "first", "done"));
-        let second_ids = ctx.append_context_items(turn(2, "second", "done"));
+        let first_ids = ctx.append_transcript_items(turn(1, "first", "done"));
+        let second_ids = ctx.append_transcript_items(turn(2, "second", "done"));
         let kept_records = second_ids
             .iter()
-            .map(|id| ctx.get_entry(id).expect("kept id exists").record.clone())
+            .map(|id| ctx.get_entry(id).expect("kept id exists").item.clone())
             .collect::<Vec<_>>();
 
         ctx.branch_at_turn_boundary(&first_ids[3])
             .expect("T1 boundary is a valid fork point");
         ctx.append_injected(compaction_summary("summary", second_ids[0].clone(), 100));
-        ctx.append_context_items(kept_records);
+        ctx.append_transcript_items(kept_records);
 
         let transcript = ctx.model_context();
         assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
         assert_eq!(transcript.last_turn_id(), TurnId(2));
-        assert!(matches!(transcript.records()[4], ContextItem::Injected(_)));
         assert!(matches!(
-            transcript.records()[5],
-            ContextItem::TurnStarted { turn_id: TurnId(2) }
+            transcript.transcript_items()[4],
+            TranscriptItem::Injected(_)
         ));
-        assert_eq!(transcript.records().len(), 9);
+        assert!(matches!(
+            transcript.transcript_items()[5],
+            TranscriptItem::TurnStarted { turn_id: TurnId(2) }
+        ));
+        assert_eq!(transcript.transcript_items().len(), 9);
         assert!(ctx.is_turn_boundary());
     }
 
     #[test]
     fn fork_at_injected_tail_is_a_valid_turn_boundary() {
         let mut ctx = TranscriptStore::new();
-        ctx.append_context_items(turn(1, "hi", "done"));
+        ctx.append_transcript_items(turn(1, "hi", "done"));
         let injected_id = ctx.append_injected(InjectedMessage::new("note", "note"));
 
         assert!(ctx.is_turn_boundary());

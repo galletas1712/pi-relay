@@ -22,7 +22,7 @@ pub(crate) struct UserInputEntry {
 /// Volatile prioritized queues feeding the live agent FSM.
 ///
 /// Mailbox contents are intentionally not durable: if the process dies, session
-/// recovery is driven from persisted context items instead.
+/// recovery is driven from persisted transcript items instead.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Mailbox {
     notifications: VecDeque<AgentEvent>,

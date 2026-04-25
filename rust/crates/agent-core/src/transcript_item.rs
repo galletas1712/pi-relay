@@ -17,7 +17,7 @@ pub enum TurnOutcome {
 /// attach to a separate lifecycle notification stream derived while the loop
 /// is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ContextItem {
+pub enum TranscriptItem {
     // Produced by the FSM during a turn:
     TurnStarted {
         turn_id: TurnId,
@@ -41,7 +41,7 @@ pub enum ContextItem {
     Injected(InjectedMessage),
 }
 
-/// Payload carried by `ContextItem::Injected`.
+/// Payload carried by `TranscriptItem::Injected`.
 ///
 /// `kind` is a free-form tag chosen by the session, orchestrator, or another
 /// extension point to classify the injected context. `content` is the textual
@@ -69,16 +69,16 @@ impl InjectedMessage {
     }
 }
 
-impl ContextItem {
+impl TranscriptItem {
     pub fn turn_id(&self) -> Option<TurnId> {
         match self {
-            ContextItem::TurnStarted { turn_id }
-            | ContextItem::ToolCallStarted { turn_id, .. }
-            | ContextItem::TurnFinished { turn_id, .. } => Some(*turn_id),
-            ContextItem::UserMessage(_)
-            | ContextItem::AssistantMessage(_)
-            | ContextItem::ToolResult(_)
-            | ContextItem::Injected(_) => None,
+            TranscriptItem::TurnStarted { turn_id }
+            | TranscriptItem::ToolCallStarted { turn_id, .. }
+            | TranscriptItem::TurnFinished { turn_id, .. } => Some(*turn_id),
+            TranscriptItem::UserMessage(_)
+            | TranscriptItem::AssistantMessage(_)
+            | TranscriptItem::ToolResult(_)
+            | TranscriptItem::Injected(_) => None,
         }
     }
 }

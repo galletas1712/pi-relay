@@ -1,7 +1,7 @@
-use agent_core::ContextItem;
+use agent_core::TranscriptItem;
 
 use crate::action::StatelessModelRequestId;
-use crate::transcript_store::tokens::estimate_records_tokens;
+use crate::transcript_store::tokens::estimate_items_tokens;
 use crate::transcript_store::{CompactionPlan, CompactionSettings, TranscriptStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +66,7 @@ pub(crate) fn prepare_auto_compaction(
     context: &TranscriptStore,
     settings: AutoCompactionSettings,
 ) -> Option<CompactionPlan> {
-    let tokens = estimate_records_tokens(context.model_context().records());
+    let tokens = estimate_items_tokens(context.model_context().transcript_items());
     if tokens <= settings.max_context_tokens {
         return None;
     }
@@ -83,10 +83,10 @@ pub(crate) fn compaction_request(plan: &CompactionPlan) -> StatelessModelRequest
         });
     }
     input.push(ModelContentBlock::Text {
-        text: format_records("TranscriptStore to summarize", &plan.records_to_summarize),
+        text: format_transcript_items("TranscriptStore to summarize", &plan.items_to_summarize),
     });
     input.push(ModelContentBlock::Text {
-        text: format_records("Recent context that will be kept", &plan.records_to_keep),
+        text: format_transcript_items("Recent context that will be kept", &plan.items_to_keep),
     });
 
     StatelessModelRequest {
@@ -102,12 +102,12 @@ pub(crate) fn compaction_request(plan: &CompactionPlan) -> StatelessModelRequest
     }
 }
 
-fn format_records(label: &str, records: &[ContextItem]) -> String {
+fn format_transcript_items(label: &str, items: &[TranscriptItem]) -> String {
     let mut out = String::new();
     out.push_str(label);
     out.push_str(":\n");
-    for record in records {
-        out.push_str(&format!("{record:?}\n"));
+    for item in items {
+        out.push_str(&format!("{item:?}\n"));
     }
     out
 }

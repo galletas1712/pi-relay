@@ -1,14 +1,14 @@
-use agent_core::{AssistantItem, ContextItem};
+use agent_core::{AssistantItem, TranscriptItem};
 
-pub(crate) fn estimate_records_tokens(records: &[ContextItem]) -> usize {
-    records.iter().map(estimate_record_tokens).sum()
+pub(crate) fn estimate_items_tokens(items: &[TranscriptItem]) -> usize {
+    items.iter().map(estimate_item_tokens).sum()
 }
 
-pub(crate) fn estimate_record_tokens(record: &ContextItem) -> usize {
-    let chars = match record {
-        ContextItem::TurnStarted { .. } | ContextItem::TurnFinished { .. } => 0,
-        ContextItem::UserMessage(content) => content.len(),
-        ContextItem::AssistantMessage(message) => message
+pub(crate) fn estimate_item_tokens(item: &TranscriptItem) -> usize {
+    let chars = match item {
+        TranscriptItem::TurnStarted { .. } | TranscriptItem::TurnFinished { .. } => 0,
+        TranscriptItem::UserMessage(content) => content.len(),
+        TranscriptItem::AssistantMessage(message) => message
             .items
             .iter()
             .map(|item| match item {
@@ -18,11 +18,11 @@ pub(crate) fn estimate_record_tokens(record: &ContextItem) -> usize {
                 }
             })
             .sum(),
-        ContextItem::ToolCallStarted { tool_call, .. } => {
+        TranscriptItem::ToolCallStarted { tool_call, .. } => {
             tool_call.tool_name.len() + tool_call.args_json.len()
         }
-        ContextItem::ToolResult(result) => result.tool_name.len() + result.output.len(),
-        ContextItem::Injected(message) => message.content.len(),
+        TranscriptItem::ToolResult(result) => result.tool_name.len() + result.output.len(),
+        TranscriptItem::Injected(message) => message.content.len(),
     };
     chars.div_ceil(4)
 }

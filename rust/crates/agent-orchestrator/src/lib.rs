@@ -54,7 +54,7 @@ impl AgentOrchestrator {
     /// Enqueues `AgentInput::Steer { from: Some(from), kind:
     /// Some(KIND_AGENT_DIRECTIVE), content }` on the target's mailbox. The
     /// `from` and `kind` tags ride along so the target's FSM materialises a
-    /// `ContextItem::Injected(InjectedMessage { kind:
+    /// `TranscriptItem::Injected(InjectedMessage { kind:
     /// "agent_directive", metadata: {"from": ...}, .. })` at turn start
     /// instead of a plain `UserMessage`.
     ///
@@ -97,7 +97,7 @@ impl AgentOrchestrator {
     /// Enqueues `AgentInput::FollowUp { from: Some(from), kind:
     /// Some(KIND_AGENT_REPORT), content }` on the parent's mailbox. The `from`
     /// and `kind` tags ride along so the parent's FSM materialises a
-    /// `ContextItem::Injected(InjectedMessage { kind: "agent_report",
+    /// `TranscriptItem::Injected(InjectedMessage { kind: "agent_report",
     /// metadata: {"from": ...}, .. })` at turn start instead of a plain
     /// `UserMessage`.
     ///
@@ -130,7 +130,7 @@ impl AgentOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{AgentInput, AssistantMessage, ContextItem, TurnId, TurnOutcome};
+    use agent_core::{AgentInput, AssistantMessage, TranscriptItem, TurnId, TurnOutcome};
     use agent_session::{
         Compact, CompactionSettings, HistoryEditError, ModelContext, PendingWork,
         ReplaceModelContext, Rewind, TranscriptStoreError,
@@ -161,10 +161,10 @@ mod tests {
     #[test]
     fn orchestrator_delegates_model_context_replacement_to_session_history_edit() {
         let mut orchestrator = AgentOrchestrator::new();
-        let model_context = ModelContext::from_records(vec![
-            ContextItem::TurnStarted { turn_id: TurnId(1) },
-            ContextItem::UserMessage("compacted".to_string()),
-            ContextItem::TurnFinished {
+        let model_context = ModelContext::from_transcript_items(vec![
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            TranscriptItem::UserMessage("compacted".to_string()),
+            TranscriptItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
@@ -200,18 +200,18 @@ mod tests {
     #[test]
     fn orchestrator_delegates_rewind_fork_and_compaction_to_session_history_edits() {
         let mut orchestrator = AgentOrchestrator::new();
-        let session = AgentSession::from_model_context(ModelContext::from_records(vec![
-            ContextItem::TurnStarted { turn_id: TurnId(1) },
-            ContextItem::UserMessage("first user message".to_string()),
-            ContextItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            ContextItem::TurnFinished {
+        let session = AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            TranscriptItem::UserMessage("first user message".to_string()),
+            TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            TranscriptItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
-            ContextItem::TurnStarted { turn_id: TurnId(2) },
-            ContextItem::UserMessage("second user message".to_string()),
-            ContextItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            ContextItem::TurnFinished {
+            TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+            TranscriptItem::UserMessage("second user message".to_string()),
+            TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            TranscriptItem::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             },
@@ -412,11 +412,11 @@ mod tests {
             .expect("parent exists");
         parent.drive();
 
-        let records = parent.model_context().records().to_vec();
-        let injected = records
+        let items = parent.model_context().transcript_items().to_vec();
+        let injected = items
             .iter()
             .find_map(|r| match r {
-                ContextItem::Injected(cm) => Some(cm),
+                TranscriptItem::Injected(cm) => Some(cm),
                 _ => None,
             })
             .expect("parent model_context should contain an injected entry from the report");
@@ -435,9 +435,9 @@ mod tests {
         // And make sure we did NOT ALSO append a plain UserMessage for the
         // report.
         assert!(
-            !records
+            !items
                 .iter()
-                .any(|r| matches!(r, ContextItem::UserMessage(s) if s == "child is done")),
+                .any(|r| matches!(r, TranscriptItem::UserMessage(s) if s == "child is done")),
             "report should not show up as a UserMessage",
         );
     }

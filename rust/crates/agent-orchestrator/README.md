@@ -107,7 +107,7 @@ spawn_parents:
 
 Both primitives are fire-and-forget. They validate the relationship, push a single `AgentInput` onto the target's mailbox via `AgentSession::enqueue_input`, and return. No wait for ack, no turn driving, no observation of downstream state.
 
-When the target session next starts a turn from a tagged input, the FSM in `agent-core` materialises a `ContextItem::Injected(InjectedMessage { kind, content, metadata: { "from": <sender_id> } })` at the turn boundary instead of a plain `UserMessage`. This preserves sender identity in the durable model context. The orchestrator owns the `KIND_*` string constants; `agent-core` and `agent-session` treat `from` and `kind` as opaque tags and never reference the specific values by name.
+When the target session next starts a turn from a tagged input, the FSM in `agent-core` materialises a `TranscriptItem::Injected(InjectedMessage { kind, content, metadata: { "from": <sender_id> } })` at the turn boundary instead of a plain `UserMessage`. This preserves sender identity in the durable model context. The orchestrator owns the `KIND_*` string constants; `agent-core` and `agent-session` treat `from` and `kind` as opaque tags and never reference the specific values by name.
 
 `RouteError` variants, from `registry.rs`:
 
@@ -132,7 +132,7 @@ Routing flow, `send_message`:
  child mailbox
         |
         v  child.drive() on next tick
- ContextItem::Injected(InjectedMessage {
+ TranscriptItem::Injected(InjectedMessage {
      kind: "agent_directive",
      content: "do X",
      metadata: { "from": parent_id },
@@ -148,7 +148,7 @@ The TypeScript counterpart (`packages/orchestrator/src/orchestrator.ts::deliverM
 ## Relationship to other crates
 
 - **`agent-session`** (direct dep): the registry's default session type is `AgentSession`. Routing calls `AgentSession::enqueue_input` to deliver inputs; it never reaches into `TranscriptStore` directly. History-edit ops (`SummarizeSpan`, `Compact`, `Rewind`, `ReplaceModelContext`, `fork`) stay on `AgentSession` and are invoked by callers through `registry_mut().get_mut(id)`.
-- **`agent-core`** (direct dep, transitively via session): the FSM types `AgentInput::Steer` and `AgentInput::FollowUp` carry `from: Option<String>` and `kind: Option<String>`. Tagged inputs become `ContextItem::Injected` entries when consumed; the invariant `from.is_some() == kind.is_some()` is enforced by the `AgentInput::steer_tagged` / `follow_up_tagged` constructors that this crate uses.
+- **`agent-core`** (direct dep, transitively via session): the FSM types `AgentInput::Steer` and `AgentInput::FollowUp` carry `from: Option<String>` and `kind: Option<String>`. Tagged inputs become `TranscriptItem::Injected` entries when consumed; the invariant `from.is_some() == kind.is_some()` is enforced by the `AgentInput::steer_tagged` / `follow_up_tagged` constructors that this crate uses.
 
 See `rust/docs/architecture.md` for the full crate stack and PR sequencing.
 

@@ -1,4 +1,4 @@
-use agent_core::ContextItem;
+use agent_core::TranscriptItem;
 
 use crate::action::SessionAction;
 
@@ -9,9 +9,9 @@ use crate::action::SessionAction;
 /// around that view while it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
-    RecordAppended {
+    TranscriptItemAppended {
         entry_id: String,
-        record: ContextItem,
+        item: TranscriptItem,
     },
     ActionRequested {
         action: SessionAction,

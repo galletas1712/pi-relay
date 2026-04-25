@@ -1,8 +1,8 @@
-use agent_core::{ContextItem, InjectedMessage};
+use agent_core::{InjectedMessage, TranscriptItem};
 
 use crate::transcript_store::edit::{HistoryEdit, HistoryEditError};
-use crate::transcript_store::tokens::estimate_records_tokens;
-use crate::transcript_store::{TranscriptEntry, TranscriptStore, TranscriptStoreError};
+use crate::transcript_store::tokens::estimate_items_tokens;
+use crate::transcript_store::{TranscriptStorageNode, TranscriptStore, TranscriptStoreError};
 
 /// A stable plan to replace a contiguous span on the active branch with a
 /// summary entry.
@@ -14,18 +14,18 @@ use crate::transcript_store::{TranscriptEntry, TranscriptStore, TranscriptStoreE
 pub struct SummarySpanPlan {
     pub first_entry_id: String,
     pub last_entry_id: String,
-    pub records_to_replace: Vec<ContextItem>,
-    pub records_after_span: Vec<ContextItem>,
+    pub items_to_replace: Vec<TranscriptItem>,
+    pub items_after_span: Vec<TranscriptItem>,
     pub tokens_before: usize,
     pub leaf_id: Option<String>,
     pub entry_count: usize,
 }
 
-/// Replace a prepared context span with a caller-provided summary record.
+/// Replace a prepared context span with a caller-provided summary item.
 ///
 /// The old entries remain in the append-only store as an orphaned branch. The
 /// active branch is rebuilt as: prefix before the span, summary, then copies of
-/// the records after the span.
+/// the items after the span.
 pub struct SummarizeSpan {
     pub plan: SummarySpanPlan,
     pub summary: InjectedMessage,
@@ -96,34 +96,34 @@ impl HistoryEdit for SummarizeSpan {
         }
 
         ctx.append_injected(self.summary);
-        ctx.append_context_items(self.plan.records_after_span.iter().cloned());
+        ctx.append_transcript_items(self.plan.items_after_span.iter().cloned());
         Ok(())
     }
 }
 
 pub(crate) fn summary_span_plan_from_indices(
     ctx: &TranscriptStore,
-    path: &[TranscriptEntry],
+    path: &[TranscriptStorageNode],
     first_index: usize,
     last_index: usize,
 ) -> SummarySpanPlan {
     SummarySpanPlan {
         first_entry_id: path[first_index].id.clone(),
         last_entry_id: path[last_index].id.clone(),
-        records_to_replace: transcript_records_in(&path[first_index..=last_index]),
-        records_after_span: transcript_records_in(&path[last_index + 1..]),
-        tokens_before: estimate_records_tokens(ctx.model_context().records()),
+        items_to_replace: transcript_items_in(&path[first_index..=last_index]),
+        items_after_span: transcript_items_in(&path[last_index + 1..]),
+        tokens_before: estimate_items_tokens(ctx.model_context().transcript_items()),
         leaf_id: ctx.leaf_id().map(str::to_string),
         entry_count: ctx.entry_count(),
     }
 }
 
-pub(crate) fn transcript_records_in(entries: &[TranscriptEntry]) -> Vec<ContextItem> {
-    entries.iter().map(|entry| entry.record.clone()).collect()
+pub(crate) fn transcript_items_in(entries: &[TranscriptStorageNode]) -> Vec<TranscriptItem> {
+    entries.iter().map(|entry| entry.item.clone()).collect()
 }
 
 fn active_span_indices(
-    path: &[TranscriptEntry],
+    path: &[TranscriptStorageNode],
     first_entry_id: &str,
     last_entry_id: &str,
 ) -> Result<(usize, usize), TranscriptStoreError> {
@@ -143,7 +143,7 @@ fn active_span_indices(
 
 fn validate_span_boundaries(
     ctx: &TranscriptStore,
-    path: &[TranscriptEntry],
+    path: &[TranscriptStorageNode],
     first_index: usize,
     last_index: usize,
 ) -> Result<(), TranscriptStoreError> {
@@ -161,14 +161,14 @@ mod tests {
     use super::*;
     use agent_core::{AssistantMessage, InjectedMessage, TurnId, TurnOutcome};
 
-    fn turn(turn_id: u64, user: &str) -> Vec<ContextItem> {
+    fn turn(turn_id: u64, user: &str) -> Vec<TranscriptItem> {
         vec![
-            ContextItem::TurnStarted {
+            TranscriptItem::TurnStarted {
                 turn_id: TurnId(turn_id),
             },
-            ContextItem::UserMessage(user.to_string()),
-            ContextItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            ContextItem::TurnFinished {
+            TranscriptItem::UserMessage(user.to_string()),
+            TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            TranscriptItem::TurnFinished {
                 turn_id: TurnId(turn_id),
                 outcome: TurnOutcome::Graceful,
             },
@@ -178,14 +178,14 @@ mod tests {
     #[test]
     fn summarize_span_replaces_a_middle_run_and_replays_suffix() {
         let mut ctx = TranscriptStore::new();
-        ctx.append_context_items(turn(1, "first"));
-        let second_ids = ctx.append_context_items(turn(2, "second"));
-        ctx.append_context_items(turn(3, "third"));
+        ctx.append_transcript_items(turn(1, "first"));
+        let second_ids = ctx.append_transcript_items(turn(2, "second"));
+        ctx.append_transcript_items(turn(3, "third"));
 
         let plan = ctx
             .prepare_summary_span(&second_ids[0], &second_ids[3])
             .expect("whole middle turn is a valid summary span");
-        assert_eq!(plan.records_after_span.len(), 4);
+        assert_eq!(plan.items_after_span.len(), 4);
 
         SummarizeSpan {
             plan,
@@ -194,31 +194,31 @@ mod tests {
         .apply(&mut ctx)
         .expect("summary span should apply");
 
-        let records = ctx.model_context().into_records();
-        assert!(records
+        let items = ctx.model_context().into_transcript_items();
+        assert!(items
             .iter()
-            .any(|record| matches!(record, ContextItem::UserMessage(text) if text == "first")));
-        assert!(records
+            .any(|item| matches!(item, TranscriptItem::UserMessage(text) if text == "first")));
+        assert!(items
             .iter()
-            .any(|record| matches!(record, ContextItem::Injected(cm) if cm.kind == "summary")));
-        assert!(!records
+            .any(|item| matches!(item, TranscriptItem::Injected(cm) if cm.kind == "summary")));
+        assert!(!items
             .iter()
-            .any(|record| matches!(record, ContextItem::UserMessage(text) if text == "second")));
-        assert!(records
+            .any(|item| matches!(item, TranscriptItem::UserMessage(text) if text == "second")));
+        assert!(items
             .iter()
-            .any(|record| matches!(record, ContextItem::UserMessage(text) if text == "third")));
+            .any(|item| matches!(item, TranscriptItem::UserMessage(text) if text == "third")));
     }
 
     #[test]
     fn summarize_span_can_replace_the_suffix() {
         let mut ctx = TranscriptStore::new();
-        ctx.append_context_items(turn(1, "first"));
-        let second_ids = ctx.append_context_items(turn(2, "second"));
+        ctx.append_transcript_items(turn(1, "first"));
+        let second_ids = ctx.append_transcript_items(turn(2, "second"));
 
         let plan = ctx
             .prepare_summary_span(&second_ids[0], &second_ids[3])
             .expect("suffix turn is a valid summary span");
-        assert!(plan.records_after_span.is_empty());
+        assert!(plan.items_after_span.is_empty());
 
         SummarizeSpan {
             plan,
@@ -227,23 +227,23 @@ mod tests {
         .apply(&mut ctx)
         .expect("suffix summary span should apply");
 
-        let records = ctx.model_context().into_records();
-        assert!(records
+        let items = ctx.model_context().into_transcript_items();
+        assert!(items
             .iter()
-            .any(|record| matches!(record, ContextItem::UserMessage(text) if text == "first")));
-        assert!(records
+            .any(|item| matches!(item, TranscriptItem::UserMessage(text) if text == "first")));
+        assert!(items
             .iter()
-            .any(|record| matches!(record, ContextItem::Injected(cm) if cm.kind == "summary")));
-        assert!(!records
+            .any(|item| matches!(item, TranscriptItem::Injected(cm) if cm.kind == "summary")));
+        assert!(!items
             .iter()
-            .any(|record| matches!(record, ContextItem::UserMessage(text) if text == "second")));
+            .any(|item| matches!(item, TranscriptItem::UserMessage(text) if text == "second")));
         assert!(ctx.is_turn_boundary());
     }
 
     #[test]
     fn summarize_span_requires_whole_turn_boundaries() {
         let mut ctx = TranscriptStore::new();
-        let ids = ctx.append_context_items(turn(1, "first"));
+        let ids = ctx.append_transcript_items(turn(1, "first"));
 
         assert_eq!(
             ctx.prepare_summary_span(&ids[1], &ids[3]),
