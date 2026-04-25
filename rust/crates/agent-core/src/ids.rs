@@ -8,6 +8,21 @@ impl TurnId {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ActionId(pub u64);
+
+impl ActionId {
+    pub fn first() -> Self {
+        Self(1)
+    }
+
+    pub fn take_next(next: &mut Self) -> Self {
+        let current = *next;
+        next.0 += 1;
+        current
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ToolCallId(pub u64);
 
 impl ToolCallId {

@@ -1,19 +1,24 @@
+use std::collections::BTreeMap;
+
 use crate::action::AgentAction;
-use crate::event::AgentEvent;
-use crate::ids::TurnId;
+use crate::event::{AgentEvent, TurnOrigin};
+use crate::ids::{ActionId, TurnId};
 use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
-use crate::transcript::{TranscriptRecord, TurnOutcome};
+use crate::record::{InjectedMessage, TranscriptRecord, TurnOutcome};
 
 // Live control state only. Durable session history lives in Transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AgentState {
+    #[default]
     Idle,
     RunningModel {
         turn_id: TurnId,
+        action_id: ActionId,
     },
     RunningTools {
         turn_id: TurnId,
         tool_calls: Vec<ToolCall>,
+        tool_action_ids: Vec<ActionId>,
         completed_results: Vec<Option<ToolResultMessage>>,
         next_result_index: usize,
     },
@@ -23,24 +28,35 @@ pub enum AgentState {
     },
 }
 
-impl Default for AgentState {
-    fn default() -> Self {
-        Self::Idle
-    }
-}
-
 impl AgentState {
-    pub(crate) fn step(&mut self, event: AgentEvent) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
+    pub(crate) fn step(
+        &mut self,
+        event: AgentEvent,
+        next_action_id: &mut ActionId,
+    ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         match event {
             AgentEvent::Interrupt => self.on_interrupt(),
-            AgentEvent::StartTurn { turn_id, input } => self.on_start_turn(turn_id, input),
-            AgentEvent::ModelCompleted { turn_id, assistant } => {
-                self.on_model_completed(turn_id, assistant)
-            }
-            AgentEvent::ToolCompleted { turn_id, result } => {
-                self.on_tool_completed(turn_id, result)
-            }
-            AgentEvent::ContinueModel => self.on_continue_model(),
+            AgentEvent::StartTurn {
+                turn_id,
+                input,
+                origin,
+            } => self.on_start_turn(turn_id, input, origin, next_action_id),
+            AgentEvent::ModelCompleted {
+                action_id,
+                turn_id,
+                assistant,
+            } => self.on_model_completed(action_id, turn_id, assistant, next_action_id),
+            AgentEvent::ModelFailed {
+                action_id,
+                turn_id,
+                error,
+            } => self.on_model_failed(action_id, turn_id, error),
+            AgentEvent::ToolCompleted {
+                action_id,
+                turn_id,
+                result,
+            } => self.on_tool_completed(action_id, turn_id, result),
+            AgentEvent::ContinueModel => self.on_continue_model(next_action_id),
         }
     }
 
@@ -48,16 +64,28 @@ impl AgentState {
         &mut self,
         turn_id: TurnId,
         input: String,
+        origin: Option<TurnOrigin>,
+        next_action_id: &mut ActionId,
     ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         match self {
             Self::Idle => {
-                *self = Self::RunningModel { turn_id };
+                let action_id = ActionId::take_next(next_action_id);
+                *self = Self::RunningModel { turn_id, action_id };
+                let first_record = match origin {
+                    None => TranscriptRecord::UserMessage(input),
+                    Some(TurnOrigin { from, kind }) => {
+                        let mut metadata = BTreeMap::new();
+                        metadata.insert("from".to_string(), from);
+                        TranscriptRecord::Injected(InjectedMessage {
+                            kind,
+                            content: input,
+                            metadata,
+                        })
+                    }
+                };
                 (
-                    vec![
-                        TranscriptRecord::TurnStarted { turn_id },
-                        TranscriptRecord::UserMessage(input),
-                    ],
-                    vec![AgentAction::RequestModel { turn_id }],
+                    vec![TranscriptRecord::TurnStarted { turn_id }, first_record],
+                    vec![AgentAction::RequestModel { action_id, turn_id }],
                 )
             }
             Self::RunningModel { .. }
@@ -68,12 +96,15 @@ impl AgentState {
 
     fn on_model_completed(
         &mut self,
+        action_id: ActionId,
         turn_id: TurnId,
         assistant: AssistantMessage,
+        next_action_id: &mut ActionId,
     ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         if !matches!(
             self,
-            Self::RunningModel { turn_id: active_turn_id } if *active_turn_id == turn_id
+            Self::RunningModel { turn_id: active_turn_id, action_id: active_action_id }
+                if *active_turn_id == turn_id && *active_action_id == action_id
         ) {
             return empty_transition();
         }
@@ -94,27 +125,66 @@ impl AgentState {
         *self = Self::RunningTools {
             turn_id,
             tool_calls: tool_calls.clone(),
+            tool_action_ids: Vec::with_capacity(tool_calls.len()),
             completed_results: vec![None; tool_calls.len()],
             next_result_index: 0,
         };
+        let Self::RunningTools {
+            tool_action_ids, ..
+        } = self
+        else {
+            unreachable!("state just entered RunningTools");
+        };
         for tool_call in tool_calls {
+            let action_id = ActionId::take_next(next_action_id);
+            tool_action_ids.push(action_id);
             records.push(TranscriptRecord::ToolCallStarted {
                 turn_id,
                 tool_call: tool_call.clone(),
             });
-            actions.push(AgentAction::RequestTool { turn_id, tool_call });
+            actions.push(AgentAction::RequestTool {
+                action_id,
+                turn_id,
+                tool_call,
+            });
         }
         (records, actions)
     }
 
+    fn on_model_failed(
+        &mut self,
+        action_id: ActionId,
+        turn_id: TurnId,
+        _error: String,
+    ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
+        if !matches!(
+            self,
+            Self::RunningModel { turn_id: active_turn_id, action_id: active_action_id }
+                if *active_turn_id == turn_id && *active_action_id == action_id
+        ) {
+            return empty_transition();
+        }
+
+        *self = Self::Idle;
+        (
+            vec![TranscriptRecord::TurnFinished {
+                turn_id,
+                outcome: TurnOutcome::Crashed,
+            }],
+            Vec::new(),
+        )
+    }
+
     fn on_tool_completed(
         &mut self,
+        action_id: ActionId,
         turn_id: TurnId,
         result: ToolResultMessage,
     ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         let Self::RunningTools {
             turn_id: active_turn_id,
             tool_calls,
+            tool_action_ids,
             completed_results,
             next_result_index,
         } = self
@@ -131,6 +201,10 @@ impl AgentState {
         }) else {
             return empty_transition();
         };
+
+        if tool_action_ids.get(result_index) != Some(&action_id) {
+            return empty_transition();
+        }
 
         if result_index < *next_result_index || completed_results[result_index].is_some() {
             return empty_transition();
@@ -155,14 +229,21 @@ impl AgentState {
         (records, Vec::new())
     }
 
-    fn on_continue_model(&mut self) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
+    fn on_continue_model(
+        &mut self,
+        next_action_id: &mut ActionId,
+    ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
         let Self::ReadyToContinue { turn_id } = self else {
             return empty_transition();
         };
         let turn_id = *turn_id;
+        let action_id = ActionId::take_next(next_action_id);
 
-        *self = Self::RunningModel { turn_id };
-        (Vec::new(), vec![AgentAction::RequestModel { turn_id }])
+        *self = Self::RunningModel { turn_id, action_id };
+        (
+            Vec::new(),
+            vec![AgentAction::RequestModel { action_id, turn_id }],
+        )
     }
 
     fn on_interrupt(&mut self) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
@@ -178,7 +259,7 @@ impl AgentState {
                     Vec::new(),
                 )
             }
-            Self::RunningModel { turn_id } => {
+            Self::RunningModel { turn_id, .. } => {
                 *self = Self::Idle;
                 (
                     vec![TranscriptRecord::TurnFinished {
@@ -191,6 +272,7 @@ impl AgentState {
             Self::RunningTools {
                 turn_id,
                 tool_calls,
+                tool_action_ids: _,
                 completed_results,
                 next_result_index,
             } => {
@@ -247,33 +329,46 @@ mod tests {
     #[test]
     fn idle_ignores_late_model_completions() {
         let event = AgentEvent::ModelCompleted {
+            action_id: ActionId(1),
             turn_id: TurnId(1),
             assistant: AssistantMessage { items: Vec::new() },
         };
 
         let mut idle = AgentState::Idle;
+        let mut next_action_id = ActionId::first();
 
-        assert!(transition_is_empty(&idle.step(event)));
+        assert!(transition_is_empty(&idle.step(event, &mut next_action_id)));
         assert_eq!(idle, AgentState::Idle);
     }
 
     #[test]
     fn running_model_accepts_only_matching_model_completion() {
-        let mut state = AgentState::RunningModel { turn_id: TurnId(2) };
+        let mut state = AgentState::RunningModel {
+            turn_id: TurnId(2),
+            action_id: ActionId(1),
+        };
         let assistant = AssistantMessage { items: Vec::new() };
         let matching = AgentEvent::ModelCompleted {
+            action_id: ActionId(1),
             turn_id: TurnId(2),
             assistant: assistant.clone(),
         };
         let stale = AgentEvent::ModelCompleted {
+            action_id: ActionId(1),
             turn_id: TurnId(1),
             assistant,
         };
 
-        let mut stale_state = AgentState::RunningModel { turn_id: TurnId(2) };
-        assert!(transition_is_empty(&stale_state.step(stale)));
+        let mut stale_state = AgentState::RunningModel {
+            turn_id: TurnId(2),
+            action_id: ActionId(1),
+        };
+        let mut next_action_id = ActionId::first();
+        assert!(transition_is_empty(
+            &stale_state.step(stale, &mut next_action_id)
+        ));
 
-        let (records, _) = state.step(matching);
+        let (records, _) = state.step(matching, &mut next_action_id);
         assert_eq!(state, AgentState::Idle);
         assert_eq!(
             records,
@@ -292,21 +387,27 @@ mod tests {
         let mut state = AgentState::RunningTools {
             turn_id: TurnId(1),
             tool_calls: vec![tool_call(1, "bash")],
+            tool_action_ids: vec![ActionId(1)],
             completed_results: vec![None],
             next_result_index: 0,
         };
         let result = AgentEvent::ToolCompleted {
+            action_id: ActionId(1),
             turn_id: TurnId(1),
             result: tool_result(1, "bash"),
         };
         let wrong_tool = AgentEvent::ToolCompleted {
+            action_id: ActionId(1),
             turn_id: TurnId(1),
             result: tool_result(1, "read"),
         };
+        let mut next_action_id = ActionId::first();
 
-        assert!(transition_is_empty(&state.clone().step(wrong_tool)));
+        assert!(transition_is_empty(
+            &state.clone().step(wrong_tool, &mut next_action_id)
+        ));
 
-        let (records, _) = state.step(result);
+        let (records, _) = state.step(result, &mut next_action_id);
         assert_eq!(state, AgentState::ReadyToContinue { turn_id: TurnId(1) });
         assert_eq!(
             records,
@@ -317,33 +418,52 @@ mod tests {
     #[test]
     fn step_moves_through_turn_tool_and_resume_states() {
         let mut state = AgentState::Idle;
+        let mut next_action_id = ActionId::first();
         let first_tool = tool_call(1, "bash");
         let second_tool = tool_call(2, "read");
 
-        let (_, actions) = state.step(AgentEvent::StartTurn {
-            turn_id: TurnId(1),
-            input: "hello".to_string(),
-        });
-        assert_eq!(state, AgentState::RunningModel { turn_id: TurnId(1) });
+        let (_, actions) = state.step(
+            AgentEvent::StartTurn {
+                turn_id: TurnId(1),
+                input: "hello".to_string(),
+                origin: None,
+            },
+            &mut next_action_id,
+        );
+        assert_eq!(
+            state,
+            AgentState::RunningModel {
+                turn_id: TurnId(1),
+                action_id: ActionId(1),
+            }
+        );
         assert_eq!(
             actions,
-            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
+            vec![AgentAction::RequestModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+            }]
         );
 
-        let (_, actions) = state.step(AgentEvent::ModelCompleted {
-            turn_id: TurnId(1),
-            assistant: AssistantMessage {
-                items: vec![
-                    AssistantItem::ToolCall(first_tool.clone()),
-                    AssistantItem::ToolCall(second_tool.clone()),
-                ],
+        let (_, actions) = state.step(
+            AgentEvent::ModelCompleted {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                assistant: AssistantMessage {
+                    items: vec![
+                        AssistantItem::ToolCall(first_tool.clone()),
+                        AssistantItem::ToolCall(second_tool.clone()),
+                    ],
+                },
             },
-        });
+            &mut next_action_id,
+        );
         assert_eq!(
             state,
             AgentState::RunningTools {
                 turn_id: TurnId(1),
                 tool_calls: vec![first_tool.clone(), second_tool.clone()],
+                tool_action_ids: vec![ActionId(2), ActionId(3)],
                 completed_results: vec![None, None],
                 next_result_index: 0,
             }
@@ -352,35 +472,46 @@ mod tests {
             actions,
             vec![
                 AgentAction::RequestTool {
+                    action_id: ActionId(2),
                     turn_id: TurnId(1),
                     tool_call: first_tool.clone(),
                 },
                 AgentAction::RequestTool {
+                    action_id: ActionId(3),
                     turn_id: TurnId(1),
                     tool_call: second_tool.clone(),
                 },
             ]
         );
 
-        let second_tool_first = state.step(AgentEvent::ToolCompleted {
-            turn_id: TurnId(1),
-            result: tool_result(2, "read"),
-        });
+        let second_tool_first = state.step(
+            AgentEvent::ToolCompleted {
+                action_id: ActionId(3),
+                turn_id: TurnId(1),
+                result: tool_result(2, "read"),
+            },
+            &mut next_action_id,
+        );
         assert!(transition_is_empty(&second_tool_first));
         assert_eq!(
             state,
             AgentState::RunningTools {
                 turn_id: TurnId(1),
                 tool_calls: vec![first_tool.clone(), second_tool.clone()],
+                tool_action_ids: vec![ActionId(2), ActionId(3)],
                 completed_results: vec![None, Some(tool_result(2, "read"))],
                 next_result_index: 0,
             }
         );
 
-        let (records, _) = state.step(AgentEvent::ToolCompleted {
-            turn_id: TurnId(1),
-            result: tool_result(1, "bash"),
-        });
+        let (records, _) = state.step(
+            AgentEvent::ToolCompleted {
+                action_id: ActionId(2),
+                turn_id: TurnId(1),
+                result: tool_result(1, "bash"),
+            },
+            &mut next_action_id,
+        );
         assert_eq!(state, AgentState::ReadyToContinue { turn_id: TurnId(1) });
         assert_eq!(
             records,
@@ -390,11 +521,20 @@ mod tests {
             ]
         );
 
-        let (_, actions) = state.step(AgentEvent::ContinueModel);
-        assert_eq!(state, AgentState::RunningModel { turn_id: TurnId(1) });
+        let (_, actions) = state.step(AgentEvent::ContinueModel, &mut next_action_id);
+        assert_eq!(
+            state,
+            AgentState::RunningModel {
+                turn_id: TurnId(1),
+                action_id: ActionId(4),
+            }
+        );
         assert_eq!(
             actions,
-            vec![AgentAction::RequestModel { turn_id: TurnId(1) }]
+            vec![AgentAction::RequestModel {
+                action_id: ActionId(4),
+                turn_id: TurnId(1),
+            }]
         );
     }
 
@@ -403,11 +543,13 @@ mod tests {
         let mut state = AgentState::RunningTools {
             turn_id: TurnId(3),
             tool_calls: vec![tool_call(1, "bash")],
+            tool_action_ids: vec![ActionId(1)],
             completed_results: vec![None],
             next_result_index: 0,
         };
+        let mut next_action_id = ActionId::first();
 
-        let (records, actions) = state.step(AgentEvent::Interrupt);
+        let (records, actions) = state.step(AgentEvent::Interrupt, &mut next_action_id);
 
         assert_eq!(state, AgentState::Idle);
         assert_eq!(

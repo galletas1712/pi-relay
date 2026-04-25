@@ -1,54 +1,15 @@
-use crate::ids::{ToolCallId, TurnId};
-use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
+use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptRecord, TurnId, TurnOutcome};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TurnOutcome {
-    Graceful,
-    Interrupted,
-    Crashed,
-}
+use crate::context::compaction::KIND_COMPACTION_SUMMARY;
 
-/// Durable append-only session record.
+/// Materialized session history.
 ///
-/// These records are persisted, replayed, compacted, forked, and rewound. They
-/// are not hook/lifecycle events; hooks should attach to a separate lifecycle
-/// notification stream derived while the loop is running.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TranscriptRecord {
-    TurnStarted {
-        turn_id: TurnId,
-    },
-    UserMessage(String),
-    AssistantMessage(AssistantMessage),
-    ToolCallStarted {
-        turn_id: TurnId,
-        tool_call: ToolCall,
-    },
-    ToolResult(ToolResultMessage),
-    TurnFinished {
-        turn_id: TurnId,
-        outcome: TurnOutcome,
-    },
-}
-
-impl TranscriptRecord {
-    pub fn turn_id(&self) -> Option<TurnId> {
-        match self {
-            TranscriptRecord::TurnStarted { turn_id }
-            | TranscriptRecord::ToolCallStarted { turn_id, .. }
-            | TranscriptRecord::TurnFinished { turn_id, .. } => Some(*turn_id),
-            TranscriptRecord::UserMessage(_)
-            | TranscriptRecord::AssistantMessage(_)
-            | TranscriptRecord::ToolResult(_) => None,
-        }
-    }
-}
-
+/// The `Context` is the canonical store; `Transcript` is a derived view over
+/// a record sequence. The session rebuilds one whenever it needs to feed the
+/// core loop or model context a contiguous ordered history, and uses the same
+/// type to rehydrate crashed sessions through explicit crash-tail recovery.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Transcript {
-    // Canonical append-only session log.
-    // TODO: Add richer compaction, rewind/fork, and resume APIs on top of this
-    // log. Boundary prefixes and crash-tail patching are the first primitives.
     records: Vec<TranscriptRecord>,
 }
 
@@ -57,7 +18,11 @@ impl Transcript {
         Self::default()
     }
 
-    pub fn from_records(mut records: Vec<TranscriptRecord>) -> Self {
+    pub fn from_records(records: Vec<TranscriptRecord>) -> Self {
+        Self { records }
+    }
+
+    pub fn from_records_recovering_crashed_tail(mut records: Vec<TranscriptRecord>) -> Self {
         Self::patch_crashed_tail(&mut records);
         Self { records }
     }
@@ -71,10 +36,26 @@ impl Transcript {
     }
 
     pub fn is_turn_boundary(&self) -> bool {
-        matches!(
-            self.records.last(),
-            None | Some(TranscriptRecord::TurnFinished { .. })
-        )
+        for record in self.records.iter().rev() {
+            match record {
+                TranscriptRecord::TurnFinished { .. } => return true,
+                TranscriptRecord::Injected(_) => continue,
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Latest compaction summary on the transcript, if any. Returns the
+    /// `content` string of the closest `TranscriptRecord::Injected` with the
+    /// well-known `compaction_summary` kind.
+    pub fn latest_compaction_summary(&self) -> Option<&str> {
+        self.records.iter().rev().find_map(|r| match r {
+            TranscriptRecord::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
+                Some(cm.content.as_str())
+            }
+            _ => None,
+        })
     }
 
     pub fn boundary_prefix(&self, len: usize) -> Option<Self> {
@@ -127,7 +108,10 @@ impl Transcript {
             .find_map(|(index, record)| match record {
                 TranscriptRecord::TurnStarted { turn_id } => Some(Some((*turn_id, index))),
                 TranscriptRecord::TurnFinished { .. } => Some(None),
-                TranscriptRecord::UserMessage(_)
+                // Injected records do not determine whether the tail turn is
+                // still open; keep looking backward for the nearest turn marker.
+                TranscriptRecord::Injected(_)
+                | TranscriptRecord::UserMessage(_)
                 | TranscriptRecord::AssistantMessage(_)
                 | TranscriptRecord::ToolCallStarted { .. }
                 | TranscriptRecord::ToolResult(_) => None,
@@ -150,7 +134,8 @@ impl Transcript {
                 TranscriptRecord::TurnStarted { .. }
                 | TranscriptRecord::UserMessage(_)
                 | TranscriptRecord::ToolCallStarted { .. }
-                | TranscriptRecord::TurnFinished { .. } => {}
+                | TranscriptRecord::TurnFinished { .. }
+                | TranscriptRecord::Injected(_) => {}
             }
         }
 
@@ -193,9 +178,8 @@ impl From<Vec<TranscriptRecord>> for Transcript {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{
-        AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
-    };
+    use crate::context::compaction::compaction_summary;
+    use agent_core::{AssistantItem, AssistantMessage, InjectedMessage, ToolResultStatus};
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
         ToolCall {
@@ -217,6 +201,22 @@ mod tests {
     #[test]
     fn empty_transcript_is_a_turn_boundary() {
         assert!(Transcript::new().is_turn_boundary());
+    }
+
+    #[test]
+    fn turn_boundary_walks_past_injected_records() {
+        let transcript = Transcript::from_records(vec![
+            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+            TranscriptRecord::UserMessage("hi".to_string()),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+            TranscriptRecord::Injected(compaction_summary("summary", "some_id", 100)),
+            TranscriptRecord::Injected(InjectedMessage::new("note", "branch note")),
+        ]);
+        assert!(transcript.is_turn_boundary());
+        assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
     }
 
     #[test]
@@ -245,7 +245,7 @@ mod tests {
         let first = tool_call(1, "bash");
         let second = tool_call(2, "read");
 
-        let transcript = Transcript::from_records(vec![
+        let transcript = Transcript::from_records_recovering_crashed_tail(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
             TranscriptRecord::UserMessage("hello".to_string()),
             TranscriptRecord::AssistantMessage(AssistantMessage {
@@ -282,7 +282,7 @@ mod tests {
     fn crashed_tail_patches_assistant_tool_calls_even_without_start_records() {
         let tool_call = tool_call(1, "bash");
 
-        let transcript = Transcript::from_records(vec![
+        let transcript = Transcript::from_records_recovering_crashed_tail(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(8) },
             TranscriptRecord::UserMessage("hello".to_string()),
             TranscriptRecord::AssistantMessage(AssistantMessage {
