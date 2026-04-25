@@ -10,13 +10,14 @@ pub enum TurnOutcome {
     Crashed,
 }
 
-/// Durable append-only session record.
+/// One model-visible item in an agent's materialized context.
 ///
-/// These records are persisted, replayed, compacted, forked, and rewound. They
-/// are not hook/lifecycle events; hooks should attach to a separate lifecycle
-/// notification stream derived while the loop is running.
+/// These items are persisted inside transcript entries, replayed, compacted,
+/// forked, and rewound. They are not hook/lifecycle events; hooks should
+/// attach to a separate lifecycle notification stream derived while the loop
+/// is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TranscriptRecord {
+pub enum ContextItem {
     // Produced by the FSM during a turn:
     TurnStarted {
         turn_id: TurnId,
@@ -40,7 +41,10 @@ pub enum TranscriptRecord {
     Injected(InjectedMessage),
 }
 
-/// Payload carried by `TranscriptRecord::Injected`.
+/// Back-compat name for `ContextItem`.
+pub type TranscriptRecord = ContextItem;
+
+/// Payload carried by `ContextItem::Injected`.
 ///
 /// `kind` is a free-form tag chosen by the session, orchestrator, or another
 /// extension point to classify the injected context. `content` is the textual
@@ -68,16 +72,16 @@ impl InjectedMessage {
     }
 }
 
-impl TranscriptRecord {
+impl ContextItem {
     pub fn turn_id(&self) -> Option<TurnId> {
         match self {
-            TranscriptRecord::TurnStarted { turn_id }
-            | TranscriptRecord::ToolCallStarted { turn_id, .. }
-            | TranscriptRecord::TurnFinished { turn_id, .. } => Some(*turn_id),
-            TranscriptRecord::UserMessage(_)
-            | TranscriptRecord::AssistantMessage(_)
-            | TranscriptRecord::ToolResult(_)
-            | TranscriptRecord::Injected(_) => None,
+            ContextItem::TurnStarted { turn_id }
+            | ContextItem::ToolCallStarted { turn_id, .. }
+            | ContextItem::TurnFinished { turn_id, .. } => Some(*turn_id),
+            ContextItem::UserMessage(_)
+            | ContextItem::AssistantMessage(_)
+            | ContextItem::ToolResult(_)
+            | ContextItem::Injected(_) => None,
         }
     }
 }

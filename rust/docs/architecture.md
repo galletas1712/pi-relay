@@ -39,7 +39,7 @@ truth for those roadmaps.
                      │  owns a collection of AgentSession
                      ▼
 ┌──────────────────────────────────────────────┐
-│ 3. Session — AgentSession, Context,          │
+│ 3. Session — AgentSession, TranscriptStore,  │
 │    ContextEdit trait + ops, AgentRunner.     │
 │    One per agent. Sole owner of durable log. │
 └──────────────────────────────────────────────┘
@@ -55,7 +55,7 @@ truth for those roadmaps.
                      │  produces records & actions
                      ▼
 ┌──────────────────────────────────────────────┐
-│ 1. Vocabulary — TranscriptRecord,            │
+│ 1. Vocabulary — ContextItem,                 │
 │    AgentAction, AgentInput, AssistantMessage,│
 │    ToolCall, ToolResult.                     │
 │    Plain data. Shared by every layer above.  │
@@ -72,7 +72,7 @@ Each layer depends only on layers below. The view layer depends only on the cont
 
 ```rust
 // What the FSM produces as durable facts:
-enum TranscriptRecord {
+enum ContextItem {
     TurnStarted { turn_id },
     UserMessage(String),
     AssistantMessage(AssistantMessage),
@@ -116,21 +116,56 @@ The FSM never holds non-POD state beyond these.
 ### Log entries (layer 3, in `agent-session`)
 
 ```rust
-struct SessionEntry {
+// Compatibility name in the current crate: `TranscriptRecord`.
+
+struct TranscriptEntry {
     id: EntryId,
     parent_id: Option<EntryId>,
     timestamp_ms: u128,
-    record: TranscriptRecord,
+    record: ContextItem,
 }
 ```
 
-**Every durable "thing injected into the model's view" is a `TranscriptRecord::Injected(InjectedMessage)` with a kind tag.** One variant, one materialization path, one future storage/RPC shape. New feature -> new well-known kind string and metadata convention, not a new entry type. Ephemeral lifecycle signals remain `SessionEvent`s, not injected transcript records.
+Current compatibility names: `TranscriptRecord = ContextItem`, `SessionEntry = TranscriptEntry`, `Transcript = ModelContext`, and `Context = TranscriptStore`.
+
+**Every durable "thing injected into the model's view" is a `ContextItem::Injected(InjectedMessage)` with a kind tag.** One variant, one materialization path, one future storage/RPC shape. New feature -> new well-known kind string and metadata convention, not a new entry type. Ephemeral lifecycle signals remain `SessionEvent`s, not injected context items.
+
+### Transcript store forest (layer 3, in `agent-session`)
+
+The durable history data structure is a forest of transcript entries:
+
+```rust
+struct TranscriptStore {
+    entries_by_id: HashMap<EntryId, TranscriptEntry>,
+    parent_by_id: HashMap<EntryId, Option<EntryId>>,
+    children_by_parent: HashMap<Option<EntryId>, Vec<EntryId>>,
+    leaf_ids: Set<EntryId>,
+}
+
+struct AgentSession {
+    current_leaf_id: Option<EntryId>,
+    // current implementation keeps this inside its session-local store;
+    // future copy-on-write storage can hoist it into SessionStore.
+}
+```
+
+Every `TranscriptEntry` has zero or one parent; many children can share the
+same parent. This is a forest of trees, not a general DAG. A session points at
+one leaf. The model-visible `ModelContext` is materialized by walking parents
+from that leaf to a root, reversing the path, and reading each entry's
+`ContextItem`.
+
+Rewind, replace, and compaction should not destroy history. In the current
+session-local implementation they move the active leaf or rebuild a fresh
+store. The target copy-on-write implementation keeps old leaves reachable in
+the shared `SessionStore`, so a session/version can move to a new leaf without
+duplicating common ancestors or losing the old path.
 
 ### Session events (layer 3, observable)
 
 ```rust
 enum SessionEvent {
-    RecordAppended { entry_id: EntryId, record: TranscriptRecord },
+    RecordAppended { entry_id: EntryId, record: ContextItem },
     ActionRequested { action: SessionAction },
     ActionCompleted { kind: SessionActionKind, id: String },
     ActionFailed { kind: SessionActionKind, id: String, error: String },
@@ -165,10 +200,10 @@ Already landed in PR #62 + #63 refactors.
 
 Partially landed in PR #63; decomposition planned.
 
-- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `Context`. The session is the sole owner of durable records for that one agent. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `transcript`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `ContextEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
+- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore` (`Context` compatibility alias). The session is the sole owner of durable records for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `transcript`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `ContextEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
 - **`ContextEdit` trait + op structs** — each history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`) that implements `ContextEdit { type Output; fn apply(self, &mut Context) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `Context` (`context.prepare_summary_span(first, last)`); prefix compaction is policy on top (`context.prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
-- **`Context`** — session-local DAG of `SessionEntry`s with a leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
-- **`Transcript`** — materialized view of the current branch's records. Live transcripts preserve open turns; resume paths explicitly crash-recover any open tail.
+- **`TranscriptStore`** — session-local forest of `TranscriptEntry`s with entry/parent/child/leaf indexes plus an active leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize. `Context` remains as a compatibility alias.
+- **`ModelContext`** — materialized view of the current root-to-leaf path's context items. Live model contexts preserve open turns; resume paths explicitly crash-recover any open tail. `Transcript` remains as a compatibility alias.
 - **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, transcript }` includes the transcript snapshot visible when the model request was made; tool and cancel actions carry only the ids/payloads needed to execute them. Session-owned stateless model requests are used for compaction side work.
 - **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans `SessionAction`s to the handler. Records auto-flow into the log; the runner does not expose them directly.
 - **Future `SessionStore` trait** — pluggable durable storage. Planned defaults are `JsonlFileSessionStore` for disk and `InMemorySessionStore` for tests, swappable for `SqliteSessionStore` later.
@@ -283,7 +318,7 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 - `context.prepare_compaction(settings)` produces a `CompactionPlan` as prefix-compaction policy on top of that primitive.
 - `Compactor::summarize(plan)` calls a `ModelProvider` to generate the summary string.
 - `session.edit(pending, Compact { plan, summary })` applies the prepared summary span with a `compaction_summary` record.
-- Orchestrator observes `SessionEvent::RecordAppended { record: TranscriptRecord::TurnFinished { .. } }` and checks thresholds; if tripped, drives the compaction pipeline.
+- Orchestrator observes `SessionEvent::RecordAppended { record: ContextItem::TurnFinished { .. } }` and checks thresholds; if tripped, drives the compaction pipeline.
 
 ### Rewind
 
@@ -295,7 +330,7 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 **Status**: landed (PR #63).
 
-- `session.fork(pending, Some(leaf))` returns an unregistered `AgentSession` with a fresh `Context` containing a copy of only the ancestor path from root to `leaf`. The child does not inherit sibling context branches, abandoned descendants, queued inputs, in-flight actions, events, or other already-forked sessions. Caller configures it (tool registry, initial injections, initial input) and registers it via `SessionRegistry`.
+- `session.fork(pending, Some(leaf))` returns an unregistered `AgentSession` with a fresh `TranscriptStore` containing a copy of only the ancestor path from root to `leaf`. The child does not inherit sibling context branches, abandoned descendants, queued inputs, in-flight actions, events, or other already-forked sessions. In the future shared-store implementation this becomes a cheap second session pointer to the same leaf/path. Caller configures the child (tool registry, initial injections, initial input) and registers it via `SessionRegistry`.
 
 ### Spawn (tool)
 
@@ -312,7 +347,7 @@ The child is not a context fork of the parent. Model, tools, and inherited conte
 
 **Status**: landed.
 
-`AgentOrchestrator::send_message(from, to, content)` and `send_report(from, content)` are the orchestrator-level routing primitives, both fire-and-forget. `send_message` validates that `to` is a direct child of `from` in the spawn tree and enqueues `AgentInput::steer_tagged(from, KIND_AGENT_DIRECTIVE, content)` on the child's mailbox; `send_report` validates that `from` has a spawn parent and enqueues `AgentInput::follow_up_tagged(from, KIND_AGENT_REPORT, content)` on the parent's mailbox. In both cases the paired `from` + `kind` tags propagate into the target's mailbox so the receiver materializes cross-session traffic as a typed `TranscriptRecord::Injected` rather than human user input. Invalid routes surface as `RouteError::{SenderNotFound, TargetNotFound, NotAChild, NoParent}`. These primitives back the `message` and `report` tools (TS parity: `packages/orchestrator/src/tools/{message,report}.ts`).
+`AgentOrchestrator::send_message(from, to, content)` and `send_report(from, content)` are the orchestrator-level routing primitives, both fire-and-forget. `send_message` validates that `to` is a direct child of `from` in the spawn tree and enqueues `AgentInput::steer_tagged(from, KIND_AGENT_DIRECTIVE, content)` on the child's mailbox; `send_report` validates that `from` has a spawn parent and enqueues `AgentInput::follow_up_tagged(from, KIND_AGENT_REPORT, content)` on the parent's mailbox. In both cases the paired `from` + `kind` tags propagate into the target's mailbox so the receiver materializes cross-session traffic as a typed `ContextItem::Injected` rather than human user input. Invalid routes surface as `RouteError::{SenderNotFound, TargetNotFound, NotAChild, NoParent}`. These primitives back the `message` and `report` tools (TS parity: `packages/orchestrator/src/tools/{message,report}.ts`).
 
 ### Report (tool)
 
@@ -320,7 +355,7 @@ The child is not a context fork of the parent. Model, tools, and inherited conte
 
 1. Child's LLM emits `tool_call: report(content)`.
 2. `ReportTool::execute` calls `orchestrator.route_report(from=child_id, content)`.
-3. Orchestrator looks up `parent = registry.parent(child_id)` and enqueues a tagged `FollowUp` on the parent's mailbox. The parent materializes it as `TranscriptRecord::Injected(InjectedMessage { kind: "agent_report", ... })` when the report starts a turn.
+3. Orchestrator looks up `parent = registry.parent(child_id)` and enqueues a tagged `FollowUp` on the parent's mailbox. The parent materializes it as `ContextItem::Injected(InjectedMessage { kind: "agent_report", ... })` when the report starts a turn.
 4. ReportTool returns `ok`. Child turn continues.
 
 ### agent_idle notification
@@ -328,7 +363,7 @@ The child is not a context fork of the parent. Model, tools, and inherited conte
 **Status**: not yet. Requires event subscription (SessionEvent stream).
 
 1. Child's FSM reaches `Idle` after a graceful `TurnFinished`.
-2. Orchestrator's event subscriber sees `SessionEvent::RecordAppended { record: TranscriptRecord::TurnFinished { outcome: Graceful, .. }, .. }`.
+2. Orchestrator's event subscriber sees `SessionEvent::RecordAppended { record: ContextItem::TurnFinished { outcome: Graceful, .. }, .. }`.
 3. If `registry.parent(child_id)` exists, enqueue a tagged `FollowUp` on the parent's mailbox. The parent materializes it as an injected `agent_idle` record when that input starts a turn.
 
 ### Worklog
@@ -365,7 +400,7 @@ Each row is one landable PR. Later PRs depend on their predecessors.
 
 | # | PR | What it adds | Unlocks |
 |---|---|---|---|
-| 1 | **#63 foundation** | `agent-session`, `agent-orchestrator` crates + Transcript unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
+| 1 | **#63 foundation** | `agent-session`, `agent-orchestrator` crates + context-item/model-context unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
 | 2 | Session decomposition | `ContextEdit` trait + op structs + `SessionRegistry<S>` + orchestrator becomes composition struct | clean target for registry-level features |
 | 3 | `SessionStore` | trait + in-memory + JSONL-file impls + wire into `AgentSession` | durable restart; resume-from-file; pluggable backends |
 | 4 | `ControlPlane` trait | trait definition + `LocalControlPlane` impl + view-layer adapter | view/control separation; future daemon |
@@ -402,7 +437,7 @@ This closes the liveness hole where repeated appends during an async summarize c
 
 ### Child reports are mailbox inputs, not history edits
 
-When a child emits `report(content)`, the orchestrator does **not** open `edit_history` on the parent. Instead the report enters the parent's mailbox as a tagged `AgentInput::FollowUp` via `follow_up_tagged(from, KIND_AGENT_REPORT, content)`. The parent's FSM materializes it as a `TranscriptRecord::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to future agent-visible notifications: use tagged mailbox input for messages that should become model-visible context, and keep purely live signals as `SessionEvent`s.
+When a child emits `report(content)`, the orchestrator does **not** open `edit_history` on the parent. Instead the report enters the parent's mailbox as a tagged `AgentInput::FollowUp` via `follow_up_tagged(from, KIND_AGENT_REPORT, content)`. The parent's FSM materializes it as a `ContextItem::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to future agent-visible notifications: use tagged mailbox input for messages that should become model-visible context, and keep purely live signals as `SessionEvent`s.
 
 This keeps `AgentSession::edit`/`fork` for genuine structural edits (compact, rewind, fork, replace_transcript) and removes the `entry_count`-churning source of compaction plan staleness.
 
@@ -432,7 +467,7 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 **Distributed-ready API vs. sync simplicity.** `ControlPlane` is async + fallible even when called in-process. Paying this for day-1 local use to keep daemon-day migration trivial.
 
-**Two tracking layers (log DAG + registry tree).** Not a duplication — the log DAG tracks intra-session branching and summary-span rewrites; the registry tracks inter-session spawn relationships. Use distinct terminology in code (`previous_entry_id` vs. `spawn_parent`) to reinforce.
+**Two tracking layers (transcript forest + registry tree).** Not a duplication — the transcript forest tracks context-item ancestry and summary-span rewrites; the registry tracks inter-session spawn relationships. Use distinct terminology in code (`previous_entry_id` vs. `spawn_parent`) to reinforce.
 
 **Unified `InjectedMessage` vs. per-kind entry types.** Unified. Every "summary / note / report injected at a boundary" is one enum variant with a kind tag. TS has 3+ entry types for this; we have 1 + extensible tag. New kinds don't require new materialization branches.
 

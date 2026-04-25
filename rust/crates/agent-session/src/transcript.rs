@@ -2,18 +2,22 @@ use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptRecord, Turn
 
 use crate::context::KIND_COMPACTION_SUMMARY;
 
-/// Materialized session history.
+/// Materialized model context for one transcript path.
 ///
-/// The `Context` is the canonical store; `Transcript` is a derived view over
-/// a record sequence. The session rebuilds one whenever it needs to feed the
-/// core loop or model context a contiguous ordered history, and uses the same
-/// type to rehydrate crashed sessions through explicit crash-tail recovery.
+/// The transcript store is canonical; `ModelContext` is a derived view over a
+/// context-item sequence. The session rebuilds one whenever it needs to feed
+/// the core loop or model provider a contiguous ordered history, and uses the
+/// same type to rehydrate crashed sessions through explicit crash-tail
+/// recovery.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Transcript {
+pub struct ModelContext {
     records: Vec<TranscriptRecord>,
 }
 
-impl Transcript {
+/// Back-compat name for `ModelContext`.
+pub type Transcript = ModelContext;
+
+impl ModelContext {
     pub fn new() -> Self {
         Self::default()
     }
@@ -169,7 +173,7 @@ impl Transcript {
     }
 }
 
-impl From<Vec<TranscriptRecord>> for Transcript {
+impl From<Vec<TranscriptRecord>> for ModelContext {
     fn from(records: Vec<TranscriptRecord>) -> Self {
         Self::from_records(records)
     }

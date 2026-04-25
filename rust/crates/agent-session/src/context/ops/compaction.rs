@@ -107,7 +107,7 @@ impl Context {
             tokens_before,
             previous_summary,
             leaf_id: self.leaf_id().map(str::to_string),
-            entry_count: self.entries().len(),
+            entry_count: self.entry_count(),
         })
     }
 
@@ -123,7 +123,7 @@ impl Context {
             return Err(ContextError::EntryNotFound);
         }
         self.validate_summary_span_plan(&plan.summary_span)?;
-        if self.leaf_id() != plan.leaf_id.as_deref() || self.entries().len() != plan.entry_count {
+        if self.leaf_id() != plan.leaf_id.as_deref() || self.entry_count() != plan.entry_count {
             return Err(ContextError::StalePlan);
         }
         if !self.is_turn_boundary() {

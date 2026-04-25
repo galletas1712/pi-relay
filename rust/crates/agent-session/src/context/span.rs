@@ -23,7 +23,7 @@ pub struct SummarySpanPlan {
 
 /// Replace a prepared context span with a caller-provided summary record.
 ///
-/// The old entries remain in the append-only DAG as an orphaned branch. The
+/// The old entries remain in the append-only store as an orphaned branch. The
 /// active branch is rebuilt as: prefix before the span, summary, then copies of
 /// the records after the span.
 pub struct SummarizeSpan {
@@ -64,7 +64,7 @@ impl Context {
         if !self.contains_entry(&plan.first_entry_id) || !self.contains_entry(&plan.last_entry_id) {
             return Err(ContextError::EntryNotFound);
         }
-        if self.leaf_id() != plan.leaf_id.as_deref() || self.entries().len() != plan.entry_count {
+        if self.leaf_id() != plan.leaf_id.as_deref() || self.entry_count() != plan.entry_count {
             return Err(ContextError::StalePlan);
         }
 
@@ -114,7 +114,7 @@ pub(crate) fn summary_span_plan_from_indices(
         records_after_span: transcript_records_in(&path[last_index + 1..]),
         tokens_before: estimate_records_tokens(ctx.transcript().records()),
         leaf_id: ctx.leaf_id().map(str::to_string),
-        entry_count: ctx.entries().len(),
+        entry_count: ctx.entry_count(),
     }
 }
 

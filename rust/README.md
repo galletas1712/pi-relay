@@ -7,8 +7,8 @@ Rust implementation of pi-relay's agent runtime. See
 
 | Crate | What it owns |
 |---|---|
-| `agent-core` | Pure deterministic FSM for agent turns. Emits TranscriptRecord events and AgentAction side-effects. No I/O. Internals (`AgentState`, `Mailbox`) are private. |
-| `agent-session` | Durable session history atop the core FSM. Owns a session-local Context (DAG of entries with one active branch/path), the materialized Transcript view, the AgentRunner, and history-edit operations (compact, rewind, fork, replace_transcript) behind the ContextEdit trait. |
+| `agent-core` | Pure deterministic FSM for agent turns. Emits `ContextItem`s and `AgentAction` side effects. `TranscriptRecord` remains as a compatibility alias. No I/O. Internals (`AgentState`, `Mailbox`) are private. |
+| `agent-session` | Durable session history atop the core FSM. Owns a session-local `TranscriptStore` forest with one active leaf/path, the materialized `ModelContext` view, the `AgentRunner`, and history-edit operations (compact, rewind, fork, replace_transcript) behind the `ContextEdit` trait. `Context`, `SessionEntry`, and `Transcript` remain as compatibility aliases. |
 | `agent-orchestrator` | Composition struct for the runtime. Currently owns a SessionRegistry that tracks session identity and spawn relationships. Grows as ModelProvider, ToolRegistry, UsageLedger, AgentWorklogStore land. |
 
 ## Layer discipline
@@ -22,7 +22,7 @@ the full layer stack including the future control-plane and view layers.
 ## Status
 
 These crates land the session-layer abstractions: a pure deterministic FSM in
-`agent-core`, durable DAG-structured session history in `agent-session`, and a
+`agent-core`, durable forest-structured session history in `agent-session`, and a
 thin composition struct in `agent-orchestrator`. Downstream work adds (in rough
 order): `SessionStore` (pluggable storage), `ControlPlane` (view/control split),
 event bus/subscriptions (observability), `ModelProvider`, `Tool`/`ToolRegistry`,
