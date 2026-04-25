@@ -4,7 +4,7 @@ Durable session context and async run-loop wrapper around the `agent-core` FSM k
 
 ## Responsibility
 
-`agent-session` is the layer that turns the pure `AgentCoreLoop` FSM into a stateful, editable session. An `AgentSession` owns the core loop (deterministic state machine), a `Context` (append-only DAG of `SessionEntry` nodes — the durable transcript), an `ActionQueue` (FIFO of model/tool requests the session has handed out but hasn't heard back about), session-owned stateless model work, and an ephemeral event outbox for live observers. `session.drive()` is the only supported way to advance the FSM; it runs the core to quiescence and absorbs every freshly-produced `TranscriptRecord` into the context, which is the sole owner of durable model-visible history.
+`agent-session` is the layer that turns the pure `AgentCoreLoop` FSM into a stateful, editable session. An `AgentSession` owns the core loop (deterministic state machine), a session-local `Context` (append-only DAG of `SessionEntry` nodes with one active leaf/path), an `ActionQueue` (FIFO of model/tool requests the session has handed out but hasn't heard back about), session-owned stateless model work, and an ephemeral event outbox for live observers. `session.drive()` is the only supported way to advance the FSM; it runs the core to quiescence and absorbs every freshly-produced `TranscriptRecord` into the context, which is the sole owner of durable model-visible history.
 
 The crate also owns the *edit* surface: `SummarizeSpan`, `Compact`, `Rewind`, and `ReplaceTranscript` are individual op structs that implement the `ContextEdit` trait. `AgentSession::edit` runs the quiescence gate (`can_edit_history`) once, dispatches to the op, then rehydrates the core loop from the new context. `AgentSession::fork` is a direct method rather than a `ContextEdit` impl because it produces a new session instead of mutating the source.
 
@@ -134,9 +134,11 @@ All three components are load-bearing:
 
 ### The Context DAG
 
-Each `SessionEntry` has a `String id` (UUID v4), an `Option<String> parent_id`, a `timestamp_ms`, and one `TranscriptRecord`. Entries sit in a `Vec<SessionEntry>` with a `HashMap<String, usize>` side-index for O(1) lookup by id. The context tracks an `Option<String> leaf_id` — the active branch head. `append_record` attaches a new child under `leaf_id` and advances the pointer. `branch(id)` / `branch_at_turn_boundary(id)` reparent the leaf onto an existing entry; subsequent appends then grow a new branch off that node. Nothing is ever deleted.
+Each `SessionEntry` has a `String id` (UUID v4), an `Option<String> parent_id`, a `timestamp_ms`, and one `TranscriptRecord`. Entries sit in a `Vec<SessionEntry>` with a `HashMap<String, usize>` side-index for O(1) lookup by id. The context tracks an `Option<String> leaf_id` — the active branch head. `append_record` attaches a new child under `leaf_id` and advances the pointer. `branch(id)` / `branch_at_turn_boundary(id)` reparent the leaf onto an existing entry; subsequent appends then grow a new branch off that node. Nothing is ever deleted from that context.
 
 `transcript()` walks from the current leaf back to the root via `parent_id`, reverses, and materializes that full active path. Summary-span edits rebuild the active branch in model-visible order, so no compaction-specific adapter is needed.
+
+A `Context` is not a global store of every spawned/forked session. It is one session's durable DAG plus one selected active path. `AgentSession::fork` creates a new independent session by copying only the ancestor path from root to the requested `leaf_id` into a fresh `Context`; sibling branches, abandoned descendants, queued inputs, in-flight actions, events, and other already-forked sessions are not copied. Persisting a whole multi-agent run therefore means persisting each registered session's `Context` plus the registry's parent/child relationships.
 
 Summary-span replacement in pictures:
 

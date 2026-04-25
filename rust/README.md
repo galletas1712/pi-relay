@@ -8,7 +8,7 @@ Rust implementation of pi-relay's agent runtime. See
 | Crate | What it owns |
 |---|---|
 | `agent-core` | Pure deterministic FSM for agent turns. Emits TranscriptRecord events and AgentAction side-effects. No I/O. Internals (`AgentState`, `Mailbox`) are private. |
-| `agent-session` | Durable session history atop the core FSM. Owns the Context (DAG of entries with branch-aware navigation), the materialized Transcript view, the AgentRunner, and history-edit operations (compact, rewind, fork, replace_transcript) behind the ContextEdit trait. |
+| `agent-session` | Durable session history atop the core FSM. Owns a session-local Context (DAG of entries with one active branch/path), the materialized Transcript view, the AgentRunner, and history-edit operations (compact, rewind, fork, replace_transcript) behind the ContextEdit trait. |
 | `agent-orchestrator` | Composition struct for the runtime. Currently owns a SessionRegistry that tracks session identity and spawn relationships. Grows as ModelProvider, ToolRegistry, UsageLedger, AgentWorklogStore land. |
 
 ## Layer discipline

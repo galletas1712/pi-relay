@@ -165,9 +165,9 @@ Already landed in PR #62 + #63 refactors.
 
 Partially landed in PR #63; decomposition planned.
 
-- **`AgentSession`** — owns `AgentCoreLoop` + `Context`. The session is the sole owner of durable records. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `transcript`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `ContextEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
+- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `Context`. The session is the sole owner of durable records for that one agent. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `transcript`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `ContextEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
 - **`ContextEdit` trait + op structs** — each history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`) that implements `ContextEdit { type Output; fn apply(self, &mut Context) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `Context` (`context.prepare_summary_span(first, last)`); prefix compaction is policy on top (`context.prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
-- **`Context`** — DAG of `SessionEntry`s with a leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
+- **`Context`** — session-local DAG of `SessionEntry`s with a leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
 - **`Transcript`** — materialized view of the current branch's records. Live transcripts preserve open turns; resume paths explicitly crash-recover any open tail.
 - **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, transcript }` includes the transcript snapshot visible when the model request was made; tool and cancel actions carry only the ids/payloads needed to execute them. Session-owned stateless model requests are used for compaction side work.
 - **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans `SessionAction`s to the handler. Records auto-flow into the log; the runner does not expose them directly.
@@ -295,7 +295,7 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 **Status**: landed (PR #63).
 
-- `session.fork(pending, Some(leaf))` returns an unregistered `AgentSession` with a copy of the ancestor path. Caller configures it (tool registry, initial injections, initial input) and registers it via `SessionRegistry`.
+- `session.fork(pending, Some(leaf))` returns an unregistered `AgentSession` with a fresh `Context` containing a copy of only the ancestor path from root to `leaf`. The child does not inherit sibling context branches, abandoned descendants, queued inputs, in-flight actions, events, or other already-forked sessions. Caller configures it (tool registry, initial injections, initial input) and registers it via `SessionRegistry`.
 
 ### Spawn (tool)
 

@@ -30,13 +30,18 @@ pub struct SessionEntry {
     pub record: TranscriptRecord,
 }
 
-/// Append-only branching log of session records — the durable session context.
+/// Append-only branching log of one session's records.
 ///
 /// Each `SessionEntry` holds a single `TranscriptRecord` plus DAG pointers
 /// (`parent_id`). The context tracks a current leaf; appends attach new
 /// entries as children of that leaf, branching operations reparent the leaf
 /// onto an existing entry, and `transcript()` walks the active branch and
 /// materializes a `Transcript` for the model.
+///
+/// A `Context` is session-local. It is not the registry-wide store of every
+/// session fork: `AgentSession::fork` copies one ancestor path into a fresh
+/// `Context` for the child session rather than sharing or cloning the source
+/// context's entire DAG.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Context {
     entries: Vec<SessionEntry>,
