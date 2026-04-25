@@ -9,6 +9,7 @@ use futures_core::Stream;
 use crate::action::SessionAction;
 use crate::event::SessionEvent;
 use crate::input::{SessionInput, SessionInputError};
+use crate::transcript::Transcript;
 use crate::AgentSession;
 
 #[derive(Debug, Clone)]
@@ -81,6 +82,12 @@ pub struct AgentRunner<HandleAction, HandleEvent = fn(SessionEvent) -> Ready<()>
     handle_event: HandleEvent,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionActionEnvelope {
+    pub action: SessionAction,
+    pub transcript: Transcript,
+}
+
 impl<HandleAction> AgentRunner<HandleAction, fn(SessionEvent) -> Ready<()>> {
     pub fn new(
         session: AgentSession,
@@ -123,7 +130,7 @@ impl<HandleAction, HandleEvent> AgentRunner<HandleAction, HandleEvent> {
 impl<HandleAction, HandleActionFuture, HandleEvent, HandleEventFuture>
     AgentRunner<HandleAction, HandleEvent>
 where
-    HandleAction: FnMut(SessionAction) -> HandleActionFuture,
+    HandleAction: FnMut(SessionActionEnvelope) -> HandleActionFuture,
     HandleActionFuture: Future<Output = ()>,
     HandleEvent: FnMut(SessionEvent) -> HandleEventFuture,
     HandleEventFuture: Future<Output = ()>,
@@ -145,7 +152,11 @@ where
             (self.handle_event)(event).await;
         }
         for action in self.session.drain_actions() {
-            (self.handle_action)(action).await;
+            let envelope = SessionActionEnvelope {
+                action,
+                transcript: self.session.transcript(),
+            };
+            (self.handle_action)(envelope).await;
         }
     }
 }
@@ -230,12 +241,76 @@ mod tests {
         block_on_ready(runner.run());
 
         assert_eq!(
-            actions.borrow().as_slice(),
-            &[SessionAction::RequestModel {
+            actions.borrow()[0].action,
+            SessionAction::RequestModel {
                 action_id: ActionId(1),
                 turn_id: TurnId(1)
-            }]
+            }
         );
+        assert_eq!(
+            actions.borrow()[0].transcript.records(),
+            &[
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage("hello".to_string()),
+            ]
+        );
+        assert_eq!(
+            runner.session().transcript().records(),
+            &[
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage("hello".to_string()),
+                TranscriptRecord::AssistantMessage(assistant),
+                TranscriptRecord::TurnFinished {
+                    turn_id: TurnId(1),
+                    outcome: TurnOutcome::Graceful,
+                },
+            ]
+        );
+        assert!(runner.session().is_idle());
+    }
+
+    #[test]
+    fn runner_action_envelope_can_drive_model_completion_from_handler() {
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let recorded_actions = actions.clone();
+        let (input_handle, input_rx) = AgentInputHandle::channel();
+        let completion_handle = Rc::new(RefCell::new(Some(input_handle.clone())));
+        let captured_completion_handle = completion_handle.clone();
+        let assistant = AssistantMessage {
+            items: vec![AssistantItem::Text("hi from handler".to_string())],
+        };
+        let assistant_for_handler = assistant.clone();
+        let mut runner = AgentRunner::new(
+            AgentSession::new(),
+            input_rx,
+            move |envelope: SessionActionEnvelope| {
+                recorded_actions.borrow_mut().push(envelope.clone());
+                if let SessionAction::RequestModel { action_id, turn_id } = envelope.action {
+                    assert!(envelope.transcript.records().iter().any(
+                        |record| matches!(record, TranscriptRecord::UserMessage(text) if text == "hello")
+                    ));
+                    if let Some(handle) = captured_completion_handle.borrow_mut().take() {
+                        handle
+                            .enqueue_input(AgentInput::ModelCompleted {
+                                action_id,
+                                turn_id,
+                                assistant: assistant_for_handler.clone(),
+                            })
+                            .expect("handler should enqueue model completion");
+                    }
+                }
+                ready(())
+            },
+        );
+
+        input_handle
+            .enqueue_input(AgentInput::follow_up("hello"))
+            .expect("runner should accept user input");
+        drop(input_handle);
+
+        block_on_ready(runner.run());
+
+        assert_eq!(actions.borrow().len(), 1);
         assert_eq!(
             runner.session().transcript().records(),
             &[
@@ -281,7 +356,7 @@ mod tests {
         assert!(actions
             .borrow()
             .iter()
-            .any(|action| matches!(action, SessionAction::RequestModel { .. })));
+            .any(|envelope| matches!(envelope.action, SessionAction::RequestModel { .. })));
         assert!(events.borrow().iter().any(|event| matches!(
             event,
             SessionEvent::RecordAppended {

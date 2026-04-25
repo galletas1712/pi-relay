@@ -46,6 +46,11 @@ impl AgentState {
                 turn_id,
                 assistant,
             } => self.on_model_completed(action_id, turn_id, assistant, next_action_id),
+            AgentEvent::ModelFailed {
+                action_id,
+                turn_id,
+                error,
+            } => self.on_model_failed(action_id, turn_id, error),
             AgentEvent::ToolCompleted {
                 action_id,
                 turn_id,
@@ -144,6 +149,30 @@ impl AgentState {
             });
         }
         (records, actions)
+    }
+
+    fn on_model_failed(
+        &mut self,
+        action_id: ActionId,
+        turn_id: TurnId,
+        _error: String,
+    ) -> (Vec<TranscriptRecord>, Vec<AgentAction>) {
+        if !matches!(
+            self,
+            Self::RunningModel { turn_id: active_turn_id, action_id: active_action_id }
+                if *active_turn_id == turn_id && *active_action_id == action_id
+        ) {
+            return empty_transition();
+        }
+
+        *self = Self::Idle;
+        (
+            vec![TranscriptRecord::TurnFinished {
+                turn_id,
+                outcome: TurnOutcome::Crashed,
+            }],
+            Vec::new(),
+        )
     }
 
     fn on_tool_completed(

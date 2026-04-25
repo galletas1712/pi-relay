@@ -71,6 +71,19 @@ impl Mailbox {
                     assistant,
                 });
             }
+            AgentInput::ModelFailed {
+                action_id,
+                turn_id,
+                error,
+            } => {
+                // External completions/failures preempt queued user work, but
+                // preserve arrival order relative to other notifications.
+                self.push_notification_back(AgentEvent::ModelFailed {
+                    action_id,
+                    turn_id,
+                    error,
+                });
+            }
             AgentInput::ToolCompleted {
                 action_id,
                 turn_id,

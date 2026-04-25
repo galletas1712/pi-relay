@@ -33,6 +33,12 @@ pub enum AgentInput {
         turn_id: TurnId,
         assistant: AssistantMessage,
     },
+    // Volatile model failure delivered by the orchestrator.
+    ModelFailed {
+        action_id: ActionId,
+        turn_id: TurnId,
+        error: String,
+    },
     // Volatile tool completion delivered by the orchestrator.
     ToolCompleted {
         action_id: ActionId,
@@ -104,6 +110,7 @@ impl AgentInput {
             }
             AgentInput::Interrupt
             | AgentInput::ModelCompleted { .. }
+            | AgentInput::ModelFailed { .. }
             | AgentInput::ToolCompleted { .. } => Ok(()),
         }
     }
@@ -140,6 +147,11 @@ pub(crate) enum AgentEvent {
         action_id: ActionId,
         turn_id: TurnId,
         assistant: AssistantMessage,
+    },
+    ModelFailed {
+        action_id: ActionId,
+        turn_id: TurnId,
+        error: String,
     },
     ToolCompleted {
         action_id: ActionId,

@@ -19,6 +19,7 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 **Composition types**
 - `AgentSession` — core loop + context + action queue, the unit of agent state.
 - `AgentRunner` — async wrapper that drives a session off an input channel.
+- `SessionActionEnvelope` — action plus the transcript snapshot visible when the action was requested.
 - `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — sender/receiver pair for the runner's input channel.
 - `SessionAction` — model/tool/cancel actions plus session-owned `RequestModelStateless`.
 - `SessionInput`, `SessionInputError` — core inputs plus stateless model completions/failures.
@@ -58,7 +59,7 @@ session.enqueue_input(AgentInput::ModelCompleted { action_id, turn_id, assistant
 session.drive();
 ```
 
-`drive` records every visible `RequestModel` / `RequestTool` into the internal action queue before callers drain the observable action outbox. `enqueue_input` validates the input and clears the matching key when the corresponding completion arrives. `CancelTurn` clears every entry for that turn id.
+`drive` records every visible `RequestModel` / `RequestTool` into the internal action queue before callers drain the observable action outbox. `enqueue_input` validates the input and clears the matching key when the corresponding completion or failure arrives. `ModelFailed` closes the turn as `Crashed`; `CancelTurn` clears every entry for that turn id.
 
 With auto-compaction enabled, a core `RequestModel` may be held by the session while it emits `SessionAction::RequestModelStateless`. The harness runs that as a stateless side-model call and returns `SessionInput::ModelStatelessCompleted` or `SessionInput::ModelStatelessFailed` through the same input channel. Successful completion applies a compaction summary to the context, then releases the held `RequestModel`. Failure releases the held `RequestModel` unchanged so the agent still makes progress.
 
@@ -189,7 +190,7 @@ Core rehydration (`rehydrate_core_from_context`) runs *after* `apply` succeeds. 
 
 ### `ActionQueue` semantics
 
-Private to the crate. `PendingActionKey { action_id: ActionId, turn_id: TurnId, kind: Model | Tool }` lives in a `VecDeque` in FIFO insertion order. `record_drained(&[AgentAction])` pushes one entry per visible `RequestModel` / `RequestTool` and clears entries for a given `turn_id` on `CancelTurn`. `record_input(&AgentInput)` removes the matching key on `ModelCompleted` / `ToolCompleted` and returns whether anything was cleared; removal is by key, not necessarily from the head, and preserves order among the survivors. Duplicates are kept — FIFO with no dedup. Stale completions (no matching key) are silent no-ops.
+Private to the crate. `PendingActionKey { action_id: ActionId, turn_id: TurnId, kind: Model | Tool }` lives in a `VecDeque` in FIFO insertion order. `record_drained(&[AgentAction])` pushes one entry per visible `RequestModel` / `RequestTool` and clears entries for a given `turn_id` on `CancelTurn`. `record_input(&AgentInput)` removes the matching key on `ModelCompleted` / `ModelFailed` / `ToolCompleted` and returns whether anything was cleared; removal is by key, not necessarily from the head, and preserves order among the survivors. Duplicates are kept — FIFO with no dedup. Stale completions (no matching key) are silent no-ops.
 
 `is_empty() == true` ⇒ no in-flight actions ⇒ `can_edit_history` clears that check.
 
@@ -201,7 +202,7 @@ The `KIND_COMPACTION_SUMMARY` constant and its builder live in `context/compacti
 
 ### `AgentRunner` (async wrapper)
 
-`AgentRunner` is the only async surface in the crate — the core loop itself is fully sync. It owns an `AgentSession` plus an `AgentInputReceiver` (the receive side of a `futures_channel::mpsc::unbounded` channel) plus a `FnMut(SessionAction) -> impl Future<Output = ()>` action handler. `run()` drives the session to quiescence, flushes drained actions through the handler, then loops awaiting the next `SessionInput`, enqueuing it, and repeating. `AgentInputHandle::channel()` hands back the matching sender; the handle is `Clone`, so orchestrator, model, tool, and stateless model tasks can all enqueue inputs back into the same session. The handle validates `SessionInput` before sending; invalid inputs return `AgentInputHandleError::Invalid` immediately.
+`AgentRunner` is the only async surface in the crate — the core loop itself is fully sync. It owns an `AgentSession` plus an `AgentInputReceiver` (the receive side of a `futures_channel::mpsc::unbounded` channel) plus a `FnMut(SessionActionEnvelope) -> impl Future<Output = ()>` action handler. `SessionActionEnvelope` carries the action and a transcript snapshot from the moment the action was requested, so a model handler can build the provider request without maintaining a parallel event mirror. `run()` drives the session to quiescence, flushes drained actions through the handler, then loops awaiting the next `SessionInput`, enqueuing it, and repeating. `AgentInputHandle::channel()` hands back the matching sender; the handle is `Clone`, so orchestrator, model, tool, and stateless model tasks can all enqueue inputs back into the same session. The handle validates `SessionInput` before sending; invalid inputs return `AgentInputHandleError::Invalid` immediately.
 
 Records are observed off the session's transcript (`runner.session().transcript()`); there is no record callback.
 

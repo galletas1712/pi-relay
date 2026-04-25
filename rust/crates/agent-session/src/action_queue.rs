@@ -75,6 +75,9 @@ impl ActionQueue {
         let target = match input {
             AgentInput::ModelCompleted {
                 action_id, turn_id, ..
+            }
+            | AgentInput::ModelFailed {
+                action_id, turn_id, ..
             } => Some(PendingActionKey {
                 action_id: *action_id,
                 turn_id: *turn_id,

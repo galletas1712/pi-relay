@@ -95,6 +95,7 @@ enum AgentInput {
     Steer    { from: Option<SessionId>, kind: Option<String>, content: String },
     FollowUp { from: Option<SessionId>, kind: Option<String>, content: String },
     ModelCompleted { action_id, turn_id, assistant },
+    ModelFailed    { action_id, turn_id, error },
     ToolCompleted  { action_id, turn_id, result },
 }
 // `from` and `kind` are either both None (human/unknown origin) or both
@@ -167,7 +168,7 @@ Already landed in PR #62 + #63 refactors.
 
 - **`AgentCoreLoop`** — FSM + mailbox + outboxes. Private fields. Public API: `new`, `resume_at_boundary`, `enqueue_input`, `drive`, `drain_records`, `drain_actions`, `is_idle`, `has_pending_work`, `last_turn_id`.
 - **`AgentState`** — private. `Idle | RunningModel | RunningTools | ReadyToContinue`.
-- **`Mailbox`** — private. Priority queue: Interrupt > ModelCompleted/ToolCompleted > Steer > FollowUp.
+- **`Mailbox`** — private. Priority queue: Interrupt > ModelCompleted/ModelFailed/ToolCompleted > Steer > FollowUp.
 
 ### Layer 3 — Session (`agent-session` crate)
 

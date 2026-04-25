@@ -264,6 +264,36 @@ mod tests {
     }
 
     #[test]
+    fn model_failure_finishes_the_turn_as_crashed() {
+        let mut loop_state = AgentCoreLoop::new();
+        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
+        loop_state.drain_actions();
+
+        records.extend(drive_collect(
+            &mut loop_state,
+            AgentInput::ModelFailed {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                error: "provider failed".to_string(),
+            },
+        ));
+
+        assert_eq!(
+            records,
+            vec![
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage("hello".to_string()),
+                TranscriptRecord::TurnFinished {
+                    turn_id: TurnId(1),
+                    outcome: TurnOutcome::Crashed,
+                },
+            ]
+        );
+        assert!(loop_state.drain_actions().is_empty());
+        assert!(loop_state.is_idle());
+    }
+
+    #[test]
     fn tool_completion_appends_a_result_and_resumes_the_model() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();

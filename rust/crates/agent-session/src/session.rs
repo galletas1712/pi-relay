@@ -75,6 +75,11 @@ impl AgentSession {
     }
 
     pub fn from_transcript(transcript: Transcript) -> Self {
+        let transcript = if transcript.is_turn_boundary() {
+            transcript
+        } else {
+            Transcript::from_records_recovering_crashed_tail(transcript.into_records())
+        };
         let last_turn_id = transcript.last_turn_id();
         let context = Context::from_transcript(&transcript);
         Self {
@@ -149,7 +154,9 @@ impl AgentSession {
         } else if self.pending_stateless_model.is_some()
             && matches!(
                 input,
-                AgentInput::ModelCompleted { .. } | AgentInput::ToolCompleted { .. }
+                AgentInput::ModelCompleted { .. }
+                    | AgentInput::ModelFailed { .. }
+                    | AgentInput::ToolCompleted { .. }
             )
         {
             return Ok(());
@@ -520,6 +527,11 @@ impl AgentSession {
                         action_id: input_action_id,
                         turn_id: input_turn_id,
                         ..
+                    }
+                    | AgentInput::ModelFailed {
+                        action_id: input_action_id,
+                        turn_id: input_turn_id,
+                        ..
                     },
                 ) => action_action_id == input_action_id && action_turn_id == input_turn_id,
                 (
@@ -552,6 +564,15 @@ impl AgentSession {
                 self.event_outbox.push_back(SessionEvent::ActionCompleted {
                     kind: SessionActionKind::Model,
                     id: action_id.0.to_string(),
+                });
+            }
+            AgentInput::ModelFailed {
+                action_id, error, ..
+            } => {
+                self.event_outbox.push_back(SessionEvent::ActionFailed {
+                    kind: SessionActionKind::Model,
+                    id: action_id.0.to_string(),
+                    error: error.clone(),
                 });
             }
             AgentInput::ToolCompleted { action_id, .. } => {
@@ -861,6 +882,36 @@ mod tests {
     }
 
     #[test]
+    fn from_transcript_recovers_an_open_tail_as_crashed() {
+        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
+            TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
+            TranscriptRecord::UserMessage("hello".to_string()),
+        ]));
+
+        assert_eq!(
+            session.transcript().records(),
+            &[
+                TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
+                TranscriptRecord::UserMessage("hello".to_string()),
+                TranscriptRecord::TurnFinished {
+                    turn_id: TurnId(7),
+                    outcome: TurnOutcome::Crashed,
+                },
+            ]
+        );
+        assert!(session.is_idle());
+
+        session
+            .enqueue_input(AgentInput::follow_up("next"))
+            .expect("plain follow-up is valid");
+        session.drive();
+        assert!(matches!(
+            session.transcript().records().last(),
+            Some(TranscriptRecord::UserMessage(text)) if text == "next"
+        ));
+    }
+
+    #[test]
     fn rehydrating_a_graceful_boundary_restores_idle_state() {
         let transcript = vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
@@ -901,6 +952,52 @@ mod tests {
             .expect("matching model completion is valid");
         session.drive();
         assert!(session.can_edit_history(PendingWork::NONE));
+    }
+
+    #[test]
+    fn model_failure_marks_turn_crashed_and_unblocks_history_edits() {
+        let mut session = AgentSession::new();
+        session
+            .enqueue_input(AgentInput::follow_up("hi"))
+            .expect("plain follow-up is valid");
+        session.drive();
+        assert_eq!(
+            session.drain_actions(),
+            vec![SessionAction::RequestModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+            }]
+        );
+
+        session
+            .enqueue_input(AgentInput::ModelFailed {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                error: "provider failed".to_string(),
+            })
+            .expect("matching model failure is valid");
+        session.drive();
+
+        assert_eq!(
+            session.transcript().records(),
+            &[
+                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
+                TranscriptRecord::UserMessage("hi".to_string()),
+                TranscriptRecord::TurnFinished {
+                    turn_id: TurnId(1),
+                    outcome: TurnOutcome::Crashed,
+                },
+            ]
+        );
+        assert!(session.can_edit_history(PendingWork::NONE));
+        assert!(session.drain_events().iter().any(|event| matches!(
+            event,
+            SessionEvent::ActionFailed {
+                kind: SessionActionKind::Model,
+                error,
+                ..
+            } if error == "provider failed"
+        )));
     }
 
     #[test]

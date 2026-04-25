@@ -17,7 +17,7 @@ See `rust/docs/architecture.md` for how this layer fits underneath `agent-sessio
 The exported surface is intentionally small. From `lib.rs`:
 
 - `AgentCoreLoop` — the FSM driver. Owns a `Mailbox`, an `AgentState`, `last_turn_id`, and two outboxes (records and actions).
-- `AgentInput` — everything the outside world can push into the loop: `Interrupt`, `Steer`, `FollowUp`, `ModelCompleted`, `ToolCompleted`. `Steer` and `FollowUp` carry optional `from` / `kind` tags (both present or both absent) identifying the source of the input; malformed inputs are rejected with `AgentInputError`.
+- `AgentInput` — everything the outside world can push into the loop: `Interrupt`, `Steer`, `FollowUp`, `ModelCompleted`, `ModelFailed`, `ToolCompleted`. `Steer` and `FollowUp` carry optional `from` / `kind` tags (both present or both absent) identifying the source of the input; malformed inputs are rejected with `AgentInputError`.
 - `AgentAction` — side-effect requests the caller must execute: `RequestModel`, `RequestTool`, `CancelTurn`.
 - `TranscriptRecord` — durable append-only record variants. Enumerated in the Internals section below.
 - `CustomMessage` — payload for `TranscriptRecord::Custom`, carrying a `kind` tag, a `content` string, and a `BTreeMap<String, String>` metadata map.
@@ -83,7 +83,7 @@ Module layout under `src/`:
 `AgentState` (see `state.rs`) has four variants:
 
 - `Idle` — no active turn. The default; also the state the loop returns to after a graceful finish or an interrupt.
-- `RunningModel { turn_id, action_id }` — a model request is outstanding for `turn_id`; awaiting the matching `ModelCompleted`.
+- `RunningModel { turn_id, action_id }` — a model request is outstanding for `turn_id`; awaiting the matching `ModelCompleted` or `ModelFailed`.
 - `RunningTools { turn_id, tool_calls, tool_action_ids, completed_results, next_result_index }` — one or more tool calls are outstanding. Results may arrive out of order; `completed_results` buffers them by index and `next_result_index` advances through them contiguously so `ToolResult` records are emitted in the order the assistant listed the calls.
 - `ReadyToContinue { turn_id }` — an internal transition point reached after every tool in the batch has completed. The mailbox immediately pumps a synthetic `ContinueModel` event, sending the FSM back to `RunningModel`.
 
@@ -97,7 +97,7 @@ Module layout under `src/`:
    |             v                        |
    |        RunningModel                  |
    |             |                        |
-   |             | ModelCompleted         |
+   |             | ModelCompleted/Failed  |
    |             |   (no tool calls)      |
    |             |   => TurnFinished      |
    |             |      {Graceful}        |
@@ -122,13 +122,13 @@ Module layout under `src/`:
    +-----------------------------------------------------------+
 ```
 
-Staleness rules enforced inside `state.rs`: `ModelCompleted` / `ToolCompleted` whose `action_id` and `turn_id` do not match the current state are silently dropped. A `ToolCompleted` whose `tool_call_id` + `tool_name` does not appear in the active batch, or whose index has already been emitted, is also dropped. An interrupted turn's late completions are therefore safely ignored, and completions from a pre-edit action cannot attach to a later action that reuses the same `TurnId`.
+Staleness rules enforced inside `state.rs`: `ModelCompleted` / `ModelFailed` / `ToolCompleted` whose `action_id` and `turn_id` do not match the current state are silently dropped. A matching `ModelFailed` closes the turn with `TurnOutcome::Crashed`. A `ToolCompleted` whose `tool_call_id` + `tool_name` does not appear in the active batch, or whose index has already been emitted, is also dropped. An interrupted turn's late completions are therefore safely ignored, and completions from a pre-edit action cannot attach to a later action that reuses the same `TurnId`.
 
 ### Mailbox + input priority
 
 `Mailbox` (see `mailbox.rs`) holds three queues plus one flag:
 
-- `notifications: VecDeque<AgentEvent>` — volatile completions (`ModelCompleted`, `ToolCompleted`) pushed to the back so arrival order is preserved. Notifications still preempt queued user work because `next_event` checks this queue before `Steer` / `FollowUp`.
+- `notifications: VecDeque<AgentEvent>` — volatile completions/failures (`ModelCompleted`, `ModelFailed`, `ToolCompleted`) pushed to the back so arrival order is preserved. Notifications still preempt queued user work because `next_event` checks this queue before `Steer` / `FollowUp`.
 - `steer: VecDeque<UserInputEntry>` — high-priority user inputs to start the next turn.
 - `follow_up: VecDeque<UserInputEntry>` — normal-priority user inputs.
 - `interrupt_requested: bool` — sticky flag set by `AgentInput::Interrupt`.
@@ -148,7 +148,7 @@ Priority order inside `Mailbox::next_event`:
 ```
 1. Interrupt  (only fires if state is RunningModel / RunningTools /
                ReadyToContinue; otherwise the flag is cleared silently)
-2. Notification  (oldest queued ModelCompleted / ToolCompleted)
+2. Notification  (oldest queued ModelCompleted / ModelFailed / ToolCompleted)
 3. ContinueModel  (synthetic, only when state == ReadyToContinue)
 4. Steer         (only consumed when state == Idle)
 5. FollowUp      (only consumed when state == Idle)
@@ -160,7 +160,7 @@ When the mailbox pops a user input entry at `Idle`, it pairs `from` with `kind` 
 
 `AgentAction` (see `action.rs`) enumerates every request the loop can make of the outside world:
 
-- `RequestModel { action_id, turn_id }` — the caller should dispatch a model call for this turn and return its completion via `AgentInput::ModelCompleted { action_id, turn_id, assistant }`.
+- `RequestModel { action_id, turn_id }` — the caller should dispatch a model call for this turn and return success via `AgentInput::ModelCompleted { action_id, turn_id, assistant }` or provider failure via `AgentInput::ModelFailed { action_id, turn_id, error }`.
 - `RequestTool { action_id, turn_id, tool_call }` — the caller should execute `tool_call` and return the result via `AgentInput::ToolCompleted { action_id, turn_id, result }`. For parallel batches, one `RequestTool` is emitted per call, in source order.
 - `CancelTurn { turn_id }` — the caller should abort all in-flight model and tool work for `turn_id`. The orchestrator is expected to fan this out to every running tool handle.
 
@@ -186,7 +186,7 @@ All three are pure requests. `agent-core` never performs the underlying I/O and 
 - **No async runtime, no I/O.** No `tokio`, no `async fn`, no threads. Callers drive it synchronously; `agent-session`'s runner module wraps it for async use.
 - **No cost / usage / token accounting.** The core emits no usage numbers and does not inspect completions for cost. Metering lives above.
 - **No tool execution.** `RequestTool` is a request; the caller runs the tool and feeds back a `ToolResultMessage`.
-- **No model provider abstraction.** The core does not know what a model is or how to call one; it just accepts `ModelCompleted { action_id, assistant, .. }` and moves on.
+- **No model provider abstraction.** The core does not know what a model is or how to call one; it just accepts `ModelCompleted { action_id, assistant, .. }` / `ModelFailed { action_id, error, .. }` and moves on.
 - **No multi-agent awareness or routing.** Inter-session routing, session registries, spawn/report semantics, and worklog triggers all live in `agent-orchestrator` / `agent-session`. The core's only concession to multi-agent existence is that `AgentInput::Steer` / `FollowUp` carry optional `from` / `kind` tags, which it propagates into `Custom` records opaquely.
 - **No knowledge of specific `Custom` kinds.** Kind strings like `compaction_summary` are defined in the session layer, not here.
 - **No provider/workspace ID allocation.** The core mints `TurnId` and `ActionId` only. `ToolCallId` values arrive from outside via the `ToolCall` structs the model produced; the core does not mint them.

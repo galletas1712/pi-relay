@@ -36,7 +36,9 @@ pub use crate::context::{
 };
 pub use crate::event::{ContextEditKind, SessionActionKind, SessionEvent};
 pub use crate::input::{SessionInput, SessionInputError};
-pub use crate::runner::{AgentInputHandle, AgentInputHandleError, AgentInputReceiver, AgentRunner};
+pub use crate::runner::{
+    AgentInputHandle, AgentInputHandleError, AgentInputReceiver, AgentRunner, SessionActionEnvelope,
+};
 pub use crate::session::AgentSession;
 pub use crate::transcript::Transcript;
 
