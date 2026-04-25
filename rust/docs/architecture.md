@@ -2,10 +2,9 @@
 
 This is the top-level plan for the Rust side of pi-relay. It describes the layer stack, the data model, the components that live in each layer, the runtime evolution from single-process to distributed, and the PR sequencing to get there.
 
-Feature-specific design docs go deeper in their own files:
-- `worklog-design.md` — background summarization into a per-agent side-store
-- `cost-aggregation.md` — usage ledger with per-agent / per-tree roll-up
-- `multi-agent-design.md` — spawn / report / agent_idle (TODO)
+Feature-specific design docs for worklogs, cost aggregation, and multi-agent
+tooling are planned. Until those files exist, this document is the source of
+truth for those roadmaps.
 
 ---
 
@@ -110,7 +109,9 @@ enum AgentInput {
 // `action_id` must be copied from the matching RequestModel / RequestTool.
 ```
 
-Every one of these serializes. The FSM never holds non-POD state beyond these.
+These are plain data shapes intended to be serializable at future persistence
+and RPC boundaries, but the current crates do not derive or require serde yet.
+The FSM never holds non-POD state beyond these.
 
 ### Log entries (layer 3, in `agent-session`)
 
@@ -118,11 +119,12 @@ Every one of these serializes. The FSM never holds non-POD state beyond these.
 struct SessionEntry {
     id: EntryId,
     parent_id: Option<EntryId>,
+    timestamp_ms: u128,
     record: TranscriptRecord,
 }
 ```
 
-**Every durable "thing injected into the model's view" is a `TranscriptRecord::Injected(InjectedMessage)` with a kind tag.** One variant, one materialization path, one serialization. New feature -> new well-known kind string and metadata convention, not a new entry type. Ephemeral lifecycle signals remain `SessionEvent`s, not injected transcript records.
+**Every durable "thing injected into the model's view" is a `TranscriptRecord::Injected(InjectedMessage)` with a kind tag.** One variant, one materialization path, one future storage/RPC shape. New feature -> new well-known kind string and metadata convention, not a new entry type. Ephemeral lifecycle signals remain `SessionEvent`s, not injected transcript records.
 
 ### Session events (layer 3, observable)
 
@@ -136,9 +138,10 @@ enum SessionEvent {
 }
 ```
 
-One event stream per session. Events are runtime observations, not additional
-transcript records; observers such as a TUI, usage ledger, or orchestrator can
-subscribe without changing the durable context.
+Each session currently exposes these through an event outbox; a later event bus
+will turn them into subscribable streams. Events are runtime observations, not
+additional transcript records, so observers such as a TUI, usage ledger, or
+orchestrator can observe session activity without changing the durable context.
 
 ### Agent vs session identity
 
@@ -156,7 +159,7 @@ Already landed in PR #62 + #63 refactors.
 
 - **`AgentCoreLoop`** — FSM + mailbox + outboxes. Private fields. Public API: `new`, `resume_at_boundary`, `enqueue_input`, `drive`, `drain_records`, `drain_actions`, `is_idle`, `has_pending_work`, `last_turn_id`.
 - **`AgentState`** — private. `Idle | RunningModel | RunningTools | ReadyToContinue`.
-- **`Mailbox`** — private. Priority queue: Interrupt > ModelCompleted/ModelFailed/ToolCompleted > Steer > FollowUp.
+- **`Mailbox`** — private. Priority queue: Interrupt > ModelCompleted/ModelFailed/ToolCompleted > ContinueModel when `ReadyToContinue` > Steer > FollowUp.
 
 ### Layer 3 — Session (`agent-session` crate)
 
@@ -168,7 +171,7 @@ Partially landed in PR #63; decomposition planned.
 - **`Transcript`** — materialized view of the current branch's records. Live transcripts preserve open turns; resume paths explicitly crash-recover any open tail.
 - **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, transcript }` includes the transcript snapshot visible when the model request was made; tool and cancel actions carry only the ids/payloads needed to execute them. Session-owned stateless model requests are used for compaction side work.
 - **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans `SessionAction`s to the handler. Records auto-flow into the log; the runner does not expose them directly.
-- **`SessionStore` trait** (PR #65) — pluggable durable storage. Default `JsonlFileSessionStore`; `InMemorySessionStore` for tests. Swappable for `SqliteSessionStore` later.
+- **Future `SessionStore` trait** — pluggable durable storage. Planned defaults are `JsonlFileSessionStore` for disk and `InMemorySessionStore` for tests, swappable for `SqliteSessionStore` later.
 
 ### Layer 4 — Control plane (`agent-orchestrator` crate and new traits)
 
@@ -330,7 +333,8 @@ The child is not a context fork of the parent. Model, tools, and inherited conte
 
 ### Worklog
 
-**Status**: not yet. See `worklog-design.md`.
+**Status**: not yet. This section is the current worklog roadmap until a
+dedicated design doc exists.
 
 - Orchestrator observes appended `TurnFinished` records, gates on `is_likely_trivial_turn`, serializes per-agent, forks parent at boundary with a single-tool registry (`[WorklogUpdateTool]`) and a `WorklogFraming` injection.
 - The fork's LLM optionally calls `worklog_update`, which writes to `AgentWorklogStore` (**not** to the session log).
@@ -338,7 +342,8 @@ The child is not a context fork of the parent. Model, tools, and inherited conte
 
 ### Cost aggregation
 
-**Status**: not yet. See `cost-aggregation.md`.
+**Status**: not yet. This section is the current cost-aggregation roadmap until
+a dedicated design doc exists.
 
 - Every `ModelProvider::complete` call carries a `UsageContext { agent_id, scope, turn_id, model, cache_scope }`.
 - On completion, orchestrator emits `SessionEvent::UsageRecorded { ctx, usage }`.
@@ -360,7 +365,7 @@ Each row is one landable PR. Later PRs depend on their predecessors.
 
 | # | PR | What it adds | Unlocks |
 |---|---|---|---|
-| 1 | **#63 (current)** | `agent-session`, `agent-orchestrator` crates + Transcript unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
+| 1 | **#63 foundation** | `agent-session`, `agent-orchestrator` crates + Transcript unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
 | 2 | Session decomposition | `ContextEdit` trait + op structs + `SessionRegistry<S>` + orchestrator becomes composition struct | clean target for registry-level features |
 | 3 | `SessionStore` | trait + in-memory + JSONL-file impls + wire into `AgentSession` | durable restart; resume-from-file; pluggable backends |
 | 4 | `ControlPlane` trait | trait definition + `LocalControlPlane` impl + view-layer adapter | view/control separation; future daemon |

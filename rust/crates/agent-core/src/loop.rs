@@ -95,8 +95,9 @@ impl AgentCoreLoop {
     }
 
     /// Drain every queued user input (Steer then FollowUp) from the mailbox
-    /// without advancing the FSM. Preserves the `from` tag each input was
-    /// enqueued with. Notifications and the interrupt flag are untouched.
+    /// without advancing the FSM. Preserves the `from` and `kind` tags each
+    /// input was enqueued with. Notifications and the interrupt flag are
+    /// untouched.
     ///
     /// Primarily intended for tests and for orchestrator introspection.
     pub fn drain_pending_inputs(&mut self) -> Vec<AgentInput> {

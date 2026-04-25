@@ -8,8 +8,9 @@ use agent_core::{ActionId, AgentAction, AgentInput, TurnId};
 /// `record_drained` pushes an entry for each `RequestModel` / `RequestTool` in
 /// a drained action batch, and clears everything for a `CancelTurn`'s turn id.
 /// `record_input` removes the matching key when a `ModelCompleted` /
-/// `ToolCompleted` arrives; removal preserves the relative order of the
-/// remaining entries. Stale completions (no matching key) are no-ops.
+/// `ModelFailed` / `ToolCompleted` arrives; removal preserves the relative
+/// order of the remaining entries. Stale completions (no matching key) are
+/// no-ops.
 ///
 /// Duplicates are kept: if the same key is recorded twice, both are held in
 /// FIFO position. Callers that care about "once per drain" should rely on

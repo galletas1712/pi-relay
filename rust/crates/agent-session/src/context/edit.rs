@@ -40,7 +40,8 @@ impl PendingWork {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryEditError {
     /// The session cannot currently edit its history (core still running,
-    /// durable leaf mid-turn, mailbox non-empty, or pending work outstanding).
+    /// durable leaf mid-turn, mailbox non-empty, undrained actions remain, or
+    /// pending work is outstanding).
     Busy,
     /// A transcript supplied to `ReplaceTranscript` did not itself end at a
     /// turn boundary.

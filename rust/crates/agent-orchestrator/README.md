@@ -102,8 +102,8 @@ spawn_parents:
 
 | Operation                         | Direction                               | Delivers via                                                 | Kind tag                |
 |-----------------------------------|-----------------------------------------|--------------------------------------------------------------|-------------------------|
-| `send_message(from, to, content)` | parent -> direct child                  | `AgentInput::Steer { from: Some(from), kind, content }`      | `KIND_AGENT_DIRECTIVE`  |
-| `send_report(from, content)`      | child -> spawn parent (registry lookup) | `AgentInput::FollowUp { from: Some(from), kind, content }`   | `KIND_AGENT_REPORT`     |
+| `send_message(from, to, content)` | parent -> direct child                  | `AgentInput::steer_tagged(from, KIND_AGENT_DIRECTIVE, content)` | `KIND_AGENT_DIRECTIVE` |
+| `send_report(from, content)`      | child -> spawn parent (registry lookup) | `AgentInput::follow_up_tagged(from, KIND_AGENT_REPORT, content)` | `KIND_AGENT_REPORT` |
 
 Both primitives are fire-and-forget. They validate the relationship, push a single `AgentInput` onto the target's mailbox via `AgentSession::enqueue_input`, and return. No wait for ack, no turn driving, no observation of downstream state.
 
@@ -139,11 +139,11 @@ Routing flow, `send_message`:
  })
 ```
 
-`send_report` is symmetric: it looks up `registry.parent(from)`, constructs `AgentInput::FollowUp { from: Some(from), kind: Some("agent_report"), content }`, and enqueues it on the parent's mailbox. Follow-ups take normal priority and wake the parent on its next idle turn.
+`send_report` is symmetric: it looks up `registry.parent(from)`, constructs `AgentInput::follow_up_tagged(from, KIND_AGENT_REPORT, content)`, and enqueues it on the parent's mailbox. Follow-ups take normal priority and wake the parent on its next idle turn.
 
 ### Why no idle-vs-busy branching
 
-The TypeScript counterpart (`packages/orchestrator/src/orchestrator.ts::deliverMessage`) inspects the target session's `isStreaming / isRetrying / isCompacting` flags and a `reactivating` latch before deciding whether to call its current `sendCustomMessage` API with `triggerTurn: true` (reactivate an idle agent) or `deliverAs: "steer"` (interrupt a busy one). The Rust mailbox model absorbs inputs uniformly: `AgentSession::enqueue_input` pushes onto a single queue without observing the target's live state. The FSM consumes queued `Steer` / `FollowUp` input only when it is `Idle`; busy sessions keep routed input queued behind any active model/tool work. `Steer` inputs are higher priority than `FollowUp` once the core returns to idle, but they do not interrupt an active turn by themselves.
+The TypeScript counterpart (`packages/orchestrator/src/orchestrator.ts::deliverMessage`) inspects the target session's `isStreaming / isRetrying / isCompacting` flags and a `reactivating` latch before deciding whether to call its current `sendCustomMessage` API with `triggerTurn: true` (reactivate an idle agent) or `deliverAs: "steer"` (interrupt a busy one). The Rust mailbox model absorbs inputs uniformly: `AgentSession::enqueue_input` pushes onto a single queue without observing the target's live state. The FSM consumes queued `Steer` / `FollowUp` input only when it is `Idle`. If the state is `RunningModel` or `RunningTools`, routed input waits behind the active work. If the state is `ReadyToContinue`, the mailbox emits the synthetic `ContinueModel` event before user input, so the current turn resumes with another model request rather than starting a new routed turn. `Steer` inputs are higher priority than `FollowUp` once the core reaches `Idle`, but they do not interrupt an active turn by themselves.
 
 ## Relationship to other crates
 

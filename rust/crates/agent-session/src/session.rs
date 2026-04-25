@@ -119,9 +119,10 @@ impl AgentSession {
     /// session; the core itself is not exposed so context absorption in `drive`
     /// cannot be bypassed.
     ///
-    /// `ModelCompleted` / `ToolCompleted` clear the matching entry from the
-    /// session's internal action queue. Stale completions (no matching
-    /// pending entry, e.g. after an interrupt) are removed with no effect.
+    /// `ModelCompleted` / `ModelFailed` / `ToolCompleted` clear the matching
+    /// entry from the session's internal action queue. Stale completions (no
+    /// matching pending entry, e.g. after an interrupt) are removed with no
+    /// effect.
     pub fn enqueue_input(&mut self, input: AgentInput) -> Result<(), AgentInputError> {
         self.enqueue_agent_input(input)
     }
@@ -206,7 +207,7 @@ impl AgentSession {
 
     /// Drain every queued user input (Steer then FollowUp) from the
     /// underlying core mailbox without advancing the session. Preserves the
-    /// `from` tag each input was enqueued with.
+    /// `from` and `kind` tags each input was enqueued with.
     ///
     /// Notifications (model/tool completions) and the interrupt flag are
     /// untouched. Primarily intended for tests and for orchestrator-level
