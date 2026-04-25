@@ -576,7 +576,7 @@ impl AgentSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auto_compaction::{OneShotModelOutput, OneShotModelPurpose};
+    use crate::auto_compaction::OneShotModelOutput;
     use crate::context::compaction::compaction_summary;
     use crate::context::{Compact, CompactionSettings, ReplaceTranscript, Rewind};
     use agent_core::{
@@ -914,7 +914,6 @@ mod tests {
         else {
             panic!("expected one-shot compaction request, got {actions:?}");
         };
-        assert_eq!(request.purpose, OneShotModelPurpose::Compaction);
         assert!(request.input.iter().any(|block| {
             matches!(
                 block,

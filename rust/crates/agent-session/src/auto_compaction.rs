@@ -21,16 +21,9 @@ impl AutoCompactionSettings {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OneShotModelRequest {
-    pub purpose: OneShotModelPurpose,
     pub instructions: String,
     pub input: Vec<ModelContentBlock>,
     pub output: OneShotModelOutputSpec,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OneShotModelPurpose {
-    Compaction,
-    Other(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,7 +90,6 @@ pub(crate) fn compaction_request(plan: &CompactionPlan) -> OneShotModelRequest {
     });
 
     OneShotModelRequest {
-        purpose: OneShotModelPurpose::Compaction,
         instructions: concat!(
             "Summarize the context that will be replaced. Preserve durable facts, ",
             "decisions, constraints, open tasks, tool results, and user intent. ",

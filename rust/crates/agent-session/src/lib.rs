@@ -26,7 +26,7 @@ mod transcript;
 pub use crate::action::{OneShotModelRequestId, SessionAction};
 pub use crate::auto_compaction::{
     AutoCompactionSettings, ImageInput, ModelContentBlock, OneShotModelOutput,
-    OneShotModelOutputSpec, OneShotModelPurpose, OneShotModelRequest,
+    OneShotModelOutputSpec, OneShotModelRequest,
 };
 pub use crate::context::compaction::compaction_summary;
 pub use crate::context::{

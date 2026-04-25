@@ -38,7 +38,7 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 - `SummarySpanPlan` — produced by `Context::prepare_summary_span`.
 - `CompactionPlan`, `CompactionSettings` — prefix-compaction policy produced by `Context::prepare_compaction`.
 - `AutoCompactionSettings` — optional session policy that pauses a model request and emits one-shot compaction work when context is over budget.
-- `OneShotModelRequest`, `OneShotModelRequestId`, `OneShotModelPurpose`, `OneShotModelOutput`, `ModelContentBlock`, `ImageInput` — stateless side-model request/response vocabulary.
+- `OneShotModelRequest`, `OneShotModelRequestId`, `OneShotModelOutput`, `ModelContentBlock`, `ImageInput` — stateless side-model request/response vocabulary.
 
 **Well-known Custom kinds**
 - `KIND_COMPACTION_SUMMARY = "compaction_summary"` + `compaction_summary(content, first_kept_entry_id, tokens_before)` builder.
