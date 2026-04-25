@@ -1,18 +1,19 @@
 use std::fmt;
-use std::future::Future;
+use std::future::{ready, Future, Ready};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_channel::mpsc::{unbounded, UnboundedReceiver, UnboundedSender};
 use futures_core::Stream;
 
-use agent_core::{AgentAction, AgentInput, AgentInputError};
-
+use crate::action::SessionAction;
+use crate::event::SessionEvent;
+use crate::input::{SessionInput, SessionInputError};
 use crate::AgentSession;
 
 #[derive(Debug, Clone)]
 pub struct AgentInputHandle {
-    inputs: UnboundedSender<AgentInput>,
+    inputs: UnboundedSender<SessionInput>,
 }
 
 impl AgentInputHandle {
@@ -25,7 +26,11 @@ impl AgentInputHandle {
         (Self { inputs }, AgentInputReceiver { inputs: input_rx })
     }
 
-    pub fn enqueue_input(&self, input: AgentInput) -> Result<(), AgentInputHandleError> {
+    pub fn enqueue_input(
+        &self,
+        input: impl Into<SessionInput>,
+    ) -> Result<(), AgentInputHandleError> {
+        let input = input.into();
         input.validate().map_err(AgentInputHandleError::Invalid)?;
         self.inputs
             .unbounded_send(input)
@@ -35,8 +40,8 @@ impl AgentInputHandle {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentInputHandleError {
-    Invalid(AgentInputError),
-    Closed(AgentInput),
+    Invalid(SessionInputError),
+    Closed(SessionInput),
 }
 
 impl fmt::Display for AgentInputHandleError {
@@ -59,7 +64,7 @@ impl std::error::Error for AgentInputHandleError {
 
 /// Receive side of the agent input queue.
 pub struct AgentInputReceiver {
-    inputs: UnboundedReceiver<AgentInput>,
+    inputs: UnboundedReceiver<SessionInput>,
 }
 
 /// Async integration shell around `AgentSession`.
@@ -69,13 +74,14 @@ pub struct AgentInputReceiver {
 /// registered handler. Records flow automatically into the session log via
 /// `AgentSession::drive`, so callers observing durable history read it off
 /// the session's transcript rather than through a record callback.
-pub struct AgentRunner<HandleAction> {
+pub struct AgentRunner<HandleAction, HandleEvent = fn(SessionEvent) -> Ready<()>> {
     session: AgentSession,
     inputs: AgentInputReceiver,
     handle_action: HandleAction,
+    handle_event: HandleEvent,
 }
 
-impl<HandleAction> AgentRunner<HandleAction> {
+impl<HandleAction> AgentRunner<HandleAction, fn(SessionEvent) -> Ready<()>> {
     pub fn new(
         session: AgentSession,
         inputs: AgentInputReceiver,
@@ -85,6 +91,23 @@ impl<HandleAction> AgentRunner<HandleAction> {
             session,
             inputs,
             handle_action,
+            handle_event: ignore_session_event,
+        }
+    }
+}
+
+impl<HandleAction, HandleEvent> AgentRunner<HandleAction, HandleEvent> {
+    pub fn new_with_events(
+        session: AgentSession,
+        inputs: AgentInputReceiver,
+        handle_action: HandleAction,
+        handle_event: HandleEvent,
+    ) -> Self {
+        Self {
+            session,
+            inputs,
+            handle_action,
+            handle_event,
         }
     }
 
@@ -97,28 +120,38 @@ impl<HandleAction> AgentRunner<HandleAction> {
     }
 }
 
-impl<HandleAction, HandleActionFuture> AgentRunner<HandleAction>
+impl<HandleAction, HandleActionFuture, HandleEvent, HandleEventFuture>
+    AgentRunner<HandleAction, HandleEvent>
 where
-    HandleAction: FnMut(AgentAction) -> HandleActionFuture,
+    HandleAction: FnMut(SessionAction) -> HandleActionFuture,
     HandleActionFuture: Future<Output = ()>,
+    HandleEvent: FnMut(SessionEvent) -> HandleEventFuture,
+    HandleEventFuture: Future<Output = ()>,
 {
     pub async fn run(&mut self) {
-        self.drive_and_flush_actions().await;
+        self.drive_and_flush().await;
 
         while let Some(input) = next_input(&mut self.inputs.inputs).await {
-            if self.session.enqueue_input(input).is_err() {
+            if self.session.enqueue_session_input(input).is_err() {
                 continue;
             }
-            self.drive_and_flush_actions().await;
+            self.drive_and_flush().await;
         }
     }
 
-    async fn drive_and_flush_actions(&mut self) {
+    async fn drive_and_flush(&mut self) {
         self.session.drive();
+        for event in self.session.drain_events() {
+            (self.handle_event)(event).await;
+        }
         for action in self.session.drain_actions() {
             (self.handle_action)(action).await;
         }
     }
+}
+
+fn ignore_session_event(_: SessionEvent) -> Ready<()> {
+    ready(())
 }
 
 struct NextInput<'a, InputStream> {
@@ -146,13 +179,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::SessionInputError;
     use std::cell::RefCell;
     use std::future::{ready, Future};
     use std::rc::Rc;
     use std::task::{Context, Poll, Waker};
 
     use agent_core::{
-        ActionId, AssistantItem, AssistantMessage, TranscriptRecord, TurnId, TurnOutcome,
+        ActionId, AgentInput, AssistantItem, AssistantMessage, TranscriptRecord, TurnId,
+        TurnOutcome,
     };
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
@@ -196,7 +231,7 @@ mod tests {
 
         assert_eq!(
             actions.borrow().as_slice(),
-            &[AgentAction::RequestModel {
+            &[SessionAction::RequestModel {
                 action_id: ActionId(1),
                 turn_id: TurnId(1)
             }]
@@ -217,6 +252,52 @@ mod tests {
     }
 
     #[test]
+    fn runner_can_forward_runtime_events() {
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let recorded_actions = actions.clone();
+        let recorded_events = events.clone();
+        let (input_handle, input_rx) = AgentInputHandle::channel();
+        let mut runner = AgentRunner::new_with_events(
+            AgentSession::new(),
+            input_rx,
+            move |action| {
+                recorded_actions.borrow_mut().push(action);
+                ready(())
+            },
+            move |event| {
+                recorded_events.borrow_mut().push(event);
+                ready(())
+            },
+        );
+
+        input_handle
+            .enqueue_input(AgentInput::follow_up("hello"))
+            .expect("runner should accept user input");
+        drop(input_handle);
+
+        block_on_ready(runner.run());
+
+        assert!(actions
+            .borrow()
+            .iter()
+            .any(|action| matches!(action, SessionAction::RequestModel { .. })));
+        assert!(events.borrow().iter().any(|event| matches!(
+            event,
+            SessionEvent::RecordAppended {
+                record: TranscriptRecord::UserMessage(text),
+                ..
+            } if text == "hello"
+        )));
+        assert!(events.borrow().iter().any(|event| matches!(
+            event,
+            SessionEvent::ActionRequested {
+                action: SessionAction::RequestModel { .. }
+            }
+        )));
+    }
+
+    #[test]
     fn input_handle_rejects_invalid_inputs_before_queueing() {
         let (input_handle, mut input_rx) = AgentInputHandle::channel();
 
@@ -230,7 +311,9 @@ mod tests {
 
         assert_eq!(
             error,
-            AgentInputHandleError::Invalid(AgentInputError::UnpairedOriginTags)
+            AgentInputHandleError::Invalid(SessionInputError::Agent(
+                agent_core::AgentInputError::UnpairedOriginTags
+            ))
         );
         drop(input_handle);
         assert!(block_on_ready(next_input(&mut input_rx.inputs)).is_none());

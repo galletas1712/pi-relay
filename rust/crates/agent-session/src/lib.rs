@@ -13,18 +13,29 @@
 
 #![forbid(unsafe_code)]
 
+mod action;
 mod action_queue;
+mod auto_compaction;
 mod context;
+mod event;
+mod input;
 mod runner;
 mod session;
 mod transcript;
 
+pub use crate::action::{OneShotModelRequestId, SessionAction};
+pub use crate::auto_compaction::{
+    AutoCompactionSettings, ImageInput, ModelContentBlock, OneShotModelOutput,
+    OneShotModelOutputSpec, OneShotModelPurpose, OneShotModelRequest,
+};
 pub use crate::context::compaction::compaction_summary;
 pub use crate::context::{
     Compact, CompactionPlan, CompactionSettings, Context, ContextEdit, ContextError,
     HistoryEditError, PendingWork, ReplaceTranscript, Rewind, SessionEntry, SummarizeSpan,
     SummarySpanPlan, KIND_COMPACTION_SUMMARY,
 };
+pub use crate::event::{ContextEditKind, SessionActionKind, SessionEvent};
+pub use crate::input::{SessionInput, SessionInputError};
 pub use crate::runner::{AgentInputHandle, AgentInputHandleError, AgentInputReceiver, AgentRunner};
 pub use crate::session::AgentSession;
 pub use crate::transcript::Transcript;

@@ -4,13 +4,13 @@ Durable session context and async run-loop wrapper around the `agent-core` FSM k
 
 ## Responsibility
 
-`agent-session` is the layer that turns the pure `AgentCoreLoop` FSM into a stateful, editable session. An `AgentSession` owns three things: the core loop (deterministic state machine), a `Context` (append-only DAG of `SessionEntry` nodes — the durable transcript), and an `ActionQueue` (FIFO of model/tool requests the session has handed out but hasn't heard back about). `session.drive()` is the only supported way to advance the FSM; it runs the core to quiescence and absorbs every freshly-produced `TranscriptRecord` into the context, which is the sole owner of durable history.
+`agent-session` is the layer that turns the pure `AgentCoreLoop` FSM into a stateful, editable session. An `AgentSession` owns the core loop (deterministic state machine), a `Context` (append-only DAG of `SessionEntry` nodes — the durable transcript), an `ActionQueue` (FIFO of model/tool requests the session has handed out but hasn't heard back about), session-owned one-shot model work, and an ephemeral event outbox for live observers. `session.drive()` is the only supported way to advance the FSM; it runs the core to quiescence and absorbs every freshly-produced `TranscriptRecord` into the context, which is the sole owner of durable model-visible history.
 
 The crate also owns the *edit* surface: `SummarizeSpan`, `Compact`, `Rewind`, and `ReplaceTranscript` are individual op structs that implement the `ContextEdit` trait. `AgentSession::edit` runs the quiescence gate (`can_edit_history`) once, dispatches to the op, then rehydrates the core loop from the new context. `AgentSession::fork` is a direct method rather than a `ContextEdit` impl because it produces a new session instead of mutating the source.
 
-`AgentRunner` is the async I/O shell. Inputs arrive via a cloneable `AgentInputHandle`; the runner calls `drive` in a loop and forwards each drained `AgentAction` to a caller-supplied handler.
+`AgentRunner` is the async I/O shell. Inputs arrive via a cloneable `AgentInputHandle`; the runner calls `drive` in a loop and forwards each drained `SessionAction` to a caller-supplied handler.
 
-What this crate does *not* own: no model calls, no tool execution, no cost tracking, no spawn/report routing, no control-plane scheduling. Those all live in `agent-orchestrator` and above. The session just drives one agent and stores its history.
+What this crate does *not* own: no model calls, no tool execution, no cost tracking, no spawn/report routing, no control-plane scheduling. Those all live in the harness / `agent-orchestrator` and above. The session just drives one agent, stores its history, and emits side work such as one-shot compaction requests.
 
 ## Public interface
 
@@ -20,6 +20,9 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 - `AgentSession` — core loop + context + action queue, the unit of agent state.
 - `AgentRunner` — async wrapper that drives a session off an input channel.
 - `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — sender/receiver pair for the runner's input channel.
+- `SessionAction` — model/tool/cancel actions plus session-owned `RequestOneShotModel`.
+- `SessionInput`, `SessionInputError` — core inputs plus one-shot completions/failures.
+- `SessionEvent` — ephemeral live activity (`RecordAppended`, `ActionRequested`, `ActionCompleted`, `ActionFailed`, `ContextEdited`).
 
 **Durable state**
 - `Context` — append-only DAG of `SessionEntry`.
@@ -34,6 +37,8 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 - `HistoryEditError` — `Busy`, `ReplacementNotAtTurnBoundary`, `Context(ContextError)`.
 - `SummarySpanPlan` — produced by `Context::prepare_summary_span`.
 - `CompactionPlan`, `CompactionSettings` — prefix-compaction policy produced by `Context::prepare_compaction`.
+- `AutoCompactionSettings` — optional session policy that pauses a model request and emits one-shot compaction work when context is over budget.
+- `OneShotModelRequest`, `OneShotModelRequestId`, `OneShotModelPurpose`, `OneShotModelOutput`, `ModelContentBlock`, `ImageInput` — stateless side-model request/response vocabulary.
 
 **Well-known Custom kinds**
 - `KIND_COMPACTION_SUMMARY = "compaction_summary"` + `compaction_summary(content, first_kept_entry_id, tokens_before)` builder.
@@ -48,12 +53,16 @@ session.enqueue_input(AgentInput::follow_up("hello"))?;
 session.drive();
 let actions = session.drain_actions();
 // caller executes actions out-of-band, feeds results back:
-let AgentAction::RequestModel { action_id, turn_id } = actions[0] else { unreachable!() };
+let SessionAction::RequestModel { action_id, turn_id } = actions[0] else { unreachable!() };
 session.enqueue_input(AgentInput::ModelCompleted { action_id, turn_id, assistant })?;
 session.drive();
 ```
 
-`drive` records every produced `RequestModel` / `RequestTool` into the internal action queue before callers drain the observable action outbox. `enqueue_input` validates the input and clears the matching key when the corresponding completion arrives. `CancelTurn` clears every entry for that turn id.
+`drive` records every visible `RequestModel` / `RequestTool` into the internal action queue before callers drain the observable action outbox. `enqueue_input` validates the input and clears the matching key when the corresponding completion arrives. `CancelTurn` clears every entry for that turn id.
+
+With auto-compaction enabled, a core `RequestModel` may be held by the session while it emits `SessionAction::RequestOneShotModel`. The harness runs that as a stateless side-model call and returns `SessionInput::OneShotModelCompleted` or `SessionInput::OneShotModelFailed` through the same input channel. Successful completion applies a compaction summary to the context, then releases the held `RequestModel`. Failure releases the held `RequestModel` unchanged so the agent still makes progress.
+
+`drain_events()` returns live-only `SessionEvent`s that explain what happened without polluting the transcript. The transcript remains the model-visible durable context.
 
 ### History edits
 
@@ -80,7 +89,11 @@ let forked: AgentSession = session.fork(pending, Some(&leaf_id))?;
 | File | Contents |
 | --- | --- |
 | `src/lib.rs` | Module declarations + public re-exports (including `agent-core` passthroughs). |
-| `src/session.rs` | `AgentSession` composition, `drive`, `enqueue_input`, `drain_actions`, `can_edit_history`, `edit`, `fork`, `rehydrate_core_from_context`. |
+| `src/action.rs` | `SessionAction`, `OneShotModelRequestId`. |
+| `src/input.rs` | `SessionInput`, `SessionInputError`. |
+| `src/event.rs` | Runtime-only `SessionEvent`, `SessionActionKind`, `ContextEditKind`. |
+| `src/auto_compaction.rs` | `AutoCompactionSettings`, one-shot model request/response types, compaction request rendering. |
+| `src/session.rs` | `AgentSession` composition, `drive`, `enqueue_input`, `enqueue_session_input`, `drain_actions`, `drain_events`, `can_edit_history`, `edit`, `fork`, `rehydrate_core_from_context`. |
 | `src/action_queue.rs` | Private `ActionQueue` (FIFO `VecDeque<PendingActionKey>`) + `record_drained` / `record_input`. |
 | `src/transcript.rs` | `Transcript` read-only view: `is_turn_boundary`, `latest_compaction_summary`, crashed-tail patching. |
 | `src/runner.rs` | `AgentRunner`, `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — async shell over `AgentSession`. |
@@ -95,21 +108,26 @@ let forked: AgentSession = session.fork(pending, Some(&leaf_id))?;
 
 ```
  AgentSession
-  ├── core: AgentCoreLoop       (from agent-core — FSM + mailbox)
-  ├── context: Context          (append-only DAG of SessionEntry)
-  └── action_queue: ActionQueue (FIFO: drained-but-not-yet-reported actions)
+  ├── core: AgentCoreLoop             (from agent-core — FSM + mailbox)
+  ├── context: Context                (append-only DAG of SessionEntry)
+  ├── action_queue: ActionQueue       (FIFO: visible in-flight model/tool actions)
+  ├── pending_one_shot: Option<...>   (session-owned side work)
+  ├── action_outbox: VecDeque<SessionAction>
+  └── event_outbox: VecDeque<SessionEvent>
 
  drive()       ─► core.drive() → drain records → append to context
-              └► drain actions → action_queue.record_drained(..) → action outbox
+              └► drain actions → maybe auto-compact → action outbox
  drain_actions ─► drain observable action outbox
+ drain_events  ─► drain live activity event outbox
  enqueue_input ─► validate → action_queue.record_input(..) → core.enqueue_input(..)
+ enqueue_session_input ─► core input OR one-shot completion/failure
  edit(op)      ─► can_edit_history? → op.apply(&mut context) → rehydrate core
 ```
 
 All three components are load-bearing:
 - **core** drives the FSM forward. It buffers records only until the session absorbs them.
 - **context** is durable history. It survives compaction because compaction is a fork, not a delete.
-- **action_queue** answers "is any work in flight?" — it's the signal that gates history edits.
+- **action_queue** answers "is any visible model/tool work in flight?" — together with pending one-shot work, it's the signal that gates history edits.
 
 ### The Context DAG
 
@@ -152,6 +170,7 @@ can_edit_history(pending) :=
     && context.is_turn_boundary()
     && !core.has_pending_work()
     && action_queue.is_empty()
+    && pending_one_shot.is_none()
     && pending.is_empty()
 ```
 
@@ -170,7 +189,7 @@ Core rehydration (`rehydrate_core_from_context`) runs *after* `apply` succeeds. 
 
 ### `ActionQueue` semantics
 
-Private to the crate. `PendingActionKey { action_id: ActionId, turn_id: TurnId, kind: Model | Tool }` lives in a `VecDeque` in FIFO insertion order. `record_drained(&[AgentAction])` pushes one entry per `RequestModel` / `RequestTool` and clears entries for a given `turn_id` on `CancelTurn`. `record_input(&AgentInput)` removes the matching key on `ModelCompleted` / `ToolCompleted`; removal is by key, not necessarily from the head, and preserves order among the survivors. Duplicates are kept — FIFO with no dedup. Stale completions (no matching key) are silent no-ops.
+Private to the crate. `PendingActionKey { action_id: ActionId, turn_id: TurnId, kind: Model | Tool }` lives in a `VecDeque` in FIFO insertion order. `record_drained(&[AgentAction])` pushes one entry per visible `RequestModel` / `RequestTool` and clears entries for a given `turn_id` on `CancelTurn`. `record_input(&AgentInput)` removes the matching key on `ModelCompleted` / `ToolCompleted` and returns whether anything was cleared; removal is by key, not necessarily from the head, and preserves order among the survivors. Duplicates are kept — FIFO with no dedup. Stale completions (no matching key) are silent no-ops.
 
 `is_empty() == true` ⇒ no in-flight actions ⇒ `can_edit_history` clears that check.
 
@@ -182,7 +201,7 @@ The `KIND_COMPACTION_SUMMARY` constant and its builder live in `context/compacti
 
 ### `AgentRunner` (async wrapper)
 
-`AgentRunner` is the only async surface in the crate — the core loop itself is fully sync. It owns an `AgentSession` plus an `AgentInputReceiver` (the receive side of a `futures_channel::mpsc::unbounded` channel) plus a `FnMut(AgentAction) -> impl Future<Output = ()>` action handler. `run()` drives the session to quiescence, flushes drained actions through the handler, then loops awaiting the next input, enqueuing it, and repeating. `AgentInputHandle::channel()` hands back the matching sender; the handle is `Clone`, so orchestrator, model, and tool tasks can all enqueue inputs back into the same session. The handle validates `AgentInput` before sending; invalid inputs return `AgentInputHandleError::Invalid` immediately.
+`AgentRunner` is the only async surface in the crate — the core loop itself is fully sync. It owns an `AgentSession` plus an `AgentInputReceiver` (the receive side of a `futures_channel::mpsc::unbounded` channel) plus a `FnMut(SessionAction) -> impl Future<Output = ()>` action handler. `run()` drives the session to quiescence, flushes drained actions through the handler, then loops awaiting the next `SessionInput`, enqueuing it, and repeating. `AgentInputHandle::channel()` hands back the matching sender; the handle is `Clone`, so orchestrator, model, tool, and one-shot tasks can all enqueue inputs back into the same session. The handle validates `SessionInput` before sending; invalid inputs return `AgentInputHandleError::Invalid` immediately.
 
 Records are observed off the session's transcript (`runner.session().transcript()`); there is no record callback.
 

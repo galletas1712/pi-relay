@@ -4,8 +4,17 @@ use agent_core::{
     AgentAction, AgentCoreLoop, AgentInput, AgentInputError, TranscriptRecord, TurnId,
 };
 
+use crate::action::{OneShotModelRequestId, SessionAction};
 use crate::action_queue::ActionQueue;
-use crate::context::{Context, ContextEdit, ContextError, HistoryEditError, PendingWork};
+use crate::auto_compaction::{
+    self, AutoCompactionSettings, OneShotModelOutput, PendingOneShot, PendingOneShotKind,
+};
+use crate::context::compaction::compaction_summary;
+use crate::context::{
+    Context, ContextEdit, ContextError, HistoryEditError, PendingWork, SummarizeSpan,
+};
+use crate::event::{ContextEditKind, SessionActionKind, SessionEvent};
+use crate::input::{SessionInput, SessionInputError};
 use crate::transcript::Transcript;
 
 /// Session shell around the pure core loop.
@@ -20,7 +29,11 @@ pub struct AgentSession {
     pub(crate) core: AgentCoreLoop,
     pub(crate) context: Context,
     action_queue: ActionQueue,
-    action_outbox: VecDeque<AgentAction>,
+    action_outbox: VecDeque<SessionAction>,
+    event_outbox: VecDeque<SessionEvent>,
+    auto_compaction: Option<AutoCompactionSettings>,
+    pending_one_shot: Option<PendingOneShot>,
+    next_one_shot_request_id: OneShotModelRequestId,
 }
 
 impl Default for AgentSession {
@@ -36,7 +49,24 @@ impl AgentSession {
             context: Context::new(),
             action_queue: ActionQueue::new(),
             action_outbox: VecDeque::new(),
+            event_outbox: VecDeque::new(),
+            auto_compaction: None,
+            pending_one_shot: None,
+            next_one_shot_request_id: OneShotModelRequestId::first(),
         }
+    }
+
+    pub fn with_auto_compaction(mut self, settings: AutoCompactionSettings) -> Self {
+        self.auto_compaction = Some(settings);
+        self
+    }
+
+    pub fn set_auto_compaction(&mut self, settings: Option<AutoCompactionSettings>) {
+        self.auto_compaction = settings;
+    }
+
+    pub fn auto_compaction(&self) -> Option<AutoCompactionSettings> {
+        self.auto_compaction
     }
 
     pub fn from_records(records: Vec<TranscriptRecord>) -> Self {
@@ -51,6 +81,10 @@ impl AgentSession {
             context,
             action_queue: ActionQueue::new(),
             action_outbox: VecDeque::new(),
+            event_outbox: VecDeque::new(),
+            auto_compaction: None,
+            pending_one_shot: None,
+            next_one_shot_request_id: OneShotModelRequestId::first(),
         }
     }
 
@@ -66,6 +100,10 @@ impl AgentSession {
             context,
             action_queue: ActionQueue::new(),
             action_outbox: VecDeque::new(),
+            event_outbox: VecDeque::new(),
+            auto_compaction: None,
+            pending_one_shot: None,
+            next_one_shot_request_id: OneShotModelRequestId::first(),
         })
     }
 
@@ -79,8 +117,46 @@ impl AgentSession {
     /// session's internal action queue. Stale completions (no matching
     /// pending entry, e.g. after an interrupt) are removed with no effect.
     pub fn enqueue_input(&mut self, input: AgentInput) -> Result<(), AgentInputError> {
+        self.enqueue_agent_input(input)
+    }
+
+    pub fn enqueue_session_input(
+        &mut self,
+        input: impl Into<SessionInput>,
+    ) -> Result<(), SessionInputError> {
+        let input = input.into();
         input.validate()?;
-        self.action_queue.record_input(&input);
+        match input {
+            SessionInput::Agent(input) => self
+                .enqueue_agent_input(input)
+                .map_err(SessionInputError::Agent),
+            SessionInput::OneShotModelCompleted { request_id, output } => {
+                self.complete_one_shot_model(request_id, output);
+                Ok(())
+            }
+            SessionInput::OneShotModelFailed { request_id, error } => {
+                self.fail_one_shot_model(request_id, error);
+                Ok(())
+            }
+        }
+    }
+
+    fn enqueue_agent_input(&mut self, input: AgentInput) -> Result<(), AgentInputError> {
+        input.validate()?;
+        if matches!(input, AgentInput::Interrupt) {
+            self.clear_pending_one_shot("interrupted");
+        } else if self.pending_one_shot.is_some()
+            && matches!(
+                input,
+                AgentInput::ModelCompleted { .. } | AgentInput::ToolCompleted { .. }
+            )
+        {
+            return Ok(());
+        }
+
+        if self.action_queue.record_input(&input) {
+            self.push_agent_completion_event(&input);
+        }
         self.drop_completed_action_from_outbox(&input);
         self.core.enqueue_input(input)
     }
@@ -139,8 +215,12 @@ impl AgentSession {
     ///
     /// Records are absorbed into the context inside `drive`, so there is no
     /// analogous `drain_records` on the session.
-    pub fn drain_actions(&mut self) -> Vec<AgentAction> {
+    pub fn drain_actions(&mut self) -> Vec<SessionAction> {
         self.action_outbox.drain(..).collect()
+    }
+
+    pub fn drain_events(&mut self) -> Vec<SessionEvent> {
+        self.event_outbox.drain(..).collect()
     }
 
     /// True when the session's history can be edited: core idle, context at a
@@ -151,6 +231,7 @@ impl AgentSession {
             && self.context.is_turn_boundary()
             && !self.core.has_pending_work()
             && self.action_queue.is_empty()
+            && self.pending_one_shot.is_none()
             && pending.is_empty()
     }
 
@@ -170,6 +251,9 @@ impl AgentSession {
         }
         let output = edit.apply(&mut self.context)?;
         self.rehydrate_core_from_context();
+        self.event_outbox.push_back(SessionEvent::ContextEdited {
+            kind: ContextEditKind::HistoryEdit,
+        });
         Ok(output)
     }
 
@@ -200,7 +284,11 @@ impl AgentSession {
         if records.is_empty() {
             return;
         }
-        self.context.append_transcript_records(records);
+        let entry_ids = self.context.append_transcript_records(records.clone());
+        for (entry_id, record) in entry_ids.into_iter().zip(records) {
+            self.event_outbox
+                .push_back(SessionEvent::RecordAppended { entry_id, record });
+        }
     }
 
     fn absorb_core_actions(&mut self) {
@@ -208,24 +296,209 @@ impl AgentSession {
         if actions.is_empty() {
             return;
         }
-        self.action_queue.record_drained(&actions);
         for action in actions {
-            if let AgentAction::CancelTurn { turn_id } = action {
-                self.action_outbox.retain(|queued| {
-                    !matches!(
-                        queued,
-                        AgentAction::RequestModel {
-                            turn_id: queued_turn_id,
-                            ..
-                        } | AgentAction::RequestTool {
-                            turn_id: queued_turn_id,
-                            ..
-                        } if *queued_turn_id == turn_id
-                    )
-                });
-            }
-            self.action_outbox.push_back(action);
+            self.handle_core_action(action);
         }
+    }
+
+    fn handle_core_action(&mut self, action: AgentAction) {
+        match action {
+            AgentAction::RequestModel { .. } => {
+                if self.maybe_start_auto_compaction(action.clone()) {
+                    return;
+                }
+                self.expose_agent_action(action);
+            }
+            AgentAction::RequestTool { .. } => self.expose_agent_action(action),
+            AgentAction::CancelTurn { turn_id } => {
+                self.clear_pending_one_shot_for_turn(turn_id);
+                self.remove_actions_for_turn(turn_id);
+                self.expose_agent_action(AgentAction::CancelTurn { turn_id });
+            }
+        }
+    }
+
+    fn maybe_start_auto_compaction(&mut self, held_model_action: AgentAction) -> bool {
+        if self.pending_one_shot.is_some() {
+            return false;
+        }
+        let Some(settings) = self.auto_compaction else {
+            return false;
+        };
+        let Some(plan) = auto_compaction::prepare_auto_compaction(&self.context, settings) else {
+            return false;
+        };
+
+        let request_id = OneShotModelRequestId::take_next(&mut self.next_one_shot_request_id);
+        let request = auto_compaction::compaction_request(&plan);
+        self.pending_one_shot = Some(PendingOneShot {
+            request_id,
+            kind: PendingOneShotKind::Compaction {
+                plan,
+                held_model_action,
+            },
+        });
+        self.push_session_action(SessionAction::RequestOneShotModel {
+            request_id,
+            request,
+        });
+        true
+    }
+
+    fn expose_agent_action(&mut self, action: AgentAction) {
+        self.action_queue
+            .record_drained(std::slice::from_ref(&action));
+        self.push_session_action(SessionAction::from(action));
+    }
+
+    fn push_session_action(&mut self, action: SessionAction) {
+        self.event_outbox.push_back(SessionEvent::ActionRequested {
+            action: action.clone(),
+        });
+        self.action_outbox.push_back(action);
+    }
+
+    fn complete_one_shot_model(
+        &mut self,
+        request_id: OneShotModelRequestId,
+        output: OneShotModelOutput,
+    ) {
+        let Some(pending) = self.take_matching_one_shot(request_id) else {
+            return;
+        };
+
+        self.event_outbox.push_back(SessionEvent::ActionCompleted {
+            kind: SessionActionKind::OneShotModel,
+            id: request_id.0.to_string(),
+        });
+
+        match pending.kind {
+            PendingOneShotKind::Compaction {
+                plan,
+                held_model_action,
+            } => {
+                let OneShotModelOutput::Text(summary) = output;
+                if let Err(error) = self.apply_pending_compaction(plan, summary) {
+                    self.event_outbox.push_back(SessionEvent::ActionFailed {
+                        kind: SessionActionKind::OneShotModel,
+                        id: request_id.0.to_string(),
+                        error: format!("{error:?}"),
+                    });
+                } else {
+                    self.event_outbox.push_back(SessionEvent::ContextEdited {
+                        kind: ContextEditKind::Compact,
+                    });
+                }
+                self.expose_agent_action(held_model_action);
+            }
+        }
+    }
+
+    fn fail_one_shot_model(&mut self, request_id: OneShotModelRequestId, error: String) {
+        let Some(pending) = self.take_matching_one_shot(request_id) else {
+            return;
+        };
+        self.event_outbox.push_back(SessionEvent::ActionFailed {
+            kind: SessionActionKind::OneShotModel,
+            id: request_id.0.to_string(),
+            error,
+        });
+        match pending.kind {
+            PendingOneShotKind::Compaction {
+                held_model_action, ..
+            } => self.expose_agent_action(held_model_action),
+        }
+    }
+
+    fn take_matching_one_shot(
+        &mut self,
+        request_id: OneShotModelRequestId,
+    ) -> Option<PendingOneShot> {
+        if self
+            .pending_one_shot
+            .as_ref()
+            .is_some_and(|pending| pending.request_id == request_id)
+        {
+            self.action_outbox.retain(|action| {
+                !matches!(
+                    action,
+                    SessionAction::RequestOneShotModel {
+                        request_id: queued_request_id,
+                        ..
+                    } if *queued_request_id == request_id
+                )
+            });
+            return self.pending_one_shot.take();
+        }
+        None
+    }
+
+    fn apply_pending_compaction(
+        &mut self,
+        plan: crate::context::CompactionPlan,
+        summary: String,
+    ) -> Result<(), HistoryEditError> {
+        let first_kept_entry_id = plan.first_kept_entry_id.clone();
+        let tokens_before = plan.tokens_before;
+        SummarizeSpan {
+            plan: plan.summary_span,
+            summary: compaction_summary(summary, first_kept_entry_id, tokens_before),
+        }
+        .apply(&mut self.context)
+    }
+
+    fn clear_pending_one_shot(&mut self, error: &str) {
+        let Some(pending) = self.pending_one_shot.take() else {
+            return;
+        };
+        let request_id = pending.request_id;
+        self.action_outbox.retain(|action| {
+            !matches!(
+                action,
+                SessionAction::RequestOneShotModel {
+                    request_id: queued_request_id,
+                    ..
+                } if *queued_request_id == request_id
+            )
+        });
+        self.event_outbox.push_back(SessionEvent::ActionFailed {
+            kind: SessionActionKind::OneShotModel,
+            id: request_id.0.to_string(),
+            error: error.to_string(),
+        });
+    }
+
+    fn clear_pending_one_shot_for_turn(&mut self, turn_id: TurnId) {
+        let clear = self.pending_one_shot.as_ref().is_some_and(|pending| {
+            matches!(
+                &pending.kind,
+                PendingOneShotKind::Compaction {
+                    held_model_action: AgentAction::RequestModel {
+                        turn_id: held_turn_id,
+                        ..
+                    },
+                    ..
+                } if *held_turn_id == turn_id
+            )
+        });
+        if clear {
+            self.clear_pending_one_shot("turn cancelled");
+        }
+    }
+
+    fn remove_actions_for_turn(&mut self, turn_id: TurnId) {
+        self.action_outbox.retain(|queued| {
+            !matches!(
+                queued,
+                SessionAction::RequestModel {
+                    turn_id: queued_turn_id,
+                    ..
+                } | SessionAction::RequestTool {
+                    turn_id: queued_turn_id,
+                    ..
+                } if *queued_turn_id == turn_id
+            )
+        });
     }
 
     fn drop_completed_action_from_outbox(&mut self, input: &AgentInput) {
@@ -234,7 +507,7 @@ impl AgentSession {
             .iter()
             .position(|action| match (action, input) {
                 (
-                    AgentAction::RequestModel {
+                    SessionAction::RequestModel {
                         action_id: action_action_id,
                         turn_id: action_turn_id,
                     },
@@ -245,7 +518,7 @@ impl AgentSession {
                     },
                 ) => action_action_id == input_action_id && action_turn_id == input_turn_id,
                 (
-                    AgentAction::RequestTool {
+                    SessionAction::RequestTool {
                         action_id: action_action_id,
                         turn_id: action_turn_id,
                         tool_call,
@@ -268,6 +541,24 @@ impl AgentSession {
         }
     }
 
+    fn push_agent_completion_event(&mut self, input: &AgentInput) {
+        match input {
+            AgentInput::ModelCompleted { action_id, .. } => {
+                self.event_outbox.push_back(SessionEvent::ActionCompleted {
+                    kind: SessionActionKind::Model,
+                    id: action_id.0.to_string(),
+                });
+            }
+            AgentInput::ToolCompleted { action_id, .. } => {
+                self.event_outbox.push_back(SessionEvent::ActionCompleted {
+                    kind: SessionActionKind::Tool,
+                    id: action_id.0.to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn rehydrate_core_from_context(&mut self) {
         let last_turn_id = self.context.transcript().last_turn_id();
         let next_action_id = self.core.next_action_id();
@@ -278,12 +569,14 @@ impl AgentSession {
         // block edits forever.
         self.action_queue.clear();
         self.action_outbox.clear();
+        self.pending_one_shot = None;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auto_compaction::{OneShotModelOutput, OneShotModelPurpose};
     use crate::context::compaction::compaction_summary;
     use crate::context::{Compact, CompactionSettings, ReplaceTranscript, Rewind};
     use agent_core::{
@@ -300,6 +593,38 @@ mod tests {
                 outcome: TurnOutcome::Graceful,
             },
         ])
+    }
+
+    fn finished_turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptRecord> {
+        vec![
+            TranscriptRecord::TurnStarted {
+                turn_id: TurnId(turn_id),
+            },
+            TranscriptRecord::UserMessage(user.to_string()),
+            TranscriptRecord::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text(assistant.to_string())],
+            }),
+            TranscriptRecord::TurnFinished {
+                turn_id: TurnId(turn_id),
+                outcome: TurnOutcome::Graceful,
+            },
+        ]
+    }
+
+    fn session_with_compactable_history() -> AgentSession {
+        let mut records = Vec::new();
+        records.extend(finished_turn(
+            1,
+            "first user message with enough text to count",
+            "first assistant message with enough text to count",
+        ));
+        records.extend(finished_turn(
+            2,
+            "second user message with enough text to count",
+            "second assistant message with enough text to count",
+        ));
+        AgentSession::from_transcript(Transcript::from_records(records))
+            .with_auto_compaction(AutoCompactionSettings::new(1, 1))
     }
 
     #[test]
@@ -558,7 +883,7 @@ mod tests {
         let actions = session.drain_actions();
         assert!(matches!(
             actions.as_slice(),
-            [AgentAction::RequestModel { .. }]
+            [SessionAction::RequestModel { .. }]
         ));
         assert!(!session.can_edit_history(PendingWork::NONE));
 
@@ -571,6 +896,182 @@ mod tests {
             .expect("matching model completion is valid");
         session.drive();
         assert!(session.can_edit_history(PendingWork::NONE));
+    }
+
+    #[test]
+    fn auto_compaction_requests_one_shot_model_before_releasing_model_request() {
+        let mut session = session_with_compactable_history();
+        session
+            .enqueue_input(AgentInput::follow_up("third user message"))
+            .expect("plain follow-up is valid");
+        session.drive();
+
+        let actions = session.drain_actions();
+        let [SessionAction::RequestOneShotModel {
+            request_id,
+            request,
+        }] = actions.as_slice()
+        else {
+            panic!("expected one-shot compaction request, got {actions:?}");
+        };
+        assert_eq!(request.purpose, OneShotModelPurpose::Compaction);
+        assert!(request.input.iter().any(|block| {
+            matches!(
+                block,
+                crate::auto_compaction::ModelContentBlock::Text { text }
+                    if text.contains("first user message")
+            )
+        }));
+        assert_eq!(session.transcript().latest_compaction_summary(), None);
+        assert!(matches!(
+            session.transcript().records().last(),
+            Some(TranscriptRecord::UserMessage(text)) if text == "third user message"
+        ));
+        assert!(!session.can_edit_history(PendingWork::NONE));
+
+        let events = session.drain_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::RecordAppended {
+                record: TranscriptRecord::TurnStarted { turn_id: TurnId(3) },
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ActionRequested {
+                action: SessionAction::RequestOneShotModel { .. }
+            }
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            SessionEvent::RecordAppended {
+                record: TranscriptRecord::Custom(_),
+                ..
+            }
+        )));
+
+        session
+            .enqueue_session_input(SessionInput::OneShotModelCompleted {
+                request_id: *request_id,
+                output: OneShotModelOutput::Text("summary text".to_string()),
+            })
+            .expect("one-shot completion should be accepted");
+
+        assert_eq!(
+            session.drain_actions(),
+            vec![SessionAction::RequestModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(3),
+            }]
+        );
+        assert_eq!(
+            session.transcript().latest_compaction_summary(),
+            Some("summary text")
+        );
+        assert!(matches!(
+            session.transcript().records().last(),
+            Some(TranscriptRecord::UserMessage(text)) if text == "third user message"
+        ));
+
+        let events = session.drain_events();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ActionCompleted {
+                kind: SessionActionKind::OneShotModel,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ContextEdited {
+                kind: ContextEditKind::Compact
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            SessionEvent::ActionRequested {
+                action: SessionAction::RequestModel {
+                    action_id: ActionId(1),
+                    turn_id: TurnId(3)
+                }
+            }
+        )));
+    }
+
+    #[test]
+    fn failed_one_shot_compaction_releases_model_request_without_editing_context() {
+        let mut session = session_with_compactable_history();
+        session
+            .enqueue_input(AgentInput::follow_up("third user message"))
+            .expect("plain follow-up is valid");
+        session.drive();
+        let actions = session.drain_actions();
+        let [SessionAction::RequestOneShotModel { request_id, .. }] = actions.as_slice() else {
+            panic!("expected one-shot compaction request, got {actions:?}");
+        };
+
+        session
+            .enqueue_session_input(SessionInput::OneShotModelFailed {
+                request_id: *request_id,
+                error: "no summary".to_string(),
+            })
+            .expect("one-shot failure should be accepted");
+
+        assert_eq!(
+            session.drain_actions(),
+            vec![SessionAction::RequestModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(3),
+            }]
+        );
+        assert_eq!(session.transcript().latest_compaction_summary(), None);
+        assert!(session.drain_events().iter().any(|event| matches!(
+            event,
+            SessionEvent::ActionFailed {
+                kind: SessionActionKind::OneShotModel,
+                error,
+                ..
+            } if error == "no summary"
+        )));
+    }
+
+    #[test]
+    fn stale_one_shot_completion_does_not_unblock_pending_compaction() {
+        let mut session = session_with_compactable_history();
+        session
+            .enqueue_input(AgentInput::follow_up("third user message"))
+            .expect("plain follow-up is valid");
+        session.drive();
+        let actions = session.drain_actions();
+        let [SessionAction::RequestOneShotModel { request_id, .. }] = actions.as_slice() else {
+            panic!("expected one-shot compaction request, got {actions:?}");
+        };
+
+        session
+            .enqueue_session_input(SessionInput::OneShotModelCompleted {
+                request_id: OneShotModelRequestId(99),
+                output: OneShotModelOutput::Text("wrong".to_string()),
+            })
+            .expect("stale one-shot completion should be accepted and ignored");
+        assert!(session.drain_actions().is_empty());
+        assert_eq!(session.transcript().latest_compaction_summary(), None);
+        assert!(!session.can_edit_history(PendingWork::NONE));
+
+        session
+            .enqueue_session_input(SessionInput::OneShotModelCompleted {
+                request_id: *request_id,
+                output: OneShotModelOutput::Text("right".to_string()),
+            })
+            .expect("matching one-shot completion should be accepted");
+        assert!(matches!(
+            session.drain_actions().as_slice(),
+            [SessionAction::RequestModel { .. }]
+        ));
+        assert_eq!(
+            session.transcript().latest_compaction_summary(),
+            Some("right")
+        );
     }
 
     #[test]
@@ -606,7 +1107,7 @@ mod tests {
         session.drive();
         assert_eq!(
             session.drain_actions(),
-            vec![AgentAction::RequestModel {
+            vec![SessionAction::RequestModel {
                 action_id: ActionId(1),
                 turn_id: TurnId(2),
             }]
@@ -637,7 +1138,7 @@ mod tests {
         session.drive();
         assert_eq!(
             session.drain_actions(),
-            vec![AgentAction::RequestModel {
+            vec![SessionAction::RequestModel {
                 action_id: ActionId(2),
                 turn_id: TurnId(2),
             }]
@@ -800,7 +1301,7 @@ mod tests {
         let actions = session.drain_actions();
         assert!(actions
             .iter()
-            .any(|a| matches!(a, AgentAction::CancelTurn { .. })));
+            .any(|a| matches!(a, SessionAction::CancelTurn { .. })));
         assert!(session.can_edit_history(PendingWork::NONE));
     }
 }

@@ -71,7 +71,7 @@ impl ActionQueue {
         }
     }
 
-    pub(crate) fn record_input(&mut self, input: &AgentInput) {
+    pub(crate) fn record_input(&mut self, input: &AgentInput) -> bool {
         let target = match input {
             AgentInput::ModelCompleted {
                 action_id, turn_id, ..
@@ -90,11 +90,13 @@ impl ActionQueue {
             _ => None,
         };
         let Some(target) = target else {
-            return;
+            return false;
         };
         if let Some(position) = self.entries.iter().position(|k| *k == target) {
             self.entries.remove(position);
+            return true;
         }
+        false
     }
 }
 
