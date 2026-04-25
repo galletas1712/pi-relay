@@ -34,7 +34,6 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 **Edit ops and support types**
 - `HistoryEdit` — trait every op implements.
 - `SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceModelContext { replacement }`.
-- `PendingWork { background_tasks: usize }` — caller-declared invisible work.
 - `HistoryEditError` — `Busy`, `ReplacementNotAtTurnBoundary`, `Store(TranscriptStoreError)`.
 - `SummarySpanPlan` — produced by `TranscriptStore::prepare_summary_span`.
 - `CompactionPlan`, `CompactionSettings` — prefix-compaction policy produced by `TranscriptStore::prepare_compaction`.
@@ -75,14 +74,14 @@ let plan = session.transcript_store().prepare_compaction(settings);
 let span = session.transcript_store().prepare_summary_span(first_id, last_id)?;
 
 // Mutating ops flow through AgentSession::edit. The quiescence gate runs once.
-session.edit(pending, SummarizeSpan { plan: span, summary })?;       // Output = ()
-session.edit(pending, Compact { plan, summary })?;                   // Output = ()
-session.edit(pending, Rewind { leaf_id: Some(id) })?;                // Output = ()
-let previous = session.edit(pending, ReplaceModelContext { replacement })?;
+session.edit(SummarizeSpan { plan: span, summary })?;       // Output = ()
+session.edit(Compact { plan, summary })?;                   // Output = ()
+session.edit(Rewind { leaf_id: Some(id) })?;                // Output = ()
+let previous = session.edit(ReplaceModelContext { replacement })?;
 //                                                             Output = ModelContext
 
-// Fork is a direct method because it produces a NEW session.
-let forked: AgentSession = session.fork(pending, Some(&leaf_id))?;
+// Fork is a direct method because it copies a path into a NEW session.
+let forked: AgentSession = session.fork(Some(&leaf_id))?;
 ```
 
 ## Internals
@@ -101,7 +100,7 @@ let forked: AgentSession = session.fork(pending, Some(&leaf_id))?;
 | `src/model_context.rs` | `ModelContext` read-only view: `is_turn_boundary`, `latest_compaction_summary`, crashed-tail patching. |
 | `src/runner.rs` | `AgentRunner`, `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — async shell over `AgentSession`. |
 | `src/transcript_store/mod.rs` | `TranscriptStore` forest, `TranscriptStorageNode`, entry/parent/leaf indexes, materialization, `is_turn_boundary`, `TranscriptStoreError`. No kind-specific knowledge. |
-| `src/transcript_store/edit.rs` | `HistoryEdit` trait, `PendingWork`, `HistoryEditError`. |
+| `src/transcript_store/edit.rs` | `HistoryEdit` trait, `HistoryEditError`. |
 | `src/transcript_store/span.rs` | Generic span-summary primitive: `SummarizeSpan`, `SummarySpanPlan`, `prepare_summary_span`, span-boundary validation. |
 | `src/transcript_store/tokens.rs` | Internal approximate token estimation used by planning and auto-compaction. |
 | `src/transcript_store/ops/compaction.rs` | Prefix-compaction policy/op: `Compact`, `CompactionPlan`, `CompactionSettings`, `prepare_compaction`, `validate_plan_matches`, `KIND_COMPACTION_SUMMARY`, `compaction_summary`. |
@@ -159,7 +158,7 @@ After SummarizeSpan over E2..E3:
 
 `Esum` is a caller-provided injected summary entry; `E4'` / `E5'` are re-appended copies of the suffix transcript items as descendants of `Esum`. The old span and suffix stay in `entries()` as an orphaned branch for audit. `Compact` is a prefix-oriented policy wrapper over this primitive.
 
-### `HistoryEdit` trait + `PendingWork`
+### `HistoryEdit` trait
 
 ```rust
 pub trait HistoryEdit {
@@ -171,17 +170,16 @@ pub trait HistoryEdit {
 `AgentSession::edit` is the only place ops run. It first consults the quiescence gate:
 
 ```
-can_edit_history(pending) :=
+can_edit_history() :=
        core.is_idle()
     && transcript_store.is_turn_boundary()
     && !core.has_pending_work()
     && action_queue.is_empty()
     && action_outbox.is_empty()
     && pending_stateless_model.is_none()
-    && pending.is_empty()
 ```
 
-The session-owned checks cover state the session can see, including undrained observable actions such as `CancelTurn` that the harness still needs to execute. `PendingWork { background_tasks: usize }` is the counter for *invisible* work the caller is tracking on its own — worklog forks, background summarization calls — that must also finish before history is safe to touch. `PendingWork::NONE` is the zero value.
+The session-owned checks cover state the session can see, including undrained observable actions such as `CancelTurn` that the harness still needs to execute and session-owned stateless model work such as auto-compaction. Orchestrator-owned background work is policy above this layer: if the orchestrator wants to block edits while worklog forks or other side tasks are running, it should choose not to call `session.edit(...)`.
 
 Op outputs:
 
@@ -215,6 +213,6 @@ Transcript items are observed through the session's `model_context()` view; ther
 ## Relationship to other crates
 
 - **Upstream** `agent-core` — provides `AgentCoreLoop`, `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptItem`, `TurnId`, `ActionId`, `TurnOutcome`, `InjectedMessage`, and the message/tool-call vocabulary. `agent-session` re-exports these so downstream has a single import path.
-- **Downstream** `agent-orchestrator` — owns a `SessionRegistry<AgentSession>` keyed by `SessionId`, routes parent/child messages and reports, and delegates every history edit to `session.edit(pending, op)` / `session.fork(pending, leaf)`. It never reaches into `TranscriptStore` internals directly; it calls `session.transcript_store().prepare_compaction(..)` as a pure query and lets the session dispatch the resulting op.
+- **Downstream** `agent-orchestrator` — owns a `SessionRegistry<AgentSession>` keyed by `SessionId`, routes parent/child messages and reports, and delegates every history edit to `session.edit(op)` / `session.fork(leaf)`. It never reaches into `TranscriptStore` internals directly; it calls `session.transcript_store().prepare_compaction(..)` as a pure query and lets the session dispatch the resulting op.
 
 For cross-cutting context (control plane, cost aggregation, worklog forks, multi-agent spawn/report), see `rust/docs/architecture.md`.

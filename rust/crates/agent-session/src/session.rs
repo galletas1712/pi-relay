@@ -12,7 +12,7 @@ use crate::event::{HistoryEditKind, SessionActionKind, SessionEvent};
 use crate::input::{SessionInput, SessionInputError};
 use crate::model_context::ModelContext;
 use crate::transcript_store::{
-    compaction_summary, HistoryEdit, HistoryEditError, PendingWork, SummarizeSpan, TranscriptStore,
+    compaction_summary, HistoryEdit, HistoryEditError, SummarizeSpan, TranscriptStore,
     TranscriptStoreError,
 };
 
@@ -245,15 +245,14 @@ impl AgentSession {
 
     /// True when the session's history can be edited: core idle, context at a
     /// turn boundary, mailbox empty, no in-flight drained actions, and no
-    /// undrained observable actions or caller-tracked background work.
-    pub fn can_edit_history(&self, pending: PendingWork) -> bool {
+    /// undrained observable actions or session-owned stateless model work.
+    pub fn can_edit_history(&self) -> bool {
         self.core.is_idle()
             && self.transcript_store.is_turn_boundary()
             && !self.core.has_pending_work()
             && self.action_queue.is_empty()
             && self.action_outbox.is_empty()
             && self.pending_stateless_model.is_none()
-            && pending.is_empty()
     }
 
     /// Apply a `HistoryEdit` operation (`Compact`, `Rewind`,
@@ -262,12 +261,8 @@ impl AgentSession {
     /// The quiescence check runs once here; the op's `apply` then mutates the
     /// context directly. On success the core loop is rehydrated from the new
     /// context so the next `drive` resumes from the correct turn id.
-    pub fn edit<E: HistoryEdit>(
-        &mut self,
-        pending: PendingWork,
-        edit: E,
-    ) -> Result<E::Output, HistoryEditError> {
-        if !self.can_edit_history(pending) {
+    pub fn edit<E: HistoryEdit>(&mut self, edit: E) -> Result<E::Output, HistoryEditError> {
+        if !self.can_edit_history() {
             return Err(HistoryEditError::Busy);
         }
         let output = edit.apply(&mut self.transcript_store)?;
@@ -285,14 +280,7 @@ impl AgentSession {
     /// Fork stays as a direct method rather than a `HistoryEdit` impl because
     /// it reads the context and produces a new session rather than mutating
     /// the source in place.
-    pub fn fork(
-        &mut self,
-        pending: PendingWork,
-        leaf_id: Option<&str>,
-    ) -> Result<AgentSession, HistoryEditError> {
-        if !self.can_edit_history(pending) {
-            return Err(HistoryEditError::Busy);
-        }
+    pub fn fork(&self, leaf_id: Option<&str>) -> Result<AgentSession, HistoryEditError> {
         let transcript_store = self
             .transcript_store
             .create_branched_store_at_turn_boundary(leaf_id)
@@ -712,24 +700,18 @@ mod tests {
             .expect("plain follow-up is valid");
 
         let busy = session
-            .edit(
-                PendingWork::NONE,
-                ReplaceModelContext {
-                    replacement: finished_model_context("compact"),
-                },
-            )
+            .edit(ReplaceModelContext {
+                replacement: finished_model_context("compact"),
+            })
             .expect_err("running sessions cannot edit history");
         assert_eq!(busy, HistoryEditError::Busy);
 
         let mut session = AgentSession::from_model_context(finished_model_context("hello"));
 
         let old = session
-            .edit(
-                PendingWork::NONE,
-                ReplaceModelContext {
-                    replacement: finished_model_context("compact"),
-                },
-            )
+            .edit(ReplaceModelContext {
+                replacement: finished_model_context("compact"),
+            })
             .expect("idle session can swap model_context");
 
         assert_eq!(old.last_turn_id(), TurnId(1));
@@ -760,39 +742,61 @@ mod tests {
         let turn_one_end_id = session.transcript_store().entries()[2].id.clone();
 
         assert_eq!(
-            session.edit(
-                PendingWork::NONE,
-                Rewind {
-                    leaf_id: Some(mid_turn_id.clone())
-                }
-            ),
+            session.edit(Rewind {
+                leaf_id: Some(mid_turn_id.clone())
+            }),
             Err(HistoryEditError::Store(
                 TranscriptStoreError::NotTurnBoundary
             ))
         );
         assert_eq!(
-            session
-                .fork(PendingWork::NONE, Some(&mid_turn_id))
-                .map(|_| ()),
+            session.fork(Some(&mid_turn_id)).map(|_| ()),
             Err(HistoryEditError::Store(
                 TranscriptStoreError::NotTurnBoundary
             ))
         );
 
         session
-            .edit(
-                PendingWork::NONE,
-                Rewind {
-                    leaf_id: Some(turn_one_end_id.clone()),
-                },
-            )
+            .edit(Rewind {
+                leaf_id: Some(turn_one_end_id.clone()),
+            })
             .expect("turn end is a valid rewind point");
         assert_eq!(session.model_context().last_turn_id(), TurnId(1));
 
         let fork = session
-            .fork(PendingWork::NONE, Some(&turn_one_end_id))
+            .fork(Some(&turn_one_end_id))
             .expect("turn end is a valid fork point");
         assert_eq!(fork.model_context().last_turn_id(), TurnId(1));
+    }
+
+    #[test]
+    fn fork_can_copy_a_boundary_path_while_source_session_is_running() {
+        let mut session = AgentSession::from_model_context(finished_model_context("hello"));
+        let boundary_id = session
+            .transcript_store()
+            .entries()
+            .last()
+            .expect("finished context has a boundary entry")
+            .id
+            .clone();
+
+        session
+            .enqueue_input(AgentInput::follow_up("new work"))
+            .expect("plain follow-up is valid");
+        session.drive();
+        assert!(!session.can_edit_history());
+
+        let fork = session
+            .fork(Some(&boundary_id))
+            .expect("fork only copies the requested boundary path");
+        assert_eq!(fork.model_context().last_turn_id(), TurnId(1));
+        assert!(matches!(
+            fork.model_context().transcript_items().last(),
+            Some(TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            })
+        ));
     }
 
     #[test]
@@ -826,13 +830,10 @@ mod tests {
             })
             .expect("old turn should be compactable");
         session
-            .edit(
-                PendingWork::NONE,
-                Compact {
-                    plan,
-                    summary: "s".to_string(),
-                },
-            )
+            .edit(Compact {
+                plan,
+                summary: "s".to_string(),
+            })
             .expect("compact should apply");
         assert_eq!(
             session.model_context().latest_compaction_summary(),
@@ -841,16 +842,13 @@ mod tests {
     }
 
     #[test]
-    fn can_edit_history_requires_idle_core_empty_queues_and_no_pending_work() {
+    fn can_edit_history_requires_idle_core_empty_queues_and_no_session_side_work() {
         let mut session = AgentSession::new();
 
         session
             .enqueue_input(AgentInput::follow_up("hello"))
             .expect("plain follow-up is valid");
-        assert!(!session.can_edit_history(PendingWork::NONE));
-        assert!(!session.can_edit_history(PendingWork {
-            background_tasks: 1,
-        }));
+        assert!(!session.can_edit_history());
     }
 
     #[test]
@@ -1005,7 +1003,7 @@ mod tests {
             actions.as_slice(),
             [SessionAction::RequestModel { .. }]
         ));
-        assert!(!session.can_edit_history(PendingWork::NONE));
+        assert!(!session.can_edit_history());
 
         session
             .enqueue_input(AgentInput::ModelCompleted {
@@ -1015,7 +1013,7 @@ mod tests {
             })
             .expect("matching model completion is valid");
         session.drive();
-        assert!(session.can_edit_history(PendingWork::NONE));
+        assert!(session.can_edit_history());
     }
 
     #[test]
@@ -1047,7 +1045,7 @@ mod tests {
                 },
             ]
         );
-        assert!(session.can_edit_history(PendingWork::NONE));
+        assert!(session.can_edit_history());
         assert!(session.drain_events().iter().any(|event| matches!(
             event,
             SessionEvent::ActionFailed {
@@ -1086,7 +1084,7 @@ mod tests {
             session.model_context().transcript_items().last(),
             Some(TranscriptItem::UserMessage(text)) if text == "third user message"
         ));
-        assert!(!session.can_edit_history(PendingWork::NONE));
+        assert!(!session.can_edit_history());
 
         let events = session.drain_events();
         assert!(events.iter().any(|event| matches!(
@@ -1208,7 +1206,7 @@ mod tests {
             .expect("stale stateless model completion should be accepted and ignored");
         assert!(session.drain_actions().is_empty());
         assert_eq!(session.model_context().latest_compaction_summary(), None);
-        assert!(!session.can_edit_history(PendingWork::NONE));
+        assert!(!session.can_edit_history());
 
         session
             .enqueue_session_input(SessionInput::ModelStatelessCompleted {
@@ -1245,7 +1243,7 @@ mod tests {
 
         let late_actions = session.drain_actions();
         assert!(late_actions.is_empty());
-        assert!(session.can_edit_history(PendingWork::NONE));
+        assert!(session.can_edit_history());
     }
 
     #[test]
@@ -1268,15 +1266,12 @@ mod tests {
             })
             .expect("matching model completion is valid");
         session.drive();
-        assert!(session.can_edit_history(PendingWork::NONE));
+        assert!(session.can_edit_history());
 
         session
-            .edit(
-                PendingWork::NONE,
-                Rewind {
-                    leaf_id: Some(turn_one_end_id),
-                },
-            )
+            .edit(Rewind {
+                leaf_id: Some(turn_one_end_id),
+            })
             .expect("completed history can rewind to turn one");
         session
             .enqueue_input(AgentInput::follow_up("new second"))
@@ -1307,7 +1302,7 @@ mod tests {
                 TranscriptItem::UserMessage("new second".to_string()),
             ]
         );
-        assert!(!session.can_edit_history(PendingWork::NONE));
+        assert!(!session.can_edit_history());
 
         session
             .enqueue_input(AgentInput::ModelCompleted {
@@ -1340,7 +1335,7 @@ mod tests {
         assert_eq!(result, Err(AgentInputError::UnpairedOriginTags));
         session.drive();
         assert!(session.model_context().transcript_items().is_empty());
-        assert!(session.can_edit_history(PendingWork::NONE));
+        assert!(session.can_edit_history());
     }
 
     #[test]
@@ -1368,7 +1363,7 @@ mod tests {
             .expect("matching model completion is valid");
         session.drive();
         session.drain_actions();
-        assert!(!session.can_edit_history(PendingWork::NONE));
+        assert!(!session.can_edit_history());
 
         session
             .enqueue_input(AgentInput::ToolCompleted {
@@ -1385,7 +1380,7 @@ mod tests {
         session.drive();
         // A second model request fires after the tool completes; the session
         // is still waiting on that completion, so edits remain blocked.
-        assert!(!session.can_edit_history(PendingWork::NONE));
+        assert!(!session.can_edit_history());
         session.drain_actions();
         session
             .enqueue_input(AgentInput::ModelCompleted {
@@ -1395,7 +1390,7 @@ mod tests {
             })
             .expect("matching model completion is valid");
         session.drive();
-        assert!(session.can_edit_history(PendingWork::NONE));
+        assert!(session.can_edit_history());
     }
 
     #[test]
@@ -1423,7 +1418,7 @@ mod tests {
             .append_injected(InjectedMessage::new("note", "c"));
 
         assert!(session.transcript_store().is_turn_boundary());
-        assert!(session.can_edit_history(PendingWork::NONE));
+        assert!(session.can_edit_history());
     }
 
     #[test]
@@ -1439,11 +1434,11 @@ mod tests {
             .enqueue_input(AgentInput::Interrupt)
             .expect("interrupt is valid");
         session.drive();
-        assert!(!session.can_edit_history(PendingWork::NONE));
+        assert!(!session.can_edit_history());
         let actions = session.drain_actions();
         assert!(actions
             .iter()
             .any(|a| matches!(a, SessionAction::CancelTurn { .. })));
-        assert!(session.can_edit_history(PendingWork::NONE));
+        assert!(session.can_edit_history());
     }
 }

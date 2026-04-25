@@ -224,7 +224,6 @@ mod tests {
     use super::*;
     use crate::model_context::ModelContext;
     use crate::session::AgentSession;
-    use crate::transcript_store::edit::PendingWork;
     use agent_core::{
         ActionId, AgentInput, AssistantItem, AssistantMessage, InjectedMessage, TranscriptItem,
         TurnId, TurnOutcome,
@@ -299,13 +298,10 @@ mod tests {
             .expect("old turn should be compactable");
 
         session
-            .edit(
-                PendingWork::NONE,
-                Compact {
-                    plan,
-                    summary: "summary".to_string(),
-                },
-            )
+            .edit(Compact {
+                plan,
+                summary: "summary".to_string(),
+            })
             .expect("history edit can compact");
 
         let transcript = session.model_context();
@@ -406,13 +402,10 @@ mod tests {
             })
             .expect("old turn should be compactable");
         session
-            .edit(
-                PendingWork::NONE,
-                Compact {
-                    plan,
-                    summary: "summary".to_string(),
-                },
-            )
+            .edit(Compact {
+                plan,
+                summary: "summary".to_string(),
+            })
             .expect("history edit can compact");
 
         // TranscriptStore grew by: 1 (CompSum) + 4 (re-appended turn 2 items) = 5.
@@ -473,13 +466,10 @@ mod tests {
             })
             .expect("old turns should be compactable");
         session
-            .edit(
-                PendingWork::NONE,
-                Compact {
-                    plan,
-                    summary: "first summary".to_string(),
-                },
-            )
+            .edit(Compact {
+                plan,
+                summary: "first summary".to_string(),
+            })
             .expect("first compaction should apply");
         assert_eq!(
             session.model_context().latest_compaction_summary(),
@@ -512,13 +502,10 @@ mod tests {
             })
             .expect("T3 is compactable past the first summary on the active branch");
         session
-            .edit(
-                PendingWork::NONE,
-                Compact {
-                    plan: plan2,
-                    summary: "second summary".to_string(),
-                },
-            )
+            .edit(Compact {
+                plan: plan2,
+                summary: "second summary".to_string(),
+            })
             .expect("second compaction should apply");
 
         let transcript = session.model_context();

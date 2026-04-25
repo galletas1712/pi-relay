@@ -192,7 +192,7 @@ Already landed in PR #62 + #63 refactors.
 
 Partially landed in PR #63; decomposition planned.
 
-- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore`. The session is the sole owner of durable transcript items for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `model_context`, `transcript_store`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `HistoryEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
+- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore`. The session is the sole owner of durable transcript items for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `model_context`, `transcript_store`, `drain_actions`. History-edit surface: `edit(op)` dispatches a `HistoryEdit` op struct after checking session-owned quiescence; `fork(leaf)` is a non-mutating direct method that returns an unregistered child `AgentSession`.
 - **`HistoryEdit` trait + op structs** — each history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceModelContext { replacement }`) that implements `HistoryEdit { type Output; fn apply(self, &mut TranscriptStore) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `TranscriptStore` (`session.transcript_store().prepare_summary_span(first, last)`); prefix compaction is policy on top (`session.transcript_store().prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
 - **`TranscriptStore`** — session-local forest of `TranscriptStorageNode`s with entry/parent/child/leaf indexes plus an active leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
 - **`ModelContext`** — materialized view of the current root-to-leaf path's transcript items. Live model contexts preserve open turns; resume paths explicitly crash-recover any open tail.
@@ -309,20 +309,20 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 - `session.transcript_store().prepare_summary_span(first, last)` is the generic primitive: replace a contiguous active-branch span with a summary and replay the suffix.
 - `session.transcript_store().prepare_compaction(settings)` produces a `CompactionPlan` as prefix-compaction policy on top of that primitive.
 - `Compactor::summarize(plan)` calls a `ModelProvider` to generate the summary string.
-- `session.edit(pending, Compact { plan, summary })` applies the prepared summary span with a `compaction_summary` item.
+- `session.edit(Compact { plan, summary })` applies the prepared summary span with a `compaction_summary` item.
 - Orchestrator observes `SessionEvent::TranscriptItemAppended { item: TranscriptItem::TurnFinished { .. } }` and checks thresholds; if tripped, drives the compaction pipeline.
 
 ### Rewind
 
 **Status**: landed (PR #63).
 
-- `session.edit(pending, Rewind { leaf_id: Some(leaf) })` moves the log's leaf pointer; the core is rehydrated from the new materialized view.
+- `session.edit(Rewind { leaf_id: Some(leaf) })` moves the log's leaf pointer; the core is rehydrated from the new materialized view.
 
 ### Fork (as primitive)
 
 **Status**: landed (PR #63).
 
-- `session.fork(pending, Some(leaf))` returns an unregistered `AgentSession` with a fresh `TranscriptStore` containing a copy of only the ancestor path from root to `leaf`. The child does not inherit sibling context branches, abandoned descendants, queued inputs, in-flight actions, events, or other already-forked sessions. In the future shared-store implementation this becomes a cheap second session pointer to the same leaf/path. Caller configures the child (tool registry, initial injections, initial input) and registers it via `SessionRegistry`.
+- `session.fork(Some(leaf))` returns an unregistered `AgentSession` with a fresh `TranscriptStore` containing a copy of only the ancestor path from root to `leaf`. The source session is unchanged, so fork does not require the source session itself to be quiescent; the requested leaf still must be a turn boundary. The child does not inherit sibling context branches, abandoned descendants, queued inputs, in-flight actions, events, or other already-forked sessions. In the future shared-store implementation this becomes a cheap second session pointer to the same leaf/path. Caller configures the child (tool registry, initial injections, initial input) and registers it via `SessionRegistry`.
 
 ### Spawn (tool)
 
@@ -429,9 +429,9 @@ This closes the liveness hole where repeated appends during an async summarize c
 
 ### Child reports are mailbox inputs, not history edits
 
-When a child emits `report(content)`, the orchestrator does **not** open `edit_history` on the parent. Instead the report enters the parent's mailbox as a tagged `AgentInput::FollowUp` via `follow_up_tagged(from, KIND_AGENT_REPORT, content)`. The parent's FSM materializes it as a `TranscriptItem::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to future agent-visible notifications: use tagged mailbox input for messages that should become model-visible context, and keep purely live signals as `SessionEvent`s.
+When a child emits `report(content)`, the orchestrator does **not** call `session.edit(...)` on the parent. Instead the report enters the parent's mailbox as a tagged `AgentInput::FollowUp` via `follow_up_tagged(from, KIND_AGENT_REPORT, content)`. The parent's FSM materializes it as a `TranscriptItem::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to future agent-visible notifications: use tagged mailbox input for messages that should become model-visible context, and keep purely live signals as `SessionEvent`s.
 
-This keeps `AgentSession::edit`/`fork` for genuine structural edits (compact, rewind, fork, replace_transcript) and removes the `entry_count`-churning source of compaction plan staleness.
+This keeps `AgentSession::edit` for genuine structural mutations (`Compact`, `Rewind`, `ReplaceModelContext`) and keeps `AgentSession::fork` as a non-mutating copy operation. Reports therefore do not churn `entry_count` before the parent actually consumes them.
 
 ### Spawn is fire-and-forget and creates a fresh session
 
@@ -445,7 +445,7 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 7. Non-goals
 
-- No support for session transcripts that aren't at turn boundaries during structural ops. Compaction/rewind/fork always require a quiescent turn boundary. Enforced by `AgentSession::edit`/`fork`'s quiescence check.
+- No support for mutating session transcripts that aren't at turn boundaries. Structural edits such as compaction, rewind, and model-context replacement require `AgentSession::edit` to pass its session-owned quiescence check. `AgentSession::fork` is not a mutation of the source session; it can copy any requested leaf that is already a turn boundary, even if the source session is currently busy elsewhere.
 - No speculative abstraction for "hooks" that don't have concrete use cases. When extensions land, their API grows out of what concrete consumers need, not ahead of them.
 - No speculative support for non-Anthropic-shaped providers beyond what `ModelProvider` naturally allows. Any provider that fits `messages + tools → assistant with tool_calls` works; we don't pre-bake support for genuinely different paradigms (e.g. step-wise agent protocols) until we have one.
 - No back-compat with the TS session format *as a byte format* — the JSONL backend may use the same layout for cross-implementation convenience, but we don't pin wire-format compatibility as a hard constraint.
@@ -455,7 +455,7 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 8. Principles in tension (explicit trade-offs)
 
-**Clean boundaries vs. API ergonomics.** The `session.edit(pending, SummarizeSpan { plan, summary })?` form is more verbose than a single `session.compactAtBoundary(plan, summary, work)` helper. Accepting the verbosity because it encodes which operations are history-edit-only in the type system.
+**Clean boundaries vs. API ergonomics.** The `session.edit(SummarizeSpan { plan, summary })?` form is more verbose than a single `session.compactAtBoundary(plan, summary)` helper. Accepting the verbosity because it encodes which operations are history-edit-only in the type system.
 
 **Distributed-ready API vs. sync simplicity.** `ControlPlane` is async + fallible even when called in-process. Paying this for day-1 local use to keep daemon-day migration trivial.
 

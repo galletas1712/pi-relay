@@ -18,30 +18,11 @@ pub trait HistoryEdit {
     fn apply(self, ctx: &mut TranscriptStore) -> Result<Self::Output, HistoryEditError>;
 }
 
-/// Caller-tracked work the session cannot observe (worklog forks, background
-/// summarization calls, etc.). The session tracks its own in-flight model and
-/// tool requests internally via the action queue, so those are not represented
-/// here.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct PendingWork {
-    pub background_tasks: usize,
-}
-
-impl PendingWork {
-    pub const NONE: Self = Self {
-        background_tasks: 0,
-    };
-
-    pub fn is_empty(self) -> bool {
-        self.background_tasks == 0
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryEditError {
     /// The session cannot currently edit its history (core still running,
     /// durable leaf mid-turn, mailbox non-empty, undrained actions remain, or
-    /// pending work is outstanding).
+    /// session-owned side work is outstanding).
     Busy,
     /// A model context supplied to `ReplaceModelContext` did not itself end at
     /// a turn boundary.

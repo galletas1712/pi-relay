@@ -132,8 +132,8 @@ mod tests {
     use super::*;
     use agent_core::{AgentInput, AssistantMessage, TranscriptItem, TurnId, TurnOutcome};
     use agent_session::{
-        Compact, CompactionSettings, HistoryEditError, ModelContext, PendingWork,
-        ReplaceModelContext, Rewind, TranscriptStoreError,
+        Compact, CompactionSettings, HistoryEditError, ModelContext, ReplaceModelContext, Rewind,
+        TranscriptStoreError,
     };
 
     #[test]
@@ -178,12 +178,9 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit(
-                PendingWork::NONE,
-                ReplaceModelContext {
-                    replacement: model_context,
-                },
-            )
+            .edit(ReplaceModelContext {
+                replacement: model_context,
+            })
             .expect("idle empty session can replace model_context");
 
         assert_eq!(
@@ -228,12 +225,9 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit(
-                PendingWork::NONE,
-                Rewind {
-                    leaf_id: Some(mid_turn_id.clone()),
-                },
-            );
+            .edit(Rewind {
+                leaf_id: Some(mid_turn_id.clone()),
+            });
         assert!(matches!(
             rewind_err,
             Err(HistoryEditError::Store(
@@ -245,7 +239,7 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .fork(PendingWork::NONE, Some(&turn_one_end_id))
+            .fork(Some(&turn_one_end_id))
             .expect("turn boundary fork should succeed");
         orchestrator
             .registry_mut()
@@ -278,13 +272,10 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit(
-                PendingWork::NONE,
-                Compact {
-                    plan,
-                    summary: "summary".to_string(),
-                },
-            )
+            .edit(Compact {
+                plan,
+                summary: "summary".to_string(),
+            })
             .expect("root can compact at turn boundary");
         assert_eq!(
             orchestrator

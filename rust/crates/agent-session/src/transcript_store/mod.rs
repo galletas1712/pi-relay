@@ -11,7 +11,7 @@ pub(crate) mod ops;
 pub(crate) mod span;
 pub(crate) mod tokens;
 
-pub use self::edit::{HistoryEdit, HistoryEditError, PendingWork};
+pub use self::edit::{HistoryEdit, HistoryEditError};
 pub use self::ops::compaction::{
     compaction_summary, Compact, CompactionPlan, CompactionSettings, KIND_COMPACTION_SUMMARY,
 };
