@@ -83,7 +83,7 @@ pub(crate) fn compaction_request(plan: &CompactionPlan) -> StatelessModelRequest
         });
     }
     input.push(ModelContentBlock::Text {
-        text: format_transcript_items("TranscriptStore to summarize", &plan.items_to_summarize),
+        text: format_transcript_items("Context to summarize", &plan.items_to_summarize),
     });
     input.push(ModelContentBlock::Text {
         text: format_transcript_items("Recent context that will be kept", &plan.items_to_keep),

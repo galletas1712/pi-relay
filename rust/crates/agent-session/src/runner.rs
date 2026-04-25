@@ -71,9 +71,9 @@ pub struct AgentInputReceiver {
 ///
 /// AgentRunner owns the proactive run loop: it receives inputs, drives the
 /// session until quiescent, and forwards any requested actions to the
-/// registered handler. Records flow automatically into the session log via
+/// registered handler. Transcript items flow automatically into the session log via
 /// `AgentSession::drive`, so callers observing durable history read it off
-/// the session's model_context rather than through a item callback.
+/// the session's model_context rather than through a transcript-item callback.
 ///
 /// Action handlers are dispatch hooks, not long-running workers. A handler may
 /// register or spawn model/tool work and enqueue the eventual completion

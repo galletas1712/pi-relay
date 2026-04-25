@@ -136,12 +136,8 @@ struct TranscriptStore {
     parent_by_id: HashMap<EntryId, Option<EntryId>>,
     children_by_parent: HashMap<Option<EntryId>, Vec<EntryId>>,
     leaf_ids: Set<EntryId>,
-}
-
-struct AgentSession {
-    current_leaf_id: Option<EntryId>,
-    // current implementation keeps this inside its session-local store;
-    // future copy-on-write storage can hoist it into SessionStore.
+    insertion_order: Vec<EntryId>,
+    active_leaf_id: Option<EntryId>,
 }
 ```
 
@@ -188,7 +184,7 @@ Multi-agent relationships (spawn parents, children) live in the `SessionRegistry
 
 Already landed in PR #62 + #63 refactors.
 
-- **`AgentCoreLoop`** — FSM + mailbox + outboxes. Private fields. Public API: `new`, `resume_at_boundary`, `enqueue_input`, `drive`, `drain_transcript_items`, `drain_actions`, `is_idle`, `has_pending_work`, `last_turn_id`.
+- **`AgentCoreLoop`** — FSM + mailbox + outboxes. Private fields. Public API: `new`, `resume_at_boundary`, `resume_at_boundary_with_next_action_id`, `enqueue_input`, `drive`, `drain_transcript_items`, `drain_actions`, `drain_pending_inputs`, `is_idle`, `has_pending_work`, `last_turn_id`, `next_action_id`.
 - **`AgentState`** — private. `Idle | RunningModel | RunningTools | ReadyToContinue`.
 - **`Mailbox`** — private. Priority queue: Interrupt > ModelCompleted/ModelFailed/ToolCompleted > ContinueModel when `ReadyToContinue` > Steer > FollowUp.
 
@@ -350,7 +346,7 @@ The child is not a context fork of the parent. Model, tools, and inherited conte
 **Status**: not yet.
 
 1. Child's LLM emits `tool_call: report(content)`.
-2. `ReportTool::execute` calls `orchestrator.route_report(from=child_id, content)`.
+2. `ReportTool::execute` calls `orchestrator.send_report(from=child_id, content)`.
 3. Orchestrator looks up `parent = registry.parent(child_id)` and enqueues a tagged `FollowUp` on the parent's mailbox. The parent materializes it as `TranscriptItem::Injected(InjectedMessage { kind: "agent_report", ... })` when the report starts a turn.
 4. ReportTool returns `ok`. Child turn continues.
 

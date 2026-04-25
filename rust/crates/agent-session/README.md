@@ -17,12 +17,13 @@ What this crate does *not* own: no model calls, no tool execution, no cost track
 All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-orchestrator`, tests, and future daemon frontends) use only these.
 
 **Composition types**
-- `AgentSession` — core loop + transcript store + active path + action queue, the unit of agent state.
+- `AgentSession` — core loop + transcript store + active path + action queue, the unit of agent state. Constructors and runtime helpers include `new`, `from_transcript_items`, `from_model_context`, `from_transcript_store`, `drive`, `enqueue_input`, `enqueue_session_input`, `drain_actions`, `drain_events`, `drain_pending_inputs`, `model_context`, `transcript_store`, `can_edit_history`, `edit`, and `fork`.
 - `AgentRunner` — async wrapper that drives a session off an input channel.
 - `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — sender/receiver pair for the runner's input channel.
 - `SessionAction` — model/tool/cancel actions plus session-owned `RequestModelStateless`. `RequestModel` carries the model-context snapshot visible when the model request was made.
 - `SessionInput`, `SessionInputError` — core inputs plus stateless model completions/failures.
 - `SessionEvent` — ephemeral live activity (`TranscriptItemAppended`, `ActionRequested`, `ActionCompleted`, `ActionFailed`, `HistoryEdited`).
+- `SessionActionKind`, `HistoryEditKind` — lightweight event classifiers surfaced by `SessionEvent`.
 
 **Durable state**
 - `TranscriptStore` — append-only forest of `TranscriptStorageNode`s plus the session's active leaf.
@@ -38,7 +39,7 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 - `SummarySpanPlan` — produced by `TranscriptStore::prepare_summary_span`.
 - `CompactionPlan`, `CompactionSettings` — prefix-compaction policy produced by `TranscriptStore::prepare_compaction`.
 - `AutoCompactionSettings` — optional session policy that pauses a model request and emits stateless model compaction work when the model context is over budget.
-- `StatelessModelRequest`, `StatelessModelRequestId`, `StatelessModelOutput`, `ModelContentBlock`, `ImageInput` — stateless side-model request/response vocabulary.
+- `StatelessModelRequest`, `StatelessModelRequestId`, `StatelessModelOutput`, `StatelessModelOutputSpec`, `ModelContentBlock`, `ImageInput` — stateless side-model request/response vocabulary.
 
 **Well-known injected-message kinds**
 - `KIND_COMPACTION_SUMMARY = "compaction_summary"` + `compaction_summary(content, first_kept_entry_id, tokens_before)` builder.
