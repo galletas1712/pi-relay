@@ -132,7 +132,7 @@ fn started_turn_id(records: &[TranscriptRecord]) -> Option<TurnId> {
         | TranscriptRecord::ToolCallStarted { .. }
         | TranscriptRecord::ToolResult(_)
         | TranscriptRecord::TurnFinished { .. }
-        | TranscriptRecord::Custom(_) => None,
+        | TranscriptRecord::Injected(_) => None,
     })
 }
 
@@ -146,7 +146,7 @@ mod tests {
     use crate::message::{
         AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
     };
-    use crate::record::{CustomMessage, TurnOutcome};
+    use crate::record::{InjectedMessage, TurnOutcome};
 
     fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {
         AssistantMessage { items }
@@ -637,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_turn_from_tagged_input_produces_custom_transcript_entry() {
+    fn idle_turn_from_tagged_input_produces_injected_transcript_entry() {
         let mut loop_state = AgentCoreLoop::new();
 
         let records = drive_collect(
@@ -652,7 +652,7 @@ mod tests {
             records,
             vec![
                 TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::Custom(CustomMessage {
+                TranscriptRecord::Injected(InjectedMessage {
                     kind: "agent_directive".to_string(),
                     content: "please do X".to_string(),
                     metadata: expected_metadata,

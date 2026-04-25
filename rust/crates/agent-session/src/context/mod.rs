@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_core::{CustomMessage, TranscriptRecord};
+use agent_core::{InjectedMessage, TranscriptRecord};
 use uuid::Uuid;
 
 use crate::transcript::Transcript;
@@ -71,9 +71,10 @@ impl Context {
     }
 
     /// True when `leaf_id` points at a turn boundary (either a
-    /// `TurnFinished` entry directly, or the empty-log sentinel). `Custom`
-    /// entries are transparent — they live between turns, so the check walks
-    /// past them to find the underlying `TurnFinished`.
+    /// `TurnFinished` entry directly, or the empty-log sentinel). Trailing
+    /// injected entries are transparent: the check walks past them to find the
+    /// underlying boundary. An injected turn opener still resolves to
+    /// `TurnStarted`, so it is not a boundary.
     pub fn is_turn_boundary_leaf<'a>(&'a self, leaf_id: Option<&'a str>) -> bool {
         let mut cursor = leaf_id;
         loop {
@@ -85,7 +86,7 @@ impl Context {
             };
             match &entry.record {
                 TranscriptRecord::TurnFinished { .. } => return true,
-                TranscriptRecord::Custom(_) => {
+                TranscriptRecord::Injected(_) => {
                     cursor = entry.parent_id.as_deref();
                 }
                 _ => return false,
@@ -107,9 +108,9 @@ impl Context {
             .collect()
     }
 
-    /// Append a `TranscriptRecord::Custom(custom)` entry and return its id.
-    pub fn append_custom(&mut self, custom: CustomMessage) -> String {
-        self.append_record(TranscriptRecord::Custom(custom))
+    /// Append a `TranscriptRecord::Injected(injected)` entry and return its id.
+    pub fn append_injected(&mut self, injected: InjectedMessage) -> String {
+        self.append_record(TranscriptRecord::Injected(injected))
     }
 
     pub fn branch(&mut self, entry_id: &str) -> Result<(), ContextError> {
@@ -235,7 +236,7 @@ fn now_ms() -> u128 {
 mod tests {
     use super::*;
     use crate::context::compaction::compaction_summary;
-    use agent_core::{AssistantItem, AssistantMessage, CustomMessage, TurnId, TurnOutcome};
+    use agent_core::{AssistantItem, AssistantMessage, InjectedMessage, TurnId, TurnOutcome};
 
     fn turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptRecord> {
         vec![
@@ -291,7 +292,7 @@ mod tests {
 
         ctx.branch_at_turn_boundary(&first_ids[3])
             .expect("T1 boundary is a valid fork point");
-        ctx.append_custom(compaction_summary("summary", second_ids[0].clone(), 100));
+        ctx.append_injected(compaction_summary("summary", second_ids[0].clone(), 100));
         ctx.append_transcript_records(kept_records);
 
         let transcript = ctx.transcript();
@@ -299,7 +300,7 @@ mod tests {
         assert_eq!(transcript.last_turn_id(), TurnId(2));
         assert!(matches!(
             transcript.records()[4],
-            TranscriptRecord::Custom(_)
+            TranscriptRecord::Injected(_)
         ));
         assert!(matches!(
             transcript.records()[5],
@@ -310,15 +311,15 @@ mod tests {
     }
 
     #[test]
-    fn fork_at_custom_tail_is_a_valid_turn_boundary() {
+    fn fork_at_injected_tail_is_a_valid_turn_boundary() {
         let mut ctx = Context::new();
         ctx.append_transcript_records(turn(1, "hi", "done"));
-        let custom_id = ctx.append_custom(CustomMessage::new("note", "note"));
+        let injected_id = ctx.append_injected(InjectedMessage::new("note", "note"));
 
         assert!(ctx.is_turn_boundary());
         let forked = ctx
-            .create_branched_context_at_turn_boundary(Some(&custom_id))
-            .expect("Custom tail should be a valid fork boundary");
-        assert_eq!(forked.leaf_id(), Some(custom_id.as_str()));
+            .create_branched_context_at_turn_boundary(Some(&injected_id))
+            .expect("injected tail should be a valid fork boundary");
+        assert_eq!(forked.leaf_id(), Some(injected_id.as_str()));
     }
 }

@@ -1,4 +1,4 @@
-use agent_core::{CustomMessage, TranscriptRecord};
+use agent_core::{InjectedMessage, TranscriptRecord};
 
 use crate::context::edit::{ContextEdit, HistoryEditError};
 use crate::context::summary::{
@@ -8,30 +8,30 @@ use crate::context::summary::{
 use crate::context::{Context, ContextError, SessionEntry};
 use crate::transcript::Transcript;
 
-/// Well-known `CustomMessage::kind` for compaction summaries.
+/// Well-known `InjectedMessage::kind` for compaction summaries.
 pub const KIND_COMPACTION_SUMMARY: &str = "compaction_summary";
 
-/// Build a `CustomMessage` tagged as a compaction summary with the standard
+/// Build an `InjectedMessage` tagged as a compaction summary with the standard
 /// `first_kept_entry_id` + `tokens_before` metadata.
 pub fn compaction_summary(
     content: impl Into<String>,
     first_kept_entry_id: impl Into<String>,
     tokens_before: usize,
-) -> CustomMessage {
-    CustomMessage::new(KIND_COMPACTION_SUMMARY, content)
+) -> InjectedMessage {
+    InjectedMessage::new(KIND_COMPACTION_SUMMARY, content)
         .with_metadata("first_kept_entry_id", first_kept_entry_id)
         .with_metadata("tokens_before", tokens_before.to_string())
 }
 
-/// True if the record is a `Custom` with kind = `compaction_summary`.
+/// True if the record is injected context with kind = `compaction_summary`.
 pub(crate) fn is_compaction_summary(record: &TranscriptRecord) -> bool {
-    matches!(record, TranscriptRecord::Custom(cm) if cm.kind == KIND_COMPACTION_SUMMARY)
+    matches!(record, TranscriptRecord::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY)
 }
 
 /// Pull the `first_kept_entry_id` metadata off a compaction summary record.
 pub(crate) fn compaction_first_kept_entry_id(record: &TranscriptRecord) -> Option<&str> {
     match record {
-        TranscriptRecord::Custom(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
+        TranscriptRecord::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
             cm.metadata.get("first_kept_entry_id").map(|s| s.as_str())
         }
         _ => None,
@@ -80,7 +80,7 @@ impl Context {
 
         let (boundary_start, previous_entry, span_start) = boundary_start_index(&path);
         let previous_summary = previous_entry.and_then(|entry| match &entry.record {
-            TranscriptRecord::Custom(cm) => Some(cm.content.clone()),
+            TranscriptRecord::Injected(cm) => Some(cm.content.clone()),
             _ => None,
         });
 
@@ -235,7 +235,7 @@ mod tests {
     use crate::context::edit::PendingWork;
     use crate::session::AgentSession;
     use agent_core::{
-        ActionId, AgentInput, AssistantItem, AssistantMessage, CustomMessage, TranscriptRecord,
+        ActionId, AgentInput, AssistantItem, AssistantMessage, InjectedMessage, TranscriptRecord,
         TurnId, TurnOutcome,
     };
 
@@ -322,7 +322,7 @@ mod tests {
         assert_eq!(session.transcript().last_turn_id(), TurnId(2));
         assert!(matches!(
             transcript.records().first(),
-            Some(TranscriptRecord::Custom(_))
+            Some(TranscriptRecord::Injected(_))
         ));
         // T1's records are no longer visible in the materialized view; the
         // old branch lives on as an orphan in the full context entries.
@@ -334,18 +334,18 @@ mod tests {
     }
 
     #[test]
-    fn compaction_plan_keeps_model_visible_custom_records() {
+    fn compaction_plan_keeps_model_visible_injected_records() {
         let mut ctx = Context::new();
         ctx.append_transcript_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::Custom(CustomMessage::new("agent_directive", "do first")),
+            TranscriptRecord::Injected(InjectedMessage::new("agent_directive", "do first")),
             TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
             TranscriptRecord::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
             TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::Custom(CustomMessage::new("agent_report", "second report")),
+            TranscriptRecord::Injected(InjectedMessage::new("agent_report", "second report")),
             TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
             TranscriptRecord::TurnFinished {
                 turn_id: TurnId(2),
@@ -360,10 +360,10 @@ mod tests {
             .expect("first turn should be compactable");
 
         assert!(plan.records_to_summarize.iter().any(
-            |record| matches!(record, TranscriptRecord::Custom(cm) if cm.kind == "agent_directive")
+            |record| matches!(record, TranscriptRecord::Injected(cm) if cm.kind == "agent_directive")
         ));
         assert!(plan.records_to_keep.iter().any(
-            |record| matches!(record, TranscriptRecord::Custom(cm) if cm.kind == "agent_report")
+            |record| matches!(record, TranscriptRecord::Injected(cm) if cm.kind == "agent_report")
         ));
 
         Compact {
@@ -374,7 +374,7 @@ mod tests {
         .expect("compaction should apply");
 
         assert!(ctx.transcript().records().iter().any(
-            |record| matches!(record, TranscriptRecord::Custom(cm) if cm.kind == "agent_report")
+            |record| matches!(record, TranscriptRecord::Injected(cm) if cm.kind == "agent_report")
         ));
     }
 
@@ -433,7 +433,7 @@ mod tests {
         let records = transcript.records();
         assert!(matches!(
             records.first(),
-            Some(TranscriptRecord::Custom(cm)) if cm.kind == KIND_COMPACTION_SUMMARY
+            Some(TranscriptRecord::Injected(cm)) if cm.kind == KIND_COMPACTION_SUMMARY
         ));
         assert_eq!(records.len(), 5);
         assert_eq!(transcript.last_turn_id(), TurnId(2));
@@ -534,7 +534,7 @@ mod tests {
             .records()
             .iter()
             .filter(
-                |r| matches!(r, TranscriptRecord::Custom(cm) if cm.kind == KIND_COMPACTION_SUMMARY),
+                |r| matches!(r, TranscriptRecord::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY),
             )
             .count();
         assert_eq!(summary_count, 1);

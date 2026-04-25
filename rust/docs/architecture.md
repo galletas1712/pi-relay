@@ -80,6 +80,13 @@ enum TranscriptRecord {
     ToolCallStarted { turn_id, tool_call },
     ToolResult(ToolResultMessage),
     TurnFinished { turn_id, outcome },
+    Injected(InjectedMessage),
+}
+
+struct InjectedMessage {
+    kind: String,
+    content: String,
+    metadata: BTreeMap<String, String>,
 }
 
 // What the FSM requests the outside world do:
@@ -108,49 +115,30 @@ Every one of these serializes. The FSM never holds non-POD state beyond these.
 ### Log entries (layer 3, in `agent-session`)
 
 ```rust
-enum SessionEntryKind {
-    Transcript(TranscriptRecord),
-    Injected(InjectedMessage),
-}
-
-struct InjectedMessage {
-    kind: InjectedKind,
-    content: String,
-}
-
-enum InjectedKind {
-    CompactionSummary { first_kept_entry_id, tokens_before },
-
-    // Multi-agent (added with spawn/report/idle):
-    SpawnBrief        { from: SessionId },
-    ChildReport       { from: SessionId },
-    ChildIdle         { from: SessionId },
+struct SessionEntry {
+    id: EntryId,
+    parent_id: Option<EntryId>,
+    record: TranscriptRecord,
 }
 ```
 
-**Every "thing injected into the model's view that isn't a literal turn record" is an `InjectedMessage` with a kind tag.** One variant, one materialization path, one serialization. New feature → new `InjectedKind` arm, not a new entry type.
+**Every durable "thing injected into the model's view" is a `TranscriptRecord::Injected(InjectedMessage)` with a kind tag.** One variant, one materialization path, one serialization. New feature -> new well-known kind string and metadata convention, not a new entry type. Ephemeral lifecycle signals remain `SessionEvent`s, not injected transcript records.
 
 ### Session events (layer 3, observable)
 
 ```rust
 enum SessionEvent {
-    // Durable (mirror of what's appended to the log):
-    RecordAppended { id: EntryId, record: TranscriptRecord },
-    InjectionAppended { id: EntryId, injection: InjectedMessage },
-    LeafMoved { new_leaf: Option<EntryId> },
-
-    // Ephemeral telemetry (not persisted):
-    UsageRecorded { ctx: UsageContext, usage: Usage },
-    RetryAttempt { turn_id, attempt: u32 },
-    CachePassObserved { r_tokens: u64, w_tokens: u64 },
-
-    // FSM transitions observers may care about:
-    StateChanged { from: AgentStateKind, to: AgentStateKind },
-    TurnFinished { turn_id, outcome: TurnOutcome },
+    RecordAppended { entry_id: EntryId, record: TranscriptRecord },
+    ActionRequested { action: SessionAction },
+    ActionCompleted { kind: SessionActionKind, id: String },
+    ActionFailed { kind: SessionActionKind, id: String, error: String },
+    ContextEdited { kind: ContextEditKind },
 }
 ```
 
-One event stream per session. Durable events also go to the `SessionStore`; ephemeral ones don't. Observers (TUI, usage ledger, cache telemetry, orchestrator's idle watcher) subscribe to the same stream.
+One event stream per session. Events are runtime observations, not additional
+transcript records; observers such as a TUI, usage ledger, or orchestrator can
+subscribe without changing the durable context.
 
 ### Agent vs session identity
 
@@ -291,7 +279,7 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 - `context.prepare_compaction(settings)` produces a `CompactionPlan` as prefix-compaction policy on top of that primitive.
 - `Compactor::summarize(plan)` calls a `ModelProvider` to generate the summary string.
 - `session.edit(pending, Compact { plan, summary })` applies the prepared summary span with a `compaction_summary` record.
-- Orchestrator observes `SessionEvent::TurnFinished` and checks thresholds; if tripped, drives the compaction pipeline.
+- Orchestrator observes `SessionEvent::RecordAppended { record: TranscriptRecord::TurnFinished { .. } }` and checks thresholds; if tripped, drives the compaction pipeline.
 
 ### Rewind
 
@@ -328,7 +316,7 @@ Model stays identical between parent and child (prefix-cache preservation). Diff
 
 1. Child's LLM emits `tool_call: report(content)`.
 2. `ReportTool::execute` calls `orchestrator.route_report(from=child_id, content)`.
-3. Orchestrator looks up `parent = registry.parent(child_id)`; appends `InjectedMessage { ChildReport { from: child_id }, content }` to parent's log; if parent is idle, enqueues FollowUp to wake it.
+3. Orchestrator looks up `parent = registry.parent(child_id)` and enqueues a tagged `FollowUp` on the parent's mailbox. The parent materializes it as `TranscriptRecord::Injected(InjectedMessage { kind: "agent_report", ... })` when the report starts a turn.
 4. ReportTool returns `ok`. Child turn continues.
 
 ### agent_idle notification
@@ -336,14 +324,14 @@ Model stays identical between parent and child (prefix-cache preservation). Diff
 **Status**: not yet. Requires event subscription (SessionEvent stream).
 
 1. Child's FSM reaches `Idle` after a graceful `TurnFinished`.
-2. Orchestrator's event subscriber sees `SessionEvent::TurnFinished { graceful }`.
-3. If `registry.parent(child_id)` exists, append `InjectedMessage { ChildIdle { from: child_id }, content: last_assistant_text }` to parent's log; wake parent if idle.
+2. Orchestrator's event subscriber sees `SessionEvent::RecordAppended { record: TranscriptRecord::TurnFinished { outcome: Graceful, .. }, .. }`.
+3. If `registry.parent(child_id)` exists, enqueue a tagged `FollowUp` on the parent's mailbox. The parent materializes it as an injected `agent_idle` record when that input starts a turn.
 
 ### Worklog
 
 **Status**: not yet. See `worklog-design.md`.
 
-- Orchestrator observes `SessionEvent::TurnFinished`, gates on `is_likely_trivial_turn`, serializes per-agent, forks parent at boundary with a single-tool registry (`[WorklogUpdateTool]`) and a `WorklogFraming` injection.
+- Orchestrator observes appended `TurnFinished` records, gates on `is_likely_trivial_turn`, serializes per-agent, forks parent at boundary with a single-tool registry (`[WorklogUpdateTool]`) and a `WorklogFraming` injection.
 - The fork's LLM optionally calls `worklog_update`, which writes to `AgentWorklogStore` (**not** to the session log).
 - Fork session is discarded on idle. Output lives in the side-store; ancestor worklogs are injected into descendants at prompt-assembly time.
 
@@ -380,7 +368,7 @@ Each row is one landable PR. Later PRs depend on their predecessors.
 | 7 | `Tool` + `ToolRegistry` | trait + built-in tool pack (bash/read/write/edit/grep/find/ls) | tool execution; spawn/report/worklog tools |
 | 8 | `Compactor` + auto-compaction | summarize plans via `ModelProvider`; orchestrator threshold watcher | production-grade context management |
 | 9 | `UsageLedger` | trait + in-memory impl + roll-up queries | cost observability; TUI footer |
-| 10 | Spawn + report + agent_idle | `SpawnTool`, `ReportTool`, idle-watcher in orchestrator; new `InjectedKind` variants | multi-agent operation |
+| 10 | Spawn + report + agent_idle | `SpawnTool`, `ReportTool`, idle-watcher in orchestrator; new injected-message kind constants | multi-agent operation |
 | 11 | `AgentWorklogStore` + worklog fork | trait + file-backed impl + `WorklogUpdateTool` + orchestrator worklog scheduler | per-agent durable knowledge; ancestor worklog injection for spawned sub-agents |
 | 12 | `PromptAssembly` | system-prompt assembly from tool/skill/persona sources; ancestor-worklog prefix injection | feature parity with TS `_rebuildSystemPrompt` |
 | 13 | Daemon + `RemoteControlPlane` | host `LocalControlPlane` in a daemon; RPC client; TUI reconnect | detachable view |
@@ -408,7 +396,7 @@ This closes the liveness hole where repeated appends during an async summarize c
 
 ### Child reports are mailbox inputs, not history edits
 
-When a child emits `report(content)`, the orchestrator does **not** open `edit_history` on the parent. Instead the report enters the parent's mailbox as an `AgentInput` variant (probably `InjectMessage(CustomMessage)` or similar, priority near `Steer`). The parent's FSM materializes it as a `TranscriptRecord::Custom` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to `agent_idle` notifications.
+When a child emits `report(content)`, the orchestrator does **not** open `edit_history` on the parent. Instead the report enters the parent's mailbox as an `AgentInput` variant (probably `InjectMessage(InjectedMessage)` or similar, priority near `Steer`). The parent's FSM materializes it as a `TranscriptRecord::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to `agent_idle` notifications.
 
 This keeps `AgentSession::edit`/`fork` for genuine structural edits (compact, rewind, fork, replace_transcript) and removes the `entry_count`-churning source of compaction plan staleness.
 

@@ -20,7 +20,7 @@ The exported surface is intentionally small. From `lib.rs`:
 - `AgentInput` — everything the outside world can push into the loop: `Interrupt`, `Steer`, `FollowUp`, `ModelCompleted`, `ModelFailed`, `ToolCompleted`. `Steer` and `FollowUp` carry optional `from` / `kind` tags (both present or both absent) identifying the source of the input; malformed inputs are rejected with `AgentInputError`.
 - `AgentAction` — side-effect requests the caller must execute: `RequestModel`, `RequestTool`, `CancelTurn`.
 - `TranscriptRecord` — durable append-only record variants. Enumerated in the Internals section below.
-- `CustomMessage` — payload for `TranscriptRecord::Custom`, carrying a `kind` tag, a `content` string, and a `BTreeMap<String, String>` metadata map.
+- `InjectedMessage` — payload for `TranscriptRecord::Injected`, carrying a `kind` tag, a `content` string, and a `BTreeMap<String, String>` metadata map.
 - `TurnOutcome` — `Graceful`, `Interrupted`, or `Crashed`; attached to `TurnFinished`.
 - `AssistantMessage`, `AssistantItem`, `ToolCall`, `ToolResultMessage`, `ToolResultStatus` — message shapes shared with the caller. `ToolResultMessage::interrupted` / `crashed` are helpers for synthesizing terminal results.
 - `TurnId`, `ActionId`, `ToolCallId` — newtype `u64` ids. `ActionId` correlates a drained `RequestModel` / `RequestTool` with the matching completion.
@@ -74,7 +74,7 @@ Module layout under `src/`:
 - `event.rs` — `AgentInput` (public) and `AgentEvent` + `TurnOrigin` (private); the public/internal event split.
 - `mailbox.rs` — `Mailbox` and `UserInputEntry`; priority queue feeding the FSM.
 - `action.rs` — `AgentAction` outbox variants.
-- `record.rs` — `TranscriptRecord`, `TurnOutcome`, `CustomMessage`.
+- `record.rs` — `TranscriptRecord`, `TurnOutcome`, `InjectedMessage`.
 - `message.rs` — `AssistantMessage`, `AssistantItem`, `ToolCall`, `ToolResultMessage`, `ToolResultStatus`.
 - `ids.rs` — `TurnId`, `ActionId`, and `ToolCallId` newtypes.
 
@@ -154,7 +154,7 @@ Priority order inside `Mailbox::next_event`:
 5. FollowUp      (only consumed when state == Idle)
 ```
 
-When the mailbox pops a user input entry at `Idle`, it pairs `from` with `kind` into a `TurnOrigin` (present iff both are `Some`). The state machine uses `TurnOrigin` to decide how to open the turn: no origin means a plain `TranscriptRecord::UserMessage(content)`; an origin means `TranscriptRecord::Custom(CustomMessage { kind, content, metadata: { "from": from } })`. This is how agent-routed injections (e.g. a parent directive or a child report) land in the transcript as tagged entries rather than as anonymous user messages. The core does not interpret specific kind strings — those conventions live in `agent-orchestrator` and `agent-session`.
+When the mailbox pops a user input entry at `Idle`, it pairs `from` with `kind` into a `TurnOrigin` (present iff both are `Some`). The state machine uses `TurnOrigin` to decide how to open the turn: no origin means a plain `TranscriptRecord::UserMessage(content)`; an origin means `TranscriptRecord::Injected(InjectedMessage { kind, content, metadata: { "from": from } })`. This is how agent-routed injections (e.g. a parent directive or a child report) land in the transcript as tagged entries rather than as anonymous user messages. The core does not interpret specific kind strings — those conventions live in `agent-orchestrator` and `agent-session`.
 
 ### Actions
 
@@ -176,7 +176,7 @@ All three are pure requests. `agent-core` never performs the underlying I/O and 
 - `ToolCallStarted { turn_id, tool_call }` — emitted per tool call when the assistant's message is processed, alongside a `RequestTool` action.
 - `ToolResult(ToolResultMessage)` — a completed tool result, emitted in assistant-declared order (late results are buffered by `completed_results` until the preceding ones arrive).
 - `TurnFinished { turn_id, outcome }` — closes the turn with `TurnOutcome::Graceful`, `Interrupted`, or `Crashed`.
-- `Custom(CustomMessage)` — the open extension point. `agent-core` **produces** this variant only in one case: when a tagged `Steer` / `FollowUp` starts a turn at `Idle`, the opening entry is a `Custom` instead of a `UserMessage`. Downstream layers (compaction summaries in `agent-session`, future multi-agent spawn briefs / child reports) append their own `Custom` entries with their own kinds. The core defines the variant and the shape; it knows nothing about specific kind strings.
+- `Injected(InjectedMessage)` — the durable, model-visible injection point. `agent-core` produces this variant when a tagged `Steer` / `FollowUp` starts a turn at `Idle`, so the opening entry is tagged injected context instead of an anonymous `UserMessage`. Downstream layers also append injected entries for compaction summaries and future multi-agent spawn briefs / child reports. The core defines the variant and shape; it does not interpret specific kind strings.
 
 `TranscriptRecord::turn_id()` returns the turn id for variants that carry one (`TurnStarted`, `ToolCallStarted`, `TurnFinished`) and `None` otherwise.
 
@@ -187,6 +187,6 @@ All three are pure requests. `agent-core` never performs the underlying I/O and 
 - **No cost / usage / token accounting.** The core emits no usage numbers and does not inspect completions for cost. Metering lives above.
 - **No tool execution.** `RequestTool` is a request; the caller runs the tool and feeds back a `ToolResultMessage`.
 - **No model provider abstraction.** The core does not know what a model is or how to call one; it just accepts `ModelCompleted { action_id, assistant, .. }` / `ModelFailed { action_id, error, .. }` and moves on.
-- **No multi-agent awareness or routing.** Inter-session routing, session registries, spawn/report semantics, and worklog triggers all live in `agent-orchestrator` / `agent-session`. The core's only concession to multi-agent existence is that `AgentInput::Steer` / `FollowUp` carry optional `from` / `kind` tags, which it propagates into `Custom` records opaquely.
-- **No knowledge of specific `Custom` kinds.** Kind strings like `compaction_summary` are defined in the session layer, not here.
+- **No multi-agent awareness or routing.** Inter-session routing, session registries, spawn/report semantics, and worklog triggers all live in `agent-orchestrator` / `agent-session`. The core's only concession to multi-agent existence is that `AgentInput::Steer` / `FollowUp` carry optional `from` / `kind` tags, which it propagates into injected records opaquely.
+- **No knowledge of specific injected-message kinds.** Kind strings like `compaction_summary` are defined in the session layer, not here.
 - **No provider/workspace ID allocation.** The core mints `TurnId` and `ActionId` only. `ToolCallId` values arrive from outside via the `ToolCall` structs the model produced; the core does not mint them.

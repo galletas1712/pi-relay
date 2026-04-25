@@ -44,6 +44,6 @@ pub use crate::transcript::Transcript;
 
 // Re-export core-owned types so downstream callers have a single import home.
 pub use agent_core::{
-    ActionId, AgentAction, AgentInput, AgentInputError, CustomMessage, ToolCallId,
+    ActionId, AgentAction, AgentInput, AgentInputError, InjectedMessage, ToolCallId,
     TranscriptRecord, TurnId, TurnOutcome,
 };

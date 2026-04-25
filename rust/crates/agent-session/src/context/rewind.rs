@@ -4,7 +4,7 @@ use crate::context::Context;
 /// A rewind operation.
 ///
 /// `leaf_id = Some(id)` moves the context leaf to `id`, which must point at a
-/// `TurnFinished` entry (directly or transparently through `Custom` entries).
+/// `TurnFinished` entry (directly or transparently through injected entries).
 /// `leaf_id = None` resets the leaf to the empty-log sentinel.
 pub struct Rewind {
     pub leaf_id: Option<String>,

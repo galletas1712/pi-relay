@@ -15,14 +15,14 @@ use agent_session::AgentSession;
 
 pub use crate::registry::{RegistryError, RouteError, SessionId, SessionRegistry};
 
-/// Well-known `CustomMessage::kind` tag for parent->child directives routed via
+/// Well-known `InjectedMessage::kind` tag for parent->child directives routed via
 /// `AgentOrchestrator::send_message`. Stored on the child's transcript as the
-/// `kind` of the `Custom` entry that opens the directive's turn.
+/// `kind` of the injected entry that opens the directive's turn.
 pub const KIND_AGENT_DIRECTIVE: &str = "agent_directive";
 
-/// Well-known `CustomMessage::kind` tag for child->parent reports routed via
+/// Well-known `InjectedMessage::kind` tag for child->parent reports routed via
 /// `AgentOrchestrator::send_report`. Stored on the parent's transcript as the
-/// `kind` of the `Custom` entry that opens the report's turn.
+/// `kind` of the injected entry that opens the report's turn.
 pub const KIND_AGENT_REPORT: &str = "agent_report";
 
 /// Composition struct for the agent runtime.
@@ -54,8 +54,9 @@ impl AgentOrchestrator {
     /// Enqueues `AgentInput::Steer { from: Some(from), kind:
     /// Some(KIND_AGENT_DIRECTIVE), content }` on the target's mailbox. The
     /// `from` and `kind` tags ride along so the target's FSM materialises a
-    /// `TranscriptRecord::Custom { kind: "agent_directive", metadata: {"from":
-    /// ...} }` at turn start instead of a plain `UserMessage`.
+    /// `TranscriptRecord::Injected(InjectedMessage { kind:
+    /// "agent_directive", metadata: {"from": ...}, .. })` at turn start
+    /// instead of a plain `UserMessage`.
     ///
     /// Validates that `to` is a direct child of `from` in the spawn tree;
     /// routing to an unrelated or descendant session returns
@@ -96,8 +97,9 @@ impl AgentOrchestrator {
     /// Enqueues `AgentInput::FollowUp { from: Some(from), kind:
     /// Some(KIND_AGENT_REPORT), content }` on the parent's mailbox. The `from`
     /// and `kind` tags ride along so the parent's FSM materialises a
-    /// `TranscriptRecord::Custom { kind: "agent_report", metadata: {"from":
-    /// ...} }` at turn start instead of a plain `UserMessage`.
+    /// `TranscriptRecord::Injected(InjectedMessage { kind: "agent_report",
+    /// metadata: {"from": ...}, .. })` at turn start instead of a plain
+    /// `UserMessage`.
     ///
     /// Validates that `from` has a registered spawn parent; an orphan
     /// sender returns `RouteError::NoParent`.
@@ -389,15 +391,15 @@ mod tests {
     }
 
     #[test]
-    fn send_report_results_in_custom_agent_report_entry_in_parent_transcript() {
-        use agent_core::CustomMessage;
+    fn send_report_results_in_injected_agent_report_entry_in_parent_transcript() {
+        use agent_core::InjectedMessage;
 
         let mut orchestrator = orchestrator_with_parent_and_child();
 
         // Send a report from B up to A, then drive A's mailbox so it starts a
         // turn from the queued follow-up. The parent transcript should open
-        // the new turn with a Custom{kind=agent_report} entry — not a plain
-        // UserMessage.
+        // the new turn with an injected entry tagged as agent_report, not a
+        // plain UserMessage.
         orchestrator
             .send_report(&"B".to_string(), "child is done".to_string())
             .expect("B -> A is a valid child->parent route");
@@ -409,19 +411,19 @@ mod tests {
         parent.drive();
 
         let records = parent.transcript().records().to_vec();
-        let custom = records
+        let injected = records
             .iter()
             .find_map(|r| match r {
-                TranscriptRecord::Custom(cm) => Some(cm),
+                TranscriptRecord::Injected(cm) => Some(cm),
                 _ => None,
             })
-            .expect("parent transcript should contain a Custom entry from the report");
+            .expect("parent transcript should contain an injected entry from the report");
 
         let mut expected_metadata = std::collections::BTreeMap::new();
         expected_metadata.insert("from".to_string(), "B".to_string());
         assert_eq!(
-            custom,
-            &CustomMessage {
+            injected,
+            &InjectedMessage {
                 kind: KIND_AGENT_REPORT.to_string(),
                 content: "child is done".to_string(),
                 metadata: expected_metadata,

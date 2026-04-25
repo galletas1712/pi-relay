@@ -39,7 +39,7 @@ impl Transcript {
         for record in self.records.iter().rev() {
             match record {
                 TranscriptRecord::TurnFinished { .. } => return true,
-                TranscriptRecord::Custom(_) => continue,
+                TranscriptRecord::Injected(_) => continue,
                 _ => return false,
             }
         }
@@ -47,11 +47,11 @@ impl Transcript {
     }
 
     /// Latest compaction summary on the transcript, if any. Returns the
-    /// `content` string of the closest `TranscriptRecord::Custom` with the
+    /// `content` string of the closest `TranscriptRecord::Injected` with the
     /// well-known `compaction_summary` kind.
     pub fn latest_compaction_summary(&self) -> Option<&str> {
         self.records.iter().rev().find_map(|r| match r {
-            TranscriptRecord::Custom(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
+            TranscriptRecord::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
                 Some(cm.content.as_str())
             }
             _ => None,
@@ -108,9 +108,9 @@ impl Transcript {
             .find_map(|(index, record)| match record {
                 TranscriptRecord::TurnStarted { turn_id } => Some(Some((*turn_id, index))),
                 TranscriptRecord::TurnFinished { .. } => Some(None),
-                // Custom records live strictly between turns; they don't
-                // participate in crash-tail patching. Keep looking backward.
-                TranscriptRecord::Custom(_)
+                // Injected records do not determine whether the tail turn is
+                // still open; keep looking backward for the nearest turn marker.
+                TranscriptRecord::Injected(_)
                 | TranscriptRecord::UserMessage(_)
                 | TranscriptRecord::AssistantMessage(_)
                 | TranscriptRecord::ToolCallStarted { .. }
@@ -135,7 +135,7 @@ impl Transcript {
                 | TranscriptRecord::UserMessage(_)
                 | TranscriptRecord::ToolCallStarted { .. }
                 | TranscriptRecord::TurnFinished { .. }
-                | TranscriptRecord::Custom(_) => {}
+                | TranscriptRecord::Injected(_) => {}
             }
         }
 
@@ -179,7 +179,7 @@ impl From<Vec<TranscriptRecord>> for Transcript {
 mod tests {
     use super::*;
     use crate::context::compaction::compaction_summary;
-    use agent_core::{AssistantItem, AssistantMessage, CustomMessage, ToolResultStatus};
+    use agent_core::{AssistantItem, AssistantMessage, InjectedMessage, ToolResultStatus};
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
         ToolCall {
@@ -204,7 +204,7 @@ mod tests {
     }
 
     #[test]
-    fn turn_boundary_walks_past_custom_records() {
+    fn turn_boundary_walks_past_injected_records() {
         let transcript = Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
             TranscriptRecord::UserMessage("hi".to_string()),
@@ -212,8 +212,8 @@ mod tests {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
-            TranscriptRecord::Custom(compaction_summary("summary", "some_id", 100)),
-            TranscriptRecord::Custom(CustomMessage::new("note", "branch note")),
+            TranscriptRecord::Injected(compaction_summary("summary", "some_id", 100)),
+            TranscriptRecord::Injected(InjectedMessage::new("note", "branch note")),
         ]);
         assert!(transcript.is_turn_boundary());
         assert_eq!(transcript.latest_compaction_summary(), Some("summary"));

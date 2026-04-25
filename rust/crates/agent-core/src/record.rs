@@ -33,28 +33,27 @@ pub enum TranscriptRecord {
         outcome: TurnOutcome,
     },
 
-    /// Appended by the session layer between turns. The FSM never produces
-    /// this variant. Different uses (compaction summary, branch summary,
-    /// future spawn briefs / child reports / extension messages) are
-    /// discriminated by `CustomMessage::kind` plus metadata. See
-    /// `agent-session` for well-known kind constants and constructors.
-    Custom(CustomMessage),
+    /// Durable, model-visible context injected by orchestration or session
+    /// machinery. This covers tagged turn-opening inputs, compaction
+    /// summaries, and future spawn/report extension messages. Different uses
+    /// are discriminated by `InjectedMessage::kind` plus metadata.
+    Injected(InjectedMessage),
 }
 
-/// Payload carried by `TranscriptRecord::Custom`.
+/// Payload carried by `TranscriptRecord::Injected`.
 ///
-/// `kind` is a free-form tag chosen by the session (or an extension) to
-/// classify the injection; `content` is the textual body surfaced to the
-/// model; `metadata` carries anchor information (e.g. the id of the first
-/// kept entry after a compaction, or the turn count the summary replaced).
+/// `kind` is a free-form tag chosen by the session, orchestrator, or another
+/// extension point to classify the injected context. `content` is the textual
+/// body surfaced to the model; `metadata` carries routing or anchor
+/// information, such as sender id or the first kept entry after compaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CustomMessage {
+pub struct InjectedMessage {
     pub kind: String,
     pub content: String,
     pub metadata: BTreeMap<String, String>,
 }
 
-impl CustomMessage {
+impl InjectedMessage {
     pub fn new(kind: impl Into<String>, content: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
@@ -78,7 +77,7 @@ impl TranscriptRecord {
             TranscriptRecord::UserMessage(_)
             | TranscriptRecord::AssistantMessage(_)
             | TranscriptRecord::ToolResult(_)
-            | TranscriptRecord::Custom(_) => None,
+            | TranscriptRecord::Injected(_) => None,
         }
     }
 }

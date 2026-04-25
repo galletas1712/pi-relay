@@ -1,4 +1,4 @@
-use agent_core::{AssistantItem, CustomMessage, TranscriptRecord};
+use agent_core::{AssistantItem, InjectedMessage, TranscriptRecord};
 
 use crate::context::edit::{ContextEdit, HistoryEditError};
 use crate::context::{Context, ContextError, SessionEntry};
@@ -27,7 +27,7 @@ pub struct SummarySpanPlan {
 /// the records after the span.
 pub struct SummarizeSpan {
     pub plan: SummarySpanPlan,
-    pub summary: CustomMessage,
+    pub summary: InjectedMessage,
 }
 
 impl Context {
@@ -94,7 +94,7 @@ impl ContextEdit for SummarizeSpan {
             None => ctx.reset_leaf(),
         }
 
-        ctx.append_custom(self.summary);
+        ctx.append_injected(self.summary);
         ctx.append_transcript_records(self.plan.records_after_span.iter().cloned());
         Ok(())
     }
@@ -143,7 +143,7 @@ pub(crate) fn estimate_record_tokens(record: &TranscriptRecord) -> usize {
             tool_call.tool_name.len() + tool_call.args_json.len()
         }
         TranscriptRecord::ToolResult(result) => result.tool_name.len() + result.output.len(),
-        TranscriptRecord::Custom(cm) => cm.content.len(),
+        TranscriptRecord::Injected(cm) => cm.content.len(),
     };
     chars.div_ceil(4)
 }
@@ -185,7 +185,7 @@ fn validate_span_boundaries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{AssistantMessage, CustomMessage, TurnId, TurnOutcome};
+    use agent_core::{AssistantMessage, InjectedMessage, TurnId, TurnOutcome};
 
     fn turn(turn_id: u64, user: &str) -> Vec<TranscriptRecord> {
         vec![
@@ -215,7 +215,7 @@ mod tests {
 
         SummarizeSpan {
             plan,
-            summary: CustomMessage::new("summary", "second summarized"),
+            summary: InjectedMessage::new("summary", "second summarized"),
         }
         .apply(&mut ctx)
         .expect("summary span should apply");
@@ -224,9 +224,9 @@ mod tests {
         assert!(records.iter().any(
             |record| matches!(record, TranscriptRecord::UserMessage(text) if text == "first")
         ));
-        assert!(records
-            .iter()
-            .any(|record| matches!(record, TranscriptRecord::Custom(cm) if cm.kind == "summary")));
+        assert!(records.iter().any(
+            |record| matches!(record, TranscriptRecord::Injected(cm) if cm.kind == "summary")
+        ));
         assert!(!records.iter().any(
             |record| matches!(record, TranscriptRecord::UserMessage(text) if text == "second")
         ));
@@ -248,7 +248,7 @@ mod tests {
 
         SummarizeSpan {
             plan,
-            summary: CustomMessage::new("summary", "second summarized"),
+            summary: InjectedMessage::new("summary", "second summarized"),
         }
         .apply(&mut ctx)
         .expect("suffix summary span should apply");
@@ -257,9 +257,9 @@ mod tests {
         assert!(records.iter().any(
             |record| matches!(record, TranscriptRecord::UserMessage(text) if text == "first")
         ));
-        assert!(records
-            .iter()
-            .any(|record| matches!(record, TranscriptRecord::Custom(cm) if cm.kind == "summary")));
+        assert!(records.iter().any(
+            |record| matches!(record, TranscriptRecord::Injected(cm) if cm.kind == "summary")
+        ));
         assert!(!records.iter().any(
             |record| matches!(record, TranscriptRecord::UserMessage(text) if text == "second")
         ));

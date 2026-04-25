@@ -107,7 +107,7 @@ spawn_parents:
 
 Both primitives are fire-and-forget. They validate the relationship, push a single `AgentInput` onto the target's mailbox via `AgentSession::enqueue_input`, and return. No wait for ack, no turn driving, no observation of downstream state.
 
-When the target session next starts a turn from a tagged input, the FSM in `agent-core` materialises a `TranscriptRecord::Custom { kind, content, metadata: { "from": <sender_id> } }` at the turn boundary instead of a plain `UserMessage`. This preserves sender identity in the durable transcript. The orchestrator owns the `KIND_*` string constants; `agent-core` and `agent-session` treat `from` and `kind` as opaque tags and never reference the specific values by name.
+When the target session next starts a turn from a tagged input, the FSM in `agent-core` materialises a `TranscriptRecord::Injected(InjectedMessage { kind, content, metadata: { "from": <sender_id> } })` at the turn boundary instead of a plain `UserMessage`. This preserves sender identity in the durable transcript. The orchestrator owns the `KIND_*` string constants; `agent-core` and `agent-session` treat `from` and `kind` as opaque tags and never reference the specific values by name.
 
 `RouteError` variants, from `registry.rs`:
 
@@ -132,23 +132,23 @@ Routing flow, `send_message`:
  child mailbox
         |
         v  child.drive() on next tick
- TranscriptRecord::Custom {
+ TranscriptRecord::Injected(InjectedMessage {
      kind: "agent_directive",
      content: "do X",
      metadata: { "from": parent_id },
- }
+ })
 ```
 
 `send_report` is symmetric: it looks up `registry.parent(from)`, constructs `AgentInput::FollowUp { from: Some(from), kind: Some("agent_report"), content }`, and enqueues it on the parent's mailbox. Follow-ups take normal priority and wake the parent on its next idle turn.
 
 ### Why no idle-vs-busy branching
 
-The TypeScript counterpart (`packages/orchestrator/src/orchestrator.ts::deliverMessage`) inspects the target session's `isStreaming / isRetrying / isCompacting` flags and a `reactivating` latch before deciding whether to call `sendCustomMessage` with `triggerTurn: true` (reactivate an idle agent) or `deliverAs: "steer"` (interrupt a busy one). The Rust mailbox model absorbs inputs uniformly: `AgentSession::enqueue_input` pushes onto a single queue, and the FSM consumes it on the next tick regardless of whether the session is currently idle, streaming, or awaiting a tool result. `Steer` inputs are simply higher priority than `FollowUp`. The orchestrator therefore does not need to know the target's live state — one decision simplified away.
+The TypeScript counterpart (`packages/orchestrator/src/orchestrator.ts::deliverMessage`) inspects the target session's `isStreaming / isRetrying / isCompacting` flags and a `reactivating` latch before deciding whether to call its current `sendCustomMessage` API with `triggerTurn: true` (reactivate an idle agent) or `deliverAs: "steer"` (interrupt a busy one). The Rust mailbox model absorbs inputs uniformly: `AgentSession::enqueue_input` pushes onto a single queue without observing the target's live state. The FSM consumes queued `Steer` / `FollowUp` input only when it is `Idle`; busy sessions keep routed input queued behind any active model/tool work. `Steer` inputs are higher priority than `FollowUp` once the core returns to idle, but they do not interrupt an active turn by themselves.
 
 ## Relationship to other crates
 
 - **`agent-session`** (direct dep): the registry's default session type is `AgentSession`. Routing calls `AgentSession::enqueue_input` to deliver inputs; it never reaches into `Context` directly. History-edit ops (`SummarizeSpan`, `Compact`, `Rewind`, `ReplaceTranscript`, `fork`) stay on `AgentSession` and are invoked by callers through `registry_mut().get_mut(id)`.
-- **`agent-core`** (direct dep, transitively via session): the FSM types `AgentInput::Steer` and `AgentInput::FollowUp` carry `from: Option<String>` and `kind: Option<String>`. Tagged inputs become `TranscriptRecord::Custom` entries when consumed; the invariant `from.is_some() == kind.is_some()` is enforced by the `AgentInput::steer_tagged` / `follow_up_tagged` constructors that this crate uses.
+- **`agent-core`** (direct dep, transitively via session): the FSM types `AgentInput::Steer` and `AgentInput::FollowUp` carry `from: Option<String>` and `kind: Option<String>`. Tagged inputs become `TranscriptRecord::Injected` entries when consumed; the invariant `from.is_some() == kind.is_some()` is enforced by the `AgentInput::steer_tagged` / `follow_up_tagged` constructors that this crate uses.
 
 See `rust/docs/architecture.md` for the full crate stack and PR sequencing.
 

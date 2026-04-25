@@ -4,7 +4,7 @@ use crate::action::AgentAction;
 use crate::event::{AgentEvent, TurnOrigin};
 use crate::ids::{ActionId, TurnId};
 use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
-use crate::record::{CustomMessage, TranscriptRecord, TurnOutcome};
+use crate::record::{InjectedMessage, TranscriptRecord, TurnOutcome};
 
 // Live control state only. Durable session history lives in Transcript.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -76,7 +76,7 @@ impl AgentState {
                     Some(TurnOrigin { from, kind }) => {
                         let mut metadata = BTreeMap::new();
                         metadata.insert("from".to_string(), from);
-                        TranscriptRecord::Custom(CustomMessage {
+                        TranscriptRecord::Injected(InjectedMessage {
                             kind,
                             content: input,
                             metadata,

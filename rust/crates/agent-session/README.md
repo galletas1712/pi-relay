@@ -41,11 +41,11 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 - `AutoCompactionSettings` — optional session policy that pauses a model request and emits stateless model compaction work when context is over budget.
 - `StatelessModelRequest`, `StatelessModelRequestId`, `StatelessModelOutput`, `ModelContentBlock`, `ImageInput` — stateless side-model request/response vocabulary.
 
-**Well-known Custom kinds**
+**Well-known injected-message kinds**
 - `KIND_COMPACTION_SUMMARY = "compaction_summary"` + `compaction_summary(content, first_kept_entry_id, tokens_before)` builder.
 
 **Re-exports from `agent-core`** (so callers have a single import home)
-- `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptRecord`, `TurnId`, `ActionId`, `ToolCallId`, `CustomMessage`, `TurnOutcome`.
+- `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptRecord`, `TurnId`, `ActionId`, `ToolCallId`, `InjectedMessage`, `TurnOutcome`.
 
 ### Drive cycle
 
@@ -152,7 +152,7 @@ After SummarizeSpan over E2..E3:
                          leaf (new branch)
 ```
 
-`Esum` is a caller-provided `Custom` summary entry; `E4'` / `E5'` are re-appended copies of the suffix records as descendants of `Esum`. The old span and suffix stay in `entries()` as an orphaned branch for audit. `Compact` is a prefix-oriented policy wrapper over this primitive.
+`Esum` is a caller-provided injected summary entry; `E4'` / `E5'` are re-appended copies of the suffix records as descendants of `Esum`. The old span and suffix stay in `entries()` as an orphaned branch for audit. `Compact` is a prefix-oriented policy wrapper over this primitive.
 
 ### `ContextEdit` trait + `PendingWork`
 
@@ -196,9 +196,9 @@ Private to the crate. `PendingActionKey { action_id: ActionId, turn_id: TurnId, 
 
 ### Kind-free `context/mod.rs` + operation-local `KIND_*` constants
 
-`context/mod.rs` owns the DAG primitives — `Context`, `SessionEntry`, `append_record`, `branch`, `is_turn_boundary_leaf` — and knows about exactly one record variant semantically: `TranscriptRecord::Custom` is treated as transparent for turn-boundary walks. It knows nothing about `"compaction_summary"` specifically.
+`context/mod.rs` owns the DAG primitives — `Context`, `SessionEntry`, `append_record`, `branch`, `is_turn_boundary_leaf` — and knows about exactly one record variant semantically: `TranscriptRecord::Injected` is treated as transparent for turn-boundary walks. It knows nothing about `"compaction_summary"` specifically.
 
-The `KIND_COMPACTION_SUMMARY` constant and its builder live in `context/compaction.rs`, the file for the policy that produces it. This keeps the DAG code decoupled from higher-level semantics: new edit ops with new `Custom` kinds can land without touching `mod.rs`.
+The `KIND_COMPACTION_SUMMARY` constant and its builder live in `context/compaction.rs`, the file for the policy that produces it. This keeps the DAG code decoupled from higher-level semantics: new edit ops with new injected-message kinds can land without touching `mod.rs`.
 
 ### `AgentRunner` (async wrapper)
 
@@ -208,7 +208,7 @@ Records are observed off the session's transcript (`runner.session().transcript(
 
 ## Relationship to other crates
 
-- **Upstream** `agent-core` — provides `AgentCoreLoop`, `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptRecord`, `TurnId`, `ActionId`, `TurnOutcome`, `CustomMessage`, and the message/tool-call vocabulary. `agent-session` re-exports these so downstream has a single import path.
+- **Upstream** `agent-core` — provides `AgentCoreLoop`, `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptRecord`, `TurnId`, `ActionId`, `TurnOutcome`, `InjectedMessage`, and the message/tool-call vocabulary. `agent-session` re-exports these so downstream has a single import path.
 - **Downstream** `agent-orchestrator` — owns a `SessionRegistry<AgentSession>` keyed by `SessionId`, routes parent/child messages and reports, and delegates every history edit to `session.edit(pending, op)` / `session.fork(pending, leaf)`. It never reaches into `Context` internals directly; it calls `session.context().prepare_compaction(..)` as a pure query and lets the session dispatch the resulting op.
 
 For cross-cutting context (control plane, cost aggregation, worklog forks, multi-agent spawn/report), see `rust/docs/architecture.md`.

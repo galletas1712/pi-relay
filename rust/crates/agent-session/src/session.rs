@@ -606,7 +606,7 @@ mod tests {
     use crate::context::compaction::compaction_summary;
     use crate::context::{Compact, CompactionSettings, ReplaceTranscript, Rewind};
     use agent_core::{
-        ActionId, AssistantItem, AssistantMessage, CustomMessage, ToolCall, ToolCallId,
+        ActionId, AssistantItem, AssistantMessage, InjectedMessage, ToolCall, ToolCallId,
         ToolResultMessage, ToolResultStatus, TurnId, TurnOutcome,
     };
 
@@ -1047,7 +1047,7 @@ mod tests {
         assert!(!events.iter().any(|event| matches!(
             event,
             SessionEvent::RecordAppended {
-                record: TranscriptRecord::Custom(_),
+                record: TranscriptRecord::Injected(_),
                 ..
             }
         )));
@@ -1360,10 +1360,10 @@ mod tests {
     }
 
     #[test]
-    fn can_edit_history_walks_past_multiple_custom_entries() {
-        // A context whose leaf is a run of back-to-back Custom entries after
+    fn can_edit_history_walks_past_multiple_injected_entries() {
+        // A context whose leaf is a run of back-to-back injected entries after
         // a TurnFinished is still at a turn boundary; can_edit_history must
-        // see through the Custom tail to the underlying TurnFinished.
+        // see through the injected tail to the underlying TurnFinished.
         let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
             TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
             TranscriptRecord::UserMessage("hi".to_string()),
@@ -1374,13 +1374,13 @@ mod tests {
         ]));
         session
             .context
-            .append_custom(CustomMessage::new("note", "a"));
+            .append_injected(InjectedMessage::new("note", "a"));
         session
             .context
-            .append_custom(compaction_summary("b", "does-not-matter", 0));
+            .append_injected(compaction_summary("b", "does-not-matter", 0));
         session
             .context
-            .append_custom(CustomMessage::new("note", "c"));
+            .append_injected(InjectedMessage::new("note", "c"));
 
         assert!(session.context().is_turn_boundary());
         assert!(session.can_edit_history(PendingWork::NONE));
