@@ -28,11 +28,10 @@ pub use crate::auto_compaction::{
     AutoCompactionSettings, ImageInput, ModelContentBlock, StatelessModelOutput,
     StatelessModelOutputSpec, StatelessModelRequest,
 };
-pub use crate::context::compaction::compaction_summary;
 pub use crate::context::{
-    Compact, CompactionPlan, CompactionSettings, Context, ContextEdit, ContextError,
-    HistoryEditError, PendingWork, ReplaceTranscript, Rewind, SessionEntry, SummarizeSpan,
-    SummarySpanPlan, KIND_COMPACTION_SUMMARY,
+    compaction_summary, Compact, CompactionPlan, CompactionSettings, Context, ContextEdit,
+    ContextError, HistoryEditError, PendingWork, ReplaceTranscript, Rewind, SessionEntry,
+    SummarizeSpan, SummarySpanPlan, KIND_COMPACTION_SUMMARY,
 };
 pub use crate::event::{ContextEditKind, SessionActionKind, SessionEvent};
 pub use crate::input::{SessionInput, SessionInputError};

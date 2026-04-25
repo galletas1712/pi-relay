@@ -99,12 +99,13 @@ let forked: AgentSession = session.fork(pending, Some(&leaf_id))?;
 | `src/action_queue.rs` | Private `ActionQueue` (FIFO `VecDeque<PendingActionKey>`) + `record_drained` / `record_input`. |
 | `src/transcript.rs` | `Transcript` read-only view: `is_turn_boundary`, `latest_compaction_summary`, crashed-tail patching. |
 | `src/runner.rs` | `AgentRunner`, `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — async shell over `AgentSession`. |
-| `src/context/mod.rs` | `Context` DAG, `SessionEntry`, leaf navigation, `is_turn_boundary`, `ContextError`. No kind-specific knowledge. |
+| `src/context/mod.rs` | `Context` DAG, `SessionEntry`, leaf navigation, materialization, `is_turn_boundary`, `ContextError`. No kind-specific knowledge. |
 | `src/context/edit.rs` | `ContextEdit` trait, `PendingWork`, `HistoryEditError`. |
-| `src/context/summary.rs` | `SummarizeSpan` op, `SummarySpanPlan`, `prepare_summary_span`, span-boundary validation. |
-| `src/context/compaction.rs` | `Compact` op, `CompactionPlan`, `CompactionSettings`, `prepare_compaction`, `validate_plan_matches`, `materialize_context`, `KIND_COMPACTION_SUMMARY`, `compaction_summary`. |
-| `src/context/rewind.rs` | `Rewind` op. |
-| `src/context/replace.rs` | `ReplaceTranscript` op (returns previous `Transcript`). |
+| `src/context/span.rs` | Generic span-summary primitive: `SummarizeSpan`, `SummarySpanPlan`, `prepare_summary_span`, span-boundary validation. |
+| `src/context/tokens.rs` | Internal approximate token estimation used by context planning and auto-compaction. |
+| `src/context/ops/compaction.rs` | Prefix-compaction policy/op: `Compact`, `CompactionPlan`, `CompactionSettings`, `prepare_compaction`, `validate_plan_matches`, `KIND_COMPACTION_SUMMARY`, `compaction_summary`. |
+| `src/context/ops/rewind.rs` | `Rewind` op. |
+| `src/context/ops/replace.rs` | `ReplaceTranscript` op (returns previous `Transcript`). |
 
 ### Composition diagram
 
@@ -135,7 +136,7 @@ All three components are load-bearing:
 
 Each `SessionEntry` has a `String id` (UUID v4), an `Option<String> parent_id`, a `timestamp_ms`, and one `TranscriptRecord`. Entries sit in a `Vec<SessionEntry>` with a `HashMap<String, usize>` side-index for O(1) lookup by id. The context tracks an `Option<String> leaf_id` — the active branch head. `append_record` attaches a new child under `leaf_id` and advances the pointer. `branch(id)` / `branch_at_turn_boundary(id)` reparent the leaf onto an existing entry; subsequent appends then grow a new branch off that node. Nothing is ever deleted.
 
-`transcript()` walks from the current leaf back to the root via `parent_id`, reverses, and hands the record sequence to `compaction::materialize_context`. Summary-span edits rebuild the active branch in model-visible order, so materialization is the full active path.
+`transcript()` walks from the current leaf back to the root via `parent_id`, reverses, and materializes that full active path. Summary-span edits rebuild the active branch in model-visible order, so no compaction-specific adapter is needed.
 
 Summary-span replacement in pictures:
 
@@ -200,7 +201,7 @@ Private to the crate. `PendingActionKey { action_id: ActionId, turn_id: TurnId, 
 
 `context/mod.rs` owns the DAG primitives — `Context`, `SessionEntry`, `append_record`, `branch`, `is_turn_boundary_leaf` — and knows about exactly one record variant semantically: `TranscriptRecord::Injected` is treated as transparent for turn-boundary walks. It knows nothing about `"compaction_summary"` specifically.
 
-The `KIND_COMPACTION_SUMMARY` constant and its builder live in `context/compaction.rs`, the file for the policy that produces it. This keeps the DAG code decoupled from higher-level semantics: new edit ops with new injected-message kinds can land without touching `mod.rs`.
+The `KIND_COMPACTION_SUMMARY` constant and its builder live in `context/ops/compaction.rs`, the file for the policy that produces it. This keeps the DAG code decoupled from higher-level semantics: new edit ops with new injected-message kinds can land without touching `mod.rs`.
 
 ### `AgentRunner` (async wrapper)
 

@@ -1,7 +1,7 @@
 use agent_core::TranscriptRecord;
 
 use crate::action::StatelessModelRequestId;
-use crate::context::summary::estimate_records_tokens;
+use crate::context::tokens::estimate_records_tokens;
 use crate::context::{CompactionPlan, CompactionSettings, Context};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

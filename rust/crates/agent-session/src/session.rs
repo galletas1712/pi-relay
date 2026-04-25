@@ -10,9 +10,9 @@ use crate::auto_compaction::{
     self, AutoCompactionSettings, PendingStatelessModel, PendingStatelessModelKind,
     StatelessModelOutput,
 };
-use crate::context::compaction::compaction_summary;
 use crate::context::{
-    Context, ContextEdit, ContextError, HistoryEditError, PendingWork, SummarizeSpan,
+    compaction_summary, Context, ContextEdit, ContextError, HistoryEditError, PendingWork,
+    SummarizeSpan,
 };
 use crate::event::{ContextEditKind, SessionActionKind, SessionEvent};
 use crate::input::{SessionInput, SessionInputError};
@@ -625,7 +625,6 @@ impl AgentSession {
 mod tests {
     use super::*;
     use crate::auto_compaction::StatelessModelOutput;
-    use crate::context::compaction::compaction_summary;
     use crate::context::{Compact, CompactionSettings, ReplaceTranscript, Rewind};
     use agent_core::{
         ActionId, AssistantItem, AssistantMessage, InjectedMessage, ToolCall, ToolCallId,

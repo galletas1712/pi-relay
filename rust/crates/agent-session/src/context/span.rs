@@ -1,6 +1,7 @@
-use agent_core::{AssistantItem, InjectedMessage, TranscriptRecord};
+use agent_core::{InjectedMessage, TranscriptRecord};
 
 use crate::context::edit::{ContextEdit, HistoryEditError};
+use crate::context::tokens::estimate_records_tokens;
 use crate::context::{Context, ContextError, SessionEntry};
 
 /// A stable plan to replace a contiguous span on the active branch with a
@@ -119,33 +120,6 @@ pub(crate) fn summary_span_plan_from_indices(
 
 pub(crate) fn transcript_records_in(entries: &[SessionEntry]) -> Vec<TranscriptRecord> {
     entries.iter().map(|entry| entry.record.clone()).collect()
-}
-
-pub(crate) fn estimate_records_tokens(records: &[TranscriptRecord]) -> usize {
-    records.iter().map(estimate_record_tokens).sum()
-}
-
-pub(crate) fn estimate_record_tokens(record: &TranscriptRecord) -> usize {
-    let chars = match record {
-        TranscriptRecord::TurnStarted { .. } | TranscriptRecord::TurnFinished { .. } => 0,
-        TranscriptRecord::UserMessage(content) => content.len(),
-        TranscriptRecord::AssistantMessage(message) => message
-            .items
-            .iter()
-            .map(|item| match item {
-                AssistantItem::Text(text) => text.len(),
-                AssistantItem::ToolCall(tool_call) => {
-                    tool_call.tool_name.len() + tool_call.args_json.len()
-                }
-            })
-            .sum(),
-        TranscriptRecord::ToolCallStarted { tool_call, .. } => {
-            tool_call.tool_name.len() + tool_call.args_json.len()
-        }
-        TranscriptRecord::ToolResult(result) => result.tool_name.len() + result.output.len(),
-        TranscriptRecord::Injected(cm) => cm.content.len(),
-    };
-    chars.div_ceil(4)
 }
 
 fn active_span_indices(

@@ -1,12 +1,11 @@
 use agent_core::{InjectedMessage, TranscriptRecord};
 
 use crate::context::edit::{ContextEdit, HistoryEditError};
-use crate::context::summary::{
-    estimate_record_tokens, estimate_records_tokens, summary_span_plan_from_indices,
-    transcript_records_in, SummarizeSpan, SummarySpanPlan,
+use crate::context::span::{
+    summary_span_plan_from_indices, transcript_records_in, SummarizeSpan, SummarySpanPlan,
 };
+use crate::context::tokens::{estimate_record_tokens, estimate_records_tokens};
 use crate::context::{Context, ContextError, SessionEntry};
-use crate::transcript::Transcript;
 
 /// Well-known `InjectedMessage::kind` for compaction summaries.
 pub const KIND_COMPACTION_SUMMARY: &str = "compaction_summary";
@@ -166,17 +165,6 @@ impl ContextEdit for Compact {
     }
 }
 
-/// Materialize the model-visible transcript for a session-context path.
-///
-/// Summary-span edits rebuild the active branch in its model-visible order:
-/// prefix before the summarized span, the summary record, then copies of the
-/// suffix after the summarized span. Materialization is therefore the full
-/// active path.
-pub(crate) fn materialize_context(path: &[SessionEntry]) -> Transcript {
-    let records = path.iter().map(|e| e.record.clone()).collect();
-    Transcript::from_records(records)
-}
-
 /// Compute the starting index for the boundary-cut search.
 ///
 /// If a previous compaction exists on the active branch, we skip everything up
@@ -234,6 +222,7 @@ mod tests {
     use super::*;
     use crate::context::edit::PendingWork;
     use crate::session::AgentSession;
+    use crate::transcript::Transcript;
     use agent_core::{
         ActionId, AgentInput, AssistantItem, AssistantMessage, InjectedMessage, TranscriptRecord,
         TurnId, TurnOutcome,

@@ -6,17 +6,18 @@ use uuid::Uuid;
 
 use crate::transcript::Transcript;
 
-pub mod compaction;
 pub mod edit;
-pub mod replace;
-pub mod rewind;
-pub mod summary;
+pub(crate) mod ops;
+pub(crate) mod span;
+pub(crate) mod tokens;
 
-pub use self::compaction::{Compact, CompactionPlan, CompactionSettings, KIND_COMPACTION_SUMMARY};
 pub use self::edit::{ContextEdit, HistoryEditError, PendingWork};
-pub use self::replace::ReplaceTranscript;
-pub use self::rewind::Rewind;
-pub use self::summary::{SummarizeSpan, SummarySpanPlan};
+pub use self::ops::compaction::{
+    compaction_summary, Compact, CompactionPlan, CompactionSettings, KIND_COMPACTION_SUMMARY,
+};
+pub use self::ops::replace::ReplaceTranscript;
+pub use self::ops::rewind::Rewind;
+pub use self::span::{SummarizeSpan, SummarySpanPlan};
 
 /// DAG entry holding a single `TranscriptRecord`. The DAG is append-only; new
 /// entries attach as children of `parent_id`. The context tracks the
@@ -190,12 +191,14 @@ impl Context {
 
     /// Materialize the active branch into a `Transcript`.
     ///
-    /// Summary-span edits rebuild the active branch in model-visible order,
-    /// so materialization is a plain full-path view. See
-    /// `compaction::materialize_context` for the tiny adapter.
+    /// Summary-span edits rebuild the active branch in model-visible order:
+    /// prefix before the summarized span, the summary record, then copies of
+    /// the suffix after the summarized span. Materialization is therefore the
+    /// full active path.
     pub fn transcript(&self) -> Transcript {
         let path = self.branch_entries(None);
-        self::compaction::materialize_context(&path)
+        let records = path.into_iter().map(|e| e.record).collect();
+        Transcript::from_records(records)
     }
 
     pub(crate) fn append_record(&mut self, record: TranscriptRecord) -> String {
@@ -235,7 +238,7 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::compaction::compaction_summary;
+    use crate::context::compaction_summary;
     use agent_core::{AssistantItem, AssistantMessage, InjectedMessage, TurnId, TurnOutcome};
 
     fn turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptRecord> {
