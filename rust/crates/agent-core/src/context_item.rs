@@ -41,9 +41,6 @@ pub enum ContextItem {
     Injected(InjectedMessage),
 }
 
-/// Back-compat name for `ContextItem`.
-pub type TranscriptRecord = ContextItem;
-
 /// Payload carried by `ContextItem::Injected`.
 ///
 /// `kind` is a free-form tag chosen by the session, orchestrator, or another

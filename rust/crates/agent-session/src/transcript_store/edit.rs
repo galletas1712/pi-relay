@@ -1,21 +1,21 @@
-use crate::context::{Context, ContextError};
+use crate::transcript_store::{TranscriptStore, TranscriptStoreError};
 
-/// Operations that mutate a quiescent `Context`.
+/// Operations that mutate a quiescent `TranscriptStore`.
 ///
 /// Each history-editing operation is its own struct (`SummarizeSpan`,
-/// `Compact`, `Rewind`, `ReplaceTranscript`) implementing this trait. The
+/// `Compact`, `Rewind`, `ReplaceModelContext`) implementing this trait. The
 /// caller obtains the right to edit via [`crate::AgentSession::edit`], which
 /// runs the quiescence check once and then dispatches to
-/// [`ContextEdit::apply`] on the provided op.
+/// [`HistoryEdit::apply`] on the provided op.
 ///
-/// `apply` takes `&mut Context` directly — op impls do not see the
+/// `apply` takes `&mut TranscriptStore` directly — op impls do not see the
 /// `AgentSession`. Core-loop rehydration happens once in `AgentSession::edit`
 /// after `apply` returns `Ok`, so each op only needs to worry about its own
 /// context mutation and its own per-op preconditions.
-pub trait ContextEdit {
+pub trait HistoryEdit {
     type Output;
 
-    fn apply(self, ctx: &mut Context) -> Result<Self::Output, HistoryEditError>;
+    fn apply(self, ctx: &mut TranscriptStore) -> Result<Self::Output, HistoryEditError>;
 }
 
 /// Caller-tracked work the session cannot observe (worklog forks, background
@@ -43,10 +43,10 @@ pub enum HistoryEditError {
     /// durable leaf mid-turn, mailbox non-empty, undrained actions remain, or
     /// pending work is outstanding).
     Busy,
-    /// A transcript supplied to `ReplaceTranscript` did not itself end at a
-    /// turn boundary.
+    /// A model context supplied to `ReplaceModelContext` did not itself end at
+    /// a turn boundary.
     ReplacementNotAtTurnBoundary,
-    /// An underlying context error: entry not found, invalid summary span,
-    /// not at a turn boundary, or a stale edit plan.
-    Context(ContextError),
+    /// An underlying transcript-store error: entry not found, invalid summary
+    /// span, not at a turn boundary, or a stale edit plan.
+    Store(TranscriptStoreError),
 }

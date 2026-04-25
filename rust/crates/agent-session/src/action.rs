@@ -1,7 +1,7 @@
 use agent_core::{ActionId, ToolCall, TurnId};
 
 use crate::auto_compaction::StatelessModelRequest;
-use crate::transcript::Transcript;
+use crate::model_context::ModelContext;
 
 /// Session-level work requested by `AgentSession`.
 ///
@@ -14,7 +14,7 @@ pub enum SessionAction {
     RequestModel {
         action_id: ActionId,
         turn_id: TurnId,
-        transcript: Transcript,
+        model_context: ModelContext,
     },
     RequestTool {
         action_id: ActionId,

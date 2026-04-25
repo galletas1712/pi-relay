@@ -16,12 +16,12 @@ use agent_session::AgentSession;
 pub use crate::registry::{RegistryError, RouteError, SessionId, SessionRegistry};
 
 /// Well-known `InjectedMessage::kind` tag for parent->child directives routed via
-/// `AgentOrchestrator::send_message`. Stored on the child's transcript as the
+/// `AgentOrchestrator::send_message`. Stored in the child's model context as the
 /// `kind` of the injected entry that opens the directive's turn.
 pub const KIND_AGENT_DIRECTIVE: &str = "agent_directive";
 
 /// Well-known `InjectedMessage::kind` tag for child->parent reports routed via
-/// `AgentOrchestrator::send_report`. Stored on the parent's transcript as the
+/// `AgentOrchestrator::send_report`. Stored in the parent's model context as the
 /// `kind` of the injected entry that opens the report's turn.
 pub const KIND_AGENT_REPORT: &str = "agent_report";
 
@@ -54,7 +54,7 @@ impl AgentOrchestrator {
     /// Enqueues `AgentInput::Steer { from: Some(from), kind:
     /// Some(KIND_AGENT_DIRECTIVE), content }` on the target's mailbox. The
     /// `from` and `kind` tags ride along so the target's FSM materialises a
-    /// `TranscriptRecord::Injected(InjectedMessage { kind:
+    /// `ContextItem::Injected(InjectedMessage { kind:
     /// "agent_directive", metadata: {"from": ...}, .. })` at turn start
     /// instead of a plain `UserMessage`.
     ///
@@ -97,7 +97,7 @@ impl AgentOrchestrator {
     /// Enqueues `AgentInput::FollowUp { from: Some(from), kind:
     /// Some(KIND_AGENT_REPORT), content }` on the parent's mailbox. The `from`
     /// and `kind` tags ride along so the parent's FSM materialises a
-    /// `TranscriptRecord::Injected(InjectedMessage { kind: "agent_report",
+    /// `ContextItem::Injected(InjectedMessage { kind: "agent_report",
     /// metadata: {"from": ...}, .. })` at turn start instead of a plain
     /// `UserMessage`.
     ///
@@ -130,10 +130,10 @@ impl AgentOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{AgentInput, AssistantMessage, TranscriptRecord, TurnId, TurnOutcome};
+    use agent_core::{AgentInput, AssistantMessage, ContextItem, TurnId, TurnOutcome};
     use agent_session::{
-        Compact, CompactionSettings, ContextError, HistoryEditError, PendingWork,
-        ReplaceTranscript, Rewind, Transcript,
+        Compact, CompactionSettings, HistoryEditError, ModelContext, PendingWork,
+        ReplaceModelContext, Rewind, TranscriptStoreError,
     };
 
     #[test]
@@ -159,12 +159,12 @@ mod tests {
     }
 
     #[test]
-    fn orchestrator_delegates_transcript_replacement_to_session_history_edit() {
+    fn orchestrator_delegates_model_context_replacement_to_session_history_edit() {
         let mut orchestrator = AgentOrchestrator::new();
-        let transcript = Transcript::from_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("compacted".to_string()),
-            TranscriptRecord::TurnFinished {
+        let model_context = ModelContext::from_records(vec![
+            ContextItem::TurnStarted { turn_id: TurnId(1) },
+            ContextItem::UserMessage("compacted".to_string()),
+            ContextItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
@@ -180,18 +180,18 @@ mod tests {
             .expect("session should exist")
             .edit(
                 PendingWork::NONE,
-                ReplaceTranscript {
-                    replacement: transcript,
+                ReplaceModelContext {
+                    replacement: model_context,
                 },
             )
-            .expect("idle empty session can replace transcript");
+            .expect("idle empty session can replace model_context");
 
         assert_eq!(
             orchestrator
                 .registry()
                 .get("root")
                 .expect("session should exist")
-                .transcript()
+                .model_context()
                 .last_turn_id(),
             TurnId(1)
         );
@@ -200,24 +200,24 @@ mod tests {
     #[test]
     fn orchestrator_delegates_rewind_fork_and_compaction_to_session_history_edits() {
         let mut orchestrator = AgentOrchestrator::new();
-        let session = AgentSession::from_transcript(Transcript::from_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("first user message".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            TranscriptRecord::TurnFinished {
+        let session = AgentSession::from_model_context(ModelContext::from_records(vec![
+            ContextItem::TurnStarted { turn_id: TurnId(1) },
+            ContextItem::UserMessage("first user message".to_string()),
+            ContextItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            ContextItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage("second user message".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            TranscriptRecord::TurnFinished {
+            ContextItem::TurnStarted { turn_id: TurnId(2) },
+            ContextItem::UserMessage("second user message".to_string()),
+            ContextItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            ContextItem::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             },
         ]));
-        let mid_turn_id = session.context().entries()[1].id.clone();
-        let turn_one_end_id = session.context().entries()[3].id.clone();
+        let mid_turn_id = session.transcript_store().entries()[1].id.clone();
+        let turn_one_end_id = session.transcript_store().entries()[3].id.clone();
 
         orchestrator
             .registry_mut()
@@ -236,7 +236,9 @@ mod tests {
             );
         assert!(matches!(
             rewind_err,
-            Err(HistoryEditError::Context(ContextError::NotTurnBoundary))
+            Err(HistoryEditError::Store(
+                TranscriptStoreError::NotTurnBoundary
+            ))
         ));
 
         let fork = orchestrator
@@ -254,7 +256,7 @@ mod tests {
                 .registry()
                 .get("fork")
                 .expect("fork should exist")
-                .transcript()
+                .model_context()
                 .last_turn_id(),
             TurnId(1)
         );
@@ -267,7 +269,7 @@ mod tests {
             .registry()
             .get("root")
             .expect("session should exist")
-            .context()
+            .transcript_store()
             .prepare_compaction(CompactionSettings {
                 keep_recent_tokens: 1,
             })
@@ -289,7 +291,7 @@ mod tests {
                 .registry()
                 .get("root")
                 .expect("root should exist")
-                .transcript()
+                .model_context()
                 .latest_compaction_summary(),
             Some("summary")
         );
@@ -397,7 +399,7 @@ mod tests {
         let mut orchestrator = orchestrator_with_parent_and_child();
 
         // Send a report from B up to A, then drive A's mailbox so it starts a
-        // turn from the queued follow-up. The parent transcript should open
+        // turn from the queued follow-up. The parent model_context should open
         // the new turn with an injected entry tagged as agent_report, not a
         // plain UserMessage.
         orchestrator
@@ -410,14 +412,14 @@ mod tests {
             .expect("parent exists");
         parent.drive();
 
-        let records = parent.transcript().records().to_vec();
+        let records = parent.model_context().records().to_vec();
         let injected = records
             .iter()
             .find_map(|r| match r {
-                TranscriptRecord::Injected(cm) => Some(cm),
+                ContextItem::Injected(cm) => Some(cm),
                 _ => None,
             })
-            .expect("parent transcript should contain an injected entry from the report");
+            .expect("parent model_context should contain an injected entry from the report");
 
         let mut expected_metadata = std::collections::BTreeMap::new();
         expected_metadata.insert("from".to_string(), "B".to_string());
@@ -435,7 +437,7 @@ mod tests {
         assert!(
             !records
                 .iter()
-                .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "child is done")),
+                .any(|r| matches!(r, ContextItem::UserMessage(s) if s == "child is done")),
             "report should not show up as a UserMessage",
         );
     }

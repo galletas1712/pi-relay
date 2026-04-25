@@ -1,8 +1,8 @@
-use agent_core::TranscriptRecord;
+use agent_core::ContextItem;
 
 use crate::action::StatelessModelRequestId;
-use crate::context::tokens::estimate_records_tokens;
-use crate::context::{CompactionPlan, CompactionSettings, Context};
+use crate::transcript_store::tokens::estimate_records_tokens;
+use crate::transcript_store::{CompactionPlan, CompactionSettings, TranscriptStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AutoCompactionSettings {
@@ -63,10 +63,10 @@ pub(crate) enum PendingStatelessModelKind {
 }
 
 pub(crate) fn prepare_auto_compaction(
-    context: &Context,
+    context: &TranscriptStore,
     settings: AutoCompactionSettings,
 ) -> Option<CompactionPlan> {
-    let tokens = estimate_records_tokens(context.transcript().records());
+    let tokens = estimate_records_tokens(context.model_context().records());
     if tokens <= settings.max_context_tokens {
         return None;
     }
@@ -83,7 +83,7 @@ pub(crate) fn compaction_request(plan: &CompactionPlan) -> StatelessModelRequest
         });
     }
     input.push(ModelContentBlock::Text {
-        text: format_records("Context to summarize", &plan.records_to_summarize),
+        text: format_records("TranscriptStore to summarize", &plan.records_to_summarize),
     });
     input.push(ModelContentBlock::Text {
         text: format_records("Recent context that will be kept", &plan.records_to_keep),
@@ -102,7 +102,7 @@ pub(crate) fn compaction_request(plan: &CompactionPlan) -> StatelessModelRequest
     }
 }
 
-fn format_records(label: &str, records: &[TranscriptRecord]) -> String {
+fn format_records(label: &str, records: &[ContextItem]) -> String {
     let mut out = String::new();
     out.push_str(label);
     out.push_str(":\n");

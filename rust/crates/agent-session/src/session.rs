@@ -1,8 +1,6 @@
 use std::collections::VecDeque;
 
-use agent_core::{
-    AgentAction, AgentCoreLoop, AgentInput, AgentInputError, TranscriptRecord, TurnId,
-};
+use agent_core::{AgentAction, AgentCoreLoop, AgentInput, AgentInputError, ContextItem, TurnId};
 
 use crate::action::{SessionAction, StatelessModelRequestId};
 use crate::action_queue::ActionQueue;
@@ -10,25 +8,25 @@ use crate::auto_compaction::{
     self, AutoCompactionSettings, PendingStatelessModel, PendingStatelessModelKind,
     StatelessModelOutput,
 };
-use crate::context::{
-    compaction_summary, Context, ContextEdit, ContextError, HistoryEditError, PendingWork,
-    SummarizeSpan,
-};
-use crate::event::{ContextEditKind, SessionActionKind, SessionEvent};
+use crate::event::{HistoryEditKind, SessionActionKind, SessionEvent};
 use crate::input::{SessionInput, SessionInputError};
-use crate::transcript::Transcript;
+use crate::model_context::ModelContext;
+use crate::transcript_store::{
+    compaction_summary, HistoryEdit, HistoryEditError, PendingWork, SummarizeSpan, TranscriptStore,
+    TranscriptStoreError,
+};
 
 /// Session shell around the pure core loop.
 ///
 /// `agent-core` owns deterministic state transitions. `agent-session` owns the
 /// point at which the session's history can be safely replaced, forked,
 /// rewound, or resumed after consulting external model/tool work. The
-/// `Context` is the sole owner of durable records; the core only buffers
+/// `TranscriptStore` is the sole owner of durable records; the core only buffers
 /// records produced in the current run until the session absorbs them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSession {
     pub(crate) core: AgentCoreLoop,
-    pub(crate) context: Context,
+    pub(crate) transcript_store: TranscriptStore,
     action_queue: ActionQueue,
     action_outbox: VecDeque<SessionAction>,
     event_outbox: VecDeque<SessionEvent>,
@@ -47,7 +45,7 @@ impl AgentSession {
     pub fn new() -> Self {
         Self {
             core: AgentCoreLoop::resume_at_boundary(TurnId::default()),
-            context: Context::new(),
+            transcript_store: TranscriptStore::new(),
             action_queue: ActionQueue::new(),
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
@@ -70,21 +68,21 @@ impl AgentSession {
         self.auto_compaction
     }
 
-    pub fn from_records(records: Vec<TranscriptRecord>) -> Self {
-        Self::from_transcript(Transcript::from_records_recovering_crashed_tail(records))
+    pub fn from_records(records: Vec<ContextItem>) -> Self {
+        Self::from_model_context(ModelContext::from_records_recovering_crashed_tail(records))
     }
 
-    pub fn from_transcript(transcript: Transcript) -> Self {
-        let transcript = if transcript.is_turn_boundary() {
-            transcript
+    pub fn from_model_context(model_context: ModelContext) -> Self {
+        let model_context = if model_context.is_turn_boundary() {
+            model_context
         } else {
-            Transcript::from_records_recovering_crashed_tail(transcript.into_records())
+            ModelContext::from_records_recovering_crashed_tail(model_context.into_records())
         };
-        let last_turn_id = transcript.last_turn_id();
-        let context = Context::from_transcript(&transcript);
+        let last_turn_id = model_context.last_turn_id();
+        let transcript_store = TranscriptStore::from_model_context(&model_context);
         Self {
             core: AgentCoreLoop::resume_at_boundary(last_turn_id),
-            context,
+            transcript_store,
             action_queue: ActionQueue::new(),
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
@@ -94,16 +92,20 @@ impl AgentSession {
         }
     }
 
-    pub fn from_context(context: Context) -> Result<Self, HistoryEditError> {
-        if !context.is_turn_boundary() {
-            return Err(HistoryEditError::Context(ContextError::NotTurnBoundary));
+    pub fn from_transcript_store(
+        transcript_store: TranscriptStore,
+    ) -> Result<Self, HistoryEditError> {
+        if !transcript_store.is_turn_boundary() {
+            return Err(HistoryEditError::Store(
+                TranscriptStoreError::NotTurnBoundary,
+            ));
         }
 
-        let transcript = context.transcript();
-        let last_turn_id = transcript.last_turn_id();
+        let model_context = transcript_store.model_context();
+        let last_turn_id = model_context.last_turn_id();
         Ok(Self {
             core: AgentCoreLoop::resume_at_boundary(last_turn_id),
-            context,
+            transcript_store,
             action_queue: ActionQueue::new(),
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
@@ -188,12 +190,12 @@ impl AgentSession {
     /// Materialized view of the session history derived from the context.
     /// With a compaction present, the latest summary is inlined ahead of the
     /// kept suffix so downstream callers see a single ordered record stream.
-    pub fn transcript(&self) -> Transcript {
-        self.context.transcript()
+    pub fn model_context(&self) -> ModelContext {
+        self.transcript_store.model_context()
     }
 
-    pub fn context(&self) -> &Context {
-        &self.context
+    pub fn transcript_store(&self) -> &TranscriptStore {
+        &self.transcript_store
     }
 
     /// Drive the core to quiescence and append any records it emitted to the
@@ -239,7 +241,7 @@ impl AgentSession {
     /// undrained observable actions or caller-tracked background work.
     pub fn can_edit_history(&self, pending: PendingWork) -> bool {
         self.core.is_idle()
-            && self.context.is_turn_boundary()
+            && self.transcript_store.is_turn_boundary()
             && !self.core.has_pending_work()
             && self.action_queue.is_empty()
             && self.action_outbox.is_empty()
@@ -247,13 +249,13 @@ impl AgentSession {
             && pending.is_empty()
     }
 
-    /// Apply a `ContextEdit` operation (`Compact`, `Rewind`,
-    /// `ReplaceTranscript`) to this session's context.
+    /// Apply a `HistoryEdit` operation (`Compact`, `Rewind`,
+    /// `ReplaceModelContext`) to this session's context.
     ///
     /// The quiescence check runs once here; the op's `apply` then mutates the
     /// context directly. On success the core loop is rehydrated from the new
     /// context so the next `drive` resumes from the correct turn id.
-    pub fn edit<E: ContextEdit>(
+    pub fn edit<E: HistoryEdit>(
         &mut self,
         pending: PendingWork,
         edit: E,
@@ -261,10 +263,10 @@ impl AgentSession {
         if !self.can_edit_history(pending) {
             return Err(HistoryEditError::Busy);
         }
-        let output = edit.apply(&mut self.context)?;
-        self.rehydrate_core_from_context();
-        self.event_outbox.push_back(SessionEvent::ContextEdited {
-            kind: ContextEditKind::HistoryEdit,
+        let output = edit.apply(&mut self.transcript_store)?;
+        self.rehydrate_core_from_transcript_store();
+        self.event_outbox.push_back(SessionEvent::HistoryEdited {
+            kind: HistoryEditKind::HistoryEdit,
         });
         Ok(output)
     }
@@ -273,7 +275,7 @@ impl AgentSession {
     /// `leaf_id` (or the root when `None`). The source session is unchanged;
     /// the caller is responsible for registering the fork if desired.
     ///
-    /// Fork stays as a direct method rather than a `ContextEdit` impl because
+    /// Fork stays as a direct method rather than a `HistoryEdit` impl because
     /// it reads the context and produces a new session rather than mutating
     /// the source in place.
     pub fn fork(
@@ -284,11 +286,11 @@ impl AgentSession {
         if !self.can_edit_history(pending) {
             return Err(HistoryEditError::Busy);
         }
-        let context = self
-            .context
-            .create_branched_context_at_turn_boundary(leaf_id)
-            .map_err(HistoryEditError::Context)?;
-        AgentSession::from_context(context)
+        let transcript_store = self
+            .transcript_store
+            .create_branched_store_at_turn_boundary(leaf_id)
+            .map_err(HistoryEditError::Store)?;
+        AgentSession::from_transcript_store(transcript_store)
     }
 
     fn absorb_core_records(&mut self) {
@@ -296,7 +298,7 @@ impl AgentSession {
         if records.is_empty() {
             return;
         }
-        let entry_ids = self.context.append_transcript_records(records.clone());
+        let entry_ids = self.transcript_store.append_context_items(records.clone());
         for (entry_id, record) in entry_ids.into_iter().zip(records) {
             self.event_outbox
                 .push_back(SessionEvent::RecordAppended { entry_id, record });
@@ -337,7 +339,8 @@ impl AgentSession {
         let Some(settings) = self.auto_compaction else {
             return false;
         };
-        let Some(plan) = auto_compaction::prepare_auto_compaction(&self.context, settings) else {
+        let Some(plan) = auto_compaction::prepare_auto_compaction(&self.transcript_store, settings)
+        else {
             return false;
         };
 
@@ -365,7 +368,7 @@ impl AgentSession {
             AgentAction::RequestModel { action_id, turn_id } => SessionAction::RequestModel {
                 action_id,
                 turn_id,
-                transcript: self.transcript(),
+                model_context: self.model_context(),
             },
             AgentAction::RequestTool {
                 action_id,
@@ -415,8 +418,8 @@ impl AgentSession {
                         error: format!("{error:?}"),
                     });
                 } else {
-                    self.event_outbox.push_back(SessionEvent::ContextEdited {
-                        kind: ContextEditKind::Compact,
+                    self.event_outbox.push_back(SessionEvent::HistoryEdited {
+                        kind: HistoryEditKind::Compact,
                     });
                 }
                 self.expose_agent_action(held_model_action);
@@ -465,7 +468,7 @@ impl AgentSession {
 
     fn apply_pending_compaction(
         &mut self,
-        plan: crate::context::CompactionPlan,
+        plan: crate::transcript_store::CompactionPlan,
         summary: String,
     ) -> Result<(), HistoryEditError> {
         let first_kept_entry_id = plan.first_kept_entry_id.clone();
@@ -474,7 +477,7 @@ impl AgentSession {
             plan: plan.summary_span,
             summary: compaction_summary(summary, first_kept_entry_id, tokens_before),
         }
-        .apply(&mut self.context)
+        .apply(&mut self.transcript_store)
     }
 
     fn clear_pending_stateless_model(&mut self, error: &str) {
@@ -607,8 +610,8 @@ impl AgentSession {
         }
     }
 
-    pub(crate) fn rehydrate_core_from_context(&mut self) {
-        let last_turn_id = self.context.transcript().last_turn_id();
+    pub(crate) fn rehydrate_core_from_transcript_store(&mut self) {
+        let last_turn_id = self.transcript_store.model_context().last_turn_id();
         let next_action_id = self.core.next_action_id();
         self.core =
             AgentCoreLoop::resume_at_boundary_with_next_action_id(last_turn_id, next_action_id);
@@ -625,33 +628,33 @@ impl AgentSession {
 mod tests {
     use super::*;
     use crate::auto_compaction::StatelessModelOutput;
-    use crate::context::{Compact, CompactionSettings, ReplaceTranscript, Rewind};
+    use crate::transcript_store::{Compact, CompactionSettings, ReplaceModelContext, Rewind};
     use agent_core::{
         ActionId, AssistantItem, AssistantMessage, InjectedMessage, ToolCall, ToolCallId,
         ToolResultMessage, ToolResultStatus, TurnId, TurnOutcome,
     };
 
-    fn finished_transcript(input: &str) -> Transcript {
-        Transcript::from_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage(input.to_string()),
-            TranscriptRecord::TurnFinished {
+    fn finished_model_context(input: &str) -> ModelContext {
+        ModelContext::from_records(vec![
+            ContextItem::TurnStarted { turn_id: TurnId(1) },
+            ContextItem::UserMessage(input.to_string()),
+            ContextItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
         ])
     }
 
-    fn finished_turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptRecord> {
+    fn finished_turn(turn_id: u64, user: &str, assistant: &str) -> Vec<ContextItem> {
         vec![
-            TranscriptRecord::TurnStarted {
+            ContextItem::TurnStarted {
                 turn_id: TurnId(turn_id),
             },
-            TranscriptRecord::UserMessage(user.to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage {
+            ContextItem::UserMessage(user.to_string()),
+            ContextItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text(assistant.to_string())],
             }),
-            TranscriptRecord::TurnFinished {
+            ContextItem::TurnFinished {
                 turn_id: TurnId(turn_id),
                 outcome: TurnOutcome::Graceful,
             },
@@ -662,11 +665,11 @@ mod tests {
         actions: Vec<SessionAction>,
         expected_action_id: ActionId,
         expected_turn_id: TurnId,
-    ) -> Transcript {
+    ) -> ModelContext {
         let [SessionAction::RequestModel {
             action_id,
             turn_id,
-            transcript,
+            model_context,
         }] = actions.as_slice()
         else {
             panic!("expected one RequestModel action, got {actions:?}");
@@ -675,7 +678,7 @@ mod tests {
             (*action_id, *turn_id),
             (expected_action_id, expected_turn_id)
         );
-        transcript.clone()
+        model_context.clone()
     }
 
     fn session_with_compactable_history() -> AgentSession {
@@ -690,12 +693,12 @@ mod tests {
             "second user message with enough text to count",
             "second assistant message with enough text to count",
         ));
-        AgentSession::from_transcript(Transcript::from_records(records))
+        AgentSession::from_model_context(ModelContext::from_records(records))
             .with_auto_compaction(AutoCompactionSettings::new(1, 1))
     }
 
     #[test]
-    fn transcript_replacement_is_only_allowed_at_turn_boundary() {
+    fn model_context_replacement_is_only_allowed_at_turn_boundary() {
         let mut session = AgentSession::new();
         session
             .enqueue_input(AgentInput::follow_up("hello"))
@@ -704,49 +707,49 @@ mod tests {
         let busy = session
             .edit(
                 PendingWork::NONE,
-                ReplaceTranscript {
-                    replacement: finished_transcript("compact"),
+                ReplaceModelContext {
+                    replacement: finished_model_context("compact"),
                 },
             )
             .expect_err("running sessions cannot edit history");
         assert_eq!(busy, HistoryEditError::Busy);
 
-        let mut session = AgentSession::from_transcript(finished_transcript("hello"));
+        let mut session = AgentSession::from_model_context(finished_model_context("hello"));
 
         let old = session
             .edit(
                 PendingWork::NONE,
-                ReplaceTranscript {
-                    replacement: finished_transcript("compact"),
+                ReplaceModelContext {
+                    replacement: finished_model_context("compact"),
                 },
             )
-            .expect("idle session can swap transcript");
+            .expect("idle session can swap model_context");
 
         assert_eq!(old.last_turn_id(), TurnId(1));
         assert_eq!(
-            session.transcript().records()[1],
-            TranscriptRecord::UserMessage("compact".to_string())
+            session.model_context().records()[1],
+            ContextItem::UserMessage("compact".to_string())
         );
     }
 
     #[test]
     fn rewind_and_fork_only_accept_turn_finished_entries() {
-        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("first".to_string()),
-            TranscriptRecord::TurnFinished {
+        let mut session = AgentSession::from_model_context(ModelContext::from_records(vec![
+            ContextItem::TurnStarted { turn_id: TurnId(1) },
+            ContextItem::UserMessage("first".to_string()),
+            ContextItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage("second".to_string()),
-            TranscriptRecord::TurnFinished {
+            ContextItem::TurnStarted { turn_id: TurnId(2) },
+            ContextItem::UserMessage("second".to_string()),
+            ContextItem::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             },
         ]));
-        let mid_turn_id = session.context().entries()[1].id.clone();
-        let turn_one_end_id = session.context().entries()[2].id.clone();
+        let mid_turn_id = session.transcript_store().entries()[1].id.clone();
+        let turn_one_end_id = session.transcript_store().entries()[2].id.clone();
 
         assert_eq!(
             session.edit(
@@ -755,13 +758,17 @@ mod tests {
                     leaf_id: Some(mid_turn_id.clone())
                 }
             ),
-            Err(HistoryEditError::Context(ContextError::NotTurnBoundary))
+            Err(HistoryEditError::Store(
+                TranscriptStoreError::NotTurnBoundary
+            ))
         );
         assert_eq!(
             session
                 .fork(PendingWork::NONE, Some(&mid_turn_id))
                 .map(|_| ()),
-            Err(HistoryEditError::Context(ContextError::NotTurnBoundary))
+            Err(HistoryEditError::Store(
+                TranscriptStoreError::NotTurnBoundary
+            ))
         );
 
         session
@@ -772,39 +779,39 @@ mod tests {
                 },
             )
             .expect("turn end is a valid rewind point");
-        assert_eq!(session.transcript().last_turn_id(), TurnId(1));
+        assert_eq!(session.model_context().last_turn_id(), TurnId(1));
 
         let fork = session
             .fork(PendingWork::NONE, Some(&turn_one_end_id))
             .expect("turn end is a valid fork point");
-        assert_eq!(fork.transcript().last_turn_id(), TurnId(1));
+        assert_eq!(fork.model_context().last_turn_id(), TurnId(1));
     }
 
     #[test]
     fn compact_op_compacts_via_context_edit_dispatch() {
-        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("first".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage {
+        let mut session = AgentSession::from_model_context(ModelContext::from_records(vec![
+            ContextItem::TurnStarted { turn_id: TurnId(1) },
+            ContextItem::UserMessage("first".to_string()),
+            ContextItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text("ok".to_string())],
             }),
-            TranscriptRecord::TurnFinished {
+            ContextItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage("second".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage {
+            ContextItem::TurnStarted { turn_id: TurnId(2) },
+            ContextItem::UserMessage("second".to_string()),
+            ContextItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text("ok2".to_string())],
             }),
-            TranscriptRecord::TurnFinished {
+            ContextItem::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             },
         ]));
 
         let plan = session
-            .context()
+            .transcript_store()
             .prepare_compaction(CompactionSettings {
                 keep_recent_tokens: 1,
             })
@@ -818,7 +825,10 @@ mod tests {
                 },
             )
             .expect("compact should apply");
-        assert_eq!(session.transcript().latest_compaction_summary(), Some("s"));
+        assert_eq!(
+            session.model_context().latest_compaction_summary(),
+            Some("s")
+        );
     }
 
     #[test]
@@ -836,11 +846,11 @@ mod tests {
 
     #[test]
     fn context_tracks_core_turn_records() {
-        let session = AgentSession::from_transcript(finished_transcript("hello"));
+        let session = AgentSession::from_model_context(finished_model_context("hello"));
 
-        assert_eq!(session.context().entries().len(), 3);
-        assert!(session.context().is_turn_boundary());
-        assert_eq!(session.transcript().last_turn_id(), TurnId(1));
+        assert_eq!(session.transcript_store().entries().len(), 3);
+        assert!(session.transcript_store().is_turn_boundary());
+        assert_eq!(session.model_context().last_turn_id(), TurnId(1));
     }
 
     #[test]
@@ -864,12 +874,12 @@ mod tests {
         session.drive();
 
         assert_eq!(
-            session.transcript().records(),
+            session.model_context().records(),
             &[
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hello".to_string()),
-                TranscriptRecord::AssistantMessage(assistant),
-                TranscriptRecord::TurnFinished {
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::UserMessage("hello".to_string()),
+                ContextItem::AssistantMessage(assistant),
+                ContextItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Graceful,
                 },
@@ -877,7 +887,7 @@ mod tests {
         );
         // Driving again absorbs nothing new; the core buffer was drained.
         session.drive();
-        assert_eq!(session.transcript().records().len(), 4);
+        assert_eq!(session.model_context().records().len(), 4);
     }
 
     #[test]
@@ -890,29 +900,29 @@ mod tests {
         session.drive();
 
         assert_eq!(
-            session.transcript().records(),
+            session.model_context().records(),
             &[
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hello".to_string()),
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::UserMessage("hello".to_string()),
             ]
         );
     }
 
     #[test]
     fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
-        let transcript = vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
-            TranscriptRecord::UserMessage("hello".to_string()),
+        let model_context = vec![
+            ContextItem::TurnStarted { turn_id: TurnId(7) },
+            ContextItem::UserMessage("hello".to_string()),
         ];
 
-        let session = AgentSession::from_records(transcript);
+        let session = AgentSession::from_records(model_context);
 
         assert_eq!(
-            session.transcript().records(),
+            session.model_context().records(),
             &[
-                TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
-                TranscriptRecord::UserMessage("hello".to_string()),
-                TranscriptRecord::TurnFinished {
+                ContextItem::TurnStarted { turn_id: TurnId(7) },
+                ContextItem::UserMessage("hello".to_string()),
+                ContextItem::TurnFinished {
                     turn_id: TurnId(7),
                     outcome: TurnOutcome::Crashed,
                 },
@@ -923,18 +933,18 @@ mod tests {
     }
 
     #[test]
-    fn from_transcript_recovers_an_open_tail_as_crashed() {
-        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
-            TranscriptRecord::UserMessage("hello".to_string()),
+    fn from_model_context_recovers_an_open_tail_as_crashed() {
+        let mut session = AgentSession::from_model_context(ModelContext::from_records(vec![
+            ContextItem::TurnStarted { turn_id: TurnId(7) },
+            ContextItem::UserMessage("hello".to_string()),
         ]));
 
         assert_eq!(
-            session.transcript().records(),
+            session.model_context().records(),
             &[
-                TranscriptRecord::TurnStarted { turn_id: TurnId(7) },
-                TranscriptRecord::UserMessage("hello".to_string()),
-                TranscriptRecord::TurnFinished {
+                ContextItem::TurnStarted { turn_id: TurnId(7) },
+                ContextItem::UserMessage("hello".to_string()),
+                ContextItem::TurnFinished {
                     turn_id: TurnId(7),
                     outcome: TurnOutcome::Crashed,
                 },
@@ -947,25 +957,25 @@ mod tests {
             .expect("plain follow-up is valid");
         session.drive();
         assert!(matches!(
-            session.transcript().records().last(),
-            Some(TranscriptRecord::UserMessage(text)) if text == "next"
+            session.model_context().records().last(),
+            Some(ContextItem::UserMessage(text)) if text == "next"
         ));
     }
 
     #[test]
     fn rehydrating_a_graceful_boundary_restores_idle_state() {
-        let transcript = vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage("hello".to_string()),
-            TranscriptRecord::TurnFinished {
+        let model_context = vec![
+            ContextItem::TurnStarted { turn_id: TurnId(2) },
+            ContextItem::UserMessage("hello".to_string()),
+            ContextItem::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             },
         ];
 
-        let session = AgentSession::from_records(transcript.clone());
+        let session = AgentSession::from_records(model_context.clone());
 
-        assert_eq!(session.transcript().records(), transcript.as_slice());
+        assert_eq!(session.model_context().records(), model_context.as_slice());
         assert!(session.is_idle());
         assert_eq!(session.last_turn_id(), TurnId(2));
     }
@@ -1014,11 +1024,11 @@ mod tests {
         session.drive();
 
         assert_eq!(
-            session.transcript().records(),
+            session.model_context().records(),
             &[
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hi".to_string()),
-                TranscriptRecord::TurnFinished {
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::UserMessage("hi".to_string()),
+                ContextItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Crashed,
                 },
@@ -1058,10 +1068,10 @@ mod tests {
                     if text.contains("first user message")
             )
         }));
-        assert_eq!(session.transcript().latest_compaction_summary(), None);
+        assert_eq!(session.model_context().latest_compaction_summary(), None);
         assert!(matches!(
-            session.transcript().records().last(),
-            Some(TranscriptRecord::UserMessage(text)) if text == "third user message"
+            session.model_context().records().last(),
+            Some(ContextItem::UserMessage(text)) if text == "third user message"
         ));
         assert!(!session.can_edit_history(PendingWork::NONE));
 
@@ -1069,7 +1079,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             SessionEvent::RecordAppended {
-                record: TranscriptRecord::TurnStarted { turn_id: TurnId(3) },
+                record: ContextItem::TurnStarted { turn_id: TurnId(3) },
                 ..
             }
         )));
@@ -1082,7 +1092,7 @@ mod tests {
         assert!(!events.iter().any(|event| matches!(
             event,
             SessionEvent::RecordAppended {
-                record: TranscriptRecord::Injected(_),
+                record: ContextItem::Injected(_),
                 ..
             }
         )));
@@ -1094,16 +1104,16 @@ mod tests {
             })
             .expect("stateless model completion should be accepted");
 
-        let request_transcript =
+        let request_model_context =
             assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-        assert_eq!(request_transcript, session.transcript());
+        assert_eq!(request_model_context, session.model_context());
         assert_eq!(
-            session.transcript().latest_compaction_summary(),
+            session.model_context().latest_compaction_summary(),
             Some("summary text")
         );
         assert!(matches!(
-            session.transcript().records().last(),
-            Some(TranscriptRecord::UserMessage(text)) if text == "third user message"
+            session.model_context().records().last(),
+            Some(ContextItem::UserMessage(text)) if text == "third user message"
         ));
 
         let events = session.drain_events();
@@ -1116,8 +1126,8 @@ mod tests {
         )));
         assert!(events.iter().any(|event| matches!(
             event,
-            SessionEvent::ContextEdited {
-                kind: ContextEditKind::Compact
+            SessionEvent::HistoryEdited {
+                kind: HistoryEditKind::Compact
             }
         )));
         assert!(events.iter().any(|event| matches!(
@@ -1151,10 +1161,10 @@ mod tests {
             })
             .expect("stateless model failure should be accepted");
 
-        let request_transcript =
+        let request_model_context =
             assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-        assert_eq!(request_transcript, session.transcript());
-        assert_eq!(session.transcript().latest_compaction_summary(), None);
+        assert_eq!(request_model_context, session.model_context());
+        assert_eq!(session.model_context().latest_compaction_summary(), None);
         assert!(session.drain_events().iter().any(|event| matches!(
             event,
             SessionEvent::ActionFailed {
@@ -1184,7 +1194,7 @@ mod tests {
             })
             .expect("stale stateless model completion should be accepted and ignored");
         assert!(session.drain_actions().is_empty());
-        assert_eq!(session.transcript().latest_compaction_summary(), None);
+        assert_eq!(session.model_context().latest_compaction_summary(), None);
         assert!(!session.can_edit_history(PendingWork::NONE));
 
         session
@@ -1198,7 +1208,7 @@ mod tests {
             [SessionAction::RequestModel { .. }]
         ));
         assert_eq!(
-            session.transcript().latest_compaction_summary(),
+            session.model_context().latest_compaction_summary(),
             Some("right")
         );
     }
@@ -1227,8 +1237,8 @@ mod tests {
 
     #[test]
     fn stale_completion_after_history_edit_cannot_attach_to_reused_turn_id() {
-        let mut session = AgentSession::from_transcript(finished_transcript("first"));
-        let turn_one_end_id = session.context().entries()[2].id.clone();
+        let mut session = AgentSession::from_model_context(finished_model_context("first"));
+        let turn_one_end_id = session.transcript_store().entries()[2].id.clone();
 
         session
             .enqueue_input(AgentInput::follow_up("old second"))
@@ -1272,16 +1282,16 @@ mod tests {
             .expect("well-formed stale completion is valid input");
         session.drive();
         assert_eq!(
-            session.transcript().records(),
+            session.model_context().records(),
             &[
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("first".to_string()),
-                TranscriptRecord::TurnFinished {
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::UserMessage("first".to_string()),
+                ContextItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Graceful,
                 },
-                TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-                TranscriptRecord::UserMessage("new second".to_string()),
+                ContextItem::TurnStarted { turn_id: TurnId(2) },
+                ContextItem::UserMessage("new second".to_string()),
             ]
         );
         assert!(!session.can_edit_history(PendingWork::NONE));
@@ -1297,8 +1307,8 @@ mod tests {
             .expect("matching model completion is valid");
         session.drive();
         assert_eq!(
-            session.transcript().records().last(),
-            Some(&TranscriptRecord::TurnFinished {
+            session.model_context().records().last(),
+            Some(&ContextItem::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             })
@@ -1316,7 +1326,7 @@ mod tests {
 
         assert_eq!(result, Err(AgentInputError::UnpairedOriginTags));
         session.drive();
-        assert!(session.transcript().records().is_empty());
+        assert!(session.model_context().records().is_empty());
         assert!(session.can_edit_history(PendingWork::NONE));
     }
 
@@ -1380,25 +1390,25 @@ mod tests {
         // A context whose leaf is a run of back-to-back injected entries after
         // a TurnFinished is still at a turn boundary; can_edit_history must
         // see through the injected tail to the underlying TurnFinished.
-        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("hi".to_string()),
-            TranscriptRecord::TurnFinished {
+        let mut session = AgentSession::from_model_context(ModelContext::from_records(vec![
+            ContextItem::TurnStarted { turn_id: TurnId(1) },
+            ContextItem::UserMessage("hi".to_string()),
+            ContextItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
         ]));
         session
-            .context
+            .transcript_store
             .append_injected(InjectedMessage::new("note", "a"));
         session
-            .context
+            .transcript_store
             .append_injected(compaction_summary("b", "does-not-matter", 0));
         session
-            .context
+            .transcript_store
             .append_injected(InjectedMessage::new("note", "c"));
 
-        assert!(session.context().is_turn_boundary());
+        assert!(session.transcript_store().is_turn_boundary());
         assert!(session.can_edit_history(PendingWork::NONE));
     }
 

@@ -1,17 +1,17 @@
-use agent_core::TranscriptRecord;
+use agent_core::ContextItem;
 
 use crate::action::SessionAction;
 
 /// Ephemeral session activity for live observers.
 ///
-/// These events are intentionally not part of the transcript. The transcript
-/// remains the model-visible durable context; events explain what the session
-/// is doing around that context while it runs.
+/// These events are intentionally not transcript-store entries. `ModelContext`
+/// remains the model-visible view; events explain what the session is doing
+/// around that view while it runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
     RecordAppended {
         entry_id: String,
-        record: TranscriptRecord,
+        record: ContextItem,
     },
     ActionRequested {
         action: SessionAction,
@@ -25,8 +25,8 @@ pub enum SessionEvent {
         id: String,
         error: String,
     },
-    ContextEdited {
-        kind: ContextEditKind,
+    HistoryEdited {
+        kind: HistoryEditKind,
     },
 }
 
@@ -39,7 +39,7 @@ pub enum SessionActionKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContextEditKind {
+pub enum HistoryEditKind {
     HistoryEdit,
     Compact,
 }

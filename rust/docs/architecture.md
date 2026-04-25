@@ -40,7 +40,7 @@ truth for those roadmaps.
                      ▼
 ┌──────────────────────────────────────────────┐
 │ 3. Session — AgentSession, TranscriptStore,  │
-│    ContextEdit trait + ops, AgentRunner.     │
+│    HistoryEdit trait + ops, AgentRunner.     │
 │    One per agent. Sole owner of durable log. │
 └──────────────────────────────────────────────┘
                      ▲
@@ -116,8 +116,6 @@ The FSM never holds non-POD state beyond these.
 ### Log entries (layer 3, in `agent-session`)
 
 ```rust
-// Compatibility name in the current crate: `TranscriptRecord`.
-
 struct TranscriptEntry {
     id: EntryId,
     parent_id: Option<EntryId>,
@@ -126,11 +124,9 @@ struct TranscriptEntry {
 }
 ```
 
-Current compatibility names: `TranscriptRecord = ContextItem`, `SessionEntry = TranscriptEntry`, `Transcript = ModelContext`, and `Context = TranscriptStore`.
-
 **Every durable "thing injected into the model's view" is a `ContextItem::Injected(InjectedMessage)` with a kind tag.** One variant, one materialization path, one future storage/RPC shape. New feature -> new well-known kind string and metadata convention, not a new entry type. Ephemeral lifecycle signals remain `SessionEvent`s, not injected context items.
 
-### Transcript store forest (layer 3, in `agent-session`)
+### TranscriptStore forest (layer 3, in `agent-session`)
 
 The durable history data structure is a forest of transcript entries:
 
@@ -169,14 +165,14 @@ enum SessionEvent {
     ActionRequested { action: SessionAction },
     ActionCompleted { kind: SessionActionKind, id: String },
     ActionFailed { kind: SessionActionKind, id: String, error: String },
-    ContextEdited { kind: ContextEditKind },
+    HistoryEdited { kind: HistoryEditKind },
 }
 ```
 
 Each session currently exposes these through an event outbox; a later event bus
 will turn them into subscribable streams. Events are runtime observations, not
-additional transcript records, so observers such as a TUI, usage ledger, or
-orchestrator can observe session activity without changing the durable context.
+additional transcript entries, so observers such as a TUI, usage ledger, or
+orchestrator can observe session activity without changing durable history.
 
 ### Agent vs session identity
 
@@ -200,11 +196,11 @@ Already landed in PR #62 + #63 refactors.
 
 Partially landed in PR #63; decomposition planned.
 
-- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore` (`Context` compatibility alias). The session is the sole owner of durable records for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `transcript`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `ContextEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
-- **`ContextEdit` trait + op structs** — each history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`) that implements `ContextEdit { type Output; fn apply(self, &mut Context) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `Context` (`context.prepare_summary_span(first, last)`); prefix compaction is policy on top (`context.prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
-- **`TranscriptStore`** — session-local forest of `TranscriptEntry`s with entry/parent/child/leaf indexes plus an active leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize. `Context` remains as a compatibility alias.
-- **`ModelContext`** — materialized view of the current root-to-leaf path's context items. Live model contexts preserve open turns; resume paths explicitly crash-recover any open tail. `Transcript` remains as a compatibility alias.
-- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, transcript }` includes the transcript snapshot visible when the model request was made; tool and cancel actions carry only the ids/payloads needed to execute them. Session-owned stateless model requests are used for compaction side work.
+- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore`. The session is the sole owner of durable records for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `model_context`, `transcript_store`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `HistoryEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
+- **`HistoryEdit` trait + op structs** — each history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceModelContext { replacement }`) that implements `HistoryEdit { type Output; fn apply(self, &mut TranscriptStore) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `TranscriptStore` (`session.transcript_store().prepare_summary_span(first, last)`); prefix compaction is policy on top (`session.transcript_store().prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
+- **`TranscriptStore`** — session-local forest of `TranscriptEntry`s with entry/parent/child/leaf indexes plus an active leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
+- **`ModelContext`** — materialized view of the current root-to-leaf path's context items. Live model contexts preserve open turns; resume paths explicitly crash-recover any open tail.
+- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, model_context }` includes the model-context snapshot visible when the model request was made; tool and cancel actions carry only the ids/payloads needed to execute them. Session-owned stateless model requests are used for compaction side work.
 - **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans `SessionAction`s to the handler. Records auto-flow into the log; the runner does not expose them directly.
 - **Future `SessionStore` trait** — pluggable durable storage. Planned defaults are `JsonlFileSessionStore` for disk and `InMemorySessionStore` for tests, swappable for `SqliteSessionStore` later.
 
@@ -401,7 +397,7 @@ Each row is one landable PR. Later PRs depend on their predecessors.
 | # | PR | What it adds | Unlocks |
 |---|---|---|---|
 | 1 | **#63 foundation** | `agent-session`, `agent-orchestrator` crates + context-item/model-context unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
-| 2 | Session decomposition | `ContextEdit` trait + op structs + `SessionRegistry<S>` + orchestrator becomes composition struct | clean target for registry-level features |
+| 2 | Session decomposition | `HistoryEdit` trait + op structs + `SessionRegistry<S>` + orchestrator becomes composition struct | clean target for registry-level features |
 | 3 | `SessionStore` | trait + in-memory + JSONL-file impls + wire into `AgentSession` | durable restart; resume-from-file; pluggable backends |
 | 4 | `ControlPlane` trait | trait definition + `LocalControlPlane` impl + view-layer adapter | view/control separation; future daemon |
 | 5 | `SessionEvent` stream | event bus + subscription on `AgentSession`; durable events mirror log writes | observers (TUI, ledger, idle watcher) |
@@ -431,7 +427,7 @@ These are documented here so the PRs that implement them stick to the intended s
 
 The session being compacted is frozen for the entire flow: `prepare → summarize → compact`. While frozen, the session queues incoming inputs (tool completions, child reports, steer, follow-up) and does not acknowledge them to the FSM until the flow completes or aborts. Tool calls the session had in flight when the flow started continue to run externally and their results queue; they're replayed to the FSM once compaction finishes.
 
-This closes the liveness hole where repeated appends during an async summarize call starve the compaction plan's staleness fingerprint. The `Compactor` PR lands the mechanism (likely a `SessionPhase::EditingHistory { queued_inputs }` on `AgentSession` with `begin_history_edit` / `commit_history_edit` / `abort_history_edit` transitions); the `ContextEdit` trait's `apply` becomes a witness over the edit phase rather than holding `&mut self` across await.
+This closes the liveness hole where repeated appends during an async summarize call starve the compaction plan's staleness fingerprint. The `Compactor` PR lands the mechanism (likely a `SessionPhase::EditingHistory { queued_inputs }` on `AgentSession` with `begin_history_edit` / `commit_history_edit` / `abort_history_edit` transitions); the `HistoryEdit` trait's `apply` becomes a witness over the edit phase rather than holding `&mut self` across await.
 
 **Parents can compact while children are still running.** Children are separate sessions with separate logs; a parent's compaction has no effect on any descendant.
 

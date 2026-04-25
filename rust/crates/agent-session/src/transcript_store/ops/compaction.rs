@@ -1,11 +1,11 @@
-use agent_core::{InjectedMessage, TranscriptRecord};
+use agent_core::{ContextItem, InjectedMessage};
 
-use crate::context::edit::{ContextEdit, HistoryEditError};
-use crate::context::span::{
+use crate::transcript_store::edit::{HistoryEdit, HistoryEditError};
+use crate::transcript_store::span::{
     summary_span_plan_from_indices, transcript_records_in, SummarizeSpan, SummarySpanPlan,
 };
-use crate::context::tokens::{estimate_record_tokens, estimate_records_tokens};
-use crate::context::{Context, ContextError, SessionEntry};
+use crate::transcript_store::tokens::{estimate_record_tokens, estimate_records_tokens};
+use crate::transcript_store::{TranscriptEntry, TranscriptStore, TranscriptStoreError};
 
 /// Well-known `InjectedMessage::kind` for compaction summaries.
 pub const KIND_COMPACTION_SUMMARY: &str = "compaction_summary";
@@ -23,14 +23,14 @@ pub fn compaction_summary(
 }
 
 /// True if the record is injected context with kind = `compaction_summary`.
-pub(crate) fn is_compaction_summary(record: &TranscriptRecord) -> bool {
-    matches!(record, TranscriptRecord::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY)
+pub(crate) fn is_compaction_summary(record: &ContextItem) -> bool {
+    matches!(record, ContextItem::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY)
 }
 
 /// Pull the `first_kept_entry_id` metadata off a compaction summary record.
-pub(crate) fn compaction_first_kept_entry_id(record: &TranscriptRecord) -> Option<&str> {
+pub(crate) fn compaction_first_kept_entry_id(record: &ContextItem) -> Option<&str> {
     match record {
-        TranscriptRecord::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
+        ContextItem::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
             cm.metadata.get("first_kept_entry_id").map(|s| s.as_str())
         }
         _ => None,
@@ -56,15 +56,15 @@ pub struct CompactionSettings {
 pub struct CompactionPlan {
     pub summary_span: SummarySpanPlan,
     pub first_kept_entry_id: String,
-    pub records_to_summarize: Vec<TranscriptRecord>,
-    pub records_to_keep: Vec<TranscriptRecord>,
+    pub records_to_summarize: Vec<ContextItem>,
+    pub records_to_keep: Vec<ContextItem>,
     pub tokens_before: usize,
     pub previous_summary: Option<String>,
     pub leaf_id: Option<String>,
     pub entry_count: usize,
 }
 
-impl Context {
+impl TranscriptStore {
     /// Plan a compaction against the current context. Returns `None` when no
     /// entries are old enough to evict under `settings`.
     pub fn prepare_compaction(&self, settings: CompactionSettings) -> Option<CompactionPlan> {
@@ -79,11 +79,11 @@ impl Context {
 
         let (boundary_start, previous_entry, span_start) = boundary_start_index(&path);
         let previous_summary = previous_entry.and_then(|entry| match &entry.record {
-            TranscriptRecord::Injected(cm) => Some(cm.content.clone()),
+            ContextItem::Injected(cm) => Some(cm.content.clone()),
             _ => None,
         });
 
-        let tokens_before = estimate_records_tokens(self.transcript().records());
+        let tokens_before = estimate_records_tokens(self.model_context().records());
         let cut_index =
             find_boundary_cut_index(&path, boundary_start, settings.keep_recent_tokens)?;
         if cut_index <= boundary_start {
@@ -118,16 +118,16 @@ impl Context {
     /// `StalePlan` if the context's leaf or entry count has drifted from the
     /// plan's fingerprint, or `NotTurnBoundary` if the current leaf isn't at
     /// a turn boundary.
-    pub fn validate_plan_matches(&self, plan: &CompactionPlan) -> Result<(), ContextError> {
+    pub fn validate_plan_matches(&self, plan: &CompactionPlan) -> Result<(), TranscriptStoreError> {
         if !self.contains_entry(&plan.first_kept_entry_id) {
-            return Err(ContextError::EntryNotFound);
+            return Err(TranscriptStoreError::EntryNotFound);
         }
         self.validate_summary_span_plan(&plan.summary_span)?;
         if self.leaf_id() != plan.leaf_id.as_deref() || self.entry_count() != plan.entry_count {
-            return Err(ContextError::StalePlan);
+            return Err(TranscriptStoreError::StalePlan);
         }
         if !self.is_turn_boundary() {
-            return Err(ContextError::NotTurnBoundary);
+            return Err(TranscriptStoreError::NotTurnBoundary);
         }
         Ok(())
     }
@@ -143,12 +143,12 @@ pub struct Compact {
     pub summary: String,
 }
 
-impl ContextEdit for Compact {
+impl HistoryEdit for Compact {
     type Output = ();
 
-    fn apply(self, ctx: &mut Context) -> Result<(), HistoryEditError> {
+    fn apply(self, ctx: &mut TranscriptStore) -> Result<(), HistoryEditError> {
         ctx.validate_plan_matches(&self.plan)
-            .map_err(HistoryEditError::Context)?;
+            .map_err(HistoryEditError::Store)?;
 
         let CompactionPlan {
             summary_span,
@@ -170,7 +170,7 @@ impl ContextEdit for Compact {
 /// If a previous compaction exists on the active branch, we skip everything up
 /// to and including its `first_kept_entry_id` — records before that were
 /// already evicted under the earlier summary.
-fn boundary_start_index(path: &[SessionEntry]) -> (usize, Option<&SessionEntry>, usize) {
+fn boundary_start_index(path: &[TranscriptEntry]) -> (usize, Option<&TranscriptEntry>, usize) {
     let previous_compaction_index = path
         .iter()
         .rposition(|entry| is_compaction_summary(&entry.record));
@@ -188,7 +188,7 @@ fn boundary_start_index(path: &[SessionEntry]) -> (usize, Option<&SessionEntry>,
 }
 
 fn find_boundary_cut_index(
-    path: &[SessionEntry],
+    path: &[TranscriptEntry],
     boundary_start: usize,
     keep_recent_tokens: usize,
 ) -> Option<usize> {
@@ -205,12 +205,12 @@ fn find_boundary_cut_index(
 }
 
 fn turn_start_at_or_before(
-    path: &[SessionEntry],
+    path: &[TranscriptEntry],
     index: usize,
     boundary_start: usize,
 ) -> Option<usize> {
     for candidate in (boundary_start..=index).rev() {
-        if matches!(path[candidate].record, TranscriptRecord::TurnStarted { .. }) {
+        if matches!(path[candidate].record, ContextItem::TurnStarted { .. }) {
             return Some(candidate);
         }
     }
@@ -220,27 +220,27 @@ fn turn_start_at_or_before(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::edit::PendingWork;
+    use crate::model_context::ModelContext;
     use crate::session::AgentSession;
-    use crate::transcript::Transcript;
+    use crate::transcript_store::edit::PendingWork;
     use agent_core::{
-        ActionId, AgentInput, AssistantItem, AssistantMessage, InjectedMessage, TranscriptRecord,
+        ActionId, AgentInput, AssistantItem, AssistantMessage, ContextItem, InjectedMessage,
         TurnId, TurnOutcome,
     };
 
     #[test]
     fn compaction_plan_cuts_only_at_turn_boundaries() {
-        let mut ctx = Context::new();
+        let mut ctx = TranscriptStore::new();
         let mut append_turn = |id: u64, user: &str, answer: &str| {
-            ctx.append_transcript_records(vec![
-                TranscriptRecord::TurnStarted {
+            ctx.append_context_items(vec![
+                ContextItem::TurnStarted {
                     turn_id: TurnId(id),
                 },
-                TranscriptRecord::UserMessage(user.to_string()),
-                TranscriptRecord::AssistantMessage(AssistantMessage {
+                ContextItem::UserMessage(user.to_string()),
+                ContextItem::AssistantMessage(AssistantMessage {
                     items: vec![AssistantItem::Text(answer.to_string())],
                 }),
-                TranscriptRecord::TurnFinished {
+                ContextItem::TurnFinished {
                     turn_id: TurnId(id),
                     outcome: TurnOutcome::Graceful,
                 },
@@ -258,39 +258,39 @@ mod tests {
 
         assert!(matches!(
             plan.records_to_keep.first(),
-            Some(TranscriptRecord::TurnStarted { turn_id: TurnId(3) })
+            Some(ContextItem::TurnStarted { turn_id: TurnId(3) })
         ));
         assert!(plan
             .records_to_summarize
             .iter()
-            .any(|record| matches!(record, TranscriptRecord::UserMessage(text) if text == "first user message")));
+            .any(|record| matches!(record, ContextItem::UserMessage(text) if text == "first user message")));
     }
 
     #[test]
     fn compaction_requires_turn_boundary_and_keeps_a_turn_boundary_suffix() {
-        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("first user message".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage {
+        let mut session = AgentSession::from_model_context(ModelContext::from_records(vec![
+            ContextItem::TurnStarted { turn_id: TurnId(1) },
+            ContextItem::UserMessage("first user message".to_string()),
+            ContextItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text("first answer".to_string())],
             }),
-            TranscriptRecord::TurnFinished {
+            ContextItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage("second user message".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage {
+            ContextItem::TurnStarted { turn_id: TurnId(2) },
+            ContextItem::UserMessage("second user message".to_string()),
+            ContextItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text("second answer".to_string())],
             }),
-            TranscriptRecord::TurnFinished {
+            ContextItem::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             },
         ]));
 
         let plan = session
-            .context()
+            .transcript_store()
             .prepare_compaction(CompactionSettings {
                 keep_recent_tokens: 1,
             })
@@ -306,37 +306,37 @@ mod tests {
             )
             .expect("history edit can compact");
 
-        let transcript = session.transcript();
+        let transcript = session.model_context();
         assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
-        assert_eq!(session.transcript().last_turn_id(), TurnId(2));
+        assert_eq!(session.model_context().last_turn_id(), TurnId(2));
         assert!(matches!(
             transcript.records().first(),
-            Some(TranscriptRecord::Injected(_))
+            Some(ContextItem::Injected(_))
         ));
         // T1's records are no longer visible in the materialized view; the
         // old branch lives on as an orphan in the full context entries.
         let has_first_user = transcript
             .records()
             .iter()
-            .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "first user message"));
+            .any(|r| matches!(r, ContextItem::UserMessage(s) if s == "first user message"));
         assert!(!has_first_user);
     }
 
     #[test]
     fn compaction_plan_keeps_model_visible_injected_records() {
-        let mut ctx = Context::new();
-        ctx.append_transcript_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::Injected(InjectedMessage::new("agent_directive", "do first")),
-            TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            TranscriptRecord::TurnFinished {
+        let mut ctx = TranscriptStore::new();
+        ctx.append_context_items(vec![
+            ContextItem::TurnStarted { turn_id: TurnId(1) },
+            ContextItem::Injected(InjectedMessage::new("agent_directive", "do first")),
+            ContextItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            ContextItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::Injected(InjectedMessage::new("agent_report", "second report")),
-            TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            TranscriptRecord::TurnFinished {
+            ContextItem::TurnStarted { turn_id: TurnId(2) },
+            ContextItem::Injected(InjectedMessage::new("agent_report", "second report")),
+            ContextItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            ContextItem::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             },
@@ -349,10 +349,10 @@ mod tests {
             .expect("first turn should be compactable");
 
         assert!(plan.records_to_summarize.iter().any(
-            |record| matches!(record, TranscriptRecord::Injected(cm) if cm.kind == "agent_directive")
+            |record| matches!(record, ContextItem::Injected(cm) if cm.kind == "agent_directive")
         ));
         assert!(plan.records_to_keep.iter().any(
-            |record| matches!(record, TranscriptRecord::Injected(cm) if cm.kind == "agent_report")
+            |record| matches!(record, ContextItem::Injected(cm) if cm.kind == "agent_report")
         ));
 
         Compact {
@@ -362,39 +362,39 @@ mod tests {
         .apply(&mut ctx)
         .expect("compaction should apply");
 
-        assert!(ctx.transcript().records().iter().any(
-            |record| matches!(record, TranscriptRecord::Injected(cm) if cm.kind == "agent_report")
+        assert!(ctx.model_context().records().iter().any(
+            |record| matches!(record, ContextItem::Injected(cm) if cm.kind == "agent_report")
         ));
     }
 
     #[test]
     fn fork_based_compaction_creates_new_branch_with_summary_then_kept_records() {
-        let mut session = AgentSession::from_transcript(Transcript::from_records(vec![
+        let mut session = AgentSession::from_model_context(ModelContext::from_records(vec![
             // turn 1
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("first".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage {
+            ContextItem::TurnStarted { turn_id: TurnId(1) },
+            ContextItem::UserMessage("first".to_string()),
+            ContextItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text("ok1".to_string())],
             }),
-            TranscriptRecord::TurnFinished {
+            ContextItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
             // turn 2
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage("second".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage {
+            ContextItem::TurnStarted { turn_id: TurnId(2) },
+            ContextItem::UserMessage("second".to_string()),
+            ContextItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text("ok2".to_string())],
             }),
-            TranscriptRecord::TurnFinished {
+            ContextItem::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             },
         ]));
 
-        let entries_before = session.context().entries().len();
+        let entries_before = session.transcript_store().entries().len();
         let plan = session
-            .context()
+            .transcript_store()
             .prepare_compaction(CompactionSettings {
                 keep_recent_tokens: 1,
             })
@@ -409,20 +409,20 @@ mod tests {
             )
             .expect("history edit can compact");
 
-        // Context grew by: 1 (CompSum) + 4 (re-appended turn 2 records) = 5.
+        // TranscriptStore grew by: 1 (CompSum) + 4 (re-appended turn 2 records) = 5.
         assert_eq!(
-            session.context().entries().len(),
+            session.transcript_store().entries().len(),
             entries_before + 5,
             "fork-based compaction should add 1 summary + the kept records as new context entries"
         );
 
         // Materialized transcript: [CompSum, TurnStarted(2), UserMessage,
         // AssistantMessage, TurnFinished(2)].
-        let transcript = session.transcript();
+        let transcript = session.model_context();
         let records = transcript.records();
         assert!(matches!(
             records.first(),
-            Some(TranscriptRecord::Injected(cm)) if cm.kind == KIND_COMPACTION_SUMMARY
+            Some(ContextItem::Injected(cm)) if cm.kind == KIND_COMPACTION_SUMMARY
         ));
         assert_eq!(records.len(), 5);
         assert_eq!(transcript.last_turn_id(), TurnId(2));
@@ -431,22 +431,22 @@ mod tests {
         // Turn 1 records are gone from the materialized view.
         let has_first = records
             .iter()
-            .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "first"));
+            .any(|r| matches!(r, ContextItem::UserMessage(s) if s == "first"));
         assert!(!has_first);
     }
 
     #[test]
     fn sequential_compactions_fork_from_the_prior_summary_on_the_active_branch() {
-        fn turn(id: u64, user: &str, answer: &str) -> Vec<TranscriptRecord> {
+        fn turn(id: u64, user: &str, answer: &str) -> Vec<ContextItem> {
             vec![
-                TranscriptRecord::TurnStarted {
+                ContextItem::TurnStarted {
                     turn_id: TurnId(id),
                 },
-                TranscriptRecord::UserMessage(user.to_string()),
-                TranscriptRecord::AssistantMessage(AssistantMessage {
+                ContextItem::UserMessage(user.to_string()),
+                ContextItem::AssistantMessage(AssistantMessage {
                     items: vec![AssistantItem::Text(answer.to_string())],
                 }),
-                TranscriptRecord::TurnFinished {
+                ContextItem::TurnFinished {
                     turn_id: TurnId(id),
                     outcome: TurnOutcome::Graceful,
                 },
@@ -456,11 +456,11 @@ mod tests {
         records.extend(turn(1, "first user message", "first assistant answer"));
         records.extend(turn(2, "second user message", "second assistant answer"));
         records.extend(turn(3, "third user message", "third assistant answer"));
-        let mut session = AgentSession::from_transcript(Transcript::from_records(records));
+        let mut session = AgentSession::from_model_context(ModelContext::from_records(records));
 
         // First compaction.
         let plan = session
-            .context()
+            .transcript_store()
             .prepare_compaction(CompactionSettings {
                 keep_recent_tokens: 1,
             })
@@ -475,7 +475,7 @@ mod tests {
             )
             .expect("first compaction should apply");
         assert_eq!(
-            session.transcript().latest_compaction_summary(),
+            session.model_context().latest_compaction_summary(),
             Some("first summary")
         );
 
@@ -499,7 +499,7 @@ mod tests {
 
         // Second compaction.
         let plan2 = session
-            .context()
+            .transcript_store()
             .prepare_compaction(CompactionSettings {
                 keep_recent_tokens: 1,
             })
@@ -514,7 +514,7 @@ mod tests {
             )
             .expect("second compaction should apply");
 
-        let transcript = session.transcript();
+        let transcript = session.model_context();
         assert_eq!(
             transcript.latest_compaction_summary(),
             Some("second summary")
@@ -523,19 +523,19 @@ mod tests {
             .records()
             .iter()
             .filter(
-                |r| matches!(r, TranscriptRecord::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY),
+                |r| matches!(r, ContextItem::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY),
             )
             .count();
         assert_eq!(summary_count, 1);
         let has_third = transcript
             .records()
             .iter()
-            .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "third user message"));
+            .any(|r| matches!(r, ContextItem::UserMessage(s) if s == "third user message"));
         assert!(!has_third);
         let has_fourth = transcript
             .records()
             .iter()
-            .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "fourth user message"));
+            .any(|r| matches!(r, ContextItem::UserMessage(s) if s == "fourth user message"));
         assert!(has_fourth);
     }
 }

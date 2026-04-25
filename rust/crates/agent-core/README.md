@@ -4,7 +4,7 @@ A deterministic, pure-Rust FSM kernel for a single agent's turn-by-turn loop —
 
 ## Responsibility
 
-This crate owns one thing: given the current FSM state plus a queued input, decide what should happen next. "What happens next" means two drained outputs — a list of `ContextItem`s that capture durable model-visible facts about the turn (turn started, user/input item, assistant said this, tool call started, tool result, turn finished), and a list of `AgentAction`s that are *requests* for the outside world to run a model call, run a tool, or cancel an in-flight turn. `TranscriptRecord` remains as a compatibility alias for `ContextItem`.
+This crate owns one thing: given the current FSM state plus a queued input, decide what should happen next. "What happens next" means two drained outputs — a list of `ContextItem`s that capture durable model-visible facts about the turn (turn started, user/input item, assistant said this, tool call started, tool result, turn finished), and a list of `AgentAction`s that are *requests* for the outside world to run a model call, run a tool, or cancel an in-flight turn.
 
 The FSM is pure: it has no `tokio`, no filesystem access, no network calls, no time source, and no persistent state beyond a small mailbox plus the live control state (`AgentState`). The crate's `Cargo.toml` has zero runtime dependencies. Callers drive the loop synchronously; anything asynchronous (model HTTP calls, tool subprocesses, on-disk logs) lives above this layer in `agent-session` and its runner.
 
@@ -20,7 +20,6 @@ The exported surface is intentionally small. From `lib.rs`:
 - `AgentInput` — everything the outside world can push into the loop: `Interrupt`, `Steer`, `FollowUp`, `ModelCompleted`, `ModelFailed`, `ToolCompleted`. `Steer` and `FollowUp` carry optional `from` / `kind` tags (both present or both absent) identifying the source of the input; malformed inputs are rejected with `AgentInputError`.
 - `AgentAction` — side-effect requests the caller must execute: `RequestModel`, `RequestTool`, `CancelTurn`.
 - `ContextItem` — durable model-visible item variants. Enumerated in the Internals section below.
-- `TranscriptRecord` — compatibility alias for `ContextItem`.
 - `InjectedMessage` — payload for `ContextItem::Injected`, carrying a `kind` tag, a `content` string, and a `BTreeMap<String, String>` metadata map.
 - `TurnOutcome` — `Graceful`, `Interrupted`, or `Crashed`; attached to `TurnFinished`.
 - `AssistantMessage`, `AssistantItem`, `ToolCall`, `ToolResultMessage`, `ToolResultStatus` — message shapes shared with the caller. `ToolResultMessage::interrupted` / `crashed` are helpers for synthesizing terminal results.
@@ -57,7 +56,7 @@ caller                       AgentCoreLoop
   +------------- loop ------------+
 ```
 
-A typical session wrapper (see `agent-session/src/session.rs`) forwards `enqueue_input` straight to the core, calls `drive()`, then absorbs the drained context items into its durable `TranscriptStore` (`Context` compatibility name). The session never exposes the core directly: it funnels every input through itself so it can track pending model/tool work for edit-quiescence checks and so items always flow into durable storage.
+A typical session wrapper (see `agent-session/src/session.rs`) forwards `enqueue_input` straight to the core, calls `drive()`, then absorbs the drained context items into its durable `TranscriptStore`. The session never exposes the core directly: it funnels every input through itself so it can track pending model/tool work for edit-quiescence checks and so items always flow into durable storage.
 
 `drain_pending_inputs()` is also exposed as an introspection hook: it pulls every queued user input (steer before follow-up) back out of the mailbox without advancing the FSM, preserving each entry's `from` / `kind` tags. Notifications and the interrupt flag are left untouched. Intended for tests and orchestrator-level routing diagnostics.
 
@@ -75,7 +74,7 @@ Module layout under `src/`:
 - `event.rs` — `AgentInput` (public) and `AgentEvent` + `TurnOrigin` (private); the public/internal event split.
 - `mailbox.rs` — `Mailbox` and `UserInputEntry`; priority queue feeding the FSM.
 - `action.rs` — `AgentAction` outbox variants.
-- `record.rs` — `ContextItem`, `TranscriptRecord` compatibility alias, `TurnOutcome`, `InjectedMessage`.
+- `context_item.rs` — `ContextItem`, `TurnOutcome`, `InjectedMessage`.
 - `message.rs` — `AssistantMessage`, `AssistantItem`, `ToolCall`, `ToolResultMessage`, `ToolResultStatus`.
 - `ids.rs` — `TurnId`, `ActionId`, and `ToolCallId` newtypes.
 
@@ -169,7 +168,7 @@ All three are pure requests. `agent-core` never performs the underlying I/O and 
 
 ### Context items
 
-`ContextItem` variants (see `record.rs`; `TranscriptRecord` remains as a compatibility alias):
+`ContextItem` variants (see `context_item.rs`):
 
 - `TurnStarted { turn_id }` — emitted at the start of every turn.
 - `UserMessage(String)` — the content of a human (or untagged) input that opened the turn.

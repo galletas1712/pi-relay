@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 
 use crate::action::AgentAction;
+use crate::context_item::ContextItem;
 use crate::event::{AgentInput, AgentInputError};
 use crate::ids::{ActionId, TurnId};
 use crate::mailbox::Mailbox;
-use crate::record::TranscriptRecord;
 use crate::state::AgentState;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,7 +14,7 @@ pub struct AgentCoreLoop {
     last_turn_id: TurnId,
     next_action_id: ActionId,
     action_outbox: VecDeque<AgentAction>,
-    record_outbox: VecDeque<TranscriptRecord>,
+    record_outbox: VecDeque<ContextItem>,
 }
 
 impl Default for AgentCoreLoop {
@@ -90,7 +90,7 @@ impl AgentCoreLoop {
         self.action_outbox.drain(..).collect()
     }
 
-    pub fn drain_records(&mut self) -> Vec<TranscriptRecord> {
+    pub fn drain_records(&mut self) -> Vec<ContextItem> {
         self.record_outbox.drain(..).collect()
     }
 
@@ -125,15 +125,15 @@ impl AgentCoreLoop {
     }
 }
 
-fn started_turn_id(records: &[TranscriptRecord]) -> Option<TurnId> {
+fn started_turn_id(records: &[ContextItem]) -> Option<TurnId> {
     records.iter().find_map(|record| match record {
-        TranscriptRecord::TurnStarted { turn_id } => Some(*turn_id),
-        TranscriptRecord::UserMessage(_)
-        | TranscriptRecord::AssistantMessage(_)
-        | TranscriptRecord::ToolCallStarted { .. }
-        | TranscriptRecord::ToolResult(_)
-        | TranscriptRecord::TurnFinished { .. }
-        | TranscriptRecord::Injected(_) => None,
+        ContextItem::TurnStarted { turn_id } => Some(*turn_id),
+        ContextItem::UserMessage(_)
+        | ContextItem::AssistantMessage(_)
+        | ContextItem::ToolCallStarted { .. }
+        | ContextItem::ToolResult(_)
+        | ContextItem::TurnFinished { .. }
+        | ContextItem::Injected(_) => None,
     })
 }
 
@@ -143,11 +143,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::action::AgentAction;
+    use crate::context_item::{InjectedMessage, TurnOutcome};
     use crate::ids::{ActionId, ToolCallId};
     use crate::message::{
         AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
     };
-    use crate::record::{InjectedMessage, TurnOutcome};
 
     fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {
         AssistantMessage { items }
@@ -171,9 +171,9 @@ mod tests {
     }
 
     /// Drive a single input end-to-end and collect every record emitted during
-    /// that cycle. Tests accumulate these into a running transcript so they can
-    /// assert the same shape they used to read off `loop_state.transcript`.
-    fn drive_collect(loop_state: &mut AgentCoreLoop, input: AgentInput) -> Vec<TranscriptRecord> {
+    /// that cycle. Tests accumulate these into a running context-item list so
+    /// they can assert the shape the session stores durably.
+    fn drive_collect(loop_state: &mut AgentCoreLoop, input: AgentInput) -> Vec<ContextItem> {
         loop_state
             .enqueue_input(input)
             .expect("test inputs should be valid");
@@ -190,8 +190,8 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hello".to_string()),
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::UserMessage("hello".to_string()),
             ]
         );
         assert_eq!(
@@ -235,10 +235,10 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hello".to_string()),
-                TranscriptRecord::AssistantMessage(assistant.clone()),
-                TranscriptRecord::ToolCallStarted {
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::UserMessage("hello".to_string()),
+                ContextItem::AssistantMessage(assistant.clone()),
+                ContextItem::ToolCallStarted {
                     turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
@@ -282,9 +282,9 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hello".to_string()),
-                TranscriptRecord::TurnFinished {
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::UserMessage("hello".to_string()),
+                ContextItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Crashed,
                 },
@@ -323,7 +323,7 @@ mod tests {
             },
         );
 
-        assert_eq!(records.last(), Some(&TranscriptRecord::ToolResult(result)));
+        assert_eq!(records.last(), Some(&ContextItem::ToolResult(result)));
         assert_eq!(
             loop_state.drain_actions(),
             vec![AgentAction::RequestModel {
@@ -368,7 +368,7 @@ mod tests {
         loop_state.drive();
 
         let records = loop_state.drain_records();
-        let expected_result_record = TranscriptRecord::ToolResult(result);
+        let expected_result_record = ContextItem::ToolResult(result);
         assert!(records
             .iter()
             .any(|record| record == &expected_result_record));
@@ -427,7 +427,7 @@ mod tests {
         );
         assert_eq!(
             records.last(),
-            Some(&TranscriptRecord::ToolCallStarted {
+            Some(&ContextItem::ToolCallStarted {
                 turn_id: TurnId(1),
                 tool_call: second.clone(),
             })
@@ -446,7 +446,7 @@ mod tests {
 
         assert_eq!(
             records.last(),
-            Some(&TranscriptRecord::ToolCallStarted {
+            Some(&ContextItem::ToolCallStarted {
                 turn_id: TurnId(1),
                 tool_call: second.clone(),
             })
@@ -472,10 +472,10 @@ mod tests {
 
         assert_eq!(
             records.last(),
-            Some(&TranscriptRecord::ToolResult(second_result.clone()))
+            Some(&ContextItem::ToolResult(second_result.clone()))
         );
-        assert_eq!(records[5], TranscriptRecord::ToolResult(first_result));
-        assert_eq!(records[6], TranscriptRecord::ToolResult(second_result));
+        assert_eq!(records[5], ContextItem::ToolResult(first_result));
+        assert_eq!(records[6], ContextItem::ToolResult(second_result));
         assert_eq!(
             loop_state.drain_actions(),
             vec![AgentAction::RequestModel {
@@ -521,22 +521,22 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("initial".to_string()),
-                TranscriptRecord::AssistantMessage(assistant_message(vec![
-                    AssistantItem::ToolCall(tool_call.clone(),)
-                ])),
-                TranscriptRecord::ToolCallStarted {
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::UserMessage("initial".to_string()),
+                ContextItem::AssistantMessage(assistant_message(vec![AssistantItem::ToolCall(
+                    tool_call.clone(),
+                )])),
+                ContextItem::ToolCallStarted {
                     turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
-                TranscriptRecord::ToolResult(ToolResultMessage::interrupted(tool_call.id, "bash")),
-                TranscriptRecord::TurnFinished {
+                ContextItem::ToolResult(ToolResultMessage::interrupted(tool_call.id, "bash")),
+                ContextItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Interrupted,
                 },
-                TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-                TranscriptRecord::UserMessage("urgent".to_string()),
+                ContextItem::TurnStarted { turn_id: TurnId(2) },
+                ContextItem::UserMessage("urgent".to_string()),
             ]
         );
         assert_eq!(
@@ -594,16 +594,16 @@ mod tests {
 
         assert_eq!(
             records.last(),
-            Some(&TranscriptRecord::TurnFinished {
+            Some(&ContextItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Interrupted,
             })
         );
         assert_eq!(
             records[5],
-            TranscriptRecord::ToolResult(ToolResultMessage::interrupted(first.id, "bash"))
+            ContextItem::ToolResult(ToolResultMessage::interrupted(first.id, "bash"))
         );
-        assert_eq!(records[6], TranscriptRecord::ToolResult(second_result));
+        assert_eq!(records[6], ContextItem::ToolResult(second_result));
         assert_eq!(
             loop_state.drain_actions(),
             vec![AgentAction::CancelTurn { turn_id: TurnId(1) }]
@@ -622,9 +622,9 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hello".to_string()),
-                TranscriptRecord::TurnFinished {
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::UserMessage("hello".to_string()),
+                ContextItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Interrupted,
                 },
@@ -652,8 +652,8 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::Injected(InjectedMessage {
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::Injected(InjectedMessage {
                     kind: "agent_directive".to_string(),
                     content: "please do X".to_string(),
                     metadata: expected_metadata,
@@ -678,8 +678,8 @@ mod tests {
         assert_eq!(
             records,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("human steer".to_string()),
+                ContextItem::TurnStarted { turn_id: TurnId(1) },
+                ContextItem::UserMessage("human steer".to_string()),
             ]
         );
     }

@@ -1,5 +1,5 @@
-use crate::context::edit::{ContextEdit, HistoryEditError};
-use crate::context::Context;
+use crate::transcript_store::edit::{HistoryEdit, HistoryEditError};
+use crate::transcript_store::TranscriptStore;
 
 /// A rewind operation.
 ///
@@ -10,14 +10,14 @@ pub struct Rewind {
     pub leaf_id: Option<String>,
 }
 
-impl ContextEdit for Rewind {
+impl HistoryEdit for Rewind {
     type Output = ();
 
-    fn apply(self, ctx: &mut Context) -> Result<(), HistoryEditError> {
+    fn apply(self, ctx: &mut TranscriptStore) -> Result<(), HistoryEditError> {
         match self.leaf_id.as_deref() {
             Some(leaf_id) => ctx
                 .branch_at_turn_boundary(leaf_id)
-                .map_err(HistoryEditError::Context)?,
+                .map_err(HistoryEditError::Store)?,
             None => ctx.reset_leaf(),
         }
         Ok(())
