@@ -192,11 +192,12 @@ Already landed in PR #62 + #63 refactors.
 
 Partially landed in PR #63; decomposition planned.
 
-- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore`. The session is the sole owner of durable transcript items for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `model_context`, `transcript_store`, `drain_actions`. History-edit surface: `edit(op)` dispatches a `HistoryEdit` op struct after checking session-owned quiescence; `fork(leaf)` is a non-mutating direct method that returns an unregistered child `AgentSession`.
-- **`HistoryEdit` trait + op structs** — each history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceModelContext { replacement }`) that implements `HistoryEdit { type Output; fn apply(self, &mut TranscriptStore) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `TranscriptStore` (`session.transcript_store().prepare_summary_span(first, last)`); prefix compaction is policy on top (`session.transcript_store().prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
+- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore`. The session is the sole owner of durable transcript items for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `enqueue_session_input`, `request_maintenance`, `is_idle`, `has_pending_work`, `last_turn_id`, `model_context`, `transcript_store`, `drain_actions`. History mutation has two session primitives: immediate `edit(op)` after session-owned quiescence, and scheduled `request_maintenance(maintenance)` at the next safe model-context barrier. `fork(leaf)` is a non-mutating direct method that returns an unregistered child `AgentSession`.
+- **`HistoryEdit` trait + op structs** — each immediate history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceModelContext { replacement }`) that implements `HistoryEdit { type Output; fn apply(self, &mut TranscriptStore) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `TranscriptStore` (`session.transcript_store().prepare_summary_span(first, last)`); prefix compaction is policy on top (`session.transcript_store().prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
+- **`SessionMaintenance`** — scheduled session-owned history maintenance. Today the only variant is `Compact { settings }`. It may be requested while the session is busy; the session applies it only when either idle at a turn boundary or holding a just-emitted `RequestModel` before exposing that action to the harness. Auto-compaction is one producer of this queue, not a separate mutation path.
 - **`TranscriptStore`** — session-local forest of `TranscriptStorageNode`s with entry/parent/child/leaf indexes plus an active leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
 - **`ModelContext`** — materialized view of the current root-to-leaf path's transcript items. Live model contexts preserve open turns; resume paths explicitly crash-recover any open tail.
-- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, model_context }` includes the model-context snapshot visible when the model request was made; tool and cancel actions carry only the ids/payloads needed to execute them. Session-owned stateless model requests are used for compaction side work.
+- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, model_context }` includes the model-context snapshot visible when the model request was made; tool and cancel actions carry only the ids/payloads needed to execute them. Session-owned stateless model requests are used for scheduled maintenance such as compaction.
 - **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans `SessionAction`s to the handler. Transcript items auto-flow into the log; the runner does not expose them directly.
 - **Future `SessionStore` trait** — pluggable durable storage. Planned defaults are `JsonlFileSessionStore` for disk and `InMemorySessionStore` for tests, swappable for `SqliteSessionStore` later.
 
@@ -304,13 +305,14 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 ### Compaction
 
-**Status**: data model landed (PR #63); executor pending.
+**Status**: data model and session maintenance lifecycle landed; provider executor pending.
 
 - `session.transcript_store().prepare_summary_span(first, last)` is the generic primitive: replace a contiguous active-branch span with a summary and replay the suffix.
 - `session.transcript_store().prepare_compaction(settings)` produces a `CompactionPlan` as prefix-compaction policy on top of that primitive.
 - `Compactor::summarize(plan)` calls a `ModelProvider` to generate the summary string.
-- `session.edit(Compact { plan, summary })` applies the prepared summary span with a `compaction_summary` item.
-- Orchestrator observes `SessionEvent::TranscriptItemAppended { item: TranscriptItem::TurnFinished { .. } }` and checks thresholds; if tripped, drives the compaction pipeline.
+- `session.edit(Compact { plan, summary })` applies the prepared summary span immediately, after the session-owned quiescence check.
+- `session.request_maintenance(SessionMaintenance::Compact { settings })` schedules compaction for the next safe model-context barrier. If the barrier is a just-emitted `RequestModel`, the session holds that model action, emits `RequestModelStateless`, applies the summary when it returns, and then exposes the held `RequestModel` with the updated `ModelContext`.
+- Auto-compaction uses the same maintenance queue: the threshold policy checks the context when the core reaches a `RequestModel` barrier, queues `SessionMaintenance::Compact` if over budget, and lets the normal maintenance lifecycle drive the stateless summary request.
 
 ### Rewind
 
@@ -399,7 +401,7 @@ Each row is one landable PR. Later PRs depend on their predecessors.
 | 5 | `SessionEvent` stream | event bus + subscription on `AgentSession`; durable events mirror log writes | observers (TUI, ledger, idle watcher) |
 | 6 | `ModelProvider` trait | trait + Anthropic adapter + `UsageContext` + retry wrapper | actual model calls; compaction executor; worklog fork model |
 | 7 | `Tool` + `ToolRegistry` | trait + built-in tool pack (bash/read/write/edit/grep/find/ls) | tool execution; spawn/report/worklog tools |
-| 8 | `Compactor` + auto-compaction | summarize plans via `ModelProvider`; orchestrator threshold watcher | production-grade context management |
+| 8 | `Compactor` executor | summarize `RequestModelStateless` compaction requests via `ModelProvider`; wire provider completions back into session maintenance | production-grade context management |
 | 9 | `UsageLedger` | trait + in-memory impl + roll-up queries | cost observability; TUI footer |
 | 10 | Spawn + report + agent_idle | `SpawnTool`, `ReportTool`, idle-watcher in orchestrator; new injected-message kind constants | multi-agent operation |
 | 11 | `AgentWorklogStore` + worklog fork | trait + file-backed impl + `WorklogUpdateTool` + orchestrator worklog scheduler | per-agent durable knowledge; ancestor worklog injection for spawned sub-agents |
@@ -419,11 +421,13 @@ Rough mapping to user-visible capability:
 
 These are documented here so the PRs that implement them stick to the intended shape.
 
-### Compaction is stop-the-world per session
+### Compaction runs as scheduled session maintenance
 
-The session being compacted is frozen for the entire flow: `prepare → summarize → compact`. While frozen, the session queues incoming inputs (tool completions, child reports, steer, follow-up) and does not acknowledge them to the FSM until the flow completes or aborts. Tool calls the session had in flight when the flow started continue to run externally and their results queue; they're replayed to the FSM once compaction finishes.
+Compaction has two drivers. Immediate manual edits use `session.edit(Compact { plan, summary })` and require the whole session to be quiescent at a turn boundary. Scheduled compaction uses `session.request_maintenance(SessionMaintenance::Compact { settings })` and runs at the next safe model-context barrier. A safe barrier is either an idle turn boundary or the moment after the core emits `RequestModel` but before the session exposes that model action to the harness.
 
-This closes the liveness hole where repeated appends during an async summarize call starve the compaction plan's staleness fingerprint. The `Compactor` PR lands the mechanism (likely a `SessionPhase::EditingHistory { queued_inputs }` on `AgentSession` with `begin_history_edit` / `commit_history_edit` / `abort_history_edit` transitions); the `HistoryEdit` trait's `apply` becomes a witness over the edit phase rather than holding `&mut self` across await.
+While maintenance is pending, the session holds normal turn advancement: queued user inputs remain in the mailbox, and a held `RequestModel` is not exposed until the stateless summary request finishes or fails. Successful maintenance validates the plan fingerprint, applies the same `Compact` operation, and then releases the held model action with the updated `ModelContext`. Failure releases the held model action unchanged so the agent still makes progress.
+
+This closes the liveness hole where repeated appends during an async summarize call starve the compaction plan's staleness fingerprint, without making auto-compaction a separate history mutation primitive. Auto-compaction is simply the threshold-based producer of `SessionMaintenance::Compact`.
 
 **Parents can compact while children are still running.** Children are separate sessions with separate logs; a parent's compaction has no effect on any descendant.
 
@@ -445,7 +449,7 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 7. Non-goals
 
-- No support for mutating session transcripts that aren't at turn boundaries. Structural edits such as compaction, rewind, and model-context replacement require `AgentSession::edit` to pass its session-owned quiescence check. `AgentSession::fork` is not a mutation of the source session; it can copy any requested leaf that is already a turn boundary, even if the source session is currently busy elsewhere.
+- No support for arbitrary immediate mutation of session transcripts that aren't at turn boundaries. Structural edits through `AgentSession::edit` require the session-owned quiescence check. Scheduled compaction is the narrow exception: it can run at a pre-model safe barrier, but the span being replaced must still begin and end on turn boundaries, and the open suffix is replayed after the summary. `AgentSession::fork` is not a mutation of the source session; it can copy any requested leaf that is already a turn boundary, even if the source session is currently busy elsewhere.
 - No speculative abstraction for "hooks" that don't have concrete use cases. When extensions land, their API grows out of what concrete consumers need, not ahead of them.
 - No speculative support for non-Anthropic-shaped providers beyond what `ModelProvider` naturally allows. Any provider that fits `messages + tools → assistant with tool_calls` works; we don't pre-bake support for genuinely different paradigms (e.g. step-wise agent protocols) until we have one.
 - No back-compat with the TS session format *as a byte format* — the JSONL backend may use the same layout for cross-implementation convenience, but we don't pin wire-format compatibility as a hard constraint.

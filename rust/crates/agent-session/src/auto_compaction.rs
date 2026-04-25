@@ -1,6 +1,5 @@
 use agent_core::TranscriptItem;
 
-use crate::action::StatelessModelRequestId;
 use crate::transcript_store::tokens::estimate_items_tokens;
 use crate::transcript_store::{CompactionPlan, CompactionSettings, TranscriptStore};
 
@@ -46,20 +45,6 @@ pub enum StatelessModelOutputSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatelessModelOutput {
     Text(String),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingStatelessModel {
-    pub(crate) request_id: StatelessModelRequestId,
-    pub(crate) kind: PendingStatelessModelKind,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PendingStatelessModelKind {
-    Compaction {
-        plan: CompactionPlan,
-        held_model_action: agent_core::AgentAction,
-    },
 }
 
 pub(crate) fn prepare_auto_compaction(

@@ -1,6 +1,6 @@
 use agent_core::{InjectedMessage, TranscriptItem};
 
-use crate::transcript_store::edit::{HistoryEdit, HistoryEditError};
+use crate::transcript_store::edit::{HistoryEdit, HistoryEditError, HistoryEditKind};
 use crate::transcript_store::span::{
     summary_span_plan_from_indices, transcript_items_in, SummarizeSpan, SummarySpanPlan,
 };
@@ -112,13 +112,16 @@ impl TranscriptStore {
     }
 
     /// Validate that a `CompactionPlan` still matches the context's current
-    /// shape.
+    /// shape, without requiring the active leaf itself to be a turn boundary.
     ///
-    /// Returns `EntryNotFound` if `plan.first_kept_entry_id` no longer exists,
-    /// `StalePlan` if the context's leaf or entry count has drifted from the
-    /// plan's fingerprint, or `NotTurnBoundary` if the current leaf isn't at
-    /// a turn boundary.
-    pub fn validate_plan_matches(&self, plan: &CompactionPlan) -> Result<(), TranscriptStoreError> {
+    /// This is the validation used by session-owned maintenance at a safe
+    /// model-context barrier. The plan's summarized span still has to start
+    /// and end on turn boundaries; the current active leaf may include an open
+    /// turn suffix that will be replayed after the summary.
+    pub(crate) fn validate_plan_fingerprint(
+        &self,
+        plan: &CompactionPlan,
+    ) -> Result<(), TranscriptStoreError> {
         if !self.contains_entry(&plan.first_kept_entry_id) {
             return Err(TranscriptStoreError::EntryNotFound);
         }
@@ -126,6 +129,18 @@ impl TranscriptStore {
         if self.leaf_id() != plan.leaf_id.as_deref() || self.entry_count() != plan.entry_count {
             return Err(TranscriptStoreError::StalePlan);
         }
+        Ok(())
+    }
+
+    /// Validate that a `CompactionPlan` still matches the context's current
+    /// shape and that the active leaf is at a turn boundary.
+    ///
+    /// Returns `EntryNotFound` if `plan.first_kept_entry_id` no longer exists,
+    /// `StalePlan` if the context's leaf or entry count has drifted from the
+    /// plan's fingerprint, or `NotTurnBoundary` if the current leaf isn't at
+    /// a turn boundary.
+    pub fn validate_plan_matches(&self, plan: &CompactionPlan) -> Result<(), TranscriptStoreError> {
+        self.validate_plan_fingerprint(plan)?;
         if !self.is_turn_boundary() {
             return Err(TranscriptStoreError::NotTurnBoundary);
         }
@@ -143,13 +158,8 @@ pub struct Compact {
     pub summary: String,
 }
 
-impl HistoryEdit for Compact {
-    type Output = ();
-
-    fn apply(self, ctx: &mut TranscriptStore) -> Result<(), HistoryEditError> {
-        ctx.validate_plan_matches(&self.plan)
-            .map_err(HistoryEditError::Store)?;
-
+impl Compact {
+    pub(crate) fn apply_validated(self, ctx: &mut TranscriptStore) -> Result<(), HistoryEditError> {
         let CompactionPlan {
             summary_span,
             first_kept_entry_id,
@@ -162,6 +172,18 @@ impl HistoryEdit for Compact {
             summary: compaction_summary(self.summary, first_kept_entry_id, tokens_before),
         }
         .apply(ctx)
+    }
+}
+
+impl HistoryEdit for Compact {
+    type Output = ();
+    const KIND: HistoryEditKind = HistoryEditKind::Compact;
+
+    fn apply(self, ctx: &mut TranscriptStore) -> Result<(), HistoryEditError> {
+        ctx.validate_plan_matches(&self.plan)
+            .map_err(HistoryEditError::Store)?;
+
+        self.apply_validated(ctx)
     }
 }
 

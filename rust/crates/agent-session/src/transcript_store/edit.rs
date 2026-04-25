@@ -14,15 +14,24 @@ use crate::transcript_store::{TranscriptStore, TranscriptStoreError};
 /// context mutation and its own per-op preconditions.
 pub trait HistoryEdit {
     type Output;
+    const KIND: HistoryEditKind;
 
     fn apply(self, ctx: &mut TranscriptStore) -> Result<Self::Output, HistoryEditError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryEditKind {
+    SummarizeSpan,
+    Compact,
+    Rewind,
+    ReplaceModelContext,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryEditError {
     /// The session cannot currently edit its history (core still running,
     /// durable leaf mid-turn, mailbox non-empty, undrained actions remain, or
-    /// session-owned side work is outstanding).
+    /// session-owned maintenance is outstanding).
     Busy,
     /// A model context supplied to `ReplaceModelContext` did not itself end at
     /// a turn boundary.

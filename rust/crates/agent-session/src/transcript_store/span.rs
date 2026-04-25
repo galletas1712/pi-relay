@@ -1,6 +1,6 @@
 use agent_core::{InjectedMessage, TranscriptItem};
 
-use crate::transcript_store::edit::{HistoryEdit, HistoryEditError};
+use crate::transcript_store::edit::{HistoryEdit, HistoryEditError, HistoryEditKind};
 use crate::transcript_store::tokens::estimate_items_tokens;
 use crate::transcript_store::{TranscriptStorageNode, TranscriptStore, TranscriptStoreError};
 
@@ -77,6 +77,7 @@ impl TranscriptStore {
 
 impl HistoryEdit for SummarizeSpan {
     type Output = ();
+    const KIND: HistoryEditKind = HistoryEditKind::SummarizeSpan;
 
     fn apply(self, ctx: &mut TranscriptStore) -> Result<(), HistoryEditError> {
         ctx.validate_summary_span_plan(&self.plan)

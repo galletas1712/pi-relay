@@ -8,7 +8,7 @@ use crate::auto_compaction::StatelessModelOutput;
 /// External input to a live `AgentSession`.
 ///
 /// Core inputs continue to feed the turn FSM. Stateless model completions feed
-/// session-owned side work such as auto-compaction.
+/// session-owned maintenance such as scheduled compaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionInput {
     Agent(AgentInput),

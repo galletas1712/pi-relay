@@ -1,4 +1,4 @@
-use crate::transcript_store::edit::{HistoryEdit, HistoryEditError};
+use crate::transcript_store::edit::{HistoryEdit, HistoryEditError, HistoryEditKind};
 use crate::transcript_store::TranscriptStore;
 
 /// A rewind operation.
@@ -12,6 +12,7 @@ pub struct Rewind {
 
 impl HistoryEdit for Rewind {
     type Output = ();
+    const KIND: HistoryEditKind = HistoryEditKind::Rewind;
 
     fn apply(self, ctx: &mut TranscriptStore) -> Result<(), HistoryEditError> {
         match self.leaf_id.as_deref() {

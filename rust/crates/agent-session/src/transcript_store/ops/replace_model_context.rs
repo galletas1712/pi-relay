@@ -1,5 +1,5 @@
 use crate::model_context::ModelContext;
-use crate::transcript_store::edit::{HistoryEdit, HistoryEditError};
+use crate::transcript_store::edit::{HistoryEdit, HistoryEditError, HistoryEditKind};
 use crate::transcript_store::TranscriptStore;
 
 /// Replace the durable transcript store with entries from a new model context.
@@ -12,6 +12,7 @@ pub struct ReplaceModelContext {
 
 impl HistoryEdit for ReplaceModelContext {
     type Output = ModelContext;
+    const KIND: HistoryEditKind = HistoryEditKind::ReplaceModelContext;
 
     fn apply(self, ctx: &mut TranscriptStore) -> Result<ModelContext, HistoryEditError> {
         if !self.replacement.is_turn_boundary() {

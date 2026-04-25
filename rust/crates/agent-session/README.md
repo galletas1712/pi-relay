@@ -4,24 +4,25 @@ Durable session history and async run-loop wrapper around the `agent-core` FSM k
 
 ## Responsibility
 
-`agent-session` is the layer that turns the pure `AgentCoreLoop` FSM into a stateful, editable session. An `AgentSession` owns the core loop (deterministic state machine), a session-local `TranscriptStore` (append-only forest of `TranscriptStorageNode` nodes with one active leaf/path), an `ActionQueue` (FIFO of model/tool requests the session has handed out but hasn't heard back about), session-owned stateless model work, and an ephemeral event outbox for live observers. `session.drive()` is the only supported way to advance the FSM; it runs the core to quiescence and absorbs every freshly-produced `TranscriptItem` into the store, which is the sole owner of durable model-visible history.
+`agent-session` is the layer that turns the pure `AgentCoreLoop` FSM into a stateful, editable session. An `AgentSession` owns the core loop (deterministic state machine), a session-local `TranscriptStore` (append-only forest of `TranscriptStorageNode` nodes with one active leaf/path), an `ActionQueue` (FIFO of model/tool requests the session has handed out but hasn't heard back about), queued/session-owned maintenance, and an ephemeral event outbox for live observers. `session.drive()` is the only supported way to advance the FSM; it runs the core to quiescence and absorbs every freshly-produced `TranscriptItem` into the store, which is the sole owner of durable model-visible history.
 
-The crate also owns the *edit* surface: `SummarizeSpan`, `Compact`, `Rewind`, and `ReplaceModelContext` are individual op structs that implement the `HistoryEdit` trait. `AgentSession::edit` runs the quiescence gate (`can_edit_history`) once, dispatches to the op, then rehydrates the core loop from the new active path. `AgentSession::fork` is a direct method rather than a `HistoryEdit` impl because it produces a new session instead of mutating the source.
+The crate exposes two primitives for mutating session history. `AgentSession::edit(op)` is the immediate path: `SummarizeSpan`, `Compact`, `Rewind`, and `ReplaceModelContext` implement the `HistoryEdit` trait, and `edit` runs the quiescence gate (`can_edit_history`) before dispatching to the op and rehydrating the core loop. `AgentSession::request_maintenance(maintenance)` is the scheduled path: it queues session-owned maintenance, currently `SessionMaintenance::Compact`, and applies it at the next safe model-context barrier. `AgentSession::fork` is a direct method rather than a `HistoryEdit` impl because it produces a new session instead of mutating the source.
 
 `AgentRunner` is the async I/O shell. Inputs arrive via a cloneable `AgentInputHandle`; the runner calls `drive` in a loop and forwards each drained `SessionAction` to a caller-supplied handler.
 
-What this crate does *not* own: no model calls, no tool execution, no cost tracking, no spawn/report routing, no control-plane scheduling. Those all live in the harness / `agent-orchestrator` and above. The session just drives one agent, stores its history, and emits side work such as stateless model compaction requests.
+What this crate does *not* own: no model calls, no tool execution, no cost tracking, no spawn/report routing, no control-plane scheduling. Those all live in the harness / `agent-orchestrator` and above. The session just drives one agent, stores its history, and emits stateless model requests needed by scheduled maintenance.
 
 ## Public interface
 
 All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-orchestrator`, tests, and future daemon frontends) use only these.
 
 **Composition types**
-- `AgentSession` — core loop + transcript store + active path + action queue, the unit of agent state. Constructors and runtime helpers include `new`, `from_transcript_items`, `from_model_context`, `from_transcript_store`, `drive`, `enqueue_input`, `enqueue_session_input`, `drain_actions`, `drain_events`, `drain_pending_inputs`, `model_context`, `transcript_store`, `can_edit_history`, `edit`, and `fork`.
+- `AgentSession` — core loop + transcript store + active path + action queue, the unit of agent state. Constructors and runtime helpers include `new`, `from_transcript_items`, `from_model_context`, `from_transcript_store`, `drive`, `enqueue_input`, `enqueue_session_input`, `request_maintenance`, `drain_actions`, `drain_events`, `drain_pending_inputs`, `model_context`, `transcript_store`, `can_edit_history`, `edit`, and `fork`.
 - `AgentRunner` — async wrapper that drives a session off an input channel.
 - `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — sender/receiver pair for the runner's input channel.
 - `SessionAction` — model/tool/cancel actions plus session-owned `RequestModelStateless`. `RequestModel` carries the model-context snapshot visible when the model request was made.
 - `SessionInput`, `SessionInputError` — core inputs plus stateless model completions/failures.
+- `SessionMaintenance` — scheduled history maintenance to apply at the next safe model-context barrier. Currently `Compact { settings }`.
 - `SessionEvent` — ephemeral live activity (`TranscriptItemAppended`, `ActionRequested`, `ActionCompleted`, `ActionFailed`, `HistoryEdited`).
 - `SessionActionKind`, `HistoryEditKind` — lightweight event classifiers surfaced by `SessionEvent`.
 
@@ -37,7 +38,7 @@ All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-
 - `HistoryEditError` — `Busy`, `ReplacementNotAtTurnBoundary`, `Store(TranscriptStoreError)`.
 - `SummarySpanPlan` — produced by `TranscriptStore::prepare_summary_span`.
 - `CompactionPlan`, `CompactionSettings` — prefix-compaction policy produced by `TranscriptStore::prepare_compaction`.
-- `AutoCompactionSettings` — optional session policy that pauses a model request and emits stateless model compaction work when the model context is over budget.
+- `AutoCompactionSettings` — optional session policy that queues compaction maintenance when the model context is over budget at a model-context barrier.
 - `StatelessModelRequest`, `StatelessModelRequestId`, `StatelessModelOutput`, `StatelessModelOutputSpec`, `ModelContentBlock`, `ImageInput` — stateless side-model request/response vocabulary.
 
 **Well-known injected-message kinds**
@@ -62,7 +63,7 @@ session.drive();
 
 `drive` tracks every visible `RequestModel` / `RequestTool` in the internal action queue before callers drain the observable action outbox. `enqueue_input` validates the input and clears the matching key when the corresponding completion or failure arrives. `ModelFailed` closes the turn as `Crashed`; `CancelTurn` clears every entry for that turn id.
 
-With auto-compaction enabled, a core `RequestModel` may be held by the session while it emits `SessionAction::RequestModelStateless`. The harness runs that as a stateless side-model call and returns `SessionInput::ModelStatelessCompleted` or `SessionInput::ModelStatelessFailed` through the same input channel. Successful completion applies a compaction summary to the transcript store, then releases the held `RequestModel`. Failure releases the held `RequestModel` unchanged so the agent still makes progress.
+With auto-compaction enabled, the threshold policy queues `SessionMaintenance::Compact` when the core reaches a model-context barrier and the context is over budget. The same maintenance queue is available to callers via `request_maintenance`, so user/tool-requested compaction and auto-compaction share the same lifecycle. When compaction maintenance starts, the session emits `SessionAction::RequestModelStateless`; the harness runs that as a stateless side-model call and returns `SessionInput::ModelStatelessCompleted` or `SessionInput::ModelStatelessFailed` through the same input channel. Successful completion applies a compaction summary to the transcript store, then releases any held `RequestModel`. Failure releases the held `RequestModel` unchanged so the agent still makes progress.
 
 `drain_events()` returns live-only `SessionEvent`s that explain what happened without polluting the transcript store. `ModelContext` remains the model-visible view.
 
@@ -80,6 +81,11 @@ session.edit(Rewind { leaf_id: Some(id) })?;                // Output = ()
 let previous = session.edit(ReplaceModelContext { replacement })?;
 //                                                             Output = ModelContext
 
+// Scheduled maintenance can be requested while busy. It runs at the next
+// safe model-context barrier, possibly by holding a RequestModel until the
+// stateless summary returns.
+session.request_maintenance(SessionMaintenance::Compact { settings });
+
 // Fork is a direct method because it copies a path into a NEW session.
 let forked: AgentSession = session.fork(Some(&leaf_id))?;
 ```
@@ -93,14 +99,15 @@ let forked: AgentSession = session.fork(Some(&leaf_id))?;
 | `src/lib.rs` | Module declarations + public re-exports (including `agent-core` passthroughs). |
 | `src/action.rs` | `SessionAction`, `StatelessModelRequestId`. |
 | `src/input.rs` | `SessionInput`, `SessionInputError`. |
-| `src/event.rs` | Runtime-only `SessionEvent`, `SessionActionKind`, `HistoryEditKind`. |
+| `src/event.rs` | Runtime-only `SessionEvent`, `SessionActionKind`. |
 | `src/auto_compaction.rs` | `AutoCompactionSettings`, stateless model request/response types, compaction request rendering. |
-| `src/session.rs` | `AgentSession` composition, `drive`, `enqueue_input`, `enqueue_session_input`, `drain_actions`, `drain_events`, `can_edit_history`, `edit`, `fork`, `rehydrate_core_from_transcript_store`. |
+| `src/maintenance.rs` | `SessionMaintenance` plus private pending-maintenance state. |
+| `src/session.rs` | `AgentSession` composition, `drive`, `enqueue_input`, `enqueue_session_input`, `request_maintenance`, `drain_actions`, `drain_events`, `can_edit_history`, `edit`, `fork`, `rehydrate_core_from_transcript_store`. |
 | `src/action_queue.rs` | Private `ActionQueue` (FIFO `VecDeque<PendingActionKey>`) + `record_drained` / `record_input`. |
 | `src/model_context.rs` | `ModelContext` read-only view: `is_turn_boundary`, `latest_compaction_summary`, crashed-tail patching. |
 | `src/runner.rs` | `AgentRunner`, `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — async shell over `AgentSession`. |
 | `src/transcript_store/mod.rs` | `TranscriptStore` forest, `TranscriptStorageNode`, entry/parent/leaf indexes, materialization, `is_turn_boundary`, `TranscriptStoreError`. No kind-specific knowledge. |
-| `src/transcript_store/edit.rs` | `HistoryEdit` trait, `HistoryEditError`. |
+| `src/transcript_store/edit.rs` | `HistoryEdit` trait, `HistoryEditKind`, `HistoryEditError`. |
 | `src/transcript_store/span.rs` | Generic span-summary primitive: `SummarizeSpan`, `SummarySpanPlan`, `prepare_summary_span`, span-boundary validation. |
 | `src/transcript_store/tokens.rs` | Internal approximate token estimation used by planning and auto-compaction. |
 | `src/transcript_store/ops/compaction.rs` | Prefix-compaction policy/op: `Compact`, `CompactionPlan`, `CompactionSettings`, `prepare_compaction`, `validate_plan_matches`, `KIND_COMPACTION_SUMMARY`, `compaction_summary`. |
@@ -114,7 +121,8 @@ let forked: AgentSession = session.fork(Some(&leaf_id))?;
   ├── core: AgentCoreLoop             (from agent-core — FSM + mailbox)
   ├── transcript_store: TranscriptStore        (append-only forest of TranscriptStorageNode)
   ├── action_queue: ActionQueue       (FIFO: visible in-flight model/tool actions)
-  ├── pending_stateless_model: Option<...>   (session-owned side work)
+  ├── maintenance_queue: VecDeque<SessionMaintenance>
+  ├── pending_maintenance: Option<...>
   ├── action_outbox: VecDeque<SessionAction>
   └── event_outbox: VecDeque<SessionEvent>
 
@@ -125,12 +133,15 @@ let forked: AgentSession = session.fork(Some(&leaf_id))?;
  enqueue_input ─► validate → action_queue.record_input(..) → core.enqueue_input(..)
  enqueue_session_input ─► core input OR stateless model completion/failure
  edit(op)      ─► can_edit_history? → op.apply(&mut transcript_store) → rehydrate core
+ request_maintenance
+              ─► queue maintenance → start at next safe model-context barrier
 ```
 
-All three components are load-bearing:
+The main pieces are load-bearing:
 - **core** drives the FSM forward. It buffers transcript items only until the session absorbs them.
 - **transcript store** is durable history. It survives compaction because compaction is a branch, not a delete.
-- **action_queue** answers "is any visible model/tool work in flight?" — together with pending stateless model work, it's the signal that gates history edits.
+- **action_queue** answers "is any visible model/tool work in flight?" — together with queued or pending maintenance, it's the signal that gates immediate history edits.
+- **maintenance_queue / pending_maintenance** model deferred session-owned history mutation without making auto-compaction a special edit path.
 
 ### TranscriptStore Forest
 
@@ -176,10 +187,13 @@ can_edit_history() :=
     && !core.has_pending_work()
     && action_queue.is_empty()
     && action_outbox.is_empty()
-    && pending_stateless_model.is_none()
+    && maintenance_queue.is_empty()
+    && pending_maintenance.is_none()
 ```
 
-The session-owned checks cover state the session can see, including undrained observable actions such as `CancelTurn` that the harness still needs to execute and session-owned stateless model work such as auto-compaction. Orchestrator-owned background work is policy above this layer: if the orchestrator wants to block edits while worklog forks or other side tasks are running, it should choose not to call `session.edit(...)`.
+The session-owned checks cover state the session can see, including undrained observable actions such as `CancelTurn` that the harness still needs to execute and queued or in-flight maintenance such as compaction. Orchestrator-owned background work is policy above this layer: if the orchestrator wants to block edits while worklog forks or other side tasks are running, it should choose not to call `session.edit(...)`.
+
+Scheduled maintenance uses a looser barrier than immediate edits. A compact request can start while the session is idle at a turn boundary, or after the core emits `RequestModel` but before the session exposes that action to the harness. In the latter case the session holds the model action, emits `RequestModelStateless`, applies the summary when it returns, and only then exposes the original `RequestModel` with an updated `ModelContext`. While maintenance is pending, `drive()` does not start new turns from queued user input.
 
 Op outputs:
 
@@ -213,6 +227,6 @@ Transcript items are observed through the session's `model_context()` view; ther
 ## Relationship to other crates
 
 - **Upstream** `agent-core` — provides `AgentCoreLoop`, `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptItem`, `TurnId`, `ActionId`, `TurnOutcome`, `InjectedMessage`, and the message/tool-call vocabulary. `agent-session` re-exports these so downstream has a single import path.
-- **Downstream** `agent-orchestrator` — owns a `SessionRegistry<AgentSession>` keyed by `SessionId`, routes parent/child messages and reports, and delegates every history edit to `session.edit(op)` / `session.fork(leaf)`. It never reaches into `TranscriptStore` internals directly; it calls `session.transcript_store().prepare_compaction(..)` as a pure query and lets the session dispatch the resulting op.
+- **Downstream** `agent-orchestrator` — owns a `SessionRegistry<AgentSession>` keyed by `SessionId`, routes parent/child messages and reports, delegates immediate history edits to `session.edit(op)`, schedules compaction through `session.request_maintenance(...)`, and creates copies with `session.fork(leaf)`. It never reaches into `TranscriptStore` internals directly; it calls transcript-store planning methods as pure queries and lets the session dispatch mutation.
 
 For cross-cutting context (control plane, cost aggregation, worklog forks, multi-agent spawn/report), see `rust/docs/architecture.md`.
