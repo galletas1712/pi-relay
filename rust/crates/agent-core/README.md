@@ -56,7 +56,7 @@ caller                       AgentCoreLoop
   +------------- loop ------------+
 ```
 
-A typical session wrapper (see `agent-session/src/session.rs`) forwards `enqueue_input` straight to the core, calls `drive()`, then absorbs the drained transcript items into its durable `TranscriptStore`. The session never exposes the core directly: it funnels every input through itself so it can track pending model/tool work for edit-quiescence checks and so items always flow into durable storage.
+A typical session wrapper (see `agent-session/src/session.rs`) forwards `enqueue_input` straight to the core, calls `drive()`, then absorbs the drained transcript items into its durable `TranscriptStore`. The session never exposes the core directly: it funnels every input through itself so it can track pending model/tool work for cancellation/stale-work invalidation and so items always flow into durable storage.
 
 `drain_pending_inputs()` is also exposed as an introspection hook: it pulls every queued user input (steer before follow-up) back out of the mailbox without advancing the FSM, preserving each entry's `from` / `kind` tags. Notifications and the interrupt flag are left untouched. Intended for tests and orchestrator-level routing diagnostics.
 

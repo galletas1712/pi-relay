@@ -6,18 +6,11 @@ use uuid::Uuid;
 
 use crate::model_context::ModelContext;
 
-pub mod edit;
-pub(crate) mod ops;
-pub(crate) mod span;
-pub(crate) mod tokens;
+pub(crate) mod compaction;
 
-pub use self::edit::{HistoryEdit, HistoryEditError, HistoryEditKind};
-pub use self::ops::compaction::{
-    compaction_summary, Compact, CompactionPlan, CompactionSettings, KIND_COMPACTION_SUMMARY,
+pub use self::compaction::{
+    compaction_summary, CompactionPlan, CompactionSettings, KIND_COMPACTION_SUMMARY,
 };
-pub use self::ops::replace_model_context::ReplaceModelContext;
-pub use self::ops::rewind::Rewind;
-pub use self::span::{SummarizeSpan, SummarySpanPlan};
 
 /// Durable transcript storage node holding one model-visible transcript item.
 ///
@@ -54,9 +47,9 @@ impl TranscriptStore {
         Self::default()
     }
 
-    pub fn from_model_context(transcript: &ModelContext) -> Self {
+    pub fn from_model_context(model_context: &ModelContext) -> Self {
         let mut ctx = Self::new();
-        ctx.append_transcript_items(transcript.transcript_items().iter().cloned());
+        ctx.append_transcript_items(model_context.transcript_items().iter().cloned());
         ctx
     }
 
@@ -150,14 +143,6 @@ impl TranscriptStore {
         self.append_transcript_item(TranscriptItem::Injected(injected))
     }
 
-    pub fn branch(&mut self, entry_id: &str) -> Result<(), TranscriptStoreError> {
-        if !self.contains_entry(entry_id) {
-            return Err(TranscriptStoreError::EntryNotFound);
-        }
-        self.active_leaf_id = Some(entry_id.to_string());
-        Ok(())
-    }
-
     pub fn branch_at_turn_boundary(&mut self, entry_id: &str) -> Result<(), TranscriptStoreError> {
         if !self.contains_entry(entry_id) {
             return Err(TranscriptStoreError::EntryNotFound);
@@ -191,17 +176,6 @@ impl TranscriptStore {
         path
     }
 
-    pub fn create_branched_store(&self, leaf_id: &str) -> Result<Self, TranscriptStoreError> {
-        if !self.contains_entry(leaf_id) {
-            return Err(TranscriptStoreError::EntryNotFound);
-        }
-
-        Ok(Self::from_entries(
-            self.branch_entries(Some(leaf_id)),
-            Some(leaf_id.to_string()),
-        ))
-    }
-
     pub fn create_branched_store_at_turn_boundary(
         &self,
         leaf_id: Option<&str>,
@@ -211,17 +185,19 @@ impl TranscriptStore {
         }
 
         match leaf_id {
-            Some(leaf_id) => self.create_branched_store(leaf_id),
+            Some(leaf_id) => Ok(Self::from_entries(
+                self.branch_entries(Some(leaf_id)),
+                Some(leaf_id.to_string()),
+            )),
             None => Ok(Self::new()),
         }
     }
 
     /// Materialize the active branch into a `ModelContext`.
     ///
-    /// Summary-span edits rebuild the active branch in model-visible order:
-    /// prefix before the summarized span, the summary item, then copies of
-    /// the suffix after the summarized span. Materialization is therefore the
-    /// full active path.
+    /// Compaction rebuilds the active branch in model-visible order: prefix
+    /// before the compacted span, the summary item, then copies of the kept
+    /// suffix. Materialization is therefore always the full active path.
     pub fn model_context(&self) -> ModelContext {
         let path = self.branch_entries(None);
         let items = path.into_iter().map(|entry| entry.item).collect();
@@ -304,12 +280,13 @@ mod tests {
     }
 
     #[test]
-    fn context_tracks_a_branch_path_from_the_active_leaf() {
+    fn store_tracks_a_branch_path_from_the_active_leaf() {
         let mut ctx = TranscriptStore::new();
         let first_ids = ctx.append_transcript_items(turn(1, "first", "done"));
         ctx.append_transcript_items(turn(2, "second", "done"));
 
-        ctx.branch(&first_ids[3]).expect("turn one should exist");
+        ctx.branch_at_turn_boundary(&first_ids[3])
+            .expect("turn one should be a valid branch point");
         ctx.append_transcript_items(turn(3, "alternate", "done"));
 
         let transcript = ctx.model_context();
@@ -325,7 +302,7 @@ mod tests {
     }
 
     #[test]
-    fn context_indexes_children_and_leaves_for_alternate_paths() {
+    fn store_indexes_children_and_leaves_for_alternate_paths() {
         let mut ctx = TranscriptStore::new();
         let first_ids = ctx.append_transcript_items(turn(1, "first", "done"));
         let original_second_ids = ctx.append_transcript_items(turn(2, "second", "done"));
@@ -349,15 +326,15 @@ mod tests {
 
     #[test]
     fn transcript_materializes_the_full_active_branch_after_a_summary() {
-        // Simulate a summary-span edit manually at the context level: append
-        // two turns, navigate back to the T1 boundary, append a summary there,
-        // then re-append T2's items as descendants. The active branch is now
+        // Simulate compaction manually at the store level: append two turns,
+        // navigate back to the T1 boundary, append a summary there, then
+        // re-append T2's items as descendants. The active branch is now
         // [T1 items..., summary, T2 items...], and the materialized view is
         // that full active path.
         let mut ctx = TranscriptStore::new();
         let first_ids = ctx.append_transcript_items(turn(1, "first", "done"));
         let second_ids = ctx.append_transcript_items(turn(2, "second", "done"));
-        let kept_records = second_ids
+        let kept_items = second_ids
             .iter()
             .map(|id| ctx.get_entry(id).expect("kept id exists").item.clone())
             .collect::<Vec<_>>();
@@ -365,7 +342,7 @@ mod tests {
         ctx.branch_at_turn_boundary(&first_ids[3])
             .expect("T1 boundary is a valid fork point");
         ctx.append_injected(compaction_summary("summary", second_ids[0].clone(), 100));
-        ctx.append_transcript_items(kept_records);
+        ctx.append_transcript_items(kept_items);
 
         let transcript = ctx.model_context();
         assert_eq!(transcript.latest_compaction_summary(), Some("summary"));

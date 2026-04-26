@@ -3,18 +3,17 @@ use std::fmt;
 use agent_core::{AgentInput, AgentInputError};
 
 use crate::action::StatelessModelRequestId;
-use crate::auto_compaction::StatelessModelOutput;
 
 /// External input to a live `AgentSession`.
 ///
 /// Core inputs continue to feed the turn FSM. Stateless model completions feed
-/// session-owned maintenance such as scheduled compaction.
+/// scheduled compaction requests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionInput {
     Agent(AgentInput),
     ModelStatelessCompleted {
         request_id: StatelessModelRequestId,
-        output: StatelessModelOutput,
+        text: String,
     },
     ModelStatelessFailed {
         request_id: StatelessModelRequestId,

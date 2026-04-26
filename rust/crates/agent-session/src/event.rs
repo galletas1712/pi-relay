@@ -1,7 +1,6 @@
 use agent_core::TranscriptItem;
 
 use crate::action::SessionAction;
-use crate::transcript_store::HistoryEditKind;
 
 /// Ephemeral session activity for live observers.
 ///
@@ -26,15 +25,13 @@ pub enum SessionEvent {
         id: String,
         error: String,
     },
-    HistoryEdited {
-        kind: HistoryEditKind,
-    },
+    HistoryCompacted,
+    HistoryRewound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionActionKind {
     Model,
     Tool,
-    TurnCancellation,
     ModelStateless,
 }

@@ -132,8 +132,7 @@ mod tests {
     use super::*;
     use agent_core::{AgentInput, AssistantMessage, TranscriptItem, TurnId, TurnOutcome};
     use agent_session::{
-        Compact, CompactionSettings, HistoryEditError, ModelContext, ReplaceModelContext, Rewind,
-        TranscriptStoreError,
+        CompactionSettings, HistoryOperationError, ModelContext, TranscriptStoreError,
     };
 
     #[test]
@@ -151,51 +150,18 @@ mod tests {
             .enqueue_input(AgentInput::follow_up("hello"))
             .expect("plain follow-up is valid");
 
-        assert!(orchestrator
-            .registry()
-            .get("root")
-            .expect("session should exist")
-            .has_pending_work());
-    }
-
-    #[test]
-    fn orchestrator_delegates_model_context_replacement_to_session_history_edit() {
-        let mut orchestrator = AgentOrchestrator::new();
-        let model_context = ModelContext::from_transcript_items(vec![
-            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::UserMessage("compacted".to_string()),
-            TranscriptItem::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-        ]);
-
-        orchestrator
-            .registry_mut()
-            .spawn("root", AgentSession::new())
-            .expect("new session should be inserted");
-        orchestrator
-            .registry_mut()
-            .get_mut("root")
-            .expect("session should exist")
-            .edit(ReplaceModelContext {
-                replacement: model_context,
-            })
-            .expect("idle empty session can replace model_context");
-
         assert_eq!(
             orchestrator
-                .registry()
-                .get("root")
+                .registry_mut()
+                .get_mut("root")
                 .expect("session should exist")
-                .model_context()
-                .last_turn_id(),
-            TurnId(1)
+                .drain_pending_inputs(),
+            vec![AgentInput::follow_up("hello")]
         );
     }
 
     #[test]
-    fn orchestrator_delegates_rewind_fork_and_compaction_to_session_history_edits() {
+    fn orchestrator_delegates_rewind_fork_and_compaction_to_session_history_operations() {
         let mut orchestrator = AgentOrchestrator::new();
         let session = AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
             TranscriptItem::TurnStarted { turn_id: TurnId(1) },
@@ -225,12 +191,10 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit(Rewind {
-                leaf_id: Some(mid_turn_id.clone()),
-            });
+            .rewind(Some(&mid_turn_id));
         assert!(matches!(
             rewind_err,
-            Err(HistoryEditError::Store(
+            Err(HistoryOperationError::Store(
                 TranscriptStoreError::NotTurnBoundary
             ))
         ));
@@ -272,10 +236,7 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit(Compact {
-                plan,
-                summary: "summary".to_string(),
-            })
+            .compact(plan, "summary")
             .expect("root can compact at turn boundary");
         assert_eq!(
             orchestrator

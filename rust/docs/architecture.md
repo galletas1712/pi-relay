@@ -40,7 +40,7 @@ truth for those roadmaps.
                      ▼
 ┌──────────────────────────────────────────────┐
 │ 3. Session — AgentSession, TranscriptStore,  │
-│    HistoryEdit trait + ops, AgentRunner.     │
+│    compaction/rewind/fork, AgentRunner.      │
 │    One per agent. Sole owner of durable log. │
 └──────────────────────────────────────────────┘
                      ▲
@@ -147,10 +147,10 @@ one leaf. The model-visible `ModelContext` is materialized by walking parents
 from that leaf to a root, reversing the path, and reading each entry's
 `TranscriptItem`.
 
-Rewind, replace, and compaction should not destroy history. In the current
-session-local implementation they move the active leaf or rebuild a fresh
-store. The target copy-on-write implementation keeps old leaves reachable in
-the shared `SessionStore`, so a session/version can move to a new leaf without
+Rewind and compaction should not destroy history. In the current session-local
+implementation they move the active leaf or rebuild a branch inside the store.
+The target copy-on-write implementation keeps old leaves reachable in the
+shared `SessionStore`, so a session/version can move to a new leaf without
 duplicating common ancestors or losing the old path.
 
 ### Session events (layer 3, observable)
@@ -161,7 +161,8 @@ enum SessionEvent {
     ActionRequested { action: SessionAction },
     ActionCompleted { kind: SessionActionKind, id: String },
     ActionFailed { kind: SessionActionKind, id: String, error: String },
-    HistoryEdited { kind: HistoryEditKind },
+    HistoryCompacted,
+    HistoryRewound,
 }
 ```
 
@@ -190,14 +191,14 @@ Already landed in PR #62 + #63 refactors.
 
 ### Layer 3 — Session (`agent-session` crate)
 
-Partially landed in PR #63; decomposition planned.
+Landed in PR #63 and hardened in PR #64.
 
-- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore`. The session is the sole owner of durable transcript items for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `enqueue_session_input`, `request_maintenance`, `is_idle`, `has_pending_work`, `last_turn_id`, `model_context`, `transcript_store`, `drain_actions`. History mutation has two session primitives: immediate `edit(op)` after session-owned quiescence, and scheduled `request_maintenance(maintenance)` at the next safe model-context barrier. `fork(leaf)` is a non-mutating direct method that returns an unregistered child `AgentSession`.
-- **`HistoryEdit` trait + op structs** — each immediate history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceModelContext { replacement }`) that implements `HistoryEdit { type Output; fn apply(self, &mut TranscriptStore) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `TranscriptStore` (`session.transcript_store().prepare_summary_span(first, last)`); prefix compaction is policy on top (`session.transcript_store().prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
-- **`SessionMaintenance`** — scheduled session-owned history maintenance. Today the only variant is `Compact { settings }`. It may be requested while the session is busy; the session applies it only when either idle at a turn boundary or holding a just-emitted `RequestModel` before exposing that action to the harness. Auto-compaction is one producer of this queue, not a separate mutation path.
+- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore`. The session is the sole owner of durable transcript items for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `enqueue_session_input`, `request_compaction`, `compact`, `rewind`, `fork`, `last_turn_id`, `model_context`, `transcript_store`, `drain_actions`, `drain_events`, and `drain_pending_inputs`.
+- **Immediate history operations** — `compact(plan, summary)` and `rewind(leaf)` validate their operation-specific preconditions before invalidating work. `compact` applies only to a plan that still matches the current transcript at a turn boundary. `rewind` validates the requested target first, then may interrupt active work before moving the leaf. Successful mutations preserve queued `Steer` / `FollowUp` inputs and rehydrate the core from the new `ModelContext`.
+- **Scheduled compaction** — `request_compaction(settings)` may be called while the session is busy. The session resolves it only when idle at a turn boundary or while holding a just-emitted `RequestModel` before exposing that action to the harness. Auto-compaction is one producer of the same compaction queue, not a separate mutation path.
 - **`TranscriptStore`** — session-local forest of `TranscriptStorageNode`s with entry/parent/child/leaf indexes plus an active leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
 - **`ModelContext`** — materialized view of the current root-to-leaf path's transcript items. Live model contexts preserve open turns; resume paths explicitly crash-recover any open tail.
-- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, model_context }` includes the model-context snapshot visible when the model request was made; tool and cancel actions carry only the ids/payloads needed to execute them. Session-owned stateless model requests are used for scheduled maintenance such as compaction.
+- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, model_context }` includes the model-context snapshot visible when the model request was made; `RequestTool` carries the tool payload; `RequestModelStateless` is used for scheduled compaction. `CancelSessionWork` is a best-effort session-wide invalidation barrier: the harness should cancel every outstanding model/tool/stateless request for that session and treat late completions as stale.
 - **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans `SessionAction`s to the handler. Transcript items auto-flow into the log; the runner does not expose them directly.
 - **Future `SessionStore` trait** — pluggable durable storage. Planned defaults are `JsonlFileSessionStore` for disk and `InMemorySessionStore` for tests, swappable for `SqliteSessionStore` later.
 
@@ -305,20 +306,19 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 ### Compaction
 
-**Status**: data model and session maintenance lifecycle landed; provider executor pending.
+**Status**: data model and scheduled compaction lifecycle landed; provider executor pending.
 
-- `session.transcript_store().prepare_summary_span(first, last)` is the generic primitive: replace a contiguous active-branch span with a summary and replay the suffix.
-- `session.transcript_store().prepare_compaction(settings)` produces a `CompactionPlan` as prefix-compaction policy on top of that primitive.
+- `session.transcript_store().prepare_compaction(settings)` produces a `CompactionPlan` for prefix compaction.
 - `Compactor::summarize(plan)` calls a `ModelProvider` to generate the summary string.
-- `session.edit(Compact { plan, summary })` applies the prepared summary span immediately, after the session-owned quiescence check.
-- `session.request_maintenance(SessionMaintenance::Compact { settings })` schedules compaction for the next safe model-context barrier. If the barrier is a just-emitted `RequestModel`, the session holds that model action, emits `RequestModelStateless`, applies the summary when it returns, and then exposes the held `RequestModel` with the updated `ModelContext`.
-- Auto-compaction uses the same maintenance queue: the threshold policy checks the context when the core reaches a `RequestModel` barrier, queues `SessionMaintenance::Compact` if over budget, and lets the normal maintenance lifecycle drive the stateless summary request.
+- `session.compact(plan, summary)` applies a plan that still matches the current transcript at a turn boundary.
+- `session.request_compaction(settings)` schedules compaction for the next safe model-context barrier. If the barrier is a just-emitted `RequestModel`, the session holds that model action, emits `RequestModelStateless`, applies the returned text summary, and then exposes the held `RequestModel` with the updated `ModelContext`.
+- Auto-compaction uses the same compaction queue: the threshold policy checks the context only when new work reaches a `RequestModel` barrier, queues compaction if over budget, and lets the normal request lifecycle drive the stateless summary request. Restoring an over-budget session stays quiescent; it does not start compaction until later input reaches a model barrier.
 
 ### Rewind
 
 **Status**: landed (PR #63).
 
-- `session.edit(Rewind { leaf_id: Some(leaf) })` moves the log's leaf pointer; the core is rehydrated from the new materialized view.
+- `session.rewind(Some(leaf))` moves the log's leaf pointer; the core is rehydrated from the new materialized view.
 
 ### Fork (as primitive)
 
@@ -395,13 +395,13 @@ Each row is one landable PR. Later PRs depend on their predecessors.
 | # | PR | What it adds | Unlocks |
 |---|---|---|---|
 | 1 | **#63 foundation** | `agent-session`, `agent-orchestrator` crates + transcript-item/model-context unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
-| 2 | Session decomposition | `HistoryEdit` trait + op structs + `SessionRegistry<S>` + orchestrator becomes composition struct | clean target for registry-level features |
+| 2 | Session hardening | session-wide cancellation + model failure path + action snapshots + simpler `compact` / `rewind` / `request_compaction` APIs + `SessionRegistry<S>` | clean target for registry-level features |
 | 3 | `SessionStore` | trait + in-memory + JSONL-file impls + wire into `AgentSession` | durable restart; resume-from-file; pluggable backends |
 | 4 | `ControlPlane` trait | trait definition + `LocalControlPlane` impl + view-layer adapter | view/control separation; future daemon |
 | 5 | `SessionEvent` stream | event bus + subscription on `AgentSession`; durable events mirror log writes | observers (TUI, ledger, idle watcher) |
 | 6 | `ModelProvider` trait | trait + Anthropic adapter + `UsageContext` + retry wrapper | actual model calls; compaction executor; worklog fork model |
 | 7 | `Tool` + `ToolRegistry` | trait + built-in tool pack (bash/read/write/edit/grep/find/ls) | tool execution; spawn/report/worklog tools |
-| 8 | `Compactor` executor | summarize `RequestModelStateless` compaction requests via `ModelProvider`; wire provider completions back into session maintenance | production-grade context management |
+| 8 | `Compactor` executor | summarize `RequestModelStateless` compaction requests via `ModelProvider`; wire provider completions back into scheduled compaction | production-grade context management |
 | 9 | `UsageLedger` | trait + in-memory impl + roll-up queries | cost observability; TUI footer |
 | 10 | Spawn + report + agent_idle | `SpawnTool`, `ReportTool`, idle-watcher in orchestrator; new injected-message kind constants | multi-agent operation |
 | 11 | `AgentWorklogStore` + worklog fork | trait + file-backed impl + `WorklogUpdateTool` + orchestrator worklog scheduler | per-agent durable knowledge; ancestor worklog injection for spawned sub-agents |
@@ -421,21 +421,21 @@ Rough mapping to user-visible capability:
 
 These are documented here so the PRs that implement them stick to the intended shape.
 
-### Compaction runs as scheduled session maintenance
+### Compaction Runs Through One Session Queue
 
-Compaction has two drivers. Immediate manual edits use `session.edit(Compact { plan, summary })` and require the whole session to be quiescent at a turn boundary. Scheduled compaction uses `session.request_maintenance(SessionMaintenance::Compact { settings })` and runs at the next safe model-context barrier. A safe barrier is either an idle turn boundary or the moment after the core emits `RequestModel` but before the session exposes that model action to the harness.
+Compaction has two drivers. Immediate manual operations use `session.compact(plan, summary)`, which first validates that the plan still matches the current transcript at a turn boundary, then applies it. Scheduled compaction uses `session.request_compaction(settings)` and runs at the next safe model-context barrier. A safe barrier is either an idle turn boundary or the moment after the core emits `RequestModel` but before the session exposes that model action to the harness. An undrained `CancelSessionWork` does not block scheduled compaction; new requests queue behind it.
 
-While maintenance is pending, the session holds normal turn advancement: queued user inputs remain in the mailbox, and a held `RequestModel` is not exposed until the stateless summary request finishes or fails. Successful maintenance validates the plan fingerprint, applies the same `Compact` operation, and then releases the held model action with the updated `ModelContext`. Failure releases the held model action unchanged so the agent still makes progress.
+While a compaction request is pending, the session holds normal turn advancement: queued `Steer` / `FollowUp` inputs remain in the mailbox, and a held `RequestModel` is not exposed until the stateless summary request finishes or fails. A successful request validates the plan fingerprint, applies the same compaction operation, and then releases the held model action with the updated `ModelContext`. Failure releases the held model action unchanged so the agent still makes progress.
 
-This closes the liveness hole where repeated appends during an async summarize call starve the compaction plan's staleness fingerprint, without making auto-compaction a separate history mutation primitive. Auto-compaction is simply the threshold-based producer of `SessionMaintenance::Compact`.
+This closes the liveness hole where repeated appends during an async summarize call starve the compaction plan's staleness fingerprint, without making auto-compaction a separate history mutation primitive. Auto-compaction is simply the threshold-based producer of queued compaction.
 
 **Parents can compact while children are still running.** Children are separate sessions with separate logs; a parent's compaction has no effect on any descendant.
 
 ### Child reports are mailbox inputs, not history edits
 
-When a child emits `report(content)`, the orchestrator does **not** call `session.edit(...)` on the parent. Instead the report enters the parent's mailbox as a tagged `AgentInput::FollowUp` via `follow_up_tagged(from, KIND_AGENT_REPORT, content)`. The parent's FSM materializes it as a `TranscriptItem::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to future agent-visible notifications: use tagged mailbox input for messages that should become model-visible context, and keep purely live signals as `SessionEvent`s.
+When a child emits `report(content)`, the orchestrator does **not** directly mutate the parent's transcript store. Instead the report enters the parent's mailbox as a tagged `AgentInput::FollowUp` via `follow_up_tagged(from, KIND_AGENT_REPORT, content)`. The parent's FSM materializes it as a `TranscriptItem::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to future agent-visible notifications: use tagged mailbox input for messages that should become model-visible context, and keep purely live signals as `SessionEvent`s.
 
-This keeps `AgentSession::edit` for genuine structural mutations (`Compact`, `Rewind`, `ReplaceModelContext`) and keeps `AgentSession::fork` as a non-mutating copy operation. Reports therefore do not churn `entry_count` before the parent actually consumes them.
+This keeps `AgentSession::compact` / `rewind` for genuine structural mutations and keeps `AgentSession::fork` as a non-mutating copy operation. Reports therefore do not churn `entry_count` before the parent actually consumes them.
 
 ### Spawn is fire-and-forget and creates a fresh session
 
@@ -449,7 +449,7 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 7. Non-goals
 
-- No support for arbitrary immediate mutation of session transcripts that aren't at turn boundaries. Structural edits through `AgentSession::edit` require the session-owned quiescence check. Scheduled compaction is the narrow exception: it can run at a pre-model safe barrier, but the span being replaced must still begin and end on turn boundaries, and the open suffix is replayed after the summary. `AgentSession::fork` is not a mutation of the source session; it can copy any requested leaf that is already a turn boundary, even if the source session is currently busy elsewhere.
+- No support for history mutations that cut through turn internals. `compact` requires a current turn boundary and a fresh plan; `rewind` may interrupt active work after validating that the target is a boundary. Scheduled compaction can also run at a pre-model safe barrier, and the open suffix is replayed after the summary. `AgentSession::fork` is not a mutation of the source session; it can copy any requested leaf that is already a turn boundary, even if the source session is currently busy elsewhere.
 - No speculative abstraction for "hooks" that don't have concrete use cases. When extensions land, their API grows out of what concrete consumers need, not ahead of them.
 - No speculative support for non-Anthropic-shaped providers beyond what `ModelProvider` naturally allows. Any provider that fits `messages + tools → assistant with tool_calls` works; we don't pre-bake support for genuinely different paradigms (e.g. step-wise agent protocols) until we have one.
 - No back-compat with the TS session format *as a byte format* — the JSONL backend may use the same layout for cross-implementation convenience, but we don't pin wire-format compatibility as a hard constraint.
@@ -459,11 +459,11 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 8. Principles in tension (explicit trade-offs)
 
-**Clean boundaries vs. API ergonomics.** The `session.edit(SummarizeSpan { plan, summary })?` form is more verbose than a single `session.compactAtBoundary(plan, summary)` helper. Accepting the verbosity because it encodes which operations are history-edit-only in the type system.
+**Clean boundaries vs. API ergonomics.** Earlier designs exposed generic span replacement and model-context replacement as public history-edit operations. PR #64 collapses that surface to the two operations with real consumers: `compact(plan, summary)` and `rewind(leaf)`. Fresh context injection is handled by constructors, not by editing a live session.
 
 **Distributed-ready API vs. sync simplicity.** `ControlPlane` is async + fallible even when called in-process. Paying this for day-1 local use to keep daemon-day migration trivial.
 
-**Two tracking layers (transcript forest + registry tree).** Not a duplication — the transcript forest tracks transcript-item ancestry and summary-span rewrites; the registry tracks inter-session spawn relationships. Use distinct terminology in code (`previous_entry_id` vs. `spawn_parent`) to reinforce.
+**Two tracking layers (transcript forest + registry tree).** Not a duplication — the transcript forest tracks transcript-item ancestry and compaction rewrites; the registry tracks inter-session spawn relationships. Use distinct terminology in code (`previous_entry_id` vs. `spawn_parent`) to reinforce.
 
 **Unified `InjectedMessage` vs. per-kind entry types.** Unified. Every "summary / note / report injected at a boundary" is one enum variant with a kind tag. TS has 3+ entry types for this; we have 1 + extensible tag. New kinds don't require new materialization branches.
 

@@ -59,34 +59,12 @@ impl ModelContext {
         })
     }
 
-    pub fn boundary_prefix(&self, len: usize) -> Option<Self> {
-        if len > self.items.len() {
-            return None;
-        }
-
-        let prefix = Self {
-            items: self.items[..len].to_vec(),
-        };
-        prefix.is_turn_boundary().then_some(prefix)
-    }
-
-    pub fn append(&mut self, item: TranscriptItem) {
-        self.items.push(item);
-    }
-
     pub fn last_turn_id(&self) -> TurnId {
         self.items
             .iter()
             .rev()
             .find_map(TranscriptItem::turn_id)
             .unwrap_or_default()
-    }
-
-    pub fn tail_outcome(&self) -> Option<TurnOutcome> {
-        match self.items.last() {
-            Some(TranscriptItem::TurnFinished { outcome, .. }) => Some(*outcome),
-            _ => None,
-        }
     }
 
     fn patch_crashed_tail(items: &mut Vec<TranscriptItem>) {
@@ -218,27 +196,6 @@ mod tests {
         ]);
         assert!(transcript.is_turn_boundary());
         assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
-    }
-
-    #[test]
-    fn boundary_prefix_requires_a_finished_turn() {
-        let transcript = ModelContext::from_transcript_items(vec![
-            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::UserMessage("hello".to_string()),
-            TranscriptItem::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-            TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-            TranscriptItem::UserMessage("next".to_string()),
-        ]);
-
-        let prefix = transcript
-            .boundary_prefix(3)
-            .expect("finished turn should be a valid boundary");
-        assert_eq!(prefix.transcript_items().len(), 3);
-        assert!(transcript.boundary_prefix(4).is_none());
-        assert!(transcript.boundary_prefix(99).is_none());
     }
 
     #[test]

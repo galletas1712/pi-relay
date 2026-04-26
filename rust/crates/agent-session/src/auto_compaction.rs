@@ -1,6 +1,6 @@
 use agent_core::TranscriptItem;
 
-use crate::transcript_store::tokens::estimate_items_tokens;
+use crate::transcript_store::compaction::estimate_items_tokens;
 use crate::transcript_store::{CompactionPlan, CompactionSettings, TranscriptStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,7 +22,6 @@ impl AutoCompactionSettings {
 pub struct StatelessModelRequest {
     pub instructions: String,
     pub input: Vec<ModelContentBlock>,
-    pub output: StatelessModelOutputSpec,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,16 +34,6 @@ pub enum ModelContentBlock {
 pub enum ImageInput {
     Url(String),
     Base64 { media_type: String, data: String },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StatelessModelOutputSpec {
-    Text,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum StatelessModelOutput {
-    Text(String),
 }
 
 pub(crate) fn prepare_auto_compaction(
@@ -83,7 +72,6 @@ pub(crate) fn compaction_request(plan: &CompactionPlan) -> StatelessModelRequest
         )
         .to_string(),
         input,
-        output: StatelessModelOutputSpec::Text,
     }
 }
 

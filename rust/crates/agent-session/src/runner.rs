@@ -261,7 +261,6 @@ mod tests {
                 },
             ]
         );
-        assert!(runner.session().is_idle());
     }
 
     #[test]
@@ -323,7 +322,6 @@ mod tests {
                 },
             ]
         );
-        assert!(runner.session().is_idle());
     }
 
     #[test]

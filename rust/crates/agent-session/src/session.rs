@@ -4,18 +4,24 @@ use agent_core::{AgentAction, AgentCoreLoop, AgentInput, AgentInputError, Transc
 
 use crate::action::{SessionAction, StatelessModelRequestId};
 use crate::action_queue::ActionQueue;
-use crate::auto_compaction::{self, AutoCompactionSettings, StatelessModelOutput};
+use crate::auto_compaction::{self, AutoCompactionSettings};
 use crate::event::{SessionActionKind, SessionEvent};
 use crate::input::{SessionInput, SessionInputError};
-use crate::maintenance::{
-    MaintenanceSource, PendingSessionMaintenance, PendingSessionMaintenanceKind,
-    QueuedSessionMaintenance, SessionMaintenance,
-};
 use crate::model_context::ModelContext;
 use crate::transcript_store::{
-    Compact, CompactionSettings, HistoryEdit, HistoryEditError, HistoryEditKind, TranscriptStore,
-    TranscriptStoreError,
+    CompactionPlan, CompactionSettings, TranscriptStore, TranscriptStoreError,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryOperationError {
+    /// The session cannot currently edit its history because its durable leaf
+    /// is mid-turn and there is no active core turn that can be interrupted to
+    /// close it.
+    Busy,
+    /// An underlying transcript-store error: entry not found, invalid summary
+    /// span, not at a turn boundary, or a stale edit plan.
+    Store(TranscriptStoreError),
+}
 
 /// Session shell around the pure core loop.
 ///
@@ -33,8 +39,8 @@ pub struct AgentSession {
     action_outbox: VecDeque<SessionAction>,
     event_outbox: VecDeque<SessionEvent>,
     auto_compaction: Option<AutoCompactionSettings>,
-    maintenance_queue: VecDeque<QueuedSessionMaintenance>,
-    pending_maintenance: Option<PendingSessionMaintenance>,
+    compaction_request_queue: VecDeque<QueuedCompactionRequest>,
+    pending_compaction: Option<PendingCompaction>,
     next_stateless_model_request_id: StatelessModelRequestId,
 }
 
@@ -53,8 +59,8 @@ impl AgentSession {
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
             auto_compaction: None,
-            maintenance_queue: VecDeque::new(),
-            pending_maintenance: None,
+            compaction_request_queue: VecDeque::new(),
+            pending_compaction: None,
             next_stateless_model_request_id: StatelessModelRequestId::first(),
         }
     }
@@ -72,19 +78,73 @@ impl AgentSession {
         self.auto_compaction
     }
 
-    /// Queue session-owned history maintenance for the next safe
-    /// model-context barrier.
+    /// Queue a compaction request for the next safe model-context barrier.
     ///
-    /// The request may be made while the session is busy. The session starts
-    /// the maintenance when it is idle at a turn boundary, or when the core
-    /// has requested a model call that has not yet been exposed to the
-    /// harness. Auto-compaction uses the same queue.
-    pub fn request_maintenance(&mut self, maintenance: SessionMaintenance) {
-        self.maintenance_queue.push_back(QueuedSessionMaintenance {
-            maintenance,
-            source: MaintenanceSource::Requested,
-        });
-        self.maybe_start_idle_maintenance();
+    /// The request may be made while the session is busy. The session starts it
+    /// when idle at a turn boundary, or when the core has requested a model
+    /// call that has not yet been exposed to the harness. Auto-compaction uses
+    /// the same queue.
+    pub fn request_compaction(&mut self, settings: CompactionSettings) {
+        self.compaction_request_queue
+            .push_back(QueuedCompactionRequest {
+                settings,
+                source: CompactionRequestSource::Requested,
+            });
+        self.maybe_start_idle_compaction_request();
+    }
+
+    /// Apply a compaction plan immediately.
+    ///
+    /// The plan must match the current transcript shape and the current leaf
+    /// must already be at a turn boundary. For compaction while a model request
+    /// is being started, use `request_compaction` so the session can hold the
+    /// model request at the barrier.
+    pub fn compact(
+        &mut self,
+        plan: CompactionPlan,
+        summary: impl Into<String>,
+    ) -> Result<(), HistoryOperationError> {
+        let summary = summary.into();
+        self.transcript_store
+            .validate_plan_matches(&plan)
+            .map_err(HistoryOperationError::Store)?;
+        self.apply_history_operation(SessionEvent::HistoryCompacted, |store| {
+            store
+                .apply_compaction(plan, summary)
+                .map_err(HistoryOperationError::Store)
+        })
+    }
+
+    /// Rewind the active transcript path to a prior turn boundary.
+    ///
+    /// `leaf_id = Some(id)` moves the active leaf to `id`; `leaf_id = None`
+    /// resets the session to the empty root. Like `compact`, rewind is a
+    /// stop-the-world edit that preserves queued user inputs while invalidating
+    /// obsolete external work.
+    pub fn rewind(&mut self, leaf_id: Option<&str>) -> Result<(), HistoryOperationError> {
+        self.validate_rewind_target(leaf_id)
+            .map_err(HistoryOperationError::Store)?;
+        self.apply_history_operation(SessionEvent::HistoryRewound, |store| {
+            match leaf_id {
+                Some(leaf_id) => store
+                    .branch_at_turn_boundary(leaf_id)
+                    .map_err(HistoryOperationError::Store)?,
+                None => store.reset_leaf(),
+            }
+            Ok(())
+        })
+    }
+
+    fn validate_rewind_target(&self, leaf_id: Option<&str>) -> Result<(), TranscriptStoreError> {
+        match leaf_id {
+            Some(leaf_id) if !self.transcript_store.contains_entry(leaf_id) => {
+                Err(TranscriptStoreError::EntryNotFound)
+            }
+            leaf_id if !self.transcript_store.is_turn_boundary_leaf(leaf_id) => {
+                Err(TranscriptStoreError::NotTurnBoundary)
+            }
+            _ => Ok(()),
+        }
     }
 
     pub fn from_transcript_items(items: Vec<TranscriptItem>) -> Self {
@@ -110,17 +170,17 @@ impl AgentSession {
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
             auto_compaction: None,
-            maintenance_queue: VecDeque::new(),
-            pending_maintenance: None,
+            compaction_request_queue: VecDeque::new(),
+            pending_compaction: None,
             next_stateless_model_request_id: StatelessModelRequestId::first(),
         }
     }
 
     pub fn from_transcript_store(
         transcript_store: TranscriptStore,
-    ) -> Result<Self, HistoryEditError> {
+    ) -> Result<Self, HistoryOperationError> {
         if !transcript_store.is_turn_boundary() {
-            return Err(HistoryEditError::Store(
+            return Err(HistoryOperationError::Store(
                 TranscriptStoreError::NotTurnBoundary,
             ));
         }
@@ -134,8 +194,8 @@ impl AgentSession {
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
             auto_compaction: None,
-            maintenance_queue: VecDeque::new(),
-            pending_maintenance: None,
+            compaction_request_queue: VecDeque::new(),
+            pending_compaction: None,
             next_stateless_model_request_id: StatelessModelRequestId::first(),
         })
     }
@@ -164,8 +224,8 @@ impl AgentSession {
             SessionInput::Agent(input) => self
                 .enqueue_agent_input(input)
                 .map_err(SessionInputError::Agent),
-            SessionInput::ModelStatelessCompleted { request_id, output } => {
-                self.complete_stateless_model(request_id, output);
+            SessionInput::ModelStatelessCompleted { request_id, text } => {
+                self.complete_stateless_model(request_id, text);
                 Ok(())
             }
             SessionInput::ModelStatelessFailed { request_id, error } => {
@@ -178,8 +238,8 @@ impl AgentSession {
     fn enqueue_agent_input(&mut self, input: AgentInput) -> Result<(), AgentInputError> {
         input.validate()?;
         if matches!(input, AgentInput::Interrupt) {
-            self.clear_pending_maintenance("interrupted");
-        } else if self.pending_maintenance.is_some()
+            self.invalidate_session_work("interrupted");
+        } else if self.pending_compaction.is_some()
             && matches!(
                 input,
                 AgentInput::ModelCompleted { .. }
@@ -202,16 +262,6 @@ impl AgentSession {
         self.core.last_turn_id()
     }
 
-    /// True when the core loop is between turns and has no in-flight work.
-    pub fn is_idle(&self) -> bool {
-        self.core.is_idle()
-    }
-
-    /// True when the core loop's mailbox still has queued inputs.
-    pub fn has_pending_work(&self) -> bool {
-        self.core.has_pending_work()
-    }
-
     /// Materialized view of the session history derived from the transcript
     /// store.
     /// With a compaction present, the latest summary is inlined ahead of the
@@ -229,13 +279,13 @@ impl AgentSession {
     /// to the session store. This is the only supported way to advance a
     /// session; the store remains the sole owner of durable history.
     pub fn drive(&mut self) {
-        if self.pending_maintenance.is_some() {
+        if self.pending_compaction.is_some() {
             return;
         }
         self.core.drive();
         self.absorb_core_transcript_items();
         self.absorb_core_actions();
-        self.maybe_start_idle_maintenance();
+        self.maybe_start_idle_compaction_request();
     }
 
     /// Drain every queued user input (Steer then FollowUp) from the
@@ -253,9 +303,9 @@ impl AgentSession {
     ///
     /// Actions are recorded in the session's internal action queue during
     /// `drive`, so model/tool completions can clear pending work even if the
-    /// caller drains the observable outbox later. History edits still require
-    /// the observable outbox itself to be empty, so callers cannot drop an
-    /// undrained cancellation action by editing first.
+    /// caller drains the observable outbox later. Session-wide cancellation is
+    /// retained until the caller drains it; stale start actions can be discarded
+    /// when the session invalidates work.
     ///
     /// Transcript items are absorbed into the store inside `drive`, so there is no
     /// analogous `drain_transcript_items` on the session.
@@ -267,49 +317,65 @@ impl AgentSession {
         self.event_outbox.drain(..).collect()
     }
 
-    /// True when the session's history can be edited immediately: core idle,
-    /// context at a turn boundary, mailbox empty, no in-flight drained
-    /// actions, no undrained observable actions, and no queued or in-flight
-    /// session-owned maintenance.
-    pub fn can_edit_history(&self) -> bool {
-        self.core.is_idle()
-            && self.transcript_store.is_turn_boundary()
-            && !self.core.has_pending_work()
-            && self.action_queue.is_empty()
-            && self.action_outbox.is_empty()
-            && self.maintenance_queue.is_empty()
-            && self.pending_maintenance.is_none()
+    fn apply_history_operation<Output>(
+        &mut self,
+        event: SessionEvent,
+        apply: impl FnOnce(&mut TranscriptStore) -> Result<Output, HistoryOperationError>,
+    ) -> Result<Output, HistoryOperationError> {
+        let queued_user_inputs = self.prepare_for_history_operation()?;
+        let output = match apply(&mut self.transcript_store) {
+            Ok(output) => output,
+            Err(error) => {
+                self.restore_queued_user_inputs(queued_user_inputs);
+                return Err(error);
+            }
+        };
+        self.rehydrate_core_from_transcript_store();
+        self.restore_queued_user_inputs(queued_user_inputs);
+        self.event_outbox.push_back(event);
+        Ok(output)
     }
 
-    /// Apply a `HistoryEdit` operation (`SummarizeSpan`, `Compact`, `Rewind`,
-    /// `ReplaceModelContext`) to this session's context.
-    ///
-    /// The quiescence check runs once here; the op's `apply` then mutates the
-    /// context directly. On success the core loop is rehydrated from the new
-    /// context so the next `drive` resumes from the correct turn id.
-    pub fn edit<E: HistoryEdit>(&mut self, edit: E) -> Result<E::Output, HistoryEditError> {
-        if !self.can_edit_history() {
-            return Err(HistoryEditError::Busy);
+    fn prepare_for_history_operation(&mut self) -> Result<Vec<AgentInput>, HistoryOperationError> {
+        let queued_user_inputs = self.core.drain_pending_inputs();
+        self.invalidate_session_work("history edited");
+        if !self.core.is_idle() {
+            if self.core.enqueue_input(AgentInput::Interrupt).is_err() {
+                self.restore_queued_user_inputs(queued_user_inputs);
+                return Err(HistoryOperationError::Busy);
+            }
+            self.core.drive();
+            self.absorb_core_transcript_items();
+            self.absorb_core_actions();
         }
-        let output = edit.apply(&mut self.transcript_store)?;
-        self.rehydrate_core_from_transcript_store();
-        self.event_outbox
-            .push_back(SessionEvent::HistoryEdited { kind: E::KIND });
-        Ok(output)
+        self.compaction_request_queue.clear();
+
+        if !self.transcript_store.is_turn_boundary() {
+            self.restore_queued_user_inputs(queued_user_inputs);
+            return Err(HistoryOperationError::Busy);
+        }
+        Ok(queued_user_inputs)
+    }
+
+    fn restore_queued_user_inputs(&mut self, inputs: Vec<AgentInput>) {
+        for input in inputs {
+            self.core
+                .enqueue_input(input)
+                .expect("drained user input remains valid when restored");
+        }
     }
 
     /// Produce an unregistered `AgentSession` whose context branches from
     /// `leaf_id` (or the root when `None`). The source session is unchanged;
     /// the caller is responsible for registering the fork if desired.
     ///
-    /// Fork stays as a direct method rather than a `HistoryEdit` impl because
-    /// it reads the context and produces a new session rather than mutating
-    /// the source in place.
-    pub fn fork(&self, leaf_id: Option<&str>) -> Result<AgentSession, HistoryEditError> {
+    /// Fork is separate from `compact` / `rewind` because it reads the context
+    /// and produces a new session rather than mutating the source in place.
+    pub fn fork(&self, leaf_id: Option<&str>) -> Result<AgentSession, HistoryOperationError> {
         let transcript_store = self
             .transcript_store
             .create_branched_store_at_turn_boundary(leaf_id)
-            .map_err(HistoryEditError::Store)?;
+            .map_err(HistoryOperationError::Store)?;
         AgentSession::from_transcript_store(transcript_store)
     }
 
@@ -338,37 +404,35 @@ impl AgentSession {
     fn handle_core_action(&mut self, action: AgentAction) {
         match action {
             AgentAction::RequestModel { .. } => {
-                if self.maybe_start_model_barrier_maintenance(action.clone()) {
+                if self.maybe_start_model_barrier_compaction_request(action.clone()) {
                     return;
                 }
                 self.expose_agent_action(action);
             }
             AgentAction::RequestTool { .. } => self.expose_agent_action(action),
-            AgentAction::CancelTurn { turn_id } => {
-                self.clear_pending_maintenance_for_turn(turn_id);
-                self.remove_actions_for_turn(turn_id);
-                self.expose_agent_action(AgentAction::CancelTurn { turn_id });
+            AgentAction::CancelTurn { .. } => {
+                self.invalidate_session_work("turn cancelled");
             }
         }
     }
 
-    fn maybe_start_model_barrier_maintenance(&mut self, held_action: AgentAction) -> bool {
-        if self.maybe_start_queued_maintenance(Some(held_action.clone())) {
+    fn maybe_start_model_barrier_compaction_request(&mut self, held_action: AgentAction) -> bool {
+        if self.maybe_start_queued_compaction_request(Some(held_action.clone())) {
             return true;
         }
         self.queue_auto_compaction_if_needed();
-        self.maybe_start_queued_maintenance(Some(held_action))
+        self.maybe_start_queued_compaction_request(Some(held_action))
     }
 
     fn queue_auto_compaction_if_needed(&mut self) {
         let Some(settings) = self.auto_compaction else {
             return;
         };
-        if self.pending_maintenance.is_some()
+        if self.pending_compaction.is_some()
             || self
-                .maintenance_queue
+                .compaction_request_queue
                 .iter()
-                .any(|queued| queued.source == MaintenanceSource::Auto)
+                .any(|queued| queued.source == CompactionRequestSource::Auto)
         {
             return;
         }
@@ -376,69 +440,61 @@ impl AgentSession {
             return;
         }
 
-        self.maintenance_queue.push_back(QueuedSessionMaintenance {
-            maintenance: SessionMaintenance::Compact {
+        self.compaction_request_queue
+            .push_back(QueuedCompactionRequest {
                 settings: CompactionSettings {
                     keep_recent_tokens: settings.keep_recent_tokens,
                 },
-            },
-            source: MaintenanceSource::Auto,
-        });
+                source: CompactionRequestSource::Auto,
+            });
     }
 
-    fn maybe_start_idle_maintenance(&mut self) {
-        if !self.can_start_idle_maintenance() {
+    fn maybe_start_idle_compaction_request(&mut self) {
+        if !self.can_start_idle_compaction_request() {
             return;
         }
-        self.maybe_start_queued_maintenance(None);
+        self.maybe_start_queued_compaction_request(None);
     }
 
-    fn can_start_idle_maintenance(&self) -> bool {
+    fn can_start_idle_compaction_request(&self) -> bool {
         self.core.is_idle()
             && self.transcript_store.is_turn_boundary()
             && !self.core.has_pending_work()
             && self.action_queue.is_empty()
-            && self.action_outbox.is_empty()
-            && self.pending_maintenance.is_none()
-            && !self.maintenance_queue.is_empty()
+            && self.pending_compaction.is_none()
+            && !self.compaction_request_queue.is_empty()
     }
 
-    fn maybe_start_queued_maintenance(&mut self, held_action: Option<AgentAction>) -> bool {
-        if self.pending_maintenance.is_some() {
+    fn maybe_start_queued_compaction_request(&mut self, held_action: Option<AgentAction>) -> bool {
+        if self.pending_compaction.is_some() {
             return false;
         }
 
         let mut held_action = held_action;
-        while let Some(queued) = self.maintenance_queue.pop_front() {
-            match queued.maintenance {
-                SessionMaintenance::Compact { settings } => {
-                    let Some(plan) = self.transcript_store.prepare_compaction(settings) else {
-                        continue;
-                    };
-                    self.start_compaction_maintenance(plan, held_action.take(), queued.source);
-                    return true;
-                }
-            }
+        while let Some(queued) = self.compaction_request_queue.pop_front() {
+            let Some(plan) = self.transcript_store.prepare_compaction(queued.settings) else {
+                continue;
+            };
+            self.start_compaction_request(plan, held_action.take(), queued.source);
+            return true;
         }
         false
     }
 
-    fn start_compaction_maintenance(
+    fn start_compaction_request(
         &mut self,
-        plan: crate::transcript_store::CompactionPlan,
+        plan: CompactionPlan,
         held_action: Option<AgentAction>,
-        source: MaintenanceSource,
+        source: CompactionRequestSource,
     ) {
         let request_id =
             StatelessModelRequestId::take_next(&mut self.next_stateless_model_request_id);
         let request = auto_compaction::compaction_request(&plan);
-        self.pending_maintenance = Some(PendingSessionMaintenance {
+        self.pending_compaction = Some(PendingCompaction {
             request_id,
-            kind: PendingSessionMaintenanceKind::Compact {
-                plan,
-                held_action,
-                source,
-            },
+            plan,
+            held_action,
+            source,
         });
         self.push_session_action(SessionAction::RequestModelStateless {
             request_id,
@@ -464,7 +520,7 @@ impl AgentSession {
                 turn_id,
                 tool_call,
             },
-            AgentAction::CancelTurn { turn_id } => SessionAction::CancelTurn { turn_id },
+            AgentAction::CancelTurn { .. } => SessionAction::CancelSessionWork,
         };
         self.push_session_action(session_action);
     }
@@ -476,12 +532,8 @@ impl AgentSession {
         self.action_outbox.push_back(action);
     }
 
-    fn complete_stateless_model(
-        &mut self,
-        request_id: StatelessModelRequestId,
-        output: StatelessModelOutput,
-    ) {
-        let Some(pending) = self.take_matching_pending_maintenance(request_id) else {
+    fn complete_stateless_model(&mut self, request_id: StatelessModelRequestId, summary: String) {
+        let Some(pending) = self.take_matching_pending_compaction(request_id) else {
             return;
         };
 
@@ -490,38 +542,27 @@ impl AgentSession {
             id: request_id.0.to_string(),
         });
 
-        match pending.kind {
-            PendingSessionMaintenanceKind::Compact {
-                plan,
+        if let Err(error) = self.apply_compaction_request(pending.plan, summary) {
+            self.event_outbox.push_back(SessionEvent::ActionFailed {
+                kind: SessionActionKind::ModelStateless,
+                id: request_id.0.to_string(),
+                error: format!("{error:?}"),
+            });
+        } else {
+            self.event_outbox.push_back(SessionEvent::HistoryCompacted);
+        }
+        if let Some(held_action) = pending.held_action {
+            self.release_held_action_after_compaction_request(
                 held_action,
-                source,
-            } => {
-                let StatelessModelOutput::Text(summary) = output;
-                if let Err(error) = self.apply_compaction_maintenance(plan, summary) {
-                    self.event_outbox.push_back(SessionEvent::ActionFailed {
-                        kind: SessionActionKind::ModelStateless,
-                        id: request_id.0.to_string(),
-                        error: format!("{error:?}"),
-                    });
-                } else {
-                    self.event_outbox.push_back(SessionEvent::HistoryEdited {
-                        kind: HistoryEditKind::Compact,
-                    });
-                }
-                if let Some(held_action) = held_action {
-                    self.release_held_action_after_maintenance(
-                        held_action,
-                        source == MaintenanceSource::Requested,
-                    );
-                } else {
-                    self.maybe_start_idle_maintenance();
-                }
-            }
+                pending.source == CompactionRequestSource::Requested,
+            );
+        } else {
+            self.maybe_start_idle_compaction_request();
         }
     }
 
     fn fail_stateless_model(&mut self, request_id: StatelessModelRequestId, error: String) {
-        let Some(pending) = self.take_matching_pending_maintenance(request_id) else {
+        let Some(pending) = self.take_matching_pending_compaction(request_id) else {
             return;
         };
         self.event_outbox.push_back(SessionEvent::ActionFailed {
@@ -529,40 +570,36 @@ impl AgentSession {
             id: request_id.0.to_string(),
             error,
         });
-        match pending.kind {
-            PendingSessionMaintenanceKind::Compact { held_action, .. } => {
-                if let Some(held_action) = held_action {
-                    self.expose_agent_action(held_action);
-                } else {
-                    self.maybe_start_idle_maintenance();
-                }
-            }
+        if let Some(held_action) = pending.held_action {
+            self.expose_agent_action(held_action);
+        } else {
+            self.maybe_start_idle_compaction_request();
         }
     }
 
-    fn release_held_action_after_maintenance(
+    fn release_held_action_after_compaction_request(
         &mut self,
         held_action: AgentAction,
         recheck_auto_compaction: bool,
     ) {
-        if self.maybe_start_queued_maintenance(Some(held_action.clone())) {
+        if self.maybe_start_queued_compaction_request(Some(held_action.clone())) {
             return;
         }
         if recheck_auto_compaction {
             self.queue_auto_compaction_if_needed();
-            if self.maybe_start_queued_maintenance(Some(held_action.clone())) {
+            if self.maybe_start_queued_compaction_request(Some(held_action.clone())) {
                 return;
             }
         }
         self.expose_agent_action(held_action);
     }
 
-    fn take_matching_pending_maintenance(
+    fn take_matching_pending_compaction(
         &mut self,
         request_id: StatelessModelRequestId,
-    ) -> Option<PendingSessionMaintenance> {
+    ) -> Option<PendingCompaction> {
         if self
-            .pending_maintenance
+            .pending_compaction
             .as_ref()
             .is_some_and(|pending| pending.request_id == request_id)
         {
@@ -575,75 +612,53 @@ impl AgentSession {
                     } if *queued_request_id == request_id
                 )
             });
-            return self.pending_maintenance.take();
+            return self.pending_compaction.take();
         }
         None
     }
 
-    fn apply_compaction_maintenance(
+    fn apply_compaction_request(
         &mut self,
-        plan: crate::transcript_store::CompactionPlan,
+        plan: CompactionPlan,
         summary: String,
-    ) -> Result<(), HistoryEditError> {
+    ) -> Result<(), HistoryOperationError> {
         self.transcript_store
             .validate_plan_fingerprint(&plan)
-            .map_err(HistoryEditError::Store)?;
-        Compact { plan, summary }.apply_validated(&mut self.transcript_store)
+            .map_err(HistoryOperationError::Store)?;
+        self.transcript_store
+            .apply_compaction(plan, summary)
+            .map_err(HistoryOperationError::Store)
     }
 
-    fn clear_pending_maintenance(&mut self, error: &str) {
-        let Some(pending) = self.pending_maintenance.take() else {
+    fn invalidate_session_work(&mut self, invalidation_reason: &str) {
+        if self.clear_stale_session_work(invalidation_reason) {
+            self.push_session_action(SessionAction::CancelSessionWork);
+        }
+        self.compaction_request_queue
+            .retain(|queued| queued.source != CompactionRequestSource::Auto);
+    }
+
+    fn clear_stale_session_work(&mut self, invalidation_reason: &str) -> bool {
+        let had_tracked_work = !self.action_queue.is_empty();
+        let had_pending_compaction = self.pending_compaction.is_some();
+        let had_start_action = self.action_outbox.iter().any(is_start_action);
+        let had_existing_cancel = self.action_outbox.iter().any(is_cancel_action);
+
+        self.action_queue.clear();
+        self.fail_and_clear_pending_compaction(invalidation_reason);
+        self.action_outbox.retain(is_cancel_action);
+
+        (had_tracked_work || had_pending_compaction || had_start_action) && !had_existing_cancel
+    }
+
+    fn fail_and_clear_pending_compaction(&mut self, error: &str) {
+        let Some(pending) = self.pending_compaction.take() else {
             return;
         };
-        let request_id = pending.request_id;
-        self.action_outbox.retain(|action| {
-            !matches!(
-                action,
-                SessionAction::RequestModelStateless {
-                    request_id: queued_request_id,
-                    ..
-                } if *queued_request_id == request_id
-            )
-        });
         self.event_outbox.push_back(SessionEvent::ActionFailed {
             kind: SessionActionKind::ModelStateless,
-            id: request_id.0.to_string(),
+            id: pending.request_id.0.to_string(),
             error: error.to_string(),
-        });
-        self.maintenance_queue
-            .retain(|queued| queued.source != MaintenanceSource::Auto);
-    }
-
-    fn clear_pending_maintenance_for_turn(&mut self, turn_id: TurnId) {
-        let clear = self.pending_maintenance.as_ref().is_some_and(|pending| {
-            matches!(
-                &pending.kind,
-                PendingSessionMaintenanceKind::Compact {
-                    held_action: Some(AgentAction::RequestModel {
-                        turn_id: held_turn_id,
-                        ..
-                    }),
-                    ..
-                } if *held_turn_id == turn_id
-            )
-        });
-        if clear {
-            self.clear_pending_maintenance("turn cancelled");
-        }
-    }
-
-    fn remove_actions_for_turn(&mut self, turn_id: TurnId) {
-        self.action_outbox.retain(|queued| {
-            !matches!(
-                queued,
-                SessionAction::RequestModel {
-                    turn_id: queued_turn_id,
-                    ..
-                } | SessionAction::RequestTool {
-                    turn_id: queued_turn_id,
-                    ..
-                } if *queued_turn_id == turn_id
-            )
         });
     }
 
@@ -729,1097 +744,44 @@ impl AgentSession {
         // longer driving; reset the queue so a rehydrated session does not
         // block edits forever.
         self.action_queue.clear();
-        self.action_outbox.clear();
-        self.maintenance_queue.clear();
-        self.pending_maintenance = None;
+        self.action_outbox.retain(is_cancel_action);
+        self.compaction_request_queue.clear();
+        self.pending_compaction = None;
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct QueuedCompactionRequest {
+    settings: CompactionSettings,
+    source: CompactionRequestSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionRequestSource {
+    Requested,
+    Auto,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingCompaction {
+    request_id: StatelessModelRequestId,
+    plan: CompactionPlan,
+    held_action: Option<AgentAction>,
+    source: CompactionRequestSource,
+}
+
+fn is_start_action(action: &SessionAction) -> bool {
+    matches!(
+        action,
+        SessionAction::RequestModel { .. }
+            | SessionAction::RequestTool { .. }
+            | SessionAction::RequestModelStateless { .. }
+    )
+}
+
+fn is_cancel_action(action: &SessionAction) -> bool {
+    matches!(action, SessionAction::CancelSessionWork)
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::auto_compaction::StatelessModelOutput;
-    use crate::transcript_store::{
-        compaction_summary, Compact, CompactionSettings, ReplaceModelContext, Rewind,
-    };
-    use agent_core::{
-        ActionId, AssistantItem, AssistantMessage, InjectedMessage, ToolCall, ToolCallId,
-        ToolResultMessage, ToolResultStatus, TurnId, TurnOutcome,
-    };
-
-    fn finished_model_context(input: &str) -> ModelContext {
-        ModelContext::from_transcript_items(vec![
-            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::UserMessage(input.to_string()),
-            TranscriptItem::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-        ])
-    }
-
-    fn finished_turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptItem> {
-        vec![
-            TranscriptItem::TurnStarted {
-                turn_id: TurnId(turn_id),
-            },
-            TranscriptItem::UserMessage(user.to_string()),
-            TranscriptItem::AssistantMessage(AssistantMessage {
-                items: vec![AssistantItem::Text(assistant.to_string())],
-            }),
-            TranscriptItem::TurnFinished {
-                turn_id: TurnId(turn_id),
-                outcome: TurnOutcome::Graceful,
-            },
-        ]
-    }
-
-    fn assert_single_request_model(
-        actions: Vec<SessionAction>,
-        expected_action_id: ActionId,
-        expected_turn_id: TurnId,
-    ) -> ModelContext {
-        let [SessionAction::RequestModel {
-            action_id,
-            turn_id,
-            model_context,
-        }] = actions.as_slice()
-        else {
-            panic!("expected one RequestModel action, got {actions:?}");
-        };
-        assert_eq!(
-            (*action_id, *turn_id),
-            (expected_action_id, expected_turn_id)
-        );
-        model_context.clone()
-    }
-
-    fn session_with_compactable_history() -> AgentSession {
-        let mut items = Vec::new();
-        items.extend(finished_turn(
-            1,
-            "first user message with enough text to count",
-            "first assistant message with enough text to count",
-        ));
-        items.extend(finished_turn(
-            2,
-            "second user message with enough text to count",
-            "second assistant message with enough text to count",
-        ));
-        AgentSession::from_model_context(ModelContext::from_transcript_items(items))
-            .with_auto_compaction(AutoCompactionSettings::new(1, 1))
-    }
-
-    #[test]
-    fn model_context_replacement_is_only_allowed_at_turn_boundary() {
-        let mut session = AgentSession::new();
-        session
-            .enqueue_input(AgentInput::follow_up("hello"))
-            .expect("plain follow-up is valid");
-
-        let busy = session
-            .edit(ReplaceModelContext {
-                replacement: finished_model_context("compact"),
-            })
-            .expect_err("running sessions cannot edit history");
-        assert_eq!(busy, HistoryEditError::Busy);
-
-        let mut session = AgentSession::from_model_context(finished_model_context("hello"));
-
-        let old = session
-            .edit(ReplaceModelContext {
-                replacement: finished_model_context("compact"),
-            })
-            .expect("idle session can swap model_context");
-
-        assert_eq!(old.last_turn_id(), TurnId(1));
-        assert_eq!(
-            session.model_context().transcript_items()[1],
-            TranscriptItem::UserMessage("compact".to_string())
-        );
-    }
-
-    #[test]
-    fn rewind_and_fork_only_accept_turn_finished_entries() {
-        let mut session =
-            AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
-                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("first".to_string()),
-                TranscriptItem::TurnFinished {
-                    turn_id: TurnId(1),
-                    outcome: TurnOutcome::Graceful,
-                },
-                TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-                TranscriptItem::UserMessage("second".to_string()),
-                TranscriptItem::TurnFinished {
-                    turn_id: TurnId(2),
-                    outcome: TurnOutcome::Graceful,
-                },
-            ]));
-        let mid_turn_id = session.transcript_store().entries()[1].id.clone();
-        let turn_one_end_id = session.transcript_store().entries()[2].id.clone();
-
-        assert_eq!(
-            session.edit(Rewind {
-                leaf_id: Some(mid_turn_id.clone())
-            }),
-            Err(HistoryEditError::Store(
-                TranscriptStoreError::NotTurnBoundary
-            ))
-        );
-        assert_eq!(
-            session.fork(Some(&mid_turn_id)).map(|_| ()),
-            Err(HistoryEditError::Store(
-                TranscriptStoreError::NotTurnBoundary
-            ))
-        );
-
-        session
-            .edit(Rewind {
-                leaf_id: Some(turn_one_end_id.clone()),
-            })
-            .expect("turn end is a valid rewind point");
-        assert_eq!(session.model_context().last_turn_id(), TurnId(1));
-
-        let fork = session
-            .fork(Some(&turn_one_end_id))
-            .expect("turn end is a valid fork point");
-        assert_eq!(fork.model_context().last_turn_id(), TurnId(1));
-    }
-
-    #[test]
-    fn fork_can_copy_a_boundary_path_while_source_session_is_running() {
-        let mut session = AgentSession::from_model_context(finished_model_context("hello"));
-        let boundary_id = session
-            .transcript_store()
-            .entries()
-            .last()
-            .expect("finished context has a boundary entry")
-            .id
-            .clone();
-
-        session
-            .enqueue_input(AgentInput::follow_up("new work"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        assert!(!session.can_edit_history());
-
-        let fork = session
-            .fork(Some(&boundary_id))
-            .expect("fork only copies the requested boundary path");
-        assert_eq!(fork.model_context().last_turn_id(), TurnId(1));
-        assert!(matches!(
-            fork.model_context().transcript_items().last(),
-            Some(TranscriptItem::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            })
-        ));
-    }
-
-    #[test]
-    fn compact_op_compacts_via_context_edit_dispatch() {
-        let mut session =
-            AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
-                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("first".to_string()),
-                TranscriptItem::AssistantMessage(AssistantMessage {
-                    items: vec![AssistantItem::Text("ok".to_string())],
-                }),
-                TranscriptItem::TurnFinished {
-                    turn_id: TurnId(1),
-                    outcome: TurnOutcome::Graceful,
-                },
-                TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-                TranscriptItem::UserMessage("second".to_string()),
-                TranscriptItem::AssistantMessage(AssistantMessage {
-                    items: vec![AssistantItem::Text("ok2".to_string())],
-                }),
-                TranscriptItem::TurnFinished {
-                    turn_id: TurnId(2),
-                    outcome: TurnOutcome::Graceful,
-                },
-            ]));
-
-        let plan = session
-            .transcript_store()
-            .prepare_compaction(CompactionSettings {
-                keep_recent_tokens: 1,
-            })
-            .expect("old turn should be compactable");
-        session
-            .edit(Compact {
-                plan,
-                summary: "s".to_string(),
-            })
-            .expect("compact should apply");
-        assert_eq!(
-            session.model_context().latest_compaction_summary(),
-            Some("s")
-        );
-    }
-
-    #[test]
-    fn can_edit_history_requires_idle_core_empty_queues_and_no_session_side_work() {
-        let mut session = AgentSession::new();
-
-        session
-            .enqueue_input(AgentInput::follow_up("hello"))
-            .expect("plain follow-up is valid");
-        assert!(!session.can_edit_history());
-    }
-
-    #[test]
-    fn context_tracks_core_turn_items() {
-        let session = AgentSession::from_model_context(finished_model_context("hello"));
-
-        assert_eq!(session.transcript_store().entries().len(), 3);
-        assert!(session.transcript_store().is_turn_boundary());
-        assert_eq!(session.model_context().last_turn_id(), TurnId(1));
-    }
-
-    #[test]
-    fn drive_absorbs_core_items_into_the_session_context() {
-        let mut session = AgentSession::new();
-        let assistant = AssistantMessage {
-            items: vec![AssistantItem::Text("hi".to_string())],
-        };
-
-        session
-            .enqueue_input(AgentInput::follow_up("hello"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        session
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(1),
-                turn_id: TurnId(1),
-                assistant: assistant.clone(),
-            })
-            .expect("matching model completion is valid");
-        session.drive();
-
-        assert_eq!(
-            session.model_context().transcript_items(),
-            &[
-                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hello".to_string()),
-                TranscriptItem::AssistantMessage(assistant),
-                TranscriptItem::TurnFinished {
-                    turn_id: TurnId(1),
-                    outcome: TurnOutcome::Graceful,
-                },
-            ]
-        );
-        // Driving again absorbs nothing new; the core buffer was drained.
-        session.drive();
-        assert_eq!(session.model_context().transcript_items().len(), 4);
-    }
-
-    #[test]
-    fn live_transcript_keeps_open_turns_open() {
-        let mut session = AgentSession::new();
-
-        session
-            .enqueue_input(AgentInput::follow_up("hello"))
-            .expect("plain follow-up is valid");
-        session.drive();
-
-        assert_eq!(
-            session.model_context().transcript_items(),
-            &[
-                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hello".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
-        let model_context = vec![
-            TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-            TranscriptItem::UserMessage("hello".to_string()),
-        ];
-
-        let session = AgentSession::from_transcript_items(model_context);
-
-        assert_eq!(
-            session.model_context().transcript_items(),
-            &[
-                TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-                TranscriptItem::UserMessage("hello".to_string()),
-                TranscriptItem::TurnFinished {
-                    turn_id: TurnId(7),
-                    outcome: TurnOutcome::Crashed,
-                },
-            ]
-        );
-        assert!(session.is_idle());
-        assert_eq!(session.last_turn_id(), TurnId(7));
-    }
-
-    #[test]
-    fn from_model_context_recovers_an_open_tail_as_crashed() {
-        let mut session =
-            AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
-                TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-                TranscriptItem::UserMessage("hello".to_string()),
-            ]));
-
-        assert_eq!(
-            session.model_context().transcript_items(),
-            &[
-                TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-                TranscriptItem::UserMessage("hello".to_string()),
-                TranscriptItem::TurnFinished {
-                    turn_id: TurnId(7),
-                    outcome: TurnOutcome::Crashed,
-                },
-            ]
-        );
-        assert!(session.is_idle());
-
-        session
-            .enqueue_input(AgentInput::follow_up("next"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        assert!(matches!(
-            session.model_context().transcript_items().last(),
-            Some(TranscriptItem::UserMessage(text)) if text == "next"
-        ));
-    }
-
-    #[test]
-    fn rehydrating_a_graceful_boundary_restores_idle_state() {
-        let model_context = vec![
-            TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-            TranscriptItem::UserMessage("hello".to_string()),
-            TranscriptItem::TurnFinished {
-                turn_id: TurnId(2),
-                outcome: TurnOutcome::Graceful,
-            },
-        ];
-
-        let session = AgentSession::from_transcript_items(model_context.clone());
-
-        assert_eq!(
-            session.model_context().transcript_items(),
-            model_context.as_slice()
-        );
-        assert!(session.is_idle());
-        assert_eq!(session.last_turn_id(), TurnId(2));
-    }
-
-    #[test]
-    fn session_blocks_edit_history_until_drained_model_action_completes() {
-        let mut session = AgentSession::new();
-        session
-            .enqueue_input(AgentInput::follow_up("hi"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        let actions = session.drain_actions();
-        assert!(matches!(
-            actions.as_slice(),
-            [SessionAction::RequestModel { .. }]
-        ));
-        assert!(!session.can_edit_history());
-
-        session
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(1),
-                turn_id: TurnId(1),
-                assistant: AssistantMessage { items: Vec::new() },
-            })
-            .expect("matching model completion is valid");
-        session.drive();
-        assert!(session.can_edit_history());
-    }
-
-    #[test]
-    fn model_failure_marks_turn_crashed_and_unblocks_history_edits() {
-        let mut session = AgentSession::new();
-        session
-            .enqueue_input(AgentInput::follow_up("hi"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
-
-        session
-            .enqueue_input(AgentInput::ModelFailed {
-                action_id: ActionId(1),
-                turn_id: TurnId(1),
-                error: "provider failed".to_string(),
-            })
-            .expect("matching model failure is valid");
-        session.drive();
-
-        assert_eq!(
-            session.model_context().transcript_items(),
-            &[
-                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hi".to_string()),
-                TranscriptItem::TurnFinished {
-                    turn_id: TurnId(1),
-                    outcome: TurnOutcome::Crashed,
-                },
-            ]
-        );
-        assert!(session.can_edit_history());
-        assert!(session.drain_events().iter().any(|event| matches!(
-            event,
-            SessionEvent::ActionFailed {
-                kind: SessionActionKind::Model,
-                error,
-                ..
-            } if error == "provider failed"
-        )));
-    }
-
-    #[test]
-    fn auto_compaction_requests_stateless_model_before_releasing_model_request() {
-        let mut session = session_with_compactable_history();
-        session
-            .enqueue_input(AgentInput::follow_up("third user message"))
-            .expect("plain follow-up is valid");
-        session.drive();
-
-        let actions = session.drain_actions();
-        let [SessionAction::RequestModelStateless {
-            request_id,
-            request,
-        }] = actions.as_slice()
-        else {
-            panic!("expected stateless model compaction request, got {actions:?}");
-        };
-        assert!(request.input.iter().any(|block| {
-            matches!(
-                block,
-                crate::auto_compaction::ModelContentBlock::Text { text }
-                    if text.contains("first user message")
-            )
-        }));
-        assert_eq!(session.model_context().latest_compaction_summary(), None);
-        assert!(matches!(
-            session.model_context().transcript_items().last(),
-            Some(TranscriptItem::UserMessage(text)) if text == "third user message"
-        ));
-        assert!(!session.can_edit_history());
-
-        let events = session.drain_events();
-        assert!(events.iter().any(|event| matches!(
-            event,
-            SessionEvent::TranscriptItemAppended {
-                item: TranscriptItem::TurnStarted { turn_id: TurnId(3) },
-                ..
-            }
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            SessionEvent::ActionRequested {
-                action: SessionAction::RequestModelStateless { .. }
-            }
-        )));
-        assert!(!events.iter().any(|event| matches!(
-            event,
-            SessionEvent::TranscriptItemAppended {
-                item: TranscriptItem::Injected(_),
-                ..
-            }
-        )));
-
-        session
-            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-                request_id: *request_id,
-                output: StatelessModelOutput::Text("summary text".to_string()),
-            })
-            .expect("stateless model completion should be accepted");
-
-        let request_model_context =
-            assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-        assert_eq!(request_model_context, session.model_context());
-        assert_eq!(
-            session.model_context().latest_compaction_summary(),
-            Some("summary text")
-        );
-        assert!(matches!(
-            session.model_context().transcript_items().last(),
-            Some(TranscriptItem::UserMessage(text)) if text == "third user message"
-        ));
-
-        let events = session.drain_events();
-        assert!(events.iter().any(|event| matches!(
-            event,
-            SessionEvent::ActionCompleted {
-                kind: SessionActionKind::ModelStateless,
-                ..
-            }
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            SessionEvent::HistoryEdited {
-                kind: HistoryEditKind::Compact
-            }
-        )));
-        assert!(events.iter().any(|event| matches!(
-            event,
-            SessionEvent::ActionRequested {
-                action: SessionAction::RequestModel {
-                    action_id: ActionId(1),
-                    turn_id: TurnId(3),
-                    ..
-                }
-            }
-        )));
-    }
-
-    #[test]
-    fn requested_compaction_maintenance_can_run_while_idle() {
-        let mut session = session_with_compactable_history();
-        session.set_auto_compaction(None);
-
-        session.request_maintenance(SessionMaintenance::Compact {
-            settings: CompactionSettings {
-                keep_recent_tokens: 1,
-            },
-        });
-
-        let actions = session.drain_actions();
-        let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-            panic!("expected stateless model compaction request, got {actions:?}");
-        };
-        assert!(!session.can_edit_history());
-
-        session
-            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-                request_id: *request_id,
-                output: StatelessModelOutput::Text("manual summary".to_string()),
-            })
-            .expect("stateless model completion should be accepted");
-
-        assert!(session.drain_actions().is_empty());
-        assert_eq!(
-            session.model_context().latest_compaction_summary(),
-            Some("manual summary")
-        );
-        assert!(session.can_edit_history());
-    }
-
-    #[test]
-    fn pending_idle_maintenance_blocks_new_turns_until_it_completes() {
-        let mut session = session_with_compactable_history();
-        session.set_auto_compaction(None);
-
-        session.request_maintenance(SessionMaintenance::Compact {
-            settings: CompactionSettings {
-                keep_recent_tokens: 1,
-            },
-        });
-        let actions = session.drain_actions();
-        let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-            panic!("expected stateless model compaction request, got {actions:?}");
-        };
-
-        session
-            .enqueue_input(AgentInput::follow_up("third user message"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        assert_eq!(session.model_context().last_turn_id(), TurnId(2));
-        assert!(session.drain_actions().is_empty());
-
-        session
-            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-                request_id: *request_id,
-                output: StatelessModelOutput::Text("manual summary".to_string()),
-            })
-            .expect("stateless model completion should be accepted");
-        session.drive();
-
-        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-        assert_eq!(
-            session.model_context().latest_compaction_summary(),
-            Some("manual summary")
-        );
-        assert!(matches!(
-            session.model_context().transcript_items().last(),
-            Some(TranscriptItem::UserMessage(text)) if text == "third user message"
-        ));
-    }
-
-    #[test]
-    fn requested_compaction_maintenance_waits_for_next_model_context_barrier() {
-        let mut session = session_with_compactable_history();
-        session.set_auto_compaction(None);
-        let tool_call = ToolCall {
-            id: ToolCallId(1),
-            tool_name: "read".to_string(),
-            args_json: "{}".to_string(),
-        };
-
-        session
-            .enqueue_input(AgentInput::follow_up("third user message"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-
-        session.request_maintenance(SessionMaintenance::Compact {
-            settings: CompactionSettings {
-                keep_recent_tokens: 1,
-            },
-        });
-        assert!(session.drain_actions().is_empty());
-        assert!(!session.can_edit_history());
-
-        session
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(1),
-                turn_id: TurnId(3),
-                assistant: AssistantMessage {
-                    items: vec![AssistantItem::ToolCall(tool_call.clone())],
-                },
-            })
-            .expect("matching model completion is valid");
-        session.drive();
-        let actions = session.drain_actions();
-        let [SessionAction::RequestTool {
-            action_id: tool_action_id,
-            turn_id,
-            ..
-        }] = actions.as_slice()
-        else {
-            panic!("expected one RequestTool action");
-        };
-        assert_eq!((*tool_action_id, *turn_id), (ActionId(2), TurnId(3)));
-
-        session
-            .enqueue_input(AgentInput::ToolCompleted {
-                action_id: ActionId(2),
-                turn_id: TurnId(3),
-                result: ToolResultMessage {
-                    tool_call_id: tool_call.id,
-                    tool_name: tool_call.tool_name.clone(),
-                    output: "ok".to_string(),
-                    status: ToolResultStatus::Success,
-                },
-            })
-            .expect("matching tool completion is valid");
-        session.drive();
-
-        let actions = session.drain_actions();
-        let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-            panic!("expected stateless model compaction request, got {actions:?}");
-        };
-        assert_eq!(session.model_context().latest_compaction_summary(), None);
-
-        session
-            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-                request_id: *request_id,
-                output: StatelessModelOutput::Text("barrier summary".to_string()),
-            })
-            .expect("stateless model completion should be accepted");
-
-        let request_model_context =
-            assert_single_request_model(session.drain_actions(), ActionId(3), TurnId(3));
-        assert_eq!(request_model_context, session.model_context());
-        assert_eq!(
-            request_model_context.latest_compaction_summary(),
-            Some("barrier summary")
-        );
-    }
-
-    #[test]
-    fn requested_maintenance_without_a_plan_does_not_bypass_auto_compaction() {
-        let mut session = session_with_compactable_history();
-
-        session.request_maintenance(SessionMaintenance::Compact {
-            settings: CompactionSettings {
-                keep_recent_tokens: usize::MAX,
-            },
-        });
-        session
-            .enqueue_input(AgentInput::follow_up("third user message"))
-            .expect("plain follow-up is valid");
-        session.drive();
-
-        let actions = session.drain_actions();
-        assert!(matches!(
-            actions.as_slice(),
-            [SessionAction::RequestModelStateless { .. }]
-        ));
-        assert_eq!(session.model_context().latest_compaction_summary(), None);
-    }
-
-    #[test]
-    fn requested_model_barrier_maintenance_rechecks_auto_compaction_before_releasing_model() {
-        let mut session = session_with_compactable_history();
-        let auto_compaction = session.auto_compaction();
-        session.set_auto_compaction(None);
-        let tool_call = ToolCall {
-            id: ToolCallId(1),
-            tool_name: "read".to_string(),
-            args_json: "{}".to_string(),
-        };
-
-        session
-            .enqueue_input(AgentInput::follow_up("third user message"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-
-        session.request_maintenance(SessionMaintenance::Compact {
-            settings: CompactionSettings {
-                keep_recent_tokens: 30,
-            },
-        });
-        session.set_auto_compaction(auto_compaction);
-        session
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(1),
-                turn_id: TurnId(3),
-                assistant: AssistantMessage {
-                    items: vec![AssistantItem::ToolCall(tool_call.clone())],
-                },
-            })
-            .expect("matching model completion is valid");
-        session.drive();
-        let actions = session.drain_actions();
-        assert!(matches!(
-            actions.as_slice(),
-            [SessionAction::RequestTool { .. }]
-        ));
-        session
-            .enqueue_input(AgentInput::ToolCompleted {
-                action_id: ActionId(2),
-                turn_id: TurnId(3),
-                result: ToolResultMessage {
-                    tool_call_id: tool_call.id,
-                    tool_name: tool_call.tool_name.clone(),
-                    output: "ok".to_string(),
-                    status: ToolResultStatus::Success,
-                },
-            })
-            .expect("matching tool completion is valid");
-        session.drive();
-
-        let actions = session.drain_actions();
-        let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-            panic!("expected requested compaction first, got {actions:?}");
-        };
-        session
-            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-                request_id: *request_id,
-                output: StatelessModelOutput::Text("manual summary".to_string()),
-            })
-            .expect("requested compaction completion should be accepted");
-
-        let actions = session.drain_actions();
-        let [SessionAction::RequestModelStateless {
-            request_id: auto_request_id,
-            ..
-        }] = actions.as_slice()
-        else {
-            panic!("expected auto-compaction recheck before RequestModel, got {actions:?}");
-        };
-        session
-            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-                request_id: *auto_request_id,
-                output: StatelessModelOutput::Text("auto summary".to_string()),
-            })
-            .expect("auto compaction completion should be accepted");
-
-        let request_model_context =
-            assert_single_request_model(session.drain_actions(), ActionId(3), TurnId(3));
-        assert_eq!(request_model_context, session.model_context());
-        assert_eq!(
-            request_model_context.latest_compaction_summary(),
-            Some("auto summary")
-        );
-    }
-
-    #[test]
-    fn failed_stateless_model_compaction_releases_model_request_without_editing_context() {
-        let mut session = session_with_compactable_history();
-        session
-            .enqueue_input(AgentInput::follow_up("third user message"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        let actions = session.drain_actions();
-        let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-            panic!("expected stateless model compaction request, got {actions:?}");
-        };
-
-        session
-            .enqueue_session_input(SessionInput::ModelStatelessFailed {
-                request_id: *request_id,
-                error: "no summary".to_string(),
-            })
-            .expect("stateless model failure should be accepted");
-
-        let request_model_context =
-            assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-        assert_eq!(request_model_context, session.model_context());
-        assert_eq!(session.model_context().latest_compaction_summary(), None);
-        assert!(session.drain_events().iter().any(|event| matches!(
-            event,
-            SessionEvent::ActionFailed {
-                kind: SessionActionKind::ModelStateless,
-                error,
-                ..
-            } if error == "no summary"
-        )));
-    }
-
-    #[test]
-    fn stale_stateless_model_completion_does_not_unblock_pending_compaction() {
-        let mut session = session_with_compactable_history();
-        session
-            .enqueue_input(AgentInput::follow_up("third user message"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        let actions = session.drain_actions();
-        let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-            panic!("expected stateless model compaction request, got {actions:?}");
-        };
-
-        session
-            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-                request_id: StatelessModelRequestId(99),
-                output: StatelessModelOutput::Text("wrong".to_string()),
-            })
-            .expect("stale stateless model completion should be accepted and ignored");
-        assert!(session.drain_actions().is_empty());
-        assert_eq!(session.model_context().latest_compaction_summary(), None);
-        assert!(!session.can_edit_history());
-
-        session
-            .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-                request_id: *request_id,
-                output: StatelessModelOutput::Text("right".to_string()),
-            })
-            .expect("matching stateless model completion should be accepted");
-        assert!(matches!(
-            session.drain_actions().as_slice(),
-            [SessionAction::RequestModel { .. }]
-        ));
-        assert_eq!(
-            session.model_context().latest_compaction_summary(),
-            Some("right")
-        );
-    }
-
-    #[test]
-    fn late_action_drain_does_not_leave_completed_request_pending() {
-        let mut session = AgentSession::new();
-        session
-            .enqueue_input(AgentInput::follow_up("hi"))
-            .expect("plain follow-up is valid");
-        session.drive();
-
-        session
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(1),
-                turn_id: TurnId(1),
-                assistant: AssistantMessage { items: Vec::new() },
-            })
-            .expect("matching model completion is valid");
-        session.drive();
-
-        let late_actions = session.drain_actions();
-        assert!(late_actions.is_empty());
-        assert!(session.can_edit_history());
-    }
-
-    #[test]
-    fn stale_completion_after_history_edit_cannot_attach_to_reused_turn_id() {
-        let mut session = AgentSession::from_model_context(finished_model_context("first"));
-        let turn_one_end_id = session.transcript_store().entries()[2].id.clone();
-
-        session
-            .enqueue_input(AgentInput::follow_up("old second"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(2));
-        session
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(1),
-                turn_id: TurnId(2),
-                assistant: AssistantMessage {
-                    items: vec![AssistantItem::Text("old response".to_string())],
-                },
-            })
-            .expect("matching model completion is valid");
-        session.drive();
-        assert!(session.can_edit_history());
-
-        session
-            .edit(Rewind {
-                leaf_id: Some(turn_one_end_id),
-            })
-            .expect("completed history can rewind to turn one");
-        session
-            .enqueue_input(AgentInput::follow_up("new second"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        assert_single_request_model(session.drain_actions(), ActionId(2), TurnId(2));
-
-        session
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(1),
-                turn_id: TurnId(2),
-                assistant: AssistantMessage {
-                    items: vec![AssistantItem::Text("stale old response".to_string())],
-                },
-            })
-            .expect("well-formed stale completion is valid input");
-        session.drive();
-        assert_eq!(
-            session.model_context().transcript_items(),
-            &[
-                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("first".to_string()),
-                TranscriptItem::TurnFinished {
-                    turn_id: TurnId(1),
-                    outcome: TurnOutcome::Graceful,
-                },
-                TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-                TranscriptItem::UserMessage("new second".to_string()),
-            ]
-        );
-        assert!(!session.can_edit_history());
-
-        session
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(2),
-                turn_id: TurnId(2),
-                assistant: AssistantMessage {
-                    items: vec![AssistantItem::Text("new response".to_string())],
-                },
-            })
-            .expect("matching model completion is valid");
-        session.drive();
-        assert_eq!(
-            session.model_context().transcript_items().last(),
-            Some(&TranscriptItem::TurnFinished {
-                turn_id: TurnId(2),
-                outcome: TurnOutcome::Graceful,
-            })
-        );
-    }
-
-    #[test]
-    fn invalid_origin_tags_are_rejected_without_mutating_session_state() {
-        let mut session = AgentSession::new();
-        let result = session.enqueue_input(AgentInput::Steer {
-            from: Some("parent".to_string()),
-            kind: None,
-            content: "half tagged".to_string(),
-        });
-
-        assert_eq!(result, Err(AgentInputError::UnpairedOriginTags));
-        session.drive();
-        assert!(session.model_context().transcript_items().is_empty());
-        assert!(session.can_edit_history());
-    }
-
-    #[test]
-    fn session_blocks_edit_history_while_tool_actions_in_flight() {
-        let mut session = AgentSession::new();
-        session
-            .enqueue_input(AgentInput::follow_up("go"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        session.drain_actions();
-
-        let tool_call = ToolCall {
-            id: ToolCallId(1),
-            tool_name: "bash".to_string(),
-            args_json: "{}".to_string(),
-        };
-        session
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(1),
-                turn_id: TurnId(1),
-                assistant: AssistantMessage {
-                    items: vec![AssistantItem::ToolCall(tool_call.clone())],
-                },
-            })
-            .expect("matching model completion is valid");
-        session.drive();
-        session.drain_actions();
-        assert!(!session.can_edit_history());
-
-        session
-            .enqueue_input(AgentInput::ToolCompleted {
-                action_id: ActionId(2),
-                turn_id: TurnId(1),
-                result: ToolResultMessage {
-                    tool_call_id: ToolCallId(1),
-                    tool_name: "bash".to_string(),
-                    output: "ok".to_string(),
-                    status: ToolResultStatus::Success,
-                },
-            })
-            .expect("matching tool completion is valid");
-        session.drive();
-        // A second model request fires after the tool completes; the session
-        // is still waiting on that completion, so edits remain blocked.
-        assert!(!session.can_edit_history());
-        session.drain_actions();
-        session
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(3),
-                turn_id: TurnId(1),
-                assistant: AssistantMessage { items: Vec::new() },
-            })
-            .expect("matching model completion is valid");
-        session.drive();
-        assert!(session.can_edit_history());
-    }
-
-    #[test]
-    fn can_edit_history_walks_past_multiple_injected_entries() {
-        // A context whose leaf is a run of back-to-back injected entries after
-        // a TurnFinished is still at a turn boundary; can_edit_history must
-        // see through the injected tail to the underlying TurnFinished.
-        let mut session =
-            AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
-                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hi".to_string()),
-                TranscriptItem::TurnFinished {
-                    turn_id: TurnId(1),
-                    outcome: TurnOutcome::Graceful,
-                },
-            ]));
-        session
-            .transcript_store
-            .append_injected(InjectedMessage::new("note", "a"));
-        session
-            .transcript_store
-            .append_injected(compaction_summary("b", "does-not-matter", 0));
-        session
-            .transcript_store
-            .append_injected(InjectedMessage::new("note", "c"));
-
-        assert!(session.transcript_store().is_turn_boundary());
-        assert!(session.can_edit_history());
-    }
-
-    #[test]
-    fn cancel_turn_clears_pending_actions_for_that_turn() {
-        let mut session = AgentSession::new();
-        session
-            .enqueue_input(AgentInput::follow_up("hi"))
-            .expect("plain follow-up is valid");
-        session.drive();
-        session.drain_actions();
-
-        session
-            .enqueue_input(AgentInput::Interrupt)
-            .expect("interrupt is valid");
-        session.drive();
-        assert!(!session.can_edit_history());
-        let actions = session.drain_actions();
-        assert!(actions
-            .iter()
-            .any(|a| matches!(a, SessionAction::CancelTurn { .. })));
-        assert!(session.can_edit_history());
-    }
-}
+mod tests;

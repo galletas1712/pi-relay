@@ -1,10 +1,5 @@
-use agent_core::{InjectedMessage, TranscriptItem};
+use agent_core::{AssistantItem, InjectedMessage, TranscriptItem};
 
-use crate::transcript_store::edit::{HistoryEdit, HistoryEditError, HistoryEditKind};
-use crate::transcript_store::span::{
-    summary_span_plan_from_indices, transcript_items_in, SummarizeSpan, SummarySpanPlan,
-};
-use crate::transcript_store::tokens::{estimate_item_tokens, estimate_items_tokens};
 use crate::transcript_store::{TranscriptStorageNode, TranscriptStore, TranscriptStoreError};
 
 /// Well-known `InjectedMessage::kind` for compaction summaries.
@@ -44,24 +39,21 @@ pub struct CompactionSettings {
 
 /// Describes a compaction the caller may apply to a session context.
 ///
-/// A plan captures a prefix-oriented summary policy on top of the generic
-/// `SummarizeSpan` edit: the span to replace (`summary_span`), the first
-/// surviving entry (`first_kept_entry_id`), the items the summarizer should
-/// read (`items_to_summarize`), the surviving suffix (`items_to_keep`),
-/// the pre-compaction token estimate (`tokens_before`), and the immediate
-/// previous summary to thread through when summarizing. `leaf_id` +
-/// `entry_count` are staleness-check hooks: the operation refuses to apply a
-/// plan if the context's shape has changed since the plan was prepared.
+/// A plan captures the entries that will be summarized, the suffix that will
+/// remain visible, and enough private staleness metadata to reject applying the
+/// plan after the transcript shape has changed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionPlan {
-    pub summary_span: SummarySpanPlan,
+    pub(crate) first_entry_id: String,
+    pub(crate) last_entry_id: String,
+    pub(crate) items_after_span: Vec<TranscriptItem>,
     pub first_kept_entry_id: String,
     pub items_to_summarize: Vec<TranscriptItem>,
     pub items_to_keep: Vec<TranscriptItem>,
     pub tokens_before: usize,
     pub previous_summary: Option<String>,
-    pub leaf_id: Option<String>,
-    pub entry_count: usize,
+    pub(crate) leaf_id: Option<String>,
+    pub(crate) entry_count: usize,
 }
 
 impl TranscriptStore {
@@ -92,7 +84,6 @@ impl TranscriptStore {
 
         let first_kept_entry = path.get(cut_index)?;
         let span_last_index = cut_index.checked_sub(1)?;
-        let summary_span = summary_span_plan_from_indices(self, &path, span_start, span_last_index);
         let items_to_summarize = transcript_items_in(&path[boundary_start..cut_index]);
         if items_to_summarize.is_empty() {
             return None;
@@ -100,7 +91,9 @@ impl TranscriptStore {
         let items_to_keep = transcript_items_in(&path[cut_index..]);
 
         Some(CompactionPlan {
-            summary_span,
+            first_entry_id: path[span_start].id.clone(),
+            last_entry_id: path[span_last_index].id.clone(),
+            items_after_span: transcript_items_in(&path[span_last_index + 1..]),
             first_kept_entry_id: first_kept_entry.id.clone(),
             items_to_summarize,
             items_to_keep,
@@ -114,10 +107,10 @@ impl TranscriptStore {
     /// Validate that a `CompactionPlan` still matches the context's current
     /// shape, without requiring the active leaf itself to be a turn boundary.
     ///
-    /// This is the validation used by session-owned maintenance at a safe
-    /// model-context barrier. The plan's summarized span still has to start
-    /// and end on turn boundaries; the current active leaf may include an open
-    /// turn suffix that will be replayed after the summary.
+    /// This is the validation used by a scheduled compaction request at a
+    /// safe model-context barrier. The plan's summarized span still has to
+    /// start and end on turn boundaries; the current active leaf may include
+    /// an open turn suffix that will be replayed after the summary.
     pub(crate) fn validate_plan_fingerprint(
         &self,
         plan: &CompactionPlan,
@@ -125,7 +118,7 @@ impl TranscriptStore {
         if !self.contains_entry(&plan.first_kept_entry_id) {
             return Err(TranscriptStoreError::EntryNotFound);
         }
-        self.validate_summary_span_plan(&plan.summary_span)?;
+        self.validate_compaction_span(plan)?;
         if self.leaf_id() != plan.leaf_id.as_deref() || self.entry_count() != plan.entry_count {
             return Err(TranscriptStoreError::StalePlan);
         }
@@ -139,51 +132,61 @@ impl TranscriptStore {
     /// `StalePlan` if the context's leaf or entry count has drifted from the
     /// plan's fingerprint, or `NotTurnBoundary` if the current leaf isn't at
     /// a turn boundary.
-    pub fn validate_plan_matches(&self, plan: &CompactionPlan) -> Result<(), TranscriptStoreError> {
+    pub(crate) fn validate_plan_matches(
+        &self,
+        plan: &CompactionPlan,
+    ) -> Result<(), TranscriptStoreError> {
         self.validate_plan_fingerprint(plan)?;
         if !self.is_turn_boundary() {
             return Err(TranscriptStoreError::NotTurnBoundary);
         }
         Ok(())
     }
-}
 
-/// A prepared compaction operation.
-///
-/// Applies by converting the compaction plan into a generic `SummarizeSpan`
-/// edit with a `compaction_summary` item. The replaced prefix stays in the
-/// context as an orphaned branch so the audit trail is preserved.
-pub struct Compact {
-    pub plan: CompactionPlan,
-    pub summary: String,
-}
-
-impl Compact {
-    pub(crate) fn apply_validated(self, ctx: &mut TranscriptStore) -> Result<(), HistoryEditError> {
-        let CompactionPlan {
-            summary_span,
-            first_kept_entry_id,
-            tokens_before,
-            ..
-        } = self.plan;
-
-        SummarizeSpan {
-            plan: summary_span,
-            summary: compaction_summary(self.summary, first_kept_entry_id, tokens_before),
+    fn validate_compaction_span(&self, plan: &CompactionPlan) -> Result<(), TranscriptStoreError> {
+        if !self.contains_entry(&plan.first_entry_id) || !self.contains_entry(&plan.last_entry_id) {
+            return Err(TranscriptStoreError::EntryNotFound);
         }
-        .apply(ctx)
+
+        let path = self.branch_entries(None);
+        let (first_index, last_index) =
+            active_span_indices(&path, &plan.first_entry_id, &plan.last_entry_id)?;
+        validate_span_boundaries(self, &path, first_index, last_index)
     }
-}
 
-impl HistoryEdit for Compact {
-    type Output = ();
-    const KIND: HistoryEditKind = HistoryEditKind::Compact;
+    fn apply_compaction_span(
+        &mut self,
+        plan: CompactionPlan,
+        summary: InjectedMessage,
+    ) -> Result<(), TranscriptStoreError> {
+        self.validate_plan_fingerprint(&plan)?;
 
-    fn apply(self, ctx: &mut TranscriptStore) -> Result<(), HistoryEditError> {
-        ctx.validate_plan_matches(&self.plan)
-            .map_err(HistoryEditError::Store)?;
+        let path = self.branch_entries(None);
+        let (first_index, _) =
+            active_span_indices(&path, &plan.first_entry_id, &plan.last_entry_id)
+                .expect("validate_plan_fingerprint guarantees active span indices");
+        let pre_span_parent_id = path[first_index].parent_id.clone();
 
-        self.apply_validated(ctx)
+        match pre_span_parent_id.as_deref() {
+            Some(id) => self.branch_at_turn_boundary(id)?,
+            None => self.reset_leaf(),
+        }
+
+        self.append_injected(summary);
+        self.append_transcript_items(plan.items_after_span);
+        Ok(())
+    }
+
+    pub(crate) fn apply_compaction(
+        &mut self,
+        plan: CompactionPlan,
+        summary: String,
+    ) -> Result<(), TranscriptStoreError> {
+        let first_kept_entry_id = plan.first_kept_entry_id.clone();
+        let tokens_before = plan.tokens_before;
+        let summary = compaction_summary(summary, first_kept_entry_id, tokens_before);
+
+        self.apply_compaction_span(plan, summary)
     }
 }
 
@@ -239,6 +242,71 @@ fn turn_start_at_or_before(
         }
     }
     Some(boundary_start)
+}
+
+fn transcript_items_in(entries: &[TranscriptStorageNode]) -> Vec<TranscriptItem> {
+    entries.iter().map(|entry| entry.item.clone()).collect()
+}
+
+fn active_span_indices(
+    path: &[TranscriptStorageNode],
+    first_entry_id: &str,
+    last_entry_id: &str,
+) -> Result<(usize, usize), TranscriptStoreError> {
+    let first_index = path
+        .iter()
+        .position(|entry| entry.id == first_entry_id)
+        .ok_or(TranscriptStoreError::InvalidSpan)?;
+    let last_index = path
+        .iter()
+        .position(|entry| entry.id == last_entry_id)
+        .ok_or(TranscriptStoreError::InvalidSpan)?;
+    if first_index > last_index {
+        return Err(TranscriptStoreError::InvalidSpan);
+    }
+    Ok((first_index, last_index))
+}
+
+fn validate_span_boundaries(
+    ctx: &TranscriptStore,
+    path: &[TranscriptStorageNode],
+    first_index: usize,
+    last_index: usize,
+) -> Result<(), TranscriptStoreError> {
+    if !ctx.is_turn_boundary_leaf(path[first_index].parent_id.as_deref()) {
+        return Err(TranscriptStoreError::NotTurnBoundary);
+    }
+    if !ctx.is_turn_boundary_leaf(Some(&path[last_index].id)) {
+        return Err(TranscriptStoreError::NotTurnBoundary);
+    }
+    Ok(())
+}
+
+pub(crate) fn estimate_items_tokens(items: &[TranscriptItem]) -> usize {
+    items.iter().map(estimate_item_tokens).sum()
+}
+
+fn estimate_item_tokens(item: &TranscriptItem) -> usize {
+    let chars = match item {
+        TranscriptItem::TurnStarted { .. } | TranscriptItem::TurnFinished { .. } => 0,
+        TranscriptItem::UserMessage(content) => content.len(),
+        TranscriptItem::AssistantMessage(message) => message
+            .items
+            .iter()
+            .map(|item| match item {
+                AssistantItem::Text(text) => text.len(),
+                AssistantItem::ToolCall(tool_call) => {
+                    tool_call.tool_name.len() + tool_call.args_json.len()
+                }
+            })
+            .sum(),
+        TranscriptItem::ToolCallStarted { tool_call, .. } => {
+            tool_call.tool_name.len() + tool_call.args_json.len()
+        }
+        TranscriptItem::ToolResult(result) => result.tool_name.len() + result.output.len(),
+        TranscriptItem::Injected(message) => message.content.len(),
+    };
+    chars.div_ceil(4)
 }
 
 #[cfg(test)]
@@ -320,11 +388,8 @@ mod tests {
             .expect("old turn should be compactable");
 
         session
-            .edit(Compact {
-                plan,
-                summary: "summary".to_string(),
-            })
-            .expect("history edit can compact");
+            .compact(plan, "summary")
+            .expect("compaction can apply");
 
         let transcript = session.model_context();
         assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
@@ -334,7 +399,8 @@ mod tests {
             Some(TranscriptItem::Injected(_))
         ));
         // T1's items are no longer visible in the materialized view; the
-        // old branch lives on as an orphan in the full context entries.
+        // Old branch nodes remain in the store even though they are no longer
+        // visible on the active materialized path.
         let has_first_user = transcript
             .transcript_items()
             .iter()
@@ -376,12 +442,8 @@ mod tests {
             .iter()
             .any(|item| matches!(item, TranscriptItem::Injected(cm) if cm.kind == "agent_report")));
 
-        Compact {
-            plan,
-            summary: "summary".to_string(),
-        }
-        .apply(&mut ctx)
-        .expect("compaction should apply");
+        ctx.apply_compaction(plan, "summary".to_string())
+            .expect("compaction should apply");
 
         assert!(ctx
             .model_context()
@@ -424,17 +486,14 @@ mod tests {
             })
             .expect("old turn should be compactable");
         session
-            .edit(Compact {
-                plan,
-                summary: "summary".to_string(),
-            })
-            .expect("history edit can compact");
+            .compact(plan, "summary")
+            .expect("compaction can apply");
 
         // TranscriptStore grew by: 1 (CompSum) + 4 (re-appended turn 2 items) = 5.
         assert_eq!(
             session.transcript_store().entries().len(),
             entries_before + 5,
-            "fork-based compaction should add 1 summary + the kept items as new context entries"
+            "fork-based compaction should add 1 summary + the kept items as new transcript nodes"
         );
 
         // Materialized transcript: [CompSum, TurnStarted(2), UserMessage,
@@ -488,10 +547,7 @@ mod tests {
             })
             .expect("old turns should be compactable");
         session
-            .edit(Compact {
-                plan,
-                summary: "first summary".to_string(),
-            })
+            .compact(plan, "first summary")
             .expect("first compaction should apply");
         assert_eq!(
             session.model_context().latest_compaction_summary(),
@@ -514,7 +570,6 @@ mod tests {
             })
             .expect("matching model completion is valid");
         session.drive();
-        assert!(session.is_idle());
 
         // Second compaction.
         let plan2 = session
@@ -524,10 +579,7 @@ mod tests {
             })
             .expect("T3 is compactable past the first summary on the active branch");
         session
-            .edit(Compact {
-                plan: plan2,
-                summary: "second summary".to_string(),
-            })
+            .compact(plan2, "second summary")
             .expect("second compaction should apply");
 
         let transcript = session.model_context();

@@ -5,10 +5,15 @@ use crate::model_context::ModelContext;
 
 /// Session-level work requested by `AgentSession`.
 ///
-/// Model/tool/turn-cancel actions are produced by `agent-core` and surfaced
-/// here with the same correlation ids. Stateless model work is owned by the
-/// session layer and bypasses the turn FSM while still flowing through the
-/// same action/completion boundary.
+/// Model/tool actions are produced by `agent-core` and surfaced here with the
+/// same correlation ids. Stateless model work is owned by the session layer and
+/// bypasses the turn FSM while still flowing through the same action/completion
+/// boundary.
+///
+/// `CancelSessionWork` is a session-wide invalidation barrier. A harness should
+/// treat every outstanding model, tool, or stateless request for this session as
+/// stale and cancel it if possible. The action is idempotent and best-effort:
+/// late completions can still race in, and the session ignores them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionAction {
     RequestModel {
@@ -21,9 +26,7 @@ pub enum SessionAction {
         turn_id: TurnId,
         tool_call: ToolCall,
     },
-    CancelTurn {
-        turn_id: TurnId,
-    },
+    CancelSessionWork,
     RequestModelStateless {
         request_id: StatelessModelRequestId,
         request: StatelessModelRequest,

@@ -6,15 +6,13 @@ use agent_core::{ActionId, AgentAction, AgentInput, TurnId};
 /// waiting to hear back about, in FIFO insertion order.
 ///
 /// `record_drained` pushes an entry for each `RequestModel` / `RequestTool` in
-/// a drained action batch, and clears everything for a `CancelTurn`'s turn id.
+/// a drained action batch. The session-wide invalidation path clears the queue
+/// when work is canceled or made stale.
 /// `record_input` removes the matching key when a `ModelCompleted` /
 /// `ModelFailed` / `ToolCompleted` arrives; removal preserves the relative
 /// order of the remaining entries. Stale completions (no matching key) are
 /// no-ops.
 ///
-/// Duplicates are kept: if the same key is recorded twice, both are held in
-/// FIFO position. Callers that care about "once per drain" should rely on
-/// the drain semantics rather than this type deduplicating.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct ActionQueue {
     entries: VecDeque<PendingActionKey>,
@@ -65,9 +63,7 @@ impl ActionQueue {
                         kind: PendingActionKind::Tool,
                     });
                 }
-                AgentAction::CancelTurn { turn_id } => {
-                    self.entries.retain(|k| k.turn_id != *turn_id);
-                }
+                AgentAction::CancelTurn { .. } => {}
             }
         }
     }
@@ -174,41 +170,10 @@ mod tests {
     }
 
     #[test]
-    fn cancel_turn_clears_pending_actions_for_that_turn_only() {
-        let mut q = ActionQueue::new();
-        q.record_drained(&[
-            model_request(1, 1),
-            tool_request(2, 1, 1),
-            model_request(3, 2),
-        ]);
-        q.record_drained(&[AgentAction::CancelTurn { turn_id: TurnId(1) }]);
-        // Turn 2 survives.
-        assert!(!q.is_empty());
-        q.record_input(&AgentInput::ModelCompleted {
-            action_id: ActionId(3),
-            turn_id: TurnId(2),
-            assistant: agent_core::AssistantMessage { items: Vec::new() },
-        });
-        assert!(q.is_empty());
-    }
-
-    #[test]
     fn clear_empties_the_queue() {
         let mut q = ActionQueue::new();
         q.record_drained(&[model_request(1, 1)]);
         q.clear();
         assert!(q.is_empty());
-    }
-
-    #[test]
-    fn record_drained_preserves_insertion_order_across_duplicates() {
-        let mut q = ActionQueue::new();
-        q.record_drained(&[
-            model_request(1, 1),
-            model_request(1, 1),
-            tool_request(2, 1, 1),
-        ]);
-        // Two model entries plus one tool entry; neither is deduplicated.
-        assert_eq!(q.entries.len(), 3);
     }
 }
