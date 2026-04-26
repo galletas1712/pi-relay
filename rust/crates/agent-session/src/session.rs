@@ -271,6 +271,23 @@ impl AgentSession {
         &self.transcript_store
     }
 
+    pub fn context_leaf_id(&self) -> Option<&str> {
+        self.transcript_store.leaf_id()
+    }
+
+    pub fn context_tokens(&self) -> Option<usize> {
+        self.context_tokens
+    }
+
+    pub fn is_quiescent(&self) -> bool {
+        self.core.is_idle()
+            && !self.core.has_pending_work()
+            && self.external_work.is_empty()
+            && self.action_outbox.is_empty()
+            && self.event_outbox.is_empty()
+            && self.compaction.is_idle()
+    }
+
     /// Drive the core to quiescence and append any transcript items it emitted
     /// to the session store. This is the only supported way to advance a
     /// session; the store remains the sole owner of durable history.

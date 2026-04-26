@@ -1,6 +1,7 @@
 use crate::ids::ToolCallId;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub items: Vec<AssistantItem>,
 }
@@ -14,20 +15,22 @@ impl AssistantMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum AssistantItem {
     Text(String),
     ToolCall(ToolCall),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: ToolCallId,
     pub tool_name: String,
     pub args_json: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ToolResultStatus {
     Success,
     Error,
@@ -35,7 +38,7 @@ pub enum ToolResultStatus {
     Crashed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolResultMessage {
     pub tool_call_id: ToolCallId,
     pub tool_name: String,

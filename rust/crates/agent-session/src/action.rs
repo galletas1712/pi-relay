@@ -1,8 +1,11 @@
 use agent_core::{ActionId, ToolCall, TurnId};
+use serde::{Deserialize, Serialize};
 
 use crate::model_context::ModelContext;
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 pub struct CompactionRequestId(pub u64);
 
 impl CompactionRequestId {
@@ -30,7 +33,8 @@ impl CompactionRequestId {
 /// treat every outstanding model, tool, or compaction request for this session as
 /// stale and cancel it if possible. The action is idempotent and best-effort:
 /// late completions can still race in, and the session ignores them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum SessionAction {
     RequestModel {
         action_id: ActionId,

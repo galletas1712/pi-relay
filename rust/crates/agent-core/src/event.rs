@@ -2,6 +2,7 @@ use std::fmt;
 
 use crate::ids::{ActionId, TurnId};
 use crate::message::{AssistantMessage, ToolResultMessage};
+use serde::{Deserialize, Serialize};
 
 /// External input to the live agent FSM.
 ///
@@ -11,7 +12,8 @@ use crate::message::{AssistantMessage, ToolResultMessage};
 /// session, e.g. a parent directive or a child report). The core crate is
 /// oblivious to what a session id *is*, and to what specific `kind` strings
 /// mean — both are opaque tags that ride along with the content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum AgentInput {
     // User asked to stop the active model/tool work.
     Interrupt,

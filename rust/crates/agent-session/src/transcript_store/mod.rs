@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::{InjectedMessage, TranscriptItem};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::model_context::ModelContext;
@@ -11,7 +12,7 @@ use crate::model_context::ModelContext;
 /// Entries form a forest: each entry has at most one parent, while a parent may
 /// have many children. A session points at one leaf and materializes model
 /// context by walking parents from that leaf back to a root.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptStorageNode {
     pub id: String,
     pub parent_id: Option<String>,

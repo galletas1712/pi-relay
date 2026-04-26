@@ -1,6 +1,7 @@
 use std::fmt;
 
 use agent_core::{ActionId, AgentInput, AgentInputError, AssistantMessage, TurnId};
+use serde::{Deserialize, Serialize};
 
 use crate::action::CompactionRequestId;
 use crate::model_context::ModelContext;
@@ -11,7 +12,8 @@ use crate::model_context::ModelContext;
 /// and direct updates can refresh the harness-provided context token count.
 /// Compaction completions replace the active model context with output returned
 /// by the remote compaction API.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum SessionInput {
     Agent(AgentInput),
     Compact,

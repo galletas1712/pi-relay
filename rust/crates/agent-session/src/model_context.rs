@@ -1,4 +1,5 @@
 use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptItem, TurnId, TurnOutcome};
+use serde::{Deserialize, Serialize};
 
 /// Materialized model context for one transcript path.
 ///
@@ -7,8 +8,9 @@ use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptItem, TurnId
 /// the core loop or model provider a contiguous ordered history, and uses the
 /// same type to rehydrate crashed sessions through explicit crash-tail
 /// recovery.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelContext {
+    #[serde(rename = "transcript_items")]
     items: Vec<TranscriptItem>,
 }
 

@@ -2,8 +2,10 @@ use std::collections::BTreeMap;
 
 use crate::ids::TurnId;
 use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TurnOutcome {
     Graceful,
     Interrupted,
@@ -16,7 +18,8 @@ pub enum TurnOutcome {
 /// forked, and rewound. They are not hook/lifecycle events; hooks should
 /// attach to a separate lifecycle notification stream derived while the loop
 /// is running.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum TranscriptItem {
     // Produced by the FSM during a turn:
     TurnStarted {
@@ -47,7 +50,7 @@ pub enum TranscriptItem {
 /// extension point to classify the injected context. `content` is the textual
 /// body surfaced to the model; `metadata` carries routing or anchor
 /// information, such as sender id or the first kept entry after compaction.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InjectedMessage {
     pub kind: String,
     pub content: String,

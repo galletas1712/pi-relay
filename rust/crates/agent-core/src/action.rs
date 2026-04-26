@@ -1,10 +1,12 @@
 use crate::ids::{ActionId, TurnId};
 use crate::message::ToolCall;
+use serde::{Deserialize, Serialize};
 
 /// Side effects requested by the core loop.
 ///
 /// The orchestrator executes these and may wrap them with hooks.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum AgentAction {
     RequestModel {
         action_id: ActionId,

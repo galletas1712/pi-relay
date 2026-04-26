@@ -10,10 +10,15 @@ Rust implementation of pi-relay's agent runtime. See
 | `agent-core` | Pure deterministic FSM for agent turns. Emits `TranscriptItem`s and `AgentAction` side effects. No I/O. Internals (`AgentState`, `Mailbox`) are private. |
 | `agent-session` | Durable session history atop the core FSM. Owns a session-local `TranscriptStore` forest with one active leaf/path, the materialized `ModelContext` view, the `AgentRunner`, remote compaction requests, and rewind/fork operations. |
 | `agent-orchestrator` | Composition struct for the runtime. Currently owns a SessionRegistry that tracks session identity and spawn relationships. Grows as ModelProvider, ToolRegistry, UsageLedger, AgentWorklogStore land. |
+| `agent-rpc` | Serde/JSON-shaped per-session host frames plus a headless runner for end-to-end harness tests. Transport is intentionally deferred. |
 
 ## Layer discipline
 
 `agent-core` ◂─ `agent-session` ◂─ `agent-orchestrator`
+
+`agent-rpc` depends on `agent-session` and sits beside the control-plane work as
+the future `SessionHandle` protocol. Views should still attach through the
+control plane.
 
 Each crate depends only on crates below it. Narrow public APIs between
 crates; implementation details stay private. See the architecture doc for
@@ -23,12 +28,13 @@ the full layer stack including the future control-plane and view layers.
 
 These crates land the session-layer abstractions: a pure deterministic FSM in
 `agent-core`, durable forest-structured session history in `agent-session`, and a
-thin composition struct in `agent-orchestrator`. Downstream work adds (in rough
-order): `SessionStore` (pluggable storage), `ControlPlane` (view/control split),
-event bus/subscriptions (observability), `ModelProvider`, `Tool`/`ToolRegistry`,
-compaction policy/execution, `UsageLedger`, multi-agent tools
-(spawn/report/idle), `AgentWorklogStore`, `PromptAssembly`, daemon +
-`RemoteControlPlane`, and distributed session processes. See the
+thin composition struct in `agent-orchestrator`, and a transport-free RPC seam in
+`agent-rpc`. Downstream work adds (in rough order): `SessionStore` (pluggable
+storage), concrete RPC transport, `ControlPlane` (view/control split), event
+bus/subscriptions (observability), `ModelProvider`, `Tool`/`ToolRegistry`,
+compaction policy/execution, `UsageLedger`, multi-agent tools (spawn/report/idle),
+`AgentWorklogStore`, `PromptAssembly`, daemon + `RemoteControlPlane`, and
+distributed session processes. See the
 [architecture doc](docs/architecture.md) for the full sequencing.
 
 ## Design docs

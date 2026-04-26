@@ -13,7 +13,7 @@ truth for those roadmaps.
 1. **Pure core, narrow boundaries.** The FSM is deterministic, has no I/O, and exposes a tiny public API. Everything that looks like a dependency of the FSM is a trait implemented outside the core.
 2. **Data and policy split at layer boundaries.** Each layer owns data that the layer above can't see. Policy lives in the outermost layer. No reach-through access.
 3. **Append-only, materialized on read.** Durable state is an append-only log. The "current view" is a function of the log plus ambient config — never a field that can drift.
-4. **Traits are future process boundaries.** Every trait we introduce can, in principle, become a network protocol. Design APIs accordingly: async, request/response shapes, serializable types.
+4. **Traits are future process boundaries.** Every trait we introduce can, in principle, become a network protocol. Design APIs accordingly: async, request/response shapes, serializable types. The `agent-rpc` crate is the first concrete attach seam: typed serde frames around one session, with transport kept separate.
 5. **One kind of thing, one place.** If we have two entry types that are "the same shape with a different tag," they collapse into one type with a tag. Applies to logs, events, injections.
 6. **No features without consumers.** Primitives wait until the thing that consumes them exists. No speculative abstractions.
 
@@ -109,9 +109,11 @@ enum AgentInput {
 // `action_id` must be copied from the matching RequestModel / RequestTool.
 ```
 
-These are plain data shapes intended to be serializable at future persistence
-and RPC boundaries, but the current crates do not derive or require serde yet.
-The FSM never holds non-POD state beyond these.
+These are plain data shapes intended to be serializable at persistence and RPC
+boundaries. Core/session public payloads derive serde for the current
+transport-free RPC seam, but the exact JSON frame shape is still experimental
+until the first TypeScript client lands. The FSM never holds non-POD state
+beyond these.
 
 ### Log entries (layer 3, in `agent-session`)
 
@@ -208,6 +210,8 @@ Landed in PR #63 and hardened in PR #64.
 ### Layer 4 — Control plane (`agent-orchestrator` crate and new traits)
 
 Partially landed as a placeholder; real shape below.
+
+- **`agent-rpc` session-host seam** — `SessionRpcHost` owns one `AgentSession` and accepts typed serde frames (`Enqueue`, `Drive`, `Snapshot`). It has no transport; stdio/TCP/WebSocket/process supervision can sit underneath later. `HeadlessSession` drives the same seam in tests with a deterministic action handler. This is a future `SessionHandle` protocol below the control plane, not the TUI's final public API.
 
 - **`SessionRegistry<S = AgentSession>`** — `HashMap<SessionId, S>` + parent-child map + helpers. Generic over session type so it can hold local `AgentSession` or remote `SessionHandle` without code changes. Pure data + lifecycle management.
 - **`ControlPlane` trait** — the view's only handle on the system:

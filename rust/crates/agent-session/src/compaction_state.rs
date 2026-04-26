@@ -32,6 +32,10 @@ impl CompactionState {
         matches!(self, Self::Running { .. })
     }
 
+    pub(crate) fn is_idle(&self) -> bool {
+        matches!(self, Self::Idle)
+    }
+
     pub(crate) fn clear(&mut self) {
         *self = Self::Idle;
     }

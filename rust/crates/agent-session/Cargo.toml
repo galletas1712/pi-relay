@@ -8,4 +8,5 @@ publish = false
 agent-core = { path = "../agent-core" }
 futures-channel = "0.3"
 futures-core = "0.3"
+serde = { version = "1", features = ["derive"] }
 uuid = { version = "1", features = ["v4"] }

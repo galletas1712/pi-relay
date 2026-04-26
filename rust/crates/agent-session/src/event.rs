@@ -1,4 +1,5 @@
 use agent_core::TranscriptItem;
+use serde::{Deserialize, Serialize};
 
 use crate::action::SessionAction;
 
@@ -7,7 +8,8 @@ use crate::action::SessionAction;
 /// These events are intentionally not transcript-store entries. `ModelContext`
 /// remains the model-visible view; events explain what the session is doing
 /// around that view while it runs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
 pub enum SessionEvent {
     TranscriptItemAppended {
         entry_id: String,
@@ -29,7 +31,8 @@ pub enum SessionEvent {
     HistoryRewound,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionActionKind {
     Model,
     Tool,
