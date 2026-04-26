@@ -40,6 +40,7 @@ fn assert_single_request_model(
         action_id,
         turn_id,
         model_context,
+        ..
     }] = actions.as_slice()
     else {
         panic!("expected one RequestModel action, got {actions:?}");
@@ -64,7 +65,6 @@ fn session_with_compactable_history() -> AgentSession {
         "second assistant message with enough text to count",
     ));
     AgentSession::from_model_context(ModelContext::from_transcript_items(items))
-        .with_auto_compaction(AutoCompactionSettings::new(1))
 }
 
 fn compacted_boundary_context(summary: &str, last_turn_id: u64) -> ModelContext {
@@ -90,17 +90,40 @@ fn compacted_open_context(summary: &str, turn_id: u64, user: &str) -> ModelConte
     ])
 }
 
+fn compacted_context_with_open_suffix(summary: &str, suffix: &[TranscriptItem]) -> ModelContext {
+    let mut items = vec![TranscriptItem::Injected(InjectedMessage::new(
+        "compaction",
+        summary,
+    ))];
+    items.extend_from_slice(suffix);
+    ModelContext::from_transcript_items(items)
+}
+
+fn open_turn_suffix(model_context: &ModelContext) -> Vec<TranscriptItem> {
+    let items = model_context.transcript_items();
+    let tail_start = items
+        .iter()
+        .rposition(|item| matches!(item, TranscriptItem::TurnStarted { .. }))
+        .expect("test context should contain an open turn");
+    items[tail_start..].to_vec()
+}
+
 fn assert_single_request_compaction(
     actions: Vec<SessionAction>,
 ) -> (CompactionRequestId, ModelContext) {
     let [SessionAction::RequestCompaction {
         request_id,
         model_context,
+        ..
     }] = actions.as_slice()
     else {
         panic!("expected one RequestCompaction action, got {actions:?}");
     };
     (*request_id, model_context.clone())
+}
+
+fn empty_assistant() -> AssistantMessage {
+    AssistantMessage { items: Vec::new() }
 }
 
 #[test]
@@ -132,6 +155,12 @@ fn rewind_and_fork_only_accept_turn_finished_entries() {
         session.fork(Some(&mid_turn_id)).map(|_| ()),
         Err(HistoryOperationError::Store(
             TranscriptStoreError::NotTurnBoundary
+        ))
+    );
+    assert_eq!(
+        session.fork(Some("missing-entry")).map(|_| ()),
+        Err(HistoryOperationError::Store(
+            TranscriptStoreError::EntryNotFound
         ))
     );
 
@@ -343,7 +372,7 @@ fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
             },
         ]
     );
-    assert_eq!(session.last_turn_id(), TurnId(7));
+    assert_eq!(session.model_context().last_turn_id(), TurnId(7));
 }
 
 #[test]
@@ -376,7 +405,53 @@ fn from_model_context_recovers_an_open_tail_as_crashed() {
 }
 
 #[test]
-fn restore_remains_quiescent_until_new_input_reaches_a_model_barrier() {
+fn from_transcript_store_recovers_an_open_tool_tail_as_crashed() {
+    let tool_call = ToolCall {
+        id: ToolCallId(1),
+        tool_name: "read".to_string(),
+        args_json: "{}".to_string(),
+    };
+    let store = TranscriptStore::from_model_context(&ModelContext::from_transcript_items(vec![
+        TranscriptItem::TurnStarted { turn_id: TurnId(7) },
+        TranscriptItem::UserMessage("hello".to_string()),
+        TranscriptItem::AssistantMessage(AssistantMessage {
+            items: vec![AssistantItem::ToolCall(tool_call.clone())],
+        }),
+        TranscriptItem::ToolCallStarted {
+            turn_id: TurnId(7),
+            tool_call: tool_call.clone(),
+        },
+    ]));
+
+    let session = AgentSession::from_transcript_store(store)
+        .expect("store restore should crash-recover an open tail");
+
+    assert_eq!(
+        session.model_context().transcript_items(),
+        &[
+            TranscriptItem::TurnStarted { turn_id: TurnId(7) },
+            TranscriptItem::UserMessage("hello".to_string()),
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call.clone())],
+            }),
+            TranscriptItem::ToolCallStarted {
+                turn_id: TurnId(7),
+                tool_call: tool_call.clone(),
+            },
+            TranscriptItem::ToolResult(ToolResultMessage::crashed(
+                tool_call.id,
+                tool_call.tool_name,
+            )),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(7),
+                outcome: TurnOutcome::Crashed,
+            },
+        ]
+    );
+}
+
+#[test]
+fn restore_recovers_open_tail_and_remains_quiescent() {
     let mut items = Vec::new();
     items.extend(finished_turn(
         1,
@@ -393,8 +468,7 @@ fn restore_remains_quiescent_until_new_input_reaches_a_model_barrier() {
         "open turn before process death".to_string(),
     ));
 
-    let mut session = AgentSession::from_transcript_items(items)
-        .with_auto_compaction(AutoCompactionSettings::new(1));
+    let mut session = AgentSession::from_transcript_items(items);
 
     assert!(session.drain_actions().is_empty());
     assert!(matches!(
@@ -406,13 +480,289 @@ fn restore_remains_quiescent_until_new_input_reaches_a_model_barrier() {
     ));
 
     session
+        .enqueue_session_input(SessionInput::ContextTokensUpdated {
+            context_leaf_id: session.transcript_store().leaf_id().map(str::to_string),
+            context_tokens: 101,
+        })
+        .expect("token update should be valid");
+    session.drive();
+    assert!(session.drain_actions().is_empty());
+
+    session
         .enqueue_input(AgentInput::follow_up("after restore"))
         .expect("plain follow-up is valid");
     session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(4));
+}
+
+#[test]
+fn context_token_updates_are_passed_to_compaction_requests() {
+    let mut session = session_with_compactable_history();
+    session
+        .enqueue_session_input(SessionInput::ContextTokensUpdated {
+            context_leaf_id: session.transcript_store().leaf_id().map(str::to_string),
+            context_tokens: 123,
+        })
+        .expect("token update should be valid");
+
+    session.compact();
+
+    let actions = session.drain_actions();
+    let [SessionAction::RequestCompaction { context_tokens, .. }] = actions.as_slice() else {
+        panic!("expected one RequestCompaction action, got {actions:?}");
+    };
+    assert_eq!(*context_tokens, Some(123));
+}
+
+#[test]
+fn context_token_count_is_cleared_when_context_changes() {
+    let mut session = session_with_compactable_history();
+    session
+        .enqueue_session_input(SessionInput::ContextTokensUpdated {
+            context_leaf_id: session.transcript_store().leaf_id().map(str::to_string),
+            context_tokens: 123,
+        })
+        .expect("token update should be valid");
+
+    session
+        .enqueue_input(AgentInput::follow_up("third user message"))
+        .expect("plain follow-up is valid");
+    session.drive();
+
+    let actions = session.drain_actions();
+    let [SessionAction::RequestModel { context_tokens, .. }] = actions.as_slice() else {
+        panic!("expected one RequestModel action, got {actions:?}");
+    };
+    assert_eq!(*context_tokens, None);
+}
+
+#[test]
+fn model_completion_context_tokens_apply_after_transcript_append() {
+    let mut session = AgentSession::new();
+    session
+        .enqueue_input(AgentInput::follow_up("first"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
+
+    session
+        .enqueue_session_input(SessionInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant: empty_assistant(),
+            context_tokens: Some(77),
+        })
+        .expect("session model completion should be valid");
+    session.drive();
+
+    session.compact();
+    let actions = session.drain_actions();
+    let [SessionAction::RequestCompaction { context_tokens, .. }] = actions.as_slice() else {
+        panic!("expected one RequestCompaction action, got {actions:?}");
+    };
+    assert_eq!(*context_tokens, Some(77));
+}
+
+#[test]
+fn model_completion_context_tokens_do_not_attach_to_next_turn_started_in_same_drive() {
+    let mut session = AgentSession::new();
+    session
+        .enqueue_input(AgentInput::follow_up("first"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
+
+    session
+        .enqueue_session_input(SessionInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant: empty_assistant(),
+            context_tokens: Some(77),
+        })
+        .expect("session model completion should be valid");
+    session
+        .enqueue_input(AgentInput::follow_up("second"))
+        .expect("plain follow-up is valid");
+    session.drive();
+
+    let actions = session.drain_actions();
+    let [SessionAction::RequestModel {
+        turn_id,
+        context_tokens,
+        ..
+    }] = actions.as_slice()
+    else {
+        panic!("expected one RequestModel action, got {actions:?}");
+    };
+    assert_eq!(*turn_id, TurnId(2));
+    assert_eq!(*context_tokens, None);
+}
+
+#[test]
+fn stale_context_token_update_for_old_leaf_is_ignored() {
+    let mut session = session_with_compactable_history();
+    let old_leaf_id = session.transcript_store().leaf_id().map(str::to_string);
+
+    session
+        .enqueue_input(AgentInput::follow_up("third user message"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
+    session
+        .enqueue_input(AgentInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(3),
+            assistant: empty_assistant(),
+        })
+        .expect("matching model completion is valid");
+    session.drive();
+
+    session
+        .enqueue_session_input(SessionInput::ContextTokensUpdated {
+            context_leaf_id: old_leaf_id,
+            context_tokens: 123,
+        })
+        .expect("stale token update is well formed");
+    session.compact();
+
+    let actions = session.drain_actions();
+    let [SessionAction::RequestCompaction { context_tokens, .. }] = actions.as_slice() else {
+        panic!("expected one RequestCompaction action, got {actions:?}");
+    };
+    assert_eq!(*context_tokens, None);
+}
+
+#[test]
+fn stale_session_model_completion_does_not_update_token_count() {
+    let mut session = AgentSession::new();
+    session
+        .enqueue_input(AgentInput::follow_up("first"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
+
+    session
+        .enqueue_input(AgentInput::Interrupt)
+        .expect("interrupt is valid");
+    session.drive();
+    assert_eq!(
+        session.drain_actions(),
+        vec![SessionAction::CancelSessionWork]
+    );
+
+    session
+        .enqueue_session_input(SessionInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant: empty_assistant(),
+            context_tokens: Some(1_000),
+        })
+        .expect("stale model completion should be accepted");
+    session.drive();
+
+    assert!(session.drain_actions().is_empty());
+
+    session.compact();
+    let actions = session.drain_actions();
+    let [SessionAction::RequestCompaction { context_tokens, .. }] = actions.as_slice() else {
+        panic!("expected one RequestCompaction action, got {actions:?}");
+    };
+    assert_eq!(*context_tokens, None);
+}
+
+#[test]
+fn unmatched_tool_completion_before_tool_request_is_ignored() {
+    let mut session = AgentSession::new();
+    let tool_call = ToolCall {
+        id: ToolCallId(1),
+        tool_name: "bash".to_string(),
+        args_json: "{}".to_string(),
+    };
+
+    session
+        .enqueue_input(AgentInput::follow_up("go"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
+
+    session
+        .enqueue_input(AgentInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call.clone())],
+            },
+        })
+        .expect("matching model completion is valid");
+    session
+        .enqueue_input(AgentInput::ToolCompleted {
+            action_id: ActionId(2),
+            turn_id: TurnId(1),
+            result: ToolResultMessage {
+                tool_call_id: tool_call.id,
+                tool_name: tool_call.tool_name.clone(),
+                output: "too early".to_string(),
+                status: ToolResultStatus::Success,
+            },
+        })
+        .expect("early tool completion is well formed but not yet matchable");
+    session.drive();
+
+    let actions = session.drain_actions();
     assert!(matches!(
-        session.drain_actions().as_slice(),
-        [SessionAction::RequestCompaction { .. }]
+        actions.as_slice(),
+        [SessionAction::RequestTool {
+            action_id: ActionId(2),
+            turn_id: TurnId(1),
+            ..
+        }]
     ));
+    assert!(!session
+        .model_context()
+        .transcript_items()
+        .iter()
+        .any(|item| matches!(item, TranscriptItem::ToolResult(_))));
+}
+
+#[test]
+fn completion_event_is_not_emitted_when_interrupt_wins_before_drive() {
+    let mut session = AgentSession::new();
+    session
+        .enqueue_input(AgentInput::follow_up("first"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
+    session.drain_events();
+
+    session
+        .enqueue_session_input(SessionInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant: empty_assistant(),
+            context_tokens: Some(77),
+        })
+        .expect("session model completion should be valid");
+    session
+        .enqueue_input(AgentInput::Interrupt)
+        .expect("interrupt is valid");
+    session.drive();
+
+    assert!(session.drain_events().iter().all(|event| {
+        !matches!(
+            event,
+            SessionEvent::ActionCompleted {
+                kind: SessionActionKind::Model,
+                id,
+            } if id == "1"
+        )
+    }));
+    assert_eq!(
+        session.model_context().transcript_items().last(),
+        Some(&TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Interrupted,
+        })
+    );
 }
 
 #[test]
@@ -432,7 +782,7 @@ fn rehydrating_a_graceful_boundary_restores_idle_state() {
         session.model_context().transcript_items(),
         model_context.as_slice()
     );
-    assert_eq!(session.last_turn_id(), TurnId(2));
+    assert_eq!(session.model_context().last_turn_id(), TurnId(2));
 }
 
 #[test]
@@ -507,11 +857,12 @@ fn model_failure_marks_turn_crashed_and_unblocks_history_operations() {
 }
 
 #[test]
-fn auto_compaction_requests_remote_compaction_before_releasing_model_request() {
+fn requested_compaction_before_a_model_barrier_defers_model_request() {
     let mut session = session_with_compactable_history();
     session
         .enqueue_input(AgentInput::follow_up("third user message"))
         .expect("plain follow-up is valid");
+    session.compact();
     session.drive();
 
     let (request_id, compaction_context) =
@@ -544,6 +895,7 @@ fn auto_compaction_requests_remote_compaction_before_releasing_model_request() {
         .enqueue_session_input(SessionInput::CompactionCompleted {
             request_id,
             replacement: replacement.clone(),
+            context_tokens: None,
         })
         .expect("compaction completion should be accepted");
 
@@ -578,7 +930,6 @@ fn auto_compaction_requests_remote_compaction_before_releasing_model_request() {
 #[test]
 fn requested_compaction_can_run_while_idle() {
     let mut session = session_with_compactable_history();
-    session.set_auto_compaction(None);
 
     session.compact();
 
@@ -588,6 +939,7 @@ fn requested_compaction_can_run_while_idle() {
         .enqueue_session_input(SessionInput::CompactionCompleted {
             request_id,
             replacement: replacement.clone(),
+            context_tokens: None,
         })
         .expect("compaction completion should be accepted");
 
@@ -596,9 +948,46 @@ fn requested_compaction_can_run_while_idle() {
 }
 
 #[test]
+fn session_input_can_request_compaction() {
+    let mut session = session_with_compactable_history();
+
+    session
+        .enqueue_session_input(SessionInput::Compact)
+        .expect("compaction request input should be valid");
+
+    assert_single_request_compaction(session.drain_actions());
+}
+
+#[test]
+fn invalid_idle_compaction_replacement_fails_without_editing_context() {
+    let mut session = session_with_compactable_history();
+    let before = session.model_context();
+
+    session.compact();
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
+    session
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: compacted_open_context("bad open summary", 2, "dangling"),
+            context_tokens: None,
+        })
+        .expect("invalid replacement is accepted as input and failed by session");
+
+    assert!(session.drain_actions().is_empty());
+    assert_eq!(session.model_context(), before);
+    assert!(session.drain_events().iter().any(|event| matches!(
+        event,
+        SessionEvent::ActionFailed {
+            kind: SessionActionKind::Compaction,
+            error,
+            ..
+        } if error.contains("turn boundary")
+    )));
+}
+
+#[test]
 fn requested_compaction_request_can_start_behind_undrained_cancel_session_work() {
     let mut session = session_with_compactable_history();
-    session.set_auto_compaction(None);
 
     session
         .enqueue_input(AgentInput::follow_up("third user message"))
@@ -624,9 +1013,222 @@ fn requested_compaction_request_can_start_behind_undrained_cancel_session_work()
 }
 
 #[test]
+fn invalid_model_barrier_compaction_replacement_releases_original_model_request() {
+    let mut session = session_with_compactable_history();
+    session
+        .enqueue_input(AgentInput::follow_up("third user message"))
+        .expect("plain follow-up is valid");
+    session.compact();
+    session.drive();
+    let (request_id, before_failure) = assert_single_request_compaction(session.drain_actions());
+
+    session
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: compacted_boundary_context("bad boundary summary", 3),
+            context_tokens: None,
+        })
+        .expect("invalid replacement is accepted as input and failed by session");
+
+    let request_model_context =
+        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
+    assert_eq!(request_model_context, before_failure);
+    assert!(session.drain_events().iter().any(|event| matches!(
+        event,
+        SessionEvent::ActionFailed {
+            kind: SessionActionKind::Compaction,
+            error,
+            ..
+        } if error.contains("model turn open")
+    )));
+}
+
+#[test]
+fn model_barrier_compaction_rejects_replacement_that_drops_open_turn_suffix() {
+    let mut session = session_with_compactable_history();
+    session
+        .enqueue_input(AgentInput::follow_up("third user message"))
+        .expect("plain follow-up is valid");
+    session.compact();
+    session.drive();
+    let (request_id, before_failure) = assert_single_request_compaction(session.drain_actions());
+
+    session
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: ModelContext::from_transcript_items(vec![
+                TranscriptItem::Injected(InjectedMessage::new("compaction", "bad")),
+                TranscriptItem::TurnStarted { turn_id: TurnId(3) },
+            ]),
+            context_tokens: None,
+        })
+        .expect("invalid replacement is accepted as input and failed by session");
+
+    let request_model_context =
+        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
+    assert_eq!(request_model_context, before_failure);
+    assert!(session.drain_events().iter().any(|event| matches!(
+        event,
+        SessionEvent::ActionFailed {
+            kind: SessionActionKind::Compaction,
+            error,
+            ..
+        } if error.contains("preserve the blocked model turn suffix")
+    )));
+}
+
+#[test]
+fn model_barrier_compaction_rejects_replacement_that_finishes_open_turn_early() {
+    let mut session = session_with_compactable_history();
+    session
+        .enqueue_input(AgentInput::follow_up("third user message"))
+        .expect("plain follow-up is valid");
+    session.compact();
+    session.drive();
+    let (request_id, before_failure) = assert_single_request_compaction(session.drain_actions());
+
+    session
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: ModelContext::from_transcript_items(vec![
+                TranscriptItem::Injected(InjectedMessage::new("compaction", "bad")),
+                TranscriptItem::TurnStarted { turn_id: TurnId(3) },
+                TranscriptItem::UserMessage("third user message".to_string()),
+                TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            ]),
+            context_tokens: None,
+        })
+        .expect("invalid replacement is accepted as input and failed by session");
+
+    let request_model_context =
+        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
+    assert_eq!(request_model_context, before_failure);
+    assert!(session.drain_events().iter().any(|event| matches!(
+        event,
+        SessionEvent::ActionFailed {
+            kind: SessionActionKind::Compaction,
+            error,
+            ..
+        } if error.contains("preserve the blocked model turn suffix")
+    )));
+}
+
+#[test]
+fn compaction_rejects_replacement_with_unmatched_tool_call() {
+    let mut session = session_with_compactable_history();
+    let tool_call = ToolCall {
+        id: ToolCallId(1),
+        tool_name: "bash".to_string(),
+        args_json: "{}".to_string(),
+    };
+    let bad_replacement = ModelContext::from_transcript_items(vec![
+        TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+        TranscriptItem::UserMessage("summary".to_string()),
+        TranscriptItem::AssistantMessage(AssistantMessage {
+            items: vec![AssistantItem::ToolCall(tool_call)],
+        }),
+        TranscriptItem::TurnFinished {
+            turn_id: TurnId(2),
+            outcome: TurnOutcome::Graceful,
+        },
+    ]);
+    let before = session.model_context();
+
+    session.compact();
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
+    session
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: bad_replacement,
+            context_tokens: None,
+        })
+        .expect("invalid replacement is accepted as input and failed by session");
+
+    assert_eq!(session.model_context(), before);
+    assert!(session.drain_events().iter().any(|event| matches!(
+        event,
+        SessionEvent::ActionFailed {
+            kind: SessionActionKind::Compaction,
+            error,
+            ..
+        } if error.contains("matching results")
+    )));
+}
+
+#[test]
+fn compaction_rejects_replacement_with_mismatched_turn_finish() {
+    let mut session = session_with_compactable_history();
+    let before = session.model_context();
+
+    session.compact();
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
+    session
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: ModelContext::from_transcript_items(vec![
+                TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+                TranscriptItem::Injected(InjectedMessage::new("compaction", "summary")),
+                TranscriptItem::TurnFinished {
+                    turn_id: TurnId(99),
+                    outcome: TurnOutcome::Graceful,
+                },
+            ]),
+            context_tokens: None,
+        })
+        .expect("invalid replacement is accepted as input and failed by session");
+
+    assert_eq!(session.model_context(), before);
+    assert!(session.drain_events().iter().any(|event| matches!(
+        event,
+        SessionEvent::ActionFailed {
+            kind: SessionActionKind::Compaction,
+            error,
+            ..
+        } if error.contains("does not match open turn")
+    )));
+}
+
+#[test]
+fn compaction_rejects_replacement_with_orphan_tool_result() {
+    let mut session = session_with_compactable_history();
+    let before = session.model_context();
+
+    session.compact();
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
+    session
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: ModelContext::from_transcript_items(vec![
+                TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+                TranscriptItem::ToolResult(ToolResultMessage {
+                    tool_call_id: ToolCallId(42),
+                    tool_name: "bash".to_string(),
+                    output: "orphan".to_string(),
+                    status: ToolResultStatus::Success,
+                }),
+                TranscriptItem::TurnFinished {
+                    turn_id: TurnId(2),
+                    outcome: TurnOutcome::Graceful,
+                },
+            ]),
+            context_tokens: None,
+        })
+        .expect("invalid replacement is accepted as input and failed by session");
+
+    assert_eq!(session.model_context(), before);
+    assert!(session.drain_events().iter().any(|event| matches!(
+        event,
+        SessionEvent::ActionFailed {
+            kind: SessionActionKind::Compaction,
+            error,
+            ..
+        } if error.contains("no matching started tool call")
+    )));
+}
+
+#[test]
 fn pending_idle_compaction_request_blocks_new_turns_until_it_completes() {
     let mut session = session_with_compactable_history();
-    session.set_auto_compaction(None);
 
     session.compact();
     let (request_id, _) = assert_single_request_compaction(session.drain_actions());
@@ -642,6 +1244,7 @@ fn pending_idle_compaction_request_blocks_new_turns_until_it_completes() {
         .enqueue_session_input(SessionInput::CompactionCompleted {
             request_id,
             replacement: compacted_boundary_context("manual summary", 2),
+            context_tokens: None,
         })
         .expect("compaction completion should be accepted");
     session.drive();
@@ -657,7 +1260,6 @@ fn pending_idle_compaction_request_blocks_new_turns_until_it_completes() {
 #[test]
 fn queued_steer_and_follow_up_survive_idle_compaction_request() {
     let mut session = session_with_compactable_history();
-    session.set_auto_compaction(None);
 
     session.compact();
     let (request_id, _) = assert_single_request_compaction(session.drain_actions());
@@ -676,6 +1278,7 @@ fn queued_steer_and_follow_up_survive_idle_compaction_request() {
         .enqueue_session_input(SessionInput::CompactionCompleted {
             request_id,
             replacement: compacted_boundary_context("compaction request summary", 2),
+            context_tokens: None,
         })
         .expect("compaction completion should be accepted");
     session.drive();
@@ -707,7 +1310,6 @@ fn queued_steer_and_follow_up_survive_idle_compaction_request() {
 #[test]
 fn requested_compaction_waits_for_next_model_context_barrier() {
     let mut session = session_with_compactable_history();
-    session.set_auto_compaction(None);
     let tool_call = ToolCall {
         id: ToolCallId(1),
         tool_name: "read".to_string(),
@@ -758,87 +1360,17 @@ fn requested_compaction_waits_for_next_model_context_barrier() {
         .expect("matching tool completion is valid");
     session.drive();
 
-    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
-    let replacement = compacted_open_context("barrier summary", 3, "third user message");
+    let (request_id, compaction_context) =
+        assert_single_request_compaction(session.drain_actions());
+    let suffix = open_turn_suffix(&compaction_context);
+    let replacement = compacted_context_with_open_suffix("barrier summary", &suffix);
     session
         .enqueue_session_input(SessionInput::CompactionCompleted {
             request_id,
             replacement: replacement.clone(),
+            context_tokens: None,
         })
         .expect("compaction completion should be accepted");
-
-    let request_model_context =
-        assert_single_request_model(session.drain_actions(), ActionId(3), TurnId(3));
-    assert_eq!(request_model_context, replacement);
-}
-
-#[test]
-fn requested_model_barrier_compaction_request_rechecks_auto_compaction_before_releasing_model() {
-    let mut session = session_with_compactable_history();
-    let auto_compaction = session.auto_compaction();
-    session.set_auto_compaction(None);
-    let tool_call = ToolCall {
-        id: ToolCallId(1),
-        tool_name: "read".to_string(),
-        args_json: "{}".to_string(),
-    };
-
-    session
-        .enqueue_input(AgentInput::follow_up("third user message"))
-        .expect("plain follow-up is valid");
-    session.drive();
-    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-
-    session.compact();
-    session.set_auto_compaction(auto_compaction);
-    session
-        .enqueue_input(AgentInput::ModelCompleted {
-            action_id: ActionId(1),
-            turn_id: TurnId(3),
-            assistant: AssistantMessage {
-                items: vec![AssistantItem::ToolCall(tool_call.clone())],
-            },
-        })
-        .expect("matching model completion is valid");
-    session.drive();
-    assert!(matches!(
-        session.drain_actions().as_slice(),
-        [SessionAction::RequestTool { .. }]
-    ));
-    session
-        .enqueue_input(AgentInput::ToolCompleted {
-            action_id: ActionId(2),
-            turn_id: TurnId(3),
-            result: ToolResultMessage {
-                tool_call_id: tool_call.id,
-                tool_name: tool_call.tool_name.clone(),
-                output: "ok".to_string(),
-                status: ToolResultStatus::Success,
-            },
-        })
-        .expect("matching tool completion is valid");
-    session.drive();
-
-    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
-    session
-        .enqueue_session_input(SessionInput::CompactionCompleted {
-            request_id,
-            replacement: compacted_open_context(
-                "manual summary that is still long enough to trigger auto",
-                3,
-                "third user message",
-            ),
-        })
-        .expect("requested compaction completion should be accepted");
-
-    let (auto_request_id, _) = assert_single_request_compaction(session.drain_actions());
-    let replacement = compacted_open_context("auto summary", 3, "third user message");
-    session
-        .enqueue_session_input(SessionInput::CompactionCompleted {
-            request_id: auto_request_id,
-            replacement: replacement.clone(),
-        })
-        .expect("auto compaction completion should be accepted");
 
     let request_model_context =
         assert_single_request_model(session.drain_actions(), ActionId(3), TurnId(3));
@@ -851,6 +1383,7 @@ fn failed_compaction_releases_model_request_without_editing_context() {
     session
         .enqueue_input(AgentInput::follow_up("third user message"))
         .expect("plain follow-up is valid");
+    session.compact();
     session.drive();
     let (request_id, before_failure) = assert_single_request_compaction(session.drain_actions());
 
@@ -875,11 +1408,12 @@ fn failed_compaction_releases_model_request_without_editing_context() {
 }
 
 #[test]
-fn stale_compaction_completion_does_not_unblock_pending_compaction() {
+fn stale_compaction_completion_does_not_finish_running_compaction() {
     let mut session = session_with_compactable_history();
     session
         .enqueue_input(AgentInput::follow_up("third user message"))
         .expect("plain follow-up is valid");
+    session.compact();
     session.drive();
     let (request_id, _) = assert_single_request_compaction(session.drain_actions());
 
@@ -887,6 +1421,7 @@ fn stale_compaction_completion_does_not_unblock_pending_compaction() {
         .enqueue_session_input(SessionInput::CompactionCompleted {
             request_id: CompactionRequestId(99),
             replacement: compacted_open_context("wrong", 3, "third user message"),
+            context_tokens: None,
         })
         .expect("stale compaction completion should be accepted and ignored");
     assert!(session.drain_actions().is_empty());
@@ -896,6 +1431,7 @@ fn stale_compaction_completion_does_not_unblock_pending_compaction() {
         .enqueue_session_input(SessionInput::CompactionCompleted {
             request_id,
             replacement: replacement.clone(),
+            context_tokens: None,
         })
         .expect("matching compaction completion should be accepted");
     let request_model_context =
@@ -909,6 +1445,7 @@ fn interrupt_during_compaction_request_cancels_session_work_and_ignores_late_com
     session
         .enqueue_input(AgentInput::follow_up("third user message"))
         .expect("plain follow-up is valid");
+    session.compact();
     session.drive();
     let (request_id, _) = assert_single_request_compaction(session.drain_actions());
 
@@ -932,6 +1469,7 @@ fn interrupt_during_compaction_request_cancels_session_work_and_ignores_late_com
         .enqueue_session_input(SessionInput::CompactionCompleted {
             request_id,
             replacement: compacted_open_context("late summary", 3, "third user message"),
+            context_tokens: None,
         })
         .expect("late compaction completion should be accepted and ignored");
     assert!(session.drain_actions().is_empty());
@@ -1120,6 +1658,55 @@ fn history_operation_interrupts_active_tool_work_before_applying() {
         .expect("late tool completion is valid but stale");
     session.drive();
     assert_eq!(session.model_context().transcript_items(), &[]);
+}
+
+#[test]
+fn mismatched_tool_completion_does_not_clear_live_tool_work() {
+    let mut session = AgentSession::new();
+    session
+        .enqueue_input(AgentInput::follow_up("go"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    session.drain_actions();
+
+    let tool_call = ToolCall {
+        id: ToolCallId(1),
+        tool_name: "bash".to_string(),
+        args_json: "{}".to_string(),
+    };
+    session
+        .enqueue_input(AgentInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call.clone())],
+            },
+        })
+        .expect("matching model completion is valid");
+    session.drive();
+    session.drain_actions();
+
+    session
+        .enqueue_input(AgentInput::ToolCompleted {
+            action_id: ActionId(2),
+            turn_id: TurnId(1),
+            result: ToolResultMessage {
+                tool_call_id: ToolCallId(99),
+                tool_name: tool_call.tool_name,
+                output: "misrouted".to_string(),
+                status: ToolResultStatus::Success,
+            },
+        })
+        .expect("well-formed but mismatched tool completion is valid");
+    session.drive();
+
+    session
+        .rewind(None)
+        .expect("edit should still cancel the real in-flight tool work");
+    assert_eq!(
+        session.drain_actions(),
+        vec![SessionAction::CancelSessionWork]
+    );
 }
 
 #[test]

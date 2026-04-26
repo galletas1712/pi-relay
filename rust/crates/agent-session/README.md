@@ -11,10 +11,12 @@ session. An `AgentSession` owns:
 - `AgentCoreLoop` — deterministic turn/tool state.
 - `TranscriptStore` — append-only forest of `TranscriptStorageNode`s with one
   active root-to-leaf path.
-- `ActionQueue` — private bookkeeping for model/tool requests that have been
-  exposed to the harness and have not completed yet.
+- `ExternalWork` — private bookkeeping for model/tool requests exposed to the
+  harness and completion events waiting for core acceptance.
+- Current context token count — optional harness-provided token count for the
+  active model-visible context.
 - Compaction request state — queued or pending remote compaction API work used
-  by manual compaction and auto-compaction.
+  by harness-requested compaction.
 - Action and event outboxes — ephemeral live outputs for the harness.
 
 `session.drive()` is the only supported way to advance the FSM. It runs the core
@@ -22,18 +24,19 @@ to quiescence and absorbs every freshly produced `TranscriptItem` into the
 store, which is the sole owner of durable model-visible history.
 
 `compact()` queues remote compaction for the next safe model-context barrier.
-The harness receives `SessionAction::RequestCompaction { model_context }`,
+The harness receives
+`SessionAction::RequestCompaction { request_id, model_context, context_leaf_id, context_tokens }`,
 calls the remote compaction API, and returns
-`SessionInput::CompactionCompleted { replacement }`. The session installs that
-replacement as a new active path in the transcript store. `rewind(leaf_id)` is
-the immediate history mutation: it validates the target first, may interrupt
-active work, then moves the active leaf and rehydrates the core. Queued user
-`Steer` / `FollowUp` inputs survive both paths. `fork(leaf_id)` creates a new
-session value rather than mutating the source.
+`SessionInput::CompactionCompleted { request_id, replacement, context_tokens }`.
+The session installs that replacement as a new active path in the transcript
+store. `rewind(leaf_id)` is the immediate history mutation: it validates the
+target first, may interrupt active work, then moves the active leaf and
+rehydrates the core. Queued user `Steer` / `FollowUp` inputs survive both paths.
+`fork(leaf_id)` creates a new session value rather than mutating the source.
 
 This crate does not own model calls, tool execution, cost tracking,
-spawn/report routing, or control-plane scheduling. Those live in the harness /
-`agent-orchestrator` and above.
+spawn/report routing, compaction budget policy, or control-plane scheduling.
+Those live in the harness / `agent-orchestrator` and above.
 
 ## Public Interface
 
@@ -50,9 +53,12 @@ All intended downstream imports are re-exported from `lib.rs`.
   sender/receiver pair for the runner.
 - `SessionAction` — model/tool actions, session-wide `CancelSessionWork`, and
   session-owned `RequestCompaction`. `RequestModel` and `RequestCompaction`
-  carry the model context snapshot visible when the request was made.
-- `SessionInput`, `SessionInputError` — core inputs plus compaction
-  completions/failures.
+  carry the model context snapshot visible when the request was made, the
+  transcript leaf that snapshot was materialized from, and the optional context
+  token count last supplied by the harness.
+- `SessionInput`, `SessionInputError` — core inputs, compaction requests,
+  model completions with an optional context token update, direct context token
+  updates, and compaction completions/failures.
 - `SessionEvent` — live-only activity such as transcript append, action
   requested/completed/failed, and history mutation events.
 - `SessionActionKind` — lightweight action event classifier.
@@ -67,8 +73,6 @@ All intended downstream imports are re-exported from `lib.rs`.
 
 **Compaction and rewind**
 
-- `AutoCompactionSettings` — optional threshold policy that queues compaction
-  when the model context is over budget at a model-context barrier.
 - `CompactionRequestId` — correlation id for remote compaction requests.
 - `HistoryOperationError` — `Busy` or `Store(TranscriptStoreError)`.
 
@@ -90,44 +94,68 @@ let SessionAction::RequestModel {
     action_id,
     turn_id,
     model_context,
+    ..
 } = &actions[0] else {
     unreachable!()
 };
 
 let provider_request = build_provider_request(model_context);
-session.enqueue_input(AgentInput::ModelCompleted {
+let provider_response = call_provider(provider_request).await?;
+session.enqueue_session_input(SessionInput::ModelCompleted {
     action_id: *action_id,
     turn_id: *turn_id,
-    assistant,
+    assistant: provider_response.assistant,
+    context_tokens: provider_response.context_tokens_after_response,
 })?;
 session.drive();
 ```
 
-`drive` records every visible `RequestModel` / `RequestTool` in the internal
-action queue before callers drain the observable action outbox. Matching
-`ModelCompleted`, `ModelFailed`, and `ToolCompleted` inputs clear those keys.
-`ModelFailed` closes the turn as `Crashed`. Interrupts and stale-work
-invalidation surface as `CancelSessionWork`, a best-effort, idempotent
-instruction for the harness to cancel all external work for this session.
+`drive` records every visible `RequestModel` / `RequestTool` in `ExternalWork`
+before callers drain the observable action outbox. Matching
+`ModelCompleted`, `ModelFailed`, and `ToolCompleted` inputs clear the matching
+pending work.
+Use `SessionInput::ModelCompleted` when the harness has a provider token count
+for the model-visible context after accepting the assistant response. Pass
+`None` if the provider only exposes numbers that cannot be mapped to that
+shape. The harness can also send
+`SessionInput::ContextTokensUpdated { context_leaf_id, context_tokens }` when
+it has computed the current context pressure outside a turn completion. The
+session applies that update only if `context_leaf_id` still matches the active
+transcript leaf, so late counts for older contexts are ignored. The lower-level
+`AgentInput::ModelCompleted` path still completes the core turn but does not
+update the session's token count.
+`ModelFailed` closes the turn as `Crashed`. Interrupts and stale-work invalidation
+surface as `CancelSessionWork`, a best-effort, idempotent instruction for the
+harness to cancel all external work for this session.
 
-With auto-compaction enabled, the threshold policy checks context size only when
-new model-context-producing work reaches a model barrier. If the context is over
-budget, the session queues compaction through the same path as `compact()`.
+`agent-session` does not decide when the context is over budget. The harness
+owns model metadata, thresholds, and auto-compaction policy. When the harness
+decides the session should compact, it calls `compact()` directly or enqueues
+`SessionInput::Compact` through an `AgentInputHandle`.
 When compaction starts, the session emits
-`SessionAction::RequestCompaction { request_id, model_context }`; the harness
-calls the remote compaction API and returns
-`SessionInput::CompactionCompleted { request_id, replacement }` or
+`SessionAction::RequestCompaction { request_id, model_context, context_leaf_id, context_tokens }`;
+the harness calls the remote compaction API and returns
+`SessionInput::CompactionCompleted { request_id, replacement, context_tokens }` or
 `SessionInput::CompactionFailed`. Success replaces the active path with the
-returned context, then releases any held `RequestModel`. Failure releases the
-held model request unchanged so the agent still makes progress. While
-compaction is pending, `drive()` does not consume queued `Steer` / `FollowUp`
-inputs.
+returned context, then releases any model request that was blocked at the
+compaction barrier. Failure releases the blocked model request unchanged so the
+agent still makes progress. While compaction is pending, `drive()` does not
+consume queued `Steer` / `FollowUp` inputs.
+
+Replacement context is validated before it is installed. Idle compaction must
+return a turn-boundary context with the same last turn id as the replaced active
+path. Model-barrier compaction must return an open context for the blocked model
+turn, with `last_turn_id` equal to that blocked `RequestModel` turn id, and it
+must preserve the already-appended open-turn suffix exactly. Invalid replacement
+is treated like compaction failure. In either shape, every assistant tool call
+already present in the replacement must have a matching tool result before the
+context can close the turn or continue the model.
 
 Restoring from transcript items or a transcript store is intentionally
 quiescent. Open transcript tails are recovered as crashed, the core is rebuilt
-idle at the recovered boundary, and auto-compaction is not started just because
-the restored context is already over budget. Auto-compaction is checked later
-when new input reaches a model-context barrier.
+idle at the recovered boundary, and compaction is not started just because the
+restored context may be over budget. The harness can feed a fresh token count
+and call `compact()` later.
 
 ## History Operations
 
@@ -136,6 +164,8 @@ session.compact();
 let SessionAction::RequestCompaction {
     request_id,
     model_context,
+    context_leaf_id,
+    ..
 } = &session.drain_actions()[0] else {
     unreachable!()
 };
@@ -143,6 +173,7 @@ let replacement = call_remote_compaction_api(model_context).await?;
 session.enqueue_session_input(SessionInput::CompactionCompleted {
     request_id: *request_id,
     replacement,
+    context_tokens: None,
 })?;
 
 session.rewind(Some(&leaf_id))?;
@@ -157,9 +188,12 @@ feeds back `CompactionCompleted`. The replacement is installed as a new active
 path in `TranscriptStore`; old nodes remain in the store for audit. Compaction
 can start while the session is idle at a turn boundary, or after the core emits
 `RequestModel` but before that action is exposed to the harness. In the latter
-case the session holds the model action, emits `RequestCompaction`, applies the
-replacement context, and only then exposes the original `RequestModel` with the
-updated `ModelContext`.
+case the session blocks the model action at the compaction barrier, emits
+`RequestCompaction`, applies the replacement context, and only then exposes the
+blocked `RequestModel` with the updated `ModelContext`. Once a `RequestModel`
+has been exposed to the harness, it is live external work; compaction can still
+be requested, but it waits for the next model-context barrier rather than
+rewriting that already-dispatched provider request.
 
 `rewind` is immediate. It validates the target boundary before cancellation or
 mutation, then invalidates live work, moves the leaf, and rehydrates the core.
@@ -171,13 +205,13 @@ mutation, then invalidates live work, moves the leaf, and rehydrates the core.
 | File | Contents |
 | --- | --- |
 | `src/lib.rs` | Module declarations and public re-exports. |
-| `src/action.rs` | `SessionAction`. |
+| `src/action.rs` | `SessionAction` and compaction request ids. |
+| `src/compaction_state.rs` | Private `Idle` / `Requested` / `Running` remote-compaction state. |
 | `src/input.rs` | `SessionInput`, `SessionInputError`. |
 | `src/event.rs` | Runtime-only `SessionEvent`, `SessionActionKind`. |
-| `src/compaction.rs` | Auto-compaction settings, request ids, and token estimation. |
+| `src/external_work.rs` | Private model/tool work tracking and delayed completion-event reconciliation. |
 | `src/session.rs` | `AgentSession`, drive/input/action lifecycle, remote compaction, rewind, restore rehydration. |
 | `src/session/tests.rs` | Session lifecycle tests. |
-| `src/action_queue.rs` | Private FIFO of visible in-flight model/tool actions. |
 | `src/model_context.rs` | `ModelContext` read-only view and crashed-tail recovery. |
 | `src/runner.rs` | `AgentRunner` async shell and input handle. |
 | `src/transcript_store/mod.rs` | Transcript forest, entry/parent/leaf indexes, materialization, boundary checks. |
@@ -188,16 +222,16 @@ mutation, then invalidates live work, moves the leaf, and rehydrates the core.
  AgentSession
   ├── core: AgentCoreLoop
   ├── transcript_store: TranscriptStore
-  ├── action_queue: ActionQueue
-  ├── compaction_request_queue: VecDeque<CompactionRequestSource>
-  ├── pending_compaction: Option<PendingCompaction>
+  ├── external_work: ExternalWork
+  ├── context_tokens: Option<usize>
+  ├── compaction: CompactionState
   ├── action_outbox: VecDeque<SessionAction>
   └── event_outbox: VecDeque<SessionEvent>
 
  drive()       ─► core.drive()
               ├► drain transcript items → append to transcript store
               └► drain actions → maybe start compaction → action outbox
- enqueue_input ─► validate → clear matching action_queue key → core.enqueue_input
+ enqueue_input ─► validate → clear matching pending work → core.enqueue_input
  compact()    ─► queue compaction → run at next model-context barrier
  rewind       ─► invalidate session work → move transcript leaf → rehydrate core
 ```
@@ -237,17 +271,27 @@ After the compaction API returns replacement context:
 ```
 
 The replacement path is whatever the harness maps back from the remote
-compaction API output.
+compaction API output, subject to the boundary/turn-id constraints described
+above.
 
-### ActionQueue
+### ExternalWork
 
-Private to the crate. `PendingActionKey { action_id, turn_id, kind }` lives in a
-`VecDeque`. `record_drained(&[AgentAction])` records visible `RequestModel` /
-`RequestTool` work. `record_input(&AgentInput)` removes the matching key on
-`ModelCompleted`, `ModelFailed`, or `ToolCompleted` and reports whether a live
-action was cleared. Stale completions are silent no-ops. History operations and
-interrupts do not wait on this queue; they clear it through session-wide
-invalidation and emit `CancelSessionWork` when external work may be live.
+Private to the crate. `ExternalWork` records visible `RequestModel` /
+`RequestTool` work as unresolved turn actions, removes the matching work when
+`ModelCompleted`, `ModelFailed`, or `ToolCompleted` arrives, and defers
+completion events until the core has accepted the completion and emitted the
+corresponding transcript items. Stale completions are silent no-ops. History
+operations and interrupts do not wait on external work; they clear it through
+session-wide invalidation and emit `CancelSessionWork` when external work may be
+live.
+
+### CompactionState
+
+Private to the session. `CompactionState` is `Idle`, `Requested`, or `Running`.
+`compact()` moves the state to `Requested`, and `drive()` starts a running remote
+compaction at the next safe model-context barrier. If compaction starts at a
+model barrier, the just-emitted `RequestModel` is blocked before dispatch and
+exposed only after compaction finishes or fails.
 
 ### AgentRunner
 

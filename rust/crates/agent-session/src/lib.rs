@@ -11,17 +11,16 @@
 #![forbid(unsafe_code)]
 
 mod action;
-mod action_queue;
-mod compaction;
+mod compaction_state;
 mod event;
+mod external_work;
 mod input;
 mod model_context;
 mod runner;
 mod session;
 mod transcript_store;
 
-pub use crate::action::SessionAction;
-pub use crate::compaction::{AutoCompactionSettings, CompactionRequestId};
+pub use crate::action::{CompactionRequestId, SessionAction};
 pub use crate::event::{SessionActionKind, SessionEvent};
 pub use crate::input::{SessionInput, SessionInputError};
 pub use crate::model_context::ModelContext;

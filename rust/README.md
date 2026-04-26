@@ -26,7 +26,7 @@ These crates land the session-layer abstractions: a pure deterministic FSM in
 thin composition struct in `agent-orchestrator`. Downstream work adds (in rough
 order): `SessionStore` (pluggable storage), `ControlPlane` (view/control split),
 event bus/subscriptions (observability), `ModelProvider`, `Tool`/`ToolRegistry`,
-`Compactor` (auto-compaction executor), `UsageLedger`, multi-agent tools
+compaction policy/execution, `UsageLedger`, multi-agent tools
 (spawn/report/idle), `AgentWorklogStore`, `PromptAssembly`, daemon +
 `RemoteControlPlane`, and distributed session processes. See the
 [architecture doc](docs/architecture.md) for the full sequencing.

@@ -184,7 +184,7 @@ All three are pure requests. `agent-core` never performs the underlying I/O and 
 
 - **No durable storage.** The core has no log, no database, no on-disk journal. `agent-session` owns the durable transcript store.
 - **No async runtime, no I/O.** No `tokio`, no `async fn`, no threads. Callers drive it synchronously; `agent-session`'s runner module wraps it for async use.
-- **No cost / usage / token accounting.** The core emits no usage numbers and does not inspect completions for cost. Metering lives above.
+- **No cost / usage / token accounting.** The core emits no usage numbers and does not inspect completions for cost. Session-level context-pressure accounting and higher-level cost metering live above.
 - **No tool execution.** `RequestTool` is a request; the caller runs the tool and feeds back a `ToolResultMessage`.
 - **No model provider abstraction.** The core does not know what a model is or how to call one; it just accepts `ModelCompleted { action_id, assistant, .. }` / `ModelFailed { action_id, error, .. }` and moves on.
 - **No multi-agent awareness or routing.** Inter-session routing, session registries, spawn/report semantics, and worklog triggers all live in `agent-orchestrator` / `agent-session`. The core's only concession to multi-agent existence is that `AgentInput::Steer` / `FollowUp` carry optional `from` / `kind` tags, which it propagates into injected transcript items opaquely.

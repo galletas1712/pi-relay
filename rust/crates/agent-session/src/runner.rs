@@ -36,6 +36,10 @@ impl AgentInputHandle {
             .unbounded_send(input)
             .map_err(|error| AgentInputHandleError::Closed(error.into_inner()))
     }
+
+    pub fn compact(&self) -> Result<(), AgentInputHandleError> {
+        self.enqueue_input(SessionInput::Compact)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -237,6 +241,7 @@ mod tests {
             action_id,
             turn_id,
             model_context,
+            ..
         } = &actions.borrow()[0]
         else {
             panic!("expected RequestModel action");
@@ -283,6 +288,7 @@ mod tests {
                     action_id,
                     turn_id,
                     model_context,
+                    ..
                 } = action
                 {
                     assert!(model_context.transcript_items().iter().any(

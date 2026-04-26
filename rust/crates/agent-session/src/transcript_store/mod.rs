@@ -179,6 +179,11 @@ impl TranscriptStore {
         &self,
         leaf_id: Option<&str>,
     ) -> Result<Self, TranscriptStoreError> {
+        if let Some(leaf_id) = leaf_id {
+            if !self.contains_entry(leaf_id) {
+                return Err(TranscriptStoreError::EntryNotFound);
+            }
+        }
         if !self.is_turn_boundary_leaf(leaf_id) {
             return Err(TranscriptStoreError::NotTurnBoundary);
         }

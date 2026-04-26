@@ -53,12 +53,110 @@ impl ModelContext {
             .unwrap_or_default()
     }
 
+    pub(crate) fn structural_error(&self) -> Option<String> {
+        let mut active_turn: Option<ActiveTurnValidation> = None;
+
+        for item in &self.items {
+            match item {
+                TranscriptItem::TurnStarted { turn_id } => {
+                    if active_turn.is_some() {
+                        return Some(format!(
+                            "turn {:?} starts before prior turn finished",
+                            turn_id
+                        ));
+                    }
+                    active_turn = Some(ActiveTurnValidation::new(*turn_id));
+                }
+                TranscriptItem::UserMessage(_) => {
+                    if active_turn.is_none() {
+                        return Some("user message appears outside a turn".to_string());
+                    }
+                }
+                TranscriptItem::Injected(_) => {}
+                TranscriptItem::AssistantMessage(message) => {
+                    let Some(turn) = active_turn.as_mut() else {
+                        return Some("assistant message appears outside a turn".to_string());
+                    };
+                    if turn.has_pending_tools() {
+                        return Some(
+                            "assistant message appears before prior tool calls completed"
+                                .to_string(),
+                        );
+                    }
+                    turn.awaiting_starts.extend(message.tool_calls().cloned());
+                }
+                TranscriptItem::ToolCallStarted { turn_id, tool_call } => {
+                    let Some(turn) = active_turn.as_mut() else {
+                        return Some("tool call starts outside a turn".to_string());
+                    };
+                    if turn.turn_id != *turn_id {
+                        return Some(format!(
+                            "tool call start turn {:?} does not match open turn {:?}",
+                            turn_id, turn.turn_id
+                        ));
+                    }
+                    let Some(index) = turn.awaiting_starts.iter().position(|pending| {
+                        pending.id == tool_call.id && pending.tool_name == tool_call.tool_name
+                    }) else {
+                        return Some(format!(
+                            "tool call {:?}/{} starts without a matching assistant tool call",
+                            tool_call.id, tool_call.tool_name
+                        ));
+                    };
+                    let tool_call = turn.awaiting_starts.remove(index);
+                    turn.awaiting_results.push(tool_call);
+                }
+                TranscriptItem::ToolResult(result) => {
+                    let Some(turn) = active_turn.as_mut() else {
+                        return Some("tool result appears outside a turn".to_string());
+                    };
+                    let Some(index) = turn.awaiting_results.iter().position(|pending| {
+                        pending.id == result.tool_call_id && pending.tool_name == result.tool_name
+                    }) else {
+                        return Some(format!(
+                            "tool result {:?}/{} has no matching started tool call",
+                            result.tool_call_id, result.tool_name
+                        ));
+                    };
+                    turn.awaiting_results.remove(index);
+                }
+                TranscriptItem::TurnFinished { turn_id, .. } => {
+                    let Some(turn) = active_turn.take() else {
+                        return Some("turn finished appears without an open turn".to_string());
+                    };
+                    if turn.turn_id != *turn_id {
+                        return Some(format!(
+                            "turn finish {:?} does not match open turn {:?}",
+                            turn_id, turn.turn_id
+                        ));
+                    }
+                    if turn.has_pending_tools() {
+                        return Some(
+                            "turn finished before assistant tool calls had matching results"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        if let Some(turn) = active_turn {
+            if turn.has_pending_tools() {
+                return Some(
+                    "open turn has assistant tool calls without matching results".to_string(),
+                );
+            }
+        }
+
+        None
+    }
+
     fn patch_crashed_tail(items: &mut Vec<TranscriptItem>) {
         let Some((turn_id, tail_start)) = Self::open_tail_turn(items) else {
             return;
         };
 
-        Self::patch_missing_tool_results(items, tail_start);
+        Self::patch_missing_tool_results(items, tail_start, turn_id);
         items.push(TranscriptItem::TurnFinished {
             turn_id,
             outcome: TurnOutcome::Crashed,
@@ -84,8 +182,13 @@ impl ModelContext {
             .flatten()
     }
 
-    fn patch_missing_tool_results(items: &mut Vec<TranscriptItem>, tail_start: usize) {
+    fn patch_missing_tool_results(
+        items: &mut Vec<TranscriptItem>,
+        tail_start: usize,
+        turn_id: TurnId,
+    ) {
         let mut tool_calls = Vec::new();
+        let mut started_tool_calls = Vec::new();
         let mut completed_tool_calls = Vec::new();
 
         for item in &items[tail_start..] {
@@ -93,44 +196,67 @@ impl ModelContext {
                 TranscriptItem::AssistantMessage(message) => {
                     tool_calls.extend(message.tool_calls().cloned());
                 }
+                TranscriptItem::ToolCallStarted { tool_call, .. } => {
+                    started_tool_calls.push((tool_call.id, tool_call.tool_name.clone()));
+                }
                 TranscriptItem::ToolResult(result) => {
                     completed_tool_calls.push((result.tool_call_id, result.tool_name.clone()));
                 }
                 TranscriptItem::TurnStarted { .. }
                 | TranscriptItem::UserMessage(_)
-                | TranscriptItem::ToolCallStarted { .. }
                 | TranscriptItem::TurnFinished { .. }
                 | TranscriptItem::Injected(_) => {}
             }
         }
 
-        for tool_call in Self::missing_tool_calls(tool_calls, completed_tool_calls) {
-            items.push(TranscriptItem::ToolResult(ToolResultMessage::crashed(
-                tool_call.id,
-                tool_call.tool_name,
-            )));
+        for tool_call in tool_calls {
+            if !Self::remove_matching_tool_call(&mut started_tool_calls, &tool_call) {
+                items.push(TranscriptItem::ToolCallStarted {
+                    turn_id,
+                    tool_call: tool_call.clone(),
+                });
+            }
+            if !Self::remove_matching_tool_call(&mut completed_tool_calls, &tool_call) {
+                items.push(TranscriptItem::ToolResult(ToolResultMessage::crashed(
+                    tool_call.id,
+                    tool_call.tool_name,
+                )));
+            }
         }
     }
 
-    fn missing_tool_calls(
-        tool_calls: Vec<ToolCall>,
-        mut completed_tool_calls: Vec<(ToolCallId, String)>,
-    ) -> Vec<ToolCall> {
-        let mut missing = Vec::new();
+    fn remove_matching_tool_call(
+        tool_calls: &mut Vec<(ToolCallId, String)>,
+        tool_call: &ToolCall,
+    ) -> bool {
+        let Some(index) = tool_calls
+            .iter()
+            .position(|(id, name)| *id == tool_call.id && name == &tool_call.tool_name)
+        else {
+            return false;
+        };
+        tool_calls.remove(index);
+        true
+    }
+}
 
-        for tool_call in tool_calls {
-            let Some(completed_index) = completed_tool_calls
-                .iter()
-                .position(|(id, name)| *id == tool_call.id && name == &tool_call.tool_name)
-            else {
-                missing.push(tool_call);
-                continue;
-            };
+struct ActiveTurnValidation {
+    turn_id: TurnId,
+    awaiting_starts: Vec<ToolCall>,
+    awaiting_results: Vec<ToolCall>,
+}
 
-            completed_tool_calls.remove(completed_index);
+impl ActiveTurnValidation {
+    fn new(turn_id: TurnId) -> Self {
+        Self {
+            turn_id,
+            awaiting_starts: Vec::new(),
+            awaiting_results: Vec::new(),
         }
+    }
 
-        missing
+    fn has_pending_tools(&self) -> bool {
+        !self.awaiting_starts.is_empty() || !self.awaiting_results.is_empty()
     }
 }
 
@@ -234,14 +360,54 @@ mod tests {
 
         assert_eq!(
             transcript.transcript_items()[3],
-            TranscriptItem::ToolResult(ToolResultMessage::crashed(tool_call.id, "bash"))
+            TranscriptItem::ToolCallStarted {
+                turn_id: TurnId(8),
+                tool_call: tool_call.clone(),
+            }
         );
         assert_eq!(
             transcript.transcript_items()[4],
+            TranscriptItem::ToolResult(ToolResultMessage::crashed(tool_call.id, "bash"))
+        );
+        assert_eq!(
+            transcript.transcript_items()[5],
             TranscriptItem::TurnFinished {
                 turn_id: TurnId(8),
                 outcome: TurnOutcome::Crashed,
             }
         );
+    }
+
+    #[test]
+    fn detects_structurally_invalid_tool_sequences() {
+        let tool_call = tool_call(1, "bash");
+        let missing_result = ModelContext::from_transcript_items(vec![
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call.clone())],
+            }),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+        ]);
+        assert!(missing_result.structural_error().is_some());
+
+        let complete = ModelContext::from_transcript_items(vec![
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call.clone())],
+            }),
+            TranscriptItem::ToolCallStarted {
+                turn_id: TurnId(1),
+                tool_call: tool_call.clone(),
+            },
+            TranscriptItem::ToolResult(tool_result(tool_call.id.0, &tool_call.tool_name)),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+        ]);
+        assert_eq!(complete.structural_error(), None);
     }
 }
