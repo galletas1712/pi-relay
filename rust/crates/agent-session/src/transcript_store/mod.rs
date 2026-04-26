@@ -6,12 +6,6 @@ use uuid::Uuid;
 
 use crate::model_context::ModelContext;
 
-pub(crate) mod compaction;
-
-pub use self::compaction::{
-    compaction_summary, CompactionPlan, CompactionSettings, KIND_COMPACTION_SUMMARY,
-};
-
 /// Durable transcript storage node holding one model-visible transcript item.
 ///
 /// Entries form a forest: each entry has at most one parent, while a parent may
@@ -143,6 +137,11 @@ impl TranscriptStore {
         self.append_transcript_item(TranscriptItem::Injected(injected))
     }
 
+    pub(crate) fn replace_active_path(&mut self, model_context: &ModelContext) {
+        self.reset_leaf();
+        self.append_transcript_items(model_context.transcript_items().iter().cloned());
+    }
+
     pub fn branch_at_turn_boundary(&mut self, entry_id: &str) -> Result<(), TranscriptStoreError> {
         if !self.contains_entry(entry_id) {
             return Err(TranscriptStoreError::EntryNotFound);
@@ -195,9 +194,7 @@ impl TranscriptStore {
 
     /// Materialize the active branch into a `ModelContext`.
     ///
-    /// Compaction rebuilds the active branch in model-visible order: prefix
-    /// before the compacted span, the summary item, then copies of the kept
-    /// suffix. Materialization is therefore always the full active path.
+    /// Materialize the full active path in model-visible order.
     pub fn model_context(&self) -> ModelContext {
         let path = self.branch_entries(None);
         let items = path.into_iter().map(|entry| entry.item).collect();
@@ -245,9 +242,7 @@ impl TranscriptStore {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TranscriptStoreError {
     EntryNotFound,
-    InvalidSpan,
     NotTurnBoundary,
-    StalePlan,
 }
 
 fn now_ms() -> u128 {
@@ -260,7 +255,6 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript_store::compaction_summary;
     use agent_core::{AssistantItem, AssistantMessage, InjectedMessage, TurnId, TurnOutcome};
 
     fn turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptItem> {
@@ -326,8 +320,8 @@ mod tests {
 
     #[test]
     fn transcript_materializes_the_full_active_branch_after_a_summary() {
-        // Simulate compaction manually at the store level: append two turns,
-        // navigate back to the T1 boundary, append a summary there, then
+        // Simulate a replacement branch manually at the store level: append two
+        // turns, navigate back to the T1 boundary, append a summary there, then
         // re-append T2's items as descendants. The active branch is now
         // [T1 items..., summary, T2 items...], and the materialized view is
         // that full active path.
@@ -341,11 +335,10 @@ mod tests {
 
         ctx.branch_at_turn_boundary(&first_ids[3])
             .expect("T1 boundary is a valid fork point");
-        ctx.append_injected(compaction_summary("summary", second_ids[0].clone(), 100));
+        ctx.append_injected(InjectedMessage::new("compaction", "summary"));
         ctx.append_transcript_items(kept_items);
 
         let transcript = ctx.model_context();
-        assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
         assert_eq!(transcript.last_turn_id(), TurnId(2));
         assert!(matches!(
             transcript.transcript_items()[4],

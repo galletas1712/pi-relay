@@ -1,7 +1,5 @@
 use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptItem, TurnId, TurnOutcome};
 
-use crate::transcript_store::KIND_COMPACTION_SUMMARY;
-
 /// Materialized model context for one transcript path.
 ///
 /// The transcript store is canonical; `ModelContext` is a derived view over a
@@ -45,18 +43,6 @@ impl ModelContext {
             }
         }
         true
-    }
-
-    /// Latest compaction summary on the transcript, if any. Returns the
-    /// `content` string of the closest `TranscriptItem::Injected` with the
-    /// well-known `compaction_summary` kind.
-    pub fn latest_compaction_summary(&self) -> Option<&str> {
-        self.items.iter().rev().find_map(|item| match item {
-            TranscriptItem::Injected(cm) if cm.kind == KIND_COMPACTION_SUMMARY => {
-                Some(cm.content.as_str())
-            }
-            _ => None,
-        })
     }
 
     pub fn last_turn_id(&self) -> TurnId {
@@ -157,7 +143,6 @@ impl From<Vec<TranscriptItem>> for ModelContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transcript_store::compaction_summary;
     use agent_core::{AssistantItem, AssistantMessage, InjectedMessage, ToolResultStatus};
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
@@ -191,11 +176,10 @@ mod tests {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
-            TranscriptItem::Injected(compaction_summary("summary", "some_id", 100)),
+            TranscriptItem::Injected(InjectedMessage::new("compaction", "summary")),
             TranscriptItem::Injected(InjectedMessage::new("note", "branch note")),
         ]);
         assert!(transcript.is_turn_boundary());
-        assert_eq!(transcript.latest_compaction_summary(), Some("summary"));
     }
 
     #[test]

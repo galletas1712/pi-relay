@@ -193,12 +193,12 @@ Already landed in PR #62 + #63 refactors.
 
 Landed in PR #63 and hardened in PR #64.
 
-- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore`. The session is the sole owner of durable transcript items for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `enqueue_session_input`, `request_compaction`, `compact`, `rewind`, `fork`, `last_turn_id`, `model_context`, `transcript_store`, `drain_actions`, `drain_events`, and `drain_pending_inputs`.
-- **Immediate history operations** — `compact(plan, summary)` and `rewind(leaf)` validate their operation-specific preconditions before invalidating work. `compact` applies only to a plan that still matches the current transcript at a turn boundary. `rewind` validates the requested target first, then may interrupt active work before moving the leaf. Successful mutations preserve queued `Steer` / `FollowUp` inputs and rehydrate the core from the new `ModelContext`.
-- **Scheduled compaction** — `request_compaction(settings)` may be called while the session is busy. The session resolves it only when idle at a turn boundary or while holding a just-emitted `RequestModel` before exposing that action to the harness. Auto-compaction is one producer of the same compaction queue, not a separate mutation path.
+- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore`. The session is the sole owner of durable transcript items for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `enqueue_session_input`, `compact`, `rewind`, `fork`, `last_turn_id`, `model_context`, `transcript_store`, `drain_actions`, `drain_events`, and `drain_pending_inputs`.
+- **Remote compaction** — `compact()` may be called while the session is busy. The session resolves it only when idle at a turn boundary or while holding a just-emitted `RequestModel` before exposing that action to the harness. It emits `RequestCompaction { model_context }`; the harness calls the remote compaction API and feeds back a replacement `ModelContext` with `CompactionCompleted`.
+- **Immediate history operations** — `rewind(leaf)` validates the requested target before invalidating work, then may interrupt active work before moving the leaf. Successful mutations preserve queued `Steer` / `FollowUp` inputs and rehydrate the core from the new `ModelContext`.
 - **`TranscriptStore`** — session-local forest of `TranscriptStorageNode`s with entry/parent/child/leaf indexes plus an active leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
 - **`ModelContext`** — materialized view of the current root-to-leaf path's transcript items. Live model contexts preserve open turns; resume paths explicitly crash-recover any open tail.
-- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, model_context }` includes the model-context snapshot visible when the model request was made; `RequestTool` carries the tool payload; `RequestModelStateless` is used for scheduled compaction. `CancelSessionWork` is a best-effort session-wide invalidation barrier: the harness should cancel every outstanding model/tool/stateless request for that session and treat late completions as stale.
+- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, model_context }` includes the model-context snapshot visible when the model request was made; `RequestTool` carries the tool payload; `RequestCompaction { request_id, model_context }` asks the harness to call the remote compaction API. `CancelSessionWork` is a best-effort session-wide invalidation barrier: the harness should cancel every outstanding model/tool/compaction request for that session and treat late completions as stale.
 - **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans `SessionAction`s to the handler. Transcript items auto-flow into the log; the runner does not expose them directly.
 - **Future `SessionStore` trait** — pluggable durable storage. Planned defaults are `JsonlFileSessionStore` for disk and `InMemorySessionStore` for tests, swappable for `SqliteSessionStore` later.
 
@@ -236,7 +236,7 @@ Partially landed as a placeholder; real shape below.
 
 - **`ModelProvider` trait** — `async fn complete(request: ModelRequest) -> ModelCompletion`. Each SDK gets an adapter crate (`agent-model-anthropic`, `agent-model-openai`).
 - **`Tool` trait + `ToolRegistry`** — `trait Tool { async fn execute(args, ctx) -> ToolResult }`. Built-ins live in `agent-tools-builtin` (one file per tool). Extension-provided tools register through the same registry.
-- **`Compactor`** — wraps a `ModelProvider` to summarize a `CompactionPlan`.
+- **Compaction executor** — maps `RequestCompaction` to the remote compaction API and maps the returned history back into `ModelContext`.
 - **`AgentWorklogStore` trait** — per-agent side-store. Default file-backed impl (`{worklog_root}/{agent_id}.worklog`).
 - **`UsageLedger` trait** — receives `UsageRecorded` events, aggregates, supports per-agent / per-tree queries.
 
@@ -306,13 +306,11 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 ### Compaction
 
-**Status**: data model and scheduled compaction lifecycle landed; provider executor pending.
+**Status**: session lifecycle landed; remote compaction API executor pending.
 
-- `session.transcript_store().prepare_compaction(settings)` produces a `CompactionPlan` for prefix compaction.
-- `Compactor::summarize(plan)` calls a `ModelProvider` to generate the summary string.
-- `session.compact(plan, summary)` applies a plan that still matches the current transcript at a turn boundary.
-- `session.request_compaction(settings)` schedules compaction for the next safe model-context barrier. If the barrier is a just-emitted `RequestModel`, the session holds that model action, emits `RequestModelStateless`, applies the returned text summary, and then exposes the held `RequestModel` with the updated `ModelContext`.
-- Auto-compaction uses the same compaction queue: the threshold policy checks the context only when new work reaches a `RequestModel` barrier, queues compaction if over budget, and lets the normal request lifecycle drive the stateless summary request. Restoring an over-budget session stays quiescent; it does not start compaction until later input reaches a model barrier.
+- `session.compact()` schedules compaction for the next safe model-context barrier. If the barrier is a just-emitted `RequestModel`, the session holds that model action, emits `RequestCompaction`, applies the returned replacement context, and then exposes the held `RequestModel` with the updated `ModelContext`.
+- The harness/provider layer calls the remote compaction API, equivalent to Codex's `/responses/compact`, using the supplied `ModelContext`.
+- Auto-compaction uses the same compaction queue: the threshold policy checks the context only when new work reaches a `RequestModel` barrier, queues compaction if over budget, and lets the normal request lifecycle drive the remote compaction request. Restoring an over-budget session stays quiescent; it does not start compaction until later input reaches a model barrier.
 
 ### Rewind
 
@@ -395,13 +393,13 @@ Each row is one landable PR. Later PRs depend on their predecessors.
 | # | PR | What it adds | Unlocks |
 |---|---|---|---|
 | 1 | **#63 foundation** | `agent-session`, `agent-orchestrator` crates + transcript-item/model-context unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
-| 2 | Session hardening | session-wide cancellation + model failure path + action snapshots + simpler `compact` / `rewind` / `request_compaction` APIs + `SessionRegistry<S>` | clean target for registry-level features |
+| 2 | Session hardening | session-wide cancellation + model failure path + action snapshots + remote `compact()` request API + `rewind` + `SessionRegistry<S>` | clean target for registry-level features |
 | 3 | `SessionStore` | trait + in-memory + JSONL-file impls + wire into `AgentSession` | durable restart; resume-from-file; pluggable backends |
 | 4 | `ControlPlane` trait | trait definition + `LocalControlPlane` impl + view-layer adapter | view/control separation; future daemon |
 | 5 | `SessionEvent` stream | event bus + subscription on `AgentSession`; durable events mirror log writes | observers (TUI, ledger, idle watcher) |
 | 6 | `ModelProvider` trait | trait + Anthropic adapter + `UsageContext` + retry wrapper | actual model calls; compaction executor; worklog fork model |
 | 7 | `Tool` + `ToolRegistry` | trait + built-in tool pack (bash/read/write/edit/grep/find/ls) | tool execution; spawn/report/worklog tools |
-| 8 | `Compactor` executor | summarize `RequestModelStateless` compaction requests via `ModelProvider`; wire provider completions back into scheduled compaction | production-grade context management |
+| 8 | Remote compaction executor | call `/responses/compact` for `RequestCompaction`; map replacement history back into `ModelContext` | production-grade context management |
 | 9 | `UsageLedger` | trait + in-memory impl + roll-up queries | cost observability; TUI footer |
 | 10 | Spawn + report + agent_idle | `SpawnTool`, `ReportTool`, idle-watcher in orchestrator; new injected-message kind constants | multi-agent operation |
 | 11 | `AgentWorklogStore` + worklog fork | trait + file-backed impl + `WorklogUpdateTool` + orchestrator worklog scheduler | per-agent durable knowledge; ancestor worklog injection for spawned sub-agents |
@@ -423,11 +421,11 @@ These are documented here so the PRs that implement them stick to the intended s
 
 ### Compaction Runs Through One Session Queue
 
-Compaction has two drivers. Immediate manual operations use `session.compact(plan, summary)`, which first validates that the plan still matches the current transcript at a turn boundary, then applies it. Scheduled compaction uses `session.request_compaction(settings)` and runs at the next safe model-context barrier. A safe barrier is either an idle turn boundary or the moment after the core emits `RequestModel` but before the session exposes that model action to the harness. An undrained `CancelSessionWork` does not block scheduled compaction; new requests queue behind it.
+Compaction has two drivers: explicit `session.compact()` and auto-compaction. Both run through one session queue and start at the next safe model-context barrier. A safe barrier is either an idle turn boundary or the moment after the core emits `RequestModel` but before the session exposes that model action to the harness. An undrained `CancelSessionWork` does not block compaction; new requests queue behind it.
 
-While a compaction request is pending, the session holds normal turn advancement: queued `Steer` / `FollowUp` inputs remain in the mailbox, and a held `RequestModel` is not exposed until the stateless summary request finishes or fails. A successful request validates the plan fingerprint, applies the same compaction operation, and then releases the held model action with the updated `ModelContext`. Failure releases the held model action unchanged so the agent still makes progress.
+While a compaction request is pending, the session holds normal turn advancement: queued `Steer` / `FollowUp` inputs remain in the mailbox, and a held `RequestModel` is not exposed until the remote compaction request finishes or fails. A successful request replaces the active model context with the API-provided replacement and then releases the held model action with the updated `ModelContext`. Failure releases the held model action unchanged so the agent still makes progress.
 
-This closes the liveness hole where repeated appends during an async summarize call starve the compaction plan's staleness fingerprint, without making auto-compaction a separate history mutation primitive. Auto-compaction is simply the threshold-based producer of queued compaction.
+Auto-compaction is simply the threshold-based producer of queued compaction.
 
 **Parents can compact while children are still running.** Children are separate sessions with separate logs; a parent's compaction has no effect on any descendant.
 
@@ -449,7 +447,7 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 7. Non-goals
 
-- No support for history mutations that cut through turn internals. `compact` requires a current turn boundary and a fresh plan; `rewind` may interrupt active work after validating that the target is a boundary. Scheduled compaction can also run at a pre-model safe barrier, and the open suffix is replayed after the summary. `AgentSession::fork` is not a mutation of the source session; it can copy any requested leaf that is already a turn boundary, even if the source session is currently busy elsewhere.
+- No support for history mutations that cut through turn internals. `rewind` may interrupt active work after validating that the target is a boundary. Remote compaction can run at an idle boundary or a pre-model safe barrier, replacing the active model context with API output. `AgentSession::fork` is not a mutation of the source session; it can copy any requested leaf that is already a turn boundary, even if the source session is currently busy elsewhere.
 - No speculative abstraction for "hooks" that don't have concrete use cases. When extensions land, their API grows out of what concrete consumers need, not ahead of them.
 - No speculative support for non-Anthropic-shaped providers beyond what `ModelProvider` naturally allows. Any provider that fits `messages + tools → assistant with tool_calls` works; we don't pre-bake support for genuinely different paradigms (e.g. step-wise agent protocols) until we have one.
 - No back-compat with the TS session format *as a byte format* — the JSONL backend may use the same layout for cross-implementation convenience, but we don't pin wire-format compatibility as a hard constraint.
@@ -459,7 +457,7 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 8. Principles in tension (explicit trade-offs)
 
-**Clean boundaries vs. API ergonomics.** Earlier designs exposed generic span replacement and model-context replacement as public history-edit operations. PR #64 collapses that surface to the two operations with real consumers: `compact(plan, summary)` and `rewind(leaf)`. Fresh context injection is handled by constructors, not by editing a live session.
+**Clean boundaries vs. API ergonomics.** Earlier designs exposed generic span replacement and local summary splicing as public history-edit operations. PR #64 collapses that surface to remote `compact()` and `rewind(leaf)`. Fresh context injection is handled by constructors, not by editing a live session.
 
 **Distributed-ready API vs. sync simplicity.** `ControlPlane` is async + fallible even when called in-process. Paying this for day-1 local use to keep daemon-day migration trivial.
 

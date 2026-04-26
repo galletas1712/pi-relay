@@ -188,5 +188,5 @@ All three are pure requests. `agent-core` never performs the underlying I/O and 
 - **No tool execution.** `RequestTool` is a request; the caller runs the tool and feeds back a `ToolResultMessage`.
 - **No model provider abstraction.** The core does not know what a model is or how to call one; it just accepts `ModelCompleted { action_id, assistant, .. }` / `ModelFailed { action_id, error, .. }` and moves on.
 - **No multi-agent awareness or routing.** Inter-session routing, session registries, spawn/report semantics, and worklog triggers all live in `agent-orchestrator` / `agent-session`. The core's only concession to multi-agent existence is that `AgentInput::Steer` / `FollowUp` carry optional `from` / `kind` tags, which it propagates into injected transcript items opaquely.
-- **No knowledge of specific injected-message kinds.** Kind strings like `compaction_summary` are defined in the session layer, not here.
+- **No knowledge of specific injected-message kinds.** Kind strings for routed reports, directives, compaction output, or other injected context are defined above the core.
 - **No provider/workspace ID allocation.** The core mints `TurnId` and `ActionId` only. `ToolCallId` values arrive from outside via the `ToolCall` structs the model produced; the core does not mint them.

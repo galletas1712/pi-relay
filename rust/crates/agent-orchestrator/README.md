@@ -147,7 +147,7 @@ The TypeScript counterpart (`packages/orchestrator/src/orchestrator.ts::deliverM
 
 ## Relationship to other crates
 
-- **`agent-session`** (direct dep): the registry's default session type is `AgentSession`. Routing calls `AgentSession::enqueue_input` to deliver inputs; it never reaches into `TranscriptStore` directly. History operations (`compact`, `rewind`, `request_compaction`, `fork`) stay on `AgentSession` and are invoked by callers through `registry_mut().get_mut(id)`.
+- **`agent-session`** (direct dep): the registry's default session type is `AgentSession`. Routing calls `AgentSession::enqueue_input` to deliver inputs; it never reaches into `TranscriptStore` directly. Compaction, rewind, and fork stay on `AgentSession` and are invoked by callers through `registry_mut().get_mut(id)`.
 - **`agent-core`** (direct dep, transitively via session): the FSM types `AgentInput::Steer` and `AgentInput::FollowUp` carry `from: Option<String>` and `kind: Option<String>`. Tagged inputs become `TranscriptItem::Injected` entries when consumed; the invariant `from.is_some() == kind.is_some()` is enforced by the `AgentInput::steer_tagged` / `follow_up_tagged` constructors that this crate uses.
 
 See `rust/docs/architecture.md` for the full crate stack and PR sequencing.

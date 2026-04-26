@@ -131,9 +131,7 @@ impl AgentOrchestrator {
 mod tests {
     use super::*;
     use agent_core::{AgentInput, AssistantMessage, TranscriptItem, TurnId, TurnOutcome};
-    use agent_session::{
-        CompactionSettings, HistoryOperationError, ModelContext, TranscriptStoreError,
-    };
+    use agent_session::{HistoryOperationError, ModelContext, SessionAction, TranscriptStoreError};
 
     #[test]
     fn orchestrator_routes_input_to_sessions() {
@@ -223,30 +221,20 @@ mod tests {
             Some(&"root".to_string())
         );
 
-        let plan = orchestrator
-            .registry()
-            .get("root")
-            .expect("session should exist")
-            .transcript_store()
-            .prepare_compaction(CompactionSettings {
-                keep_recent_tokens: 1,
-            })
-            .expect("old turn should be compactable");
         orchestrator
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .compact(plan, "summary")
-            .expect("root can compact at turn boundary");
-        assert_eq!(
+            .compact();
+        assert!(matches!(
             orchestrator
-                .registry()
-                .get("root")
+                .registry_mut()
+                .get_mut("root")
                 .expect("root should exist")
-                .model_context()
-                .latest_compaction_summary(),
-            Some("summary")
-        );
+                .drain_actions()
+                .as_slice(),
+            [SessionAction::RequestCompaction { .. }]
+        ));
     }
 
     fn orchestrator_with_parent_and_child() -> AgentOrchestrator {

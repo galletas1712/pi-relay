@@ -33,5 +33,5 @@ pub enum SessionEvent {
 pub enum SessionActionKind {
     Model,
     Tool,
-    ModelStateless,
+    Compaction,
 }

@@ -2,15 +2,13 @@ use std::collections::VecDeque;
 
 use agent_core::{AgentAction, AgentCoreLoop, AgentInput, AgentInputError, TranscriptItem, TurnId};
 
-use crate::action::{SessionAction, StatelessModelRequestId};
+use crate::action::SessionAction;
 use crate::action_queue::ActionQueue;
-use crate::auto_compaction::{self, AutoCompactionSettings};
+use crate::compaction::{self, AutoCompactionSettings, CompactionRequestId};
 use crate::event::{SessionActionKind, SessionEvent};
 use crate::input::{SessionInput, SessionInputError};
 use crate::model_context::ModelContext;
-use crate::transcript_store::{
-    CompactionPlan, CompactionSettings, TranscriptStore, TranscriptStoreError,
-};
+use crate::transcript_store::{TranscriptStore, TranscriptStoreError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryOperationError {
@@ -18,15 +16,15 @@ pub enum HistoryOperationError {
     /// is mid-turn and there is no active core turn that can be interrupted to
     /// close it.
     Busy,
-    /// An underlying transcript-store error: entry not found, invalid summary
-    /// span, not at a turn boundary, or a stale edit plan.
+    /// An underlying transcript-store error: entry not found or not at a turn
+    /// boundary.
     Store(TranscriptStoreError),
 }
 
 /// Session shell around the pure core loop.
 ///
 /// `agent-core` owns deterministic state transitions. `agent-session` owns the
-/// point at which the session's history can be safely replaced, forked,
+/// point at which the session's history can be safely compacted, forked,
 /// rewound, or resumed after consulting external model/tool work. The
 /// `TranscriptStore` is the sole owner of durable transcript items; the core
 /// only buffers items produced in the current run until the session absorbs
@@ -39,9 +37,9 @@ pub struct AgentSession {
     action_outbox: VecDeque<SessionAction>,
     event_outbox: VecDeque<SessionEvent>,
     auto_compaction: Option<AutoCompactionSettings>,
-    compaction_request_queue: VecDeque<QueuedCompactionRequest>,
+    compaction_request_queue: VecDeque<CompactionRequestSource>,
     pending_compaction: Option<PendingCompaction>,
-    next_stateless_model_request_id: StatelessModelRequestId,
+    next_compaction_request_id: CompactionRequestId,
 }
 
 impl Default for AgentSession {
@@ -61,7 +59,7 @@ impl AgentSession {
             auto_compaction: None,
             compaction_request_queue: VecDeque::new(),
             pending_compaction: None,
-            next_stateless_model_request_id: StatelessModelRequestId::first(),
+            next_compaction_request_id: CompactionRequestId::first(),
         }
     }
 
@@ -78,41 +76,16 @@ impl AgentSession {
         self.auto_compaction
     }
 
-    /// Queue a compaction request for the next safe model-context barrier.
+    /// Queue a remote compaction request for the next safe model-context barrier.
     ///
     /// The request may be made while the session is busy. The session starts it
     /// when idle at a turn boundary, or when the core has requested a model
     /// call that has not yet been exposed to the harness. Auto-compaction uses
     /// the same queue.
-    pub fn request_compaction(&mut self, settings: CompactionSettings) {
+    pub fn compact(&mut self) {
         self.compaction_request_queue
-            .push_back(QueuedCompactionRequest {
-                settings,
-                source: CompactionRequestSource::Requested,
-            });
+            .push_back(CompactionRequestSource::Requested);
         self.maybe_start_idle_compaction_request();
-    }
-
-    /// Apply a compaction plan immediately.
-    ///
-    /// The plan must match the current transcript shape and the current leaf
-    /// must already be at a turn boundary. For compaction while a model request
-    /// is being started, use `request_compaction` so the session can hold the
-    /// model request at the barrier.
-    pub fn compact(
-        &mut self,
-        plan: CompactionPlan,
-        summary: impl Into<String>,
-    ) -> Result<(), HistoryOperationError> {
-        let summary = summary.into();
-        self.transcript_store
-            .validate_plan_matches(&plan)
-            .map_err(HistoryOperationError::Store)?;
-        self.apply_history_operation(SessionEvent::HistoryCompacted, |store| {
-            store
-                .apply_compaction(plan, summary)
-                .map_err(HistoryOperationError::Store)
-        })
     }
 
     /// Rewind the active transcript path to a prior turn boundary.
@@ -172,7 +145,7 @@ impl AgentSession {
             auto_compaction: None,
             compaction_request_queue: VecDeque::new(),
             pending_compaction: None,
-            next_stateless_model_request_id: StatelessModelRequestId::first(),
+            next_compaction_request_id: CompactionRequestId::first(),
         }
     }
 
@@ -196,7 +169,7 @@ impl AgentSession {
             auto_compaction: None,
             compaction_request_queue: VecDeque::new(),
             pending_compaction: None,
-            next_stateless_model_request_id: StatelessModelRequestId::first(),
+            next_compaction_request_id: CompactionRequestId::first(),
         })
     }
 
@@ -224,12 +197,15 @@ impl AgentSession {
             SessionInput::Agent(input) => self
                 .enqueue_agent_input(input)
                 .map_err(SessionInputError::Agent),
-            SessionInput::ModelStatelessCompleted { request_id, text } => {
-                self.complete_stateless_model(request_id, text);
+            SessionInput::CompactionCompleted {
+                request_id,
+                replacement,
+            } => {
+                self.complete_compaction_request(request_id, replacement);
                 Ok(())
             }
-            SessionInput::ModelStatelessFailed { request_id, error } => {
-                self.fail_stateless_model(request_id, error);
+            SessionInput::CompactionFailed { request_id, error } => {
+                self.fail_compaction_request(request_id, error);
                 Ok(())
             }
         }
@@ -264,9 +240,6 @@ impl AgentSession {
 
     /// Materialized view of the session history derived from the transcript
     /// store.
-    /// With a compaction present, the latest summary is inlined ahead of the
-    /// kept suffix so downstream callers see a single ordered transcript-item
-    /// stream.
     pub fn model_context(&self) -> ModelContext {
         self.transcript_store.model_context()
     }
@@ -369,8 +342,8 @@ impl AgentSession {
     /// `leaf_id` (or the root when `None`). The source session is unchanged;
     /// the caller is responsible for registering the fork if desired.
     ///
-    /// Fork is separate from `compact` / `rewind` because it reads the context
-    /// and produces a new session rather than mutating the source in place.
+    /// Fork is separate from `rewind` because it reads the context and produces
+    /// a new session rather than mutating the source in place.
     pub fn fork(&self, leaf_id: Option<&str>) -> Result<AgentSession, HistoryOperationError> {
         let transcript_store = self
             .transcript_store
@@ -432,21 +405,16 @@ impl AgentSession {
             || self
                 .compaction_request_queue
                 .iter()
-                .any(|queued| queued.source == CompactionRequestSource::Auto)
+                .any(|source| *source == CompactionRequestSource::Auto)
         {
             return;
         }
-        if auto_compaction::prepare_auto_compaction(&self.transcript_store, settings).is_none() {
+        if !compaction::should_auto_compact(&self.transcript_store.model_context(), settings) {
             return;
         }
 
         self.compaction_request_queue
-            .push_back(QueuedCompactionRequest {
-                settings: CompactionSettings {
-                    keep_recent_tokens: settings.keep_recent_tokens,
-                },
-                source: CompactionRequestSource::Auto,
-            });
+            .push_back(CompactionRequestSource::Auto);
     }
 
     fn maybe_start_idle_compaction_request(&mut self) {
@@ -471,11 +439,12 @@ impl AgentSession {
         }
 
         let mut held_action = held_action;
-        while let Some(queued) = self.compaction_request_queue.pop_front() {
-            let Some(plan) = self.transcript_store.prepare_compaction(queued.settings) else {
+        while let Some(source) = self.compaction_request_queue.pop_front() {
+            let model_context = self.transcript_store.model_context();
+            if model_context.transcript_items().is_empty() {
                 continue;
-            };
-            self.start_compaction_request(plan, held_action.take(), queued.source);
+            }
+            self.start_compaction_request(model_context, held_action.take(), source);
             return true;
         }
         false
@@ -483,22 +452,19 @@ impl AgentSession {
 
     fn start_compaction_request(
         &mut self,
-        plan: CompactionPlan,
+        model_context: ModelContext,
         held_action: Option<AgentAction>,
         source: CompactionRequestSource,
     ) {
-        let request_id =
-            StatelessModelRequestId::take_next(&mut self.next_stateless_model_request_id);
-        let request = auto_compaction::compaction_request(&plan);
+        let request_id = CompactionRequestId::take_next(&mut self.next_compaction_request_id);
         self.pending_compaction = Some(PendingCompaction {
             request_id,
-            plan,
             held_action,
             source,
         });
-        self.push_session_action(SessionAction::RequestModelStateless {
+        self.push_session_action(SessionAction::RequestCompaction {
             request_id,
-            request,
+            model_context,
         });
     }
 
@@ -532,25 +498,22 @@ impl AgentSession {
         self.action_outbox.push_back(action);
     }
 
-    fn complete_stateless_model(&mut self, request_id: StatelessModelRequestId, summary: String) {
+    fn complete_compaction_request(
+        &mut self,
+        request_id: CompactionRequestId,
+        replacement: ModelContext,
+    ) {
         let Some(pending) = self.take_matching_pending_compaction(request_id) else {
             return;
         };
 
         self.event_outbox.push_back(SessionEvent::ActionCompleted {
-            kind: SessionActionKind::ModelStateless,
+            kind: SessionActionKind::Compaction,
             id: request_id.0.to_string(),
         });
 
-        if let Err(error) = self.apply_compaction_request(pending.plan, summary) {
-            self.event_outbox.push_back(SessionEvent::ActionFailed {
-                kind: SessionActionKind::ModelStateless,
-                id: request_id.0.to_string(),
-                error: format!("{error:?}"),
-            });
-        } else {
-            self.event_outbox.push_back(SessionEvent::HistoryCompacted);
-        }
+        self.apply_compaction_replacement(replacement);
+        self.event_outbox.push_back(SessionEvent::HistoryCompacted);
         if let Some(held_action) = pending.held_action {
             self.release_held_action_after_compaction_request(
                 held_action,
@@ -561,12 +524,12 @@ impl AgentSession {
         }
     }
 
-    fn fail_stateless_model(&mut self, request_id: StatelessModelRequestId, error: String) {
+    fn fail_compaction_request(&mut self, request_id: CompactionRequestId, error: String) {
         let Some(pending) = self.take_matching_pending_compaction(request_id) else {
             return;
         };
         self.event_outbox.push_back(SessionEvent::ActionFailed {
-            kind: SessionActionKind::ModelStateless,
+            kind: SessionActionKind::Compaction,
             id: request_id.0.to_string(),
             error,
         });
@@ -596,7 +559,7 @@ impl AgentSession {
 
     fn take_matching_pending_compaction(
         &mut self,
-        request_id: StatelessModelRequestId,
+        request_id: CompactionRequestId,
     ) -> Option<PendingCompaction> {
         if self
             .pending_compaction
@@ -606,7 +569,7 @@ impl AgentSession {
             self.action_outbox.retain(|action| {
                 !matches!(
                     action,
-                    SessionAction::RequestModelStateless {
+                    SessionAction::RequestCompaction {
                         request_id: queued_request_id,
                         ..
                     } if *queued_request_id == request_id
@@ -617,17 +580,8 @@ impl AgentSession {
         None
     }
 
-    fn apply_compaction_request(
-        &mut self,
-        plan: CompactionPlan,
-        summary: String,
-    ) -> Result<(), HistoryOperationError> {
-        self.transcript_store
-            .validate_plan_fingerprint(&plan)
-            .map_err(HistoryOperationError::Store)?;
-        self.transcript_store
-            .apply_compaction(plan, summary)
-            .map_err(HistoryOperationError::Store)
+    fn apply_compaction_replacement(&mut self, replacement: ModelContext) {
+        self.transcript_store.replace_active_path(&replacement);
     }
 
     fn invalidate_session_work(&mut self, invalidation_reason: &str) {
@@ -635,7 +589,7 @@ impl AgentSession {
             self.push_session_action(SessionAction::CancelSessionWork);
         }
         self.compaction_request_queue
-            .retain(|queued| queued.source != CompactionRequestSource::Auto);
+            .retain(|source| *source != CompactionRequestSource::Auto);
     }
 
     fn clear_stale_session_work(&mut self, invalidation_reason: &str) -> bool {
@@ -656,7 +610,7 @@ impl AgentSession {
             return;
         };
         self.event_outbox.push_back(SessionEvent::ActionFailed {
-            kind: SessionActionKind::ModelStateless,
+            kind: SessionActionKind::Compaction,
             id: pending.request_id.0.to_string(),
             error: error.to_string(),
         });
@@ -750,12 +704,6 @@ impl AgentSession {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct QueuedCompactionRequest {
-    settings: CompactionSettings,
-    source: CompactionRequestSource,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactionRequestSource {
     Requested,
@@ -764,8 +712,7 @@ enum CompactionRequestSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PendingCompaction {
-    request_id: StatelessModelRequestId,
-    plan: CompactionPlan,
+    request_id: CompactionRequestId,
     held_action: Option<AgentAction>,
     source: CompactionRequestSource,
 }
@@ -775,7 +722,7 @@ fn is_start_action(action: &SessionAction) -> bool {
         action,
         SessionAction::RequestModel { .. }
             | SessionAction::RequestTool { .. }
-            | SessionAction::RequestModelStateless { .. }
+            | SessionAction::RequestCompaction { .. }
     )
 }
 

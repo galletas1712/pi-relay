@@ -1,17 +1,17 @@
 use agent_core::{ActionId, ToolCall, TurnId};
 
-use crate::auto_compaction::StatelessModelRequest;
+use crate::compaction::CompactionRequestId;
 use crate::model_context::ModelContext;
 
 /// Session-level work requested by `AgentSession`.
 ///
 /// Model/tool actions are produced by `agent-core` and surfaced here with the
-/// same correlation ids. Stateless model work is owned by the session layer and
-/// bypasses the turn FSM while still flowing through the same action/completion
-/// boundary.
+/// same correlation ids. Compaction work asks the harness to call the remote
+/// compaction API with the supplied model-context snapshot and return a
+/// replacement context.
 ///
 /// `CancelSessionWork` is a session-wide invalidation barrier. A harness should
-/// treat every outstanding model, tool, or stateless request for this session as
+/// treat every outstanding model, tool, or compaction request for this session as
 /// stale and cancel it if possible. The action is idempotent and best-effort:
 /// late completions can still race in, and the session ignores them.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,23 +27,8 @@ pub enum SessionAction {
         tool_call: ToolCall,
     },
     CancelSessionWork,
-    RequestModelStateless {
-        request_id: StatelessModelRequestId,
-        request: StatelessModelRequest,
+    RequestCompaction {
+        request_id: CompactionRequestId,
+        model_context: ModelContext,
     },
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct StatelessModelRequestId(pub u64);
-
-impl StatelessModelRequestId {
-    pub fn first() -> Self {
-        Self(1)
-    }
-
-    pub fn take_next(next: &mut Self) -> Self {
-        let current = *next;
-        next.0 += 1;
-        current
-    }
 }

@@ -1,5 +1,4 @@
 use super::*;
-use crate::transcript_store::{compaction_summary, CompactionSettings};
 use agent_core::{
     ActionId, AssistantItem, AssistantMessage, InjectedMessage, ToolCall, ToolCallId,
     ToolResultMessage, ToolResultStatus, TurnId, TurnOutcome,
@@ -65,7 +64,43 @@ fn session_with_compactable_history() -> AgentSession {
         "second assistant message with enough text to count",
     ));
     AgentSession::from_model_context(ModelContext::from_transcript_items(items))
-        .with_auto_compaction(AutoCompactionSettings::new(1, 1))
+        .with_auto_compaction(AutoCompactionSettings::new(1))
+}
+
+fn compacted_boundary_context(summary: &str, last_turn_id: u64) -> ModelContext {
+    ModelContext::from_transcript_items(vec![
+        TranscriptItem::TurnStarted {
+            turn_id: TurnId(last_turn_id),
+        },
+        TranscriptItem::Injected(InjectedMessage::new("compaction", summary)),
+        TranscriptItem::TurnFinished {
+            turn_id: TurnId(last_turn_id),
+            outcome: TurnOutcome::Graceful,
+        },
+    ])
+}
+
+fn compacted_open_context(summary: &str, turn_id: u64, user: &str) -> ModelContext {
+    ModelContext::from_transcript_items(vec![
+        TranscriptItem::Injected(InjectedMessage::new("compaction", summary)),
+        TranscriptItem::TurnStarted {
+            turn_id: TurnId(turn_id),
+        },
+        TranscriptItem::UserMessage(user.to_string()),
+    ])
+}
+
+fn assert_single_request_compaction(
+    actions: Vec<SessionAction>,
+) -> (CompactionRequestId, ModelContext) {
+    let [SessionAction::RequestCompaction {
+        request_id,
+        model_context,
+    }] = actions.as_slice()
+    else {
+        panic!("expected one RequestCompaction action, got {actions:?}");
+    };
+    (*request_id, model_context.clone())
 }
 
 #[test]
@@ -137,70 +172,6 @@ fn fork_can_copy_a_boundary_path_while_source_session_is_running() {
             turn_id: TurnId(1),
             outcome: TurnOutcome::Graceful,
         })
-    ));
-}
-
-#[test]
-fn compact_method_applies_compaction_plan() {
-    let mut session = AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
-        TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-        TranscriptItem::UserMessage("first".to_string()),
-        TranscriptItem::AssistantMessage(AssistantMessage {
-            items: vec![AssistantItem::Text("ok".to_string())],
-        }),
-        TranscriptItem::TurnFinished {
-            turn_id: TurnId(1),
-            outcome: TurnOutcome::Graceful,
-        },
-        TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-        TranscriptItem::UserMessage("second".to_string()),
-        TranscriptItem::AssistantMessage(AssistantMessage {
-            items: vec![AssistantItem::Text("ok2".to_string())],
-        }),
-        TranscriptItem::TurnFinished {
-            turn_id: TurnId(2),
-            outcome: TurnOutcome::Graceful,
-        },
-    ]));
-
-    let plan = session
-        .transcript_store()
-        .prepare_compaction(CompactionSettings {
-            keep_recent_tokens: 1,
-        })
-        .expect("old turn should be compactable");
-    session.compact(plan, "s").expect("compact should apply");
-    assert_eq!(
-        session.model_context().latest_compaction_summary(),
-        Some("s")
-    );
-}
-
-#[test]
-fn compact_rejects_active_turn_plan_without_canceling_work() {
-    let mut session = session_with_compactable_history();
-    session.set_auto_compaction(None);
-    session
-        .enqueue_input(AgentInput::follow_up("third user message"))
-        .expect("plain follow-up is valid");
-    session.drive();
-
-    let plan = session
-        .transcript_store()
-        .prepare_compaction(CompactionSettings {
-            keep_recent_tokens: 1,
-        })
-        .expect("open suffix can still be planned for scheduled compaction");
-    assert_eq!(
-        session.compact(plan, "summary"),
-        Err(HistoryOperationError::Store(
-            TranscriptStoreError::NotTurnBoundary
-        ))
-    );
-
-    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-    assert!(session.model_context().transcript_items().iter().any(
-        |item| matches!(item, TranscriptItem::UserMessage(text) if text == "third user message")
     ));
 }
 
@@ -423,7 +394,7 @@ fn restore_remains_quiescent_until_new_input_reaches_a_model_barrier() {
     ));
 
     let mut session = AgentSession::from_transcript_items(items)
-        .with_auto_compaction(AutoCompactionSettings::new(1, 1));
+        .with_auto_compaction(AutoCompactionSettings::new(1));
 
     assert!(session.drain_actions().is_empty());
     assert!(matches!(
@@ -440,7 +411,7 @@ fn restore_remains_quiescent_until_new_input_reaches_a_model_barrier() {
     session.drive();
     assert!(matches!(
         session.drain_actions().as_slice(),
-        [SessionAction::RequestModelStateless { .. }]
+        [SessionAction::RequestCompaction { .. }]
     ));
 }
 
@@ -536,31 +507,20 @@ fn model_failure_marks_turn_crashed_and_unblocks_history_operations() {
 }
 
 #[test]
-fn auto_compaction_requests_stateless_model_before_releasing_model_request() {
+fn auto_compaction_requests_remote_compaction_before_releasing_model_request() {
     let mut session = session_with_compactable_history();
     session
         .enqueue_input(AgentInput::follow_up("third user message"))
         .expect("plain follow-up is valid");
     session.drive();
 
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModelStateless {
-        request_id,
-        request,
-    }] = actions.as_slice()
-    else {
-        panic!("expected stateless model compaction request, got {actions:?}");
-    };
-    assert!(request.input.iter().any(|block| {
-        matches!(
-            block,
-            crate::auto_compaction::ModelContentBlock::Text { text }
-                if text.contains("first user message")
-        )
-    }));
-    assert_eq!(session.model_context().latest_compaction_summary(), None);
+    let (request_id, compaction_context) =
+        assert_single_request_compaction(session.drain_actions());
+    assert!(compaction_context.transcript_items().iter().any(
+        |item| matches!(item, TranscriptItem::UserMessage(text) if text.contains("first user message"))
+    ));
     assert!(matches!(
-        session.model_context().transcript_items().last(),
+        compaction_context.transcript_items().last(),
         Some(TranscriptItem::UserMessage(text)) if text == "third user message"
     ));
 
@@ -575,41 +535,28 @@ fn auto_compaction_requests_stateless_model_before_releasing_model_request() {
     assert!(events.iter().any(|event| matches!(
         event,
         SessionEvent::ActionRequested {
-            action: SessionAction::RequestModelStateless { .. }
-        }
-    )));
-    assert!(!events.iter().any(|event| matches!(
-        event,
-        SessionEvent::TranscriptItemAppended {
-            item: TranscriptItem::Injected(_),
-            ..
+            action: SessionAction::RequestCompaction { .. }
         }
     )));
 
+    let replacement = compacted_open_context("summary text", 3, "third user message");
     session
-        .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-            request_id: *request_id,
-            text: "summary text".to_string(),
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: replacement.clone(),
         })
-        .expect("stateless model completion should be accepted");
+        .expect("compaction completion should be accepted");
 
     let request_model_context =
         assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
+    assert_eq!(request_model_context, replacement);
     assert_eq!(request_model_context, session.model_context());
-    assert_eq!(
-        session.model_context().latest_compaction_summary(),
-        Some("summary text")
-    );
-    assert!(matches!(
-        session.model_context().transcript_items().last(),
-        Some(TranscriptItem::UserMessage(text)) if text == "third user message"
-    ));
 
     let events = session.drain_events();
     assert!(events.iter().any(|event| matches!(
         event,
         SessionEvent::ActionCompleted {
-            kind: SessionActionKind::ModelStateless,
+            kind: SessionActionKind::Compaction,
             ..
         }
     )));
@@ -633,27 +580,19 @@ fn requested_compaction_can_run_while_idle() {
     let mut session = session_with_compactable_history();
     session.set_auto_compaction(None);
 
-    session.request_compaction(CompactionSettings {
-        keep_recent_tokens: 1,
-    });
+    session.compact();
 
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-        panic!("expected stateless model compaction request, got {actions:?}");
-    };
-
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
+    let replacement = compacted_boundary_context("manual summary", 2);
     session
-        .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-            request_id: *request_id,
-            text: "manual summary".to_string(),
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: replacement.clone(),
         })
-        .expect("stateless model completion should be accepted");
+        .expect("compaction completion should be accepted");
 
     assert!(session.drain_actions().is_empty());
-    assert_eq!(
-        session.model_context().latest_compaction_summary(),
-        Some("manual summary")
-    );
+    assert_eq!(session.model_context(), replacement);
 }
 
 #[test]
@@ -672,16 +611,14 @@ fn requested_compaction_request_can_start_behind_undrained_cancel_session_work()
         .expect("interrupt is valid");
     session.drive();
 
-    session.request_compaction(CompactionSettings {
-        keep_recent_tokens: 1,
-    });
+    session.compact();
 
     let actions = session.drain_actions();
     assert!(matches!(
         actions.as_slice(),
         [
             SessionAction::CancelSessionWork,
-            SessionAction::RequestModelStateless { .. }
+            SessionAction::RequestCompaction { .. }
         ]
     ));
 }
@@ -691,13 +628,8 @@ fn pending_idle_compaction_request_blocks_new_turns_until_it_completes() {
     let mut session = session_with_compactable_history();
     session.set_auto_compaction(None);
 
-    session.request_compaction(CompactionSettings {
-        keep_recent_tokens: 1,
-    });
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-        panic!("expected stateless model compaction request, got {actions:?}");
-    };
+    session.compact();
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
 
     session
         .enqueue_input(AgentInput::follow_up("third user message"))
@@ -707,20 +639,17 @@ fn pending_idle_compaction_request_blocks_new_turns_until_it_completes() {
     assert!(session.drain_actions().is_empty());
 
     session
-        .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-            request_id: *request_id,
-            text: "manual summary".to_string(),
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: compacted_boundary_context("manual summary", 2),
         })
-        .expect("stateless model completion should be accepted");
+        .expect("compaction completion should be accepted");
     session.drive();
 
-    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-    assert_eq!(
-        session.model_context().latest_compaction_summary(),
-        Some("manual summary")
-    );
+    let request_context =
+        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
     assert!(matches!(
-        session.model_context().transcript_items().last(),
+        request_context.transcript_items().last(),
         Some(TranscriptItem::UserMessage(text)) if text == "third user message"
     ));
 }
@@ -730,13 +659,8 @@ fn queued_steer_and_follow_up_survive_idle_compaction_request() {
     let mut session = session_with_compactable_history();
     session.set_auto_compaction(None);
 
-    session.request_compaction(CompactionSettings {
-        keep_recent_tokens: 1,
-    });
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-        panic!("expected stateless model compaction request, got {actions:?}");
-    };
+    session.compact();
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
 
     session
         .enqueue_input(AgentInput::follow_up("normal queued work"))
@@ -749,11 +673,11 @@ fn queued_steer_and_follow_up_survive_idle_compaction_request() {
     assert!(session.drain_actions().is_empty());
 
     session
-        .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-            request_id: *request_id,
-            text: "compaction request summary".to_string(),
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: compacted_boundary_context("compaction request summary", 2),
         })
-        .expect("stateless model completion should be accepted");
+        .expect("compaction completion should be accepted");
     session.drive();
 
     let first_request_context =
@@ -796,9 +720,7 @@ fn requested_compaction_waits_for_next_model_context_barrier() {
     session.drive();
     assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
 
-    session.request_compaction(CompactionSettings {
-        keep_recent_tokens: 1,
-    });
+    session.compact();
     assert!(session.drain_actions().is_empty());
 
     session
@@ -836,46 +758,18 @@ fn requested_compaction_waits_for_next_model_context_barrier() {
         .expect("matching tool completion is valid");
     session.drive();
 
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-        panic!("expected stateless model compaction request, got {actions:?}");
-    };
-    assert_eq!(session.model_context().latest_compaction_summary(), None);
-
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
+    let replacement = compacted_open_context("barrier summary", 3, "third user message");
     session
-        .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-            request_id: *request_id,
-            text: "barrier summary".to_string(),
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: replacement.clone(),
         })
-        .expect("stateless model completion should be accepted");
+        .expect("compaction completion should be accepted");
 
     let request_model_context =
         assert_single_request_model(session.drain_actions(), ActionId(3), TurnId(3));
-    assert_eq!(request_model_context, session.model_context());
-    assert_eq!(
-        request_model_context.latest_compaction_summary(),
-        Some("barrier summary")
-    );
-}
-
-#[test]
-fn requested_compaction_request_without_a_plan_does_not_bypass_auto_compaction() {
-    let mut session = session_with_compactable_history();
-
-    session.request_compaction(CompactionSettings {
-        keep_recent_tokens: usize::MAX,
-    });
-    session
-        .enqueue_input(AgentInput::follow_up("third user message"))
-        .expect("plain follow-up is valid");
-    session.drive();
-
-    let actions = session.drain_actions();
-    assert!(matches!(
-        actions.as_slice(),
-        [SessionAction::RequestModelStateless { .. }]
-    ));
-    assert_eq!(session.model_context().latest_compaction_summary(), None);
+    assert_eq!(request_model_context, replacement);
 }
 
 #[test]
@@ -895,9 +789,7 @@ fn requested_model_barrier_compaction_request_rechecks_auto_compaction_before_re
     session.drive();
     assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
 
-    session.request_compaction(CompactionSettings {
-        keep_recent_tokens: 30,
-    });
+    session.compact();
     session.set_auto_compaction(auto_compaction);
     session
         .enqueue_input(AgentInput::ModelCompleted {
@@ -909,9 +801,8 @@ fn requested_model_barrier_compaction_request_rechecks_auto_compaction_before_re
         })
         .expect("matching model completion is valid");
     session.drive();
-    let actions = session.drain_actions();
     assert!(matches!(
-        actions.as_slice(),
+        session.drain_actions().as_slice(),
         [SessionAction::RequestTool { .. }]
     ));
     session
@@ -928,124 +819,98 @@ fn requested_model_barrier_compaction_request_rechecks_auto_compaction_before_re
         .expect("matching tool completion is valid");
     session.drive();
 
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-        panic!("expected requested compaction first, got {actions:?}");
-    };
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
     session
-        .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-            request_id: *request_id,
-            text: "manual summary".to_string(),
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: compacted_open_context(
+                "manual summary that is still long enough to trigger auto",
+                3,
+                "third user message",
+            ),
         })
         .expect("requested compaction completion should be accepted");
 
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModelStateless {
-        request_id: auto_request_id,
-        ..
-    }] = actions.as_slice()
-    else {
-        panic!("expected auto-compaction recheck before RequestModel, got {actions:?}");
-    };
+    let (auto_request_id, _) = assert_single_request_compaction(session.drain_actions());
+    let replacement = compacted_open_context("auto summary", 3, "third user message");
     session
-        .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-            request_id: *auto_request_id,
-            text: "auto summary".to_string(),
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id: auto_request_id,
+            replacement: replacement.clone(),
         })
         .expect("auto compaction completion should be accepted");
 
     let request_model_context =
         assert_single_request_model(session.drain_actions(), ActionId(3), TurnId(3));
-    assert_eq!(request_model_context, session.model_context());
-    assert_eq!(
-        request_model_context.latest_compaction_summary(),
-        Some("auto summary")
-    );
+    assert_eq!(request_model_context, replacement);
 }
 
 #[test]
-fn failed_stateless_model_compaction_releases_model_request_without_editing_context() {
+fn failed_compaction_releases_model_request_without_editing_context() {
     let mut session = session_with_compactable_history();
     session
         .enqueue_input(AgentInput::follow_up("third user message"))
         .expect("plain follow-up is valid");
     session.drive();
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-        panic!("expected stateless model compaction request, got {actions:?}");
-    };
+    let (request_id, before_failure) = assert_single_request_compaction(session.drain_actions());
 
     session
-        .enqueue_session_input(SessionInput::ModelStatelessFailed {
-            request_id: *request_id,
-            error: "no summary".to_string(),
+        .enqueue_session_input(SessionInput::CompactionFailed {
+            request_id,
+            error: "compact failed".to_string(),
         })
-        .expect("stateless model failure should be accepted");
+        .expect("compaction failure should be accepted");
 
     let request_model_context =
         assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
-    assert_eq!(request_model_context, session.model_context());
-    assert_eq!(session.model_context().latest_compaction_summary(), None);
+    assert_eq!(request_model_context, before_failure);
     assert!(session.drain_events().iter().any(|event| matches!(
         event,
         SessionEvent::ActionFailed {
-            kind: SessionActionKind::ModelStateless,
+            kind: SessionActionKind::Compaction,
             error,
             ..
-        } if error == "no summary"
+        } if error == "compact failed"
     )));
 }
 
 #[test]
-fn stale_stateless_model_completion_does_not_unblock_pending_compaction() {
+fn stale_compaction_completion_does_not_unblock_pending_compaction() {
     let mut session = session_with_compactable_history();
     session
         .enqueue_input(AgentInput::follow_up("third user message"))
         .expect("plain follow-up is valid");
     session.drive();
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-        panic!("expected stateless model compaction request, got {actions:?}");
-    };
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
 
     session
-        .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-            request_id: StatelessModelRequestId(99),
-            text: "wrong".to_string(),
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id: CompactionRequestId(99),
+            replacement: compacted_open_context("wrong", 3, "third user message"),
         })
-        .expect("stale stateless model completion should be accepted and ignored");
+        .expect("stale compaction completion should be accepted and ignored");
     assert!(session.drain_actions().is_empty());
-    assert_eq!(session.model_context().latest_compaction_summary(), None);
 
+    let replacement = compacted_open_context("right", 3, "third user message");
     session
-        .enqueue_session_input(SessionInput::ModelStatelessCompleted {
-            request_id: *request_id,
-            text: "right".to_string(),
+        .enqueue_session_input(SessionInput::CompactionCompleted {
+            request_id,
+            replacement: replacement.clone(),
         })
-        .expect("matching stateless model completion should be accepted");
-    assert!(matches!(
-        session.drain_actions().as_slice(),
-        [SessionAction::RequestModel { .. }]
-    ));
-    assert_eq!(
-        session.model_context().latest_compaction_summary(),
-        Some("right")
-    );
+        .expect("matching compaction completion should be accepted");
+    let request_model_context =
+        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(3));
+    assert_eq!(request_model_context, replacement);
 }
 
 #[test]
-fn interrupt_during_stateless_compaction_request_cancels_session_work_and_ignores_late_completion()
-{
+fn interrupt_during_compaction_request_cancels_session_work_and_ignores_late_completion() {
     let mut session = session_with_compactable_history();
     session
         .enqueue_input(AgentInput::follow_up("third user message"))
         .expect("plain follow-up is valid");
     session.drive();
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModelStateless { request_id, .. }] = actions.as_slice() else {
-        panic!("expected stateless model compaction request, got {actions:?}");
-    };
-    let request_id = *request_id;
+    let (request_id, _) = assert_single_request_compaction(session.drain_actions());
 
     session
         .enqueue_input(AgentInput::Interrupt)
@@ -1057,21 +922,19 @@ fn interrupt_during_stateless_compaction_request_cancels_session_work_and_ignore
     assert!(session.drain_events().iter().any(|event| matches!(
         event,
         SessionEvent::ActionFailed {
-            kind: SessionActionKind::ModelStateless,
+            kind: SessionActionKind::Compaction,
             error,
             ..
         } if error == "interrupted"
     )));
-    assert_eq!(session.model_context().latest_compaction_summary(), None);
 
     session
-        .enqueue_session_input(SessionInput::ModelStatelessCompleted {
+        .enqueue_session_input(SessionInput::CompactionCompleted {
             request_id,
-            text: "late summary".to_string(),
+            replacement: compacted_open_context("late summary", 3, "third user message"),
         })
-        .expect("late stateless model completion should be accepted and ignored");
+        .expect("late compaction completion should be accepted and ignored");
     assert!(session.drain_actions().is_empty());
-    assert_eq!(session.model_context().latest_compaction_summary(), None);
 }
 
 #[test]
@@ -1276,7 +1139,7 @@ fn rewind_accepts_injected_tail_at_turn_boundary() {
         .append_injected(InjectedMessage::new("note", "a"));
     session
         .transcript_store
-        .append_injected(compaction_summary("b", "does-not-matter", 0));
+        .append_injected(InjectedMessage::new("compaction", "b"));
     session
         .transcript_store
         .append_injected(InjectedMessage::new("note", "c"));

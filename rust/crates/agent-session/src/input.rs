@@ -2,21 +2,22 @@ use std::fmt;
 
 use agent_core::{AgentInput, AgentInputError};
 
-use crate::action::StatelessModelRequestId;
+use crate::compaction::CompactionRequestId;
+use crate::model_context::ModelContext;
 
 /// External input to a live `AgentSession`.
 ///
-/// Core inputs continue to feed the turn FSM. Stateless model completions feed
-/// scheduled compaction requests.
+/// Core inputs continue to feed the turn FSM. Compaction completions replace
+/// the active model context with output returned by the remote compaction API.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionInput {
     Agent(AgentInput),
-    ModelStatelessCompleted {
-        request_id: StatelessModelRequestId,
-        text: String,
+    CompactionCompleted {
+        request_id: CompactionRequestId,
+        replacement: ModelContext,
     },
-    ModelStatelessFailed {
-        request_id: StatelessModelRequestId,
+    CompactionFailed {
+        request_id: CompactionRequestId,
         error: String,
     },
 }
@@ -31,7 +32,7 @@ impl SessionInput {
     pub fn validate(&self) -> Result<(), SessionInputError> {
         match self {
             Self::Agent(input) => input.validate().map_err(SessionInputError::Agent),
-            Self::ModelStatelessCompleted { .. } | Self::ModelStatelessFailed { .. } => Ok(()),
+            Self::CompactionCompleted { .. } | Self::CompactionFailed { .. } => Ok(()),
         }
     }
 }
