@@ -1,10 +1,9 @@
 //! RPC-shaped per-session host for headless harnesses and future control planes.
 //!
 //! This crate deliberately starts with the smallest useful boundary: typed
-//! request/response frames around one `AgentSession`, plus a synchronous
-//! headless runner for tests. Transport is intentionally absent here. Stdio,
-//! TCP, WebSocket, or a process supervisor can serialize these frames later
-//! without changing session semantics.
+//! request/response frames around one `AgentSession`. Transport is
+//! intentionally absent here. Stdio, TCP, WebSocket, or a process supervisor
+//! can serialize these frames later without changing session semantics.
 
 #![forbid(unsafe_code)]
 
@@ -61,16 +60,12 @@ pub struct SessionStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionRpcError {
     InvalidInput(String),
-    Handler(String),
-    NotQuiescent(String),
 }
 
 impl fmt::Display for SessionRpcError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidInput(error) => write!(f, "invalid session input: {error}"),
-            Self::Handler(error) => write!(f, "headless action handler failed: {error}"),
-            Self::NotQuiescent(error) => write!(f, "session is not quiescent: {error}"),
         }
     }
 }
@@ -96,10 +91,6 @@ impl SessionRpcHost {
 
     pub fn from_session(session: AgentSession) -> Self {
         Self { session }
-    }
-
-    pub fn session(&self) -> &AgentSession {
-        &self.session
     }
 
     pub fn handle(
@@ -144,98 +135,6 @@ impl SessionRpcHost {
     }
 }
 
-/// A deterministic headless action handler used by tests and future CLI smoke
-/// checks. Real harnesses will execute actions asynchronously over RPC; this
-/// trait keeps the first end-to-end path synchronous and tiny.
-pub trait HeadlessActionHandler {
-    fn handle_action(
-        &mut self,
-        action: SessionAction,
-    ) -> Result<Vec<SessionInput>, SessionRpcError>;
-}
-
-/// Runs one `SessionRpcHost` against a local deterministic action handler.
-pub struct HeadlessSession<H> {
-    host: SessionRpcHost,
-    handler: H,
-}
-
-impl<H> HeadlessSession<H>
-where
-    H: HeadlessActionHandler,
-{
-    pub fn new(host: SessionRpcHost, handler: H) -> Self {
-        Self { host, handler }
-    }
-
-    pub fn snapshot(&self) -> SessionSnapshot {
-        self.host.snapshot()
-    }
-
-    pub fn status(&self) -> SessionStatus {
-        self.host.status()
-    }
-
-    pub fn enqueue(&mut self, input: SessionInput) -> Result<(), SessionRpcError> {
-        self.host.handle(SessionRpcRequest::Enqueue { input })?;
-        Ok(())
-    }
-
-    pub fn run_until_quiescent(
-        &mut self,
-        max_cycles: usize,
-    ) -> Result<HeadlessRun, SessionRpcError> {
-        let mut run = HeadlessRun::default();
-        if self.host.status().quiescent {
-            return Ok(run);
-        }
-
-        for _ in 0..max_cycles {
-            let response = self.host.handle(SessionRpcRequest::Drive)?;
-            let SessionRpcResponse::Driven {
-                actions, events, ..
-            } = response
-            else {
-                unreachable!("drive returns a driven response");
-            };
-
-            let made_progress = !actions.is_empty() || !events.is_empty();
-            run.actions.extend(actions.iter().cloned());
-            run.events.extend(events);
-
-            let mut inputs = Vec::new();
-            for action in actions {
-                inputs.extend(self.handler.handle_action(action)?);
-            }
-            let had_inputs = !inputs.is_empty();
-            for input in inputs {
-                self.host.handle(SessionRpcRequest::Enqueue { input })?;
-            }
-
-            if self.host.status().quiescent {
-                return Ok(run);
-            }
-
-            if !made_progress && !had_inputs {
-                return Err(SessionRpcError::NotQuiescent(
-                    "no local progress remains, but the session is still waiting on work"
-                        .to_string(),
-                ));
-            }
-        }
-
-        Err(SessionRpcError::NotQuiescent(format!(
-            "headless session did not become quiescent within {max_cycles} cycles"
-        )))
-    }
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct HeadlessRun {
-    pub actions: Vec<SessionAction>,
-    pub events: Vec<SessionEvent>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,21 +165,14 @@ mod tests {
         fn push_tool_result(&mut self, result: ToolResultMessage) {
             self.tool_results.push_back(result);
         }
-    }
 
-    impl HeadlessActionHandler for ScriptedActionHandler {
-        fn handle_action(
-            &mut self,
-            action: SessionAction,
-        ) -> Result<Vec<SessionInput>, SessionRpcError> {
+        fn handle_action(&mut self, action: SessionAction) -> Result<Vec<SessionInput>, String> {
             match action {
                 SessionAction::RequestModel {
                     action_id, turn_id, ..
                 } => {
                     let Some(assistant) = self.model_replies.pop_front() else {
-                        return Err(SessionRpcError::Handler(
-                            "missing scripted model reply".to_string(),
-                        ));
+                        return Err("missing scripted model reply".to_string());
                     };
                     Ok(vec![SessionInput::ModelCompleted {
                         action_id,
@@ -293,9 +185,7 @@ mod tests {
                     action_id, turn_id, ..
                 } => {
                     let Some(result) = self.tool_results.pop_front() else {
-                        return Err(SessionRpcError::Handler(
-                            "missing scripted tool result".to_string(),
-                        ));
+                        return Err("missing scripted tool result".to_string());
                     };
                     Ok(vec![SessionInput::Agent(AgentInput::ToolCompleted {
                         action_id,
@@ -305,9 +195,7 @@ mod tests {
                 }
                 SessionAction::RequestCompaction { request_id, .. } => {
                     let Some(replacement) = self.compaction_replacements.pop_front() else {
-                        return Err(SessionRpcError::Handler(
-                            "missing scripted compaction replacement".to_string(),
-                        ));
+                        return Err("missing scripted compaction replacement".to_string());
                     };
                     Ok(vec![SessionInput::CompactionCompleted {
                         request_id,
@@ -321,6 +209,64 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[derive(Debug, Default, Clone, PartialEq, Eq)]
+    struct HeadlessRun {
+        actions: Vec<SessionAction>,
+        events: Vec<SessionEvent>,
+    }
+
+    fn run_until_quiescent(
+        host: &mut SessionRpcHost,
+        handler: &mut ScriptedActionHandler,
+        max_cycles: usize,
+    ) -> Result<HeadlessRun, String> {
+        let mut run = HeadlessRun::default();
+        if host.status().quiescent {
+            return Ok(run);
+        }
+
+        for _ in 0..max_cycles {
+            let response = host
+                .handle(SessionRpcRequest::Drive)
+                .map_err(|error| error.to_string())?;
+            let SessionRpcResponse::Driven {
+                actions, events, ..
+            } = response
+            else {
+                unreachable!("drive returns a driven response");
+            };
+
+            let made_progress = !actions.is_empty() || !events.is_empty();
+            run.actions.extend(actions.iter().cloned());
+            run.events.extend(events);
+
+            let mut inputs = Vec::new();
+            for action in actions {
+                inputs.extend(handler.handle_action(action)?);
+            }
+            let had_inputs = !inputs.is_empty();
+            for input in inputs {
+                host.handle(SessionRpcRequest::Enqueue { input })
+                    .map_err(|error| error.to_string())?;
+            }
+
+            if host.status().quiescent {
+                return Ok(run);
+            }
+
+            if !made_progress && !had_inputs {
+                return Err(
+                    "no local progress remains, but the session is still waiting on work"
+                        .to_string(),
+                );
+            }
+        }
+
+        Err(format!(
+            "headless session did not become quiescent within {max_cycles} cycles"
+        ))
     }
 
     #[test]
@@ -361,16 +307,15 @@ mod tests {
         handler.push_model_reply(AssistantMessage {
             items: vec![AssistantItem::Text("hi".to_string())],
         });
-        let mut session = HeadlessSession::new(SessionRpcHost::new(), handler);
+        let mut host = SessionRpcHost::new();
 
-        session
-            .enqueue(AgentInput::follow_up("hello").into())
-            .expect("enqueue succeeds");
-        session
-            .run_until_quiescent(8)
-            .expect("headless run succeeds");
+        host.handle(SessionRpcRequest::Enqueue {
+            input: AgentInput::follow_up("hello").into(),
+        })
+        .expect("enqueue succeeds");
+        run_until_quiescent(&mut host, &mut handler, 8).expect("headless run succeeds");
 
-        let snapshot = session.snapshot();
+        let snapshot = host.snapshot();
         assert_eq!(
             snapshot.model_context.transcript_items().last(),
             Some(&TranscriptItem::TurnFinished {
@@ -386,23 +331,22 @@ mod tests {
         handler.push_model_reply(AssistantMessage {
             items: vec![AssistantItem::Text("hi".to_string())],
         });
-        let mut session = HeadlessSession::new(SessionRpcHost::new(), handler);
+        let mut host = SessionRpcHost::new();
 
-        session
-            .enqueue(AgentInput::follow_up("hello").into())
-            .expect("enqueue succeeds");
-        session
-            .run_until_quiescent(2)
+        host.handle(SessionRpcRequest::Enqueue {
+            input: AgentInput::follow_up("hello").into(),
+        })
+        .expect("enqueue succeeds");
+        run_until_quiescent(&mut host, &mut handler, 2)
             .expect("two cycles are enough: request model, then complete it");
     }
 
     #[test]
     fn already_quiescent_headless_session_needs_no_cycles() {
-        let mut session = HeadlessSession::new(SessionRpcHost::new(), ScriptedActionHandler::new());
+        let mut host = SessionRpcHost::new();
+        let mut handler = ScriptedActionHandler::new();
 
-        session
-            .run_until_quiescent(0)
-            .expect("new session is already quiescent");
+        run_until_quiescent(&mut host, &mut handler, 0).expect("new session is already quiescent");
     }
 
     #[test]
@@ -425,16 +369,15 @@ mod tests {
         handler.push_model_reply(AssistantMessage {
             items: vec![AssistantItem::Text("finished".to_string())],
         });
-        let mut session = HeadlessSession::new(SessionRpcHost::new(), handler);
+        let mut host = SessionRpcHost::new();
 
-        session
-            .enqueue(AgentInput::follow_up("use a tool").into())
-            .expect("enqueue succeeds");
-        session
-            .run_until_quiescent(16)
-            .expect("headless run succeeds");
+        host.handle(SessionRpcRequest::Enqueue {
+            input: AgentInput::follow_up("use a tool").into(),
+        })
+        .expect("enqueue succeeds");
+        run_until_quiescent(&mut host, &mut handler, 16).expect("headless run succeeds");
 
-        let snapshot = session.snapshot();
+        let snapshot = host.snapshot();
         let items = snapshot.model_context.transcript_items();
         assert!(items.iter().any(|item| matches!(
             item,
@@ -461,16 +404,16 @@ mod tests {
         handler.push_model_reply(AssistantMessage {
             items: vec![AssistantItem::ToolCall(tool_call)],
         });
-        let mut session = HeadlessSession::new(SessionRpcHost::new(), handler);
+        let mut host = SessionRpcHost::new();
 
-        session
-            .enqueue(AgentInput::follow_up("use a tool").into())
-            .expect("enqueue succeeds");
+        host.handle(SessionRpcRequest::Enqueue {
+            input: AgentInput::follow_up("use a tool").into(),
+        })
+        .expect("enqueue succeeds");
 
-        assert!(matches!(
-            session.run_until_quiescent(8),
-            Err(SessionRpcError::Handler(error)) if error.contains("tool result")
-        ));
+        let error =
+            run_until_quiescent(&mut host, &mut handler, 8).expect_err("tool result is missing");
+        assert!(error.contains("tool result"));
     }
 
     #[test]

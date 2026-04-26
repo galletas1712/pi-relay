@@ -10,7 +10,7 @@ Rust implementation of pi-relay's agent runtime. See
 | `agent-core` | Pure deterministic FSM for agent turns. Emits `TranscriptItem`s and `AgentAction` side effects. No I/O. Internals (`AgentState`, `Mailbox`) are private. |
 | `agent-session` | Durable session history atop the core FSM. Owns a session-local `TranscriptStore` forest with one active leaf/path, the materialized `ModelContext` view, the `AgentRunner`, remote compaction requests, and rewind/fork operations. |
 | `agent-orchestrator` | Composition struct for the runtime. Currently owns a SessionRegistry that tracks session identity and spawn relationships. Grows as ModelProvider, ToolRegistry, UsageLedger, AgentWorklogStore land. |
-| `agent-rpc` | Serde/JSON-shaped per-session host frames plus a headless runner for end-to-end harness tests. Transport is intentionally deferred. |
+| `agent-rpc` | Serde/JSON-shaped per-session host frames. Transport and action execution are intentionally deferred. |
 
 ## Layer discipline
 

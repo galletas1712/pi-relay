@@ -211,7 +211,7 @@ Landed in PR #63 and hardened in PR #64.
 
 Partially landed as a placeholder; real shape below.
 
-- **`agent-rpc` session-host seam** — `SessionRpcHost` owns one `AgentSession` and accepts typed serde frames (`Enqueue`, `Drive`, `Snapshot`). It has no transport; stdio/TCP/WebSocket/process supervision can sit underneath later. `HeadlessSession` drives the same seam in tests with a deterministic action handler. This is a future `SessionHandle` protocol below the control plane, not the TUI's final public API.
+- **`agent-rpc` session-host seam** — `SessionRpcHost` owns one `AgentSession` and accepts typed serde frames (`Enqueue`, `Drive`, `Snapshot`). It has no transport and does not execute actions; stdio/TCP/WebSocket/process supervision and the real harness loop sit in later layers. Tests drive the seam with local scripted helpers. This is a future `SessionHandle` protocol below the control plane, not the TUI's final public API.
 
 - **`SessionRegistry<S = AgentSession>`** — `HashMap<SessionId, S>` + parent-child map + helpers. Generic over session type so it can hold local `AgentSession` or remote `SessionHandle` without code changes. Pure data + lifecycle management.
 - **`ControlPlane` trait** — the view's only handle on the system:
