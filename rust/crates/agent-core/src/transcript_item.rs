@@ -10,13 +10,14 @@ pub enum TurnOutcome {
     Crashed,
 }
 
-/// Durable append-only session record.
+/// One model-visible item in an agent's materialized context.
 ///
-/// These records are persisted, replayed, compacted, forked, and rewound. They
-/// are not hook/lifecycle events; hooks should attach to a separate lifecycle
-/// notification stream derived while the loop is running.
+/// These items are persisted inside transcript entries, replayed, compacted,
+/// forked, and rewound. They are not hook/lifecycle events; hooks should
+/// attach to a separate lifecycle notification stream derived while the loop
+/// is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TranscriptRecord {
+pub enum TranscriptItem {
     // Produced by the FSM during a turn:
     TurnStarted {
         turn_id: TurnId,
@@ -40,7 +41,7 @@ pub enum TranscriptRecord {
     Injected(InjectedMessage),
 }
 
-/// Payload carried by `TranscriptRecord::Injected`.
+/// Payload carried by `TranscriptItem::Injected`.
 ///
 /// `kind` is a free-form tag chosen by the session, orchestrator, or another
 /// extension point to classify the injected context. `content` is the textual
@@ -68,16 +69,16 @@ impl InjectedMessage {
     }
 }
 
-impl TranscriptRecord {
+impl TranscriptItem {
     pub fn turn_id(&self) -> Option<TurnId> {
         match self {
-            TranscriptRecord::TurnStarted { turn_id }
-            | TranscriptRecord::ToolCallStarted { turn_id, .. }
-            | TranscriptRecord::TurnFinished { turn_id, .. } => Some(*turn_id),
-            TranscriptRecord::UserMessage(_)
-            | TranscriptRecord::AssistantMessage(_)
-            | TranscriptRecord::ToolResult(_)
-            | TranscriptRecord::Injected(_) => None,
+            TranscriptItem::TurnStarted { turn_id }
+            | TranscriptItem::ToolCallStarted { turn_id, .. }
+            | TranscriptItem::TurnFinished { turn_id, .. } => Some(*turn_id),
+            TranscriptItem::UserMessage(_)
+            | TranscriptItem::AssistantMessage(_)
+            | TranscriptItem::ToolResult(_)
+            | TranscriptItem::Injected(_) => None,
         }
     }
 }

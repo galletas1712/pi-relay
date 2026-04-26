@@ -1,216 +1,320 @@
 # agent-session
 
-Durable session context and async run-loop wrapper around the `agent-core` FSM kernel.
+Durable session history and an async run-loop wrapper around the `agent-core`
+FSM kernel.
 
 ## Responsibility
 
-`agent-session` is the layer that turns the pure `AgentCoreLoop` FSM into a stateful, editable session. An `AgentSession` owns the core loop (deterministic state machine), a `Context` (append-only DAG of `SessionEntry` nodes — the durable transcript), an `ActionQueue` (FIFO of model/tool requests the session has handed out but hasn't heard back about), session-owned stateless model work, and an ephemeral event outbox for live observers. `session.drive()` is the only supported way to advance the FSM; it runs the core to quiescence and absorbs every freshly-produced `TranscriptRecord` into the context, which is the sole owner of durable model-visible history.
+`agent-session` turns the pure `AgentCoreLoop` FSM into a stateful, editable
+session. An `AgentSession` owns:
 
-The crate also owns the *edit* surface: `SummarizeSpan`, `Compact`, `Rewind`, and `ReplaceTranscript` are individual op structs that implement the `ContextEdit` trait. `AgentSession::edit` runs the quiescence gate (`can_edit_history`) once, dispatches to the op, then rehydrates the core loop from the new context. `AgentSession::fork` is a direct method rather than a `ContextEdit` impl because it produces a new session instead of mutating the source.
+- `AgentCoreLoop` — deterministic turn/tool state.
+- `TranscriptStore` — append-only forest of `TranscriptStorageNode`s with one
+  active root-to-leaf path.
+- `ExternalWork` — private bookkeeping for model/tool requests exposed to the
+  harness and completion events waiting for core acceptance.
+- Current context token count — optional harness-provided token count for the
+  active model-visible context.
+- Compaction request state — queued or pending remote compaction API work used
+  by harness-requested compaction.
+- Action and event outboxes — ephemeral live outputs for the harness.
 
-`AgentRunner` is the async I/O shell. Inputs arrive via a cloneable `AgentInputHandle`; the runner calls `drive` in a loop and forwards each drained `SessionAction` to a caller-supplied handler.
+`session.drive()` is the only supported way to advance the FSM. It runs the core
+to quiescence and absorbs every freshly produced `TranscriptItem` into the
+store, which is the sole owner of durable model-visible history.
 
-What this crate does *not* own: no model calls, no tool execution, no cost tracking, no spawn/report routing, no control-plane scheduling. Those all live in the harness / `agent-orchestrator` and above. The session just drives one agent, stores its history, and emits side work such as stateless model compaction requests.
+`compact()` queues remote compaction for the next safe model-context barrier.
+The harness receives
+`SessionAction::RequestCompaction { request_id, model_context, context_leaf_id, context_tokens }`,
+calls the remote compaction API, and returns
+`SessionInput::CompactionCompleted { request_id, replacement, context_tokens }`.
+The session installs that replacement as a new active path in the transcript
+store. `rewind(leaf_id)` is the immediate history mutation: it validates the
+target first, may interrupt active work, then moves the active leaf and
+rehydrates the core. Queued user `Steer` / `FollowUp` inputs survive both paths.
+`fork(leaf_id)` creates a new session value rather than mutating the source.
 
-## Public interface
+This crate does not own model calls, tool execution, cost tracking,
+spawn/report routing, compaction budget policy, or control-plane scheduling.
+Those live in the harness / `agent-orchestrator` and above.
 
-All exports are re-exported from `lib.rs`. Downstream callers (primarily `agent-orchestrator`, tests, and future daemon frontends) use only these.
+## Public Interface
+
+All intended downstream imports are re-exported from `lib.rs`.
 
 **Composition types**
-- `AgentSession` — core loop + context + action queue, the unit of agent state.
-- `AgentRunner` — async wrapper that drives a session off an input channel.
-- `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — sender/receiver pair for the runner's input channel.
-- `SessionAction` — model/tool/cancel actions plus session-owned `RequestModelStateless`. `RequestModel` carries the transcript snapshot visible when the model request was made.
-- `SessionInput`, `SessionInputError` — core inputs plus stateless model completions/failures.
-- `SessionEvent` — ephemeral live activity (`RecordAppended`, `ActionRequested`, `ActionCompleted`, `ActionFailed`, `ContextEdited`).
+
+- `AgentSession` — constructors plus `drive`, `enqueue_input`,
+  `enqueue_session_input`, `compact`, `rewind`, `fork`, `drain_actions`,
+  `drain_events`, `drain_pending_inputs`, `model_context`, and
+  `transcript_store`.
+- `AgentRunner` — async wrapper that drives a session from an input channel.
+- `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` —
+  sender/receiver pair for the runner.
+- `SessionAction` — model/tool actions, session-wide `CancelSessionWork`, and
+  session-owned `RequestCompaction`. `RequestModel` and `RequestCompaction`
+  carry the model context snapshot visible when the request was made, the
+  transcript leaf that snapshot was materialized from, and the optional context
+  token count last supplied by the harness.
+- `SessionInput`, `SessionInputError` — core inputs, compaction requests,
+  model completions with an optional context token update, direct context token
+  updates, and compaction completions/failures.
+- `SessionEvent` — live-only activity such as transcript append, action
+  requested/completed/failed, and history mutation events.
+- `SessionActionKind` — lightweight action event classifier.
 
 **Durable state**
-- `Context` — append-only DAG of `SessionEntry`.
-- `SessionEntry` — `{ id, parent_id, timestamp_ms, record }`.
-- `Transcript` — read-only materialized view derived from a record slice.
-- `ContextError` — `EntryNotFound`, `InvalidSpan`, `NotTurnBoundary`, `StalePlan`.
 
-**Edit ops and support types**
-- `ContextEdit` — trait every op implements.
-- `SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`.
-- `PendingWork { background_tasks: usize }` — caller-declared invisible work.
-- `HistoryEditError` — `Busy`, `ReplacementNotAtTurnBoundary`, `Context(ContextError)`.
-- `SummarySpanPlan` — produced by `Context::prepare_summary_span`.
-- `CompactionPlan`, `CompactionSettings` — prefix-compaction policy produced by `Context::prepare_compaction`.
-- `AutoCompactionSettings` — optional session policy that pauses a model request and emits stateless model compaction work when context is over budget.
-- `StatelessModelRequest`, `StatelessModelRequestId`, `StatelessModelOutput`, `ModelContentBlock`, `ImageInput` — stateless side-model request/response vocabulary.
+- `TranscriptStore` — append-only forest of `TranscriptStorageNode`s plus one
+  active leaf.
+- `TranscriptStorageNode` — `{ id, parent_id, timestamp_ms, item }`.
+- `ModelContext` — read-only materialized view derived from the active path.
+- `TranscriptStoreError` — `EntryNotFound`, `NotTurnBoundary`.
 
-**Well-known injected-message kinds**
-- `KIND_COMPACTION_SUMMARY = "compaction_summary"` + `compaction_summary(content, first_kept_entry_id, tokens_before)` builder.
+**Compaction and rewind**
 
-**Re-exports from `agent-core`** (so callers have a single import home)
-- `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptRecord`, `TurnId`, `ActionId`, `ToolCallId`, `InjectedMessage`, `TurnOutcome`.
-- `AssistantMessage`, `AssistantItem`, `ToolCall`, `ToolResultMessage`, `ToolResultStatus`.
+- `CompactionRequestId` — correlation id for remote compaction requests.
+- `HistoryOperationError` — `Busy` or `Store(TranscriptStoreError)`.
 
-### Drive cycle
+**Re-exports from `agent-core`**
+
+`AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptItem`, `TurnId`,
+`ActionId`, `ToolCallId`, `InjectedMessage`, `TurnOutcome`,
+`AssistantMessage`, `AssistantItem`, `ToolCall`, `ToolResultMessage`, and
+`ToolResultStatus`.
+
+## Drive Cycle
 
 ```rust
 session.enqueue_input(AgentInput::follow_up("hello"))?;
 session.drive();
+
 let actions = session.drain_actions();
-// caller executes actions out-of-band, feeds results back:
-let SessionAction::RequestModel { action_id, turn_id, transcript } = &actions[0] else { unreachable!() };
-let provider_request = build_provider_request(transcript);
-session.enqueue_input(AgentInput::ModelCompleted { action_id: *action_id, turn_id: *turn_id, assistant })?;
+let SessionAction::RequestModel {
+    action_id,
+    turn_id,
+    model_context,
+    ..
+} = &actions[0] else {
+    unreachable!()
+};
+
+let provider_request = build_provider_request(model_context);
+let provider_response = call_provider(provider_request).await?;
+session.enqueue_session_input(SessionInput::ModelCompleted {
+    action_id: *action_id,
+    turn_id: *turn_id,
+    assistant: provider_response.assistant,
+    context_tokens: provider_response.context_tokens_after_response,
+})?;
 session.drive();
 ```
 
-`drive` records every visible `RequestModel` / `RequestTool` into the internal action queue before callers drain the observable action outbox. `enqueue_input` validates the input and clears the matching key when the corresponding completion or failure arrives. `ModelFailed` closes the turn as `Crashed`; `CancelTurn` clears every entry for that turn id.
+`drive` records every visible `RequestModel` / `RequestTool` in `ExternalWork`
+before callers drain the observable action outbox. Matching
+`ModelCompleted`, `ModelFailed`, and `ToolCompleted` inputs clear the matching
+pending work.
+Use `SessionInput::ModelCompleted` when the harness has a provider token count
+for the model-visible context after accepting the assistant response. Pass
+`None` if the provider only exposes numbers that cannot be mapped to that
+shape. The harness can also send
+`SessionInput::ContextTokensUpdated { context_leaf_id, context_tokens }` when
+it has computed the current context pressure outside a turn completion. The
+session applies that update only if `context_leaf_id` still matches the active
+transcript leaf, so late counts for older contexts are ignored. The lower-level
+`AgentInput::ModelCompleted` path still completes the core turn but does not
+update the session's token count.
+`ModelFailed` closes the turn as `Crashed`. Interrupts and stale-work invalidation
+surface as `CancelSessionWork`, a best-effort, idempotent instruction for the
+harness to cancel all external work for this session.
 
-With auto-compaction enabled, a core `RequestModel` may be held by the session while it emits `SessionAction::RequestModelStateless`. The harness runs that as a stateless side-model call and returns `SessionInput::ModelStatelessCompleted` or `SessionInput::ModelStatelessFailed` through the same input channel. Successful completion applies a compaction summary to the context, then releases the held `RequestModel`. Failure releases the held `RequestModel` unchanged so the agent still makes progress.
+`agent-session` does not decide when the context is over budget. The harness
+owns model metadata, thresholds, and auto-compaction policy. When the harness
+decides the session should compact, it calls `compact()` directly or enqueues
+`SessionInput::Compact` through an `AgentInputHandle`.
+When compaction starts, the session emits
+`SessionAction::RequestCompaction { request_id, model_context, context_leaf_id, context_tokens }`;
+the harness calls the remote compaction API and returns
+`SessionInput::CompactionCompleted { request_id, replacement, context_tokens }` or
+`SessionInput::CompactionFailed`. Success replaces the active path with the
+returned context, then releases any model request that was blocked at the
+compaction barrier. Failure releases the blocked model request unchanged so the
+agent still makes progress. While compaction is pending, `drive()` does not
+consume queued `Steer` / `FollowUp` inputs.
 
-`drain_events()` returns live-only `SessionEvent`s that explain what happened without polluting the transcript. The transcript remains the model-visible durable context.
+Replacement context is validated before it is installed. Idle compaction must
+return a turn-boundary context with the same last turn id as the replaced active
+path. Model-barrier compaction must return an open context for the blocked model
+turn, with `last_turn_id` equal to that blocked `RequestModel` turn id, and it
+must preserve the already-appended open-turn suffix exactly. Invalid replacement
+is treated like compaction failure. In either shape, every assistant tool call
+already present in the replacement must have a matching tool result before the
+context can close the turn or continue the model.
 
-### History edits
+Restoring from transcript items or a transcript store is intentionally
+quiescent. Open transcript tails are recovered as crashed, the core is rebuilt
+idle at the recovered boundary, and compaction is not started just because the
+restored context may be over budget. The harness can feed a fresh token count
+and call `compact()` later.
+
+## History Operations
 
 ```rust
-// Pure query: no mutation, safe to call any time.
-let plan = session.context().prepare_compaction(settings);
-let span = session.context().prepare_summary_span(first_id, last_id)?;
+session.compact();
+let SessionAction::RequestCompaction {
+    request_id,
+    model_context,
+    context_leaf_id,
+    ..
+} = &session.drain_actions()[0] else {
+    unreachable!()
+};
+let replacement = call_remote_compaction_api(model_context).await?;
+session.enqueue_session_input(SessionInput::CompactionCompleted {
+    request_id: *request_id,
+    replacement,
+    context_tokens: None,
+})?;
 
-// Mutating ops flow through AgentSession::edit. The quiescence gate runs once.
-session.edit(pending, SummarizeSpan { plan: span, summary })?;       // Output = ()
-session.edit(pending, Compact { plan, summary })?;                   // Output = ()
-session.edit(pending, Rewind { leaf_id: Some(id) })?;                // Output = ()
-let previous = session.edit(pending, ReplaceTranscript { replacement })?;
-//                                                             Output = Transcript
+session.rewind(Some(&leaf_id))?;
+session.rewind(None)?;
 
-// Fork is a direct method because it produces a NEW session.
-let forked: AgentSession = session.fork(pending, Some(&leaf_id))?;
+let forked: AgentSession = session.fork(Some(&leaf_id))?;
 ```
+
+`compact()` is asynchronous from the session's point of view: it queues a remote
+compaction request and applies the returned replacement context when the harness
+feeds back `CompactionCompleted`. The replacement is installed as a new active
+path in `TranscriptStore`; old nodes remain in the store for audit. Compaction
+can start while the session is idle at a turn boundary, or after the core emits
+`RequestModel` but before that action is exposed to the harness. In the latter
+case the session blocks the model action at the compaction barrier, emits
+`RequestCompaction`, applies the replacement context, and only then exposes the
+blocked `RequestModel` with the updated `ModelContext`. Once a `RequestModel`
+has been exposed to the harness, it is live external work; compaction can still
+be requested, but it waits for the next model-context barrier rather than
+rewriting that already-dispatched provider request.
+
+`rewind` is immediate. It validates the target boundary before cancellation or
+mutation, then invalidates live work, moves the leaf, and rehydrates the core.
 
 ## Internals
 
-### Module map
+### Module Map
 
 | File | Contents |
 | --- | --- |
-| `src/lib.rs` | Module declarations + public re-exports (including `agent-core` passthroughs). |
-| `src/action.rs` | `SessionAction`, `StatelessModelRequestId`. |
+| `src/lib.rs` | Module declarations and public re-exports. |
+| `src/action.rs` | `SessionAction` and compaction request ids. |
+| `src/compaction_state.rs` | Private `Idle` / `Requested` / `Running` remote-compaction state. |
 | `src/input.rs` | `SessionInput`, `SessionInputError`. |
-| `src/event.rs` | Runtime-only `SessionEvent`, `SessionActionKind`, `ContextEditKind`. |
-| `src/auto_compaction.rs` | `AutoCompactionSettings`, stateless model request/response types, compaction request rendering. |
-| `src/session.rs` | `AgentSession` composition, `drive`, `enqueue_input`, `enqueue_session_input`, `drain_actions`, `drain_events`, `can_edit_history`, `edit`, `fork`, `rehydrate_core_from_context`. |
-| `src/action_queue.rs` | Private `ActionQueue` (FIFO `VecDeque<PendingActionKey>`) + `record_drained` / `record_input`. |
-| `src/transcript.rs` | `Transcript` read-only view: `is_turn_boundary`, `latest_compaction_summary`, crashed-tail patching. |
-| `src/runner.rs` | `AgentRunner`, `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` — async shell over `AgentSession`. |
-| `src/context/mod.rs` | `Context` DAG, `SessionEntry`, leaf navigation, `is_turn_boundary`, `ContextError`. No kind-specific knowledge. |
-| `src/context/edit.rs` | `ContextEdit` trait, `PendingWork`, `HistoryEditError`. |
-| `src/context/summary.rs` | `SummarizeSpan` op, `SummarySpanPlan`, `prepare_summary_span`, span-boundary validation. |
-| `src/context/compaction.rs` | `Compact` op, `CompactionPlan`, `CompactionSettings`, `prepare_compaction`, `validate_plan_matches`, `materialize_context`, `KIND_COMPACTION_SUMMARY`, `compaction_summary`. |
-| `src/context/rewind.rs` | `Rewind` op. |
-| `src/context/replace.rs` | `ReplaceTranscript` op (returns previous `Transcript`). |
+| `src/event.rs` | Runtime-only `SessionEvent`, `SessionActionKind`. |
+| `src/external_work.rs` | Private model/tool work tracking and delayed completion-event reconciliation. |
+| `src/session.rs` | `AgentSession`, drive/input/action lifecycle, remote compaction, rewind, restore rehydration. |
+| `src/session/tests.rs` | Session lifecycle tests. |
+| `src/model_context.rs` | `ModelContext` read-only view and crashed-tail recovery. |
+| `src/runner.rs` | `AgentRunner` async shell and input handle. |
+| `src/transcript_store/mod.rs` | Transcript forest, entry/parent/leaf indexes, materialization, boundary checks. |
 
-### Composition diagram
+### Composition
 
 ```
  AgentSession
-  ├── core: AgentCoreLoop             (from agent-core — FSM + mailbox)
-  ├── context: Context                (append-only DAG of SessionEntry)
-  ├── action_queue: ActionQueue       (FIFO: visible in-flight model/tool actions)
-  ├── pending_stateless_model: Option<...>   (session-owned side work)
+  ├── core: AgentCoreLoop
+  ├── transcript_store: TranscriptStore
+  ├── external_work: ExternalWork
+  ├── context_tokens: Option<usize>
+  ├── compaction: CompactionState
   ├── action_outbox: VecDeque<SessionAction>
   └── event_outbox: VecDeque<SessionEvent>
 
- drive()       ─► core.drive() → drain records → append to context
-              └► drain actions → maybe auto-compact → action outbox
- drain_actions ─► drain observable action outbox
- drain_events  ─► drain live activity event outbox
- enqueue_input ─► validate → action_queue.record_input(..) → core.enqueue_input(..)
- enqueue_session_input ─► core input OR stateless model completion/failure
- edit(op)      ─► can_edit_history? → op.apply(&mut context) → rehydrate core
+ drive()       ─► core.drive()
+              ├► drain transcript items → append to transcript store
+              └► drain actions → maybe start compaction → action outbox
+ enqueue_input ─► validate → clear matching pending work → core.enqueue_input
+ compact()    ─► queue compaction → run at next model-context barrier
+ rewind       ─► invalidate session work → move transcript leaf → rehydrate core
 ```
 
-All three components are load-bearing:
-- **core** drives the FSM forward. It buffers records only until the session absorbs them.
-- **context** is durable history. It survives compaction because compaction is a fork, not a delete.
-- **action_queue** answers "is any visible model/tool work in flight?" — together with pending stateless model work, it's the signal that gates history edits.
+### TranscriptStore Forest
 
-### The Context DAG
+Each `TranscriptStorageNode` has a UUID string id, an optional parent id,
+timestamp, and one `TranscriptItem`. Entries form a forest: every entry has at
+most one parent, and a parent may have many children. The store tracks one
+active leaf; `model_context()` materializes exactly that root-to-leaf path.
 
-Each `SessionEntry` has a `String id` (UUID v4), an `Option<String> parent_id`, a `timestamp_ms`, and one `TranscriptRecord`. Entries sit in a `Vec<SessionEntry>` with a `HashMap<String, usize>` side-index for O(1) lookup by id. The context tracks an `Option<String> leaf_id` — the active branch head. `append_record` attaches a new child under `leaf_id` and advances the pointer. `branch(id)` / `branch_at_turn_boundary(id)` reparent the leaf onto an existing entry; subsequent appends then grow a new branch off that node. Nothing is ever deleted.
+`append_transcript_items` attaches new children under the active leaf.
+`branch_at_turn_boundary(id)` moves the active leaf onto an existing boundary
+entry; subsequent appends grow a new path off that node. Remote compaction
+replacement resets the active leaf to the root and appends the replacement
+context as a new path. Nothing is deleted.
 
-`transcript()` walks from the current leaf back to the root via `parent_id`, reverses, and hands the record sequence to `compaction::materialize_context`. Summary-span edits rebuild the active branch in model-visible order, so materialization is the full active path.
+Today each session owns an independent `TranscriptStore`. `fork(leaf)` copies
+only the ancestor path from root to `leaf` into a new session; sibling branches,
+abandoned descendants, queued inputs, in-flight actions, events, and other
+sessions are not copied. A future shared store can make this a cheap second leaf
+pointer without changing the public session operations.
 
-Summary-span replacement in pictures:
+Remote compaction replacement in pictures:
 
 ```
-Initial branch:
-  E0 ── E1 ── E2 ── E3 ── E4 ── E5
-                                ▲
+Initial active path:
+  E0 -- E1 -- E2 -- E3 -- E4 -- E5
+                                ^
                                 leaf
 
-After SummarizeSpan over E2..E3:
-  E0 ── E1 ── E2 ── E3 ── E4 ── E5      (abandoned suffix; still in DAG)
-          \
-           Esum ── E4' ── E5'
-                         ▲
-                         leaf (new branch)
+After the compaction API returns replacement context:
+  E0 -- E1 -- E2 -- E3 -- E4 -- E5      (old path remains in store)
+  R0 -- R1 -- R2
+              ^
+              leaf
 ```
 
-`Esum` is a caller-provided injected summary entry; `E4'` / `E5'` are re-appended copies of the suffix records as descendants of `Esum`. The old span and suffix stay in `entries()` as an orphaned branch for audit. `Compact` is a prefix-oriented policy wrapper over this primitive.
+The replacement path is whatever the harness maps back from the remote
+compaction API output, subject to the boundary/turn-id constraints described
+above.
 
-### `ContextEdit` trait + `PendingWork`
+### ExternalWork
 
-```rust
-pub trait ContextEdit {
-    type Output;
-    fn apply(self, ctx: &mut Context) -> Result<Self::Output, HistoryEditError>;
-}
-```
+Private to the crate. `ExternalWork` records visible `RequestModel` /
+`RequestTool` work as unresolved turn actions, removes the matching work when
+`ModelCompleted`, `ModelFailed`, or `ToolCompleted` arrives, and defers
+completion events until the core has accepted the completion and emitted the
+corresponding transcript items. Stale completions are silent no-ops. History
+operations and interrupts do not wait on external work; they clear it through
+session-wide invalidation and emit `CancelSessionWork` when external work may be
+live.
 
-`AgentSession::edit` is the only place ops run. It first consults the quiescence gate:
+### CompactionState
 
-```
-can_edit_history(pending) :=
-       core.is_idle()
-    && context.is_turn_boundary()
-    && !core.has_pending_work()
-    && action_queue.is_empty()
-    && action_outbox.is_empty()
-    && pending_stateless_model.is_none()
-    && pending.is_empty()
-```
+Private to the session. `CompactionState` is `Idle`, `Requested`, or `Running`.
+`compact()` moves the state to `Requested`, and `drive()` starts a running remote
+compaction at the next safe model-context barrier. If compaction starts at a
+model barrier, the just-emitted `RequestModel` is blocked before dispatch and
+exposed only after compaction finishes or fails.
 
-The session-owned checks cover state the session can see, including undrained observable actions such as `CancelTurn` that the harness still needs to execute. `PendingWork { background_tasks: usize }` is the counter for *invisible* work the caller is tracking on its own — worklog forks, background summarization calls — that must also finish before history is safe to touch. `PendingWork::NONE` is the zero value.
+### AgentRunner
 
-Op outputs:
+`AgentRunner` is the only async surface in the crate. It owns an `AgentSession`,
+an input receiver, and a `FnMut(SessionAction) -> impl Future<Output = ()>`
+action handler. `run()` drives the session, flushes events and actions, then
+awaits the next `SessionInput`.
 
-| Op | `Output` | Summary |
-| --- | --- | --- |
-| `SummarizeSpan { plan, summary }` | `()` | Validates a contiguous active-branch span, replaces it with a summary, re-appends the suffix. |
-| `Compact { plan, summary }` | `()` | Prefix-compaction wrapper that summarizes old context through `SummarizeSpan`. |
-| `Rewind { leaf_id }` | `()` | `Some(id)` → `branch_at_turn_boundary(id)`; `None` → `reset_leaf()`. |
-| `ReplaceTranscript { replacement }` | `Transcript` | Swaps the whole context for one built from `replacement`; returns the previous transcript. |
+`RequestModel` actions include the `ModelContext` snapshot needed to build the
+provider request. `RequestCompaction` actions include the `ModelContext`
+snapshot needed to call the remote compaction API. The action handler should
+register or spawn long-running model/tool/compaction work and return promptly,
+then enqueue completion or failure later through an `AgentInputHandle`.
 
-Core rehydration (`rehydrate_core_from_context`) runs *after* `apply` succeeds. It lives in `AgentSession::edit`, not the trait, because `apply` sees only `&mut Context` and can't touch the core loop. Rehydration rebuilds the core at the current `last_turn_id` while preserving the next `ActionId`, then defensively clears pre-edit action bookkeeping. The quiescence gate requires the observable action outbox to be empty before an edit starts, so callers cannot drop an undrained `CancelTurn`.
+## Relationship To Other Crates
 
-### `ActionQueue` semantics
+- **Upstream `agent-core`** — provides the FSM, mailbox input/action vocabulary,
+  transcript item types, IDs, and message/tool-call structures. `agent-session`
+  re-exports these for a single downstream import path.
+- **Downstream `agent-orchestrator`** — owns `SessionRegistry<AgentSession>`,
+  routes parent/child messages and reports through `enqueue_input`, invokes
+  `compact`, `rewind`, and `fork`, and stays out of `TranscriptStore`
+  internals.
 
-Private to the crate. `PendingActionKey { action_id: ActionId, turn_id: TurnId, kind: Model | Tool }` lives in a `VecDeque` in FIFO insertion order. `record_drained(&[AgentAction])` pushes one entry per visible `RequestModel` / `RequestTool` and clears entries for a given `turn_id` on `CancelTurn`. `record_input(&AgentInput)` removes the matching key on `ModelCompleted` / `ModelFailed` / `ToolCompleted` and returns whether anything was cleared; removal is by key, not necessarily from the head, and preserves order among the survivors. Duplicates are kept — FIFO with no dedup. Stale completions (no matching key) are silent no-ops.
-
-`is_empty() == true` ⇒ no in-flight actions ⇒ `can_edit_history` clears that check.
-
-### Kind-free `context/mod.rs` + operation-local `KIND_*` constants
-
-`context/mod.rs` owns the DAG primitives — `Context`, `SessionEntry`, `append_record`, `branch`, `is_turn_boundary_leaf` — and knows about exactly one record variant semantically: `TranscriptRecord::Injected` is treated as transparent for turn-boundary walks. It knows nothing about `"compaction_summary"` specifically.
-
-The `KIND_COMPACTION_SUMMARY` constant and its builder live in `context/compaction.rs`, the file for the policy that produces it. This keeps the DAG code decoupled from higher-level semantics: new edit ops with new injected-message kinds can land without touching `mod.rs`.
-
-### `AgentRunner` (async wrapper)
-
-`AgentRunner` is the only async surface in the crate — the core loop itself is fully sync. It owns an `AgentSession` plus an `AgentInputReceiver` (the receive side of a `futures_channel::mpsc::unbounded` channel) plus a `FnMut(SessionAction) -> impl Future<Output = ()>` action handler. `run()` drives the session to quiescence, flushes drained actions through the handler, then loops awaiting the next `SessionInput`, enqueuing it, and repeating. `RequestModel` actions include the transcript snapshot from the moment the model request was made, so a model handler can build the provider request without maintaining a parallel event mirror. The action handler is a dispatch hook: it should register or spawn long-running model/tool work and return promptly, then enqueue completion/failure later through an `AgentInputHandle`. Awaiting the provider/tool call inline will intentionally block this simple runner from processing further inputs. `AgentInputHandle::channel()` hands back the matching sender; the handle is `Clone`, so orchestrator, model, tool, and stateless model tasks can all enqueue inputs back into the same session. The handle validates `SessionInput` before sending; invalid inputs return `AgentInputHandleError::Invalid` immediately.
-
-Records are observed off the session's transcript (`runner.session().transcript()`); there is no record callback.
-
-## Relationship to other crates
-
-- **Upstream** `agent-core` — provides `AgentCoreLoop`, `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptRecord`, `TurnId`, `ActionId`, `TurnOutcome`, `InjectedMessage`, and the message/tool-call vocabulary. `agent-session` re-exports these so downstream has a single import path.
-- **Downstream** `agent-orchestrator` — owns a `SessionRegistry<AgentSession>` keyed by `SessionId`, routes parent/child messages and reports, and delegates every history edit to `session.edit(pending, op)` / `session.fork(pending, leaf)`. It never reaches into `Context` internals directly; it calls `session.context().prepare_compaction(..)` as a pure query and lets the session dispatch the resulting op.
-
-For cross-cutting context (control plane, cost aggregation, worklog forks, multi-agent spawn/report), see `rust/docs/architecture.md`.
+For cross-cutting context such as control plane, usage, worklogs, and
+multi-agent spawn/report, see `rust/docs/architecture.md`.

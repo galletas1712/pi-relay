@@ -2,10 +2,9 @@
 
 This is the top-level plan for the Rust side of pi-relay. It describes the layer stack, the data model, the components that live in each layer, the runtime evolution from single-process to distributed, and the PR sequencing to get there.
 
-Feature-specific design docs go deeper in their own files:
-- `worklog-design.md` — background summarization into a per-agent side-store
-- `cost-aggregation.md` — usage ledger with per-agent / per-tree roll-up
-- `multi-agent-design.md` — spawn / report / agent_idle (TODO)
+Feature-specific design docs for worklogs, cost aggregation, and multi-agent
+tooling are planned. Until those files exist, this document is the source of
+truth for those roadmaps.
 
 ---
 
@@ -40,8 +39,8 @@ Feature-specific design docs go deeper in their own files:
                      │  owns a collection of AgentSession
                      ▼
 ┌──────────────────────────────────────────────┐
-│ 3. Session — AgentSession, Context,          │
-│    ContextEdit trait + ops, AgentRunner.     │
+│ 3. Session — AgentSession, TranscriptStore,  │
+│    compaction/rewind/fork, AgentRunner.      │
 │    One per agent. Sole owner of durable log. │
 └──────────────────────────────────────────────┘
                      ▲
@@ -53,10 +52,10 @@ Feature-specific design docs go deeper in their own files:
 │    and ActionId.                             │
 └──────────────────────────────────────────────┘
                      ▲
-                     │  produces records & actions
+                     │  produces transcript items & actions
                      ▼
 ┌──────────────────────────────────────────────┐
-│ 1. Vocabulary — TranscriptRecord,            │
+│ 1. Vocabulary — TranscriptItem,              │
 │    AgentAction, AgentInput, AssistantMessage,│
 │    ToolCall, ToolResult.                     │
 │    Plain data. Shared by every layer above.  │
@@ -69,11 +68,11 @@ Each layer depends only on layers below. The view layer depends only on the cont
 
 ## 2. Data model
 
-### Records, actions, inputs (layer 1, in `agent-core`)
+### Transcript items, actions, inputs (layer 1, in `agent-core`)
 
 ```rust
-// What the FSM produces as durable facts:
-enum TranscriptRecord {
+// What the FSM produces as durable model-visible items:
+enum TranscriptItem {
     TurnStarted { turn_id },
     UserMessage(String),
     AssistantMessage(AssistantMessage),
@@ -110,35 +109,67 @@ enum AgentInput {
 // `action_id` must be copied from the matching RequestModel / RequestTool.
 ```
 
-Every one of these serializes. The FSM never holds non-POD state beyond these.
+These are plain data shapes intended to be serializable at future persistence
+and RPC boundaries, but the current crates do not derive or require serde yet.
+The FSM never holds non-POD state beyond these.
 
 ### Log entries (layer 3, in `agent-session`)
 
 ```rust
-struct SessionEntry {
+struct TranscriptStorageNode {
     id: EntryId,
     parent_id: Option<EntryId>,
-    record: TranscriptRecord,
+    timestamp_ms: u128,
+    item: TranscriptItem,
 }
 ```
 
-**Every durable "thing injected into the model's view" is a `TranscriptRecord::Injected(InjectedMessage)` with a kind tag.** One variant, one materialization path, one serialization. New feature -> new well-known kind string and metadata convention, not a new entry type. Ephemeral lifecycle signals remain `SessionEvent`s, not injected transcript records.
+**Every durable "thing injected into the model's view" is a `TranscriptItem::Injected(InjectedMessage)` with a kind tag.** One variant, one materialization path, one future storage/RPC shape. New feature -> new well-known kind string and metadata convention, not a new entry type. Ephemeral lifecycle signals remain `SessionEvent`s, not injected transcript items.
+
+### TranscriptStore forest (layer 3, in `agent-session`)
+
+The durable history data structure is a forest of transcript entries:
+
+```rust
+struct TranscriptStore {
+    entries_by_id: HashMap<EntryId, TranscriptStorageNode>,
+    parent_by_id: HashMap<EntryId, Option<EntryId>>,
+    children_by_parent: HashMap<Option<EntryId>, Vec<EntryId>>,
+    leaf_ids: Set<EntryId>,
+    insertion_order: Vec<EntryId>,
+    active_leaf_id: Option<EntryId>,
+}
+```
+
+Every `TranscriptStorageNode` has zero or one parent; many children can share the
+same parent. This is a forest of trees, not a general DAG. A session points at
+one leaf. The model-visible `ModelContext` is materialized by walking parents
+from that leaf to a root, reversing the path, and reading each entry's
+`TranscriptItem`.
+
+Rewind and compaction should not destroy history. In the current session-local
+implementation they move the active leaf or rebuild a branch inside the store.
+The target copy-on-write implementation keeps old leaves reachable in the
+shared `SessionStore`, so a session/version can move to a new leaf without
+duplicating common ancestors or losing the old path.
 
 ### Session events (layer 3, observable)
 
 ```rust
 enum SessionEvent {
-    RecordAppended { entry_id: EntryId, record: TranscriptRecord },
+    TranscriptItemAppended { entry_id: EntryId, item: TranscriptItem },
     ActionRequested { action: SessionAction },
     ActionCompleted { kind: SessionActionKind, id: String },
     ActionFailed { kind: SessionActionKind, id: String, error: String },
-    ContextEdited { kind: ContextEditKind },
+    HistoryCompacted,
+    HistoryRewound,
 }
 ```
 
-One event stream per session. Events are runtime observations, not additional
-transcript records; observers such as a TUI, usage ledger, or orchestrator can
-subscribe without changing the durable context.
+Each session currently exposes these through an event outbox; a later event bus
+will turn them into subscribable streams. Events are runtime observations, not
+additional transcript entries, so observers such as a TUI, usage ledger, or
+orchestrator can observe session activity without changing durable history.
 
 ### Agent vs session identity
 
@@ -154,21 +185,25 @@ Multi-agent relationships (spawn parents, children) live in the `SessionRegistry
 
 Already landed in PR #62 + #63 refactors.
 
-- **`AgentCoreLoop`** — FSM + mailbox + outboxes. Private fields. Public API: `new`, `resume_at_boundary`, `enqueue_input`, `drive`, `drain_records`, `drain_actions`, `is_idle`, `has_pending_work`, `last_turn_id`.
+- **`AgentCoreLoop`** — FSM + mailbox + outboxes. Private fields. Public API: `new`, `resume_at_boundary`, `resume_at_boundary_with_next_action_id`, `enqueue_input`, `drive`, `drain_transcript_items`, `drain_actions`, `drain_pending_inputs`, `is_idle`, `has_pending_work`, `last_turn_id`, `next_action_id`.
 - **`AgentState`** — private. `Idle | RunningModel | RunningTools | ReadyToContinue`.
-- **`Mailbox`** — private. Priority queue: Interrupt > ModelCompleted/ModelFailed/ToolCompleted > Steer > FollowUp.
+- **`Mailbox`** — private. Priority queue: Interrupt > ModelCompleted/ModelFailed/ToolCompleted > ContinueModel when `ReadyToContinue` > Steer > FollowUp.
 
 ### Layer 3 — Session (`agent-session` crate)
 
-Partially landed in PR #63; decomposition planned.
+Landed in PR #63 and hardened in PR #64.
 
-- **`AgentSession`** — owns `AgentCoreLoop` + `Context`. The session is the sole owner of durable records. Runtime surface: `drive`, `enqueue_input`, `is_idle`, `has_pending_work`, `last_turn_id`, `transcript`, `drain_actions`. History-edit surface: `edit(pending, op)` dispatches a `ContextEdit` op struct; `fork(pending, leaf)` is a direct method that returns an unregistered child `AgentSession`.
-- **`ContextEdit` trait + op structs** — each history-editing operation is its own struct (`SummarizeSpan { plan, summary }`, `Compact { plan, summary }`, `Rewind { leaf_id }`, `ReplaceTranscript { replacement }`) that implements `ContextEdit { type Output; fn apply(self, &mut Context) -> Result<Output, HistoryEditError> }`. The quiescence check runs once inside `AgentSession::edit` before dispatching to `apply`. Generic summary-span planning is a pure query on `Context` (`context.prepare_summary_span(first, last)`); prefix compaction is policy on top (`context.prepare_compaction(settings)`). `fork` stays a direct `AgentSession` method because it produces a new session value rather than mutating in place.
-- **`Context`** — DAG of `SessionEntry`s with a leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
-- **`Transcript`** — materialized view of the current branch's records. Live transcripts preserve open turns; resume paths explicitly crash-recover any open tail.
-- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, transcript }` includes the transcript snapshot visible when the model request was made; tool and cancel actions carry only the ids/payloads needed to execute them. Session-owned stateless model requests are used for compaction side work.
-- **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans `SessionAction`s to the handler. Records auto-flow into the log; the runner does not expose them directly.
-- **`SessionStore` trait** (PR #65) — pluggable durable storage. Default `JsonlFileSessionStore`; `InMemorySessionStore` for tests. Swappable for `SqliteSessionStore` later.
+- **`AgentSession`** — owns `AgentCoreLoop` + a session-local `TranscriptStore`. The session is the sole owner of durable transcript items for that one agent in the current implementation. Runtime surface: `drive`, `enqueue_input`, `enqueue_session_input`, `compact`, `rewind`, `fork`, `model_context`, `transcript_store`, `drain_actions`, `drain_events`, and `drain_pending_inputs`.
+- **Remote compaction** — `compact()` may be called while the session is busy. The session resolves it only when idle at a turn boundary or while blocking a just-emitted `RequestModel` before exposing that action to the harness. It emits `RequestCompaction { request_id, model_context, context_leaf_id, context_tokens }`; the harness calls the remote compaction API and feeds back a replacement `ModelContext` plus optional replacement context token count with `CompactionCompleted`.
+- **Context token accounting** — session-level, not core-level, and intentionally policy-free. The harness owns model metadata, budget thresholds, and the decision to call `compact()` / enqueue `SessionInput::Compact`. `agent-session` stores only the latest harness-provided `context_tokens` value for the active model-visible context, supplied through `SessionInput::ModelCompleted`, `SessionInput::ContextTokensUpdated`, or `SessionInput::CompactionCompleted`. Direct `ContextTokensUpdated` inputs are anchored to a `context_leaf_id` and are ignored if the active transcript leaf has moved. Transcript appends, history edits, and rehydration clear the count because it no longer describes the current context exactly. Stale completions ignored by the session do not update this state.
+- **Immediate history operations** — `rewind(leaf)` validates the requested target before invalidating work, then may interrupt active work before moving the leaf. Successful mutations preserve queued `Steer` / `FollowUp` inputs and rehydrate the core from the new `ModelContext`.
+- **`ExternalWork`** — private session bookkeeping for model/tool work exposed to the harness. It tracks unresolved turn actions and defers completion events until the core has accepted the completion.
+- **`CompactionState`** — private `Idle | Requested | Running` state for remote compaction. A running model-barrier compaction may carry one blocked, not-yet-exposed `RequestModel` that is released after compaction finishes or fails.
+- **`TranscriptStore`** — session-local forest of `TranscriptStorageNode`s with entry/parent/child/leaf indexes plus an active leaf pointer. Pure data structure. Knows about branch-aware append, navigate, materialize.
+- **`ModelContext`** — materialized view of the current root-to-leaf path's transcript items. Live model contexts preserve open turns; resume paths explicitly crash-recover any open tail.
+- **`SessionAction`** — public harness-facing work item. `RequestModel { action_id, turn_id, model_context, context_leaf_id, context_tokens }` includes the model-context snapshot visible when the model request was made; `RequestTool` carries the tool payload; `RequestCompaction { request_id, model_context, context_leaf_id, context_tokens }` asks the harness to call the remote compaction API. `CancelSessionWork` is a best-effort session-wide invalidation barrier: the harness should cancel every outstanding model/tool/compaction request for that session and treat late completions as stale.
+- **`AgentRunner<HandleAction>`** — wraps an `AgentSession` + an input channel + an action handler. Its `run()` loop calls `session.drive()` and fans `SessionAction`s to the handler. Transcript items auto-flow into the log; the runner does not expose them directly.
+- **Future `SessionStore` trait** — pluggable durable storage. Planned defaults are `JsonlFileSessionStore` for disk and `InMemorySessionStore` for tests, swappable for `SqliteSessionStore` later.
 
 ### Layer 4 — Control plane (`agent-orchestrator` crate and new traits)
 
@@ -204,7 +239,7 @@ Partially landed as a placeholder; real shape below.
 
 - **`ModelProvider` trait** — `async fn complete(request: ModelRequest) -> ModelCompletion`. Each SDK gets an adapter crate (`agent-model-anthropic`, `agent-model-openai`).
 - **`Tool` trait + `ToolRegistry`** — `trait Tool { async fn execute(args, ctx) -> ToolResult }`. Built-ins live in `agent-tools-builtin` (one file per tool). Extension-provided tools register through the same registry.
-- **`Compactor`** — wraps a `ModelProvider` to summarize a `CompactionPlan`.
+- **Compaction executor** — maps `RequestCompaction` to the remote compaction API and maps the returned history back into `ModelContext`.
 - **`AgentWorklogStore` trait** — per-agent side-store. Default file-backed impl (`{worklog_root}/{agent_id}.worklog`).
 - **`UsageLedger` trait** — receives `UsageRecorded` events, aggregates, supports per-agent / per-tree queries.
 
@@ -274,25 +309,23 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 ### Compaction
 
-**Status**: data model landed (PR #63); executor pending.
+**Status**: session lifecycle landed; remote compaction API executor pending.
 
-- `context.prepare_summary_span(first, last)` is the generic primitive: replace a contiguous active-branch span with a summary and replay the suffix.
-- `context.prepare_compaction(settings)` produces a `CompactionPlan` as prefix-compaction policy on top of that primitive.
-- `Compactor::summarize(plan)` calls a `ModelProvider` to generate the summary string.
-- `session.edit(pending, Compact { plan, summary })` applies the prepared summary span with a `compaction_summary` record.
-- Orchestrator observes `SessionEvent::RecordAppended { record: TranscriptRecord::TurnFinished { .. } }` and checks thresholds; if tripped, drives the compaction pipeline.
+- `session.compact()` schedules compaction for the next safe model-context barrier. If the barrier is a just-emitted `RequestModel`, the session blocks that model action before dispatch, emits `RequestCompaction`, applies the returned replacement context, and then exposes the blocked `RequestModel` with the updated `ModelContext`.
+- The harness/provider layer calls the remote compaction API, equivalent to Codex's `/responses/compact`, using the supplied `ModelContext`.
+- Auto-compaction policy lives in the harness, not in `agent-session`. The harness can use the `context_leaf_id` / `context_tokens` included with `RequestModel` / `RequestCompaction` plus provider metadata it owns to decide when to call `session.compact()`. Those fields are observational for an already-exposed `RequestModel`; to compact before that same provider request, the harness must request compaction before the session exposes the model action. Restoring an over-budget session stays quiescent; it does not start compaction unless the harness explicitly requests it later.
 
 ### Rewind
 
 **Status**: landed (PR #63).
 
-- `session.edit(pending, Rewind { leaf_id: Some(leaf) })` moves the log's leaf pointer; the core is rehydrated from the new materialized view.
+- `session.rewind(Some(leaf))` moves the log's leaf pointer; the core is rehydrated from the new materialized view.
 
 ### Fork (as primitive)
 
 **Status**: landed (PR #63).
 
-- `session.fork(pending, Some(leaf))` returns an unregistered `AgentSession` with a copy of the ancestor path. Caller configures it (tool registry, initial injections, initial input) and registers it via `SessionRegistry`.
+- `session.fork(Some(leaf))` returns an unregistered `AgentSession` with a fresh `TranscriptStore` containing a copy of only the ancestor path from root to `leaf`. The source session is unchanged, so fork does not require the source session itself to be quiescent; the requested leaf still must be a turn boundary. The child does not inherit sibling context branches, abandoned descendants, queued inputs, in-flight actions, events, or other already-forked sessions. In the future shared-store implementation this becomes a cheap second session pointer to the same leaf/path. Caller configures the child (tool registry, initial injections, initial input) and registers it via `SessionRegistry`.
 
 ### Spawn (tool)
 
@@ -309,15 +342,15 @@ The child is not a context fork of the parent. Model, tools, and inherited conte
 
 **Status**: landed.
 
-`AgentOrchestrator::send_message(from, to, content)` and `send_report(from, content)` are the orchestrator-level routing primitives, both fire-and-forget. `send_message` validates that `to` is a direct child of `from` in the spawn tree and enqueues `AgentInput::steer_tagged(from, KIND_AGENT_DIRECTIVE, content)` on the child's mailbox; `send_report` validates that `from` has a spawn parent and enqueues `AgentInput::follow_up_tagged(from, KIND_AGENT_REPORT, content)` on the parent's mailbox. In both cases the paired `from` + `kind` tags propagate into the target's mailbox so the receiver materializes cross-session traffic as a typed `TranscriptRecord::Injected` rather than human user input. Invalid routes surface as `RouteError::{SenderNotFound, TargetNotFound, NotAChild, NoParent}`. These primitives back the `message` and `report` tools (TS parity: `packages/orchestrator/src/tools/{message,report}.ts`).
+`AgentOrchestrator::send_message(from, to, content)` and `send_report(from, content)` are the orchestrator-level routing primitives, both fire-and-forget. `send_message` validates that `to` is a direct child of `from` in the spawn tree and enqueues `AgentInput::steer_tagged(from, KIND_AGENT_DIRECTIVE, content)` on the child's mailbox; `send_report` validates that `from` has a spawn parent and enqueues `AgentInput::follow_up_tagged(from, KIND_AGENT_REPORT, content)` on the parent's mailbox. In both cases the paired `from` + `kind` tags propagate into the target's mailbox so the receiver materializes cross-session traffic as a typed `TranscriptItem::Injected` rather than human user input. Invalid routes surface as `RouteError::{SenderNotFound, TargetNotFound, NotAChild, NoParent}`. These primitives back the `message` and `report` tools (TS parity: `packages/orchestrator/src/tools/{message,report}.ts`).
 
 ### Report (tool)
 
 **Status**: not yet.
 
 1. Child's LLM emits `tool_call: report(content)`.
-2. `ReportTool::execute` calls `orchestrator.route_report(from=child_id, content)`.
-3. Orchestrator looks up `parent = registry.parent(child_id)` and enqueues a tagged `FollowUp` on the parent's mailbox. The parent materializes it as `TranscriptRecord::Injected(InjectedMessage { kind: "agent_report", ... })` when the report starts a turn.
+2. `ReportTool::execute` calls `orchestrator.send_report(from=child_id, content)`.
+3. Orchestrator looks up `parent = registry.parent(child_id)` and enqueues a tagged `FollowUp` on the parent's mailbox. The parent materializes it as `TranscriptItem::Injected(InjectedMessage { kind: "agent_report", ... })` when the report starts a turn.
 4. ReportTool returns `ok`. Child turn continues.
 
 ### agent_idle notification
@@ -325,20 +358,22 @@ The child is not a context fork of the parent. Model, tools, and inherited conte
 **Status**: not yet. Requires event subscription (SessionEvent stream).
 
 1. Child's FSM reaches `Idle` after a graceful `TurnFinished`.
-2. Orchestrator's event subscriber sees `SessionEvent::RecordAppended { record: TranscriptRecord::TurnFinished { outcome: Graceful, .. }, .. }`.
-3. If `registry.parent(child_id)` exists, enqueue a tagged `FollowUp` on the parent's mailbox. The parent materializes it as an injected `agent_idle` record when that input starts a turn.
+2. Orchestrator's event subscriber sees `SessionEvent::TranscriptItemAppended { item: TranscriptItem::TurnFinished { outcome: Graceful, .. }, .. }`.
+3. If `registry.parent(child_id)` exists, enqueue a tagged `FollowUp` on the parent's mailbox. The parent materializes it as an injected `agent_idle` item when that input starts a turn.
 
 ### Worklog
 
-**Status**: not yet. See `worklog-design.md`.
+**Status**: not yet. This section is the current worklog roadmap until a
+dedicated design doc exists.
 
-- Orchestrator observes appended `TurnFinished` records, gates on `is_likely_trivial_turn`, serializes per-agent, forks parent at boundary with a single-tool registry (`[WorklogUpdateTool]`) and a `WorklogFraming` injection.
+- Orchestrator observes appended `TurnFinished` items, gates on `is_likely_trivial_turn`, serializes per-agent, forks parent at boundary with a single-tool registry (`[WorklogUpdateTool]`) and a `WorklogFraming` injection.
 - The fork's LLM optionally calls `worklog_update`, which writes to `AgentWorklogStore` (**not** to the session log).
 - Fork session is discarded on idle. Output lives in the side-store; ancestor worklogs are injected into descendants at prompt-assembly time.
 
 ### Cost aggregation
 
-**Status**: not yet. See `cost-aggregation.md`.
+**Status**: not yet. This section is the current cost-aggregation roadmap until
+a dedicated design doc exists.
 
 - Every `ModelProvider::complete` call carries a `UsageContext { agent_id, scope, turn_id, model, cache_scope }`.
 - On completion, orchestrator emits `SessionEvent::UsageRecorded { ctx, usage }`.
@@ -360,14 +395,14 @@ Each row is one landable PR. Later PRs depend on their predecessors.
 
 | # | PR | What it adds | Unlocks |
 |---|---|---|---|
-| 1 | **#63 (current)** | `agent-session`, `agent-orchestrator` crates + Transcript unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
-| 2 | Session decomposition | `ContextEdit` trait + op structs + `SessionRegistry<S>` + orchestrator becomes composition struct | clean target for registry-level features |
+| 1 | **#63 foundation** | `agent-session`, `agent-orchestrator` crates + transcript-item/model-context unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
+| 2 | Session hardening | session-wide cancellation + model failure path + action snapshots + remote `compact()` request API + `rewind` + `SessionRegistry<S>` | clean target for registry-level features |
 | 3 | `SessionStore` | trait + in-memory + JSONL-file impls + wire into `AgentSession` | durable restart; resume-from-file; pluggable backends |
 | 4 | `ControlPlane` trait | trait definition + `LocalControlPlane` impl + view-layer adapter | view/control separation; future daemon |
 | 5 | `SessionEvent` stream | event bus + subscription on `AgentSession`; durable events mirror log writes | observers (TUI, ledger, idle watcher) |
 | 6 | `ModelProvider` trait | trait + Anthropic adapter + `UsageContext` + retry wrapper | actual model calls; compaction executor; worklog fork model |
 | 7 | `Tool` + `ToolRegistry` | trait + built-in tool pack (bash/read/write/edit/grep/find/ls) | tool execution; spawn/report/worklog tools |
-| 8 | `Compactor` + auto-compaction | summarize plans via `ModelProvider`; orchestrator threshold watcher | production-grade context management |
+| 8 | Remote compaction executor | call `/responses/compact` for `RequestCompaction`; map replacement history back into `ModelContext` | production-grade context management |
 | 9 | `UsageLedger` | trait + in-memory impl + roll-up queries | cost observability; TUI footer |
 | 10 | Spawn + report + agent_idle | `SpawnTool`, `ReportTool`, idle-watcher in orchestrator; new injected-message kind constants | multi-agent operation |
 | 11 | `AgentWorklogStore` + worklog fork | trait + file-backed impl + `WorklogUpdateTool` + orchestrator worklog scheduler | per-agent durable knowledge; ancestor worklog injection for spawned sub-agents |
@@ -387,19 +422,21 @@ Rough mapping to user-visible capability:
 
 These are documented here so the PRs that implement them stick to the intended shape.
 
-### Compaction is stop-the-world per session
+### Compaction Runs Through One Session State
 
-The session being compacted is frozen for the entire flow: `prepare → summarize → compact`. While frozen, the session queues incoming inputs (tool completions, child reports, steer, follow-up) and does not acknowledge them to the FSM until the flow completes or aborts. Tool calls the session had in flight when the flow started continue to run externally and their results queue; they're replayed to the FSM once compaction finishes.
+Compaction has one session primitive: `session.compact()`. User-triggered compaction and harness-triggered auto-compaction both call that same primitive, and the request starts at the next safe model-context barrier. A safe barrier is either an idle turn boundary or the moment after the core emits `RequestModel` but before the session exposes that model action to the harness. An undrained `CancelSessionWork` does not block compaction; new requests queue behind it.
 
-This closes the liveness hole where repeated appends during an async summarize call starve the compaction plan's staleness fingerprint. The `Compactor` PR lands the mechanism (likely a `SessionPhase::EditingHistory { queued_inputs }` on `AgentSession` with `begin_history_edit` / `commit_history_edit` / `abort_history_edit` transitions); the `ContextEdit` trait's `apply` becomes a witness over the edit phase rather than holding `&mut self` across await.
+While a compaction request is pending, the session holds normal turn advancement: queued `Steer` / `FollowUp` inputs remain in the mailbox, and a blocked `RequestModel` is not exposed until the remote compaction request finishes or fails. A successful request replaces the active model context with the API-provided replacement and then releases the blocked model action with the updated `ModelContext`. Idle compaction replacements must end at a turn boundary with the same last turn id as the replaced path; model-barrier replacements must keep the blocked model turn open, use that blocked turn id, and preserve the already-appended open-turn suffix exactly. Any assistant tool call already present in a replacement must have a matching tool result before the context closes or continues the turn. Invalid replacement is treated as compaction failure. Failure releases the blocked model action unchanged so the agent still makes progress.
+
+The session does not estimate tokens and does not know threshold policy. It only carries the latest harness-provided `context_tokens` value through `RequestModel` and `RequestCompaction`, together with the `context_leaf_id` that token count describes. The harness decides whether that count is over budget. Compaction replacement and history rehydration clear the context-token anchor unless the harness provides a replacement count, because the old count no longer describes the active context.
 
 **Parents can compact while children are still running.** Children are separate sessions with separate logs; a parent's compaction has no effect on any descendant.
 
 ### Child reports are mailbox inputs, not history edits
 
-When a child emits `report(content)`, the orchestrator does **not** open `edit_history` on the parent. Instead the report enters the parent's mailbox as a tagged `AgentInput::FollowUp` via `follow_up_tagged(from, KIND_AGENT_REPORT, content)`. The parent's FSM materializes it as a `TranscriptRecord::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to future agent-visible notifications: use tagged mailbox input for messages that should become model-visible context, and keep purely live signals as `SessionEvent`s.
+When a child emits `report(content)`, the orchestrator does **not** directly mutate the parent's transcript store. Instead the report enters the parent's mailbox as a tagged `AgentInput::FollowUp` via `follow_up_tagged(from, KIND_AGENT_REPORT, content)`. The parent's FSM materializes it as a `TranscriptItem::Injected` in the log when it next transitions from `Idle` to `RunningModel` — not before. Same applies to future agent-visible notifications: use tagged mailbox input for messages that should become model-visible context, and keep purely live signals as `SessionEvent`s.
 
-This keeps `AgentSession::edit`/`fork` for genuine structural edits (compact, rewind, fork, replace_transcript) and removes the `entry_count`-churning source of compaction plan staleness.
+This keeps `AgentSession::compact` / `rewind` for genuine structural mutations and keeps `AgentSession::fork` as a non-mutating copy operation. Reports therefore do not churn `entry_count` before the parent actually consumes them.
 
 ### Spawn is fire-and-forget and creates a fresh session
 
@@ -413,7 +450,7 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 7. Non-goals
 
-- No support for session transcripts that aren't at turn boundaries during structural ops. Compaction/rewind/fork always require a quiescent turn boundary. Enforced by `AgentSession::edit`/`fork`'s quiescence check.
+- No support for history mutations that cut through turn internals. `rewind` may interrupt active work after validating that the target is a boundary. Remote compaction can run at an idle boundary or a pre-model safe barrier, replacing the active model context with API output. `AgentSession::fork` is not a mutation of the source session; it can copy any requested leaf that is already a turn boundary, even if the source session is currently busy elsewhere.
 - No speculative abstraction for "hooks" that don't have concrete use cases. When extensions land, their API grows out of what concrete consumers need, not ahead of them.
 - No speculative support for non-Anthropic-shaped providers beyond what `ModelProvider` naturally allows. Any provider that fits `messages + tools → assistant with tool_calls` works; we don't pre-bake support for genuinely different paradigms (e.g. step-wise agent protocols) until we have one.
 - No back-compat with the TS session format *as a byte format* — the JSONL backend may use the same layout for cross-implementation convenience, but we don't pin wire-format compatibility as a hard constraint.
@@ -423,11 +460,11 @@ Spawn does not require the parent to be at a turn boundary — a spawn tool invo
 
 ## 8. Principles in tension (explicit trade-offs)
 
-**Clean boundaries vs. API ergonomics.** The `session.edit(pending, SummarizeSpan { plan, summary })?` form is more verbose than a single `session.compactAtBoundary(plan, summary, work)` helper. Accepting the verbosity because it encodes which operations are history-edit-only in the type system.
+**Clean boundaries vs. API ergonomics.** Earlier designs exposed generic span replacement and local summary splicing as public history-edit operations. PR #64 collapses that surface to remote `compact()` and `rewind(leaf)`. Fresh context injection is handled by constructors, not by editing a live session.
 
 **Distributed-ready API vs. sync simplicity.** `ControlPlane` is async + fallible even when called in-process. Paying this for day-1 local use to keep daemon-day migration trivial.
 
-**Two tracking layers (log DAG + registry tree).** Not a duplication — the log DAG tracks intra-session branching and summary-span rewrites; the registry tracks inter-session spawn relationships. Use distinct terminology in code (`previous_entry_id` vs. `spawn_parent`) to reinforce.
+**Two tracking layers (transcript forest + registry tree).** Not a duplication — the transcript forest tracks transcript-item ancestry and compaction rewrites; the registry tracks inter-session spawn relationships. Use distinct terminology in code (`previous_entry_id` vs. `spawn_parent`) to reinforce.
 
 **Unified `InjectedMessage` vs. per-kind entry types.** Unified. Every "summary / note / report injected at a boundary" is one enum variant with a kind tag. TS has 3+ entry types for this; we have 1 + extensible tag. New kinds don't require new materialization branches.
 

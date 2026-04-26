@@ -134,7 +134,7 @@ impl std::error::Error for AgentInputError {}
 /// Runtime input to the live agent FSM.
 ///
 /// These events are volatile control inputs. Accepted transitions may append
-/// durable TranscriptRecords, but AgentEvent itself is not persisted.
+/// durable transcript items, but AgentEvent itself is not persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AgentEvent {
     Interrupt,

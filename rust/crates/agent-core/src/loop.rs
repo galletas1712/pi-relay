@@ -4,8 +4,8 @@ use crate::action::AgentAction;
 use crate::event::{AgentInput, AgentInputError};
 use crate::ids::{ActionId, TurnId};
 use crate::mailbox::Mailbox;
-use crate::record::TranscriptRecord;
 use crate::state::AgentState;
+use crate::transcript_item::TranscriptItem;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCoreLoop {
@@ -14,7 +14,7 @@ pub struct AgentCoreLoop {
     last_turn_id: TurnId,
     next_action_id: ActionId,
     action_outbox: VecDeque<AgentAction>,
-    record_outbox: VecDeque<TranscriptRecord>,
+    transcript_item_outbox: VecDeque<TranscriptItem>,
 }
 
 impl Default for AgentCoreLoop {
@@ -25,7 +25,7 @@ impl Default for AgentCoreLoop {
             last_turn_id: TurnId::default(),
             next_action_id: ActionId::first(),
             action_outbox: VecDeque::new(),
-            record_outbox: VecDeque::new(),
+            transcript_item_outbox: VecDeque::new(),
         }
     }
 }
@@ -37,7 +37,8 @@ impl AgentCoreLoop {
 
     /// Resume a fresh idle core at the given turn boundary.
     ///
-    /// Callers own durable history; the core itself no longer buffers records.
+    /// Callers own durable history; the core itself no longer buffers
+    /// transcript items.
     /// The session derives `last_turn_id` from its log before calling this.
     pub fn resume_at_boundary(last_turn_id: TurnId) -> Self {
         Self::resume_at_boundary_with_next_action_id(last_turn_id, ActionId::first())
@@ -53,7 +54,7 @@ impl AgentCoreLoop {
             last_turn_id,
             next_action_id,
             action_outbox: VecDeque::new(),
-            record_outbox: VecDeque::new(),
+            transcript_item_outbox: VecDeque::new(),
         }
     }
 
@@ -90,13 +91,14 @@ impl AgentCoreLoop {
         self.action_outbox.drain(..).collect()
     }
 
-    pub fn drain_records(&mut self) -> Vec<TranscriptRecord> {
-        self.record_outbox.drain(..).collect()
+    pub fn drain_transcript_items(&mut self) -> Vec<TranscriptItem> {
+        self.transcript_item_outbox.drain(..).collect()
     }
 
     /// Drain every queued user input (Steer then FollowUp) from the mailbox
-    /// without advancing the FSM. Preserves the `from` tag each input was
-    /// enqueued with. Notifications and the interrupt flag are untouched.
+    /// without advancing the FSM. Preserves the `from` and `kind` tags each
+    /// input was enqueued with. Notifications and the interrupt flag are
+    /// untouched.
     ///
     /// Primarily intended for tests and for orchestrator introspection.
     pub fn drain_pending_inputs(&mut self) -> Vec<AgentInput> {
@@ -110,29 +112,29 @@ impl AgentCoreLoop {
                 return;
             };
 
-            let (records, actions) = self.state.step(event, &mut self.next_action_id);
-            if records.is_empty() && actions.is_empty() {
+            let (items, actions) = self.state.step(event, &mut self.next_action_id);
+            if items.is_empty() && actions.is_empty() {
                 continue;
             }
 
-            if let Some(turn_id) = started_turn_id(&records) {
+            if let Some(turn_id) = started_turn_id(&items) {
                 self.last_turn_id = turn_id;
             }
-            self.record_outbox.extend(records);
+            self.transcript_item_outbox.extend(items);
             self.action_outbox.extend(actions);
         }
     }
 }
 
-fn started_turn_id(records: &[TranscriptRecord]) -> Option<TurnId> {
-    records.iter().find_map(|record| match record {
-        TranscriptRecord::TurnStarted { turn_id } => Some(*turn_id),
-        TranscriptRecord::UserMessage(_)
-        | TranscriptRecord::AssistantMessage(_)
-        | TranscriptRecord::ToolCallStarted { .. }
-        | TranscriptRecord::ToolResult(_)
-        | TranscriptRecord::TurnFinished { .. }
-        | TranscriptRecord::Injected(_) => None,
+fn started_turn_id(items: &[TranscriptItem]) -> Option<TurnId> {
+    items.iter().find_map(|item| match item {
+        TranscriptItem::TurnStarted { turn_id } => Some(*turn_id),
+        TranscriptItem::UserMessage(_)
+        | TranscriptItem::AssistantMessage(_)
+        | TranscriptItem::ToolCallStarted { .. }
+        | TranscriptItem::ToolResult(_)
+        | TranscriptItem::TurnFinished { .. }
+        | TranscriptItem::Injected(_) => None,
     })
 }
 
@@ -146,7 +148,7 @@ mod tests {
     use crate::message::{
         AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
     };
-    use crate::record::{InjectedMessage, TurnOutcome};
+    use crate::transcript_item::{InjectedMessage, TurnOutcome};
 
     fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {
         AssistantMessage { items }
@@ -169,28 +171,28 @@ mod tests {
         }
     }
 
-    /// Drive a single input end-to-end and collect every record emitted during
-    /// that cycle. Tests accumulate these into a running transcript so they can
-    /// assert the same shape they used to read off `loop_state.transcript`.
-    fn drive_collect(loop_state: &mut AgentCoreLoop, input: AgentInput) -> Vec<TranscriptRecord> {
+    /// Drive a single input end-to-end and collect every item emitted during
+    /// that cycle. Tests accumulate these into a running transcript-item list so
+    /// they can assert the shape the session stores durably.
+    fn drive_collect(loop_state: &mut AgentCoreLoop, input: AgentInput) -> Vec<TranscriptItem> {
         loop_state
             .enqueue_input(input)
             .expect("test inputs should be valid");
         loop_state.drive();
-        loop_state.drain_records()
+        loop_state.drain_transcript_items()
     }
 
     #[test]
     fn starting_a_turn_appends_boundary_events_and_requests_the_model() {
         let mut loop_state = AgentCoreLoop::new();
 
-        let records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
+        let items = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
 
         assert_eq!(
-            records,
+            items,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hello".to_string()),
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage("hello".to_string()),
             ]
         );
         assert_eq!(
@@ -213,7 +215,7 @@ mod tests {
     fn model_completion_with_a_tool_call_appends_assistant_and_starts_the_tool() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
+        let mut items = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
@@ -222,7 +224,7 @@ mod tests {
             AssistantItem::ToolCall(tool_call.clone()),
         ]);
 
-        records.extend(drive_collect(
+        items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
                 action_id: ActionId(1),
@@ -232,12 +234,12 @@ mod tests {
         ));
 
         assert_eq!(
-            records,
+            items,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hello".to_string()),
-                TranscriptRecord::AssistantMessage(assistant.clone()),
-                TranscriptRecord::ToolCallStarted {
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::AssistantMessage(assistant.clone()),
+                TranscriptItem::ToolCallStarted {
                     turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
@@ -266,10 +268,10 @@ mod tests {
     #[test]
     fn model_failure_finishes_the_turn_as_crashed() {
         let mut loop_state = AgentCoreLoop::new();
-        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
+        let mut items = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
         loop_state.drain_actions();
 
-        records.extend(drive_collect(
+        items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelFailed {
                 action_id: ActionId(1),
@@ -279,11 +281,11 @@ mod tests {
         ));
 
         assert_eq!(
-            records,
+            items,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hello".to_string()),
-                TranscriptRecord::TurnFinished {
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Crashed,
                 },
@@ -313,7 +315,7 @@ mod tests {
         loop_state.drain_actions();
 
         let result = successful_tool_result(tool_call.id, "bash");
-        let records = drive_collect(
+        let items = drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
                 action_id: ActionId(2),
@@ -322,7 +324,7 @@ mod tests {
             },
         );
 
-        assert_eq!(records.last(), Some(&TranscriptRecord::ToolResult(result)));
+        assert_eq!(items.last(), Some(&TranscriptItem::ToolResult(result)));
         assert_eq!(
             loop_state.drain_actions(),
             vec![AgentAction::RequestModel {
@@ -366,11 +368,9 @@ mod tests {
             .expect("matching tool completion is valid");
         loop_state.drive();
 
-        let records = loop_state.drain_records();
-        let expected_result_record = TranscriptRecord::ToolResult(result);
-        assert!(records
-            .iter()
-            .any(|record| record == &expected_result_record));
+        let items = loop_state.drain_transcript_items();
+        let expected_result_item = TranscriptItem::ToolResult(result);
+        assert!(items.iter().any(|item| item == &expected_result_item));
         assert_eq!(
             loop_state.drain_actions(),
             vec![
@@ -391,7 +391,7 @@ mod tests {
     fn multiple_tool_calls_run_in_parallel_and_results_are_recorded_in_source_order() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
+        let mut items = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
         loop_state.drain_actions();
 
         let first = tool_call(&mut next_tool_call_id, "bash");
@@ -400,7 +400,7 @@ mod tests {
             AssistantItem::ToolCall(first.clone()),
             AssistantItem::ToolCall(second.clone()),
         ]);
-        records.extend(drive_collect(
+        items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
                 action_id: ActionId(1),
@@ -425,15 +425,15 @@ mod tests {
             ]
         );
         assert_eq!(
-            records.last(),
-            Some(&TranscriptRecord::ToolCallStarted {
+            items.last(),
+            Some(&TranscriptItem::ToolCallStarted {
                 turn_id: TurnId(1),
                 tool_call: second.clone(),
             })
         );
 
         let second_result = successful_tool_result(second.id, "read");
-        records.extend(drive_collect(
+        items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
                 action_id: ActionId(3),
@@ -441,11 +441,11 @@ mod tests {
                 result: second_result.clone(),
             },
         ));
-        records.extend(drive_collect(&mut loop_state, AgentInput::steer("urgent")));
+        items.extend(drive_collect(&mut loop_state, AgentInput::steer("urgent")));
 
         assert_eq!(
-            records.last(),
-            Some(&TranscriptRecord::ToolCallStarted {
+            items.last(),
+            Some(&TranscriptItem::ToolCallStarted {
                 turn_id: TurnId(1),
                 tool_call: second.clone(),
             })
@@ -460,7 +460,7 @@ mod tests {
         ));
 
         let first_result = successful_tool_result(first.id, "bash");
-        records.extend(drive_collect(
+        items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
                 action_id: ActionId(2),
@@ -470,11 +470,11 @@ mod tests {
         ));
 
         assert_eq!(
-            records.last(),
-            Some(&TranscriptRecord::ToolResult(second_result.clone()))
+            items.last(),
+            Some(&TranscriptItem::ToolResult(second_result.clone()))
         );
-        assert_eq!(records[5], TranscriptRecord::ToolResult(first_result));
-        assert_eq!(records[6], TranscriptRecord::ToolResult(second_result));
+        assert_eq!(items[5], TranscriptItem::ToolResult(first_result));
+        assert_eq!(items[6], TranscriptItem::ToolResult(second_result));
         assert_eq!(
             loop_state.drain_actions(),
             vec![AgentAction::RequestModel {
@@ -496,12 +496,12 @@ mod tests {
     fn interrupting_a_running_tool_closes_the_turn_and_starts_queued_steer_work() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("initial"));
+        let mut items = drive_collect(&mut loop_state, AgentInput::follow_up("initial"));
         loop_state.drain_actions();
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
         let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
-        records.extend(drive_collect(
+        items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
                 action_id: ActionId(1),
@@ -511,31 +511,31 @@ mod tests {
         ));
         loop_state.drain_actions();
 
-        records.extend(drive_collect(&mut loop_state, AgentInput::steer("urgent")));
+        items.extend(drive_collect(&mut loop_state, AgentInput::steer("urgent")));
 
         assert!(loop_state.drain_actions().is_empty());
 
-        records.extend(drive_collect(&mut loop_state, AgentInput::Interrupt));
+        items.extend(drive_collect(&mut loop_state, AgentInput::Interrupt));
 
         assert_eq!(
-            records,
+            items,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("initial".to_string()),
-                TranscriptRecord::AssistantMessage(assistant_message(vec![
-                    AssistantItem::ToolCall(tool_call.clone(),)
-                ])),
-                TranscriptRecord::ToolCallStarted {
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage("initial".to_string()),
+                TranscriptItem::AssistantMessage(assistant_message(vec![AssistantItem::ToolCall(
+                    tool_call.clone(),
+                )])),
+                TranscriptItem::ToolCallStarted {
                     turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
-                TranscriptRecord::ToolResult(ToolResultMessage::interrupted(tool_call.id, "bash")),
-                TranscriptRecord::TurnFinished {
+                TranscriptItem::ToolResult(ToolResultMessage::interrupted(tool_call.id, "bash")),
+                TranscriptItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Interrupted,
                 },
-                TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-                TranscriptRecord::UserMessage("urgent".to_string()),
+                TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+                TranscriptItem::UserMessage("urgent".to_string()),
             ]
         );
         assert_eq!(
@@ -561,7 +561,7 @@ mod tests {
     fn interrupting_parallel_tools_cancels_the_turn_and_records_unfinished_tools() {
         let mut loop_state = AgentCoreLoop::new();
         let mut next_tool_call_id = ToolCallId::first();
-        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("initial"));
+        let mut items = drive_collect(&mut loop_state, AgentInput::follow_up("initial"));
         loop_state.drain_actions();
 
         let first = tool_call(&mut next_tool_call_id, "bash");
@@ -570,7 +570,7 @@ mod tests {
             AssistantItem::ToolCall(first.clone()),
             AssistantItem::ToolCall(second.clone()),
         ]);
-        records.extend(drive_collect(
+        items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
                 action_id: ActionId(1),
@@ -581,7 +581,7 @@ mod tests {
         loop_state.drain_actions();
 
         let second_result = successful_tool_result(second.id, "read");
-        records.extend(drive_collect(
+        items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
                 action_id: ActionId(3),
@@ -589,20 +589,20 @@ mod tests {
                 result: second_result.clone(),
             },
         ));
-        records.extend(drive_collect(&mut loop_state, AgentInput::Interrupt));
+        items.extend(drive_collect(&mut loop_state, AgentInput::Interrupt));
 
         assert_eq!(
-            records.last(),
-            Some(&TranscriptRecord::TurnFinished {
+            items.last(),
+            Some(&TranscriptItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Interrupted,
             })
         );
         assert_eq!(
-            records[5],
-            TranscriptRecord::ToolResult(ToolResultMessage::interrupted(first.id, "bash"))
+            items[5],
+            TranscriptItem::ToolResult(ToolResultMessage::interrupted(first.id, "bash"))
         );
-        assert_eq!(records[6], TranscriptRecord::ToolResult(second_result));
+        assert_eq!(items[6], TranscriptItem::ToolResult(second_result));
         assert_eq!(
             loop_state.drain_actions(),
             vec![AgentAction::CancelTurn { turn_id: TurnId(1) }]
@@ -613,17 +613,17 @@ mod tests {
     #[test]
     fn interrupting_a_running_model_without_queued_work_finishes_interrupted() {
         let mut loop_state = AgentCoreLoop::new();
-        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
+        let mut items = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
         loop_state.drain_actions();
 
-        records.extend(drive_collect(&mut loop_state, AgentInput::Interrupt));
+        items.extend(drive_collect(&mut loop_state, AgentInput::Interrupt));
 
         assert_eq!(
-            records,
+            items,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("hello".to_string()),
-                TranscriptRecord::TurnFinished {
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Interrupted,
                 },
@@ -640,7 +640,7 @@ mod tests {
     fn idle_turn_from_tagged_input_produces_injected_transcript_entry() {
         let mut loop_state = AgentCoreLoop::new();
 
-        let records = drive_collect(
+        let items = drive_collect(
             &mut loop_state,
             AgentInput::steer_tagged("parent-session", "agent_directive", "please do X"),
         );
@@ -649,10 +649,10 @@ mod tests {
         expected_metadata.insert("from".to_string(), "parent-session".to_string());
 
         assert_eq!(
-            records,
+            items,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::Injected(InjectedMessage {
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::Injected(InjectedMessage {
                     kind: "agent_directive".to_string(),
                     content: "please do X".to_string(),
                     metadata: expected_metadata,
@@ -672,13 +672,13 @@ mod tests {
     fn idle_turn_from_untagged_input_produces_user_message() {
         let mut loop_state = AgentCoreLoop::new();
 
-        let records = drive_collect(&mut loop_state, AgentInput::steer("human steer"));
+        let items = drive_collect(&mut loop_state, AgentInput::steer("human steer"));
 
         assert_eq!(
-            records,
+            items,
             vec![
-                TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-                TranscriptRecord::UserMessage("human steer".to_string()),
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                TranscriptItem::UserMessage("human steer".to_string()),
             ]
         );
     }
@@ -686,13 +686,13 @@ mod tests {
     #[test]
     fn stale_completions_are_ignored_after_an_interrupt() {
         let mut loop_state = AgentCoreLoop::new();
-        let mut records = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
+        let mut items = drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
         loop_state.drain_actions();
-        records.extend(drive_collect(&mut loop_state, AgentInput::Interrupt));
+        items.extend(drive_collect(&mut loop_state, AgentInput::Interrupt));
         loop_state.drain_actions();
 
         let stale_assistant = assistant_message(vec![AssistantItem::Text("stale".to_string())]);
-        records.extend(drive_collect(
+        items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ModelCompleted {
                 action_id: ActionId(1),
@@ -701,7 +701,7 @@ mod tests {
             },
         ));
 
-        assert_eq!(records.len(), 3);
+        assert_eq!(items.len(), 3);
         assert!(loop_state.drain_actions().is_empty());
         assert_eq!(loop_state.state, AgentState::Idle);
     }

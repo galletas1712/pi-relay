@@ -16,12 +16,12 @@ use agent_session::AgentSession;
 pub use crate::registry::{RegistryError, RouteError, SessionId, SessionRegistry};
 
 /// Well-known `InjectedMessage::kind` tag for parent->child directives routed via
-/// `AgentOrchestrator::send_message`. Stored on the child's transcript as the
+/// `AgentOrchestrator::send_message`. Stored in the child's model context as the
 /// `kind` of the injected entry that opens the directive's turn.
 pub const KIND_AGENT_DIRECTIVE: &str = "agent_directive";
 
 /// Well-known `InjectedMessage::kind` tag for child->parent reports routed via
-/// `AgentOrchestrator::send_report`. Stored on the parent's transcript as the
+/// `AgentOrchestrator::send_report`. Stored in the parent's model context as the
 /// `kind` of the injected entry that opens the report's turn.
 pub const KIND_AGENT_REPORT: &str = "agent_report";
 
@@ -54,7 +54,7 @@ impl AgentOrchestrator {
     /// Enqueues `AgentInput::Steer { from: Some(from), kind:
     /// Some(KIND_AGENT_DIRECTIVE), content }` on the target's mailbox. The
     /// `from` and `kind` tags ride along so the target's FSM materialises a
-    /// `TranscriptRecord::Injected(InjectedMessage { kind:
+    /// `TranscriptItem::Injected(InjectedMessage { kind:
     /// "agent_directive", metadata: {"from": ...}, .. })` at turn start
     /// instead of a plain `UserMessage`.
     ///
@@ -97,7 +97,7 @@ impl AgentOrchestrator {
     /// Enqueues `AgentInput::FollowUp { from: Some(from), kind:
     /// Some(KIND_AGENT_REPORT), content }` on the parent's mailbox. The `from`
     /// and `kind` tags ride along so the parent's FSM materialises a
-    /// `TranscriptRecord::Injected(InjectedMessage { kind: "agent_report",
+    /// `TranscriptItem::Injected(InjectedMessage { kind: "agent_report",
     /// metadata: {"from": ...}, .. })` at turn start instead of a plain
     /// `UserMessage`.
     ///
@@ -130,11 +130,8 @@ impl AgentOrchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{AgentInput, AssistantMessage, TranscriptRecord, TurnId, TurnOutcome};
-    use agent_session::{
-        Compact, CompactionSettings, ContextError, HistoryEditError, PendingWork,
-        ReplaceTranscript, Rewind, Transcript,
-    };
+    use agent_core::{AgentInput, AssistantMessage, TranscriptItem, TurnId, TurnOutcome};
+    use agent_session::{HistoryOperationError, ModelContext, SessionAction, TranscriptStoreError};
 
     #[test]
     fn orchestrator_routes_input_to_sessions() {
@@ -151,73 +148,37 @@ mod tests {
             .enqueue_input(AgentInput::follow_up("hello"))
             .expect("plain follow-up is valid");
 
-        assert!(orchestrator
-            .registry()
-            .get("root")
-            .expect("session should exist")
-            .has_pending_work());
-    }
-
-    #[test]
-    fn orchestrator_delegates_transcript_replacement_to_session_history_edit() {
-        let mut orchestrator = AgentOrchestrator::new();
-        let transcript = Transcript::from_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("compacted".to_string()),
-            TranscriptRecord::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-        ]);
-
-        orchestrator
-            .registry_mut()
-            .spawn("root", AgentSession::new())
-            .expect("new session should be inserted");
-        orchestrator
-            .registry_mut()
-            .get_mut("root")
-            .expect("session should exist")
-            .edit(
-                PendingWork::NONE,
-                ReplaceTranscript {
-                    replacement: transcript,
-                },
-            )
-            .expect("idle empty session can replace transcript");
-
         assert_eq!(
             orchestrator
-                .registry()
-                .get("root")
+                .registry_mut()
+                .get_mut("root")
                 .expect("session should exist")
-                .transcript()
-                .last_turn_id(),
-            TurnId(1)
+                .drain_pending_inputs(),
+            vec![AgentInput::follow_up("hello")]
         );
     }
 
     #[test]
-    fn orchestrator_delegates_rewind_fork_and_compaction_to_session_history_edits() {
+    fn orchestrator_delegates_rewind_fork_and_compaction_to_session_history_operations() {
         let mut orchestrator = AgentOrchestrator::new();
-        let session = AgentSession::from_transcript(Transcript::from_records(vec![
-            TranscriptRecord::TurnStarted { turn_id: TurnId(1) },
-            TranscriptRecord::UserMessage("first user message".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            TranscriptRecord::TurnFinished {
+        let session = AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            TranscriptItem::UserMessage("first user message".to_string()),
+            TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            TranscriptItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
-            TranscriptRecord::TurnStarted { turn_id: TurnId(2) },
-            TranscriptRecord::UserMessage("second user message".to_string()),
-            TranscriptRecord::AssistantMessage(AssistantMessage { items: Vec::new() }),
-            TranscriptRecord::TurnFinished {
+            TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+            TranscriptItem::UserMessage("second user message".to_string()),
+            TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+            TranscriptItem::TurnFinished {
                 turn_id: TurnId(2),
                 outcome: TurnOutcome::Graceful,
             },
         ]));
-        let mid_turn_id = session.context().entries()[1].id.clone();
-        let turn_one_end_id = session.context().entries()[3].id.clone();
+        let mid_turn_id = session.transcript_store().entries()[1].id.clone();
+        let turn_one_end_id = session.transcript_store().entries()[3].id.clone();
 
         orchestrator
             .registry_mut()
@@ -228,22 +189,19 @@ mod tests {
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit(
-                PendingWork::NONE,
-                Rewind {
-                    leaf_id: Some(mid_turn_id.clone()),
-                },
-            );
+            .rewind(Some(&mid_turn_id));
         assert!(matches!(
             rewind_err,
-            Err(HistoryEditError::Context(ContextError::NotTurnBoundary))
+            Err(HistoryOperationError::Store(
+                TranscriptStoreError::NotTurnBoundary
+            ))
         ));
 
         let fork = orchestrator
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .fork(PendingWork::NONE, Some(&turn_one_end_id))
+            .fork(Some(&turn_one_end_id))
             .expect("turn boundary fork should succeed");
         orchestrator
             .registry_mut()
@@ -254,7 +212,7 @@ mod tests {
                 .registry()
                 .get("fork")
                 .expect("fork should exist")
-                .transcript()
+                .model_context()
                 .last_turn_id(),
             TurnId(1)
         );
@@ -263,36 +221,20 @@ mod tests {
             Some(&"root".to_string())
         );
 
-        let plan = orchestrator
-            .registry()
-            .get("root")
-            .expect("session should exist")
-            .context()
-            .prepare_compaction(CompactionSettings {
-                keep_recent_tokens: 1,
-            })
-            .expect("old turn should be compactable");
         orchestrator
             .registry_mut()
             .get_mut("root")
             .expect("session should exist")
-            .edit(
-                PendingWork::NONE,
-                Compact {
-                    plan,
-                    summary: "summary".to_string(),
-                },
-            )
-            .expect("root can compact at turn boundary");
-        assert_eq!(
+            .compact();
+        assert!(matches!(
             orchestrator
-                .registry()
-                .get("root")
+                .registry_mut()
+                .get_mut("root")
                 .expect("root should exist")
-                .transcript()
-                .latest_compaction_summary(),
-            Some("summary")
-        );
+                .drain_actions()
+                .as_slice(),
+            [SessionAction::RequestCompaction { .. }]
+        ));
     }
 
     fn orchestrator_with_parent_and_child() -> AgentOrchestrator {
@@ -397,7 +339,7 @@ mod tests {
         let mut orchestrator = orchestrator_with_parent_and_child();
 
         // Send a report from B up to A, then drive A's mailbox so it starts a
-        // turn from the queued follow-up. The parent transcript should open
+        // turn from the queued follow-up. The parent model_context should open
         // the new turn with an injected entry tagged as agent_report, not a
         // plain UserMessage.
         orchestrator
@@ -410,14 +352,14 @@ mod tests {
             .expect("parent exists");
         parent.drive();
 
-        let records = parent.transcript().records().to_vec();
-        let injected = records
+        let items = parent.model_context().transcript_items().to_vec();
+        let injected = items
             .iter()
             .find_map(|r| match r {
-                TranscriptRecord::Injected(cm) => Some(cm),
+                TranscriptItem::Injected(cm) => Some(cm),
                 _ => None,
             })
-            .expect("parent transcript should contain an injected entry from the report");
+            .expect("parent model_context should contain an injected entry from the report");
 
         let mut expected_metadata = std::collections::BTreeMap::new();
         expected_metadata.insert("from".to_string(), "B".to_string());
@@ -433,9 +375,9 @@ mod tests {
         // And make sure we did NOT ALSO append a plain UserMessage for the
         // report.
         assert!(
-            !records
+            !items
                 .iter()
-                .any(|r| matches!(r, TranscriptRecord::UserMessage(s) if s == "child is done")),
+                .any(|r| matches!(r, TranscriptItem::UserMessage(s) if s == "child is done")),
             "report should not show up as a UserMessage",
         );
     }
