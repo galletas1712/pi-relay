@@ -13,7 +13,7 @@ truth for those roadmaps.
 1. **Pure core, narrow boundaries.** The FSM is deterministic, has no I/O, and exposes a tiny public API. Everything that looks like a dependency of the FSM is a trait implemented outside the core.
 2. **Data and policy split at layer boundaries.** Each layer owns data that the layer above can't see. Policy lives in the outermost layer. No reach-through access.
 3. **Append-only, materialized on read.** Durable state is an append-only log. The "current view" is a function of the log plus ambient config — never a field that can drift.
-4. **Traits are future process boundaries.** Every trait we introduce can, in principle, become a network protocol. Design APIs accordingly: async, request/response shapes, serializable types. The `agent-rpc` crate is the first concrete attach seam: typed serde frames around one session, with transport kept separate.
+4. **Traits are future process boundaries.** Every trait we introduce can, in principle, become a network protocol. Design APIs accordingly: async, request/response shapes, serializable types. The `agent-runtime` crate is the first per-session runtime seam: `SessionInput` goes in, `SessionEvent` comes out, and transport framing stays separate.
 5. **One kind of thing, one place.** If we have two entry types that are "the same shape with a different tag," they collapse into one type with a tag. Applies to logs, events, injections.
 6. **No features without consumers.** Primitives wait until the thing that consumes them exists. No speculative abstractions.
 
@@ -36,7 +36,14 @@ truth for those roadmaps.
 │    cross-session policy.                     │
 └──────────────────────────────────────────────┘
                      ▲
-                     │  owns a collection of AgentSession
+                     │  owns SessionRuntime or SessionHandle
+                     ▼
+┌──────────────────────────────────────────────┐
+│ Runtime — SessionRuntime plus future model,  │
+│    tool, compaction executors. One per agent.│
+└──────────────────────────────────────────────┘
+                     ▲
+                     │  owns one AgentSession
                      ▼
 ┌──────────────────────────────────────────────┐
 │ 3. Session — AgentSession, TranscriptStore,  │
@@ -109,11 +116,10 @@ enum AgentInput {
 // `action_id` must be copied from the matching RequestModel / RequestTool.
 ```
 
-These are plain data shapes intended to be serializable at persistence and RPC
-boundaries. Core/session public payloads derive serde for the current
-transport-free RPC seam, but the exact JSON frame shape is still experimental
-until the first TypeScript client lands. The FSM never holds non-POD state
-beyond these.
+These are plain data shapes intended to be serializable at persistence and
+future RPC boundaries. Core/session public payloads derive serde so a later
+transport can frame them, but this layer does not define JSON request/response
+frames. The FSM never holds non-POD state beyond these.
 
 ### Log entries (layer 3, in `agent-session`)
 
@@ -211,9 +217,9 @@ Landed in PR #63 and hardened in PR #64.
 
 Partially landed as a placeholder; real shape below.
 
-- **`agent-rpc` session-host seam** — `SessionRpcHost` owns one `AgentSession` and accepts typed serde frames (`Enqueue`, `Drive`, `Snapshot`). It has no transport and does not execute actions; stdio/TCP/WebSocket/process supervision and the real harness loop sit in later layers. Tests drive the seam with local scripted helpers. This is a future `SessionHandle` protocol below the control plane, not the TUI's final public API.
+- **`agent-runtime` session runtime** — `SessionRuntime` owns one `AgentSession`. Its semantic boundary is `SessionInput` in and observer `SessionEvent`s out; `SessionAction`s are consumed by an executor hook until the real model/tool/compaction executors land. It has no transport, no ad hoc snapshot API, and no shutdown command. Stdio/TCP/WebSocket/process supervision can wrap the runtime later, and attach/bootstrap should read durable session state through the store/control-plane read model. This is the future unit behind a `SessionHandle`, not the TUI's final public API.
 
-- **`SessionRegistry<S = AgentSession>`** — `HashMap<SessionId, S>` + parent-child map + helpers. Generic over session type so it can hold local `AgentSession` or remote `SessionHandle` without code changes. Pure data + lifecycle management.
+- **`SessionRegistry<S = AgentSession>`** — `HashMap<SessionId, S>` + parent-child map + helpers. The landed orchestrator placeholder still stores `AgentSession` directly. The registry is generic so the control-plane wiring pass can move to local `SessionRuntime` or remote `SessionHandle` without changing the registry data structure.
 - **`ControlPlane` trait** — the view's only handle on the system:
   ```rust
   trait ControlPlane: Send + Sync {
@@ -224,7 +230,7 @@ Partially landed as a placeholder; real shape below.
       async fn request_boundary_op(&self, id: &SessionId, op: BoundaryOp) -> Result<(), CpError>;
   }
   ```
-- **`LocalControlPlane`** (day-1 default) — implements `ControlPlane` by holding a `SessionRegistry<AgentSession>` and running sessions in-process. All methods are still `async fn` so the trait shape stays RPC-friendly, but local calls don't actually cross any boundary.
+- **`LocalControlPlane`** (day-1 target) — implements `ControlPlane` by holding a `SessionRegistry<SessionRuntime>` and running sessions in-process. All methods are still `async fn` so the trait shape stays RPC-friendly, but local calls don't actually cross any boundary.
 - **`RemoteControlPlane`** (future, daemon-day) — RPC client to a daemon that hosts `LocalControlPlane`.
 - **`AgentOrchestrator`** — composition struct that wires everything together:
   ```rust
@@ -261,7 +267,7 @@ The code path is identical in all three modes; only the `ControlPlane` impl and 
 │                                                │
 │  ┌──────────────────────────────────────────┐  │
 │  │ LocalControlPlane                        │  │
-│  │   SessionRegistry<AgentSession>          │  │
+│  │   SessionRegistry<SessionRuntime>        │  │
 │  │   (all sessions live in this process)    │  │
 │  └──────────────────────────────────────────┘  │
 │                                                │
@@ -301,9 +307,9 @@ Same `LocalControlPlane` implementation, hosted by a daemon instead of the CLI. 
                   └──────────┘ └──────────┘
 ```
 
-Registry is generic: `SessionRegistry<SessionHandle>` instead of `SessionRegistry<AgentSession>`. A session process hosts exactly one session, runs its own `AgentRunner`, owns its local `SessionStore`. Control plane routes messages via RPC. Observers (usage ledger, worklog store) become shared services.
+Registry is generic: `SessionRegistry<SessionHandle>` instead of `SessionRegistry<SessionRuntime>`. A session process hosts exactly one `SessionRuntime` and owns its local `SessionStore`. Control plane routes messages via RPC. Observers (usage ledger, worklog store) become shared services.
 
-**The session layer code does not change across stages 1→2→3.** The control plane layer grows impls. The view layer never sees the difference.
+**The session/runtime code does not change across stages 1→2→3.** The control plane layer grows impls. The view layer never sees the difference.
 
 ---
 
@@ -337,7 +343,7 @@ Each feature is a consumer of the layer stack. Here's how each one maps:
 
 1. Parent agent's LLM emits `tool_call: spawn(prompt, tools, …)`.
 2. `SpawnTool::execute` calls `orchestrator.spawn_child(parent_id, request)`.
-3. Orchestrator: allocate child_id → construct a fresh `AgentSession` → configure the child's model/tool registry → append the requested spawn brief and optional worklog/context injections → enqueue the initial `FollowUp` → `registry.insert(child_id, child, parent=parent_id)` → start the child's `AgentRunner` task.
+3. Orchestrator: allocate child_id → construct a fresh `AgentSession` → wrap it in `SessionRuntime` with the child's model/tool registry → append the requested spawn brief and optional worklog/context injections → enqueue the initial `FollowUp` → `registry.insert(child_id, runtime, parent=parent_id)` → start the runtime task.
 4. SpawnTool returns `ok({ child_id })` immediately. Parent turn continues.
 
 The child is not a context fork of the parent. Model, tools, and inherited context are spawn-request policy: callers can keep them identical for delegation or choose a narrower/different setup for review, verification, or isolated sub-work.
@@ -401,24 +407,25 @@ Each row is one landable PR. Later PRs depend on their predecessors.
 |---|---|---|---|
 | 1 | **#63 foundation** | `agent-session`, `agent-orchestrator` crates + transcript-item/model-context unification + boundary seal + InjectedMessage unification + session-aware runner | every item below |
 | 2 | Session hardening | session-wide cancellation + model failure path + action snapshots + remote `compact()` request API + `rewind` + `SessionRegistry<S>` | clean target for registry-level features |
-| 3 | `SessionStore` | trait + in-memory + JSONL-file impls + wire into `AgentSession` | durable restart; resume-from-file; pluggable backends |
-| 4 | `ControlPlane` trait | trait definition + `LocalControlPlane` impl + view-layer adapter | view/control separation; future daemon |
-| 5 | `SessionEvent` stream | event bus + subscription on `AgentSession`; durable events mirror log writes | observers (TUI, ledger, idle watcher) |
-| 6 | `ModelProvider` trait | trait + Anthropic adapter + `UsageContext` + retry wrapper | actual model calls; compaction executor; worklog fork model |
-| 7 | `Tool` + `ToolRegistry` | trait + built-in tool pack (bash/read/write/edit/grep/find/ls) | tool execution; spawn/report/worklog tools |
-| 8 | Remote compaction executor | call `/responses/compact` for `RequestCompaction`; map replacement history back into `ModelContext` | production-grade context management |
-| 9 | `UsageLedger` | trait + in-memory impl + roll-up queries | cost observability; TUI footer |
-| 10 | Spawn + report + agent_idle | `SpawnTool`, `ReportTool`, idle-watcher in orchestrator; new injected-message kind constants | multi-agent operation |
-| 11 | `AgentWorklogStore` + worklog fork | trait + file-backed impl + `WorklogUpdateTool` + orchestrator worklog scheduler | per-agent durable knowledge; ancestor worklog injection for spawned sub-agents |
-| 12 | `PromptAssembly` | system-prompt assembly from tool/skill/persona sources; ancestor-worklog prefix injection | feature parity with TS `_rebuildSystemPrompt` |
-| 13 | Daemon + `RemoteControlPlane` | host `LocalControlPlane` in a daemon; RPC client; TUI reconnect | detachable view |
-| 14 | Distributed session processes | `SessionHandle` as a session-shaped RPC client; `SessionRegistry<SessionHandle>`; cross-host spawn | agents on different hosts |
+| 3 | `SessionRuntime` shell | per-session runtime crate; `SessionInput` in, `SessionEvent` out; no transport or snapshot protocol | one runtime per future session process |
+| 4 | `SessionStore` | trait + in-memory + JSONL-file impls + wire into `AgentSession` | durable restart; resume-from-file; pluggable backends |
+| 5 | `ControlPlane` trait | trait definition + `LocalControlPlane` impl + view-layer adapter | view/control separation; future daemon |
+| 6 | `SessionEvent` stream | event bus + subscription on `SessionRuntime`; durable events mirror log writes | observers (TUI, ledger, idle watcher) |
+| 7 | `ModelProvider` trait | trait + Anthropic adapter + `UsageContext` + retry wrapper | actual model calls; compaction executor; worklog fork model |
+| 8 | `Tool` + `ToolRegistry` | trait + built-in tool pack (bash/read/write/edit/grep/find/ls) | tool execution; spawn/report/worklog tools |
+| 9 | Remote compaction executor | call `/responses/compact` for `RequestCompaction`; map replacement history back into `ModelContext` | production-grade context management |
+| 10 | `UsageLedger` | trait + in-memory impl + roll-up queries | cost observability; TUI footer |
+| 11 | Spawn + report + agent_idle | `SpawnTool`, `ReportTool`, idle-watcher in orchestrator; new injected-message kind constants | multi-agent operation |
+| 12 | `AgentWorklogStore` + worklog fork | trait + file-backed impl + `WorklogUpdateTool` + orchestrator worklog scheduler | per-agent durable knowledge; ancestor worklog injection for spawned sub-agents |
+| 13 | `PromptAssembly` | system-prompt assembly from tool/skill/persona sources; ancestor-worklog prefix injection | feature parity with TS `_rebuildSystemPrompt` |
+| 14 | Daemon + `RemoteControlPlane` | host `LocalControlPlane` in a daemon; RPC client; TUI reconnect | detachable view |
+| 15 | Distributed session processes | `SessionHandle` as a session-shaped RPC client; `SessionRegistry<SessionHandle>`; cross-host spawn | agents on different hosts |
 
 Rough mapping to user-visible capability:
-- After PR #8: a Rust agent can run a full conversational turn with compaction.
-- After PR #10: multi-agent, spawn-and-report works locally.
-- After PR #13: you can close the TUI and agents keep running.
-- After PR #14: agents can live anywhere.
+- After PR #9: a Rust agent can run a full conversational turn with compaction.
+- After PR #11: multi-agent, spawn-and-report works locally.
+- After PR #14: you can close the TUI and agents keep running.
+- After PR #15: agents can live anywhere.
 
 ---
 

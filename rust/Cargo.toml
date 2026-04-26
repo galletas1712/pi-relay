@@ -3,7 +3,7 @@ members = [
     "crates/agent-core",
     "crates/agent-session",
     "crates/agent-orchestrator",
-    "crates/agent-rpc",
+    "crates/agent-runtime",
 ]
 resolver = "2"
 
