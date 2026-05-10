@@ -36,7 +36,7 @@ rehydrates the core. Queued user `Steer` / `FollowUp` inputs survive both paths.
 
 This crate does not own model calls, tool execution, cost tracking,
 spawn/report routing, compaction budget policy, or control-plane scheduling.
-Those live in the harness / `agent-orchestrator` and above.
+Those live in the harness and above.
 
 ## Public Interface
 
@@ -51,6 +51,8 @@ All intended downstream imports are re-exported from `lib.rs`.
 - `AgentRunner` — async wrapper that drives a session from an input channel.
 - `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` —
   sender/receiver pair for the runner.
+- `SessionRegistry`, `SessionId`, `RegistryError` — in-memory registry for
+  live independent sessions. This is process state, not durable storage.
 - `SessionAction` — model/tool actions, session-wide `CancelSessionWork`, and
   session-owned `RequestCompaction`. `RequestModel` and `RequestCompaction`
   carry the model context snapshot visible when the request was made, the
@@ -69,7 +71,12 @@ All intended downstream imports are re-exported from `lib.rs`.
   active leaf.
 - `TranscriptStorageNode` — `{ id, parent_id, timestamp_ms, item }`.
 - `ModelContext` — read-only materialized view derived from the active path.
-- `TranscriptStoreError` — `EntryNotFound`, `NotTurnBoundary`.
+- `StoredSession`, `StoredTranscriptEntry`, `SessionStore` — backend-neutral
+  persistence types re-exported from `agent-store`.
+- `AgentSession::to_stored_session` / `AgentSession::from_stored_session` —
+  bridge live sessions to swappable storage backends.
+- `TranscriptStoreError` — `EntryNotFound`, `NotTurnBoundary`,
+  `DuplicateEntry`, `MissingParent`.
 
 **Compaction and rewind**
 
@@ -81,7 +88,7 @@ All intended downstream imports are re-exported from `lib.rs`.
 `AgentInput`, `AgentInputError`, `AgentAction`, `TranscriptItem`, `TurnId`,
 `ActionId`, `ToolCallId`, `InjectedMessage`, `TurnOutcome`,
 `AssistantMessage`, `AssistantItem`, `ToolCall`, `ToolResultMessage`, and
-`ToolResultStatus`.
+`ToolResultStatus`, `UserMessage`.
 
 ## Drive Cycle
 
@@ -213,6 +220,7 @@ mutation, then invalidates live work, moves the leaf, and rehydrates the core.
 | `src/session.rs` | `AgentSession`, drive/input/action lifecycle, remote compaction, rewind, restore rehydration. |
 | `src/session/tests.rs` | Session lifecycle tests. |
 | `src/model_context.rs` | `ModelContext` read-only view and crashed-tail recovery. |
+| `src/registry.rs` | In-memory live-session registry. |
 | `src/runner.rs` | `AgentRunner` async shell and input handle. |
 | `src/transcript_store/mod.rs` | Transcript forest, entry/parent/leaf indexes, materialization, boundary checks. |
 
@@ -249,11 +257,12 @@ entry; subsequent appends grow a new path off that node. Remote compaction
 replacement resets the active leaf to the root and appends the replacement
 context as a new path. Nothing is deleted.
 
-Today each session owns an independent `TranscriptStore`. `fork(leaf)` copies
+Each live session owns an independent `TranscriptStore`. `fork(leaf)` copies
 only the ancestor path from root to `leaf` into a new session; sibling branches,
 abandoned descendants, queued inputs, in-flight actions, events, and other
-sessions are not copied. A future shared store can make this a cheap second leaf
-pointer without changing the public session operations.
+sessions are not copied. Persistence happens through backend-neutral
+`StoredSession` snapshots, so a future database backend can store shared rows or
+copy-on-write branches without changing the public session operations.
 
 Remote compaction replacement in pictures:
 
@@ -311,10 +320,6 @@ then enqueue completion or failure later through an `AgentInputHandle`.
 - **Upstream `agent-core`** — provides the FSM, mailbox input/action vocabulary,
   transcript item types, IDs, and message/tool-call structures. `agent-session`
   re-exports these for a single downstream import path.
-- **Downstream `agent-orchestrator`** — owns `SessionRegistry<AgentSession>`,
-  routes parent/child messages and reports through `enqueue_input`, invokes
-  `compact`, `rewind`, and `fork`, and stays out of `TranscriptStore`
-  internals.
 
 For cross-cutting context such as control plane, usage, worklogs, and
 multi-agent spawn/report, see `rust/docs/architecture.md`.

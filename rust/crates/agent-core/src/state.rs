@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use crate::action::AgentAction;
 use crate::event::{AgentEvent, TurnOrigin};
 use crate::ids::{ActionId, TurnId};
-use crate::message::{AssistantMessage, ToolCall, ToolResultMessage};
+use crate::message::{AssistantMessage, ToolCall, ToolResultMessage, UserMessage};
 use crate::transcript_item::{InjectedMessage, TranscriptItem, TurnOutcome};
 
 // Live control state only. Durable session history lives in TranscriptStore.
@@ -63,7 +63,7 @@ impl AgentState {
     fn on_start_turn(
         &mut self,
         turn_id: TurnId,
-        input: String,
+        input: UserMessage,
         origin: Option<TurnOrigin>,
         next_action_id: &mut ActionId,
     ) -> (Vec<TranscriptItem>, Vec<AgentAction>) {
@@ -78,7 +78,10 @@ impl AgentState {
                         metadata.insert("from".to_string(), from);
                         TranscriptItem::Injected(InjectedMessage {
                             kind,
-                            content: input,
+                            content: input
+                                .as_text()
+                                .unwrap_or("[structured user message]")
+                                .to_string(),
                             metadata,
                         })
                     }
@@ -307,7 +310,7 @@ mod tests {
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
         ToolCall {
-            id: ToolCallId(id),
+            id: ToolCallId::from_u64(id),
             tool_name: name.to_string(),
             args_json: "{}".to_string(),
         }
@@ -315,7 +318,7 @@ mod tests {
 
     fn tool_result(id: u64, name: &str) -> ToolResultMessage {
         ToolResultMessage {
-            tool_call_id: ToolCallId(id),
+            tool_call_id: ToolCallId::from_u64(id),
             tool_name: name.to_string(),
             output: "ok".to_string(),
             status: ToolResultStatus::Success,
@@ -425,7 +428,7 @@ mod tests {
         let (_, actions) = state.step(
             AgentEvent::StartTurn {
                 turn_id: TurnId(1),
-                input: "hello".to_string(),
+                input: UserMessage::text("hello"),
                 origin: None,
             },
             &mut next_action_id,
@@ -556,7 +559,7 @@ mod tests {
             items,
             vec![
                 TranscriptItem::ToolResult(crate::message::ToolResultMessage::interrupted(
-                    ToolCallId(1),
+                    ToolCallId::from_u64(1),
                     "bash"
                 )),
                 TranscriptItem::TurnFinished {

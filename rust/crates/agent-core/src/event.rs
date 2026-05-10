@@ -1,7 +1,7 @@
 use std::fmt;
 
 use crate::ids::{ActionId, TurnId};
-use crate::message::{AssistantMessage, ToolResultMessage};
+use crate::message::{AssistantMessage, ToolResultMessage, UserMessage};
 
 /// External input to the live agent FSM.
 ///
@@ -19,27 +19,27 @@ pub enum AgentInput {
     Steer {
         from: Option<String>,
         kind: Option<String>,
-        content: String,
+        content: UserMessage,
     },
     // Normal-priority input for the next available turn.
     FollowUp {
         from: Option<String>,
         kind: Option<String>,
-        content: String,
+        content: UserMessage,
     },
-    // Volatile model completion delivered by the orchestrator.
+    // Volatile model completion delivered by the caller.
     ModelCompleted {
         action_id: ActionId,
         turn_id: TurnId,
         assistant: AssistantMessage,
     },
-    // Volatile model failure delivered by the orchestrator.
+    // Volatile model failure delivered by the caller.
     ModelFailed {
         action_id: ActionId,
         turn_id: TurnId,
         error: String,
     },
-    // Volatile tool completion delivered by the orchestrator.
+    // Volatile tool completion delivered by the caller.
     ToolCompleted {
         action_id: ActionId,
         turn_id: TurnId,
@@ -53,7 +53,16 @@ impl AgentInput {
         Self::Steer {
             from: None,
             kind: None,
-            content: content.into(),
+            content: UserMessage::text(content),
+        }
+    }
+
+    /// Steer input with structured user content, including images.
+    pub fn steer_message(content: UserMessage) -> Self {
+        Self::Steer {
+            from: None,
+            kind: None,
+            content,
         }
     }
 
@@ -62,14 +71,23 @@ impl AgentInput {
         Self::FollowUp {
             from: None,
             kind: None,
-            content: content.into(),
+            content: UserMessage::text(content),
+        }
+    }
+
+    /// Follow-up input with structured user content, including images.
+    pub fn follow_up_message(content: UserMessage) -> Self {
+        Self::FollowUp {
+            from: None,
+            kind: None,
+            content,
         }
     }
 
     /// Steer input tagged as coming from the given session with the given kind.
     ///
-    /// Used for agent-routed injections (e.g. parent directives); see
-    /// `agent-orchestrator` for the well-known kind constants.
+    /// Used for caller-defined injected context. The core treats `kind` as an
+    /// opaque tag and does not define well-known routing constants.
     pub fn steer_tagged(
         from: impl Into<String>,
         kind: impl Into<String>,
@@ -78,15 +96,15 @@ impl AgentInput {
         Self::Steer {
             from: Some(from.into()),
             kind: Some(kind.into()),
-            content: content.into(),
+            content: UserMessage::text(content),
         }
     }
 
     /// Follow-up input tagged as coming from the given session with the given
     /// kind.
     ///
-    /// Used for agent-routed injections (e.g. child reports); see
-    /// `agent-orchestrator` for the well-known kind constants.
+    /// Used for caller-defined injected context. The core treats `kind` as an
+    /// opaque tag and does not define well-known routing constants.
     pub fn follow_up_tagged(
         from: impl Into<String>,
         kind: impl Into<String>,
@@ -95,7 +113,7 @@ impl AgentInput {
         Self::FollowUp {
             from: Some(from.into()),
             kind: Some(kind.into()),
-            content: content.into(),
+            content: UserMessage::text(content),
         }
     }
 
@@ -140,7 +158,7 @@ pub(crate) enum AgentEvent {
     Interrupt,
     StartTurn {
         turn_id: TurnId,
-        input: String,
+        input: UserMessage,
         origin: Option<TurnOrigin>,
     },
     ModelCompleted {

@@ -23,7 +23,8 @@ pub use crate::core_loop::AgentCoreLoop;
 pub use crate::event::{AgentInput, AgentInputError};
 pub use crate::ids::{ActionId, ToolCallId, TurnId};
 pub use crate::message::{
-    AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
+    AssistantItem, AssistantMessage, ContentBlock, ImageContent, ImageSource, ToolCall,
+    ToolDefinition, ToolResultMessage, ToolResultStatus, UserMessage,
 };
 pub use crate::transcript_item::{InjectedMessage, TranscriptItem, TurnOutcome};
 

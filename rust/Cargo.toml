@@ -1,11 +1,32 @@
 [workspace]
 members = [
+    "crates/agent-vocab",
     "crates/agent-core",
     "crates/agent-session",
-    "crates/agent-orchestrator",
+    "crates/agent-store",
+    "crates/agent-provider",
+    "crates/agent-tools",
+    "crates/pi-cli",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 publish = false
+
+[workspace.dependencies]
+agent-vocab = { path = "crates/agent-vocab" }
+agent-core = { path = "crates/agent-core" }
+agent-session = { path = "crates/agent-session" }
+agent-store = { path = "crates/agent-store" }
+agent-provider = { path = "crates/agent-provider" }
+agent-tools = { path = "crates/agent-tools" }
+async-trait = "0.1"
+futures-channel = "0.3"
+futures-core = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "time"] }
+uuid = { version = "1", features = ["serde", "v4"] }

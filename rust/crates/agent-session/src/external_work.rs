@@ -107,7 +107,7 @@ impl UnresolvedTurnAction {
             } => Some(Self::tool(
                 *action_id,
                 *turn_id,
-                tool_call.id,
+                tool_call.id.clone(),
                 tool_call.tool_name.clone(),
             )),
             AgentAction::CancelTurn { .. } => None,
@@ -126,7 +126,7 @@ impl UnresolvedTurnAction {
             } => Some(Self::tool(
                 *action_id,
                 *turn_id,
-                tool_call.id,
+                tool_call.id.clone(),
                 tool_call.tool_name.clone(),
             )),
             SessionAction::CancelSessionWork | SessionAction::RequestCompaction { .. } => None,
@@ -148,7 +148,7 @@ impl UnresolvedTurnAction {
             } => Some(Self::tool(
                 *action_id,
                 *turn_id,
-                result.tool_call_id,
+                result.tool_call_id.clone(),
                 result.tool_name.clone(),
             )),
             AgentInput::Interrupt | AgentInput::Steer { .. } | AgentInput::FollowUp { .. } => None,
@@ -224,7 +224,7 @@ impl DeferredCompletionEvent {
             } => Some(Self::ToolCompleted {
                 action_id: *action_id,
                 turn_id: *turn_id,
-                tool_call_id: result.tool_call_id,
+                tool_call_id: result.tool_call_id.clone(),
                 tool_name: result.tool_name.clone(),
             }),
             AgentInput::Interrupt | AgentInput::Steer { .. } | AgentInput::FollowUp { .. } => None,
@@ -331,7 +331,7 @@ mod tests {
             action_id: ActionId(action),
             turn_id: TurnId(turn),
             tool_call: ToolCall {
-                id: ToolCallId(id),
+                id: ToolCallId::from_u64(id),
                 tool_name: "bash".to_string(),
                 args_json: "{}".to_string(),
             },
@@ -361,7 +361,7 @@ mod tests {
             action_id: ActionId(2),
             turn_id: TurnId(1),
             result: ToolResultMessage {
-                tool_call_id: ToolCallId(1),
+                tool_call_id: ToolCallId::from_u64(1),
                 tool_name: "bash".to_string(),
                 output: "ok".to_string(),
                 status: ToolResultStatus::Success,
@@ -384,7 +384,7 @@ mod tests {
             action_id: ActionId(2),
             turn_id: TurnId(1),
             result: ToolResultMessage {
-                tool_call_id: ToolCallId(99),
+                tool_call_id: ToolCallId::from_u64(99),
                 tool_name: "bash".to_string(),
                 output: "wrong call".to_string(),
                 status: ToolResultStatus::Success,
@@ -394,7 +394,7 @@ mod tests {
             action_id: ActionId(2),
             turn_id: TurnId(1),
             result: ToolResultMessage {
-                tool_call_id: ToolCallId(1),
+                tool_call_id: ToolCallId::from_u64(1),
                 tool_name: "other".to_string(),
                 output: "wrong tool".to_string(),
                 status: ToolResultStatus::Success,

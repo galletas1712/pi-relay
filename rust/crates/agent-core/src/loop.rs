@@ -100,7 +100,7 @@ impl AgentCoreLoop {
     /// input was enqueued with. Notifications and the interrupt flag are
     /// untouched.
     ///
-    /// Primarily intended for tests and for orchestrator introspection.
+    /// Primarily intended for tests and for caller introspection.
     pub fn drain_pending_inputs(&mut self) -> Vec<AgentInput> {
         self.mailbox.drain_pending_inputs()
     }
@@ -146,7 +146,7 @@ mod tests {
     use crate::action::AgentAction;
     use crate::ids::{ActionId, ToolCallId};
     use crate::message::{
-        AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus,
+        AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus, UserMessage,
     };
     use crate::transcript_item::{InjectedMessage, TurnOutcome};
 
@@ -192,7 +192,7 @@ mod tests {
             items,
             vec![
                 TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("hello")),
             ]
         );
         assert_eq!(
@@ -237,7 +237,7 @@ mod tests {
             items,
             vec![
                 TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("hello")),
                 TranscriptItem::AssistantMessage(assistant.clone()),
                 TranscriptItem::ToolCallStarted {
                     turn_id: TurnId(1),
@@ -284,7 +284,7 @@ mod tests {
             items,
             vec![
                 TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("hello")),
                 TranscriptItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Crashed,
@@ -314,7 +314,7 @@ mod tests {
         );
         loop_state.drain_actions();
 
-        let result = successful_tool_result(tool_call.id, "bash");
+        let result = successful_tool_result(tool_call.id.clone(), "bash");
         let items = drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
@@ -350,7 +350,7 @@ mod tests {
 
         let tool_call = tool_call(&mut next_tool_call_id, "bash");
         let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
-        let result = successful_tool_result(tool_call.id, "bash");
+        let result = successful_tool_result(tool_call.id.clone(), "bash");
 
         loop_state
             .enqueue_input(AgentInput::ModelCompleted {
@@ -432,7 +432,7 @@ mod tests {
             })
         );
 
-        let second_result = successful_tool_result(second.id, "read");
+        let second_result = successful_tool_result(second.id.clone(), "read");
         items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
@@ -459,7 +459,7 @@ mod tests {
             }
         ));
 
-        let first_result = successful_tool_result(first.id, "bash");
+        let first_result = successful_tool_result(first.id.clone(), "bash");
         items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
@@ -521,7 +521,7 @@ mod tests {
             items,
             vec![
                 TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("initial".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("initial")),
                 TranscriptItem::AssistantMessage(assistant_message(vec![AssistantItem::ToolCall(
                     tool_call.clone(),
                 )])),
@@ -529,13 +529,16 @@ mod tests {
                     turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
-                TranscriptItem::ToolResult(ToolResultMessage::interrupted(tool_call.id, "bash")),
+                TranscriptItem::ToolResult(ToolResultMessage::interrupted(
+                    tool_call.id.clone(),
+                    "bash",
+                )),
                 TranscriptItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Interrupted,
                 },
                 TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-                TranscriptItem::UserMessage("urgent".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("urgent")),
             ]
         );
         assert_eq!(
@@ -580,7 +583,7 @@ mod tests {
         ));
         loop_state.drain_actions();
 
-        let second_result = successful_tool_result(second.id, "read");
+        let second_result = successful_tool_result(second.id.clone(), "read");
         items.extend(drive_collect(
             &mut loop_state,
             AgentInput::ToolCompleted {
@@ -600,7 +603,7 @@ mod tests {
         );
         assert_eq!(
             items[5],
-            TranscriptItem::ToolResult(ToolResultMessage::interrupted(first.id, "bash"))
+            TranscriptItem::ToolResult(ToolResultMessage::interrupted(first.id.clone(), "bash"))
         );
         assert_eq!(items[6], TranscriptItem::ToolResult(second_result));
         assert_eq!(
@@ -622,7 +625,7 @@ mod tests {
             items,
             vec![
                 TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("hello")),
                 TranscriptItem::TurnFinished {
                     turn_id: TurnId(1),
                     outcome: TurnOutcome::Interrupted,
@@ -678,7 +681,7 @@ mod tests {
             items,
             vec![
                 TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("human steer".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("human steer")),
             ]
         );
     }

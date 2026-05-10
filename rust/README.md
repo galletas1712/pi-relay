@@ -1,47 +1,44 @@
-# Rust agent stack
+# Rust Agent Stack
 
-Rust implementation of pi-relay's agent runtime. See
-[`docs/architecture.md`](docs/architecture.md) for the comprehensive plan.
+Personal-use Rust rewrite of the core pi-style agent runtime. The design keeps
+the good local semantics around resume, rewind, fork, and compaction while
+removing the hierarchical subagent machinery from the TypeScript fork.
 
-## Crate layout
+See [`docs/architecture.md`](docs/architecture.md) for the detailed design.
+
+## Crate Layout
 
 | Crate | What it owns |
-|---|---|
-| `agent-core` | Pure deterministic FSM for agent turns. Emits `TranscriptItem`s and `AgentAction` side effects. No I/O. Internals (`AgentState`, `Mailbox`) are private. |
-| `agent-session` | Durable session history atop the core FSM. Owns a session-local `TranscriptStore` forest with one active leaf/path, the materialized `ModelContext` view, the `AgentRunner`, remote compaction requests, and rewind/fork operations. |
-| `agent-orchestrator` | Composition struct for the runtime. Currently owns a SessionRegistry that tracks session identity and spawn relationships. Grows as ModelProvider, ToolRegistry, UsageLedger, AgentWorklogStore land. |
-
-## Layer discipline
-
-`agent-core` ◂─ `agent-session` ◂─ `agent-orchestrator`
-
-Each crate depends only on crates below it. Narrow public APIs between
-crates; implementation details stay private. See the architecture doc for
-the full layer stack including the future control-plane and view layers.
-
-## Status
-
-These crates land the session-layer abstractions: a pure deterministic FSM in
-`agent-core`, durable forest-structured session history in `agent-session`, and a
-thin composition struct in `agent-orchestrator`. Downstream work adds (in rough
-order): `SessionStore` (pluggable storage), `ControlPlane` (view/control split),
-event bus/subscriptions (observability), `ModelProvider`, `Tool`/`ToolRegistry`,
-compaction policy/execution, `UsageLedger`, multi-agent tools
-(spawn/report/idle), `AgentWorklogStore`, `PromptAssembly`, daemon +
-`RemoteControlPlane`, and distributed session processes. See the
-[architecture doc](docs/architecture.md) for the full sequencing.
-
-## Design docs
-
-- [`docs/architecture.md`](docs/architecture.md) — overall plan
-
-Feature-specific design docs for worklogs, cost aggregation, and multi-agent
-tooling are planned; their current roadmap lives in the architecture doc.
+| --- | --- |
+| `agent-vocab` | Shared serializable ids, message blocks, images, assistant items, tool calls/results, and transcript items. |
+| `agent-core` | Pure deterministic FSM for one agent turn loop. No I/O. |
+| `agent-session` | Durable transcript forest, model context materialization, resume/rewind/fork/compaction, runner, and storage snapshots. |
+| `agent-store` | Backend-neutral `SessionStore`, `StoredSession`, in-memory store, and JSONL store. |
+| `agent-provider` | `ModelProvider` plus OpenAI and Anthropic adapters. |
+| `agent-tools` | `AgentTool`, `ToolRegistry`, and builtin `read`/`write`/`edit`/`bash` tools. |
+| `pi-cli` | Minimal `pi-rs` driver for one local session. |
 
 ## Running
 
-```
-cargo test --manifest-path rust/Cargo.toml --all
-cargo clippy --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+```sh
+cargo check --manifest-path rust/Cargo.toml --all
+cargo test --manifest-path rust/Cargo.toml -p agent-core
 cargo fmt --manifest-path rust/Cargo.toml --all --check
+```
+
+Full workspace test linking currently depends on the local macOS toolchain
+finding the Apple SDK and `libiconv`. On this machine the passing full command
+is:
+
+```sh
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
+RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/clang' \
+cargo test --manifest-path rust/Cargo.toml --all
+```
+
+## CLI Smoke Test
+
+```sh
+ANTHROPIC_API_KEY=... cargo run --manifest-path rust/Cargo.toml -p pi-cli -- claude claude-sonnet-4-5 "hello"
+OPENAI_API_KEY=... cargo run --manifest-path rust/Cargo.toml -p pi-cli -- openai gpt-4.1 "hello"
 ```

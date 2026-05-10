@@ -1,192 +1,72 @@
 # agent-core
 
-A deterministic, pure-Rust FSM kernel for a single agent's turn-by-turn loop — no I/O, no async, no persistence.
+Deterministic FSM kernel for one agent turn loop.
 
 ## Responsibility
 
-This crate owns one thing: given the current FSM state plus a queued input, decide what should happen next. "What happens next" means two drained outputs — a list of `TranscriptItem`s that capture durable model-visible facts about the turn (turn started, user/input item, assistant said this, tool call started, tool result, turn finished), and a list of `AgentAction`s that are *requests* for the outside world to run a model call, run a tool, or cancel an in-flight turn.
+`agent-core` owns the live control state for a single session:
 
-The FSM is pure: it has no `tokio`, no filesystem access, no network calls, no time source, and no persistent state beyond a small mailbox plus the live control state (`AgentState`). The crate's `Cargo.toml` has zero runtime dependencies. Callers drive the loop synchronously; anything asynchronous (model HTTP calls, tool subprocesses, on-disk logs) lives above this layer in `agent-session` and its runner.
+- priority mailbox
+- turn state machine
+- action outbox
+- transcript-item outbox
+- `TurnId` and `ActionId` progression
 
-The transcript items the loop produces are handed to the caller. `agent-core` does not persist them, does not re-read them, and does not index into past turns. Once items are drained, the core forgets them. The only "memory" the core carries across turns is `last_turn_id: TurnId`, `next_action_id: ActionId`, and whatever is queued in the mailbox.
+It does not call models, run tools, persist history, know storage backends, or
+know about hierarchical agents. Callers feed inputs in, call `drive`, then drain
+the requested actions and transcript items.
 
-See `rust/docs/architecture.md` for how this layer fits underneath `agent-session` and the control plane.
+## Inputs
 
-## Public interface
+`AgentInput` variants:
 
-The exported surface is intentionally small. From `lib.rs`:
+- `Interrupt`
+- `Steer`
+- `FollowUp`
+- `ModelCompleted`
+- `ModelFailed`
+- `ToolCompleted`
 
-- `AgentCoreLoop` — the FSM driver. Owns a `Mailbox`, an `AgentState`, `last_turn_id`, and two outboxes (transcript items and actions).
-- `AgentInput` — everything the outside world can push into the loop: `Interrupt`, `Steer`, `FollowUp`, `ModelCompleted`, `ModelFailed`, `ToolCompleted`. `Steer` and `FollowUp` carry optional `from` / `kind` tags (both present or both absent) identifying the source of the input; malformed inputs are rejected with `AgentInputError`.
-- `AgentAction` — side-effect requests the caller must execute: `RequestModel`, `RequestTool`, `CancelTurn`.
-- `TranscriptItem` — durable model-visible item variants. Enumerated in the Internals section below.
-- `InjectedMessage` — payload for `TranscriptItem::Injected`, carrying a `kind` tag, a `content` string, and a `BTreeMap<String, String>` metadata map.
-- `TurnOutcome` — `Graceful`, `Interrupted`, or `Crashed`; attached to `TurnFinished`.
-- `AssistantMessage`, `AssistantItem`, `ToolCall`, `ToolResultMessage`, `ToolResultStatus` — message shapes shared with the caller. `ToolResultMessage::interrupted` / `crashed` are helpers for synthesizing terminal results.
-- `TurnId`, `ActionId`, `ToolCallId` — newtype `u64` ids. `ActionId` correlates a drained `RequestModel` / `RequestTool` with the matching completion.
+`Steer` and `FollowUp` carry a `UserMessage`, which can contain text and image
+content blocks. They may also carry opaque `from` and `kind` tags. If tags are
+present, both must be present.
 
-`AgentState`, `AgentEvent`, `Mailbox`, and `TurnOrigin` are deliberately **not** re-exported; they are implementation details. Callers observe liveness through `AgentCoreLoop::is_idle()` and `AgentCoreLoop::has_pending_work()`.
+## Outputs
 
-### Caller cycle
+`TranscriptItem` variants:
 
-Downstream wrappers (canonically `AgentSession` in `agent-session`) follow this cycle:
+- `TurnStarted`
+- `UserMessage(UserMessage)`
+- `AssistantMessage`
+- `ToolCallStarted`
+- `ToolResult`
+- `TurnFinished`
+- `Injected`
 
-```
-caller                       AgentCoreLoop
-  |                               |
-  |-- enqueue_input(input) ------>|  (push into mailbox)
-  |                               |
-  |-- drive() ------------------->|  (advance FSM to quiescence)
-  |                               |     state transitions run;
-  |                               |     transcript items + actions accumulate
-  |                               |     in outboxes
-  |                               |
-  |<-- drain_transcript_items() -----------|  (TurnStarted, UserMessage,
-  |                               |   AssistantMessage, ToolResult,
-  |                               |   TurnFinished, ...)
-  |                               |
-  |<-- drain_actions() -----------|  (RequestModel / RequestTool /
-  |                               |   CancelTurn)
-  |                               |
-  |  (caller executes actions,    |
-  |   feeds results back with the |
-  |   action_id from the matching |
-  |   RequestModel / RequestTool) |
-  |                               |
-  +------------- loop ------------+
-```
+`AgentAction` variants:
 
-A typical session wrapper (see `agent-session/src/session.rs`) forwards `enqueue_input` straight to the core, calls `drive()`, then absorbs the drained transcript items into its durable `TranscriptStore`. The session never exposes the core directly: it funnels every input through itself so it can track pending model/tool work for cancellation/stale-work invalidation and so items always flow into durable storage.
+- `RequestModel`
+- `RequestTool`
+- `CancelTurn`
 
-`drain_pending_inputs()` is also exposed as an introspection hook: it pulls every queued user input (steer before follow-up) back out of the mailbox without advancing the FSM, preserving each entry's `from` / `kind` tags. Notifications and the interrupt flag are left untouched. Intended for tests and orchestrator-level routing diagnostics.
+The core never performs those actions. It only requests them.
 
-### Key invariant
+## Important Semantics
 
-`agent-core` owns no persistent state outside its mailbox plus the live `AgentState`. Every transcript item it produces is handed off via `drain_transcript_items()` and then forgotten. If the caller wants to resume a session after a restart, it uses `AgentCoreLoop::resume_at_boundary(last_turn_id)` to build a fresh, idle core seeded with the next turn id and a fresh action id sequence — the model context is rebuilt by the session from its own durable log.
+- Completion inputs must match the active `action_id` and `turn_id`, otherwise
+  they are ignored as stale.
+- Tool results can arrive out of order, but transcript `ToolResult` items are
+  emitted in the assistant-declared tool-call order.
+- Interrupting model/tool work closes the turn as interrupted and emits a
+  cancellation request for external work.
+- Untagged user input becomes `TranscriptItem::UserMessage`.
+- Tagged user input becomes `TranscriptItem::Injected` with the tag metadata.
 
-## Internals
+The tagged path is generic injected context, not subagent orchestration.
 
-Module layout under `src/`:
+## Relationship To Other Crates
 
-- `lib.rs` — crate root; re-exports the public surface; `#![forbid(unsafe_code)]`.
-- `loop.rs` (mounted as `mod core_loop`) — `AgentCoreLoop`, the driver that pulls events out of the mailbox and feeds them to the state machine until it quiesces.
-- `state.rs` — `AgentState` enum and its `step` function; the heart of the FSM.
-- `event.rs` — `AgentInput` (public) and `AgentEvent` + `TurnOrigin` (private); the public/internal event split.
-- `mailbox.rs` — `Mailbox` and `UserInputEntry`; priority queue feeding the FSM.
-- `action.rs` — `AgentAction` outbox variants.
-- `transcript_item.rs` — `TranscriptItem`, `TurnOutcome`, `InjectedMessage`.
-- `message.rs` — `AssistantMessage`, `AssistantItem`, `ToolCall`, `ToolResultMessage`, `ToolResultStatus`.
-- `ids.rs` — `TurnId`, `ActionId`, and `ToolCallId` newtypes.
-
-### State machine
-
-`AgentState` (see `state.rs`) has four variants:
-
-- `Idle` — no active turn. The default; also the state the loop returns to after a graceful finish or an interrupt.
-- `RunningModel { turn_id, action_id }` — a model request is outstanding for `turn_id`; awaiting the matching `ModelCompleted` or `ModelFailed`.
-- `RunningTools { turn_id, tool_calls, tool_action_ids, completed_results, next_result_index }` — one or more tool calls are outstanding. Results may arrive out of order; `completed_results` buffers them by index and `next_result_index` advances through them contiguously so `ToolResult` items are emitted in the order the assistant listed the calls.
-- `ReadyToContinue { turn_id }` — an internal transition point reached after every tool in the batch has completed. The mailbox immediately pumps a synthetic `ContinueModel` event, sending the FSM back to `RunningModel`.
-
-```
-              StartTurn (at Idle)
-                  |
-                  v
-   +---------> Idle <---------------------+
-   |             |                        |
-   |             | StartTurn              |
-   |             v                        |
-   |        RunningModel                  |
-   |             |                        |
-   |             | ModelCompleted/Failed  |
-   |             |   (no tool calls)      |
-   |             |   => TurnFinished      |
-   |             |      {Graceful}        |
-   |             +------------------------+
-   |             |
-   |             | ModelCompleted
-   |             |   (with tool calls)
-   |             v
-   |        RunningTools
-   |             |
-   |             | every tool completed
-   |             v
-   |        ReadyToContinue
-   |             |
-   |             | ContinueModel (synthetic)
-   |             v
-   |        RunningModel ... (loop)
-   |
-   | Interrupt (from RunningModel / RunningTools / ReadyToContinue)
-   |   => TurnFinished{Interrupted}
-   |      + CancelTurn action (skipped from ReadyToContinue)
-   +-----------------------------------------------------------+
-```
-
-Staleness rules enforced inside `state.rs`: `ModelCompleted` / `ModelFailed` / `ToolCompleted` whose `action_id` and `turn_id` do not match the current state are silently dropped. A matching `ModelFailed` closes the turn with `TurnOutcome::Crashed`. A `ToolCompleted` whose `tool_call_id` + `tool_name` does not appear in the active batch, or whose index has already been emitted, is also dropped. An interrupted turn's late completions are therefore safely ignored, and completions from a pre-edit action cannot attach to a later action that reuses the same `TurnId`.
-
-### Mailbox + input priority
-
-`Mailbox` (see `mailbox.rs`) holds three queues plus one flag:
-
-- `notifications: VecDeque<AgentEvent>` — volatile completions/failures (`ModelCompleted`, `ModelFailed`, `ToolCompleted`) pushed to the back so arrival order is preserved. Notifications still preempt queued user work because `next_event` checks this queue before `Steer` / `FollowUp`.
-- `steer: VecDeque<UserInputEntry>` — high-priority user inputs to start the next turn.
-- `follow_up: VecDeque<UserInputEntry>` — normal-priority user inputs.
-- `interrupt_requested: bool` — sticky flag set by `AgentInput::Interrupt`.
-
-Each user input entry carries its sender tags:
-
-```rust
-struct UserInputEntry {
-    from:    Option<String>,
-    kind:    Option<String>,
-    content: String,
-}
-```
-
-Priority order inside `Mailbox::next_event`:
-
-```
-1. Interrupt  (only fires if state is RunningModel / RunningTools /
-               ReadyToContinue; otherwise the flag is cleared silently)
-2. Notification  (oldest queued ModelCompleted / ModelFailed / ToolCompleted)
-3. ContinueModel  (synthetic, only when state == ReadyToContinue)
-4. Steer         (only consumed when state == Idle)
-5. FollowUp      (only consumed when state == Idle)
-```
-
-When the mailbox pops a user input entry at `Idle`, it pairs `from` with `kind` into a `TurnOrigin` (present iff both are `Some`). The state machine uses `TurnOrigin` to decide how to open the turn: no origin means a plain `TranscriptItem::UserMessage(content)`; an origin means `TranscriptItem::Injected(InjectedMessage { kind, content, metadata: { "from": from } })`. This is how agent-routed injections (e.g. a parent directive or a child report) land in model context as tagged entries rather than as anonymous user messages. The core does not interpret specific kind strings — those conventions live in `agent-orchestrator` and `agent-session`.
-
-### Actions
-
-`AgentAction` (see `action.rs`) enumerates every request the loop can make of the outside world:
-
-- `RequestModel { action_id, turn_id }` — the caller should dispatch a model call for this turn and return success via `AgentInput::ModelCompleted { action_id, turn_id, assistant }` or provider failure via `AgentInput::ModelFailed { action_id, turn_id, error }`.
-- `RequestTool { action_id, turn_id, tool_call }` — the caller should execute `tool_call` and return the result via `AgentInput::ToolCompleted { action_id, turn_id, result }`. For parallel batches, one `RequestTool` is emitted per call, in source order.
-- `CancelTurn { turn_id }` — the caller should abort all in-flight model and tool work for `turn_id`. The orchestrator is expected to fan this out to every running tool handle.
-
-All three are pure requests. `agent-core` never performs the underlying I/O and never observes whether it succeeded — completions come back through `enqueue_input`.
-
-### Transcript items
-
-`TranscriptItem` variants (see `transcript_item.rs`):
-
-- `TurnStarted { turn_id }` — emitted at the start of every turn.
-- `UserMessage(String)` — the content of a human (or untagged) input that opened the turn.
-- `AssistantMessage(AssistantMessage)` — the model's output for the turn, containing an ordered `Vec<AssistantItem>` of `Text` and `ToolCall` items.
-- `ToolCallStarted { turn_id, tool_call }` — emitted per tool call when the assistant's message is processed, alongside a `RequestTool` action.
-- `ToolResult(ToolResultMessage)` — a completed tool result, emitted in assistant-declared order (late results are buffered by `completed_results` until the preceding ones arrive).
-- `TurnFinished { turn_id, outcome }` — closes the turn with `TurnOutcome::Graceful`, `Interrupted`, or `Crashed`.
-- `Injected(InjectedMessage)` — the durable, model-visible injection point. `agent-core` produces this variant when a tagged `Steer` / `FollowUp` starts a turn at `Idle`, so the opening entry is tagged injected context instead of an anonymous `UserMessage`. Downstream layers also append injected entries for compaction summaries and future multi-agent spawn briefs / child reports. The core defines the variant and shape; it does not interpret specific kind strings.
-
-`TranscriptItem::turn_id()` returns the turn id for variants that carry one (`TurnStarted`, `ToolCallStarted`, `TurnFinished`) and `None` otherwise.
-
-## What this crate does NOT do
-
-- **No durable storage.** The core has no log, no database, no on-disk journal. `agent-session` owns the durable transcript store.
-- **No async runtime, no I/O.** No `tokio`, no `async fn`, no threads. Callers drive it synchronously; `agent-session`'s runner module wraps it for async use.
-- **No cost / usage / token accounting.** The core emits no usage numbers and does not inspect completions for cost. Session-level context-pressure accounting and higher-level cost metering live above.
-- **No tool execution.** `RequestTool` is a request; the caller runs the tool and feeds back a `ToolResultMessage`.
-- **No model provider abstraction.** The core does not know what a model is or how to call one; it just accepts `ModelCompleted { action_id, assistant, .. }` / `ModelFailed { action_id, error, .. }` and moves on.
-- **No multi-agent awareness or routing.** Inter-session routing, session registries, spawn/report semantics, and worklog triggers all live in `agent-orchestrator` / `agent-session`. The core's only concession to multi-agent existence is that `AgentInput::Steer` / `FollowUp` carry optional `from` / `kind` tags, which it propagates into injected transcript items opaquely.
-- **No knowledge of specific injected-message kinds.** Kind strings for routed reports, directives, compaction output, or other injected context are defined above the core.
-- **No provider/workspace ID allocation.** The core mints `TurnId` and `ActionId` only. `ToolCallId` values arrive from outside via the `ToolCall` structs the model produced; the core does not mint them.
+- `agent-vocab` owns the shared message/transcript shapes.
+- `agent-session` owns durable history, resume, rewind, fork, compaction, and
+  runner integration.
+- Providers and tools live above the core.

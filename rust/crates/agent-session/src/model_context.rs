@@ -197,10 +197,11 @@ impl ModelContext {
                     tool_calls.extend(message.tool_calls().cloned());
                 }
                 TranscriptItem::ToolCallStarted { tool_call, .. } => {
-                    started_tool_calls.push((tool_call.id, tool_call.tool_name.clone()));
+                    started_tool_calls.push((tool_call.id.clone(), tool_call.tool_name.clone()));
                 }
                 TranscriptItem::ToolResult(result) => {
-                    completed_tool_calls.push((result.tool_call_id, result.tool_name.clone()));
+                    completed_tool_calls
+                        .push((result.tool_call_id.clone(), result.tool_name.clone()));
                 }
                 TranscriptItem::TurnStarted { .. }
                 | TranscriptItem::UserMessage(_)
@@ -269,19 +270,21 @@ impl From<Vec<TranscriptItem>> for ModelContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{AssistantItem, AssistantMessage, InjectedMessage, ToolResultStatus};
+    use agent_core::{
+        AssistantItem, AssistantMessage, InjectedMessage, ToolResultStatus, UserMessage,
+    };
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
         ToolCall {
-            id: ToolCallId(id),
+            id: ToolCallId::from_u64(id),
             tool_name: name.to_string(),
             args_json: "{}".to_string(),
         }
     }
 
-    fn tool_result(id: u64, name: &str) -> ToolResultMessage {
+    fn tool_result(id: impl Into<ToolCallId>, name: &str) -> ToolResultMessage {
         ToolResultMessage {
-            tool_call_id: ToolCallId(id),
+            tool_call_id: id.into(),
             tool_name: name.to_string(),
             output: "ok".to_string(),
             status: ToolResultStatus::Success,
@@ -297,7 +300,7 @@ mod tests {
     fn turn_boundary_walks_past_injected_messages() {
         let transcript = ModelContext::from_transcript_items(vec![
             TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::UserMessage("hi".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("hi")),
             TranscriptItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
@@ -315,7 +318,7 @@ mod tests {
 
         let transcript = ModelContext::from_transcript_items_recovering_crashed_tail(vec![
             TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-            TranscriptItem::UserMessage("hello".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("hello")),
             TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![
                     AssistantItem::ToolCall(first.clone()),
@@ -342,7 +345,7 @@ mod tests {
         );
         assert_eq!(
             transcript.transcript_items()[6],
-            TranscriptItem::ToolResult(ToolResultMessage::crashed(second.id, "read"))
+            TranscriptItem::ToolResult(ToolResultMessage::crashed(second.id.clone(), "read"))
         );
     }
 
@@ -352,7 +355,7 @@ mod tests {
 
         let transcript = ModelContext::from_transcript_items_recovering_crashed_tail(vec![
             TranscriptItem::TurnStarted { turn_id: TurnId(8) },
-            TranscriptItem::UserMessage("hello".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("hello")),
             TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
             }),
@@ -367,7 +370,7 @@ mod tests {
         );
         assert_eq!(
             transcript.transcript_items()[4],
-            TranscriptItem::ToolResult(ToolResultMessage::crashed(tool_call.id, "bash"))
+            TranscriptItem::ToolResult(ToolResultMessage::crashed(tool_call.id.clone(), "bash"))
         );
         assert_eq!(
             transcript.transcript_items()[5],
@@ -402,7 +405,7 @@ mod tests {
                 turn_id: TurnId(1),
                 tool_call: tool_call.clone(),
             },
-            TranscriptItem::ToolResult(tool_result(tool_call.id.0, &tool_call.tool_name)),
+            TranscriptItem::ToolResult(tool_result(tool_call.id.clone(), &tool_call.tool_name)),
             TranscriptItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,

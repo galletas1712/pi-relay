@@ -7,7 +7,7 @@ use agent_core::{
 fn finished_model_context(input: &str) -> ModelContext {
     ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-        TranscriptItem::UserMessage(input.to_string()),
+        TranscriptItem::UserMessage(UserMessage::text(input)),
         TranscriptItem::TurnFinished {
             turn_id: TurnId(1),
             outcome: TurnOutcome::Graceful,
@@ -20,7 +20,7 @@ fn finished_turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptIte
         TranscriptItem::TurnStarted {
             turn_id: TurnId(turn_id),
         },
-        TranscriptItem::UserMessage(user.to_string()),
+        TranscriptItem::UserMessage(UserMessage::text(user)),
         TranscriptItem::AssistantMessage(AssistantMessage {
             items: vec![AssistantItem::Text(assistant.to_string())],
         }),
@@ -86,7 +86,7 @@ fn compacted_open_context(summary: &str, turn_id: u64, user: &str) -> ModelConte
         TranscriptItem::TurnStarted {
             turn_id: TurnId(turn_id),
         },
-        TranscriptItem::UserMessage(user.to_string()),
+        TranscriptItem::UserMessage(UserMessage::text(user)),
     ])
 }
 
@@ -130,13 +130,13 @@ fn empty_assistant() -> AssistantMessage {
 fn rewind_and_fork_only_accept_turn_finished_entries() {
     let mut session = AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-        TranscriptItem::UserMessage("first".to_string()),
+        TranscriptItem::UserMessage(UserMessage::text("first")),
         TranscriptItem::TurnFinished {
             turn_id: TurnId(1),
             outcome: TurnOutcome::Graceful,
         },
         TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-        TranscriptItem::UserMessage("second".to_string()),
+        TranscriptItem::UserMessage(UserMessage::text("second")),
         TranscriptItem::TurnFinished {
             turn_id: TurnId(2),
             outcome: TurnOutcome::Graceful,
@@ -208,7 +208,7 @@ fn fork_can_copy_a_boundary_path_while_source_session_is_running() {
 fn invalid_rewind_target_does_not_cancel_live_work() {
     let mut session = AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-        TranscriptItem::UserMessage("first".to_string()),
+        TranscriptItem::UserMessage(UserMessage::text("first")),
         TranscriptItem::TurnFinished {
             turn_id: TurnId(1),
             outcome: TurnOutcome::Graceful,
@@ -321,7 +321,7 @@ fn drive_absorbs_core_items_into_the_session_context() {
         session.model_context().transcript_items(),
         &[
             TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::UserMessage("hello".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("hello")),
             TranscriptItem::AssistantMessage(assistant),
             TranscriptItem::TurnFinished {
                 turn_id: TurnId(1),
@@ -347,7 +347,7 @@ fn live_transcript_keeps_open_turns_open() {
         session.model_context().transcript_items(),
         &[
             TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::UserMessage("hello".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("hello")),
         ]
     );
 }
@@ -356,7 +356,7 @@ fn live_transcript_keeps_open_turns_open() {
 fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
     let model_context = vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-        TranscriptItem::UserMessage("hello".to_string()),
+        TranscriptItem::UserMessage(UserMessage::text("hello")),
     ];
 
     let session = AgentSession::from_transcript_items(model_context);
@@ -365,7 +365,7 @@ fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
         session.model_context().transcript_items(),
         &[
             TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-            TranscriptItem::UserMessage("hello".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("hello")),
             TranscriptItem::TurnFinished {
                 turn_id: TurnId(7),
                 outcome: TurnOutcome::Crashed,
@@ -379,14 +379,14 @@ fn rehydrating_an_incomplete_transcript_patches_a_crashed_finish() {
 fn from_model_context_recovers_an_open_tail_as_crashed() {
     let mut session = AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-        TranscriptItem::UserMessage("hello".to_string()),
+        TranscriptItem::UserMessage(UserMessage::text("hello")),
     ]));
 
     assert_eq!(
         session.model_context().transcript_items(),
         &[
             TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-            TranscriptItem::UserMessage("hello".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("hello")),
             TranscriptItem::TurnFinished {
                 turn_id: TurnId(7),
                 outcome: TurnOutcome::Crashed,
@@ -407,13 +407,13 @@ fn from_model_context_recovers_an_open_tail_as_crashed() {
 #[test]
 fn from_transcript_store_recovers_an_open_tool_tail_as_crashed() {
     let tool_call = ToolCall {
-        id: ToolCallId(1),
+        id: ToolCallId::from_u64(1),
         tool_name: "read".to_string(),
         args_json: "{}".to_string(),
     };
     let store = TranscriptStore::from_model_context(&ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-        TranscriptItem::UserMessage("hello".to_string()),
+        TranscriptItem::UserMessage(UserMessage::text("hello")),
         TranscriptItem::AssistantMessage(AssistantMessage {
             items: vec![AssistantItem::ToolCall(tool_call.clone())],
         }),
@@ -430,7 +430,7 @@ fn from_transcript_store_recovers_an_open_tool_tail_as_crashed() {
         session.model_context().transcript_items(),
         &[
             TranscriptItem::TurnStarted { turn_id: TurnId(7) },
-            TranscriptItem::UserMessage("hello".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("hello")),
             TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
             }),
@@ -451,6 +451,29 @@ fn from_transcript_store_recovers_an_open_tool_tail_as_crashed() {
 }
 
 #[test]
+fn stored_session_round_trips_the_active_branch() {
+    let mut items = Vec::new();
+    items.extend(finished_turn(1, "first", "done"));
+    items.extend(finished_turn(2, "second", "done"));
+    let mut session = AgentSession::from_model_context(ModelContext::from_transcript_items(items));
+    let first_turn_leaf_id = session.transcript_store().entries()[3].id.clone();
+
+    session
+        .rewind(Some(&first_turn_leaf_id))
+        .expect("first turn finish is a valid branch target");
+    let stored = session.to_stored_session("s1");
+    assert_eq!(stored.active_leaf_id, Some(first_turn_leaf_id.clone()));
+
+    let restored =
+        AgentSession::from_stored_session(stored).expect("stored session should rehydrate");
+    assert_eq!(restored.model_context(), session.model_context());
+    assert_eq!(
+        restored.transcript_store().leaf_id(),
+        Some(first_turn_leaf_id.as_str())
+    );
+}
+
+#[test]
 fn restore_recovers_open_tail_and_remains_quiescent() {
     let mut items = Vec::new();
     items.extend(finished_turn(
@@ -464,9 +487,9 @@ fn restore_recovers_open_tail_and_remains_quiescent() {
         "second assistant message with enough text to count",
     ));
     items.push(TranscriptItem::TurnStarted { turn_id: TurnId(3) });
-    items.push(TranscriptItem::UserMessage(
-        "open turn before process death".to_string(),
-    ));
+    items.push(TranscriptItem::UserMessage(UserMessage::text(
+        "open turn before process death",
+    )));
 
     let mut session = AgentSession::from_transcript_items(items);
 
@@ -674,7 +697,7 @@ fn stale_session_model_completion_does_not_update_token_count() {
 fn unmatched_tool_completion_before_tool_request_is_ignored() {
     let mut session = AgentSession::new();
     let tool_call = ToolCall {
-        id: ToolCallId(1),
+        id: ToolCallId::from_u64(1),
         tool_name: "bash".to_string(),
         args_json: "{}".to_string(),
     };
@@ -769,7 +792,7 @@ fn completion_event_is_not_emitted_when_interrupt_wins_before_drive() {
 fn rehydrating_a_graceful_boundary_restores_idle_state() {
     let model_context = vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-        TranscriptItem::UserMessage("hello".to_string()),
+        TranscriptItem::UserMessage(UserMessage::text("hello")),
         TranscriptItem::TurnFinished {
             turn_id: TurnId(2),
             outcome: TurnOutcome::Graceful,
@@ -839,7 +862,7 @@ fn model_failure_marks_turn_crashed_and_unblocks_history_operations() {
         session.model_context().transcript_items(),
         &[
             TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::UserMessage("hi".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("hi")),
             TranscriptItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Crashed,
@@ -1093,7 +1116,7 @@ fn model_barrier_compaction_rejects_replacement_that_finishes_open_turn_early() 
             replacement: ModelContext::from_transcript_items(vec![
                 TranscriptItem::Injected(InjectedMessage::new("compaction", "bad")),
                 TranscriptItem::TurnStarted { turn_id: TurnId(3) },
-                TranscriptItem::UserMessage("third user message".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("third user message")),
                 TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
             ]),
             context_tokens: None,
@@ -1117,13 +1140,13 @@ fn model_barrier_compaction_rejects_replacement_that_finishes_open_turn_early() 
 fn compaction_rejects_replacement_with_unmatched_tool_call() {
     let mut session = session_with_compactable_history();
     let tool_call = ToolCall {
-        id: ToolCallId(1),
+        id: ToolCallId::from_u64(1),
         tool_name: "bash".to_string(),
         args_json: "{}".to_string(),
     };
     let bad_replacement = ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-        TranscriptItem::UserMessage("summary".to_string()),
+        TranscriptItem::UserMessage(UserMessage::text("summary")),
         TranscriptItem::AssistantMessage(AssistantMessage {
             items: vec![AssistantItem::ToolCall(tool_call)],
         }),
@@ -1201,7 +1224,7 @@ fn compaction_rejects_replacement_with_orphan_tool_result() {
             replacement: ModelContext::from_transcript_items(vec![
                 TranscriptItem::TurnStarted { turn_id: TurnId(2) },
                 TranscriptItem::ToolResult(ToolResultMessage {
-                    tool_call_id: ToolCallId(42),
+                    tool_call_id: ToolCallId::from_u64(42),
                     tool_name: "bash".to_string(),
                     output: "orphan".to_string(),
                     status: ToolResultStatus::Success,
@@ -1311,7 +1334,7 @@ fn queued_steer_and_follow_up_survive_idle_compaction_request() {
 fn requested_compaction_waits_for_next_model_context_barrier() {
     let mut session = session_with_compactable_history();
     let tool_call = ToolCall {
-        id: ToolCallId(1),
+        id: ToolCallId::from_u64(1),
         tool_name: "read".to_string(),
         args_json: "{}".to_string(),
     };
@@ -1540,13 +1563,13 @@ fn stale_completion_after_history_operation_cannot_attach_to_reused_turn_id() {
         session.model_context().transcript_items(),
         &[
             TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::UserMessage("first".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("first")),
             TranscriptItem::TurnFinished {
                 turn_id: TurnId(1),
                 outcome: TurnOutcome::Graceful,
             },
             TranscriptItem::TurnStarted { turn_id: TurnId(2) },
-            TranscriptItem::UserMessage("new second".to_string()),
+            TranscriptItem::UserMessage(UserMessage::text("new second")),
         ]
     );
 
@@ -1601,7 +1624,7 @@ fn invalid_origin_tags_are_rejected_without_mutating_session_state() {
     let result = session.enqueue_input(AgentInput::Steer {
         from: Some("parent".to_string()),
         kind: None,
-        content: "half tagged".to_string(),
+        content: UserMessage::text("half tagged"),
     });
 
     assert_eq!(result, Err(AgentInputError::UnpairedOriginTags));
@@ -1619,7 +1642,7 @@ fn history_operation_interrupts_active_tool_work_before_applying() {
     session.drain_actions();
 
     let tool_call = ToolCall {
-        id: ToolCallId(1),
+        id: ToolCallId::from_u64(1),
         tool_name: "bash".to_string(),
         args_json: "{}".to_string(),
     };
@@ -1670,7 +1693,7 @@ fn mismatched_tool_completion_does_not_clear_live_tool_work() {
     session.drain_actions();
 
     let tool_call = ToolCall {
-        id: ToolCallId(1),
+        id: ToolCallId::from_u64(1),
         tool_name: "bash".to_string(),
         args_json: "{}".to_string(),
     };
@@ -1691,7 +1714,7 @@ fn mismatched_tool_completion_does_not_clear_live_tool_work() {
             action_id: ActionId(2),
             turn_id: TurnId(1),
             result: ToolResultMessage {
-                tool_call_id: ToolCallId(99),
+                tool_call_id: ToolCallId::from_u64(99),
                 tool_name: tool_call.tool_name,
                 output: "misrouted".to_string(),
                 status: ToolResultStatus::Success,
@@ -1715,7 +1738,7 @@ fn rewind_accepts_injected_tail_at_turn_boundary() {
     // a TurnFinished is still at a turn boundary.
     let mut session = AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-        TranscriptItem::UserMessage("hi".to_string()),
+        TranscriptItem::UserMessage(UserMessage::text("hi")),
         TranscriptItem::TurnFinished {
             turn_id: TurnId(1),
             outcome: TurnOutcome::Graceful,

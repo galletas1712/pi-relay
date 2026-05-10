@@ -19,7 +19,7 @@ pub struct AgentInputHandle {
 impl AgentInputHandle {
     /// Create the input side of an agent run loop.
     ///
-    /// The handle is cloneable so orchestrator, model, and tool tasks can all
+    /// The handle is cloneable so model, tool, and UI/control tasks can all
     /// enqueue completions or user input back into the same session.
     pub fn channel() -> (Self, AgentInputReceiver) {
         let (inputs, input_rx) = unbounded();
@@ -196,6 +196,7 @@ mod tests {
 
     use agent_core::{
         ActionId, AgentInput, AssistantItem, AssistantMessage, TranscriptItem, TurnId, TurnOutcome,
+        UserMessage,
     };
 
     fn block_on_ready<F: Future>(future: F) -> F::Output {
@@ -251,14 +252,14 @@ mod tests {
             model_context.transcript_items(),
             &[
                 TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("hello")),
             ]
         );
         assert_eq!(
             runner.session().model_context().transcript_items(),
             &[
                 TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("hello")),
                 TranscriptItem::AssistantMessage(assistant),
                 TranscriptItem::TurnFinished {
                     turn_id: TurnId(1),
@@ -320,7 +321,7 @@ mod tests {
             runner.session().model_context().transcript_items(),
             &[
                 TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::UserMessage("hello".to_string()),
+                TranscriptItem::UserMessage(UserMessage::text("hello")),
                 TranscriptItem::AssistantMessage(assistant),
                 TranscriptItem::TurnFinished {
                     turn_id: TurnId(1),
@@ -384,7 +385,7 @@ mod tests {
             .enqueue_input(AgentInput::FollowUp {
                 from: None,
                 kind: Some("child_report".to_string()),
-                content: "half tagged".to_string(),
+                content: UserMessage::text("half tagged"),
             })
             .expect_err("invalid input should be rejected before channel send");
 

@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 
 use crate::event::{AgentEvent, AgentInput, TurnOrigin};
 use crate::ids::TurnId;
+use crate::message::UserMessage;
 use crate::state::AgentState;
 
 /// A queued user input plus its optional sender/kind tags.
@@ -16,7 +17,7 @@ use crate::state::AgentState;
 pub(crate) struct UserInputEntry {
     pub(crate) from: Option<String>,
     pub(crate) kind: Option<String>,
-    pub(crate) content: String,
+    pub(crate) content: UserMessage,
 }
 
 /// Volatile prioritized queues feeding the live agent FSM.
@@ -119,7 +120,7 @@ impl Mailbox {
         self.steer.push_back(UserInputEntry {
             from: None,
             kind: None,
-            content: input.into(),
+            content: UserMessage::text(input),
         });
     }
 
@@ -128,7 +129,7 @@ impl Mailbox {
         self.follow_up.push_back(UserInputEntry {
             from: None,
             kind: None,
-            content: input.into(),
+            content: UserMessage::text(input),
         });
     }
 
@@ -217,7 +218,7 @@ mod tests {
 
     fn tool_result(id: u64, name: &str) -> ToolResultMessage {
         ToolResultMessage {
-            tool_call_id: ToolCallId(id),
+            tool_call_id: ToolCallId::from_u64(id),
             tool_name: name.to_string(),
             output: "ok".to_string(),
             status: ToolResultStatus::Success,
@@ -258,11 +259,11 @@ mod tests {
 
         assert_eq!(
             mailbox.pop_user_input_entry().map(|e| e.content),
-            Some("steer".to_string())
+            Some(UserMessage::text("steer"))
         );
         assert_eq!(
             mailbox.pop_user_input_entry().map(|e| e.content),
-            Some("follow-up".to_string())
+            Some(UserMessage::text("follow-up"))
         );
         assert!(mailbox.pop_user_input_entry().is_none());
     }
@@ -316,7 +317,7 @@ mod tests {
             mailbox.next_event(&AgentState::Idle, TurnId(2)),
             Some(AgentEvent::StartTurn {
                 turn_id: TurnId(2),
-                input: "steer".to_string(),
+                input: UserMessage::text("steer"),
                 origin: None,
             })
         );
@@ -324,7 +325,7 @@ mod tests {
             mailbox.next_event(&AgentState::Idle, TurnId(3)),
             Some(AgentEvent::StartTurn {
                 turn_id: TurnId(3),
-                input: "follow-up".to_string(),
+                input: UserMessage::text("follow-up"),
                 origin: None,
             })
         );
@@ -349,7 +350,7 @@ mod tests {
             event,
             AgentEvent::StartTurn {
                 turn_id: TurnId(1),
-                input: "do X".to_string(),
+                input: UserMessage::text("do X"),
                 origin: Some(TurnOrigin {
                     from: "parent".to_string(),
                     kind: "agent_directive".to_string(),
@@ -373,7 +374,7 @@ mod tests {
             event,
             AgentEvent::StartTurn {
                 turn_id: TurnId(1),
-                input: "plain".to_string(),
+                input: UserMessage::text("plain"),
                 origin: None,
             }
         );

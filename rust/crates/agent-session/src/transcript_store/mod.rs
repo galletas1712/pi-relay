@@ -2,6 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_core::{InjectedMessage, TranscriptItem};
+use agent_store::StoredTranscriptEntry;
 use uuid::Uuid;
 
 use crate::model_context::ModelContext;
@@ -15,7 +16,7 @@ use crate::model_context::ModelContext;
 pub struct TranscriptStorageNode {
     pub id: String,
     pub parent_id: Option<String>,
-    pub timestamp_ms: u128,
+    pub timestamp_ms: u64,
     pub item: TranscriptItem,
 }
 
@@ -189,7 +190,7 @@ impl TranscriptStore {
         }
 
         match leaf_id {
-            Some(leaf_id) => Ok(Self::from_entries(
+            Some(leaf_id) => Ok(Self::from_trusted_entries(
                 self.branch_entries(Some(leaf_id)),
                 Some(leaf_id.to_string()),
             )),
@@ -234,7 +235,35 @@ impl TranscriptStore {
         id
     }
 
-    fn from_entries(entries: Vec<TranscriptStorageNode>, active_leaf_id: Option<String>) -> Self {
+    pub fn from_storage_entries(
+        entries: Vec<TranscriptStorageNode>,
+        active_leaf_id: Option<String>,
+    ) -> Result<Self, TranscriptStoreError> {
+        let mut ids = BTreeSet::new();
+        for entry in &entries {
+            if !ids.insert(entry.id.clone()) {
+                return Err(TranscriptStoreError::DuplicateEntry);
+            }
+        }
+        for entry in &entries {
+            if let Some(parent_id) = &entry.parent_id {
+                if !ids.contains(parent_id) {
+                    return Err(TranscriptStoreError::MissingParent);
+                }
+            }
+        }
+        if let Some(active_leaf_id) = &active_leaf_id {
+            if !ids.contains(active_leaf_id) {
+                return Err(TranscriptStoreError::EntryNotFound);
+            }
+        }
+        Ok(Self::from_trusted_entries(entries, active_leaf_id))
+    }
+
+    fn from_trusted_entries(
+        entries: Vec<TranscriptStorageNode>,
+        active_leaf_id: Option<String>,
+    ) -> Self {
         let mut ctx = Self::new();
         for entry in entries {
             ctx.append_entry(entry);
@@ -248,26 +277,52 @@ impl TranscriptStore {
 pub enum TranscriptStoreError {
     EntryNotFound,
     NotTurnBoundary,
+    DuplicateEntry,
+    MissingParent,
 }
 
-fn now_ms() -> u128 {
+impl From<TranscriptStorageNode> for StoredTranscriptEntry {
+    fn from(value: TranscriptStorageNode) -> Self {
+        Self {
+            id: value.id,
+            parent_id: value.parent_id,
+            timestamp_ms: value.timestamp_ms,
+            item: value.item,
+        }
+    }
+}
+
+impl From<StoredTranscriptEntry> for TranscriptStorageNode {
+    fn from(value: StoredTranscriptEntry) -> Self {
+        Self {
+            id: value.id,
+            parent_id: value.parent_id,
+            timestamp_ms: value.timestamp_ms,
+            item: value.item,
+        }
+    }
+}
+
+fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis())
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{AssistantItem, AssistantMessage, InjectedMessage, TurnId, TurnOutcome};
+    use agent_core::{
+        AssistantItem, AssistantMessage, InjectedMessage, TurnId, TurnOutcome, UserMessage,
+    };
 
     fn turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptItem> {
         vec![
             TranscriptItem::TurnStarted {
                 turn_id: TurnId(turn_id),
             },
-            TranscriptItem::UserMessage(user.to_string()),
+            TranscriptItem::UserMessage(UserMessage::text(user)),
             TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text(assistant.to_string())],
             }),
@@ -292,11 +347,11 @@ mod tests {
         assert_eq!(transcript.last_turn_id(), TurnId(3));
         assert_eq!(
             transcript.transcript_items()[1],
-            TranscriptItem::UserMessage("first".to_string())
+            TranscriptItem::UserMessage(UserMessage::text("first"))
         );
         assert_eq!(
             transcript.transcript_items()[5],
-            TranscriptItem::UserMessage("alternate".to_string())
+            TranscriptItem::UserMessage(UserMessage::text("alternate"))
         );
     }
 

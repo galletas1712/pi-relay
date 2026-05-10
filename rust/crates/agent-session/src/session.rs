@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
 
+#[cfg(test)]
+use agent_core::UserMessage;
 use agent_core::{AgentAction, AgentCoreLoop, AgentInput, AgentInputError, TranscriptItem, TurnId};
+use agent_store::StoredSession;
 
 use crate::action::{CompactionRequestId, SessionAction};
 use crate::compaction_state::{CompactionBarrierModelRequest, CompactionState, RunningCompaction};
@@ -170,6 +173,35 @@ impl AgentSession {
         Ok(session)
     }
 
+    /// Convert the durable transcript forest into a backend-neutral storage
+    /// snapshot. Runtime mailboxes, pending external work, and action outboxes
+    /// are intentionally excluded: resume semantics are derived from the
+    /// persisted transcript path, not from volatile in-flight work.
+    pub fn to_stored_session(&self, session_id: impl Into<String>) -> StoredSession {
+        let mut stored = StoredSession::new(session_id);
+        stored.active_leaf_id = self.transcript_store.leaf_id().map(str::to_string);
+        stored.entries = self
+            .transcript_store
+            .entries()
+            .into_iter()
+            .map(Into::into)
+            .collect();
+        stored
+    }
+
+    /// Rehydrate a session from a backend-neutral storage snapshot.
+    ///
+    /// If the active branch ends mid-turn, the existing crash-tail recovery is
+    /// applied before the session resumes. That keeps the same resume semantics
+    /// for JSONL, future Postgres rows, or any other backend.
+    pub fn from_stored_session(stored: StoredSession) -> Result<Self, HistoryOperationError> {
+        let entries = stored.entries.into_iter().map(Into::into).collect();
+        let transcript_store =
+            TranscriptStore::from_storage_entries(entries, stored.active_leaf_id)
+                .map_err(HistoryOperationError::Store)?;
+        Self::from_transcript_store(transcript_store)
+    }
+
     /// Enqueue a new input into the underlying core loop.
     ///
     /// This is the only supported way to feed the core from outside the
@@ -289,8 +321,8 @@ impl AgentSession {
     /// `from` and `kind` tags each input was enqueued with.
     ///
     /// Notifications (model/tool completions) and the interrupt flag are
-    /// untouched. Primarily intended for tests and for orchestrator-level
-    /// introspection of routing.
+    /// untouched. Primarily intended for tests and for caller-level
+    /// introspection.
     pub fn drain_pending_inputs(&mut self) -> Vec<AgentInput> {
         self.core.drain_pending_inputs()
     }
