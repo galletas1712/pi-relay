@@ -153,7 +153,11 @@ function supportsThinkingLevel(model: Model<Api>, level: string): boolean {
 	return getThinkingLevels(model).includes(level);
 }
 
-function buildFallbackModel(provider: string, modelId: string, availableModels: Model<Api>[]): Model<Api> | undefined {
+export function buildFallbackModel(
+	provider: string,
+	modelId: string,
+	availableModels: Model<Api>[],
+): Model<Api> | undefined {
 	const providerModels = availableModels.filter((m) => m.provider === provider);
 	if (providerModels.length === 0) return undefined;
 
@@ -536,7 +540,9 @@ export async function findInitialModel(options: {
 
 	// 3. Try saved default from settings
 	if (defaultProvider && defaultModelId) {
-		const found = modelRegistry.find(defaultProvider, defaultModelId);
+		const found =
+			modelRegistry.find(defaultProvider, defaultModelId) ??
+			buildFallbackModel(defaultProvider, defaultModelId, modelRegistry.getAll());
 		if (found) {
 			model = found;
 			if (defaultThinkingLevel) {
@@ -577,7 +583,9 @@ export async function restoreModelFromSession(
 	shouldPrintMessages: boolean,
 	modelRegistry: ModelRegistry,
 ): Promise<{ model: Model<Api> | undefined; fallbackMessage: string | undefined }> {
-	const restoredModel = modelRegistry.find(savedProvider, savedModelId);
+	const restoredModel =
+		modelRegistry.find(savedProvider, savedModelId) ??
+		buildFallbackModel(savedProvider, savedModelId, modelRegistry.getAll());
 
 	// Check if restored model exists and still has auth configured
 	const hasConfiguredAuth = restoredModel ? modelRegistry.hasConfiguredAuth(restoredModel) : false;

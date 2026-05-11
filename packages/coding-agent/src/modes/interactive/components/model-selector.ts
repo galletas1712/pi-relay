@@ -10,6 +10,7 @@ import {
 	type TUI,
 } from "@pi-relay/tui";
 import type { ModelRegistry } from "../../../core/model-registry.js";
+import { buildFallbackModel } from "../../../core/model-resolver.js";
 import type { SettingsManager } from "../../../core/settings-manager.js";
 import { theme } from "../theme/theme.js";
 import { DynamicBorder } from "./dynamic-border.js";
@@ -48,6 +49,8 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private scopedModelItems: ModelItem[] = [];
 	private activeModels: ModelItem[] = [];
 	private filteredModels: ModelItem[] = [];
+	private customModelItem?: ModelItem;
+	private customModelError?: string;
 	private selectedIndex: number = 0;
 	private currentModel?: Model<any>;
 	private settingsManager: SettingsManager;
@@ -104,9 +107,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			this.searchInput.setValue(initialSearchInput);
 		}
 		this.searchInput.onSubmit = () => {
-			// Enter on search input selects the first filtered item
-			if (this.filteredModels[this.selectedIndex]) {
-				this.handleSelect(this.filteredModels[this.selectedIndex].model);
+			const selectedModel = this.getSelectedModel();
+			if (selectedModel) {
+				this.handleSelect(selectedModel);
 			}
 		};
 		this.addChild(this.searchInput);
@@ -224,7 +227,75 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				)
 			: this.activeModels;
 		this.selectedIndex = Math.min(this.selectedIndex, Math.max(0, this.filteredModels.length - 1));
+		const custom = this.filteredModels.length === 0 ? this.buildCustomModelItem(query) : {};
+		this.customModelItem = custom.item;
+		this.customModelError = custom.error;
 		this.updateList();
+	}
+
+	private buildCustomModelItem(query: string): { item?: ModelItem; error?: string } {
+		const reference = query.trim();
+		if (!reference || this.allModels.length === 0) return {};
+
+		const providersByLowerName = new Map<string, string>();
+		for (const item of this.allModels) {
+			if (!providersByLowerName.has(item.provider.toLowerCase())) {
+				providersByLowerName.set(item.provider.toLowerCase(), item.provider);
+			}
+		}
+
+		let provider: string | undefined;
+		let modelId = reference;
+		const slashIndex = reference.indexOf("/");
+		if (slashIndex > 0) {
+			const maybeProvider = reference.substring(0, slashIndex).trim();
+			const canonicalProvider = providersByLowerName.get(maybeProvider.toLowerCase());
+			if (canonicalProvider) {
+				provider = canonicalProvider;
+				modelId = reference.substring(slashIndex + 1).trim();
+			}
+		}
+
+		if (!provider) {
+			const currentProvider = this.currentModel?.provider;
+			if (currentProvider && providersByLowerName.has(currentProvider.toLowerCase())) {
+				provider = providersByLowerName.get(currentProvider.toLowerCase());
+			} else {
+				const activeProviders = Array.from(new Set(this.activeModels.map((item) => item.provider)));
+				const allProviders = Array.from(new Set(this.allModels.map((item) => item.provider)));
+				provider =
+					activeProviders.length === 1 ? activeProviders[0] : allProviders.length === 1 ? allProviders[0] : undefined;
+			}
+		}
+
+		if (!provider) {
+			return { error: "Type provider/model-id to use a custom model." };
+		}
+		if (!modelId) {
+			return { error: "Type a model id after the provider/ prefix." };
+		}
+
+		const model = buildFallbackModel(
+			provider,
+			modelId,
+			this.allModels.map((item) => item.model),
+		);
+		if (!model) {
+			return { error: `No configured provider found for "${provider}".` };
+		}
+
+		return {
+			item: {
+				provider: model.provider,
+				id: model.id,
+				model,
+			},
+		};
+	}
+
+	private getSelectedModel(): Model<any> | undefined {
+		const selectedModel = this.filteredModels[this.selectedIndex]?.model;
+		return selectedModel ?? this.customModelItem?.model;
 	}
 
 	private updateList(): void {
@@ -276,7 +347,25 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				this.listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
 			}
 		} else if (this.filteredModels.length === 0) {
-			this.listContainer.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
+			if (this.customModelItem) {
+				const prefix = theme.fg("accent", "→ ");
+				const providerBadge = theme.fg("muted", `[${this.customModelItem.provider}]`);
+				this.listContainer.addChild(
+					new Text(
+						`${prefix + theme.fg("accent", `Use custom model: ${this.customModelItem.id}`)} ${providerBadge}`,
+						0,
+						0,
+					),
+				);
+				this.listContainer.addChild(
+					new Text(theme.fg("muted", `  Reuses provider settings from ${this.customModelItem.provider}`), 0, 0),
+				);
+			} else {
+				this.listContainer.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
+				if (this.customModelError) {
+					this.listContainer.addChild(new Text(theme.fg("muted", `  ${this.customModelError}`), 0, 0));
+				}
+			}
 		} else {
 			const selected = this.filteredModels[this.selectedIndex];
 			this.listContainer.addChild(new Spacer(1));
@@ -310,9 +399,9 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		}
 		// Enter
 		else if (kb.matches(keyData, "tui.select.confirm")) {
-			const selectedModel = this.filteredModels[this.selectedIndex];
+			const selectedModel = this.getSelectedModel();
 			if (selectedModel) {
-				this.handleSelect(selectedModel.model);
+				this.handleSelect(selectedModel);
 			}
 		}
 		// Escape or Ctrl+C

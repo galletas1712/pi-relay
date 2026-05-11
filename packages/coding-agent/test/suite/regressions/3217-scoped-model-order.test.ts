@@ -95,4 +95,62 @@ describe("issue #3217 scoped model ordering", () => {
 
 		expect(orderedIds).toEqual([modelTwo.id, modelOne.id, modelThree.id]);
 	});
+
+	it("selects a custom model id when the /model search has no matches", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1", name: "One", reasoning: true }],
+		});
+		harnesses.push(harness);
+
+		const currentModel = harness.getModel("faux-1")!;
+		let selectedModel: typeof currentModel | undefined;
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			currentModel,
+			harness.settingsManager,
+			harness.session.modelRegistry,
+			[],
+			(model) => {
+				selectedModel = model;
+			},
+			() => {},
+			"ghost-model",
+		);
+
+		await waitForAsyncRender();
+		selector.handleInput("\r");
+
+		expect(selectedModel?.provider).toBe(currentModel.provider);
+		expect(selectedModel?.id).toBe("ghost-model");
+		expect(harness.settingsManager.getDefaultProvider()).toBe(currentModel.provider);
+		expect(harness.settingsManager.getDefaultModel()).toBe("ghost-model");
+	});
+
+	it("accepts provider-prefixed custom model ids in the /model search", async () => {
+		const harness = await createHarness({
+			models: [{ id: "faux-1", name: "One", reasoning: true }],
+		});
+		harnesses.push(harness);
+
+		const currentModel = harness.getModel("faux-1")!;
+		let selectedModel: typeof currentModel | undefined;
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			currentModel,
+			harness.settingsManager,
+			harness.session.modelRegistry,
+			[],
+			(model) => {
+				selectedModel = model;
+			},
+			() => {},
+			`${currentModel.provider}/ghost-model`,
+		);
+
+		await waitForAsyncRender();
+		selector.handleInput("\r");
+
+		expect(selectedModel?.provider).toBe(currentModel.provider);
+		expect(selectedModel?.id).toBe("ghost-model");
+	});
 });
