@@ -68,5 +68,5 @@ The tagged path is generic injected context, not subagent orchestration.
 
 - `agent-vocab` owns the shared message/transcript shapes.
 - `agent-session` owns durable history, resume, rewind, fork, compaction, and
-  runner integration.
+  session integration.
 - Providers and tools live above the core.

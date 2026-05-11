@@ -6,6 +6,7 @@ members = [
     "crates/agent-store",
     "crates/agent-provider",
     "crates/agent-tools",
+    "crates/agent-daemon",
     "crates/pi-cli",
 ]
 resolver = "2"
@@ -21,12 +22,15 @@ agent-session = { path = "crates/agent-session" }
 agent-store = { path = "crates/agent-store" }
 agent-provider = { path = "crates/agent-provider" }
 agent-tools = { path = "crates/agent-tools" }
+anyhow = "1"
 async-trait = "0.1"
-futures-channel = "0.3"
-futures-core = "0.3"
+futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "json"] }
 thiserror = "2"
-tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "time"] }
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-tungstenite = "0.29"
 uuid = { version = "1", features = ["serde", "v4"] }

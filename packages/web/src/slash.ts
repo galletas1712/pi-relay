@@ -1,0 +1,50 @@
+export interface SlashCommandInfo {
+	name: string;
+	description: string;
+	argumentHint?: string;
+	requiresArgs?: boolean;
+}
+
+export interface ParsedSlash {
+	name: string;
+	args: string;
+	raw: string;
+}
+
+export const COMMANDS: SlashCommandInfo[] = [
+	{ name: "help", description: "Show slash commands." },
+	{ name: "new", description: "Create and select a session.", argumentHint: "[title]" },
+	{ name: "refresh", description: "Reload sessions and current transcript." },
+	{ name: "clear", description: "Clear local notices for this view." },
+	{ name: "status", description: "Show selected session state." },
+	{ name: "rewind", description: "Open the rewind picker." },
+	{ name: "fork", description: "Open the fork picker.", argumentHint: "[title]" },
+	{ name: "compact", description: "Request context compaction." },
+	{ name: "context", description: "Inspect model context.", argumentHint: "[entry-id]" },
+	{ name: "tree", description: "Summarize transcript tree." },
+	{ name: "system", description: "Read or set global system prompt.", argumentHint: "[clear|prompt...]" },
+	{ name: "provider", description: "Read or set session provider.", argumentHint: "[kind model]" },
+	{ name: "tools", description: "List daemon tools." }
+];
+
+export function filterCommands(query: string): SlashCommandInfo[] {
+	const q = query.toLowerCase();
+	if (!q) return COMMANDS.slice();
+	return COMMANDS.filter((command) => command.name.startsWith(q));
+}
+
+export function findCommand(name: string): SlashCommandInfo | undefined {
+	const normalized = name.toLowerCase();
+	return COMMANDS.find((command) => command.name === normalized);
+}
+
+export function parseSlash(input: string): ParsedSlash | null {
+	const trimmed = input.trim();
+	if (!trimmed.startsWith("/")) return null;
+	const match = trimmed.match(/^\/([^\s]*)(?:\s+([\s\S]*))?$/);
+	return {
+		name: (match?.[1] ?? "").toLowerCase(),
+		args: (match?.[2] ?? "").trim(),
+		raw: trimmed
+	};
+}

@@ -1,8 +1,8 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::storage::StoredTranscriptEntry;
 use agent_core::{InjectedMessage, TranscriptItem};
-use agent_store::StoredTranscriptEntry;
 use uuid::Uuid;
 
 use crate::model_context::ModelContext;
@@ -24,7 +24,7 @@ pub struct TranscriptStorageNode {
 ///
 /// Each `TranscriptStorageNode` holds a single `TranscriptItem` plus a parent
 /// pointer. The store keeps direct indexes by entry id, parent id, and current
-/// leaves so future registry/storage layers can discover sibling paths and
+/// leaves so future storage layers can discover sibling paths and
 /// common ancestors quickly. The active leaf is the one path this session is
 /// currently using.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -196,6 +196,19 @@ impl TranscriptStore {
             )),
             None => Ok(Self::new()),
         }
+    }
+
+    pub fn create_branched_store_at_entry(
+        &self,
+        leaf_id: &str,
+    ) -> Result<Self, TranscriptStoreError> {
+        if !self.contains_entry(leaf_id) {
+            return Err(TranscriptStoreError::EntryNotFound);
+        }
+        Ok(Self::from_trusted_entries(
+            self.branch_entries(Some(leaf_id)),
+            Some(leaf_id.to_string()),
+        ))
     }
 
     /// Materialize the active branch into a `ModelContext`.
@@ -423,5 +436,23 @@ mod tests {
             .create_branched_store_at_turn_boundary(Some(&injected_id))
             .expect("injected tail should be a valid fork boundary");
         assert_eq!(forked.leaf_id(), Some(injected_id.as_str()));
+    }
+
+    #[test]
+    fn branched_store_can_end_at_any_existing_entry() {
+        let mut ctx = TranscriptStore::new();
+        let ids = ctx.append_transcript_items(turn(1, "hi", "done"));
+        let user_message_id = &ids[1];
+
+        let forked = ctx
+            .create_branched_store_at_entry(user_message_id)
+            .expect("any existing transcript entry can be copied for fork");
+        assert_eq!(forked.leaf_id(), Some(user_message_id.as_str()));
+        assert!(!forked.is_turn_boundary());
+
+        assert_eq!(
+            ctx.create_branched_store_at_entry("missing-entry").err(),
+            Some(TranscriptStoreError::EntryNotFound)
+        );
     }
 }

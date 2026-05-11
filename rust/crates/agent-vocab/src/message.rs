@@ -1,4 +1,6 @@
-use serde::{Deserialize, Serialize};
+use serde::de::{self, MapAccess, Visitor};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::ids::ToolCallId;
@@ -110,12 +112,98 @@ impl AssistantMessage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantItem {
     Text(String),
     ThinkingRedacted,
     ToolCall(ToolCall),
+}
+
+impl Serialize for AssistantItem {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            Self::Text(text) => {
+                let mut state = serializer.serialize_struct("AssistantItem", 2)?;
+                state.serialize_field("type", "text")?;
+                state.serialize_field("text", text)?;
+                state.end()
+            }
+            Self::ThinkingRedacted => {
+                let mut state = serializer.serialize_struct("AssistantItem", 1)?;
+                state.serialize_field("type", "thinking_redacted")?;
+                state.end()
+            }
+            Self::ToolCall(call) => {
+                let mut state = serializer.serialize_struct("AssistantItem", 4)?;
+                state.serialize_field("type", "tool_call")?;
+                state.serialize_field("id", &call.id)?;
+                state.serialize_field("tool_name", &call.tool_name)?;
+                state.serialize_field("args_json", &call.args_json)?;
+                state.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AssistantItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_map(AssistantItemVisitor)
+    }
+}
+
+struct AssistantItemVisitor;
+
+impl<'de> Visitor<'de> for AssistantItemVisitor {
+    type Value = AssistantItem;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("an assistant item object")
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut kind: Option<String> = None;
+        let mut text: Option<String> = None;
+        let mut id: Option<ToolCallId> = None;
+        let mut tool_name: Option<String> = None;
+        let mut args_json: Option<String> = None;
+
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type" => kind = Some(map.next_value()?),
+                "text" => text = Some(map.next_value()?),
+                "id" => id = Some(map.next_value()?),
+                "tool_name" => tool_name = Some(map.next_value()?),
+                "args_json" => args_json = Some(map.next_value()?),
+                _ => {
+                    let _ = map.next_value::<de::IgnoredAny>()?;
+                }
+            }
+        }
+
+        match kind.as_deref() {
+            Some("text") => Ok(AssistantItem::Text(text.unwrap_or_default())),
+            Some("thinking_redacted") => Ok(AssistantItem::ThinkingRedacted),
+            Some("tool_call") => Ok(AssistantItem::ToolCall(ToolCall {
+                id: id.ok_or_else(|| de::Error::missing_field("id"))?,
+                tool_name: tool_name.ok_or_else(|| de::Error::missing_field("tool_name"))?,
+                args_json: args_json.unwrap_or_else(|| "{}".to_string()),
+            })),
+            Some(other) => Err(de::Error::unknown_variant(
+                other,
+                &["text", "thinking_redacted", "tool_call"],
+            )),
+            None => Err(de::Error::missing_field("type")),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -197,5 +285,47 @@ impl ToolResultMessage {
             output: "crashed before tool result was recorded".to_string(),
             status: ToolResultStatus::Crashed,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn assistant_item_serializes_as_tagged_objects() {
+        let message = AssistantMessage {
+            items: vec![
+                AssistantItem::Text("hello".to_string()),
+                AssistantItem::ThinkingRedacted,
+                AssistantItem::ToolCall(ToolCall {
+                    id: ToolCallId::new("call_1"),
+                    tool_name: "read".to_string(),
+                    args_json: "{\"path\":\"README.md\"}".to_string(),
+                }),
+            ],
+        };
+
+        let value = serde_json::to_value(&message).expect("assistant message serializes");
+        assert_eq!(
+            value,
+            json!({
+                "items": [
+                    { "type": "text", "text": "hello" },
+                    { "type": "thinking_redacted" },
+                    {
+                        "type": "tool_call",
+                        "id": "call_1",
+                        "tool_name": "read",
+                        "args_json": "{\"path\":\"README.md\"}",
+                    }
+                ]
+            })
+        );
+
+        let round_trip: AssistantMessage =
+            serde_json::from_value(value).expect("assistant message deserializes");
+        assert_eq!(round_trip, message);
     }
 }

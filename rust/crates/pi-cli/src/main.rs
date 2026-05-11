@@ -4,7 +4,7 @@ use std::sync::Arc;
 use agent_core::AgentInput;
 use agent_provider::anthropic::AnthropicProvider;
 use agent_provider::openai::OpenAiProvider;
-use agent_provider::{ModelProvider, ModelRequest};
+use agent_provider::{ModelProvider, ModelRequest, PromptSections};
 use agent_session::{AgentSession, SessionAction, SessionInput};
 use agent_tools::{ToolContext, ToolRegistry};
 
@@ -56,10 +56,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     let response = provider
                         .complete(ModelRequest {
                             model: model.clone(),
-                            system_prompt: Some("You are a concise coding agent.".to_string()),
+                            prompt: PromptSections::new(
+                                Some("You are a concise coding agent.".to_string()),
+                                Some(format!(
+                                    "Current working directory: {}",
+                                    tool_ctx.cwd.display()
+                                )),
+                            ),
                             transcript: model_context.into_transcript_items(),
                             tools: tools.definitions(),
-                            max_tokens: Some(4096),
+                            max_tokens: None,
+                            prompt_cache_key: None,
                         })
                         .await?;
                     let text = response.assistant.text();

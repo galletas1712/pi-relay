@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+		<meta name="color-scheme" content="light dark" />
+		<link rel="icon" href="data:," />
+		<title>pi relay</title>
+		<script>
+			(function () {
+				try {
+					var stored = localStorage.getItem("pi-relay-theme");
+					var system = window.matchMedia("(prefers-color-scheme: dark)").matches;
+					var dark = stored === "dark" || (stored !== "light" && system);
+					if (dark) document.documentElement.classList.add("dark");
+					if (stored === "light") document.documentElement.classList.add("light");
+				} catch (_) {
+					/* localStorage may be unavailable */
+				}
+			})();
+		</script>
+	</head>
+	<body>
+		<div id="root"></div>
+		<script type="module" src="/src/main.tsx"></script>
+	</body>
+</html>

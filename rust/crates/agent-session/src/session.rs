@@ -1,17 +1,16 @@
 use std::collections::VecDeque;
 
-#[cfg(test)]
-use agent_core::UserMessage;
-use agent_core::{AgentAction, AgentCoreLoop, AgentInput, AgentInputError, TranscriptItem, TurnId};
-use agent_store::StoredSession;
-
 use crate::action::{CompactionRequestId, SessionAction};
 use crate::compaction_state::{CompactionBarrierModelRequest, CompactionState, RunningCompaction};
 use crate::event::{SessionActionKind, SessionEvent};
 use crate::external_work::ExternalWork;
 use crate::input::{SessionInput, SessionInputError};
 use crate::model_context::ModelContext;
+use crate::storage::StoredSession;
 use crate::transcript_store::{TranscriptStore, TranscriptStoreError};
+#[cfg(test)]
+use agent_core::UserMessage;
+use agent_core::{AgentAction, AgentCoreLoop, AgentInput, AgentInputError, TranscriptItem, TurnId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryOperationError {
@@ -173,10 +172,10 @@ impl AgentSession {
         Ok(session)
     }
 
-    /// Convert the durable transcript forest into a backend-neutral storage
-    /// snapshot. Runtime mailboxes, pending external work, and action outboxes
-    /// are intentionally excluded: resume semantics are derived from the
-    /// persisted transcript path, not from volatile in-flight work.
+    /// Convert the durable transcript forest into a storage snapshot. Runtime
+    /// mailboxes, pending external work, and action outboxes are intentionally
+    /// excluded: resume semantics are derived from the persisted transcript
+    /// path, not from volatile in-flight work.
     pub fn to_stored_session(&self, session_id: impl Into<String>) -> StoredSession {
         let mut stored = StoredSession::new(session_id);
         stored.active_leaf_id = self.transcript_store.leaf_id().map(str::to_string);
@@ -189,11 +188,11 @@ impl AgentSession {
         stored
     }
 
-    /// Rehydrate a session from a backend-neutral storage snapshot.
+    /// Rehydrate a session from a storage snapshot.
     ///
     /// If the active branch ends mid-turn, the existing crash-tail recovery is
-    /// applied before the session resumes. That keeps the same resume semantics
-    /// for JSONL, future Postgres rows, or any other backend.
+    /// applied before the session resumes. That keeps resume semantics derived
+    /// from the stored transcript path rather than volatile runtime state.
     pub fn from_stored_session(stored: StoredSession) -> Result<Self, HistoryOperationError> {
         let entries = stored.entries.into_iter().map(Into::into).collect();
         let transcript_store =
@@ -374,17 +373,23 @@ impl AgentSession {
         }
     }
 
-    /// Produce an unregistered `AgentSession` whose context branches from
-    /// `leaf_id` (or the root when `None`). The source session is unchanged;
-    /// the caller is responsible for registering the fork if desired.
+    /// Produce an unregistered `AgentSession` whose context branches from an
+    /// existing transcript entry. The source session is unchanged; the caller
+    /// is responsible for registering the fork if desired.
     ///
     /// Fork is separate from `rewind` because it reads the context and produces
     /// a new session rather than mutating the source in place.
-    pub fn fork(&self, leaf_id: Option<&str>) -> Result<AgentSession, HistoryOperationError> {
+    pub fn fork(&self, leaf_id: &str) -> Result<AgentSession, HistoryOperationError> {
         let transcript_store = self
             .transcript_store
-            .create_branched_store_at_turn_boundary(leaf_id)
+            .create_branched_store_at_entry(leaf_id)
             .map_err(HistoryOperationError::Store)?;
+        if !transcript_store.is_turn_boundary() {
+            let model_context = ModelContext::from_transcript_items_recovering_interrupted_tail(
+                transcript_store.model_context().into_transcript_items(),
+            );
+            return Ok(AgentSession::from_model_context(model_context));
+        }
         AgentSession::from_transcript_store(transcript_store)
     }
 
@@ -440,7 +445,7 @@ impl AgentSession {
                 }
                 AgentAction::RequestTool { .. } => self.expose_agent_action(action),
                 AgentAction::CancelTurn { .. } => {
-                    self.invalidate_session_work("turn cancelled");
+                    self.invalidate_session_work("turn interrupted");
                 }
             }
         }

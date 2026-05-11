@@ -1,7 +1,6 @@
 # agent-session
 
-Durable session history and an async run-loop wrapper around the `agent-core`
-FSM kernel.
+Durable session history around the `agent-core` FSM kernel.
 
 ## Responsibility
 
@@ -29,10 +28,13 @@ The harness receives
 calls the remote compaction API, and returns
 `SessionInput::CompactionCompleted { request_id, replacement, context_tokens }`.
 The session installs that replacement as a new active path in the transcript
-store. `rewind(leaf_id)` is the immediate history mutation: it validates the
-target first, may interrupt active work, then moves the active leaf and
-rehydrates the core. Queued user `Steer` / `FollowUp` inputs survive both paths.
-`fork(leaf_id)` creates a new session value rather than mutating the source.
+store. `rewind(leaf_id)` is the immediate history mutation: it validates that
+the target is a turn boundary first, may interrupt active work, then moves the
+active leaf and rehydrates the core. Queued user `Steer` / `FollowUp` inputs
+survive both paths. `fork(entry_id)` creates a new session value from any
+existing transcript entry rather than mutating the source. If the selected entry
+is not a boundary, the fork closes the copied tail as interrupted so the new
+session can be driven immediately.
 
 This crate does not own model calls, tool execution, cost tracking,
 spawn/report routing, compaction budget policy, or control-plane scheduling.
@@ -48,11 +50,6 @@ All intended downstream imports are re-exported from `lib.rs`.
   `enqueue_session_input`, `compact`, `rewind`, `fork`, `drain_actions`,
   `drain_events`, `drain_pending_inputs`, `model_context`, and
   `transcript_store`.
-- `AgentRunner` — async wrapper that drives a session from an input channel.
-- `AgentInputHandle`, `AgentInputHandleError`, `AgentInputReceiver` —
-  sender/receiver pair for the runner.
-- `SessionRegistry`, `SessionId`, `RegistryError` — in-memory registry for
-  live independent sessions. This is process state, not durable storage.
 - `SessionAction` — model/tool actions, session-wide `CancelSessionWork`, and
   session-owned `RequestCompaction`. `RequestModel` and `RequestCompaction`
   carry the model context snapshot visible when the request was made, the
@@ -71,10 +68,10 @@ All intended downstream imports are re-exported from `lib.rs`.
   active leaf.
 - `TranscriptStorageNode` — `{ id, parent_id, timestamp_ms, item }`.
 - `ModelContext` — read-only materialized view derived from the active path.
-- `StoredSession`, `StoredTranscriptEntry`, `SessionStore` — backend-neutral
-  persistence types re-exported from `agent-store`.
+- `StoredSession`, `StoredTranscriptEntry` — storage snapshot shapes owned by
+  this crate.
 - `AgentSession::to_stored_session` / `AgentSession::from_stored_session` —
-  bridge live sessions to swappable storage backends.
+  bridge live sessions to durable storage snapshots.
 - `TranscriptStoreError` — `EntryNotFound`, `NotTurnBoundary`,
   `DuplicateEntry`, `MissingParent`.
 
@@ -137,8 +134,9 @@ harness to cancel all external work for this session.
 
 `agent-session` does not decide when the context is over budget. The harness
 owns model metadata, thresholds, and auto-compaction policy. When the harness
-decides the session should compact, it calls `compact()` directly or enqueues
-`SessionInput::Compact` through an `AgentInputHandle`.
+decides the session should compact, it calls `compact()` directly or sends
+`SessionInput::Compact` through whatever outer control plane is driving the
+session.
 When compaction starts, the session emits
 `SessionAction::RequestCompaction { request_id, model_context, context_leaf_id, context_tokens }`;
 the harness calls the remote compaction API and returns
@@ -186,7 +184,7 @@ session.enqueue_session_input(SessionInput::CompactionCompleted {
 session.rewind(Some(&leaf_id))?;
 session.rewind(None)?;
 
-let forked: AgentSession = session.fork(Some(&leaf_id))?;
+let forked: AgentSession = session.fork(&entry_id)?;
 ```
 
 `compact()` is asynchronous from the session's point of view: it queues a remote
@@ -220,8 +218,6 @@ mutation, then invalidates live work, moves the leaf, and rehydrates the core.
 | `src/session.rs` | `AgentSession`, drive/input/action lifecycle, remote compaction, rewind, restore rehydration. |
 | `src/session/tests.rs` | Session lifecycle tests. |
 | `src/model_context.rs` | `ModelContext` read-only view and crashed-tail recovery. |
-| `src/registry.rs` | In-memory live-session registry. |
-| `src/runner.rs` | `AgentRunner` async shell and input handle. |
 | `src/transcript_store/mod.rs` | Transcript forest, entry/parent/leaf indexes, materialization, boundary checks. |
 
 ### Composition
@@ -253,16 +249,17 @@ active leaf; `model_context()` materializes exactly that root-to-leaf path.
 
 `append_transcript_items` attaches new children under the active leaf.
 `branch_at_turn_boundary(id)` moves the active leaf onto an existing boundary
-entry; subsequent appends grow a new path off that node. Remote compaction
-replacement resets the active leaf to the root and appends the replacement
-context as a new path. Nothing is deleted.
+entry; subsequent appends grow a new path off that node. Forking is broader and
+can copy a path ending at any existing entry because it does not mutate the
+source store. Remote compaction replacement resets the active leaf to the root
+and appends the replacement context as a new path. Nothing is deleted.
 
 Each live session owns an independent `TranscriptStore`. `fork(leaf)` copies
 only the ancestor path from root to `leaf` into a new session; sibling branches,
 abandoned descendants, queued inputs, in-flight actions, events, and other
-sessions are not copied. Persistence happens through backend-neutral
-`StoredSession` snapshots, so a future database backend can store shared rows or
-copy-on-write branches without changing the public session operations.
+sessions are not copied. Persistence crosses the session boundary through
+`StoredSession` snapshots owned by this crate. The websocket daemon stores those
+semantics through normalized Postgres rows in `agent-store`.
 
 Remote compaction replacement in pictures:
 
@@ -302,24 +299,11 @@ compaction at the next safe model-context barrier. If compaction starts at a
 model barrier, the just-emitted `RequestModel` is blocked before dispatch and
 exposed only after compaction finishes or fails.
 
-### AgentRunner
-
-`AgentRunner` is the only async surface in the crate. It owns an `AgentSession`,
-an input receiver, and a `FnMut(SessionAction) -> impl Future<Output = ()>`
-action handler. `run()` drives the session, flushes events and actions, then
-awaits the next `SessionInput`.
-
-`RequestModel` actions include the `ModelContext` snapshot needed to build the
-provider request. `RequestCompaction` actions include the `ModelContext`
-snapshot needed to call the remote compaction API. The action handler should
-register or spawn long-running model/tool/compaction work and return promptly,
-then enqueue completion or failure later through an `AgentInputHandle`.
-
 ## Relationship To Other Crates
 
 - **Upstream `agent-core`** — provides the FSM, mailbox input/action vocabulary,
   transcript item types, IDs, and message/tool-call structures. `agent-session`
   re-exports these for a single downstream import path.
 
-For cross-cutting context such as control plane, usage, worklogs, and
-multi-agent spawn/report, see `rust/docs/architecture.md`.
+For cross-cutting context such as the websocket control plane, providers,
+storage, and worklogs, see `rust/docs/architecture.md`.

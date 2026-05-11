@@ -5,6 +5,10 @@ the good local semantics around resume, rewind, fork, and compaction while
 removing the hierarchical subagent machinery from the TypeScript fork.
 
 See [`docs/architecture.md`](docs/architecture.md) for the detailed design.
+See [`docs/websocket-rpc.md`](docs/websocket-rpc.md) for the implemented
+Postgres-first websocket RPC contract and manual exercise plan.
+See [`docs/design-decisions.md`](docs/design-decisions.md) for the visible UI
+choices and invisible runtime/storage decisions.
 
 ## Crate Layout
 
@@ -12,10 +16,11 @@ See [`docs/architecture.md`](docs/architecture.md) for the detailed design.
 | --- | --- |
 | `agent-vocab` | Shared serializable ids, message blocks, images, assistant items, tool calls/results, and transcript items. |
 | `agent-core` | Pure deterministic FSM for one agent turn loop. No I/O. |
-| `agent-session` | Durable transcript forest, model context materialization, resume/rewind/fork/compaction, runner, and storage snapshots. |
-| `agent-store` | Backend-neutral `SessionStore`, `StoredSession`, in-memory store, and JSONL store. |
+| `agent-session` | Durable transcript forest, model context materialization, resume/rewind/fork/compaction, and storage snapshots. |
+| `agent-store` | Postgres-only session/event/action/input persistence for the daemon. |
 | `agent-provider` | `ModelProvider` plus OpenAI and Anthropic adapters. |
 | `agent-tools` | `AgentTool`, `ToolRegistry`, and builtin `read`/`write`/`edit`/`bash` tools. |
+| `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch. |
 | `pi-cli` | Minimal `pi-rs` driver for one local session. |
 
 ## Running
@@ -36,7 +41,68 @@ RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/clang' \
 cargo test --manifest-path rust/Cargo.toml --all
 ```
 
-## CLI Smoke Test
+## Websocket Daemon
+
+Start Postgres, for example with OrbStack/Docker:
+
+```sh
+DOCKER_HOST=unix:///Users/schwinns/.orbstack/run/docker.sock \
+docker run -d --name pi-relay-pg \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_DB=pi_relay \
+  -p 55432:5432 postgres:16-alpine
+```
+
+Run the daemon:
+
+```sh
+SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
+RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/clang' \
+cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
+  --database-url postgres://postgres:postgres@127.0.0.1:55432/pi_relay \
+  --bind 127.0.0.1:8787 \
+  --workspace /Users/schwinns/.codex/worktrees/45d5/pi-relay
+```
+
+The websocket endpoint is `ws://127.0.0.1:8787`.
+
+Provider credential loading:
+
+- `provider.kind = "codex"` uses `CODEX_ACCESS_TOKEN` or
+  `~/.codex/auth.json`, including `tokens.account_id` when present.
+- `provider.kind = "openai"` uses `OPENAI_API_KEY` or an API key in
+  `~/.codex/auth.json`.
+- `provider.kind = "anthropic"` or `"claude"` uses `ANTHROPIC_API_KEY`.
+
+Session provider config supports an optional explicit `max_tokens` cap and
+`prompt_cache: { "key": "..." }`; the daemon does not add a default OpenAI/Codex
+output cap. The prompt-cache key is sent on the OpenAI request path. The system
+prompt is global daemon configuration exposed over websocket `config.get` /
+`config.set`, not per-session state.
+
+Provider requests render the prompt in two sections: the global system prompt
+as a stable prefix first, then daemon-generated dynamic context such as the
+current workspace. Conversation transcript and tool results come after those
+prompt sections.
+
+## Web UI
+
+```sh
+npm run dev:web
+```
+
+The web UI runs at `http://127.0.0.1:8788` and connects to
+`ws://127.0.0.1:8787` by default. Override the daemon URL with
+`VITE_PI_AGENT_WS`.
+
+The composer sends regular text as `input.follow_up`. Slash commands expose the
+session operations intended for the UI: `/new`, `/refresh`, `/status`,
+`/rewind`, `/fork`, `/compact`, `/context`, `/tree`, `/system`, `/provider`,
+and `/tools`. Active turns use the stop button; queued follow-ups can be
+promoted to steer from the queue pane above the composer.
+
+## CLI Composition Check
 
 ```sh
 ANTHROPIC_API_KEY=... cargo run --manifest-path rust/Cargo.toml -p pi-cli -- claude claude-sonnet-4-5 "hello"

@@ -37,7 +37,7 @@ impl ModelProvider for AnthropicProvider {
             "max_tokens": request.max_tokens.unwrap_or(4096),
             "messages": transcript_to_messages(&request.transcript)?,
         });
-        if let Some(system_prompt) = request.system_prompt {
+        if let Some(system_prompt) = request.prompt.render_joined() {
             body["system"] = json!(system_prompt);
         }
         if !request.tools.is_empty() {

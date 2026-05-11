@@ -6,7 +6,5 @@ publish = false
 
 [dependencies]
 agent-core = { workspace = true }
-agent-store = { workspace = true }
-futures-channel = { workspace = true }
-futures-core = { workspace = true }
-uuid = { version = "1", features = ["v4"] }
+serde = { workspace = true }
+uuid = { workspace = true }

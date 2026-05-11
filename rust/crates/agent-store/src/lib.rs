@@ -1,306 +1,327 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
-use std::fs;
-use std::path::{Path, PathBuf};
+mod postgres;
 
-use agent_vocab::TranscriptItem;
-use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
+use std::fmt;
+use std::str::FromStr;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredTranscriptEntry {
-    pub id: String,
-    pub parent_id: Option<String>,
-    pub timestamp_ms: u64,
-    pub item: TranscriptItem,
-}
+use agent_session::{SessionAction, UserMessage};
+pub use agent_session::{StoredSession, StoredTranscriptEntry};
+pub use postgres::PostgresAgentStore;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct StoredSession {
-    pub session_id: String,
-    pub active_leaf_id: Option<String>,
-    pub metadata: BTreeMap<String, String>,
-    pub entries: Vec<StoredTranscriptEntry>,
-}
-
-impl StoredSession {
-    pub fn new(session_id: impl Into<String>) -> Self {
-        Self {
-            session_id: session_id.into(),
-            active_leaf_id: None,
-            metadata: BTreeMap::new(),
-            entries: Vec::new(),
+macro_rules! text_enum {
+    ($(
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($variant:ident => $wire:literal),+ $(,)?
         }
-    }
-}
+    )+) => {
+        $(
+            $(#[$meta])*
+            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+            pub enum $name {
+                $($variant),+
+            }
 
-#[derive(Debug, Error)]
-pub enum StoreError {
-    #[error("session not found: {0}")]
-    SessionNotFound(String),
-    #[error("io error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("json error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("invalid store record: {0}")]
-    InvalidRecord(String),
-}
-
-pub type StoreResult<T> = Result<T, StoreError>;
-
-#[async_trait]
-pub trait SessionStore: Send + Sync {
-    async fn load_session(&self, session_id: &str) -> StoreResult<Option<StoredSession>>;
-    async fn write_session(&self, session: &StoredSession) -> StoreResult<()>;
-    async fn append_entries(
-        &self,
-        session_id: &str,
-        entries: &[StoredTranscriptEntry],
-        active_leaf_id: Option<&str>,
-    ) -> StoreResult<()>;
-    async fn set_active_leaf(
-        &self,
-        session_id: &str,
-        active_leaf_id: Option<&str>,
-    ) -> StoreResult<()>;
-}
-
-#[derive(Debug, Clone)]
-pub struct InMemorySessionStore {
-    sessions: std::sync::Arc<std::sync::Mutex<BTreeMap<String, StoredSession>>>,
-}
-
-impl Default for InMemorySessionStore {
-    fn default() -> Self {
-        Self {
-            sessions: std::sync::Arc::new(std::sync::Mutex::new(BTreeMap::new())),
-        }
-    }
-}
-
-#[async_trait]
-impl SessionStore for InMemorySessionStore {
-    async fn load_session(&self, session_id: &str) -> StoreResult<Option<StoredSession>> {
-        Ok(self
-            .sessions
-            .lock()
-            .expect("in-memory store lock poisoned")
-            .get(session_id)
-            .cloned())
-    }
-
-    async fn write_session(&self, session: &StoredSession) -> StoreResult<()> {
-        self.sessions
-            .lock()
-            .expect("in-memory store lock poisoned")
-            .insert(session.session_id.clone(), session.clone());
-        Ok(())
-    }
-
-    async fn append_entries(
-        &self,
-        session_id: &str,
-        entries: &[StoredTranscriptEntry],
-        active_leaf_id: Option<&str>,
-    ) -> StoreResult<()> {
-        let mut sessions = self.sessions.lock().expect("in-memory store lock poisoned");
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| StoreError::SessionNotFound(session_id.to_string()))?;
-        session.entries.extend(entries.iter().cloned());
-        session.active_leaf_id = active_leaf_id.map(str::to_string);
-        Ok(())
-    }
-
-    async fn set_active_leaf(
-        &self,
-        session_id: &str,
-        active_leaf_id: Option<&str>,
-    ) -> StoreResult<()> {
-        let mut sessions = self.sessions.lock().expect("in-memory store lock poisoned");
-        let session = sessions
-            .get_mut(session_id)
-            .ok_or_else(|| StoreError::SessionNotFound(session_id.to_string()))?;
-        session.active_leaf_id = active_leaf_id.map(str::to_string);
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct JsonlSessionStore {
-    root: PathBuf,
-}
-
-impl JsonlSessionStore {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-
-    fn path_for(&self, session_id: &str) -> PathBuf {
-        self.root.join(format!("{session_id}.jsonl"))
-    }
-
-    fn ensure_root(&self) -> StoreResult<()> {
-        fs::create_dir_all(&self.root)?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum JsonlRecord {
-    Session {
-        version: u32,
-        session_id: String,
-        active_leaf_id: Option<String>,
-        metadata: BTreeMap<String, String>,
-    },
-    Entry {
-        entry: StoredTranscriptEntry,
-    },
-}
-
-#[async_trait]
-impl SessionStore for JsonlSessionStore {
-    async fn load_session(&self, session_id: &str) -> StoreResult<Option<StoredSession>> {
-        let path = self.path_for(session_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        read_jsonl_session(&path)
-    }
-
-    async fn write_session(&self, session: &StoredSession) -> StoreResult<()> {
-        self.ensure_root()?;
-        write_jsonl_session(&self.path_for(&session.session_id), session)
-    }
-
-    async fn append_entries(
-        &self,
-        session_id: &str,
-        entries: &[StoredTranscriptEntry],
-        active_leaf_id: Option<&str>,
-    ) -> StoreResult<()> {
-        let mut session = self
-            .load_session(session_id)
-            .await?
-            .ok_or_else(|| StoreError::SessionNotFound(session_id.to_string()))?;
-        session.entries.extend(entries.iter().cloned());
-        session.active_leaf_id = active_leaf_id.map(str::to_string);
-        self.write_session(&session).await
-    }
-
-    async fn set_active_leaf(
-        &self,
-        session_id: &str,
-        active_leaf_id: Option<&str>,
-    ) -> StoreResult<()> {
-        let mut session = self
-            .load_session(session_id)
-            .await?
-            .ok_or_else(|| StoreError::SessionNotFound(session_id.to_string()))?;
-        session.active_leaf_id = active_leaf_id.map(str::to_string);
-        self.write_session(&session).await
-    }
-}
-
-fn read_jsonl_session(path: &Path) -> StoreResult<Option<StoredSession>> {
-    let text = fs::read_to_string(path)?;
-    let mut session: Option<StoredSession> = None;
-    for (index, line) in text.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<JsonlRecord>(line)? {
-            JsonlRecord::Session {
-                version: _,
-                session_id,
-                active_leaf_id,
-                metadata,
-            } => {
-                if index != 0 {
-                    return Err(StoreError::InvalidRecord(
-                        "session header must be the first JSONL record".to_string(),
-                    ));
+            impl $name {
+                pub fn as_str(self) -> &'static str {
+                    match self {
+                        $(Self::$variant => $wire),+
+                    }
                 }
-                session = Some(StoredSession {
-                    session_id,
-                    active_leaf_id,
-                    metadata,
-                    entries: Vec::new(),
-                });
             }
-            JsonlRecord::Entry { entry } => {
-                let Some(session) = &mut session else {
-                    return Err(StoreError::InvalidRecord(
-                        "entry appeared before session header".to_string(),
-                    ));
-                };
-                session.entries.push(entry);
+
+            impl fmt::Display for $name {
+                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    f.write_str(self.as_str())
+                }
             }
-        }
-    }
-    Ok(session)
+
+            impl FromStr for $name {
+                type Err = String;
+
+                fn from_str(value: &str) -> Result<Self, Self::Err> {
+                    match value {
+                        $($wire => Ok(Self::$variant),)+
+                        other => Err(format!(
+                            "unknown {}: {other}",
+                            stringify!($name),
+                        )),
+                    }
+                }
+            }
+
+            impl Serialize for $name {
+                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+                where
+                    S: Serializer,
+                {
+                    serializer.serialize_str(self.as_str())
+                }
+            }
+
+            impl<'de> Deserialize<'de> for $name {
+                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+                where
+                    D: Deserializer<'de>,
+                {
+                    let value = String::deserialize(deserializer)?;
+                    Self::from_str(&value).map_err(D::Error::custom)
+                }
+            }
+        )+
+    };
 }
 
-fn write_jsonl_session(path: &Path, session: &StoredSession) -> StoreResult<()> {
-    let mut output = String::new();
-    output.push_str(&serde_json::to_string(&JsonlRecord::Session {
-        version: 1,
-        session_id: session.session_id.clone(),
-        active_leaf_id: session.active_leaf_id.clone(),
-        metadata: session.metadata.clone(),
-    })?);
-    output.push('\n');
-    for entry in &session.entries {
-        output.push_str(&serde_json::to_string(&JsonlRecord::Entry {
-            entry: entry.clone(),
-        })?);
-        output.push('\n');
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProviderKind {
+    OpenAi,
+    Codex,
+    Claude,
+}
+
+impl ProviderKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Codex => "codex",
+            Self::Claude => "claude",
+        }
     }
-    fs::write(path, output)?;
-    Ok(())
+
+    pub fn is_codex(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+}
+
+impl fmt::Display for ProviderKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ProviderKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "openai" => Ok(Self::OpenAi),
+            "codex" => Ok(Self::Codex),
+            "claude" | "anthropic" => Ok(Self::Claude),
+            other => Err(format!("unsupported provider kind: {other}")),
+        }
+    }
+}
+
+impl Serialize for ProviderKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::from_str(&value).map_err(D::Error::custom)
+    }
+}
+
+text_enum! {
+    pub enum InputPriority {
+        FollowUp => "follow_up",
+        Steer => "steer",
+    }
+
+    pub enum QueuedInputStatus {
+        Queued => "queued",
+        Consuming => "consuming",
+        Consumed => "consumed",
+        Cancelled => "cancelled",
+    }
+
+    pub enum ActionKind {
+        Model => "model",
+        Tool => "tool",
+        Compaction => "compaction",
+        Cancel => "cancel",
+    }
+
+    pub enum ActionStatus {
+        Pending => "pending",
+        Running => "running",
+        Completed => "completed",
+        Error => "error",
+        Interrupted => "interrupted",
+        Stale => "stale",
+    }
+
+    pub enum SessionActivity {
+        Idle => "idle",
+        Queued => "queued",
+        Running => "running",
+    }
+
+    pub enum EventType {
+        SessionCreated => "session.created",
+        SessionConfigured => "session.configured",
+        SessionRecovered => "session.recovered",
+        SessionIdle => "session.idle",
+        SessionWorkCancelled => "session.work_cancelled",
+        InputQueued => "input.queued",
+        InputPromoted => "input.promoted",
+        InputReplaced => "input.replaced",
+        InputCancelled => "input.cancelled",
+        InputConsumed => "input.consumed",
+        InputAccepted => "input.accepted",
+        InputIgnored => "input.ignored",
+        HistoryRewound => "history.rewound",
+        HistoryForked => "history.forked",
+        HistoryCompacted => "history.compacted",
+        ActionRequested => "action.requested",
+        ModelRequested => "model.requested",
+        ModelCompleted => "model.completed",
+        ModelError => "model.error",
+        ToolRequested => "tool.requested",
+        ToolStarted => "tool.started",
+        ToolCompleted => "tool.completed",
+        ToolError => "tool.error",
+        CompactionRequested => "compaction.requested",
+        CompactionCompleted => "compaction.completed",
+        CompactionError => "compaction.error",
+        TranscriptAppended => "transcript.appended",
+        TurnStarted => "turn.started",
+        TurnFinished => "turn.finished",
+        AssistantMessage => "assistant.message",
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderConfig {
+    pub kind: ProviderKind,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache: Option<Value>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionConfig {
+    pub provider: ProviderConfig,
+    pub metadata: Value,
+}
+
+impl SessionConfig {
+    pub fn harness(&self) -> bool {
+        self.metadata
+            .get("harness")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EventFrame {
+    pub event_id: i64,
+    pub event: EventType,
+    pub session_id: String,
+    pub data: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActionUpdate {
+    pub row_id: String,
+    pub attempt_id: String,
+    pub status: ActionStatus,
+    pub result: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct DispatchAction {
+    pub row_id: String,
+    pub attempt_id: String,
+    pub action: SessionAction,
+    pub config: SessionConfig,
+}
+
+pub struct EnqueueUserInputResult {
+    pub input_id: String,
+    pub event: Option<EventFrame>,
+}
+
+#[derive(Debug, Clone)]
+pub struct InputRecord {
+    pub input_id: String,
+    pub status: QueuedInputStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct AcceptedInput {
+    pub priority: InputPriority,
+    pub content: UserMessage,
+    pub client_input_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedInput {
+    pub id: String,
+    pub priority: InputPriority,
+    pub content: UserMessage,
+    pub client_input_id: Option<String>,
+    pub claim_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct StoredAction {
+    pub kind: ActionKind,
+    pub action_id: i64,
+    pub turn_id: Option<i64>,
+    pub attempt_id: String,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_vocab::{TranscriptItem, TurnId, UserMessage};
+    use serde_json::json;
 
-    #[tokio::test]
-    async fn memory_store_round_trips_sessions() {
-        let store = InMemorySessionStore::default();
-        let mut session = StoredSession::new("s1");
-        session.entries.push(StoredTranscriptEntry {
-            id: "e1".to_string(),
-            parent_id: None,
-            timestamp_ms: 1,
-            item: TranscriptItem::UserMessage(UserMessage::text("hi")),
-        });
-        session.active_leaf_id = Some("e1".to_string());
+    #[test]
+    fn provider_kind_accepts_legacy_anthropic_alias() {
+        let config: ProviderConfig = serde_json::from_value(json!({
+            "kind": "anthropic",
+            "model": "claude-sonnet-4-5",
+        }))
+        .expect("legacy provider kind should deserialize");
 
-        store.write_session(&session).await.unwrap();
-        assert_eq!(store.load_session("s1").await.unwrap(), Some(session));
+        assert_eq!(config.kind, ProviderKind::Claude);
+        assert_eq!(serde_json::to_value(config.kind).unwrap(), json!("claude"));
     }
 
-    #[tokio::test]
-    async fn jsonl_store_round_trips_sessions() {
-        let root = std::env::temp_dir().join(format!("agent-store-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let store = JsonlSessionStore::new(&root);
-        let mut session = StoredSession::new("s2");
-        session.entries.push(StoredTranscriptEntry {
-            id: "e1".to_string(),
-            parent_id: None,
-            timestamp_ms: 1,
-            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-        });
-        session.active_leaf_id = Some("e1".to_string());
+    #[test]
+    fn input_priority_round_trips_as_wire_string() {
+        assert_eq!(
+            serde_json::to_value(InputPriority::FollowUp).unwrap(),
+            json!("follow_up")
+        );
+        assert_eq!(
+            serde_json::from_value::<InputPriority>(json!("steer")).unwrap(),
+            InputPriority::Steer
+        );
+    }
 
-        store.write_session(&session).await.unwrap();
-        assert_eq!(store.load_session("s2").await.unwrap(), Some(session));
-        let _ = fs::remove_dir_all(root);
+    #[test]
+    fn invalid_storage_vocab_is_rejected() {
+        let error = serde_json::from_value::<ActionStatus>(json!("done"))
+            .expect_err("invalid action status should fail");
+
+        assert!(error.to_string().contains("unknown ActionStatus"));
     }
 }

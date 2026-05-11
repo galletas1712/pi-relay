@@ -30,16 +30,15 @@ avoids broad plugin/general-user machinery until there is a concrete consumer.
    Providers emit opaque ids. Numeric ids were convenient for early FSM tests,
    but string ids avoid lossy adapters and make storage/provider interop clean.
 
-5. Storage is a trait from the start.
-   JSONL is the first backend, but `SessionStore` is deliberately backend
-   neutral so a future Postgres backend can implement the same operations
-   without touching `agent-session` or the CLI.
+5. Storage started as a trait, but the Rust websocket path is now Postgres-only.
+   The initial JSONL/in-memory experiment helped prove the session snapshot
+   shape; once Postgres became the durable control-plane source of truth, the
+   separate `SessionStore` abstraction was removed.
 
 6. `agent-orchestrator` was removed.
    After demotion it only contained a live-session registry, so the separate
-   crate name was misleading. `SessionRegistry`, `SessionId`, and
-   `RegistryError` now live in `agent-session`; they are in-memory process
-   state, not durable storage.
+   crate name was misleading. The follow-on `SessionRegistry` and async channel
+   runner were removed too; durable storage should be the session lookup layer.
 
 7. Existing session semantics are preserved as the runtime foundation.
    `AgentSession` still owns resume, rewind, fork, compaction, open-tail crash
@@ -48,14 +47,14 @@ avoids broad plugin/general-user machinery until there is a concrete consumer.
    are better for this codebase.
 
 8. Storage snapshots live at the session boundary.
-   `agent-store` owns backend-neutral persistence shapes and traits, while
-   `agent-session` owns conversion to and from those shapes. This keeps the
-   storage crate independent of live session internals but makes persistence
-   usable by real sessions.
+   `agent-session` owns `StoredSession` and `StoredTranscriptEntry` plus
+   conversion to and from live sessions. `agent-store` owns the concrete
+   Postgres model that persists those semantics for the websocket daemon.
 
    Transcript timestamps are `u64` milliseconds. `SystemTime::as_millis()`
    yields `u128`, but JSON does not need 128-bit millisecond values and
-   `serde_json` rejects `u128`; `u64` keeps the JSONL backend portable.
+   `serde_json` rejects `u128`; `u64` keeps the serialized snapshot shape
+   portable.
 
 9. Provider adapters start as complete-request adapters.
    Streaming can be normalized later inside `agent-provider`; the first Rust
@@ -64,9 +63,10 @@ avoids broad plugin/general-user machinery until there is a concrete consumer.
 
 10. Builtin tools are intentionally unsandboxed primitives.
     `read`, `write`, `edit`, and `bash` are enough for a personal coding loop.
-    Permissioning/sandbox policy belongs above `agent-tools` when needed.
+    Tool calls are always allowed; there is no approval interface or tool policy
+    in the Rust plan.
 
-11. The CLI is a smoke-test harness, not the product shell.
+11. The CLI is a composition harness, not the product shell.
     `pi-rs` proves the crates compose: session, provider, and tools can drive a
     simple prompt. Durable named sessions and richer UX can be layered on later.
 
@@ -78,11 +78,13 @@ avoids broad plugin/general-user machinery until there is a concrete consumer.
   call ids through `agent-vocab`.
 - Added session-to-storage conversion:
   `AgentSession::to_stored_session` and `AgentSession::from_stored_session`.
-- Added in-memory and JSONL `SessionStore` implementations.
+- Added initial in-memory and JSONL `SessionStore` implementations, then later
+  removed them when Postgres became the only supported durable backend.
 - Added OpenAI and Anthropic provider adapters.
 - Added a separate async tool registry with builtin local tools.
-- Removed the `agent-orchestrator` crate and moved the independent-session
-  registry into `agent-session`.
+- Removed the `agent-orchestrator` crate.
+- Removed the in-memory `SessionRegistry` and async channel `AgentRunner` from
+  `agent-session`.
 - Updated the Rust architecture docs and crate READMEs to reflect the new
   target.
 
@@ -93,6 +95,555 @@ avoids broad plugin/general-user machinery until there is a concrete consumer.
 - `cargo test --manifest-path rust/Cargo.toml -p agent-core` passes: 22 tests.
 - Full workspace tests pass with the Apple SDK/linker made explicit:
   `SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/clang' cargo test --manifest-path rust/Cargo.toml --all`.
-  The current suite runs 94 unit tests across the workspace plus doc-test
+  The current suite runs 90 unit tests across the workspace plus doc-test
   harnesses. The default `cc` on this machine is a profile GCC that cannot find
   `libiconv`, so the explicit linker environment is required here.
+
+### Websocket/Postgres Plan
+
+- Added `rust/docs/websocket-rpc.md` as the source of truth for the
+  frontend-facing control plane.
+- Decision: no user-facing `open`, `close`, `resume`, or `delete` session RPC.
+  Sessions are durable Postgres records; websocket connections subscribe to
+  them but do not define their lifecycle.
+- Decision: no approval interface. Tool requests always run, and interruption
+  is turn-level through `input.interrupt`.
+- Decision: do not add a rich persisted session status enum. The frontend gets
+  a derived `activity` of `idle`, `queued`, or `running`; interrupted/crashed
+  are turn outcomes in transcript history.
+- Decision: an open transcript tail is valid while external work is running
+  when pending action rows explain it. Interrupt should be atomic at the
+  repository level: either the pre-interrupt open tail remains recoverable, or
+  the post-interrupt tail is closed with `TurnFinished(Interrupted)`.
+- Decision: daemon death is recovered at Postgres transaction boundaries. A
+  restarted daemon repairs open tails and stale action attempts; external tool
+  side effects are not transactional and may survive even when their action is
+  later marked stale/error.
+- Decision: move to Postgres before implementing websocket RPC. Postgres should
+  hold sessions, transcript entries, queued inputs, action state, and event
+  logs. A transient in-memory `AgentSession` may exist while actively driving a
+  turn, but it is not source-of-truth staging.
+- Decision: source-mutating history writes are idle-only in the websocket
+  contract. Rewind, active-leaf mutation, and compaction should fail with
+  `session_busy` while a turn is running; users must interrupt first and retry
+  after idle. Fork is allowed while the source is running when it targets an
+  explicit committed turn boundary, because it does not mutate the source.
+- Decision: websocket validation should emulate real frontend/user behavior.
+  Scenario scripts should send websocket RPC, observe events, and verify
+  persisted Postgres consequences. Dev harness controls are only for forcing
+  substantial lifecycle edges that would otherwise be timing-sensitive; provider
+  runs through OpenAI/Anthropic should assert real protocol consequences, not
+  merely connection success.
+- Added a manual websocket exercise runbook with concrete JSON frames for
+  basic turns, image inputs, steer/follow-up ordering, interruption, real tool
+  success/error behavior, parallel tool ordering, rewind, running-safe fork, invalid
+  fork targets, compaction validity, event replay, crash recovery, and real
+  provider behavior.
+- Added the documentation-sync rule to the implementation sequence so crate
+  boundaries, RPC methods, lifecycle rules, and storage invariants are reflected
+  across the READMEs, architecture docs, websocket RPC docs, and worklog.
+### Websocket/Postgres Implementation
+
+- Added `agent-daemon` with the `pi-agentd` binary.
+- Added a concrete Postgres repository for the websocket path. It migrates and
+  writes normalized `sessions`, `transcript_entries`, `queued_inputs`,
+  `actions`, and `events` tables.
+- Kept Postgres as the only durable websocket backend. The original
+  backend-neutral `agent-store` layer was later collapsed into a concrete
+  Postgres crate, while snapshot shapes moved to `agent-session`.
+- Implemented websocket RPC for session creation/list/get/configuration,
+  event subscription, follow-up/steer/interrupt input, history tree/context/
+  rewind/fork, tool listing, compaction request, and model/compaction harness
+  controls.
+- Implemented the simplified lifecycle model: no explicit open/close/resume/
+  delete, no approval RPC, no persisted session status enum beyond derived
+  `idle`/`queued`/`running`.
+- Implemented Postgres as the consistency boundary. Accepted transitions commit
+  transcript entries, action rows, queued-input updates, active-leaf changes,
+  and events together.
+- Added per-action `attempt_id` and guarded completions so late model/tool/
+  compaction results from stale attempts cannot mutate transcript history.
+- Recovery now runs before first touch of an idle-looking session. If the
+  daemon died with pending work, recovery marks unfinished actions stale,
+  appends recovered transcript entries, emits transcript/turn events for those
+  entries, and emits `session.recovered`.
+- Fork is allowed while the source is running if the target is an explicit
+  committed turn boundary. Fork from `null` is rejected.
+- Rewind, session configuration, and websocket compaction request are idle-only.
+- Tools run automatically through the builtin registry. Tool-returned failures
+  become error `ToolResult`s and `error` action rows; there is still no approval
+  or denial path.
+- `AssistantItem` now serializes with explicit object tags so websocket/harness
+  assistant messages and stored transcript JSON are stable:
+  `text`, `thinking_redacted`, and `tool_call`.
+- `OpenAiProvider` now supports two wire APIs:
+  OpenAI Chat Completions for API-key use, and streamed Responses API for the
+  ChatGPT/Codex backend.
+- Added `ModelRequest::prompt_cache_key`; `agent-daemon` maps
+  `provider.prompt_cache.key` to that field.
+- `agent-daemon` reads Codex ChatGPT credentials from `CODEX_ACCESS_TOKEN` or
+  `~/.codex/auth.json`, including `tokens.account_id`.
+- Moved system prompt configuration out of sessions. It now lives in global
+  daemon config exposed by `config.get` / `config.set`; provider dispatch reads
+  that global prompt for model requests.
+- Added a TypeScript websocket UI in `packages/web`, borrowing the dense
+  three-pane session/log/inspector feel from `~/bigband/web` while keeping this
+  project session-only. There is no task abstraction in the frontend.
+- Frontend slash commands are thin websocket calls over the real RPC contract:
+  `/new`, `/refresh`, `/status`, `/steer`, `/interrupt`, `/rewind`, `/fork`,
+  `/compact`, `/context`, `/tree`, `/system`, `/provider`, and `/tools`.
+  `/system` reads and writes global daemon config, not session config.
+- `/rewind` and `/fork` now open history pickers instead of accepting raw
+  transcript ids. The picker is the only web UI path for those history
+  mutations; `/fork [title]` may prefill a title, but the branch point is still
+  selected from visible turn context.
+- Fork semantics were loosened from "committed boundary" to "any existing
+  transcript entry." Rewind and compaction remain source-mutating operations
+  that are constrained to idle/boundary-safe states; fork is source-non-mutating
+  and can safely copy a partial path. Child sessions created from a non-boundary
+  point close that copied tail as `Interrupted`, keeping the child runnable
+  without treating the deliberate fork as daemon crash recovery.
+- Tightened the websocket idle gate so source-mutating operations also reject
+  sessions with queued-but-not-yet-consumed input. In user terms, idle means
+  between turns after active work and queued input have drained.
+- Removed the frontend's generic "message queued" and "steer queued" transcript
+  notices. They were only RPC acceptance acknowledgements for durable queued
+  inputs, not conversation events, and they surfaced confusingly while the agent
+  was still running.
+- Current-session picker testing caught a hydration race: invoking `/fork` or
+  `/rewind` immediately after selecting a session could open against an empty
+  local `entries` array. The slash handlers now refresh `history.tree` before
+  displaying either picker and pass the freshly loaded entries directly into
+  the dialog instead of relying on React state flush timing.
+- Restored slash autocomplete as a shallow command-name helper. While typing a
+  partial command, Enter accepts the highlighted completion and inserts a
+  trailing space; because the menu only appears for a bare command token, the
+  next Enter submits and opens the picker/action. Exact commands such as
+  `/fork` still submit immediately.
+- Added command metadata for required arguments. Exact `/steer` now completes
+  to `/steer ` instead of executing with an empty message, and submitting a
+  required-argument command without arguments leaves the composer intact with a
+  usage notice.
+- Browser testing found that notices were hidden when no session was selected;
+  the empty transcript view now still renders local notices such as `/help`
+  output and connection errors.
+- Browser testing also surfaced dev-only noise from the Vite page: a missing
+  favicon request and React StrictMode's intentional websocket mount/unmount
+  cycle. The web app now declares an empty favicon and renders once in dev so
+  the websocket connection is not opened and immediately closed by StrictMode.
+- User screenshot review caught assistant text overlapping the copyable entry id
+  gutter. Assistant/tool transcript rows now use a grid with a reserved id
+  column instead of placing the id absolutely over content.
+- Transcript rendering now hides turn-start, graceful turn-finish, and
+  tool-call-start bookkeeping entries. Assistant tool calls render as compact
+  collapsible rows with the matching tool result folded into the same row,
+  following the Bigband/Claude Relay pattern instead of exposing raw event
+  records.
+- The web client intentionally keeps no durable RAM staging layer. It subscribes
+  to durable session events, refreshes `session.get` / `history.tree`, and lets
+  Postgres-backed daemon state remain the source of truth.
+- Duplicate websocket input retries with the same `client_input_id` now return
+  the original queued input without emitting a second `input.queued` event.
+- Queued inputs now remain durable `queued` rows while external model/tool/
+  compaction work is unfinished. They are only marked `consumed` in the same
+  transaction that materializes the next transcript turn, so daemon death cannot
+  lose accepted input sitting only in the live session projection.
+- If Postgres persistence fails after a live session advances, the daemon evicts
+  that live session so the next interaction reloads from durable storage instead
+  of treating RAM as a recovery source.
+- Added `docs/design-decisions.md` to document both visible choices (session-only
+  UI, slash commands, global system prompt, no approvals) and invisible choices
+  (Postgres authority, queue durability, idempotency, recovery, provider/tool
+  boundaries).
+
+### Manual Websocket Verification
+
+The daemon was exercised against a real Postgres 16 container through OrbStack:
+
+```sh
+DOCKER_HOST=unix:///Users/schwinns/.orbstack/run/docker.sock docker run -d \
+  --name pi-relay-pg \
+  -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_USER=postgres \
+  -e POSTGRES_DB=pi_relay \
+  -p 55432:5432 postgres:16-alpine
+```
+
+Manual websocket scenarios completed:
+
+- Basic harness turn, event subscription, replay, `session.get`, and
+  `history.context`.
+- Global system prompt persistence, update, and clearing with `null`.
+- Text and image content persistence through Postgres and context
+  materialization.
+- Follow-up/steer queue ordering and duplicate `client_input_id` idempotency.
+- Interrupt of pending model work, stale harness completion rejection, and
+  interrupted turn closure.
+- Running rewind rejection, post-interrupt rewind success, and non-boundary
+  rewind rejection.
+- Running-safe fork from a previous boundary, fork-from-null rejection, and
+  open-turn fork rejection.
+- Real `read`, `write`, `edit`, and `bash` tool execution, including tool
+  errors and parallel tool requests.
+- Valid compaction completion and invalid compaction error persistence.
+- Daemon death/restart recovery with stale actions, crashed turn tail,
+  `turn.finished`, and `session.recovered` replay.
+- Event replay high-water behavior: `events.subscribe(after_event_id)` returned
+  durable replay without duplicating those events as live frames.
+- Real Codex text turn through websocket using `~/.codex/auth.json`.
+- Real Codex image-URL turn through websocket using the streamed Responses API.
+
+Anthropic websocket smoke was not run because no raw `ANTHROPIC_API_KEY` was
+available in the environment; the local Claude Code credentials were present
+but not exposed as an Anthropic API key.
+
+### Codex Auth Recovery
+
+New session creation was verified in the browser and did not crash the daemon.
+The failing "new session" case was a first-turn provider failure: the Codex
+Responses request returned HTTP 401 from `chatgpt.com/backend-api/codex`, and
+the session FSM correctly closed that turn as `Crashed`.
+
+Implementation decision: provider credentials are reloaded for every model
+request instead of being captured once at daemon startup. This keeps Postgres
+session state independent from process-local auth state and lets a refreshed
+`~/.codex/auth.json` take effect without recreating a session.
+
+Implementation decision: when the Codex provider returns 401, the daemon uses
+the same ChatGPT OAuth refresh endpoint and client id as upstream Codex, writes
+the refreshed tokens back to `~/.codex/auth.json`, and retries the model request
+once. There is no broad retry loop or fallback provider; a second failure is
+persisted as the real model error.
+
+UI decision: durable `model.error` events are now surfaced as visible notices.
+The transcript may still show a crashed turn when the model fails, but the user
+also sees the provider error that caused it.
+
+Follow-up browser finding: after `/new <title>` the React selected-session state
+changed, but the mutable ref used by immediate sends could still contain the
+previous session id until the next render effect. The UI now updates both at the
+same time for slash-created sessions, forks, initial selection, and manual row
+selection. This prevents a fast follow-up after session creation from landing in
+the previously selected session.
+
+Verification:
+
+- `npm run build:web` passes.
+- `cargo test --manifest-path rust/Cargo.toml -p agent-daemon -p agent-provider`
+  passes with the explicit Apple SDK/linker environment.
+- Full workspace tests pass with the same explicit linker environment: 91 unit
+  tests plus doc-test harnesses.
+- A real websocket smoke created a Codex `gpt-5.5` session, sent
+  `input.follow_up`, observed `turn.finished` with `Graceful`, and got
+  `auth smoke ok` from the model. The smoke session was deleted afterward.
+- A real headed Chrome smoke created a session through `/new <title>`, sent the
+  next message from the composer, and Postgres showed the message, assistant
+  reply, and graceful turn in the newly created session. That smoke session was
+  deleted afterward.
+
+### Markdown And HTML Rendering
+
+Assistant text is rendered through `react-markdown` with GitHub-flavored
+Markdown enabled. The web app styles headings, lists, links, inline code,
+fenced code blocks, blockquotes, tables, and horizontal rules inside the
+existing compact session-log layout.
+
+Raw HTML embedded in assistant Markdown is parsed with `rehype-raw`, so passive
+HTML elements such as `<details>`, custom table markup, and inline semantic
+tags render as DOM. Script execution is not enabled in the main app origin; if
+active HTML/JS artifacts become useful, they should run in a sandboxed preview
+surface rather than inside the transcript log.
+
+Verification: a disposable harness session rendered Markdown headings, bold
+text, list items, fenced code, a raw-HTML `<details>` block, and a raw-HTML
+table cell in headed Chrome without console errors. The smoke session was
+deleted afterward.
+
+### Real Browser Verification
+
+The Vite UI was driven in headed Google Chrome through Playwright Core against
+the live websocket daemon and the same Postgres database. Screenshots from the
+run were written under `/tmp/pi-relay-browser.4B6Thz/screens`.
+
+Browser-driven scenarios completed:
+
+- Initial load, websocket connection, and `/help` before selecting a session.
+- `/new` session creation and automatic selection.
+- Global `/system` update and clear, including inspector visibility.
+- `/provider codex gpt-5.5` with metadata preservation verified through RPC.
+- Plain composer follow-up, `/steer`, harness model completions, and visible
+  transcript order: first follow-up, steer, then queued normal follow-up.
+- `/status`, `/context`, `/tree`, `/tools`, and `/refresh` visible notices.
+- Running-safe `/fork <boundary>` while the source session had a running model
+  action.
+- `/fork root` rejection.
+- Busy `/rewind root` rejection while a model action was running.
+- `/interrupt` followed by successful `/rewind root`.
+- Idle `/fork <boundary>` followed by `/rewind root` on the child.
+- Copyable transcript entry ids rendered in the browser.
+- Updated web history behavior to test `/rewind` and `/fork` as dialog-driven
+  picker flows rather than raw boundary-id slash commands.
+- Updated transcript rendering checks to expect hidden turn bookkeeping and
+  compact tool rows with folded results.
+- Added fork-any-entry coverage to keep rewind boundary rules separate from
+  fork branch-copy rules.
+- Added queued-state lifecycle coverage: a queued-but-not-consumed input makes
+  `history.rewind` return `session_busy`, so idle really means no active or
+  queued user work.
+- Browser console was treated as a failure signal after filtering nothing; the
+  final run passed without console errors or warnings.
+- Follow-up cleanup removed the browser/manual verification sessions from the
+  shared local Postgres database. Future browser verification should either use
+  a disposable database or clean up tagged test sessions immediately so the real
+  UI does not show verification debris.
+
+### Review Notes
+
+Subagent review focused on simplicity, modularity, and avoiding brittle fallback
+paths. Changes made from that review:
+
+- Follow-on dispatches after model/tool completions are no longer dropped.
+- Interrupt no longer inserts a durable cancel action row that leaves a session
+  busy; it bulk-updates unfinished work and emits `session.work_cancelled`.
+- Queue consumption is committed atomically with the transcript/action/event
+  transition that consumed it.
+- Recovery runs before idle-gated mutations.
+- Stale completion checks use persisted attempt identity.
+- Event replay now tracks a per-socket high-water mark so replayed durable
+  events are not duplicated by buffered live broadcasts.
+- Documentation now describes the actual harness surface and the real provider
+  credential paths.
+
+### Draft Sessions, Queue Claims, And Picker Targets
+
+- Added `session.start` for the web draft path. It creates a durable session,
+  records `session.created` plus `input.accepted`, materializes the first user
+  input into transcript/action/event state, and only then dispatches follow-on
+  work. Retrying with the same stable draft-owned `session_id` returns the
+  existing session instead of creating another row.
+- Changed ordinary idle `input.follow_up` / `input.steer` handling so messages
+  are fed directly into the session when no work or queued backlog exists.
+  Busy-session inputs still use `queued_inputs`.
+- Hardened queued-input consumption: the pump claims a row as `consuming` with
+  a claim id, `input.replace_queued` and `input.cancel_queued` only work while
+  the row is still `queued`, and the final `consuming -> consumed` update is
+  validated inside the transcript/action/event transaction.
+- Added abandoned-claim recovery by resetting `consuming` rows to `queued` when
+  a session is first touched after daemon restart.
+- Extended `history.fork` with `placement: "before"` for user-message fork
+  targets while keeping fork-from-null invalid.
+- Changed the web UI so New session and `/new` create local `localStorage`
+  drafts. Drafts survive refresh, appear in the sidebar, and disappear only
+  after `session.start` returns a durable session.
+- Added web-owned composer draft storage for existing sessions. Rewind/fork
+  user-message targets restore the historical message into the composer without
+  writing that draft into core session tables.
+- Updated the rewind/fork picker to operate on visible targets. Rewind maps
+  user messages to the previous safe boundary/root; fork maps user messages to
+  `placement: "before"` and maps completed assistant responses to the enclosing
+  completed turn boundary.
+- Added a `metadata.hidden = true` list filter so local verification sessions
+  can be removed from the sidebar without inventing a durable delete/open/close
+  lifecycle.
+- Kept documentation in sync across `websocket-rpc.md`,
+  `design-decisions.md`, `architecture.md`, and
+  `draft-sessions-and-history-plan.md`.
+
+### Atomic Input Ledger And Branch-Aware Pickers
+
+- Finished the `client_input_id` idempotency path for idle inputs. Immediate
+  `input.follow_up`, `input.steer`, and `session.start` now record a consumed
+  input ledger row in the same Postgres transaction that appends transcript,
+  action, active-leaf, and event state. Retrying a lost websocket response
+  returns the durable record instead of appending a duplicate user message.
+- Added optional `expected_active_leaf_id` validation for user input and
+  `history.rewind`. The web UI records the base active leaf for composer drafts
+  and sends it back so restored historical edits cannot silently land on a
+  newer branch.
+- Serialized source-mutating session operations through the same per-session
+  pump lock used for turn driving. Rewind, configure, and compaction now share
+  the source-mutation critical section with input pumping instead of relying on
+  a separate RAM staging model.
+- Tightened queued-input failure handling: if a claimed queued input cannot be
+  fed into the session, the daemon moves that exact claim back to `queued`
+  before returning the input error.
+- Updated the web history picker to compute targets from transcript parent
+  chains rather than the raw append order. Rewind options are active-branch
+  boundary/user-message choices; fork options can target any explicit entry.
+  Forking from a user message still uses `placement: "before"`, while assistant
+  and tool targets fork from the exact selected entry.
+- Removed the bare root rewind option from the UI picker. The first user
+  message target still rewinds the backend to root, but restores that message
+  into the composer so the user never lands on an empty pre-message state by
+  accident.
+- Kept slash command text out of draft persistence. Slash autocomplete still
+  helps discovery: Enter completes a partial command, and the next Enter
+  executes commands such as `/rewind` or `/fork`.
+- Browser verification passed against the live daemon: Markdown and raw HTML
+  assistant rendering, slash autocomplete, picker-only rewind/fork, composer
+  restoration, forked child composer restoration, and unsent local draft
+  survival across reload.
+- Manual websocket verification passed against the live Postgres daemon:
+  `session.start` replay, immediate input replay, queued replace/cancel,
+  queued consumption replay, stale active-leaf rejection, busy rewind rejection,
+  fork-from-running-source, fork-from-null rejection, interrupt then rewind,
+  and daemon restart recovery to a crashed idle turn.
+
+### Active-Branch Transcript Rendering
+
+- Fixed the main web transcript to render the active root-to-leaf branch rather
+  than every row in the append-only transcript forest. Rewind still preserves
+  abandoned rows durably for history/fork operations, but off-branch UI elements
+  no longer remain in the visible conversation.
+- Browser verification created a two-turn harness session, rewound to before
+  the second user message through the picker, and confirmed the second turn
+  disappeared from `.message-scroll` while the historical user message was
+  restored into the composer.
+
+### Queue Pane And Stop Control
+
+- Removed `/steer` and `/interrupt` from the web slash command surface. Normal
+  composer submits now always send `input.follow_up`; active interruption is a
+  stop button next to the composer.
+- Added `input.promote_queued` to promote a still-queued follow-up to steer
+  priority. Promotion records `origin.promoted_at`, and the queue consumes
+  steers by promotion order before unpromoted follow-ups by creation order.
+- Added `queued_inputs` to `session.get` snapshots so the web UI can render a
+  small composer-adjacent queue pane. Follow-up rows show a steer button;
+  promoted rows show as steering and cannot be promoted again.
+- Verified by websocket that three queued follow-ups promoted in the order
+  "two" then "one" were consumed as `two`, `one`, then the unpromoted third
+  follow-up.
+- Verified in a real browser that pressing Enter during a running turn creates
+  visible queued follow-up rows, the row-level steer button promotes one row,
+  and the stop button interrupts a running turn to an idle interrupted tail.
+
+### Agent Daemon Decomposition
+
+- Split the 3.6k-line `agent-daemon/src/main.rs` into focused modules:
+  `config.rs`, `types.rs`, `auth.rs`, `codec.rs`, `provider_runtime.rs`,
+  `runtime.rs`, and `state.rs`, with persistence now owned by `agent-store`.
+- Kept websocket routing and RPC handlers in `main.rs`; moved live session
+  pump/dispatch/recovery into `runtime.rs` so handler code no longer owns the
+  turn lifecycle.
+- Moved Postgres SQL and transaction helpers out of daemon control flow, first
+  into a daemon repository module and then into `agent-store::PostgresAgentStore`.
+- Moved Codex credential refresh into `auth.rs` and provider selection into
+  `provider_runtime.rs` so provider execution is decoupled from websocket RPC.
+- Documented the daemon module boundaries in `architecture.md` and
+  `design-decisions.md`.
+
+### OpenAI Chat Completions Request Policy
+
+- Updated the OpenAI Chat Completions renderer to set the request policy fields
+  we always want for this personal agent path: `parallel_tool_calls = true`,
+  `service_tier = "priority"`, `store = false`, and
+  `prompt_cache_retention = "24h"`.
+- Forwarded `ModelRequest::prompt_cache_key` on Chat Completions and added a
+  stable default cache key when session/provider config does not specify one.
+- Switched the Chat Completions token cap field from `max_tokens` to
+  `max_completion_tokens` to match the current request surface.
+- Added provider tests for the Chat Completions body so these defaults remain
+  visible and intentional.
+- Documented the prompt-caching layout implication: keep the cacheable global
+  system/tool/project prefix before dynamic session/user context.
+- Added `PromptSections` to provider requests. The global system prompt is now
+  the stable prefix, daemon runtime context is rendered after it, and transcript
+  history follows both sections.
+- Kept the stable/dynamic split internal. Provider rendering appends runtime
+  context plainly after the stable prefix rather than adding a model-facing
+  "Dynamic Context" heading.
+- Removed the daemon and CLI default output-token caps for OpenAI/Codex
+  requests. `provider.max_tokens` is now only an explicit opt-in cap; Anthropic
+  keeps a provider-local fallback because its Messages API requires the field.
+
+### Postgres Store Consolidation
+
+- Removed the old `agent-store` in-memory/JSONL `SessionStore` layer. Postgres
+  is now the only supported durable backend.
+- Moved the concrete Postgres repository from `agent-daemon` into
+  `agent-store::PostgresAgentStore`, including schema migration, session
+  configuration, transcript persistence, queued input ledger, actions, events,
+  recovery helpers, and global daemon config.
+- Moved `StoredSession` and `StoredTranscriptEntry` into `agent-session`, where
+  they describe live-session snapshots rather than a pluggable backend API.
+- Slimmed `agent-daemon` further: it now owns websocket routing, auth,
+  provider/tool dispatch, recovery orchestration, and live session pumping, but
+  not the SQL implementation.
+- Removed a stale `agent-vocab` dependency from `agent-store`; the store depends
+  on `agent-session` for the session/action/transcript shapes it persists.
+- Cleaned the local Postgres database of 37 disposable verification sessions.
+  The remaining visible sessions are the two real-looking web sessions.
+- Moved the Postgres store from `tokio-postgres` to SQLx. `PostgresAgentStore`
+  now uses `PgPool`, SQLx transactions, SQLx bind parameters, and typed row
+  decoding while keeping SQL visible for the transaction-heavy recovery and
+  ledger logic. Diesel/SeaQuery are credible packages, but they add more
+  abstraction than this JSONB-heavy store currently needs.
+
+### Typed Wire Vocabulary
+
+- Replaced ad hoc Rust `String`/`&str` control-flow checks for the small closed
+  vocabularies with enums: `ProviderKind`, `InputPriority`,
+  `QueuedInputStatus`, `ActionKind`, `ActionStatus`, `SessionActivity`, and
+  `EventType`.
+- Kept the Postgres and websocket representation unchanged by serializing those
+  enums to the existing wire strings. Existing `anthropic` provider configs are
+  accepted as a legacy alias and normalized to `claude`.
+- Typed the daemon RPC boundary for websocket method dispatch and fork
+  placement, while preserving the existing `unknown_method` and
+  `invalid_placement` error behavior.
+- Simplified the daemon codec by deserializing user content blocks, image
+  sources, and assistant items through the existing serde-tagged vocabulary
+  types instead of manually matching `"type"` and `"kind"` strings.
+- Added focused unit coverage for enum round-tripping, legacy provider alias
+  parsing, invalid storage vocabulary rejection, RPC method parsing, and fork
+  placement parsing.
+
+### Empty Draft Cleanup
+
+- Confirmed the "extra empty sessions" were browser-local draft rows, not
+  durable Postgres sessions. The earlier Postgres cleanup removed disposable
+  verification sessions while preserving real web sessions with transcript
+  history.
+- Added UI-owned cleanup for empty unsent local drafts. Creating a new draft
+  now collapses abandoned empty drafts, and selecting another session deletes
+  the current draft if its composer is still empty.
+- Kept the refresh behavior we wanted: one empty unsent draft can still survive
+  browser refresh while it is the active local draft. Drafts with typed composer
+  content remain durable browser-local state until sent or cleared.
+
+### Transcript Notice Placement
+
+- Stopped rendering transient UI notices inside the transcript stream. The
+  message list now renders only branch-filtered transcript entries plus the
+  live activity pill.
+- Moved success/error/info notices to a fixed toast stack outside the transcript
+  pane, with inspector-aware positioning and automatic expiry.
+- Removed the `draft created` notice entirely. Draft creation is represented by
+  the active local draft/sidebar row, and surfacing it as a transcript-adjacent
+  green line made it look like durable agent history.
+
+### Codex Residency Header
+
+- Diagnosed the web-visible Codex `401 Unauthorized` failure. The ChatGPT/Codex
+  token refresh path was working, but the backend response body said
+  `Workspace is not authorized in this region.`
+- Compared the request with upstream Codex and confirmed the missing routing
+  signal was the `x-openai-internal-codex-residency: us` header.
+- Added that residency header to every Codex provider request alongside the
+  bearer token and `ChatGPT-Account-ID`.
+- Verified the same refreshed `~/.codex/auth.json` credentials return a live
+  `200` stream from `https://chatgpt.com/backend-api/codex/responses` when the
+  residency header is present.
+
+### Rewind Picker Simplification
+
+- Removed duplicate "after turn" choices from the web rewind picker. The only
+  visible rewind path is now choosing a historical user message, rewinding to
+  the boundary before that message, and restoring that message into the composer
+  for editing.
+- Left the Rust RPC and storage model unchanged. Rewind remains the low-level
+  "set active leaf to a turn boundary/root" operation, while fork remains the
+  source-non-mutating "copy from any transcript entry" operation. The frontend
+  maps both operations from the same transcript-entry history data but applies a
+  narrower rewind filter.

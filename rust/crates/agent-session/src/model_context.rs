@@ -22,7 +22,14 @@ impl ModelContext {
     }
 
     pub fn from_transcript_items_recovering_crashed_tail(mut items: Vec<TranscriptItem>) -> Self {
-        Self::patch_crashed_tail(&mut items);
+        Self::patch_open_tail(&mut items, TurnOutcome::Crashed);
+        Self { items }
+    }
+
+    pub fn from_transcript_items_recovering_interrupted_tail(
+        mut items: Vec<TranscriptItem>,
+    ) -> Self {
+        Self::patch_open_tail(&mut items, TurnOutcome::Interrupted);
         Self { items }
     }
 
@@ -151,16 +158,13 @@ impl ModelContext {
         None
     }
 
-    fn patch_crashed_tail(items: &mut Vec<TranscriptItem>) {
+    fn patch_open_tail(items: &mut Vec<TranscriptItem>, outcome: TurnOutcome) {
         let Some((turn_id, tail_start)) = Self::open_tail_turn(items) else {
             return;
         };
 
-        Self::patch_missing_tool_results(items, tail_start, turn_id);
-        items.push(TranscriptItem::TurnFinished {
-            turn_id,
-            outcome: TurnOutcome::Crashed,
-        });
+        Self::patch_missing_tool_results(items, tail_start, turn_id, outcome);
+        items.push(TranscriptItem::TurnFinished { turn_id, outcome });
     }
 
     fn open_tail_turn(items: &[TranscriptItem]) -> Option<(TurnId, usize)> {
@@ -186,6 +190,7 @@ impl ModelContext {
         items: &mut Vec<TranscriptItem>,
         tail_start: usize,
         turn_id: TurnId,
+        outcome: TurnOutcome,
     ) {
         let mut tool_calls = Vec::new();
         let mut started_tool_calls = Vec::new();
@@ -218,10 +223,15 @@ impl ModelContext {
                 });
             }
             if !Self::remove_matching_tool_call(&mut completed_tool_calls, &tool_call) {
-                items.push(TranscriptItem::ToolResult(ToolResultMessage::crashed(
-                    tool_call.id,
-                    tool_call.tool_name,
-                )));
+                let result = match outcome {
+                    TurnOutcome::Interrupted => {
+                        ToolResultMessage::interrupted(tool_call.id, tool_call.tool_name)
+                    }
+                    TurnOutcome::Graceful | TurnOutcome::Crashed => {
+                        ToolResultMessage::crashed(tool_call.id, tool_call.tool_name)
+                    }
+                };
+                items.push(TranscriptItem::ToolResult(result));
             }
         }
     }
