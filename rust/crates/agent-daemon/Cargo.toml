@@ -9,6 +9,7 @@ name = "pi-agentd"
 path = "src/main.rs"
 
 [dependencies]
+agent-core = { workspace = true }
 agent-provider = { workspace = true }
 agent-session = { workspace = true }
 agent-store = { workspace = true }

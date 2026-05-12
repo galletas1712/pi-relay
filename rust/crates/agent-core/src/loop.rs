@@ -1,11 +1,10 @@
 use std::collections::VecDeque;
 
 use crate::action::AgentAction;
-use crate::event::{AgentInput, AgentInputError};
-use crate::ids::{ActionId, TurnId};
+use crate::event::AgentInput;
 use crate::mailbox::Mailbox;
 use crate::state::AgentState;
-use crate::transcript_item::TranscriptItem;
+use agent_vocab::{ActionId, TranscriptItem, TurnId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentCoreLoop {
@@ -40,14 +39,7 @@ impl AgentCoreLoop {
     /// Callers own durable history; the core itself no longer buffers
     /// transcript items.
     /// The session derives `last_turn_id` from its log before calling this.
-    pub fn resume_at_boundary(last_turn_id: TurnId) -> Self {
-        Self::resume_at_boundary_with_next_action_id(last_turn_id, ActionId::first())
-    }
-
-    pub fn resume_at_boundary_with_next_action_id(
-        last_turn_id: TurnId,
-        next_action_id: ActionId,
-    ) -> Self {
+    pub fn resume_at(last_turn_id: TurnId, next_action_id: ActionId) -> Self {
         Self {
             mailbox: Mailbox::default(),
             state: AgentState::Idle,
@@ -58,7 +50,7 @@ impl AgentCoreLoop {
         }
     }
 
-    pub fn enqueue_input(&mut self, input: AgentInput) -> Result<(), AgentInputError> {
+    pub fn enqueue_input(&mut self, input: AgentInput) {
         self.mailbox.push_input(input)
     }
 
@@ -68,6 +60,10 @@ impl AgentCoreLoop {
     /// underlying `AgentState` enum, which is a private implementation detail.
     pub fn is_idle(&self) -> bool {
         self.state == AgentState::Idle
+    }
+
+    pub fn is_ready_to_continue(&self) -> bool {
+        matches!(self.state, AgentState::ReadyToContinue { .. })
     }
 
     /// True when the mailbox still has queued inputs waiting to be processed.
@@ -122,6 +118,9 @@ impl AgentCoreLoop {
             }
             self.transcript_item_outbox.extend(items);
             self.action_outbox.extend(actions);
+            if self.is_ready_to_continue() {
+                return;
+            }
         }
     }
 }
@@ -134,21 +133,18 @@ fn started_turn_id(items: &[TranscriptItem]) -> Option<TurnId> {
         | TranscriptItem::ToolCallStarted { .. }
         | TranscriptItem::ToolResult(_)
         | TranscriptItem::TurnFinished { .. }
-        | TranscriptItem::Injected(_) => None,
+        | TranscriptItem::CompactionSummary(_) => None,
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
-
     use crate::action::AgentAction;
-    use crate::ids::{ActionId, ToolCallId};
-    use crate::message::{
-        AssistantItem, AssistantMessage, ToolCall, ToolResultMessage, ToolResultStatus, UserMessage,
+    use agent_vocab::{
+        ActionId, AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage,
+        ToolResultStatus, TurnOutcome, UserMessage,
     };
-    use crate::transcript_item::{InjectedMessage, TurnOutcome};
 
     fn assistant_message(items: Vec<AssistantItem>) -> AssistantMessage {
         AssistantMessage { items }
@@ -175,9 +171,7 @@ mod tests {
     /// that cycle. Tests accumulate these into a running transcript-item list so
     /// they can assert the shape the session stores durably.
     fn drive_collect(loop_state: &mut AgentCoreLoop, input: AgentInput) -> Vec<TranscriptItem> {
-        loop_state
-            .enqueue_input(input)
-            .expect("test inputs should be valid");
+        loop_state.enqueue_input(input);
         loop_state.drive();
         loop_state.drain_transcript_items()
     }
@@ -257,9 +251,11 @@ mod tests {
             loop_state.state,
             AgentState::RunningTools {
                 turn_id: TurnId(1),
-                tool_calls: vec![tool_call],
-                tool_action_ids: vec![ActionId(2)],
-                completed_results: vec![None],
+                tools: vec![crate::state::RunningTool {
+                    call: tool_call,
+                    action_id: ActionId(2),
+                    result: None,
+                }],
                 next_result_index: 0,
             }
         );
@@ -325,6 +321,13 @@ mod tests {
         );
 
         assert_eq!(items.last(), Some(&TranscriptItem::ToolResult(result)));
+        assert!(loop_state.drain_actions().is_empty());
+        assert_eq!(
+            loop_state.state,
+            AgentState::ReadyToContinue { turn_id: TurnId(1) }
+        );
+
+        loop_state.drive();
         assert_eq!(
             loop_state.drain_actions(),
             vec![AgentAction::RequestModel {
@@ -352,20 +355,16 @@ mod tests {
         let assistant = assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]);
         let result = successful_tool_result(tool_call.id.clone(), "bash");
 
-        loop_state
-            .enqueue_input(AgentInput::ModelCompleted {
-                action_id: ActionId(1),
-                turn_id: TurnId(1),
-                assistant,
-            })
-            .expect("matching model completion is valid");
-        loop_state
-            .enqueue_input(AgentInput::ToolCompleted {
-                action_id: ActionId(2),
-                turn_id: TurnId(1),
-                result: result.clone(),
-            })
-            .expect("matching tool completion is valid");
+        loop_state.enqueue_input(AgentInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant,
+        });
+        loop_state.enqueue_input(AgentInput::ToolCompleted {
+            action_id: ActionId(2),
+            turn_id: TurnId(1),
+            result: result.clone(),
+        });
         loop_state.drive();
 
         let items = loop_state.drain_transcript_items();
@@ -373,17 +372,24 @@ mod tests {
         assert!(items.iter().any(|item| item == &expected_result_item));
         assert_eq!(
             loop_state.drain_actions(),
-            vec![
-                AgentAction::RequestTool {
-                    action_id: ActionId(2),
-                    turn_id: TurnId(1),
-                    tool_call,
-                },
-                AgentAction::RequestModel {
-                    action_id: ActionId(3),
-                    turn_id: TurnId(1)
-                },
-            ]
+            vec![AgentAction::RequestTool {
+                action_id: ActionId(2),
+                turn_id: TurnId(1),
+                tool_call,
+            }]
+        );
+        assert_eq!(
+            loop_state.state,
+            AgentState::ReadyToContinue { turn_id: TurnId(1) }
+        );
+
+        loop_state.drive();
+        assert_eq!(
+            loop_state.drain_actions(),
+            vec![AgentAction::RequestModel {
+                action_id: ActionId(3),
+                turn_id: TurnId(1)
+            },]
         );
     }
 
@@ -476,13 +482,25 @@ mod tests {
         assert_eq!(items[5], TranscriptItem::ToolResult(first_result));
         assert_eq!(items[6], TranscriptItem::ToolResult(second_result));
         assert_eq!(
+            loop_state.state,
+            AgentState::ReadyToContinue { turn_id: TurnId(1) }
+        );
+        assert_eq!(loop_state.mailbox.steer_len(), 1);
+
+        loop_state.drive();
+        items.extend(loop_state.drain_transcript_items());
+        assert_eq!(
+            items[7],
+            TranscriptItem::UserMessage(UserMessage::text("urgent"))
+        );
+        assert_eq!(
             loop_state.drain_actions(),
             vec![AgentAction::RequestModel {
                 action_id: ActionId(4),
                 turn_id: TurnId(1)
             }]
         );
-        assert_eq!(loop_state.mailbox.steer_len(), 1);
+        assert_eq!(loop_state.mailbox.steer_len(), 0);
         assert_eq!(
             loop_state.state,
             AgentState::RunningModel {
@@ -637,38 +655,6 @@ mod tests {
             vec![AgentAction::CancelTurn { turn_id: TurnId(1) }]
         );
         assert_eq!(loop_state.state, AgentState::Idle);
-    }
-
-    #[test]
-    fn idle_turn_from_tagged_input_produces_injected_transcript_entry() {
-        let mut loop_state = AgentCoreLoop::new();
-
-        let items = drive_collect(
-            &mut loop_state,
-            AgentInput::steer_tagged("parent-session", "agent_directive", "please do X"),
-        );
-
-        let mut expected_metadata = BTreeMap::new();
-        expected_metadata.insert("from".to_string(), "parent-session".to_string());
-
-        assert_eq!(
-            items,
-            vec![
-                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-                TranscriptItem::Injected(InjectedMessage {
-                    kind: "agent_directive".to_string(),
-                    content: "please do X".to_string(),
-                    metadata: expected_metadata,
-                }),
-            ]
-        );
-        assert_eq!(
-            loop_state.drain_actions(),
-            vec![AgentAction::RequestModel {
-                action_id: ActionId(1),
-                turn_id: TurnId(1)
-            }]
-        );
     }
 
     #[test]

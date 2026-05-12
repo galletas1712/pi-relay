@@ -67,8 +67,6 @@ pub enum ProviderError {
     Http(#[from] reqwest::Error),
     #[error("provider returned an error: {0}")]
     Provider(String),
-    #[error("unsupported transcript item for provider request")]
-    UnsupportedTranscriptItem,
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }

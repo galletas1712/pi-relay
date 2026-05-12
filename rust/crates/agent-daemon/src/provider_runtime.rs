@@ -1,8 +1,10 @@
 use agent_provider::anthropic::AnthropicProvider;
 use agent_provider::openai::OpenAiProvider;
 use agent_provider::{ModelProvider, ModelRequest, PromptSections, ProviderError};
-use agent_session::{AssistantMessage, ModelContext};
-use agent_store::{ProviderKind, SessionConfig};
+use agent_session::ModelContext;
+use agent_store::SessionConfig;
+use agent_tools::limit_tool_output;
+use agent_vocab::{AssistantMessage, ProviderKind, TranscriptItem, UserMessage};
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
@@ -20,7 +22,7 @@ pub(crate) async fn run_model(
             state.repo.global_system_prompt().await?,
             Some(dynamic_prompt_context(state)),
         ),
-        transcript: model_context.into_transcript_items(),
+        transcript: provider_transcript(model_context),
         tools: state.tools.definitions(),
         max_tokens: config.provider.max_tokens,
         prompt_cache_key: config
@@ -47,11 +49,80 @@ pub(crate) async fn run_model(
     }
 }
 
+const COMPACTION_SYSTEM_PROMPT: &str = "\
+Summarize the conversation transcript for future continuation. Preserve concrete
+files, commands, constraints, decisions, unresolved work, and user preferences.
+Do not mention that you are summarizing unless it is useful context.";
+
+const COMPACTION_USER_PROMPT: &str = "\
+Summarize the transcript above into a compact continuation context.";
+
+pub(crate) async fn run_compaction(
+    config: &SessionConfig,
+    model_context: ModelContext,
+) -> Result<String> {
+    let mut transcript = provider_transcript(model_context);
+    transcript.push(TranscriptItem::UserMessage(UserMessage::text(
+        COMPACTION_USER_PROMPT,
+    )));
+    let request = ModelRequest {
+        model: config.provider.model.clone(),
+        prompt: PromptSections::new(Some(COMPACTION_SYSTEM_PROMPT.to_string()), None),
+        transcript,
+        tools: Vec::new(),
+        max_tokens: config.provider.max_tokens,
+        prompt_cache_key: config
+            .provider
+            .prompt_cache
+            .as_ref()
+            .and_then(|value| value.get("key"))
+            .and_then(Value::as_str)
+            .map(|key| format!("{key}:compaction")),
+    };
+
+    let credentials = Credentials::load();
+    let provider = provider_for_config(config, &credentials)?;
+    let assistant = match provider.complete(request.clone()).await {
+        Ok(response) => response.assistant,
+        Err(error)
+            if config.provider.kind.is_codex() && provider_error_status(&error) == Some(401) =>
+        {
+            let credentials = refresh_codex_credentials().await?;
+            let provider = provider_for_config(config, &credentials)?;
+            provider.complete(request).await?.assistant
+        }
+        Err(error) => return Err(anyhow::Error::from(error)),
+    };
+    let summary = assistant.text().trim().to_string();
+    if summary.is_empty() {
+        return Err(anyhow!("compaction provider returned an empty summary"));
+    }
+    Ok(summary)
+}
+
 fn dynamic_prompt_context(state: &AppState) -> String {
     format!(
         "Current working directory: {}",
         state.tool_context.cwd.display()
     )
+}
+
+fn provider_transcript(model_context: ModelContext) -> Vec<TranscriptItem> {
+    model_context
+        .into_transcript_items()
+        .into_iter()
+        .map(limit_transcript_tool_output)
+        .collect()
+}
+
+fn limit_transcript_tool_output(item: TranscriptItem) -> TranscriptItem {
+    match item {
+        TranscriptItem::ToolResult(mut result) => {
+            result.output = limit_tool_output(result.output);
+            TranscriptItem::ToolResult(result)
+        }
+        item => item,
+    }
 }
 
 fn provider_for_config(
@@ -85,5 +156,26 @@ fn provider_error_status(error: &ProviderError) -> Option<u16> {
     match error {
         ProviderError::Http(error) => error.status().map(|status| status.as_u16()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_vocab::{ToolCallId, ToolResultMessage};
+
+    #[test]
+    fn provider_transcript_bounds_historical_tool_results() {
+        let model_context = ModelContext::from_transcript_items(vec![TranscriptItem::ToolResult(
+            ToolResultMessage::success(ToolCallId::from_u64(1), "bash", "x".repeat(30_000)),
+        )]);
+
+        let transcript = provider_transcript(model_context);
+        let TranscriptItem::ToolResult(result) = &transcript[0] else {
+            panic!("expected tool result");
+        };
+
+        assert!(result.output.len() < 30_000);
+        assert!(result.output.contains("[tool output truncated:"));
     }
 }

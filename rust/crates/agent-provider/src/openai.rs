@@ -1,6 +1,6 @@
 use agent_vocab::{
-    AssistantItem, AssistantMessage, ContentBlock, ToolCall, ToolCallId, TranscriptItem,
-    UserMessage,
+    AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ToolCall, ToolCallId,
+    TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -236,8 +236,11 @@ fn transcript_to_messages(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>
             TranscriptItem::UserMessage(message) => {
                 messages.push(json!({ "role": "user", "content": openai_user_content(message) }));
             }
-            TranscriptItem::Injected(message) => {
-                messages.push(json!({ "role": "user", "content": message.content }));
+            TranscriptItem::CompactionSummary(summary) => {
+                messages.push(json!({
+                    "role": "user",
+                    "content": compaction_summary_text(summary),
+                }));
             }
             TranscriptItem::AssistantMessage(message) => {
                 let text = message.text();
@@ -314,11 +317,11 @@ fn transcript_to_response_items(items: &[TranscriptItem]) -> ProviderResult<Vec<
                     "content": responses_user_content(message),
                 }));
             }
-            TranscriptItem::Injected(message) => {
+            TranscriptItem::CompactionSummary(summary) => {
                 responses.push(json!({
                     "type": "message",
                     "role": "user",
-                    "content": [{ "type": "input_text", "text": message.content }],
+                    "content": [{ "type": "input_text", "text": compaction_summary_text(summary) }],
                 }));
             }
             TranscriptItem::AssistantMessage(message) => {
@@ -371,6 +374,13 @@ fn responses_user_content(message: &UserMessage) -> Vec<Value> {
             },
         })
         .collect()
+}
+
+fn compaction_summary_text(summary: &CompactionSummary) -> String {
+    format!(
+        "The conversation history before this point was compacted into this summary:\n\n{}",
+        summary.summary
+    )
 }
 
 fn parse_openai_message(message: &Value) -> AssistantMessage {
@@ -493,7 +503,11 @@ mod tests {
     fn codex_auth_adds_account_and_residency_headers() {
         let provider = OpenAiProvider::codex("access-token", Some("account-id".to_string()));
         let request = provider
-            .add_auth(provider.client.post("https://chatgpt.com/backend-api/codex/responses"))
+            .add_auth(
+                provider
+                    .client
+                    .post("https://chatgpt.com/backend-api/codex/responses"),
+            )
             .build()
             .expect("request builds");
 

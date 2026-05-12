@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use agent_core::TranscriptItem;
+use agent_vocab::TranscriptItem;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

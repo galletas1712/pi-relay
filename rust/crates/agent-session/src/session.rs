@@ -1,16 +1,14 @@
 use std::collections::VecDeque;
 
-use crate::action::{CompactionRequestId, SessionAction};
-use crate::compaction_state::{CompactionBarrierModelRequest, CompactionState, RunningCompaction};
-use crate::event::{SessionActionKind, SessionEvent};
-use crate::external_work::ExternalWork;
+use crate::action::SessionAction;
+use crate::event::SessionEvent;
 use crate::input::{SessionInput, SessionInputError};
-use crate::model_context::ModelContext;
+use crate::model_context::{ModelContext, OpenTurnClosure};
+use crate::outstanding_actions::OutstandingActions;
 use crate::storage::StoredSession;
 use crate::transcript_store::{TranscriptStore, TranscriptStoreError};
-#[cfg(test)]
-use agent_core::UserMessage;
-use agent_core::{AgentAction, AgentCoreLoop, AgentInput, AgentInputError, TranscriptItem, TurnId};
+use agent_core::{AgentAction, AgentCoreLoop, AgentInput};
+use agent_vocab::{ActionId, TranscriptItem, TurnId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryOperationError {
@@ -26,22 +24,20 @@ pub enum HistoryOperationError {
 /// Session shell around the pure core loop.
 ///
 /// `agent-core` owns deterministic state transitions. `agent-session` owns the
-/// point at which the session's history can be safely compacted, forked,
-/// rewound, or resumed after consulting external model/tool work. The
+/// point at which the session's history can be safely forked, rewound, or
+/// resumed after consulting external model/tool work. The
 /// `TranscriptStore` is the sole owner of durable transcript items; the core
-/// only buffers items produced in the current run until the session absorbs
+/// only buffers items produced in the current run until the session drains
 /// them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentSession {
     pub(crate) core: AgentCoreLoop,
     pub(crate) transcript_store: TranscriptStore,
-    external_work: ExternalWork,
+    outstanding_actions: OutstandingActions,
     action_outbox: VecDeque<SessionAction>,
     event_outbox: VecDeque<SessionEvent>,
     context_tokens: Option<usize>,
-    pending_model_context_tokens: Option<(TurnId, Option<usize>)>,
-    compaction: CompactionState,
-    next_compaction_request_id: CompactionRequestId,
+    pending_model_context_tokens: PendingModelContextTokens,
 }
 
 impl Default for AgentSession {
@@ -53,36 +49,22 @@ impl Default for AgentSession {
 impl AgentSession {
     pub fn new() -> Self {
         Self {
-            core: AgentCoreLoop::resume_at_boundary(TurnId::default()),
+            core: AgentCoreLoop::resume_at(TurnId::default(), ActionId::first()),
             transcript_store: TranscriptStore::new(),
-            external_work: ExternalWork::new(),
+            outstanding_actions: OutstandingActions::default(),
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
             context_tokens: None,
-            pending_model_context_tokens: None,
-            compaction: CompactionState::Idle,
-            next_compaction_request_id: CompactionRequestId::first(),
+            pending_model_context_tokens: PendingModelContextTokens::default(),
         }
-    }
-
-    /// Queue a remote compaction request for the next safe model-context barrier.
-    ///
-    /// The request may be made while the session is busy. The session starts it
-    /// when idle at a turn boundary, or when the core has requested a model
-    /// call that has not yet been exposed to the harness. The session does not
-    /// decide when compaction is needed; the harness owns that policy and calls
-    /// this method when it wants the session to compact.
-    pub fn compact(&mut self) {
-        self.compaction.request();
-        self.maybe_start_compaction(None);
     }
 
     /// Rewind the active transcript path to a prior turn boundary.
     ///
     /// `leaf_id = Some(id)` moves the active leaf to `id`; `leaf_id = None`
-    /// resets the session to the empty root. Like `compact`, rewind is a
-    /// stop-the-world edit that preserves queued user inputs while invalidating
-    /// obsolete external work.
+    /// resets the session to the empty root. Rewind is a stop-the-world edit
+    /// that preserves queued user inputs while invalidating obsolete
+    /// outstanding work.
     pub fn rewind(&mut self, leaf_id: Option<&str>) -> Result<(), HistoryOperationError> {
         match leaf_id {
             Some(leaf_id) if !self.transcript_store.contains_entry(leaf_id) => {
@@ -90,7 +72,7 @@ impl AgentSession {
                     TranscriptStoreError::EntryNotFound,
                 ));
             }
-            leaf_id if !self.transcript_store.is_turn_boundary_leaf(leaf_id) => {
+            leaf_id if !self.transcript_store.is_turn_boundary_at(leaf_id) => {
                 return Err(HistoryOperationError::Store(
                     TranscriptStoreError::NotTurnBoundary,
                 ));
@@ -102,10 +84,10 @@ impl AgentSession {
         let result = match leaf_id {
             Some(leaf_id) => self
                 .transcript_store
-                .branch_at_turn_boundary(leaf_id)
+                .set_active_leaf_to_boundary(leaf_id)
                 .map_err(HistoryOperationError::Store),
             None => {
-                self.transcript_store.reset_leaf();
+                self.transcript_store.reset_active_leaf();
                 Ok(())
             }
         };
@@ -115,70 +97,42 @@ impl AgentSession {
             return Err(error);
         }
 
-        self.rehydrate_core_from_transcript_store();
+        self.reset_runtime_to_active_leaf();
         self.restore_queued_user_inputs(queued_user_inputs);
         self.event_outbox.push_back(SessionEvent::HistoryRewound);
         Ok(())
     }
 
-    pub fn from_transcript_items(items: Vec<TranscriptItem>) -> Self {
-        Self::from_model_context(ModelContext::from_transcript_items_recovering_crashed_tail(
-            items,
-        ))
-    }
-
     pub fn from_model_context(model_context: ModelContext) -> Self {
-        let model_context = if model_context.is_turn_boundary() {
-            model_context
-        } else {
-            ModelContext::from_transcript_items_recovering_crashed_tail(
-                model_context.into_transcript_items(),
-            )
-        };
+        let model_context = model_context.close_open_turn(OpenTurnClosure::Crashed);
         let last_turn_id = model_context.last_turn_id();
         let transcript_store = TranscriptStore::from_model_context(&model_context);
         let mut session = Self::new();
-        session.core = AgentCoreLoop::resume_at_boundary(last_turn_id);
+        session.core = AgentCoreLoop::resume_at(last_turn_id, ActionId::first());
         session.transcript_store = transcript_store;
         session
     }
 
-    pub fn from_transcript_store(
+    pub(crate) fn from_transcript_store(
         mut transcript_store: TranscriptStore,
     ) -> Result<Self, HistoryOperationError> {
-        if !transcript_store.is_turn_boundary() {
-            let items = transcript_store.model_context().into_transcript_items();
-            let original_len = items.len();
-            let recovered = ModelContext::from_transcript_items_recovering_crashed_tail(items)
-                .into_transcript_items();
-            if recovered.len() == original_len {
-                return Err(HistoryOperationError::Store(
-                    TranscriptStoreError::NotTurnBoundary,
-                ));
-            }
-            transcript_store.append_transcript_items(recovered.into_iter().skip(original_len));
-            if !transcript_store.is_turn_boundary() {
-                return Err(HistoryOperationError::Store(
-                    TranscriptStoreError::NotTurnBoundary,
-                ));
-            }
-        }
+        Self::close_transcript_store_open_turn(&mut transcript_store, OpenTurnClosure::Crashed)?;
 
         let model_context = transcript_store.model_context();
         let last_turn_id = model_context.last_turn_id();
         let mut session = Self::new();
-        session.core = AgentCoreLoop::resume_at_boundary(last_turn_id);
+        session.core = AgentCoreLoop::resume_at(last_turn_id, ActionId::first());
         session.transcript_store = transcript_store;
         Ok(session)
     }
 
     /// Convert the durable transcript forest into a storage snapshot. Runtime
-    /// mailboxes, pending external work, and action outboxes are intentionally
+    /// mailboxes, outstanding requests, and action outboxes are intentionally
     /// excluded: resume semantics are derived from the persisted transcript
     /// path, not from volatile in-flight work.
     pub fn to_stored_session(&self, session_id: impl Into<String>) -> StoredSession {
         let mut stored = StoredSession::new(session_id);
-        stored.active_leaf_id = self.transcript_store.leaf_id().map(str::to_string);
+        stored.active_leaf_id = self.transcript_store.active_leaf_id().map(str::to_string);
         stored.entries = self
             .transcript_store
             .entries()
@@ -190,7 +144,7 @@ impl AgentSession {
 
     /// Rehydrate a session from a storage snapshot.
     ///
-    /// If the active branch ends mid-turn, the existing crash-tail recovery is
+    /// If the active branch ends mid-turn, the open turn is closed as crashed
     /// applied before the session resumes. That keeps resume semantics derived
     /// from the stored transcript path rather than volatile runtime state.
     pub fn from_stored_session(stored: StoredSession) -> Result<Self, HistoryOperationError> {
@@ -208,30 +162,21 @@ impl AgentSession {
     /// cannot be bypassed.
     ///
     /// `ModelCompleted` / `ModelFailed` / `ToolCompleted` resolve matching
-    /// external work tracked by the session. Stale completions (no matching
+    /// outstanding work tracked by the session. Stale completions (no matching
     /// pending work, e.g. after an interrupt) are removed with no effect.
-    pub fn enqueue_input(&mut self, input: AgentInput) -> Result<(), AgentInputError> {
-        input.validate()?;
-        if !self.prepare_agent_input(&input, None) {
+    pub fn enqueue_input(&mut self, input: AgentInput) -> Result<(), SessionInputError> {
+        if matches!(input, AgentInput::ModelCompleted { .. }) {
+            return Err(SessionInputError::ModelCompletionRequiresSessionInput);
+        }
+        if !self.accept_agent_input(&input, None) {
             return Ok(());
         }
-        self.core.enqueue_input(input)
+        self.core.enqueue_input(input);
+        Ok(())
     }
 
-    pub fn enqueue_session_input(
-        &mut self,
-        input: impl Into<SessionInput>,
-    ) -> Result<(), SessionInputError> {
-        let input = input.into();
-        input.validate()?;
+    pub fn enqueue_session_input(&mut self, input: SessionInput) -> Result<(), SessionInputError> {
         match input {
-            SessionInput::Agent(input) => {
-                self.enqueue_input(input).map_err(SessionInputError::Agent)
-            }
-            SessionInput::Compact => {
-                self.compact();
-                Ok(())
-            }
             SessionInput::ModelCompleted {
                 action_id,
                 turn_id,
@@ -243,11 +188,8 @@ impl AgentSession {
                     turn_id,
                     assistant,
                 };
-                input.validate().map_err(SessionInputError::Agent)?;
-                if self.prepare_agent_input(&input, context_tokens) {
-                    self.core
-                        .enqueue_input(input)
-                        .map_err(SessionInputError::Agent)?;
+                if self.accept_agent_input(&input, context_tokens) {
+                    self.core.enqueue_input(input);
                 }
                 Ok(())
             }
@@ -255,37 +197,34 @@ impl AgentSession {
                 context_leaf_id,
                 context_tokens,
             } => {
-                if self.current_context_leaf_id() == context_leaf_id {
+                if self.transcript_store.active_leaf_id().map(str::to_string) == context_leaf_id {
                     self.context_tokens = Some(context_tokens);
                 }
-                Ok(())
-            }
-            SessionInput::CompactionCompleted {
-                request_id,
-                replacement,
-                context_tokens,
-            } => {
-                self.complete_compaction_request(request_id, replacement, context_tokens);
-                Ok(())
-            }
-            SessionInput::CompactionFailed { request_id, error } => {
-                self.fail_compaction_request(request_id, error);
                 Ok(())
             }
         }
     }
 
-    fn prepare_agent_input(&mut self, input: &AgentInput, context_tokens: Option<usize>) -> bool {
+    fn accept_agent_input(&mut self, input: &AgentInput, context_tokens: Option<usize>) -> bool {
         if matches!(input, AgentInput::Interrupt) {
             self.invalidate_session_work("interrupted");
         }
 
-        if is_external_completion(input) {
-            if self.compaction.is_running() || !self.external_work.record_completion(input) {
+        if matches!(
+            input,
+            AgentInput::ModelCompleted { .. }
+                | AgentInput::ModelFailed { .. }
+                | AgentInput::ToolCompleted { .. }
+        ) {
+            if !self.outstanding_actions.accept_completion(input) {
                 return false;
             }
             if let AgentInput::ModelCompleted { turn_id, .. } = input {
-                self.pending_model_context_tokens = Some((*turn_id, context_tokens));
+                self.pending_model_context_tokens =
+                    PendingModelContextTokens::ModelTokenUpdatePendingAcceptance {
+                        turn_id: *turn_id,
+                        context_tokens,
+                    };
             }
             self.drop_completed_action_from_outbox(input);
         }
@@ -298,6 +237,10 @@ impl AgentSession {
         self.transcript_store.model_context()
     }
 
+    pub fn is_ready_to_continue(&self) -> bool {
+        self.core.is_ready_to_continue()
+    }
+
     pub fn transcript_store(&self) -> &TranscriptStore {
         &self.transcript_store
     }
@@ -306,13 +249,9 @@ impl AgentSession {
     /// to the session store. This is the only supported way to advance a
     /// session; the store remains the sole owner of durable history.
     pub fn drive(&mut self) {
-        if self.compaction.is_running() {
-            return;
-        }
         self.core.drive();
-        self.absorb_core_transcript_items();
-        self.absorb_core_actions();
-        self.maybe_start_compaction(None);
+        self.drain_core_transcript_items();
+        self.drain_core_actions();
     }
 
     /// Drain every queued user input (Steer then FollowUp) from the
@@ -328,13 +267,13 @@ impl AgentSession {
 
     /// Drain pending actions the core produced during the last `drive`.
     ///
-    /// Actions are recorded as external work during `drive`, so model/tool
+    /// Actions are tracked as outstanding requests during `drive`, so model/tool
     /// completions can clear pending work even if the caller drains the
     /// observable outbox later. Session-wide cancellation is retained until the
     /// caller drains it; stale start actions can be discarded when the session
     /// invalidates work.
     ///
-    /// Transcript items are absorbed into the store inside `drive`, so there is no
+    /// Transcript items are drained into the store inside `drive`, so there is no
     /// analogous `drain_transcript_items` on the session.
     pub fn drain_actions(&mut self) -> Vec<SessionAction> {
         self.action_outbox.drain(..).collect()
@@ -348,15 +287,11 @@ impl AgentSession {
         let queued_user_inputs = self.core.drain_pending_inputs();
         self.invalidate_session_work("history edited");
         if !self.core.is_idle() {
-            if self.core.enqueue_input(AgentInput::Interrupt).is_err() {
-                self.restore_queued_user_inputs(queued_user_inputs);
-                return Err(HistoryOperationError::Busy);
-            }
+            self.core.enqueue_input(AgentInput::Interrupt);
             self.core.drive();
-            self.absorb_core_transcript_items();
-            self.absorb_core_actions();
+            self.drain_core_transcript_items();
+            self.drain_core_actions();
         }
-        self.compaction.clear();
 
         if !self.transcript_store.is_turn_boundary() {
             self.restore_queued_user_inputs(queued_user_inputs);
@@ -367,9 +302,7 @@ impl AgentSession {
 
     fn restore_queued_user_inputs(&mut self, inputs: Vec<AgentInput>) {
         for input in inputs {
-            self.core
-                .enqueue_input(input)
-                .expect("drained user input remains valid when restored");
+            self.core.enqueue_input(input);
         }
     }
 
@@ -382,68 +315,46 @@ impl AgentSession {
     pub fn fork(&self, leaf_id: &str) -> Result<AgentSession, HistoryOperationError> {
         let transcript_store = self
             .transcript_store
-            .create_branched_store_at_entry(leaf_id)
+            .copy_path_to_entry(leaf_id)
             .map_err(HistoryOperationError::Store)?;
         if !transcript_store.is_turn_boundary() {
-            let model_context = ModelContext::from_transcript_items_recovering_interrupted_tail(
-                transcript_store.model_context().into_transcript_items(),
-            );
+            let model_context = transcript_store
+                .model_context()
+                .close_open_turn(OpenTurnClosure::Interrupted);
             return Ok(AgentSession::from_model_context(model_context));
         }
         AgentSession::from_transcript_store(transcript_store)
     }
 
-    fn absorb_core_transcript_items(&mut self) {
+    fn drain_core_transcript_items(&mut self) {
         let items = self.core.drain_transcript_items();
         if items.is_empty() {
-            self.pending_model_context_tokens = None;
-            self.external_work
+            self.pending_model_context_tokens = PendingModelContextTokens::Empty;
+            self.outstanding_actions
                 .emit_events_after_core_accepts(&items, &mut self.event_outbox);
             return;
         }
         self.context_tokens = None;
-        let pending_model_context_tokens = if self
-            .pending_model_context_tokens
-            .as_ref()
-            .is_some_and(|(turn_id, _)| last_turn_id_in_items(&items) == Some(*turn_id))
-        {
-            self.pending_model_context_tokens
-                .take()
-                .map(|(_, context_tokens)| context_tokens)
-        } else {
-            self.pending_model_context_tokens = None;
-            None
-        };
         let entry_ids = self.transcript_store.append_transcript_items(items.clone());
         for (entry_id, item) in entry_ids.into_iter().zip(items.iter().cloned()) {
             self.event_outbox
                 .push_back(SessionEvent::TranscriptItemAppended { entry_id, item });
         }
-        if let Some(context_tokens) = pending_model_context_tokens {
-            self.context_tokens = context_tokens;
-        }
-        self.external_work
+        self.pending_model_context_tokens
+            .apply_if_accepted_by(&items, &mut self.context_tokens);
+        self.outstanding_actions
             .emit_events_after_core_accepts(&items, &mut self.event_outbox);
     }
 
-    fn absorb_core_actions(&mut self) {
+    fn drain_core_actions(&mut self) {
         let actions = self.core.drain_actions();
         if actions.is_empty() {
             return;
         }
         for action in actions {
             match &action {
-                AgentAction::RequestModel { action_id, turn_id } => {
-                    if self.maybe_start_compaction(Some(CompactionBarrierModelRequest::new(
-                        *action_id,
-                        *turn_id,
-                        self.current_open_turn_suffix(),
-                    ))) {
-                        continue;
-                    }
-                    self.expose_agent_action(action);
-                }
-                AgentAction::RequestTool { .. } => self.expose_agent_action(action),
+                AgentAction::RequestModel { .. } => self.queue_core_action(action),
+                AgentAction::RequestTool { .. } => self.queue_core_action(action),
                 AgentAction::CancelTurn { .. } => {
                     self.invalidate_session_work("turn interrupted");
                 }
@@ -451,46 +362,14 @@ impl AgentSession {
         }
     }
 
-    fn maybe_start_compaction(
-        &mut self,
-        blocked_model_request: Option<CompactionBarrierModelRequest>,
-    ) -> bool {
-        if !self.compaction.is_requested() {
-            return false;
-        }
-        if blocked_model_request.is_none()
-            && (!self.core.is_idle()
-                || !self.transcript_store.is_turn_boundary()
-                || self.core.has_pending_work()
-                || !self.external_work.is_empty())
-        {
-            return false;
-        }
-
-        let model_context = self.transcript_store.model_context();
-        if model_context.transcript_items().is_empty() {
-            self.compaction.clear();
-            return false;
-        }
-        let request_id = CompactionRequestId::take_next(&mut self.next_compaction_request_id);
-        self.compaction.start(request_id, blocked_model_request);
-        self.push_session_action(SessionAction::RequestCompaction {
-            request_id,
-            model_context,
-            context_leaf_id: self.current_context_leaf_id(),
-            context_tokens: self.context_tokens,
-        });
-        true
-    }
-
-    fn expose_agent_action(&mut self, action: AgentAction) {
-        self.external_work.record_dispatched(&action);
+    fn queue_core_action(&mut self, action: AgentAction) {
+        self.outstanding_actions.track_request(&action);
         let session_action = match action {
             AgentAction::RequestModel { action_id, turn_id } => SessionAction::RequestModel {
                 action_id,
                 turn_id,
                 model_context: self.model_context(),
-                context_leaf_id: self.current_context_leaf_id(),
+                context_leaf_id: self.transcript_store.active_leaf_id().map(str::to_string),
                 context_tokens: self.context_tokens,
             },
             AgentAction::RequestTool {
@@ -504,181 +383,38 @@ impl AgentSession {
             },
             AgentAction::CancelTurn { .. } => SessionAction::CancelSessionWork,
         };
-        self.push_session_action(session_action);
+        self.queue_session_action(session_action);
     }
 
-    fn push_session_action(&mut self, action: SessionAction) {
+    fn queue_session_action(&mut self, action: SessionAction) {
         self.event_outbox.push_back(SessionEvent::ActionRequested {
             action: action.clone(),
         });
         self.action_outbox.push_back(action);
     }
 
-    fn complete_compaction_request(
-        &mut self,
-        request_id: CompactionRequestId,
-        replacement: ModelContext,
-        context_tokens: Option<usize>,
-    ) {
-        let Some(running) = self.take_running_compaction(request_id) else {
-            return;
-        };
-
-        if let Some(error) =
-            self.compaction_replacement_error(&replacement, running.blocked_model_request.as_ref())
-        {
-            self.event_outbox.push_back(SessionEvent::ActionFailed {
-                kind: SessionActionKind::Compaction,
-                id: request_id.0.to_string(),
-                error,
-            });
-            if let Some(blocked_model_request) = running.blocked_model_request {
-                self.expose_agent_action(blocked_model_request.into_agent_action());
-            } else {
-                self.maybe_start_compaction(None);
-            }
-            return;
-        }
-
-        self.event_outbox.push_back(SessionEvent::ActionCompleted {
-            kind: SessionActionKind::Compaction,
-            id: request_id.0.to_string(),
-        });
-
-        let had_blocked_model_request = running.blocked_model_request.is_some();
-        let queued_user_inputs = if had_blocked_model_request {
-            Vec::new()
-        } else {
-            self.core.drain_pending_inputs()
-        };
-        self.transcript_store.replace_active_path(&replacement);
-        self.context_tokens = context_tokens;
-        if !had_blocked_model_request {
-            let last_turn_id = self.transcript_store.model_context().last_turn_id();
-            let next_action_id = self.core.next_action_id();
-            self.core =
-                AgentCoreLoop::resume_at_boundary_with_next_action_id(last_turn_id, next_action_id);
-            self.restore_queued_user_inputs(queued_user_inputs);
-        }
-        self.event_outbox.push_back(SessionEvent::HistoryCompacted);
-        if let Some(blocked_model_request) = running.blocked_model_request {
-            if self.maybe_start_compaction(Some(blocked_model_request.clone())) {
-                return;
-            }
-            self.expose_agent_action(blocked_model_request.into_agent_action());
-        } else {
-            self.maybe_start_compaction(None);
-        }
-    }
-
-    fn compaction_replacement_error(
-        &self,
-        replacement: &ModelContext,
-        blocked_model_request: Option<&CompactionBarrierModelRequest>,
-    ) -> Option<String> {
-        if let Some(error) = replacement.structural_error() {
-            return Some(format!("invalid compaction replacement: {error}"));
-        }
-        match blocked_model_request {
-            Some(blocked_model_request) => {
-                if replacement.is_turn_boundary() {
-                    return Some(
-                        "compaction replacement must keep the blocked model turn open".to_string(),
-                    );
-                }
-                if replacement.last_turn_id() != blocked_model_request.turn_id() {
-                    return Some(format!(
-                        "compaction replacement last turn {:?} does not match blocked model turn {:?}",
-                        replacement.last_turn_id(),
-                        blocked_model_request.turn_id()
-                    ));
-                }
-                if !replacement
-                    .transcript_items()
-                    .ends_with(blocked_model_request.required_turn_suffix())
-                {
-                    return Some(
-                        "compaction replacement must preserve the blocked model turn suffix"
-                            .to_string(),
-                    );
-                }
-                None
-            }
-            None => {
-                if !replacement.is_turn_boundary() {
-                    return Some(
-                        "idle compaction replacement must end at a turn boundary".to_string(),
-                    );
-                }
-                let current_turn_id = self.transcript_store.model_context().last_turn_id();
-                if replacement.last_turn_id() != current_turn_id {
-                    return Some(format!(
-                        "idle compaction replacement last turn {:?} does not match current turn {:?}",
-                        replacement.last_turn_id(),
-                        current_turn_id
-                    ));
-                }
-                None
-            }
-        }
-    }
-
-    fn fail_compaction_request(&mut self, request_id: CompactionRequestId, error: String) {
-        let Some(running) = self.take_running_compaction(request_id) else {
-            return;
-        };
-        self.event_outbox.push_back(SessionEvent::ActionFailed {
-            kind: SessionActionKind::Compaction,
-            id: request_id.0.to_string(),
-            error,
-        });
-        if let Some(blocked_model_request) = running.blocked_model_request {
-            self.expose_agent_action(blocked_model_request.into_agent_action());
-        } else {
-            self.maybe_start_compaction(None);
-        }
-    }
-
-    fn take_running_compaction(
-        &mut self,
-        request_id: CompactionRequestId,
-    ) -> Option<RunningCompaction> {
-        let running = self.compaction.take_running(request_id)?;
-        self.action_outbox.retain(|action| {
-            !matches!(
+    fn invalidate_session_work(&mut self, _invalidation_reason: &str) {
+        let had_tracked_work = !self.outstanding_actions.is_empty();
+        let had_active_core_work = !self.core.is_idle();
+        let had_start_action = self.action_outbox.iter().any(|action| {
+            matches!(
                 action,
-                SessionAction::RequestCompaction {
-                    request_id: queued_request_id,
-                    ..
-                } if *queued_request_id == request_id
+                SessionAction::RequestModel { .. } | SessionAction::RequestTool { .. }
             )
         });
-        Some(running)
-    }
+        let had_existing_cancel = self
+            .action_outbox
+            .iter()
+            .any(|action| matches!(action, SessionAction::CancelSessionWork));
 
-    fn invalidate_session_work(&mut self, invalidation_reason: &str) {
-        let had_tracked_work = !self.external_work.is_empty();
-        let had_active_core_work = !self.core.is_idle();
-        let had_running_compaction = self.compaction.is_running();
-        let had_start_action = self.action_outbox.iter().any(SessionAction::is_start);
-        let had_existing_cancel = self.action_outbox.iter().any(SessionAction::is_cancel);
-
-        self.external_work.clear();
+        self.outstanding_actions.clear();
         self.context_tokens = None;
-        self.pending_model_context_tokens = None;
-        if let Some(running) = self.compaction.abandon() {
-            self.event_outbox.push_back(SessionEvent::ActionFailed {
-                kind: SessionActionKind::Compaction,
-                id: running.request_id.0.to_string(),
-                error: invalidation_reason.to_string(),
-            });
-        }
-        self.action_outbox.retain(SessionAction::is_cancel);
+        self.pending_model_context_tokens = PendingModelContextTokens::Empty;
+        self.action_outbox
+            .retain(|action| matches!(action, SessionAction::CancelSessionWork));
 
-        if (had_active_core_work || had_tracked_work || had_running_compaction || had_start_action)
-            && !had_existing_cancel
-        {
-            self.push_session_action(SessionAction::CancelSessionWork);
+        if (had_active_core_work || had_tracked_work || had_start_action) && !had_existing_cancel {
+            self.queue_session_action(SessionAction::CancelSessionWork);
         }
     }
 
@@ -686,56 +422,85 @@ impl AgentSession {
         let position = self
             .action_outbox
             .iter()
-            .position(|action| ExternalWork::action_matches_completion(action, input));
+            .position(|action| action.matches_completion(input));
         if let Some(position) = position {
             self.action_outbox.remove(position);
         }
     }
 
-    pub(crate) fn rehydrate_core_from_transcript_store(&mut self) {
+    fn reset_runtime_to_active_leaf(&mut self) {
         let last_turn_id = self.transcript_store.model_context().last_turn_id();
         let next_action_id = self.core.next_action_id();
-        self.core =
-            AgentCoreLoop::resume_at_boundary_with_next_action_id(last_turn_id, next_action_id);
+        self.core = AgentCoreLoop::resume_at(last_turn_id, next_action_id);
         // Any actions tracked as pending belong to a prior run we're no
         // longer driving; reset the queue so a rehydrated session does not
         // block edits forever.
-        self.external_work.clear();
-        self.action_outbox.retain(SessionAction::is_cancel);
-        self.compaction.clear();
+        self.outstanding_actions.clear();
+        self.action_outbox
+            .retain(|action| matches!(action, SessionAction::CancelSessionWork));
         self.context_tokens = None;
-        self.pending_model_context_tokens = None;
+        self.pending_model_context_tokens = PendingModelContextTokens::Empty;
     }
 
-    fn current_context_leaf_id(&self) -> Option<String> {
-        self.transcript_store.leaf_id().map(str::to_string)
-    }
+    fn close_transcript_store_open_turn(
+        transcript_store: &mut TranscriptStore,
+        closure: OpenTurnClosure,
+    ) -> Result<(), HistoryOperationError> {
+        if transcript_store.is_turn_boundary() {
+            return Ok(());
+        }
 
-    fn current_open_turn_suffix(&self) -> Vec<TranscriptItem> {
-        let model_context = self.transcript_store.model_context();
-        let items = model_context.transcript_items();
-        let Some(tail_start) = items
-            .iter()
-            .rposition(|item| matches!(item, TranscriptItem::TurnStarted { .. }))
+        let items = transcript_store.model_context().into_transcript_items();
+        let original_len = items.len();
+        let recovered = ModelContext::from_transcript_items(items)
+            .close_open_turn(closure)
+            .into_transcript_items();
+        if recovered.len() == original_len {
+            return Err(HistoryOperationError::Store(
+                TranscriptStoreError::NotTurnBoundary,
+            ));
+        }
+
+        transcript_store.append_transcript_items(recovered.into_iter().skip(original_len));
+        if transcript_store.is_turn_boundary() {
+            Ok(())
+        } else {
+            Err(HistoryOperationError::Store(
+                TranscriptStoreError::NotTurnBoundary,
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+enum PendingModelContextTokens {
+    #[default]
+    Empty,
+    ModelTokenUpdatePendingAcceptance {
+        turn_id: TurnId,
+        context_tokens: Option<usize>,
+    },
+}
+
+impl PendingModelContextTokens {
+    fn apply_if_accepted_by(
+        &mut self,
+        items: &[TranscriptItem],
+        current_context_tokens: &mut Option<usize>,
+    ) {
+        let Self::ModelTokenUpdatePendingAcceptance {
+            turn_id,
+            context_tokens,
+        } = std::mem::take(self)
         else {
-            return Vec::new();
+            return;
         };
-        items[tail_start..].to_vec()
+        if items.iter().rev().find_map(TranscriptItem::turn_id) == Some(turn_id) {
+            *current_context_tokens = context_tokens;
+        }
     }
-}
-
-fn last_turn_id_in_items(items: &[TranscriptItem]) -> Option<TurnId> {
-    items.iter().rev().find_map(TranscriptItem::turn_id)
-}
-
-fn is_external_completion(input: &AgentInput) -> bool {
-    matches!(
-        input,
-        AgentInput::ModelCompleted { .. }
-            | AgentInput::ModelFailed { .. }
-            | AgentInput::ToolCompleted { .. }
-    )
 }
 
 #[cfg(test)]
+#[path = "session_tests.rs"]
 mod tests;

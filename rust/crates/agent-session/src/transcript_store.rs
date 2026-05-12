@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::storage::StoredTranscriptEntry;
-use agent_core::{InjectedMessage, TranscriptItem};
+use agent_vocab::TranscriptItem;
 use uuid::Uuid;
 
 use crate::model_context::ModelContext;
@@ -52,7 +52,7 @@ impl TranscriptStore {
     ///
     /// This is an owned snapshot because the store indexes entries by id
     /// internally. Future persistence code can serialize this vector together
-    /// with `leaf_id()`.
+    /// with `active_leaf_id()`.
     pub fn entries(&self) -> Vec<TranscriptStorageNode> {
         self.insertion_order
             .iter()
@@ -60,11 +60,7 @@ impl TranscriptStore {
             .collect()
     }
 
-    pub fn entry_count(&self) -> usize {
-        self.insertion_order.len()
-    }
-
-    pub fn leaf_ids(&self) -> impl Iterator<Item = &str> {
+    pub fn all_leaf_ids(&self) -> impl Iterator<Item = &str> {
         self.leaf_ids.iter().map(String::as_str)
     }
 
@@ -83,7 +79,7 @@ impl TranscriptStore {
             .collect()
     }
 
-    pub fn leaf_id(&self) -> Option<&str> {
+    pub fn active_leaf_id(&self) -> Option<&str> {
         self.active_leaf_id.as_deref()
     }
 
@@ -92,30 +88,21 @@ impl TranscriptStore {
     }
 
     pub fn is_turn_boundary(&self) -> bool {
-        self.is_turn_boundary_leaf(self.leaf_id())
+        self.is_turn_boundary_at(self.active_leaf_id())
     }
 
-    /// True when `leaf_id` points at a turn boundary (either a
-    /// `TurnFinished` entry directly, or the empty-log sentinel). Trailing
-    /// injected entries are transparent: the check walks past them to find the
-    /// underlying boundary. An injected turn opener still resolves to
-    /// `TurnStarted`, so it is not a boundary.
-    pub fn is_turn_boundary_leaf<'a>(&'a self, leaf_id: Option<&'a str>) -> bool {
-        let mut cursor = leaf_id;
-        loop {
-            let Some(id) = cursor else {
-                return true;
-            };
-            let Some(entry) = self.get_entry(id) else {
-                return false;
-            };
-            match &entry.item {
-                TranscriptItem::TurnFinished { .. } => return true,
-                TranscriptItem::Injected(_) => {
-                    cursor = entry.parent_id.as_deref();
-                }
-                _ => return false,
-            }
+    /// True when `leaf_id` points at a turn boundary: a finished turn, a
+    /// compacted root, or the empty-log sentinel.
+    pub fn is_turn_boundary_at<'a>(&'a self, entry_id: Option<&'a str>) -> bool {
+        let Some(id) = entry_id else {
+            return true;
+        };
+        let Some(entry) = self.get_entry(id) else {
+            return false;
+        };
+        match &entry.item {
+            TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_) => true,
+            _ => false,
         }
     }
 
@@ -133,36 +120,35 @@ impl TranscriptStore {
             .collect()
     }
 
-    /// Append a `TranscriptItem::Injected(injected)` entry and return its id.
-    pub fn append_injected(&mut self, injected: InjectedMessage) -> String {
-        self.append_transcript_item(TranscriptItem::Injected(injected))
-    }
-
-    pub(crate) fn replace_active_path(&mut self, model_context: &ModelContext) {
-        self.reset_leaf();
-        self.append_transcript_items(model_context.transcript_items().iter().cloned());
-    }
-
-    pub fn branch_at_turn_boundary(&mut self, entry_id: &str) -> Result<(), TranscriptStoreError> {
+    pub fn set_active_leaf_to_boundary(
+        &mut self,
+        entry_id: &str,
+    ) -> Result<(), TranscriptStoreError> {
         if !self.contains_entry(entry_id) {
             return Err(TranscriptStoreError::EntryNotFound);
         }
-        if !self.is_turn_boundary_leaf(Some(entry_id)) {
+        if !self.is_turn_boundary_at(Some(entry_id)) {
             return Err(TranscriptStoreError::NotTurnBoundary);
         }
         self.active_leaf_id = Some(entry_id.to_string());
         Ok(())
     }
 
-    pub fn reset_leaf(&mut self) {
+    pub fn reset_active_leaf(&mut self) {
         self.active_leaf_id = None;
     }
 
-    pub fn branch_entries(&self, leaf_id: Option<&str>) -> Vec<TranscriptStorageNode> {
+    fn active_path_entries(&self) -> Vec<TranscriptStorageNode> {
+        self.path_entries(self.active_leaf_id.as_deref())
+    }
+
+    pub fn path_entries_to(&self, entry_id: &str) -> Vec<TranscriptStorageNode> {
+        self.path_entries(Some(entry_id))
+    }
+
+    fn path_entries(&self, entry_id: Option<&str>) -> Vec<TranscriptStorageNode> {
         let mut path = Vec::new();
-        let mut current = leaf_id
-            .or(self.active_leaf_id.as_deref())
-            .and_then(|id| self.entries_by_id.get(id));
+        let mut current = entry_id.and_then(|id| self.entries_by_id.get(id));
 
         while let Some(entry) = current {
             path.push(entry.clone());
@@ -176,38 +162,13 @@ impl TranscriptStore {
         path
     }
 
-    pub fn create_branched_store_at_turn_boundary(
-        &self,
-        leaf_id: Option<&str>,
-    ) -> Result<Self, TranscriptStoreError> {
-        if let Some(leaf_id) = leaf_id {
-            if !self.contains_entry(leaf_id) {
-                return Err(TranscriptStoreError::EntryNotFound);
-            }
-        }
-        if !self.is_turn_boundary_leaf(leaf_id) {
-            return Err(TranscriptStoreError::NotTurnBoundary);
-        }
-
-        match leaf_id {
-            Some(leaf_id) => Ok(Self::from_trusted_entries(
-                self.branch_entries(Some(leaf_id)),
-                Some(leaf_id.to_string()),
-            )),
-            None => Ok(Self::new()),
-        }
-    }
-
-    pub fn create_branched_store_at_entry(
-        &self,
-        leaf_id: &str,
-    ) -> Result<Self, TranscriptStoreError> {
-        if !self.contains_entry(leaf_id) {
+    pub fn copy_path_to_entry(&self, entry_id: &str) -> Result<Self, TranscriptStoreError> {
+        if !self.contains_entry(entry_id) {
             return Err(TranscriptStoreError::EntryNotFound);
         }
         Ok(Self::from_trusted_entries(
-            self.branch_entries(Some(leaf_id)),
-            Some(leaf_id.to_string()),
+            self.path_entries_to(entry_id),
+            Some(entry_id.to_string()),
         ))
     }
 
@@ -215,7 +176,7 @@ impl TranscriptStore {
     ///
     /// Materialize the full active path in model-visible order.
     pub fn model_context(&self) -> ModelContext {
-        let path = self.branch_entries(None);
+        let path = self.active_path_entries();
         let items = path.into_iter().map(|entry| entry.item).collect();
         ModelContext::from_transcript_items(items)
     }
@@ -279,7 +240,19 @@ impl TranscriptStore {
     ) -> Self {
         let mut ctx = Self::new();
         for entry in entries {
-            ctx.append_entry(entry);
+            let id = entry.id.clone();
+            let parent_id = entry.parent_id.clone();
+            ctx.parent_by_id.insert(id.clone(), parent_id.clone());
+            ctx.children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(id.clone());
+            ctx.leaf_ids.insert(id.clone());
+            ctx.insertion_order.push(id.clone());
+            ctx.entries_by_id.insert(id, entry);
+        }
+        for parent_id in ctx.parent_by_id.values().flatten() {
+            ctx.leaf_ids.remove(parent_id);
         }
         ctx.active_leaf_id = active_leaf_id;
         ctx
@@ -326,8 +299,8 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{
-        AssistantItem, AssistantMessage, InjectedMessage, TurnId, TurnOutcome, UserMessage,
+    use agent_vocab::{
+        AssistantItem, AssistantMessage, CompactionSummary, TurnId, TurnOutcome, UserMessage,
     };
 
     fn turn(turn_id: u64, user: &str, assistant: &str) -> Vec<TranscriptItem> {
@@ -352,7 +325,7 @@ mod tests {
         let first_ids = ctx.append_transcript_items(turn(1, "first", "done"));
         ctx.append_transcript_items(turn(2, "second", "done"));
 
-        ctx.branch_at_turn_boundary(&first_ids[3])
+        ctx.set_active_leaf_to_boundary(&first_ids[3])
             .expect("turn one should be a valid branch point");
         ctx.append_transcript_items(turn(3, "alternate", "done"));
 
@@ -374,7 +347,7 @@ mod tests {
         let first_ids = ctx.append_transcript_items(turn(1, "first", "done"));
         let original_second_ids = ctx.append_transcript_items(turn(2, "second", "done"));
 
-        ctx.branch_at_turn_boundary(&first_ids[3])
+        ctx.set_active_leaf_to_boundary(&first_ids[3])
             .expect("T1 boundary is a valid fork point");
         let alternate_second_ids = ctx.append_transcript_items(turn(3, "alternate", "done"));
 
@@ -382,7 +355,7 @@ mod tests {
         assert!(children.contains(&original_second_ids[0].as_str()));
         assert!(children.contains(&alternate_second_ids[0].as_str()));
 
-        let leaves = ctx.leaf_ids().collect::<Vec<_>>();
+        let leaves = ctx.all_leaf_ids().collect::<Vec<_>>();
         assert!(leaves.contains(&original_second_ids[3].as_str()));
         assert!(leaves.contains(&alternate_second_ids[3].as_str()));
         assert_eq!(
@@ -392,50 +365,58 @@ mod tests {
     }
 
     #[test]
-    fn transcript_materializes_the_full_active_branch_after_a_summary() {
-        // Simulate a replacement branch manually at the store level: append two
-        // turns, navigate back to the T1 boundary, append a summary there, then
-        // re-append T2's items as descendants. The active branch is now
-        // [T1 items..., summary, T2 items...], and the materialized view is
-        // that full active path.
-        let mut ctx = TranscriptStore::new();
-        let first_ids = ctx.append_transcript_items(turn(1, "first", "done"));
-        let second_ids = ctx.append_transcript_items(turn(2, "second", "done"));
-        let kept_items = second_ids
-            .iter()
-            .map(|id| ctx.get_entry(id).expect("kept id exists").item.clone())
-            .collect::<Vec<_>>();
+    fn restore_rebuilds_indexes_without_parent_first_order() {
+        let parent = TranscriptStorageNode {
+            id: "parent".to_string(),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::UserMessage(UserMessage::text("parent")),
+        };
+        let child = TranscriptStorageNode {
+            id: "child".to_string(),
+            parent_id: Some("parent".to_string()),
+            timestamp_ms: 2,
+            item: TranscriptItem::UserMessage(UserMessage::text("child")),
+        };
 
-        ctx.branch_at_turn_boundary(&first_ids[3])
-            .expect("T1 boundary is a valid fork point");
-        ctx.append_injected(InjectedMessage::new("compaction", "summary"));
-        ctx.append_transcript_items(kept_items);
+        let store =
+            TranscriptStore::from_storage_entries(vec![child, parent], Some("child".to_string()))
+                .expect("restore should not depend on parent-first order");
 
-        let transcript = ctx.model_context();
-        assert_eq!(transcript.last_turn_id(), TurnId(2));
-        assert!(matches!(
-            transcript.transcript_items()[4],
-            TranscriptItem::Injected(_)
-        ));
-        assert!(matches!(
-            transcript.transcript_items()[5],
-            TranscriptItem::TurnStarted { turn_id: TurnId(2) }
-        ));
-        assert_eq!(transcript.transcript_items().len(), 9);
-        assert!(ctx.is_turn_boundary());
+        assert_eq!(
+            store
+                .active_path_entries()
+                .into_iter()
+                .map(|entry| entry.id)
+                .collect::<Vec<_>>(),
+            vec!["parent", "child"]
+        );
+        assert_eq!(store.child_ids(None), vec!["parent"]);
+        assert_eq!(store.child_ids(Some("parent")), vec!["child"]);
+        assert_eq!(store.all_leaf_ids().collect::<Vec<_>>(), vec!["child"]);
     }
 
     #[test]
-    fn fork_at_injected_tail_is_a_valid_turn_boundary() {
-        let mut ctx = TranscriptStore::new();
-        ctx.append_transcript_items(turn(1, "hi", "done"));
-        let injected_id = ctx.append_injected(InjectedMessage::new("note", "note"));
+    fn compaction_summary_root_is_a_boundary() {
+        let summary = TranscriptStorageNode {
+            id: "summary".to_string(),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::CompactionSummary(CompactionSummary::new(
+                "session",
+                "source",
+                "summary text",
+                Some(128),
+                TurnId(4),
+            )),
+        };
 
-        assert!(ctx.is_turn_boundary());
-        let forked = ctx
-            .create_branched_store_at_turn_boundary(Some(&injected_id))
-            .expect("injected tail should be a valid fork boundary");
-        assert_eq!(forked.leaf_id(), Some(injected_id.as_str()));
+        let store =
+            TranscriptStore::from_storage_entries(vec![summary], Some("summary".to_string()))
+                .expect("compacted root should restore");
+
+        assert!(store.is_turn_boundary());
+        assert_eq!(store.model_context().last_turn_id(), TurnId(4));
     }
 
     #[test]
@@ -445,13 +426,13 @@ mod tests {
         let user_message_id = &ids[1];
 
         let forked = ctx
-            .create_branched_store_at_entry(user_message_id)
+            .copy_path_to_entry(user_message_id)
             .expect("any existing transcript entry can be copied for fork");
-        assert_eq!(forked.leaf_id(), Some(user_message_id.as_str()));
+        assert_eq!(forked.active_leaf_id(), Some(user_message_id.as_str()));
         assert!(!forked.is_turn_boundary());
 
         assert_eq!(
-            ctx.create_branched_store_at_entry("missing-entry").err(),
+            ctx.copy_path_to_entry("missing-entry").err(),
             Some(TranscriptStoreError::EntryNotFound)
         );
     }

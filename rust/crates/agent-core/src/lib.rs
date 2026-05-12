@@ -12,21 +12,12 @@ mod action;
 #[path = "loop.rs"]
 mod core_loop;
 mod event;
-mod ids;
 mod mailbox;
-mod message;
 mod state;
-mod transcript_item;
 
 pub use crate::action::AgentAction;
 pub use crate::core_loop::AgentCoreLoop;
-pub use crate::event::{AgentInput, AgentInputError};
-pub use crate::ids::{ActionId, ToolCallId, TurnId};
-pub use crate::message::{
-    AssistantItem, AssistantMessage, ContentBlock, ImageContent, ImageSource, ToolCall,
-    ToolDefinition, ToolResultMessage, ToolResultStatus, UserMessage,
-};
-pub use crate::transcript_item::{InjectedMessage, TranscriptItem, TurnOutcome};
+pub use crate::event::{AgentInput, TurnInput};
 
 // `AgentState` and `Mailbox` are intentionally not re-exported: they are
 // implementation details of the core loop. Callers observe liveness via

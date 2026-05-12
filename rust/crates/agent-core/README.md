@@ -10,7 +10,7 @@ Deterministic FSM kernel for one agent turn loop.
 - turn state machine
 - action outbox
 - transcript-item outbox
-- `TurnId` and `ActionId` progression
+- `TurnId` and `ActionId` progression over IDs defined by `agent-vocab`
 
 It does not call models, run tools, persist history, know storage backends, or
 know about hierarchical agents. Callers feed inputs in, call `drive`, then drain
@@ -28,8 +28,8 @@ the requested actions and transcript items.
 - `ToolCompleted`
 
 `Steer` and `FollowUp` carry a `UserMessage`, which can contain text and image
-content blocks. They may also carry opaque `from` and `kind` tags. If tags are
-present, both must be present.
+content blocks. The core does not model caller-authored injected context,
+subagent routing, compaction, or storage.
 
 ## Outputs
 
@@ -41,7 +41,6 @@ present, both must be present.
 - `ToolCallStarted`
 - `ToolResult`
 - `TurnFinished`
-- `Injected`
 
 `AgentAction` variants:
 
@@ -59,14 +58,11 @@ The core never performs those actions. It only requests them.
   emitted in the assistant-declared tool-call order.
 - Interrupting model/tool work closes the turn as interrupted and emits a
   cancellation request for external work.
-- Untagged user input becomes `TranscriptItem::UserMessage`.
-- Tagged user input becomes `TranscriptItem::Injected` with the tag metadata.
-
-The tagged path is generic injected context, not subagent orchestration.
+- User input becomes `TranscriptItem::UserMessage`.
 
 ## Relationship To Other Crates
 
 - `agent-vocab` owns the shared message/transcript shapes.
-- `agent-session` owns durable history, resume, rewind, fork, compaction, and
-  session integration.
+- `agent-session` owns durable history, resume, rewind, fork, and session
+  integration. Compaction is installed durably by `agent-store`.
 - Providers and tools live above the core.

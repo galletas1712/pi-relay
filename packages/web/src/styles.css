@@ -228,7 +228,8 @@ pre {
 
 .primary-button,
 .icon-button,
-.send-button {
+.send-button,
+.stop-button {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
@@ -262,7 +263,8 @@ pre {
 }
 
 .icon-button:hover,
-.send-button:hover {
+.send-button:hover,
+.stop-button:hover {
 	border-color: var(--border);
 	background: var(--accent);
 	color: var(--accent-foreground);
@@ -369,6 +371,34 @@ pre {
 .session-leaf {
 	font-family: var(--font-mono);
 	font-size: 10.5px;
+}
+
+.session-row-action {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	width: 24px;
+	height: 24px;
+	border-radius: 6px;
+	color: var(--muted-foreground);
+	opacity: 0;
+}
+
+.session-row:hover .session-row-action,
+.session-row:focus-visible .session-row-action,
+.session-row-action:focus-visible {
+	opacity: 1;
+}
+
+.session-row-action:hover,
+.session-row-action:focus-visible {
+	background: var(--muted);
+	color: var(--foreground);
+	outline: none;
+}
+
+.session-row.selected .session-row-action {
+	color: var(--accent-foreground);
 }
 
 .empty-list,
@@ -818,7 +848,7 @@ pre {
 
 .history-dialog {
 	display: flex;
-	width: min(620px, calc(100vw - 48px));
+	width: min(760px, calc(100vw - 48px));
 	max-height: min(720px, calc(100vh - 48px));
 	flex-direction: column;
 	overflow: hidden;
@@ -897,10 +927,39 @@ pre {
 	box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 35%, transparent);
 }
 
+.history-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 8px;
+	padding: 12px;
+}
+
+.secondary-button {
+	display: inline-flex;
+	height: 32px;
+	align-items: center;
+	justify-content: center;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--background);
+	color: var(--foreground);
+	padding: 0 12px;
+	font-size: 12px;
+	cursor: pointer;
+}
+
+.secondary-button:hover {
+	background: var(--muted);
+}
+
 .history-options {
 	min-height: 0;
 	overflow: auto;
 	padding: 8px;
+}
+
+.history-options.tree {
+	padding: 6px;
 }
 
 .history-option {
@@ -921,6 +980,52 @@ pre {
 .history-option:hover {
 	background: var(--accent);
 	color: var(--accent-foreground);
+}
+
+.history-option:disabled {
+	cursor: default;
+	color: var(--muted-foreground);
+}
+
+.history-option:disabled:hover {
+	background: transparent;
+	color: var(--muted-foreground);
+}
+
+.history-option.tree-row {
+	position: relative;
+	grid-template-columns: calc(var(--tree-depth, 0) * 18px + 44px) 42px minmax(0, 1fr) auto;
+	min-height: 54px;
+	padding: 7px 10px 7px 8px;
+}
+
+.history-option.tree-row.on-active-path {
+	background: color-mix(in oklch, var(--accent) 55%, transparent);
+}
+
+.tree-guides {
+	position: relative;
+	align-self: stretch;
+}
+
+.tree-guides::before {
+	content: "";
+	position: absolute;
+	top: -8px;
+	bottom: -8px;
+	left: calc(max(var(--tree-depth, 0), 1) * 18px - 10px);
+	border-left: 1px solid var(--border);
+	opacity: calc(min(var(--tree-depth, 0), 1));
+}
+
+.tree-guides::after {
+	content: "";
+	position: absolute;
+	top: 50%;
+	left: calc(max(var(--tree-depth, 0), 1) * 18px - 10px);
+	width: 14px;
+	border-top: 1px solid var(--border);
+	opacity: calc(min(var(--tree-depth, 0), 1));
 }
 
 .history-option-icon {
@@ -982,6 +1087,10 @@ pre {
 	font-size: 10px;
 	font-weight: 400;
 	color: var(--muted-foreground);
+}
+
+.history-badge.muted {
+	border-style: dashed;
 }
 
 .history-empty {
@@ -1054,7 +1163,6 @@ pre {
 	height: 44px;
 	border-color: var(--border);
 	background: var(--background);
-	color: var(--muted-foreground);
 }
 
 .stop-button:not(:disabled) {

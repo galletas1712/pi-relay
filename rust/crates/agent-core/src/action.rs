@@ -1,5 +1,4 @@
-use crate::ids::{ActionId, TurnId};
-use crate::message::ToolCall;
+use agent_vocab::{ActionId, ToolCall, TurnId};
 
 /// Side effects requested by the core loop.
 ///

@@ -16,8 +16,7 @@ tools, and a Postgres-backed websocket control plane.
 4. Keep providers intentionally narrow: Codex/OpenAI and Anthropic/Claude only.
 5. Keep tools separate from the agent loop so tool sets can be customized
    without changing the FSM.
-6. Avoid hierarchical subagent machinery until there is a concrete personal-use
-   reason to reintroduce it.
+6. Do not include subagent orchestration or generic injected-message routing.
 
 ## Crate Stack
 
@@ -30,7 +29,7 @@ pi-cli
 
 agent-session
   AgentSession, TranscriptStore, ModelContext,
-  resume/rewind/fork/compaction, storage snapshots
+  resume/rewind/fork, storage snapshots
 
 agent-core
   deterministic FSM for one turn loop; no I/O
@@ -63,7 +62,8 @@ Its module split is:
 - `types.rs`: daemon-local RPC envelopes, request parameter structs, runtime
   handles, and websocket errors.
 - `state.rs`: process-local daemon state: repository handle, active session
-  projections, pump locks, event broadcaster, tool registry, and tool context.
+  projections, per-session driver locks, event broadcaster, tool registry, and
+  tool context.
 - `codec.rs`: translation between JSON-RPC payloads and core/session vocabulary,
   plus transcript recovery helpers that operate on storage-neutral session
   shapes.
@@ -71,8 +71,9 @@ Its module split is:
 - `provider_runtime.rs`: provider selection and model execution. It is the only
   daemon module that knows how provider config maps to concrete provider
   adapters.
-- `runtime.rs`: live session loading, crash recovery, pump locking, queued-input
-  consumption, action completion, model/tool dispatch, and event publishing.
+- `runtime.rs`: `SessionDriver`, live session loading, crash recovery,
+  queued-input consumption, action completion, model/tool dispatch, and event
+  publishing.
 - `agent-store::PostgresAgentStore`: concrete Postgres persistence. SQL,
   transaction boundaries, row mapping, event replay, input ledger, action rows,
   daemon config, and recovery persistence live in the storage crate rather than
@@ -93,11 +94,15 @@ Implemented user-facing behavior:
 - String tool-call ids.
 - Automatic local tool execution with no approval interface.
 - Durable session rows in Postgres for websocket sessions.
-- Event replay with `events.subscribe(after_event_id)`.
+- Reconnect event replay with `events.subscribe(after_event_id)`; initial
+  subscriptions attach from the current head and load state from snapshots.
 - Derived session activity: `idle`, `queued`, `running`.
 - Steer/follow-up sends with idempotent `client_input_id` for both idle
   accepted input and busy queued input.
 - Queued follow-up promotion to steer priority, consumed in promotion order.
+- Mid-turn steer insertion after completed tool results and before the next
+  model request; follow-ups remain next-turn work, and compaction remains an
+  action barrier.
 - Turn-level interrupt.
 - Idle-only rewind.
 - Running-safe fork from any explicit transcript entry, with user-message
@@ -134,8 +139,8 @@ Not implemented by design:
 - `AssistantMessage`: ordered `Vec<AssistantItem>`.
 - `AssistantItem`: `Text`, `ThinkingRedacted`, or `ToolCall`.
 - `ToolDefinition`, `ToolCall`, `ToolResultMessage`, `ToolResultStatus`.
-- `TranscriptItem`: `TurnStarted`, `UserMessage`, `Injected`,
-  `AssistantMessage`, `ToolCallStarted`, `ToolResult`, and `TurnFinished`.
+- `TranscriptItem`: `TurnStarted`, `UserMessage`, `AssistantMessage`,
+  `ToolCallStarted`, `ToolResult`, `TurnFinished`, and `CompactionSummary`.
 
 Thinking block content is intentionally discarded. Images are first-class input
 because the agent needs vision-capable provider requests.
@@ -151,8 +156,7 @@ because the agent needs vision-capable provider requests.
 - No filesystem, network, async runtime, provider SDK, tool execution, durable
   storage, or websocket concepts.
 
-Tagged steer/follow-up inputs are generic injected context. They are not
-subagent routing.
+The core does not model injected context, sources, agents, or routing metadata.
 
 ## Session Semantics
 
@@ -162,8 +166,7 @@ subagent routing.
 
 - `AgentCoreLoop`.
 - `TranscriptStore`.
-- Private external-work tracking.
-- Compaction state.
+- Private outstanding action tracking.
 - Optional context-token count.
 - Action and event outboxes.
 
@@ -179,18 +182,24 @@ pub struct TranscriptStorageNode {
 ```
 
 The active session view is one root-to-leaf path. `ModelContext` is
-materialized from that path for provider requests and compaction requests.
+materialized from that path for provider requests and daemon-owned compaction
+jobs.
 
 Important operations:
 
 - Restore/resume: build an idle core from stored transcript history. Open tails
   are recovered as crashed before the session is exposed as idle.
 - Rewind: move the active leaf to a prior turn boundary without deleting rows.
-- Fork: copy a path ending at any existing transcript entry into a new
-  independent session, closing a copied partial tail as interrupted when the
-  target is not already a turn boundary.
-- Compaction: ask the harness/provider for a replacement `ModelContext`,
-  validate it, and install it as a new active path.
+- Fork: copy the source session's transcript forest snapshot into a new
+  independent session, then set the child active leaf to the selected entry.
+  If the selected entry is not already a boundary, the child gets an appended
+  interrupted tail on that branch. Copying the whole forest keeps prior
+  compaction roots and pre-compaction branches navigable inside the fork.
+- Compaction: the daemon asks the provider to summarize the active
+  `ModelContext`; `agent-store` atomically appends a
+  `TranscriptItem::CompactionSummary` root and makes that root active. The old
+  branch remains available for fork, same-session active-leaf switching,
+  rewind, and tree inspection. Compaction is not a session boundary.
 
 The session primitive can invalidate active work during a local rewind. The
 websocket contract is stricter: source-mutating history writes are idle-only so
@@ -222,15 +231,25 @@ claims are reset to `queued` on first touch after daemon restart. That avoids a
 consumed-but-not-transcripted mailbox gap during daemon death while still
 letting queued edits fail cleanly once consumption has begun.
 
+Unfinished actions are execution leases owned by the daemon process. Startup
+marks leftover unfinished action rows stale before accepting websocket clients.
+If a stale action left the active transcript in an open turn, first touch
+rehydrates the session and appends a crashed turn boundary. A clean boundary
+with an unfinished action is otherwise treated as legitimate live work, which is
+what lets queued follow-ups wait behind provider-backed compaction without
+triggering transcript repair.
+
 The Postgres data model is documented in
 [`websocket-rpc.md`](websocket-rpc.md). Its important recovery invariants are:
 
 - Open transcript tails are valid while unfinished actions explain them.
 - Interrupt commits the closed interrupted tail and action invalidation
   together.
+- Session-wide cancellation is represented by `session.work_cancelled`; it does
+  not create a model/tool action row.
 - Daemon death before commit leaves the old open tail recoverable.
 - Daemon death after commit leaves replayable events.
-- Daemon death during external work is repaired on next touch with stale
+- Daemon death during outstanding model/tool work is repaired on next touch with stale
   actions plus a crashed turn tail.
 - Late completions from stale attempts cannot mutate history.
 
@@ -303,7 +322,7 @@ Postgres. It owns:
 
 - Schema migration for the normalized Postgres tables.
 - Websocket request routing.
-- Durable event replay.
+- Reconnect event replay.
 - Session recovery before first touch.
 - Global daemon configuration for the system prompt.
 - Provider credential loading.
@@ -329,7 +348,7 @@ daemon is now the main frontend integration path.
 - `agent-orchestrator` crate.
 - `SessionRegistry`.
 - Async channel `AgentRunner`.
-- Hierarchical subagent-specific control surfaces.
+- Hierarchical subagent-specific control surfaces and routing metadata.
 
 Durable storage is the registry. Process-local state only exists to drive
 current work.
@@ -344,7 +363,8 @@ The current implementation has been checked with:
 - Manual websocket exercises against a real Postgres database.
 - Browser flow checks against the real websocket daemon.
 - Real Codex text and image-URL turns through the websocket daemon.
-- Daemon death/restart recovery with durable event replay.
+- Daemon death/restart recovery with snapshot reload plus reconnect event
+  replay.
 
 Anthropic real-provider websocket tests require a raw `ANTHROPIC_API_KEY`; the
 local Claude Code credentials were not a raw Anthropic key.

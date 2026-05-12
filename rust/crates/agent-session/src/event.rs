@@ -1,4 +1,4 @@
-use agent_core::TranscriptItem;
+use agent_vocab::TranscriptItem;
 
 use crate::action::SessionAction;
 
@@ -25,7 +25,6 @@ pub enum SessionEvent {
         id: String,
         error: String,
     },
-    HistoryCompacted,
     HistoryRewound,
 }
 
@@ -33,5 +32,4 @@ pub enum SessionEvent {
 pub enum SessionActionKind {
     Model,
     Tool,
-    Compaction,
 }

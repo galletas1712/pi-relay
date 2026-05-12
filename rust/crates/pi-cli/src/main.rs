@@ -93,16 +93,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             error.to_string(),
                         ),
                     };
-                    session.enqueue_session_input(SessionInput::Agent(
-                        AgentInput::ToolCompleted {
-                            action_id,
-                            turn_id,
-                            result,
-                        },
-                    ))?;
+                    session.enqueue_input(AgentInput::ToolCompleted {
+                        action_id,
+                        turn_id,
+                        result,
+                    })?;
                 }
-                SessionAction::CancelSessionWork { .. }
-                | SessionAction::RequestCompaction { .. } => {}
+                SessionAction::CancelSessionWork { .. } => {}
             }
         }
     }

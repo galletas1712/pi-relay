@@ -6,5 +6,6 @@ publish = false
 
 [dependencies]
 agent-core = { workspace = true }
+agent-vocab = { workspace = true }
 serde = { workspace = true }
 uuid = { workspace = true }

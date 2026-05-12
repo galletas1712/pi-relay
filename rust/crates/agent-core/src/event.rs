@@ -1,31 +1,30 @@
-use std::fmt;
+use agent_vocab::{
+    ActionId, AssistantMessage, ToolResultMessage, TranscriptItem, TurnId, UserMessage,
+};
 
-use crate::ids::{ActionId, TurnId};
-use crate::message::{AssistantMessage, ToolResultMessage, UserMessage};
+/// First transcript record for a new turn.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnInput(pub UserMessage);
+
+impl TurnInput {
+    pub(crate) fn into_transcript_item(self) -> TranscriptItem {
+        TranscriptItem::UserMessage(self.0)
+    }
+}
 
 /// External input to the live agent FSM.
 ///
-/// **Invariant (for `Steer` and `FollowUp`):** `from.is_some() == kind.is_some()`.
-/// Either both `None` (input came from the human user or unknown origin —
-/// same thing at the core layer) or both `Some` (input was injected by another
-/// session, e.g. a parent directive or a child report). The core crate is
-/// oblivious to what a session id *is*, and to what specific `kind` strings
-/// mean — both are opaque tags that ride along with the content.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentInput {
     // User asked to stop the active model/tool work.
     Interrupt,
     // High-priority input. Runs before queued follow-up work.
     Steer {
-        from: Option<String>,
-        kind: Option<String>,
-        content: UserMessage,
+        content: TurnInput,
     },
     // Normal-priority input for the next available turn.
     FollowUp {
-        from: Option<String>,
-        kind: Option<String>,
-        content: UserMessage,
+        content: TurnInput,
     },
     // Volatile model completion delivered by the caller.
     ModelCompleted {
@@ -51,103 +50,31 @@ impl AgentInput {
     /// Steer input from the human user (or unknown origin).
     pub fn steer(content: impl Into<String>) -> Self {
         Self::Steer {
-            from: None,
-            kind: None,
-            content: UserMessage::text(content),
+            content: TurnInput(UserMessage::text(content)),
         }
     }
 
     /// Steer input with structured user content, including images.
     pub fn steer_message(content: UserMessage) -> Self {
         Self::Steer {
-            from: None,
-            kind: None,
-            content,
+            content: TurnInput(content),
         }
     }
 
     /// Follow-up input from the human user (or unknown origin).
     pub fn follow_up(content: impl Into<String>) -> Self {
         Self::FollowUp {
-            from: None,
-            kind: None,
-            content: UserMessage::text(content),
+            content: TurnInput(UserMessage::text(content)),
         }
     }
 
     /// Follow-up input with structured user content, including images.
     pub fn follow_up_message(content: UserMessage) -> Self {
         Self::FollowUp {
-            from: None,
-            kind: None,
-            content,
-        }
-    }
-
-    /// Steer input tagged as coming from the given session with the given kind.
-    ///
-    /// Used for caller-defined injected context. The core treats `kind` as an
-    /// opaque tag and does not define well-known routing constants.
-    pub fn steer_tagged(
-        from: impl Into<String>,
-        kind: impl Into<String>,
-        content: impl Into<String>,
-    ) -> Self {
-        Self::Steer {
-            from: Some(from.into()),
-            kind: Some(kind.into()),
-            content: UserMessage::text(content),
-        }
-    }
-
-    /// Follow-up input tagged as coming from the given session with the given
-    /// kind.
-    ///
-    /// Used for caller-defined injected context. The core treats `kind` as an
-    /// opaque tag and does not define well-known routing constants.
-    pub fn follow_up_tagged(
-        from: impl Into<String>,
-        kind: impl Into<String>,
-        content: impl Into<String>,
-    ) -> Self {
-        Self::FollowUp {
-            from: Some(from.into()),
-            kind: Some(kind.into()),
-            content: UserMessage::text(content),
-        }
-    }
-
-    pub fn validate(&self) -> Result<(), AgentInputError> {
-        match self {
-            AgentInput::Steer { from, kind, .. } | AgentInput::FollowUp { from, kind, .. } => {
-                if from.is_some() == kind.is_some() {
-                    Ok(())
-                } else {
-                    Err(AgentInputError::UnpairedOriginTags)
-                }
-            }
-            AgentInput::Interrupt
-            | AgentInput::ModelCompleted { .. }
-            | AgentInput::ModelFailed { .. }
-            | AgentInput::ToolCompleted { .. } => Ok(()),
+            content: TurnInput(content),
         }
     }
 }
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentInputError {
-    UnpairedOriginTags,
-}
-
-impl fmt::Display for AgentInputError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnpairedOriginTags => write!(f, "from and kind tags must be paired"),
-        }
-    }
-}
-
-impl std::error::Error for AgentInputError {}
 
 /// Runtime input to the live agent FSM.
 ///
@@ -158,8 +85,10 @@ pub(crate) enum AgentEvent {
     Interrupt,
     StartTurn {
         turn_id: TurnId,
-        input: UserMessage,
-        origin: Option<TurnOrigin>,
+        input: TurnInput,
+    },
+    Steer {
+        input: TurnInput,
     },
     ModelCompleted {
         action_id: ActionId,
@@ -177,15 +106,4 @@ pub(crate) enum AgentEvent {
         result: ToolResultMessage,
     },
     ContinueModel,
-}
-
-/// Origin tag attached to a turn that was started from an agent-routed input
-/// (e.g. a parent directive or a child report) rather than from a human user.
-///
-/// Present iff the originating `AgentInput::Steer`/`FollowUp` carried both a
-/// `from` and a `kind` — the paired-invariant enforced on `AgentInput`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TurnOrigin {
-    pub from: String,
-    pub kind: String,
 }

@@ -1,23 +1,14 @@
 use std::collections::VecDeque;
 
-use crate::event::{AgentEvent, AgentInput, TurnOrigin};
-use crate::ids::TurnId;
-use crate::message::UserMessage;
+use crate::event::{AgentEvent, AgentInput, TurnInput};
 use crate::state::AgentState;
+use agent_vocab::TurnId;
 
-/// A queued user input plus its optional sender/kind tags.
+/// A queued turn input.
 ///
-/// `from = None` (paired with `kind = None`) means the input came from the
-/// human user (or unknown origin — same thing at the core layer). `from =
-/// Some(session_id)` (paired with `kind = Some(kind_tag)`) means it was
-/// injected by another session (e.g. a parent directive or a child report).
-/// `from` and `kind` are always both `None` or both `Some`, matching the
-/// `AgentInput::Steer`/`FollowUp` invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UserInputEntry {
-    pub(crate) from: Option<String>,
-    pub(crate) kind: Option<String>,
-    pub(crate) content: UserMessage,
+    pub(crate) content: TurnInput,
 }
 
 /// Volatile prioritized queues feeding the live agent FSM.
@@ -33,31 +24,14 @@ pub struct Mailbox {
 }
 
 impl Mailbox {
-    pub(crate) fn push_input(&mut self, input: AgentInput) -> Result<(), crate::AgentInputError> {
-        input.validate()?;
+    pub(crate) fn push_input(&mut self, input: AgentInput) {
         match input {
             AgentInput::Interrupt => self.request_interrupt(),
-            AgentInput::Steer {
-                from,
-                kind,
-                content,
-            } => {
-                self.steer.push_back(UserInputEntry {
-                    from,
-                    kind,
-                    content,
-                });
+            AgentInput::Steer { content } => {
+                self.steer.push_back(UserInputEntry { content });
             }
-            AgentInput::FollowUp {
-                from,
-                kind,
-                content,
-            } => {
-                self.follow_up.push_back(UserInputEntry {
-                    from,
-                    kind,
-                    content,
-                });
+            AgentInput::FollowUp { content } => {
+                self.follow_up.push_back(UserInputEntry { content });
             }
             AgentInput::ModelCompleted {
                 action_id,
@@ -99,7 +73,6 @@ impl Mailbox {
                 });
             }
         }
-        Ok(())
     }
 
     #[cfg(test)]
@@ -118,44 +91,38 @@ impl Mailbox {
     #[cfg(test)]
     fn push_steer(&mut self, input: impl Into<String>) {
         self.steer.push_back(UserInputEntry {
-            from: None,
-            kind: None,
-            content: UserMessage::text(input),
+            content: TurnInput(agent_vocab::UserMessage::text(input)),
         });
     }
 
     #[cfg(test)]
     fn push_follow_up(&mut self, input: impl Into<String>) {
         self.follow_up.push_back(UserInputEntry {
-            from: None,
-            kind: None,
-            content: UserMessage::text(input),
+            content: TurnInput(agent_vocab::UserMessage::text(input)),
         });
     }
 
-    /// Pop the next queued user input entry (steer before follow-up),
-    /// preserving the `from`/`kind` tags it was enqueued with.
+    /// Pop the next queued user input entry (steer before follow-up).
     fn pop_user_input_entry(&mut self) -> Option<UserInputEntry> {
         self.steer
             .pop_front()
             .or_else(|| self.follow_up.pop_front())
     }
 
+    fn pop_steer_input_entry(&mut self) -> Option<UserInputEntry> {
+        self.steer.pop_front()
+    }
+
     /// Drain every queued user input as reconstructed `AgentInput` values,
-    /// preserving priority order (steer before follow-up) and the
-    /// `from`/`kind` tags each entry was enqueued with.
+    /// preserving priority order (steer before follow-up).
     ///
     /// Notifications and interrupt state are left untouched.
     pub(crate) fn drain_pending_inputs(&mut self) -> Vec<AgentInput> {
         let mut drained = Vec::with_capacity(self.steer.len() + self.follow_up.len());
         drained.extend(self.steer.drain(..).map(|entry| AgentInput::Steer {
-            from: entry.from,
-            kind: entry.kind,
             content: entry.content,
         }));
         drained.extend(self.follow_up.drain(..).map(|entry| AgentInput::FollowUp {
-            from: entry.from,
-            kind: entry.kind,
             content: entry.content,
         }));
         drained
@@ -183,18 +150,18 @@ impl Mailbox {
         }
 
         match state {
-            AgentState::ReadyToContinue { .. } => Some(AgentEvent::ContinueModel),
-            AgentState::Idle => self.pop_user_input_entry().map(|entry| {
-                let origin = entry
-                    .from
-                    .zip(entry.kind)
-                    .map(|(from, kind)| TurnOrigin { from, kind });
-                AgentEvent::StartTurn {
+            AgentState::ReadyToContinue { .. } => self
+                .pop_steer_input_entry()
+                .map(|entry| AgentEvent::Steer {
+                    input: entry.content,
+                })
+                .or(Some(AgentEvent::ContinueModel)),
+            AgentState::Idle => self
+                .pop_user_input_entry()
+                .map(|entry| AgentEvent::StartTurn {
                     turn_id: next_turn_id,
                     input: entry.content,
-                    origin,
-                }
-            }),
+                }),
             AgentState::RunningModel { .. } | AgentState::RunningTools { .. } => None,
         }
     }
@@ -213,8 +180,10 @@ impl Mailbox {
 mod tests {
     use super::*;
     use crate::event::AgentEvent;
-    use crate::ids::{ActionId, ToolCallId};
-    use crate::message::{AssistantMessage, ToolResultMessage, ToolResultStatus};
+    use agent_vocab::UserMessage;
+    use agent_vocab::{
+        ActionId, AssistantMessage, ToolCallId, ToolResultMessage, ToolResultStatus,
+    };
 
     fn tool_result(id: u64, name: &str) -> ToolResultMessage {
         ToolResultMessage {
@@ -259,11 +228,11 @@ mod tests {
 
         assert_eq!(
             mailbox.pop_user_input_entry().map(|e| e.content),
-            Some(UserMessage::text("steer"))
+            Some(TurnInput(UserMessage::text("steer")))
         );
         assert_eq!(
             mailbox.pop_user_input_entry().map(|e| e.content),
-            Some(UserMessage::text("follow-up"))
+            Some(TurnInput(UserMessage::text("follow-up")))
         );
         assert!(mailbox.pop_user_input_entry().is_none());
     }
@@ -284,9 +253,7 @@ mod tests {
             mailbox.next_event(
                 &AgentState::RunningTools {
                     turn_id: TurnId(1),
-                    tool_calls: Vec::new(),
-                    tool_action_ids: Vec::new(),
-                    completed_results: Vec::new(),
+                    tools: Vec::new(),
                     next_result_index: 0,
                 },
                 TurnId(99)
@@ -297,9 +264,7 @@ mod tests {
             mailbox.next_event(
                 &AgentState::RunningTools {
                     turn_id: TurnId(1),
-                    tool_calls: Vec::new(),
-                    tool_action_ids: Vec::new(),
-                    completed_results: Vec::new(),
+                    tools: Vec::new(),
                     next_result_index: 0,
                 },
                 TurnId(99)
@@ -311,71 +276,40 @@ mod tests {
                 &AgentState::ReadyToContinue { turn_id: TurnId(1) },
                 TurnId(99)
             ),
+            Some(AgentEvent::Steer {
+                input: TurnInput(UserMessage::text("steer")),
+            })
+        );
+        assert_eq!(
+            mailbox.next_event(
+                &AgentState::ReadyToContinue { turn_id: TurnId(1) },
+                TurnId(99)
+            ),
             Some(AgentEvent::ContinueModel)
         );
         assert_eq!(
             mailbox.next_event(&AgentState::Idle, TurnId(2)),
             Some(AgentEvent::StartTurn {
                 turn_id: TurnId(2),
-                input: UserMessage::text("steer"),
-                origin: None,
-            })
-        );
-        assert_eq!(
-            mailbox.next_event(&AgentState::Idle, TurnId(3)),
-            Some(AgentEvent::StartTurn {
-                turn_id: TurnId(3),
-                input: UserMessage::text("follow-up"),
-                origin: None,
+                input: TurnInput(UserMessage::text("follow-up")),
             })
         );
     }
 
     #[test]
-    fn tagged_steer_surfaces_turn_origin_on_next_event() {
+    fn user_steer_surfaces_user_turn_input() {
         let mut mailbox = Mailbox::default();
-        mailbox
-            .push_input(AgentInput::steer_tagged(
-                "parent",
-                "agent_directive",
-                "do X",
-            ))
-            .expect("test input should be valid");
+        mailbox.push_input(AgentInput::steer("plain"));
 
         let event = mailbox
             .next_event(&AgentState::Idle, TurnId(1))
-            .expect("tagged steer should surface as StartTurn");
+            .expect("user steer should surface as StartTurn");
 
         assert_eq!(
             event,
             AgentEvent::StartTurn {
                 turn_id: TurnId(1),
-                input: UserMessage::text("do X"),
-                origin: Some(TurnOrigin {
-                    from: "parent".to_string(),
-                    kind: "agent_directive".to_string(),
-                }),
-            }
-        );
-    }
-
-    #[test]
-    fn untagged_steer_surfaces_without_origin() {
-        let mut mailbox = Mailbox::default();
-        mailbox
-            .push_input(AgentInput::steer("plain"))
-            .expect("test input should be valid");
-
-        let event = mailbox
-            .next_event(&AgentState::Idle, TurnId(1))
-            .expect("untagged steer should surface as StartTurn");
-
-        assert_eq!(
-            event,
-            AgentEvent::StartTurn {
-                turn_id: TurnId(1),
-                input: UserMessage::text("plain"),
-                origin: None,
+                input: TurnInput(UserMessage::text("plain")),
             }
         );
     }

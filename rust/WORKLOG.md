@@ -1,5 +1,45 @@
 # Rust Rewrite Worklog
 
+## 2026-05-12
+
+### Compaction And History Forest Proposal
+
+Added `rust/docs/compaction-and-history-forest.md` to capture the proposed
+model where rewind, fork, and compaction share the same transcript-forest
+primitive. The key design choice is to make compaction append a new
+model-visible root with a lineage pointer to the summarized source leaf, rather
+than replacing the active path returned from the harness.
+
+Implemented the first pass of that proposal:
+
+- Added `TranscriptItem::CompactionSummary` with `source_session_id`,
+  `source_leaf_id`, `summary`, `tokens_before`, and `last_turn_id`.
+- Removed the generic `InjectedMessage` transcript path from vocabulary, core,
+  session, providers, and web rendering. The only non-turn transcript context
+  we currently need is typed compaction summary context.
+- Removed session-owned replacement-context compaction:
+  `CompactionState`, `SessionAction::RequestCompaction`,
+  `SessionInput::CompactionCompleted`, and harness compaction RPC methods.
+- Moved compaction completion to `agent-store` as a Postgres compare-and-set
+  transaction. It inserts a compacted root with `parent_id = null`, updates
+  `sessions.active_leaf_id`, marks the compaction action complete/stale/error,
+  and emits transcript/history/compaction events atomically.
+- Added a daemon-owned provider compaction path with no tools. It summarizes
+  only the dynamic transcript/model context; the global stable system prompt
+  remains provider configuration and continues to be rendered before transcript
+  context on ordinary model calls.
+- Updated the web transcript and picker types for `compaction_summary`. The
+  main conversation renders the active branch only, while rewind/fork pickers
+  can target entries across the full transcript tree.
+
+Verification:
+
+- `cargo check --workspace` passes.
+- `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test --workspace`
+  passes. The explicit linker is required on this machine because the default
+  profile `cc` is GCC and cannot find macOS `libiconv`.
+- `npm run build` in `packages/web` passes.
+
 ## 2026-05-10
 
 ### Scope
@@ -212,9 +252,10 @@ avoids broad plugin/general-user machinery until there is a concrete consumer.
   was still running.
 - Current-session picker testing caught a hydration race: invoking `/fork` or
   `/rewind` immediately after selecting a session could open against an empty
-  local `entries` array. The slash handlers now refresh `history.tree` before
-  displaying either picker and pass the freshly loaded entries directly into
-  the dialog instead of relying on React state flush timing.
+  local `entries` array. The slash handlers now refresh the expanded
+  `session.get` snapshot before displaying either picker and pass the freshly
+  loaded entries directly into the dialog instead of relying on React state
+  flush timing.
 - Restored slash autocomplete as a shallow command-name helper. While typing a
   partial command, Enter accepts the highlighted completion and inserts a
   trailing space; because the menu only appears for a bare command token, the
@@ -240,7 +281,7 @@ avoids broad plugin/general-user machinery until there is a concrete consumer.
   following the Bigband/Claude Relay pattern instead of exposing raw event
   records.
 - The web client intentionally keeps no durable RAM staging layer. It subscribes
-  to durable session events, refreshes `session.get` / `history.tree`, and lets
+  to transient session events, refreshes expanded `session.get`, and lets
   Postgres-backed daemon state remain the source of truth.
 - Duplicate websocket input retries with the same `client_input_id` now return
   the original queued input without emitting a second `input.queued` event.
@@ -289,7 +330,8 @@ Manual websocket scenarios completed:
 - Daemon death/restart recovery with stale actions, crashed turn tail,
   `turn.finished`, and `session.recovered` replay.
 - Event replay high-water behavior: `events.subscribe(after_event_id)` returned
-  durable replay without duplicating those events as live frames.
+  buffered replay while a session was active without duplicating those events
+  as live frames.
 - Real Codex text turn through websocket using `~/.codex/auth.json`.
 - Real Codex image-URL turn through websocket using the streamed Responses API.
 
@@ -315,9 +357,9 @@ the refreshed tokens back to `~/.codex/auth.json`, and retries the model request
 once. There is no broad retry loop or fallback provider; a second failure is
 persisted as the real model error.
 
-UI decision: durable `model.error` events are now surfaced as visible notices.
-The transcript may still show a crashed turn when the model fails, but the user
-also sees the provider error that caused it.
+UI decision: live `model.error` events are surfaced as visible notices. The
+transcript may still show a crashed turn when the model fails, but old provider
+error notices are not durable session history.
 
 Follow-up browser finding: after `/new <title>` the React selected-session state
 changed, but the mutable ref used by immediate sends could still contain the
@@ -409,8 +451,8 @@ paths. Changes made from that review:
   transition that consumed it.
 - Recovery runs before idle-gated mutations.
 - Stale completion checks use persisted attempt identity.
-- Event replay now tracks a per-socket high-water mark so replayed durable
-  events are not duplicated by buffered live broadcasts.
+- Event replay now tracks a per-socket high-water mark so replayed buffered
+  events are not duplicated by live broadcasts.
 - Documentation now describes the actual harness surface and the real provider
   credential paths.
 
@@ -421,12 +463,11 @@ paths. Changes made from that review:
   input into transcript/action/event state, and only then dispatches follow-on
   work. Retrying with the same stable draft-owned `session_id` returns the
   existing session instead of creating another row.
-- Changed ordinary idle `input.follow_up` / `input.steer` handling so messages
-  are fed directly into the session when no work or queued backlog exists.
-  Busy-session inputs still use `queued_inputs`.
-- Hardened queued-input consumption: the pump claims a row as `consuming` with
-  a claim id, `input.replace_queued` and `input.cancel_queued` only work while
-  the row is still `queued`, and the final `consuming -> consumed` update is
+- Changed ordinary idle `input.follow_up` handling so messages are fed directly
+  into the session when no work or queued backlog exists. Busy-session inputs
+  still use `queued_inputs`; visible steering is queued-row promotion.
+- Hardened queued-input consumption: the session driver claims a row as
+  `consuming` with a claim id, and the final `consuming -> consumed` update is
   validated inside the transcript/action/event transaction.
 - Added abandoned-claim recovery by resetting `consuming` rows to `queued` when
   a session is first touched after daemon restart.
@@ -452,18 +493,18 @@ paths. Changes made from that review:
 ### Atomic Input Ledger And Branch-Aware Pickers
 
 - Finished the `client_input_id` idempotency path for idle inputs. Immediate
-  `input.follow_up`, `input.steer`, and `session.start` now record a consumed
-  input ledger row in the same Postgres transaction that appends transcript,
-  action, active-leaf, and event state. Retrying a lost websocket response
-  returns the durable record instead of appending a duplicate user message.
+  `input.follow_up` and `session.start` now record a consumed input ledger row
+  in the same Postgres transaction that appends transcript, action, active-leaf,
+  and event state. Retrying a lost websocket response returns the durable record
+  instead of appending a duplicate user message.
 - Added optional `expected_active_leaf_id` validation for user input and
   `history.rewind`. The web UI records the base active leaf for composer drafts
   and sends it back so restored historical edits cannot silently land on a
   newer branch.
-- Serialized source-mutating session operations through the same per-session
-  pump lock used for turn driving. Rewind, configure, and compaction now share
-  the source-mutation critical section with input pumping instead of relying on
-  a separate RAM staging model.
+- Serialized source-mutating session operations through the per-session
+  `SessionDriver`. Rewind, configure, and compaction now share the same
+  source-mutation critical section as input driving instead of relying on a
+  separate RAM staging model.
 - Tightened queued-input failure handling: if a claimed queued input cannot be
   fed into the session, the daemon moves that exact claim back to `queued`
   before returning the input error.
@@ -524,8 +565,8 @@ paths. Changes made from that review:
   `config.rs`, `types.rs`, `auth.rs`, `codec.rs`, `provider_runtime.rs`,
   `runtime.rs`, and `state.rs`, with persistence now owned by `agent-store`.
 - Kept websocket routing and RPC handlers in `main.rs`; moved live session
-  pump/dispatch/recovery into `runtime.rs` so handler code no longer owns the
-  turn lifecycle.
+  driving, dispatch, and recovery into `runtime.rs` so handler code no longer
+  owns the turn lifecycle.
 - Moved Postgres SQL and transaction helpers out of daemon control flow, first
   into a daemon repository module and then into `agent-store::PostgresAgentStore`.
 - Moved Codex credential refresh into `auth.rs` and provider selection into
@@ -568,10 +609,11 @@ paths. Changes made from that review:
 - Moved `StoredSession` and `StoredTranscriptEntry` into `agent-session`, where
   they describe live-session snapshots rather than a pluggable backend API.
 - Slimmed `agent-daemon` further: it now owns websocket routing, auth,
-  provider/tool dispatch, recovery orchestration, and live session pumping, but
+  provider/tool dispatch, recovery orchestration, and live session driving, but
   not the SQL implementation.
-- Removed a stale `agent-vocab` dependency from `agent-store`; the store depends
-  on `agent-session` for the session/action/transcript shapes it persists.
+- Split store imports by ownership: `agent-store` depends directly on
+  `agent-vocab` for message/config vocabulary and on `agent-session` for
+  session snapshots and actions.
 - Cleaned the local Postgres database of 37 disposable verification sessions.
   The remaining visible sessions are the two real-looking web sessions.
 - Moved the Postgres store from `tokio-postgres` to SQLx. `PostgresAgentStore`
@@ -647,3 +689,252 @@ paths. Changes made from that review:
   source-non-mutating "copy from any transcript entry" operation. The frontend
   maps both operations from the same transcript-entry history data but applies a
   narrower rewind filter.
+
+### Kernel Simplification Pass
+
+- Made `agent-vocab` the canonical import path for IDs, messages, transcript
+  items, provider config, and tool-result vocabulary. `agent-core` now exports
+  only `AgentInput`, `TurnInput`, `AgentAction`, and `AgentCoreLoop`.
+- Removed `TurnOrigin` and the tagged steer/follow-up constructors. The core
+  now distinguishes only user input from generic injected context; it carries no
+  subagent source/kind routing metadata.
+- Kept `InjectedMessage.kind` as transcript vocabulary for caller-authored
+  notes such as compaction summaries, not as a subagent protocol.
+- Collapsed the session model-completion path so provider completions with
+  token-count updates must use `SessionInput::ModelCompleted`; direct
+  `AgentSession::enqueue_input(AgentInput::ModelCompleted { .. })` is rejected.
+- Simplified live tool state in `agent-core` from parallel vectors into one
+  per-tool slot containing the call, action id, and optional result.
+- Trimmed `TranscriptStore` by removing unused public helpers such as
+  `entry_count` and the boundary-copy helper. Active path enumeration is now an
+  internal materialization detail.
+- Removed the remaining duplicate completion-correlation logic. Model/tool
+  completions now compare through one `CompletionTarget` shape used by session
+  actions and outstanding action tracking.
+- Removed `SessionInput::Agent`; plain agent inputs now enter only through
+  `AgentSession::enqueue_input`, while session-owned inputs such as model
+  completions with context tokens enter through `enqueue_session_input`.
+- Folded daemon recovery/loading helpers into `SessionDriver` so there are no
+  parallel free-function and driver-method paths.
+- Collapsed Postgres event insertion to one SQLx helper shared by pool and
+  transaction callers.
+- Made compaction invalidation account for a second compaction request that
+  arrived while a compaction was already running. Invalidation still cancels
+  both the active request and that queued follow-up, but `AbandonedCompaction`
+  now carries the discarded-request fact and the failed event says so.
+- Removed the unused `ModelContext::from_transcript_items_closing_open_turn_as_crashed`
+  convenience helper and the public `AgentSession::from_transcript_items`
+  wrapper. Tests now compose through `ModelContext::from_transcript_items` and
+  `AgentSession::from_model_context` directly.
+
+### Review Phase 2-4 Follow-Up
+
+- Made spawned model/tool completion failures observable. Provider/tool domain
+  failures still flow through normal session inputs, but infrastructure
+  failures from stale attempts, persistence, or post-completion driving now log,
+  mark the action stale, and emit an error event instead of leaving a running
+  action row behind.
+- Hardened websocket handling so malformed JSON returns an RPC error frame
+  without dropping the connection. Broadcast lag now replays missed events from
+  Postgres using the per-subscription high-water cursor.
+- Configured the Postgres pool explicitly and added a shutdown drain for
+  in-flight dispatch tasks before closing the pool.
+- Pruned the websocket RPC surface: empty durable session creation, direct
+  `input.steer`, and queued replace/cancel RPCs are gone. User-visible steering
+  is only queued follow-up promotion.
+- Expanded `session.get` with `include_entries=true` so the web client can
+  hydrate snapshot and transcript with one RPC. `history.tree` remains as a
+  manual/debug endpoint.
+- Wired real event replay in the web client by tracking `last_event_id` per
+  session and passing it into `events.subscribe` after reconnect/session
+  switches.
+- Moved the visible composer into `composer.tsx`, added a `RpcClient`
+  interface, removed the `composerHydrating` requestAnimationFrame gate,
+  centralized slash-prefix parsing, generated fresh `client_input_id`s per send,
+  validated stored composer drafts, and tightened the TypeScript wire unions.
+- Pruned completed dispatch task handles as new dispatches are registered so
+  the graceful-shutdown drain tracks live/recent work instead of growing for the
+  entire daemon lifetime.
+- Re-verified the pass with the Rust test suite, the web production build, the
+  web unit tests, a manual websocket replay/bad-frame script, and a real browser
+  smoke flow for markdown rendering plus rewind/fork dialogs.
+
+### Append-Only Compaction Forest Pass
+
+- Implemented the `rust/docs/compaction-and-history-forest.md` proposal as the
+  active compaction model: compaction now appends a typed
+  `TranscriptItem::CompactionSummary` root instead of replacing the active
+  transcript path.
+- Removed generic `InjectedMessage` vocabulary and the session-owned
+  replacement-context compaction FSM. `agent-session` treats compaction
+  summaries as valid boundary roots and otherwise stays focused on turn
+  mechanics, rewind, and fork.
+- Kept the configured global system prompt out of compaction input. Normal
+  provider turns still render the stable prompt first, then dynamic daemon
+  context, then transcript history; compaction summarizes only the dynamic
+  transcript/model context materialized from the chosen active leaf.
+- Made manual compaction a durable Postgres action barrier. Queued follow-ups
+  can be accepted while compaction runs, but they are not consumed into the
+  transcript until the compaction action completes or fails.
+- Fixed daemon recovery around that barrier. A clean boundary with unfinished
+  action rows is valid live work, not transcript corruption. On daemon startup,
+  leftover unfinished actions are marked stale because provider/tool futures
+  cannot survive the process boundary; open transcript tails are then repaired
+  on first touch with a crashed turn boundary.
+- Verified with `cargo check --workspace`, `CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/usr/bin/cc cargo test --workspace`,
+  and `npm run build`.
+- Verified against a real Postgres database and websocket client: two harness
+  turns were compacted by the Codex provider into a `compaction_summary` root,
+  the summary preserved transcript facts without leaking a stable global prompt
+  marker, a follow-up queued during compaction was consumed only after
+  `compaction.completed`, and a simulated daemon restart marked an unfinished
+  model action stale then repaired the open turn as crashed.
+- Dropped the temporary `pi_relay_forest_*` verification databases after the
+  manual websocket checks.
+
+### Web Draft Removal And Tree Picker
+
+- Removed web-only draft sessions and durable composer drafts from the React
+  state model. The sidebar now lists only durable Postgres sessions, and "New
+  session" simply clears the selected session so the first real composer send
+  creates the durable session through `session.start`.
+- Added a startup cleanup for the old localStorage draft keys. The UI no longer
+  reads those keys, so stale browser-local drafts cannot reappear as fake
+  sessions.
+- Kept rewind/fork editing as a transient composer convenience: selecting a
+  historical user message restores its text into the visible composer, but the
+  transcript forest remains the source of truth.
+- Reworked the rewind/fork picker to render the transcript forest as a tree,
+  including sibling branches and active-path highlighting. Rewind enables only
+  editable user-message targets; fork can branch from selectable transcript
+  points.
+- Added a delayed refresh after terminal activity events so the UI has another
+  chance to observe derived `idle` state if the immediate event-driven refresh
+  lands while the daemon is still draining follow-on work.
+- Verified with `npm run test` and `npm run build` in `packages/web`.
+
+### Real Browser History Flow Verification
+
+- Drove Chrome through the web app against a fresh Postgres database and the
+  real Codex provider. The run used real composer input, send/stop button
+  clicks, slash autocomplete, rewind/fork picker rows, provider-backed
+  compaction, and real bash tool calls.
+- Verified normal multi-turn output, slash autocomplete followed by execution,
+  idle rewind-to-edit, fork-before-user with restored composer text, manual
+  compaction into a `compaction_summary` root, post-compaction follow-up, fork
+  from the compaction summary, and rewind from the compacted forest back into a
+  pre-compaction user message.
+- Verified fork while the source session was running. The source turn continued
+  independently while the child session accepted its own real provider turn.
+- Found and fixed the running rewind failure. `CancelSessionWork` is a
+  session-wide invalidation event, not a persisted model/tool action row; the
+  store now records `session.work_cancelled` directly instead of routing it
+  through `action_payload`. That keeps interrupt persistence atomic and
+  prevents the active runtime from being dropped before the interrupted tail is
+  committed.
+- Late model/tool completions now check whether their exact action attempt is
+  still completable before requiring an active runtime. After interrupt or
+  rewind, stale provider/tool completions are ignored without emitting a
+  spurious `model.error` or `tool.error`.
+- Verified running rewind after the fix: the UI interrupted the active turn,
+  rewound to the selected user message, restored composer text, sent the
+  replacement, and kept the abandoned running branch off the active path.
+- Verified compact-while-running rejection and the stop button. Running compact
+  did not create a new compaction action, and stop committed an interrupted
+  turn plus `session.work_cancelled`.
+- Verified queued follow-ups and per-row steer promotion in the queue pane with
+  a long real bash tool call. The promoted row persisted as `steer`, and after
+  stopping the active turn the steer message was consumed before the ordinary
+  follow-up.
+- Final verification passed with `npm run test`, `npm run build`, and
+  `SDKROOT=$(xcrun --show-sdk-path) MACOSX_DEPLOYMENT_TARGET=15.0
+  CC=/Library/Developer/CommandLineTools/usr/bin/clang
+  CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/Library/Developer/CommandLineTools/usr/bin/clang
+  cargo test`.
+
+### Fork Preserves Session Forests
+
+- Adjusted `history.fork` so a child session receives the source session's full
+  transcript forest snapshot, not only the selected root-to-leaf path. The
+  child active leaf still points at the requested fork target, and non-boundary
+  targets still get an appended interrupted tail in the child.
+- This keeps compaction roots and pre-compaction branches navigable inside a
+  forked session. Compaction remains a node/root inside a session boundary; it
+  is not treated as a session boundary or as a destructive replacement.
+- Updated websocket and architecture docs to state the whole-forest fork
+  behavior explicitly.
+
+### Same-Session History Switching
+
+- Added a `/switch` picker in the web UI. It uses the same transcript tree as
+  rewind/fork. Selecting a completed turn or `compaction_summary` root moves
+  the active leaf inside the same session through `history.rewind`; it does not
+  create a new session.
+- Verified in the live browser against the Postgres-backed UI database:
+  `/switch` selected the compaction root inside the original session, then
+  selected a pre-compaction `End of turn 1` boundary, then restored the session
+  to its original active leaf. Session count stayed stable, and the source
+  session still had one compaction root plus the full transcript forest.
+- Removed the temporary `session_verify_full_forest_fork` row after the manual
+  verification pass.
+
+### Switch Replaces Rewind Command
+
+- Removed `/rewind` and `/tree` from the web slash-command surface. The tree is
+  now a picker rendering detail, and same-session history movement is exposed
+  only through `/switch`.
+- Expanded `/switch` targets to include historical user messages. Selecting one
+  uses the existing non-destructive `history.rewind` RPC to move to the
+  previous boundary/root and restores that message into the composer. Completed
+  turn boundaries and compaction roots still switch the active leaf directly.
+- Kept `/switch` idle-only before the picker opens and at target selection time.
+  `/fork` remains allowed while the source session is running and still creates
+  a new session.
+- Verified with `npm run test`, `npm run build`, and a live browser smoke:
+  autocomplete no longer showed `/rewind` or `/tree`, `/switch` restored an
+  editable user message, running `/switch` surfaced the stop-first error, and
+  `/fork` created a child while the source had active work. Temporary
+  `simplify-*` smoke sessions were deleted afterward.
+
+### Follow-Up Queueing and Tool Output Bounds
+
+- Investigated session `9a059b37-d14f-4429-b612-5610a4f06ea5`. The follow-up
+  failure came from validating `expected_active_leaf_id` before deciding whether
+  the input should be queued. That validation is now only applied to idle,
+  immediately-materialized inputs; follow-ups for active sessions are future
+  queue records and no longer fail just because the live leaf moved.
+- Updated the web client to omit `expected_active_leaf_id` while the selected
+  session is active. Idle sends still carry the optimistic history check.
+- Traced the steer crash to an oversized historical bash tool result. Built-in
+  `read` and `bash` now bound returned tool output, and provider requests also
+  bound historical tool results so already-existing transcripts cannot overflow
+  model context just by being replayed.
+- Verified with `npm run test`, `npm run build`,
+  `SDKROOT=$(xcrun --show-sdk-path) MACOSX_DEPLOYMENT_TARGET=15.0
+  CC=/Library/Developer/CommandLineTools/usr/bin/clang
+  CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=/Library/Developer/CommandLineTools/usr/bin/clang
+  cargo test -p agent-tools -p agent-daemon`, and a websocket smoke that
+  queued a follow-up with an intentionally stale leaf while the session was
+  running. The temporary smoke session was deleted afterward.
+- Fixed steer materialization at the tool-to-model boundary. The core now stops
+  at `ReadyToContinue`, the daemon claims a queued steer before continuing the
+  model, and the steer is appended as a same-turn `user_message` after the tool
+  results. Follow-ups do not use this mid-turn slot. Compaction remains a
+  barrier, rewind/switch remain idle-only, and fork does not move queued inputs
+  out of the source session.
+- Verified by websocket harness smoke: a model requested a sleeping bash tool,
+  a follow-up was queued and promoted while the tool was running, and after the
+  tool completed the next model action's context contained `tool_result` then
+  the promoted steer user message with no `turn_finished` between them. The
+  temporary smoke session was deleted afterward.
+- Moved stale error-notice handling out of the web UI. The Postgres `events`
+  table is now a transient reconnect buffer: missing/null `after_event_id`
+  subscribes from the current event head, and once a session publishes
+  `session.idle`, the daemon clears that session's event rows. Idle
+  configuration, same-session history switching, and fork child creation clear
+  the same way after live publication. Durable state still comes from
+  `session.get`/`history.tree`, so old `model.error` events are not stored as
+  session history or re-shown as fresh notifications.
+- Moved fork lineage needed by empty-session pruning out of transient events and
+  into child session metadata under `metadata.fork`, so event cleanup does not
+  make intentionally empty fork children look accidental.

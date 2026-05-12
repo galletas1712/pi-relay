@@ -47,6 +47,23 @@ pub trait AgentTool: Send + Sync {
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage>;
 }
 
+const MAX_TOOL_OUTPUT_CHARS: usize = 24_000;
+const TOOL_OUTPUT_HEAD_CHARS: usize = 12_000;
+const TOOL_OUTPUT_TAIL_CHARS: usize = 8_000;
+
+pub fn limit_tool_output(output: String) -> String {
+    let total = output.chars().count();
+    if total <= MAX_TOOL_OUTPUT_CHARS {
+        return output;
+    }
+
+    let head: String = output.chars().take(TOOL_OUTPUT_HEAD_CHARS).collect();
+    let tail_chars: Vec<char> = output.chars().rev().take(TOOL_OUTPUT_TAIL_CHARS).collect();
+    let tail: String = tail_chars.into_iter().rev().collect();
+    let omitted = total.saturating_sub(TOOL_OUTPUT_HEAD_CHARS + TOOL_OUTPUT_TAIL_CHARS);
+    format!("{head}\n\n[tool output truncated: {omitted} characters omitted]\n\n{tail}")
+}
+
 #[derive(Default)]
 pub struct ToolRegistry {
     tools: BTreeMap<String, Box<dyn AgentTool>>,
@@ -113,7 +130,7 @@ impl AgentTool for ReadTool {
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
         let args: ReadArgs = serde_json::from_str(&call.args_json)?;
         let path = ctx.cwd.join(args.path);
-        let output = tokio::fs::read_to_string(path).await?;
+        let output = limit_tool_output(tokio::fs::read_to_string(path).await?);
         Ok(ToolResultMessage::success(
             call.id.clone(),
             &call.tool_name,
@@ -248,11 +265,53 @@ impl AgentTool for BashTool {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let text = limit_tool_output(text);
         let result = if output.status.success() {
             ToolResultMessage::success(call.id.clone(), &call.tool_name, text)
         } else {
             ToolResultMessage::error(call.id.clone(), &call.tool_name, text)
         };
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn leaves_short_tool_output_alone() {
+        assert_eq!(limit_tool_output("hello".to_string()), "hello");
+    }
+
+    #[test]
+    fn truncates_tool_output_with_head_and_tail() {
+        let output = format!(
+            "{}{}{}",
+            "a".repeat(TOOL_OUTPUT_HEAD_CHARS),
+            "b".repeat(5_000),
+            "c".repeat(TOOL_OUTPUT_TAIL_CHARS)
+        );
+        let limited = limit_tool_output(output);
+
+        assert!(limited.starts_with(&"a".repeat(TOOL_OUTPUT_HEAD_CHARS)));
+        assert!(limited.contains("[tool output truncated: 5000 characters omitted]"));
+        assert!(limited.ends_with(&"c".repeat(TOOL_OUTPUT_TAIL_CHARS)));
+        assert!(!limited.contains(&"b".repeat(5_000)));
+    }
+
+    #[test]
+    fn truncates_on_char_boundaries() {
+        let output = format!(
+            "{}{}{}",
+            "α".repeat(TOOL_OUTPUT_HEAD_CHARS),
+            "β".repeat(5_000),
+            "γ".repeat(TOOL_OUTPUT_TAIL_CHARS)
+        );
+        let limited = limit_tool_output(output);
+
+        assert!(limited.starts_with(&"α".repeat(TOOL_OUTPUT_HEAD_CHARS)));
+        assert!(limited.contains("5000 characters omitted"));
+        assert!(limited.ends_with(&"γ".repeat(TOOL_OUTPUT_TAIL_CHARS)));
     }
 }

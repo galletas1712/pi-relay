@@ -16,16 +16,29 @@ type Pending = {
 	reject: (error: Error) => void;
 };
 
-type EventHandler = (event: EventFrame) => void;
-type StatusHandler = (status: "connecting" | "open" | "closed" | "error") => void;
+export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
 
-export class AgentRpcClient {
+type EventHandler = (event: EventFrame) => void;
+type StatusHandler = (status: ConnectionStatus) => void;
+
+export interface RpcClient {
+	connect(): Promise<void>;
+	close(): void;
+	isOpen(): boolean;
+	onEvent(handler: EventHandler): () => void;
+	onStatus(handler: StatusHandler): () => void;
+	request<T>(method: string, params?: Record<string, unknown>): Promise<T>;
+}
+
+export class AgentRpcClient implements RpcClient {
 	private ws: WebSocket | null = null;
 	private nextId = 1;
 	private pending = new Map<string, Pending>();
 	private eventHandlers = new Set<EventHandler>();
 	private statusHandlers = new Set<StatusHandler>();
 	private openPromise: Promise<void> | null = null;
+	private closedByUser = false;
+	private reconnectTimer: number | null = null;
 
 	constructor(private readonly url: string) {}
 
@@ -33,6 +46,11 @@ export class AgentRpcClient {
 		if (this.ws?.readyState === WebSocket.OPEN) return Promise.resolve();
 		if (this.openPromise) return this.openPromise;
 
+		this.closedByUser = false;
+		if (this.reconnectTimer !== null) {
+			window.clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
+		}
 		this.emitStatus("connecting");
 		this.ws = new WebSocket(this.url);
 		this.openPromise = new Promise((resolve, reject) => {
@@ -67,12 +85,18 @@ export class AgentRpcClient {
 				pending.reject(new Error("websocket closed"));
 			}
 			this.pending.clear();
+			if (!this.closedByUser) this.scheduleReconnect();
 		});
 
 		return this.openPromise;
 	}
 
 	close(): void {
+		this.closedByUser = true;
+		if (this.reconnectTimer !== null) {
+			window.clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
+		}
 		this.ws?.close();
 		this.ws = null;
 	}
@@ -109,7 +133,13 @@ export class AgentRpcClient {
 	}
 
 	private handleMessage(message: MessageEvent<string>): void {
-		const data = JSON.parse(message.data) as RpcResponse<unknown> | EventFrame;
+		let data: RpcResponse<unknown> | EventFrame;
+		try {
+			data = JSON.parse(message.data) as RpcResponse<unknown> | EventFrame;
+		} catch {
+			this.emitStatus("error");
+			return;
+		}
 		if ("ok" in data) {
 			const pending = this.pending.get(data.id);
 			if (!pending) return;
@@ -126,8 +156,18 @@ export class AgentRpcClient {
 		for (const handler of this.eventHandlers) handler(data);
 	}
 
-	private emitStatus(status: "connecting" | "open" | "closed" | "error"): void {
+	private emitStatus(status: ConnectionStatus): void {
 		for (const handler of this.statusHandlers) handler(status);
+	}
+
+	private scheduleReconnect(): void {
+		if (this.reconnectTimer !== null) return;
+		this.reconnectTimer = window.setTimeout(() => {
+			this.reconnectTimer = null;
+			void this.connect().catch(() => {
+				if (!this.closedByUser) this.scheduleReconnect();
+			});
+		}, 750);
 	}
 }
 

@@ -1,4 +1,4 @@
-use agent_session::AgentSession;
+use agent_session::{AgentSession, SessionAction};
 use agent_store::SessionConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -34,22 +34,27 @@ pub(crate) struct RuntimeSession {
     pub(crate) config: SessionConfig,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DispatchAction {
+    pub(crate) row_id: String,
+    pub(crate) attempt_id: String,
+    pub(crate) action: SessionAction,
+    pub(crate) config: SessionConfig,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RpcMethod {
-    SessionCreate,
     SessionStart,
     SessionList,
     SessionGet,
+    SessionRename,
     SessionConfigure,
     ConfigGet,
     ConfigSet,
     EventsSubscribe,
     EventsUnsubscribe,
     InputFollowUp,
-    InputSteer,
     InputPromoteQueued,
-    InputReplaceQueued,
-    InputCancelQueued,
     InputInterrupt,
     HistoryTree,
     HistoryContext,
@@ -59,27 +64,22 @@ pub(crate) enum RpcMethod {
     CompactionRequest,
     HarnessModelComplete,
     HarnessModelFail,
-    HarnessCompactionComplete,
-    HarnessCompactionFail,
 }
 
 impl RpcMethod {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
-            "session.create" => Some(Self::SessionCreate),
             "session.start" => Some(Self::SessionStart),
             "session.list" => Some(Self::SessionList),
             "session.get" => Some(Self::SessionGet),
+            "session.rename" => Some(Self::SessionRename),
             "session.configure" => Some(Self::SessionConfigure),
             "config.get" => Some(Self::ConfigGet),
             "config.set" => Some(Self::ConfigSet),
             "events.subscribe" => Some(Self::EventsSubscribe),
             "events.unsubscribe" => Some(Self::EventsUnsubscribe),
             "input.follow_up" => Some(Self::InputFollowUp),
-            "input.steer" => Some(Self::InputSteer),
             "input.promote_queued" => Some(Self::InputPromoteQueued),
-            "input.replace_queued" => Some(Self::InputReplaceQueued),
-            "input.cancel_queued" => Some(Self::InputCancelQueued),
             "input.interrupt" => Some(Self::InputInterrupt),
             "history.tree" => Some(Self::HistoryTree),
             "history.context" => Some(Self::HistoryContext),
@@ -89,8 +89,6 @@ impl RpcMethod {
             "compaction.request" => Some(Self::CompactionRequest),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
-            "harness.compaction.complete" => Some(Self::HarnessCompactionComplete),
-            "harness.compaction.fail" => Some(Self::HarnessCompactionFail),
             _ => None,
         }
     }

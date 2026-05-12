@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use serde::{Deserialize, Serialize};
 
 use crate::ids::TurnId;
@@ -29,34 +27,32 @@ pub enum TranscriptItem {
         turn_id: TurnId,
         outcome: TurnOutcome,
     },
-    Injected(InjectedMessage),
+    CompactionSummary(CompactionSummary),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InjectedMessage {
-    pub kind: String,
-    pub content: String,
-    pub metadata: BTreeMap<String, String>,
+pub struct CompactionSummary {
+    pub source_session_id: String,
+    pub source_leaf_id: String,
+    pub summary: String,
+    pub tokens_before: Option<usize>,
+    pub last_turn_id: TurnId,
 }
 
-impl InjectedMessage {
-    pub fn new(kind: impl Into<String>, content: impl Into<String>) -> Self {
-        Self {
-            kind: kind.into(),
-            content: content.into(),
-            metadata: BTreeMap::new(),
-        }
-    }
-
-    pub fn with_metadata(
-        kind: impl Into<String>,
-        content: impl Into<String>,
-        metadata: BTreeMap<String, String>,
+impl CompactionSummary {
+    pub fn new(
+        source_session_id: impl Into<String>,
+        source_leaf_id: impl Into<String>,
+        summary: impl Into<String>,
+        tokens_before: Option<usize>,
+        last_turn_id: TurnId,
     ) -> Self {
         Self {
-            kind: kind.into(),
-            content: content.into(),
-            metadata,
+            source_session_id: source_session_id.into(),
+            source_leaf_id: source_leaf_id.into(),
+            summary: summary.into(),
+            tokens_before,
+            last_turn_id,
         }
     }
 }
@@ -67,10 +63,10 @@ impl TranscriptItem {
             TranscriptItem::TurnStarted { turn_id }
             | TranscriptItem::ToolCallStarted { turn_id, .. }
             | TranscriptItem::TurnFinished { turn_id, .. } => Some(*turn_id),
+            TranscriptItem::CompactionSummary(summary) => Some(summary.last_turn_id),
             TranscriptItem::UserMessage(_)
             | TranscriptItem::AssistantMessage(_)
-            | TranscriptItem::ToolResult(_)
-            | TranscriptItem::Injected(_) => None,
+            | TranscriptItem::ToolResult(_) => None,
         }
     }
 }

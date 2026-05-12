@@ -1,10 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_session::{
-    AssistantMessage, ModelContext, StoredSession, TranscriptStorageNode, TranscriptStore,
-    TranscriptStoreError, UserMessage,
+    ModelContext, StoredSession, TranscriptStorageNode, TranscriptStore, TranscriptStoreError,
 };
-use agent_vocab::{ContentBlock, TranscriptItem};
+use agent_vocab::{AssistantMessage, ContentBlock, TranscriptItem, UserMessage};
 use serde::Deserialize;
 use serde_json::Value;
 use uuid::Uuid;
@@ -22,16 +21,6 @@ pub(crate) fn parse_assistant_message(
 ) -> std::result::Result<AssistantMessage, RpcError> {
     serde_json::from_value(value)
         .map_err(|error| RpcError::new("invalid_params", error.to_string()))
-}
-
-pub(crate) fn parse_model_context(value: Value) -> std::result::Result<ModelContext, RpcError> {
-    let items_value = value
-        .get("items")
-        .cloned()
-        .ok_or_else(|| RpcError::new("invalid_params", "replacement.items is required"))?;
-    let items: Vec<TranscriptItem> = serde_json::from_value(items_value)
-        .map_err(|error| RpcError::new("invalid_params", error.to_string()))?;
-    Ok(ModelContext::from_transcript_items(items))
 }
 
 pub(crate) fn from_params<T: for<'de> Deserialize<'de>>(
@@ -76,7 +65,7 @@ pub(crate) fn recover_fork_branch_tail(
         .map(|entry| entry.item.clone())
         .collect::<Vec<_>>();
     let original_len = items.len();
-    let recovered = ModelContext::from_transcript_items_recovering_interrupted_tail(items)
+    let recovered = ModelContext::from_transcript_items_closing_open_turn_as_interrupted(items)
         .into_transcript_items();
     let mut parent_id = branch.last().map(|entry| entry.id.clone());
     for item in recovered.into_iter().skip(original_len) {
@@ -96,7 +85,7 @@ pub(crate) fn fork_branch_before_user_message(
     store: &TranscriptStore,
     user_leaf_id: &str,
 ) -> Vec<TranscriptStorageNode> {
-    let branch = store.branch_entries(Some(user_leaf_id));
+    let branch = store.path_entries_to(user_leaf_id);
     let previous_boundary_id = branch
         .iter()
         .rev()
@@ -106,7 +95,7 @@ pub(crate) fn fork_branch_before_user_message(
             _ => None,
         });
     previous_boundary_id
-        .map(|leaf_id| store.branch_entries(Some(leaf_id)))
+        .map(|leaf_id| store.path_entries_to(leaf_id))
         .unwrap_or_default()
 }
 

@@ -48,7 +48,7 @@ for local verification cleanup; it is not a lifecycle state and does not delete
 or mutate transcript history.
 
 Composer drafts for existing sessions are also web-owned `localStorage` state.
-They are used for restored historical user messages after rewind or fork, and
+They are used for restored historical user messages after switch or fork, and
 are deliberately not stored in `sessions.metadata` or transcript rows.
 
 ### Slash Commands Are Thin RPC Calls
@@ -59,16 +59,15 @@ frontend command model.
 - `/new [title]` creates a local draft session.
 - `/refresh` reloads sessions, tools, global config, and the current transcript.
 - `/status` reads the selected session snapshot.
-- `/rewind` opens a picker of visible rewind targets. User-message targets
-  rewind to the previous safe boundary and restore that message into the
-  composer for editing. The picker does not expose a bare root option; the
-  first user message is the visible way to rewind to root with editable text.
 - `/fork [title]` opens a picker of visible fork targets and can prefill the
   fork title. User-message targets fork from before the message and restore
   that message into the child composer.
+- `/switch` opens the same-session history picker. It is idle-only. User
+  message targets move the active leaf to the previous safe boundary and
+  restore that message into the composer for editing; completed turn and
+  compaction-summary targets simply become the active leaf.
 - `/compact` requests context compaction.
 - `/context [entry-id]` inspects materialized model context.
-- `/tree` reloads and summarizes the transcript tree.
 - `/system [clear|prompt...]` reads or writes the global daemon system prompt.
 - `/provider [kind model]` reads or updates the selected session provider.
 - `/tools` lists daemon tools.
@@ -89,7 +88,7 @@ it is not a transcript event and was visually misleading while the agent was
 still running. Errors still surface, while real conversation progress comes
 from transcript entries and activity/tool state.
 
-Rewind and fork do not accept raw transcript ids in the web UI. The picker is
+Switch and fork do not accept raw transcript ids in the web UI. The picker is
 the only user-facing path, so history mutations are chosen from visible turn
 context rather than opaque storage identifiers.
 
@@ -98,7 +97,7 @@ not rendered as transcript messages. Assistant tool calls render as compact
 collapsible rows inspired by Bigband and Claude Relay, with the matching result
 folded into the tool row instead of appearing as a separate raw event.
 
-The central transcript renders only the active root-to-leaf branch. Rewind does
+The central transcript renders only the active root-to-leaf branch. Switch does
 not delete abandoned rows from Postgres, but those off-branch rows disappear
 from the main conversation view. They remain available to the history tree and
 fork picker.
@@ -130,8 +129,8 @@ to accidentally couple to everything else now live elsewhere:
 - credential loading and Codex refresh in `auth.rs`
 - JSON-to-vocabulary parsing and transcript recovery helpers in `codec.rs`
 - provider selection and request execution in `provider_runtime.rs`
-- live session lifecycle, pump locking, queued-input materialization, dispatch,
-  and event publication in `runtime.rs`
+- live session lifecycle, `SessionDriver` serialization, queued-input
+  materialization, dispatch, and event publication in `runtime.rs`
 - process-local daemon state in `state.rs`
 - all Postgres SQL and transaction boundaries in
   `agent-store::PostgresAgentStore`
@@ -191,17 +190,17 @@ than trusting in-memory state that may be ahead of storage.
 ### No Durable RAM Staging Layer
 
 The frontend does not keep an authoritative transcript cache. It subscribes to
-events and refreshes `session.get` plus `history.tree` from the daemon. The
-daemon similarly avoids a second durable staging model in RAM; active memory is
-only a work-in-progress projection.
+events and refreshes `session.get` with `include_entries=true` from the daemon.
+The daemon similarly avoids a second durable staging model in RAM; active memory
+is only a work-in-progress projection.
 
 This keeps the Postgres-only direction clean: storage changes should not leak
 into frontend state semantics.
 
 ### Idle Input Skips The Queue, Busy Input Stays Durable
 
-When a session is idle, `input.follow_up`, `input.steer`, and `session.start`
-feed the message directly into the session and persist the resulting
+When a session is idle, `input.follow_up` and `session.start` feed the message
+directly into the session and persist the resulting
 transcript/actions/events before dispatching follow-on work. The same
 transaction records a consumed input ledger row when a `client_input_id` is
 present. That keeps the common path small without losing retry idempotency:
@@ -212,10 +211,18 @@ When a model/tool/compaction action is unfinished, composer sends remain
 `queued_inputs.status='queued'` follow-ups by default. Promoting a row changes
 its priority to `steer` and records `origin.promoted_at`; the queue consumes
 steers first in promotion order, then remaining follow-ups in creation order.
-Before the daemon materializes a queued row, it claims the row as `consuming`;
-queued edit/cancel/promote RPCs only work before that claim. The daemon only
-marks a claimed input `consumed` in the transaction that also appends the
-corresponding transcript and action events.
+If an active turn has just finished a tool batch and is about to request the
+model again, the daemon claims one queued steer before continuing and appends it
+as a same-turn `user_message` after the tool results. Follow-ups are not
+eligible for that mid-turn slot. During compaction there is no same-turn slot,
+so queued steers wait behind the compaction action and become the next turn from
+the compacted root. Rewind/switch remain idle-only, and fork copies transcript
+history without moving the source session's queued inputs.
+Before the daemon materializes a queued row, it claims the row as `consuming`.
+The websocket surface only exposes queued promotion; editing historical input
+uses interrupt plus rewind/fork picker semantics. The daemon only marks a
+claimed input `consumed` in the transaction that also appends the corresponding
+transcript and action events.
 
 That choice prevents a daemon-death gap where accepted user input has been moved
 into an in-memory mailbox but has not yet appeared in transcript history.
@@ -269,6 +276,38 @@ Interrupted and crashed states are transcript outcomes, not broad session
 lifecycle states. The session activity enum stays small: `idle`, `queued`, and
 `running`.
 
+### Compaction Is A Typed Root, Not A Replacement Transcript
+
+Compaction follows the proposal in `rust/docs/compaction-and-history-forest.md`.
+The daemon summarizes only the dynamic transcript/model context for the active
+leaf. It does not summarize or rewrite the global stable system prompt, which
+remains provider configuration rendered before transcript history on normal
+model calls.
+
+The summary is persisted as `TranscriptItem::CompactionSummary` with
+`parent_id = null`. Its `source_session_id` and `source_leaf_id` are lineage
+pointers for the UI/tree, not model-visible ancestry. Postgres installs that
+root with a compare-and-set transaction that also marks the compaction action
+complete and emits `history.compacted` / `compaction.completed`.
+
+This removed the old generic `InjectedMessage` path and the session-owned
+replacement-context compaction FSM. `agent-session` no longer asks a harness to
+return an arbitrary `ModelContext`; the only special transcript context shape is
+the typed compacted root.
+
+### The Web UI Does Not Own Session Drafts
+
+The web client no longer keeps a parallel list of browser-local session drafts.
+Only Postgres-backed sessions appear in the sidebar. Starting a new chat is a
+composer state: the selected session is cleared, and the first non-command send
+creates the durable session through `session.start`.
+
+This keeps the UI aligned with the append-only transcript forest. Rewind and
+fork are tree operations over durable transcript entries; their only extra UI
+convenience is restoring a selected user message into the composer for editing.
+That restored text is transient visible state, not a second session model or a
+localStorage-backed branch.
+
 ### Provider Scope Is Intentionally Small
 
 `agent-provider` targets OpenAI/Codex and Anthropic/Claude. The daemon reads
@@ -316,7 +355,7 @@ tool calls.
 This keeps core portable and makes future tool customization a daemon/runtime
 choice.
 
-### `agent-core` Stays Vocabulary And FSM
+### `agent-core` Stays The FSM
 
 `agent-core` remains the finite-state turn engine and intentionally does not own
 provider IO, websocket RPC, storage backends, or tool execution. Vocabulary
@@ -327,8 +366,9 @@ not need to grow just to share message data shapes.
 
 The old orchestration shape has been demoted into session semantics. The session
 crate owns transcript branches, model context materialization, fork/rewind,
-compaction validation, queued input ordering, and restoration from stored
-session data.
+queued input ordering, and restoration from stored session data. Compaction
+installation lives in `agent-store` because it is a durable Postgres
+transaction.
 
 The websocket daemon is the process boundary and repository owner; it is not a
 general hierarchical subagent orchestrator.
@@ -337,11 +377,12 @@ general hierarchical subagent orchestrator.
 
 The highest-value tests are real behavioral exercises, not stub-heavy checks:
 
-- Rust unit tests cover FSM, session branching, compaction validity, restoration,
-  and stale completion invariants.
-- Manual websocket scripts exercise real Postgres transitions, durable event
-  replay, global config, input idempotency, steer/follow-up ordering, fork,
-  rewind, interrupt, recovery, tools, and real Codex provider calls.
+- Rust unit tests cover FSM, session branching, compaction-summary boundaries,
+  restoration, and stale completion invariants.
+- Manual websocket scripts exercise real Postgres transitions, transient
+  reconnect event replay, global config, input idempotency, steer/follow-up
+  ordering, fork, rewind, interrupt, recovery, tools, and real Codex provider
+  calls.
 - The web app is built with TypeScript/Vite and then run against the same
   websocket daemon used for manual RPC exercises. Browser checks cover markdown
   and raw HTML rendering, slash autocomplete, picker-only rewind/fork, restored
@@ -363,10 +404,11 @@ with that refreshed token, and retry the same request once. This mirrors the
 upstream Codex behavior without adding a generic fallback chain that would hide
 real provider failures.
 
-Provider errors are session events as well as turn outcomes. A model failure can
-still close the open turn as `Crashed`, but websocket clients should surface the
-paired `model.error` event so the user sees whether the cause was auth, network,
-or provider-side rejection.
+Provider errors are live session events as well as turn outcomes. A model
+failure can still close the open turn as `Crashed`, but websocket clients should
+surface the paired `model.error` event while it is live so the user sees whether
+the cause was auth, network, or provider-side rejection. Old provider errors are
+not durable notifications.
 
 ## Frontend Selection Is Immediate State
 

@@ -13,6 +13,7 @@ dependencies = [
 name = "agent-daemon"
 version = "0.1.0"
 dependencies = [
+ "agent-core",
  "agent-provider",
  "agent-session",
  "agent-store",
@@ -47,6 +48,7 @@ name = "agent-session"
 version = "0.1.0"
 dependencies = [
  "agent-core",
+ "agent-vocab",
  "serde",
  "uuid",
 ]
@@ -56,6 +58,7 @@ name = "agent-store"
 version = "0.1.0"
 dependencies = [
  "agent-session",
+ "agent-vocab",
  "anyhow",
  "serde",
  "serde_json",

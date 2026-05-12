@@ -1,12 +1,11 @@
-use agent_core::{ToolCall, ToolCallId, ToolResultMessage, TranscriptItem, TurnId, TurnOutcome};
+use agent_vocab::{ToolCall, ToolResultMessage, TranscriptItem, TurnId, TurnOutcome};
 
 /// Materialized model context for one transcript path.
 ///
 /// The transcript store is canonical; `ModelContext` is a derived view over a
 /// transcript item sequence. The session rebuilds one whenever it needs to feed
 /// the core loop or model provider a contiguous ordered history, and uses the
-/// same type to rehydrate crashed sessions through explicit crash-tail
-/// recovery.
+/// same type to make copied or restored open turns structurally complete.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ModelContext {
     items: Vec<TranscriptItem>,
@@ -21,16 +20,15 @@ impl ModelContext {
         Self { items }
     }
 
-    pub fn from_transcript_items_recovering_crashed_tail(mut items: Vec<TranscriptItem>) -> Self {
-        Self::patch_open_tail(&mut items, TurnOutcome::Crashed);
-        Self { items }
+    pub fn from_transcript_items_closing_open_turn_as_interrupted(
+        items: Vec<TranscriptItem>,
+    ) -> Self {
+        Self::from_transcript_items(items).close_open_turn(OpenTurnClosure::Interrupted)
     }
 
-    pub fn from_transcript_items_recovering_interrupted_tail(
-        mut items: Vec<TranscriptItem>,
-    ) -> Self {
-        Self::patch_open_tail(&mut items, TurnOutcome::Interrupted);
-        Self { items }
+    pub(crate) fn close_open_turn(mut self, closure: OpenTurnClosure) -> Self {
+        Self::close_open_turn_items(&mut self.items, closure);
+        self
     }
 
     pub fn transcript_items(&self) -> &[TranscriptItem] {
@@ -45,7 +43,7 @@ impl ModelContext {
         for item in self.items.iter().rev() {
             match item {
                 TranscriptItem::TurnFinished { .. } => return true,
-                TranscriptItem::Injected(_) => continue,
+                TranscriptItem::CompactionSummary(_) => return true,
                 _ => return false,
             }
         }
@@ -60,114 +58,19 @@ impl ModelContext {
             .unwrap_or_default()
     }
 
-    pub(crate) fn structural_error(&self) -> Option<String> {
-        let mut active_turn: Option<ActiveTurnValidation> = None;
-
-        for item in &self.items {
-            match item {
-                TranscriptItem::TurnStarted { turn_id } => {
-                    if active_turn.is_some() {
-                        return Some(format!(
-                            "turn {:?} starts before prior turn finished",
-                            turn_id
-                        ));
-                    }
-                    active_turn = Some(ActiveTurnValidation::new(*turn_id));
-                }
-                TranscriptItem::UserMessage(_) => {
-                    if active_turn.is_none() {
-                        return Some("user message appears outside a turn".to_string());
-                    }
-                }
-                TranscriptItem::Injected(_) => {}
-                TranscriptItem::AssistantMessage(message) => {
-                    let Some(turn) = active_turn.as_mut() else {
-                        return Some("assistant message appears outside a turn".to_string());
-                    };
-                    if turn.has_pending_tools() {
-                        return Some(
-                            "assistant message appears before prior tool calls completed"
-                                .to_string(),
-                        );
-                    }
-                    turn.awaiting_starts.extend(message.tool_calls().cloned());
-                }
-                TranscriptItem::ToolCallStarted { turn_id, tool_call } => {
-                    let Some(turn) = active_turn.as_mut() else {
-                        return Some("tool call starts outside a turn".to_string());
-                    };
-                    if turn.turn_id != *turn_id {
-                        return Some(format!(
-                            "tool call start turn {:?} does not match open turn {:?}",
-                            turn_id, turn.turn_id
-                        ));
-                    }
-                    let Some(index) = turn.awaiting_starts.iter().position(|pending| {
-                        pending.id == tool_call.id && pending.tool_name == tool_call.tool_name
-                    }) else {
-                        return Some(format!(
-                            "tool call {:?}/{} starts without a matching assistant tool call",
-                            tool_call.id, tool_call.tool_name
-                        ));
-                    };
-                    let tool_call = turn.awaiting_starts.remove(index);
-                    turn.awaiting_results.push(tool_call);
-                }
-                TranscriptItem::ToolResult(result) => {
-                    let Some(turn) = active_turn.as_mut() else {
-                        return Some("tool result appears outside a turn".to_string());
-                    };
-                    let Some(index) = turn.awaiting_results.iter().position(|pending| {
-                        pending.id == result.tool_call_id && pending.tool_name == result.tool_name
-                    }) else {
-                        return Some(format!(
-                            "tool result {:?}/{} has no matching started tool call",
-                            result.tool_call_id, result.tool_name
-                        ));
-                    };
-                    turn.awaiting_results.remove(index);
-                }
-                TranscriptItem::TurnFinished { turn_id, .. } => {
-                    let Some(turn) = active_turn.take() else {
-                        return Some("turn finished appears without an open turn".to_string());
-                    };
-                    if turn.turn_id != *turn_id {
-                        return Some(format!(
-                            "turn finish {:?} does not match open turn {:?}",
-                            turn_id, turn.turn_id
-                        ));
-                    }
-                    if turn.has_pending_tools() {
-                        return Some(
-                            "turn finished before assistant tool calls had matching results"
-                                .to_string(),
-                        );
-                    }
-                }
-            }
-        }
-
-        if let Some(turn) = active_turn {
-            if turn.has_pending_tools() {
-                return Some(
-                    "open turn has assistant tool calls without matching results".to_string(),
-                );
-            }
-        }
-
-        None
-    }
-
-    fn patch_open_tail(items: &mut Vec<TranscriptItem>, outcome: TurnOutcome) {
-        let Some((turn_id, tail_start)) = Self::open_tail_turn(items) else {
+    fn close_open_turn_items(items: &mut Vec<TranscriptItem>, closure: OpenTurnClosure) {
+        let Some((turn_id, turn_start)) = Self::open_turn_start(items) else {
             return;
         };
 
-        Self::patch_missing_tool_results(items, tail_start, turn_id, outcome);
-        items.push(TranscriptItem::TurnFinished { turn_id, outcome });
+        Self::complete_open_tool_calls(items, turn_start, turn_id, closure);
+        items.push(TranscriptItem::TurnFinished {
+            turn_id,
+            outcome: closure.turn_outcome(),
+        });
     }
 
-    fn open_tail_turn(items: &[TranscriptItem]) -> Option<(TurnId, usize)> {
+    fn open_turn_start(items: &[TranscriptItem]) -> Option<(TurnId, usize)> {
         items
             .iter()
             .enumerate()
@@ -175,9 +78,7 @@ impl ModelContext {
             .find_map(|(index, item)| match item {
                 TranscriptItem::TurnStarted { turn_id } => Some(Some((*turn_id, index))),
                 TranscriptItem::TurnFinished { .. } => Some(None),
-                // Injected messages do not determine whether the tail turn is
-                // still open; keep looking backward for the nearest turn marker.
-                TranscriptItem::Injected(_)
+                TranscriptItem::CompactionSummary(_)
                 | TranscriptItem::UserMessage(_)
                 | TranscriptItem::AssistantMessage(_)
                 | TranscriptItem::ToolCallStarted { .. }
@@ -186,88 +87,77 @@ impl ModelContext {
             .flatten()
     }
 
-    fn patch_missing_tool_results(
+    fn complete_open_tool_calls(
         items: &mut Vec<TranscriptItem>,
-        tail_start: usize,
+        turn_start: usize,
         turn_id: TurnId,
-        outcome: TurnOutcome,
+        closure: OpenTurnClosure,
     ) {
         let mut tool_calls = Vec::new();
-        let mut started_tool_calls = Vec::new();
-        let mut completed_tool_calls = Vec::new();
+        let mut started_tool_calls = Vec::<ToolCall>::new();
+        let mut completed_tool_results = Vec::<ToolResultMessage>::new();
 
-        for item in &items[tail_start..] {
+        for item in &items[turn_start..] {
             match item {
                 TranscriptItem::AssistantMessage(message) => {
                     tool_calls.extend(message.tool_calls().cloned());
                 }
                 TranscriptItem::ToolCallStarted { tool_call, .. } => {
-                    started_tool_calls.push((tool_call.id.clone(), tool_call.tool_name.clone()));
+                    started_tool_calls.push(tool_call.clone());
                 }
                 TranscriptItem::ToolResult(result) => {
-                    completed_tool_calls
-                        .push((result.tool_call_id.clone(), result.tool_name.clone()));
+                    completed_tool_results.push(result.clone());
                 }
                 TranscriptItem::TurnStarted { .. }
                 | TranscriptItem::UserMessage(_)
                 | TranscriptItem::TurnFinished { .. }
-                | TranscriptItem::Injected(_) => {}
+                | TranscriptItem::CompactionSummary(_) => {}
             }
         }
 
         for tool_call in tool_calls {
-            if !Self::remove_matching_tool_call(&mut started_tool_calls, &tool_call) {
+            if let Some(index) = started_tool_calls.iter().position(|started| {
+                started.id == tool_call.id && started.tool_name == tool_call.tool_name
+            }) {
+                started_tool_calls.remove(index);
+            } else {
                 items.push(TranscriptItem::ToolCallStarted {
                     turn_id,
                     tool_call: tool_call.clone(),
                 });
             }
-            if !Self::remove_matching_tool_call(&mut completed_tool_calls, &tool_call) {
-                let result = match outcome {
-                    TurnOutcome::Interrupted => {
-                        ToolResultMessage::interrupted(tool_call.id, tool_call.tool_name)
-                    }
-                    TurnOutcome::Graceful | TurnOutcome::Crashed => {
-                        ToolResultMessage::crashed(tool_call.id, tool_call.tool_name)
-                    }
-                };
-                items.push(TranscriptItem::ToolResult(result));
+            if let Some(index) = completed_tool_results.iter().position(|result| {
+                result.tool_call_id == tool_call.id && result.tool_name == tool_call.tool_name
+            }) {
+                completed_tool_results.remove(index);
+            } else {
+                items.push(TranscriptItem::ToolResult(
+                    closure.missing_tool_result(tool_call),
+                ));
             }
         }
     }
-
-    fn remove_matching_tool_call(
-        tool_calls: &mut Vec<(ToolCallId, String)>,
-        tool_call: &ToolCall,
-    ) -> bool {
-        let Some(index) = tool_calls
-            .iter()
-            .position(|(id, name)| *id == tool_call.id && name == &tool_call.tool_name)
-        else {
-            return false;
-        };
-        tool_calls.remove(index);
-        true
-    }
 }
 
-struct ActiveTurnValidation {
-    turn_id: TurnId,
-    awaiting_starts: Vec<ToolCall>,
-    awaiting_results: Vec<ToolCall>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OpenTurnClosure {
+    Crashed,
+    Interrupted,
 }
 
-impl ActiveTurnValidation {
-    fn new(turn_id: TurnId) -> Self {
-        Self {
-            turn_id,
-            awaiting_starts: Vec::new(),
-            awaiting_results: Vec::new(),
+impl OpenTurnClosure {
+    fn turn_outcome(self) -> TurnOutcome {
+        match self {
+            Self::Crashed => TurnOutcome::Crashed,
+            Self::Interrupted => TurnOutcome::Interrupted,
         }
     }
 
-    fn has_pending_tools(&self) -> bool {
-        !self.awaiting_starts.is_empty() || !self.awaiting_results.is_empty()
+    fn missing_tool_result(self, tool_call: ToolCall) -> ToolResultMessage {
+        match self {
+            Self::Crashed => ToolResultMessage::crashed(tool_call.id, tool_call.tool_name),
+            Self::Interrupted => ToolResultMessage::interrupted(tool_call.id, tool_call.tool_name),
+        }
     }
 }
 
@@ -280,8 +170,9 @@ impl From<Vec<TranscriptItem>> for ModelContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_core::{
-        AssistantItem, AssistantMessage, InjectedMessage, ToolResultStatus, UserMessage,
+    use agent_vocab::{
+        AssistantItem, AssistantMessage, CompactionSummary, ToolCallId, ToolResultStatus,
+        UserMessage,
     };
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
@@ -307,18 +198,13 @@ mod tests {
     }
 
     #[test]
-    fn turn_boundary_walks_past_injected_messages() {
-        let transcript = ModelContext::from_transcript_items(vec![
-            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::UserMessage(UserMessage::text("hi")),
-            TranscriptItem::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-            TranscriptItem::Injected(InjectedMessage::new("compaction", "summary")),
-            TranscriptItem::Injected(InjectedMessage::new("note", "branch note")),
-        ]);
+    fn compaction_summary_is_a_turn_boundary() {
+        let transcript =
+            ModelContext::from_transcript_items(vec![TranscriptItem::CompactionSummary(
+                CompactionSummary::new("session", "source", "summary", None, TurnId(3)),
+            )]);
         assert!(transcript.is_turn_boundary());
+        assert_eq!(transcript.last_turn_id(), TurnId(3));
     }
 
     #[test]
@@ -326,7 +212,7 @@ mod tests {
         let first = tool_call(1, "bash");
         let second = tool_call(2, "read");
 
-        let transcript = ModelContext::from_transcript_items_recovering_crashed_tail(vec![
+        let transcript = ModelContext::from_transcript_items(vec![
             TranscriptItem::TurnStarted { turn_id: TurnId(7) },
             TranscriptItem::UserMessage(UserMessage::text("hello")),
             TranscriptItem::AssistantMessage(AssistantMessage {
@@ -344,7 +230,8 @@ mod tests {
                 tool_call: second.clone(),
             },
             TranscriptItem::ToolResult(tool_result(1, "bash")),
-        ]);
+        ])
+        .close_open_turn(OpenTurnClosure::Crashed);
 
         assert_eq!(
             transcript.transcript_items().last(),
@@ -363,13 +250,14 @@ mod tests {
     fn crashed_tail_patches_assistant_tool_calls_even_without_start_items() {
         let tool_call = tool_call(1, "bash");
 
-        let transcript = ModelContext::from_transcript_items_recovering_crashed_tail(vec![
+        let transcript = ModelContext::from_transcript_items(vec![
             TranscriptItem::TurnStarted { turn_id: TurnId(8) },
             TranscriptItem::UserMessage(UserMessage::text("hello")),
             TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
             }),
-        ]);
+        ])
+        .close_open_turn(OpenTurnClosure::Crashed);
 
         assert_eq!(
             transcript.transcript_items()[3],
@@ -389,38 +277,5 @@ mod tests {
                 outcome: TurnOutcome::Crashed,
             }
         );
-    }
-
-    #[test]
-    fn detects_structurally_invalid_tool_sequences() {
-        let tool_call = tool_call(1, "bash");
-        let missing_result = ModelContext::from_transcript_items(vec![
-            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::AssistantMessage(AssistantMessage {
-                items: vec![AssistantItem::ToolCall(tool_call.clone())],
-            }),
-            TranscriptItem::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-        ]);
-        assert!(missing_result.structural_error().is_some());
-
-        let complete = ModelContext::from_transcript_items(vec![
-            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
-            TranscriptItem::AssistantMessage(AssistantMessage {
-                items: vec![AssistantItem::ToolCall(tool_call.clone())],
-            }),
-            TranscriptItem::ToolCallStarted {
-                turn_id: TurnId(1),
-                tool_call: tool_call.clone(),
-            },
-            TranscriptItem::ToolResult(tool_result(tool_call.id.clone(), &tool_call.tool_name)),
-            TranscriptItem::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-        ]);
-        assert_eq!(complete.structural_error(), None);
     }
 }

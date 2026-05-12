@@ -14,17 +14,12 @@ export interface ParsedSlash {
 export const COMMANDS: SlashCommandInfo[] = [
 	{ name: "help", description: "Show slash commands." },
 	{ name: "new", description: "Create and select a session.", argumentHint: "[title]" },
-	{ name: "refresh", description: "Reload sessions and current transcript." },
-	{ name: "clear", description: "Clear local notices for this view." },
-	{ name: "status", description: "Show selected session state." },
-	{ name: "rewind", description: "Open the rewind picker." },
 	{ name: "fork", description: "Open the fork picker.", argumentHint: "[title]" },
+	{ name: "switch", description: "Switch branches or edit a historical message." },
 	{ name: "compact", description: "Request context compaction." },
-	{ name: "context", description: "Inspect model context.", argumentHint: "[entry-id]" },
-	{ name: "tree", description: "Summarize transcript tree." },
 	{ name: "system", description: "Read or set global system prompt.", argumentHint: "[clear|prompt...]" },
-	{ name: "provider", description: "Read or set session provider.", argumentHint: "[kind model]" },
-	{ name: "tools", description: "List daemon tools." }
+	{ name: "rename", description: "Rename the selected session.", argumentHint: "<title|clear>" },
+	{ name: "provider", description: "Read or set session provider.", argumentHint: "[kind model]" }
 ];
 
 export function filterCommands(query: string): SlashCommandInfo[] {
@@ -36,6 +31,11 @@ export function filterCommands(query: string): SlashCommandInfo[] {
 export function findCommand(name: string): SlashCommandInfo | undefined {
 	const normalized = name.toLowerCase();
 	return COMMANDS.find((command) => command.name === normalized);
+}
+
+export function matchSlashPrefix(input: string): string | null {
+	const match = input.match(/^\/(\S*)$/);
+	return match ? (match[1] ?? "").toLowerCase() : null;
 }
 
 export function parseSlash(input: string): ParsedSlash | null {

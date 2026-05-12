@@ -1,6 +1,6 @@
 use agent_vocab::{
-    AssistantItem, AssistantMessage, ContentBlock, ToolCall, ToolCallId, ToolDefinition,
-    TranscriptItem, UserMessage,
+    AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ToolCall, ToolCallId,
+    ToolDefinition, TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -78,10 +78,10 @@ fn transcript_to_messages(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>
                 messages
                     .push(json!({ "role": "user", "content": anthropic_user_content(message) }));
             }
-            TranscriptItem::Injected(message) => {
+            TranscriptItem::CompactionSummary(summary) => {
                 messages.push(json!({
                     "role": "user",
-                    "content": [{ "type": "text", "text": message.content }],
+                    "content": [{ "type": "text", "text": compaction_summary_text(summary) }],
                 }));
             }
             TranscriptItem::AssistantMessage(message) => {
@@ -121,6 +121,13 @@ fn transcript_to_messages(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>
         }
     }
     Ok(messages)
+}
+
+fn compaction_summary_text(summary: &CompactionSummary) -> String {
+    format!(
+        "The conversation history before this point was compacted into this summary:\n\n{}",
+        summary.summary
+    )
 }
 
 fn anthropic_user_content(message: &UserMessage) -> Value {

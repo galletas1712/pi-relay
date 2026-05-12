@@ -1,10 +1,8 @@
-use std::collections::BTreeMap;
-
 use crate::action::AgentAction;
-use crate::event::{AgentEvent, TurnOrigin};
-use crate::ids::{ActionId, TurnId};
-use crate::message::{AssistantMessage, ToolCall, ToolResultMessage, UserMessage};
-use crate::transcript_item::{InjectedMessage, TranscriptItem, TurnOutcome};
+use crate::event::{AgentEvent, TurnInput};
+use agent_vocab::{
+    ActionId, AssistantMessage, ToolCall, ToolResultMessage, TranscriptItem, TurnId, TurnOutcome,
+};
 
 // Live control state only. Durable session history lives in TranscriptStore.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -17,15 +15,20 @@ pub enum AgentState {
     },
     RunningTools {
         turn_id: TurnId,
-        tool_calls: Vec<ToolCall>,
-        tool_action_ids: Vec<ActionId>,
-        completed_results: Vec<Option<ToolResultMessage>>,
+        tools: Vec<RunningTool>,
         next_result_index: usize,
     },
     // Internal transition point after every tool in a batch has completed.
     ReadyToContinue {
         turn_id: TurnId,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RunningTool {
+    pub(crate) call: ToolCall,
+    pub(crate) action_id: ActionId,
+    pub(crate) result: Option<ToolResultMessage>,
 }
 
 impl AgentState {
@@ -36,11 +39,10 @@ impl AgentState {
     ) -> (Vec<TranscriptItem>, Vec<AgentAction>) {
         match event {
             AgentEvent::Interrupt => self.on_interrupt(),
-            AgentEvent::StartTurn {
-                turn_id,
-                input,
-                origin,
-            } => self.on_start_turn(turn_id, input, origin, next_action_id),
+            AgentEvent::StartTurn { turn_id, input } => {
+                self.on_start_turn(turn_id, input, next_action_id)
+            }
+            AgentEvent::Steer { input } => self.on_steer(input, next_action_id),
             AgentEvent::ModelCompleted {
                 action_id,
                 turn_id,
@@ -63,31 +65,18 @@ impl AgentState {
     fn on_start_turn(
         &mut self,
         turn_id: TurnId,
-        input: UserMessage,
-        origin: Option<TurnOrigin>,
+        input: TurnInput,
         next_action_id: &mut ActionId,
     ) -> (Vec<TranscriptItem>, Vec<AgentAction>) {
         match self {
             Self::Idle => {
                 let action_id = ActionId::take_next(next_action_id);
                 *self = Self::RunningModel { turn_id, action_id };
-                let first_record = match origin {
-                    None => TranscriptItem::UserMessage(input),
-                    Some(TurnOrigin { from, kind }) => {
-                        let mut metadata = BTreeMap::new();
-                        metadata.insert("from".to_string(), from);
-                        TranscriptItem::Injected(InjectedMessage {
-                            kind,
-                            content: input
-                                .as_text()
-                                .unwrap_or("[structured user message]")
-                                .to_string(),
-                            metadata,
-                        })
-                    }
-                };
                 (
-                    vec![TranscriptItem::TurnStarted { turn_id }, first_record],
+                    vec![
+                        TranscriptItem::TurnStarted { turn_id },
+                        input.into_transcript_item(),
+                    ],
                     vec![AgentAction::RequestModel { action_id, turn_id }],
                 )
             }
@@ -95,6 +84,24 @@ impl AgentState {
             | Self::RunningTools { .. }
             | Self::ReadyToContinue { .. } => empty_transition(),
         }
+    }
+
+    fn on_steer(
+        &mut self,
+        input: TurnInput,
+        next_action_id: &mut ActionId,
+    ) -> (Vec<TranscriptItem>, Vec<AgentAction>) {
+        let Self::ReadyToContinue { turn_id } = self else {
+            return empty_transition();
+        };
+        let turn_id = *turn_id;
+        let action_id = ActionId::take_next(next_action_id);
+
+        *self = Self::RunningModel { turn_id, action_id };
+        (
+            vec![input.into_transcript_item()],
+            vec![AgentAction::RequestModel { action_id, turn_id }],
+        )
     }
 
     fn on_model_completed(
@@ -125,22 +132,9 @@ impl AgentState {
             return (items, actions);
         }
 
-        *self = Self::RunningTools {
-            turn_id,
-            tool_calls: tool_calls.clone(),
-            tool_action_ids: Vec::with_capacity(tool_calls.len()),
-            completed_results: vec![None; tool_calls.len()],
-            next_result_index: 0,
-        };
-        let Self::RunningTools {
-            tool_action_ids, ..
-        } = self
-        else {
-            unreachable!("state just entered RunningTools");
-        };
+        let mut tools = Vec::with_capacity(tool_calls.len());
         for tool_call in tool_calls {
             let action_id = ActionId::take_next(next_action_id);
-            tool_action_ids.push(action_id);
             items.push(TranscriptItem::ToolCallStarted {
                 turn_id,
                 tool_call: tool_call.clone(),
@@ -148,9 +142,19 @@ impl AgentState {
             actions.push(AgentAction::RequestTool {
                 action_id,
                 turn_id,
-                tool_call,
+                tool_call: tool_call.clone(),
+            });
+            tools.push(RunningTool {
+                call: tool_call,
+                action_id,
+                result: None,
             });
         }
+        *self = Self::RunningTools {
+            turn_id,
+            tools,
+            next_result_index: 0,
+        };
         (items, actions)
     }
 
@@ -186,9 +190,7 @@ impl AgentState {
     ) -> (Vec<TranscriptItem>, Vec<AgentAction>) {
         let Self::RunningTools {
             turn_id: active_turn_id,
-            tool_calls,
-            tool_action_ids,
-            completed_results,
+            tools,
             next_result_index,
         } = self
         else {
@@ -199,32 +201,32 @@ impl AgentState {
             return empty_transition();
         }
 
-        let Some(result_index) = tool_calls.iter().position(|tool_call| {
-            tool_call.id == result.tool_call_id && tool_call.tool_name == result.tool_name
+        let Some(result_index) = tools.iter().position(|tool| {
+            tool.call.id == result.tool_call_id && tool.call.tool_name == result.tool_name
         }) else {
             return empty_transition();
         };
 
-        if tool_action_ids.get(result_index) != Some(&action_id) {
+        if tools[result_index].action_id != action_id {
             return empty_transition();
         }
 
-        if result_index < *next_result_index || completed_results[result_index].is_some() {
+        if result_index < *next_result_index || tools[result_index].result.is_some() {
             return empty_transition();
         }
 
-        completed_results[result_index] = Some(result);
+        tools[result_index].result = Some(result);
 
         let mut items = Vec::new();
-        while *next_result_index < completed_results.len() {
-            let Some(result) = completed_results[*next_result_index].take() else {
+        while *next_result_index < tools.len() {
+            let Some(result) = tools[*next_result_index].result.take() else {
                 break;
             };
             items.push(TranscriptItem::ToolResult(result));
             *next_result_index += 1;
         }
 
-        let finished = *next_result_index == tool_calls.len();
+        let finished = *next_result_index == tools.len();
         if finished {
             *self = Self::ReadyToContinue { turn_id };
         }
@@ -253,6 +255,8 @@ impl AgentState {
         match self.clone() {
             Self::Idle => empty_transition(),
             Self::ReadyToContinue { turn_id } => {
+                // All external tool work has already completed in this state;
+                // interrupt only closes the turn and has nothing to cancel.
                 *self = Self::Idle;
                 (
                     vec![TranscriptItem::TurnFinished {
@@ -274,17 +278,14 @@ impl AgentState {
             }
             Self::RunningTools {
                 turn_id,
-                tool_calls,
-                tool_action_ids: _,
-                completed_results,
+                tools,
                 next_result_index,
             } => {
                 *self = Self::Idle;
                 let mut items = Vec::new();
-                for (index, tool_call) in tool_calls.into_iter().enumerate().skip(next_result_index)
-                {
-                    let result = completed_results[index].clone().unwrap_or_else(|| {
-                        ToolResultMessage::interrupted(tool_call.id, tool_call.tool_name)
+                for tool in tools.into_iter().skip(next_result_index) {
+                    let result = tool.result.unwrap_or_else(|| {
+                        ToolResultMessage::interrupted(tool.call.id, tool.call.tool_name)
                     });
                     items.push(TranscriptItem::ToolResult(result));
                 }
@@ -305,8 +306,10 @@ fn empty_transition() -> (Vec<TranscriptItem>, Vec<AgentAction>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::ToolCallId;
-    use crate::message::{AssistantItem, AssistantMessage, ToolResultMessage, ToolResultStatus};
+    use agent_vocab::{
+        AssistantItem, AssistantMessage, ToolCallId, ToolResultMessage, ToolResultStatus,
+        UserMessage,
+    };
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
         ToolCall {
@@ -322,6 +325,26 @@ mod tests {
             tool_name: name.to_string(),
             output: "ok".to_string(),
             status: ToolResultStatus::Success,
+        }
+    }
+
+    fn running_tool(action_id: u64, call: ToolCall) -> RunningTool {
+        RunningTool {
+            call,
+            action_id: ActionId(action_id),
+            result: None,
+        }
+    }
+
+    fn completed_running_tool(
+        action_id: u64,
+        call: ToolCall,
+        result: ToolResultMessage,
+    ) -> RunningTool {
+        RunningTool {
+            call,
+            action_id: ActionId(action_id),
+            result: Some(result),
         }
     }
 
@@ -389,9 +412,7 @@ mod tests {
     fn running_tool_accepts_only_matching_tool_completion() {
         let mut state = AgentState::RunningTools {
             turn_id: TurnId(1),
-            tool_calls: vec![tool_call(1, "bash")],
-            tool_action_ids: vec![ActionId(1)],
-            completed_results: vec![None],
+            tools: vec![running_tool(1, tool_call(1, "bash"))],
             next_result_index: 0,
         };
         let result = AgentEvent::ToolCompleted {
@@ -428,8 +449,7 @@ mod tests {
         let (_, actions) = state.step(
             AgentEvent::StartTurn {
                 turn_id: TurnId(1),
-                input: UserMessage::text("hello"),
-                origin: None,
+                input: TurnInput(UserMessage::text("hello")),
             },
             &mut next_action_id,
         );
@@ -465,9 +485,10 @@ mod tests {
             state,
             AgentState::RunningTools {
                 turn_id: TurnId(1),
-                tool_calls: vec![first_tool.clone(), second_tool.clone()],
-                tool_action_ids: vec![ActionId(2), ActionId(3)],
-                completed_results: vec![None, None],
+                tools: vec![
+                    running_tool(2, first_tool.clone()),
+                    running_tool(3, second_tool.clone()),
+                ],
                 next_result_index: 0,
             }
         );
@@ -500,9 +521,10 @@ mod tests {
             state,
             AgentState::RunningTools {
                 turn_id: TurnId(1),
-                tool_calls: vec![first_tool.clone(), second_tool.clone()],
-                tool_action_ids: vec![ActionId(2), ActionId(3)],
-                completed_results: vec![None, Some(tool_result(2, "read"))],
+                tools: vec![
+                    running_tool(2, first_tool.clone()),
+                    completed_running_tool(3, second_tool.clone(), tool_result(2, "read")),
+                ],
                 next_result_index: 0,
             }
         );
@@ -545,9 +567,7 @@ mod tests {
     fn interrupt_transitions_running_state_and_reports_cleanup_work() {
         let mut state = AgentState::RunningTools {
             turn_id: TurnId(3),
-            tool_calls: vec![tool_call(1, "bash")],
-            tool_action_ids: vec![ActionId(1)],
-            completed_results: vec![None],
+            tools: vec![running_tool(1, tool_call(1, "bash"))],
             next_result_index: 0,
         };
         let mut next_action_id = ActionId::first();
@@ -558,7 +578,7 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                TranscriptItem::ToolResult(crate::message::ToolResultMessage::interrupted(
+                TranscriptItem::ToolResult(ToolResultMessage::interrupted(
                     ToolCallId::from_u64(1),
                     "bash"
                 )),

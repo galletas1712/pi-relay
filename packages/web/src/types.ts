@@ -1,4 +1,10 @@
 export type Activity = "idle" | "queued" | "running";
+export type InputPriority = "follow_up" | "steer";
+export type QueuedInputStatus = "queued" | "consuming" | "consumed" | "cancelled";
+export type ActionKind = "model" | "tool" | "compaction";
+export type ActionStatus = "running" | "completed" | "error" | "interrupted" | "stale";
+export type ToolResultStatus = "Success" | "Error" | "Interrupted" | "Crashed";
+export type TurnOutcome = "Graceful" | "Interrupted" | "Crashed";
 
 export interface ProviderConfig {
 	kind: string;
@@ -18,15 +24,15 @@ export interface SessionSummary {
 
 export interface PendingAction {
 	action_row_id: string;
-	kind: "model" | "tool" | "compaction" | string;
-	status: string;
+	kind: ActionKind;
+	status: ActionStatus;
 	payload: Record<string, unknown>;
 }
 
 export interface QueuedInput {
 	input_id: string;
-	priority: "follow_up" | "steer" | string;
-	status: "queued" | "consuming" | string;
+	priority: InputPriority;
+	status: QueuedInputStatus;
 	content: ContentBlock[];
 	client_input_id?: string | null;
 	created_at: string;
@@ -42,6 +48,7 @@ export interface SessionSnapshot {
 	pending_actions: PendingAction[];
 	queued_inputs: QueuedInput[];
 	last_event_id: number;
+	entries?: TranscriptEntry[];
 }
 
 export interface DaemonConfig {
@@ -89,7 +96,7 @@ export interface ToolResultMessage {
 	tool_call_id: string;
 	tool_name: string;
 	output: string;
-	status: "Success" | "Error" | "Interrupted" | "Crashed" | string;
+	status: ToolResultStatus;
 }
 
 export type TranscriptItem =
@@ -97,9 +104,16 @@ export type TranscriptItem =
 	| { type: "user_message"; content: ContentBlock[] }
 	| { type: "assistant_message"; items: AssistantItem[] }
 	| { type: "tool_call_started"; turn_id: number; tool_call: ToolCall }
-	| { type: "tool_result"; tool_call_id: string; tool_name: string; output: string; status: string }
-	| { type: "turn_finished"; turn_id: number; outcome: "Graceful" | "Interrupted" | "Crashed" | string }
-	| { type: "injected"; kind: string; content: string; metadata: Record<string, string> };
+	| { type: "tool_result"; tool_call_id: string; tool_name: string; output: string; status: ToolResultStatus }
+	| { type: "turn_finished"; turn_id: number; outcome: TurnOutcome }
+	| {
+			type: "compaction_summary";
+			source_session_id: string;
+			source_leaf_id: string;
+			summary: string;
+			tokens_before?: number | null;
+			last_turn_id: number;
+	  };
 
 export interface TranscriptEntry {
 	id: string;

@@ -14,8 +14,8 @@ sending the same websocket frames a frontend would send.
    There is no user-facing `open`, `close`, `resume`, or `delete` RPC. A
    frontend starts a new chat with `session.start` when the first message is
    sent, subscribes with `events.subscribe`, and gets the current state with
-   `session.get`. `session.create` remains available for harness/manual uses
-   that need an empty durable session.
+   `session.get`. Empty durable sessions are not part of the websocket
+   contract; browser-local drafts become durable only through `session.start`.
 
 2. Idle sessions resume implicitly.
    When a daemon starts or a browser reconnects, the active leaf, transcript
@@ -50,10 +50,11 @@ sending the same websocket frames a frontend would send.
    cancellation command and interrupts the active turn.
 
 8. Daemon death is recoverable state.
-   If the daemon dies with an open turn, the next daemon repairs the session on
-   first touch by marking unfinished actions stale and appending a crashed turn
-   tail. External side effects, such as files written by tools, are not
-   transactional.
+   On startup, a daemon marks leftover unfinished action rows stale because the
+   provider/tool futures from the previous process cannot resume. If the daemon
+   died with an open turn, first touch then repairs the session by appending a
+   crashed turn tail. External side effects, such as files written by tools,
+   are not transactional.
 
 ## Postgres Model
 
@@ -158,12 +159,13 @@ response does not append the user message twice. Busy-session rows stay
 cannot lose accepted input that has not yet appeared in the transcript.
 
 Before a queued input is materialized, the daemon claims it by moving it to
-`consuming` and recording a claim id in `origin`. `input.replace_queued` and
-`input.cancel_queued` only work while a row is still `queued`. The daemon marks
-the row `consumed` in the same transaction that appends the corresponding
-transcript/action events, and validates the claim id before doing so. On daemon
-restart, abandoned `consuming` rows are reset to `queued` before recovery
-continues.
+`consuming` and recording a claim id in `origin`. The user-facing edit path is
+`input.interrupt` followed by picker-driven rewind or fork; queued rows can be
+promoted to steer priority but are not edited or cancelled through websocket
+RPC. The daemon marks the row `consumed` in the same transaction that appends
+the corresponding transcript/action events, and validates the claim id before
+doing so. On daemon restart, abandoned `consuming` rows are reset to `queued`
+before recovery continues.
 
 ### `actions`
 
@@ -188,7 +190,7 @@ mutating the transcript after interrupt/recovery.
 
 ### `events`
 
-Append-only websocket event log:
+Transient websocket reconnect buffer:
 
 ```text
 id bigserial primary key
@@ -198,8 +200,19 @@ payload jsonb not null
 created_at timestamptz not null default now()
 ```
 
-`events.subscribe(after_event_id)` returns missed rows in the RPC response and
-then streams live event frames on the same websocket.
+`events.subscribe(after_event_id)` is a reconnect stream, not a historical
+notification feed. With a concrete `after_event_id`, it returns missed rows in
+the RPC response and then streams live event frames on the same websocket while
+those rows are still in the reconnect buffer. With `after_event_id = null` or
+omitted, it starts at the current event head and returns no historical events;
+clients should load durable state through `session.get`/`history.tree` instead.
+When a session reaches idle, the daemon publishes `session.idle` to live
+subscribers and then clears that session's event rows. Idle-only mutations such
+as configuration changes, same-session history switching, and child fork
+creation also clear their session event buffers after live publication. Durable
+session state lives in `sessions`, `transcript_entries`, `queued_inputs`, and
+`actions`; old toast-worthy events such as `model.error` are not retained as
+history.
 
 ## Transcript Validity
 
@@ -272,30 +285,6 @@ Live events:
 
 ## Session RPC
 
-### `session.create`
-
-Creates an empty durable session row. The web UI does not use this for blank
-new chats; it keeps those as browser-local drafts and calls `session.start`
-when the first message is sent.
-
-```json
-{
-  "session_id": "optional",
-  "provider": {
-    "kind": "codex",
-    "model": "gpt-5.5",
-    "prompt_cache": { "key": "pi-relay-local" }
-  },
-  "metadata": {}
-}
-```
-
-Result:
-
-```json
-{ "session_id": "s1", "activity": "idle" }
-```
-
 ### `session.start`
 
 Creates a durable session and immediately feeds the first user message. This is
@@ -345,7 +334,7 @@ Browser-local drafts are not returned by this RPC.
 Recovers the session if needed, then returns a durable snapshot.
 
 ```json
-{ "session_id": "s1" }
+{ "session_id": "s1", "include_entries": true }
 ```
 
 Result shape:
@@ -359,13 +348,37 @@ Result shape:
   "metadata": {},
   "pending_actions": [],
   "queued_inputs": [],
-  "last_event_id": 42
+  "last_event_id": 42,
+  "entries": []
 }
 ```
 
 `queued_inputs` contains live queued or consuming user inputs with `input_id`,
 `priority`, `status`, `content`, `client_input_id`, `created_at`, and optional
 `promoted_at`. The web UI uses it for the composer-adjacent queue pane.
+`entries` is included only when `include_entries` is true. The web UI uses that
+expanded snapshot for normal transcript refreshes so it does not need a second
+round trip.
+
+### `session.rename`
+
+Updates the UI-facing session title stored in metadata. Send `null` or an empty
+string to clear the custom title. This is a dedicated path so clients do not need
+to round-trip or overwrite unrelated metadata keys.
+
+Request:
+
+```json
+{ "session_id": "s1", "title": "Production deploy notes" }
+```
+
+Response:
+
+```json
+{ "session_id": "s1", "title": "Production deploy notes", "activity": "idle" }
+```
+
+Emits `session.configured`, so subscribed clients should refresh lists/snapshots.
 
 ### `session.configure`
 
@@ -405,6 +418,10 @@ The response contains:
 
 After the response, matching live events stream as event frames.
 
+If `after_event_id` is `null` or omitted, the daemon subscribes from the current
+head and returns an empty replay. Use a concrete id only for reconnecting after
+a known high-water mark.
+
 ### `events.unsubscribe`
 
 Stops streaming live events for a session on the current websocket.
@@ -435,17 +452,15 @@ historical edit cannot silently send into a newer context. `client_input_id`
 is optional but strongly recommended for frontend sends; without it, retry
 idempotency is intentionally not provided.
 
-### `input.steer`
-
-High-priority user message. This remains a backend primitive, but the web UI
-does not expose it as a slash command. Normal text sends use
-`input.follow_up`; users promote queued follow-ups with
-`input.promote_queued`.
-
 ### `input.promote_queued`
 
 Promotes a still-queued follow-up into the steer queue. Promotions are consumed
-in promotion order before remaining follow-ups.
+in promotion order before remaining follow-ups. If a turn is between completed
+tool results and the next model request, the daemon claims the next queued steer
+and appends it as a same-turn user message before sending that model request.
+Follow-ups never use that mid-turn slot. Steers queued while compaction is
+running wait for the compaction action and then materialize as the next turn
+from the active compacted root.
 
 ```json
 { "session_id": "s1", "input_id": "input_..." }
@@ -453,32 +468,6 @@ in promotion order before remaining follow-ups.
 
 Rows already `consuming`, `consumed`, cancelled, or already steering fail with
 `input_already_consuming`.
-
-### `input.replace_queued`
-
-Replaces a queued input that has not yet been claimed by the daemon.
-
-```json
-{
-  "session_id": "s1",
-  "input_id": "input_...",
-  "content": [
-    { "type": "text", "text": "Edited queued text" }
-  ]
-}
-```
-
-Rows already `consuming` or `consumed` fail with
-`input_already_consuming`; at that point the UI should use interrupt plus
-rewind if the message is visible in transcript history.
-
-### `input.cancel_queued`
-
-Cancels a queued input that has not yet been claimed.
-
-```json
-{ "session_id": "s1", "input_id": "input_..." }
-```
 
 ### `input.interrupt`
 
@@ -516,6 +505,10 @@ omitted.
 ### `history.rewind`
 
 Idle-only. Moves the active leaf to a committed turn boundary or to root.
+This is the one source-mutating history operation: frontends use the same RPC
+both for "rewind and edit this user message" and for "switch the active view to
+this completed branch or compaction root." The RPC never creates a session and
+never deletes abandoned branches.
 
 ```json
 { "session_id": "s1", "leaf_id": "entry_4", "expected_active_leaf_id": "entry_9" }
@@ -534,9 +527,12 @@ has moved since the picker was opened, rewind fails with `history_changed`.
 ### `history.fork`
 
 Creates a new durable session from any existing transcript entry. This does not
-mutate the source, so it can run while the source is busy. If the target entry
-is inside an open turn, the child receives an interrupted turn finish after the
-copied prefix.
+mutate the source, so it can run while the source is busy. The child receives a
+snapshot of the source session's full transcript forest, then its active leaf is
+set to the requested fork target. That means compaction roots and
+pre-compaction branches remain navigable in the child session. If the target
+entry is inside an open turn, the child receives an interrupted turn finish on
+that copied branch.
 
 ```json
 {
@@ -589,17 +585,17 @@ development harness to complete or fail that action.
 
 Harness methods are development-only controls for exercising lifecycle edges
 while still using the real websocket router, Postgres repository, session FSM,
-and event log.
+and event buffer.
 
 Implemented harness methods:
 
 - `harness.model.complete`
 - `harness.model.fail`
-- `harness.compaction.complete`
-- `harness.compaction.fail`
 
 There is deliberately no `harness.tool.complete` or `harness.tool.timeout`.
-Tool behavior is tested by letting the real builtin tools run.
+Tool behavior is tested by letting the real builtin tools run. Compaction is
+also no longer harness-completed; `compaction.request` starts a provider-backed
+daemon job that writes a compacted transcript root transactionally.
 
 ### `harness.model.complete`
 
@@ -623,24 +619,9 @@ Assistant items support:
 { "type": "tool_call", "id": "call_1", "tool_name": "read", "args_json": "{\"path\":\"README.md\"}" }
 ```
 
-### `harness.compaction.complete`
-
-```json
-{
-  "session_id": "s1",
-  "action_row_id": "action_...",
-  "replacement": {
-    "items": []
-  }
-}
-```
-
-Invalid replacement contexts produce `compaction.error`, leave the previous
-active context intact, and persist the compaction action as `error`.
-
 ## Event Set
 
-Current durable event names:
+Current event names:
 
 ```text
 session.created
@@ -648,9 +629,7 @@ session.configured
 input.accepted
 input.queued
 input.consumed
-input.replaced
 input.promoted
-input.cancelled
 input.ignored
 transcript.appended
 turn.started
@@ -703,7 +682,7 @@ select priority, status, client_input_id, content
 
 1. `session.start` with metadata `{ "harness": true, "created_by": "web" }`
    and a stable client-chosen `session_id`.
-2. `events.subscribe`.
+2. `events.subscribe` with `after_event_id: null`.
 3. Capture `model.requested.data.action_row_id`.
 4. `harness.model.complete` with a text assistant message.
 5. `session.get` and `history.context`.
@@ -714,12 +693,15 @@ Verify:
 
 - `input.accepted`, `turn.started`,
   `model.requested`, `model.completed`, `assistant.message`, and `session.idle`
-  are durable.
+  are observed while the turn is active.
 - No durable empty web session is created before the first message, the model
   action is completed, and the active leaf ends at a turn boundary.
 - The repeated `session.start` returns `"replayed": true` and does not append a
   duplicate user message.
-- Replay returns only events with `id > after_event_id`.
+- Replay returns only buffered events with `id > after_event_id`; once the
+  session is idle, the event buffer for that session is empty.
+- Initial subscribe with `after_event_id: null` does not replay historical
+  events; it only attaches to future live events.
 
 ### 2. Global System Prompt Configuration
 
@@ -749,10 +731,13 @@ stored transcript.
 
 Verify only one normal row and one normal `input.queued` event exist, no queued
 input is marked `consumed` while a model action is running, the promoted steer
-is consumed before the unpromoted follow-up after the boundary, and each queued
-input is claimed as `consuming` before becoming transcript.
-`input.replace_queued`, `input.cancel_queued`, and `input.promote_queued` must
-succeed before claim and fail once the row is `consuming` or `consumed`.
+is consumed before the unpromoted follow-up at the next eligible boundary, and
+each queued input is claimed as `consuming` before becoming transcript. When
+the eligible boundary is a tool-to-model continuation, verify the promoted steer
+appears after the tool results and before the next model action without a
+`turn_finished` between them.
+`input.promote_queued` must succeed before claim and fail once the row is
+`consuming` or `consumed`.
 
 Also verify an idle `input.follow_up` retried with the same `client_input_id`
 returns `"replayed": true`, leaves exactly one user-message transcript entry,
@@ -810,14 +795,17 @@ declared order.
 ### 9. Compaction Validity
 
 1. Request compaction on an idle session.
-2. Complete with a valid replacement context.
-3. Request compaction again and complete with an invalid context, such as a tool
-   result without a matching tool call.
-4. Request compaction while a model action is running.
+2. Observe `compaction.requested`, then let the daemon/provider complete it.
+3. Verify the new active leaf is a `compaction_summary` root with
+   `parent_id = null`, `source_session_id`, `source_leaf_id`, and
+   `last_turn_id`.
+4. Queue a normal follow-up while compaction is running and verify it is not
+   consumed until `compaction.completed` or `compaction.error`.
+5. Request compaction while a model action is running.
 
-Verify valid compaction emits `compaction.completed` and `history.compacted`,
-invalid compaction emits `compaction.error` and leaves `active_leaf_id`
-unchanged, and running compaction fails with `session_busy`.
+Verify compaction emits `compaction.completed` and `history.compacted`, the
+old source branch remains in `history.tree`, and running compaction requests
+fail with `session_busy`.
 
 ### 10. Daemon Death Recovery
 
@@ -838,9 +826,11 @@ Verify:
 
 - Markdown and raw HTML assistant text render in the transcript.
 - Slash autocomplete uses Enter once to complete and the next Enter to execute.
-- `/rewind` and `/fork` open pickers; there is no raw-id path in the UI.
-- Rewind to a user-message target restores that historical text into the
-  composer.
+- `/switch` and `/fork` open pickers; there is no raw-id path in the UI.
+- `/switch` is idle-only. Switching to a user-message target restores that
+  historical text into the composer; switching to a completed turn or
+  compaction root changes the active leaf inside the same session.
+- `/rewind` and `/tree` are not part of the user-facing slash surface.
 - Fork from a user-message target creates a child and restores the historical
   text into the child composer.
 - A brand-new local draft survives browser refresh without creating a durable
@@ -852,7 +842,7 @@ With `~/.codex/auth.json` or `CODEX_ACCESS_TOKEN` available:
 
 ```json
 {
-  "method": "session.create",
+  "method": "session.start",
   "params": {
     "session_id": "manual_real_codex",
     "provider": {

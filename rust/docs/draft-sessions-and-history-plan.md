@@ -43,7 +43,7 @@ human edits, stages, and navigates those semantics.
 - Rewind as a core active-leaf mutation to root or a valid turn boundary.
 - Fork as a core branch-copy operation from an explicit transcript entry.
 - Provider configuration, global system prompt configuration, tool definitions,
-  transcript/history reads, and durable event replay.
+  transcript/history reads, and transient reconnect event replay.
 - Recovery after daemon death and stale action handling.
 - Validation of core invariants: no source-mutating history operations while
   busy, no fork from null, no rewind to a non-boundary, no replacing already
@@ -90,10 +90,10 @@ validity.
 prevents an invalid durable intermediate state by atomically creating a session
 and its first input.
 
-`input.replace_queued` and `input.cancel_queued` belong in Rust because queued
-inputs are durable backend-owned work. Editing a queued input must respect
-idempotency and must fail once that input has been consumed into transcript
-history.
+Queued inputs are durable backend-owned work, but the websocket UI no longer
+edits or cancels queued rows directly. The visible edit path is interrupt plus
+rewind/fork picker semantics; queued rows can only be promoted to steer
+priority before the daemon claims them.
 
 `history.fork { placement: "before" }` is acceptable in Rust because it is a
 core branch operation from an explicit transcript entry. The UI draft restored
@@ -107,16 +107,16 @@ consequence of choosing a historical user message.
 - **Frontend draft session**: A browser-local unsent chat draft. It has a draft
   id, title, provider config, and composer text, but no Postgres session row.
 - **Durable session**: A Postgres `sessions` row with at least one meaningful
-  durable state marker: queued input, transcript entries, fork provenance,
-  actions, or events from real use.
+  durable state marker: queued input, transcript entries, fork metadata, or
+  actions from real use.
 - **Composer draft**: Text currently in the message box. Composer drafts live in
   web/client state, not in the core session row. Initially this is browser
   storage keyed by draft id or durable session id.
 
 ## Frontend Draft Sessions
 
-Clicking `New session` or running `/new` should create a local draft selection,
-not call `session.create`.
+Clicking `New session` or running `/new` creates a local draft selection. No
+durable session row is created until `session.start`.
 
 Draft shape in browser storage:
 
@@ -174,8 +174,8 @@ Behavior:
 The frontend then removes the local draft, selects the real session id,
 subscribes to its events, and clears the composer.
 
-`session.create` may remain for harness/manual/internal uses, but the web UI
-should not use it for blank new chats.
+The websocket contract has no empty-session creation RPC; harness/manual flows
+should use `session.start` or direct fixtures.
 
 ## UI Draft Store For Existing Sessions
 
@@ -258,7 +258,7 @@ User-message target:
 - Put that user message in the child composer via the UI draft store.
 - For the first user message, child `active_leaf_id` is `null` and the child may
   have no transcript entries.
-- The child is still a real durable session because it has fork provenance and a
+- The child is still a real durable session because it has fork metadata and a
   local composer draft in the UI that created it.
 
 Assistant-message target:
@@ -319,7 +319,7 @@ Candidate definition:
 - no `transcript_entries`
 - no `queued_inputs`
 - no `actions`
-- no meaningful fork provenance events that should be kept
+- no durable fork metadata that should be kept
 
 First run a read-only count/list query and inspect candidates. Delete only after
 the candidate set looks correct.
@@ -380,16 +380,10 @@ The interrupted branch remains in the append-only transcript forest. Rewind
 only changes the active path, which preserves our existing semantics.
 
 If the message is still queued and has not become a transcript entry yet, rewind
-is the wrong primitive because there is nothing to rewind to. For that edge,
-the UI needs a small pending-input edit/cancel capability:
-
-- Prefer `input.replace_queued` for replacing a queued input before it is
-  consumed.
-- Alternatively, `input.cancel_queued` plus local composer restoration.
-
-This should only apply to queued inputs that are still `status='queued'`. Once
-the input is consumed into transcript history, use interrupt plus rewind-to-user
-message.
+is the wrong primitive because there is nothing to rewind to. For the current
+personal-use UI, queued rows are left alone except for `input.promote_queued`;
+editing uses interrupt plus rewind/fork once the message is part of transcript
+history.
 
 ## Race Conditions And Required Invariants
 
@@ -420,11 +414,9 @@ queued row, and the daemon later appends the old content into transcript.
 Invariant:
 
 - The daemon must claim a queued input before materializing it.
-- `input.replace_queued` and `input.cancel_queued` only succeed when
-  `status='queued'`.
-- Once claimed, status becomes `consuming` with a claim/attempt id. UI edits now
-  fail with `input_already_consuming` and should use interrupt+rewind if the
-  message appears in transcript.
+- Once claimed, status becomes `consuming` with a claim/attempt id. UI steering
+  promotion now fails with `input_already_consuming`; editing should use
+  interrupt+rewind if the message appears in transcript.
 - Transcript append and final `consuming -> consumed` validate the claim id in
   one transaction.
 - Daemon recovery resets abandoned `consuming` rows to `queued` before
@@ -480,10 +472,8 @@ to be submitted into a different context than the one it was restored from.
 Invariant:
 
 - UI draft records include `base_active_leaf_id`.
-- `input.follow_up`/`input.steer` accept optional `expected_active_leaf_id`.
-- The web UI normally sends `input.follow_up`; `input.steer` is a backend
-  primitive, while visible steering is `input.promote_queued` on a queued
-  follow-up row.
+- `input.follow_up` accepts optional `expected_active_leaf_id`.
+- Visible steering is `input.promote_queued` on a queued follow-up row.
 - If the backend sees a mismatch, it rejects with `history_changed`; the UI
   refreshes and asks whether to keep the draft against the new context.
 
@@ -513,8 +503,8 @@ accidental empty session.
 
 Invariant:
 
-- `history.fork` emits durable fork provenance events on the source and child.
-- Empty-session pruning excludes sessions with fork provenance events.
+- `history.fork` writes durable fork lineage into the child session metadata.
+- Empty-session pruning excludes sessions with fork metadata.
 - The local UI draft attached to the child is not part of core validity.
 
 ### LocalStorage Multi-Tab Draft Conflicts
@@ -535,16 +525,16 @@ Invariant:
 ### Empty Session Pruning During Active Creation
 
 Risk: a cleanup job deletes a just-created session before its first queued input
-or fork provenance is visible.
+or fork metadata is visible.
 
 Invariant:
 
 - `session.start` creates session and initial input atomically, so this cannot
   happen for web-created first-message sessions.
-- Manual pruning should ignore very recent sessions or run only after the UI no
-  longer uses eager `session.create`.
+- Manual pruning should ignore very recent sessions. The UI never creates empty
+  durable sessions eagerly.
 - Automated pruning, if added, should require an age threshold and no actions,
-  queued inputs, transcript entries, or provenance events.
+  queued inputs, transcript entries, or fork metadata.
 
 ### Event Subscription And Draft Cleanup
 
@@ -553,10 +543,11 @@ Risk: the UI starts a session, deletes the local draft, but misses the
 
 Invariant:
 
-- After `session.start`, the UI should subscribe with `after_event_id: null` or
-  refresh `session.get`/`history.tree` directly.
-- Event replay is durable; UI correctness should not depend on receiving live
-  broadcasts in the moment.
+- After `session.start`, the UI should subscribe from its last known
+  `last_event_id` and refresh `session.get` with `include_entries=true`.
+- Event replay is a transient reconnect buffer while a session is active; UI
+  correctness after reconnect should come from refreshing durable state with
+  `session.get`/`history.tree`.
 
 ## Test Plan
 
@@ -590,7 +581,7 @@ Manual browser/RPC tests should cover real behavior, not stub-only checks:
 6. Fork from first user message.
    - Child is durable.
    - Child may have zero transcript entries.
-   - Child has core fork provenance events.
+   - Child has durable fork metadata.
    - UI draft store contains the selected historical message for the child.
    - Child is not considered empty/prunable.
 
@@ -605,17 +596,17 @@ Manual browser/RPC tests should cover real behavior, not stub-only checks:
 
 9. Prune existing empties.
    - Candidate list excludes sessions with transcript entries, queued inputs,
-     actions, or fork provenance.
+     actions, or fork metadata.
 
 10. Interrupt to edit last message.
     - While a model turn is running, the UI interrupts, waits for idle, rewinds
       to before the last user message, and restores that message into the
       composer from UI draft state.
 
-11. Edit still-queued input.
-    - If an input is still `queued` and not yet transcript, `input.replace_queued`
-      or `input.cancel_queued` updates/cancels that queued row without using
-      rewind.
+11. Promote still-queued input.
+    - If an input is still `queued` and not yet transcript, `input.promote_queued`
+      can move it into the steer queue. Editing remains picker-based after
+      transcript materialization.
 
 ## Open Implementation Notes
 
