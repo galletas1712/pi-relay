@@ -1,0 +1,944 @@
+<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>Provider Reasoning and Tool Continuity</title>
+	<style>
+		:root {
+			color-scheme: light;
+			--bg: #f7f8fa;
+			--panel: #ffffff;
+			--ink: #15181d;
+			--muted: #626a73;
+			--line: #dfe3e8;
+			--soft: #eef1f4;
+			--accent: #5661f6;
+			--accent-soft: #eef0ff;
+			--danger: #d92d20;
+			--danger-soft: #fff1f0;
+			--success: #168a4a;
+			--success-soft: #ecfdf3;
+			--warn: #946200;
+			--warn-soft: #fff6db;
+			--mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+			--sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+		}
+
+		* {
+			box-sizing: border-box;
+		}
+
+		body {
+			margin: 0;
+			background: var(--bg);
+			color: var(--ink);
+			font-family: var(--sans);
+			line-height: 1.55;
+		}
+
+		main {
+			width: min(1180px, calc(100% - 40px));
+			margin: 0 auto;
+			padding: 44px 0 72px;
+		}
+
+		header {
+			margin-bottom: 28px;
+		}
+
+		h1 {
+			margin: 0 0 10px;
+			font-size: clamp(32px, 5vw, 58px);
+			line-height: 1.03;
+			letter-spacing: 0;
+		}
+
+		h2 {
+			margin: 34px 0 12px;
+			font-size: 24px;
+			line-height: 1.2;
+			letter-spacing: 0;
+		}
+
+		h3 {
+			margin: 22px 0 10px;
+			font-size: 17px;
+			line-height: 1.25;
+			letter-spacing: 0;
+		}
+
+		p {
+			margin: 0 0 12px;
+		}
+
+		a {
+			color: var(--accent);
+			text-decoration-thickness: 1px;
+			text-underline-offset: 3px;
+		}
+
+		code,
+		pre {
+			font-family: var(--mono);
+		}
+
+		code {
+			border: 1px solid var(--line);
+			border-radius: 5px;
+			background: var(--soft);
+			padding: 1px 5px;
+			font-size: 0.92em;
+		}
+
+		pre {
+			margin: 12px 0 0;
+			border: 1px solid var(--line);
+			border-radius: 8px;
+			background: #111418;
+			color: #f3f6f8;
+			padding: 14px;
+			overflow: auto;
+			font-size: 12px;
+			line-height: 1.48;
+		}
+
+		.lede {
+			max-width: 820px;
+			color: var(--muted);
+			font-size: 18px;
+		}
+
+		.grid {
+			display: grid;
+			grid-template-columns: repeat(12, 1fr);
+			gap: 16px;
+		}
+
+		.card {
+			border: 1px solid var(--line);
+			border-radius: 8px;
+			background: var(--panel);
+			padding: 18px;
+			box-shadow: 0 1px 2px rgba(18, 25, 38, 0.04);
+		}
+
+		.span-4 {
+			grid-column: span 4;
+		}
+
+		.span-6 {
+			grid-column: span 6;
+		}
+
+		.span-8 {
+			grid-column: span 8;
+		}
+
+		.span-12 {
+			grid-column: span 12;
+		}
+
+		.kicker {
+			display: inline-flex;
+			align-items: center;
+			margin-bottom: 10px;
+			border-radius: 999px;
+			background: var(--accent-soft);
+			padding: 4px 9px;
+			color: var(--accent);
+			font-family: var(--mono);
+			font-size: 12px;
+			font-weight: 600;
+		}
+
+		.callout {
+			border-left: 4px solid var(--accent);
+			background: var(--accent-soft);
+		}
+
+		.callout.warn {
+			border-left-color: var(--warn);
+			background: var(--warn-soft);
+		}
+
+		.callout.danger {
+			border-left-color: var(--danger);
+			background: var(--danger-soft);
+		}
+
+		.callout.success {
+			border-left-color: var(--success);
+			background: var(--success-soft);
+		}
+
+		.flow {
+			display: grid;
+			grid-template-columns: 1fr 44px 1fr 44px 1fr;
+			gap: 10px;
+			align-items: stretch;
+			margin-top: 14px;
+		}
+
+		.node {
+			border: 1px solid var(--line);
+			border-radius: 8px;
+			background: var(--panel);
+			padding: 12px;
+		}
+
+		.node strong {
+			display: block;
+			margin-bottom: 5px;
+			font-size: 14px;
+		}
+
+		.node small {
+			color: var(--muted);
+		}
+
+		.arrow {
+			display: flex;
+			align-items: center;
+			justify-content: center;
+			color: var(--muted);
+			font-family: var(--mono);
+			font-size: 22px;
+		}
+
+		.stack {
+			display: grid;
+			gap: 8px;
+			margin-top: 12px;
+		}
+
+		.item {
+			display: grid;
+			grid-template-columns: 170px minmax(0, 1fr);
+			gap: 12px;
+			align-items: start;
+			border: 1px solid var(--line);
+			border-radius: 7px;
+			background: var(--panel);
+			padding: 10px 12px;
+		}
+
+		.item .type {
+			font-family: var(--mono);
+			font-size: 12px;
+			font-weight: 600;
+		}
+
+		.item.reasoning {
+			border-color: #b8c0ff;
+			background: #f7f8ff;
+		}
+
+		.item.message {
+			border-color: #cfd8e3;
+		}
+
+		.item.tool {
+			border-color: #b7e4ca;
+			background: #fbfffc;
+		}
+
+		.item.output {
+			border-color: #ffd7a6;
+			background: #fffaf2;
+		}
+
+		.table {
+			width: 100%;
+			border-collapse: collapse;
+			margin-top: 12px;
+			font-size: 14px;
+		}
+
+		.table th,
+		.table td {
+			border-bottom: 1px solid var(--line);
+			padding: 10px;
+			text-align: left;
+			vertical-align: top;
+		}
+
+		.table th {
+			color: var(--muted);
+			font-family: var(--mono);
+			font-size: 12px;
+			font-weight: 600;
+			text-transform: uppercase;
+		}
+
+		.checklist {
+			display: grid;
+			gap: 8px;
+			margin: 14px 0 0;
+			padding: 0;
+			list-style: none;
+		}
+
+		.checklist li {
+			border: 1px solid var(--line);
+			border-radius: 7px;
+			background: var(--panel);
+			padding: 10px 12px;
+		}
+
+		.checklist strong {
+			color: var(--ink);
+		}
+
+		.caption {
+			margin-top: 8px;
+			color: var(--muted);
+			font-size: 13px;
+		}
+
+		footer {
+			margin-top: 36px;
+			color: var(--muted);
+			font-size: 13px;
+		}
+
+		@media (max-width: 900px) {
+			main {
+				width: min(100% - 24px, 1180px);
+				padding-top: 28px;
+			}
+
+			.span-4,
+			.span-6,
+			.span-8,
+			.span-12 {
+				grid-column: span 12;
+			}
+
+			.flow {
+				grid-template-columns: 1fr;
+			}
+
+			.arrow {
+				min-height: 24px;
+				transform: rotate(90deg);
+			}
+
+			.item {
+				grid-template-columns: 1fr;
+			}
+		}
+	</style>
+</head>
+<body>
+	<main>
+		<header>
+			<div class="kicker">Provider continuity surface</div>
+			<h1>Reasoning and tool continuity across OpenAI and Anthropic</h1>
+			<p class="lede">
+				OpenAI Responses and Anthropic Messages can both be used in a stateless pi-relay
+				architecture, but neither should be flattened to plain chat text. The common unit is
+				a provider replay stream: visible messages, opaque reasoning/thinking continuity,
+				tool calls, and matching tool outputs.
+			</p>
+		</header>
+
+		<section class="grid">
+			<article class="card callout success span-12">
+				<h2>Short version</h2>
+				<p>
+					For pi-relay, "stateless provider" should mean: Postgres remains the canonical state,
+					each provider call sends a reconstructed prompt/replay stream, and correctness never
+					depends on provider-retained conversation state such as OpenAI <code>previous_response_id</code>.
+				</p>
+				<p>
+					That is valid, but only if we preserve the model output items needed to continue a
+					tool loop. OpenAI calls these <code>reasoning</code>, <code>message</code>, and
+					<code>function_call</code> items. Anthropic calls them content blocks such as
+					<code>thinking</code>, <code>redacted_thinking</code>, <code>tool_use</code>, and
+					<code>tool_result</code>.
+				</p>
+				<p>
+					This note is scoped to tools that participate in the model loop, including local/client
+					tools and remote/provider tools such as web search. Cloud sandboxes, remote sessions, and
+					managed cloud agents are intentionally out of scope.
+				</p>
+			</article>
+
+			<article class="card span-6">
+				<h2>Stateful continuation</h2>
+				<div class="flow">
+					<div class="node">
+						<strong>Request 1</strong>
+						<small>user input, tools</small>
+					</div>
+					<div class="arrow">-&gt;</div>
+					<div class="node">
+						<strong>Response 1</strong>
+						<small>OpenAI stores response state</small>
+					</div>
+					<div class="arrow">-&gt;</div>
+					<div class="node">
+						<strong>Request 2</strong>
+						<small><code>previous_response_id</code> plus new input</small>
+					</div>
+				</div>
+				<p class="caption">
+					This is simpler because the API can recover prior output items from the response ID.
+					It is not the architecture we want as the source of truth.
+				</p>
+			</article>
+
+			<article class="card span-6">
+				<h2>Stateless continuation</h2>
+				<div class="flow">
+					<div class="node">
+						<strong>Request 1</strong>
+						<small>user input, tools, <code>store:false</code></small>
+					</div>
+					<div class="arrow">-&gt;</div>
+					<div class="node">
+						<strong>Persist output</strong>
+						<small>store typed output items ourselves</small>
+					</div>
+					<div class="arrow">-&gt;</div>
+					<div class="node">
+						<strong>Request 2</strong>
+						<small>replay previous output items plus tool output</small>
+					</div>
+				</div>
+				<p class="caption">
+					This is the pi-relay shape: provider remains a pure adapter over our transcript store.
+				</p>
+			</article>
+		</section>
+
+		<section class="card span-12">
+			<h2>The common surface</h2>
+			<p>
+				The clean abstraction for pi-relay is not "Chat Completions messages" and not
+				"Responses output items" directly. It is a provider-neutral transcript plus replay
+				surface. The visible transcript can stay human-shaped, while the replay lane preserves
+				provider-specific records byte-shape-stably enough to send them back.
+			</p>
+			<table class="table">
+				<thead>
+					<tr>
+						<th>Pi-relay concept</th>
+						<th>OpenAI Responses</th>
+						<th>Anthropic Messages</th>
+						<th>Visible?</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td>User input</td>
+						<td><code>message</code> with <code>role:user</code></td>
+						<td><code>role:user</code> message content blocks</td>
+						<td>Yes</td>
+					</tr>
+					<tr>
+						<td>Assistant text</td>
+						<td><code>message</code> with <code>role:assistant</code>, often with <code>phase</code></td>
+						<td><code>text</code> content block in an assistant message</td>
+						<td>Yes</td>
+					</tr>
+					<tr>
+						<td>Opaque reasoning continuity</td>
+						<td><code>reasoning</code> item with <code>encrypted_content</code></td>
+						<td><code>thinking</code> block with <code>signature</code>, or <code>redacted_thinking</code></td>
+						<td>No, except optional debug metadata</td>
+					</tr>
+					<tr>
+						<td>Tool call</td>
+						<td><code>function_call</code>, custom/freeform call item, or provider tool call item</td>
+						<td><code>tool_use</code> block, or provider tool block such as <code>server_tool_use</code></td>
+						<td>Yes</td>
+					</tr>
+					<tr>
+						<td>Tool output</td>
+						<td><code>function_call_output</code> or provider tool result item tied by call ID</td>
+						<td><code>tool_result</code> user block, or provider result block such as <code>web_search_tool_result</code></td>
+						<td>Yes</td>
+					</tr>
+					<tr>
+						<td>Provider replay record</td>
+						<td>Prior <code>response.output[]</code> items replayed in future <code>input[]</code></td>
+						<td>Prior assistant/user messages replayed through the Messages API</td>
+						<td>Mixed: render only human-meaningful records</td>
+					</tr>
+				</tbody>
+			</table>
+			<h3>Suggested provider-neutral shape</h3>
+			<p>
+				The core session FSM should not need to know whether a replay record came from
+				<code>response.output[]</code> or an Anthropic content block. It only needs stable IDs,
+				parentage, visibility, and provider-specific replay payloads kept behind the provider boundary.
+			</p>
+			<pre>type ProviderReplayRecord =
+  | { kind: "user_message", visible: true, content: ContentBlock[] }
+  | { kind: "assistant_text", visible: true, text: string, phase?: string }
+  | { kind: "reasoning_state", visible: false, provider: "openai" | "anthropic", raw: Json }
+  | { kind: "tool_call", visible: true, call_id: string, name: string, input: Json | string, raw: Json }
+  | { kind: "tool_result", visible: true, call_id: string, output: ContentBlock[] | string }
+  | { kind: "provider_event", visible: false, provider: string, raw: Json };</pre>
+			<p class="caption">
+				The <code>raw</code> payload is what lets each provider serializer replay exact fields such as
+				OpenAI <code>encrypted_content</code>, Anthropic <code>signature</code>, Anthropic
+				<code>redacted_thinking</code>, remote tool fields, custom tool fields, and future provider-only metadata.
+			</p>
+		</section>
+
+		<section class="card span-12">
+			<h2>OpenAI continuity rule</h2>
+			<p>
+				The important rule from the reasoning guide is: when a reasoning model returns a tool call
+				and we manually continue the conversation, preserve the relevant output items that led to
+				that tool call and pass them back with the tool result.
+			</p>
+			<p>
+				For an agent, that means the replayed input after a tool completes should look like this:
+			</p>
+			<div class="stack">
+				<div class="item message">
+					<div class="type">message:user</div>
+					<div>The user's request, plus any earlier compacted context that is still model-visible.</div>
+				</div>
+				<div class="item reasoning">
+					<div class="type">reasoning</div>
+					<div>Opaque reasoning item returned by the model. In stateless mode, this needs encrypted content.</div>
+				</div>
+				<div class="item message">
+					<div class="type">message:assistant</div>
+					<div>Visible assistant preamble or text, with its original <code>phase</code> preserved.</div>
+				</div>
+				<div class="item tool">
+					<div class="type">function_call</div>
+					<div>The exact tool call item returned by the model, including <code>call_id</code>, name, and arguments.</div>
+				</div>
+				<div class="item output">
+					<div class="type">function_call_output</div>
+					<div>The result we produced by running the tool, tied to the same <code>call_id</code>.</div>
+				</div>
+			</div>
+			<p class="caption">
+				The same idea applies to custom/freeform tools and remote/provider tools: preserve the
+				returned call item shape and append or replay the matching output item.
+			</p>
+		</section>
+
+		<section class="grid">
+			<article class="card span-8">
+				<h2>What encrypted reasoning is</h2>
+				<p>
+					Reasoning tokens are not visible chain-of-thought. They are internal model computation.
+					In ordinary API output, we do not get those tokens back. In stateless Responses mode,
+					OpenAI exposes an opaque encrypted payload so the next request can continue the same
+					reasoning/tool loop without revealing the reasoning text.
+				</p>
+				<pre>{
+  "model": "gpt-5.5",
+  "store": false,
+  "input": [...],
+  "tools": [...],
+  "include": ["reasoning.encrypted_content"]
+}</pre>
+				<p class="caption">
+					The encrypted value is storage/replay material only. It should not be rendered in the UI,
+					summarized, edited, or inspected.
+				</p>
+			</article>
+
+			<aside class="card callout danger span-4">
+				<h2>Not thinking_redacted</h2>
+				<p>
+					This is not the old <code>thinking_redacted</code> row. That was a visible placeholder in
+					our transcript. Encrypted reasoning is provider continuity state. It belongs in the
+					model replay path, not in the user-facing transcript.
+				</p>
+			</aside>
+		</section>
+
+		<section class="card span-12">
+			<h2>Why phase matters</h2>
+			<p>
+				GPT-5.5 and GPT-5.4 can produce assistant text before or between tool calls. OpenAI recommends
+				preserving assistant message <code>phase</code> values in long-running or tool-heavy Responses
+				flows. The two important values are:
+			</p>
+			<table class="table">
+				<thead>
+					<tr>
+						<th>Phase</th>
+						<th>Meaning</th>
+						<th>Why it matters</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td><code>commentary</code></td>
+						<td>Intermediate assistant update, such as "I'll inspect the logs first."</td>
+						<td>Should not be treated as the final answer when replayed.</td>
+					</tr>
+					<tr>
+						<td><code>final_answer</code></td>
+						<td>The completed user-facing answer.</td>
+						<td>Marks that the model intended to finish the turn.</td>
+					</tr>
+				</tbody>
+			</table>
+			<p class="caption">
+				If we manually replay assistant history and drop <code>phase</code>, an intermediate preamble can
+				look like a final answer to the model.
+			</p>
+		</section>
+
+		<section class="grid">
+			<article class="card span-8">
+				<h2>Anthropic continuity rule</h2>
+				<p>
+					Anthropic's Messages API has the same underlying shape, but the replay records live inside
+					message content arrays instead of a top-level Responses <code>output[]</code>. Assistant
+					messages can contain <code>thinking</code>, <code>redacted_thinking</code>, <code>text</code>,
+					and <code>tool_use</code> blocks. Tool results are returned in the next user message as
+					<code>tool_result</code> blocks.
+				</p>
+				<p>
+					With extended thinking and tool use, Anthropic says the full unmodified thinking block must
+					be passed back during the active tool trajectory. The <code>signature</code> field is opaque
+					verification material. A <code>redacted_thinking</code> block is also opaque and must be
+					preserved if it is part of the active trajectory.
+				</p>
+				<div class="stack">
+					<div class="item message">
+						<div class="type">role:user</div>
+						<div>User asks for work.</div>
+					</div>
+					<div class="item reasoning">
+						<div class="type">thinking</div>
+						<div>Assistant thinking block, including exact <code>signature</code>. Replay-only.</div>
+					</div>
+					<div class="item message">
+						<div class="type">text</div>
+						<div>Optional assistant preamble or visible progress text.</div>
+					</div>
+					<div class="item tool">
+						<div class="type">tool_use</div>
+						<div>Tool request with <code>id</code>, <code>name</code>, and JSON <code>input</code>.</div>
+					</div>
+					<div class="item output">
+						<div class="type">tool_result</div>
+						<div>Next user message content block with the same <code>tool_use_id</code>.</div>
+					</div>
+				</div>
+			</article>
+
+			<aside class="card callout warn span-4">
+				<h2>Different placement, same invariant</h2>
+				<p>
+					OpenAI returns replay records as response output items. Anthropic returns replay records as
+					message content blocks. The invariant is the same: do not modify, reorder, orphan, or
+					partially drop the active reasoning/thinking -> tool call -> tool result chain.
+				</p>
+			</aside>
+		</section>
+
+		<section class="grid">
+			<article class="card span-6">
+				<h2>Anthropic request shape</h2>
+				<p>
+					The harness in <code>~/Downloads/src</code> builds Anthropic requests around
+					<code>anthropic.beta.messages.create</code>. It sends normalized messages, system blocks,
+					tools, <code>tool_choice</code>, optional <code>thinking</code>, beta headers, prompt-cache
+					breakpoints, and optional API context management.
+				</p>
+				<pre>{
+  "model": "claude-...",
+  "system": [...],
+  "messages": [
+    {
+      "role": "assistant",
+      "content": [
+        { "type": "thinking", "thinking": "...", "signature": "..." },
+        { "type": "tool_use", "id": "toolu_1", "name": "read", "input": {...} }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        { "type": "tool_result", "tool_use_id": "toolu_1", "content": "..." }
+      ]
+    }
+  ],
+  "tools": [...],
+  "tool_choice": { "type": "auto" },
+  "thinking": { "type": "enabled", "budget_tokens": 12000 }
+}</pre>
+			</article>
+
+			<article class="card span-6">
+				<h2>OpenAI request shape</h2>
+				<p>
+					The equivalent stateless OpenAI request sends the complete reconstructed input and asks
+					for encrypted reasoning content when reasoning continuity matters.
+				</p>
+				<pre>{
+  "model": "gpt-5.5",
+  "instructions": "...",
+  "store": false,
+  "include": ["reasoning.encrypted_content"],
+  "input": [
+    { "type": "message", "role": "user", "content": [...] },
+    { "type": "reasoning", "id": "rs_...", "encrypted_content": "..." },
+    { "type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{}" },
+    { "type": "function_call_output", "call_id": "call_1", "output": "..." }
+  ],
+  "tools": [...]
+}</pre>
+			</article>
+		</section>
+
+		<section class="card span-12">
+			<h2>What the Anthropic harness teaches us</h2>
+			<p>
+				<code>~/Downloads/src</code> is complex, but the useful lessons are concrete:
+			</p>
+			<ul class="checklist">
+				<li>
+					<strong>Tool result pairing is structural.</strong>
+					The harness normalizes and validates <code>tool_use</code> / <code>tool_result</code>
+					pairing before calling the API because orphaned results or duplicate IDs cause hard
+					provider errors.
+				</li>
+				<li>
+					<strong>Thinking blocks are protected replay records.</strong>
+					The harness comments state that thinking/redacted-thinking blocks must survive the
+					active assistant trajectory. It also tombstones partial streaming messages because
+					invalid thinking signatures can poison future requests.
+				</li>
+				<li>
+					<strong>Streaming fallback is dangerous around tools.</strong>
+					If a partial stream already emitted tool calls, a fallback retry can produce different
+					tool IDs. The harness discards pending results from failed attempts to avoid orphaned
+					tool outputs.
+				</li>
+				<li>
+					<strong>Prompt caching is prompt-shape-sensitive.</strong>
+					The harness caches tool schemas, applies <code>cache_control</code> at selected system,
+					tool, and message boundaries, and avoids mutating assistant messages that will be replayed.
+				</li>
+				<li>
+					<strong>Provider-specific cleanup should live at the boundary.</strong>
+					Claude Code has many normalizers for Anthropic-only fields. Pi-relay should keep that
+					kind of provider translation inside <code>agent-provider</code>, not in the core FSM.
+				</li>
+			</ul>
+		</section>
+
+		<section class="grid">
+			<article class="card span-6">
+				<h2>Lossy OpenAI replay</h2>
+				<p>
+					This is close to our current Chat-Completions-shaped transcript. It keeps only visible text,
+					the tool call, and the tool result.
+				</p>
+				<pre>[
+  { "role": "user", "content": "Fix the bug" },
+  { "role": "assistant", "content": "I'll inspect files." },
+  {
+    "type": "function_call",
+    "call_id": "call_1",
+    "name": "read",
+    "arguments": "{\"path\":\"src/lib.rs\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "call_1",
+    "output": "file contents..."
+  }
+]</pre>
+				<p class="caption">
+					Missing: encrypted reasoning and assistant phase. It may work sometimes, but it is lossy.
+					The Anthropic analog is dropping <code>thinking.signature</code> or <code>redacted_thinking</code>.
+				</p>
+			</article>
+
+			<article class="card span-6">
+				<h2>Faithful OpenAI replay</h2>
+				<p>
+					This keeps the response output items that the reasoning model needs to continue the
+					tool loop.
+				</p>
+				<pre>[
+  { "role": "user", "content": "Fix the bug" },
+  {
+    "type": "reasoning",
+    "id": "rs_...",
+    "encrypted_content": "..."
+  },
+  {
+    "type": "message",
+    "role": "assistant",
+    "phase": "commentary",
+    "content": [{ "type": "output_text", "text": "I'll inspect files." }]
+  },
+  {
+    "type": "function_call",
+    "call_id": "call_1",
+    "name": "read",
+    "arguments": "{\"path\":\"src/lib.rs\"}"
+  },
+  {
+    "type": "function_call_output",
+    "call_id": "call_1",
+    "output": "file contents..."
+  }
+]</pre>
+				<p class="caption">
+					This is still stateless: everything needed for the next request is stored by pi-relay.
+				</p>
+			</article>
+		</section>
+
+		<section class="card span-12">
+			<h2>Faithful Anthropic replay</h2>
+			<p>
+				The Anthropic equivalent is not a top-level item list. It is an assistant message whose
+				content blocks preserve thinking and tool use, followed by a user message whose content
+				starts with the matching tool result.
+			</p>
+			<pre>[
+  {
+    "role": "assistant",
+    "content": [
+      {
+        "type": "thinking",
+        "thinking": "...",
+        "signature": "opaque verification string"
+      },
+      {
+        "type": "text",
+        "text": "I'll inspect files."
+      },
+      {
+        "type": "tool_use",
+        "id": "toolu_1",
+        "name": "read",
+        "input": { "path": "src/lib.rs" }
+      }
+    ]
+  },
+  {
+    "role": "user",
+    "content": [
+      {
+        "type": "tool_result",
+        "tool_use_id": "toolu_1",
+        "content": "file contents..."
+      }
+    ]
+  }
+]</pre>
+			<p class="caption">
+				Anthropic's docs also allow <code>redacted_thinking</code>. Treat it like encrypted reasoning:
+				store it, replay it, do not render it as useful content.
+			</p>
+		</section>
+
+		<section class="card span-12">
+			<h2>Implications for pi-relay</h2>
+			<ul class="checklist">
+				<li>
+					<strong>Provider stays stateless.</strong>
+					Each provider can build a complete request from our transcript and replay lane. OpenAI
+					does not need <code>previous_response_id</code>; Anthropic does not need hidden session
+					state in the Messages API.
+				</li>
+				<li>
+					<strong>Transcript needs a provider replay lane.</strong>
+					We need somewhere to persist replay-only OpenAI output items and Anthropic thinking
+					blocks without rendering them as chat messages.
+				</li>
+				<li>
+					<strong>Active tool loops should not be compacted away.</strong>
+					Compaction can summarize completed prior history, but it should not rewrite or drop the
+					open chain of reasoning/thinking -> tool call -> tool output.
+				</li>
+				<li>
+					<strong>Fork and switch should branch replay state too.</strong>
+					If a user branches from a point inside a provider tool loop, the branch must include the
+					replay records that are ancestors of that point.
+				</li>
+				<li>
+					<strong>UI should render only human-meaningful items.</strong>
+					Text, tool calls, tool results, crashes, compactions, and branches are visible. Encrypted
+					reasoning, Anthropic thinking signatures, and redacted thinking are not.
+				</li>
+			</ul>
+		</section>
+
+		<section class="grid">
+			<article class="card callout warn span-6">
+				<h2>What can go wrong if we drop items</h2>
+				<p>
+					The model may treat an intermediate preamble as a completed answer, fail to connect a tool
+					result to the reasoning that requested it, repeat a tool call, lose track of whether it was
+					in a planning/commentary phase, reject a request because a thinking signature changed, or
+					behave differently after a fork/compact even though the visible transcript looks equivalent.
+				</p>
+			</article>
+
+			<article class="card callout span-6">
+				<h2>Useful design rule</h2>
+				<p>
+					Store visible transcript items for humans, and store provider replay items for the model.
+					Those two lanes can reference the same logical turn, but they should not be forced to have
+					the same shape.
+				</p>
+			</article>
+		</section>
+
+		<section class="card span-12">
+			<h2>References</h2>
+			<p>
+				Official provider docs and local harness source used for this note:
+			</p>
+			<ul>
+				<li>
+					<a href="https://developers.openai.com/api/docs/guides/reasoning">Reasoning models guide</a>:
+					interleaved thinking, encrypted reasoning items, and assistant <code>phase</code>.
+				</li>
+				<li>
+					<a href="https://developers.openai.com/api/docs/guides/conversation-state">Conversation state guide</a>:
+					requests are stateless unless you choose a conversation-state mechanism.
+				</li>
+				<li>
+					<a href="https://developers.openai.com/api/reference/resources/responses/methods/create">Responses create reference</a>:
+					<code>store</code>, <code>include</code>, response items, and tool call item shapes.
+				</li>
+				<li>
+					<a href="https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking">Anthropic extended thinking guide</a>:
+					preserving <code>thinking</code> blocks, <code>signature</code>, <code>redacted_thinking</code>,
+					and interleaved thinking with tool use.
+				</li>
+				<li>
+					<a href="https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/implement-tool-use">Anthropic tool use guide</a>:
+					<code>tool_use</code> blocks in assistant messages and <code>tool_result</code> blocks in
+					user messages.
+				</li>
+				<li>
+					Local source pointers: <code>~/Downloads/src/services/api/claude.ts</code>,
+					<code>~/Downloads/src/utils/messages.ts</code>, <code>~/Downloads/src/query.ts</code>, and
+					<code>~/Downloads/src/utils/api.ts</code>.
+				</li>
+			</ul>
+		</section>
+
+		<footer>
+			Created for pi-relay. Core takeaway: a stateless provider layer is viable across OpenAI and
+			Anthropic, but the transcript must preserve replay-only provider records in addition to the
+			human transcript.
+		</footer>
+	</main>
+</body>
+</html>
