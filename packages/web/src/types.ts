@@ -78,7 +78,6 @@ export interface UserMessage {
 
 export type AssistantItem =
 	| { type: "text"; text: string }
-	| { type: "thinking_redacted" }
 	| {
 			type: "tool_call";
 			id: string;

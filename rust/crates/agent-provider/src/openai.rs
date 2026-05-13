@@ -3,6 +3,10 @@ use agent_vocab::{
     TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
+use reqwest::{
+    header::{ACCEPT, ACCEPT_ENCODING},
+    StatusCode,
+};
 use serde_json::{json, Value};
 
 use crate::{
@@ -70,6 +74,7 @@ impl OpenAiProvider {
     }
 
     fn add_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let request = request.header(ACCEPT_ENCODING, "identity");
         match &self.auth {
             OpenAiAuth::ApiKey(api_key) => request.bearer_auth(api_key),
             OpenAiAuth::Codex {
@@ -103,17 +108,22 @@ impl OpenAiProvider {
     async fn complete_chat(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
         let body = chat_completion_body(request)?;
 
-        let response: Value = self
+        let response = self
             .add_auth(self.client.post(format!(
                 "{}/chat/completions",
                 self.base_url.trim_end_matches('/')
             )))
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .json()
             .await?;
+        let (status, text) = response_text(response).await?;
+        ensure_success(status, &text)?;
+        let response: Value = serde_json::from_str(&text).map_err(|error| {
+            ProviderError::Provider(format!(
+                "failed to parse OpenAI chat response JSON: {error}; body: {}",
+                response_excerpt(&text)
+            ))
+        })?;
 
         let message = response
             .pointer("/choices/0/message")
@@ -130,18 +140,61 @@ impl OpenAiProvider {
             .add_auth(
                 self.client
                     .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
-                    .header(reqwest::header::ACCEPT, "text/event-stream"),
+                    .header(ACCEPT, "text/event-stream"),
             )
             .json(&body)
             .send()
-            .await?
-            .error_for_status()?
-            .text()
             .await?;
+        let (status, text) = response_text(text).await?;
+        ensure_success(status, &text)?;
 
         Ok(ModelResponse {
             assistant: parse_responses_sse(&text)?,
         })
+    }
+}
+
+async fn response_text(response: reqwest::Response) -> ProviderResult<(StatusCode, String)> {
+    let status = response.status();
+    let bytes = response.bytes().await?;
+    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn ensure_success(status: StatusCode, body: &str) -> ProviderResult<()> {
+    if status.is_success() {
+        return Ok(());
+    }
+    Err(ProviderError::Provider(format!(
+        "HTTP {}: {}",
+        status.as_u16(),
+        response_error_message(body)
+    )))
+}
+
+fn response_error_message(body: &str) -> String {
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/error/message")
+                .or_else(|| value.pointer("/detail"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| response_excerpt(body))
+}
+
+fn response_excerpt(body: &str) -> String {
+    const MAX_CHARS: usize = 1200;
+    let trimmed = body.trim();
+    let mut excerpt = trimmed.chars().take(MAX_CHARS).collect::<String>();
+    if trimmed.chars().count() > MAX_CHARS {
+        excerpt.push_str("...");
+    }
+    if excerpt.is_empty() {
+        "empty response body".to_string()
+    } else {
+        excerpt
     }
 }
 
@@ -486,9 +539,7 @@ fn parse_response_output_item(item: &Value, items: &mut Vec<AssistantItem>) -> P
                 args_json: arguments.to_string(),
             }));
         }
-        Some("reasoning") | Some("reasoning_summary") => {
-            items.push(AssistantItem::ThinkingRedacted);
-        }
+        Some("reasoning") | Some("reasoning_summary") => {}
         _ => {}
     }
     Ok(())

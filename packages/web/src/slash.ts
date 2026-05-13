@@ -21,7 +21,8 @@ export const COMMANDS: SlashCommandInfo[] = [
 	{ name: "rename", description: "Rename the selected session.", argumentHint: "<title>" },
 	{ name: "archive", description: "Archive the selected idle session." },
 	{ name: "unarchive", description: "Unarchive the selected session." },
-	{ name: "provider", description: "Read or set session provider.", argumentHint: "[kind model]" }
+	{ name: "provider", description: "Read or set session provider.", argumentHint: "[kind model]" },
+	{ name: "export", description: "Export assistant messages from the current branch." }
 ];
 
 export function filterCommands(query: string): SlashCommandInfo[] {

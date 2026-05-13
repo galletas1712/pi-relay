@@ -3,6 +3,7 @@ import { AlertTriangle, Check, ChevronDown, Copy, Loader2, Terminal, Wrench } fr
 import rehypeRaw from "rehype-raw";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { assistantMessageText } from "./exportTranscript.ts";
 import { branchEntriesFor } from "./historyTargets.ts";
 import { contentBlocksToText, firstLine } from "./text.ts";
 import type { NoticeTone, TranscriptEntry, TranscriptItem } from "./types.ts";
@@ -82,7 +83,7 @@ function TranscriptEntryView({
 		return <UserBubble item={item} entryId={entry.id} />;
 	}
 	if (item.type === "assistant_message") {
-		return <AssistantBlock item={item} entryId={entry.id} toolResults={toolIndex.results} />;
+		return <AssistantBlock item={item} toolResults={toolIndex.results} />;
 	}
 	if (item.type === "tool_result") {
 		if (toolIndex.calls.has(item.tool_call_id)) return null;
@@ -108,40 +109,52 @@ function UserBubble({ item, entryId }: { item: Extract<TranscriptItem, { type: "
 
 function AssistantBlock({
 	item,
-	entryId,
 	toolResults
 }: {
 	item: Extract<TranscriptItem, { type: "assistant_message" }>;
-	entryId: string;
 	toolResults: Map<string, ToolResultItem>;
 }) {
+	const text = assistantMessageText(item);
 	return (
 		<div className="message-row assistant-row">
-			<EntryId entryId={entryId} />
-			<div className="assistant-block">
+			<div className={`assistant-block ${text ? "has-copy" : ""}`}>
 				{item.items.map((assistantItem, index) => {
 					if (assistantItem.type === "text") {
 						return <MarkdownText text={assistantItem.text} key={index} />;
 					}
-					if (assistantItem.type === "thinking_redacted") {
+					if (assistantItem.type === "tool_call") {
 						return (
-							<div className="thinking" key={index}>
-								thinking redacted
-							</div>
+							<ToolCard
+								key={assistantItem.id}
+								toolName={assistantItem.tool_name}
+								toolId={assistantItem.id}
+								argsJson={assistantItem.args_json}
+								result={toolResults.get(assistantItem.id)}
+							/>
 						);
 					}
-					return (
-						<ToolCard
-							key={assistantItem.id}
-							toolName={assistantItem.tool_name}
-							toolId={assistantItem.id}
-							argsJson={assistantItem.args_json}
-							result={toolResults.get(assistantItem.id)}
-						/>
-					);
+					return null;
 				})}
+				{text ? <AssistantCopyButton text={text} /> : null}
 			</div>
 		</div>
+	);
+}
+
+function AssistantCopyButton({ text }: { text: string }) {
+	const [copied, setCopied] = useState(false);
+	const copy = () => {
+		void navigator.clipboard?.writeText(text)
+			.then(() => {
+				setCopied(true);
+				window.setTimeout(() => setCopied(false), 1200);
+			})
+			.catch(() => undefined);
+	};
+	return (
+		<button type="button" className="assistant-copy-button" onClick={copy} title="Copy assistant message" aria-label="Copy assistant message">
+			{copied ? <Check size={13} /> : <Copy size={13} />}
+		</button>
 	);
 }
 

@@ -122,10 +122,11 @@ export function HistoryPickerDialog({
 						const display = row.option;
 						const isCollapsedBranch = hiddenBranchIds.has(row.entry.id);
 						const canCollapse = row.isBranchRoot && !row.isOnActivePath;
+						const outcomeClass = nonGracefulOutcomeClass(display.outcome);
 						return (
 							<div
 								key={row.entry.id}
-								className={`history-tree-item ${row.isOnActivePath ? "on-active-path" : ""} ${isCollapsedBranch ? "collapsed" : ""}`}
+								className={`history-tree-item ${row.isOnActivePath ? "on-active-path" : ""} ${isCollapsedBranch ? "collapsed" : ""} ${outcomeClass}`}
 								style={{ "--tree-depth": row.depth } as CSSProperties}
 							>
 								{canCollapse ? (
@@ -161,6 +162,9 @@ export function HistoryPickerDialog({
 											{display.title}
 											{row.isActive ? <span className="history-badge">current</span> : null}
 											{isCollapsedBranch ? <span className="history-badge muted">{row.descendantCount} hidden</span> : null}
+											{display.outcome && display.outcome !== "Graceful" ? (
+												<span className="history-badge danger">{display.outcome.toLowerCase()}</span>
+											) : null}
 										</span>
 										<span className="history-option-preview">{display.preview}</span>
 									</span>
@@ -249,4 +253,10 @@ function historyPickerRows(
 	};
 	for (const root of children.get(null) ?? []) visit(root, 0, null, false);
 	return rows;
+}
+
+function nonGracefulOutcomeClass(outcome: HistoryTargetOption["outcome"]): string {
+	if (outcome === "Crashed") return "turn-crashed";
+	if (outcome === "Interrupted") return "turn-interrupted";
+	return "";
 }

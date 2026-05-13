@@ -137,6 +137,20 @@ describe("historySwitchOptions", () => {
 		});
 		expect(options.some((option) => option.id === "assistant2")).toBe(false);
 	});
+
+	it("preserves non-graceful turn outcomes on switch targets", () => {
+		const entries = fixtureEntries().map((item) =>
+			item.id === "finish2"
+				? entry(item.id, item.parent_id, { type: "turn_finished", turn_id: 2, outcome: "Crashed" }, 7)
+				: item
+		);
+		const options = historySwitchOptions(entries, "finish2");
+
+		expect(options.find((option) => option.id === "finish2")).toMatchObject({
+			outcome: "Crashed",
+			isActive: true
+		});
+	});
 });
 
 describe("historyTreeRows", () => {

@@ -96,7 +96,7 @@ impl AssistantMessage {
     pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
         self.items.iter().filter_map(|item| match item {
             AssistantItem::ToolCall(tool_call) => Some(tool_call),
-            AssistantItem::Text(_) | AssistantItem::ThinkingRedacted => None,
+            AssistantItem::Text(_) => None,
         })
     }
 
@@ -105,7 +105,7 @@ impl AssistantMessage {
             .iter()
             .filter_map(|item| match item {
                 AssistantItem::Text(text) => Some(text.as_str()),
-                AssistantItem::ToolCall(_) | AssistantItem::ThinkingRedacted => None,
+                AssistantItem::ToolCall(_) => None,
             })
             .collect::<Vec<_>>()
             .join("")
@@ -115,7 +115,6 @@ impl AssistantMessage {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AssistantItem {
     Text(String),
-    ThinkingRedacted,
     ToolCall(ToolCall),
 }
 
@@ -129,11 +128,6 @@ impl Serialize for AssistantItem {
                 let mut state = serializer.serialize_struct("AssistantItem", 2)?;
                 state.serialize_field("type", "text")?;
                 state.serialize_field("text", text)?;
-                state.end()
-            }
-            Self::ThinkingRedacted => {
-                let mut state = serializer.serialize_struct("AssistantItem", 1)?;
-                state.serialize_field("type", "thinking_redacted")?;
                 state.end()
             }
             Self::ToolCall(call) => {
@@ -191,16 +185,12 @@ impl<'de> Visitor<'de> for AssistantItemVisitor {
 
         match kind.as_deref() {
             Some("text") => Ok(AssistantItem::Text(text.unwrap_or_default())),
-            Some("thinking_redacted") => Ok(AssistantItem::ThinkingRedacted),
             Some("tool_call") => Ok(AssistantItem::ToolCall(ToolCall {
                 id: id.ok_or_else(|| de::Error::missing_field("id"))?,
                 tool_name: tool_name.ok_or_else(|| de::Error::missing_field("tool_name"))?,
                 args_json: args_json.unwrap_or_else(|| "{}".to_string()),
             })),
-            Some(other) => Err(de::Error::unknown_variant(
-                other,
-                &["text", "thinking_redacted", "tool_call"],
-            )),
+            Some(other) => Err(de::Error::unknown_variant(other, &["text", "tool_call"])),
             None => Err(de::Error::missing_field("type")),
         }
     }
@@ -298,7 +288,6 @@ mod tests {
         let message = AssistantMessage {
             items: vec![
                 AssistantItem::Text("hello".to_string()),
-                AssistantItem::ThinkingRedacted,
                 AssistantItem::ToolCall(ToolCall {
                     id: ToolCallId::new("call_1"),
                     tool_name: "read".to_string(),
@@ -313,7 +302,6 @@ mod tests {
             json!({
                 "items": [
                     { "type": "text", "text": "hello" },
-                    { "type": "thinking_redacted" },
                     {
                         "type": "tool_call",
                         "id": "call_1",

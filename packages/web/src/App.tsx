@@ -2,7 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type 
 import { createAgentApi } from "./agentApi.ts";
 import { Composer } from "./composer.tsx";
 import { HistoryPickerDialog } from "./historyPicker.tsx";
-import type { HistoryTargetOption } from "./historyTargets.ts";
+import { branchEntriesFor, type HistoryTargetOption } from "./historyTargets.ts";
+import { ExportDialog } from "./exportDialog.tsx";
 import { randomId } from "./ids.ts";
 import {
 	Inspector,
@@ -32,6 +33,10 @@ const MAX_NOTICES = 24;
 const NOTICE_TTL_MS = 4000;
 const OLD_DRAFT_STORAGE_KEYS = ["pi-relay.web.draft-sessions.v1", "pi-relay.web.composer-drafts.v1"];
 
+type ExportDialogState = {
+	entries: TranscriptEntry[];
+};
+
 type HistoryDialogState = {
 	mode: "fork" | "switch";
 	entries: TranscriptEntry[];
@@ -58,6 +63,7 @@ export function App() {
 	const [rightOpen, setRightOpen] = useState(true);
 	const [showArchived, setShowArchived] = useState(false);
 	const [historyDialog, setHistoryDialog] = useState<HistoryDialogState | null>(null);
+	const [exportDialog, setExportDialog] = useState<ExportDialogState | null>(null);
 	const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
 	const [renameValue, setRenameValue] = useState("");
 
@@ -487,6 +493,16 @@ export function App() {
 				});
 				return;
 			}
+			if (name === "export") {
+				const refreshed = await refreshSelected(sessionId);
+				setExportDialog({
+					entries: branchEntriesFor(
+						refreshed?.entries ?? entries,
+						refreshed?.snapshot.active_leaf_id ?? snapshot?.active_leaf_id ?? null
+					)
+				});
+				return;
+			}
 			if (name === "compact") {
 				const result = await api.requestCompaction(sessionId);
 				pushActionNotice("success", `compaction requested ${result.action_row_id ?? ""}`.trim());
@@ -725,6 +741,15 @@ export function App() {
 							.then(() => setHistoryDialog(null))
 							.catch((error) => pushNotice("error", errorMessage(error)));
 					}}
+				/>
+			) : null}
+			{exportDialog ? (
+				<ExportDialog
+					entries={exportDialog.entries}
+					onClose={() => setExportDialog(null)}
+					onCopied={() => pushNotice("success", "export copied to clipboard")}
+					onDownloaded={() => pushNotice("success", "export downloaded")}
+					onError={(error) => pushNotice("error", errorMessage(error))}
 				/>
 			) : null}
 			<NoticeStack notices={notices} rightOpen={rightOpen} />

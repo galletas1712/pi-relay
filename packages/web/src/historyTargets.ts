@@ -1,5 +1,5 @@
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
-import type { TranscriptEntry, TranscriptItem } from "./types.ts";
+import type { TranscriptEntry, TranscriptItem, TurnOutcome } from "./types.ts";
 
 export type HistoryPlacement = "at" | "before";
 
@@ -15,6 +15,7 @@ export interface HistoryTargetOption {
 	preview: string;
 	meta: string;
 	isActive: boolean;
+	outcome?: TurnOutcome;
 }
 
 export interface HistoryTreeRow {
@@ -238,7 +239,8 @@ function forkOptionForEntry(
 			title: `End of turn ${item.turn_id}`,
 			preview: `${item.outcome.toLowerCase()} turn boundary.`,
 			meta: time,
-			isActive
+			isActive,
+			outcome: item.outcome
 		};
 	}
 	if (item.type === "compaction_summary") {
@@ -293,7 +295,8 @@ function switchOptionForEntry(
 			title: "Assistant message",
 			preview: assistant ? assistantPreview(assistant.item) || "Assistant message." : `${item.outcome.toLowerCase()} turn completed.`,
 			meta: `switch · ${time}`,
-			isActive: activeLeafId === entry.id
+			isActive: activeLeafId === entry.id,
+			outcome: item.outcome
 		};
 	}
 	if (item.type !== "compaction_summary") return null;

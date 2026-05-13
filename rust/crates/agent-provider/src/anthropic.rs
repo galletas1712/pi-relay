@@ -91,7 +91,6 @@ fn transcript_to_messages(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>
                         AssistantItem::Text(text) => {
                             content.push(json!({ "type": "text", "text": text }))
                         }
-                        AssistantItem::ThinkingRedacted => {}
                         AssistantItem::ToolCall(call) => content.push(json!({
                             "type": "tool_use",
                             "id": call.id.as_str(),
@@ -168,9 +167,7 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<AssistantMessage>
                     items.push(AssistantItem::Text(text.to_string()));
                 }
             }
-            Some("thinking") | Some("redacted_thinking") => {
-                items.push(AssistantItem::ThinkingRedacted);
-            }
+            Some("thinking") | Some("redacted_thinking") => {}
             Some("tool_use") => {
                 let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
                 let name = block
