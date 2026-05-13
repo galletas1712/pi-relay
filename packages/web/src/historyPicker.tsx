@@ -1,7 +1,6 @@
 import { useMemo, useState, type CSSProperties } from "react";
 import { GitFork, RotateCcw, X } from "lucide-react";
 import {
-	historyEntryDisplay,
 	historyForkOptions,
 	historySwitchOptions,
 	historyTreeRows,
@@ -39,7 +38,11 @@ export function HistoryPickerDialog({
 		[options]
 	);
 	const rows = useMemo(() => historyTreeRows(entries, activeLeafId), [activeLeafId, entries]);
-	const targetCount = options.filter((option) => option.id).length;
+	const visibleRows = rows.flatMap((row) => {
+		const option = optionsByEntryId.get(row.entry.id);
+		return option ? [{ row, option }] : [];
+	});
+	const targetCount = visibleRows.length;
 	const title = mode === "fork" ? "Fork session" : "Switch branch";
 	const description =
 		mode === "fork"
@@ -82,22 +85,17 @@ export function HistoryPickerDialog({
 				) : null}
 
 				<div className="history-options tree" role="tree" aria-label={`${mode} targets`}>
-					{rows.map((row) => {
-						const option = optionsByEntryId.get(row.entry.id);
-						const display = option ?? historyEntryDisplay(row.entry, entries);
-						const disabled = !option;
+					{visibleRows.map(({ row, option }) => {
+						const display = option;
 						return (
 							<button
 								key={row.entry.id}
 								className={`history-option tree-row ${row.isOnActivePath ? "on-active-path" : ""}`}
 								style={{ "--tree-depth": row.depth } as CSSProperties}
 								type="button"
-								disabled={disabled}
 								role="treeitem"
 								aria-selected={row.isActive}
-								aria-disabled={disabled}
 								onClick={() => {
-									if (!option) return;
 									if (mode === "fork") {
 										onFork(option, forkTitle);
 									} else {
@@ -113,7 +111,6 @@ export function HistoryPickerDialog({
 									<span className="history-option-title">
 										{display.title}
 										{row.isActive ? <span className="history-badge">current</span> : null}
-										{disabled ? <span className="history-badge muted">view</span> : null}
 									</span>
 									<span className="history-option-preview">{display.preview}</span>
 								</span>

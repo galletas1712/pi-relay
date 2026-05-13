@@ -6,8 +6,7 @@ use agent_session::{
 };
 use agent_store::{
     AcceptedInput, ActionStatus, ActionUpdate, CompactionJob, EventFrame, EventType, InputPriority,
-    OutputBatch, PersistedAction, QueueMutationError, QueueMutationErrorKind, QueuedInput,
-    SessionActivity, SessionConfig,
+    OutputBatch, PersistedAction, QueueMutationError, QueuedInput, SessionActivity, SessionConfig,
 };
 use agent_vocab::{ToolResultMessage, ToolResultStatus, UserMessage};
 use anyhow::Context;
@@ -478,11 +477,7 @@ pub(crate) fn collect_runtime_outputs(
 
 pub(crate) fn map_queued_mutation_error(error: anyhow::Error) -> RpcError {
     if let Some(error) = error.downcast_ref::<QueueMutationError>() {
-        return match error.kind() {
-            QueueMutationErrorKind::NotEditableOrNotFound => {
-                RpcError::new("input_already_consuming", error.to_string())
-            }
-        };
+        return RpcError::new("input_not_found", error.to_string());
     }
     error.into()
 }

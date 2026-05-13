@@ -5,8 +5,8 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    EnqueueUserInputResult, EventFrame, EventType, InputPriority, InputRecord, QueueMutationError,
-    QueuedInput, QueuedInputStatus,
+    EnqueueUserInputResult, EventType, InputPriority, InputRecord, PromoteQueuedInputResult,
+    QueueMutationError, QueuedInput, QueuedInputStatus,
 };
 
 use super::events::insert_event_tx;
@@ -179,7 +179,7 @@ impl PostgresAgentStore {
         &self,
         session_id: &str,
         input_id: &str,
-    ) -> Result<EventFrame> {
+    ) -> Result<PromoteQueuedInputResult> {
         let mut tx = self.pool.begin().await?;
         let editable_queue = queued_input_is_editable(None);
         let query = format!(
@@ -201,7 +201,29 @@ impl PostgresAgentStore {
             .fetch_optional(&mut *tx)
             .await?;
         let Some(row) = row else {
-            return Err(QueueMutationError::not_editable_or_not_found(input_id).into());
+            let row = sqlx::query(
+                r#"
+                    select priority, status
+                    from queued_inputs
+                    where session_id=$1 and id=$2::text
+                    "#,
+            )
+            .bind(session_id)
+            .bind(input_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(row) = row else {
+                return Err(QueueMutationError::not_found(input_id).into());
+            };
+            let result = PromoteQueuedInputResult {
+                input_id: input_id.to_string(),
+                priority: row_text::<InputPriority>(&row, "priority")?,
+                status: row_text::<QueuedInputStatus>(&row, "status")?,
+                promoted: false,
+                event: None,
+            };
+            tx.commit().await?;
+            return Ok(result);
         };
         let event = insert_event_tx(
             &mut tx,
@@ -217,7 +239,13 @@ impl PostgresAgentStore {
         )
         .await?;
         tx.commit().await?;
-        Ok(event)
+        Ok(PromoteQueuedInputResult {
+            input_id: input_id.to_string(),
+            priority: InputPriority::Steer,
+            status: QueuedInputStatus::Queued,
+            promoted: true,
+            event: Some(event),
+        })
     }
 
     pub async fn has_queued_inputs(&self, session_id: &str) -> Result<bool> {

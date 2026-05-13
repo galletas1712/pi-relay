@@ -7,6 +7,7 @@ import type {
 	HistoryTree,
 	InputPriority,
 	ProviderConfig,
+	QueuedInputStatus,
 	SessionSnapshot,
 	SessionSummary,
 	ToolDefinition,
@@ -36,7 +37,7 @@ export interface AgentApi {
 	interrupt(sessionId: string): Promise<InterruptResult>;
 	rewindHistory(params: RewindHistoryParams): Promise<RewindHistoryResult>;
 	forkHistory(params: ForkHistoryParams): Promise<ForkHistoryResult>;
-	renameSession(sessionId: string, title: string | null): Promise<RenameSessionResult>;
+	renameSession(sessionId: string, title: string): Promise<RenameSessionResult>;
 	configureSession(params: ConfigureSessionParams): Promise<ConfigureSessionResult>;
 	promoteQueuedInput(sessionId: string, inputId: string): Promise<PromoteQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
@@ -95,11 +96,14 @@ export interface ForkHistoryResult {
 
 export interface PromoteQueuedResult {
 	input_id: string;
+	priority: InputPriority;
+	status: QueuedInputStatus;
+	promoted: boolean;
 }
 
 export interface RenameSessionResult {
 	session_id: string;
-	title: string | null;
+	title: string;
 	activity: Activity;
 }
 
@@ -234,7 +238,7 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	renameSession(sessionId: string, title: string | null): Promise<RenameSessionResult> {
+	renameSession(sessionId: string, title: string): Promise<RenameSessionResult> {
 		return this.client.request<RenameSessionResult>("session.rename", {
 			session_id: sessionId,
 			title

@@ -106,19 +106,12 @@ impl PostgresAgentStore {
         Ok((frames, dispatch))
     }
 
-    pub async fn rename_session(
-        &self,
-        session_id: &str,
-        title: Option<&str>,
-    ) -> Result<Vec<EventFrame>> {
+    pub async fn rename_session(&self, session_id: &str, title: &str) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r#"
                 update sessions
-                set metadata = case
-                        when $2::text is null then metadata - 'title'
-                        else jsonb_set(metadata, '{title}', to_jsonb($2::text), true)
-                    end,
+                set metadata = jsonb_set(metadata, '{title}', to_jsonb($2::text), true),
                     updated_at = now()
                 where id = $1
             "#,

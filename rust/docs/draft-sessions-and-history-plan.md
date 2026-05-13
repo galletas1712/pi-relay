@@ -415,8 +415,8 @@ Invariant:
 
 - The daemon must claim a queued input before materializing it.
 - Once claimed, status becomes `consuming` with a claim/attempt id. UI steering
-  promotion now fails with `input_already_consuming`; editing should use
-  interrupt+rewind if the message appears in transcript.
+  promotion returns `"promoted": false` with the current row status; editing
+  should use interrupt+switch if the message appears in transcript.
 - Transcript append and final `consuming -> consumed` validate the claim id in
   one transaction.
 - Daemon recovery resets abandoned `consuming` rows to `queued` before
@@ -605,7 +605,8 @@ Manual browser/RPC tests should cover real behavior, not stub-only checks:
 
 11. Promote still-queued input.
     - If an input is still `queued` and not yet transcript, `input.promote_queued`
-      can move it into the steer queue. Editing remains picker-based after
+      can move it into the steer queue. Once claimed or consumed, promotion is
+      reported as a normal no-op and editing remains picker-based after
       transcript materialization.
 
 ## Open Implementation Notes

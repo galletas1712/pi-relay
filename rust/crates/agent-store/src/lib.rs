@@ -177,6 +177,14 @@ pub struct EnqueueUserInputResult {
     pub event: Option<EventFrame>,
 }
 
+pub struct PromoteQueuedInputResult {
+    pub input_id: String,
+    pub priority: InputPriority,
+    pub status: QueuedInputStatus,
+    pub promoted: bool,
+    pub event: Option<EventFrame>,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub session_id: String,
@@ -251,27 +259,16 @@ pub struct GlobalConfig {
     pub system_prompt: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueueMutationErrorKind {
-    NotEditableOrNotFound,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueMutationError {
-    kind: QueueMutationErrorKind,
     input_id: String,
 }
 
 impl QueueMutationError {
-    pub fn not_editable_or_not_found(input_id: impl Into<String>) -> Self {
+    pub fn not_found(input_id: impl Into<String>) -> Self {
         Self {
-            kind: QueueMutationErrorKind::NotEditableOrNotFound,
             input_id: input_id.into(),
         }
-    }
-
-    pub fn kind(&self) -> QueueMutationErrorKind {
-        self.kind
     }
 
     pub fn input_id(&self) -> &str {
@@ -281,13 +278,7 @@ impl QueueMutationError {
 
 impl fmt::Display for QueueMutationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.kind {
-            QueueMutationErrorKind::NotEditableOrNotFound => write!(
-                f,
-                "queued input is no longer editable or was not found: {}",
-                self.input_id
-            ),
-        }
+        write!(f, "queued input not found: {}", self.input_id)
     }
 }
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent, type SetStateAction } from "react";
 import { createAgentApi } from "./agentApi.ts";
 import { Composer } from "./composer.tsx";
 import { HistoryPickerDialog } from "./historyPicker.tsx";
@@ -141,7 +141,13 @@ export function App() {
 		(event: EventFrame) => {
 			lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
 			if (event.session_id === selectedRef.current) {
+				applyQueuedInputEvent(event, setSnapshot);
 				if (event.event === "model.error") pushNotice("error", modelErrorNotice(event.data));
+				if (event.event === "turn.finished") {
+					const outcome = typeof event.data.outcome === "string" ? event.data.outcome : null;
+					if (outcome === "Interrupted") pushNotice("info", "turn interrupted");
+					if (outcome === "Crashed") pushNotice("error", "turn crashed");
+				}
 				scheduleSelectedRefresh(event.session_id);
 				if (isTerminalActivityEvent(event.event)) {
 					window.setTimeout(() => {
@@ -250,9 +256,10 @@ export function App() {
 	const renameSession = useCallback(async () => {
 		if (!renameSessionId) return;
 		const title = renameValue.trim();
-		await api.renameSession(renameSessionId, title || null);
+		if (!title) throw new Error("session title is required");
+		await api.renameSession(renameSessionId, title);
 		await Promise.all([loadSessions(), renameSessionId === selectedRef.current ? refreshSelected(renameSessionId) : Promise.resolve(null)]);
-		pushNotice("success", title ? `renamed session to “${truncate(title, 80)}”` : "cleared session title");
+		pushNotice("success", `renamed session to “${truncate(title, 80)}”`);
 		closeRenameDialog();
 	}, [api, closeRenameDialog, loadSessions, pushNotice, refreshSelected, renameSessionId, renameValue]);
 
@@ -373,10 +380,13 @@ export function App() {
 	const promoteQueuedInput = useCallback(
 		async (inputId: string) => {
 			const sessionId = requireSelected();
-			await api.promoteQueuedInput(sessionId, inputId);
+			const result = await api.promoteQueuedInput(sessionId, inputId);
 			await Promise.all([refreshSelected(sessionId), loadSessions()]);
+			if (!result.promoted && result.status !== "queued") {
+				pushNotice("info", "message is already being processed");
+			}
 		},
-		[api, loadSessions, refreshSelected, requireSelected]
+		[api, loadSessions, pushNotice, refreshSelected, requireSelected]
 	);
 
 	const stopActiveTurn = useCallback(async () => {
@@ -456,10 +466,9 @@ export function App() {
 					if (session) openRenameDialog(session);
 					return;
 				}
-				const title = args === "clear" ? null : args;
-				await api.renameSession(sessionId, title);
+				await api.renameSession(sessionId, args);
 				await Promise.all([loadSessions(), refreshSelected(sessionId)]);
-				pushActionNotice("success", title ? `renamed session to “${truncate(title, 80)}”` : "cleared session title");
+				pushActionNotice("success", `renamed session to “${truncate(args, 80)}”`);
 				return;
 			}
 			if (name === "provider") {
@@ -613,7 +622,6 @@ export function App() {
 					activeLeafId={snapshot?.active_leaf_id ?? null}
 					isRunning={snapshot?.activity === "running"}
 					hasSession={!!selectedId}
-					notices={notices}
 				/>
 			</main>
 
@@ -695,9 +703,9 @@ function RenameSessionDialog({
 }) {
 	return (
 		<div className="modal-scrim" role="presentation" onMouseDown={onClose}>
-			<div className="history-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
-				<div className="history-dialog-head">
-					<div className="history-dialog-copy">
+			<div className="rename-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+				<div className="rename-dialog-head">
+					<div className="rename-dialog-copy">
 						<h2 id="rename-dialog-title">Rename session</h2>
 					</div>
 					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close rename dialog">
@@ -710,11 +718,11 @@ function RenameSessionDialog({
 						onSubmit();
 					}}
 				>
-					<label className="history-title-field">
+					<label className="rename-field">
 						<span>Session title</span>
-						<input value={value} onChange={(event) => onChange(event.target.value)} autoFocus placeholder="Empty clears custom title" />
+						<input value={value} onChange={(event) => onChange(event.target.value)} autoFocus placeholder="Session title" required />
 					</label>
-					<div className="history-actions">
+					<div className="rename-actions">
 						<button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
 						<button type="submit" className="primary-button">Save</button>
 					</div>
@@ -742,6 +750,30 @@ function isTerminalActivityEvent(event: string): boolean {
 
 function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
+}
+
+function applyQueuedInputEvent(
+	event: EventFrame,
+	setSnapshot: Dispatch<SetStateAction<SessionSnapshot | null>>
+) {
+	if (event.event !== "input.consumed" && event.event !== "input.promoted") return;
+	const inputId = typeof event.data.input_id === "string" ? event.data.input_id : null;
+	if (!inputId) return;
+	setSnapshot((current) => {
+		if (!current || current.session_id !== event.session_id) return current;
+		if (event.event === "input.consumed") {
+			const queuedInputs = current.queued_inputs.filter((input) => input.input_id !== inputId);
+			return queuedInputs.length === current.queued_inputs.length ? current : { ...current, queued_inputs: queuedInputs };
+		}
+		const promotedAt = typeof event.data.promoted_at === "string" ? event.data.promoted_at : null;
+		let changed = false;
+		const queuedInputs = current.queued_inputs.map((input) => {
+			if (input.input_id !== inputId) return input;
+			changed = true;
+			return { ...input, priority: "steer" as const, status: "queued" as const, promoted_at: promotedAt };
+		});
+		return changed ? { ...current, queued_inputs: queuedInputs } : current;
+	});
 }
 
 function modelErrorNotice(data: Record<string, unknown>): string {

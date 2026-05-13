@@ -31,6 +31,10 @@ export interface HistoryEntryDisplay {
 	meta: string;
 }
 
+type AssistantTranscriptEntry = TranscriptEntry & {
+	item: Extract<TranscriptItem, { type: "assistant_message" }>;
+};
+
 export function historyForkOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
 	const options: HistoryTargetOption[] = [];
 	for (const entry of entries) {
@@ -76,7 +80,9 @@ export function historyTreeRows(entries: TranscriptEntry[], activeLeafId: string
 			isActive: activeLeafId === entry.id,
 			isOnActivePath: activePath.has(entry.id)
 		});
-		for (const child of children.get(entry.id) ?? []) visit(child, depth + 1);
+		const entryChildren = children.get(entry.id) ?? [];
+		const childDepth = depth + (entryChildren.length > 1 ? 1 : 0);
+		for (const child of entryChildren) visit(child, childDepth);
 	};
 	for (const root of children.get(null) ?? []) visit(root, 0);
 	return rows;
@@ -252,13 +258,27 @@ function switchOptionForEntry(
 			sourceEntryId: entry.id,
 			restoreText: text,
 			turnLabel: currentTurnId ? `u${currentTurnId}` : "user",
-			title: currentTurnId ? `Edit user message in turn ${currentTurnId}` : "Edit user message",
+			title: "User message",
 			preview: truncate(text.trim() || "Empty user message.", 96),
-			meta: `before message · ${time}`,
+			meta: `edit · ${time}`,
 			isActive: false
 		};
 	}
-	if (item.type !== "turn_finished" && item.type !== "compaction_summary") return null;
+	if (item.type === "turn_finished") {
+		const assistant = previousAssistantMessage(entries, index);
+		return {
+			id: entry.id,
+			actionLeafId: entry.id,
+			expectedActiveLeafId: activeLeafId,
+			sourceEntryId: entry.id,
+			turnLabel: `a${item.turn_id}`,
+			title: "Assistant message",
+			preview: assistant ? assistantPreview(assistant.item) || "Assistant message." : `${item.outcome.toLowerCase()} turn completed.`,
+			meta: `switch · ${time}`,
+			isActive: activeLeafId === entry.id
+		};
+	}
+	if (item.type !== "compaction_summary") return null;
 	const display = historyEntryDisplay(entry, entries);
 	return {
 		id: entry.id,
@@ -288,6 +308,17 @@ function previousTurnBoundaryId(entries: TranscriptEntry[], beforeIndex: number)
 		const entry = entries[index];
 		if (entry.item.type === "turn_finished") return entry.id;
 		if (entry.item.type === "compaction_summary") return entry.id;
+	}
+	return null;
+}
+
+function previousAssistantMessage(entries: TranscriptEntry[], beforeIndex: number): AssistantTranscriptEntry | null {
+	for (let index = beforeIndex - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (entry.item.type === "assistant_message") {
+			return entry as AssistantTranscriptEntry;
+		}
+		if (entry.item.type === "turn_started" || entry.item.type === "turn_finished" || entry.item.type === "compaction_summary") return null;
 	}
 	return null;
 }

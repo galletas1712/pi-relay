@@ -362,8 +362,8 @@ round trip.
 
 ### `session.rename`
 
-Updates the UI-facing session title stored in metadata. Send `null` or an empty
-string to clear the custom title. This is a dedicated path so clients do not need
+Updates the UI-facing session title stored in metadata. The title is required
+and must be a non-empty string. This is a dedicated path so clients do not need
 to round-trip or overwrite unrelated metadata keys.
 
 Request:
@@ -466,8 +466,21 @@ from the active compacted root.
 { "session_id": "s1", "input_id": "input_..." }
 ```
 
-Rows already `consuming`, `consumed`, cancelled, or already steering fail with
-`input_already_consuming`.
+Response:
+
+```json
+{
+  "input_id": "input_...",
+  "priority": "steer",
+  "status": "queued",
+  "promoted": true
+}
+```
+
+If the row was already claimed or consumed, the call succeeds with
+`"promoted": false` and the current row status. This makes the browser's stale
+queued-row race non-fatal. A missing input id still fails with
+`input_not_found`.
 
 ### `input.interrupt`
 
@@ -736,8 +749,8 @@ each queued input is claimed as `consuming` before becoming transcript. When
 the eligible boundary is a tool-to-model continuation, verify the promoted steer
 appears after the tool results and before the next model action without a
 `turn_finished` between them.
-`input.promote_queued` must succeed before claim and fail once the row is
-`consuming` or `consumed`.
+`input.promote_queued` must promote before claim and return `"promoted": false`
+with the current row status once the row is `consuming` or `consumed`.
 
 Also verify an idle `input.follow_up` retried with the same `client_input_id`
 returns `"replayed": true`, leaves exactly one user-message transcript entry,

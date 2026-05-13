@@ -380,14 +380,14 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
 
 async fn session_rename(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
-    let title = params.get("title").and_then(Value::as_str).map(str::trim);
-    let title = match title {
-        Some("") | None => None,
-        Some(value) => Some(value.to_string()),
-    };
+    let title = required_string(&params, "title")?.trim().to_string();
+    if title.is_empty() {
+        return Err(RpcError::new("invalid_params", "session title is required"));
+    }
+    let _driver = SessionDriver::acquire(state, &session_id).await;
     let events = state
         .repo
-        .rename_session(&session_id, title.as_deref())
+        .rename_session(&session_id, &title)
         .await
         .map_err(anyhow::Error::from)?;
     publish_events(state, events);
@@ -633,13 +633,20 @@ async fn input_promote_queued(
     let input_id = required_string(&params, "input_id")?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.recover_if_needed().await?;
-    let event = state
+    let result = state
         .repo
         .promote_queued_input(&session_id, &input_id)
         .await
         .map_err(map_queued_mutation_error)?;
-    publish_events(state, vec![event]);
-    Ok(json!({ "input_id": input_id }))
+    if let Some(event) = result.event {
+        publish_events(state, vec![event]);
+    }
+    Ok(json!({
+        "input_id": result.input_id,
+        "priority": result.priority,
+        "status": result.status,
+        "promoted": result.promoted,
+    }))
 }
 
 async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

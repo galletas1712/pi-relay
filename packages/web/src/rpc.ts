@@ -52,14 +52,13 @@ export class AgentRpcClient implements RpcClient {
 			this.reconnectTimer = null;
 		}
 		this.emitStatus("connecting");
-		this.ws = new WebSocket(this.url);
+		const ws = new WebSocket(this.url);
+		this.ws = ws;
 		this.openPromise = new Promise((resolve, reject) => {
-			const ws = this.ws;
-			if (!ws) return reject(new Error("websocket was not created"));
-
 			ws.addEventListener(
 				"open",
 				() => {
+					if (this.ws !== ws) return;
 					this.emitStatus("open");
 					this.openPromise = null;
 					resolve();
@@ -69,6 +68,7 @@ export class AgentRpcClient implements RpcClient {
 			ws.addEventListener(
 				"error",
 				() => {
+					if (this.ws !== ws) return;
 					this.emitStatus("error");
 					this.openPromise = null;
 					reject(new Error(`failed to connect ${this.url}`));
@@ -77,10 +77,14 @@ export class AgentRpcClient implements RpcClient {
 			);
 		});
 
-		this.ws.addEventListener("message", (message) => this.handleMessage(message));
-		this.ws.addEventListener("close", () => {
+		ws.addEventListener("message", (message) => {
+			if (this.ws === ws) this.handleMessage(message);
+		});
+		ws.addEventListener("close", () => {
+			if (this.ws !== ws) return;
 			this.emitStatus("closed");
 			this.openPromise = null;
+			this.ws = null;
 			for (const pending of this.pending.values()) {
 				pending.reject(new Error("websocket closed"));
 			}
@@ -97,8 +101,13 @@ export class AgentRpcClient implements RpcClient {
 			window.clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
 		}
-		this.ws?.close();
+		for (const pending of this.pending.values()) {
+			pending.reject(new Error("websocket closed"));
+		}
+		this.pending.clear();
+		const ws = this.ws;
 		this.ws = null;
+		ws?.close();
 	}
 
 	isOpen(): boolean {

@@ -125,8 +125,9 @@ describe("historySwitchOptions", () => {
 		expect(options.find((option) => option.id === "user3")).toMatchObject({
 			actionLeafId: "compact1",
 			restoreText: "after compaction",
-			title: "Edit user message in turn 3",
+			title: "User message",
 			turnLabel: "u3",
+			meta: expect.stringContaining("edit ·"),
 			isActive: false
 		});
 		expect(options.find((option) => option.id === "user1")).toMatchObject({
@@ -144,14 +145,14 @@ describe("historyTreeRows", () => {
 
 		expect(rows.map((row) => [row.entry.id, row.depth, row.isOnActivePath])).toEqual([
 			["start1", 0, true],
-			["user1", 1, true],
-			["assistant1", 2, true],
-			["finish1", 3, true],
-			["start2", 4, true],
-			["user2", 5, true],
-			["assistant2", 6, true],
-			["finish2", 7, true],
-			["sibling", 4, false]
+			["user1", 0, true],
+			["assistant1", 0, true],
+			["finish1", 0, true],
+			["start2", 1, true],
+			["user2", 1, true],
+			["assistant2", 1, true],
+			["finish2", 1, true],
+			["sibling", 1, false]
 		]);
 	});
 });

@@ -5,7 +5,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { branchEntriesFor } from "./historyTargets.ts";
 import { contentBlocksToText, firstLine } from "./text.ts";
-import type { Notice, NoticeTone, TranscriptEntry, TranscriptItem } from "./types.ts";
+import type { NoticeTone, TranscriptEntry, TranscriptItem } from "./types.ts";
 
 type ToolResultItem = Extract<TranscriptItem, { type: "tool_result" }>;
 
@@ -13,14 +13,12 @@ export function MessageList({
 	entries,
 	activeLeafId,
 	isRunning,
-	hasSession,
-	notices = []
+	hasSession
 }: {
 	entries: TranscriptEntry[];
 	activeLeafId: string | null;
 	isRunning: boolean;
 	hasSession: boolean;
-	notices?: Notice[];
 }) {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const visibleEntries = useMemo(
@@ -50,7 +48,6 @@ export function MessageList({
 			{visibleEntries.map((entry) => (
 				<TranscriptEntryView entry={entry} key={entry.id} toolIndex={toolIndex} />
 			))}
-			<LocalNotices notices={notices} />
 			{isRunning ? (
 				<div className="activity-indicator">
 					<Loader2 className="spin" size={14} />
@@ -58,17 +55,6 @@ export function MessageList({
 				</div>
 			) : null}
 		</div>
-	);
-}
-
-function LocalNotices({ notices }: { notices: Notice[] }) {
-	if (notices.length === 0) return null;
-	return (
-		<>
-			{notices.map((notice) => (
-				<SystemMessage tone={notice.tone} text={notice.text} key={notice.id} />
-			))}
-		</>
 	);
 }
 
