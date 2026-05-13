@@ -143,10 +143,9 @@ fn provider_for_config(
                 credentials.codex_account_id.clone(),
             )),
             ProviderKind::Claude => Box::new(AnthropicProvider::new(
-                credentials
-                    .anthropic_api_key
-                    .clone()
-                    .ok_or_else(|| anyhow!("ANTHROPIC_API_KEY not found in env"))?,
+                credentials.anthropic_api_key.clone().ok_or_else(|| {
+                    anyhow!("ANTHROPIC_API_KEY not found in env or Claude Code keychain")
+                })?,
             )),
         };
     Ok(provider)

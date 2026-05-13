@@ -202,9 +202,6 @@ fn responses_body(
     if include_prompt_cache_retention {
         body["prompt_cache_retention"] = json!(EXTENDED_PROMPT_CACHE_RETENTION);
     }
-    if let Some(max_tokens) = request.max_tokens {
-        body["max_output_tokens"] = json!(max_tokens);
-    }
     Ok(body)
 }
 
@@ -469,7 +466,7 @@ mod tests {
         );
         assert_eq!(body["include"][0], RESPONSES_REASONING_INCLUDE);
         assert_eq!(body["tool_choice"], "auto");
-        assert_eq!(body["max_output_tokens"], 2048);
+        assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["instructions"], "static system\n\ncwd: /tmp/project");
         assert_eq!(body["input"][0]["role"], "user");

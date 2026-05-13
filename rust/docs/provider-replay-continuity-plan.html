@@ -517,6 +517,8 @@ struct ModelContext {
 					OpenAI is now implemented as a Responses-only provider. Public OpenAI requests use
 					<code>prompt_cache_retention:"24h"</code>; the ChatGPT Codex backend keeps
 					<code>prompt_cache_key</code> but omits that retention field because the backend rejects it.
+					OpenAI/Codex requests also omit <code>max_output_tokens</code>; pi-relay should not impose a
+					token cap, and the Codex Responses endpoint rejects that field.
 				</li>
 				<li>
 					Provider replay records currently live inside <code>AssistantMessage.items</code> as
@@ -528,7 +530,8 @@ struct ModelContext {
 					Anthropic requests enable extended thinking and preserve complete raw
 					<code>thinking</code>, <code>redacted_thinking</code>, <code>text</code>, and
 					<code>tool_use</code> blocks for round-trip continuity. The UI hides these opaque records by
-					default.
+					default. The stable system prefix is sent as a cached system block with a 1-hour
+					<code>cache_control</code> marker; dynamic context is an uncached suffix.
 				</li>
 				<li>
 					Custom/freeform OpenAI tools and first-class hosted-tool UI are still separate additions.
@@ -554,15 +557,16 @@ struct ModelContext {
 						<code>phase</code>, function/custom tool calls, and matching tool outputs into
 						Responses <code>input[]</code>.
 					</li>
-					<li>
-						<strong>Freeform tools</strong>
-						Add an explicit <code>ToolInputMode::FreeformGrammar</code>. Do not fake freeform
-						tools on Chat Completions.
-					</li>
-					<li>
-						<strong>Chat Completions</strong>
-						Keep as a compatibility provider path for now, but mark it lossy for reasoning/tool
-						continuity and unsupported for freeform custom tools.
+				<li>
+					<strong>Freeform tools</strong>
+					Defer <code>ToolInputMode::FreeformGrammar</code> until there is a concrete
+					patch/file-edit tool that needs raw grammar input. The current local tools remain
+					JSON-schema tools.
+				</li>
+				<li>
+					<strong>Chat Completions</strong>
+					Removed from the OpenAI provider path. Reintroduce only as a deliberately lossy
+					provider adapter if there is a concrete need.
 					</li>
 				</ul>
 			</article>
@@ -580,11 +584,13 @@ struct ModelContext {
 						Reject invalid tool chains before provider calls: no orphaned <code>tool_result</code>,
 						no duplicate <code>tool_use</code> IDs, and no missing result for a completed local tool.
 					</li>
-					<li>
-						<strong>Prompt caching</strong>
-						Cache stable system/tool prefixes with <code>cache_control</code> where supported.
-						Do not mutate assistant messages that need to be replayed byte-shape-stably.
-					</li>
+				<li>
+					<strong>Prompt caching</strong>
+					Cache the stable prefix with <code>cache_control</code>. Because Anthropic caches the
+					prompt prefix in <code>tools</code>, <code>system</code>, <code>messages</code> order,
+					a cache marker on the stable system block also covers the stable local tool definitions
+					that precede it.
+				</li>
 					<li>
 						<strong>Streaming fallback</strong>
 						If a stream fails after tool calls have appeared, discard partial replay records for that
@@ -779,15 +785,19 @@ struct ModelContext {
 			<ul class="checklist">
 				<li>
 					<strong>OpenAI Responses</strong>
-					A real OpenAI/Codex Responses turn with tool use can continue statelessly after daemon restart.
+					Done: real Codex Responses turns cover text, replay-preserving continuation, local
+					tool use, and daemon restart recovery after a killed in-flight tool action.
 				</li>
 				<li>
 					<strong>Anthropic</strong>
-					A real Anthropic extended-thinking tool turn can preserve thinking signatures and continue after tool results.
+					Done: real Anthropic Messages turns preserve thinking signatures across text,
+					continuation, and local tool-use loops.
 				</li>
 				<li>
 					<strong>History operations</strong>
-					Fork, switch, compaction, and branch rendering preserve both visible transcript and replay records.
+					Done at the WebSocket/storage layer: fork while active, switch blocking while active,
+					fork continuation, manual compaction, and switching between a compaction root and
+					pre-compaction branch all preserve visible transcript and replay records.
 				</li>
 				<li>
 					<strong>UI</strong>

@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use crate::{ModelProvider, ModelRequest, ModelResponse, ProviderError, ProviderResult};
 
 const THINKING_BUDGET_TOKENS: u32 = 1024;
+const ANTHROPIC_BETA_HEADER: &str = "interleaved-thinking-2025-05-14,extended-cache-ttl-2025-04-11";
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -42,6 +43,7 @@ impl ModelProvider for AnthropicProvider {
             .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", ANTHROPIC_BETA_HEADER)
             .json(&body)
             .send()
             .await?;
@@ -74,8 +76,8 @@ fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
             "budget_tokens": THINKING_BUDGET_TOKENS,
         },
     });
-    if let Some(system_prompt) = request.prompt.render_joined() {
-        body["system"] = json!(system_prompt);
+    if let Some(system_blocks) = anthropic_system_blocks(&request.prompt) {
+        body["system"] = Value::Array(system_blocks);
     }
     if !request.tools.is_empty() {
         body["tools"] = Value::Array(request.tools.iter().map(anthropic_tool).collect());
@@ -133,6 +135,27 @@ fn anthropic_tool(tool: &ToolDefinition) -> Value {
         "description": tool.description,
         "input_schema": tool.input_schema,
     })
+}
+
+fn anthropic_system_blocks(prompt: &crate::PromptSections) -> Option<Vec<Value>> {
+    let mut blocks = Vec::new();
+    if let Some(stable) = &prompt.stable_prefix {
+        blocks.push(json!({
+            "type": "text",
+            "text": stable,
+            "cache_control": {
+                "type": "ephemeral",
+                "ttl": "1h",
+            },
+        }));
+    }
+    if let Some(dynamic) = &prompt.dynamic_context {
+        blocks.push(json!({
+            "type": "text",
+            "text": dynamic,
+        }));
+    }
+    (!blocks.is_empty()).then_some(blocks)
 }
 
 fn transcript_to_messages(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>> {
@@ -295,7 +318,17 @@ mod tests {
         })
         .expect("body renders");
 
-        assert_eq!(body["system"], "stable rules");
+        assert_eq!(
+            body["system"],
+            json!([{
+                "type": "text",
+                "text": "stable rules",
+                "cache_control": {
+                    "type": "ephemeral",
+                    "ttl": "1h",
+                },
+            }])
+        );
         assert_eq!(body["thinking"]["type"], "enabled");
         assert_eq!(body["thinking"]["budget_tokens"], THINKING_BUDGET_TOKENS);
         assert_eq!(body["tool_choice"]["type"], "auto");

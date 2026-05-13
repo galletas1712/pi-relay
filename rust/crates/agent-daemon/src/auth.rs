@@ -1,6 +1,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{anyhow, Result};
@@ -29,9 +30,38 @@ impl Credentials {
                 .ok()
                 .or_else(|| codex.access_token.clone()),
             codex_account_id: codex.account_id,
-            anthropic_api_key: env::var("ANTHROPIC_API_KEY").ok(),
+            anthropic_api_key: env::var("ANTHROPIC_API_KEY")
+                .ok()
+                .or_else(read_claude_code_keychain_api_key),
         }
     }
+}
+
+fn read_claude_code_keychain_api_key() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+
+    let username = env::var("USER").ok().filter(|value| !value.is_empty())?;
+    let output = Command::new("security")
+        .args([
+            "find-generic-password",
+            "-a",
+            &username,
+            "-w",
+            "-s",
+            "Claude Code",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    String::from_utf8(output.stdout)
+        .ok()
+        .map(|key| key.trim().to_string())
+        .filter(|key| key.starts_with("sk-ant-"))
 }
 
 #[derive(Debug, Default)]
