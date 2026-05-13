@@ -118,7 +118,8 @@ Implemented user-facing behavior:
 - Provider config with `max_tokens` and `prompt_cache.key`.
 - Real Codex provider path through `~/.codex/auth.json` or
   `CODEX_ACCESS_TOKEN`.
-- OpenAI API-key and Anthropic API-key provider adapters.
+- OpenAI Responses provider through ChatGPT/Codex subscription auth and
+  Anthropic API-key provider adapter.
 
 Not implemented by design:
 
@@ -274,8 +275,7 @@ history.
 
 Provider adapters:
 
-- OpenAI Chat Completions via API key.
-- Codex/ChatGPT backend via streamed Responses API, bearer ChatGPT token,
+- OpenAI/Codex backend via streamed Responses API, bearer ChatGPT token,
   optional `ChatGPT-Account-ID`, and the Codex residency routing header.
 - Anthropic Messages API via `ANTHROPIC_API_KEY`.
 
@@ -288,8 +288,8 @@ Supported provider features:
 - Redacted thinking markers.
 - Stable-prefix/dynamic-context prompt rendering.
 - Prompt cache key on OpenAI request paths.
-- Priority service tier, explicit parallel tool calls, disabled output storage,
-  and 24-hour prompt-cache retention on Chat Completions.
+- Priority service tier, explicit parallel tool calls, and disabled output
+  storage on OpenAI/Codex Responses requests.
 - No daemon-enforced OpenAI/Codex output-token cap when `max_tokens` is omitted.
 
 Streaming is currently normalized inside the OpenAI/Codex provider by reading

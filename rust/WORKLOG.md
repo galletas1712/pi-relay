@@ -1003,3 +1003,109 @@ paths. Changes made from that review:
   model interrupt continue. The smoke verified one user-message row, preserved
   old terminal branches, clean active context, and graceful completion after
   resume; temporary `session_retry_smoke_*` rows were deleted.
+
+### Provider Model Lock And Reasoning Effort
+
+- Verified the current provider APIs before changing the UI contract. OpenAI
+  Responses exposes `reasoning.effort` with OpenAI-specific levels from `none`
+  through `xhigh`; Anthropic Claude Opus 4.7 exposes `output_config.effort`
+  with Claude levels from `low` through `max` and requires adaptive thinking rather than manual
+  `budget_tokens`.
+- Added `reasoning_effort` to `ProviderConfig`. The web UI writes explicit
+  `xhigh` defaults for new OpenAI and Claude sessions, while the serde fallback
+  for older stored sessions stays conservative at `medium` so historical Codex
+  sessions are not silently replayed at a new effort level. The OpenAI
+  serializer accepts only OpenAI effort keys; the Claude serializer accepts only
+  Claude effort keys and sends `thinking: { type: "adaptive" }` plus
+  `output_config.effort`.
+- Removed the `/provider` slash-command path from the web UI. The log header now
+  owns model selection and reasoning effort selection. The picker intentionally
+  exposes only OpenAI `gpt-5.5` and Claude `claude-opus-4-7` for now.
+- Locked `provider.kind` and `provider.model` after the first transcript entry
+  at the daemon RPC boundary. Reasoning effort remains configurable even during
+  active turns; the daemon updates the active runtime config so the new effort
+  applies to subsequent provider requests without pretending that provider/model
+  replay state can be migrated mid-session.
+- Verified with `cargo check --manifest-path rust/Cargo.toml -p agent-vocab -p
+  agent-provider -p agent-daemon` and `npm run build:web --silent`. A full
+  `cargo test` attempt reached the linker but failed locally with
+  `ld: library not found for -liconv`.
+
+### Responses Overload Debugging
+
+- Investigated new-session `Our servers are currently overloaded` crashes after
+  the OpenAI Responses migration. The failing persisted rows were actually
+  `codex` provider sessions with no stored `reasoning_effort`, and the daemon
+  had no public `OPENAI_API_KEY`; it only had Codex/ChatGPT auth from
+  `~/.codex/auth.json`.
+- Matched the request policy more closely to the credential path. Public
+  OpenAI API-key requests still send `service_tier: "priority"` and
+  `prompt_cache_retention: "24h"`, while Codex-auth requests omit both fields.
+  This avoids applying public-API cache/service-tier knobs to the ChatGPT Codex
+  backend by accident.
+- Let OpenAI-configured sessions fall back to Codex auth when no OpenAI API key
+  is available, while preserving Codex token refresh on 401s. That keeps the UI
+  model picker usable on machines that only have Codex credentials.
+- Verified with `cargo check --manifest-path rust/Cargo.toml -p agent-vocab -p
+  agent-provider -p agent-daemon`, `npm run build:web --silent`, a rebuilt and
+  restarted daemon, and two live websocket smokes. A Codex-auth medium request
+  and an OpenAI-configured `xhigh` request using Codex auth both completed
+  gracefully; temporary `session_debug_*` rows were deleted afterward.
+
+### Subscription-Only OpenAI Transport
+
+- Removed the daemon's public OpenAI API-key branch. OpenAI-configured sessions
+  now always use the ChatGPT/Codex subscription token from `~/.codex/auth.json`
+  or `CODEX_ACCESS_TOKEN`; the only OpenAI 401 recovery path is the Codex token
+  refresh flow.
+- Updated the small `pi-rs openai` CLI path to use the same subscription token
+  transport instead of `OPENAI_API_KEY`, and changed its default OpenAI model to
+  `gpt-5.5`.
+- Renamed the web model label to `GPT-5.5 (ChatGPT)` so the UI does not imply
+  public API-key authentication.
+- Verified with `cargo check --manifest-path rust/Cargo.toml -p agent-daemon -p
+  pi-cli`, `npm run build:web --silent`, a rebuilt/restarted daemon, and a live
+  websocket smoke for an `openai:gpt-5.5` `xhigh` session. The smoke completed
+  gracefully and the temporary `session_debug_subscription_*` row was deleted.
+
+### Assistant Boundary Design Plan
+
+- Audited the current turn, fork, switch, render, and export assumptions around
+  assistant messages. The core already supports multiple model responses inside
+  one turn, but the web export and history picker still use pair-shaped labels
+  and previews in places.
+- Wrote `rust/docs/assistant-boundary-plan.html` with an additive plan: normalize
+  provider continuation metadata, derive turn views over transcript paths, keep
+  switch stable-boundary-only, keep fork entry-addressable, and make export
+  default to final answers or whole turns instead of raw assistant/user pairs.
+
+### Prefix Cache Request Shape
+
+- Made the OpenAI provider subscription-only at the provider boundary as well as
+  the daemon boundary. `OpenAiProvider` now always signs requests with the
+  ChatGPT/Codex bearer token, optional `ChatGPT-Account-ID`, and the Codex
+  residency header; the old plain API-key provider state is gone.
+- Changed OpenAI Responses serialization so the stable global system prompt is
+  the only `instructions` content. Dynamic daemon context is the first input
+  item, followed by transcript replay, so stable instructions/tools can remain
+  cacheable across sessions while transcript prefixes can cache within a
+  session. The default `prompt_cache_key` is derived from model, stable prompt,
+  and sorted tool schema.
+- Changed Anthropic Messages serialization to sort tools, mark the final stable
+  tool and stable system block with 1-hour `cache_control`, and add one latest
+  eligible transcript cache breakpoint. Thinking and redacted thinking replay
+  blocks remain preserved but are never used as the cache marker.
+- Added provider-neutral usage metrics to `ModelResponse` and persisted them on
+  model action results. OpenAI reads `input_tokens_details.cached_tokens`;
+  Anthropic reads `cache_creation_input_tokens` and
+  `cache_read_input_tokens`. This is intentionally the whole observability
+  surface for now; no new inspector panels, logs, or debug commands.
+- Updated docs in `README.md`, websocket RPC, architecture, design decisions,
+  provider continuity, and `rust/docs/prefix-caching-plan.html` to reflect
+  subscription-only OpenAI auth and the implemented cache boundaries.
+- Verified with `RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/cc'
+  cargo test --manifest-path rust/Cargo.toml -p agent-provider`,
+  `RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/cc'
+  cargo check --manifest-path rust/Cargo.toml -p agent-daemon -p pi-cli`, and
+  `RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/cc'
+  cargo test --manifest-path rust/Cargo.toml -p agent-daemon`.

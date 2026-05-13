@@ -8,10 +8,11 @@ import {
 	Search,
 	Settings
 } from "lucide-react";
+import type { ModelOption } from "./sessionDefaults.ts";
 import { COMMANDS } from "./slash.ts";
 import { isArchivedSession, sessionTitle, type SessionListItem } from "./sessionList.ts";
 import { truncate } from "./text.ts";
-import type { Activity, DaemonConfig, Notice, SessionSnapshot, ToolDefinition } from "./types.ts";
+import type { Activity, DaemonConfig, Notice, ReasoningEffort, SessionSnapshot, ToolDefinition } from "./types.ts";
 
 export function SidebarHeader({
 	counts,
@@ -161,15 +162,38 @@ export function SessionRow({
 export function LogHeader({
 	session,
 	snapshot,
+	modelOptions,
+	modelValue,
+	modelLocked,
+	modelControlsDisabled,
+	reasoningEfforts,
+	reasoningEffort,
+	onModelChange,
+	onReasoningEffortChange,
 	rightOpen,
 	onToggleRight
 }: {
 	session: SessionListItem | null;
 	snapshot: SessionSnapshot | null;
+	modelOptions: ModelOption[];
+	modelValue: string;
+	modelLocked: boolean;
+	modelControlsDisabled: boolean;
+	reasoningEfforts: ReasoningEffort[];
+	reasoningEffort: ReasoningEffort;
+	onModelChange: (value: string) => void;
+	onReasoningEffortChange: (value: ReasoningEffort) => void;
 	rightOpen: boolean;
 	onToggleRight: () => void;
 }) {
 	const archived = session ? isArchivedSession(session) : false;
+	const modelDisabled = modelLocked || modelControlsDisabled;
+	const displayedModelOptions = modelOptions.some((option) => option.id === modelValue)
+		? modelOptions
+		: [{ id: modelValue, label: modelValue }, ...modelOptions];
+	const displayedEfforts = reasoningEfforts.includes(reasoningEffort)
+		? reasoningEfforts
+		: [reasoningEffort, ...reasoningEfforts];
 	return (
 		<div className="log-header">
 			<span className={`dot ${archived ? "archived" : "ok"}`} />
@@ -181,6 +205,33 @@ export function LogHeader({
 			) : (
 				<span className="log-session">no session selected</span>
 			)}
+			<div className="log-controls">
+				<label className="header-select">
+					<span>model</span>
+					<select
+						value={modelValue}
+						disabled={modelDisabled}
+						title={modelLocked ? "model is locked after the first transcript entry" : "model"}
+						onChange={(event) => onModelChange(event.target.value)}
+					>
+						{displayedModelOptions.map((option) => (
+							<option key={option.id} value={option.id}>{option.label}</option>
+						))}
+					</select>
+				</label>
+				<label className="header-select compact">
+					<span>effort</span>
+					<select
+						value={reasoningEffort}
+						title="reasoning effort"
+						onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
+					>
+						{displayedEfforts.map((effort) => (
+							<option key={effort} value={effort}>{effort}</option>
+						))}
+					</select>
+				</label>
+			</div>
 			<button className="icon-button tiny" type="button" onClick={onToggleRight} title={rightOpen ? "close inspector" : "open inspector"}>
 				{rightOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}
 			</button>
@@ -238,12 +289,6 @@ export function Inspector({
 						<div className="kv">
 							<span>leaf</span>
 							<strong>{snapshot.active_leaf_id?.slice(0, 12) ?? "root"}</strong>
-						</div>
-						<div className="kv">
-							<span>provider</span>
-							<strong>
-								{snapshot.provider.kind} {snapshot.provider.model}
-							</strong>
 						</div>
 						<div className="kv">
 							<span>metadata</span>

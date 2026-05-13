@@ -429,12 +429,57 @@ pre {
 }
 
 .log-session {
-	margin-left: auto;
+	min-width: 0;
+	flex: 1;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
 	text-transform: none;
 	letter-spacing: 0;
+}
+
+.log-controls {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	margin-left: auto;
+	min-width: 0;
+}
+
+.header-select {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+
+.header-select span {
+	color: var(--muted-foreground);
+}
+
+.header-select select {
+	height: 28px;
+	max-width: 180px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--background);
+	color: var(--foreground);
+	padding: 0 24px 0 8px;
+	font-family: var(--font-mono);
+	font-size: 11px;
+	letter-spacing: 0;
+	text-transform: none;
+}
+
+.header-select.compact select {
+	max-width: 92px;
+}
+
+.header-select select:disabled {
+	cursor: not-allowed;
+	opacity: 0.6;
 }
 
 .message-scroll {
@@ -578,6 +623,15 @@ pre {
 
 .assistant-markdown {
 	margin: 6px 0;
+}
+
+.assistant-block.phase-tool_request .assistant-markdown,
+.assistant-block.phase-running .assistant-markdown {
+	color: var(--muted-foreground);
+}
+
+.assistant-block.phase-aborted .assistant-markdown {
+	color: var(--destructive);
 }
 
 .assistant-markdown > :first-child {
@@ -1732,6 +1786,15 @@ pre {
 .export-option-title {
 	font-size: 12px;
 	font-weight: 600;
+}
+
+.export-option-title.phase-tool_request,
+.export-option-title.phase-running {
+	color: var(--muted-foreground);
+}
+
+.export-option-title.phase-aborted {
+	color: var(--destructive);
 }
 
 .export-option-preview {

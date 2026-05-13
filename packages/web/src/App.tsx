@@ -15,7 +15,16 @@ import {
 } from "./panels.tsx";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, filterCommands, findCommand, matchSlashPrefix, parseSlash, type ParsedSlash } from "./slash.ts";
-import { DEFAULT_PROVIDER, textContent } from "./sessionDefaults.ts";
+import {
+	DEFAULT_PROVIDER,
+	MODEL_OPTIONS,
+	providerFromModelKey,
+	providerModelKey,
+	providerReasoningEffort,
+	reasoningEffortsForProvider,
+	textContent,
+	withReasoningEffort
+} from "./sessionDefaults.ts";
 import { sessionTitle, isArchivedSession, tallyActivities, type SessionListItem } from "./sessionList.ts";
 import { firstLine, truncate } from "./text.ts";
 import { MessageList } from "./transcript.tsx";
@@ -23,6 +32,8 @@ import type {
 	DaemonConfig,
 	EventFrame,
 	Notice,
+	ProviderConfig,
+	ReasoningEffort,
 	SessionSnapshot,
 	SessionSummary,
 	ToolDefinition,
@@ -57,6 +68,7 @@ export function App() {
 	const [tools, setTools] = useState<ToolDefinition[]>([]);
 	const [query, setQuery] = useState("");
 	const [composer, setComposer] = useState("");
+	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
 	const [slashIndex, setSlashIndex] = useState(0);
 	const [sending, setSending] = useState(false);
 	const [stopping, setStopping] = useState(false);
@@ -236,6 +248,42 @@ export function App() {
 		[sessionItems, selectedId]
 	);
 
+	const activeProvider = snapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
+	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
+	const modelLocked = !!selectedId && (entries.length > 0 || snapshot?.active_leaf_id !== null);
+	const modelControlsDisabled = !!selectedId && snapshot?.activity !== "idle";
+
+	const configureProvider = useCallback(
+		async (provider: ProviderConfig) => {
+			const sessionId = selectedRef.current;
+			if (!sessionId) {
+				setNewSessionProvider(provider);
+				return;
+			}
+			await api.configureSession({ sessionId, provider });
+			await Promise.all([loadSessions(), refreshSelected(sessionId)]);
+		},
+		[api, loadSessions, refreshSelected]
+	);
+
+	const changeModel = useCallback(
+		async (modelKey: string) => {
+			if (modelLocked) {
+				pushNotice("info", "model is locked after the first transcript entry");
+				return;
+			}
+			await configureProvider(providerFromModelKey(modelKey, activeProvider));
+		},
+		[activeProvider, configureProvider, modelLocked, pushNotice]
+	);
+
+	const changeReasoningEffort = useCallback(
+		async (effort: ReasoningEffort) => {
+			await configureProvider(withReasoningEffort(activeProvider, effort));
+		},
+		[activeProvider, configureProvider]
+	);
+
 	const filteredSessions = useMemo(() => {
 		const q = query.trim().toLowerCase();
 		const visibleSessions = showArchived ? sessionItems : sessionItems.filter((session) => !isArchivedSession(session));
@@ -349,19 +397,19 @@ export function App() {
 			const sessionId = randomId("session");
 			const title = nextSessionTitleRef.current || titleFromText(text);
 			nextSessionTitleRef.current = null;
-			const result = await api.startSession({
-				sessionId,
-				provider: DEFAULT_PROVIDER,
-				metadata: { title, created_by: "web" },
-				clientInputId: randomId("web_start"),
-				priority: "follow_up",
-				content: textContent(text)
+				const result = await api.startSession({
+					sessionId,
+					provider: newSessionProvider,
+					metadata: { title, created_by: "web" },
+					clientInputId: randomId("web_start"),
+					priority: "follow_up",
+					content: textContent(text)
 			});
 			await loadSessions();
 			selectSession(result.session_id);
 			return result.session_id;
 		},
-		[api, loadSessions, selectSession]
+		[api, loadSessions, newSessionProvider, selectSession]
 	);
 
 	const forkFromTarget = useCallback(
@@ -555,31 +603,12 @@ export function App() {
 				await setSessionArchived(session, name === "archive");
 				return;
 			}
-			if (name === "provider") {
-				if (!args) {
-					const provider = snapshot?.provider ?? selectedSession?.provider;
-					pushActionNotice("info", provider ? `${provider.kind} ${provider.model}` : "no provider loaded");
-					return;
-				}
-				const [kind, model] = args.split(/\s+/).filter(Boolean);
-				if (!kind || !model) throw new Error("usage: /provider <kind> <model>");
-				const previous = snapshot?.provider ?? selectedSession?.provider ?? DEFAULT_PROVIDER;
-				const provider = { ...previous, kind, model };
-				await api.configureSession({
-					sessionId,
-					provider
-				});
-				await Promise.all([loadSessions(), refreshSelected(sessionId)]);
-				pushActionNotice("success", `provider set to ${kind} ${model}`);
-				return;
-			}
 			throw new Error(`unknown command: /${name}`);
 		},
 		[
 			api,
 			createSession,
 			entries,
-			loadGlobal,
 			loadSessions,
 			openRenameDialog,
 			pushNotice,
@@ -703,6 +732,18 @@ export function App() {
 				<LogHeader
 					session={selectedSession}
 					snapshot={snapshot}
+					modelOptions={MODEL_OPTIONS}
+					modelValue={providerModelKey(activeProvider)}
+					modelLocked={modelLocked}
+					modelControlsDisabled={modelControlsDisabled}
+					reasoningEfforts={reasoningEfforts}
+					reasoningEffort={providerReasoningEffort(activeProvider)}
+					onModelChange={(value) => {
+						void changeModel(value).catch((error) => pushNotice("error", errorMessage(error)));
+					}}
+					onReasoningEffortChange={(value) => {
+						void changeReasoningEffort(value).catch((error) => pushNotice("error", errorMessage(error)));
+					}}
 					rightOpen={rightOpen}
 					onToggleRight={() => setRightOpen((open) => !open)}
 				/>

@@ -1,7 +1,10 @@
 #![forbid(unsafe_code)]
 
-use agent_vocab::{AssistantMessage, ProviderReplayItem, ToolDefinition, TranscriptItem};
+use agent_vocab::{
+    AssistantMessage, ProviderReplayItem, ReasoningEffort, ToolDefinition, TranscriptItem,
+};
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod anthropic;
@@ -14,6 +17,7 @@ pub struct ModelRequest {
     pub transcript: Vec<ModelTranscriptEntry>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
+    pub reasoning_effort: ReasoningEffort,
     pub prompt_cache_key: Option<String>,
 }
 
@@ -75,6 +79,16 @@ fn normalize_prompt_section(value: Option<String>) -> Option<String> {
 pub struct ModelResponse {
     pub assistant: AssistantMessage,
     pub provider_replay: Vec<ProviderReplayItem>,
+    pub usage: Option<ProviderUsage>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderUsage {
+    pub input_tokens: Option<usize>,
+    pub output_tokens: Option<usize>,
+    pub total_tokens: Option<usize>,
+    pub cache_read_input_tokens: Option<usize>,
+    pub cache_creation_input_tokens: Option<usize>,
 }
 
 #[derive(Debug, Error)]

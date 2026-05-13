@@ -1,5 +1,12 @@
-import { contentBlocksToText, firstLine, truncate } from "./text.ts";
-import type { TranscriptEntry, TranscriptItem } from "./types.ts";
+import { firstLine, truncate } from "./text.ts";
+import {
+	assistantMessageText,
+	buildTurnViews,
+	modelStepPhaseLabel,
+	userMessageExportText
+} from "./turnView.ts";
+import type { ModelStepPhase } from "./turnView.ts";
+import type { TranscriptEntry } from "./types.ts";
 
 export type ExportBlock =
 	| {
@@ -11,39 +18,35 @@ export type ExportBlock =
 			type: "assistant";
 			entryId: string;
 			text: string;
-			priorUserEntryId: string | null;
+			priorUserEntryIds: string[];
+			phase: ModelStepPhase;
+			turnLabel: string;
 	  };
 
 export type AssistantExportBlock = Extract<ExportBlock, { type: "assistant" }>;
 
-export function assistantMessageText(item: Extract<TranscriptItem, { type: "assistant_message" }>): string {
-	return item.items
-		.map((assistantItem) => (assistantItem.type === "text" ? assistantItem.text : ""))
-		.filter(Boolean)
-		.join("\n\n")
-		.trim();
-}
+export { assistantMessageText };
 
 export function buildExportBlocks(entries: TranscriptEntry[]): ExportBlock[] {
 	const blocks: ExportBlock[] = [];
-	let currentUserEntryId: string | null = null;
+	const turns = buildTurnViews(entries);
 
-	for (const entry of entries) {
-		if (entry.item.type === "user_message") {
-			const text = contentBlocksToText(entry.item.content).trim();
-			currentUserEntryId = entry.id;
-			if (text) blocks.push({ type: "user", entryId: entry.id, text });
-			continue;
+	for (const turn of turns) {
+		const priorUserEntryIds = turn.userInputs.map((input) => input.id);
+		for (const input of turn.userInputs) {
+			const text = userMessageExportText(input);
+			if (text) blocks.push({ type: "user", entryId: input.id, text });
 		}
 
-		if (entry.item.type === "assistant_message") {
-			const text = assistantMessageText(entry.item);
-			if (!text) continue;
+		for (const step of turn.modelSteps) {
+			if (!step.text) continue;
 			blocks.push({
 				type: "assistant",
-				entryId: entry.id,
-				text,
-				priorUserEntryId: currentUserEntryId
+				entryId: step.entry.id,
+				text: step.text,
+				priorUserEntryIds,
+				phase: step.phase,
+				turnLabel: turn.turnId ? `turn ${turn.turnId}` : "session"
 			});
 		}
 	}
@@ -55,11 +58,17 @@ export function assistantExportBlocks(blocks: ExportBlock[]): AssistantExportBlo
 	return blocks.filter((block): block is AssistantExportBlock => block.type === "assistant");
 }
 
+export function defaultSelectedAssistantIds(blocks: ExportBlock[]): Set<string> {
+	const assistants = assistantExportBlocks(blocks);
+	const finalAnswers = assistants.filter((block) => block.phase === "final_answer");
+	return new Set((finalAnswers.length > 0 ? finalAnswers : assistants).map((assistant) => assistant.entryId));
+}
+
 export function formatExportMarkdown(blocks: ExportBlock[], selectedAssistantIds: Set<string>): string {
 	const requiredUserIds = new Set<string>();
 	for (const block of blocks) {
-		if (block.type === "assistant" && selectedAssistantIds.has(block.entryId) && block.priorUserEntryId) {
-			requiredUserIds.add(block.priorUserEntryId);
+		if (block.type === "assistant" && selectedAssistantIds.has(block.entryId)) {
+			for (const userEntryId of block.priorUserEntryIds) requiredUserIds.add(userEntryId);
 		}
 	}
 
@@ -73,6 +82,10 @@ export function formatExportMarkdown(blocks: ExportBlock[], selectedAssistantIds
 	}
 
 	return parts.join("\n\n").trim();
+}
+
+export function exportTitle(block: AssistantExportBlock, index: number): string {
+	return `${modelStepPhaseLabel(block.phase)} ${index + 1} · ${block.turnLabel}`;
 }
 
 export function exportPreview(text: string): string {

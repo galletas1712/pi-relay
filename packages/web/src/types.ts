@@ -5,10 +5,12 @@ export type ActionKind = "model" | "tool" | "compaction";
 export type ActionStatus = "running" | "completed" | "error" | "interrupted" | "stale";
 export type ToolResultStatus = "Success" | "Error" | "Interrupted" | "Crashed";
 export type TurnOutcome = "Graceful" | "Interrupted" | "Crashed";
+export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface ProviderConfig {
 	kind: string;
 	model: string;
+	reasoning_effort?: ReasoningEffort;
 	max_tokens?: number;
 	prompt_cache?: Record<string, unknown>;
 }

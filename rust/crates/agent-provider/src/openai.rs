@@ -1,6 +1,6 @@
 use agent_vocab::{
     AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
-    ProviderReplayItem, ToolCall, ToolCallId, TranscriptItem, UserMessage,
+    ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::{
@@ -10,47 +10,29 @@ use reqwest::{
 use serde_json::{json, Value};
 
 use crate::{
-    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError, ProviderResult,
+    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError,
+    ProviderResult, ProviderUsage,
 };
 
-const DEFAULT_PROMPT_CACHE_KEY: &str = "pi-relay-openai-responses";
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
-const EXTENDED_PROMPT_CACHE_RETENTION: &str = "24h";
+const OPENAI_PRIORITY_SERVICE_TIER: &str = "priority";
 const CODEX_RESIDENCY_HEADER: &str = "x-openai-internal-codex-residency";
 const CODEX_RESIDENCY_US: &str = "us";
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
     client: reqwest::Client,
-    auth: OpenAiAuth,
+    access_token: String,
+    account_id: Option<String>,
     base_url: String,
 }
 
-#[derive(Debug, Clone)]
-enum OpenAiAuth {
-    ApiKey(String),
-    Codex {
-        access_token: String,
-        account_id: Option<String>,
-    },
-}
-
 impl OpenAiProvider {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            auth: OpenAiAuth::ApiKey(api_key.into()),
-            base_url: "https://api.openai.com/v1".to_string(),
-        }
-    }
-
     pub fn codex(access_token: impl Into<String>, account_id: Option<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            auth: OpenAiAuth::Codex {
-                access_token: access_token.into(),
-                account_id,
-            },
+            access_token: access_token.into(),
+            account_id,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
         }
     }
@@ -65,34 +47,15 @@ impl OpenAiProvider {
     }
 
     fn add_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let request = request.header(ACCEPT_ENCODING, "identity");
-        match &self.auth {
-            OpenAiAuth::ApiKey(api_key) => request.bearer_auth(api_key),
-            OpenAiAuth::Codex {
-                access_token,
-                account_id,
-            } => {
-                let request = request
-                    .bearer_auth(access_token)
-                    .header(CODEX_RESIDENCY_HEADER, CODEX_RESIDENCY_US);
-                if let Some(account_id) = account_id {
-                    request.header("ChatGPT-Account-ID", account_id)
-                } else {
-                    request
-                }
-            }
+        let request = request
+            .header(ACCEPT_ENCODING, "identity")
+            .bearer_auth(&self.access_token)
+            .header(CODEX_RESIDENCY_HEADER, CODEX_RESIDENCY_US);
+        if let Some(account_id) = &self.account_id {
+            request.header("ChatGPT-Account-ID", account_id)
+        } else {
+            request
         }
-    }
-
-    fn replay_provider_kind(&self) -> ProviderKind {
-        match self.auth {
-            OpenAiAuth::ApiKey(_) => ProviderKind::OpenAi,
-            OpenAiAuth::Codex { .. } => ProviderKind::Codex,
-        }
-    }
-
-    fn supports_extended_prompt_cache_retention(&self) -> bool {
-        matches!(self.auth, OpenAiAuth::ApiKey(_))
     }
 }
 
@@ -105,7 +68,7 @@ impl ModelProvider for OpenAiProvider {
 
 impl OpenAiProvider {
     async fn complete_responses(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
-        let body = responses_body(request, self.supports_extended_prompt_cache_retention())?;
+        let body = responses_body(request)?;
 
         let text = self
             .add_auth(
@@ -119,7 +82,7 @@ impl OpenAiProvider {
         let (status, text) = response_text(text).await?;
         ensure_success(status, &text)?;
 
-        parse_responses_sse(&text, self.replay_provider_kind())
+        parse_responses_sse(&text, ProviderKind::Codex)
     }
 }
 
@@ -166,15 +129,35 @@ fn response_excerpt(body: &str) -> String {
     }
 }
 
-fn responses_body(
-    request: ModelRequest,
-    include_prompt_cache_retention: bool,
-) -> ProviderResult<Value> {
+fn responses_body(request: ModelRequest) -> ProviderResult<Value> {
+    let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
+    let tools = response_tools(&request.tools);
     let prompt_cache_key = request
         .prompt_cache_key
-        .unwrap_or_else(|| DEFAULT_PROMPT_CACHE_KEY.to_string());
-    let tools: Vec<Value> = request
-        .tools
+        .unwrap_or_else(|| default_prompt_cache_key(&request.model, &request.prompt, &tools));
+    let body = json!({
+        "model": request.model,
+        "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
+        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.transcript)?,
+        "tools": tools,
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+            "effort": reasoning_effort,
+        },
+        "store": false,
+        "stream": true,
+        "include": [RESPONSES_REASONING_INCLUDE],
+        "prompt_cache_key": prompt_cache_key,
+        "service_tier": OPENAI_PRIORITY_SERVICE_TIER,
+    });
+    Ok(body)
+}
+
+fn response_tools(tools: &[agent_vocab::ToolDefinition]) -> Vec<Value> {
+    let mut tools = tools.to_vec();
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    tools
         .iter()
         .map(|tool| {
             json!({
@@ -184,25 +167,34 @@ fn responses_body(
                 "parameters": tool.input_schema,
             })
         })
-        .collect();
-    let mut body = json!({
-        "model": request.model,
-        "instructions": request.prompt.render_joined().unwrap_or_default(),
-        "input": transcript_to_response_items(&request.transcript)?,
-        "tools": tools,
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-        "reasoning": null,
-        "service_tier": "priority",
-        "store": false,
-        "stream": true,
-        "include": [RESPONSES_REASONING_INCLUDE],
-        "prompt_cache_key": prompt_cache_key,
-    });
-    if include_prompt_cache_retention {
-        body["prompt_cache_retention"] = json!(EXTENDED_PROMPT_CACHE_RETENTION);
+        .collect()
+}
+
+fn default_prompt_cache_key(
+    model: &str,
+    prompt: &crate::PromptSections,
+    tools: &[Value],
+) -> String {
+    let mut hasher = StableHasher::new();
+    hasher.write_str("pi-relay:codex-responses:v1");
+    hasher.write_str(model);
+    hasher.write_str(prompt.stable_prefix.as_deref().unwrap_or_default());
+    hasher.write_str(&serde_json::to_string(tools).unwrap_or_default());
+    format!("pi-relay-codex-{:016x}", hasher.finish())
+}
+
+fn openai_reasoning_effort(effort: ReasoningEffort) -> ProviderResult<&'static str> {
+    match effort {
+        ReasoningEffort::None
+        | ReasoningEffort::Minimal
+        | ReasoningEffort::Low
+        | ReasoningEffort::Medium
+        | ReasoningEffort::High
+        | ReasoningEffort::XHigh => Ok(effort.as_str()),
+        ReasoningEffort::Max => Err(ProviderError::Provider(
+            "reasoning effort max is not supported by OpenAI".to_string(),
+        )),
     }
-    Ok(body)
 }
 
 fn transcript_to_response_items(items: &[ModelTranscriptEntry]) -> ProviderResult<Vec<Value>> {
@@ -261,6 +253,22 @@ fn transcript_to_response_items(items: &[ModelTranscriptEntry]) -> ProviderResul
     Ok(responses)
 }
 
+fn response_input_items(
+    dynamic_context: Option<&str>,
+    transcript: &[ModelTranscriptEntry],
+) -> ProviderResult<Vec<Value>> {
+    let mut items = Vec::new();
+    if let Some(dynamic_context) = dynamic_context.filter(|value| !value.trim().is_empty()) {
+        items.push(json!({
+            "type": "message",
+            "role": "user",
+            "content": [{ "type": "input_text", "text": dynamic_context }],
+        }));
+    }
+    items.extend(transcript_to_response_items(transcript)?);
+    Ok(items)
+}
+
 fn openai_replay_items(replay: &[ProviderReplayItem]) -> ProviderResult<Vec<Value>> {
     replay
         .iter()
@@ -298,6 +306,7 @@ fn compaction_summary_text(summary: &CompactionSummary) -> String {
 fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<ModelResponse> {
     let mut items = Vec::new();
     let mut provider_replay = Vec::new();
+    let mut usage = None;
     for data in sse_data_events(text) {
         let event: Value = serde_json::from_str(data)?;
         match event.get("type").and_then(Value::as_str) {
@@ -322,12 +331,16 @@ fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<Mod
                     "response incomplete: {reason}"
                 )));
             }
+            Some("response.completed") => {
+                usage = event.pointer("/response/usage").and_then(openai_usage);
+            }
             _ => {}
         }
     }
     Ok(ModelResponse {
         assistant: AssistantMessage { items },
         provider_replay,
+        usage,
     })
 }
 
@@ -389,6 +402,55 @@ fn parse_response_output_item(
     Ok(())
 }
 
+fn openai_usage(value: &Value) -> Option<ProviderUsage> {
+    Some(ProviderUsage {
+        input_tokens: value
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        output_tokens: value
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        total_tokens: value
+            .get("total_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        cache_read_input_tokens: value
+            .pointer("/input_tokens_details/cached_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        cache_creation_input_tokens: None,
+    })
+}
+
+struct StableHasher(u64);
+
+impl StableHasher {
+    fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+
+    fn write_str(&mut self, value: &str) {
+        self.write_usize(value.len());
+        for byte in value.as_bytes() {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn write_usize(&mut self, value: usize) {
+        for byte in value.to_le_bytes() {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn finish(self) -> u64 {
+        self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,94 +493,152 @@ mod tests {
     }
 
     #[test]
-    fn responses_body_sets_openai_request_policy() {
-        let body = responses_body(
-            ModelRequest {
-                model: "gpt-5.1".to_string(),
-                prompt: PromptSections::new(
-                    Some("static system".to_string()),
-                    Some("cwd: /tmp/project".to_string()),
-                ),
-                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-                tools: vec![ToolDefinition {
-                    name: "read".to_string(),
-                    description: "read a file".to_string(),
-                    input_schema: json!({
-                        "type": "object",
-                        "properties": {
-                            "path": { "type": "string" }
-                        },
-                        "required": ["path"]
-                    }),
-                }],
-                max_tokens: Some(2048),
-                prompt_cache_key: Some("pi-relay-test".to_string()),
-            },
-            true,
-        )
+    fn codex_auth_adds_priority_service_tier() {
+        let body = responses_body(ModelRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::default(),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+        })
+        .expect("responses body renders");
+
+        assert_eq!(body["service_tier"], "priority");
+        assert!(body.get("prompt_cache_retention").is_none());
+    }
+
+    #[test]
+    fn responses_body_sets_codex_request_shape() {
+        let body = responses_body(ModelRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::new(
+                Some("static system".to_string()),
+                Some("cwd: /tmp/project".to_string()),
+            ),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tools: vec![ToolDefinition {
+                name: "read".to_string(),
+                description: "read a file".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" }
+                    },
+                    "required": ["path"]
+                }),
+            }],
+            max_tokens: Some(2048),
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: Some("pi-relay-test".to_string()),
+        })
         .expect("responses body renders");
 
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["service_tier"], "priority");
         assert_eq!(body["store"], false);
         assert_eq!(body["stream"], true);
+        assert_eq!(body["reasoning"]["effort"], "high");
         assert_eq!(body["prompt_cache_key"], "pi-relay-test");
-        assert_eq!(
-            body["prompt_cache_retention"],
-            EXTENDED_PROMPT_CACHE_RETENTION
-        );
+        assert!(body.get("prompt_cache_retention").is_none());
         assert_eq!(body["include"][0], RESPONSES_REASONING_INCLUDE);
         assert_eq!(body["tool_choice"], "auto");
         assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["tools"][0]["name"], "read");
-        assert_eq!(body["instructions"], "static system\n\ncwd: /tmp/project");
+        assert_eq!(body["instructions"], "static system");
         assert_eq!(body["input"][0]["role"], "user");
+        assert_eq!(body["input"][0]["content"][0]["text"], "cwd: /tmp/project");
+        assert_eq!(body["input"][1]["role"], "user");
+        assert_eq!(body["input"][1]["content"][0]["text"], "hello");
     }
 
     #[test]
-    fn responses_body_uses_default_cache_key() {
-        let body = responses_body(
-            ModelRequest {
-                model: "gpt-5.1".to_string(),
-                prompt: PromptSections::default(),
-                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-                tools: Vec::new(),
-                max_tokens: None,
-                prompt_cache_key: None,
-            },
-            false,
-        )
+    fn responses_body_uses_stable_default_cache_key() {
+        let first = responses_body(ModelRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::new(
+                Some("stable rules".to_string()),
+                Some("cwd: /tmp/one".to_string()),
+            ),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+        })
+        .expect("responses body renders");
+        let second = responses_body(ModelRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::new(
+                Some("stable rules".to_string()),
+                Some("cwd: /tmp/two".to_string()),
+            ),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("changed")).into()],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+        })
         .expect("responses body renders");
 
-        assert_eq!(body["prompt_cache_key"], DEFAULT_PROMPT_CACHE_KEY);
-        assert!(body.get("prompt_cache_retention").is_none());
-        assert_eq!(body["tools"], json!([]));
-        assert!(body.get("max_output_tokens").is_none());
+        let key = first["prompt_cache_key"].as_str().expect("cache key");
+        assert!(key.starts_with("pi-relay-codex-"));
+        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert!(first.get("prompt_cache_retention").is_none());
+        assert_eq!(first["service_tier"], "priority");
+        assert_eq!(first["tools"], json!([]));
+        assert!(first.get("max_output_tokens").is_none());
     }
 
     #[test]
-    fn responses_body_keeps_stable_prompt_before_dynamic_context() {
-        let body = responses_body(
-            ModelRequest {
-                model: "gpt-5.1-codex".to_string(),
-                prompt: PromptSections::new(
-                    Some("stable agent rules".to_string()),
-                    Some("workspace: /tmp/pi".to_string()),
-                ),
-                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-                tools: Vec::new(),
-                max_tokens: None,
-                prompt_cache_key: Some("cache-key".to_string()),
-            },
-            false,
-        )
+    fn responses_body_keeps_dynamic_context_out_of_instructions() {
+        let body = responses_body(ModelRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::new(
+                Some("stable agent rules".to_string()),
+                Some("workspace: /tmp/pi".to_string()),
+            ),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: Some("cache-key".to_string()),
+        })
         .expect("responses body renders");
 
-        assert_eq!(
-            body["instructions"],
-            "stable agent rules\n\nworkspace: /tmp/pi"
-        );
+        assert_eq!(body["instructions"], "stable agent rules");
+        assert_eq!(body["input"][0]["content"][0]["text"], "workspace: /tmp/pi");
+        assert_eq!(body["input"][1]["content"][0]["text"], "hello");
         assert_eq!(body["prompt_cache_key"], "cache-key");
+    }
+
+    #[test]
+    fn responses_body_sorts_tools_for_cache_stability() {
+        let body = responses_body(ModelRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::stable("stable agent rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tools: vec![
+                ToolDefinition {
+                    name: "write".to_string(),
+                    description: "write a file".to_string(),
+                    input_schema: json!({ "type": "object" }),
+                },
+                ToolDefinition {
+                    name: "read".to_string(),
+                    description: "read a file".to_string(),
+                    input_schema: json!({ "type": "object" }),
+                },
+            ],
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+        })
+        .expect("responses body renders");
+
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert_eq!(body["tools"][1]["name"], "write");
     }
 
     #[test]
@@ -556,7 +676,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
 data: {"type":"response.completed","response":{"id":"resp_1"}}
 "#;
 
-        let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
+        let response = parse_responses_sse(sse, ProviderKind::Codex).expect("sse parses");
         let assistant = response.assistant;
 
         assert_eq!(assistant.text(), "hello");
@@ -573,6 +693,22 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
             response.provider_replay[1].raw_type().as_deref(),
             Some("function_call")
         );
+        assert_eq!(response.provider_replay[0].provider, ProviderKind::Codex);
+    }
+
+    #[test]
+    fn responses_sse_parses_usage_cache_metrics() {
+        let sse = r#"data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":80}}}}
+"#;
+
+        let response = parse_responses_sse(sse, ProviderKind::Codex).expect("sse parses");
+        let usage = response.usage.expect("usage should be parsed");
+
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.total_tokens, Some(120));
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
+        assert_eq!(usage.cache_creation_input_tokens, None);
     }
 
     #[test]

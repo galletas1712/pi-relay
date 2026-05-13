@@ -3,9 +3,10 @@ import { AlertTriangle, Check, ChevronDown, Copy, Loader2, RotateCcw, Terminal, 
 import rehypeRaw from "rehype-raw";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { assistantMessageText } from "./exportTranscript.ts";
 import { branchEntriesFor } from "./historyTargets.ts";
 import { contentBlocksToText, firstLine } from "./text.ts";
+import { assistantMessageText, buildTurnViews } from "./turnView.ts";
+import type { ModelStepView } from "./turnView.ts";
 import type { NoticeTone, TranscriptEntry, TranscriptItem } from "./types.ts";
 
 type ToolResultItem = Extract<TranscriptItem, { type: "tool_result" }>;
@@ -36,6 +37,13 @@ export function MessageList({
 		node.scrollTop = node.scrollHeight;
 	}, [visibleEntries.length]);
 	const toolIndex = useMemo(() => indexToolEntries(visibleEntries), [visibleEntries]);
+	const modelStepsByEntry = useMemo(() => {
+		const steps = new Map<string, ModelStepView>();
+		for (const turn of buildTurnViews(visibleEntries)) {
+			for (const step of turn.modelSteps) steps.set(step.entry.id, step);
+		}
+		return steps;
+	}, [visibleEntries]);
 
 	if (!hasSession) {
 		return (
@@ -54,6 +62,7 @@ export function MessageList({
 				<TranscriptEntryView
 					entry={entry}
 					key={entry.id}
+					modelStep={modelStepsByEntry.get(entry.id)}
 					toolIndex={toolIndex}
 					isActiveLeaf={entry.id === activeLeafId}
 					isRunning={isRunning}
@@ -73,6 +82,7 @@ export function MessageList({
 
 function TranscriptEntryView({
 	entry,
+	modelStep,
 	toolIndex,
 	isActiveLeaf,
 	isRunning,
@@ -80,6 +90,7 @@ function TranscriptEntryView({
 	resuming
 }: {
 	entry: TranscriptEntry;
+	modelStep?: ModelStepView;
 	toolIndex: ReturnType<typeof indexToolEntries>;
 	isActiveLeaf: boolean;
 	isRunning: boolean;
@@ -115,7 +126,7 @@ function TranscriptEntryView({
 		return <UserBubble item={item} entryId={entry.id} />;
 	}
 	if (item.type === "assistant_message") {
-		return <AssistantBlock item={item} toolResults={toolIndex.results} />;
+		return <AssistantBlock item={item} modelStep={modelStep} toolResults={toolIndex.results} />;
 	}
 	if (item.type === "tool_result") {
 		if (toolIndex.calls.has(item.tool_call_id)) return null;
@@ -141,15 +152,18 @@ function UserBubble({ item, entryId }: { item: Extract<TranscriptItem, { type: "
 
 function AssistantBlock({
 	item,
+	modelStep,
 	toolResults
 }: {
 	item: Extract<TranscriptItem, { type: "assistant_message" }>;
+	modelStep?: ModelStepView;
 	toolResults: Map<string, ToolResultItem>;
 }) {
 	const text = assistantMessageText(item);
+	const phase = modelStep?.phase ?? "unknown";
 	return (
 		<div className="message-row assistant-row">
-			<div className={`assistant-block ${text ? "has-copy" : ""}`}>
+			<div className={`assistant-block phase-${phase} ${text ? "has-copy" : ""}`}>
 				{item.items.map((assistantItem, index) => {
 					if (assistantItem.type === "text") {
 						return <MarkdownText text={assistantItem.text} key={index} />;

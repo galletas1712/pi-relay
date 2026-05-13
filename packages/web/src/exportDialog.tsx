@@ -3,8 +3,10 @@ import { Download, FileText } from "lucide-react";
 import {
 	assistantExportBlocks,
 	buildExportBlocks,
+	defaultSelectedAssistantIds,
 	downloadMarkdown,
 	exportPreview,
+	exportTitle,
 	formatExportMarkdown
 } from "./exportTranscript.ts";
 import type { TranscriptEntry } from "./types.ts";
@@ -24,11 +26,11 @@ export function ExportDialog({
 }) {
 	const blocks = useMemo(() => buildExportBlocks(entries), [entries]);
 	const assistants = useMemo(() => assistantExportBlocks(blocks), [blocks]);
-	const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set(assistants.map((assistant) => assistant.entryId)));
+	const [selectedIds, setSelectedIds] = useState<Set<string>>(() => defaultSelectedAssistantIds(blocks));
 
 	useEffect(() => {
-		setSelectedIds(new Set(assistants.map((assistant) => assistant.entryId)));
-	}, [assistants]);
+		setSelectedIds(defaultSelectedAssistantIds(blocks));
+	}, [blocks]);
 
 	const markdown = useMemo(() => formatExportMarkdown(blocks, selectedIds), [blocks, selectedIds]);
 	const selectedCount = selectedIds.size;
@@ -77,7 +79,7 @@ export function ExportDialog({
 					<span className="history-dialog-icon" aria-hidden="true"><FileText size={15} /></span>
 					<div className="history-dialog-copy">
 						<h2 id="export-dialog-title">Export messages</h2>
-						<p>Select assistant messages from the current branch. Prior user messages are included once.</p>
+						<p>Select model steps from the current branch. User inputs from the containing turn are included once.</p>
 					</div>
 					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close export dialog">×</button>
 				</div>
@@ -102,7 +104,7 @@ export function ExportDialog({
 								onChange={() => toggle(assistant.entryId)}
 							/>
 							<span className="export-option-main">
-								<span className="export-option-title">Assistant message {index + 1}</span>
+								<span className={`export-option-title phase-${assistant.phase}`}>{exportTitle(assistant, index)}</span>
 								<span className="export-option-preview">{exportPreview(assistant.text)}</span>
 							</span>
 						</label>

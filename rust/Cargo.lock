@@ -1054,6 +1054,7 @@ dependencies = [
  "agent-session",
  "agent-tools",
  "agent-vocab",
+ "serde_json",
  "tokio",
 ]
 

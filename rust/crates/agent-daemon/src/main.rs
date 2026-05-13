@@ -406,7 +406,6 @@ async fn session_configure(
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let driver = SessionDriver::acquire(state, &session_id).await;
-    driver.ensure_idle_for_source_mutation().await?;
     let current = state
         .repo
         .load_session_config(&session_id)
@@ -418,19 +417,47 @@ async fn session_configure(
         .map(serde_json::from_value)
         .transpose()
         .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
-        .unwrap_or(current.provider);
-    let metadata = params.get("metadata").cloned().unwrap_or(current.metadata);
+        .unwrap_or_else(|| current.provider.clone());
+    let metadata = params
+        .get("metadata")
+        .cloned()
+        .unwrap_or_else(|| current.metadata.clone());
+    let model_changed = provider_model_changed(&current.provider, &provider);
+    let metadata_changed = metadata != current.metadata;
+    if model_changed || metadata_changed {
+        driver.ensure_idle_for_source_mutation().await?;
+    }
+    if model_changed {
+        let stored = state
+            .repo
+            .load_stored_session(&session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if !stored.entries.is_empty() {
+            return Err(RpcError::new(
+                "provider_locked",
+                "session model cannot be changed after the first transcript entry",
+            ));
+        }
+    }
     let config = SessionConfig { provider, metadata };
     let events = state
         .repo
         .configure_session(&session_id, &config)
         .await
         .map_err(anyhow::Error::from)?;
+    if let Some(active) = driver.active_session().await {
+        active.lock().await.config = config.clone();
+    }
     publish_events(state, events);
     clear_event_buffer_if_idle(state, &session_id).await?;
     Ok(
         json!({ "session_id": session_id, "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)? }),
     )
+}
+
+fn provider_model_changed(previous: &ProviderConfig, next: &ProviderConfig) -> bool {
+    previous.kind != next.kind || previous.model != next.model
 }
 
 async fn config_get(state: &AppState) -> std::result::Result<Value, RpcError> {

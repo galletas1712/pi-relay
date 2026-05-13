@@ -1,11 +1,58 @@
-import type { ContentBlock, ProviderConfig } from "./types.ts";
+import type { ContentBlock, ProviderConfig, ReasoningEffort } from "./types.ts";
+
+export interface ModelOption {
+	id: string;
+	label: string;
+	provider: ProviderConfig;
+}
+
+const PROMPT_CACHE = { key: "pi-relay-web" };
+
+export const MODEL_OPTIONS: ModelOption[] = [
+	{
+		id: "openai:gpt-5.5",
+		label: "GPT-5.5 (ChatGPT)",
+		provider: { kind: "openai", model: "gpt-5.5", reasoning_effort: "xhigh", prompt_cache: PROMPT_CACHE }
+	},
+	{
+		id: "claude:claude-opus-4-7",
+		label: "Claude Opus 4.7",
+		provider: { kind: "claude", model: "claude-opus-4-7", reasoning_effort: "xhigh", prompt_cache: PROMPT_CACHE }
+	}
+];
+
+export const OPENAI_REASONING_EFFORTS: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
+export const CLAUDE_REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
 
 export const DEFAULT_PROVIDER: ProviderConfig = {
-	kind: "codex",
+	kind: "openai",
 	model: "gpt-5.5",
-	prompt_cache: { key: "pi-relay-web" }
+	reasoning_effort: "xhigh",
+	prompt_cache: PROMPT_CACHE
 };
 
 export function textContent(text: string): ContentBlock[] {
 	return [{ type: "text", text }];
+}
+
+export function providerModelKey(provider: ProviderConfig): string {
+	return `${provider.kind}:${provider.model}`;
+}
+
+export function providerReasoningEffort(provider: ProviderConfig): ReasoningEffort {
+	return provider.reasoning_effort ?? "xhigh";
+}
+
+export function withReasoningEffort(provider: ProviderConfig, reasoningEffort: ReasoningEffort): ProviderConfig {
+	return { ...provider, reasoning_effort: reasoningEffort };
+}
+
+export function providerFromModelKey(modelKey: string, current: ProviderConfig): ProviderConfig {
+	const option = MODEL_OPTIONS.find((candidate) => candidate.id === modelKey);
+	if (!option) return current;
+	return { ...option.provider };
+}
+
+export function reasoningEffortsForProvider(provider: ProviderConfig): ReasoningEffort[] {
+	return provider.kind === "claude" ? CLAUDE_REASONING_EFFORTS : OPENAI_REASONING_EFFORTS;
 }

@@ -736,17 +736,24 @@ async fn run_model_turn(
         .active_session()
         .await
         .ok_or_else(|| RpcError::new("stale_action", "session is not active"))?;
-    let (input, status, update_result, provider_replay) = match result {
-        Ok(response) => (
-            AgentInput::ModelCompleted {
-                action_id,
-                turn_id,
-                assistant: response.assistant,
-            },
-            ActionStatus::Completed,
-            json!({ "source": "provider" }),
-            response.provider_replay,
-        ),
+    let (input, status, update_result, provider_replay, context_tokens) = match result {
+        Ok(response) => {
+            let context_tokens = response.usage.as_ref().and_then(|usage| usage.input_tokens);
+            (
+                AgentInput::ModelCompleted {
+                    action_id,
+                    turn_id,
+                    assistant: response.assistant,
+                },
+                ActionStatus::Completed,
+                json!({
+                    "source": "provider",
+                    "usage": response.usage,
+                }),
+                response.provider_replay,
+                context_tokens,
+            )
+        }
         Err(error) => {
             let message = error.to_string();
             (
@@ -758,6 +765,7 @@ async fn run_model_turn(
                 ActionStatus::Error,
                 json!({ "error": message }),
                 Vec::new(),
+                None,
             )
         }
     };
@@ -771,7 +779,7 @@ async fn run_model_turn(
                 status,
                 result: update_result,
             }),
-            None,
+            context_tokens,
             provider_replay,
         )
         .await?;

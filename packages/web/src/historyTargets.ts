@@ -1,5 +1,14 @@
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
-import type { TranscriptEntry, TranscriptItem, TurnOutcome } from "./types.ts";
+import {
+	buildTurnViews,
+	modelStepForEntry,
+	modelStepPhaseLabel,
+	modelStepPreview,
+	modelStepTitle,
+	terminalModelStep,
+	turnForBoundaryEntry
+} from "./turnView.ts";
+import type { TranscriptEntry, TurnOutcome } from "./types.ts";
 
 export type HistoryPlacement = "at" | "before";
 
@@ -34,10 +43,6 @@ export interface HistoryEntryDisplay {
 	preview: string;
 	meta: string;
 }
-
-type AssistantTranscriptEntry = TranscriptEntry & {
-	item: Extract<TranscriptItem, { type: "assistant_message" }>;
-};
 
 export function historyForkOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
 	const options: HistoryTargetOption[] = [];
@@ -201,18 +206,16 @@ function forkOptionForEntry(
 		};
 	}
 	if (item.type === "assistant_message") {
-		const toolNames = item.items
-			.filter((assistantItem) => assistantItem.type === "tool_call")
-			.map((assistantItem) => assistantItem.tool_name);
+		const step = modelStepForEntry(buildTurnViews(entries), entry.id);
 		return {
 			id: entry.id,
 			actionLeafId: entry.id,
 			sourceEntryId: entry.id,
 			placement: "at",
 			turnLabel: currentTurnId ? `a${currentTurnId}` : "asst",
-			title: currentTurnId ? `Assistant message in turn ${currentTurnId}` : "Assistant message",
-			preview: assistantPreview(item) || (toolNames.length ? `Tool call: ${toolNames.join(", ")}` : "Assistant message."),
-			meta: time,
+			title: step ? modelStepTitle(step) : currentTurnId ? `Assistant message in turn ${currentTurnId}` : "Assistant message",
+			preview: step ? modelStepPreview(step) : "Assistant message.",
+			meta: step ? `${modelStepPhaseLabel(step.phase)} · ${time}` : time,
 			isActive
 		};
 	}
@@ -285,15 +288,16 @@ function switchOptionForEntry(
 		};
 	}
 	if (item.type === "turn_finished") {
-		const assistant = previousAssistantMessage(entries, index);
+		const turn = turnForBoundaryEntry(buildTurnViews(entries), entry.id);
+		const step = turn ? terminalModelStep(turn) : null;
 		return {
 			id: entry.id,
 			actionLeafId: entry.id,
 			expectedActiveLeafId: activeLeafId,
 			sourceEntryId: entry.id,
-			turnLabel: `a${item.turn_id}`,
-			title: "Assistant message",
-			preview: assistant ? assistantPreview(assistant.item) || "Assistant message." : `${item.outcome.toLowerCase()} turn completed.`,
+			turnLabel: `t${item.turn_id}`,
+			title: step ? modelStepTitle(step) : `End of turn ${item.turn_id}`,
+			preview: step ? modelStepPreview(step) : `${item.outcome.toLowerCase()} turn completed.`,
 			meta: `switch · ${time}`,
 			isActive: activeLeafId === entry.id,
 			outcome: item.outcome
@@ -314,32 +318,11 @@ function switchOptionForEntry(
 	};
 }
 
-function assistantPreview(item: Extract<TranscriptItem, { type: "assistant_message" }>): string {
-	return truncate(
-		item.items
-			.map((assistantItem) => (assistantItem.type === "text" ? assistantItem.text : ""))
-			.join(" ")
-			.trim(),
-		96
-	);
-}
-
 function previousTurnBoundaryId(entries: TranscriptEntry[], beforeIndex: number): string | null {
 	for (let index = beforeIndex - 1; index >= 0; index -= 1) {
 		const entry = entries[index];
 		if (entry.item.type === "turn_finished") return entry.id;
 		if (entry.item.type === "compaction_summary") return entry.id;
-	}
-	return null;
-}
-
-function previousAssistantMessage(entries: TranscriptEntry[], beforeIndex: number): AssistantTranscriptEntry | null {
-	for (let index = beforeIndex - 1; index >= 0; index -= 1) {
-		const entry = entries[index];
-		if (entry.item.type === "assistant_message") {
-			return entry as AssistantTranscriptEntry;
-		}
-		if (entry.item.type === "turn_started" || entry.item.type === "turn_finished" || entry.item.type === "compaction_summary") return null;
 	}
 	return null;
 }

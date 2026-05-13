@@ -13,7 +13,6 @@ const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Credentials {
-    pub(crate) openai_api_key: Option<String>,
     pub(crate) codex_access_token: Option<String>,
     pub(crate) codex_account_id: Option<String>,
     pub(crate) anthropic_api_key: Option<String>,
@@ -23,9 +22,6 @@ impl Credentials {
     pub(crate) fn load() -> Self {
         let codex = read_codex_auth();
         Self {
-            openai_api_key: env::var("OPENAI_API_KEY")
-                .ok()
-                .or_else(|| codex.openai_api_key.clone()),
             codex_access_token: env::var("CODEX_ACCESS_TOKEN")
                 .ok()
                 .or_else(|| codex.access_token.clone()),
@@ -67,7 +63,6 @@ fn read_claude_code_keychain_api_key() -> Option<String> {
 #[derive(Debug, Default)]
 struct CodexAuthSnapshot {
     path: Option<PathBuf>,
-    pub(crate) openai_api_key: Option<String>,
     access_token: Option<String>,
     refresh_token: Option<String>,
     account_id: Option<String>,
@@ -87,11 +82,6 @@ fn read_codex_auth() -> CodexAuthSnapshot {
     };
     CodexAuthSnapshot {
         path: Some(path),
-        openai_api_key: value
-            .get("OPENAI_API_KEY")
-            .and_then(Value::as_str)
-            .filter(|key| !key.trim().is_empty())
-            .map(ToOwned::to_owned),
         access_token: value
             .pointer("/tokens/access_token")
             .and_then(Value::as_str)

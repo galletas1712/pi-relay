@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Prefix Caching Plan</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f8fa;
+      --fg: #14171a;
+      --muted: #626a73;
+      --card: #ffffff;
+      --border: #d9dee5;
+      --accent: #4f5cf7;
+      --good: #14824c;
+      --warn: #9a6700;
+      --bad: #b42318;
+      --code: #eef1f5;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #090c0f;
+        --fg: #e8eaed;
+        --muted: #9aa3ad;
+        --card: #11161b;
+        --border: #27313a;
+        --code: #1a2027;
+      }
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 48px 24px 72px;
+    }
+    h1, h2, h3 { line-height: 1.2; }
+    h1 { margin: 0 0 8px; font-size: 32px; }
+    h2 { margin: 34px 0 12px; font-size: 22px; }
+    h3 { margin: 24px 0 8px; font-size: 16px; }
+    p { margin: 8px 0; }
+    a { color: var(--accent); }
+    .subtle { color: var(--muted); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px 20px;
+      margin: 14px 0;
+    }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+    code {
+      background: var(--code);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 1px 5px;
+    }
+    pre {
+      overflow: auto;
+      background: var(--code);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 9px 10px;
+      vertical-align: top;
+      text-align: left;
+    }
+    th { background: var(--code); }
+    .status {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid var(--border);
+    }
+    .ok { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Prefix Caching Plan</h1>
+  <p class="subtle">Goal: make provider requests cache-friendly by construction, with request-shape tests and real usage metrics proving cache hits.</p>
+
+  <div class="card">
+    <h2>Summary</h2>
+    <p>pi-relay uses OpenAI through Codex subscription auth only. The OpenAI provider should therefore match the Codex harness shape: ChatGPT bearer token, Codex backend, <code>prompt_cache_key</code>, <code>store: false</code>, priority service tier, and no plain API-key request path.</p>
+    <p>The cache boundary is now provider-owned and testable. OpenAI keeps dynamic context out of the stable <code>instructions</code> prefix and uses a deterministic cache cohort key. Anthropic marks stable tools, stable system prompt, and the latest eligible transcript block with cache breakpoints, following the same broad shape as Claude Code.</p>
+  </div>
+
+  <h2>Provider Rules</h2>
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Provider</th><th>What the API wants</th><th>pi-relay target shape</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>OpenAI Responses</td>
+          <td>Prompt caching is automatic for eligible prompts. Exact prefix matches matter. <code>prompt_cache_key</code> helps route related requests. Codex subscription transport should not send unsupported plain-API-only fields.</td>
+          <td>Stable instructions and stable sorted tools first; dynamic cwd/worktree/session state later in <code>input</code>. Use a deterministic cache cohort key, not a magic global string. Log <code>usage.input_tokens_details.cached_tokens</code>.</td>
+        </tr>
+        <tr>
+          <td>Anthropic Messages</td>
+          <td>Caches are controlled with <code>cache_control</code> breakpoints. Cache order is <code>tools</code> → <code>system</code> → <code>messages</code>. There are up to 4 breakpoints, and lookback is block-based.</td>
+          <td>Mark the stable tool prefix, stable system block, and latest eligible message block. Preserve thinking blocks in provider replay. Log cache read/write usage.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Current Diagnosis</h2>
+  <div class="card">
+    <h3>OpenAI</h3>
+    <ul>
+      <li><span class="status ok">done</span> <code>agent-provider/src/openai.rs</code> uses the Codex subscription backend only; the old plain API-key auth split is gone.</li>
+      <li><span class="status ok">done</span> <code>responses_body</code> renders <code>instructions</code> as stable prefix only. Dynamic context is the first synthetic input item, followed by transcript items.</li>
+      <li><span class="status ok">done</span> Default cache key is derived from model + stable prompt + stable sorted tool schema. It intentionally ignores cwd, transcript, active leaf, timestamps, and current user input.</li>
+      <li><span class="status ok">done</span> Provider usage/cache metrics are parsed into <code>ModelResponse.usage</code> and persisted on model action results.</li>
+    </ul>
+
+    <h3>Anthropic</h3>
+    <ul>
+      <li><span class="status ok">done</span> <code>anthropic_system_blocks</code> marks the stable system block with <code>cache_control: { type: "ephemeral", ttl: "1h" }</code>.</li>
+      <li><span class="status ok">good</span> Provider replay stores <code>thinking</code> and <code>redacted_thinking</code> blocks unchanged and replays them before normalized visible text/tool calls.</li>
+      <li><span class="status ok">done</span> A message-level cache breakpoint is added to the latest eligible transcript block so long multi-turn prefixes can be reused.</li>
+      <li><span class="status ok">done</span> Tool schemas are rendered in deterministic order and the last stable tool is cache-marked.</li>
+      <li><span class="status ok">done</span> <code>cache_read_input_tokens</code> and <code>cache_creation_input_tokens</code> are parsed into provider usage.</li>
+    </ul>
+  </div>
+
+  <h2>Target Request Shapes</h2>
+  <div class="card">
+<pre><code>// OpenAI Responses
+{
+  model,
+  instructions: stable_system_prompt_only,
+  tools: stable_sorted_tools,
+  input: [
+    { role: "user", content: [{ type: "input_text", text: dynamic_context_label }] },
+    ...transcript_items
+  ],
+  prompt_cache_key: cache_cohort_key,
+  service_tier: "priority",
+  parallel_tool_calls: true,
+  store: false
+}</code></pre>
+
+<pre><code>// Anthropic Messages
+{
+  tools: [
+    ...stable_sorted_tools,
+    // final stable tool gets cache_control
+  ],
+  system: [
+    { type: "text", text: stable_system_prompt, cache_control: { type: "ephemeral", ttl: "1h" } },
+    { type: "text", text: dynamic_context_label }
+  ],
+  messages: [
+    ...transcript_messages_with_provider_replay,
+    // exactly one latest eligible message block gets a message-level cache marker
+  ],
+  thinking: { type: "adaptive" },
+  output_config: { effort }
+}</code></pre>
+  </div>
+
+  <h2>Implementation Plan</h2>
+  <div class="card">
+    <h3>Phase 1: Keep cache policy at the provider boundary</h3>
+    <ol>
+      <li><span class="status ok">done</span> Do not add a new cache-planning abstraction yet. The rules are small enough to live in the provider serializers.</li>
+      <li>Keep it out of <code>agent-session</code>. Cache policy is provider serialization/runtime behavior, not transcript semantics.</li>
+      <li><span class="status ok">done</span> Derive the OpenAI default cache cohort from model, stable prompt, and stable tool schema. Do not include current user input, cwd, active leaf id, or timestamps.</li>
+      <li><span class="status ok">done</span> Allow explicit override from <code>ProviderConfig.prompt_cache</code> for experiments, but make the default good.</li>
+    </ol>
+
+    <h3>Phase 2: Fix OpenAI request shape</h3>
+    <ol>
+      <li><span class="status ok">done</span> Render <code>instructions</code> as the stable system prompt only.</li>
+      <li><span class="status ok">done</span> Move dynamic context into a synthetic first input item, after the stable request prefix. It stays plain and timestamp-free.</li>
+      <li><span class="status ok">done</span> Omit <code>prompt_cache_retention</code>; pi-relay does not use OpenAI API-key auth.</li>
+      <li><span class="status ok">done</span> Parse <code>response.completed.response.usage</code> and store/log <code>cached_tokens</code>.</li>
+      <li><span class="status ok">done</span> Add request-body tests: changing cwd/transcript changes only dynamic input/transcript, not <code>instructions</code>, tools, or cache key.</li>
+    </ol>
+
+    <h3>Phase 3: Fix Anthropic request shape</h3>
+    <ol>
+      <li><span class="status ok">done</span> Keep the stable system <code>cache_control</code> marker.</li>
+      <li><span class="status ok">done</span> Add exactly one message-level <code>cache_control</code> marker to the latest eligible content block, similar to Claude Code’s <code>messagesToMessageParams</code> flow.</li>
+      <li><span class="status ok">done</span> Do not add <code>cache_control</code> to thinking blocks or non-cacheable content blocks.</li>
+      <li><span class="status ok">done</span> Keep tool definitions stable with deterministic ordering and a cache marker on the last stable tool.</li>
+      <li><span class="status ok">done</span> Parse response <code>usage</code> and store/log <code>cache_creation_input_tokens</code>, <code>cache_read_input_tokens</code>, and input/output tokens.</li>
+      <li><span class="status ok">done</span> Add tests for stable system, sorted tools, latest-message cache marker, thinking/replay preservation, and usage fields.</li>
+    </ol>
+
+    <h3>Phase 4: Add observability</h3>
+    <ol>
+      <li><span class="status ok">done</span> Extend <code>ModelResponse</code> with <code>ProviderUsage</code>. Keep the fields provider-neutral but lossless enough for cache metrics.</li>
+      <li><span class="status ok">done</span> Persist usage on the model action row, not as transcript content.</li>
+      <li><span class="status ok">done</span> Stop there for now. The model action result is enough to inspect cache behavior when debugging without adding new UI, logs, or cache-specific commands.</li>
+    </ol>
+
+    <h3>Phase 5: Real verification</h3>
+    <ol>
+      <li>OpenAI: send two similar Responses requests through the daemon in one session. Assert the second response reports non-zero <code>cached_tokens</code> once the prompt is above the minimum.</li>
+      <li>Anthropic: send two similar Messages requests through the daemon. Assert first request creates cache tokens and the second reads cache tokens.</li>
+      <li>Run a multi-tool turn and verify Anthropic thinking/replay blocks are preserved while cache metrics remain sensible.</li>
+      <li>Run fork/switch/compact after cached turns and verify no cache metadata appears in the visible transcript tree.</li>
+    </ol>
+  </div>
+
+  <h2>Design Choices</h2>
+  <div class="card">
+    <ul>
+      <li>Cache policy belongs in <code>agent-provider</code>/<code>agent-daemon</code>, not in <code>agent-session</code>. Sessions store semantic transcript facts; providers decide how to serialize those facts efficiently.</li>
+      <li>Usage metrics belong with action/runtime records, not transcript entries. They describe a provider call, not a user-visible conversation event.</li>
+      <li>Dynamic context should be late and minimal. Worktree/cwd matter, timestamps and UI state do not.</li>
+      <li>Tool schema stability is as important as prompt stability. Adding remote web search is fine, but it should be a deliberate tool-set change because tools are part of the cacheable prefix.</li>
+      <li>No token cap is required for caching. We only need to structure the prompt so repeated prefixes are actually reusable.</li>
+    </ul>
+  </div>
+
+  <h2>Sources Checked</h2>
+  <div class="card">
+    <ul>
+      <li>OpenAI prompt caching docs: <a href="https://developers.openai.com/api/docs/guides/prompt-caching">developers.openai.com/api/docs/guides/prompt-caching</a></li>
+      <li>OpenAI Codex harness: <code>~/codex/codex-rs/codex-api/src/common.rs</code>, <code>~/codex/codex-rs/core/src/client.rs</code></li>
+      <li>Anthropic prompt caching docs: <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching">platform.claude.com/docs/en/build-with-claude/prompt-caching</a></li>
+      <li>Anthropic extended thinking docs: <a href="https://platform.claude.com/docs/en/build-with-claude/extended-thinking">platform.claude.com/docs/en/build-with-claude/extended-thinking</a></li>
+      <li>Anthropic harness: <code>~/Downloads/src/services/api/claude.ts</code>, <code>~/Downloads/src/tools.ts</code>, <code>~/Downloads/src/utils/api.ts</code></li>
+      <li>pi-relay provider code: <code>rust/crates/agent-provider/src/openai.rs</code>, <code>rust/crates/agent-provider/src/anthropic.rs</code>, <code>rust/crates/agent-daemon/src/provider_runtime.rs</code></li>
+    </ul>
+  </div>
+</main>
+</body>
+</html>

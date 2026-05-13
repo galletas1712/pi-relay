@@ -496,11 +496,12 @@ struct ModelTranscriptEntry {
 			<h2>Implementation notes</h2>
 			<ul class="checklist">
 				<li>
-					OpenAI is now implemented as a Responses-only provider. Public OpenAI requests use
-					<code>prompt_cache_retention:"24h"</code>; the ChatGPT Codex backend keeps
-					<code>prompt_cache_key</code> but omits that retention field because the backend rejects it.
-					OpenAI/Codex requests also omit <code>max_output_tokens</code>; pi-relay should not impose a
-					token cap, and the Codex Responses endpoint rejects that field.
+					OpenAI is now implemented as a Responses-only provider through ChatGPT/Codex
+					subscription auth. The provider keeps <code>prompt_cache_key</code> but omits
+					<code>prompt_cache_retention</code> because pi-relay does not use the plain OpenAI
+					API-key transport. OpenAI/Codex requests also omit <code>max_output_tokens</code>;
+					pi-relay should not impose a token cap, and the Codex Responses endpoint rejects
+					that field.
 				</li>
 					<li>
 						Provider replay now lives in <code>StoredTranscriptEntry.provider_replay</code> and

@@ -69,8 +69,14 @@ frontend command model.
 - `/compact` requests context compaction.
 - `/context [entry-id]` inspects materialized model context.
 - `/system [clear|prompt...]` reads or writes the global daemon system prompt.
-- `/provider [kind model]` reads or updates the selected session provider.
 - `/tools` lists daemon tools.
+
+Model selection is not a slash command. The web top bar exposes the small model
+picker and provider-specific reasoning effort picker. Provider/model identity is
+locked after the first transcript entry because OpenAI Responses and Anthropic
+Messages both carry provider-shaped replay state across turns; reasoning effort
+is still a per-request knob and can be changed during a running turn. The change
+applies to later provider requests, not one already in flight.
 
 Normal composer text is always `input.follow_up`, even while the agent is
 running. Queued follow-ups appear in a small pane above the composer. Each
@@ -312,26 +318,29 @@ localStorage-backed branch.
 
 `agent-provider` targets OpenAI/Codex and Anthropic/Claude. The daemon reads
 Codex credentials from `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json`, including
-the ChatGPT/Codex account id when present. OpenAI API-key use still goes through
-Chat Completions; Codex credential use goes through streamed Responses.
+the ChatGPT/Codex account id when present. OpenAI models always use this
+ChatGPT/Codex subscription transport; pi-relay no longer supports plain OpenAI
+API-key auth.
 
 Provider config supports `prompt_cache.key`, which the daemon forwards on the
-OpenAI request path. Chat Completions also hardcodes the low-variance request
-policy we want for personal use: `parallel_tool_calls = true`,
-`service_tier = "priority"`, `store = false`, and
-`prompt_cache_retention = "24h"`. If no explicit `prompt_cache.key` is provided,
-the Chat Completions path uses a stable pi-relay default key so repeated local
-sessions still route toward the same prompt cache. The actual system prompt
-remains global.
+OpenAI request path. The Codex Responses request hardcodes the low-variance
+request policy we want for personal use: `parallel_tool_calls = true`,
+`service_tier = "priority"`, and `store = false`. It intentionally omits
+`prompt_cache_retention` because pi-relay does not use the plain OpenAI API-key
+path. If no explicit `prompt_cache.key` is provided, the provider derives a
+stable cache cohort key from the model, stable system prompt, and sorted tool
+schema so repeated local sessions route toward the same prompt cache. The actual
+system prompt remains global.
 
 Provider requests now carry `PromptSections`: a stable prefix and dynamic
 context. The stable prefix is the global system prompt. The daemon appends
 dynamic runtime context after it, currently the workspace cwd, and only then
-does the provider render transcript history. Chat Completions emits two system
-messages in that order. Responses and Anthropic join the same two sections with
-plain spacing inside their single instruction/system field. The rendered prompt
-does not include an artificial "dynamic context" heading; that split is an
-internal cache-layout detail, not model-facing instruction text.
+does the provider render transcript history. OpenAI Responses renders the
+stable prefix as `instructions` and the dynamic context as the first input item.
+Anthropic renders the stable prefix as a cache-marked system block and the
+dynamic context as an uncached system suffix. The rendered prompt does not
+include an artificial "dynamic context" heading; that split is an internal
+cache-layout detail, not model-facing instruction text.
 
 Prompt caching works best when the beginning of the prompt is identical across
 requests. That means the long-lived global system prompt, stable tool
@@ -342,8 +351,9 @@ prefix-adjacent prompt for little value.
 
 The daemon also no longer imposes a default OpenAI/Codex output-token cap.
 `provider.max_tokens` remains an optional explicit cap if a particular session
-needs one. Anthropic still receives a provider-local `max_tokens` fallback
-because the Messages API requires that field.
+needs one. Claude Opus 4.7 uses adaptive thinking with `output_config.effort`;
+the provider sends a 64k `max_tokens` fallback because the Messages API requires
+that field and Anthropic recommends a large cap for `xhigh`/`max`.
 
 ### Tools Are A Separate Runtime Surface
 

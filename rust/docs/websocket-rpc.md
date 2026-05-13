@@ -80,8 +80,9 @@ metadata jsonb not null default '{}'::jsonb
 
 ```json
 {
-  "kind": "codex",
+  "kind": "openai",
   "model": "gpt-5.5",
+  "reasoning_effort": "xhigh",
   "prompt_cache": { "key": "pi-relay-local" }
 }
 ```
@@ -93,14 +94,18 @@ Supported provider kinds are:
   available, and sends the Codex residency routing header required by
   workspace-backed ChatGPT accounts. This is the path tested with real
   credentials.
-- `openai`: OpenAI Chat Completions through `OPENAI_API_KEY` or
-  `~/.codex/auth.json` if it contains an API key.
+- `openai`: alias for the same ChatGPT/Codex subscription transport. pi-relay
+  intentionally does not support plain OpenAI API-key auth for OpenAI models.
 - `anthropic` or `claude`: Anthropic Messages API through `ANTHROPIC_API_KEY`.
 
 `prompt_cache.key` maps to `ModelRequest::prompt_cache_key` and is sent on the
-OpenAI request path. The Chat Completions path uses a stable default cache key
-when this field is omitted. `max_tokens` is optional; when omitted the daemon
-does not set an OpenAI/Codex output cap.
+OpenAI request path. `max_tokens` is optional; when omitted the daemon does not
+set an OpenAI output cap.
+
+`reasoning_effort` defaults to `xhigh`. OpenAI currently accepts `none`,
+`minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay. Claude accepts
+`low`, `medium`, `high`, `xhigh`, and `max`; Claude Opus 4.7 requests are sent
+with adaptive thinking and `output_config.effort`.
 
 ### `daemon_config`
 
@@ -382,7 +387,11 @@ Emits `session.configured`, so subscribed clients should refresh lists/snapshots
 
 ### `session.configure`
 
-Idle-only. Replaces provider config and/or metadata.
+Idle-only. Replaces provider config and/or metadata. Once a session has any
+transcript entry, `provider.kind` and `provider.model` are locked; clients may
+still change provider-adjacent knobs such as `reasoning_effort` during or
+between turns. Runtime changes apply to subsequently created provider requests,
+not to an already in-flight request.
 
 ## Config RPC
 

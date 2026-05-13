@@ -1,16 +1,18 @@
 use agent_vocab::{
     AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
-    ProviderReplayItem, ToolCall, ToolCallId, ToolDefinition, TranscriptItem, UserMessage,
+    ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId, ToolDefinition, TranscriptItem,
+    UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 use crate::{
-    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError, ProviderResult,
+    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError,
+    ProviderResult, ProviderUsage,
 };
 
-const THINKING_BUDGET_TOKENS: u32 = 1024;
+const DEFAULT_MAX_TOKENS: u32 = 65_536;
 const ANTHROPIC_BETA_HEADER: &str = "interleaved-thinking-2025-05-14,extended-cache-ttl-2025-04-11";
 
 #[derive(Debug, Clone)]
@@ -63,27 +65,44 @@ impl ModelProvider for AnthropicProvider {
 }
 
 fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
-    let max_tokens = request
-        .max_tokens
-        .unwrap_or(4096)
-        .max(THINKING_BUDGET_TOKENS + 1);
+    let effort = anthropic_reasoning_effort(request.reasoning_effort)?;
+    let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
+    let mut messages = transcript_to_messages(&request.transcript)?;
+    add_transcript_cache_breakpoint(&mut messages);
     let mut body = json!({
         "model": request.model,
         "max_tokens": max_tokens,
-        "messages": transcript_to_messages(&request.transcript)?,
+        "messages": messages,
         "thinking": {
-            "type": "enabled",
-            "budget_tokens": THINKING_BUDGET_TOKENS,
+            "type": "adaptive",
+        },
+        "output_config": {
+            "effort": effort,
         },
     });
     if let Some(system_blocks) = anthropic_system_blocks(&request.prompt) {
         body["system"] = Value::Array(system_blocks);
     }
     if !request.tools.is_empty() {
-        body["tools"] = Value::Array(request.tools.iter().map(anthropic_tool).collect());
+        let mut tools = anthropic_tools(&request.tools);
+        mark_last_tool_for_cache(&mut tools);
+        body["tools"] = Value::Array(tools);
         body["tool_choice"] = json!({ "type": "auto" });
     }
     Ok(body)
+}
+
+fn anthropic_reasoning_effort(effort: ReasoningEffort) -> ProviderResult<&'static str> {
+    match effort {
+        ReasoningEffort::Low
+        | ReasoningEffort::Medium
+        | ReasoningEffort::High
+        | ReasoningEffort::XHigh
+        | ReasoningEffort::Max => Ok(effort.as_str()),
+        ReasoningEffort::None | ReasoningEffort::Minimal => Err(ProviderError::Provider(
+            "reasoning effort is not supported by Claude".to_string(),
+        )),
+    }
 }
 
 async fn response_text(response: reqwest::Response) -> ProviderResult<(StatusCode, String)> {
@@ -129,11 +148,30 @@ fn response_excerpt(body: &str) -> String {
     }
 }
 
+fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+    let mut tools = tools.to_vec();
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    tools.iter().map(anthropic_tool).collect()
+}
+
 fn anthropic_tool(tool: &ToolDefinition) -> Value {
     json!({
         "name": tool.name,
         "description": tool.description,
         "input_schema": tool.input_schema,
+    })
+}
+
+fn mark_last_tool_for_cache(tools: &mut [Value]) {
+    if let Some(tool) = tools.last_mut().and_then(Value::as_object_mut) {
+        tool.insert("cache_control".to_string(), cache_control_1h());
+    }
+}
+
+fn cache_control_1h() -> Value {
+    json!({
+        "type": "ephemeral",
+        "ttl": "1h",
     })
 }
 
@@ -143,10 +181,7 @@ fn anthropic_system_blocks(prompt: &crate::PromptSections) -> Option<Vec<Value>>
         blocks.push(json!({
             "type": "text",
             "text": stable,
-            "cache_control": {
-                "type": "ephemeral",
-                "ttl": "1h",
-            },
+            "cache_control": cache_control_1h(),
         }));
     }
     if let Some(dynamic) = &prompt.dynamic_context {
@@ -156,6 +191,42 @@ fn anthropic_system_blocks(prompt: &crate::PromptSections) -> Option<Vec<Value>>
         }));
     }
     (!blocks.is_empty()).then_some(blocks)
+}
+
+fn add_transcript_cache_breakpoint(messages: &mut [Value]) {
+    for message in messages.iter_mut().rev() {
+        let Some(content) = message.get_mut("content") else {
+            continue;
+        };
+        let Some(block) = latest_cacheable_content_block(content) else {
+            continue;
+        };
+        if let Some(object) = block.as_object_mut() {
+            object.insert("cache_control".to_string(), cache_control_1h());
+            return;
+        }
+    }
+}
+
+fn latest_cacheable_content_block(content: &mut Value) -> Option<&mut Value> {
+    let blocks = content.as_array_mut()?;
+    blocks
+        .iter_mut()
+        .rev()
+        .find(|block| is_cacheable_transcript_block(block))
+}
+
+fn is_cacheable_transcript_block(block: &Value) -> bool {
+    let Some(object) = block.as_object() else {
+        return false;
+    };
+    if object.contains_key("cache_control") {
+        return false;
+    }
+    matches!(
+        object.get("type").and_then(Value::as_str),
+        Some("text" | "tool_use" | "tool_result")
+    )
 }
 
 fn transcript_to_messages(items: &[ModelTranscriptEntry]) -> ProviderResult<Vec<Value>> {
@@ -291,6 +362,29 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
     Ok(ModelResponse {
         assistant: AssistantMessage { items },
         provider_replay,
+        usage: response.get("usage").and_then(anthropic_usage),
+    })
+}
+
+fn anthropic_usage(value: &Value) -> Option<ProviderUsage> {
+    Some(ProviderUsage {
+        input_tokens: value
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        output_tokens: value
+            .get("output_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        total_tokens: None,
+        cache_read_input_tokens: value
+            .get("cache_read_input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
+        cache_creation_input_tokens: value
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
     })
 }
 
@@ -315,6 +409,7 @@ mod tests {
                 }),
             }],
             max_tokens: Some(2048),
+            reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
         })
         .expect("body renders");
@@ -330,10 +425,92 @@ mod tests {
                 },
             }])
         );
-        assert_eq!(body["thinking"]["type"], "enabled");
-        assert_eq!(body["thinking"]["budget_tokens"], THINKING_BUDGET_TOKENS);
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "medium");
+        assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tools"][0]["name"], "read");
+        assert_eq!(
+            body["tools"][0]["cache_control"],
+            json!({
+                "type": "ephemeral",
+                "ttl": "1h",
+            })
+        );
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({
+                "type": "ephemeral",
+                "ttl": "1h",
+            })
+        );
+    }
+
+    #[test]
+    fn messages_body_sorts_tools_for_cache_stability() {
+        let body = messages_body(ModelRequest {
+            model: "claude-opus-4-7".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tools: vec![
+                ToolDefinition {
+                    name: "write".to_string(),
+                    description: "write a file".to_string(),
+                    input_schema: json!({ "type": "object" }),
+                },
+                ToolDefinition {
+                    name: "read".to_string(),
+                    description: "read a file".to_string(),
+                    input_schema: json!({ "type": "object" }),
+                },
+            ],
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::XHigh,
+            prompt_cache_key: None,
+        })
+        .expect("body renders");
+
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert_eq!(body["tools"][1]["name"], "write");
+        assert!(body["tools"][0].get("cache_control").is_none());
+        assert_eq!(
+            body["tools"][1]["cache_control"],
+            json!({
+                "type": "ephemeral",
+                "ttl": "1h",
+            })
+        );
+    }
+
+    #[test]
+    fn messages_body_marks_latest_transcript_block_for_cache() {
+        let body = messages_body(ModelRequest {
+            model: "claude-opus-4-7".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![
+                TranscriptItem::UserMessage(UserMessage::text("first")).into(),
+                TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::Text("second".to_string())],
+                })
+                .into(),
+            ],
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::XHigh,
+            prompt_cache_key: None,
+        })
+        .expect("body renders");
+
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(
+            body["messages"][1]["content"][0]["cache_control"],
+            json!({
+                "type": "ephemeral",
+                "ttl": "1h",
+            })
+        );
     }
 
     #[test]
@@ -369,6 +546,30 @@ mod tests {
             response.provider_replay[3].raw_type().as_deref(),
             Some("tool_use")
         );
+    }
+
+    #[test]
+    fn anthropic_parser_preserves_usage_cache_metrics() {
+        let response = json!({
+            "content": [
+                { "type": "text", "text": "hello" }
+            ],
+            "usage": {
+                "input_tokens": 100,
+                "output_tokens": 20,
+                "cache_read_input_tokens": 75,
+                "cache_creation_input_tokens": 25
+            }
+        });
+
+        let response = parse_anthropic_message(&response).expect("message parses");
+        let usage = response.usage.expect("usage should be parsed");
+
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.total_tokens, None);
+        assert_eq!(usage.cache_read_input_tokens, Some(75));
+        assert_eq!(usage.cache_creation_input_tokens, Some(25));
     }
 
     #[test]

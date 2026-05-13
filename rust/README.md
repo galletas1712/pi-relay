@@ -71,15 +71,18 @@ Provider credential loading:
 
 - `provider.kind = "codex"` uses `CODEX_ACCESS_TOKEN` or
   `~/.codex/auth.json`, including `tokens.account_id` when present.
-- `provider.kind = "openai"` uses `OPENAI_API_KEY` or an API key in
-  `~/.codex/auth.json`.
+- `provider.kind = "openai"` uses the same ChatGPT/Codex subscription auth
+  path. pi-relay does not support plain OpenAI API-key auth for OpenAI models.
 - `provider.kind = "anthropic"` or `"claude"` uses `ANTHROPIC_API_KEY`.
 
-Session provider config supports an optional explicit `max_tokens` cap and
-`prompt_cache: { "key": "..." }`; the daemon does not add a default OpenAI/Codex
-output cap. The prompt-cache key is sent on the OpenAI request path. The system
-prompt is global daemon configuration exposed over websocket `config.get` /
-`config.set`, not per-session state.
+Session provider config supports `reasoning_effort`, an optional explicit
+`max_tokens` cap, and `prompt_cache: { "key": "..." }`. OpenAI accepts
+`none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; Claude accepts `low`,
+`medium`, `high`, `xhigh`, and `max`. The daemon does not add a default OpenAI output
+cap. Claude Opus 4.7 uses adaptive thinking with `output_config.effort` and a
+64k default `max_tokens` value because the Messages API requires that field.
+The system prompt is global daemon configuration exposed over websocket
+`config.get` / `config.set`, not per-session state.
 
 Provider requests render the prompt in two sections: the global system prompt
 as a stable prefix first, then daemon-generated dynamic context such as the
@@ -96,17 +99,20 @@ The web UI runs at `http://127.0.0.1:8788` and connects to
 `ws://127.0.0.1:8787` by default. Override the daemon URL with
 `VITE_PI_AGENT_WS`.
 
-The composer sends regular text as `input.follow_up`. Slash commands expose the
-session operations intended for the UI: `/new`, `/fork`, `/switch`, `/retry`,
-`/continue`, `/compact`, `/system`, `/rename`, `/archive`, `/unarchive`,
-`/provider`, and `/export`. Active turns use the stop button; queued follow-ups
-can be promoted to steer from the queue pane above the composer. Crashed or
-interrupted terminal model turns can also be retried/continued directly from
-the transcript row.
+The composer sends regular text as `input.follow_up`. The top bar exposes the
+model picker and provider-specific reasoning effort picker. The model is locked
+once the session has transcript history; reasoning effort can still be changed
+during or between turns and applies to subsequently created provider requests.
+Slash commands expose the session operations intended for the UI:
+`/new`, `/fork`, `/switch`, `/retry`, `/continue`, `/compact`, `/system`,
+`/rename`, `/archive`, `/unarchive`, and `/export`. Active turns use the stop
+button; queued follow-ups can be promoted to steer from the queue pane above the
+composer. Crashed or interrupted terminal model turns can also be
+retried/continued directly from the transcript row.
 
 ## CLI Composition Check
 
 ```sh
 ANTHROPIC_API_KEY=... cargo run --manifest-path rust/Cargo.toml -p pi-cli -- claude claude-sonnet-4-5 "hello"
-OPENAI_API_KEY=... cargo run --manifest-path rust/Cargo.toml -p pi-cli -- openai gpt-4.1 "hello"
+cargo run --manifest-path rust/Cargo.toml -p pi-cli -- openai gpt-5.5 "hello"
 ```

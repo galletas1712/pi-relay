@@ -27,6 +27,7 @@ pub(crate) async fn run_model(
         transcript: provider_transcript(model_context),
         tools: state.tools.definitions(),
         max_tokens: config.provider.max_tokens,
+        reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config
             .provider
             .prompt_cache
@@ -38,14 +39,12 @@ pub(crate) async fn run_model(
 
     let credentials = Credentials::load();
     let provider = provider_for_config(config, &credentials)?;
-    match provider.complete(request.clone()).await {
+    match provider.provider.complete(request.clone()).await {
         Ok(response) => Ok(response),
-        Err(error)
-            if config.provider.kind.is_codex() && provider_error_status(&error) == Some(401) =>
-        {
+        Err(error) if provider.uses_codex_auth && provider_error_status(&error) == Some(401) => {
             let credentials = refresh_codex_credentials().await?;
             let provider = provider_for_config(config, &credentials)?;
-            Ok(provider.complete(request).await?)
+            Ok(provider.provider.complete(request).await?)
         }
         Err(error) => Err(anyhow::Error::from(error)),
     }
@@ -71,6 +70,7 @@ pub(crate) async fn run_compaction(
         transcript,
         tools: Vec::new(),
         max_tokens: config.provider.max_tokens,
+        reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config
             .provider
             .prompt_cache
@@ -82,14 +82,12 @@ pub(crate) async fn run_compaction(
 
     let credentials = Credentials::load();
     let provider = provider_for_config(config, &credentials)?;
-    let assistant = match provider.complete(request.clone()).await {
+    let assistant = match provider.provider.complete(request.clone()).await {
         Ok(response) => response.assistant,
-        Err(error)
-            if config.provider.kind.is_codex() && provider_error_status(&error) == Some(401) =>
-        {
+        Err(error) if provider.uses_codex_auth && provider_error_status(&error) == Some(401) => {
             let credentials = refresh_codex_credentials().await?;
             let provider = provider_for_config(config, &credentials)?;
-            provider.complete(request).await?.assistant
+            provider.provider.complete(request).await?.assistant
         }
         Err(error) => return Err(anyhow::Error::from(error)),
     };
@@ -128,30 +126,44 @@ fn limit_transcript_tool_output(item: TranscriptItem) -> TranscriptItem {
     }
 }
 
+struct ProviderHandle {
+    provider: Box<dyn ModelProvider>,
+    uses_codex_auth: bool,
+}
+
 fn provider_for_config(
     config: &SessionConfig,
     credentials: &Credentials,
-) -> Result<Box<dyn ModelProvider>> {
-    let provider: Box<dyn ModelProvider> =
-        match config.provider.kind {
-            ProviderKind::OpenAi => Box::new(OpenAiProvider::new(
-                credentials.openai_api_key.clone().ok_or_else(|| {
-                    anyhow!("OPENAI_API_KEY not found in env or ~/.codex/auth.json")
+) -> Result<ProviderHandle> {
+    let handle = match config.provider.kind {
+        ProviderKind::OpenAi => ProviderHandle {
+            provider: Box::new(OpenAiProvider::codex(
+                credentials.codex_access_token.clone().ok_or_else(|| {
+                    anyhow!("~/.codex ChatGPT token not found for OpenAI subscription transport")
                 })?,
+                credentials.codex_account_id.clone(),
             )),
-            ProviderKind::Codex => Box::new(OpenAiProvider::codex(
+            uses_codex_auth: true,
+        },
+        ProviderKind::Codex => ProviderHandle {
+            provider: Box::new(OpenAiProvider::codex(
                 credentials.codex_access_token.clone().ok_or_else(|| {
                     anyhow!("CODEX_ACCESS_TOKEN or ~/.codex ChatGPT token not found")
                 })?,
                 credentials.codex_account_id.clone(),
             )),
-            ProviderKind::Claude => Box::new(AnthropicProvider::new(
+            uses_codex_auth: true,
+        },
+        ProviderKind::Claude => ProviderHandle {
+            provider: Box::new(AnthropicProvider::new(
                 credentials.anthropic_api_key.clone().ok_or_else(|| {
                     anyhow!("ANTHROPIC_API_KEY not found in env or Claude Code keychain")
                 })?,
             )),
-        };
-    Ok(provider)
+            uses_codex_auth: false,
+        },
+    };
+    Ok(handle)
 }
 
 fn provider_error_status(error: &ProviderError) -> Option<u16> {

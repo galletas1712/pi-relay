@@ -20,7 +20,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let provider_name = args.next().unwrap_or_else(|| "claude".to_string());
     let model = args.next().unwrap_or_else(|| match provider_name.as_str() {
-        "openai" => "gpt-4.1".to_string(),
+        "openai" => "gpt-5.5".to_string(),
         _ => "claude-sonnet-4-5".to_string(),
     });
     let prompt = args.collect::<Vec<_>>().join(" ");
@@ -29,7 +29,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let provider: Arc<dyn ModelProvider> = match provider_name.as_str() {
-        "openai" => Arc::new(OpenAiProvider::new(env::var("OPENAI_API_KEY")?)),
+        "openai" => {
+            let (access_token, account_id) = read_codex_auth()?;
+            Arc::new(OpenAiProvider::codex(access_token, account_id))
+        }
         "claude" | "anthropic" => Arc::new(AnthropicProvider::new(env::var("ANTHROPIC_API_KEY")?)),
         other => return Err(format!("unknown provider: {other}").into()),
     };
@@ -70,9 +73,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 .collect(),
                             tools: tools.definitions(),
                             max_tokens: None,
+                            reasoning_effort: agent_vocab::ReasoningEffort::XHigh,
                             prompt_cache_key: None,
                         })
                         .await?;
+                    let context_tokens =
+                        response.usage.as_ref().and_then(|usage| usage.input_tokens);
                     let text = response.assistant.text();
                     if !text.trim().is_empty() {
                         println!("{text}");
@@ -81,7 +87,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         action_id,
                         turn_id,
                         assistant: response.assistant,
-                        context_tokens: None,
+                        context_tokens,
                     })?;
                 }
                 SessionAction::RequestTool {
@@ -109,4 +115,26 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn read_codex_auth() -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
+    if let Ok(token) = env::var("CODEX_ACCESS_TOKEN") {
+        return Ok((token, env::var("CODEX_ACCOUNT_ID").ok()));
+    }
+
+    let path = env::var("HOME")? + "/.codex/auth.json";
+    let contents = std::fs::read_to_string(&path)?;
+    let value: serde_json::Value = serde_json::from_str(&contents)?;
+    let access_token = value
+        .pointer("/tokens/access_token")
+        .and_then(serde_json::Value::as_str)
+        .filter(|token| !token.trim().is_empty())
+        .ok_or("~/.codex/auth.json does not contain tokens.access_token")?
+        .to_string();
+    let account_id = value
+        .pointer("/tokens/account_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|account| !account.trim().is_empty())
+        .map(ToOwned::to_owned);
+    Ok((access_token, account_id))
 }
