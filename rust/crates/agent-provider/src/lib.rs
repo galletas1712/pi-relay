@@ -67,6 +67,8 @@ pub enum ProviderError {
     Http(#[from] reqwest::Error),
     #[error("provider returned an error: {0}")]
     Provider(String),
+    #[error("provider returned HTTP {status}: {message}")]
+    Status { status: u16, message: String },
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }

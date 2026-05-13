@@ -1,6 +1,6 @@
 use agent_vocab::{
-    AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ToolCall, ToolCallId,
-    TranscriptItem, UserMessage,
+    AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
+    ProviderReplayRecord, ToolCall, ToolCallId, TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::{
@@ -9,11 +9,10 @@ use reqwest::{
 };
 use serde_json::{json, Value};
 
-use crate::{
-    ModelProvider, ModelRequest, ModelResponse, PromptSections, ProviderError, ProviderResult,
-};
+use crate::{ModelProvider, ModelRequest, ModelResponse, ProviderError, ProviderResult};
 
-const DEFAULT_PROMPT_CACHE_KEY: &str = "pi-relay-openai-chat";
+const DEFAULT_PROMPT_CACHE_KEY: &str = "pi-relay-openai-responses";
+const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
 const EXTENDED_PROMPT_CACHE_RETENTION: &str = "24h";
 const CODEX_RESIDENCY_HEADER: &str = "x-openai-internal-codex-residency";
 const CODEX_RESIDENCY_US: &str = "us";
@@ -23,7 +22,6 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     auth: OpenAiAuth,
     base_url: String,
-    wire_api: OpenAiWireApi,
 }
 
 #[derive(Debug, Clone)]
@@ -35,19 +33,12 @@ enum OpenAiAuth {
     },
 }
 
-#[derive(Debug, Clone, Copy)]
-enum OpenAiWireApi {
-    ChatCompletions,
-    Responses,
-}
-
 impl OpenAiProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
             auth: OpenAiAuth::ApiKey(api_key.into()),
             base_url: "https://api.openai.com/v1".to_string(),
-            wire_api: OpenAiWireApi::ChatCompletions,
         }
     }
 
@@ -59,7 +50,6 @@ impl OpenAiProvider {
                 account_id,
             },
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
-            wire_api: OpenAiWireApi::Responses,
         }
     }
 
@@ -68,8 +58,7 @@ impl OpenAiProvider {
         self
     }
 
-    pub fn with_responses_api(mut self) -> Self {
-        self.wire_api = OpenAiWireApi::Responses;
+    pub fn with_responses_api(self) -> Self {
         self
     }
 
@@ -92,49 +81,29 @@ impl OpenAiProvider {
             }
         }
     }
+
+    fn replay_provider_kind(&self) -> ProviderKind {
+        match self.auth {
+            OpenAiAuth::ApiKey(_) => ProviderKind::OpenAi,
+            OpenAiAuth::Codex { .. } => ProviderKind::Codex,
+        }
+    }
+
+    fn supports_extended_prompt_cache_retention(&self) -> bool {
+        matches!(self.auth, OpenAiAuth::ApiKey(_))
+    }
 }
 
 #[async_trait]
 impl ModelProvider for OpenAiProvider {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
-        match self.wire_api {
-            OpenAiWireApi::ChatCompletions => self.complete_chat(request).await,
-            OpenAiWireApi::Responses => self.complete_responses(request).await,
-        }
+        self.complete_responses(request).await
     }
 }
 
 impl OpenAiProvider {
-    async fn complete_chat(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
-        let body = chat_completion_body(request)?;
-
-        let response = self
-            .add_auth(self.client.post(format!(
-                "{}/chat/completions",
-                self.base_url.trim_end_matches('/')
-            )))
-            .json(&body)
-            .send()
-            .await?;
-        let (status, text) = response_text(response).await?;
-        ensure_success(status, &text)?;
-        let response: Value = serde_json::from_str(&text).map_err(|error| {
-            ProviderError::Provider(format!(
-                "failed to parse OpenAI chat response JSON: {error}; body: {}",
-                response_excerpt(&text)
-            ))
-        })?;
-
-        let message = response
-            .pointer("/choices/0/message")
-            .ok_or_else(|| ProviderError::Provider("missing choices[0].message".to_string()))?;
-        Ok(ModelResponse {
-            assistant: parse_openai_message(message),
-        })
-    }
-
     async fn complete_responses(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
-        let body = responses_body(request)?;
+        let body = responses_body(request, self.supports_extended_prompt_cache_retention())?;
 
         let text = self
             .add_auth(
@@ -149,7 +118,7 @@ impl OpenAiProvider {
         ensure_success(status, &text)?;
 
         Ok(ModelResponse {
-            assistant: parse_responses_sse(&text)?,
+            assistant: parse_responses_sse(&text, self.replay_provider_kind())?,
         })
     }
 }
@@ -164,11 +133,10 @@ fn ensure_success(status: StatusCode, body: &str) -> ProviderResult<()> {
     if status.is_success() {
         return Ok(());
     }
-    Err(ProviderError::Provider(format!(
-        "HTTP {}: {}",
-        status.as_u16(),
-        response_error_message(body)
-    )))
+    Err(ProviderError::Status {
+        status: status.as_u16(),
+        message: response_error_message(body),
+    })
 }
 
 fn response_error_message(body: &str) -> String {
@@ -198,60 +166,13 @@ fn response_excerpt(body: &str) -> String {
     }
 }
 
-fn chat_completion_body(request: ModelRequest) -> ProviderResult<Value> {
+fn responses_body(
+    request: ModelRequest,
+    include_prompt_cache_retention: bool,
+) -> ProviderResult<Value> {
     let prompt_cache_key = request
         .prompt_cache_key
         .unwrap_or_else(|| DEFAULT_PROMPT_CACHE_KEY.to_string());
-    let mut messages = Vec::new();
-    messages.extend(chat_prompt_messages(&request.prompt));
-    messages.extend(transcript_to_messages(&request.transcript)?);
-
-    let tools: Vec<Value> = request
-        .tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.input_schema,
-                }
-            })
-        })
-        .collect();
-
-    let mut body = json!({
-        "model": request.model,
-        "messages": messages,
-        "parallel_tool_calls": true,
-        "prompt_cache_key": prompt_cache_key,
-        "prompt_cache_retention": EXTENDED_PROMPT_CACHE_RETENTION,
-        "service_tier": "priority",
-        "store": false,
-    });
-    if !tools.is_empty() {
-        body["tools"] = Value::Array(tools);
-        body["tool_choice"] = json!("auto");
-    }
-    if let Some(max_tokens) = request.max_tokens {
-        body["max_completion_tokens"] = json!(max_tokens);
-    }
-    Ok(body)
-}
-
-fn chat_prompt_messages(prompt: &PromptSections) -> Vec<Value> {
-    let mut messages = Vec::new();
-    if let Some(stable_prefix) = &prompt.stable_prefix {
-        messages.push(json!({ "role": "system", "content": stable_prefix }));
-    }
-    if let Some(dynamic_context) = &prompt.dynamic_context {
-        messages.push(json!({ "role": "system", "content": dynamic_context }));
-    }
-    messages
-}
-
-fn responses_body(request: ModelRequest) -> ProviderResult<Value> {
     let tools: Vec<Value> = request
         .tools
         .iter()
@@ -272,91 +193,19 @@ fn responses_body(request: ModelRequest) -> ProviderResult<Value> {
         "tool_choice": "auto",
         "parallel_tool_calls": true,
         "reasoning": null,
+        "service_tier": "priority",
         "store": false,
         "stream": true,
-        "include": [],
+        "include": [RESPONSES_REASONING_INCLUDE],
+        "prompt_cache_key": prompt_cache_key,
     });
-    if let Some(prompt_cache_key) = request.prompt_cache_key {
-        body["prompt_cache_key"] = json!(prompt_cache_key);
+    if include_prompt_cache_retention {
+        body["prompt_cache_retention"] = json!(EXTENDED_PROMPT_CACHE_RETENTION);
+    }
+    if let Some(max_tokens) = request.max_tokens {
+        body["max_output_tokens"] = json!(max_tokens);
     }
     Ok(body)
-}
-
-fn transcript_to_messages(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>> {
-    let mut messages = Vec::new();
-    for item in items {
-        match item {
-            TranscriptItem::UserMessage(message) => {
-                messages.push(json!({ "role": "user", "content": openai_user_content(message) }));
-            }
-            TranscriptItem::CompactionSummary(summary) => {
-                messages.push(json!({
-                    "role": "user",
-                    "content": compaction_summary_text(summary),
-                }));
-            }
-            TranscriptItem::AssistantMessage(message) => {
-                let text = message.text();
-                let tool_calls = message
-                    .tool_calls()
-                    .map(|call| {
-                        json!({
-                            "id": call.id.as_str(),
-                            "type": "function",
-                            "function": {
-                                "name": &call.tool_name,
-                                "arguments": &call.args_json,
-                            }
-                        })
-                    })
-                    .collect::<Vec<_>>();
-                if !tool_calls.is_empty() {
-                    messages.push(json!({
-                        "role": "assistant",
-                        "content": if text.is_empty() { Value::Null } else { json!(text) },
-                        "tool_calls": tool_calls,
-                    }));
-                } else if !text.is_empty() {
-                    messages.push(json!({ "role": "assistant", "content": text }));
-                }
-            }
-            TranscriptItem::ToolResult(result) => {
-                messages.push(json!({
-                    "role": "tool",
-                    "tool_call_id": result.tool_call_id.as_str(),
-                    "content": result.output,
-                }));
-            }
-            TranscriptItem::TurnStarted { .. }
-            | TranscriptItem::ToolCallStarted { .. }
-            | TranscriptItem::TurnFinished { .. } => {}
-        }
-    }
-    Ok(messages)
-}
-
-fn openai_user_content(message: &UserMessage) -> Value {
-    if let Some(text) = message.as_text() {
-        return json!(text);
-    }
-    Value::Array(
-        message
-            .content
-            .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
-                ContentBlock::Image { image } => match &image.source {
-                    agent_vocab::ImageSource::Url(url) => {
-                        json!({ "type": "image_url", "image_url": { "url": url } })
-                    }
-                    agent_vocab::ImageSource::Base64(data) => {
-                        let url = format!("data:{};base64,{}", image.mime_type, data);
-                        json!({ "type": "image_url", "image_url": { "url": url } })
-                    }
-                },
-            })
-            .collect(),
-    )
 }
 
 fn transcript_to_response_items(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>> {
@@ -378,21 +227,26 @@ fn transcript_to_response_items(items: &[TranscriptItem]) -> ProviderResult<Vec<
                 }));
             }
             TranscriptItem::AssistantMessage(message) => {
-                let text = message.text();
-                if !text.is_empty() {
-                    responses.push(json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{ "type": "output_text", "text": text }],
-                    }));
-                }
-                for call in message.tool_calls() {
-                    responses.push(json!({
-                        "type": "function_call",
-                        "call_id": call.id.as_str(),
-                        "name": call.tool_name,
-                        "arguments": call.args_json,
-                    }));
+                let replay_items = openai_replay_items(message)?;
+                if !replay_items.is_empty() {
+                    responses.extend(replay_items);
+                } else {
+                    let text = message.text();
+                    if !text.is_empty() {
+                        responses.push(json!({
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{ "type": "output_text", "text": text }],
+                        }));
+                    }
+                    for call in message.tool_calls() {
+                        responses.push(json!({
+                            "type": "function_call",
+                            "call_id": call.id.as_str(),
+                            "name": call.tool_name,
+                            "arguments": call.args_json,
+                        }));
+                    }
                 }
             }
             TranscriptItem::ToolResult(result) => {
@@ -408,6 +262,14 @@ fn transcript_to_response_items(items: &[TranscriptItem]) -> ProviderResult<Vec<
         }
     }
     Ok(responses)
+}
+
+fn openai_replay_items(message: &AssistantMessage) -> ProviderResult<Vec<Value>> {
+    message
+        .replay_records()
+        .filter(|record| matches!(record.provider, ProviderKind::OpenAi | ProviderKind::Codex))
+        .map(|record| record.raw_value().map_err(ProviderError::Json))
+        .collect()
 }
 
 fn responses_user_content(message: &UserMessage) -> Vec<Value> {
@@ -436,45 +298,14 @@ fn compaction_summary_text(summary: &CompactionSummary) -> String {
     )
 }
 
-fn parse_openai_message(message: &Value) -> AssistantMessage {
-    let mut items = Vec::new();
-    if let Some(content) = message.get("content").and_then(Value::as_str) {
-        if !content.is_empty() {
-            items.push(AssistantItem::Text(content.to_string()));
-        }
-    }
-    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-        for call in tool_calls {
-            let Some(function) = call.get("function") else {
-                continue;
-            };
-            let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
-            let name = function
-                .get("name")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let args = function
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("{}");
-            items.push(AssistantItem::ToolCall(ToolCall {
-                id: ToolCallId::new(id),
-                tool_name: name.to_string(),
-                args_json: args.to_string(),
-            }));
-        }
-    }
-    AssistantMessage { items }
-}
-
-fn parse_responses_sse(text: &str) -> ProviderResult<AssistantMessage> {
+fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<AssistantMessage> {
     let mut items = Vec::new();
     for data in sse_data_events(text) {
         let event: Value = serde_json::from_str(data)?;
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_item.done") => {
                 if let Some(item) = event.get("item") {
-                    parse_response_output_item(item, &mut items)?;
+                    parse_response_output_item(item, &mut items, provider)?;
                 }
             }
             Some("response.failed") => {
@@ -505,9 +336,22 @@ fn sse_data_events(text: &str) -> impl Iterator<Item = &str> {
         .filter(|line| !line.trim().is_empty() && *line != "[DONE]")
 }
 
-fn parse_response_output_item(item: &Value, items: &mut Vec<AssistantItem>) -> ProviderResult<()> {
-    match item.get("type").and_then(Value::as_str) {
-        Some("message") => {
+fn parse_response_output_item(
+    item: &Value,
+    items: &mut Vec<AssistantItem>,
+    provider: ProviderKind,
+) -> ProviderResult<()> {
+    let item_type = item
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    items.push(AssistantItem::ProviderReplayRecord(
+        ProviderReplayRecord::new(provider, &item_type, item)?,
+    ));
+
+    match item_type.as_str() {
+        "message" => {
             if item.get("role").and_then(Value::as_str) != Some("assistant") {
                 return Ok(());
             }
@@ -523,7 +367,7 @@ fn parse_response_output_item(item: &Value, items: &mut Vec<AssistantItem>) -> P
                 }
             }
         }
-        Some("function_call") => {
+        "function_call" => {
             let call_id = item
                 .get("call_id")
                 .and_then(Value::as_str)
@@ -539,7 +383,7 @@ fn parse_response_output_item(item: &Value, items: &mut Vec<AssistantItem>) -> P
                 args_json: arguments.to_string(),
             }));
         }
-        Some("reasoning") | Some("reasoning_summary") => {}
+        "reasoning" | "reasoning_summary" => {}
         _ => {}
     }
     Ok(())
@@ -548,6 +392,7 @@ fn parse_response_output_item(item: &Value, items: &mut Vec<AssistantItem>) -> P
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::PromptSections;
     use agent_vocab::{ToolCall, ToolDefinition, ToolResultMessage};
 
     #[test]
@@ -586,73 +431,87 @@ mod tests {
     }
 
     #[test]
-    fn chat_completion_body_sets_openai_request_policy() {
-        let body = chat_completion_body(ModelRequest {
-            model: "gpt-5.1".to_string(),
-            prompt: PromptSections::new(
-                Some("static system".to_string()),
-                Some("cwd: /tmp/project".to_string()),
-            ),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello"))],
-            tools: vec![ToolDefinition {
-                name: "read".to_string(),
-                description: "read a file".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string" }
-                    },
-                    "required": ["path"]
-                }),
-            }],
-            max_tokens: Some(2048),
-            prompt_cache_key: Some("pi-relay-test".to_string()),
-        })
-        .expect("chat body renders");
+    fn responses_body_sets_openai_request_policy() {
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.1".to_string(),
+                prompt: PromptSections::new(
+                    Some("static system".to_string()),
+                    Some("cwd: /tmp/project".to_string()),
+                ),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello"))],
+                tools: vec![ToolDefinition {
+                    name: "read".to_string(),
+                    description: "read a file".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        },
+                        "required": ["path"]
+                    }),
+                }],
+                max_tokens: Some(2048),
+                prompt_cache_key: Some("pi-relay-test".to_string()),
+            },
+            true,
+        )
+        .expect("responses body renders");
 
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["service_tier"], "priority");
         assert_eq!(body["store"], false);
+        assert_eq!(body["stream"], true);
         assert_eq!(body["prompt_cache_key"], "pi-relay-test");
-        assert_eq!(body["prompt_cache_retention"], "24h");
+        assert_eq!(
+            body["prompt_cache_retention"],
+            EXTENDED_PROMPT_CACHE_RETENTION
+        );
+        assert_eq!(body["include"][0], RESPONSES_REASONING_INCLUDE);
         assert_eq!(body["tool_choice"], "auto");
-        assert_eq!(body["max_completion_tokens"], 2048);
-        assert_eq!(body["tools"][0]["function"]["name"], "read");
-        assert_eq!(body["messages"][0]["content"], "static system");
-        assert_eq!(body["messages"][1]["content"], "cwd: /tmp/project");
-        assert_eq!(body["messages"][2]["role"], "user");
+        assert_eq!(body["max_output_tokens"], 2048);
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert_eq!(body["instructions"], "static system\n\ncwd: /tmp/project");
+        assert_eq!(body["input"][0]["role"], "user");
     }
 
     #[test]
-    fn chat_completion_body_uses_default_cache_key() {
-        let body = chat_completion_body(ModelRequest {
-            model: "gpt-5.1".to_string(),
-            prompt: PromptSections::default(),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello"))],
-            tools: Vec::new(),
-            max_tokens: None,
-            prompt_cache_key: None,
-        })
-        .expect("chat body renders");
+    fn responses_body_uses_default_cache_key() {
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.1".to_string(),
+                prompt: PromptSections::default(),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello"))],
+                tools: Vec::new(),
+                max_tokens: None,
+                prompt_cache_key: None,
+            },
+            false,
+        )
+        .expect("responses body renders");
 
         assert_eq!(body["prompt_cache_key"], DEFAULT_PROMPT_CACHE_KEY);
-        assert!(body.get("tool_choice").is_none());
-        assert!(body.get("max_completion_tokens").is_none());
+        assert!(body.get("prompt_cache_retention").is_none());
+        assert_eq!(body["tools"], json!([]));
+        assert!(body.get("max_output_tokens").is_none());
     }
 
     #[test]
     fn responses_body_keeps_stable_prompt_before_dynamic_context() {
-        let body = responses_body(ModelRequest {
-            model: "gpt-5.1-codex".to_string(),
-            prompt: PromptSections::new(
-                Some("stable agent rules".to_string()),
-                Some("workspace: /tmp/pi".to_string()),
-            ),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello"))],
-            tools: Vec::new(),
-            max_tokens: None,
-            prompt_cache_key: Some("cache-key".to_string()),
-        })
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.1-codex".to_string(),
+                prompt: PromptSections::new(
+                    Some("stable agent rules".to_string()),
+                    Some("workspace: /tmp/pi".to_string()),
+                ),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello"))],
+                tools: Vec::new(),
+                max_tokens: None,
+                prompt_cache_key: Some("cache-key".to_string()),
+            },
+            false,
+        )
         .expect("responses body renders");
 
         assert_eq!(
@@ -663,13 +522,13 @@ mod tests {
     }
 
     #[test]
-    fn transcript_to_messages_preserves_assistant_tool_calls() {
+    fn transcript_to_response_items_preserves_assistant_tool_calls() {
         let tool_call = ToolCall {
             id: ToolCallId::new("call_1"),
             tool_name: "read".to_string(),
             args_json: "{\"path\":\"README.md\"}".to_string(),
         };
-        let messages = transcript_to_messages(&[
+        let items = transcript_to_response_items(&[
             TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
             }),
@@ -681,11 +540,11 @@ mod tests {
         ])
         .expect("tool transcript should render");
 
-        assert_eq!(messages[0]["role"], "assistant");
-        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "read");
-        assert_eq!(messages[1]["role"], "tool");
-        assert_eq!(messages[1]["tool_call_id"], "call_1");
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "call_1");
+        assert_eq!(items[0]["name"], "read");
+        assert_eq!(items[1]["type"], "function_call_output");
+        assert_eq!(items[1]["call_id"], "call_1");
     }
 
     #[test]
@@ -695,13 +554,39 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
 data: {"type":"response.completed","response":{"id":"resp_1"}}
 "#;
 
-        let assistant = parse_responses_sse(sse).expect("sse parses");
+        let assistant = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
 
         assert_eq!(assistant.text(), "hello");
         let calls = assistant.tool_calls().collect::<Vec<_>>();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id.as_str(), "call_1");
         assert_eq!(calls[0].tool_name, "read");
+        let replay = assistant.replay_records().collect::<Vec<_>>();
+        assert_eq!(replay.len(), 2);
+        assert_eq!(replay[0].record_type, "message");
+        assert_eq!(replay[1].record_type, "function_call");
+    }
+
+    #[test]
+    fn responses_input_prefers_openai_replay_records() {
+        let raw = json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "hello", "annotations": [] }],
+            "status": "completed",
+        });
+        let items =
+            transcript_to_response_items(&[TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![
+                    AssistantItem::ProviderReplayRecord(
+                        ProviderReplayRecord::new(ProviderKind::OpenAi, "message", &raw).unwrap(),
+                    ),
+                    AssistantItem::Text("hello".to_string()),
+                ],
+            })])
+            .expect("responses input renders");
+
+        assert_eq!(items, vec![raw]);
     }
 
     #[test]

@@ -7,8 +7,8 @@ mod transcript_item;
 
 pub use crate::ids::{ActionId, ToolCallId, TurnId};
 pub use crate::message::{
-    AssistantItem, AssistantMessage, ContentBlock, ImageContent, ImageSource, ToolCall,
-    ToolDefinition, ToolResultMessage, ToolResultStatus, UserMessage,
+    AssistantItem, AssistantMessage, ContentBlock, ImageContent, ImageSource, ProviderReplayRecord,
+    ToolCall, ToolDefinition, ToolResultMessage, ToolResultStatus, UserMessage,
 };
 pub use crate::provider::{ProviderConfig, ProviderKind};
 pub use crate::transcript_item::{CompactionSummary, TranscriptItem, TurnOutcome};

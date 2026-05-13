@@ -4,6 +4,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::ids::ToolCallId;
+use crate::provider::ProviderKind;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserMessage {
@@ -96,7 +97,7 @@ impl AssistantMessage {
     pub fn tool_calls(&self) -> impl Iterator<Item = &ToolCall> {
         self.items.iter().filter_map(|item| match item {
             AssistantItem::ToolCall(tool_call) => Some(tool_call),
-            AssistantItem::Text(_) => None,
+            AssistantItem::Text(_) | AssistantItem::ProviderReplayRecord(_) => None,
         })
     }
 
@@ -105,10 +106,17 @@ impl AssistantMessage {
             .iter()
             .filter_map(|item| match item {
                 AssistantItem::Text(text) => Some(text.as_str()),
-                AssistantItem::ToolCall(_) => None,
+                AssistantItem::ToolCall(_) | AssistantItem::ProviderReplayRecord(_) => None,
             })
             .collect::<Vec<_>>()
             .join("")
+    }
+
+    pub fn replay_records(&self) -> impl Iterator<Item = &ProviderReplayRecord> {
+        self.items.iter().filter_map(|item| match item {
+            AssistantItem::ProviderReplayRecord(record) => Some(record),
+            AssistantItem::Text(_) | AssistantItem::ToolCall(_) => None,
+        })
     }
 }
 
@@ -116,6 +124,32 @@ impl AssistantMessage {
 pub enum AssistantItem {
     Text(String),
     ToolCall(ToolCall),
+    ProviderReplayRecord(ProviderReplayRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderReplayRecord {
+    pub provider: ProviderKind,
+    pub record_type: String,
+    pub raw_json: String,
+}
+
+impl ProviderReplayRecord {
+    pub fn new(
+        provider: ProviderKind,
+        record_type: impl Into<String>,
+        raw: &Value,
+    ) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            provider,
+            record_type: record_type.into(),
+            raw_json: serde_json::to_string(raw)?,
+        })
+    }
+
+    pub fn raw_value(&self) -> Result<Value, serde_json::Error> {
+        serde_json::from_str(&self.raw_json)
+    }
 }
 
 impl Serialize for AssistantItem {
@@ -136,6 +170,14 @@ impl Serialize for AssistantItem {
                 state.serialize_field("id", &call.id)?;
                 state.serialize_field("tool_name", &call.tool_name)?;
                 state.serialize_field("args_json", &call.args_json)?;
+                state.end()
+            }
+            Self::ProviderReplayRecord(record) => {
+                let mut state = serializer.serialize_struct("AssistantItem", 4)?;
+                state.serialize_field("type", "provider_replay_record")?;
+                state.serialize_field("provider", &record.provider)?;
+                state.serialize_field("record_type", &record.record_type)?;
+                state.serialize_field("raw_json", &record.raw_json)?;
                 state.end()
             }
         }
@@ -169,6 +211,9 @@ impl<'de> Visitor<'de> for AssistantItemVisitor {
         let mut id: Option<ToolCallId> = None;
         let mut tool_name: Option<String> = None;
         let mut args_json: Option<String> = None;
+        let mut provider: Option<ProviderKind> = None;
+        let mut record_type: Option<String> = None;
+        let mut raw_json: Option<String> = None;
 
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
@@ -177,6 +222,9 @@ impl<'de> Visitor<'de> for AssistantItemVisitor {
                 "id" => id = Some(map.next_value()?),
                 "tool_name" => tool_name = Some(map.next_value()?),
                 "args_json" => args_json = Some(map.next_value()?),
+                "provider" => provider = Some(map.next_value()?),
+                "record_type" => record_type = Some(map.next_value()?),
+                "raw_json" => raw_json = Some(map.next_value()?),
                 _ => {
                     let _ = map.next_value::<de::IgnoredAny>()?;
                 }
@@ -190,7 +238,18 @@ impl<'de> Visitor<'de> for AssistantItemVisitor {
                 tool_name: tool_name.ok_or_else(|| de::Error::missing_field("tool_name"))?,
                 args_json: args_json.unwrap_or_else(|| "{}".to_string()),
             })),
-            Some(other) => Err(de::Error::unknown_variant(other, &["text", "tool_call"])),
+            Some("provider_replay_record") => {
+                Ok(AssistantItem::ProviderReplayRecord(ProviderReplayRecord {
+                    provider: provider.ok_or_else(|| de::Error::missing_field("provider"))?,
+                    record_type: record_type
+                        .ok_or_else(|| de::Error::missing_field("record_type"))?,
+                    raw_json: raw_json.ok_or_else(|| de::Error::missing_field("raw_json"))?,
+                }))
+            }
+            Some(other) => Err(de::Error::unknown_variant(
+                other,
+                &["text", "tool_call", "provider_replay_record"],
+            )),
             None => Err(de::Error::missing_field("type")),
         }
     }
@@ -293,6 +352,12 @@ mod tests {
                     tool_name: "read".to_string(),
                     args_json: "{\"path\":\"README.md\"}".to_string(),
                 }),
+                AssistantItem::ProviderReplayRecord(ProviderReplayRecord {
+                    provider: ProviderKind::OpenAi,
+                    record_type: "reasoning".to_string(),
+                    raw_json: "{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}"
+                        .to_string(),
+                }),
             ],
         };
 
@@ -307,6 +372,12 @@ mod tests {
                         "id": "call_1",
                         "tool_name": "read",
                         "args_json": "{\"path\":\"README.md\"}",
+                    },
+                    {
+                        "type": "provider_replay_record",
+                        "provider": "openai",
+                        "record_type": "reasoning",
+                        "raw_json": "{\"type\":\"reasoning\",\"encrypted_content\":\"opaque\"}",
                     }
                 ]
             })

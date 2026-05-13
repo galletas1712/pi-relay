@@ -154,6 +154,7 @@ fn provider_for_config(
 
 fn provider_error_status(error: &ProviderError) -> Option<u16> {
     match error {
+        ProviderError::Status { status, .. } => Some(*status),
         ProviderError::Http(error) => error.status().map(|status| status.as_u16()),
         _ => None,
     }

@@ -83,6 +83,12 @@ export type AssistantItem =
 			id: string;
 			tool_name: string;
 			args_json: string;
+	  }
+	| {
+			type: "provider_replay_record";
+			provider: "openai" | "codex" | "claude";
+			record_type: string;
+			raw_json: string;
 	  };
 
 export interface ToolCall {

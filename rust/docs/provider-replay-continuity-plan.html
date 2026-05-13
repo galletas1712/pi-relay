@@ -461,8 +461,8 @@ struct ModelContext {
 				<li>
 					<strong>Phase 1: Add replay records without changing behavior</strong>
 					Add types in <code>agent-vocab</code>, extend provider parser tests, and store replay records
-					for new outputs. Keep current Chat Completions behavior and existing UI rendering intact.
-					This phase should be schema-compatible and easy to roll forward.
+					for new outputs. Existing UI rendering should remain intact because replay records are hidden
+					assistant items, not visible chat rows.
 				</li>
 				<li>
 					<strong>Phase 2: Make OpenAI Responses stateless-correct</strong>
@@ -504,10 +504,38 @@ struct ModelContext {
 				</li>
 				<li>
 					<strong>Phase 8: Remove compatibility glue</strong>
-					Once both providers serialize from replay records, remove lossy transcript-to-wire paths and
-					tests that assert the older Chat-Completions-shaped behavior.
+					Remove the OpenAI Chat Completions path and any tests that assert the older
+					Chat-Completions-shaped behavior. OpenAI should be Responses-only.
 				</li>
 			</ol>
+		</section>
+
+		<section class="card span-12">
+			<h2>Implementation notes</h2>
+			<ul class="checklist">
+				<li>
+					OpenAI is now implemented as a Responses-only provider. Public OpenAI requests use
+					<code>prompt_cache_retention:"24h"</code>; the ChatGPT Codex backend keeps
+					<code>prompt_cache_key</code> but omits that retention field because the backend rejects it.
+				</li>
+				<li>
+					Provider replay records currently live inside <code>AssistantMessage.items</code> as
+					<code>provider_replay_record</code>. This keeps the append-only transcript tree unchanged:
+					fork, switch, compaction, and Postgres persistence carry replay records with the same branch
+					entries as their visible assistant text/tool calls.
+				</li>
+				<li>
+					Anthropic requests enable extended thinking and preserve complete raw
+					<code>thinking</code>, <code>redacted_thinking</code>, <code>text</code>, and
+					<code>tool_use</code> blocks for round-trip continuity. The UI hides these opaque records by
+					default.
+				</li>
+				<li>
+					Custom/freeform OpenAI tools and first-class hosted-tool UI are still separate additions.
+					The existing registry only exposes JSON-schema local tools, so this pass avoids adding an
+					unused tool-definition abstraction until a concrete freeform tool is introduced.
+				</li>
+			</ul>
 		</section>
 
 		<section class="grid">
