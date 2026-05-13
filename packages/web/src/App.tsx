@@ -60,6 +60,7 @@ export function App() {
 	const [slashIndex, setSlashIndex] = useState(0);
 	const [sending, setSending] = useState(false);
 	const [stopping, setStopping] = useState(false);
+	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
 	const [rightOpen, setRightOpen] = useState(true);
 	const [showArchived, setShowArchived] = useState(false);
 	const [historyDialog, setHistoryDialog] = useState<HistoryDialogState | null>(null);
@@ -440,6 +441,31 @@ export function App() {
 		}
 	}, [api, loadSessions, pushNotice, refreshSelected, requireSelected]);
 
+	const resumeTerminalTurn = useCallback(
+		async (leafId?: string | null) => {
+			const sessionId = requireSelected();
+			const current = await refreshSelected(sessionId);
+			const activeLeafId = leafId ?? current?.snapshot.active_leaf_id ?? snapshot?.active_leaf_id ?? null;
+			if (!activeLeafId) throw new Error("no terminal turn to resume");
+			if ((current?.snapshot.activity ?? snapshot?.activity) !== "idle") {
+				throw new Error("stop the active turn before retrying");
+			}
+			setResumingTurnId(activeLeafId);
+			try {
+				const result = await api.resumeTurn({
+					sessionId,
+					leafId: activeLeafId,
+					expectedActiveLeafId: current?.snapshot.active_leaf_id ?? snapshot?.active_leaf_id ?? null
+				});
+				await Promise.all([refreshSelected(sessionId), loadSessions()]);
+				pushNotice("success", result.outcome === "Interrupted" ? "continued turn" : "retry started");
+			} finally {
+				setResumingTurnId(null);
+			}
+		},
+		[api, loadSessions, pushNotice, refreshSelected, requireSelected, snapshot?.active_leaf_id, snapshot?.activity]
+	);
+
 	const executeSlash = useCallback(
 		async (parsed: ParsedSlash) => {
 			const name = parsed.name;
@@ -503,6 +529,10 @@ export function App() {
 				});
 				return;
 			}
+			if (name === "retry" || name === "continue") {
+				await resumeTerminalTurn();
+				return;
+			}
 			if (name === "compact") {
 				const result = await api.requestCompaction(sessionId);
 				pushActionNotice("success", `compaction requested ${result.action_row_id ?? ""}`.trim());
@@ -555,6 +585,7 @@ export function App() {
 			pushNotice,
 			refreshSelected,
 			requireSelected,
+			resumeTerminalTurn,
 			selectedSession,
 			sessionItems,
 			setSessionArchived,
@@ -680,6 +711,10 @@ export function App() {
 					activeLeafId={snapshot?.active_leaf_id ?? null}
 					isRunning={snapshot?.activity === "running"}
 					hasSession={!!selectedId}
+					onResumeTurn={(entryId) => {
+						void resumeTerminalTurn(entryId).catch((error) => pushNotice("error", errorMessage(error)));
+					}}
+					resumingTurnId={resumingTurnId}
 				/>
 			</main>
 

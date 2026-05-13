@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use agent_vocab::{AssistantMessage, ToolDefinition, TranscriptItem};
+use agent_vocab::{AssistantMessage, ProviderReplayItem, ToolDefinition, TranscriptItem};
 use async_trait::async_trait;
 use thiserror::Error;
 
@@ -11,10 +11,25 @@ pub mod openai;
 pub struct ModelRequest {
     pub model: String,
     pub prompt: PromptSections,
-    pub transcript: Vec<TranscriptItem>,
+    pub transcript: Vec<ModelTranscriptEntry>,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub prompt_cache_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelTranscriptEntry {
+    pub item: TranscriptItem,
+    pub provider_replay: Vec<ProviderReplayItem>,
+}
+
+impl From<TranscriptItem> for ModelTranscriptEntry {
+    fn from(item: TranscriptItem) -> Self {
+        Self {
+            item,
+            provider_replay: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -59,6 +74,7 @@ fn normalize_prompt_section(value: Option<String>) -> Option<String> {
 #[derive(Debug, Clone)]
 pub struct ModelResponse {
     pub assistant: AssistantMessage,
+    pub provider_replay: Vec<ProviderReplayItem>,
 }
 
 #[derive(Debug, Error)]

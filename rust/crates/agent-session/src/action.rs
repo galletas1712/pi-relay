@@ -95,7 +95,7 @@ impl CompletionTarget {
         }
     }
 
-    fn from_session_action(action: &SessionAction) -> Option<Self> {
+    pub(crate) fn from_session_action(action: &SessionAction) -> Option<Self> {
         match action {
             SessionAction::RequestModel {
                 action_id, turn_id, ..

@@ -60,6 +60,7 @@ pub(crate) enum RpcMethod {
     HistoryContext,
     HistoryRewind,
     HistoryFork,
+    TurnResume,
     ToolsList,
     CompactionRequest,
     HarnessModelComplete,
@@ -85,6 +86,7 @@ impl RpcMethod {
             "history.context" => Some(Self::HistoryContext),
             "history.rewind" => Some(Self::HistoryRewind),
             "history.fork" => Some(Self::HistoryFork),
+            "turn.resume" => Some(Self::TurnResume),
             "tools.list" => Some(Self::ToolsList),
             "compaction.request" => Some(Self::CompactionRequest),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
@@ -150,6 +152,7 @@ mod tests {
             RpcMethod::parse("input.follow_up"),
             Some(RpcMethod::InputFollowUp)
         );
+        assert_eq!(RpcMethod::parse("turn.resume"), Some(RpcMethod::TurnResume));
         assert_eq!(RpcMethod::parse("input.fly"), None);
     }
 

@@ -63,7 +63,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                     tool_ctx.cwd.display()
                                 )),
                             ),
-                            transcript: model_context.into_transcript_items(),
+                            transcript: model_context
+                                .into_transcript_items()
+                                .into_iter()
+                                .map(Into::into)
+                                .collect(),
                             tools: tools.definitions(),
                             max_tokens: None,
                             prompt_cache_key: None,

@@ -1,5 +1,43 @@
 # Rust Rewrite Worklog
 
+## 2026-05-13
+
+### Provider Replay Sidecar Cleanup
+
+Moved provider replay out of semantic assistant messages. The old
+`ProviderReplayRecord` shape made `AssistantMessage.items` carry both visible
+assistant output and opaque provider-continuation payloads, which muddied the
+core/session boundary and leaked provider concerns into UI-facing transcript
+types.
+
+Implemented the cleaner split:
+
+- `AssistantItem` is now only visible `Text` or semantic `ToolCall`.
+- `ProviderReplayItem` lives with provider vocabulary and stores
+  `{ provider, raw_json }` for exact OpenAI Responses and Anthropic Messages
+  replay.
+- `StoredTranscriptEntry` and `TranscriptStorageNode` carry a
+  `provider_replay` sidecar, so replay remains aligned with the append-only
+  transcript tree without becoming a visible transcript item.
+- `ModelContext` materializes `ModelContextEntry` values and preserves replay
+  sidecars along fork/switch/compact branches.
+- `ModelRequest` now passes `Vec<ModelTranscriptEntry>` to providers.
+  Providers serialize replay sidecars when present and fall back to semantic
+  transcript items for older or replay-free history.
+- Postgres has a sibling `transcript_entries.provider_replay` JSONB column.
+  The schema migration lifts legacy `provider_replay_record` assistant items
+  into that column and removes them from assistant message JSON.
+- The daemon attaches provider replay returned by model calls to the persisted
+  assistant transcript entry in the same output batch.
+- Web types no longer include a `provider_replay_record` assistant item; replay
+  is available only as optional entry sidecar/debug data.
+
+Verification:
+
+- `cargo test --manifest-path rust/Cargo.toml --workspace --quiet` passes with
+  the macOS SDK/linker environment.
+- `npm run build:web --silent` passes.
+
 ## 2026-05-12
 
 ### Compaction And History Forest Proposal
@@ -938,3 +976,30 @@ paths. Changes made from that review:
 - Moved fork lineage needed by empty-session pruning out of transient events and
   into child session metadata under `metadata.fork`, so event cleanup does not
   make intentionally empty fork children look accidental.
+
+### Terminal Turn Retry/Continue
+
+- Added a narrow retry/continue primitive for terminal model turns. A crashed
+  or interrupted `TurnFinished` can now be resumed through `turn.resume`; the
+  daemon finds the original model action checkpoint, sets the session active
+  leaf back to that checkpoint, and creates a fresh model action with the same
+  turn/action ids.
+- Kept the append-only transcript semantics: the old crashed/interrupted
+  terminal branch remains in the forest, while the resumed assistant output
+  appends as a sibling branch under the original checkpoint. The user message is
+  not duplicated, and the active context no longer contains the abandoned
+  terminal marker after the resumed turn completes.
+- Intentionally limited the first implementation to model-terminal failures and
+  interruptions. Interrupted/crashed tool-running turns return `not_resumable`
+  until there is an explicit tool rerun policy.
+- Added transcript-row Retry/Continue actions plus `/retry` and `/continue`
+  slash commands in the web UI. Both call the same `turn.resume` RPC and remain
+  idle-only.
+- Updated the websocket RPC docs, architecture notes, and README slash-command
+  list to include the new lifecycle operation.
+- Verified with `cargo test --manifest-path rust/Cargo.toml -p agent-session
+  -p agent-store -p agent-daemon`, `npm run build:web --silent`, and a live
+  websocket/Postgres harness smoke covering both forced model crash retry and
+  model interrupt continue. The smoke verified one user-message row, preserved
+  old terminal branches, clean active context, and graceful completion after
+  resume; temporary `session_retry_smoke_*` rows were deleted.

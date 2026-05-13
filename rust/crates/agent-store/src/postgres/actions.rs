@@ -2,7 +2,7 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 use sqlx::Row;
 
-use crate::{ActionKind, EventFrame, EventType, StoredAction};
+use crate::{ActionKind, ActionStatus, EventFrame, EventType, ResumableModelAction, StoredAction};
 
 use super::events::insert_event_tx;
 use super::rows::row_text;
@@ -49,6 +49,60 @@ impl PostgresAgentStore {
             turn_id: row.get("turn_id"),
             attempt_id: row.get("attempt_id"),
         })
+    }
+
+    pub async fn find_resumable_model_action(
+        &self,
+        session_id: &str,
+        turn_id: agent_vocab::TurnId,
+    ) -> Result<Option<ResumableModelAction>> {
+        let statuses = [
+            ActionStatus::Error,
+            ActionStatus::Interrupted,
+            ActionStatus::Stale,
+        ]
+        .into_iter()
+        .map(|status| status.as_str().to_string())
+        .collect::<Vec<_>>();
+        let row = sqlx::query(
+            r#"
+            select action_id, turn_id, status, payload
+            from actions
+            where session_id=$1
+                and turn_id=$2
+                and kind=$3
+                and status = any($4::text[])
+            order by updated_at desc, created_at desc
+            limit 1
+            "#,
+        )
+        .bind(session_id)
+        .bind(turn_id.0 as i64)
+        .bind(ActionKind::Model.as_str())
+        .bind(statuses)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let payload: serde_json::Value = row.get("payload");
+        let context_leaf_id = payload
+            .get("context_leaf_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| anyhow!("resumable model action has no context_leaf_id"))?
+            .to_string();
+        let context_tokens = payload
+            .get("context_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value as usize);
+        Ok(Some(ResumableModelAction {
+            action_id: agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64),
+            turn_id: agent_vocab::TurnId(row.get::<i64, _>("turn_id") as u64),
+            status: row_text::<ActionStatus>(&row, "status")?,
+            context_leaf_id,
+            context_tokens,
+        }))
     }
 
     pub async fn action_can_complete(

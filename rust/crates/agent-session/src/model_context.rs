@@ -1,4 +1,12 @@
-use agent_vocab::{ToolCall, ToolResultMessage, TranscriptItem, TurnId, TurnOutcome};
+use agent_vocab::{
+    ProviderReplayItem, ToolCall, ToolResultMessage, TranscriptItem, TurnId, TurnOutcome,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelContextEntry {
+    pub item: TranscriptItem,
+    pub provider_replay: Vec<ProviderReplayItem>,
+}
 
 /// Materialized model context for one transcript path.
 ///
@@ -9,6 +17,7 @@ use agent_vocab::{ToolCall, ToolResultMessage, TranscriptItem, TurnId, TurnOutco
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct ModelContext {
     items: Vec<TranscriptItem>,
+    provider_replay: Vec<Vec<ProviderReplayItem>>,
 }
 
 impl ModelContext {
@@ -17,7 +26,24 @@ impl ModelContext {
     }
 
     pub fn from_transcript_items(items: Vec<TranscriptItem>) -> Self {
-        Self { items }
+        let provider_replay = vec![Vec::new(); items.len()];
+        Self {
+            items,
+            provider_replay,
+        }
+    }
+
+    pub fn from_entries(entries: Vec<ModelContextEntry>) -> Self {
+        let mut items = Vec::with_capacity(entries.len());
+        let mut provider_replay = Vec::with_capacity(entries.len());
+        for entry in entries {
+            items.push(entry.item);
+            provider_replay.push(entry.provider_replay);
+        }
+        Self {
+            items,
+            provider_replay,
+        }
     }
 
     pub fn from_transcript_items_closing_open_turn_as_interrupted(
@@ -28,6 +54,7 @@ impl ModelContext {
 
     pub(crate) fn close_open_turn(mut self, closure: OpenTurnClosure) -> Self {
         Self::close_open_turn_items(&mut self.items, closure);
+        self.provider_replay.resize_with(self.items.len(), Vec::new);
         self
     }
 
@@ -37,6 +64,17 @@ impl ModelContext {
 
     pub fn into_transcript_items(self) -> Vec<TranscriptItem> {
         self.items
+    }
+
+    pub fn into_entries(self) -> Vec<ModelContextEntry> {
+        self.items
+            .into_iter()
+            .zip(self.provider_replay)
+            .map(|(item, provider_replay)| ModelContextEntry {
+                item,
+                provider_replay,
+            })
+            .collect()
     }
 
     pub fn is_turn_boundary(&self) -> bool {

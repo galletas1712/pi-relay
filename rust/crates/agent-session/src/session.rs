@@ -326,6 +326,55 @@ impl AgentSession {
         AgentSession::from_transcript_store(transcript_store)
     }
 
+    /// Resume a terminal crashed/interrupted model turn from its original
+    /// model-context checkpoint.
+    ///
+    /// The old terminal branch remains durable history. New model output will
+    /// append as a sibling branch under `checkpoint_leaf_id`, so retry/continue
+    /// does not duplicate the user's original message.
+    pub fn resume_model_turn(
+        &mut self,
+        checkpoint_leaf_id: &str,
+        turn_id: TurnId,
+        action_id: ActionId,
+        context_tokens: Option<usize>,
+    ) -> Result<(), HistoryOperationError> {
+        if !self.transcript_store.contains_entry(checkpoint_leaf_id) {
+            return Err(HistoryOperationError::Store(
+                TranscriptStoreError::EntryNotFound,
+            ));
+        }
+
+        let queued_user_inputs = self.prepare_for_history_operation()?;
+        let result = self
+            .transcript_store
+            .set_active_leaf_to_entry(checkpoint_leaf_id)
+            .map_err(HistoryOperationError::Store);
+        if let Err(error) = result {
+            self.restore_queued_user_inputs(queued_user_inputs);
+            return Err(error);
+        }
+
+        self.core = AgentCoreLoop::resume_running_model(turn_id, action_id);
+        self.outstanding_actions.clear();
+        self.action_outbox
+            .retain(|action| matches!(action, SessionAction::CancelSessionWork));
+        self.context_tokens = context_tokens;
+        self.pending_model_context_tokens = PendingModelContextTokens::Empty;
+
+        let action = SessionAction::RequestModel {
+            action_id,
+            turn_id,
+            model_context: self.model_context(),
+            context_leaf_id: Some(checkpoint_leaf_id.to_string()),
+            context_tokens,
+        };
+        self.outstanding_actions.track_session_action(&action);
+        self.queue_session_action(action);
+        self.restore_queued_user_inputs(queued_user_inputs);
+        Ok(())
+    }
+
     fn drain_core_transcript_items(&mut self) {
         let items = self.core.drain_transcript_items();
         if items.is_empty() {

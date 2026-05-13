@@ -8,7 +8,7 @@ use std::str::FromStr;
 use agent_session::{
     ModelContext, SessionAction, SessionEvent, StoredTranscriptEntry, TranscriptStorageNode,
 };
-use agent_vocab::{ProviderConfig, TurnId, UserMessage};
+use agent_vocab::{ActionId, ProviderConfig, TurnId, UserMessage};
 pub use postgres::PostgresAgentStore;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -312,6 +312,15 @@ pub struct StoredAction {
     pub action_id: i64,
     pub turn_id: Option<i64>,
     pub attempt_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumableModelAction {
+    pub action_id: ActionId,
+    pub turn_id: TurnId,
+    pub status: ActionStatus,
+    pub context_leaf_id: String,
+    pub context_tokens: Option<usize>,
 }
 
 pub struct OutputBatch<'a> {

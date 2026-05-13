@@ -1,12 +1,14 @@
 use agent_vocab::{
     AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
-    ProviderReplayRecord, ToolCall, ToolCallId, ToolDefinition, TranscriptItem, UserMessage,
+    ProviderReplayItem, ToolCall, ToolCallId, ToolDefinition, TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
-use crate::{ModelProvider, ModelRequest, ModelResponse, ProviderError, ProviderResult};
+use crate::{
+    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError, ProviderResult,
+};
 
 const THINKING_BUDGET_TOKENS: u32 = 1024;
 const ANTHROPIC_BETA_HEADER: &str = "interleaved-thinking-2025-05-14,extended-cache-ttl-2025-04-11";
@@ -56,9 +58,7 @@ impl ModelProvider for AnthropicProvider {
             ))
         })?;
 
-        Ok(ModelResponse {
-            assistant: parse_anthropic_message(&response)?,
-        })
+        parse_anthropic_message(&response)
     }
 }
 
@@ -158,10 +158,10 @@ fn anthropic_system_blocks(prompt: &crate::PromptSections) -> Option<Vec<Value>>
     (!blocks.is_empty()).then_some(blocks)
 }
 
-fn transcript_to_messages(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>> {
+fn transcript_to_messages(items: &[ModelTranscriptEntry]) -> ProviderResult<Vec<Value>> {
     let mut messages = Vec::new();
-    for item in items {
-        match item {
+    for entry in items {
+        match &entry.item {
             TranscriptItem::UserMessage(message) => {
                 messages
                     .push(json!({ "role": "user", "content": anthropic_user_content(message) }));
@@ -173,7 +173,7 @@ fn transcript_to_messages(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>
                 }));
             }
             TranscriptItem::AssistantMessage(message) => {
-                let mut content = anthropic_replay_blocks(message)?;
+                let mut content = anthropic_replay_blocks(&entry.provider_replay)?;
                 if content.is_empty() {
                     for item in &message.items {
                         match item {
@@ -186,7 +186,6 @@ fn transcript_to_messages(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>
                                 "name": call.tool_name,
                                 "input": call.args_value().unwrap_or_else(|_| json!({})),
                             })),
-                            AssistantItem::ProviderReplayRecord(_) => {}
                         }
                     }
                 }
@@ -213,9 +212,9 @@ fn transcript_to_messages(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>
     Ok(messages)
 }
 
-fn anthropic_replay_blocks(message: &AssistantMessage) -> ProviderResult<Vec<Value>> {
-    message
-        .replay_records()
+fn anthropic_replay_blocks(replay: &[ProviderReplayItem]) -> ProviderResult<Vec<Value>> {
+    replay
+        .iter()
         .filter(|record| record.provider == ProviderKind::Claude)
         .map(|record| record.raw_value().map_err(ProviderError::Json))
         .collect()
@@ -253,19 +252,18 @@ fn anthropic_user_content(message: &UserMessage) -> Value {
     )
 }
 
-fn parse_anthropic_message(response: &Value) -> ProviderResult<AssistantMessage> {
+fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
     let content = response
         .get("content")
         .and_then(Value::as_array)
         .ok_or_else(|| ProviderError::Provider("missing content array".to_string()))?;
     let mut items = Vec::new();
+    let mut provider_replay = Vec::new();
     for block in content {
         let Some(block_type) = block.get("type").and_then(Value::as_str) else {
             continue;
         };
-        items.push(AssistantItem::ProviderReplayRecord(
-            ProviderReplayRecord::new(ProviderKind::Claude, block_type, block)?,
-        ));
+        provider_replay.push(ProviderReplayItem::new(ProviderKind::Claude, block)?);
 
         match block_type {
             "text" => {
@@ -290,7 +288,10 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<AssistantMessage>
             _ => {}
         }
     }
-    Ok(AssistantMessage { items })
+    Ok(ModelResponse {
+        assistant: AssistantMessage { items },
+        provider_replay,
+    })
 }
 
 #[cfg(test)]
@@ -303,7 +304,7 @@ mod tests {
         let body = messages_body(ModelRequest {
             model: "claude-sonnet-4-5".to_string(),
             prompt: PromptSections::stable("stable rules"),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello"))],
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tools: vec![ToolDefinition {
                 name: "read".to_string(),
                 description: "read a file".to_string(),
@@ -346,34 +347,40 @@ mod tests {
             ]
         });
 
-        let assistant = parse_anthropic_message(&response).expect("message parses");
+        let response = parse_anthropic_message(&response).expect("message parses");
+        let assistant = response.assistant;
 
         assert_eq!(assistant.text(), "hello");
         let calls = assistant.tool_calls().collect::<Vec<_>>();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id.as_str(), "toolu_1");
         assert_eq!(calls[0].tool_name, "read");
-        let replay = assistant.replay_records().collect::<Vec<_>>();
-        assert_eq!(replay.len(), 4);
-        assert_eq!(replay[0].provider, ProviderKind::Claude);
-        assert_eq!(replay[0].record_type, "thinking");
-        assert_eq!(replay[1].record_type, "redacted_thinking");
-        assert_eq!(replay[3].record_type, "tool_use");
+        assert_eq!(response.provider_replay.len(), 4);
+        assert_eq!(response.provider_replay[0].provider, ProviderKind::Claude);
+        assert_eq!(
+            response.provider_replay[0].raw_type().as_deref(),
+            Some("thinking")
+        );
+        assert_eq!(
+            response.provider_replay[1].raw_type().as_deref(),
+            Some("redacted_thinking")
+        );
+        assert_eq!(
+            response.provider_replay[3].raw_type().as_deref(),
+            Some("tool_use")
+        );
     }
 
     #[test]
     fn anthropic_serializer_prefers_replay_blocks() {
         let raw = json!({ "type": "thinking", "thinking": "private", "signature": "sig" });
-        let messages =
-            transcript_to_messages(&[TranscriptItem::AssistantMessage(AssistantMessage {
-                items: vec![
-                    AssistantItem::ProviderReplayRecord(
-                        ProviderReplayRecord::new(ProviderKind::Claude, "thinking", &raw).unwrap(),
-                    ),
-                    AssistantItem::Text("visible".to_string()),
-                ],
-            })])
-            .expect("messages render");
+        let messages = transcript_to_messages(&[ModelTranscriptEntry {
+            item: TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("visible".to_string())],
+            }),
+            provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
+        }])
+        .expect("messages render");
 
         assert_eq!(messages[0]["content"], json!([raw]));
     }

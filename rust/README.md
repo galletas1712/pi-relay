@@ -97,10 +97,12 @@ The web UI runs at `http://127.0.0.1:8788` and connects to
 `VITE_PI_AGENT_WS`.
 
 The composer sends regular text as `input.follow_up`. Slash commands expose the
-session operations intended for the UI: `/new`, `/refresh`, `/status`,
-`/rewind`, `/fork`, `/compact`, `/context`, `/tree`, `/system`, `/provider`,
-and `/tools`. Active turns use the stop button; queued follow-ups can be
-promoted to steer from the queue pane above the composer.
+session operations intended for the UI: `/new`, `/fork`, `/switch`, `/retry`,
+`/continue`, `/compact`, `/system`, `/rename`, `/archive`, `/unarchive`,
+`/provider`, and `/export`. Active turns use the stop button; queued follow-ups
+can be promoted to steer from the queue pane above the composer. Crashed or
+interrupted terminal model turns can also be retried/continued directly from
+the transcript row.
 
 ## CLI Composition Check
 

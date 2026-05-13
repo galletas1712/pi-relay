@@ -1,11 +1,10 @@
 use std::collections::{BTreeSet, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::model_context::{ModelContext, ModelContextEntry};
 use crate::storage::StoredTranscriptEntry;
-use agent_vocab::TranscriptItem;
+use agent_vocab::{ProviderReplayItem, TranscriptItem};
 use uuid::Uuid;
-
-use crate::model_context::ModelContext;
 
 /// Durable transcript storage node holding one model-visible transcript item.
 ///
@@ -18,6 +17,7 @@ pub struct TranscriptStorageNode {
     pub parent_id: Option<String>,
     pub timestamp_ms: u64,
     pub item: TranscriptItem,
+    pub provider_replay: Vec<ProviderReplayItem>,
 }
 
 /// Append-only transcript forest plus one active session leaf.
@@ -134,6 +134,14 @@ impl TranscriptStore {
         Ok(())
     }
 
+    pub fn set_active_leaf_to_entry(&mut self, entry_id: &str) -> Result<(), TranscriptStoreError> {
+        if !self.contains_entry(entry_id) {
+            return Err(TranscriptStoreError::EntryNotFound);
+        }
+        self.active_leaf_id = Some(entry_id.to_string());
+        Ok(())
+    }
+
     pub fn reset_active_leaf(&mut self) {
         self.active_leaf_id = None;
     }
@@ -177,8 +185,14 @@ impl TranscriptStore {
     /// Materialize the full active path in model-visible order.
     pub fn model_context(&self) -> ModelContext {
         let path = self.active_path_entries();
-        let items = path.into_iter().map(|entry| entry.item).collect();
-        ModelContext::from_transcript_items(items)
+        ModelContext::from_entries(
+            path.into_iter()
+                .map(|entry| ModelContextEntry {
+                    item: entry.item,
+                    provider_replay: entry.provider_replay,
+                })
+                .collect(),
+        )
     }
 
     pub(crate) fn append_transcript_item(&mut self, item: TranscriptItem) -> String {
@@ -187,6 +201,7 @@ impl TranscriptStore {
             parent_id: self.active_leaf_id.clone(),
             timestamp_ms: now_ms(),
             item,
+            provider_replay: Vec::new(),
         };
         self.append_entry(entry)
     }
@@ -274,6 +289,7 @@ impl From<TranscriptStorageNode> for StoredTranscriptEntry {
             parent_id: value.parent_id,
             timestamp_ms: value.timestamp_ms,
             item: value.item,
+            provider_replay: value.provider_replay,
         }
     }
 }
@@ -285,6 +301,7 @@ impl From<StoredTranscriptEntry> for TranscriptStorageNode {
             parent_id: value.parent_id,
             timestamp_ms: value.timestamp_ms,
             item: value.item,
+            provider_replay: value.provider_replay,
         }
     }
 }
@@ -371,12 +388,14 @@ mod tests {
             parent_id: None,
             timestamp_ms: 1,
             item: TranscriptItem::UserMessage(UserMessage::text("parent")),
+            provider_replay: Vec::new(),
         };
         let child = TranscriptStorageNode {
             id: "child".to_string(),
             parent_id: Some("parent".to_string()),
             timestamp_ms: 2,
             item: TranscriptItem::UserMessage(UserMessage::text("child")),
+            provider_replay: Vec::new(),
         };
 
         let store =
@@ -409,6 +428,7 @@ mod tests {
                 Some(128),
                 TurnId(4),
             )),
+            provider_replay: Vec::new(),
         };
 
         let store =

@@ -37,6 +37,7 @@ pub(super) fn row_to_stored_entry(row: &PgRow) -> Result<StoredTranscriptEntry> 
         parent_id: row.get("parent_id"),
         timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
         item: serde_json::from_value(row.get("item"))?,
+        provider_replay: serde_json::from_value(row.get("provider_replay"))?,
     })
 }
 

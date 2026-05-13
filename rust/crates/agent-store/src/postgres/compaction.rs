@@ -32,7 +32,7 @@ impl PostgresAgentStore {
         let source_leaf_id =
             active_leaf_id.ok_or_else(|| anyhow!("cannot compact an empty session"))?;
         let rows = sqlx::query(
-            "select id, parent_id, timestamp_ms, item from transcript_entries where session_id=$1 order by sequence",
+            "select id, parent_id, timestamp_ms, item, provider_replay from transcript_entries where session_id=$1 order by sequence",
         )
         .bind(session_id)
         .fetch_all(&mut *tx)
@@ -181,6 +181,7 @@ impl PostgresAgentStore {
                 job.tokens_before,
                 job.last_turn_id,
             )),
+            provider_replay: Vec::new(),
         };
         insert_stored_entry_tx(&mut tx, &job.source_session_id, &entry).await?;
         sqlx::query("update sessions set active_leaf_id=$2::text, updated_at=now() where id=$1")

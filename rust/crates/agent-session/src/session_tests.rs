@@ -724,6 +724,108 @@ fn model_failure_marks_turn_crashed_and_unblocks_history_operations() {
 }
 
 #[test]
+fn terminal_model_turn_can_resume_from_original_checkpoint_without_duplicate_user_message() {
+    let mut session = AgentSession::new();
+    session
+        .enqueue_input(AgentInput::follow_up("hi"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
+    let checkpoint_id = session
+        .transcript_store()
+        .entries()
+        .last()
+        .expect("model checkpoint should be the user message")
+        .id
+        .clone();
+
+    session
+        .enqueue_input(AgentInput::ModelFailed {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            error: "provider failed".to_string(),
+        })
+        .expect("matching model failure is valid");
+    session.drive();
+    assert!(matches!(
+        session.model_context().transcript_items().last(),
+        Some(TranscriptItem::TurnFinished {
+            outcome: TurnOutcome::Crashed,
+            ..
+        })
+    ));
+
+    session
+        .resume_model_turn(&checkpoint_id, TurnId(1), ActionId(1), Some(55))
+        .expect("crashed model turn can be resumed from its checkpoint");
+    let resumed_context =
+        assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
+    assert_eq!(
+        resumed_context.transcript_items(),
+        &[
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            TranscriptItem::UserMessage(UserMessage::text("hi")),
+        ]
+    );
+    assert_eq!(
+        session.transcript_store().active_leaf_id(),
+        Some(checkpoint_id.as_str())
+    );
+
+    session
+        .enqueue_session_input(SessionInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::Text("resumed".to_string())],
+            },
+            context_tokens: None,
+        })
+        .expect("matching resumed model completion is valid");
+    session.drive();
+
+    let model_context = session.model_context();
+    let items = model_context.transcript_items();
+    assert_eq!(
+        items,
+        &[
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            TranscriptItem::UserMessage(UserMessage::text("hi")),
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("resumed".to_string())],
+            }),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+        ]
+    );
+    assert_eq!(
+        session
+            .transcript_store()
+            .entries()
+            .into_iter()
+            .filter(|entry| matches!(
+                entry.item,
+                TranscriptItem::UserMessage(ref message) if message == &UserMessage::text("hi")
+            ))
+            .count(),
+        1
+    );
+    assert!(session
+        .transcript_store()
+        .entries()
+        .into_iter()
+        .any(|entry| matches!(
+            entry.item,
+            TranscriptItem::TurnFinished {
+                outcome: TurnOutcome::Crashed,
+                ..
+            }
+        )));
+}
+
+#[test]
 fn late_action_drain_does_not_leave_completed_request_pending() {
     let mut session = AgentSession::new();
     session

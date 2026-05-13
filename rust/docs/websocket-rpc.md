@@ -573,6 +573,30 @@ frontend composer draft, not transcript state in the child.
 `leaf_id: null` fails with `missing_leaf_id`; unknown entries fail with
 `entry_not_found`.
 
+### `turn.resume`
+
+Idle-only. Restarts the active terminal turn when that turn ended as
+`Crashed` or `Interrupted` during model work. The daemon looks up the original
+model action checkpoint, moves the active leaf back to that checkpoint, and
+creates a fresh model action with the same turn/action ids. The old terminal
+branch stays in the transcript forest; the retried/continued output becomes a
+sibling branch, so the original user message is not duplicated.
+
+```json
+{
+  "session_id": "s1",
+  "leaf_id": "entry_turn_finished",
+  "expected_active_leaf_id": "entry_turn_finished"
+}
+```
+
+`leaf_id` may be omitted to resume the current active leaf. If supplied, it
+must be the active leaf; this RPC is not a general history switch. Graceful
+turns fail with `not_resumable`, non-terminal targets fail with
+`not_terminal_turn`, active/queued sessions fail with `session_busy`, and turns
+whose terminal work was tool execution fail with `not_resumable` until explicit
+tool-rerun semantics exist.
+
 ## Tools
 
 ### `tools.list`
@@ -591,8 +615,9 @@ failures.
 ### `compaction.request`
 
 Idle-only in the websocket contract. Requests compaction of the active context
-and creates a running compaction action. The current implementation expects the
-development harness to complete or fail that action.
+and creates a running compaction action. The daemon runs the configured provider
+for compaction and writes the compacted transcript root transactionally before
+queued follow-ups can advance.
 
 ## Development Harness RPC
 
@@ -766,6 +791,21 @@ Verify the turn finishes as `Interrupted`, unfinished actions become
 `interrupted` or stale, the stale completion is rejected with `stale_action`,
 and the assistant text is not appended.
 
+### 5a. Retry And Continue
+
+1. Start a harness-backed turn and fail its model action with
+   `harness.model.fail`.
+2. Call `turn.resume` on the crashed terminal leaf.
+3. Complete the resumed model action with `harness.model.complete`.
+4. Repeat with `input.interrupt` instead of `harness.model.fail`.
+
+Verify both retry and continue set activity back to `running`, create a new
+model action from the original checkpoint, leave exactly one copy of the user
+message in the transcript forest, preserve the old crashed/interrupted terminal
+branch off the active path, and finish gracefully once the resumed action
+completes. Also verify `turn.resume` rejects an interrupted tool-running turn
+with `not_resumable`.
+
 ### 6. Rewind Lifecycle
 
 1. Create two completed turns and record boundary leaf ids.
@@ -844,6 +884,8 @@ Verify:
   historical text into the composer; switching to a completed turn or
   compaction root changes the active leaf inside the same session.
 - `/rewind` and `/tree` are not part of the user-facing slash surface.
+- Crashed and interrupted terminal model turns show Retry/Continue actions,
+  and `/retry` / `/continue` invoke the same `turn.resume` RPC.
 - Fork from a user-message target creates a child and restores the historical
   text into the child composer.
 - A brand-new local draft survives browser refresh without creating a durable

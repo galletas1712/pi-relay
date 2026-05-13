@@ -74,6 +74,34 @@ pub struct ProviderConfig {
     pub prompt_cache: Option<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderReplayItem {
+    pub provider: ProviderKind,
+    pub raw_json: String,
+}
+
+impl ProviderReplayItem {
+    pub fn new(provider: ProviderKind, raw: &Value) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            provider,
+            raw_json: serde_json::to_string(raw)?,
+        })
+    }
+
+    pub fn raw_value(&self) -> Result<Value, serde_json::Error> {
+        serde_json::from_str(&self.raw_json)
+    }
+
+    pub fn raw_type(&self) -> Option<String> {
+        self.raw_value().ok().and_then(|value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

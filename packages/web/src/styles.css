@@ -701,6 +701,9 @@ pre {
 }
 
 .system-message {
+	display: flex;
+	align-items: center;
+	gap: 8px;
 	max-width: 900px;
 	margin: 6px auto;
 	padding: 0 24px;
@@ -715,6 +718,30 @@ pre {
 
 .system-message.error {
 	color: var(--destructive);
+}
+
+.system-message-action {
+	display: inline-flex;
+	align-items: center;
+	gap: 5px;
+	height: 24px;
+	border: 1px solid color-mix(in oklch, currentColor 32%, var(--border));
+	border-radius: 999px;
+	background: var(--card);
+	padding: 0 8px;
+	font-family: var(--font-mono);
+	font-size: 10.5px;
+	color: inherit;
+	cursor: pointer;
+}
+
+.system-message-action:hover:not(:disabled) {
+	background: var(--muted);
+}
+
+.system-message-action:disabled {
+	cursor: default;
+	opacity: 0.65;
 }
 
 .notice-stack {

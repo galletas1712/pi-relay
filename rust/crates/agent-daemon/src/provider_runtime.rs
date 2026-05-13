@@ -1,10 +1,12 @@
 use agent_provider::anthropic::AnthropicProvider;
 use agent_provider::openai::OpenAiProvider;
-use agent_provider::{ModelProvider, ModelRequest, PromptSections, ProviderError};
+use agent_provider::{
+    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, PromptSections, ProviderError,
+};
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
 use agent_tools::limit_tool_output;
-use agent_vocab::{AssistantMessage, ProviderKind, TranscriptItem, UserMessage};
+use agent_vocab::{ProviderKind, TranscriptItem, UserMessage};
 use anyhow::{anyhow, Result};
 use serde_json::Value;
 
@@ -15,7 +17,7 @@ pub(crate) async fn run_model(
     state: &AppState,
     config: &SessionConfig,
     model_context: ModelContext,
-) -> Result<AssistantMessage> {
+) -> Result<ModelResponse> {
     let request = ModelRequest {
         model: config.provider.model.clone(),
         prompt: PromptSections::new(
@@ -37,13 +39,13 @@ pub(crate) async fn run_model(
     let credentials = Credentials::load();
     let provider = provider_for_config(config, &credentials)?;
     match provider.complete(request.clone()).await {
-        Ok(response) => Ok(response.assistant),
+        Ok(response) => Ok(response),
         Err(error)
             if config.provider.kind.is_codex() && provider_error_status(&error) == Some(401) =>
         {
             let credentials = refresh_codex_credentials().await?;
             let provider = provider_for_config(config, &credentials)?;
-            Ok(provider.complete(request).await?.assistant)
+            Ok(provider.complete(request).await?)
         }
         Err(error) => Err(anyhow::Error::from(error)),
     }
@@ -62,9 +64,7 @@ pub(crate) async fn run_compaction(
     model_context: ModelContext,
 ) -> Result<String> {
     let mut transcript = provider_transcript(model_context);
-    transcript.push(TranscriptItem::UserMessage(UserMessage::text(
-        COMPACTION_USER_PROMPT,
-    )));
+    transcript.push(TranscriptItem::UserMessage(UserMessage::text(COMPACTION_USER_PROMPT)).into());
     let request = ModelRequest {
         model: config.provider.model.clone(),
         prompt: PromptSections::new(Some(COMPACTION_SYSTEM_PROMPT.to_string()), None),
@@ -107,11 +107,14 @@ fn dynamic_prompt_context(state: &AppState) -> String {
     )
 }
 
-fn provider_transcript(model_context: ModelContext) -> Vec<TranscriptItem> {
+fn provider_transcript(model_context: ModelContext) -> Vec<ModelTranscriptEntry> {
     model_context
-        .into_transcript_items()
+        .into_entries()
         .into_iter()
-        .map(limit_transcript_tool_output)
+        .map(|entry| ModelTranscriptEntry {
+            item: limit_transcript_tool_output(entry.item),
+            provider_replay: entry.provider_replay,
+        })
         .collect()
 }
 
@@ -171,7 +174,7 @@ mod tests {
         )]);
 
         let transcript = provider_transcript(model_context);
-        let TranscriptItem::ToolResult(result) = &transcript[0] else {
+        let TranscriptItem::ToolResult(result) = &transcript[0].item else {
             panic!("expected tool result");
         };
 

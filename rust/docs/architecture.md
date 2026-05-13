@@ -104,6 +104,9 @@ Implemented user-facing behavior:
   model request; follow-ups remain next-turn work, and compaction remains an
   action barrier.
 - Turn-level interrupt.
+- Idle-only retry/continue for terminal model turns. This resumes from the
+  original model checkpoint and appends a sibling branch instead of duplicating
+  the user message.
 - Idle-only rewind.
 - Running-safe fork from any explicit transcript entry, with user-message
   "fork before" support.

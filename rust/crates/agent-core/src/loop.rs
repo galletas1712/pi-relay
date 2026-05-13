@@ -50,6 +50,23 @@ impl AgentCoreLoop {
         }
     }
 
+    /// Resume while a model request is already in flight.
+    ///
+    /// Durable session storage owns the transcript checkpoint and the
+    /// persisted action row. The core only needs the correlation ids needed to
+    /// accept the eventual model completion/failure and allocate any later tool
+    /// actions after the model returns.
+    pub fn resume_running_model(turn_id: TurnId, action_id: ActionId) -> Self {
+        Self {
+            mailbox: Mailbox::default(),
+            state: AgentState::RunningModel { turn_id, action_id },
+            last_turn_id: turn_id,
+            next_action_id: ActionId(action_id.0 + 1),
+            action_outbox: VecDeque::new(),
+            transcript_item_outbox: VecDeque::new(),
+        }
+    }
+
     pub fn enqueue_input(&mut self, input: AgentInput) {
         self.mailbox.push_input(input)
     }

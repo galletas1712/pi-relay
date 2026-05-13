@@ -1,6 +1,6 @@
 use agent_vocab::{
     AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
-    ProviderReplayRecord, ToolCall, ToolCallId, TranscriptItem, UserMessage,
+    ProviderReplayItem, ToolCall, ToolCallId, TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::{
@@ -9,7 +9,9 @@ use reqwest::{
 };
 use serde_json::{json, Value};
 
-use crate::{ModelProvider, ModelRequest, ModelResponse, ProviderError, ProviderResult};
+use crate::{
+    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError, ProviderResult,
+};
 
 const DEFAULT_PROMPT_CACHE_KEY: &str = "pi-relay-openai-responses";
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
@@ -117,9 +119,7 @@ impl OpenAiProvider {
         let (status, text) = response_text(text).await?;
         ensure_success(status, &text)?;
 
-        Ok(ModelResponse {
-            assistant: parse_responses_sse(&text, self.replay_provider_kind())?,
-        })
+        parse_responses_sse(&text, self.replay_provider_kind())
     }
 }
 
@@ -205,10 +205,10 @@ fn responses_body(
     Ok(body)
 }
 
-fn transcript_to_response_items(items: &[TranscriptItem]) -> ProviderResult<Vec<Value>> {
+fn transcript_to_response_items(items: &[ModelTranscriptEntry]) -> ProviderResult<Vec<Value>> {
     let mut responses = Vec::new();
-    for item in items {
-        match item {
+    for entry in items {
+        match &entry.item {
             TranscriptItem::UserMessage(message) => {
                 responses.push(json!({
                     "type": "message",
@@ -224,7 +224,7 @@ fn transcript_to_response_items(items: &[TranscriptItem]) -> ProviderResult<Vec<
                 }));
             }
             TranscriptItem::AssistantMessage(message) => {
-                let replay_items = openai_replay_items(message)?;
+                let replay_items = openai_replay_items(&entry.provider_replay)?;
                 if !replay_items.is_empty() {
                     responses.extend(replay_items);
                 } else {
@@ -261,9 +261,9 @@ fn transcript_to_response_items(items: &[TranscriptItem]) -> ProviderResult<Vec<
     Ok(responses)
 }
 
-fn openai_replay_items(message: &AssistantMessage) -> ProviderResult<Vec<Value>> {
-    message
-        .replay_records()
+fn openai_replay_items(replay: &[ProviderReplayItem]) -> ProviderResult<Vec<Value>> {
+    replay
+        .iter()
         .filter(|record| matches!(record.provider, ProviderKind::OpenAi | ProviderKind::Codex))
         .map(|record| record.raw_value().map_err(ProviderError::Json))
         .collect()
@@ -295,14 +295,15 @@ fn compaction_summary_text(summary: &CompactionSummary) -> String {
     )
 }
 
-fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<AssistantMessage> {
+fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<ModelResponse> {
     let mut items = Vec::new();
+    let mut provider_replay = Vec::new();
     for data in sse_data_events(text) {
         let event: Value = serde_json::from_str(data)?;
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_item.done") => {
                 if let Some(item) = event.get("item") {
-                    parse_response_output_item(item, &mut items, provider)?;
+                    parse_response_output_item(item, &mut items, &mut provider_replay, provider)?;
                 }
             }
             Some("response.failed") => {
@@ -324,7 +325,10 @@ fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<Ass
             _ => {}
         }
     }
-    Ok(AssistantMessage { items })
+    Ok(ModelResponse {
+        assistant: AssistantMessage { items },
+        provider_replay,
+    })
 }
 
 fn sse_data_events(text: &str) -> impl Iterator<Item = &str> {
@@ -336,6 +340,7 @@ fn sse_data_events(text: &str) -> impl Iterator<Item = &str> {
 fn parse_response_output_item(
     item: &Value,
     items: &mut Vec<AssistantItem>,
+    provider_replay: &mut Vec<ProviderReplayItem>,
     provider: ProviderKind,
 ) -> ProviderResult<()> {
     let item_type = item
@@ -343,9 +348,7 @@ fn parse_response_output_item(
         .and_then(Value::as_str)
         .unwrap_or("unknown")
         .to_string();
-    items.push(AssistantItem::ProviderReplayRecord(
-        ProviderReplayRecord::new(provider, &item_type, item)?,
-    ));
+    provider_replay.push(ProviderReplayItem::new(provider, item)?);
 
     match item_type.as_str() {
         "message" => {
@@ -436,7 +439,7 @@ mod tests {
                     Some("static system".to_string()),
                     Some("cwd: /tmp/project".to_string()),
                 ),
-                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello"))],
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tools: vec![ToolDefinition {
                     name: "read".to_string(),
                     description: "read a file".to_string(),
@@ -478,7 +481,7 @@ mod tests {
             ModelRequest {
                 model: "gpt-5.1".to_string(),
                 prompt: PromptSections::default(),
-                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello"))],
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tools: Vec::new(),
                 max_tokens: None,
                 prompt_cache_key: None,
@@ -502,7 +505,7 @@ mod tests {
                     Some("stable agent rules".to_string()),
                     Some("workspace: /tmp/pi".to_string()),
                 ),
-                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello"))],
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tools: Vec::new(),
                 max_tokens: None,
                 prompt_cache_key: Some("cache-key".to_string()),
@@ -528,12 +531,14 @@ mod tests {
         let items = transcript_to_response_items(&[
             TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
-            }),
+            })
+            .into(),
             TranscriptItem::ToolResult(ToolResultMessage::success(
                 tool_call.id,
                 "read",
                 "contents",
-            )),
+            ))
+            .into(),
         ])
         .expect("tool transcript should render");
 
@@ -551,37 +556,40 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
 data: {"type":"response.completed","response":{"id":"resp_1"}}
 "#;
 
-        let assistant = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
+        let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
+        let assistant = response.assistant;
 
         assert_eq!(assistant.text(), "hello");
         let calls = assistant.tool_calls().collect::<Vec<_>>();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id.as_str(), "call_1");
         assert_eq!(calls[0].tool_name, "read");
-        let replay = assistant.replay_records().collect::<Vec<_>>();
-        assert_eq!(replay.len(), 2);
-        assert_eq!(replay[0].record_type, "message");
-        assert_eq!(replay[1].record_type, "function_call");
+        assert_eq!(response.provider_replay.len(), 2);
+        assert_eq!(
+            response.provider_replay[0].raw_type().as_deref(),
+            Some("message")
+        );
+        assert_eq!(
+            response.provider_replay[1].raw_type().as_deref(),
+            Some("function_call")
+        );
     }
 
     #[test]
-    fn responses_input_prefers_openai_replay_records() {
+    fn responses_input_prefers_openai_replay_sidecar() {
         let raw = json!({
             "type": "message",
             "role": "assistant",
             "content": [{ "type": "output_text", "text": "hello", "annotations": [] }],
             "status": "completed",
         });
-        let items =
-            transcript_to_response_items(&[TranscriptItem::AssistantMessage(AssistantMessage {
-                items: vec![
-                    AssistantItem::ProviderReplayRecord(
-                        ProviderReplayRecord::new(ProviderKind::OpenAi, "message", &raw).unwrap(),
-                    ),
-                    AssistantItem::Text("hello".to_string()),
-                ],
-            })])
-            .expect("responses input renders");
+        let items = transcript_to_response_items(&[ModelTranscriptEntry {
+            item: TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("hello".to_string())],
+            }),
+            provider_replay: vec![ProviderReplayItem::new(ProviderKind::OpenAi, &raw).unwrap()],
+        }])
+        .expect("responses input renders");
 
         assert_eq!(items, vec![raw]);
     }
@@ -597,12 +605,14 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
                         source: agent_vocab::ImageSource::Base64("abc".to_string()),
                     },
                 },
-            ])),
+            ]))
+            .into(),
             TranscriptItem::ToolResult(ToolResultMessage::success(
                 ToolCallId::new("call_1"),
                 "read",
                 "contents",
-            )),
+            ))
+            .into(),
         ])
         .expect("responses input renders");
 

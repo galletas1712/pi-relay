@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use agent_core::{AgentAction, AgentInput};
 use agent_vocab::{ActionId, ToolCallId, TranscriptItem, TurnId, TurnOutcome};
 
-use crate::action::CompletionTarget;
+use crate::action::{CompletionTarget, SessionAction};
 use crate::event::{SessionActionKind, SessionEvent};
 
 /// Tracks model/tool actions that have left the session but have not been
@@ -32,6 +32,12 @@ impl OutstandingActions {
 
     pub(crate) fn track_request(&mut self, action: &AgentAction) {
         if let Some(action) = CompletionTarget::from_core_action(action) {
+            self.pending.push_back(action);
+        }
+    }
+
+    pub(crate) fn track_session_action(&mut self, action: &SessionAction) {
+        if let Some(action) = CompletionTarget::from_session_action(action) {
             self.pending.push_back(action);
         }
     }

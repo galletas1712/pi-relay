@@ -35,6 +35,7 @@ export interface AgentApi {
 	startSession(params: StartSessionParams): Promise<StartSessionResult>;
 	queueFollowUp(params: QueueFollowUpParams): Promise<FollowUpResult>;
 	interrupt(sessionId: string): Promise<InterruptResult>;
+	resumeTurn(params: ResumeTurnParams): Promise<ResumeTurnResult>;
 	rewindHistory(params: RewindHistoryParams): Promise<RewindHistoryResult>;
 	forkHistory(params: ForkHistoryParams): Promise<ForkHistoryResult>;
 	renameSession(sessionId: string, title: string): Promise<RenameSessionResult>;
@@ -80,6 +81,19 @@ export interface FollowUpResult {
 export interface InterruptResult {
 	interrupted?: boolean;
 	ignored?: boolean;
+}
+
+export interface ResumeTurnParams {
+	sessionId: string;
+	leafId?: string | null;
+	expectedActiveLeafId?: string | null;
+}
+
+export interface ResumeTurnResult {
+	session_id: string;
+	turn_id: number;
+	outcome: "Interrupted" | "Crashed";
+	checkpoint_leaf_id: string;
 }
 
 export interface RewindHistoryResult {
@@ -220,6 +234,14 @@ class AgentApiClient implements AgentApi {
 
 	interrupt(sessionId: string): Promise<InterruptResult> {
 		return this.client.request<InterruptResult>("input.interrupt", { session_id: sessionId });
+	}
+
+	resumeTurn(params: ResumeTurnParams): Promise<ResumeTurnResult> {
+		return this.client.request<ResumeTurnResult>("turn.resume", {
+			session_id: params.sessionId,
+			leaf_id: params.leafId,
+			expected_active_leaf_id: params.expectedActiveLeafId
+		});
 	}
 
 	rewindHistory(params: RewindHistoryParams): Promise<RewindHistoryResult> {

@@ -83,13 +83,12 @@ export type AssistantItem =
 			id: string;
 			tool_name: string;
 			args_json: string;
-	  }
-	| {
-			type: "provider_replay_record";
-			provider: "openai" | "codex" | "claude";
-			record_type: string;
-			raw_json: string;
 	  };
+
+export interface ProviderReplayItem {
+	provider: "openai" | "codex" | "claude";
+	raw_json: string;
+}
 
 export interface ToolCall {
 	id: string;
@@ -125,6 +124,7 @@ export interface TranscriptEntry {
 	parent_id: string | null;
 	timestamp_ms: number;
 	item: TranscriptItem;
+	provider_replay?: ProviderReplayItem[];
 }
 
 export interface HistoryTree {

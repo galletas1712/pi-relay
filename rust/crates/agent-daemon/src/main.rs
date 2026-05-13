@@ -28,7 +28,7 @@ use agent_store::{
     PostgresAgentStore, QueuedInputStatus, SessionConfig,
 };
 use agent_tools::{ToolContext, ToolRegistry};
-use agent_vocab::{ActionId, ProviderConfig, TranscriptItem, TurnId};
+use agent_vocab::{ActionId, ProviderConfig, TranscriptItem, TurnId, TurnOutcome};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -244,6 +244,7 @@ async fn dispatch_request(
         RpcMethod::HistoryContext => history_context(state, params).await,
         RpcMethod::HistoryRewind => history_rewind(state, params).await,
         RpcMethod::HistoryFork => history_fork(state, params).await,
+        RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => Ok(json!({ "tools": state.tools.definitions() })),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
@@ -598,6 +599,7 @@ async fn input_user(
                             content: content.clone(),
                             client_input_id: client_input_id.clone(),
                         }),
+                        Vec::new(),
                     )
                     .await?,
             )
@@ -669,7 +671,7 @@ async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result
         return Ok(json!({ "ignored": true }));
     };
     let dispatches = driver
-        .apply_agent_input(active, AgentInput::Interrupt, None, None)
+        .apply_agent_input(active, AgentInput::Interrupt, None, None, Vec::new())
         .await?;
     driver.dispatch(dispatches);
     driver.drive_until_blocked().await?;
@@ -839,6 +841,91 @@ async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Va
     }))
 }
 
+async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.ensure_idle_for_source_mutation().await?;
+
+    let stored = state
+        .repo
+        .load_stored_session(&session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    ensure_expected_active_leaf_matches(&stored.active_leaf_id, &params)?;
+    let leaf_id = params
+        .get("leaf_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| stored.active_leaf_id.clone())
+        .ok_or_else(|| {
+            RpcError::new("no_terminal_turn", "session has no terminal turn to resume")
+        })?;
+    if stored.active_leaf_id.as_deref() != Some(leaf_id.as_str()) {
+        return Err(RpcError::new(
+            "history_changed",
+            "turn.resume only resumes the active terminal turn",
+        ));
+    }
+
+    let store = transcript_store_from_stored(&stored)?;
+    let Some(entry) = store.get_entry(&leaf_id) else {
+        return Err(RpcError::new(
+            "entry_not_found",
+            "active transcript entry not found",
+        ));
+    };
+    let (turn_id, outcome) = match &entry.item {
+        TranscriptItem::TurnFinished { turn_id, outcome } => (*turn_id, *outcome),
+        _ => {
+            return Err(RpcError::new(
+                "not_terminal_turn",
+                "turn.resume requires an interrupted or crashed terminal turn",
+            ))
+        }
+    };
+    if !matches!(outcome, TurnOutcome::Interrupted | TurnOutcome::Crashed) {
+        return Err(RpcError::new(
+            "not_resumable",
+            "only crashed or interrupted turns can be resumed",
+        ));
+    }
+
+    let action = state
+        .repo
+        .find_resumable_model_action(&session_id, turn_id)
+        .await
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| {
+            RpcError::new(
+                "not_resumable",
+                "this turn cannot be resumed because its terminal work was not a model request",
+            )
+        })?;
+    if !store.contains_entry(&action.context_leaf_id) {
+        return Err(RpcError::new(
+            "invalid_resume_checkpoint",
+            "model resume checkpoint is not in the transcript",
+        ));
+    }
+
+    let dispatches = driver
+        .resume_model_turn(
+            &action.context_leaf_id,
+            action.turn_id,
+            action.action_id,
+            action.context_tokens,
+        )
+        .await?;
+    driver.dispatch(dispatches);
+    Ok(json!({
+        "session_id": session_id,
+        "turn_id": turn_id.0,
+        "outcome": outcome,
+        "prior_action_status": action.status,
+        "checkpoint_leaf_id": action.context_leaf_id,
+    }))
+}
+
 async fn compaction_request(
     state: &AppState,
     params: Value,
@@ -904,6 +991,7 @@ async fn harness_model_complete(
                 result: json!({ "source": "harness" }),
             }),
             None,
+            Vec::new(),
         )
         .await?;
     driver.dispatch(dispatches);
@@ -946,6 +1034,7 @@ async fn harness_model_fail(
                 result: json!({ "error": error }),
             }),
             None,
+            Vec::new(),
         )
         .await?;
     driver.dispatch(dispatches);

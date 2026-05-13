@@ -36,10 +36,52 @@ create table if not exists transcript_entries (
     parent_id text null,
     timestamp_ms bigint not null,
     item jsonb not null,
+    provider_replay jsonb not null default '[]'::jsonb,
     turn_id bigint null,
     sequence bigserial not null,
     primary key (session_id, id)
 );
+
+alter table transcript_entries
+    add column if not exists provider_replay jsonb not null default '[]'::jsonb;
+
+with split as (
+    select
+        transcript_entries.session_id,
+        transcript_entries.id,
+        coalesce(
+            jsonb_agg(
+                jsonb_build_object(
+                    'provider', element.value->'provider',
+                    'raw_json', element.value->'raw_json'
+                )
+            ) filter (where element.value->>'type' = 'provider_replay_record'),
+            '[]'::jsonb
+        ) as replay,
+        coalesce(
+            jsonb_agg(element.value) filter (
+                where element.value->>'type' is distinct from 'provider_replay_record'
+            ),
+            '[]'::jsonb
+        ) as visible_items
+    from transcript_entries
+    cross join lateral jsonb_array_elements(
+        case
+            when transcript_entries.item->>'type' = 'assistant_message'
+             and jsonb_typeof(transcript_entries.item->'items') = 'array'
+            then transcript_entries.item->'items'
+            else '[]'::jsonb
+        end
+    ) as element(value)
+    group by transcript_entries.session_id, transcript_entries.id
+)
+update transcript_entries
+set provider_replay = transcript_entries.provider_replay || split.replay,
+    item = jsonb_set(transcript_entries.item, '{items}', split.visible_items)
+from split
+where transcript_entries.session_id = split.session_id
+  and transcript_entries.id = split.id
+  and jsonb_array_length(split.replay) > 0;
 
 create index if not exists transcript_entries_session_sequence_idx
     on transcript_entries(session_id, sequence);

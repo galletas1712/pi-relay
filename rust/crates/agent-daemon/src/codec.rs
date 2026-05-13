@@ -74,6 +74,7 @@ pub(crate) fn recover_fork_branch_tail(
             parent_id: parent_id.clone(),
             timestamp_ms: now_ms(),
             item,
+            provider_replay: Vec::new(),
         };
         parent_id = Some(node.id.clone());
         branch.push(node);

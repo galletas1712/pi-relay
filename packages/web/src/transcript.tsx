@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Check, ChevronDown, Copy, Loader2, Terminal, Wrench } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, Copy, Loader2, RotateCcw, Terminal, Wrench } from "lucide-react";
 import rehypeRaw from "rehype-raw";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -14,12 +14,16 @@ export function MessageList({
 	entries,
 	activeLeafId,
 	isRunning,
-	hasSession
+	hasSession,
+	onResumeTurn,
+	resumingTurnId
 }: {
 	entries: TranscriptEntry[];
 	activeLeafId: string | null;
 	isRunning: boolean;
 	hasSession: boolean;
+	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
+	resumingTurnId?: string | null;
 }) {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const visibleEntries = useMemo(
@@ -47,7 +51,15 @@ export function MessageList({
 	return (
 		<div className="message-scroll" ref={scrollRef}>
 			{visibleEntries.map((entry) => (
-				<TranscriptEntryView entry={entry} key={entry.id} toolIndex={toolIndex} />
+				<TranscriptEntryView
+					entry={entry}
+					key={entry.id}
+					toolIndex={toolIndex}
+					isActiveLeaf={entry.id === activeLeafId}
+					isRunning={isRunning}
+					onResumeTurn={onResumeTurn}
+					resuming={entry.id === resumingTurnId}
+				/>
 			))}
 			{isRunning ? (
 				<div className="activity-indicator">
@@ -61,10 +73,18 @@ export function MessageList({
 
 function TranscriptEntryView({
 	entry,
-	toolIndex
+	toolIndex,
+	isActiveLeaf,
+	isRunning,
+	onResumeTurn,
+	resuming
 }: {
 	entry: TranscriptEntry;
 	toolIndex: ReturnType<typeof indexToolEntries>;
+	isActiveLeaf: boolean;
+	isRunning: boolean;
+	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
+	resuming: boolean;
 }) {
 	const item = entry.item;
 	if (item.type === "turn_started") {
@@ -72,10 +92,22 @@ function TranscriptEntryView({
 	}
 	if (item.type === "turn_finished") {
 		if (item.outcome === "Graceful") return null;
+		const canResume = isActiveLeaf && !isRunning && !!onResumeTurn;
+		const actionLabel = item.outcome === "Interrupted" ? "Continue" : "Retry";
+		const resumableOutcome = item.outcome as "Interrupted" | "Crashed";
 		return (
 			<SystemMessage
 				tone={item.outcome === "Interrupted" ? "info" : "error"}
 				text={`turn ${item.turn_id} ${item.outcome.toLowerCase()}`}
+				action={
+					canResume
+						? {
+								label: resuming ? "Starting..." : actionLabel,
+								disabled: resuming,
+								onClick: () => onResumeTurn?.(entry.id, resumableOutcome)
+							}
+						: undefined
+				}
 			/>
 		);
 	}
@@ -253,11 +285,27 @@ function ToolOutput({ result }: { result: ToolResultItem }) {
 	return <pre className={result.status === "Success" ? "" : "tool-output-error"}>{display}</pre>;
 }
 
-function SystemMessage({ tone, text, entryId }: { tone: NoticeTone; text: string; entryId?: string }) {
+function SystemMessage({
+	tone,
+	text,
+	entryId,
+	action
+}: {
+	tone: NoticeTone;
+	text: string;
+	entryId?: string;
+	action?: { label: string; disabled?: boolean; onClick: () => void };
+}) {
 	return (
 		<div className={`system-message ${tone}`}>
 			{entryId ? <EntryId entryId={entryId} inline /> : null}
-			{text}
+			<span>{text}</span>
+			{action ? (
+				<button type="button" className="system-message-action" onClick={action.onClick} disabled={action.disabled}>
+					<RotateCcw size={12} />
+					{action.label}
+				</button>
+			) : null}
 		</div>
 	);
 }

@@ -469,24 +469,26 @@
 					</tr>
 				</tbody>
 			</table>
-			<h3>Suggested provider-neutral shape</h3>
-			<p>
-				The core session FSM should not need to know whether a replay record came from
-				<code>response.output[]</code> or an Anthropic content block. It only needs stable IDs,
-				parentage, visibility, and provider-specific replay payloads kept behind the provider boundary.
-			</p>
-			<pre>type ProviderReplayRecord =
-  | { kind: "user_message", visible: true, content: ContentBlock[] }
-  | { kind: "assistant_text", visible: true, text: string, phase?: string }
-  | { kind: "reasoning_state", visible: false, provider: "openai" | "anthropic", raw: Json }
-  | { kind: "tool_call", visible: true, call_id: string, name: string, input: Json | string, raw: Json }
-  | { kind: "tool_result", visible: true, call_id: string, output: ContentBlock[] | string }
-  | { kind: "provider_event", visible: false, provider: string, raw: Json };</pre>
-			<p class="caption">
-				The <code>raw</code> payload is what lets each provider serializer replay exact fields such as
-				OpenAI <code>encrypted_content</code>, Anthropic <code>signature</code>, Anthropic
-				<code>redacted_thinking</code>, remote tool fields, custom tool fields, and future provider-only metadata.
-			</p>
+				<h3>Implemented provider-neutral shape</h3>
+				<p>
+					The core session FSM should not need to know whether replay data came from
+					<code>response.output[]</code> or an Anthropic content block. It only needs semantic transcript
+					items; provider-specific continuation payloads stay in an entry-aligned sidecar.
+				</p>
+				<pre>struct ModelTranscriptEntry {
+    item: TranscriptItem,
+    provider_replay: Vec&lt;ProviderReplayItem&gt;,
+}
+
+struct ProviderReplayItem {
+    provider: ProviderKind,
+    raw_json: String,
+}</pre>
+				<p class="caption">
+					The <code>raw_json</code> payload is what lets each provider serializer replay exact fields such as
+					OpenAI <code>encrypted_content</code>, Anthropic <code>signature</code>, Anthropic
+					<code>redacted_thinking</code>, remote tool fields, custom tool fields, and future provider-only metadata.
+				</p>
 		</section>
 
 		<section class="card span-12">

@@ -20,7 +20,7 @@ impl PostgresAgentStore {
             .await?
             .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         let rows = sqlx::query(
-            "select id, parent_id, timestamp_ms, item from transcript_entries where session_id=$1 order by sequence",
+            "select id, parent_id, timestamp_ms, item, provider_replay from transcript_entries where session_id=$1 order by sequence",
         )
         .bind(session_id)
         .fetch_all(&self.pool)
@@ -208,6 +208,7 @@ pub(super) async fn insert_entry_tx(
         parent_id: entry.parent_id.clone(),
         timestamp_ms: entry.timestamp_ms,
         item: entry.item.clone(),
+        provider_replay: entry.provider_replay.clone(),
     };
     insert_stored_entry_tx(tx, session_id, &stored).await
 }
@@ -220,8 +221,8 @@ pub(super) async fn insert_stored_entry_tx(
     let turn_id = entry.item.turn_id().map(|turn_id| turn_id.0 as i64);
     sqlx::query(
         r#"
-        insert into transcript_entries (session_id, id, parent_id, timestamp_ms, item, turn_id)
-        values ($1::text, $2::text, $3::text, $4, $5, $6::bigint)
+        insert into transcript_entries (session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id)
+        values ($1::text, $2::text, $3::text, $4, $5, $6, $7::bigint)
         on conflict (session_id, id) do nothing
         "#,
     )
@@ -230,6 +231,7 @@ pub(super) async fn insert_stored_entry_tx(
     .bind(&entry.parent_id)
     .bind(entry.timestamp_ms as i64)
     .bind(serde_json::to_value(&entry.item)?)
+    .bind(serde_json::to_value(&entry.provider_replay)?)
     .bind(turn_id)
     .execute(&mut **tx)
     .await?;

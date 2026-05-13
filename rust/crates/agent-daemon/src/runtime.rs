@@ -2,13 +2,16 @@ use std::sync::Arc;
 
 use agent_core::AgentInput;
 use agent_session::{
-    AgentSession, SessionAction, SessionEvent, SessionInput, TranscriptStorageNode,
+    AgentSession, HistoryOperationError, SessionAction, SessionEvent, SessionInput,
+    TranscriptStorageNode, TranscriptStoreError,
 };
 use agent_store::{
     AcceptedInput, ActionStatus, ActionUpdate, CompactionJob, EventFrame, EventType, InputPriority,
     OutputBatch, PersistedAction, QueueMutationError, QueuedInput, SessionActivity, SessionConfig,
 };
-use agent_vocab::{ToolResultMessage, ToolResultStatus, UserMessage};
+use agent_vocab::{
+    ProviderReplayItem, ToolResultMessage, ToolResultStatus, TranscriptItem, UserMessage,
+};
 use anyhow::Context;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -235,7 +238,7 @@ impl SessionDriver {
                 continue;
             }
             let dispatched = self
-                .persist_active_outputs(active.clone(), None, None, None)
+                .persist_active_outputs(active.clone(), None, None, None, Vec::new())
                 .await?;
             let has_dispatched_work = !dispatched.is_empty();
             dispatched_all.extend(dispatched.clone());
@@ -278,7 +281,7 @@ impl SessionDriver {
                         return Err(RpcError::new("invalid_input", error.to_string()));
                     }
                     let dispatched = self
-                        .persist_active_outputs(active, None, Some(queued), None)
+                        .persist_active_outputs(active, None, Some(queued), None, Vec::new())
                         .await?;
                     let has_dispatched_work = !dispatched.is_empty();
                     dispatched_all.extend(dispatched.clone());
@@ -340,7 +343,7 @@ impl SessionDriver {
             return Err(RpcError::new("invalid_input", error.to_string()));
         }
 
-        self.persist_active_outputs(active, None, Some(queued), None)
+        self.persist_active_outputs(active, None, Some(queued), None, Vec::new())
             .await
             .map(Some)
     }
@@ -351,6 +354,7 @@ impl SessionDriver {
         input: AgentInput,
         action_update: Option<ActionUpdate>,
         context_tokens: Option<usize>,
+        provider_replay: Vec<ProviderReplayItem>,
     ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
         if let Some(update) = &action_update {
             if !self
@@ -389,7 +393,42 @@ impl SessionDriver {
                     .map_err(|error| RpcError::new("invalid_input", error.to_string()))?,
             }
         }
-        self.persist_active_outputs(active, action_update, None, None)
+        self.persist_active_outputs(active, action_update, None, None, provider_replay)
+            .await
+    }
+
+    pub(crate) async fn resume_model_turn(
+        &self,
+        checkpoint_leaf_id: &str,
+        turn_id: agent_vocab::TurnId,
+        action_id: agent_vocab::ActionId,
+        context_tokens: Option<usize>,
+    ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
+        let config = self
+            .state
+            .repo
+            .load_session_config(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let stored = self
+            .state
+            .repo
+            .load_stored_session(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let mut session = AgentSession::from_stored_session(stored)
+            .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
+        session
+            .resume_model_turn(checkpoint_leaf_id, turn_id, action_id, context_tokens)
+            .map_err(history_error_to_rpc)?;
+
+        let active = Arc::new(Mutex::new(RuntimeSession { session, config }));
+        self.state
+            .active
+            .lock()
+            .await
+            .insert(self.session_id.clone(), active.clone());
+        self.persist_active_outputs(active, None, None, None, Vec::new())
             .await
     }
 
@@ -399,8 +438,9 @@ impl SessionDriver {
         action_update: Option<ActionUpdate>,
         consumed_input: Option<QueuedInput>,
         accepted_input: Option<AcceptedInput>,
+        provider_replay: Vec<ProviderReplayItem>,
     ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
-        let (entries, events, actions, active_leaf_id, config) = {
+        let (mut entries, events, actions, active_leaf_id, config) = {
             let mut runtime = active.lock().await;
             let (entries, events, actions, active_leaf_id) = collect_runtime_outputs(&mut runtime);
             (
@@ -411,6 +451,7 @@ impl SessionDriver {
                 runtime.config.clone(),
             )
         };
+        attach_provider_replay(&mut entries, provider_replay)?;
         let persisted = self
             .state
             .repo
@@ -475,11 +516,51 @@ pub(crate) fn collect_runtime_outputs(
     (entries, events, actions, active_leaf_id)
 }
 
+fn attach_provider_replay(
+    entries: &mut [TranscriptStorageNode],
+    provider_replay: Vec<ProviderReplayItem>,
+) -> std::result::Result<(), RpcError> {
+    if provider_replay.is_empty() {
+        return Ok(());
+    }
+    let Some(entry) = entries
+        .iter_mut()
+        .rev()
+        .find(|entry| matches!(entry.item, TranscriptItem::AssistantMessage(_)))
+    else {
+        return Err(RpcError::new(
+            "invalid_provider_output",
+            "provider replay sidecar had no assistant transcript entry",
+        ));
+    };
+    entry.provider_replay.extend(provider_replay);
+    Ok(())
+}
+
 pub(crate) fn map_queued_mutation_error(error: anyhow::Error) -> RpcError {
     if let Some(error) = error.downcast_ref::<QueueMutationError>() {
         return RpcError::new("input_not_found", error.to_string());
     }
     error.into()
+}
+
+pub(crate) fn history_error_to_rpc(error: HistoryOperationError) -> RpcError {
+    match error {
+        HistoryOperationError::Busy => RpcError::new("session_busy", "session history is busy"),
+        HistoryOperationError::Store(TranscriptStoreError::EntryNotFound) => {
+            RpcError::new("entry_not_found", "transcript entry not found")
+        }
+        HistoryOperationError::Store(TranscriptStoreError::NotTurnBoundary) => {
+            RpcError::new("not_turn_boundary", "target is not a turn boundary")
+        }
+        HistoryOperationError::Store(TranscriptStoreError::DuplicateEntry) => {
+            RpcError::new("invalid_transcript", "duplicate transcript entry")
+        }
+        HistoryOperationError::Store(TranscriptStoreError::MissingParent) => RpcError::new(
+            "invalid_transcript",
+            "transcript entry has a missing parent",
+        ),
+    }
 }
 
 pub(crate) fn attach_dispatch_config(
@@ -655,15 +736,16 @@ async fn run_model_turn(
         .active_session()
         .await
         .ok_or_else(|| RpcError::new("stale_action", "session is not active"))?;
-    let (input, status, update_result) = match result {
-        Ok(assistant) => (
+    let (input, status, update_result, provider_replay) = match result {
+        Ok(response) => (
             AgentInput::ModelCompleted {
                 action_id,
                 turn_id,
-                assistant,
+                assistant: response.assistant,
             },
             ActionStatus::Completed,
             json!({ "source": "provider" }),
+            response.provider_replay,
         ),
         Err(error) => {
             let message = error.to_string();
@@ -675,6 +757,7 @@ async fn run_model_turn(
                 },
                 ActionStatus::Error,
                 json!({ "error": message }),
+                Vec::new(),
             )
         }
     };
@@ -689,6 +772,7 @@ async fn run_model_turn(
                 result: update_result,
             }),
             None,
+            provider_replay,
         )
         .await?;
     driver.dispatch(dispatches);
@@ -807,6 +891,7 @@ async fn run_tool_turn(
             }),
             consumed_input,
             None,
+            Vec::new(),
         )
         .await?;
     driver.dispatch(dispatches);

@@ -22,7 +22,7 @@ mod transcript_store;
 pub use crate::action::SessionAction;
 pub use crate::event::{SessionActionKind, SessionEvent};
 pub use crate::input::{SessionInput, SessionInputError};
-pub use crate::model_context::ModelContext;
+pub use crate::model_context::{ModelContext, ModelContextEntry};
 pub use crate::session::{AgentSession, HistoryOperationError};
 pub use crate::storage::{StoredSession, StoredTranscriptEntry};
 pub use crate::transcript_store::{TranscriptStorageNode, TranscriptStore, TranscriptStoreError};
