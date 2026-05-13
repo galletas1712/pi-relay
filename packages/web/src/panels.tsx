@@ -1,24 +1,27 @@
 import {
+	Archive,
+	ArchiveRestore,
 	Edit3,
 	PanelRightClose,
 	PanelRightOpen,
 	Plus,
-	RefreshCw,
 	Search,
 	Settings
 } from "lucide-react";
 import { COMMANDS } from "./slash.ts";
-import { sessionTitle, type SessionListItem } from "./sessionList.ts";
+import { isArchivedSession, sessionTitle, type SessionListItem } from "./sessionList.ts";
 import { truncate } from "./text.ts";
 import type { Activity, DaemonConfig, Notice, SessionSnapshot, ToolDefinition } from "./types.ts";
 
 export function SidebarHeader({
 	counts,
 	total,
+	archived,
 	connection
 }: {
 	counts: Record<Activity, number>;
 	total: number;
+	archived: number;
 	connection: string;
 }) {
 	return (
@@ -36,6 +39,11 @@ export function SidebarHeader({
 						<span className="count">{counts[activity] ?? 0}</span>
 					</span>
 				))}
+				<span className="activity-chip">
+					<span className="dot archived" />
+					archived
+					<span className="count">{archived}</span>
+				</span>
 			</div>
 		</div>
 	);
@@ -44,15 +52,15 @@ export function SidebarHeader({
 export function SidebarToolbar({
 	query,
 	onQueryChange,
-	onNew,
-	onRefresh,
-	loading
+	showArchived,
+	onToggleArchived,
+	onNew
 }: {
 	query: string;
 	onQueryChange: (query: string) => void;
+	showArchived: boolean;
+	onToggleArchived: () => void;
 	onNew: () => void;
-	onRefresh: () => void;
-	loading: boolean;
 }) {
 	return (
 		<div className="sidebar-toolbar">
@@ -61,8 +69,14 @@ export function SidebarToolbar({
 					<Plus size={14} />
 					New session
 				</button>
-				<button className="icon-button" type="button" onClick={onRefresh} aria-label="refresh" title="refresh">
-					<RefreshCw size={14} className={loading ? "spin" : ""} />
+				<button
+					className={`icon-button ${showArchived ? "pressed" : ""}`}
+					type="button"
+					onClick={onToggleArchived}
+					aria-label={showArchived ? "hide archived sessions" : "show archived sessions"}
+					title={showArchived ? "hide archived sessions" : "show archived sessions"}
+				>
+					<Archive size={14} />
 				</button>
 			</div>
 			<label className="search-box">
@@ -77,24 +91,29 @@ export function SessionRow({
 	session,
 	selected,
 	onSelect,
-	onRename
+	onRename,
+	onArchiveToggle
 }: {
 	session: SessionListItem;
 	selected: boolean;
 	onSelect: () => void;
 	onRename: () => void;
+	onArchiveToggle: () => void;
 }) {
+	const archived = isArchivedSession(session);
+	const canArchive = session.activity === "idle";
+	const ArchiveIcon = archived ? ArchiveRestore : Archive;
 	return (
-		<button className={`session-row ${selected ? "selected" : ""}`} type="button" onClick={onSelect}>
-			<span className={`status-rail ${session.activity}`} />
+		<button className={`session-row ${selected ? "selected" : ""} ${archived ? "archived" : ""}`} type="button" onClick={onSelect}>
+			<span className={`status-rail ${archived ? "archived" : session.activity}`} />
 			<span className="session-main">
 				<span className="session-title">{sessionTitle(session)}</span>
 				<span className="session-sub">
-					{session.provider.kind} - {session.provider.model}
+					{archived ? "archived - " : ""}{session.provider.kind} - {session.provider.model}
 				</span>
-			</span>
-			<span className="session-leaf">
-				{session.active_leaf_id ? session.active_leaf_id.slice(0, 6) : "root"}
+				<span className="session-leaf">
+					{session.active_leaf_id ? session.active_leaf_id.slice(0, 6) : "root"}
+				</span>
 			</span>
 			<span
 				className="session-row-action"
@@ -115,6 +134,26 @@ export function SessionRow({
 			>
 				<Edit3 size={13} />
 			</span>
+			<span
+				className={`session-row-action ${canArchive ? "" : "disabled"}`}
+				role="button"
+				tabIndex={canArchive ? 0 : -1}
+				title={canArchive ? (archived ? "unarchive session" : "archive session") : "only idle sessions can be archived"}
+				aria-label={`${archived ? "unarchive" : "archive"} ${sessionTitle(session)}`}
+				aria-disabled={!canArchive}
+				onClick={(event) => {
+					event.stopPropagation();
+					if (canArchive) onArchiveToggle();
+				}}
+				onKeyDown={(event) => {
+					if (!canArchive || (event.key !== "Enter" && event.key !== " ")) return;
+					event.preventDefault();
+					event.stopPropagation();
+					onArchiveToggle();
+				}}
+			>
+				<ArchiveIcon size={13} />
+			</span>
 		</button>
 	);
 }
@@ -130,13 +169,14 @@ export function LogHeader({
 	rightOpen: boolean;
 	onToggleRight: () => void;
 }) {
+	const archived = session ? isArchivedSession(session) : false;
 	return (
 		<div className="log-header">
-			<span className="dot ok" />
+			<span className={`dot ${archived ? "archived" : "ok"}`} />
 			<span>agent-log</span>
 			{session ? (
 				<span className="log-session">
-					{sessionTitle(session)} - {snapshot?.activity ?? session.activity}
+					{sessionTitle(session)} - {archived ? "archived" : (snapshot?.activity ?? session.activity)}
 				</span>
 			) : (
 				<span className="log-session">no session selected</span>
@@ -190,6 +230,10 @@ export function Inspector({
 						<div className="kv">
 							<span>activity</span>
 							<strong>{snapshot.activity}</strong>
+						</div>
+						<div className="kv">
+							<span>archived</span>
+							<strong>{snapshot.metadata.archived === true ? "yes" : "no"}</strong>
 						</div>
 						<div className="kv">
 							<span>leaf</span>

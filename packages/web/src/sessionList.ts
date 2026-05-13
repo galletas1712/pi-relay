@@ -7,6 +7,10 @@ export function sessionTitle(session: SessionListItem): string {
 	return typeof title === "string" && title.trim() ? title : session.session_id.slice(0, 13);
 }
 
+export function isArchivedSession(session: SessionListItem): boolean {
+	return session.metadata?.archived === true;
+}
+
 export function tallyActivities(sessions: SessionListItem[]): Record<Activity, number> {
 	return sessions.reduce<Record<Activity, number>>(
 		(counts, session) => {

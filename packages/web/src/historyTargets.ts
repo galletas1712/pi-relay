@@ -22,6 +22,9 @@ export interface HistoryTreeRow {
 	depth: number;
 	isActive: boolean;
 	isOnActivePath: boolean;
+	parentId?: string | null;
+	isBranchRoot?: boolean;
+	descendantCount?: number;
 }
 
 export interface HistoryEntryDisplay {
@@ -72,19 +75,34 @@ export function historyTreeRows(entries: TranscriptEntry[], activeLeafId: string
 	}
 
 	const activePath = new Set(branchEntriesFor(entries, activeLeafId).map((entry) => entry.id));
+	const sizeCache = new Map<string, number>();
+	const branchSize = (entryId: string): number => {
+		const cached = sizeCache.get(entryId);
+		if (cached !== undefined) return cached;
+		const size = 1 + (children.get(entryId) ?? []).reduce((sum, child) => sum + branchSize(child.id), 0);
+		sizeCache.set(entryId, size);
+		return size;
+	};
 	const rows: HistoryTreeRow[] = [];
-	const visit = (entry: TranscriptEntry, depth: number) => {
+	const visit = (entry: TranscriptEntry, depth: number, parentId: string | null, isBranchRoot: boolean) => {
 		rows.push({
 			entry,
 			depth,
 			isActive: activeLeafId === entry.id,
-			isOnActivePath: activePath.has(entry.id)
+			isOnActivePath: activePath.has(entry.id),
+			parentId,
+			isBranchRoot,
+			descendantCount: branchSize(entry.id) - 1
 		});
 		const entryChildren = children.get(entry.id) ?? [];
-		const childDepth = depth + (entryChildren.length > 1 ? 1 : 0);
-		for (const child of entryChildren) visit(child, childDepth);
+		const hasSplit = entryChildren.length > 1;
+		const activeChild = entryChildren.find((child) => activePath.has(child.id));
+		for (const child of entryChildren) {
+			const isAlternateBranch = hasSplit && child.id !== activeChild?.id;
+			visit(child, depth + (isAlternateBranch ? 1 : 0), entry.id, hasSplit);
+		}
 	};
-	for (const root of children.get(null) ?? []) visit(root, 0);
+	for (const root of children.get(null) ?? []) visit(root, 0, null, false);
 	return rows;
 }
 

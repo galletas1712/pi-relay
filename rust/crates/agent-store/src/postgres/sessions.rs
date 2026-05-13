@@ -142,7 +142,7 @@ impl PostgresAgentStore {
         config: &SessionConfig,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query(
+        let result = sqlx::query(
             "update sessions set provider_config=$2, metadata=$3, updated_at=now() where id=$1",
         )
         .bind(session_id)
@@ -150,6 +150,9 @@ impl PostgresAgentStore {
         .bind(&config.metadata)
         .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
         let event = insert_event_tx(
             &mut tx,
             session_id,
@@ -185,7 +188,9 @@ impl PostgresAgentStore {
                         and not exists(select 1 from actions a where a.session_id=s.id)
                         and not (s.metadata ? 'fork')
                     )
-                order by s.updated_at desc
+                order by
+                    case when s.metadata->>'archived' = 'true' then 1 else 0 end asc,
+                    s.updated_at desc
                 limit $1
                 "#
         );

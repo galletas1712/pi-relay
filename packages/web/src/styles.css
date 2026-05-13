@@ -1066,15 +1066,51 @@ pre {
 	color: var(--muted-foreground);
 }
 
-.history-option.tree-row {
+.history-tree-item {
 	position: relative;
-	grid-template-columns: calc(var(--tree-depth, 0) * 18px + 44px) 42px minmax(0, 1fr) auto;
-	min-height: 54px;
-	padding: 7px 10px 7px 8px;
 }
 
-.history-option.tree-row.on-active-path {
+.history-tree-item.on-active-path .history-option.tree-row {
 	background: color-mix(in oklch, var(--accent) 55%, transparent);
+}
+
+.history-tree-item.collapsed .history-option.tree-row {
+	border: 1px dashed var(--border);
+}
+
+.branch-toggle {
+	position: absolute;
+	top: 50%;
+	left: calc(var(--tree-depth, 0) * 18px + 2px);
+	z-index: 1;
+	display: inline-flex;
+	width: 20px;
+	height: 20px;
+	align-items: center;
+	justify-content: center;
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	background: var(--card);
+	color: var(--muted-foreground);
+	padding: 0;
+	transform: translateY(-50%) rotate(90deg);
+	cursor: pointer;
+}
+
+.branch-toggle[aria-expanded="false"] {
+	transform: translateY(-50%);
+}
+
+.branch-toggle:hover {
+	background: var(--accent);
+	color: var(--accent-foreground);
+}
+
+.history-option.tree-row {
+	position: relative;
+	grid-template-columns: calc(var(--tree-depth, 0) * 18px + 24px) 42px minmax(0, 1fr) auto;
+	min-height: 54px;
+	padding: 7px 10px 7px 6px;
 }
 
 .tree-guides {
@@ -1087,7 +1123,7 @@ pre {
 	position: absolute;
 	top: -8px;
 	bottom: -8px;
-	left: calc(max(var(--tree-depth, 0), 1) * 18px - 10px);
+	left: calc(max(var(--tree-depth, 0), 1) * 18px - 16px);
 	border-left: 1px solid var(--border);
 	opacity: calc(min(var(--tree-depth, 0), 1));
 }
@@ -1096,7 +1132,7 @@ pre {
 	content: "";
 	position: absolute;
 	top: 50%;
-	left: calc(max(var(--tree-depth, 0), 1) * 18px - 10px);
+	left: calc(max(var(--tree-depth, 0), 1) * 18px - 16px);
 	width: 14px;
 	border-top: 1px solid var(--border);
 	opacity: calc(min(var(--tree-depth, 0), 1));
@@ -1495,4 +1531,37 @@ pre {
 	to {
 		transform: rotate(360deg);
 	}
+}
+
+.dot.archived {
+	background: var(--muted-foreground);
+}
+
+.icon-button.pressed {
+	border-color: var(--border);
+	background: var(--accent);
+	color: var(--accent-foreground);
+}
+
+.status-rail.archived {
+	background: var(--muted-foreground);
+}
+
+.session-row.archived {
+	color: var(--muted-foreground);
+}
+
+.session-row.archived .session-title {
+	color: color-mix(in oklch, var(--foreground) 72%, var(--muted-foreground));
+}
+
+.session-row-action.disabled {
+	cursor: default;
+	opacity: 0.32;
+}
+
+.session-row-action.disabled:hover,
+.session-row-action.disabled:focus-visible {
+	background: transparent;
+	color: var(--muted-foreground);
 }

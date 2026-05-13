@@ -15,7 +15,7 @@ import {
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, filterCommands, findCommand, matchSlashPrefix, parseSlash, type ParsedSlash } from "./slash.ts";
 import { DEFAULT_PROVIDER, textContent } from "./sessionDefaults.ts";
-import { sessionTitle, tallyActivities, type SessionListItem } from "./sessionList.ts";
+import { sessionTitle, isArchivedSession, tallyActivities, type SessionListItem } from "./sessionList.ts";
 import { firstLine, truncate } from "./text.ts";
 import { MessageList } from "./transcript.tsx";
 import type {
@@ -55,8 +55,8 @@ export function App() {
 	const [slashIndex, setSlashIndex] = useState(0);
 	const [sending, setSending] = useState(false);
 	const [stopping, setStopping] = useState(false);
-	const [loading, setLoading] = useState(true);
 	const [rightOpen, setRightOpen] = useState(true);
+	const [showArchived, setShowArchived] = useState(false);
 	const [historyDialog, setHistoryDialog] = useState<HistoryDialogState | null>(null);
 	const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
 	const [renameValue, setRenameValue] = useState("");
@@ -123,6 +123,7 @@ export function App() {
 			lastEventIds.current.set(sessionId, nextSnapshot.last_event_id);
 			setSnapshot(nextSnapshot);
 			setEntries(nextSnapshot.entries ?? []);
+			setSessions((current) => mergeSnapshotIntoSessionList(current, nextSnapshot));
 			return { snapshot: nextSnapshot, entries: nextSnapshot.entries ?? [] };
 		},
 		[api]
@@ -181,13 +182,9 @@ export function App() {
 		void api
 			.connect()
 			.then(async () => {
-				const [loadedSessions] = await Promise.all([loadSessions(), loadGlobal()]);
-				if (!selectedRef.current && loadedSessions[0]) {
-					selectSession(loadedSessions[0].session_id);
-				}
+				await Promise.all([loadSessions(), loadGlobal()]);
 			})
-			.catch((error) => pushNotice("error", errorMessage(error)))
-			.finally(() => setLoading(false));
+			.catch((error) => pushNotice("error", errorMessage(error)));
 		return () => {
 			offStatus();
 			offEvent();
@@ -223,7 +220,7 @@ export function App() {
 	}, [api, handleSessionEvent, pushNotice, refreshSelected, selectedId]);
 
 	const sessionItems = useMemo<SessionListItem[]>(
-		() => sessions,
+		() => [...sessions].sort(compareSessionsForSidebar),
 		[sessions]
 	);
 
@@ -234,14 +231,17 @@ export function App() {
 
 	const filteredSessions = useMemo(() => {
 		const q = query.trim().toLowerCase();
-		if (!q) return sessionItems;
-		return sessionItems.filter((session) => {
+		const visibleSessions = showArchived ? sessionItems : sessionItems.filter((session) => !isArchivedSession(session));
+		if (!q) return visibleSessions;
+		return visibleSessions.filter((session) => {
 			const title = sessionTitle(session).toLowerCase();
 			return title.includes(q) || session.session_id.toLowerCase().includes(q);
 		});
-	}, [query, sessionItems]);
+	}, [query, sessionItems, showArchived]);
 
-	const counts = useMemo(() => tallyActivities(sessionItems), [sessionItems]);
+	const activeSessionItems = useMemo(() => sessionItems.filter((session) => !isArchivedSession(session)), [sessionItems]);
+	const counts = useMemo(() => tallyActivities(activeSessionItems), [activeSessionItems]);
+	const archivedCount = sessionItems.length - activeSessionItems.length;
 
 	const openRenameDialog = useCallback((session: SessionListItem) => {
 		setRenameSessionId(session.session_id);
@@ -262,6 +262,25 @@ export function App() {
 		pushNotice("success", `renamed session to “${truncate(title, 80)}”`);
 		closeRenameDialog();
 	}, [api, closeRenameDialog, loadSessions, pushNotice, refreshSelected, renameSessionId, renameValue]);
+
+	const setSessionArchived = useCallback(
+		async (session: SessionListItem, archived: boolean) => {
+			const current = session.session_id === selectedRef.current ? await refreshSelected(session.session_id) : null;
+			const activity = current?.snapshot.activity ?? session.activity;
+			if (activity !== "idle") throw new Error("only idle sessions can be archived");
+			const metadata = { ...(current?.snapshot.metadata ?? session.metadata) };
+			if (archived) metadata.archived = true;
+			else delete metadata.archived;
+			await api.configureSession({
+				sessionId: session.session_id,
+				provider: current?.snapshot.provider ?? session.provider,
+				metadata
+			});
+			await Promise.all([loadSessions(), session.session_id === selectedRef.current ? refreshSelected(session.session_id) : Promise.resolve(null)]);
+			pushNotice("success", archived ? `archived “${truncate(sessionTitle(session), 80)}”` : `unarchived “${truncate(sessionTitle(session), 80)}”`);
+		},
+		[api, loadSessions, pushNotice, refreshSelected]
+	);
 
 	const slashState = useMemo<{ visible: boolean; commands: typeof COMMANDS }>(() => {
 		const prefix = matchSlashPrefix(composer);
@@ -294,6 +313,19 @@ export function App() {
 	const queueUserInput = useCallback(
 		async (text: string) => {
 			const sessionId = requireSelected();
+			if (selectedSession && isArchivedSession(selectedSession)) {
+				const current = snapshot ?? (await refreshSelected(sessionId))?.snapshot;
+				if ((current?.activity ?? selectedSession.activity) !== "idle") {
+					throw new Error("only idle archived sessions can be resumed");
+				}
+				const metadata = { ...(current?.metadata ?? selectedSession.metadata) };
+				delete metadata.archived;
+				await api.configureSession({
+					sessionId,
+					provider: current?.provider ?? selectedSession.provider,
+					metadata
+				});
+			}
 			const clientInputId = randomId("web_input");
 			await api.queueFollowUp({
 				sessionId,
@@ -302,7 +334,7 @@ export function App() {
 				content: textContent(text)
 			});
 		},
-		[api, requireSelected, snapshot?.active_leaf_id, snapshot?.activity]
+		[api, refreshSelected, requireSelected, selectedSession, snapshot]
 	);
 
 	const startNewSession = useCallback(
@@ -471,6 +503,12 @@ export function App() {
 				pushActionNotice("success", `renamed session to “${truncate(args, 80)}”`);
 				return;
 			}
+			if (name === "archive" || name === "unarchive") {
+				const session = selectedSession ?? sessionItems.find((item) => item.session_id === sessionId);
+				if (!session) throw new Error("select a session first");
+				await setSessionArchived(session, name === "archive");
+				return;
+			}
 			if (name === "provider") {
 				if (!args) {
 					const provider = snapshot?.provider ?? selectedSession?.provider;
@@ -503,6 +541,7 @@ export function App() {
 			requireSelected,
 			selectedSession,
 			sessionItems,
+			setSessionArchived,
 			snapshot
 		]
 	);
@@ -588,13 +627,13 @@ export function App() {
 	return (
 		<div className="app-shell" style={layoutStyle}>
 			<aside className="sidebar" data-slot="sidebar">
-				<SidebarHeader counts={counts} total={sessionItems.length} connection={connection} />
+				<SidebarHeader counts={counts} total={activeSessionItems.length} archived={archivedCount} connection={connection} />
 				<SidebarToolbar
 					query={query}
 					onQueryChange={setQuery}
+					showArchived={showArchived}
+					onToggleArchived={() => setShowArchived((show) => !show)}
 					onNew={() => void createSession()}
-					onRefresh={() => void Promise.all([loadSessions(), loadGlobal(), refreshSelected()])}
-					loading={loading}
 				/>
 				<div className="session-list" role="listbox" aria-label="sessions">
 					{filteredSessions.map((session) => (
@@ -604,6 +643,9 @@ export function App() {
 							selected={session.session_id === selectedId}
 							onSelect={() => selectSession(session.session_id)}
 							onRename={() => openRenameDialog(session)}
+							onArchiveToggle={() => {
+								void setSessionArchived(session, !isArchivedSession(session)).catch((error) => pushNotice("error", errorMessage(error)));
+							}}
 						/>
 					))}
 					{filteredSessions.length === 0 ? <div className="empty-list">No sessions</div> : null}
@@ -730,6 +772,28 @@ function RenameSessionDialog({
 			</div>
 		</div>
 	);
+}
+
+function compareSessionsForSidebar(left: SessionListItem, right: SessionListItem): number {
+	const archivedDelta = Number(isArchivedSession(left)) - Number(isArchivedSession(right));
+	if (archivedDelta !== 0) return archivedDelta;
+	return Date.parse(right.updated_at) - Date.parse(left.updated_at);
+}
+
+function mergeSnapshotIntoSessionList(sessions: SessionSummary[], snapshot: SessionSnapshot): SessionSummary[] {
+	let found = false;
+	const nextSessions = sessions.map((session) => {
+		if (session.session_id !== snapshot.session_id) return session;
+		found = true;
+		return {
+			...session,
+			activity: snapshot.activity,
+			active_leaf_id: snapshot.active_leaf_id,
+			provider: snapshot.provider,
+			metadata: snapshot.metadata
+		};
+	});
+	return found ? nextSessions : sessions;
 }
 
 function titleFromText(text: string): string {

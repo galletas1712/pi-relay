@@ -148,10 +148,10 @@ describe("historyTreeRows", () => {
 			["user1", 0, true],
 			["assistant1", 0, true],
 			["finish1", 0, true],
-			["start2", 1, true],
-			["user2", 1, true],
-			["assistant2", 1, true],
-			["finish2", 1, true],
+			["start2", 0, true],
+			["user2", 0, true],
+			["assistant2", 0, true],
+			["finish2", 0, true],
 			["sibling", 1, false]
 		]);
 	});

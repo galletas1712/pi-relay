@@ -19,6 +19,8 @@ export const COMMANDS: SlashCommandInfo[] = [
 	{ name: "compact", description: "Request context compaction." },
 	{ name: "system", description: "Read or set global system prompt.", argumentHint: "[clear|prompt...]" },
 	{ name: "rename", description: "Rename the selected session.", argumentHint: "<title>" },
+	{ name: "archive", description: "Archive the selected idle session." },
+	{ name: "unarchive", description: "Unarchive the selected session." },
 	{ name: "provider", description: "Read or set session provider.", argumentHint: "[kind model]" }
 ];
 
