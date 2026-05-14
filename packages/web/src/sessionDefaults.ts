@@ -11,7 +11,7 @@ const PROMPT_CACHE = { key: "pi-relay-web" };
 export const MODEL_OPTIONS: ModelOption[] = [
 	{
 		id: "openai:gpt-5.5",
-		label: "GPT-5.5 (ChatGPT)",
+		label: "OpenAI GPT-5.5",
 		provider: { kind: "openai", model: "gpt-5.5", reasoning_effort: "xhigh", prompt_cache: PROMPT_CACHE }
 	},
 	{

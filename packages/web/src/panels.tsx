@@ -12,7 +12,7 @@ import type { ModelOption } from "./sessionDefaults.ts";
 import { COMMANDS } from "./slash.ts";
 import { isArchivedSession, sessionTitle, type SessionListItem } from "./sessionList.ts";
 import { truncate } from "./text.ts";
-import type { Activity, DaemonConfig, Notice, ReasoningEffort, SessionSnapshot, ToolDefinition } from "./types.ts";
+import type { Activity, DaemonConfig, Notice, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
 
 export function SidebarHeader({
 	counts,
@@ -259,7 +259,7 @@ export function Inspector({
 }: {
 	snapshot: SessionSnapshot | null;
 	config: DaemonConfig;
-	tools: ToolDefinition[];
+	tools: ToolListing[];
 }) {
 	return (
 		<div className="inspector-inner">
@@ -318,7 +318,7 @@ export function Inspector({
 				<h2>Tools</h2>
 				<div className="tool-list">
 					{tools.map((tool) => (
-						<span key={tool.name}>{tool.name}</span>
+						<span key={tool.name} title={tool.name}>{tool.pretty_name}</span>
 					))}
 				</div>
 			</section>

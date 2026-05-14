@@ -1,0 +1,1065 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Provider Tool Surface Plan</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #f7f8fa;
+      --fg: #14171a;
+      --muted: #626a73;
+      --card: #ffffff;
+      --border: #d9dee5;
+      --accent: #4f5cf7;
+      --good: #14824c;
+      --warn: #9a6700;
+      --bad: #b42318;
+      --code: #eef1f5;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #090c0f;
+        --fg: #e8eaed;
+        --muted: #9aa3ad;
+        --card: #11161b;
+        --border: #27313a;
+        --code: #1a2027;
+      }
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    main {
+      max-width: 1120px;
+      margin: 0 auto;
+      padding: 48px 24px 72px;
+    }
+    h1, h2, h3 { line-height: 1.2; }
+    h1 { margin: 0 0 8px; font-size: 32px; }
+    h2 { margin: 34px 0 12px; font-size: 22px; }
+    h3 { margin: 24px 0 8px; font-size: 16px; }
+    p { margin: 8px 0; }
+    a { color: var(--accent); }
+    .subtle { color: var(--muted); }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px 20px;
+      margin: 14px 0;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 14px;
+      margin: 14px 0;
+    }
+    code, pre {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+      font-size: 0.92em;
+    }
+    code {
+      background: var(--code);
+      border: 1px solid var(--border);
+      border-radius: 5px;
+      padding: 1px 5px;
+    }
+    pre {
+      overflow: auto;
+      background: var(--code);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 12px 14px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0;
+      font-size: 14px;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 9px 10px;
+      vertical-align: top;
+      text-align: left;
+    }
+    th { background: var(--code); }
+    .status {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 12px;
+      font-weight: 600;
+      border: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    .ok { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Provider Tool Surface Plan</h1>
+  <p class="subtle">Goal: stop treating every tool as a provider-neutral JSON function, while keeping pi-relay small, local-first, and cache-friendly.</p>
+
+  <div class="card">
+    <h2>Summary</h2>
+    <p>The main abstraction change should be simple: split <strong>what the model sees</strong> from <strong>who executes the tool</strong>. Today <code>agent_vocab::ToolDefinition</code> is doing too much: it is simultaneously a model schema, a local dispatch key, and a provider request shape. That is why local <code>bash</code>, provider-hosted <code>web_search</code>, Anthropic server tools, future MCP, and OpenAI freeform/custom tools all feel like exceptions.</p>
+    <p>The updated direction is even narrower: do <strong>not</strong> force OpenAI and Anthropic to share a fake common tool set such as <code>bash/read/write/edit</code>. Each provider should expose the coding tools it is trained to use. Underneath those provider-native tools, pi-relay can still share the same local runtimes: a persistent terminal, a patch applier, and a text-editor filesystem adapter.</p>
+    <p>The new design should keep provider-specific <code>ToolProfile</code> rendering in <code>agent-provider</code>, and keep execution runtimes in <code>agent-tools</code>. Runtime dispatch only handles tools whose execution owner is pi-relay. Provider-hosted tools are stored and rendered as transcript events, but never become pending local actions.</p>
+  </div>
+
+  <h2>What The APIs Actually Expose</h2>
+
+  <div class="card">
+    <h3>OpenAI Responses</h3>
+    <p>OpenAI's current docs say Responses tools include built-in tools, function calling, tool search, and remote MCP servers. New web search integrations should use <code>{ "type": "web_search" }</code>; responses include <code>web_search_call</code> output items and citations. There is no separate top-level OpenAI <code>web_fetch</code> tool like Anthropic's. Instead, the OpenAI web search tool can emit actions such as <code>search</code>, <code>open_page</code>, and <code>find_in_page</code>; Codex models those as <code>WebSearchAction::Search</code>, <code>WebSearchAction::OpenPage</code>, and <code>WebSearchAction::FindInPage</code>. Function tools are normal JSON schema tools. Custom tools can use context-free grammars such as Lark or regex, which is the path Codex uses for token-efficient freeform payloads such as patches.</p>
+    <p>For the OpenAI coding profile, follow the OpenAI/Codex harness shape: shell/search commands are used for reading and inspecting the repository, while <code>apply_patch</code> is the edit primitive. Codex does not expose a general workspace <code>read</code>/<code>write</code> function in the core coding surface; file inspection happens through shell commands such as <code>rg</code>, <code>sed</code>, <code>ls</code>, and <code>find</code>. MCP resource reads are a separate MCP surface, not the normal filesystem read path.</p>
+    <p>We should not enable hosted shell because it is a cloud sandbox. The OpenAI coding profile should expose only <code>shell</code> as the model-visible terminal tool, backed by pi-relay's persistent terminal runtime and scoped to the session worktree. Treat <code>local_shell</code> as a historical compatibility detail from Codex internals, not as the target pi-relay surface.</p>
+  </div>
+
+  <div class="card">
+    <h3>Anthropic Messages</h3>
+    <p>Anthropic's docs make the execution boundary explicit. Client tools produce <code>tool_use</code> blocks, our application executes them, and we send back <code>tool_result</code>. Server tools such as <code>web_search</code>, <code>web_fetch</code>, <code>code_execution</code>, and <code>tool_search</code> run on Anthropic infrastructure; the API response includes <code>server_tool_use</code> and tool result blocks, but pi-relay does not execute those tools locally.</p>
+    <p>The Anthropic coding profile should use Anthropic-schema client tools directly: <code>bash_20250124</code> for shell and <code>text_editor_20250728</code> for file viewing/creation/editing. These are not server tools: Anthropic defines the schema, but pi-relay still executes the operation. The adapter maps Anthropic's native command shapes into the same persistent terminal and filesystem runtimes used by the OpenAI profile.</p>
+  </div>
+
+  <h2>Repository Findings</h2>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Codebase</th><th>Relevant shape</th><th>Design lesson for pi-relay</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>/Users/schwinns/codex</code></td>
+          <td><code>codex-rs/tools/src/tool_spec.rs</code> models OpenAI tools as an enum: <code>function</code>, <code>namespace</code>, <code>tool_search</code>, <code>local_shell</code>, <code>web_search</code>, <code>image_generation</code>, and <code>custom</code>. The shell handlers also expose a normal <code>shell</code> function shape. <code>core/src/tools/router.rs</code> converts provider output items into local dispatch only for client-executed items.</td>
+          <td>Provider wire shape belongs near the provider/tool renderer. Local dispatch is separate. For pi-relay, target the modern <code>shell</code> surface and keep <code>local_shell</code> out of the planned tool profile.</td>
+        </tr>
+        <tr>
+          <td><code>/Users/schwinns/Downloads/src</code></td>
+          <td><code>Tool.ts</code> defines tool implementation traits. <code>utils/api.ts</code> renders tools to Anthropic API schemas and caches stable base schemas. <code>tools/WebSearchTool</code> is currently a local wrapper that calls Anthropic again with <code>web_search_20250305</code> as an extra server tool. <code>tools/WebFetchTool</code> is a local fetch-and-process wrapper, while the latest Anthropic API also has native server <code>web_fetch</code>.</td>
+          <td>Do not let provider request rendering live inside each tool implementation. Cache stable tool schemas. Prefer direct provider server tools for simple web search/fetch instead of a nested local wrapper unless we need custom permission or post-processing.</td>
+        </tr>
+        <tr>
+          <td><code>pi-relay</code></td>
+          <td><code>agent-tools/src/lib.rs</code> has a small local registry for <code>read</code>, <code>write</code>, <code>edit</code>, and <code>bash</code>. <code>agent-provider/src/openai.rs</code> renders every tool as an OpenAI <code>function</code>. <code>agent-provider/src/anthropic.rs</code> renders every tool as an Anthropic user-defined JSON tool.</td>
+          <td>The current shape is clean for four local JSON tools, but it cannot represent provider-hosted tools, freeform tools, provider-native client schemas, or MCP without adding ad hoc branches.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Token Efficiency Findings</h2>
+
+  <div class="card">
+    <h3>Hermes And OpenClaw</h3>
+    <table>
+      <thead>
+        <tr><th>System</th><th>How tools are exposed</th><th>Token-efficiency consequence</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Hermes agent</td>
+          <td><code>model_tools.py</code> loads a registry of OpenAI-format function definitions. <code>tools/file_tools.py</code> registers JSON-schema tools such as <code>read_file</code>, <code>write_file</code>, <code>patch</code>, and <code>search_files</code>. The patch tool accepts a patch string inside JSON.</td>
+          <td>Hermes mostly uses custom JSON tools. It saves tokens by keeping tools narrow, filtering toolsets, using a dedicated search tool, and bounding read output. It does not avoid JSON escaping for large patch/file payloads.</td>
+        </tr>
+        <tr>
+          <td>OpenClaw</td>
+          <td><code>src/tools/types.ts</code> defines generic <code>ToolDescriptor</code> objects with <code>name</code>, <code>description</code>, and <code>inputSchema</code>. The code-agent plugin registers TypeBox/JSON-schema orchestration tools such as launching, listing, responding to, and managing agent sessions.</td>
+          <td>OpenClaw is a tool registry and orchestration layer, not a compact freeform coding-tool protocol. Its own tools are JSON-schema shaped; coding token efficiency comes mostly from the delegated harness, such as Codex or Claude Code.</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>The takeaway is that many agent systems still define custom JSON tools because the abstraction is portable and easy to validate. That is acceptable for small arguments such as <code>pattern</code>, <code>path</code>, or <code>session_id</code>. It is expensive for large text payloads such as full file contents, shell heredocs, or patches.</p>
+  </div>
+
+  <div class="card">
+    <h3>Efficient Ways To Call Tools</h3>
+    <table>
+      <thead>
+        <tr><th>Approach</th><th>Efficiency</th><th>Reliability</th><th>Use in pi-relay</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>Provider-native client tools</td>
+          <td>Best when available. Tool specs are compact or built into the provider's trained surface, and the model does not need verbose custom schemas.</td>
+          <td>High. The provider understands the tool shape and streams structured tool events.</td>
+          <td>Use as the default: OpenAI <code>shell</code>/<code>apply_patch</code>, Anthropic <code>bash_20250124</code>/<code>text_editor_20250728</code>.</td>
+        </tr>
+        <tr>
+          <td>OpenAI custom/freeform grammar tools</td>
+          <td>Excellent for raw text payloads. The model can emit a patch body directly instead of escaping it as a JSON string.</td>
+          <td>High if the grammar is tight and the runtime validates paths/operations.</td>
+          <td>Use for OpenAI <code>apply_patch</code> if the native subscription-auth tool shape is unavailable or not enough. This is the Codex-style escape hatch.</td>
+        </tr>
+        <tr>
+          <td>Small custom JSON tools</td>
+          <td>Good for small argument objects. The JSON overhead is tiny compared with the useful result.</td>
+          <td>High with strict schemas and bounded outputs.</td>
+          <td>Use for <code>grep</code>. Arguments are small and the output bound matters more than the call syntax.</td>
+        </tr>
+        <tr>
+          <td>Large custom JSON string tools</td>
+          <td>Poor. Newlines, quotes, and backslashes are escaped, and invalid JSON recovery becomes part of the harness.</td>
+          <td>Medium. Validation helps, but payload generation is brittle.</td>
+          <td>Avoid for patch and full-file write paths. Prefer <code>apply_patch</code> or provider-native editor operations.</td>
+        </tr>
+        <tr>
+          <td>Assistant-text protocols such as XML or fenced blocks</td>
+          <td>Can be very compact because the payload is plain text.</td>
+          <td>Low to medium. The harness must parse in-band assistant text, reject ambiguity, and emulate tool-call semantics.</td>
+          <td>Do not use initially. It is a fallback only if neither provider-native nor OpenAI freeform/custom tools can express a needed operation.</td>
+        </tr>
+        <tr>
+          <td>Line arrays, base64, or shell heredocs inside JSON</td>
+          <td>Usually not better. They move the escaping around or add wrapper overhead.</td>
+          <td>Medium. They may reduce parse mistakes in some cases but do not solve token cost.</td>
+          <td>Avoid as a core design choice.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>pi-relay Policy</h3>
+    <ul>
+      <li>Use provider-native coding tools wherever the provider has a first-class client tool.</li>
+      <li>Keep <code>apply_patch</code> always available for OpenAI, with a native or freeform/custom wire shape.</li>
+      <li>Keep <code>grep</code> as a custom JSON tool because its inputs are small and its output can be bounded aggressively.</li>
+      <li>Do not expose generic <code>write_file(content)</code> or patch-as-JSON-string tools in the normal coding profile.</li>
+      <li>Optimize tool result sizes as much as tool call syntax: bounded search/read output saves more context than shaving a few JSON tokens from small calls.</li>
+      <li>Keep the provider replay model structured. Token-efficient tool calls are not worth losing clean fork, switch, compaction, and retry semantics.</li>
+    </ul>
+  </div>
+
+  <h2>Tool Taxonomy</h2>
+
+  <div class="grid">
+    <div class="card">
+      <h3>Local Client Tools</h3>
+      <p>pi-relay executes these in the selected session worktree and returns a result to the model. The model-visible name does not need to be shared across providers. Examples: OpenAI shell, OpenAI <code>apply_patch</code>, Anthropic <code>bash_20250124</code>, Anthropic <code>text_editor_20250728</code>, future local MCP client tools.</p>
+      <p><span class="status ok">Keep</span> This is the core local substrate, but provider profiles choose the visible schema.</p>
+    </div>
+    <div class="card">
+      <h3>Provider-Hosted Tools</h3>
+      <p>The provider executes these inside the model request. pi-relay enables them, parses resulting events, stores provider replay, and renders them in the UI. Examples: OpenAI <code>web_search</code>, Anthropic <code>web_search_20250305</code>, Anthropic <code>web_fetch_20250910</code>.</p>
+      <p><span class="status ok">Add</span> No local pending action is created.</p>
+    </div>
+    <div class="card">
+      <h3>Provider-Native Client Tools</h3>
+      <p>The provider owns the schema, but pi-relay executes the operation. Examples: OpenAI <code>shell</code>, OpenAI <code>apply_patch</code>, Anthropic <code>bash_20250124</code>, and Anthropic <code>text_editor_20250728</code>.</p>
+      <p><span class="status ok">Use now</span> This should be the main coding surface instead of a provider-neutral <code>bash/read/write/edit</code> facade.</p>
+    </div>
+    <div class="card">
+      <h3>Custom Tools</h3>
+      <p>Tools we inject that are not provider built-ins. They may be JSON-schema tools on both providers or OpenAI-only freeform/custom grammar tools. This is where an OpenAI <code>apply_patch</code> grammar or a pi-relay-specific file operation substrate belongs.</p>
+      <p><span class="status ok">Design now</span> Keep this extensible without making every tool provider-specific.</p>
+    </div>
+    <div class="card">
+      <h3>MCP Tools</h3>
+      <p>Two modes exist: pi-relay can run a local MCP client and expose tools as local client tools, or the provider can connect to remote MCP servers directly. For personal use, local MCP client mode is the better default because it supports stdio/local servers and keeps credentials under pi-relay control.</p>
+      <p><span class="status warn">Phase later</span> Design for it, do not implement first.</p>
+    </div>
+    <div class="card">
+      <h3>Cloud Sandbox Tools</h3>
+      <p>Provider code execution, hosted shell containers, and computer-use sandboxes are powerful but not aligned with the current goal. The user explicitly does not want cloud sandboxes surfaced here.</p>
+      <p><span class="status bad">Exclude</span> Do not enable by default.</p>
+    </div>
+  </div>
+
+  <h2>Provider-Native Client Tools</h2>
+
+  <div class="card">
+    <p>Provider-native client tools should become the normal coding surface. The provider owns the model-visible schema and training surface; pi-relay owns execution. This avoids making Claude pretend it has OpenAI tools, and avoids making OpenAI pretend it has Anthropic's text editor.</p>
+    <p>The shared part is below the model boundary: terminal execution, patch application, filesystem editing, truncation, timeout handling, worktree scoping, and transcript result storage. The session FSM should still only see "local tool requested" and "tool result appended"; it should not need to know whether the visible request was OpenAI shell, Anthropic bash, OpenAI <code>apply_patch</code>, or Anthropic text editor.</p>
+  </div>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Provider</th><th>Model-visible tools</th><th>What the model uses them for</th><th>pi-relay runtime</th><th>Decision</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>OpenAI</td>
+          <td><code>shell</code></td>
+          <td>Repository inspection, file reading, search, tests, builds, long-running commands, and terminal interaction. This is the OpenAI/Codex path for read-like operations: use <code>rg</code>, <code>sed</code>, <code>cat</code>, <code>ls</code>, <code>find</code>, etc.</td>
+          <td><code>PersistentTerminal</code> scoped to the session cwd/worktree, with command start, stdin write/poll, timeout, output truncation, and process cleanup.</td>
+          <td><span class="status ok">Use</span></td>
+        </tr>
+        <tr>
+          <td>OpenAI</td>
+          <td><code>apply_patch</code></td>
+          <td>Workspace edits and file creation/deletion. Codex uses a freeform/custom grammar version because patches are much more token-efficient outside JSON strings.</td>
+          <td><code>WorkspaceFileRuntime</code> through an OpenAI patch adapter. It validates paths under the session worktree, applies the patch atomically enough for one tool call, and returns compact success/error output.</td>
+          <td><span class="status ok">Use</span></td>
+        </tr>
+        <tr>
+          <td>OpenAI</td>
+          <td><code>grep</code></td>
+          <td>Fast repository search without making the model hand-roll <code>rg</code> flags through shell. This is a custom pi-relay tool, not an OpenAI built-in.</td>
+          <td><code>WorkspaceSearchRuntime</code> invokes <code>rg</code> directly, with path scoping, max match limits, context line limits, and compact output formatting.</td>
+          <td><span class="status ok">Add</span></td>
+        </tr>
+        <tr>
+          <td>OpenAI</td>
+          <td><code>web_search</code></td>
+          <td>Remote web search, page opening, in-page finding, and provider citations/events.</td>
+          <td>Provider-hosted. Store and render <code>search</code>, <code>open_page</code>, and <code>find_in_page</code> hosted tool events; do not create a local pending action.</td>
+          <td><span class="status ok">Use</span></td>
+        </tr>
+        <tr>
+          <td>OpenAI</td>
+          <td><code>computer</code>, hosted code execution, provider tool search, MCP</td>
+          <td>Computer use, cloud sandboxes, dynamic tool discovery, or external toolsets.</td>
+          <td>Separate future drivers or provider-hosted replay. Do not include in the first coding profile.</td>
+          <td><span class="status bad">Defer</span></td>
+        </tr>
+        <tr>
+          <td>Anthropic</td>
+          <td><code>bash_20250124</code></td>
+          <td>Repository inspection, file reading, search, tests, builds, long-running commands, and terminal interaction.</td>
+          <td><code>PersistentTerminal</code> scoped to the session cwd/worktree. Anthropic's <code>restart</code> behavior maps to resetting that terminal session.</td>
+          <td><span class="status ok">Use</span></td>
+        </tr>
+        <tr>
+          <td>Anthropic</td>
+          <td><code>text_editor_20250728</code></td>
+          <td>File viewing, file creation, string replacement, and insertion. The Claude 4 <code>text_editor_20250728</code> version does not include <code>undo_edit</code>, so pi-relay should not promise editor undo here.</td>
+          <td><code>WorkspaceFileRuntime</code> through an Anthropic text-editor adapter. It scopes paths to the worktree and maps commands such as <code>view</code>, <code>create</code>, <code>str_replace</code>, and <code>insert</code> to local filesystem operations.</td>
+          <td><span class="status ok">Use</span></td>
+        </tr>
+        <tr>
+          <td>Anthropic</td>
+          <td><code>grep</code></td>
+          <td>Fast repository search via a compact custom client tool. Anthropic's native text editor can view files/directories, but it does not provide indexed grep-like search.</td>
+          <td><code>WorkspaceSearchRuntime</code> invokes <code>rg</code> directly and returns bounded, structured matches.</td>
+          <td><span class="status ok">Use</span></td>
+        </tr>
+        <tr>
+          <td>Anthropic</td>
+          <td><code>web_search_20250305</code>, <code>web_fetch_20250910</code></td>
+          <td>Remote web search and URL fetch with provider-produced result blocks.</td>
+          <td>Provider-hosted. Store and render <code>server_tool_use</code> and result blocks; do not create local pending actions.</td>
+          <td><span class="status ok">Use</span></td>
+        </tr>
+        <tr>
+          <td>Anthropic</td>
+          <td><code>computer_20251124</code>, code execution, tool search, MCP, memory</td>
+          <td>Computer use, cloud sandboxes, dynamic discovery, remote toolsets, or persistent cross-session memory.</td>
+          <td>Separate future drivers or provider-hosted replay. Do not include in the first coding profile.</td>
+          <td><span class="status bad">Defer</span></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>How To Wire Them</h3>
+    <p>The adapter should be provider-specific only at the request/response boundary. Internally, all provider-native client calls should become a local action over one of a few runtime capabilities.</p>
+<pre><code>Provider response item
+  -&gt; provider parser recognizes native client call
+  -&gt; ProviderToolCall { profile, native_kind, call_id, raw_input }
+  -&gt; provider adapter resolves native_kind to LocalRuntimeKind
+  -&gt; adapter converts raw_input into a runtime command
+  -&gt; existing session action lifecycle runs
+  -&gt; adapter converts runtime output into provider-native tool result</code></pre>
+    <p>This needs three small abstraction additions:</p>
+    <ul>
+      <li><code>ProviderToolProfile</code>: <code>OpenAiCoding</code> or <code>AnthropicCoding</code>, selected by the session's provider/model.</li>
+      <li><code>ProviderNativeClientKind</code>: <code>OpenAiShell</code>, <code>OpenAiApplyPatch</code>, <code>AnthropicBash</code>, <code>AnthropicTextEditor</code>, etc.</li>
+      <li><code>LocalRuntimeKind</code>: <code>PersistentTerminal</code>, <code>WorkspaceFileRuntime</code>, or <code>WorkspaceSearchRuntime</code>.</li>
+    </ul>
+    <p>Do not make <code>agent-session</code> know OpenAI or Anthropic schemas. The FSM can store an opaque local action with a provider call id and normalized result lifecycle; provider replay keeps the exact wire item needed to resume the model.</p>
+  </div>
+
+  <div class="card">
+    <h3>Shared Runtime Layers</h3>
+    <p>The provider-native adapters should stay thin. <code>OpenAiShell</code> and <code>AnthropicBash</code> should both call into one terminal runtime. <code>OpenAiApplyPatch</code> and <code>AnthropicTextEditor</code> should both call into one workspace-file substrate, even though their model-visible commands are different. <code>grep</code> is a separate read-only search runtime backed by ripgrep.</p>
+<pre><code>OpenAI shell
+Anthropic bash_20250124
+  -&gt; TerminalAdapter
+  -&gt; PersistentTerminal
+       - session cwd/worktree
+       - process lifecycle
+       - stdin/stdout polling
+       - timeout and truncation
+       - restart/cleanup
+
+OpenAI apply_patch
+Anthropic text_editor_20250728
+  -&gt; EditAdapter
+  -&gt; WorkspaceFileRuntime
+       - path scoping
+       - file reads and writes
+       - patch application
+       - exact string replacement
+       - insert/create/delete primitives
+       - compact success/error reporting</code></pre>
+
+<pre><code>OpenAI grep
+Anthropic grep
+  -&gt; SearchAdapter
+  -&gt; WorkspaceSearchRuntime
+       - rg invocation without shell interpolation
+       - path/include/exclude scoping
+       - max match and context limits
+       - compact structured result output</code></pre>
+    <p>The important distinction is adapter versus runtime. An adapter translates a provider-native or custom model-visible shape into a local command. A runtime owns behavior that must be identical across providers: path safety, cwd/worktree selection, file mutation semantics, terminal persistence, search limits, truncation, and error formatting.</p>
+  </div>
+
+  <h2>Recommended Coding Profiles</h2>
+
+  <div class="card">
+    <table>
+      <thead>
+        <tr><th>Profile</th><th>Expose to model</th><th>Do not expose yet</th><th>Execution owner</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>OpenAI coding</td>
+          <td><code>shell</code>, <code>apply_patch</code>, custom <code>grep</code>, and provider-hosted <code>web_search</code>.</td>
+          <td>Generic <code>read</code>/<code>write</code>/<code>edit</code> JSON tools, hosted shell/code execution, computer use, tool search, MCP.</td>
+          <td>Shell, patch, and grep are pi-relay local. Web search is provider-hosted.</td>
+        </tr>
+        <tr>
+          <td>Anthropic coding</td>
+          <td><code>bash_20250124</code>, <code>text_editor_20250728</code>, custom <code>grep</code>, provider-hosted <code>web_search_20250305</code>, and provider-hosted <code>web_fetch_20250910</code>.</td>
+          <td>Generic <code>bash</code>/<code>read</code>/<code>write</code>/<code>edit</code> JSON tools, cloud code execution, computer use, tool search, MCP, memory.</td>
+          <td>Bash, text editor, and grep are pi-relay local. Web search/fetch are provider-hosted.</td>
+        </tr>
+        <tr>
+          <td>Custom substrate</td>
+          <td>Only provider-native tools that map to local runtimes. OpenAI gets patch; Anthropic gets text editor.</td>
+          <td>A separate provider-neutral model-visible tool set.</td>
+          <td>pi-relay local runtimes.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Proposed Rust Abstractions</h2>
+
+  <div class="card">
+    <p>Keep <code>agent-session</code> focused on transcript and state machine semantics. Provider-specific tool wire formats belong in <code>agent-provider</code>. Local execution belongs in <code>agent-tools</code>. The shared abstraction is not "a universal list of tools"; it is "provider-native tool calls map to a small set of local runtime capabilities."</p>
+
+<pre><code>agent-tools
+  RuntimeRegistry
+    PersistentTerminal(SessionId, Worktree)
+    WorkspaceFileRuntime(Worktree)
+    WorkspaceSearchRuntime(Worktree)
+
+  RuntimeCommand
+    Terminal { command, stdin, timeout, restart }
+    WorkspaceFile { operation }
+    WorkspaceSearch { operation }
+
+  WorkspaceFileOperation
+    ApplyPatch { patch_text or structured_operation }
+    View { path, range }
+    Create { path, content }
+    Replace { path, old, new }
+    Insert { path, line, content }
+    Delete { path }
+
+  WorkspaceSearchOperation
+    Grep { pattern, path, include, exclude, context, max_matches, case_sensitive }
+
+agent-provider
+  ProviderToolProfile
+    OpenAiCoding
+      - shell
+      - apply_patch
+      - grep
+      - web_search, including search/open_page/find_in_page hosted actions
+    AnthropicCoding
+      - bash_20250124
+      - text_editor_20250728
+      - grep
+      - web_search_20250305
+      - web_fetch_20250910
+
+  ProviderNativeClientKind
+    OpenAiShell
+    OpenAiApplyPatch
+    AnthropicBash
+    AnthropicTextEditor
+    CustomGrep</code></pre>
+
+    <p><code>ToolDefinition</code> can remain temporarily for legacy JSON tools while the provider profiles are migrated, but it should no longer be treated as the canonical coding interface. The long-term shared interface is runtime commands, not provider-neutral model-visible tools.</p>
+  </div>
+
+  <div class="card">
+    <h3>Provider Rendering</h3>
+<pre><code>agent-provider/openai_tools.rs
+  fn render_openai_coding_tools(config, model_capabilities) -&gt; Vec&lt;OpenAiToolSpec&gt;
+
+OpenAiToolSpec
+  Shell
+  ApplyPatch { custom grammar or native item shape }
+  Function { name: grep, description, parameters, strict }
+  WebSearch { filters, user_location, search_context_size, external_web_access }
+
+agent-provider/anthropic_tools.rs
+  fn render_anthropic_coding_tools(config, model_capabilities) -&gt; AnthropicRenderedTools
+
+AnthropicToolSpec
+  AnthropicSchemaClientTool { type: bash_20250124, name: bash }
+  AnthropicSchemaClientTool { type: text_editor_20250728, name: str_replace_based_edit_tool }
+  ClientTool { name: grep, description, input_schema, strict, cache_control }
+  ServerWebSearch { version, domains, user_location, optional_max_uses }
+  ServerWebFetch { version, domains, citations, optional_max_uses, optional_max_content_tokens }</code></pre>
+    <p>The renderers own provider quirks: OpenAI <code>custom</code> grammar, OpenAI hosted <code>web_search</code>, Anthropic dated tool versions, Anthropic cache markers, and Anthropic beta headers. The session runtime should never inspect those wire variants.</p>
+  </div>
+
+  <div class="card">
+    <h3>Provider Output Parsing</h3>
+    <p>Provider outputs should be normalized into two categories:</p>
+    <ul>
+      <li><strong>Local tool requests</strong>: create a pending action in <code>agent-session</code>, then <code>agent-daemon</code> dispatches through <code>agent-tools</code>.</li>
+      <li><strong>Provider-hosted tool events</strong>: store in <code>provider_replay</code>, surface to the UI as transcript metadata, and keep them in replay context for future provider calls.</li>
+    </ul>
+<pre><code>ProviderOutputItem
+  AssistantText
+  LocalToolCall { id, provider_native_kind, raw_input }
+  HostedToolUse { id, provider, name, input, result, status }
+  Reasoning
+  UnknownReplayable { raw }</code></pre>
+    <p>This avoids pretending that Anthropic <code>server_tool_use</code> or OpenAI <code>web_search_call</code> is a local action. It also keeps fork, switch, compaction, and retry semantics clean because provider-hosted events remain append-only transcript/replay data.</p>
+  </div>
+
+  <h2>Flow Diagrams</h2>
+
+  <div class="card">
+    <h3>Local Tool Flow</h3>
+<pre><code>User message
+  -&gt; provider request with provider-native coding profile
+  -&gt; model emits OpenAI shell/apply_patch or Anthropic bash/text_editor
+  -&gt; provider parser records a local pending action with the raw provider call id
+  -&gt; agent-daemon dispatches the matching agent-tools runtime
+  -&gt; tool result is appended
+  -&gt; provider adapter renders the provider-native tool result on continuation</code></pre>
+  </div>
+
+  <div class="card">
+    <h3>Provider-Hosted Tool Flow</h3>
+<pre><code>User message
+  -&gt; provider request with hosted tool spec
+  -&gt; provider/model runs hosted web_search or web_fetch internally
+  -&gt; provider response includes hosted tool events and final text
+  -&gt; pi-relay stores raw replay items
+  -&gt; UI renders search/fetch events
+  -&gt; no local pending action is created</code></pre>
+  </div>
+
+  <div class="card">
+    <h3>MCP Later</h3>
+<pre><code>Local MCP mode:
+  RuntimeRegistry discovers MCP tool
+  -&gt; render through provider-specific MCP/tool-search profile
+  -&gt; model emits local tool call
+  -&gt; pi-relay calls MCP server
+
+Provider-hosted MCP mode:
+  Provider profile renders provider MCP toolset
+  -&gt; provider calls remote MCP server
+  -&gt; pi-relay observes hosted MCP events only</code></pre>
+  </div>
+
+  <h2>Implementation Plan</h2>
+
+  <div class="card">
+    <h3>Phase 1: Add Provider Coding Profiles</h3>
+    <ul>
+      <li>Add <code>ProviderToolProfile::OpenAiCoding</code> and <code>ProviderToolProfile::AnthropicCoding</code> in <code>agent-provider</code>.</li>
+      <li>Stop treating <code>bash/read/write/edit</code> as the provider-neutral model contract for new sessions.</li>
+      <li>Render OpenAI as <code>shell</code> plus <code>apply_patch</code> plus custom <code>grep</code> plus provider-hosted <code>web_search</code>.</li>
+      <li>Render Anthropic as <code>bash_20250124</code>, <code>text_editor_20250728</code>, custom <code>grep</code>, provider-hosted <code>web_search_20250305</code>, and provider-hosted <code>web_fetch_20250910</code>.</li>
+      <li>Keep deterministic ordering and cache markers stable inside the renderers.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Phase 2: Build Shared Local Runtimes</h3>
+    <ul>
+      <li>Add <code>PersistentTerminal</code> per session/worktree. OpenAI shell and Anthropic bash both use it.</li>
+      <li>Add one <code>WorkspaceFileRuntime</code>. OpenAI <code>apply_patch</code> and Anthropic <code>text_editor_20250728</code> both use it.</li>
+      <li>Add one <code>WorkspaceSearchRuntime</code>. The custom <code>grep</code> tool invokes ripgrep directly instead of going through shell.</li>
+      <li>Put patch application, exact replacement, insert, create, delete, and file viewing behind the same path-scoped workspace file layer.</li>
+      <li>Keep path scoping, output truncation, timeout, command lifecycle behavior, and file mutation semantics in these runtimes rather than in provider code.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Phase 3: Parse Native Calls And Hosted Events</h3>
+    <ul>
+      <li>OpenAI: parse <code>shell</code> calls into <code>PersistentTerminal</code> actions, <code>apply_patch</code> calls into <code>WorkspaceFileRuntime</code> actions, and <code>grep</code> calls into <code>WorkspaceSearchRuntime</code> actions.</li>
+      <li>OpenAI: parse and persist <code>web_search_call</code> output items, including action details and citations where present.</li>
+      <li>Anthropic: parse <code>bash_20250124</code> calls into <code>PersistentTerminal</code> actions, <code>text_editor_20250728</code> calls into <code>WorkspaceFileRuntime</code> actions, and <code>grep</code> calls into <code>WorkspaceSearchRuntime</code> actions.</li>
+      <li>Anthropic: parse and persist <code>server_tool_use</code>, <code>web_search_tool_result</code>, and <code>web_fetch_tool_result</code> blocks.</li>
+      <li>Do not turn hosted events into <code>ToolCallStarted</code> or local pending actions.</li>
+      <li>Expose hosted events over WebSocket RPC as transcript decorations so the UI can render them like tool cards.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Phase 4: Retire Legacy Generic Tools</h3>
+    <ul>
+      <li>Remove provider exposure for generic JSON <code>bash/read/write/edit</code> once native profiles pass live tests.</li>
+      <li>Keep the underlying code only if a runtime still needs it; otherwise delete the unused handlers.</li>
+      <li>Keep <code>ToolDefinition</code> only where legacy transcript replay requires it. New provider calls should go through native profiles.</li>
+      <li>Document that file reading on OpenAI is shell-based, while file reading on Anthropic is text-editor-based.</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h3>Phase 5: MCP And Deferral</h3>
+    <ul>
+      <li>Add local MCP client tool discovery when there is a real MCP server to support.</li>
+      <li>Expose local MCP tools through provider-specific renderers only after the first native coding profiles are stable.</li>
+      <li>Add OpenAI <code>tool_search</code> and Anthropic <code>defer_loading</code> only after the tool catalog is large enough to justify it.</li>
+      <li>Do not add provider-hosted MCP first. It only supports public remote servers and would complicate credential boundaries.</li>
+    </ul>
+  </div>
+
+  <h2>Upstream Tool Schemas</h2>
+
+  <div class="card">
+    <h3>OpenAI Responses Schema Shapes</h3>
+    <table>
+      <thead>
+        <tr><th>Tool</th><th>Request tool spec</th><th>Model output item</th><th>Continuation input</th><th>Runtime mapping</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>shell</code></td>
+          <td><code>{ "type": "shell" }</code>. The environment description should live in stable instructions, not in a changing tool description.</td>
+          <td><code>shell_call</code> with <code>call_id</code>, <code>status</code>, and <code>action</code>. <code>action.commands</code> is a list of commands; <code>timeout_ms</code> and <code>max_output_length</code> may be present.</td>
+          <td><code>shell_call_output</code> with the original <code>call_id</code> and command output.</td>
+          <td><code>OpenAiShell</code> adapter to <code>PersistentTerminal</code>.</td>
+        </tr>
+        <tr>
+          <td><code>apply_patch</code></td>
+          <td>Implemented as an OpenAI <code>custom</code> grammar tool named <code>apply_patch</code>. This matches the Codex freeform approach and avoids JSON-escaping large diffs.</td>
+          <td><code>custom_tool_call</code> with <code>call_id</code>, <code>name: "apply_patch"</code>, and raw patch <code>input</code>.</td>
+          <td><code>custom_tool_call_output</code> with the original <code>call_id</code> and compact execution output.</td>
+          <td><code>OpenAiApplyPatch</code> adapter to <code>WorkspaceFileRuntime::ApplyPatch</code>.</td>
+        </tr>
+        <tr>
+          <td><code>web_search</code></td>
+          <td><code>{ "type": "web_search", "search_context_size": "high" }</code>, optionally with <code>filters.allowed_domains</code>, <code>user_location</code>, or <code>external_web_access</code>.</td>
+          <td><code>web_search_call</code> events and answer annotations/citations. The action can be <code>search</code>, <code>open_page</code>, or <code>find_in_page</code>. Sources can be requested with response <code>include</code> fields.</td>
+          <td>No local tool output; provider-hosted events are replayed as provider items.</td>
+          <td>Provider-hosted replay only.</td>
+        </tr>
+        <tr>
+          <td><code>grep</code></td>
+          <td>Custom OpenAI function tool: <code>{ "type": "function", "name": "grep", "description": stable_text, "strict": true, "parameters": schema }</code>.</td>
+          <td>Function call named <code>grep</code> with strict JSON arguments.</td>
+          <td>Function/tool output associated with the generated call id.</td>
+          <td><code>CustomGrep</code> adapter to <code>WorkspaceSearchRuntime::Grep</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Anthropic Messages Schema Shapes</h3>
+    <table>
+      <thead>
+        <tr><th>Tool</th><th>Request tool spec</th><th>Model output block</th><th>Continuation input</th><th>Runtime mapping</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>bash_20250124</code></td>
+          <td><code>{ "type": "bash_20250124", "name": "bash" }</code>.</td>
+          <td><code>tool_use</code> named <code>bash</code>. Input has <code>command</code> unless <code>restart: true</code> is used.</td>
+          <td>User message content block <code>tool_result</code> with <code>tool_use_id</code> and output text.</td>
+          <td><code>AnthropicBash</code> adapter to <code>PersistentTerminal</code>. <code>restart</code> resets the terminal.</td>
+        </tr>
+        <tr>
+          <td><code>text_editor_20250728</code></td>
+          <td><code>{ "type": "text_editor_20250728", "name": "str_replace_based_edit_tool" }</code>, with <code>max_characters</code> omitted by default.</td>
+          <td><code>tool_use</code> named <code>str_replace_based_edit_tool</code>. This exact name comes from Anthropic's text editor tool examples and is what Claude returns in <code>tool_use.name</code>. Commands include <code>view</code>, <code>create</code>, <code>str_replace</code>, and <code>insert</code>. <code>undo_edit</code> is not supported for this Claude 4 version.</td>
+          <td>User message content block <code>tool_result</code> with <code>tool_use_id</code> and output text.</td>
+          <td><code>AnthropicTextEditor</code> adapter to <code>WorkspaceFileRuntime</code>. <code>view</code> is read-only, but belongs here because it is part of the upstream text editor tool contract.</td>
+        </tr>
+        <tr>
+          <td><code>web_search_20250305</code></td>
+          <td><code>{ "type": "web_search_20250305", "name": "web_search" }</code>, optionally with domain/location filters or an explicit workflow budget.</td>
+          <td><code>server_tool_use</code> and web search result blocks produced by Anthropic.</td>
+          <td>No local tool result. Replay the provider-hosted blocks.</td>
+          <td>Provider-hosted replay only.</td>
+        </tr>
+        <tr>
+          <td><code>web_fetch_20250910</code></td>
+          <td><code>{ "type": "web_fetch_20250910", "name": "web_fetch", "citations": { "enabled": true } }</code>, optionally with domain controls or explicit workflow budgets.</td>
+          <td><code>server_tool_use</code> and web fetch result blocks produced by Anthropic.</td>
+          <td>No local tool result. Replay the provider-hosted blocks.</td>
+          <td>Provider-hosted replay only.</td>
+        </tr>
+        <tr>
+          <td><code>grep</code></td>
+          <td>User-defined client tool with stable <code>name</code>, <code>description</code>, <code>input_schema</code>, and optional <code>cache_control</code> on the final always-loaded tool.</td>
+          <td><code>tool_use</code> named <code>grep</code> with JSON input.</td>
+          <td>User message content block <code>tool_result</code> with <code>tool_use_id</code> and bounded match output.</td>
+          <td><code>CustomGrep</code> adapter to <code>WorkspaceSearchRuntime::Grep</code>.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>pi-relay Custom Grep Schema</h3>
+    <p><code>grep</code> is intentionally custom because neither upstream coding surface gives us a dedicated ripgrep tool. It should be read-only, strict, bounded, and backed by <code>rg</code> directly rather than by shell string interpolation.</p>
+<pre><code>{
+  "name": "grep",
+  "description": "Search files in the current workspace with ripgrep.",
+  "parameters": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "pattern": {
+        "type": "string",
+        "description": "Regular expression to search for."
+      },
+      "path": {
+        "type": "string",
+        "description": "Optional file or directory path relative to the workspace root."
+      },
+      "include": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional glob allow-list, for example ['*.rs', '*.ts']."
+      },
+      "exclude": {
+        "type": "array",
+        "items": { "type": "string" },
+        "description": "Optional glob deny-list."
+      },
+      "context": {
+        "type": "integer",
+        "description": "Number of context lines before and after each match."
+      },
+      "max_matches": {
+        "type": "integer",
+        "description": "Maximum number of matching lines to return."
+      },
+      "case_sensitive": {
+        "type": "boolean",
+        "description": "Whether matching should be case-sensitive."
+      }
+    },
+    "required": ["pattern"]
+  }
+}</code></pre>
+    <p>This is the logical schema. The OpenAI strict renderer may need to transform optional fields into nullable required fields to satisfy Structured Outputs constraints; the runtime should treat <code>null</code> the same as omission. Runtime defaults should stay stable: <code>path</code> defaults to the workspace root, <code>context</code> defaults to <code>0</code>, <code>max_matches</code> defaults to a modest cap such as <code>100</code>, and omitted <code>case_sensitive</code> uses ripgrep's normal smart-case behavior.</p>
+  </div>
+
+  <h2>Tool Spec Knobs</h2>
+
+  <div class="card">
+    <h3>Tool Effort Defaults</h3>
+    <p>Provider-native tools should follow the same bias as model reasoning: default to high-quality retrieval and generous inspection. Avoid provider-visible <code>max_*</code> fields by default. Most of them are budgets or truncation controls, not quality knobs, and they can create surprising failures or hidden information loss.</p>
+    <p>The model does not configure these values. pi-relay sets them when rendering the provider request. The model can choose whether to use an enabled tool and can choose the tool input, such as a search query or URL. Optional provider <code>max_*</code> fields should be added only for explicit workflow budgets, not as part of the normal high-effort profile.</p>
+    <table>
+      <thead>
+        <tr><th>Provider</th><th>Tool</th><th>High-effort default</th><th>Why</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td>OpenAI</td>
+          <td><code>web_search</code></td>
+          <td><code>search_context_size: "high"</code></td>
+          <td>Matches the intent of <code>xhigh</code> reasoning: let the hosted search tool provide richer context when the model decides web evidence matters.</td>
+        </tr>
+        <tr>
+          <td>Anthropic</td>
+          <td><code>web_search_20250305</code></td>
+          <td>omit <code>max_uses</code> by default</td>
+          <td>Let Claude perform the searches it needs. Add <code>max_uses</code> only for a workflow that explicitly wants a budget.</td>
+        </tr>
+        <tr>
+          <td>Anthropic</td>
+          <td><code>web_fetch_20250910</code></td>
+          <td><code>citations.enabled: true</code>; omit <code>max_uses</code> and <code>max_content_tokens</code> by default</td>
+          <td>Fetch should be useful for substantial docs/pages. Add provider limits only for explicit budgets or truncation policies.</td>
+        </tr>
+        <tr>
+          <td>Anthropic</td>
+          <td><code>text_editor_20250728</code></td>
+          <td>omit <code>max_characters</code> by default</td>
+          <td>Do not silently truncate file views at the provider-tool level. Use targeted ranges and local runtime safety limits instead.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Research Mode</h3>
+    <p>OpenAI deep research should be a separate provider profile, not a hidden mutation of the normal coding profile. OpenAI exposes deep research through dedicated models such as <code>o3-deep-research</code> and <code>o4-mini-deep-research</code> in the Responses API. A deep research request must include at least one data source, such as <code>web_search</code>, remote MCP, or file search. It can also include <code>code_interpreter</code>, but that is a cloud sandbox and should stay out of the default coding profile.</p>
+    <p>For deep research, pi-relay should set request-level research policy explicitly:</p>
+<pre><code>OpenAIResearchProfile {
+  model: "o3-deep-research" | "o4-mini-deep-research",
+  tools: [
+    WebSearch { search_context_size: "high", external_web_access: true },
+    // optional later: remote MCP or file_search
+    // optional only if explicitly enabled: code_interpreter
+  ],
+  background: true,
+  max_tool_calls: optional_explicit_research_budget,
+}</code></pre>
+    <p><code>max_tool_calls</code> is different from a tool's own quality setting. It is a total request budget for deep research tool calls such as web search, MCP, and code interpreter. The model still decides how to spend that budget. Similarly, Anthropic <code>max_uses</code>, <code>max_characters</code>, and <code>max_content_tokens</code> are guardrail/truncation controls. Omit them by default and add them only when the user explicitly wants a bounded research run or a workflow has a known cap.</p>
+  </div>
+
+  <div class="card">
+    <h3>OpenAI Responses</h3>
+    <p>OpenAI tool knobs depend on the tool kind. Built-in tools have small fixed specs. Function and custom tools expose richer model-visible metadata. The first implementation uses a Codex-compatible function tool named <code>shell</code>, OpenAI hosted <code>web_search</code>, a custom-function <code>grep</code>, and Codex-style custom/freeform <code>apply_patch</code>. The ChatGPT/Codex subscription endpoint rejected the platform <code>{ "type": "shell" }</code> shape during validation, so pi-relay keeps the model-visible name <code>shell</code> but renders it as a function tool for this transport.</p>
+    <table>
+      <thead>
+        <tr><th>Knob</th><th>Where it applies</th><th>What it does</th><th>pi-relay decision</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>type</code></td>
+          <td>All OpenAI tools</td>
+          <td>Selects the tool family: <code>shell</code>, <code>apply_patch</code>, <code>web_search</code>, <code>function</code>, <code>custom</code>, etc.</td>
+          <td>Use <code>shell</code>, custom/freeform <code>apply_patch</code>, custom-function <code>grep</code>, and <code>web_search</code> in the first OpenAI coding profile.</td>
+        </tr>
+        <tr>
+          <td><code>name</code>, <code>description</code>, <code>parameters</code></td>
+          <td>OpenAI <code>function</code> tools</td>
+          <td>Defines a JSON-schema function tool. <code>description</code> and schema text are model-visible and affect cache stability.</td>
+          <td>Use this for <code>grep</code>. Avoid reviving generic <code>read/write/edit</code> functions. Keep the grep description short, stable, and sorted consistently with the rest of the profile.</td>
+        </tr>
+        <tr>
+          <td><code>strict</code></td>
+          <td>OpenAI <code>function</code> tools</td>
+          <td>Enforces Structured Outputs for function arguments. OpenAI recommends strict mode for reliable schema adherence.</td>
+          <td>Set <code>strict: true</code> for <code>grep</code> and any remaining JSON function tools. It is not relevant to built-in <code>shell</code>, <code>apply_patch</code>, or <code>web_search</code>.</td>
+        </tr>
+        <tr>
+          <td><code>format</code></td>
+          <td>OpenAI <code>custom</code> tools</td>
+          <td>Defines freeform input constraints, such as a Lark grammar. Codex uses this style for token-efficient patch payloads.</td>
+          <td><code>apply_patch</code> should always be available in the OpenAI coding profile. The current implementation uses Codex-style custom/freeform <code>apply_patch</code>; revisit a native provider item shape only after subscription-auth compatibility is proven.</td>
+        </tr>
+        <tr>
+          <td><code>search_context_size</code></td>
+          <td>OpenAI <code>web_search</code></td>
+          <td>Controls the amount of search context: <code>low</code>, <code>medium</code>, or <code>high</code>.</td>
+          <td>Default to <code>high</code>. Keep this stable in the provider renderer rather than making it a per-turn toggle.</td>
+        </tr>
+        <tr>
+          <td><code>filters.allowed_domains</code></td>
+          <td>OpenAI <code>web_search</code></td>
+          <td>Restricts search to an allow-list of domains.</td>
+          <td>Unset by default. Set only when the user or a workflow explicitly scopes sources.</td>
+        </tr>
+        <tr>
+          <td><code>user_location</code></td>
+          <td>OpenAI <code>web_search</code></td>
+          <td>Provides approximate country/city/region/timezone for local results.</td>
+          <td>Unset by default. Add only for location-sensitive queries and never bake a stale location into the stable tool prefix.</td>
+        </tr>
+        <tr>
+          <td><code>external_web_access</code></td>
+          <td>OpenAI <code>web_search</code></td>
+          <td>Controls live web access versus cached/indexed-only search.</td>
+          <td>Leave default live access enabled. Add an explicit offline mode later if needed.</td>
+        </tr>
+        <tr>
+          <td><code>tool_choice</code></td>
+          <td>Request-level</td>
+          <td>Controls whether the model may, must, or must not use tools.</td>
+          <td>Use <code>auto</code>. Do not force tools except in a dedicated diagnostic flow.</td>
+        </tr>
+        <tr>
+          <td><code>parallel_tool_calls</code></td>
+          <td>Request-level function-tool behavior</td>
+          <td>Controls parallel function calls, but OpenAI documents that parallel function calling is not available when using built-in tools.</td>
+          <td>Do not rely on it for built-ins. Because <code>grep</code> is read-only, it can tolerate concurrency, but shell and file mutation still need runtime-level serialization.</td>
+        </tr>
+        <tr>
+          <td><code>max_tool_calls</code></td>
+          <td>OpenAI deep research requests</td>
+          <td>Controls the total number of tool calls a deep research model may make before returning a result.</td>
+          <td>Set only in a dedicated research profile. Do not apply it to the normal coding profile unless the API accepts it for that model/tool combination and we intentionally want a hard cap.</td>
+        </tr>
+        <tr>
+          <td><code>background</code></td>
+          <td>OpenAI deep research requests</td>
+          <td>Runs long research tasks asynchronously so the client can poll or receive a webhook when complete.</td>
+          <td>Use for deep research mode because these turns can be long. Keep normal coding turns foreground.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h3>Anthropic Messages</h3>
+    <p>Anthropic exposes both model-visible tool metadata and request-level tool behavior. The provider-native bash and text editor tools have fixed schemas, while server web tools expose filtering and usage knobs.</p>
+    <table>
+      <thead>
+        <tr><th>Knob</th><th>Where it applies</th><th>What it does</th><th>pi-relay decision</th></tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td><code>type</code></td>
+          <td>All Anthropic tools</td>
+          <td>Selects the tool family/version, such as <code>bash_20250124</code>, <code>text_editor_20250728</code>, <code>web_search_20250305</code>, or <code>web_fetch_20250910</code>.</td>
+          <td>Pin versions explicitly in provider rendering config. Do not store versions in session FSM state.</td>
+        </tr>
+        <tr>
+          <td><code>name</code></td>
+          <td>All Anthropic tools</td>
+          <td>The tool name returned in <code>tool_use</code> blocks.</td>
+          <td>Use Anthropic's trained names: <code>bash</code> and <code>str_replace_based_edit_tool</code>.</td>
+        </tr>
+        <tr>
+          <td><code>description</code>, <code>input_schema</code></td>
+          <td>User-defined Anthropic client tools</td>
+          <td>Defines custom JSON tools.</td>
+          <td>Use this for <code>grep</code>. Prefer Anthropic-schema client tools instead of custom <code>bash/read/write/edit</code>.</td>
+        </tr>
+        <tr>
+          <td><code>strict</code></td>
+          <td>Anthropic tools that accept strict mode</td>
+          <td>Requests stricter schema adherence where supported.</td>
+          <td>Set <code>strict: true</code> for <code>grep</code> if accepted. For Anthropic-schema tools, test acceptance first; omit if the API rejects it.</td>
+        </tr>
+        <tr>
+          <td><code>input_examples</code></td>
+          <td>Anthropic tools</td>
+          <td>Adds example inputs to steer tool use.</td>
+          <td>Omit initially. The native tools are already trained surfaces, and the <code>grep</code> schema should be simple enough without examples.</td>
+        </tr>
+        <tr>
+          <td><code>cache_control</code></td>
+          <td>Anthropic tools and other cacheable blocks</td>
+          <td>Marks a prompt cache breakpoint.</td>
+          <td>Attach one stable cache breakpoint at the end of the always-loaded tool list after tool order is deterministic. Do not make per-session tool descriptions dynamic.</td>
+        </tr>
+        <tr>
+          <td><code>defer_loading</code></td>
+          <td>Anthropic deferred/tool-search surfaces</td>
+          <td>Defers loading tool definitions until discovered.</td>
+          <td>Do not use yet. We are deferring tool search and MCP, and the first profile is small.</td>
+        </tr>
+        <tr>
+          <td><code>max_characters</code></td>
+          <td><code>text_editor_20250728</code></td>
+          <td>Controls truncation when viewing large files.</td>
+          <td>Omit by default. Add only when the user or workflow explicitly wants provider-tool truncation.</td>
+        </tr>
+        <tr>
+          <td><code>max_uses</code></td>
+          <td>Anthropic server web tools</td>
+          <td>Caps how many times the server tool can be used in a request.</td>
+          <td>Omit by default. Add only for explicit workflow budgets, since this can cause <code>max_uses_exceeded</code> errors during otherwise useful research.</td>
+        </tr>
+        <tr>
+          <td><code>max_content_tokens</code></td>
+          <td>Anthropic <code>web_fetch</code></td>
+          <td>Caps fetched page content that enters context.</td>
+          <td>Omit by default. Add only for workflows that explicitly want truncation, because this can hide relevant content from the model.</td>
+        </tr>
+        <tr>
+          <td><code>citations</code></td>
+          <td>Anthropic <code>web_fetch</code></td>
+          <td>Enables citations for fetched page content.</td>
+          <td>Set <code>{ "enabled": true }</code> by default so fetched pages are auditable like search results.</td>
+        </tr>
+        <tr>
+          <td><code>allowed_domains</code>, <code>blocked_domains</code></td>
+          <td>Anthropic server web tools</td>
+          <td>Restricts or blocks domains.</td>
+          <td>Unset by default. Apply only when the user or workflow explicitly scopes sources.</td>
+        </tr>
+        <tr>
+          <td><code>user_location</code></td>
+          <td>Anthropic web search</td>
+          <td>Provides approximate location for local search behavior.</td>
+          <td>Unset by default. Add only for location-sensitive queries.</td>
+        </tr>
+        <tr>
+          <td><code>tool_choice</code></td>
+          <td>Request-level</td>
+          <td>Controls automatic, forced, named, or no tool use.</td>
+          <td>Use <code>{ "type": "auto", "disable_parallel_tool_use": true }</code> initially.</td>
+        </tr>
+        <tr>
+          <td><code>disable_parallel_tool_use</code></td>
+          <td>Anthropic <code>tool_choice</code></td>
+          <td>When true, limits Claude to one tool use under <code>auto</code>, or exactly one under forced modes.</td>
+          <td>Set <code>true</code> initially because the persistent terminal is stateful. Relax later only after per-runtime concurrency policies exist.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2>Invariants To Enforce</h2>
+
+  <div class="card">
+    <ul>
+      <li>A provider-hosted tool must never create an <code>ActionRequested</code> row or local pending action.</li>
+      <li>A provider-native client call must resolve to a known local runtime before it can enter the session FSM.</li>
+      <li>The OpenAI coding profile must always include <code>apply_patch</code>; only its wire shape may vary.</li>
+      <li>Provider replay must preserve hosted tool events exactly enough to reconstruct the next stateless provider request.</li>
+      <li>Provider tool lists must be deterministically sorted, and cache-affecting tool descriptions must not drift per turn.</li>
+      <li>Provider-native tool effort defaults must be high and stable without unnecessary provider-visible <code>max_*</code> caps. OpenAI web search uses <code>high</code> context; Anthropic web search/fetch and text editor omit optional caps unless a workflow explicitly asks for a budget or truncation policy.</li>
+      <li>Provider-specific tool versions belong in provider rendering config, not in session state.</li>
+      <li>A session's selected provider/model determines its coding tool profile. Do not change the provider-visible tool profile mid-session.</li>
+      <li>Cloud sandbox tools remain disabled unless explicitly added later.</li>
+    </ul>
+  </div>
+
+  <h2>Open Questions</h2>
+
+  <div class="card">
+    <ul>
+      <li>For OpenAI <code>apply_patch</code>, the first implementation uses the exact Codex-style freeform custom grammar shape. A native provider item shape can be evaluated later without changing the local patch runtime.</li>
+      <li>For OpenAI shell, the first implementation renders a function tool named <code>shell</code> because the ChatGPT/Codex subscription endpoint rejected the platform <code>{ "type": "shell" }</code> shape with <code>Unsupported tool type: shell</code>. The target model-visible tool remains <code>shell</code>; do not design around deprecated <code>local_shell</code>. The provider still parses <code>shell_call</code> defensively in case a future transport supports it.</li>
+      <li>Should exact URL fetch exist as a pi-relay local tool? Anthropic has native server <code>web_fetch</code>. OpenAI covers page opening and in-page search as hosted <code>web_search</code> actions rather than a separate <code>web_fetch</code> tool. A future local <code>web_fetch</code> runtime may still be useful for provider parity or authenticated/local-network fetches, but it should not block the first profile.</li>
+    </ul>
+  </div>
+
+  <h2>Sources</h2>
+  <div class="card">
+    <ul>
+      <li><a href="https://developers.openai.com/api/docs/guides/tools">OpenAI: Using tools</a></li>
+      <li><a href="https://developers.openai.com/api/docs/guides/tools-web-search">OpenAI: Web search</a></li>
+      <li><a href="https://developers.openai.com/api/docs/guides/function-calling">OpenAI: Function calling and custom tools</a></li>
+      <li><a href="https://platform.openai.com/docs/guides/function-calling/parallel-function-calling-and-structured-outputs">OpenAI: Parallel function calling and Structured Outputs</a></li>
+      <li><a href="https://developers.openai.com/api/docs/guides/tools-shell">OpenAI: Shell</a></li>
+      <li><a href="https://developers.openai.com/api/docs/guides/tools-local-shell">OpenAI: Local shell</a></li>
+      <li><a href="https://developers.openai.com/api/docs/guides/tools-apply-patch">OpenAI: Apply Patch</a></li>
+      <li><a href="https://developers.openai.com/api/docs/guides/tools-computer-use">OpenAI: Computer use</a></li>
+      <li><a href="https://developers.openai.com/api/docs/guides/tools-tool-search">OpenAI: Tool search</a></li>
+      <li><a href="https://developers.openai.com/api/docs/guides/tools-connectors-mcp">OpenAI: MCP and Connectors</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview">Anthropic: Tool use with Claude</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/how-tool-use-works">Anthropic: How tool use works</a></li>
+      <li><a href="https://platform.claude.com/docs/en/docs/agents-and-tools/tool-use/implement-tool-use">Anthropic: Implement tool use</a></li>
+      <li><a href="https://platform.claude.com/docs/en/api/messages">Anthropic: Messages API reference</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/tool-reference">Anthropic: Tool reference</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/bash-tool">Anthropic: Bash tool</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/text-editor-tool">Anthropic: Text editor tool</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/memory-tool">Anthropic: Memory tool</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/computer-use-tool">Anthropic: Computer use tool</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-search-tool">Anthropic: Web search tool</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/web-fetch-tool">Anthropic: Web fetch tool</a></li>
+      <li><a href="https://platform.claude.com/docs/en/agents-and-tools/mcp-connector">Anthropic: MCP connector</a></li>
+      <li>Local source: <code>/Users/schwinns/codex/codex-rs/tools/src/tool_spec.rs</code>, <code>/Users/schwinns/codex/codex-rs/core/src/tools/spec_plan.rs</code>, <code>/Users/schwinns/codex/codex-rs/core/src/tools/handlers/shell_spec.rs</code>, <code>/Users/schwinns/codex/codex-rs/core/src/tools/handlers/apply_patch_spec.rs</code>, <code>/Users/schwinns/Downloads/src/Tool.ts</code>, <code>/Users/schwinns/Downloads/src/utils/api.ts</code>, <code>/Users/schwinns/Downloads/src/tools/WebSearchTool/WebSearchTool.ts</code>, <code>/Users/schwinns/Downloads/src/tools/WebFetchTool/WebFetchTool.ts</code>, <code>/tmp/pi-relay-tool-survey/hermes-agent/model_tools.py</code>, <code>/tmp/pi-relay-tool-survey/hermes-agent/tools/file_tools.py</code>, <code>/tmp/pi-relay-tool-survey/openclaw/src/tools/types.ts</code>, <code>/tmp/pi-relay-tool-survey/openclaw/src/tools/protocol.ts</code>, <code>/tmp/pi-relay-tool-survey/openclaw-code-agent/index.ts</code>, <code>rust/crates/agent-tools/src/lib.rs</code>, <code>rust/crates/agent-provider/src/openai.rs</code>, and <code>rust/crates/agent-provider/src/anthropic.rs</code>.</li>
+    </ul>
+  </div>
+</main>
+</body>
+</html>

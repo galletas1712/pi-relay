@@ -56,7 +56,7 @@ export function assistantMessageText(item: Extract<TranscriptItem, { type: "assi
 	return item.items
 		.map((assistantItem) => (assistantItem.type === "text" ? assistantItem.text : ""))
 		.filter(Boolean)
-		.join("\n\n")
+		.join("")
 		.trim();
 }
 

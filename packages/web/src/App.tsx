@@ -36,7 +36,7 @@ import type {
 	ReasoningEffort,
 	SessionSnapshot,
 	SessionSummary,
-	ToolDefinition,
+	ToolListing,
 	TranscriptEntry
 } from "./types.ts";
 
@@ -65,7 +65,7 @@ export function App() {
 	const [entries, setEntries] = useState<TranscriptEntry[]>([]);
 	const [notices, setNotices] = useState<Notice[]>([]);
 	const [config, setConfig] = useState<DaemonConfig>({ system_prompt: null });
-	const [tools, setTools] = useState<ToolDefinition[]>([]);
+	const [tools, setTools] = useState<ToolListing[]>([]);
 	const [query, setQuery] = useState("");
 	const [composer, setComposer] = useState("");
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
@@ -129,9 +129,8 @@ export function App() {
 	}, [api]);
 
 	const loadGlobal = useCallback(async () => {
-		const [nextConfig, nextTools] = await Promise.all([api.getConfig(), api.listTools()]);
+		const nextConfig = await api.getConfig();
 		setConfig(nextConfig);
-		setTools(nextTools);
 	}, [api]);
 
 	const refreshSelected = useCallback(
@@ -249,6 +248,7 @@ export function App() {
 	);
 
 	const activeProvider = snapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
+	const activeProviderKind = activeProvider.kind;
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
 	const modelLocked = !!selectedId && (entries.length > 0 || snapshot?.active_leaf_id !== null);
 	const modelControlsDisabled = !!selectedId && snapshot?.activity !== "idle";
@@ -265,6 +265,22 @@ export function App() {
 		},
 		[api, loadSessions, refreshSelected]
 	);
+
+	useEffect(() => {
+		if (connection !== "open") return;
+		let cancelled = false;
+		void api
+			.listTools(activeProviderKind)
+			.then((nextTools) => {
+				if (!cancelled) setTools(nextTools);
+			})
+			.catch((error) => {
+				if (!cancelled) pushNotice("error", errorMessage(error));
+			});
+		return () => {
+			cancelled = true;
+		};
+	}, [activeProviderKind, api, connection, pushNotice]);
 
 	const changeModel = useCallback(
 		async (modelKey: string) => {

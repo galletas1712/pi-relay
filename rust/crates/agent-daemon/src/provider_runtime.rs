@@ -1,7 +1,8 @@
 use agent_provider::anthropic::AnthropicProvider;
 use agent_provider::openai::OpenAiProvider;
 use agent_provider::{
-    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, PromptSections, ProviderError,
+    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, PromptSections,
+    ProviderError, ProviderToolProfile,
 };
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
@@ -25,7 +26,8 @@ pub(crate) async fn run_model(
             Some(dynamic_prompt_context(state)),
         ),
         transcript: provider_transcript(model_context),
-        tools: state.tools.definitions(),
+        tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
+        tools: state.tools.definitions_for_provider(config.provider.kind),
         max_tokens: config.provider.max_tokens,
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config
@@ -68,6 +70,7 @@ pub(crate) async fn run_compaction(
         model: config.provider.model.clone(),
         prompt: PromptSections::new(Some(COMPACTION_SYSTEM_PROMPT.to_string()), None),
         transcript,
+        tool_profile: ProviderToolProfile::None,
         tools: Vec::new(),
         max_tokens: config.provider.max_tokens,
         reasoning_effort: config.provider.reasoning_effort,
@@ -140,15 +143,6 @@ fn provider_for_config(
             provider: Box::new(OpenAiProvider::codex(
                 credentials.codex_access_token.clone().ok_or_else(|| {
                     anyhow!("~/.codex ChatGPT token not found for OpenAI subscription transport")
-                })?,
-                credentials.codex_account_id.clone(),
-            )),
-            uses_codex_auth: true,
-        },
-        ProviderKind::Codex => ProviderHandle {
-            provider: Box::new(OpenAiProvider::codex(
-                credentials.codex_access_token.clone().ok_or_else(|| {
-                    anyhow!("CODEX_ACCESS_TOKEN or ~/.codex ChatGPT token not found")
                 })?,
                 credentials.codex_account_id.clone(),
             )),

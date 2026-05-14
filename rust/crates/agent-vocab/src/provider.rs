@@ -8,7 +8,6 @@ use serde_json::Value;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderKind {
     OpenAi,
-    Codex,
     Claude,
 }
 
@@ -16,13 +15,8 @@ impl ProviderKind {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::OpenAi => "openai",
-            Self::Codex => "codex",
             Self::Claude => "claude",
         }
-    }
-
-    pub fn is_codex(self) -> bool {
-        matches!(self, Self::Codex)
     }
 }
 
@@ -38,7 +32,6 @@ impl FromStr for ProviderKind {
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value {
             "openai" => Ok(Self::OpenAi),
-            "codex" => Ok(Self::Codex),
             "claude" | "anthropic" => Ok(Self::Claude),
             other => Err(format!("unsupported provider kind: {other}")),
         }
@@ -153,13 +146,39 @@ pub struct ProviderConfig {
 pub struct ProviderReplayItem {
     pub provider: ProviderKind,
     pub raw_json: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<ReplayDisplay>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayDisplay {
+    pub kind: ReplayDisplayKind,
+    pub pretty_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayDisplayKind {
+    LocalTool,
+    HostedTool,
 }
 
 impl ProviderReplayItem {
     pub fn new(provider: ProviderKind, raw: &Value) -> Result<Self, serde_json::Error> {
+        Self::new_with_display(provider, raw, None)
+    }
+
+    pub fn new_with_display(
+        provider: ProviderKind,
+        raw: &Value,
+        display: Option<ReplayDisplay>,
+    ) -> Result<Self, serde_json::Error> {
         Ok(Self {
             provider,
             raw_json: serde_json::to_string(raw)?,
+            display,
         })
     }
 
@@ -193,5 +212,43 @@ mod tests {
         assert_eq!(config.kind, ProviderKind::Claude);
         assert_eq!(config.reasoning_effort, ReasoningEffort::Medium);
         assert_eq!(serde_json::to_value(config.kind).unwrap(), json!("claude"));
+    }
+
+    #[test]
+    fn provider_kind_does_not_accept_codex_as_provider_name() {
+        let error = serde_json::from_value::<ProviderConfig>(json!({
+            "kind": "codex",
+            "model": "gpt-5.5",
+        }))
+        .expect_err("codex is an auth transport, not a provider name");
+
+        assert!(error.to_string().contains("unsupported provider kind"));
+    }
+
+    #[test]
+    fn provider_replay_display_is_explicit() {
+        let replay = ProviderReplayItem::new_with_display(
+            ProviderKind::Claude,
+            &json!({
+                "type": "server_tool_use",
+                "id": "srv_1",
+                "name": "web_fetch",
+                "input": { "url": "https://example.com" },
+            }),
+            Some(ReplayDisplay {
+                kind: ReplayDisplayKind::HostedTool,
+                pretty_name: "Web fetch".to_string(),
+                input_summary: Some("https://example.com".to_string()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            replay.display,
+            Some(ReplayDisplay {
+                kind: ReplayDisplayKind::HostedTool,
+                pretty_name: "Web fetch".to_string(),
+                input_summary: Some("https://example.com".to_string()),
+            })
+        );
     }
 }

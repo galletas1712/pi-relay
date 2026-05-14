@@ -1,19 +1,25 @@
+use agent_tools::{builtin_tool_definition, tool_display, ToolDisplayInput};
 use agent_vocab::{
     AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
-    ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId, ToolDefinition, TranscriptItem,
-    UserMessage,
+    ProviderReplayItem, ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, ToolDefinition,
+    TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError,
-    ProviderResult, ProviderUsage,
+    ProviderResult, ProviderToolProfile, ProviderUsage,
 };
 
 const DEFAULT_MAX_TOKENS: u32 = 65_536;
-const ANTHROPIC_BETA_HEADER: &str = "interleaved-thinking-2025-05-14,extended-cache-ttl-2025-04-11";
+const ANTHROPIC_BETA_HEADER: &str =
+    "claude-code-20250219,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14,extended-cache-ttl-2025-04-11,web-fetch-2025-09-10,context-management-2025-06-27";
+const CLAUDE_CODE_VERSION: &str = "2.1.75";
+const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75 (external, cli)";
+const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
 
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
@@ -30,24 +36,29 @@ impl AnthropicProvider {
             base_url: "https://api.anthropic.com/v1".to_string(),
         }
     }
-
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
-    }
 }
 
 #[async_trait]
 impl ModelProvider for AnthropicProvider {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
+        let session_id = request
+            .prompt_cache_key
+            .clone()
+            .unwrap_or_else(|| "pi-relay".to_string());
         let body = messages_body(request)?;
 
         let response = self
             .client
             .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
+            .header("accept", "application/json")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", ANTHROPIC_BETA_HEADER)
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("User-Agent", CLAUDE_CODE_USER_AGENT)
+            .header("x-app", "cli")
+            .header("X-Claude-Code-Session-Id", session_id)
+            .header("x-client-request-id", client_request_id())
             .json(&body)
             .send()
             .await?;
@@ -80,16 +91,24 @@ fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
             "effort": effort,
         },
     });
-    if let Some(system_blocks) = anthropic_system_blocks(&request.prompt) {
+    if let Some(system_blocks) = anthropic_system_blocks(&request.prompt, &request.transcript) {
         body["system"] = Value::Array(system_blocks);
     }
-    if !request.tools.is_empty() {
-        let mut tools = anthropic_tools(&request.tools);
+    let mut tools = anthropic_tools(request.tool_profile, &request.tools)?;
+    if !tools.is_empty() {
         mark_last_tool_for_cache(&mut tools);
         body["tools"] = Value::Array(tools);
         body["tool_choice"] = json!({ "type": "auto" });
     }
     Ok(body)
+}
+
+fn client_request_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("pi-relay-{nanos}")
 }
 
 fn anthropic_reasoning_effort(effort: ReasoningEffort) -> ProviderResult<&'static str> {
@@ -125,11 +144,21 @@ fn response_error_message(body: &str) -> String {
     serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|value| {
-            value
+            let message = value
                 .pointer("/error/message")
                 .or_else(|| value.pointer("/message"))
                 .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
+                .map(ToOwned::to_owned)?;
+            let error_type = value.pointer("/error/type").and_then(Value::as_str);
+            let request_id = value.get("request_id").and_then(Value::as_str);
+            Some(match (error_type, request_id) {
+                (Some(error_type), Some(request_id)) => {
+                    format!("{error_type}: {message} ({request_id})")
+                }
+                (Some(error_type), None) => format!("{error_type}: {message}"),
+                (None, Some(request_id)) => format!("{message} ({request_id})"),
+                (None, None) => message,
+            })
         })
         .unwrap_or_else(|| response_excerpt(body))
 }
@@ -148,7 +177,21 @@ fn response_excerpt(body: &str) -> String {
     }
 }
 
-fn anthropic_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+fn anthropic_tools(
+    profile: ProviderToolProfile,
+    tools: &[ToolDefinition],
+) -> ProviderResult<Vec<Value>> {
+    match profile {
+        ProviderToolProfile::None => Ok(Vec::new()),
+        ProviderToolProfile::CustomDefinitions => Ok(anthropic_custom_definition_tools(tools)),
+        ProviderToolProfile::AnthropicCoding => Ok(anthropic_coding_tools()),
+        ProviderToolProfile::OpenAiCoding => Err(ProviderError::Provider(
+            "OpenAI coding tools cannot be sent to Claude".to_string(),
+        )),
+    }
+}
+
+fn anthropic_custom_definition_tools(tools: &[ToolDefinition]) -> Vec<Value> {
     let mut tools = tools.to_vec();
     tools.sort_by(|left, right| left.name.cmp(&right.name));
     tools.iter().map(anthropic_tool).collect()
@@ -160,6 +203,29 @@ fn anthropic_tool(tool: &ToolDefinition) -> Value {
         "description": tool.description,
         "input_schema": tool.input_schema,
     })
+}
+
+fn anthropic_coding_tools() -> Vec<Value> {
+    vec![
+        json!({
+            "type": "bash_20250124",
+            "name": "bash",
+        }),
+        json!({
+            "type": "text_editor_20250728",
+            "name": "str_replace_based_edit_tool",
+        }),
+        anthropic_tool(&builtin_tool_definition("grep").expect("grep tool must be registered")),
+        json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+        }),
+        json!({
+            "type": "web_fetch_20250910",
+            "name": "web_fetch",
+            "citations": { "enabled": true },
+        }),
+    ]
 }
 
 fn mark_last_tool_for_cache(tools: &mut [Value]) {
@@ -175,8 +241,14 @@ fn cache_control_1h() -> Value {
     })
 }
 
-fn anthropic_system_blocks(prompt: &crate::PromptSections) -> Option<Vec<Value>> {
-    let mut blocks = Vec::new();
+fn anthropic_system_blocks(
+    prompt: &crate::PromptSections,
+    transcript: &[ModelTranscriptEntry],
+) -> Option<Vec<Value>> {
+    let mut blocks = vec![json!({
+        "type": "text",
+        "text": attribution_header(transcript),
+    })];
     if let Some(stable) = &prompt.stable_prefix {
         blocks.push(json!({
             "type": "text",
@@ -191,6 +263,37 @@ fn anthropic_system_blocks(prompt: &crate::PromptSections) -> Option<Vec<Value>>
         }));
     }
     (!blocks.is_empty()).then_some(blocks)
+}
+
+fn attribution_header(transcript: &[ModelTranscriptEntry]) -> String {
+    let fingerprint = attribution_fingerprint(transcript);
+    format!(
+        "x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}.{fingerprint}; cc_entrypoint=cli;"
+    )
+}
+
+fn attribution_fingerprint(transcript: &[ModelTranscriptEntry]) -> String {
+    let text = first_user_text(transcript).unwrap_or_default();
+    let chars = [
+        text.chars().nth(4).unwrap_or('0'),
+        text.chars().nth(7).unwrap_or('0'),
+        text.chars().nth(20).unwrap_or('0'),
+    ]
+    .iter()
+    .collect::<String>();
+    let input = format!("{ATTRIBUTION_FINGERPRINT_SALT}{chars}{CLAUDE_CODE_VERSION}");
+    let mut hash = 0u32;
+    for byte in input.bytes() {
+        hash = hash.wrapping_mul(31).wrapping_add(u32::from(byte));
+    }
+    format!("{hash:08x}").chars().take(3).collect()
+}
+
+fn first_user_text(transcript: &[ModelTranscriptEntry]) -> Option<&str> {
+    transcript.iter().find_map(|entry| match &entry.item {
+        TranscriptItem::UserMessage(message) => message.as_text(),
+        _ => None,
+    })
 }
 
 fn add_transcript_cache_breakpoint(messages: &mut [Value]) {
@@ -334,22 +437,30 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
         let Some(block_type) = block.get("type").and_then(Value::as_str) else {
             continue;
         };
-        provider_replay.push(ProviderReplayItem::new(ProviderKind::Claude, block)?);
+        let display = anthropic_provider_replay_display(block);
+        provider_replay.push(ProviderReplayItem::new_with_display(
+            ProviderKind::Claude,
+            block,
+            display,
+        )?);
 
         match block_type {
             "text" => {
                 if let Some(text) = block.get("text").and_then(Value::as_str) {
-                    items.push(AssistantItem::Text(text.to_string()));
+                    push_text_item(&mut items, text);
                 }
             }
             "thinking" | "redacted_thinking" => {}
             "tool_use" => {
-                let id = block.get("id").and_then(Value::as_str).unwrap_or_default();
-                let name = block
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+                let id = block.get("id").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::Provider("Claude tool_use missing id".to_string())
+                })?;
+                let name = block.get("name").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderError::Provider("Claude tool_use missing name".to_string())
+                })?;
+                let input = block.get("input").cloned().ok_or_else(|| {
+                    ProviderError::Provider("Claude tool_use missing input".to_string())
+                })?;
                 items.push(AssistantItem::ToolCall(ToolCall {
                     id: ToolCallId::new(id),
                     tool_name: name.to_string(),
@@ -364,6 +475,36 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
         provider_replay,
         usage: response.get("usage").and_then(anthropic_usage),
     })
+}
+
+fn anthropic_provider_replay_display(block: &Value) -> Option<ReplayDisplay> {
+    let name = block.get("name").and_then(Value::as_str)?;
+    match block.get("type").and_then(Value::as_str)? {
+        "server_tool_use" => tool_display(
+            ProviderKind::Claude,
+            name,
+            ToolDisplayInput::HostedTool,
+            block.get("input"),
+        ),
+        "tool_use" => tool_display(
+            ProviderKind::Claude,
+            name,
+            ToolDisplayInput::LocalTool,
+            block.get("input"),
+        ),
+        _ => None,
+    }
+}
+
+fn push_text_item(items: &mut Vec<AssistantItem>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(AssistantItem::Text(previous)) = items.last_mut() {
+        previous.push_str(text);
+    } else {
+        items.push(AssistantItem::Text(text.to_string()));
+    }
 }
 
 fn anthropic_usage(value: &Value) -> Option<ProviderUsage> {
@@ -399,6 +540,7 @@ mod tests {
             model: "claude-sonnet-4-5".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![ToolDefinition {
                 name: "read".to_string(),
                 description: "read a file".to_string(),
@@ -414,16 +556,21 @@ mod tests {
         })
         .expect("body renders");
 
+        assert!(body["system"][0]["text"]
+            .as_str()
+            .expect("attribution text")
+            .starts_with("x-anthropic-billing-header: cc_version="));
+        assert!(body["system"][0].get("cache_control").is_none());
         assert_eq!(
-            body["system"],
-            json!([{
+            body["system"][1],
+            json!({
                 "type": "text",
                 "text": "stable rules",
                 "cache_control": {
                     "type": "ephemeral",
                     "ttl": "1h",
                 },
-            }])
+            })
         );
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "medium");
@@ -452,6 +599,7 @@ mod tests {
             model: "claude-opus-4-7".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![
                 ToolDefinition {
                     name: "write".to_string(),
@@ -483,6 +631,37 @@ mod tests {
     }
 
     #[test]
+    fn messages_body_renders_anthropic_native_coding_tools() {
+        let body = messages_body(ModelRequest {
+            model: "claude-opus-4-7".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::AnthropicCoding,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::XHigh,
+            prompt_cache_key: None,
+        })
+        .expect("body renders");
+
+        assert_eq!(body["tools"][0]["type"], "bash_20250124");
+        assert_eq!(body["tools"][0]["name"], "bash");
+        assert_eq!(body["tools"][1]["type"], "text_editor_20250728");
+        assert_eq!(body["tools"][1]["name"], "str_replace_based_edit_tool");
+        assert_eq!(body["tools"][2]["name"], "grep");
+        assert_eq!(body["tools"][3]["type"], "web_search_20250305");
+        assert_eq!(body["tools"][4]["type"], "web_fetch_20250910");
+        assert_eq!(body["tools"][4]["citations"]["enabled"], true);
+        assert_eq!(
+            body["tools"][4]["cache_control"],
+            json!({
+                "type": "ephemeral",
+                "ttl": "1h",
+            })
+        );
+    }
+
+    #[test]
     fn messages_body_marks_latest_transcript_block_for_cache() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
@@ -494,6 +673,7 @@ mod tests {
                 })
                 .into(),
             ],
+            tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
             reasoning_effort: ReasoningEffort::XHigh,

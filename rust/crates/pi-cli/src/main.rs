@@ -4,9 +4,10 @@ use std::sync::Arc;
 use agent_core::AgentInput;
 use agent_provider::anthropic::AnthropicProvider;
 use agent_provider::openai::OpenAiProvider;
-use agent_provider::{ModelProvider, ModelRequest, PromptSections};
+use agent_provider::{ModelProvider, ModelRequest, PromptSections, ProviderToolProfile};
 use agent_session::{AgentSession, SessionAction, SessionInput};
 use agent_tools::{ToolContext, ToolRegistry};
+use agent_vocab::ProviderKind;
 
 #[tokio::main]
 async fn main() {
@@ -28,13 +29,17 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err("usage: pi-rs [claude|openai] [model] <prompt>".into());
     }
 
-    let provider: Arc<dyn ModelProvider> = match provider_name.as_str() {
-        "openai" => {
+    let provider_kind = match provider_name.as_str() {
+        "openai" => ProviderKind::OpenAi,
+        "claude" | "anthropic" => ProviderKind::Claude,
+        other => return Err(format!("unknown provider: {other}").into()),
+    };
+    let provider: Arc<dyn ModelProvider> = match provider_kind {
+        ProviderKind::OpenAi => {
             let (access_token, account_id) = read_codex_auth()?;
             Arc::new(OpenAiProvider::codex(access_token, account_id))
         }
-        "claude" | "anthropic" => Arc::new(AnthropicProvider::new(env::var("ANTHROPIC_API_KEY")?)),
-        other => return Err(format!("unknown provider: {other}").into()),
+        ProviderKind::Claude => Arc::new(AnthropicProvider::new(env::var("ANTHROPIC_API_KEY")?)),
     };
 
     let mut session = AgentSession::new();
@@ -71,7 +76,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 .into_iter()
                                 .map(Into::into)
                                 .collect(),
-                            tools: tools.definitions(),
+                            tool_profile: ProviderToolProfile::for_provider(provider_kind),
+                            tools: tools.definitions_for_provider(provider_kind),
                             max_tokens: None,
                             reasoning_effort: agent_vocab::ReasoningEffort::XHigh,
                             prompt_cache_key: None,

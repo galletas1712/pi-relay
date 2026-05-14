@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 use agent_vocab::{
-    AssistantMessage, ProviderReplayItem, ReasoningEffort, ToolDefinition, TranscriptItem,
+    AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolDefinition,
+    TranscriptItem,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -15,10 +16,28 @@ pub struct ModelRequest {
     pub model: String,
     pub prompt: PromptSections,
     pub transcript: Vec<ModelTranscriptEntry>,
+    pub tool_profile: ProviderToolProfile,
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub reasoning_effort: ReasoningEffort,
     pub prompt_cache_key: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderToolProfile {
+    None,
+    CustomDefinitions,
+    OpenAiCoding,
+    AnthropicCoding,
+}
+
+impl ProviderToolProfile {
+    pub fn for_provider(kind: ProviderKind) -> Self {
+        match kind {
+            ProviderKind::OpenAi => Self::OpenAiCoding,
+            ProviderKind::Claude => Self::AnthropicCoding,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

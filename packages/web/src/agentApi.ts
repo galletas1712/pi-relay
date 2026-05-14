@@ -10,7 +10,7 @@ import type {
 	QueuedInputStatus,
 	SessionSnapshot,
 	SessionSummary,
-	ToolDefinition,
+	ToolListing,
 	TranscriptItem
 } from "./types.ts";
 import type { HistoryPlacement } from "./historyTargets.ts";
@@ -27,7 +27,7 @@ export interface AgentApi {
 	listSessions(limit?: number): Promise<SessionSummary[]>;
 	getConfig(): Promise<DaemonConfig>;
 	setConfig(systemPrompt: string | null): Promise<DaemonConfig>;
-	listTools(): Promise<ToolDefinition[]>;
+	listTools(provider: string): Promise<ToolListing[]>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
 	getHistoryTree(sessionId: string): Promise<HistoryTree>;
 	subscribeEvents(sessionId: string, afterEventId: number | null): Promise<EventFrame[]>;
@@ -184,8 +184,8 @@ class AgentApiClient implements AgentApi {
 		return this.client.request<DaemonConfig>("config.set", { system_prompt: systemPrompt });
 	}
 
-	async listTools(): Promise<ToolDefinition[]> {
-		const result = await this.client.request<{ tools: ToolDefinition[] }>("tools.list");
+	async listTools(provider: string): Promise<ToolListing[]> {
+		const result = await this.client.request<{ tools: ToolListing[] }>("tools.list", { provider });
 		return result.tools;
 	}
 

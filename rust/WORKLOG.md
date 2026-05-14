@@ -1109,3 +1109,7 @@ paths. Changes made from that review:
   cargo check --manifest-path rust/Cargo.toml -p agent-daemon -p pi-cli`, and
   `RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/cc'
   cargo test --manifest-path rust/Cargo.toml -p agent-daemon`.
+
+- Mirrored Claude Code-style Anthropic request attribution in `agent-provider` after live 429s from the plain API-key request shape. The Anthropic provider now sends the Claude Code beta/identity headers (`claude-code-20250219`, `User-Agent: claude-cli/...`, `x-app`, session/request ids) and prepends the uncached `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli;` system block while keeping that provider-specific envelope out of core/session state.
+- Verified the attribution fix with a direct Anthropic Messages smoke: the same Claude Code keychain API key that had returned HTTP 429 succeeded with HTTP 200 once the identity/attribution envelope was present.
+- Rebuilt and restarted the daemon, then ran a real websocket Anthropic session using `claude-opus-4-7`/`xhigh`. The live turn exercised provider-native Bash, text editor create/view/replace, custom ripgrep, hosted web search, and hosted web fetch. The local tools completed successfully, OpenAI docs web search returned hosted results, web fetch returned an upstream inaccessible-URL result, and the turn finished `Graceful`. Postgres provider replay includes hosted `server_tool_use`, `web_search_tool_result`, and `web_fetch_tool_result` blocks, and model action usage shows prompt cache creation followed by cache reads.

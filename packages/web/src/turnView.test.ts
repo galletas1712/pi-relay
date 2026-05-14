@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildTurnViews, terminalModelStep } from "./turnView.ts";
+import { assistantMessageText, buildTurnViews, terminalModelStep } from "./turnView.ts";
 import type { AssistantItem, TranscriptEntry, TranscriptItem } from "./types.ts";
 
 describe("buildTurnViews", () => {
@@ -55,6 +55,15 @@ describe("buildTurnViews", () => {
 
 		expect(turn.outcome).toBe("Crashed");
 		expect(turn.modelSteps[0].phase).toBe("aborted");
+	});
+
+	it("does not inject paragraph breaks between adjacent provider text blocks", () => {
+		const item: Extract<TranscriptItem, { type: "assistant_message" }> = {
+			type: "assistant_message",
+			items: [text("describing it as "), text("OpenAI's interface"), text(", along with the endpoint.")]
+		};
+
+		expect(assistantMessageText(item)).toBe("describing it as OpenAI's interface, along with the endpoint.");
 	});
 });
 

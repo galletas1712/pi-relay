@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+agent-tools = { workspace = true }
 agent-vocab = { workspace = true }
 async-trait = { workspace = true }
 reqwest = { workspace = true }

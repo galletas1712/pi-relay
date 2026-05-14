@@ -743,6 +743,62 @@ pre {
 	margin: 1em 0;
 }
 
+.citation-list {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 6px;
+	margin: 8px 0;
+}
+
+.citation-label {
+	font-family: var(--font-mono);
+	font-size: 10.5px;
+	text-transform: uppercase;
+	color: var(--muted-foreground);
+}
+
+.citation-chip {
+	display: inline-flex;
+	min-width: 0;
+	max-width: 260px;
+	align-items: center;
+	gap: 6px;
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	background: color-mix(in oklch, var(--muted) 45%, transparent);
+	padding: 3px 8px 3px 4px;
+	color: var(--foreground);
+	text-decoration: none;
+}
+
+.citation-chip:hover {
+	border-color: color-mix(in oklch, var(--primary) 35%, var(--border));
+	background: color-mix(in oklch, var(--primary) 8%, var(--muted));
+}
+
+.citation-index {
+	display: inline-flex;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: center;
+	width: 18px;
+	height: 18px;
+	border-radius: 999px;
+	background: var(--background);
+	font-family: var(--font-mono);
+	font-size: 10.5px;
+	color: var(--muted-foreground);
+}
+
+.citation-title {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: 11.5px;
+}
+
 .thinking {
 	display: inline-flex;
 	margin: 4px 0;
@@ -948,6 +1004,89 @@ pre {
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
 	font-size: 11.5px;
+}
+
+.tool-card pre.tool-diff {
+	white-space: pre-wrap;
+}
+
+.tool-card pre.tool-file {
+	background: color-mix(in oklch, var(--background) 85%, transparent);
+}
+
+.edit-preview-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	border-bottom: 1px solid var(--border);
+	padding: 8px 10px;
+	font-family: var(--font-mono);
+	font-size: 12px;
+	color: var(--muted-foreground);
+}
+
+.edit-preview-file {
+	color: var(--foreground);
+	font-weight: 600;
+	overflow-wrap: anywhere;
+}
+
+.edit-count {
+	font-weight: 600;
+}
+
+.edit-count.add {
+	color: var(--success);
+}
+
+.edit-count.remove {
+	color: var(--destructive);
+}
+
+.edit-diff {
+	max-height: 360px;
+	overflow: auto;
+	font-family: var(--font-mono);
+	font-size: 11.5px;
+}
+
+.edit-diff-row {
+	display: grid;
+	grid-template-columns: 28px minmax(0, 1fr);
+	min-height: 22px;
+	align-items: start;
+}
+
+.edit-diff-row.add {
+	background: color-mix(in oklch, var(--success) 10%, transparent);
+}
+
+.edit-diff-row.remove {
+	background: color-mix(in oklch, var(--destructive) 10%, transparent);
+}
+
+.edit-diff-marker {
+	padding: 2px 8px;
+	text-align: right;
+	user-select: none;
+	color: var(--muted-foreground);
+}
+
+.edit-diff-row.add .edit-diff-marker,
+.edit-diff-row.add .edit-diff-text {
+	color: var(--success);
+}
+
+.edit-diff-row.remove .edit-diff-marker,
+.edit-diff-row.remove .edit-diff-text {
+	color: var(--destructive);
+}
+
+.edit-diff-text {
+	min-width: 0;
+	padding: 2px 10px 2px 4px;
+	white-space: pre-wrap;
+	overflow-wrap: anywhere;
 }
 
 .modal-scrim {

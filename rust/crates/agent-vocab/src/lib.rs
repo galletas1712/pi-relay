@@ -10,5 +10,8 @@ pub use crate::message::{
     AssistantItem, AssistantMessage, ContentBlock, ImageContent, ImageSource, ToolCall,
     ToolDefinition, ToolResultMessage, ToolResultStatus, UserMessage,
 };
-pub use crate::provider::{ProviderConfig, ProviderKind, ProviderReplayItem, ReasoningEffort};
+pub use crate::provider::{
+    ProviderConfig, ProviderKind, ProviderReplayItem, ReasoningEffort, ReplayDisplay,
+    ReplayDisplayKind,
+};
 pub use crate::transcript_item::{CompactionSummary, TranscriptItem, TurnOutcome};

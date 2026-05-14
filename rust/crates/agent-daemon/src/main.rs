@@ -28,7 +28,7 @@ use agent_store::{
     PostgresAgentStore, QueuedInputStatus, SessionConfig,
 };
 use agent_tools::{ToolContext, ToolRegistry};
-use agent_vocab::{ActionId, ProviderConfig, TranscriptItem, TurnId, TurnOutcome};
+use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -245,11 +245,22 @@ async fn dispatch_request(
         RpcMethod::HistoryRewind => history_rewind(state, params).await,
         RpcMethod::HistoryFork => history_fork(state, params).await,
         RpcMethod::TurnResume => turn_resume(state, params).await,
-        RpcMethod::ToolsList => Ok(json!({ "tools": state.tools.definitions() })),
+        RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }
+}
+
+fn tools_list(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let provider = required_string(&params, "provider")?;
+    let provider = provider.parse::<ProviderKind>().map_err(|error| {
+        RpcError::new(
+            "invalid_provider",
+            format!("invalid provider for tools.list: {error}"),
+        )
+    })?;
+    Ok(json!({ "tools": state.tools.listings_for_provider(provider) }))
 }
 
 async fn session_start(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

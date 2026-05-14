@@ -8,7 +8,7 @@ export type TurnOutcome = "Graceful" | "Interrupted" | "Crashed";
 export type ReasoningEffort = "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";
 
 export interface ProviderConfig {
-	kind: string;
+	kind: "openai" | "claude";
 	model: string;
 	reasoning_effort?: ReasoningEffort;
 	max_tokens?: number;
@@ -88,8 +88,15 @@ export type AssistantItem =
 	  };
 
 export interface ProviderReplayItem {
-	provider: "openai" | "codex" | "claude";
+	provider: "openai" | "claude";
 	raw_json: string;
+	display?: ReplayDisplay | null;
+}
+
+export interface ReplayDisplay {
+	kind: "local_tool" | "hosted_tool";
+	pretty_name: string;
+	input_summary?: string | null;
 }
 
 export interface ToolCall {
@@ -139,6 +146,11 @@ export interface ToolDefinition {
 	name: string;
 	description: string;
 	input_schema: unknown;
+}
+
+export interface ToolListing extends ToolDefinition {
+	pretty_name: string;
+	kind: "local_tool" | "hosted_tool";
 }
 
 export type NoticeTone = "info" | "success" | "error";

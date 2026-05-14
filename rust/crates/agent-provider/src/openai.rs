@@ -1,6 +1,8 @@
+use agent_tools::{builtin_tool_definition, tool_display, ToolDisplayInput};
 use agent_vocab::{
     AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
-    ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, UserMessage,
+    ProviderReplayItem, ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem,
+    UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::{
@@ -11,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::{
     ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError,
-    ProviderResult, ProviderUsage,
+    ProviderResult, ProviderToolProfile, ProviderUsage,
 };
 
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
@@ -35,15 +37,6 @@ impl OpenAiProvider {
             account_id,
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
         }
-    }
-
-    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
-        self.base_url = base_url.into();
-        self
-    }
-
-    pub fn with_responses_api(self) -> Self {
-        self
     }
 
     fn add_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -82,7 +75,7 @@ impl OpenAiProvider {
         let (status, text) = response_text(text).await?;
         ensure_success(status, &text)?;
 
-        parse_responses_sse(&text, ProviderKind::Codex)
+        parse_responses_sse(&text, ProviderKind::OpenAi)
     }
 }
 
@@ -131,7 +124,7 @@ fn response_excerpt(body: &str) -> String {
 
 fn responses_body(request: ModelRequest) -> ProviderResult<Value> {
     let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
-    let tools = response_tools(&request.tools);
+    let tools = response_tools(request.tool_profile, &request.tools)?;
     let prompt_cache_key = request
         .prompt_cache_key
         .unwrap_or_else(|| default_prompt_cache_key(&request.model, &request.prompt, &tools));
@@ -154,7 +147,21 @@ fn responses_body(request: ModelRequest) -> ProviderResult<Value> {
     Ok(body)
 }
 
-fn response_tools(tools: &[agent_vocab::ToolDefinition]) -> Vec<Value> {
+fn response_tools(
+    profile: ProviderToolProfile,
+    tools: &[agent_vocab::ToolDefinition],
+) -> ProviderResult<Vec<Value>> {
+    match profile {
+        ProviderToolProfile::None => Ok(Vec::new()),
+        ProviderToolProfile::CustomDefinitions => Ok(response_custom_definition_tools(tools)),
+        ProviderToolProfile::OpenAiCoding => Ok(openai_coding_tools()),
+        ProviderToolProfile::AnthropicCoding => Err(ProviderError::Provider(
+            "Anthropic coding tools cannot be sent to OpenAI".to_string(),
+        )),
+    }
+}
+
+fn response_custom_definition_tools(tools: &[agent_vocab::ToolDefinition]) -> Vec<Value> {
     let mut tools = tools.to_vec();
     tools.sort_by(|left, right| left.name.cmp(&right.name));
     tools
@@ -170,17 +177,97 @@ fn response_tools(tools: &[agent_vocab::ToolDefinition]) -> Vec<Value> {
         .collect()
 }
 
+const APPLY_PATCH_LARK_GRAMMAR: &str = r#"start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+filename: /(.+)/
+add_line: "+" /(.*)/ LF
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+%import common.LF
+"#;
+
+fn openai_coding_tools() -> Vec<Value> {
+    vec![
+        openai_apply_patch_tool(),
+        openai_grep_tool(),
+        openai_shell_tool(),
+        json!({
+            "type": "web_search",
+            "search_context_size": "high",
+        }),
+    ]
+}
+
+fn openai_apply_patch_tool() -> Value {
+    json!({
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Use apply_patch to edit files. This is a freeform grammar tool; emit the raw patch body, not JSON.",
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": APPLY_PATCH_LARK_GRAMMAR,
+        },
+    })
+}
+
+fn openai_shell_tool() -> Value {
+    json!({
+        "type": "function",
+        "name": "shell",
+        "description": "Run a local shell command in the session workspace.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Command argv to execute."
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "Workspace-relative working directory."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Optional command timeout in milliseconds."
+                }
+            },
+            "required": ["command"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn openai_grep_tool() -> Value {
+    let tool = builtin_tool_definition("grep").expect("grep tool must be registered");
+    json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.input_schema,
+    })
+}
+
 fn default_prompt_cache_key(
     model: &str,
     prompt: &crate::PromptSections,
     tools: &[Value],
 ) -> String {
     let mut hasher = StableHasher::new();
-    hasher.write_str("pi-relay:codex-responses:v1");
+    hasher.write_str("pi-relay:openai-responses:v1");
     hasher.write_str(model);
     hasher.write_str(prompt.stable_prefix.as_deref().unwrap_or_default());
     hasher.write_str(&serde_json::to_string(tools).unwrap_or_default());
-    format!("pi-relay-codex-{:016x}", hasher.finish())
+    format!("pi-relay-openai-{:016x}", hasher.finish())
 }
 
 fn openai_reasoning_effort(effort: ReasoningEffort) -> ProviderResult<&'static str> {
@@ -229,21 +316,12 @@ fn transcript_to_response_items(items: &[ModelTranscriptEntry]) -> ProviderResul
                         }));
                     }
                     for call in message.tool_calls() {
-                        responses.push(json!({
-                            "type": "function_call",
-                            "call_id": call.id.as_str(),
-                            "name": call.tool_name,
-                            "arguments": call.args_json,
-                        }));
+                        responses.push(response_tool_call_item(call));
                     }
                 }
             }
             TranscriptItem::ToolResult(result) => {
-                responses.push(json!({
-                    "type": "function_call_output",
-                    "call_id": result.tool_call_id.as_str(),
-                    "output": result.output,
-                }));
+                responses.push(response_tool_result_item(result));
             }
             TranscriptItem::TurnStarted { .. }
             | TranscriptItem::ToolCallStarted { .. }
@@ -251,6 +329,50 @@ fn transcript_to_response_items(items: &[ModelTranscriptEntry]) -> ProviderResul
         }
     }
     Ok(responses)
+}
+
+fn response_tool_call_item(call: &ToolCall) -> Value {
+    if call.tool_name == "apply_patch" {
+        let input = call
+            .args_value()
+            .ok()
+            .and_then(|value| {
+                value
+                    .get("input")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| call.args_json.clone());
+        json!({
+            "type": "custom_tool_call",
+            "call_id": call.id.as_str(),
+            "name": call.tool_name,
+            "input": input,
+        })
+    } else {
+        json!({
+            "type": "function_call",
+            "call_id": call.id.as_str(),
+            "name": call.tool_name,
+            "arguments": call.args_json,
+        })
+    }
+}
+
+fn response_tool_result_item(result: &agent_vocab::ToolResultMessage) -> Value {
+    if result.tool_name == "apply_patch" {
+        json!({
+            "type": "custom_tool_call_output",
+            "call_id": result.tool_call_id.as_str(),
+            "output": result.output,
+        })
+    } else {
+        json!({
+            "type": "function_call_output",
+            "call_id": result.tool_call_id.as_str(),
+            "output": result.output,
+        })
+    }
 }
 
 fn response_input_items(
@@ -272,7 +394,7 @@ fn response_input_items(
 fn openai_replay_items(replay: &[ProviderReplayItem]) -> ProviderResult<Vec<Value>> {
     replay
         .iter()
-        .filter(|record| matches!(record.provider, ProviderKind::OpenAi | ProviderKind::Codex))
+        .filter(|record| matches!(record.provider, ProviderKind::OpenAi))
         .map(|record| record.raw_value().map_err(ProviderError::Json))
         .collect()
 }
@@ -323,13 +445,12 @@ fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<Mod
                 return Err(ProviderError::Provider(message.to_string()));
             }
             Some("response.incomplete") => {
-                let reason = event
+                let message = event
                     .pointer("/response/incomplete_details/reason")
                     .and_then(Value::as_str)
-                    .unwrap_or("unknown");
-                return Err(ProviderError::Provider(format!(
-                    "response incomplete: {reason}"
-                )));
+                    .map(|reason| format!("response incomplete: {reason}"))
+                    .unwrap_or_else(|| "response incomplete".to_string());
+                return Err(ProviderError::Provider(message));
             }
             Some("response.completed") => {
                 usage = event.pointer("/response/usage").and_then(openai_usage);
@@ -359,11 +480,13 @@ fn parse_response_output_item(
     let item_type = item
         .get("type")
         .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    provider_replay.push(ProviderReplayItem::new(provider, item)?);
+        .ok_or_else(|| ProviderError::Provider("OpenAI output item missing type".to_string()))?;
+    let display = openai_provider_replay_display(provider, item);
+    provider_replay.push(ProviderReplayItem::new_with_display(
+        provider, item, display,
+    )?);
 
-    match item_type.as_str() {
+    match item_type {
         "message" => {
             if item.get("role").and_then(Value::as_str) != Some("assistant") {
                 return Ok(());
@@ -373,7 +496,7 @@ fn parse_response_output_item(
                     if part.get("type").and_then(Value::as_str) == Some("output_text") {
                         if let Some(text) = part.get("text").and_then(Value::as_str) {
                             if !text.is_empty() {
-                                items.push(AssistantItem::Text(text.to_string()));
+                                push_text_item(items, text);
                             }
                         }
                     }
@@ -381,25 +504,96 @@ fn parse_response_output_item(
             }
         }
         "function_call" => {
-            let call_id = item
-                .get("call_id")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+            let call_id = item.get("call_id").and_then(Value::as_str).ok_or_else(|| {
+                ProviderError::Provider("OpenAI function_call missing call_id".to_string())
+            })?;
+            let name = item.get("name").and_then(Value::as_str).ok_or_else(|| {
+                ProviderError::Provider("OpenAI function_call missing name".to_string())
+            })?;
             let arguments = item
                 .get("arguments")
                 .and_then(Value::as_str)
-                .unwrap_or("{}");
+                .ok_or_else(|| {
+                    ProviderError::Provider("OpenAI function_call missing arguments".to_string())
+                })?;
             items.push(AssistantItem::ToolCall(ToolCall {
                 id: ToolCallId::new(call_id),
                 tool_name: name.to_string(),
                 args_json: arguments.to_string(),
             }));
         }
+        "custom_tool_call" => {
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProviderError::Provider("OpenAI custom_tool_call missing call_id".to_string())
+                })?;
+            let name = item.get("name").and_then(Value::as_str).ok_or_else(|| {
+                ProviderError::Provider("OpenAI custom_tool_call missing name".to_string())
+            })?;
+            let input = item.get("input").and_then(Value::as_str).ok_or_else(|| {
+                ProviderError::Provider("OpenAI custom_tool_call missing input".to_string())
+            })?;
+            items.push(AssistantItem::ToolCall(ToolCall {
+                id: ToolCallId::new(call_id),
+                tool_name: name.to_string(),
+                args_json: json!({ "input": input }).to_string(),
+            }));
+        }
         "reasoning" | "reasoning_summary" => {}
         _ => {}
     }
     Ok(())
+}
+
+fn openai_provider_replay_display(provider: ProviderKind, item: &Value) -> Option<ReplayDisplay> {
+    match item.get("type").and_then(Value::as_str)? {
+        "web_search_call" => {
+            let action = item.get("action")?;
+            let tool_name = match action.get("type").and_then(Value::as_str)? {
+                "search" => "web_search",
+                "open_page" => "open_page",
+                _ => return None,
+            };
+            tool_display(
+                provider,
+                tool_name,
+                ToolDisplayInput::HostedTool,
+                Some(action),
+            )
+        }
+        "function_call" => {
+            let name = item.get("name").and_then(Value::as_str)?;
+            let arguments = item
+                .get("arguments")
+                .and_then(Value::as_str)
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())?;
+            tool_display(
+                provider,
+                name,
+                ToolDisplayInput::LocalTool,
+                Some(&arguments),
+            )
+        }
+        "custom_tool_call" => {
+            let name = item.get("name").and_then(Value::as_str)?;
+            tool_display(provider, name, ToolDisplayInput::LocalTool, None)
+        }
+        _ => None,
+    }
+}
+
+fn push_text_item(items: &mut Vec<AssistantItem>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(AssistantItem::Text(previous)) = items.last_mut() {
+        previous.push_str(text);
+    } else {
+        items.push(AssistantItem::Text(text.to_string()));
+    }
 }
 
 fn openai_usage(value: &Value) -> Option<ProviderUsage> {
@@ -498,6 +692,7 @@ mod tests {
             model: "gpt-5.5".to_string(),
             prompt: PromptSections::default(),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
             reasoning_effort: ReasoningEffort::Medium,
@@ -510,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_body_sets_codex_request_shape() {
+    fn responses_body_sets_openai_request_shape() {
         let body = responses_body(ModelRequest {
             model: "gpt-5.5".to_string(),
             prompt: PromptSections::new(
@@ -518,6 +713,7 @@ mod tests {
                 Some("cwd: /tmp/project".to_string()),
             ),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![ToolDefinition {
                 name: "read".to_string(),
                 description: "read a file".to_string(),
@@ -562,6 +758,7 @@ mod tests {
                 Some("cwd: /tmp/one".to_string()),
             ),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
             reasoning_effort: ReasoningEffort::Medium,
@@ -575,6 +772,7 @@ mod tests {
                 Some("cwd: /tmp/two".to_string()),
             ),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("changed")).into()],
+            tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
             reasoning_effort: ReasoningEffort::High,
@@ -583,7 +781,7 @@ mod tests {
         .expect("responses body renders");
 
         let key = first["prompt_cache_key"].as_str().expect("cache key");
-        assert!(key.starts_with("pi-relay-codex-"));
+        assert!(key.starts_with("pi-relay-openai-"));
         assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
         assert!(first.get("prompt_cache_retention").is_none());
         assert_eq!(first["service_tier"], "priority");
@@ -600,6 +798,7 @@ mod tests {
                 Some("workspace: /tmp/pi".to_string()),
             ),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
             tools: Vec::new(),
             max_tokens: None,
             reasoning_effort: ReasoningEffort::Medium,
@@ -619,6 +818,7 @@ mod tests {
             model: "gpt-5.5".to_string(),
             prompt: PromptSections::stable("stable agent rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![
                 ToolDefinition {
                     name: "write".to_string(),
@@ -639,6 +839,29 @@ mod tests {
 
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["tools"][1]["name"], "write");
+    }
+
+    #[test]
+    fn responses_body_renders_openai_native_coding_tools() {
+        let body = responses_body(ModelRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::stable("stable agent rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::OpenAiCoding,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::XHigh,
+            prompt_cache_key: None,
+        })
+        .expect("responses body renders");
+
+        assert_eq!(body["tools"][0]["type"], "custom");
+        assert_eq!(body["tools"][0]["name"], "apply_patch");
+        assert_eq!(body["tools"][1]["name"], "grep");
+        assert_eq!(body["tools"][2]["type"], "function");
+        assert_eq!(body["tools"][2]["name"], "shell");
+        assert_eq!(body["tools"][3]["type"], "web_search");
+        assert_eq!(body["tools"][3]["search_context_size"], "high");
     }
 
     #[test]
@@ -676,7 +899,7 @@ data: {"type":"response.output_item.done","item":{"type":"function_call","call_i
 data: {"type":"response.completed","response":{"id":"resp_1"}}
 "#;
 
-        let response = parse_responses_sse(sse, ProviderKind::Codex).expect("sse parses");
+        let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
         let assistant = response.assistant;
 
         assert_eq!(assistant.text(), "hello");
@@ -693,7 +916,28 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
             response.provider_replay[1].raw_type().as_deref(),
             Some("function_call")
         );
-        assert_eq!(response.provider_replay[0].provider, ProviderKind::Codex);
+        assert_eq!(response.provider_replay[0].provider, ProviderKind::OpenAi);
+    }
+
+    #[test]
+    fn responses_sse_parses_custom_and_function_calls() {
+        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_shell","name":"shell","arguments":"{\"command\":[\"pwd\"],\"timeout_ms\":120000}","status":"completed"}}
+data: {"type":"response.completed","response":{"id":"resp_1"}}
+"#;
+
+        let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
+        let calls = response.assistant.tool_calls().collect::<Vec<_>>();
+
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].tool_name, "apply_patch");
+        assert_eq!(
+            calls[0].args_value().unwrap()["input"],
+            "*** Begin Patch\n*** End Patch\n"
+        );
+        assert_eq!(calls[1].tool_name, "shell");
+        assert_eq!(calls[1].args_value().unwrap()["command"], json!(["pwd"]));
+        assert_eq!(calls[1].args_value().unwrap()["timeout_ms"], 120000);
     }
 
     #[test]
@@ -701,7 +945,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
         let sse = r#"data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":80}}}}
 "#;
 
-        let response = parse_responses_sse(sse, ProviderKind::Codex).expect("sse parses");
+        let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
         let usage = response.usage.expect("usage should be parsed");
 
         assert_eq!(usage.input_tokens, Some(100));
