@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assistantRenderParts, editToolPreview } from "./transcript.tsx";
+import { assistantRenderParts, editToolPreview, isScrolledAtBottom } from "./transcript.tsx";
 import type { AssistantItem, ProviderReplayItem } from "./types.ts";
 
 describe("assistantRenderParts", () => {
@@ -76,3 +76,14 @@ function replay(provider: ProviderReplayItem["provider"], raw: unknown, display:
 		display
 	};
 }
+
+describe("isScrolledAtBottom", () => {
+	it("only treats the exact bottom as pinned", () => {
+		expect(isScrolledAtBottom({ scrollHeight: 1000, scrollTop: 600, clientHeight: 400 })).toBe(true);
+		expect(isScrolledAtBottom({ scrollHeight: 1000, scrollTop: 599, clientHeight: 400 })).toBe(false);
+	});
+
+	it("treats overscroll past the bottom as pinned", () => {
+		expect(isScrolledAtBottom({ scrollHeight: 1000, scrollTop: 601, clientHeight: 400 })).toBe(true);
+	});
+});

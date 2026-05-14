@@ -785,6 +785,7 @@ export function App() {
 					activeLeafId={snapshot?.active_leaf_id ?? null}
 					isRunning={snapshot?.activity === "running"}
 					hasSession={!!selectedId}
+					sessionId={selectedId}
 					onResumeTurn={(entryId) => {
 						void resumeTerminalTurn(entryId).catch((error) => pushNotice("error", errorMessage(error)));
 					}}

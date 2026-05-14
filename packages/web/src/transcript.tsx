@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useMemo, useRef, useState, type UIEvent } from "react";
 import { AlertTriangle, Check, ChevronDown, Copy, Globe2, Loader2, RotateCcw, Terminal, Wrench } from "lucide-react";
 import rehypeRaw from "rehype-raw";
 import ReactMarkdown from "react-markdown";
@@ -12,11 +12,18 @@ import type { AssistantItem, NoticeTone, ReplayDisplay, TranscriptEntry, Transcr
 
 type ToolResultItem = Extract<TranscriptItem, { type: "tool_result" }>;
 
+type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
+
+export function isScrolledAtBottom(node: ScrollMetrics): boolean {
+	return node.scrollHeight - node.scrollTop - node.clientHeight <= 0;
+}
+
 export function MessageList({
 	entries,
 	activeLeafId,
 	isRunning,
 	hasSession,
+	sessionId,
 	onResumeTurn,
 	resumingTurnId
 }: {
@@ -24,19 +31,40 @@ export function MessageList({
 	activeLeafId: string | null;
 	isRunning: boolean;
 	hasSession: boolean;
+	sessionId?: string | null;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
 }) {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
+	const shouldStickToBottomRef = useRef(true);
+	const scrollResetKeyRef = useRef<string | null | undefined>(undefined);
 	const visibleEntries = useMemo(
 		() => (hasSession ? branchEntriesFor(entries, activeLeafId) : entries),
 		[activeLeafId, entries, hasSession]
 	);
-	useEffect(() => {
+
+	const scrollToBottom = useCallback(() => {
 		const node = scrollRef.current;
 		if (!node) return;
 		node.scrollTop = node.scrollHeight;
-	}, [visibleEntries.length]);
+		shouldStickToBottomRef.current = true;
+	}, []);
+
+	const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
+		shouldStickToBottomRef.current = isScrolledAtBottom(event.currentTarget);
+	}, []);
+
+	useLayoutEffect(() => {
+		const resetKey = hasSession ? (sessionId ?? "__active_session__") : null;
+		if (scrollResetKeyRef.current === resetKey) return;
+		scrollResetKeyRef.current = resetKey;
+		scrollToBottom();
+	}, [hasSession, scrollToBottom, sessionId]);
+
+	useLayoutEffect(() => {
+		if (!shouldStickToBottomRef.current) return;
+		scrollToBottom();
+	}, [isRunning, scrollToBottom, visibleEntries]);
 	const toolIndex = useMemo(() => indexToolEntries(visibleEntries), [visibleEntries]);
 	const modelStepsByEntry = useMemo(() => {
 		const steps = new Map<string, ModelStepView>();
@@ -48,7 +76,7 @@ export function MessageList({
 
 	if (!hasSession) {
 		return (
-			<div className="message-scroll" ref={scrollRef}>
+			<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 				<div className="empty-state">
 					<Terminal size={34} />
 					<span>Select or create a session</span>
@@ -58,7 +86,7 @@ export function MessageList({
 	}
 
 	return (
-		<div className="message-scroll" ref={scrollRef}>
+		<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 			{visibleEntries.map((entry) => (
 				<TranscriptEntryView
 					entry={entry}
