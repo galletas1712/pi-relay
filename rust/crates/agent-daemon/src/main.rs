@@ -231,6 +231,7 @@ async fn dispatch_request(
         RpcMethod::SessionGet => session_get(state, params).await,
         RpcMethod::SessionRename => session_rename(state, params).await,
         RpcMethod::SessionConfigure => session_configure(state, params).await,
+        RpcMethod::SessionDelete => session_delete(state, params).await,
         RpcMethod::ConfigGet => config_get(state).await,
         RpcMethod::ConfigSet => config_set(state, params).await,
         RpcMethod::EventsSubscribe => {
@@ -408,6 +409,36 @@ async fn session_rename(state: &AppState, params: Value) -> std::result::Result<
         "session_id": session_id,
         "title": title,
         "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?
+    }))
+}
+
+async fn session_delete(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    if !state
+        .repo
+        .session_exists(&session_id)
+        .await
+        .map_err(anyhow::Error::from)?
+    {
+        return Err(RpcError::new("session_not_found", "session not found"));
+    }
+
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.ensure_idle_for_source_mutation().await?;
+    state.active.lock().await.remove(&session_id);
+
+    let deleted = state
+        .repo
+        .delete_session(&session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    if !deleted {
+        return Err(RpcError::new("session_not_found", "session not found"));
+    }
+
+    Ok(json!({
+        "session_id": session_id,
+        "deleted": true,
     }))
 }
 

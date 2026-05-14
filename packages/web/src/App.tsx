@@ -55,6 +55,11 @@ type HistoryDialogState = {
 	initialForkTitle?: string;
 };
 
+type DeleteDialogState = {
+	session: SessionListItem;
+	deleting: boolean;
+};
+
 export function App() {
 	const api = useMemo(() => createAgentApi(), []);
 	const [connection, setConnection] = useState<ConnectionStatus>("connecting");
@@ -79,6 +84,7 @@ export function App() {
 	const [exportDialog, setExportDialog] = useState<ExportDialogState | null>(null);
 	const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
 	const [renameValue, setRenameValue] = useState("");
+	const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
 
 	const refreshTimer = useRef<number | null>(null);
 	const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -352,6 +358,46 @@ export function App() {
 		},
 		[api, loadSessions, pushNotice, refreshSelected]
 	);
+
+	const closeDeleteDialog = useCallback(() => {
+		setDeleteDialog(null);
+	}, []);
+
+	const deleteSession = useCallback(async () => {
+		if (!deleteDialog || deleteDialog.deleting) return;
+		setDeleteDialog((current) => (current ? { ...current, deleting: true } : current));
+		const session = deleteDialog.session;
+		const sessionId = session.session_id;
+		const title = sessionTitle(session);
+		try {
+			const current = sessionId === selectedRef.current ? await refreshSelected(sessionId) : null;
+			const activity = current?.snapshot.activity ?? session.activity;
+			if (activity !== "idle") throw new Error("only idle sessions can be deleted");
+
+			await api.deleteSession(sessionId);
+			if (refreshTimer.current !== null) {
+				window.clearTimeout(refreshTimer.current);
+				refreshTimer.current = null;
+			}
+			lastEventIds.current.delete(sessionId);
+			pendingComposerBySession.current.delete(sessionId);
+			setSessions((currentSessions) => currentSessions.filter((session) => session.session_id !== sessionId));
+
+			if (selectedRef.current === sessionId) {
+				selectSession(null);
+				setSnapshot(null);
+				setEntries([]);
+				setComposer("");
+			}
+
+			closeDeleteDialog();
+			await loadSessions();
+			pushNotice("success", `deleted “${truncate(title, 80)}”`);
+		} catch (error) {
+			setDeleteDialog((current) => (current?.session.session_id === sessionId ? { ...current, deleting: false } : current));
+			throw error;
+		}
+	}, [api, closeDeleteDialog, deleteDialog, loadSessions, pushNotice, refreshSelected, selectSession]);
 
 	const slashState = useMemo<{ visible: boolean; commands: typeof COMMANDS }>(() => {
 		const prefix = matchSlashPrefix(composer);
@@ -708,6 +754,7 @@ export function App() {
 							onArchiveToggle={() => {
 								void setSessionArchived(session, !isArchivedSession(session)).catch((error) => pushNotice("error", errorMessage(error)));
 							}}
+							onDelete={() => setDeleteDialog({ session, deleting: false })}
 						/>
 					))}
 					{filteredSessions.length === 0 ? <div className="empty-list">No sessions</div> : null}
@@ -786,6 +833,17 @@ export function App() {
 				/>
 			) : null}
 
+			{deleteDialog ? (
+				<DeleteSessionDialog
+					session={deleteDialog.session}
+					deleting={deleteDialog.deleting}
+					onClose={closeDeleteDialog}
+					onConfirm={() => {
+						void deleteSession().catch((error) => pushNotice("error", errorMessage(error)));
+					}}
+				/>
+			) : null}
+
 			{historyDialog ? (
 				<HistoryPickerDialog
 					mode={historyDialog.mode}
@@ -856,6 +914,46 @@ function RenameSessionDialog({
 						<button type="submit" className="primary-button">Save</button>
 					</div>
 				</form>
+			</div>
+		</div>
+	);
+}
+
+function DeleteSessionDialog({
+	session,
+	deleting,
+	onClose,
+	onConfirm
+}: {
+	session: SessionListItem;
+	deleting: boolean;
+	onClose: () => void;
+	onConfirm: () => void;
+}) {
+	const title = sessionTitle(session);
+	return (
+		<div className="modal-scrim" role="presentation" onMouseDown={deleting ? undefined : onClose}>
+			<div className="rename-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+				<div className="rename-dialog-head">
+					<div className="rename-dialog-copy">
+						<h2 id="delete-dialog-title">Delete session</h2>
+					</div>
+					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close delete dialog" disabled={deleting}>
+						×
+					</button>
+				</div>
+				<div className="delete-dialog-body">
+					<p>
+						Delete <strong>{title}</strong> permanently?
+					</p>
+					<p className="muted">This removes the transcript, queued inputs, actions, and events for this session. This cannot be undone.</p>
+				</div>
+				<div className="rename-actions">
+					<button type="button" className="secondary-button" onClick={onClose} disabled={deleting}>Cancel</button>
+					<button type="button" className="primary-button destructive" onClick={onConfirm} disabled={deleting}>
+						{deleting ? "Deleting..." : "Delete"}
+					</button>
+				</div>
 			</div>
 		</div>
 	);

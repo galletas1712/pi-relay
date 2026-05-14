@@ -251,6 +251,11 @@ pre {
 	font-weight: 600;
 }
 
+.primary-button.destructive {
+	background: var(--destructive);
+	color: white;
+}
+
 .icon-button {
 	width: 32px;
 	color: var(--muted-foreground);
@@ -260,6 +265,11 @@ pre {
 	width: 26px;
 	height: 26px;
 	margin-left: 4px;
+}
+
+.icon-button:disabled {
+	cursor: not-allowed;
+	opacity: 0.55;
 }
 
 .icon-button:hover,
@@ -397,8 +407,19 @@ pre {
 	outline: none;
 }
 
+.session-row-action.danger:hover,
+.session-row-action.danger:focus-visible {
+	background: color-mix(in oklch, var(--destructive) 16%, transparent);
+	color: var(--destructive);
+}
+
 .session-row.selected .session-row-action {
 	color: var(--accent-foreground);
+}
+
+.session-row.selected .session-row-action.danger:hover,
+.session-row.selected .session-row-action.danger:focus-visible {
+	color: var(--destructive);
 }
 
 .empty-list,
@@ -1248,6 +1269,21 @@ pre {
 	box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 35%, transparent);
 }
 
+.delete-dialog-body {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	padding: 14px 16px;
+}
+
+.delete-dialog-body p {
+	margin: 0;
+}
+
+.delete-dialog-body strong {
+	overflow-wrap: anywhere;
+}
+
 .rename-actions {
 	display: flex;
 	justify-content: flex-end;
@@ -1963,4 +1999,9 @@ pre {
 .secondary-button:disabled {
 	cursor: not-allowed;
 	opacity: 0.55;
+}
+
+.primary-button.destructive:disabled {
+	background: var(--destructive);
+	color: white;
 }

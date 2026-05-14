@@ -39,6 +39,7 @@ export interface AgentApi {
 	rewindHistory(params: RewindHistoryParams): Promise<RewindHistoryResult>;
 	forkHistory(params: ForkHistoryParams): Promise<ForkHistoryResult>;
 	renameSession(sessionId: string, title: string): Promise<RenameSessionResult>;
+	deleteSession(sessionId: string): Promise<DeleteSessionResult>;
 	configureSession(params: ConfigureSessionParams): Promise<ConfigureSessionResult>;
 	promoteQueuedInput(sessionId: string, inputId: string): Promise<PromoteQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
@@ -119,6 +120,11 @@ export interface RenameSessionResult {
 	session_id: string;
 	title: string;
 	activity: Activity;
+}
+
+export interface DeleteSessionResult {
+	session_id: string;
+	deleted: boolean;
 }
 
 export interface ConfigureSessionResult {
@@ -264,6 +270,12 @@ class AgentApiClient implements AgentApi {
 		return this.client.request<RenameSessionResult>("session.rename", {
 			session_id: sessionId,
 			title
+		});
+	}
+
+	deleteSession(sessionId: string): Promise<DeleteSessionResult> {
+		return this.client.request<DeleteSessionResult>("session.delete", {
+			session_id: sessionId
 		});
 	}
 

@@ -6,7 +6,8 @@ import {
 	PanelRightOpen,
 	Plus,
 	Search,
-	Settings
+	Settings,
+	Trash2
 } from "lucide-react";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { COMMANDS } from "./slash.ts";
@@ -93,16 +94,19 @@ export function SessionRow({
 	selected,
 	onSelect,
 	onRename,
-	onArchiveToggle
+	onArchiveToggle,
+	onDelete
 }: {
 	session: SessionListItem;
 	selected: boolean;
 	onSelect: () => void;
 	onRename: () => void;
 	onArchiveToggle: () => void;
+	onDelete: () => void;
 }) {
 	const archived = isArchivedSession(session);
 	const canArchive = session.activity === "idle";
+	const canDelete = session.activity === "idle";
 	const ArchiveIcon = archived ? ArchiveRestore : Archive;
 	return (
 		<button className={`session-row ${selected ? "selected" : ""} ${archived ? "archived" : ""}`} type="button" onClick={onSelect}>
@@ -154,6 +158,26 @@ export function SessionRow({
 				}}
 			>
 				<ArchiveIcon size={13} />
+			</span>
+			<span
+				className={`session-row-action danger ${canDelete ? "" : "disabled"}`}
+				role="button"
+				tabIndex={canDelete ? 0 : -1}
+				title={canDelete ? "delete session" : "only idle sessions can be deleted"}
+				aria-label={`delete ${sessionTitle(session)}`}
+				aria-disabled={!canDelete}
+				onClick={(event) => {
+					event.stopPropagation();
+					if (canDelete) onDelete();
+				}}
+				onKeyDown={(event) => {
+					if (!canDelete || (event.key !== "Enter" && event.key !== " ")) return;
+					event.preventDefault();
+					event.stopPropagation();
+					onDelete();
+				}}
+			>
+				<Trash2 size={13} />
 			</span>
 		</button>
 	);

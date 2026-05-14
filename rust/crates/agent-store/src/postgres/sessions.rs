@@ -136,6 +136,14 @@ impl PostgresAgentStore {
         Ok(vec![event])
     }
 
+    pub async fn delete_session(&self, session_id: &str) -> Result<bool> {
+        let result = sqlx::query("delete from sessions where id=$1")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn configure_session(
         &self,
         session_id: &str,
