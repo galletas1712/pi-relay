@@ -112,7 +112,9 @@ pub(crate) async fn run_compaction(
 
 fn dynamic_prompt_context(state: &AppState) -> String {
     format!(
-        "Current working directory: {}",
+        "Current working directory: {}\n\
+         The bash tool runs each command in a fresh shell rooted here; chain commands with `&&` \
+         (or call `cd` inside the command) when you need to scope work to a subdirectory.",
         state.tool_context.cwd.display()
     )
 }

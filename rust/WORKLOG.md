@@ -1,5 +1,63 @@
 # Rust Rewrite Worklog
 
+## 2026-05-14
+
+### Unify Shell Tool As `bash` For Both Providers
+
+Replaced the diverging shell surfaces (OpenAI custom `shell` function tool and
+Anthropic native `bash_20250124`) with a single custom function tool named
+`bash`, registered identically for both providers via the existing builtin
+tool registry.
+
+Motivation: the daemon spawns a fresh `sh -lc` per call, so the persistent-
+session contract Anthropic advertises for `bash_20250124` (and the `restart`
+op the model is trained to use) was a misrepresentation of what the runtime
+actually does. Going custom on both sides keeps the model's expectations
+aligned with the runtime, removes the per-provider tool divergence for
+shell, and lets the registry/display layer treat bash uniformly. The edit
+tools (`apply_patch` for OpenAI, `text_editor_20250728` for Anthropic) stay
+provider-native because their schemas are semantically rich enough to be
+worth the provider training prior.
+
+Changes:
+
+- `agent-tools`: collapsed `BashTool`/`ShellTool` into one `BashTool` whose
+  definition is registered for both providers. Schema is
+  `{ command: string | argv, timeout_ms?: integer }` — the `workdir`
+  override was removed since the daemon workspace is fixed at launch and
+  the model can chain with `&&` or call `cd` inside the command instead.
+- `agent-provider/openai.rs`: removed `openai_shell_tool()`. The OpenAI
+  coding profile now renders `bash` and `grep` through one shared
+  `openai_function_from_builtin` helper.
+- `agent-provider/anthropic.rs`: replaced the `{type: bash_20250124, name: bash}`
+  literal with the same custom-function rendering used for `grep`.
+- `agent-daemon`: added a one-line nudge to the dynamic prompt context so the
+  model is told explicitly that each bash call runs in a fresh shell. This
+  hedges against Claude's prior toward `bash_20250124`'s persistence
+  semantics, costs ~30 tokens, and sits in dynamic context so it does not
+  perturb the cached stable prefix.
+- Updated provider tests for the new tool ordering and SSE fixtures, plus
+  the registry/display tests that asserted the old `shell`/`bash` split.
+
+Rollout requires a DB migration. An untracked
+`scripts/migrate_shell_to_bash.py` walks JSONB recursively in
+`transcript_entries.item`, `transcript_entries.provider_replay` (including
+nested `raw_json` strings from OpenAI function_call replay items),
+`actions.payload`, and `events.payload`, rewriting `tool_name: "shell"`
+and `name: "shell"` to `"bash"`. The procedure is: stop the daemon, drain
+in-flight actions (or accept they will be marked stale), `pg_dump`,
+`--dry-run`, then run for real. Anthropic-side sessions need no migration
+because the wire-level tool name has always been `"bash"` — only the
+wrapper `type` changes, and that lives in the regenerated request body.
+
+Verification:
+
+- `cargo check --workspace` passes.
+- `agent-tools` (8 tests), `agent-provider` (28 tests), `agent-core`
+  (22 tests), `agent-session` (69 tests), `agent-store` (2 tests),
+  `agent-daemon` (3 tests), and `agent-vocab` (4 tests) all pass under the
+  Apple SDK/linker environment.
+
 ## 2026-05-13
 
 ### Provider Replay Sidecar Cleanup

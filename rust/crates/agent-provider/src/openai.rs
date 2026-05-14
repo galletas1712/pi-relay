@@ -305,8 +305,8 @@ eof_line: "*** End of File" LF
 fn openai_coding_tools() -> Vec<Value> {
     vec![
         openai_apply_patch_tool(),
-        openai_grep_tool(),
-        openai_shell_tool(),
+        openai_function_from_builtin("bash"),
+        openai_function_from_builtin("grep"),
         json!({
             "type": "web_search",
             "search_context_size": "high",
@@ -327,36 +327,9 @@ fn openai_apply_patch_tool() -> Value {
     })
 }
 
-fn openai_shell_tool() -> Value {
-    json!({
-        "type": "function",
-        "name": "shell",
-        "description": "Run a local shell command in the session workspace.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "array",
-                    "items": { "type": "string" },
-                    "description": "Command argv to execute."
-                },
-                "workdir": {
-                    "type": "string",
-                    "description": "Workspace-relative working directory."
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "description": "Optional command timeout in milliseconds."
-                }
-            },
-            "required": ["command"],
-            "additionalProperties": false
-        }
-    })
-}
-
-fn openai_grep_tool() -> Value {
-    let tool = builtin_tool_definition("grep").expect("grep tool must be registered");
+fn openai_function_from_builtin(name: &str) -> Value {
+    let tool = builtin_tool_definition(name)
+        .unwrap_or_else(|| panic!("{name} tool must be registered"));
     json!({
         "type": "function",
         "name": tool.name,
@@ -1033,9 +1006,10 @@ mod tests {
 
         assert_eq!(body["tools"][0]["type"], "custom");
         assert_eq!(body["tools"][0]["name"], "apply_patch");
-        assert_eq!(body["tools"][1]["name"], "grep");
+        assert_eq!(body["tools"][1]["type"], "function");
+        assert_eq!(body["tools"][1]["name"], "bash");
         assert_eq!(body["tools"][2]["type"], "function");
-        assert_eq!(body["tools"][2]["name"], "shell");
+        assert_eq!(body["tools"][2]["name"], "grep");
         assert_eq!(body["tools"][3]["type"], "web_search");
         assert_eq!(body["tools"][3]["search_context_size"], "high");
     }
@@ -1098,7 +1072,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     #[test]
     fn responses_sse_parses_custom_and_function_calls() {
         let sse = r#"data: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}
-data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_shell","name":"shell","arguments":"{\"command\":[\"pwd\"],\"timeout_ms\":120000}","status":"completed"}}
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_bash","name":"bash","arguments":"{\"command\":[\"pwd\"],\"timeout_ms\":120000}","status":"completed"}}
 data: {"type":"response.completed","response":{"id":"resp_1"}}
 "#;
 
@@ -1111,7 +1085,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
             calls[0].args_value().unwrap()["input"],
             "*** Begin Patch\n*** End Patch\n"
         );
-        assert_eq!(calls[1].tool_name, "shell");
+        assert_eq!(calls[1].tool_name, "bash");
         assert_eq!(calls[1].args_value().unwrap()["command"], json!(["pwd"]));
         assert_eq!(calls[1].args_value().unwrap()["timeout_ms"], 120000);
     }

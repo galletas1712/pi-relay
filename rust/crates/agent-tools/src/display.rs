@@ -35,10 +35,10 @@ const TOOL_DISPLAY_SPECS: &[ToolDisplaySpec] = &[
     },
     ToolDisplaySpec {
         name: "bash",
-        provider: Some(ProviderKind::Claude),
+        provider: None,
         kind: ToolDisplayInput::LocalTool,
         pretty_name: "Bash",
-        summary: ToolSummary::Field("command"),
+        summary: ToolSummary::ShellCommand,
     },
     ToolDisplaySpec {
         name: "grep",
@@ -53,13 +53,6 @@ const TOOL_DISPLAY_SPECS: &[ToolDisplaySpec] = &[
         kind: ToolDisplayInput::HostedTool,
         pretty_name: "Open page",
         summary: ToolSummary::Field("url"),
-    },
-    ToolDisplaySpec {
-        name: "shell",
-        provider: Some(ProviderKind::OpenAi),
-        kind: ToolDisplayInput::LocalTool,
-        pretty_name: "Bash",
-        summary: ToolSummary::ShellCommand,
     },
     ToolDisplaySpec {
         name: "str_replace_based_edit_tool",
@@ -261,7 +254,7 @@ mod tests {
         assert_eq!(
             tool_display(
                 ProviderKind::OpenAi,
-                "shell",
+                "bash",
                 ToolDisplayInput::LocalTool,
                 Some(&json!({ "command": ["pwd"] })),
             ),
@@ -274,11 +267,15 @@ mod tests {
         assert_eq!(
             tool_display(
                 ProviderKind::Claude,
-                "shell",
+                "bash",
                 ToolDisplayInput::LocalTool,
-                Some(&json!({ "command": ["pwd"] })),
+                Some(&json!({ "command": "pwd && ls" })),
             ),
-            None
+            Some(ReplayDisplay {
+                kind: ReplayDisplayKind::LocalTool,
+                pretty_name: "Bash".to_string(),
+                input_summary: Some("pwd && ls".to_string()),
+            })
         );
     }
 }

@@ -5,24 +5,24 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::context::{workspace_path, ToolContext};
+use crate::context::ToolContext;
 use crate::error::{ToolError, ToolResult};
 use crate::output::limit_tool_output;
 use crate::registry::AgentTool;
 
+/// Single shell tool, registered as `bash` for both providers.
+///
+/// Each call runs in a fresh `sh -lc` subprocess rooted at the daemon
+/// workspace. There is no persistent shell state across calls and no
+/// per-call working-directory override — the model is told to chain with
+/// `&&` (or call `cd` inside the command) when it needs to scope work to a
+/// subdirectory.
 #[derive(Debug, Clone, Copy)]
 pub struct BashTool;
 
 #[derive(Debug, Deserialize)]
 struct BashArgs {
-    command: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ShellArgs {
     command: ShellCommand,
-    #[serde(default)]
-    workdir: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
 }
@@ -39,41 +39,10 @@ impl AgentTool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash".to_string(),
-            description: "Run a shell command in the workspace and return stdout/stderr."
+            description: "Run a shell command in the daemon workspace and return stdout/stderr. \
+                Each call runs in a fresh shell rooted at the workspace; chain commands with `&&` \
+                (or call `cd` inside the command) when you need to scope work to a subdirectory."
                 .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "command": { "type": "string" } },
-                "required": ["command"],
-                "additionalProperties": false
-            }),
-        }
-    }
-
-    async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
-        let args: BashArgs = serde_json::from_str(&call.args_json)?;
-        run_shell(
-            call,
-            ctx,
-            ShellArgs {
-                command: ShellCommand::Text(args.command),
-                workdir: None,
-                timeout_ms: None,
-            },
-        )
-        .await
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct ShellTool;
-
-#[async_trait]
-impl AgentTool for ShellTool {
-    fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "shell".to_string(),
-            description: "Run a local shell command in the workspace.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -81,10 +50,13 @@ impl AgentTool for ShellTool {
                         "oneOf": [
                             { "type": "string" },
                             { "type": "array", "items": { "type": "string" } }
-                        ]
+                        ],
+                        "description": "Shell command to execute. Either a single string (run via `sh -lc`) or an argv array (executed directly)."
                     },
-                    "workdir": { "type": "string" },
-                    "timeout_ms": { "type": "integer" }
+                    "timeout_ms": {
+                        "type": "integer",
+                        "description": "Optional command timeout in milliseconds."
+                    }
                 },
                 "required": ["command"],
                 "additionalProperties": false
@@ -93,21 +65,16 @@ impl AgentTool for ShellTool {
     }
 
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
-        let args: ShellArgs = serde_json::from_str(&call.args_json)?;
-        run_shell(call, ctx, args).await
+        let args: BashArgs = serde_json::from_str(&call.args_json)?;
+        run_bash(call, ctx, args).await
     }
 }
 
-async fn run_shell(
+async fn run_bash(
     call: &ToolCall,
     ctx: &ToolContext,
-    args: ShellArgs,
+    args: BashArgs,
 ) -> ToolResult<ToolResultMessage> {
-    let cwd = args
-        .workdir
-        .as_ref()
-        .map(|path| workspace_path(ctx, path))
-        .unwrap_or_else(|| ctx.cwd.clone());
     let timeout = args
         .timeout_ms
         .map(Duration::from_millis)
@@ -121,7 +88,7 @@ async fn run_shell(
         ShellCommand::Argv(argv) => {
             let Some((program, argv)) = argv.split_first() else {
                 return Err(ToolError::InvalidInput(
-                    "shell command argv cannot be empty".to_string(),
+                    "bash command argv cannot be empty".to_string(),
                 ));
             };
             let mut process = tokio::process::Command::new(program);
@@ -129,7 +96,7 @@ async fn run_shell(
             process
         }
     };
-    command.current_dir(cwd);
+    command.current_dir(&ctx.cwd);
     let output = tokio::time::timeout(timeout, command.output())
         .await
         .map_err(|_| ToolError::Timeout)??;

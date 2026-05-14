@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use crate::context::ToolContext;
 use crate::display::{tool_pretty_name, ToolDisplayInput};
 use crate::error::{ToolError, ToolResult};
-use crate::tools::{ApplyPatchTool, BashTool, GrepTool, ShellTool, TextEditorTool};
+use crate::tools::{ApplyPatchTool, BashTool, GrepTool, TextEditorTool};
 
 #[async_trait]
 pub trait AgentTool: Send + Sync {
@@ -30,7 +30,6 @@ pub fn builtin_tool_definition(name: &str) -> Option<ToolDefinition> {
         "apply_patch" => Some(ApplyPatchTool.definition()),
         "bash" => Some(BashTool.definition()),
         "grep" => Some(GrepTool.definition()),
-        "shell" => Some(ShellTool.definition()),
         "str_replace_based_edit_tool" => Some(TextEditorTool.definition()),
         _ => None,
     }
@@ -45,7 +44,7 @@ struct RegisteredTool {
     tool: Box<dyn AgentTool>,
 }
 
-const OPENAI_LOCAL_TOOL_NAMES: &[&str] = &["apply_patch", "grep", "shell"];
+const OPENAI_LOCAL_TOOL_NAMES: &[&str] = &["apply_patch", "bash", "grep"];
 const CLAUDE_LOCAL_TOOL_NAMES: &[&str] = &["bash", "grep", "str_replace_based_edit_tool"];
 const OPENAI_HOSTED_TOOL_NAMES: &[&str] = &["web_search"];
 const CLAUDE_HOSTED_TOOL_NAMES: &[&str] = &["web_search", "web_fetch"];
@@ -58,7 +57,6 @@ impl ToolRegistry {
     pub fn with_builtin_tools() -> Self {
         let mut registry = Self::new();
         registry.register(BashTool);
-        registry.register(ShellTool);
         registry.register(GrepTool);
         registry.register(ApplyPatchTool);
         registry.register(TextEditorTool);
@@ -179,7 +177,6 @@ mod tests {
         .collect::<Vec<_>>();
 
         assert!(names.contains(&"bash".to_string()));
-        assert!(names.contains(&"shell".to_string()));
         assert!(names.contains(&"apply_patch".to_string()));
         assert!(names.contains(&"grep".to_string()));
         assert!(names.contains(&"str_replace_based_edit_tool".to_string()));
@@ -199,7 +196,7 @@ mod tests {
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(openai, ["apply_patch", "grep", "shell"]);
+        assert_eq!(openai, ["apply_patch", "bash", "grep"]);
         assert_eq!(claude, ["bash", "grep", "str_replace_based_edit_tool"]);
     }
 
@@ -221,8 +218,8 @@ mod tests {
             openai,
             [
                 ("apply_patch".to_string(), "Edit".to_string()),
+                ("bash".to_string(), "Bash".to_string()),
                 ("grep".to_string(), "Grep".to_string()),
-                ("shell".to_string(), "Bash".to_string()),
                 ("web_search".to_string(), "Web search".to_string()),
             ]
         );

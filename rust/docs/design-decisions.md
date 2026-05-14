@@ -359,6 +359,35 @@ tool calls.
 This keeps core portable and makes future tool customization a daemon/runtime
 choice.
 
+### Provider Tool Surfaces Diverge Only When Semantics Justify It
+
+Coding tools split into two posture buckets:
+
+- **Uniform custom function tools** for `bash` and `grep`. Both providers see
+  the same JSON-schema function tool, generated from a single builtin
+  definition in `agent-tools`. The pi-relay runtime is stateless per call
+  (fresh `sh -lc` per `bash` invocation, fresh `rg` per `grep` invocation),
+  so the model-facing contract should match what the runtime can actually
+  honor. Using Anthropic's native `bash_20250124` would have advertised a
+  persistent shell session with a `restart` op that the runtime does not
+  back, which is worse than losing the small training prior associated with
+  the native tool name.
+- **Provider-native** for the edit tools: OpenAI's `apply_patch` uses a Lark
+  grammar so patches escape the JSON-string ghetto (real token win), and
+  Anthropic's `text_editor_20250728` exposes `view`/`create`/`str_replace`/
+  `insert` semantics the model is specifically trained to use. These
+  schemas are semantically rich enough that paraphrasing them as generic
+  function tools would lose information the provider's training already
+  encodes.
+- **Hosted** for `web_search` and `web_fetch` — pi-relay does not execute
+  these, so the provider owns the schema by definition.
+
+The daemon workspace is fixed at process launch. `bash` does not accept a
+`workdir` override; the model relies on the announced cwd in the dynamic
+prompt context and uses `&&` chaining or inline `cd` for subdirectory work.
+Any future persistent-shell runtime would add session-level cwd state
+underneath the same model-visible schema, not above it.
+
 ### `agent-core` Stays The FSM
 
 `agent-core` remains the finite-state turn engine and intentionally does not own

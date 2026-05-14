@@ -228,10 +228,7 @@ fn anthropic_tool(tool: &ToolDefinition) -> Value {
 
 fn anthropic_coding_tools() -> Vec<Value> {
     vec![
-        json!({
-            "type": "bash_20250124",
-            "name": "bash",
-        }),
+        anthropic_tool(&builtin_tool_definition("bash").expect("bash tool must be registered")),
         json!({
             "type": "text_editor_20250728",
             "name": "str_replace_based_edit_tool",
@@ -781,11 +778,12 @@ mod tests {
         })
         .expect("body renders");
 
-        assert_eq!(body["tools"][0]["type"], "bash_20250124");
         assert_eq!(body["tools"][0]["name"], "bash");
+        assert!(body["tools"][0].get("type").is_none());
         assert_eq!(body["tools"][1]["type"], "text_editor_20250728");
         assert_eq!(body["tools"][1]["name"], "str_replace_based_edit_tool");
         assert_eq!(body["tools"][2]["name"], "grep");
+        assert!(body["tools"][2].get("type").is_none());
         assert_eq!(body["tools"][3]["type"], "web_search_20250305");
         assert_eq!(body["tools"][4]["type"], "web_fetch_20250910");
         assert_eq!(body["tools"][4]["citations"]["enabled"], true);
