@@ -115,8 +115,8 @@ consequence of choosing a historical user message.
 
 ## Frontend Draft Sessions
 
-Clicking `New session` or running `/new` creates a local draft selection. No
-durable session row is created until `session.start`.
+Clicking `New session` creates a local draft selection. No durable session row
+is created until `session.start`.
 
 Draft shape in browser storage:
 

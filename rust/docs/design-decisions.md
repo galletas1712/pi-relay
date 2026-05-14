@@ -32,11 +32,10 @@ interaction.
 
 ### Draft Sessions Are Browser State
 
-Clicking New session or running `/new` creates a browser-local draft session,
-not a Postgres row. The draft row stores a stable future `session_id`, title,
-provider, composer text, and timestamps in `localStorage`; this is enough for a
-brand-new unsent draft to survive refresh without polluting durable agent
-state.
+Clicking New session creates a browser-local draft session, not a Postgres row.
+The draft row stores a stable future `session_id`, title, provider, composer
+text, and timestamps in `localStorage`; this is enough for a brand-new unsent
+draft to survive refresh without polluting durable agent state.
 
 Sending the first normal message from that draft calls `session.start`, which
 creates the durable session and immediately materializes the first user input.
@@ -53,12 +52,9 @@ are deliberately not stored in `sessions.metadata` or transcript rows.
 
 ### Slash Commands Are Thin RPC Calls
 
-Slash commands exist to expose real websocket operations without adding a second
-frontend command model.
+Slash commands exist to expose real websocket operations that do not already
+have dedicated UI controls, without adding a second frontend command model.
 
-- `/new [title]` creates a local draft session.
-- `/refresh` reloads sessions, tools, global config, and the current transcript.
-- `/status` reads the selected session snapshot.
 - `/fork [title]` opens a picker of visible fork targets and can prefill the
   fork title. User-message targets fork from before the message and restore
   that message into the child composer.
@@ -67,9 +63,7 @@ frontend command model.
   restore that message into the composer for editing; completed turn and
   compaction-summary targets simply become the active leaf.
 - `/compact` requests context compaction.
-- `/context [entry-id]` inspects materialized model context.
 - `/system [clear|prompt...]` reads or writes the global daemon system prompt.
-- `/tools` lists daemon tools.
 
 Model selection is not a slash command. The web top bar exposes the small model
 picker and provider-specific reasoning effort picker. Provider/model identity is
@@ -425,6 +419,6 @@ not durable notifications.
 The web composer uses an imperative selected-session ref so queued sends do not
 wait for a React render to find their target. Any code path that changes the
 selected session must update that ref and the React state together. This matters
-for `/new` and `fork`: the next Enter key after creating a session should target
-the new durable session immediately, not the session that happened to be
-selected one render earlier.
+for new-session and fork flows: the next Enter key after creating a session
+should target the new durable session immediately, not the session that happened
+to be selected one render earlier.

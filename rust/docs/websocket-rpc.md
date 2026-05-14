@@ -892,9 +892,10 @@ Verify:
 - `/switch` is idle-only. Switching to a user-message target restores that
   historical text into the composer; switching to a completed turn or
   compaction root changes the active leaf inside the same session.
-- `/rewind` and `/tree` are not part of the user-facing slash surface.
-- Crashed and interrupted terminal model turns show Retry/Continue actions,
-  and `/retry` / `/continue` invoke the same `turn.resume` RPC.
+- `/new`, `/retry`, `/continue`, `/rename`, `/archive`, `/unarchive`,
+  `/rewind`, and `/tree` are not part of the user-facing slash surface.
+- Crashed and interrupted terminal model turns show Retry/Continue actions that
+  invoke the `turn.resume` RPC.
 - Fork from a user-message target creates a child and restores the historical
   text into the child composer.
 - A brand-new local draft survives browser refresh without creating a durable

@@ -541,10 +541,8 @@ export function App() {
 				pushActionNotice("info", `commands: ${COMMANDS.map((command) => `/${command.name}`).join(", ")}`);
 				return;
 			}
-			if (name === "new") {
-				await createSession(args);
-				pushActionNotice("success", args ? `created session “${truncate(args, 80)}”` : "created session");
-				return;
+			if (!findCommand(name)) {
+				throw new Error(`unknown command: /${name}`);
 			}
 			if (name === "system") {
 				if (!args) {
@@ -593,47 +591,19 @@ export function App() {
 				});
 				return;
 			}
-			if (name === "retry" || name === "continue") {
-				await resumeTerminalTurn();
-				return;
-			}
 			if (name === "compact") {
 				const result = await api.requestCompaction(sessionId);
 				pushActionNotice("success", `compaction requested ${result.action_row_id ?? ""}`.trim());
-				return;
-			}
-			if (name === "rename") {
-				if (!args) {
-					const session = selectedSession ?? sessionItems.find((item) => item.session_id === sessionId);
-					if (session) openRenameDialog(session);
-					return;
-				}
-				await api.renameSession(sessionId, args);
-				await Promise.all([loadSessions(), refreshSelected(sessionId)]);
-				pushActionNotice("success", `renamed session to “${truncate(args, 80)}”`);
-				return;
-			}
-			if (name === "archive" || name === "unarchive") {
-				const session = selectedSession ?? sessionItems.find((item) => item.session_id === sessionId);
-				if (!session) throw new Error("select a session first");
-				await setSessionArchived(session, name === "archive");
 				return;
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
 		[
 			api,
-			createSession,
 			entries,
-			loadSessions,
-			openRenameDialog,
 			pushNotice,
 			refreshSelected,
 			requireSelected,
-			resumeTerminalTurn,
-			selectedSession,
-			sessionItems,
-			setSessionArchived,
 			snapshot
 		]
 	);

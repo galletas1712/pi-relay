@@ -103,12 +103,12 @@ The composer sends regular text as `input.follow_up`. The top bar exposes the
 model picker and provider-specific reasoning effort picker. The model is locked
 once the session has transcript history; reasoning effort can still be changed
 during or between turns and applies to subsequently created provider requests.
-Slash commands expose the session operations intended for the UI:
-`/new`, `/fork`, `/switch`, `/retry`, `/continue`, `/compact`, `/system`,
-`/rename`, `/archive`, `/unarchive`, and `/export`. Active turns use the stop
-button; queued follow-ups can be promoted to steer from the queue pane above the
-composer. Crashed or interrupted terminal model turns can also be
-retried/continued directly from the transcript row.
+Slash commands expose operations that do not already have dedicated controls:
+`/fork`, `/switch`, `/compact`, `/system`, and `/export`. Active turns use the
+stop button; new, rename, archive, and unarchive use sidebar controls; queued
+follow-ups can be promoted to steer from the queue pane above the composer.
+Crashed or interrupted terminal model turns can be retried/continued directly
+from the transcript row.
 
 ## CLI Composition Check
 
