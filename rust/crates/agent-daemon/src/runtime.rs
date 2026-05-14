@@ -613,7 +613,7 @@ async fn run_compaction_job(
     job: CompactionJob,
     config: SessionConfig,
 ) -> std::result::Result<(), RpcError> {
-    let result = run_compaction(&config, job.model_context.clone()).await;
+    let result = run_compaction(&config, &session_id, job.model_context.clone()).await;
     let events = match result {
         Ok(summary) => {
             let result = state
@@ -722,7 +722,7 @@ async fn run_model_turn(
         return Ok(());
     };
 
-    let result = run_model(&state, &dispatch.config, model_context).await;
+    let result = run_model(&state, &dispatch.config, &session_id, model_context).await;
     let driver = SessionDriver::acquire(&state, &session_id).await;
     if !state
         .repo

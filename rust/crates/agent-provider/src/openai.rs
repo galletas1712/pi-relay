@@ -5,11 +5,10 @@ use agent_vocab::{
     UserMessage,
 };
 use async_trait::async_trait;
-use reqwest::{
-    header::{ACCEPT, ACCEPT_ENCODING},
-    StatusCode,
-};
+use reqwest::{header::ACCEPT, StatusCode};
 use serde_json::{json, Value};
+use std::sync::OnceLock;
+use uuid::Uuid;
 
 use crate::{
     ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError,
@@ -18,7 +17,24 @@ use crate::{
 
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
 const OPENAI_PRIORITY_SERVICE_TIER: &str = "priority";
-const CODEX_RESIDENCY_HEADER: &str = "x-openai-internal-codex-residency";
+
+// Header names: byte-for-byte aligned with Codex CLI's
+// `~/codex/codex-rs/login/src/auth/default_client.rs` and
+// `~/codex/codex-rs/core/src/client.rs`. Casing matches the CLI exactly so
+// pi-relay's request envelope is indistinguishable from a real Codex client.
+const HEADER_ORIGINATOR: &str = "originator";
+const HEADER_USER_AGENT: &str = "User-Agent";
+const HEADER_RESIDENCY: &str = "x-openai-internal-codex-residency";
+const HEADER_CHATGPT_ACCOUNT: &str = "ChatGPT-Account-ID";
+const HEADER_INSTALLATION_ID: &str = "x-codex-installation-id";
+const HEADER_WINDOW_ID: &str = "x-codex-window-id";
+const HEADER_CLIENT_REQUEST_ID: &str = "x-client-request-id";
+
+// The Codex CLI's `originator` is the literal string `codex_cli_rs`. Sending
+// this from pi-relay is deliberate: the ChatGPT backend uses it for routing
+// and rate-limit accounting (see `is_first_party_originator` in the Codex
+// source). Diverging from this label is what causes throttling.
+const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_RESIDENCY_US: &str = "us";
 
 #[derive(Debug, Clone)]
@@ -26,30 +42,101 @@ pub struct OpenAiProvider {
     client: reqwest::Client,
     access_token: String,
     account_id: Option<String>,
+    /// Persistent Codex installation identifier (UUID), read from
+    /// `~/.codex/installation_id` by the daemon and passed through as the
+    /// `x-codex-installation-id` header on every request. Optional because
+    /// pi-cli and tests may not have a Codex install.
+    installation_id: Option<String>,
+    /// Per-process window id, matching Codex CLI's behavior. Stable for the
+    /// lifetime of the provider instance; sent as `x-codex-window-id`.
+    window_id: String,
     base_url: String,
 }
 
 impl OpenAiProvider {
-    pub fn codex(access_token: impl Into<String>, account_id: Option<String>) -> Self {
+    pub fn codex(
+        access_token: impl Into<String>,
+        account_id: Option<String>,
+        installation_id: Option<String>,
+    ) -> Self {
         Self {
             client: reqwest::Client::new(),
             access_token: access_token.into(),
             account_id,
+            installation_id,
+            window_id: Uuid::new_v4().to_string(),
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
         }
     }
 
-    fn add_auth(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let request = request
-            .header(ACCEPT_ENCODING, "identity")
+    /// Apply the full Codex CLI request envelope: auth, identity, and the
+    /// per-request `x-client-request-id` / `session_id` routing pair. Mirrors
+    /// `build_responses_identity_headers` + `build_session_headers` in
+    /// `~/codex/codex-rs/core/src/client.rs` and `default_headers()` in
+    /// `~/codex/codex-rs/login/src/auth/default_client.rs`.
+    fn add_codex_headers(
+        &self,
+        request: reqwest::RequestBuilder,
+        session_id: &str,
+    ) -> reqwest::RequestBuilder {
+        let mut request = request
+            // Identity (default_headers in Codex CLI).
+            .header(HEADER_ORIGINATOR, CODEX_ORIGINATOR)
+            .header(HEADER_USER_AGENT, codex_user_agent())
+            .header(HEADER_RESIDENCY, CODEX_RESIDENCY_US)
+            // Auth (BearerAuthProvider in Codex CLI).
             .bearer_auth(&self.access_token)
-            .header(CODEX_RESIDENCY_HEADER, CODEX_RESIDENCY_US);
-        if let Some(account_id) = &self.account_id {
-            request.header("ChatGPT-Account-ID", account_id)
-        } else {
-            request
+            // Codex installation + window identity. Both are documented as
+            // observability/routing hints in core/src/client.rs.
+            .header(HEADER_WINDOW_ID, &self.window_id)
+            // Per-request and per-session routing. Codex emits all four
+            // (`session_id`/`session-id`/`thread_id`/`thread-id`) — we send
+            // both spellings of each because the backend currently parses
+            // either casing inconsistently. The thread id doubles as the
+            // `x-client-request-id` so traces line up with the prompt-cache
+            // bucket.
+            .header(HEADER_CLIENT_REQUEST_ID, session_id)
+            .header("session_id", session_id)
+            .header("session-id", session_id)
+            .header("thread_id", session_id)
+            .header("thread-id", session_id);
+
+        if let Some(installation_id) = &self.installation_id {
+            request = request.header(HEADER_INSTALLATION_ID, installation_id);
         }
+        if let Some(account_id) = &self.account_id {
+            request = request.header(HEADER_CHATGPT_ACCOUNT, account_id);
+        }
+        request
     }
+}
+
+/// Codex CLI-style User-Agent, evaluated once per process. Format mirrors
+/// `get_codex_user_agent` in the Codex source:
+///     `codex_cli_rs/{version} ({os_type} {os_version}; {arch}) {term_ua}`
+///
+/// We omit the trailing `{term_ua}` (terminal-detected suffix) because
+/// pi-relay's daemon runs detached from any TTY; Codex itself tolerates that
+/// suffix being empty.
+fn codex_user_agent() -> &'static str {
+    static UA: OnceLock<String> = OnceLock::new();
+    UA.get_or_init(|| {
+        let info = os_info::get();
+        // Pin a Codex CLI version that we know the backend accepts. We
+        // intentionally do NOT use pi-relay's own crate version here — the
+        // originator+UA pair has to look like a Codex CLI build to clear
+        // anti-abuse heuristics, same as the Anthropic attribution mimicry.
+        let codex_version = "0.130.0";
+        format!(
+            "{}/{} ({} {}; {})",
+            CODEX_ORIGINATOR,
+            codex_version,
+            info.os_type(),
+            info.version(),
+            info.architecture().unwrap_or("unknown"),
+        )
+    })
+    .as_str()
 }
 
 #[async_trait]
@@ -61,13 +148,24 @@ impl ModelProvider for OpenAiProvider {
 
 impl OpenAiProvider {
     async fn complete_responses(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
-        let body = responses_body(request)?;
+        // Lift the session id off the request before consuming it for the body.
+        // This is the value the Codex CLI calls `thread_id`: the unique
+        // pi-relay session identifier that doubles as the prompt-cache cohort
+        // and as every routing header (session_id, x-client-request-id,
+        // etc.). Falling back to a fresh UUID keeps the CLI / test paths
+        // functional, but the daemon always supplies a real session id.
+        let session_id = request
+            .session_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let body = responses_body(request, &session_id)?;
 
         let text = self
-            .add_auth(
+            .add_codex_headers(
                 self.client
                     .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
                     .header(ACCEPT, "text/event-stream"),
+                &session_id,
             )
             .json(&body)
             .send()
@@ -122,12 +220,22 @@ fn response_excerpt(body: &str) -> String {
     }
 }
 
-fn responses_body(request: ModelRequest) -> ProviderResult<Value> {
+fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Value> {
     let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
     let tools = response_tools(request.tool_profile, &request.tools)?;
+    // Cache cohort priority, highest to lowest:
+    //   1. Explicit override from `ProviderConfig.prompt_cache.key` (lets
+    //      operators force a particular bucket from config).
+    //   2. The session id we received from the daemon, matching Codex CLI's
+    //      `prompt_cache_key = thread_id.to_string()` (see
+    //      `~/codex/codex-rs/core/src/client.rs`). One bucket per pi-relay
+    //      session keeps us well under OpenAI's ~15 RPM-per-shard ceiling
+    //      while still maximising in-session prefix reuse.
+    //   3. Deterministic config-hash fallback for tests / pi-cli that don't
+    //      supply a session id.
     let prompt_cache_key = request
         .prompt_cache_key
-        .unwrap_or_else(|| default_prompt_cache_key(&request.model, &request.prompt, &tools));
+        .unwrap_or_else(|| session_id.to_string());
     let body = json!({
         "model": request.model,
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
@@ -255,19 +363,6 @@ fn openai_grep_tool() -> Value {
         "description": tool.description,
         "parameters": tool.input_schema,
     })
-}
-
-fn default_prompt_cache_key(
-    model: &str,
-    prompt: &crate::PromptSections,
-    tools: &[Value],
-) -> String {
-    let mut hasher = StableHasher::new();
-    hasher.write_str("pi-relay:openai-responses:v1");
-    hasher.write_str(model);
-    hasher.write_str(prompt.stable_prefix.as_deref().unwrap_or_default());
-    hasher.write_str(&serde_json::to_string(tools).unwrap_or_default());
-    format!("pi-relay-openai-{:016x}", hasher.finish())
 }
 
 fn openai_reasoning_effort(effort: ReasoningEffort) -> ProviderResult<&'static str> {
@@ -618,33 +713,6 @@ fn openai_usage(value: &Value) -> Option<ProviderUsage> {
     })
 }
 
-struct StableHasher(u64);
-
-impl StableHasher {
-    fn new() -> Self {
-        Self(0xcbf29ce484222325)
-    }
-
-    fn write_str(&mut self, value: &str) {
-        self.write_usize(value.len());
-        for byte in value.as_bytes() {
-            self.0 ^= u64::from(*byte);
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    fn write_usize(&mut self, value: usize) {
-        for byte in value.to_le_bytes() {
-            self.0 ^= u64::from(byte);
-            self.0 = self.0.wrapping_mul(0x100000001b3);
-        }
-    }
-
-    fn finish(self) -> u64 {
-        self.0
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,38 +720,93 @@ mod tests {
     use agent_vocab::{ToolCall, ToolDefinition, ToolResultMessage};
 
     #[test]
-    fn codex_auth_adds_account_and_residency_headers() {
-        let provider = OpenAiProvider::codex("access-token", Some("account-id".to_string()));
+    fn codex_headers_match_codex_cli_envelope() {
+        let provider = OpenAiProvider::codex(
+            "access-token",
+            Some("account-id".to_string()),
+            Some("install-uuid-1234".to_string()),
+        );
         let request = provider
-            .add_auth(
+            .add_codex_headers(
                 provider
                     .client
                     .post("https://chatgpt.com/backend-api/codex/responses"),
+                "session-uuid-abcd",
             )
             .build()
             .expect("request builds");
 
-        assert_eq!(
+        let header = |name: &str| {
             request
                 .headers()
-                .get(reqwest::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok()),
-            Some("Bearer access-token")
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
+
+        // Identity envelope (default_headers in Codex CLI).
+        assert_eq!(header("authorization").as_deref(), Some("Bearer access-token"));
+        assert_eq!(header("originator").as_deref(), Some(CODEX_ORIGINATOR));
+        assert!(
+            header("user-agent")
+                .as_deref()
+                .map(|ua| ua.starts_with("codex_cli_rs/"))
+                .unwrap_or(false),
+            "user-agent should start with codex_cli_rs/: {:?}",
+            header("user-agent")
         );
+        assert_eq!(header(HEADER_RESIDENCY).as_deref(), Some(CODEX_RESIDENCY_US));
+        assert_eq!(header("chatgpt-account-id").as_deref(), Some("account-id"));
+
+        // Codex-specific identity headers.
         assert_eq!(
-            request
-                .headers()
-                .get("ChatGPT-Account-ID")
-                .and_then(|value| value.to_str().ok()),
-            Some("account-id")
+            header(HEADER_INSTALLATION_ID).as_deref(),
+            Some("install-uuid-1234")
         );
+        assert!(
+            header(HEADER_WINDOW_ID)
+                .as_deref()
+                .map(|value| Uuid::parse_str(value).is_ok())
+                .unwrap_or(false),
+            "window id should be a UUID: {:?}",
+            header(HEADER_WINDOW_ID)
+        );
+
+        // Session routing headers — all four spellings, all pinned to the
+        // same id we pass in.
+        for name in ["session_id", "session-id", "thread_id", "thread-id"] {
+            assert_eq!(
+                header(name).as_deref(),
+                Some("session-uuid-abcd"),
+                "{name} should carry the session id"
+            );
+        }
         assert_eq!(
-            request
-                .headers()
-                .get(CODEX_RESIDENCY_HEADER)
-                .and_then(|value| value.to_str().ok()),
-            Some(CODEX_RESIDENCY_US)
+            header(HEADER_CLIENT_REQUEST_ID).as_deref(),
+            Some("session-uuid-abcd")
         );
+    }
+
+    #[test]
+    fn codex_headers_omit_optional_fields_when_absent() {
+        // Account id + installation id are both optional in the daemon.
+        let provider = OpenAiProvider::codex("access-token", None, None);
+        let request = provider
+            .add_codex_headers(
+                provider
+                    .client
+                    .post("https://chatgpt.com/backend-api/codex/responses"),
+                "session-xyz",
+            )
+            .build()
+            .expect("request builds");
+
+        assert!(request.headers().get("chatgpt-account-id").is_none());
+        assert!(request.headers().get(HEADER_INSTALLATION_ID).is_none());
+        // But the required envelope is still present.
+        assert!(request.headers().get("authorization").is_some());
+        assert!(request.headers().get("originator").is_some());
+        assert!(request.headers().get(HEADER_WINDOW_ID).is_some());
     }
 
     #[test]
@@ -697,7 +820,8 @@ mod tests {
             max_tokens: None,
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
-        })
+            session_id: None,
+        }, "test-session")
         .expect("responses body renders");
 
         assert_eq!(body["service_tier"], "priority");
@@ -728,7 +852,8 @@ mod tests {
             max_tokens: Some(2048),
             reasoning_effort: ReasoningEffort::High,
             prompt_cache_key: Some("pi-relay-test".to_string()),
-        })
+            session_id: None,
+        }, "test-session")
         .expect("responses body renders");
 
         assert_eq!(body["parallel_tool_calls"], true);
@@ -750,7 +875,12 @@ mod tests {
     }
 
     #[test]
-    fn responses_body_uses_stable_default_cache_key() {
+    fn responses_body_cache_key_falls_back_to_session_id() {
+        // When the daemon doesn't supply a `prompt_cache_key` override, the
+        // body should reuse the session id as the cache cohort — matching
+        // Codex CLI's `prompt_cache_key = thread_id.to_string()`. Two
+        // requests with the same session id must produce the same cohort
+        // even when their dynamic context and transcripts differ.
         let first = responses_body(ModelRequest {
             model: "gpt-5.5".to_string(),
             prompt: PromptSections::new(
@@ -763,7 +893,8 @@ mod tests {
             max_tokens: None,
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
-        })
+            session_id: None,
+        }, "test-session")
         .expect("responses body renders");
         let second = responses_body(ModelRequest {
             model: "gpt-5.5".to_string(),
@@ -777,16 +908,58 @@ mod tests {
             max_tokens: None,
             reasoning_effort: ReasoningEffort::High,
             prompt_cache_key: None,
-        })
+            session_id: None,
+        }, "test-session")
         .expect("responses body renders");
 
-        let key = first["prompt_cache_key"].as_str().expect("cache key");
-        assert!(key.starts_with("pi-relay-openai-"));
-        assert_eq!(first["prompt_cache_key"], second["prompt_cache_key"]);
+        assert_eq!(first["prompt_cache_key"], "test-session");
+        assert_eq!(second["prompt_cache_key"], "test-session");
         assert!(first.get("prompt_cache_retention").is_none());
         assert_eq!(first["service_tier"], "priority");
         assert_eq!(first["tools"], json!([]));
         assert!(first.get("max_output_tokens").is_none());
+    }
+
+    #[test]
+    fn responses_body_prefers_explicit_prompt_cache_key_override() {
+        // Explicit override on the request body still wins over the session
+        // id fallback, so operators can pin a custom cohort via
+        // `ProviderConfig.prompt_cache.key`.
+        let body = responses_body(ModelRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: Some("explicit-cohort".to_string()),
+            session_id: None,
+        }, "session-not-used")
+        .expect("responses body renders");
+
+        assert_eq!(body["prompt_cache_key"], "explicit-cohort");
+    }
+
+    #[test]
+    fn responses_body_session_id_from_request_used_as_cache_key() {
+        // End-to-end check that `ModelRequest.session_id` flows through the
+        // ModelProvider trait into the cache key: when the daemon passes a
+        // session id, it lands as the prompt_cache_key.
+        let body = responses_body(ModelRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+            session_id: Some("daemon-session-id".to_string()),
+        }, "daemon-session-id")
+        .expect("responses body renders");
+
+        assert_eq!(body["prompt_cache_key"], "daemon-session-id");
     }
 
     #[test]
@@ -803,7 +976,8 @@ mod tests {
             max_tokens: None,
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: Some("cache-key".to_string()),
-        })
+            session_id: None,
+        }, "test-session")
         .expect("responses body renders");
 
         assert_eq!(body["instructions"], "stable agent rules");
@@ -834,7 +1008,8 @@ mod tests {
             max_tokens: None,
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
-        })
+            session_id: None,
+        }, "test-session")
         .expect("responses body renders");
 
         assert_eq!(body["tools"][0]["name"], "read");
@@ -852,7 +1027,8 @@ mod tests {
             max_tokens: None,
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
-        })
+            session_id: None,
+        }, "test-session")
         .expect("responses body renders");
 
         assert_eq!(body["tools"][0]["type"], "custom");

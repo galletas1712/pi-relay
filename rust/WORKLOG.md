@@ -1113,3 +1113,120 @@ paths. Changes made from that review:
 - Mirrored Claude Code-style Anthropic request attribution in `agent-provider` after live 429s from the plain API-key request shape. The Anthropic provider now sends the Claude Code beta/identity headers (`claude-code-20250219`, `User-Agent: claude-cli/...`, `x-app`, session/request ids) and prepends the uncached `x-anthropic-billing-header: cc_version=...; cc_entrypoint=cli;` system block while keeping that provider-specific envelope out of core/session state.
 - Verified the attribution fix with a direct Anthropic Messages smoke: the same Claude Code keychain API key that had returned HTTP 429 succeeded with HTTP 200 once the identity/attribution envelope was present.
 - Rebuilt and restarted the daemon, then ran a real websocket Anthropic session using `claude-opus-4-7`/`xhigh`. The live turn exercised provider-native Bash, text editor create/view/replace, custom ripgrep, hosted web search, and hosted web fetch. The local tools completed successfully, OpenAI docs web search returned hosted results, web fetch returned an upstream inaccessible-URL result, and the turn finished `Graceful`. Postgres provider replay includes hosted `server_tool_use`, `web_search_tool_result`, and `web_fetch_tool_result` blocks, and model action usage shows prompt cache creation followed by cache reads.
+
+### Prefix Cache Tuning Pass
+
+- Re-audited `agent-provider/src/anthropic.rs` against the Anthropic Messages
+  prompt-caching docs (`docs.claude.com/en/docs/build-with-claude/prompt-caching`)
+  and `agent-provider/src/openai.rs` against the OpenAI Responses prompt-caching
+  guide (`developers.openai.com/api/docs/guides/prompt-caching`). The earlier
+  implementation worked but spent breakpoints and TTL premium suboptimally.
+- Split the Anthropic `cache_control` helper into `cache_control_1h()` for the
+  stable system block only and `cache_control_5m()` (default ephemeral, no
+  `ttl`) for the transcript-tail marker. The latest-message breakpoint is
+  regenerated each turn, so paying the 1h write premium (2x base input vs
+  1.25x for 5m) is pure waste; 5m is the right shelf life for that marker.
+- Dropped `mark_last_tool_for_cache`. Anthropic hashes the cumulative prefix
+  in `tools -> system -> messages` order, so the stable-system breakpoint
+  already covers the entire tools array via the cumulative hash. The
+  tools-level marker burned one of 4 breakpoint slots for zero capability,
+  and we want that slot back for the deep-history marker below.
+- Added a conditional deep-history breakpoint in
+  `add_transcript_cache_breakpoints`. When the transcript has more cacheable
+  content blocks than `TRANSCRIPT_LOOKBACK_BLOCKS` (18, kept slightly under
+  Anthropic's documented ~20 to leave room for in-turn growth), we additionally
+  stamp a 5m marker on the cacheable block that's roughly 18 blocks behind the
+  tail. Without this, long agentic sessions (each turn producing 6-10
+  tool_use/tool_result blocks) silently stop hitting their older cached
+  prefix once the gap exceeds the automatic 20-block backward walk.
+- Stabilized the Claude Code attribution fingerprint. It used to be derived
+  from the first user message, which sat at `system[0]` (before the cache
+  breakpoint) and therefore partitioned the cached stable-system prefix
+  per-conversation. It now derives from `prompt.stable_prefix`, falling back
+  to the first user text only when no stable prefix is configured (e.g.
+  compaction calls). Two sessions with the same global system prompt now
+  produce identical `system[0]` bytes and can share the cached prefix.
+- Hard-coded `thinking: { type: "adaptive" }` with an explanatory comment.
+  Anthropic invalidates the message-content cache on any `thinking` change
+  (enable/disable or budget), so this parameter must remain a build-time
+  constant; reasoning effort already lives in `output_config.effort`, which
+  the docs explicitly call out as not affecting messages-level cache.
+- Left a `TODO(prefix-cache)` in `responses_body` to set
+  `prompt_cache_retention: "24h"` once the Codex subscription transport
+  (`chatgpt.com/backend-api/codex`) accepts it. The public Responses API
+  documents this parameter, but Codex tracks support in openai/codex#18130
+  and currently no-ops or errors when it's sent. 24h retention would close
+  the gap with Anthropic's 1h `cache_control` TTL on the stable prefix.
+- Updated `rust/docs/prefix-caching-plan.html` so the target request shapes
+  and current-state checklist match the new behavior (5m on transcript tail,
+  no per-tool marker, conditional deep-history marker, fingerprint stabilized
+  off the stable system prompt).
+- Refreshed the Anthropic provider tests: existing breakpoint assertions
+  switched to `{ type: "ephemeral" }` (no `ttl`) for transcript-tail and
+  tool-level no-marker, and added new tests for `stable_system_block_keeps_one_hour_ttl`,
+  `short_transcript_uses_only_tail_breakpoint`,
+  `long_transcript_adds_deep_history_breakpoint`,
+  `attribution_fingerprint_is_stable_across_different_first_user_messages`,
+  and `attribution_fingerprint_changes_with_stable_prompt`.
+- Verified with `RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/cc'
+  cargo test --manifest-path rust/Cargo.toml -p agent-provider` (25 tests
+  passing, including the 6 new ones),
+  `RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/cc'
+  cargo check --manifest-path rust/Cargo.toml -p agent-daemon -p pi-cli`,
+  and `RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/cc'
+  cargo test --manifest-path rust/Cargo.toml -p agent-daemon` (3 tests).
+
+### Codex CLI Envelope Parity + Per-Session Cache Key
+
+- Audited `~/codex/codex-rs/` (the Codex CLI source) to lift the exact request
+  envelope it sends to `chatgpt.com/backend-api/codex/responses`. References:
+  `login/src/auth/default_client.rs::default_headers`,
+  `model-provider/src/bearer_auth_provider.rs::add_auth_headers`,
+  `core/src/client.rs::build_responses_identity_headers` +
+  `build_session_headers`, and `codex-api/src/requests/headers.rs`.
+- Replaced `OpenAiProvider::add_auth` with `add_codex_headers` that emits the
+  full Codex CLI envelope: `originator: codex_cli_rs`, a Codex-shaped
+  `User-Agent` (`codex_cli_rs/0.130.0 ({os_type} {version}; {arch})`),
+  `x-openai-internal-codex-residency: us`, `Authorization: Bearer`,
+  `ChatGPT-Account-ID`, `x-codex-installation-id`, `x-codex-window-id`,
+  `x-client-request-id`, and all four spellings of the session/thread id
+  (`session_id`, `session-id`, `thread_id`, `thread-id`). Dropped the legacy
+  `Accept-Encoding: identity` override since Codex itself doesn't send it.
+- Added `os_info` + `uuid` deps to `agent-provider`. `User-Agent` is computed
+  once per process via `OnceLock`. The window id is a per-`OpenAiProvider`
+  UUID, regenerated when the provider is rebuilt (matches Codex CLI's
+  per-process `current_window_id`).
+- Plumbed `session_id` through `ModelRequest`. The daemon
+  (`provider_runtime.rs`) now passes the pi-relay session id into every
+  `run_model` / `run_compaction` call. The OpenAI provider uses that as the
+  source of truth for both the `prompt_cache_key` body field and every
+  session/thread/request id header. The cache cohort is now unique per
+  pi-relay session, matching Codex CLI's `prompt_cache_key =
+  thread_id.to_string()` in `core/src/client.rs`. Compaction reuses the
+  parent session id with a `:compaction` suffix so headers stay correlated
+  for tracing without polluting the main session's cache bucket.
+- Added Codex installation-id passthrough. `auth.rs::Credentials::load` now
+  reads `~/.codex/installation_id` (the persistent UUID Codex CLI maintains
+  at `core/src/installation_id.rs`) and threads it into the provider so the
+  `x-codex-installation-id` header matches what a real Codex CLI on the same
+  machine would send. Falls back gracefully when absent (pi-cli, tests).
+- Deleted the previous content-hash `default_prompt_cache_key` and its
+  `StableHasher` helper — the new session-id-as-key strategy supersedes
+  them. Added focused tests covering the new ordering: explicit
+  `ProviderConfig.prompt_cache.key` override wins; otherwise
+  `ModelRequest.session_id` is the key; otherwise the literal session id
+  passed at the provider-call boundary is the key.
+- Rewrote `codex_auth_adds_account_and_residency_headers` into
+  `codex_headers_match_codex_cli_envelope` (full envelope assertion) and
+  added `codex_headers_omit_optional_fields_when_absent` to cover the
+  no-account-id / no-install-id path. Refreshed all the test sites in
+  `agent-provider` to populate the new `session_id` field; tests now run
+  through `responses_body` with an explicit test session id.
+- Updated `rust/docs/prefix-caching-plan.html` so the OpenAI current-state
+  checklist reflects the new envelope (session-id cohort + Codex CLI headers)
+  and removes the TODO that lived in `responses_body`.
+- Verified with `RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/cc'
+  cargo test --manifest-path rust/Cargo.toml -p agent-provider` (28 tests,
+  including 2 new envelope tests and 2 new cache-key tests),
+  `cargo test --manifest-path rust/Cargo.toml -p agent-daemon` (3 tests), and
+  `cargo check --manifest-path rust/Cargo.toml --workspace`.

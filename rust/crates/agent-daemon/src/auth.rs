@@ -15,6 +15,7 @@ const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 pub(crate) struct Credentials {
     pub(crate) codex_access_token: Option<String>,
     pub(crate) codex_account_id: Option<String>,
+    pub(crate) codex_installation_id: Option<String>,
     pub(crate) anthropic_api_key: Option<String>,
 }
 
@@ -26,10 +27,29 @@ impl Credentials {
                 .ok()
                 .or_else(|| codex.access_token.clone()),
             codex_account_id: codex.account_id,
+            codex_installation_id: read_codex_installation_id(),
             anthropic_api_key: env::var("ANTHROPIC_API_KEY")
                 .ok()
                 .or_else(read_claude_code_keychain_api_key),
         }
+    }
+}
+
+/// Read the persistent Codex installation id from `~/.codex/installation_id`,
+/// matching the format the Codex CLI maintains. This file is a UUID v4 that
+/// the CLI rotates with `codex login`, so pi-relay can piggy-back on it for
+/// the `x-codex-installation-id` header without inventing a separate identity.
+///
+/// Returns `None` when the file is missing or unreadable; the caller can fall
+/// back to omitting the header (Codex backend tolerates its absence).
+fn read_codex_installation_id() -> Option<String> {
+    let path = env::var("HOME").ok().map(PathBuf::from)?.join(".codex/installation_id");
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let trimmed = contents.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 

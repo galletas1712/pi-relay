@@ -21,6 +21,16 @@ const CLAUDE_CODE_VERSION: &str = "2.1.75";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75 (external, cli)";
 const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
 
+// Anthropic's documented per-breakpoint backward lookback when matching a new
+// request against existing cache entries. We use this to decide when the tail
+// cache breakpoint alone can no longer cover the whole transcript history and a
+// second deeper breakpoint is worth spending a slot on. Keep a small slack
+// (18 vs 20) so the deep breakpoint stays inside the tail breakpoint's lookback
+// window even after the conversation grows by a couple of blocks per turn.
+//
+// See: https://docs.claude.com/en/docs/build-with-claude/prompt-caching
+const TRANSCRIPT_LOOKBACK_BLOCKS: usize = 18;
+
 #[derive(Debug, Clone)]
 pub struct AnthropicProvider {
     client: reqwest::Client,
@@ -79,11 +89,17 @@ fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
     let effort = anthropic_reasoning_effort(request.reasoning_effort)?;
     let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
     let mut messages = transcript_to_messages(&request.transcript)?;
-    add_transcript_cache_breakpoint(&mut messages);
+    add_transcript_cache_breakpoints(&mut messages);
     let mut body = json!({
         "model": request.model,
         "max_tokens": max_tokens,
         "messages": messages,
+        // Adaptive thinking is intentionally hard-coded and must not become a
+        // per-request toggle: Anthropic invalidates the message-content cache
+        // whenever the `thinking` parameter changes (enabling/disabling or
+        // budget changes). Reasoning effort lives in `output_config` instead,
+        // which is documented not to affect the messages-level cache.
+        // See: https://docs.claude.com/en/docs/build-with-claude/prompt-caching
         "thinking": {
             "type": "adaptive",
         },
@@ -94,9 +110,14 @@ fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
     if let Some(system_blocks) = anthropic_system_blocks(&request.prompt, &request.transcript) {
         body["system"] = Value::Array(system_blocks);
     }
-    let mut tools = anthropic_tools(request.tool_profile, &request.tools)?;
+    let tools = anthropic_tools(request.tool_profile, &request.tools)?;
     if !tools.is_empty() {
-        mark_last_tool_for_cache(&mut tools);
+        // Intentionally no tool-level `cache_control` breakpoint. Anthropic
+        // hashes the cumulative prefix in `tools -> system -> messages` order,
+        // so the breakpoint on the stable system block already covers the
+        // tools array via the cumulative hash. Spending one of the 4 allowed
+        // breakpoints on the last tool would buy zero additional caching and
+        // costs us a slot we use for the deep-history transcript marker.
         body["tools"] = Value::Array(tools);
         body["tool_choice"] = json!({ "type": "auto" });
     }
@@ -228,16 +249,24 @@ fn anthropic_coding_tools() -> Vec<Value> {
     ]
 }
 
-fn mark_last_tool_for_cache(tools: &mut [Value]) {
-    if let Some(tool) = tools.last_mut().and_then(Value::as_object_mut) {
-        tool.insert("cache_control".to_string(), cache_control_1h());
-    }
-}
-
+/// 1-hour ephemeral cache control. Use only on prefixes that are stable enough
+/// to outlive the 5-minute default window — currently the stable system block.
+/// 1-hour writes cost 2x base input tokens (vs 1.25x for the 5-minute default),
+/// so this is the wrong choice for any breakpoint that is regenerated each turn.
 fn cache_control_1h() -> Value {
     json!({
         "type": "ephemeral",
         "ttl": "1h",
+    })
+}
+
+/// 5-minute ephemeral cache control (Anthropic's default when `ttl` is omitted).
+/// Use for short-lived breakpoints like the latest transcript block: these are
+/// superseded by the next turn's breakpoint, so paying the 1-hour write
+/// premium would be wasted.
+fn cache_control_5m() -> Value {
+    json!({
+        "type": "ephemeral",
     })
 }
 
@@ -247,7 +276,7 @@ fn anthropic_system_blocks(
 ) -> Option<Vec<Value>> {
     let mut blocks = vec![json!({
         "type": "text",
-        "text": attribution_header(transcript),
+        "text": attribution_header(prompt, transcript),
     })];
     if let Some(stable) = &prompt.stable_prefix {
         blocks.push(json!({
@@ -265,15 +294,37 @@ fn anthropic_system_blocks(
     (!blocks.is_empty()).then_some(blocks)
 }
 
-fn attribution_header(transcript: &[ModelTranscriptEntry]) -> String {
-    let fingerprint = attribution_fingerprint(transcript);
+fn attribution_header(prompt: &crate::PromptSections, transcript: &[ModelTranscriptEntry]) -> String {
+    let fingerprint = attribution_fingerprint(prompt, transcript);
     format!(
         "x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}.{fingerprint}; cc_entrypoint=cli;"
     )
 }
 
-fn attribution_fingerprint(transcript: &[ModelTranscriptEntry]) -> String {
-    let text = first_user_text(transcript).unwrap_or_default();
+/// Derive the Claude-Code-style attribution fingerprint.
+///
+/// We intentionally derive this from the *stable system prompt* rather than
+/// the first user message. The attribution header sits at `system[0]`, before
+/// the stable-system cache breakpoint, so it is part of the cumulative cache
+/// hash. Fingerprinting off the first user message — as Claude Code itself
+/// does — would partition the cached system prefix per-conversation: two
+/// sessions with identical system prompts but different opening messages would
+/// never share the cache entry.
+///
+/// Deriving from `stable_prefix` instead means every pi-relay session with the
+/// same global system prompt produces the same fingerprint and therefore the
+/// same cached prefix, enabling true cross-session reuse of the stable-system
+/// cache. We fall back to a digest of the first user text only when no stable
+/// prefix is configured (e.g. compaction calls), so the header is never empty.
+fn attribution_fingerprint(
+    prompt: &crate::PromptSections,
+    transcript: &[ModelTranscriptEntry],
+) -> String {
+    let text = prompt
+        .stable_prefix
+        .as_deref()
+        .or_else(|| first_user_text(transcript))
+        .unwrap_or_default();
     let chars = [
         text.chars().nth(4).unwrap_or('0'),
         text.chars().nth(7).unwrap_or('0'),
@@ -296,7 +347,61 @@ fn first_user_text(transcript: &[ModelTranscriptEntry]) -> Option<&str> {
     })
 }
 
-fn add_transcript_cache_breakpoint(messages: &mut [Value]) {
+/// Place message-level cache breakpoints on the transcript.
+///
+/// Strategy:
+/// - Always mark the latest cacheable content block in the most recent message
+///   (the "tail" breakpoint). Anthropic's backward lookup will find this on the
+///   next turn and use it as the read prefix.
+/// - When the transcript has grown past Anthropic's documented ~20-block
+///   lookback ceiling, additionally mark a "deep" breakpoint roughly
+///   `TRANSCRIPT_LOOKBACK_BLOCKS` content-blocks behind the tail. Without this,
+///   long agentic sessions with many tool_use/tool_result blocks will silently
+///   stop hitting their older cached prefix once the gap exceeds 20 blocks.
+///
+/// Both markers use the 5-minute (default) TTL: each is regenerated on the next
+/// turn anyway, so the 1-hour write premium (2x base input vs 1.25x) would be
+/// pure waste here. The 1-hour TTL is reserved for the stable system block.
+fn add_transcript_cache_breakpoints(messages: &mut [Value]) {
+    // 1. Tail breakpoint: walk the most recent message backwards and mark the
+    //    latest eligible content block.
+    let tail_block_index = mark_latest_cacheable_block(messages, cache_control_5m());
+    let Some(tail_index) = tail_block_index else {
+        return;
+    };
+
+    // 2. Deep-history breakpoint: only worth a slot if the total cacheable
+    //    block count from the start to (but not including) the tail block is
+    //    larger than the lookback window. Otherwise the tail marker's
+    //    automatic ~20-block walk already covers the whole prefix.
+    let total_cacheable = count_cacheable_blocks_through(messages, tail_index);
+    if total_cacheable <= TRANSCRIPT_LOOKBACK_BLOCKS {
+        return;
+    }
+    // Place the deep marker `TRANSCRIPT_LOOKBACK_BLOCKS` cacheable-blocks back
+    // from the tail so it stays inside the tail's lookback window while
+    // extending coverage to older history.
+    let deep_target = total_cacheable.saturating_sub(TRANSCRIPT_LOOKBACK_BLOCKS);
+    mark_cacheable_block_at_index(messages, deep_target, cache_control_5m());
+}
+
+/// Walk messages in reverse and stamp `cache_control` on the latest cacheable
+/// content block. Returns the cumulative index (1-based) of that block in
+/// cacheable-block-order from the front, or `None` if nothing was marked.
+fn mark_latest_cacheable_block(messages: &mut [Value], cache_control: Value) -> Option<usize> {
+    let mut total = 0usize;
+    for message in messages.iter() {
+        if let Some(content) = message.get("content").and_then(Value::as_array) {
+            for block in content {
+                if is_cacheable_transcript_block(block) {
+                    total += 1;
+                }
+            }
+        }
+    }
+    if total == 0 {
+        return None;
+    }
     for message in messages.iter_mut().rev() {
         let Some(content) = message.get_mut("content") else {
             continue;
@@ -305,8 +410,44 @@ fn add_transcript_cache_breakpoint(messages: &mut [Value]) {
             continue;
         };
         if let Some(object) = block.as_object_mut() {
-            object.insert("cache_control".to_string(), cache_control_1h());
-            return;
+            object.insert("cache_control".to_string(), cache_control);
+            return Some(total);
+        }
+    }
+    None
+}
+
+/// Count cacheable blocks from the start up to and including the `tail_index`-th
+/// cacheable block.
+fn count_cacheable_blocks_through(messages: &[Value], tail_index: usize) -> usize {
+    // `tail_index` is the count-of-cacheable-blocks up to and including the
+    // tail, so the total cacheable blocks is exactly `tail_index`.
+    let _ = messages;
+    tail_index
+}
+
+/// Stamp `cache_control` on the `target`-th cacheable content block (1-based,
+/// counted from the start), if it exists and isn't already marked.
+fn mark_cacheable_block_at_index(messages: &mut [Value], target: usize, cache_control: Value) {
+    if target == 0 {
+        return;
+    }
+    let mut seen = 0usize;
+    for message in messages.iter_mut() {
+        let Some(content) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for block in content.iter_mut() {
+            if !is_cacheable_transcript_block(block) {
+                continue;
+            }
+            seen += 1;
+            if seen == target {
+                if let Some(object) = block.as_object_mut() {
+                    object.insert("cache_control".to_string(), cache_control);
+                }
+                return;
+            }
         }
     }
 }
@@ -553,6 +694,7 @@ mod tests {
             max_tokens: Some(2048),
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
+            session_id: None,
         })
         .expect("body renders");
 
@@ -577,18 +719,16 @@ mod tests {
         assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tools"][0]["name"], "read");
-        assert_eq!(
-            body["tools"][0]["cache_control"],
-            json!({
-                "type": "ephemeral",
-                "ttl": "1h",
-            })
-        );
+        // Tools must NOT carry a cache_control breakpoint: the stable system
+        // block's breakpoint already covers tools via the cumulative prefix
+        // hash, so a tools-level marker would waste a breakpoint slot.
+        assert!(body["tools"][0].get("cache_control").is_none());
+        // Latest transcript block uses 5m (default ephemeral, no `ttl` field):
+        // it's regenerated each turn, so paying the 1h write premium is waste.
         assert_eq!(
             body["messages"][0]["content"][0]["cache_control"],
             json!({
                 "type": "ephemeral",
-                "ttl": "1h",
             })
         );
     }
@@ -615,19 +755,15 @@ mod tests {
             max_tokens: None,
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
+            session_id: None,
         })
         .expect("body renders");
 
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["tools"][1]["name"], "write");
+        // No tools-level breakpoints regardless of how many tools there are.
         assert!(body["tools"][0].get("cache_control").is_none());
-        assert_eq!(
-            body["tools"][1]["cache_control"],
-            json!({
-                "type": "ephemeral",
-                "ttl": "1h",
-            })
-        );
+        assert!(body["tools"][1].get("cache_control").is_none());
     }
 
     #[test]
@@ -641,6 +777,7 @@ mod tests {
             max_tokens: None,
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
+            session_id: None,
         })
         .expect("body renders");
 
@@ -652,13 +789,14 @@ mod tests {
         assert_eq!(body["tools"][3]["type"], "web_search_20250305");
         assert_eq!(body["tools"][4]["type"], "web_fetch_20250910");
         assert_eq!(body["tools"][4]["citations"]["enabled"], true);
-        assert_eq!(
-            body["tools"][4]["cache_control"],
-            json!({
-                "type": "ephemeral",
-                "ttl": "1h",
-            })
-        );
+        // Native coding tools also carry no per-tool cache_control: the
+        // stable-system breakpoint covers them via the cumulative hash.
+        for index in 0..5 {
+            assert!(
+                body["tools"][index].get("cache_control").is_none(),
+                "tool {index} should not carry cache_control"
+            );
+        }
     }
 
     #[test]
@@ -678,17 +816,19 @@ mod tests {
             max_tokens: None,
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
+            session_id: None,
         })
         .expect("body renders");
 
         assert!(body["messages"][0]["content"][0]
             .get("cache_control")
             .is_none());
+        // Latest transcript block carries a 5m (default ephemeral) breakpoint,
+        // not 1h: the marker is regenerated next turn.
         assert_eq!(
             body["messages"][1]["content"][0]["cache_control"],
             json!({
                 "type": "ephemeral",
-                "ttl": "1h",
             })
         );
     }
@@ -764,5 +904,191 @@ mod tests {
         .expect("messages render");
 
         assert_eq!(messages[0]["content"], json!([raw]));
+    }
+
+    #[test]
+    fn stable_system_block_keeps_one_hour_ttl() {
+        let body = messages_body(ModelRequest {
+            model: "claude-opus-4-7".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+            session_id: None,
+        })
+        .expect("body renders");
+
+        // Stable system block keeps the 1h TTL — it's long-lived across many
+        // turns and benefits from the extended retention even at 2x write cost.
+        assert_eq!(
+            body["system"][1]["cache_control"],
+            json!({
+                "type": "ephemeral",
+                "ttl": "1h",
+            })
+        );
+    }
+
+    #[test]
+    fn short_transcript_uses_only_tail_breakpoint() {
+        let transcript = vec![
+            TranscriptItem::UserMessage(UserMessage::text("turn 1")).into(),
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("response 1".to_string())],
+            })
+            .into(),
+            TranscriptItem::UserMessage(UserMessage::text("turn 2")).into(),
+        ];
+        let body = messages_body(ModelRequest {
+            model: "claude-opus-4-7".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript,
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+            session_id: None,
+        })
+        .expect("body renders");
+
+        // Only the LAST message carries cache_control; earlier ones are
+        // covered by Anthropic's automatic ~20-block backward walk.
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(
+            body["messages"][2]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn long_transcript_adds_deep_history_breakpoint() {
+        // Build a transcript with enough cacheable blocks to exceed
+        // TRANSCRIPT_LOOKBACK_BLOCKS (18). Each pair contributes 2 blocks.
+        let mut transcript = Vec::new();
+        for index in 0..25 {
+            transcript
+                .push(TranscriptItem::UserMessage(UserMessage::text(format!("u{index}"))).into());
+            transcript.push(
+                TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::Text(format!("a{index}"))],
+                })
+                .into(),
+            );
+        }
+        let body = messages_body(ModelRequest {
+            model: "claude-opus-4-7".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript,
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+            session_id: None,
+        })
+        .expect("body renders");
+
+        let messages = body["messages"].as_array().expect("messages array");
+        // Tail breakpoint: last message must carry cache_control.
+        let last = messages.last().expect("at least one message");
+        assert_eq!(
+            last["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        // Deep breakpoint: exactly one earlier message also carries
+        // cache_control, and it lives within the lookback window of the tail.
+        let marked_indices: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message["content"][0].get("cache_control").is_some())
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            marked_indices.len(),
+            2,
+            "expected exactly tail + deep breakpoints, got {marked_indices:?}"
+        );
+        let tail_index = marked_indices[1];
+        let deep_index = marked_indices[0];
+        assert!(
+            deep_index < tail_index,
+            "deep breakpoint must come before tail"
+        );
+        // Deep marker should be within the lookback window of the tail.
+        assert!(
+            tail_index - deep_index <= TRANSCRIPT_LOOKBACK_BLOCKS,
+            "deep breakpoint at {deep_index} is too far from tail at {tail_index}"
+        );
+    }
+
+    #[test]
+    fn attribution_fingerprint_is_stable_across_different_first_user_messages() {
+        // Two requests with identical stable system prompts but completely
+        // different opening user messages must produce the same fingerprint —
+        // that's the whole point of deriving it from `stable_prefix`.
+        let make_body = |first_user: &str| {
+            messages_body(ModelRequest {
+                model: "claude-opus-4-7".to_string(),
+                prompt: PromptSections::stable("a stable system prompt long enough to fingerprint"),
+                transcript: vec![
+                    TranscriptItem::UserMessage(UserMessage::text(first_user)).into(),
+                ],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: None,
+            session_id: None,
+            })
+            .expect("body renders")
+        };
+
+        let body_a = make_body("Explain quantum tunneling like I'm five");
+        let body_b = make_body("write me a haiku about ferrets");
+
+        let header_a = body_a["system"][0]["text"].as_str().expect("text");
+        let header_b = body_b["system"][0]["text"].as_str().expect("text");
+        assert_eq!(
+            header_a, header_b,
+            "attribution headers must match across sessions with the same stable prompt"
+        );
+    }
+
+    #[test]
+    fn attribution_fingerprint_changes_with_stable_prompt() {
+        // Sanity check: changing the stable system prompt SHOULD change the
+        // fingerprint, otherwise it would be useless for routing.
+        let make_body = |stable: &str| {
+            messages_body(ModelRequest {
+                model: "claude-opus-4-7".to_string(),
+                prompt: PromptSections::stable(stable),
+                transcript: vec![
+                    TranscriptItem::UserMessage(UserMessage::text("anything")).into(),
+                ],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: None,
+            session_id: None,
+            })
+            .expect("body renders")
+        };
+
+        let body_a = make_body("you are a helpful coding assistant working on rust");
+        let body_b = make_body("you are a research assistant focused on biology");
+        assert_ne!(
+            body_a["system"][0]["text"], body_b["system"][0]["text"],
+            "different stable prompts must produce different fingerprints"
+        );
     }
 }

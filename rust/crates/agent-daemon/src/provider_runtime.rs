@@ -17,6 +17,7 @@ use crate::state::AppState;
 pub(crate) async fn run_model(
     state: &AppState,
     config: &SessionConfig,
+    session_id: &str,
     model_context: ModelContext,
 ) -> Result<ModelResponse> {
     let request = ModelRequest {
@@ -37,6 +38,7 @@ pub(crate) async fn run_model(
             .and_then(|value| value.get("key"))
             .and_then(Value::as_str)
             .map(str::to_string),
+        session_id: Some(session_id.to_string()),
     };
 
     let credentials = Credentials::load();
@@ -62,6 +64,7 @@ Summarize the transcript above into a compact continuation context.";
 
 pub(crate) async fn run_compaction(
     config: &SessionConfig,
+    session_id: &str,
     model_context: ModelContext,
 ) -> Result<String> {
     let mut transcript = provider_transcript(model_context);
@@ -81,6 +84,12 @@ pub(crate) async fn run_compaction(
             .and_then(|value| value.get("key"))
             .and_then(Value::as_str)
             .map(|key| format!("{key}:compaction")),
+        // Compaction calls reuse the parent session's id with a `:compaction`
+        // suffix so the headers stay correlated for tracing without polluting
+        // the main session's prompt-cache bucket (the suffix on
+        // `prompt_cache_key` covers cache isolation; `session_id` on the wire
+        // is just identity).
+        session_id: Some(format!("{session_id}:compaction")),
     };
 
     let credentials = Credentials::load();
@@ -145,6 +154,7 @@ fn provider_for_config(
                     anyhow!("~/.codex ChatGPT token not found for OpenAI subscription transport")
                 })?,
                 credentials.codex_account_id.clone(),
+                credentials.codex_installation_id.clone(),
             )),
             uses_codex_auth: true,
         },

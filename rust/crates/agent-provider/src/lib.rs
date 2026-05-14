@@ -20,7 +20,17 @@ pub struct ModelRequest {
     pub tools: Vec<ToolDefinition>,
     pub max_tokens: Option<u32>,
     pub reasoning_effort: ReasoningEffort,
+    /// Explicit override for the provider's prompt-cache routing key. When
+    /// `None`, providers fall back to `session_id` (the documented "unique to
+    /// us" cohort) and finally to a deterministic config-hash for test/CLI
+    /// paths that don't carry a session.
     pub prompt_cache_key: Option<String>,
+    /// Stable identifier for the pi-relay session that owns this request.
+    /// Mirrors Codex CLI's `thread_id` semantics: it doubles as the prompt
+    /// cache key (so each session gets its own routing bucket and stays
+    /// under OpenAI's ~15 RPM per-shard ceiling) and as the value of the
+    /// `session_id` / `thread_id` / `x-client-request-id` headers.
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

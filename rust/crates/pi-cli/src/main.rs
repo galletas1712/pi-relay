@@ -37,7 +37,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let provider: Arc<dyn ModelProvider> = match provider_kind {
         ProviderKind::OpenAi => {
             let (access_token, account_id) = read_codex_auth()?;
-            Arc::new(OpenAiProvider::codex(access_token, account_id))
+            // pi-cli doesn't track a persistent installation id — Codex
+            // tolerates the header being absent.
+            Arc::new(OpenAiProvider::codex(access_token, account_id, None))
         }
         ProviderKind::Claude => Arc::new(AnthropicProvider::new(env::var("ANTHROPIC_API_KEY")?)),
     };
@@ -81,6 +83,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             max_tokens: None,
                             reasoning_effort: agent_vocab::ReasoningEffort::XHigh,
                             prompt_cache_key: None,
+                            session_id: None,
                         })
                         .await?;
                     let context_tokens =

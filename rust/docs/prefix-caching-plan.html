@@ -121,8 +121,8 @@
         </tr>
         <tr>
           <td>Anthropic Messages</td>
-          <td>Caches are controlled with <code>cache_control</code> breakpoints. Cache order is <code>tools</code> → <code>system</code> → <code>messages</code>. There are up to 4 breakpoints, and lookback is block-based.</td>
-          <td>Mark the stable tool prefix, stable system block, and latest eligible message block. Preserve thinking blocks in provider replay. Log cache read/write usage.</td>
+          <td>Caches are controlled with <code>cache_control</code> breakpoints. Cache order is <code>tools</code> → <code>system</code> → <code>messages</code>. There are up to 4 breakpoints, and the automatic backward walk looks back ~20 content blocks per breakpoint. 5m writes cost 1.25x base input; 1h writes cost 2x; reads cost 0.1x.</td>
+          <td>Mark the stable system block (1h TTL) and the latest eligible message block (5m TTL). For long transcripts also mark a deeper history block so coverage extends past the 20-block lookback. No per-tool marker — the stable-system breakpoint covers tools transitively. Preserve thinking blocks in provider replay. Log cache read/write usage.</td>
         </tr>
       </tbody>
     </table>
@@ -134,7 +134,8 @@
     <ul>
       <li><span class="status ok">done</span> <code>agent-provider/src/openai.rs</code> uses the Codex subscription backend only; the old plain API-key auth split is gone.</li>
       <li><span class="status ok">done</span> <code>responses_body</code> renders <code>instructions</code> as stable prefix only. Dynamic context is the first synthetic input item, followed by transcript items.</li>
-      <li><span class="status ok">done</span> Default cache key is derived from model + stable prompt + stable sorted tool schema. It intentionally ignores cwd, transcript, active leaf, timestamps, and current user input.</li>
+      <li><span class="status ok">done</span> Default cache key is the pi-relay session id (matching Codex CLI&rsquo;s <code>prompt_cache_key = thread_id.to_string()</code>): one routing bucket per session, well under OpenAI&rsquo;s ~15 RPM-per-shard ceiling while still maximizing in-session prefix reuse. An explicit <code>ProviderConfig.prompt_cache.key</code> override still wins.</li>
+      <li><span class="status ok">done</span> The HTTP envelope mirrors Codex CLI byte-for-byte: <code>originator: codex_cli_rs</code>, <code>User-Agent: codex_cli_rs/{ver} ({os}; {arch})</code>, <code>x-openai-internal-codex-residency: us</code>, <code>x-codex-installation-id</code> (from <code>~/.codex/installation_id</code>), <code>x-codex-window-id</code> (per-process UUID), and the full <code>session_id</code>/<code>session-id</code>/<code>thread_id</code>/<code>thread-id</code>/<code>x-client-request-id</code> routing pair. This matches <code>build_responses_identity_headers</code>+<code>build_session_headers</code>+<code>default_headers</code> in the Codex CLI source.</li>
       <li><span class="status ok">done</span> Provider usage/cache metrics are parsed into <code>ModelResponse.usage</code> and persisted on model action results.</li>
     </ul>
 
@@ -142,8 +143,11 @@
     <ul>
       <li><span class="status ok">done</span> <code>anthropic_system_blocks</code> marks the stable system block with <code>cache_control: { type: "ephemeral", ttl: "1h" }</code>.</li>
       <li><span class="status ok">good</span> Provider replay stores <code>thinking</code> and <code>redacted_thinking</code> blocks unchanged and replays them before normalized visible text/tool calls.</li>
-      <li><span class="status ok">done</span> A message-level cache breakpoint is added to the latest eligible transcript block so long multi-turn prefixes can be reused.</li>
-      <li><span class="status ok">done</span> Tool schemas are rendered in deterministic order and the last stable tool is cache-marked.</li>
+      <li><span class="status ok">done</span> A 5-minute (default ephemeral) cache breakpoint is added to the latest eligible transcript block. 5m is correct here because the marker is regenerated each turn — 1h writes cost 2x base input vs 1.25x for 5m, so the long-TTL premium would be wasted.</li>
+      <li><span class="status ok">done</span> When the transcript exceeds Anthropic's ~20-block lookback window, an additional 5m breakpoint is placed deeper in the history (~18 cacheable-blocks back from the tail) so older prefixes remain discoverable past the automatic lookback ceiling.</li>
+      <li><span class="status ok">done</span> Tool schemas are rendered in deterministic sorted order. No per-tool <code>cache_control</code>: the stable-system breakpoint already covers tools via Anthropic's <code>tools → system → messages</code> cumulative prefix hash, so a tools-level marker would burn a breakpoint slot for zero gain.</li>
+      <li><span class="status ok">done</span> The Claude-Code attribution fingerprint is derived from the stable system prompt (not the first user message), so two sessions with the same global prompt produce the same <code>system[0]</code> bytes and can share the cached stable-system prefix across sessions.</li>
+      <li><span class="status ok">done</span> <code>thinking: { type: "adaptive" }</code> is hard-coded with a comment: Anthropic invalidates message-content cache on any <code>thinking</code> change, so this must not become a per-request toggle.</li>
       <li><span class="status ok">done</span> <code>cache_read_input_tokens</code> and <code>cache_creation_input_tokens</code> are parsed into provider usage.</li>
     </ul>
   </div>
@@ -169,15 +173,20 @@
 {
   tools: [
     ...stable_sorted_tools,
-    // final stable tool gets cache_control
+    // no per-tool cache_control: covered by the stable-system breakpoint
+    // via Anthropic's tools -> system -> messages cumulative prefix hash
   ],
   system: [
+    { type: "text", text: attribution_header },                                           // fingerprinted off stable_prefix, cross-session-stable
     { type: "text", text: stable_system_prompt, cache_control: { type: "ephemeral", ttl: "1h" } },
-    { type: "text", text: dynamic_context_label }
+    { type: "text", text: dynamic_context_label }                                          // uncached suffix
   ],
   messages: [
     ...transcript_messages_with_provider_replay,
-    // exactly one latest eligible message block gets a message-level cache marker
+    // latest eligible message block gets cache_control: { type: "ephemeral" }  (5m default)
+    // PLUS: when total cacheable blocks > ~18, an additional 5m marker
+    //       roughly 18 blocks back from the tail, to extend coverage past
+    //       Anthropic's 20-block automatic lookback ceiling
   ],
   thinking: { type: "adaptive" },
   output_config: { effort }
