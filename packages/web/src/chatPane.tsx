@@ -60,6 +60,7 @@ export const ChatPane = memo(function ChatPane({
 			/>
 			<MessageList
 				entries={entries}
+				pendingActions={snapshot?.pending_actions ?? []}
 				activeLeafId={snapshot?.active_leaf_id ?? null}
 				isRunning={snapshot?.activity === "running"}
 				hasSession={!!selectedId}

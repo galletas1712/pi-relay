@@ -1,20 +1,70 @@
-import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type UIEvent } from "react";
-import { AlertTriangle, Check, ChevronDown, Copy, Globe2, Loader2, RotateCcw, Terminal, Wrench } from "lucide-react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type UIEvent } from "react";
+import { AlertTriangle, Check, ChevronDown, Copy, Loader2, RotateCcw, Terminal } from "lucide-react";
 import rehypeRaw from "rehype-raw";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { branchEntriesFor } from "./historyTargets.ts";
 import { citationsFromReplay, hostedToolsFromReplay, localToolCallIdFromReplay, parsedProviderReplay, replayContainsAssistantText } from "./providerReplay.ts";
+import type { HostedToolView, SourceCitation } from "./providerReplay.ts";
 import { contentBlocksToText, firstLine } from "./text.ts";
 import { assistantMessageText, buildTurnViews } from "./turnView.ts";
-import type { ModelStepView } from "./turnView.ts";
-import type { AssistantItem, NoticeTone, ReplayDisplay, TranscriptEntry, TranscriptItem } from "./types.ts";
+import type { ModelStepView, TurnView } from "./turnView.ts";
+import type { AssistantItem, NoticeTone, PendingAction, ReplayDisplay, TranscriptEntry, TranscriptItem } from "./types.ts";
 
 type ToolResultItem = Extract<TranscriptItem, { type: "tool_result" }>;
+type AssistantMessageEntry = TranscriptEntry & { item: Extract<TranscriptItem, { type: "assistant_message" }> };
+type ToolRunStatusKind = "success" | "error" | "running";
+
+type ToolRunItem =
+	| {
+			source: "local";
+			key: string;
+			entryId: string;
+			id: string;
+			rawName: string;
+			prettyName: string;
+			title: string;
+			statusKind: ToolRunStatusKind;
+			statusLabel: string;
+			argsJson?: string;
+			display?: ReplayDisplay | null;
+			result?: ToolResultItem;
+			input: Record<string, unknown> | null;
+			editPreview: EditToolPreview | null;
+	  }
+	| {
+			source: "hosted";
+			key: string;
+			entryId: string;
+			id: string;
+			rawName: string;
+			prettyName: string;
+			title: string;
+			statusKind: ToolRunStatusKind;
+			statusLabel: string;
+			tool: HostedToolView;
+	  };
+
+type TranscriptDisplayNode =
+	| { type: "user"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "user_message" }> } }
+	| {
+			type: "assistant_text";
+			key: string;
+			entry: AssistantMessageEntry;
+			text: string;
+			copyText: string;
+			phase: ModelStepView["phase"];
+			citations: SourceCitation[];
+	  }
+	| { type: "tool_group"; key: string; id: string; items: ToolRunItem[]; turnId: number | null; turnOpen: boolean; isLive: boolean }
+	| { type: "turn_finished"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "turn_finished" }> } }
+	| { type: "tool_result"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "tool_result" }> } }
+	| { type: "compaction_summary"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "compaction_summary" }> } };
 
 type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
 const STICKY_BOTTOM_EPSILON_PX = 1;
 const ACTIVE_SESSION_SCROLL_KEY = "__active_session__";
+const RECENT_TOOL_ROW_COUNT = 3;
 
 export interface ScrollPositionSnapshot {
 	scrollTop: number;
@@ -47,6 +97,7 @@ export function restoreScrollPosition(node: ScrollMetrics, position: ScrollPosit
 
 export const MessageList = memo(function MessageList({
 	entries,
+	pendingActions,
 	activeLeafId,
 	isRunning,
 	hasSession,
@@ -56,6 +107,7 @@ export const MessageList = memo(function MessageList({
 	resumingTurnId
 }: {
 	entries: TranscriptEntry[];
+	pendingActions?: PendingAction[];
 	activeLeafId: string | null;
 	isRunning: boolean;
 	hasSession: boolean;
@@ -150,13 +202,13 @@ export const MessageList = memo(function MessageList({
 		return () => observer.disconnect();
 	}, [entriesBelongToSelectedSession, hasSession, scrollToBottom]);
 	const toolIndex = useMemo(() => indexToolEntries(visibleEntries), [visibleEntries]);
-	const modelStepsByEntry = useMemo(() => {
-		const steps = new Map<string, ModelStepView>();
-		for (const turn of buildTurnViews(visibleEntries)) {
-			for (const step of turn.modelSteps) steps.set(step.entry.id, step);
-		}
-		return steps;
-	}, [visibleEntries]);
+	const turnViews = useMemo(() => buildTurnViews(visibleEntries), [visibleEntries]);
+	const displayNodes = useMemo(() => deriveTranscriptDisplayNodes(visibleEntries, turnViews, toolIndex.results, pendingActions), [pendingActions, toolIndex.results, turnViews, visibleEntries]);
+	const resumeEntryIdByNode = useMemo(() => {
+		const ids = new Map<string, string>();
+		for (const node of displayNodes) ids.set(node.key, resumeBoundaryIdForNode(node, turnViews) ?? nodeLeafId(node));
+		return ids;
+	}, [displayNodes, turnViews]);
 
 	if (!hasSession) {
 		return (
@@ -172,16 +224,16 @@ export const MessageList = memo(function MessageList({
 	return (
 		<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 			<div className="message-scroll-content" ref={contentRef}>
-				{visibleEntries.map((entry) => (
-					<TranscriptEntryView
-						entry={entry}
-						key={entry.id}
-						modelStep={modelStepsByEntry.get(entry.id)}
+				{displayNodes.map((node) => (
+					<TranscriptDisplayNodeView
+						node={node}
+						key={node.key}
 						toolIndex={toolIndex}
-						isActiveLeaf={entry.id === activeLeafId}
+						isActiveLeaf={resumeEntryIdByNode.get(node.key) === activeLeafId}
 						isRunning={isRunning}
 						onResumeTurn={onResumeTurn}
-						resuming={entry.id === resumingTurnId}
+						resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
+						resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
 					/>
 				))}
 				{isRunning ? (
@@ -195,28 +247,34 @@ export const MessageList = memo(function MessageList({
 	);
 });
 
-const TranscriptEntryView = memo(function TranscriptEntryView({
-	entry,
-	modelStep,
+const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
+	node,
 	toolIndex,
 	isActiveLeaf,
 	isRunning,
 	onResumeTurn,
+	resumeEntryId,
 	resuming
 }: {
-	entry: TranscriptEntry;
-	modelStep?: ModelStepView;
+	node: TranscriptDisplayNode;
 	toolIndex: ReturnType<typeof indexToolEntries>;
 	isActiveLeaf: boolean;
 	isRunning: boolean;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
+	resumeEntryId: string;
 	resuming: boolean;
 }) {
-	const item = entry.item;
-	if (item.type === "turn_started") {
-		return null;
+	if (node.type === "user") {
+		return <UserBubble item={node.entry.item} entryId={node.entry.id} />;
 	}
-	if (item.type === "turn_finished") {
+	if (node.type === "assistant_text") {
+		return <AssistantTextBlock node={node} />;
+	}
+	if (node.type === "tool_group") {
+		return <ToolRunGroup node={node} />;
+	}
+	if (node.type === "turn_finished") {
+		const item = node.entry.item;
 		if (item.outcome === "Graceful") return null;
 		const canResume = isActiveLeaf && !isRunning && !!onResumeTurn;
 		const actionLabel = item.outcome === "Interrupted" ? "Continue" : "Retry";
@@ -230,27 +288,19 @@ const TranscriptEntryView = memo(function TranscriptEntryView({
 						? {
 								label: resuming ? "Starting..." : actionLabel,
 								disabled: resuming,
-								onClick: () => onResumeTurn?.(entry.id, resumableOutcome)
+								onClick: () => onResumeTurn?.(resumeEntryId, resumableOutcome)
 							}
 						: undefined
 				}
 			/>
 		);
 	}
-	if (item.type === "user_message") {
-		return <UserBubble item={item} entryId={entry.id} />;
-	}
-	if (item.type === "assistant_message") {
-		return <AssistantBlock item={item} providerReplay={entry.provider_replay} modelStep={modelStep} toolResults={toolIndex.results} />;
-	}
-	if (item.type === "tool_result") {
+	if (node.type === "tool_result") {
+		const item = node.entry.item;
 		if (toolIndex.calls.has(item.tool_call_id)) return null;
-		return <ToolResultCard item={item} entryId={entry.id} />;
+		return <ToolResultCard item={item} entryId={node.entry.id} />;
 	}
-	if (item.type === "tool_call_started") {
-		return null;
-	}
-	if (item.type === "compaction_summary") {
+	if (node.type === "compaction_summary") {
 		return <SystemMessage tone="info" text="compacted history" />;
 	}
 	return null;
@@ -261,52 +311,6 @@ const UserBubble = memo(function UserBubble({ item, entryId }: { item: Extract<T
 		<div className="message-row user-row">
 			<EntryId entryId={entryId} />
 			<div className="user-bubble">{contentBlocksToText(item.content)}</div>
-		</div>
-	);
-});
-
-const AssistantBlock = memo(function AssistantBlock({
-	item,
-	providerReplay,
-	modelStep,
-	toolResults
-}: {
-	item: Extract<TranscriptItem, { type: "assistant_message" }>;
-	providerReplay?: TranscriptEntry["provider_replay"];
-	modelStep?: ModelStepView;
-	toolResults: Map<string, ToolResultItem>;
-}) {
-	const text = assistantMessageText(item);
-	const phase = modelStep?.phase ?? "unknown";
-	const renderParts = assistantRenderParts(item.items, providerReplay);
-	const citations = citationsFromReplay(providerReplay);
-	return (
-		<div className="message-row assistant-row">
-			<div className={`assistant-block phase-${phase} ${text ? "has-copy" : ""}`}>
-				{renderParts.map((part) => {
-					if (part.type === "text") {
-						return <MarkdownText text={part.item.text} key={part.key} />;
-					}
-					if (part.type === "tool_call") {
-						return (
-							<ToolCard
-								key={part.item.id}
-								toolName={part.item.tool_name}
-								toolId={part.item.id}
-								argsJson={part.item.args_json}
-								result={toolResults.get(part.item.id)}
-								display={part.display}
-							/>
-						);
-					}
-					if (part.type === "hosted_tool") {
-						return <HostedToolCard key={part.key} tool={part.tool} />;
-					}
-					return null;
-				})}
-				{citations.length ? <CitationList citations={citations} /> : null}
-				{text ? <AssistantCopyButton text={text} /> : null}
-			</div>
 		</div>
 	);
 });
@@ -399,6 +403,293 @@ function coalesceAdjacentTextItems(items: AssistantItem[]): AssistantItem[] {
 	return merged;
 }
 
+export function deriveTranscriptDisplayNodes(
+	entries: TranscriptEntry[],
+	turns: TurnView[] = buildTurnViews(entries),
+	toolResults: Map<string, ToolResultItem> = indexToolEntries(entries).results,
+	pendingActions: PendingAction[] = []
+): TranscriptDisplayNode[] {
+	const builder = new TranscriptDisplayBuilder(entries, turns, toolResults, pendingActions);
+	return builder.build();
+}
+
+class TranscriptDisplayBuilder {
+	private readonly turnByEntryId = new Map<string, TurnView>();
+	private readonly toolCallIds = new Set<string>();
+	private readonly nodes: TranscriptDisplayNode[] = [];
+	private pendingGroup: Extract<TranscriptDisplayNode, { type: "tool_group" }> | null = null;
+
+	constructor(
+		private readonly entries: TranscriptEntry[],
+		private readonly turns: TurnView[],
+		private readonly toolResults: Map<string, ToolResultItem>,
+		private readonly pendingActions: PendingAction[]
+	) {
+		for (const turn of turns) {
+			for (const entry of turn.entries) this.turnByEntryId.set(entry.id, turn);
+		}
+		for (const entry of entries) {
+			if (entry.item.type !== "assistant_message") continue;
+			for (const assistantItem of entry.item.items) {
+				if (assistantItem.type === "tool_call") this.toolCallIds.add(assistantItem.id);
+			}
+		}
+	}
+
+	build(): TranscriptDisplayNode[] {
+		for (const entry of this.entries) this.appendEntry(entry);
+		this.flushGroup();
+		this.appendPendingToolRuns();
+		return markLiveToolGroups(this.nodes);
+	}
+
+	private appendEntry(entry: TranscriptEntry) {
+		const item = entry.item;
+		if (item.type === "turn_started") {
+			this.flushGroup();
+			return;
+		}
+		if (item.type === "user_message") {
+			this.flushGroup();
+			this.nodes.push({ type: "user", key: entry.id, entry: entry as Extract<TranscriptDisplayNode, { type: "user" }>["entry"] });
+			return;
+		}
+		if (item.type === "assistant_message") {
+			this.appendAssistantMessage(entry as AssistantMessageEntry);
+			return;
+		}
+		if (item.type === "tool_result") {
+			if (!this.toolCallIds.has(item.tool_call_id)) {
+				this.flushGroup();
+				this.nodes.push({ type: "tool_result", key: entry.id, entry: entry as Extract<TranscriptDisplayNode, { type: "tool_result" }>["entry"] });
+			}
+			return;
+		}
+		if (item.type === "tool_call_started") return;
+		if (item.type === "turn_finished") {
+			this.flushGroup();
+			this.nodes.push({ type: "turn_finished", key: entry.id, entry: entry as Extract<TranscriptDisplayNode, { type: "turn_finished" }>["entry"] });
+			return;
+		}
+		if (item.type === "compaction_summary") {
+			this.flushGroup();
+			this.nodes.push({ type: "compaction_summary", key: entry.id, entry: entry as Extract<TranscriptDisplayNode, { type: "compaction_summary" }>["entry"] });
+		}
+	}
+
+	private appendAssistantMessage(entry: AssistantMessageEntry) {
+		const parts = assistantRenderParts(entry.item.items, entry.provider_replay);
+		const citations = citationsFromReplay(entry.provider_replay);
+		let citationsRendered = false;
+		for (const part of parts) {
+			if (part.type === "text") {
+				if (!part.item.text) continue;
+				this.flushGroup();
+				this.nodes.push(this.assistantTextNode(entry, part.key, part.item.text, citationsRendered ? [] : citations));
+				citationsRendered = true;
+				continue;
+			}
+			if (part.type === "tool_call") {
+				this.appendToolItem(entry, localToolRunItem(entry.id, part, this.toolResults.get(part.item.id)));
+				continue;
+			}
+			this.appendToolItem(entry, hostedToolRunItem(entry.id, part));
+		}
+		if (citations.length && !citationsRendered) {
+			this.flushGroup();
+			this.nodes.push(this.assistantTextNode(entry, "citations", "", citations));
+		}
+	}
+
+	private assistantTextNode(
+		entry: AssistantMessageEntry,
+		key: string,
+		text: string,
+		citations: SourceCitation[]
+	): Extract<TranscriptDisplayNode, { type: "assistant_text" }> {
+		const step = this.turnByEntryId.get(entry.id)?.modelSteps.find((candidate) => candidate.entry.id === entry.id);
+		return {
+			type: "assistant_text",
+			key: `${entry.id}-${key}`,
+			entry,
+			text,
+			copyText: assistantMessageText(entry.item),
+			phase: step?.phase ?? "unknown",
+			citations
+		};
+	}
+
+	private appendToolItem(entry: AssistantMessageEntry, item: ToolRunItem) {
+		const turn = this.turnByEntryId.get(entry.id);
+		if (!this.pendingGroup) {
+			this.pendingGroup = {
+				type: "tool_group",
+				key: `tool-group-${entry.id}-${item.key}`,
+				id: `tool-group-${entry.id}-${item.id}`,
+				items: [],
+				turnId: turn?.turnId ?? null,
+				turnOpen: !turn?.boundaryEntry,
+				isLive: false
+			};
+		}
+		this.pendingGroup.items.push(item);
+	}
+
+	private flushGroup() {
+		if (!this.pendingGroup) return;
+		this.nodes.push(this.pendingGroup);
+		this.pendingGroup = null;
+	}
+
+	private appendPendingToolRuns() {
+		const pendingTools = this.pendingActions
+			.filter((action) => action.kind === "tool" && action.status === "running")
+			.map((action) => toolRunItemFromPendingAction(action))
+			.filter((item): item is ToolRunItem => !!item);
+		if (!pendingTools.length) return;
+		const lastNode = this.nodes.at(-1);
+		if (lastNode?.type === "tool_group" && lastNode.turnOpen) {
+			const existingTools = new Set(lastNode.items.map((item) => `${item.rawName}:${item.id}`));
+			lastNode.items.push(...pendingTools.filter((item) => !existingTools.has(`${item.rawName}:${item.id}`)));
+			return;
+		}
+		const lastAssistant = [...this.nodes].reverse().find((node) => node.type === "assistant_text") as Extract<TranscriptDisplayNode, { type: "assistant_text" }> | undefined;
+		const turn = lastAssistant ? this.turnByEntryId.get(lastAssistant.entry.id) : undefined;
+		this.nodes.push({
+			type: "tool_group",
+			key: `tool-group-pending-${pendingTools[0].id}`,
+			id: `tool-group-pending-${pendingTools[0].id}`,
+			items: pendingTools,
+			turnId: turn?.turnId ?? null,
+			turnOpen: true,
+			isLive: true
+		});
+	}
+}
+
+function toolRunItemFromPendingAction(action: PendingAction): ToolRunItem | null {
+	const payload = action.payload;
+	const id = stringValue(payload.id) ?? stringValue(payload.tool_call_id) ?? action.action_row_id;
+	const toolName = stringValue(payload.tool_name) ?? stringValue(payload.name) ?? "tool";
+	const argsJson = typeof payload.args_json === "string" ? payload.args_json : JSON.stringify(payload);
+	const input = parseToolInput(argsJson) ?? (payload && typeof payload === "object" && !Array.isArray(payload) ? payload : null);
+	const prettyName = prettyToolName(toolName);
+	const editPreview = editToolPreview(toolName, input);
+	return {
+		source: "local",
+		key: `pending-${action.action_row_id}`,
+		entryId: action.action_row_id,
+		id,
+		rawName: toolName,
+		prettyName: editPreview ? "Edit" : prettyName,
+		title: editPreview?.header ?? formatDisplayHeader(prettyName, inputSummaryFromInput(toolName, input)),
+		statusKind: "running",
+		statusLabel: "running",
+		argsJson,
+		input,
+		editPreview
+	};
+}
+
+function markLiveToolGroups(nodes: TranscriptDisplayNode[]): TranscriptDisplayNode[] {
+	const liveGroupByTurn = new Map<number | "none", string>();
+	for (const node of nodes) {
+		if (node.type !== "tool_group" || !node.turnOpen) continue;
+		liveGroupByTurn.set(node.turnId ?? "none", node.id);
+	}
+	return nodes.map((node) => {
+		if (node.type !== "tool_group" || !node.turnOpen) return node;
+		return { ...node, isLive: liveGroupByTurn.get(node.turnId ?? "none") === node.id };
+	});
+}
+
+function localToolRunItem(
+	entryId: string,
+	part: Extract<AssistantRenderPart, { type: "tool_call" }>,
+	result?: ToolResultItem
+): ToolRunItem {
+	const input = parseToolInput(part.item.args_json);
+	const statusKind = !result ? "running" : result.status === "Success" ? "success" : "error";
+	const editPreview = editToolPreview(part.item.tool_name, input, result);
+	const prettyName = part.display?.pretty_name ?? prettyToolName(part.item.tool_name);
+	return {
+		source: "local",
+		key: `local-${entryId}-${part.item.id}`,
+		entryId,
+		id: part.item.id,
+		rawName: part.item.tool_name,
+		prettyName: editPreview ? "Edit" : prettyName,
+		title: editPreview?.header ?? formatDisplayHeader(prettyName, part.display?.input_summary ?? inputSummaryFromInput(part.item.tool_name, input)),
+		statusKind,
+		statusLabel: result ? result.status.toLowerCase() : "running",
+		argsJson: part.item.args_json,
+		display: part.display,
+		result,
+		input,
+		editPreview
+	};
+}
+
+function hostedToolRunItem(entryId: string, part: Extract<AssistantRenderPart, { type: "hosted_tool" }>): ToolRunItem {
+	const statusKind = part.tool.status === "completed" ? "success" : part.tool.status === "error" ? "error" : "running";
+	return {
+		source: "hosted",
+		key: `hosted-${entryId}-${part.tool.id}`,
+		entryId,
+		id: part.tool.id,
+		rawName: part.tool.name,
+		prettyName: part.tool.prettyName,
+		title: formatDisplayHeader(part.tool.prettyName, part.tool.inputSummary),
+		statusKind,
+		statusLabel: part.tool.status,
+		tool: part.tool
+	};
+}
+
+function nodeLeafId(node: TranscriptDisplayNode): string {
+	if (node.type === "tool_group") return node.items.at(-1)?.entryId ?? node.id;
+	return node.entry.id;
+}
+
+function resumeBoundaryIdForNode(node: TranscriptDisplayNode, turns: TurnView[]): string | null {
+	if (node.type !== "turn_finished") return null;
+	const turn = turns.find((candidate) => candidate.boundaryEntry?.id === node.entry.id);
+	const lastModelEntryId = turn?.modelSteps.at(-1)?.entry.id ?? null;
+	return lastModelEntryId ?? node.entry.id;
+}
+
+function prettyToolName(toolName: string): string {
+	switch (toolName) {
+		case "apply_patch":
+		case "str_replace_based_edit_tool":
+			return "Edit";
+		case "bash":
+			return "Bash";
+		case "grep":
+			return "Grep";
+		case "web_search":
+			return "Web search";
+		case "web_fetch":
+			return "Web fetch";
+		case "open_page":
+			return "Open page";
+		default:
+			return toolName;
+	}
+}
+
+function inputSummaryFromInput(toolName: string, input: Record<string, unknown> | null): string | null {
+	if (!input) return null;
+	if (toolName === "bash") {
+		const command = input.command;
+		if (typeof command === "string") return firstLine(command);
+		if (Array.isArray(command)) return firstLine(command.filter((part): part is string => typeof part === "string").join(" "));
+	}
+	if (toolName === "grep") return [stringValue(input.pattern), stringValue(input.path)].filter(Boolean).join(" ") || null;
+	if (toolName === "str_replace_based_edit_tool") return [stringValue(input.command), stringValue(input.path)].filter(Boolean).join(" ") || null;
+	return null;
+}
+
 function AssistantCopyButton({ text }: { text: string }) {
 	const [copied, setCopied] = useState(false);
 	const copy = () => {
@@ -457,115 +748,215 @@ function CitationList({ citations }: { citations: ReturnType<typeof citationsFro
 	);
 }
 
-const HostedToolCard = memo(function HostedToolCard({ tool }: { tool: ReturnType<typeof hostedToolsFromReplay>[number] }) {
-	const [expanded, setExpanded] = useState(false);
-	const failed = tool.status === "error";
-	const ok = tool.status === "completed";
+const AssistantTextBlock = memo(function AssistantTextBlock({ node }: { node: Extract<TranscriptDisplayNode, { type: "assistant_text" }> }) {
 	return (
-		<div className={`tool-card hosted ${failed ? "error" : ok ? "ok" : "running"}`}>
-			<button className="tool-card-toggle" type="button" onClick={() => setExpanded((open) => !open)}>
-				<span className="tool-status-icon" aria-hidden="true">
-					{failed ? <AlertTriangle size={14} /> : ok ? <Check size={14} /> : <Loader2 className="spin" size={14} />}
-				</span>
-				<Globe2 size={13} className="tool-wrench" />
-				<span className="tool-title">{formatDisplayHeader(tool.prettyName, tool.inputSummary)}</span>
-				<span className="tool-status">{tool.status}</span>
-				<ChevronDown size={14} className={`tool-chevron ${expanded ? "open" : ""}`} />
-			</button>
-			{expanded ? (
-				<div className="tool-card-body">
-					{tool.input ? (
-						<div className="tool-section">
-							<div className="tool-section-label">input</div>
-							<pre>{JSON.stringify(tool.input, null, 2)}</pre>
-						</div>
-					) : null}
-					{tool.output ? (
-						<div className="tool-section">
-							<div className="tool-section-label">output</div>
-							<pre className={failed ? "tool-output-error" : ""}>{tool.output}</pre>
-						</div>
-					) : null}
-					<div className="tool-call-id">
-						{tool.provider} hosted tool {tool.id}
+		<div className="message-row assistant-row">
+			<div className={`assistant-block phase-${node.phase} ${node.copyText ? "has-copy" : ""}`}>
+				{node.text ? <MarkdownText text={node.text} /> : null}
+				{node.citations.length ? <CitationList citations={node.citations} /> : null}
+				{node.copyText ? <AssistantCopyButton text={node.copyText} /> : null}
+			</div>
+		</div>
+	);
+});
+
+const ToolRunGroup = memo(function ToolRunGroup({ node }: { node: Extract<TranscriptDisplayNode, { type: "tool_group" }> }) {
+	const defaultExpanded = shouldDefaultExpandGroup(node);
+	const [expanded, setExpanded] = useState(defaultExpanded);
+	useEffect(() => {
+		setExpanded(defaultExpanded);
+	}, [defaultExpanded, node.id]);
+
+	const status = groupStatus(node.items);
+	const visibleItems = visibleToolItems(node, expanded);
+	const hiddenEarlierCount = hiddenEarlierToolCount(node, visibleItems);
+	const icon = status === "running" ? <Loader2 className="spin" size={14} /> : <Check size={14} />;
+
+	return (
+		<div className="message-row assistant-row">
+			<div className={`tool-run-group ${status} ${expanded ? "expanded" : "collapsed"} ${node.isLive ? "live" : ""}`}>
+				<button className="tool-run-group-head" type="button" onClick={() => setExpanded((open) => !open)} aria-expanded={expanded}>
+					<span className="tool-run-status-icon" aria-hidden="true">
+						{icon}
+					</span>
+					<span className="tool-run-head-main">
+						<span className="tool-run-title">{groupTitle(node)}</span>
+						<span className="tool-run-summary" aria-label="Tool counts">
+							{groupSummaryPills(node.items).map((pill) => (
+								<span className="tool-run-pill" key={pill}>{pill}</span>
+							))}
+						</span>
+					</span>
+					<ChevronDown size={14} className={`tool-chevron ${expanded ? "open" : ""}`} />
+				</button>
+				{expanded || visibleItems.length ? (
+					<div className="tool-run-detail">
+						{hiddenEarlierCount ? (
+							<div className="tool-run-detail-line hidden">
+								<span className="tool-run-detail-icon">…</span>
+								<span>{hiddenEarlierCount} earlier {plural(hiddenEarlierCount, "tool")}</span>
+								<span>hidden</span>
+							</div>
+						) : null}
+						{visibleItems.map((item) => (
+							<ToolRunDetailItem item={item} key={item.key} />
+						))}
 					</div>
+				) : null}
+			</div>
+		</div>
+	);
+});
+
+const ToolRunDetailItem = memo(function ToolRunDetailItem({ item, defaultExpanded = false }: { item: ToolRunItem; defaultExpanded?: boolean }) {
+	const [expanded, setExpanded] = useState(defaultExpanded);
+	const isExpandable = item.source === "local" ? !!item.editPreview || !!item.input || !!item.result : !!item.tool.input || !!item.tool.output;
+	const rowStyle = isExpandable ? undefined : { gridTemplateColumns: "24px minmax(0, 1fr) auto" };
+	const icon =
+		item.statusKind === "error" ? (
+			<AlertTriangle size={13} />
+		) : item.statusKind === "running" ? (
+			<Loader2 className="spin" size={13} />
+		) : (
+			<Check size={13} />
+		);
+	return (
+		<div className={`tool-run-item ${item.statusKind} ${expanded ? "expanded" : ""}`}>
+			<button
+				className="tool-run-item-toggle"
+				type="button"
+				onClick={() => (isExpandable ? setExpanded((open) => !open) : undefined)}
+				aria-expanded={isExpandable ? expanded : undefined}
+				disabled={!isExpandable}
+				style={rowStyle}
+			>
+				<span className="tool-run-item-icon" aria-hidden="true">
+					{icon}
+				</span>
+				<span className="tool-run-item-title">{item.title}</span>
+				<span className="tool-run-item-status">{isEditToolRunItem(item) && item.statusKind === "success" ? "diff" : item.statusLabel}</span>
+				{isExpandable ? <ChevronDown size={13} className={`tool-chevron ${expanded ? "open" : ""}`} /> : null}
+			</button>
+			{expanded && isExpandable ? (
+				<div className="tool-run-item-body">
+					{item.source === "local" ? <LocalToolRunBody item={item} /> : <HostedToolRunBody item={item} />}
 				</div>
 			) : null}
 		</div>
 	);
 });
 
+function LocalToolRunBody({ item }: { item: Extract<ToolRunItem, { source: "local" }> }) {
+	const result = item.result;
+	const showResultOutput = result && (!item.editPreview?.hideSuccessOutput || result.status !== "Success");
+	return (
+		<>
+			{item.editPreview ? (
+				<EditToolView preview={item.editPreview} />
+			) : item.input ? (
+				<div className="tool-section">
+					<div className="tool-section-label">input</div>
+					<pre>{JSON.stringify(item.input, null, 2)}</pre>
+				</div>
+			) : null}
+			{showResultOutput ? (
+				<div className="tool-section">
+					<div className="tool-section-label">output</div>
+					<ToolOutput result={result} />
+				</div>
+			) : !item.result ? (
+				<div className="tool-pending">waiting for tool result</div>
+			) : null}
+			{item.editPreview ? null : <div className="tool-call-id">id {item.id}</div>}
+		</>
+	);
+}
+
+function HostedToolRunBody({ item }: { item: Extract<ToolRunItem, { source: "hosted" }> }) {
+	const failed = item.tool.status === "error";
+	return (
+		<>
+			{item.tool.input ? (
+				<div className="tool-section">
+					<div className="tool-section-label">input</div>
+					<pre>{JSON.stringify(item.tool.input, null, 2)}</pre>
+				</div>
+			) : null}
+			{item.tool.output ? (
+				<div className="tool-section">
+					<div className="tool-section-label">output</div>
+					<pre className={failed ? "tool-output-error" : ""}>{item.tool.output}</pre>
+				</div>
+			) : null}
+			<div className="tool-call-id">
+				{item.tool.provider} hosted tool {item.tool.id}
+			</div>
+		</>
+	);
+}
+
+function shouldDefaultExpandGroup(node: Extract<TranscriptDisplayNode, { type: "tool_group" }>): boolean {
+	if (node.isLive) return true;
+	return node.items.some((item) => item.statusKind === "running");
+}
+
+function groupStatus(items: ToolRunItem[]): "complete" | "running" {
+	return items.some((item) => item.statusKind === "running") ? "running" : "complete";
+}
+
+function groupTitle(node: Extract<TranscriptDisplayNode, { type: "tool_group" }>): string {
+	if (node.isLive || groupStatus(node.items) === "running") return "Agent is working";
+	return `Used ${node.items.length} ${plural(node.items.length, "tool")}`;
+}
+
+function groupSummaryPills(items: ToolRunItem[]): string[] {
+	const status = groupStatus(items);
+	if (status === "running") {
+		const completed = items.filter((item) => item.statusKind !== "running").length;
+		const running = items.length - completed;
+		return [`${items.length} ${plural(items.length, "tool")}`, `${completed} completed`, `${running} running`];
+	}
+	const counts = new Map<string, number>();
+	for (const item of items) counts.set(item.prettyName, (counts.get(item.prettyName) ?? 0) + 1);
+	return [...counts.entries()]
+		.sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+		.slice(0, 5)
+		.map(([name, count]) => `${count} ${name}`);
+}
+
+function visibleToolItems(node: Extract<TranscriptDisplayNode, { type: "tool_group" }>, expanded: boolean): ToolRunItem[] {
+	if (expanded && !node.isLive) return node.items;
+	return node.items.slice(-RECENT_TOOL_ROW_COUNT);
+}
+
+function hiddenEarlierToolCount(node: Extract<TranscriptDisplayNode, { type: "tool_group" }>, visibleItems: ToolRunItem[]): number {
+	return Math.max(0, node.items.length - visibleItems.length);
+}
+
+function isEditToolRunItem(item: ToolRunItem): item is Extract<ToolRunItem, { source: "local" }> & { editPreview: EditToolPreview } {
+	return item.source === "local" && !!item.editPreview;
+}
+
+function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
+	return count === 1 ? singular : pluralForm;
+}
+
 const ToolResultCard = memo(function ToolResultCard({ item, entryId }: { item: Extract<TranscriptItem, { type: "tool_result" }>; entryId: string }) {
+	const runItem = localToolRunItem(
+		entryId,
+		{
+			type: "tool_call",
+			key: `orphan-${item.tool_call_id}`,
+			item: { type: "tool_call", id: item.tool_call_id, tool_name: item.tool_name, args_json: "{}" }
+		},
+		item
+	);
 	return (
 		<div className="message-row tool-row">
 			<EntryId entryId={entryId} />
-			<ToolCard toolName={item.tool_name} toolId={item.tool_call_id} result={item} />
-		</div>
-	);
-});
-
-const ToolCard = memo(function ToolCard({
-	toolName,
-	toolId,
-	argsJson,
-	result,
-	display
-}: {
-	toolName: string;
-	toolId: string;
-	argsJson?: string;
-	result?: ToolResultItem;
-	display?: ReplayDisplay | null;
-}) {
-	const [expanded, setExpanded] = useState(false);
-	const input = parseToolInput(argsJson);
-	const status = result ? result.status : "Running";
-	const ok = result?.status === "Success";
-	const failed = !!result && !ok;
-	const editPreview = editToolPreview(toolName, input, result);
-	const header = editPreview?.header ?? formatDisplayHeader(display?.pretty_name ?? toolName, display?.input_summary ?? null);
-	const showResultOutput = result && (!editPreview?.hideSuccessOutput || result.status !== "Success");
-
-	return (
-		<div className={`tool-card ${failed ? "error" : ok ? "ok" : "running"}`}>
-			<button className="tool-card-toggle" type="button" onClick={() => setExpanded((open) => !open)}>
-				<span className="tool-status-icon" aria-hidden="true">
-					{!result ? (
-						<Loader2 className="spin" size={14} />
-					) : failed ? (
-						<AlertTriangle size={14} />
-					) : (
-						<Check size={14} />
-					)}
-				</span>
-				<Wrench size={13} className="tool-wrench" />
-				<span className="tool-title">{header}</span>
-				<span className="tool-status">{status.toLowerCase()}</span>
-				<ChevronDown size={14} className={`tool-chevron ${expanded ? "open" : ""}`} />
-			</button>
-			{expanded ? (
-				<div className="tool-card-body">
-					{editPreview ? (
-						<EditToolView preview={editPreview} />
-					) : input ? (
-						<div className="tool-section">
-							<div className="tool-section-label">input</div>
-							<pre>{JSON.stringify(input, null, 2)}</pre>
-						</div>
-					) : null}
-					{showResultOutput ? (
-						<div className="tool-section">
-							<div className="tool-section-label">output</div>
-							<ToolOutput result={result} />
-						</div>
-					) : !result ? (
-						<div className="tool-pending">waiting for tool result</div>
-					) : null}
-					{editPreview ? null : (
-						<div className="tool-call-id">id {toolId}</div>
-					)}
-				</div>
-			) : null}
+			<div className="tool-card stand-alone">
+				<ToolRunDetailItem item={runItem} />
+			</div>
 		</div>
 	);
 });
@@ -593,7 +984,7 @@ export function editToolPreview(
 	result?: ToolResultItem
 ): EditToolPreview | null {
 	if (toolName === "apply_patch") {
-		const patch = stringValue(input?.input);
+		const patch = stringValue(input?.input) ?? result?.output ?? null;
 		return patch ? applyPatchPreview(patch) : null;
 	}
 
