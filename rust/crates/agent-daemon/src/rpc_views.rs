@@ -1,5 +1,6 @@
 use agent_session::StoredTranscriptEntry;
 use agent_store::{GlobalConfig, HistoryTree, Project, SessionSnapshot, SessionSummary};
+use agent_vocab::TranscriptItem;
 use serde_json::{json, Value};
 
 pub(crate) fn global_config(config: GlobalConfig) -> Value {
@@ -78,7 +79,7 @@ pub(crate) fn session_snapshot(
         "last_event_id": snapshot.last_event_id,
     });
     if let Some(entries) = entries {
-        value["entries"] = json!(entries);
+        value["entries"] = json!(redact_entries(entries));
     }
     value
 }
@@ -87,6 +88,18 @@ pub(crate) fn history_tree(tree: HistoryTree) -> Value {
     json!({
         "session_id": tree.session_id,
         "active_leaf_id": tree.active_leaf_id,
-        "entries": tree.entries,
+        "entries": redact_entries(tree.entries),
     })
+}
+
+fn redact_entries(entries: Vec<StoredTranscriptEntry>) -> Vec<StoredTranscriptEntry> {
+    entries
+        .into_iter()
+        .map(|mut entry| {
+            if matches!(entry.item, TranscriptItem::CompactionSummary(_)) {
+                entry.provider_replay.clear();
+            }
+            entry
+        })
+        .collect()
 }

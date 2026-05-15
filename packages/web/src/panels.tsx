@@ -141,6 +141,11 @@ export const Sidebar = memo(function Sidebar({
 	);
 });
 
+function pendingActionLabel(action: SessionSnapshot["pending_actions"][number]): string {
+	if (action.kind !== "compaction") return action.kind;
+	return action.payload.trigger === "auto" ? "auto-compaction" : "compaction";
+}
+
 export function ProjectList({
 	projects,
 	selectedProjectId,
@@ -503,7 +508,7 @@ export function Inspector({
 					<div className="pending-list">
 						{snapshot.pending_actions.map((action) => (
 							<div className="pending-row" key={action.action_row_id}>
-								<span>{action.kind}</span>
+								<span>{pendingActionLabel(action)}</span>
 								<code>{action.action_row_id.slice(0, 12)}</code>
 							</div>
 						))}

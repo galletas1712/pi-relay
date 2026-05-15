@@ -11,7 +11,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
     ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError,
-    ProviderResult, ProviderToolProfile, ProviderUsage,
+    ProviderResult, ProviderTokenCountRequest, ProviderTokenCountResponse, ProviderToolProfile,
+    ProviderUsage,
 };
 
 const DEFAULT_MAX_TOKENS: u32 = 65_536;
@@ -36,6 +37,26 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+}
+
+fn parse_anthropic_count_tokens(text: &str) -> ProviderResult<ProviderTokenCountResponse> {
+    let response: Value = serde_json::from_str(text).map_err(|error| {
+        ProviderError::Provider(format!(
+            "failed to parse Anthropic count_tokens response JSON: {error}; body: {}",
+            response_excerpt(text)
+        ))
+    })?;
+    let input_tokens = response
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            ProviderError::Provider(
+                "Anthropic count_tokens response missing input_tokens".to_string(),
+            )
+        })?;
+    Ok(ProviderTokenCountResponse {
+        input_tokens: input_tokens as usize,
+    })
 }
 
 impl AnthropicProvider {
@@ -83,6 +104,39 @@ impl ModelProvider for AnthropicProvider {
 
         parse_anthropic_message(&response)
     }
+
+    async fn count_tokens(
+        &self,
+        request: ProviderTokenCountRequest,
+    ) -> ProviderResult<ProviderTokenCountResponse> {
+        let session_id = request
+            .session_id
+            .clone()
+            .unwrap_or_else(|| "pi-relay".to_string());
+        let body = count_tokens_body(request)?;
+
+        let response = self
+            .client
+            .post(format!(
+                "{}/messages/count_tokens",
+                self.base_url.trim_end_matches('/')
+            ))
+            .header("accept", "application/json")
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-beta", ANTHROPIC_BETA_HEADER)
+            .header("anthropic-dangerous-direct-browser-access", "true")
+            .header("User-Agent", CLAUDE_CODE_USER_AGENT)
+            .header("x-app", "cli")
+            .header("X-Claude-Code-Session-Id", session_id)
+            .header("x-client-request-id", client_request_id())
+            .json(&body)
+            .send()
+            .await?;
+        let (status, text) = response_text(response).await?;
+        ensure_success(status, &text)?;
+        parse_anthropic_count_tokens(&text)
+    }
 }
 
 fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
@@ -118,6 +172,23 @@ fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
         // tools array via the cumulative hash. Spending one of the 4 allowed
         // breakpoints on the last tool would buy zero additional caching and
         // costs us a slot we use for the deep-history transcript marker.
+        body["tools"] = Value::Array(tools);
+        body["tool_choice"] = json!({ "type": "auto" });
+    }
+    Ok(body)
+}
+
+fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value> {
+    let messages = transcript_to_messages(&request.transcript)?;
+    let mut body = json!({
+        "model": request.model,
+        "messages": messages,
+    });
+    if let Some(system_blocks) = anthropic_system_blocks(&request.prompt, &request.transcript) {
+        body["system"] = Value::Array(system_blocks);
+    }
+    let tools = anthropic_tools(request.tool_profile, &request.tools)?;
+    if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
         body["tool_choice"] = json!({ "type": "auto" });
     }

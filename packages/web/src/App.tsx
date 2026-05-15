@@ -458,6 +458,9 @@ export function App() {
 
 			if (event.session_id === selectedRef.current) {
 				if (event.event === "model.error") pushNotice("error", modelErrorNotice(event.data));
+				if (event.event === "compaction.requested") pushNotice("info", compactionRequestedNotice(event.data));
+				if (event.event === "compaction.completed") pushNotice("success", compactionCompletedNotice(event.data));
+				if (event.event === "compaction.error") pushNotice("error", compactionErrorNotice(event.data));
 				if (event.event === "turn.finished") {
 					const outcome = typeof event.data.outcome === "string" ? event.data.outcome : null;
 					if (outcome === "Interrupted") pushNotice("info", "turn interrupted");
@@ -1428,6 +1431,26 @@ function errorMessage(error: unknown): string {
 function modelErrorNotice(data: Record<string, unknown>): string {
 	const error = typeof data.error === "string" ? data.error : "model request failed";
 	return `model error: ${truncate(error, 420)}`;
+}
+
+function compactionRequestedNotice(data: Record<string, unknown>): string {
+	const trigger = typeof data.trigger === "string" ? data.trigger : null;
+	return trigger === "auto" ? "auto-compaction started" : "compaction started";
+}
+
+function compactionCompletedNotice(data: Record<string, unknown>): string {
+	const trigger = typeof data.trigger === "string" ? data.trigger : null;
+	const provider = typeof data.provider === "string" ? data.provider : null;
+	const remote = data.remote === true;
+	const prefix = trigger === "auto" ? "auto-compaction" : "compaction";
+	if (provider === "openai" && remote) return `${prefix} completed with OpenAI provider-native compaction`;
+	if (provider === "claude") return `${prefix} completed with Claude summary`;
+	return `${prefix} completed`;
+}
+
+function compactionErrorNotice(data: Record<string, unknown>): string {
+	const error = typeof data.error === "string" ? data.error : "compaction failed";
+	return `compaction error: ${truncate(error, 420)}`;
 }
 
 function RenameSessionDialog({

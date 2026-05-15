@@ -1,6 +1,6 @@
 use agent_session::{SessionAction, SessionEvent, TranscriptStorageNode};
 use anyhow::{anyhow, Result};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use sqlx::Row;
 
 use crate::{
@@ -13,6 +13,25 @@ use super::events::insert_event_tx;
 use super::outputs::persist_outputs_tx;
 use super::sql::{action_is_unfinished, queued_input_is_active};
 use super::PostgresAgentStore;
+
+fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    value.as_object_mut().expect("value was forced to object")
+}
+
+fn ensure_compaction_auto_state_object(metadata: &mut Value) -> &mut Map<String, Value> {
+    let root = ensure_object(metadata);
+    let compaction = root
+        .entry("compaction".to_string())
+        .or_insert_with(|| json!({}));
+    let compaction = ensure_object(compaction);
+    let auto_state = compaction
+        .entry("auto_state".to_string())
+        .or_insert_with(|| json!({}));
+    ensure_object(auto_state)
+}
 
 impl PostgresAgentStore {
     pub async fn create_session(
@@ -47,6 +66,112 @@ impl PostgresAgentStore {
         .await?;
         tx.commit().await?;
         Ok(vec![event])
+    }
+
+    pub async fn update_session_metadata(
+        &self,
+        session_id: &str,
+        metadata: &Value,
+    ) -> Result<Vec<EventFrame>> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
+            .bind(session_id)
+            .bind(metadata)
+            .execute(&mut *tx)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(anyhow!("session not found: {session_id}"));
+        }
+        let event = insert_event_tx(
+            &mut tx,
+            session_id,
+            EventType::SessionConfigured,
+            json!({ "metadata": metadata }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(vec![event])
+    }
+
+    pub async fn record_auto_compaction_failure(
+        &self,
+        session_id: &str,
+        config: &SessionConfig,
+        source_leaf_id: &str,
+        error: &str,
+    ) -> Result<()> {
+        let current = self.load_session_config(session_id).await?;
+        let max_failures = current
+            .metadata
+            .pointer("/compaction/config/max_consecutive_failures")
+            .and_then(Value::as_u64)
+            .or_else(|| {
+                config
+                    .metadata
+                    .pointer("/compaction/config/max_consecutive_failures")
+                    .and_then(Value::as_u64)
+            })
+            .map(|value| value as usize)
+            .unwrap_or(3)
+            .max(1);
+        let mut metadata = current.metadata;
+        let state = ensure_compaction_auto_state_object(&mut metadata);
+        let failures = state
+            .get("consecutive_failures")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            .saturating_add(1);
+        state.insert("consecutive_failures".to_string(), json!(failures));
+        state.insert("last_failure".to_string(), json!(error));
+        state.insert("last_failure_leaf_id".to_string(), json!(source_leaf_id));
+        state.insert(
+            "suppressed".to_string(),
+            json!(failures as usize >= max_failures),
+        );
+        sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
+            .bind(session_id)
+            .bind(metadata)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn reset_auto_compaction_failures(&self, session_id: &str) -> Result<()> {
+        let current = self.load_session_config(session_id).await?;
+        let mut metadata = current.metadata;
+        let state = ensure_compaction_auto_state_object(&mut metadata);
+        state.insert("consecutive_failures".to_string(), json!(0));
+        state.insert("suppressed".to_string(), json!(false));
+        state.insert("last_failure".to_string(), Value::Null);
+        state.insert("last_failure_leaf_id".to_string(), Value::Null);
+        sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
+            .bind(session_id)
+            .bind(metadata)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn record_compaction_success(
+        &self,
+        session_id: &str,
+        new_root_id: Option<&str>,
+        _manual: bool,
+    ) -> Result<()> {
+        let current = self.load_session_config(session_id).await?;
+        let mut metadata = current.metadata;
+        let state = ensure_compaction_auto_state_object(&mut metadata);
+        state.insert("consecutive_failures".to_string(), json!(0));
+        state.insert("suppressed".to_string(), json!(false));
+        state.insert("last_failure".to_string(), Value::Null);
+        state.insert("last_failure_leaf_id".to_string(), Value::Null);
+        state.insert("last_success_root_id".to_string(), json!(new_root_id));
+        sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
+            .bind(session_id)
+            .bind(metadata)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn session_exists(&self, session_id: &str) -> Result<bool> {

@@ -210,6 +210,7 @@ export const MessageList = memo(function MessageList({
 	const toolIndex = useMemo(() => indexToolEntries(visibleEntries), [visibleEntries]);
 	const turnViews = useMemo(() => buildTurnViews(visibleEntries), [visibleEntries]);
 	const displayNodes = useMemo(() => deriveTranscriptDisplayNodes(visibleEntries, turnViews, toolIndex.results, pendingActions), [pendingActions, toolIndex.results, turnViews, visibleEntries]);
+	const runningCompaction = useMemo(() => pendingActions?.find((action) => action.kind === "compaction" && action.status === "running") ?? null, [pendingActions]);
 	const resumeEntryIdByNode = useMemo(() => {
 		const ids = new Map<string, string>();
 		for (const node of displayNodes) ids.set(node.key, resumeBoundaryIdForNode(node, turnViews) ?? nodeLeafId(node));
@@ -259,7 +260,7 @@ export const MessageList = memo(function MessageList({
 				{isRunning ? (
 					<div className="activity-indicator">
 						<Loader2 className="spin" size={14} />
-						Agent active
+						{runningCompaction ? compactionActivityText(runningCompaction) : "Agent active"}
 					</div>
 				) : null}
 			</div>
@@ -620,6 +621,13 @@ function toolRunItemFromPendingAction(action: PendingAction): ToolRunItem | null
 		input,
 		editPreview
 	};
+}
+
+function compactionActivityText(action: PendingAction): string {
+	const trigger = typeof action.payload.trigger === "string" ? action.payload.trigger : null;
+	const reason = typeof action.payload.reason === "string" ? action.payload.reason : null;
+	if (trigger === "auto") return reason ? `Auto-compacting history (${reason})` : "Auto-compacting history";
+	return "Compacting history";
 }
 
 function markLiveToolGroups(nodes: TranscriptDisplayNode[]): TranscriptDisplayNode[] {

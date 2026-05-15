@@ -78,6 +78,8 @@ function activityForEvent(event: string): SessionSummary["activity"] | null {
 		event === "model.requested" ||
 		event === "tool.requested" ||
 		event === "compaction.requested" ||
+		event === "compaction.completed" ||
+		event === "compaction.error" ||
 		event === "tool.started"
 	) {
 		return "running";
@@ -90,6 +92,7 @@ function sessionInvalidationReason(event: string): string | null {
 	if (event === "transcript.appended") return "transcript append event lacks full entry data";
 	if (event === "turn.started" || event === "turn.finished" || event === "assistant.message") return event;
 	if (event === "history.rewound" || event === "history.compacted") return event;
+	if (event === "compaction.completed" || event === "compaction.error") return event;
 	return isTerminalActivityEvent(event) ? event : null;
 }
 

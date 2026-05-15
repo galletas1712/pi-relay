@@ -33,6 +33,42 @@ pub struct ModelRequest {
     pub session_id: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct ProviderCompactionRequest {
+    pub model: String,
+    pub instructions: Option<String>,
+    pub transcript: Vec<ModelTranscriptEntry>,
+    pub tool_profile: ProviderToolProfile,
+    pub tools: Vec<ToolDefinition>,
+    pub reasoning_effort: ReasoningEffort,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderCompactionResponse {
+    /// Provider-returned text, if the provider exposes one. Provider-native
+    /// compaction endpoints can return only opaque replay state.
+    pub summary: Option<String>,
+    pub provider_replay: Vec<ProviderReplayItem>,
+    pub usage: Option<ProviderUsage>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ProviderTokenCountRequest {
+    pub model: String,
+    pub prompt: PromptSections,
+    pub transcript: Vec<ModelTranscriptEntry>,
+    pub tool_profile: ProviderToolProfile,
+    pub tools: Vec<ToolDefinition>,
+    pub reasoning_effort: ReasoningEffort,
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderTokenCountResponse {
+    pub input_tokens: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProviderToolProfile {
     None,
@@ -137,4 +173,26 @@ pub type ProviderResult<T> = Result<T, ProviderError>;
 #[async_trait]
 pub trait ModelProvider: Send + Sync {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse>;
+
+    fn supports_remote_compaction(&self) -> bool {
+        false
+    }
+
+    async fn compact(
+        &self,
+        _request: ProviderCompactionRequest,
+    ) -> ProviderResult<ProviderCompactionResponse> {
+        Err(ProviderError::Provider(
+            "provider does not support remote compaction".to_string(),
+        ))
+    }
+
+    async fn count_tokens(
+        &self,
+        _request: ProviderTokenCountRequest,
+    ) -> ProviderResult<ProviderTokenCountResponse> {
+        Err(ProviderError::Provider(
+            "provider does not support token counting".to_string(),
+        ))
+    }
 }

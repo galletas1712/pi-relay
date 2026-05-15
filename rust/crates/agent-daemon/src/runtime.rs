@@ -6,9 +6,9 @@ use agent_session::{
     TranscriptStorageNode, TranscriptStoreError,
 };
 use agent_store::{
-    AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionJob, EventFrame, EventType,
-    InputPriority, OutputBatch, PersistedAction, QueueMutationError, QueuedInput, SessionActivity,
-    SessionConfig,
+    AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionCompletion, CompactionJob,
+    CompactionTrigger, EventFrame, EventType, InputPriority, OutputBatch, PersistedAction,
+    QueueMutationError, QueuedInput, SessionActivity, SessionConfig,
 };
 use agent_tools::dynamic_tool_context;
 use agent_vocab::{
@@ -20,7 +20,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::task::JoinHandle;
 
 use crate::codec::transcript_store_from_stored;
-use crate::provider_runtime::{run_compaction, run_model};
+use crate::provider_runtime::{
+    auto_limit_tokens, compaction_auto_state, compaction_config, count_model_input_tokens,
+    run_compaction, run_model,
+};
 use crate::state::{AppState, RunningTask};
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
@@ -260,6 +263,10 @@ impl SessionDriver {
                 break;
             }
 
+            if self.maybe_start_auto_compaction(active.clone()).await? {
+                break;
+            }
+
             let maybe_input = self
                 .state
                 .repo
@@ -308,6 +315,107 @@ impl SessionDriver {
             break;
         }
         Ok(dispatched_all)
+    }
+
+    async fn maybe_start_auto_compaction(
+        &self,
+        active: Arc<Mutex<RuntimeSession>>,
+    ) -> std::result::Result<bool, RpcError> {
+        let (config, model_context, live_context_tokens, is_boundary, active_leaf_id) = {
+            let runtime = active.lock().await;
+            (
+                runtime.config.clone(),
+                runtime.session.model_context(),
+                runtime.session.context_tokens(),
+                runtime.session.transcript_store().is_turn_boundary(),
+                runtime
+                    .session
+                    .transcript_store()
+                    .active_leaf_id()
+                    .map(str::to_string),
+            )
+        };
+        if !is_boundary {
+            return Ok(false);
+        }
+        let Some(active_leaf_id) = active_leaf_id else {
+            return Ok(false);
+        };
+        if matches!(
+            model_context.transcript_items().last(),
+            Some(TranscriptItem::CompactionSummary(_))
+        ) {
+            return Ok(false);
+        }
+
+        let compaction_config = compaction_config(&config);
+        if !compaction_config.auto_enabled {
+            return Ok(false);
+        }
+        let auto_state = compaction_auto_state(&config);
+        if auto_state.suppressed
+            || auto_state.last_failure_leaf_id.as_deref() == Some(active_leaf_id.as_str())
+        {
+            return Ok(false);
+        }
+        let Some(limit) = auto_limit_tokens(&compaction_config) else {
+            return Ok(false);
+        };
+
+        let next_input = self
+            .state
+            .repo
+            .peek_next_queued_input(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let projected = if let Some(next_input) = next_input.as_ref() {
+            let projected_context =
+                projected_context_with_input(model_context.clone(), next_input.content.clone());
+            count_model_input_tokens(&self.state, &config, &self.session_id, projected_context)
+                .await
+                .map_err(anyhow::Error::from)?
+        } else if let Some(tokens) = live_context_tokens {
+            tokens
+        } else if let Some(snapshot) = self
+            .state
+            .repo
+            .latest_context_usage_for_active_path(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?
+            .filter(|snapshot| snapshot.context_leaf_id.as_deref() == Some(&active_leaf_id))
+        {
+            snapshot.input_tokens
+        } else {
+            count_model_input_tokens(
+                &self.state,
+                &config,
+                &self.session_id,
+                model_context.clone(),
+            )
+            .await
+            .map_err(anyhow::Error::from)?
+        };
+        if projected < limit {
+            return Ok(false);
+        }
+
+        let reason =
+            format!("threshold: projected_context_tokens {projected} >= auto_limit_tokens {limit}");
+        let created = self
+            .state
+            .repo
+            .create_compaction_action(
+                &self.session_id,
+                CompactionTrigger::Auto {
+                    reason: reason.clone(),
+                },
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        publish_events(&self.state, created.events);
+        self.state.active.lock().await.remove(&self.session_id);
+        spawn_compaction(&self.state, self.session_id.clone(), created.job, config);
+        Ok(true)
     }
 
     async fn consume_ready_steer(
@@ -492,6 +600,25 @@ pub(crate) fn agent_input_from_queued_priority(
     }
 }
 
+fn projected_context_with_input(
+    model_context: agent_session::ModelContext,
+    input: UserMessage,
+) -> agent_session::ModelContext {
+    let next_turn_id = model_context.last_turn_id().next();
+    let mut entries = model_context.into_entries();
+    entries.push(agent_session::ModelContextEntry {
+        item: TranscriptItem::TurnStarted {
+            turn_id: next_turn_id,
+        },
+        provider_replay: Vec::new(),
+    });
+    entries.push(agent_session::ModelContextEntry {
+        item: TranscriptItem::UserMessage(input),
+        provider_replay: Vec::new(),
+    });
+    agent_session::ModelContext::from_entries(entries)
+}
+
 pub(crate) fn collect_runtime_outputs(
     runtime: &mut RuntimeSession,
 ) -> (
@@ -671,21 +798,55 @@ async fn run_compaction_job(
     job: CompactionJob,
     config: SessionConfig,
 ) -> std::result::Result<(), RpcError> {
-    let result = run_compaction(&config, &session_id, job.model_context.clone()).await;
+    let result = run_compaction(&state, &config, &session_id, job.model_context.clone()).await;
     let events = match result {
-        Ok(summary) => {
+        Ok(output) => {
+            let completion = CompactionCompletion {
+                summary: output.summary,
+                summary_kind: output.summary_kind.as_str().to_string(),
+                provider_replay: output.provider_replay,
+                remote: output.remote,
+                provider: output.provider,
+                usage: output.usage,
+            };
             let result = state
                 .repo
-                .complete_compaction_action(&job, summary)
+                .complete_compaction_action(&job, completion)
                 .await
                 .map_err(anyhow::Error::from)?;
+            if result.new_root_id.is_some() {
+                state
+                    .repo
+                    .record_compaction_success(
+                        &session_id,
+                        result.new_root_id.as_deref(),
+                        matches!(job.trigger, CompactionTrigger::Manual),
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            }
             result.events
         }
-        Err(error) => state
-            .repo
-            .fail_compaction_action(&job, error.to_string())
-            .await
-            .map_err(anyhow::Error::from)?,
+        Err(error) => {
+            let error = error.to_string();
+            if matches!(job.trigger, CompactionTrigger::Auto { .. }) {
+                state
+                    .repo
+                    .record_auto_compaction_failure(
+                        &session_id,
+                        &config,
+                        &job.source_leaf_id,
+                        &error,
+                    )
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            }
+            state
+                .repo
+                .fail_compaction_action(&job, error)
+                .await
+                .map_err(anyhow::Error::from)?
+        }
     };
     publish_events(&state, events);
 
@@ -812,6 +973,13 @@ async fn run_model_turn(
     let (input, status, update_result, provider_replay, context_tokens) = match result {
         Ok(response) => {
             let context_tokens = response.usage.as_ref().and_then(|usage| usage.input_tokens);
+            if context_tokens.is_some() {
+                state
+                    .repo
+                    .reset_auto_compaction_failures(&session_id)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            }
             (
                 AgentInput::ModelCompleted {
                     action_id,

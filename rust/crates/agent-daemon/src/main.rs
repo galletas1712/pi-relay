@@ -24,8 +24,8 @@ use std::sync::{Arc, Mutex as StdMutex};
 use agent_core::AgentInput;
 use agent_session::AgentSession;
 use agent_store::{
-    AcceptedInput, ActionKind, ActionStatus, ActionUpdate, EventFrame, EventType, InputPriority,
-    PostgresAgentStore, QueuedInputStatus, SessionConfig,
+    AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
+    EventType, InputPriority, PostgresAgentStore, QueuedInputStatus, SessionConfig,
 };
 use agent_tools::{ToolContext, ToolRegistry};
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -1164,7 +1164,7 @@ async fn compaction_request(
         .map_err(anyhow::Error::from)?;
     let created = state
         .repo
-        .create_compaction_action(&session_id)
+        .create_compaction_action(&session_id, CompactionTrigger::Manual)
         .await
         .map_err(anyhow::Error::from)?;
     publish_events(state, created.events);
