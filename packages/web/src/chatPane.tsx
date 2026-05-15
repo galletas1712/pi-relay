@@ -64,6 +64,7 @@ export const ChatPane = memo(function ChatPane({
 				isRunning={snapshot?.activity === "running"}
 				hasSession={!!selectedId}
 				sessionId={selectedId}
+				entriesSessionId={snapshot?.session_id ?? null}
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}
 			/>

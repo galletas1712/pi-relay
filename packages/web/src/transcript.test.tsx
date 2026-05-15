@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assistantRenderParts, editToolPreview, isScrolledAtBottom } from "./transcript.tsx";
+import { assistantRenderParts, captureScrollPosition, editToolPreview, isScrolledAtBottom, restoreScrollPosition } from "./transcript.tsx";
 import type { AssistantItem, ProviderReplayItem } from "./types.ts";
 
 describe("assistantRenderParts", () => {
@@ -86,5 +86,26 @@ describe("isScrolledAtBottom", () => {
 
 	it("treats overscroll past the bottom as pinned", () => {
 		expect(isScrolledAtBottom({ scrollHeight: 1000, scrollTop: 601, clientHeight: 400 })).toBe(true);
+	});
+});
+
+describe("scroll position snapshots", () => {
+	it("restores an unpinned scroll offset", () => {
+		const node = { scrollHeight: 1000, scrollTop: 600, clientHeight: 400 };
+		const position = captureScrollPosition({ ...node, scrollTop: 250 });
+
+		const sticky = restoreScrollPosition(node, position);
+
+		expect(node.scrollTop).toBe(250);
+		expect(sticky).toBe(false);
+	});
+
+	it("restores sticky-bottom as the current bottom", () => {
+		const node = { scrollHeight: 1400, scrollTop: 0, clientHeight: 400 };
+
+		const sticky = restoreScrollPosition(node, { scrollTop: 600, sticky: true });
+
+		expect(node.scrollTop).toBe(1000);
+		expect(sticky).toBe(true);
 	});
 });

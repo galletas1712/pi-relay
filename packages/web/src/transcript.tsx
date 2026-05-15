@@ -14,9 +14,35 @@ type ToolResultItem = Extract<TranscriptItem, { type: "tool_result" }>;
 
 type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
 const STICKY_BOTTOM_EPSILON_PX = 1;
+const ACTIVE_SESSION_SCROLL_KEY = "__active_session__";
+
+export interface ScrollPositionSnapshot {
+	scrollTop: number;
+	sticky: boolean;
+}
 
 export function isScrolledAtBottom(node: ScrollMetrics): boolean {
 	return node.scrollHeight - node.scrollTop - node.clientHeight <= STICKY_BOTTOM_EPSILON_PX;
+}
+
+function bottomScrollTop(node: ScrollMetrics): number {
+	return Math.max(0, node.scrollHeight - node.clientHeight);
+}
+
+export function captureScrollPosition(node: ScrollMetrics): ScrollPositionSnapshot {
+	return {
+		scrollTop: node.scrollTop,
+		sticky: isScrolledAtBottom(node)
+	};
+}
+
+export function restoreScrollPosition(node: ScrollMetrics, position: ScrollPositionSnapshot): boolean {
+	if (position.sticky) {
+		node.scrollTop = bottomScrollTop(node);
+	} else {
+		node.scrollTop = position.scrollTop;
+	}
+	return isScrolledAtBottom(node);
 }
 
 export const MessageList = memo(function MessageList({
@@ -25,6 +51,7 @@ export const MessageList = memo(function MessageList({
 	isRunning,
 	hasSession,
 	sessionId,
+	entriesSessionId,
 	onResumeTurn,
 	resumingTurnId
 }: {
@@ -33,13 +60,19 @@ export const MessageList = memo(function MessageList({
 	isRunning: boolean;
 	hasSession: boolean;
 	sessionId?: string | null;
+	entriesSessionId?: string | null;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
 }) {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const contentRef = useRef<HTMLDivElement | null>(null);
 	const shouldStickToBottomRef = useRef(true);
-	const scrollResetKeyRef = useRef<string | null | undefined>(undefined);
+	const activeScrollSessionKeyRef = useRef<string | null>(null);
+	const activeScrollSessionCanSaveRef = useRef(false);
+	const pendingScrollRestoreRef = useRef<{ key: string; position: ScrollPositionSnapshot } | null>(null);
+	const scrollPositionsRef = useRef(new Map<string, ScrollPositionSnapshot>());
+	const scrollSessionKey = hasSession ? (sessionId ?? ACTIVE_SESSION_SCROLL_KEY) : null;
+	const entriesBelongToSelectedSession = !hasSession || !sessionId || entriesSessionId === sessionId;
 	const visibleEntries = useMemo(
 		() => (hasSession ? branchEntriesFor(entries, activeLeafId) : entries),
 		[activeLeafId, entries, hasSession]
@@ -48,25 +81,59 @@ export const MessageList = memo(function MessageList({
 	const scrollToBottom = useCallback(() => {
 		const node = scrollRef.current;
 		if (!node) return;
-		node.scrollTop = node.scrollHeight;
+		node.scrollTop = bottomScrollTop(node);
 		shouldStickToBottomRef.current = true;
+		const key = activeScrollSessionKeyRef.current;
+		if (key && activeScrollSessionCanSaveRef.current) scrollPositionsRef.current.set(key, { scrollTop: node.scrollTop, sticky: true });
 	}, []);
 
 	const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
-		shouldStickToBottomRef.current = isScrolledAtBottom(event.currentTarget);
+		if (pendingScrollRestoreRef.current?.key === activeScrollSessionKeyRef.current) return;
+		const position = captureScrollPosition(event.currentTarget);
+		shouldStickToBottomRef.current = position.sticky;
+		const key = activeScrollSessionKeyRef.current;
+		if (key && activeScrollSessionCanSaveRef.current) scrollPositionsRef.current.set(key, position);
 	}, []);
 
 	useLayoutEffect(() => {
-		const resetKey = hasSession ? (sessionId ?? "__active_session__") : null;
-		if (scrollResetKeyRef.current === resetKey) return;
-		scrollResetKeyRef.current = resetKey;
-		scrollToBottom();
-	}, [hasSession, scrollToBottom, sessionId]);
+		if (activeScrollSessionKeyRef.current === scrollSessionKey) return;
+		const node = scrollRef.current;
+		const previousKey = activeScrollSessionKeyRef.current;
+		if (previousKey && node && activeScrollSessionCanSaveRef.current) scrollPositionsRef.current.set(previousKey, captureScrollPosition(node));
+		activeScrollSessionKeyRef.current = scrollSessionKey;
+		activeScrollSessionCanSaveRef.current = false;
+		if (!scrollSessionKey) {
+			pendingScrollRestoreRef.current = null;
+			shouldStickToBottomRef.current = true;
+			return;
+		}
+		const fallbackPosition = node ? captureScrollPosition(node) : { scrollTop: 0, sticky: true };
+		pendingScrollRestoreRef.current = {
+			key: scrollSessionKey,
+			position: scrollPositionsRef.current.get(scrollSessionKey) ?? fallbackPosition
+		};
+		shouldStickToBottomRef.current = false;
+	}, [scrollSessionKey]);
 
 	useLayoutEffect(() => {
+		const pendingRestore = pendingScrollRestoreRef.current;
+		if (pendingRestore?.key === scrollSessionKey) {
+			if (!entriesBelongToSelectedSession) return;
+			const node = scrollRef.current;
+			if (node) {
+				const sticky = restoreScrollPosition(node, pendingRestore.position);
+				shouldStickToBottomRef.current = sticky;
+				if (scrollSessionKey) scrollPositionsRef.current.set(scrollSessionKey, { scrollTop: node.scrollTop, sticky });
+			}
+			activeScrollSessionCanSaveRef.current = true;
+			pendingScrollRestoreRef.current = null;
+			return;
+		}
+		if (!entriesBelongToSelectedSession) return;
+		activeScrollSessionCanSaveRef.current = true;
 		if (!shouldStickToBottomRef.current) return;
 		scrollToBottom();
-	}, [isRunning, scrollToBottom, visibleEntries]);
+	}, [entriesBelongToSelectedSession, isRunning, scrollSessionKey, scrollToBottom, visibleEntries]);
 
 	useLayoutEffect(() => {
 		if (!hasSession || typeof ResizeObserver === "undefined") return;
@@ -74,12 +141,14 @@ export const MessageList = memo(function MessageList({
 		const content = contentRef.current;
 		if (!scroller || !content) return;
 		const observer = new ResizeObserver(() => {
+			if (pendingScrollRestoreRef.current?.key === activeScrollSessionKeyRef.current) return;
+			if (!entriesBelongToSelectedSession) return;
 			if (shouldStickToBottomRef.current) scrollToBottom();
 		});
 		observer.observe(scroller);
 		observer.observe(content);
 		return () => observer.disconnect();
-	}, [hasSession, scrollToBottom]);
+	}, [entriesBelongToSelectedSession, hasSession, scrollToBottom]);
 	const toolIndex = useMemo(() => indexToolEntries(visibleEntries), [visibleEntries]);
 	const modelStepsByEntry = useMemo(() => {
 		const steps = new Map<string, ModelStepView>();
