@@ -1,6 +1,7 @@
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { assistantRenderParts, captureScrollPosition, editToolPreview, isScrolledAtBottom, restoreScrollPosition } from "./transcript.tsx";
-import type { AssistantItem, ProviderReplayItem } from "./types.ts";
+import { assistantRenderParts, captureScrollPosition, editToolPreview, isScrolledAtBottom, MessageList, restoreScrollPosition } from "./transcript.tsx";
+import type { AssistantItem, ProviderReplayItem, TranscriptEntry } from "./types.ts";
 
 describe("assistantRenderParts", () => {
 	it("uses local replay display metadata even when no hosted tools are present", () => {
@@ -109,3 +110,31 @@ describe("scroll position snapshots", () => {
 		expect(sticky).toBe(true);
 	});
 });
+
+describe("MessageList session loading guard", () => {
+	it("shows a loading state instead of stale entries when entries belong to another session", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[userEntry("entry_1", "stale transcript text")]}
+				activeLeafId="entry_1"
+				isRunning={false}
+				hasSession
+				sessionId="session_b"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain("Loading session");
+		expect(html).not.toContain("stale transcript text");
+	});
+});
+
+function userEntry(id: string, text: string): TranscriptEntry {
+	return {
+		id,
+		parent_id: null,
+		timestamp_ms: 0,
+		item: { type: "user_message", content: [{ type: "text", text }] },
+		provider_replay: []
+	};
+}

@@ -9,6 +9,7 @@ export interface ChatPaneProps {
 	session: SessionDisplayInfo | null;
 	snapshot: SessionSnapshot | null;
 	entries: TranscriptEntry[];
+	transcriptLoading: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
 	modelLocked: boolean;
@@ -28,6 +29,7 @@ export const ChatPane = memo(function ChatPane({
 	session,
 	snapshot,
 	entries,
+	transcriptLoading,
 	modelOptions,
 	modelValue,
 	modelLocked,
@@ -66,6 +68,7 @@ export const ChatPane = memo(function ChatPane({
 				hasSession={!!selectedId}
 				sessionId={selectedId}
 				entriesSessionId={snapshot?.session_id ?? null}
+				loadingSession={transcriptLoading}
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}
 			/>
