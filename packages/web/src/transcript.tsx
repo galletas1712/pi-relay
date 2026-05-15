@@ -103,6 +103,7 @@ export const MessageList = memo(function MessageList({
 	hasSession,
 	sessionId,
 	entriesSessionId,
+	loadingSession = false,
 	onResumeTurn,
 	resumingTurnId
 }: {
@@ -113,6 +114,7 @@ export const MessageList = memo(function MessageList({
 	hasSession: boolean;
 	sessionId?: string | null;
 	entriesSessionId?: string | null;
+	loadingSession?: boolean;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
 }) {
@@ -125,9 +127,10 @@ export const MessageList = memo(function MessageList({
 	const scrollPositionsRef = useRef(new Map<string, ScrollPositionSnapshot>());
 	const scrollSessionKey = hasSession ? (sessionId ?? ACTIVE_SESSION_SCROLL_KEY) : null;
 	const entriesBelongToSelectedSession = !hasSession || !sessionId || entriesSessionId === sessionId;
+	const effectiveEntries = entriesBelongToSelectedSession ? entries : [];
 	const visibleEntries = useMemo(
-		() => (hasSession ? branchEntriesFor(entries, activeLeafId) : entries),
-		[activeLeafId, entries, hasSession]
+		() => (hasSession ? branchEntriesFor(effectiveEntries, activeLeafId) : effectiveEntries),
+		[activeLeafId, effectiveEntries, hasSession]
 	);
 
 	const scrollToBottom = useCallback(() => {
@@ -216,6 +219,17 @@ export const MessageList = memo(function MessageList({
 				<div className="empty-state">
 					<Terminal size={34} />
 					<span>Select or create a session</span>
+				</div>
+			</div>
+		);
+	}
+
+	if (loadingSession || !entriesBelongToSelectedSession) {
+		return (
+			<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
+				<div className="empty-state">
+					<Loader2 className="spin" size={28} />
+					<span>Loading session...</span>
 				</div>
 			</div>
 		);

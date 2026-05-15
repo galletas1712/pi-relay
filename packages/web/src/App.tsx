@@ -7,6 +7,7 @@ import { branchEntriesFor, type HistoryTargetOption } from "./historyTargets.ts"
 import { ExportDialog } from "./exportDialog.tsx";
 import { randomId } from "./ids.ts";
 import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
+import { approximateJsonSize, perfLog, perfNow } from "./perf.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import {
@@ -36,6 +37,21 @@ import type {
 
 const MAX_NOTICES = 24;
 const NOTICE_TTL_MS = 4000;
+const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
+const MAX_CACHED_SESSIONS = 20;
+const MAX_CACHED_ENTRIES = 8_000;
+
+type EntryScope = "active_branch" | "full_tree";
+type CachedSnapshot = Omit<SessionSnapshot, "entries">;
+
+type CachedSession = {
+	snapshot: CachedSnapshot;
+	entries: TranscriptEntry[];
+	entryScope: EntryScope;
+	cachedAt: number;
+	lastEventId: number;
+	stale: boolean;
+};
 
 type ExportDialogState = {
 	entries: TranscriptEntry[];
@@ -89,12 +105,98 @@ export function App() {
 	const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
 
 	const refreshTimer = useRef<number | null>(null);
+	const sessionListRefreshTimer = useRef<number | null>(null);
 	const composerHandleRef = useRef<ComposerHandle | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
 	const selectedProjectRef = useRef<string | null>(null);
 	const sessionsRef = useRef(new Map<string, SessionSummary>());
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
+	const sessionCacheRef = useRef(new Map<string, CachedSession>());
+	const selectedRequestGeneration = useRef(0);
+	const sessionListGeneration = useRef(0);
+
+	const writeCachedSession = useCallback((sessionId: string, nextSnapshot: SessionSnapshot, nextEntries: TranscriptEntry[], entryScope: EntryScope) => {
+		const { entries: _ignored, ...snapshotWithoutEntries } = nextSnapshot;
+		sessionCacheRef.current.set(sessionId, {
+			snapshot: snapshotWithoutEntries,
+			entries: nextEntries,
+			entryScope,
+			cachedAt: Date.now(),
+			lastEventId: nextSnapshot.last_event_id,
+			stale: false
+		});
+		trimSessionCache(sessionCacheRef.current);
+	}, []);
+
+	const patchCachedSession = useCallback((sessionId: string, patcher: (cached: CachedSession) => CachedSession) => {
+		const cached = sessionCacheRef.current.get(sessionId);
+		if (!cached) return;
+		sessionCacheRef.current.set(sessionId, patcher(cached));
+	}, []);
+
+	const markCachedSessionStale = useCallback((sessionId: string) => {
+		patchCachedSession(sessionId, (cached) => ({ ...cached, stale: true }));
+	}, [patchCachedSession]);
+
+	const deleteCachedSession = useCallback((sessionId: string) => {
+		sessionCacheRef.current.delete(sessionId);
+	}, []);
+
+	const clearSelectedSessionState = useCallback(() => {
+		selectedRequestGeneration.current += 1;
+		setSnapshot(null);
+		setEntries([]);
+	}, []);
+
+	const patchSessionSummary = useCallback(
+		(sessionId: string, patch: Partial<SessionSummary>) => {
+			setSessions((current) => patchSessionSummaryList(current, sessionId, patch));
+			setSnapshot((current) => {
+				if (!current || current.session_id !== sessionId) return current;
+				return { ...current, ...snapshotPatchFromSummaryPatch(patch) };
+			});
+			patchCachedSession(sessionId, (cached) => ({
+				...cached,
+				snapshot: { ...cached.snapshot, ...snapshotPatchFromSummaryPatch(patch) }
+			}));
+		},
+		[patchCachedSession]
+	);
+
+	const patchSessionMetadata = useCallback(
+		(sessionId: string, patch: Record<string, unknown>, removeKeys: string[] = []) => {
+			setSessions((current) => patchSessionMetadataInList(current, sessionId, patch, removeKeys));
+			setSnapshot((current) => {
+				if (!current || current.session_id !== sessionId) return current;
+				return { ...current, metadata: mergeMetadata(current.metadata, patch, removeKeys) };
+			});
+			patchCachedSession(sessionId, (cached) => ({
+				...cached,
+				snapshot: {
+					...cached.snapshot,
+					metadata: mergeMetadata(cached.snapshot.metadata, patch, removeKeys)
+				}
+			}));
+		},
+		[patchCachedSession]
+	);
+
+	const patchProvider = useCallback(
+		(sessionId: string, provider: ProviderConfig) => patchSessionSummary(sessionId, { provider }),
+		[patchSessionSummary]
+	);
+
+	const patchQueuedInput = useCallback(
+		(event: EventFrame) => {
+			applyQueuedInputEvent(event, setSnapshot);
+			patchCachedSession(event.session_id, (cached) => ({
+				...cached,
+				snapshot: applyQueuedInputEventToSnapshot(event, cached.snapshot)
+			}));
+		},
+		[patchCachedSession]
+	);
 
 	const selectSession = useCallback(
 		(sessionId: string | null) => {
@@ -104,8 +206,22 @@ export function App() {
 				return;
 			}
 			if (sessionId === null) nextSessionTitleRef.current = null;
+			selectedRequestGeneration.current += 1;
 			selectedRef.current = sessionId;
 			setSelectedId(sessionId);
+			if (!sessionId) {
+				setSnapshot(null);
+				setEntries([]);
+				return;
+			}
+			const cached = sessionCacheRef.current.get(sessionId);
+			if (cached && !cached.stale) {
+				setSnapshot(snapshotWithEntries(cached.snapshot));
+				setEntries(cached.entries);
+				return;
+			}
+			setSnapshot(null);
+			setEntries([]);
 		},
 		[]
 	);
@@ -138,14 +254,28 @@ export function App() {
 	}, [notices.length]);
 
 	const loadSessions = useCallback(async (projectId = selectedProjectRef.current) => {
-		if (!projectId) {
+		const generation = ++sessionListGeneration.current;
+		const expectedProjectId = projectId;
+		if (!expectedProjectId) {
 			setSessions([]);
 			return [];
 		}
-		const nextSessions = await api.listSessions(100, projectId);
+		const nextSessions = await api.listSessions(100, expectedProjectId);
+		if (generation !== sessionListGeneration.current || selectedProjectRef.current !== expectedProjectId) return nextSessions;
 		setSessions(nextSessions);
 		return nextSessions;
 	}, [api]);
+
+	const scheduleSessionListRefresh = useCallback(
+		(delayMs = SESSION_LIST_REFRESH_DEBOUNCE_MS) => {
+			if (sessionListRefreshTimer.current !== null) return;
+			sessionListRefreshTimer.current = window.setTimeout(() => {
+				sessionListRefreshTimer.current = null;
+				void loadSessions().catch(() => undefined);
+			}, delayMs);
+		},
+		[loadSessions]
+	);
 
 	const loadProjects = useCallback(async () => {
 		const nextProjects = await api.listProjects();
@@ -159,8 +289,8 @@ export function App() {
 			selectedProjectRef.current = nextSelected;
 			setSelectedProjectId(nextSelected);
 			selectSession(null);
-			setSnapshot(null);
-			setEntries([]);
+			setQuery("");
+			composerHandleRef.current?.setValue("");
 		}
 		return nextProjects;
 	}, [api, selectSession]);
@@ -171,21 +301,34 @@ export function App() {
 	}, [api]);
 
 	const refreshSelected = useCallback(
-		async (sessionId = selectedRef.current) => {
+		async (sessionId = selectedRef.current, options: { entryScope?: EntryScope; force?: boolean } = {}) => {
 			if (!sessionId) return null;
+			const generation = ++selectedRequestGeneration.current;
+			const startedAt = perfNow();
+			perfLog("session.get start", { sessionId, source: options.force ? "force" : "refresh" });
 			const nextSnapshot = await api.getSession(sessionId, { includeEntries: true });
-			if (selectedRef.current !== sessionId) return null;
+			const nextEntries = nextSnapshot.entries ?? [];
+			const rpcMs = perfNow() - startedAt;
+			perfLog("session.get end", {
+				sessionId,
+				entries: nextEntries.length,
+				approxBytes: approximateJsonSize(nextSnapshot),
+				rpcMs: Math.round(rpcMs),
+				entryScope: options.entryScope ?? "full_tree"
+			});
+			if (selectedRef.current !== sessionId || generation !== selectedRequestGeneration.current) return null;
 			lastEventIds.current.set(sessionId, nextSnapshot.last_event_id);
+			writeCachedSession(sessionId, nextSnapshot, nextEntries, options.entryScope ?? "full_tree");
 			setSnapshot(nextSnapshot);
-			setEntries(nextSnapshot.entries ?? []);
+			setEntries(nextEntries);
 			setSessions((current) => mergeSnapshotIntoSessionList(current, nextSnapshot));
 			if (nextSnapshot.project_id !== selectedProjectRef.current) {
 				selectedProjectRef.current = nextSnapshot.project_id;
 				setSelectedProjectId(nextSnapshot.project_id);
 			}
-			return { snapshot: nextSnapshot, entries: nextSnapshot.entries ?? [] };
+			return { snapshot: nextSnapshot, entries: nextEntries };
 		},
-		[api]
+		[api, writeCachedSession]
 	);
 
 	const scheduleSelectedRefresh = useCallback((sessionId = selectedRef.current, delayMs = 80) => {
@@ -202,28 +345,38 @@ export function App() {
 			const eventSession = sessionsRef.current.get(event.session_id);
 			if (eventSession?.project_id && eventSession.project_id !== selectedProjectRef.current) return;
 			lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
-			setSessions((current) => applySessionActivityEvent(current, event.event, event.session_id));
+			patchCachedSession(event.session_id, (cached) => ({
+				...cached,
+				lastEventId: Math.max(cached.lastEventId, event.event_id)
+			}));
+
+			const sessionPatch = sessionPatchFromEvent(event);
+			if (sessionPatch.metadata) {
+				patchSessionMetadata(event.session_id, sessionPatch.metadata, sessionPatch.metadataRemove);
+			}
+			if (sessionPatch.provider) {
+				patchProvider(event.session_id, sessionPatch.provider);
+			}
+			if (sessionPatch.activity) patchSessionSummary(event.session_id, { activity: sessionPatch.activity });
+			if (sessionPatch.queuedInputPatch) {
+				patchQueuedInput(event);
+			}
+
+			const shouldRefreshSelected = shouldRefreshSelectedForEvent(event);
+			if (shouldRefreshSelected) markCachedSessionStale(event.session_id);
+
 			if (event.session_id === selectedRef.current) {
-				applyQueuedInputEvent(event, setSnapshot);
 				if (event.event === "model.error") pushNotice("error", modelErrorNotice(event.data));
 				if (event.event === "turn.finished") {
 					const outcome = typeof event.data.outcome === "string" ? event.data.outcome : null;
 					if (outcome === "Interrupted") pushNotice("info", "turn interrupted");
 					if (outcome === "Crashed") pushNotice("error", "turn crashed");
 				}
-				scheduleSelectedRefresh(event.session_id);
-				if (isTerminalActivityEvent(event.event)) {
-					window.setTimeout(() => {
-						void refreshSelected(event.session_id).catch((error) => pushNotice("error", errorMessage(error)));
-						void loadSessions().catch(() => undefined);
-					}, 350);
-				}
+				if (shouldRefreshSelected) scheduleSelectedRefresh(event.session_id);
 			}
-			if (isSessionListRefreshEvent(event.event)) {
-				void loadSessions().catch(() => undefined);
-			}
+			if (isSessionListRefreshEvent(event.event)) scheduleSessionListRefresh();
 		},
-		[loadSessions, pushNotice, refreshSelected, scheduleSelectedRefresh]
+		[markCachedSessionStale, patchCachedSession, patchProvider, patchQueuedInput, patchSessionMetadata, patchSessionSummary, pushNotice, scheduleSelectedRefresh, scheduleSessionListRefresh]
 	);
 
 	useEffect(() => {
@@ -231,6 +384,7 @@ export function App() {
 			setConnection(status);
 			if (status !== "open") {
 				subscribedEventSessionIds.current.clear();
+				for (const sessionId of sessionCacheRef.current.keys()) markCachedSessionStale(sessionId);
 				return;
 			}
 			void loadProjects()
@@ -249,9 +403,11 @@ export function App() {
 		return () => {
 			offStatus();
 			offEvent();
+			if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
+			if (sessionListRefreshTimer.current !== null) window.clearTimeout(sessionListRefreshTimer.current);
 			api.close();
 		};
-	}, [api, handleSessionEvent, loadGlobal, loadProjects, loadSessions, pushNotice, refreshSelected]);
+	}, [api, handleSessionEvent, loadGlobal, loadProjects, loadSessions, markCachedSessionStale, pushNotice, refreshSelected]);
 
 	useEffect(() => {
 		void loadSessions().catch((error) => pushNotice("error", errorMessage(error)));
@@ -259,19 +415,19 @@ export function App() {
 
 	useEffect(() => {
 		if (!selectedId) {
-			setSnapshot(null);
-			setEntries([]);
+			clearSelectedSessionState();
 			return;
 		}
-		let cancelled = false;
-		void refreshSelected(selectedId)
-			.catch((error) => {
-				if (!cancelled) pushNotice("error", errorMessage(error));
-			});
-		return () => {
-			cancelled = true;
-		};
-	}, [pushNotice, refreshSelected, selectedId]);
+		const cached = sessionCacheRef.current.get(selectedId);
+		if (cached && !cached.stale) {
+			setSnapshot(snapshotWithEntries(cached.snapshot));
+			setEntries(cached.entries);
+			return;
+		}
+		setSnapshot(null);
+		setEntries([]);
+		void refreshSelected(selectedId).catch((error) => pushNotice("error", errorMessage(error)));
+	}, [clearSelectedSessionState, pushNotice, refreshSelected, selectedId]);
 
 	useEffect(() => {
 		if (connection !== "open") return;
@@ -317,21 +473,23 @@ export function App() {
 		if (!selectedId) return;
 		if (sessionItems.some((session) => session.session_id === selectedId)) return;
 		selectSession(null);
-		setSnapshot(null);
-		setEntries([]);
 	}, [selectSession, selectedId, sessionItems]);
 
+	const loadedSnapshot = snapshot?.session_id === selectedId ? snapshot : null;
+	const loadedEntries = loadedSnapshot ? entries : [];
+	const transcriptLoading = !!selectedId && !loadedSnapshot;
+
 	const snapshotChatSession = useMemo(() => {
-		if (!selectedId || !snapshot) return null;
+		if (!selectedId || !loadedSnapshot) return null;
 		return {
 			session_id: selectedId,
-			project_id: snapshot.project_id,
-			activity: snapshot.activity,
-			active_leaf_id: snapshot.active_leaf_id,
-			provider: snapshot.provider,
-			metadata: snapshot.metadata
+			project_id: loadedSnapshot.project_id,
+			activity: loadedSnapshot.activity,
+			active_leaf_id: loadedSnapshot.active_leaf_id,
+			provider: loadedSnapshot.provider,
+			metadata: loadedSnapshot.metadata
 		};
-	}, [selectedId, snapshot]);
+	}, [loadedSnapshot, selectedId]);
 	const selectedListChatSession = useMemo(() => {
 		if (!selectedId) return null;
 		return {
@@ -345,11 +503,11 @@ export function App() {
 	}, [newSessionProvider, selectedId, selectedProjectId, selectedSession]);
 	const selectedChatSession = snapshotChatSession ?? selectedListChatSession;
 
-	const activeProvider = snapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
+	const activeProvider = loadedSnapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
 	const activeProviderKind = activeProvider.kind;
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
-	const modelLocked = !!selectedId && (entries.length > 0 || snapshot?.active_leaf_id !== null);
-	const modelControlsDisabled = !!selectedId && snapshot?.activity !== "idle";
+	const modelLocked = !!selectedId && !!loadedSnapshot && (loadedEntries.length > 0 || loadedSnapshot.active_leaf_id !== null);
+	const modelControlsDisabled = !!selectedId && (!loadedSnapshot || loadedSnapshot.activity !== "idle");
 
 	const configureProvider = useCallback(
 		async (provider: ProviderConfig) => {
@@ -359,9 +517,10 @@ export function App() {
 				return;
 			}
 			await api.configureSession({ sessionId, provider });
-			await Promise.all([loadSessions(), refreshSelected(sessionId)]);
+			patchProvider(sessionId, provider);
+			scheduleSessionListRefresh();
 		},
-		[api, loadSessions, refreshSelected]
+		[api, patchProvider, scheduleSessionListRefresh]
 	);
 
 	useEffect(() => {
@@ -427,28 +586,31 @@ export function App() {
 		const title = renameValue.trim();
 		if (!title) throw new Error("session title is required");
 		await api.renameSession(renameSessionId, title);
-		await Promise.all([loadSessions(), renameSessionId === selectedRef.current ? refreshSelected(renameSessionId) : Promise.resolve(null)]);
+		patchSessionMetadata(renameSessionId, { title });
+		scheduleSessionListRefresh();
 		pushNotice("success", `renamed session to “${truncate(title, 80)}”`);
 		closeRenameDialog();
-	}, [api, closeRenameDialog, loadSessions, pushNotice, refreshSelected, renameSessionId, renameValue]);
+	}, [api, closeRenameDialog, patchSessionMetadata, pushNotice, renameSessionId, renameValue, scheduleSessionListRefresh]);
 
 	const setSessionArchived = useCallback(
 		async (session: SessionListItem, archived: boolean) => {
-			const current = session.session_id === selectedRef.current ? await refreshSelected(session.session_id) : null;
-			const activity = current?.snapshot.activity ?? session.activity;
+			const sessionId = session.session_id;
+			const currentSnapshot = loadedSnapshot?.session_id === sessionId ? loadedSnapshot : null;
+			const activity = currentSnapshot?.activity ?? session.activity;
 			if (activity !== "idle") throw new Error("only idle sessions can be archived");
-			const metadata = { ...(current?.snapshot.metadata ?? session.metadata) };
+			const metadata = { ...(currentSnapshot?.metadata ?? session.metadata) };
 			if (archived) metadata.archived = true;
 			else delete metadata.archived;
 			await api.configureSession({
-				sessionId: session.session_id,
-				provider: current?.snapshot.provider ?? session.provider,
+				sessionId,
+				provider: currentSnapshot?.provider ?? session.provider,
 				metadata
 			});
-			await Promise.all([loadSessions(), session.session_id === selectedRef.current ? refreshSelected(session.session_id) : Promise.resolve(null)]);
+			patchSessionMetadata(sessionId, archived ? { archived: true } : {}, archived ? [] : ["archived"]);
+			scheduleSessionListRefresh();
 			pushNotice("success", archived ? `archived “${truncate(sessionTitle(session), 80)}”` : `unarchived “${truncate(sessionTitle(session), 80)}”`);
 		},
-		[api, loadSessions, pushNotice, refreshSelected]
+		[api, loadedSnapshot, patchSessionMetadata, pushNotice, scheduleSessionListRefresh]
 	);
 
 	const closeDeleteDialog = useCallback(() => {
@@ -472,24 +634,23 @@ export function App() {
 				refreshTimer.current = null;
 			}
 			lastEventIds.current.delete(sessionId);
+			deleteCachedSession(sessionId);
 			composerHandleRef.current?.clearSession(sessionId);
-			setSessions((currentSessions) => currentSessions.filter((session) => session.session_id !== sessionId));
+			setSessions((currentSessions) => currentSessions.filter((candidate) => candidate.session_id !== sessionId));
 
 			if (selectedRef.current === sessionId) {
 				selectSession(null);
-				setSnapshot(null);
-				setEntries([]);
 				composerHandleRef.current?.setValue("");
 			}
 
 			closeDeleteDialog();
-			await loadSessions();
+			scheduleSessionListRefresh(0);
 			pushNotice("success", `deleted “${truncate(title, 80)}”`);
 		} catch (error) {
 			setDeleteDialog((current) => (current?.session.session_id === sessionId ? { ...current, deleting: false } : current));
 			throw error;
 		}
-	}, [api, closeDeleteDialog, deleteDialog, loadSessions, pushNotice, refreshSelected, selectSession]);
+	}, [api, closeDeleteDialog, deleteCachedSession, deleteDialog, pushNotice, refreshSelected, scheduleSessionListRefresh, selectSession]);
 
 	const createSession = useCallback(
 		(title?: string) => {
@@ -499,8 +660,6 @@ export function App() {
 			}
 			nextSessionTitleRef.current = title?.trim() || null;
 			selectSession(null);
-			setSnapshot(null);
-			setEntries([]);
 			composerHandleRef.current?.setValue("");
 			requestAnimationFrame(() => composerHandleRef.current?.focus());
 			return null;
@@ -516,8 +675,11 @@ export function App() {
 	const queueUserInput = useCallback(
 		async (text: string) => {
 			const sessionId = requireSelected();
+			if (!loadedSnapshot && selectedRef.current === sessionId) {
+				throw new Error("session is still loading");
+			}
 			if (selectedSession && isArchivedSession(selectedSession)) {
-				const current = snapshot ?? (await refreshSelected(sessionId))?.snapshot;
+				const current = loadedSnapshot?.session_id === sessionId ? loadedSnapshot : (await refreshSelected(sessionId))?.snapshot;
 				if ((current?.activity ?? selectedSession.activity) !== "idle") {
 					throw new Error("only idle archived sessions can be resumed");
 				}
@@ -528,16 +690,18 @@ export function App() {
 					provider: current?.provider ?? selectedSession.provider,
 					metadata
 				});
+				patchSessionMetadata(sessionId, {}, ["archived"]);
+				scheduleSessionListRefresh();
 			}
 			const clientInputId = randomId("web_input");
 			await api.queueFollowUp({
 				sessionId,
 				clientInputId,
-				expectedActiveLeafId: snapshot?.activity === "idle" ? (snapshot.active_leaf_id ?? null) : undefined,
+				expectedActiveLeafId: loadedSnapshot?.activity === "idle" ? (loadedSnapshot.active_leaf_id ?? null) : undefined,
 				content: textContent(text)
 			});
 		},
-		[api, refreshSelected, requireSelected, selectedSession, snapshot]
+		[api, loadedSnapshot, patchSessionMetadata, refreshSelected, requireSelected, scheduleSessionListRefresh, selectedSession]
 	);
 
 	const startNewSession = useCallback(
@@ -575,9 +739,9 @@ export function App() {
 			if (normalizedTitle) {
 				await api.configureSession({
 					sessionId: fork.session_id,
-					provider: snapshot?.provider ?? selectedSession?.provider ?? DEFAULT_PROVIDER,
+					provider: loadedSnapshot?.provider ?? selectedSession?.provider ?? DEFAULT_PROVIDER,
 					metadata: {
-						...(snapshot?.metadata ?? selectedSession?.metadata ?? {}),
+						...(loadedSnapshot?.metadata ?? selectedSession?.metadata ?? {}),
 						title: normalizedTitle
 					}
 				});
@@ -590,29 +754,30 @@ export function App() {
 			pushNotice("success", `forked ${fork.session_id}`);
 			return fork.session_id;
 		},
-		[api, loadSessions, pushNotice, requireSelected, selectedSession, selectSession, snapshot]
+		[api, loadSessions, loadedSnapshot, pushNotice, requireSelected, selectedSession, selectSession]
 	);
 
 	const switchToTarget = useCallback(
 		async (target: HistoryTargetOption) => {
 			const sessionId = requireSelected();
 			const current = await refreshSelected(sessionId);
-			if ((current?.snapshot.activity ?? snapshot?.activity) !== "idle") {
+			if ((current?.snapshot.activity ?? loadedSnapshot?.activity) !== "idle") {
 				throw new Error("stop the active turn before switching history");
 			}
 			await api.rewindHistory({
 				sessionId,
 				leafId: target.actionLeafId,
-				expectedActiveLeafId: target.expectedActiveLeafId ?? current?.snapshot.active_leaf_id ?? snapshot?.active_leaf_id ?? null
+				expectedActiveLeafId: target.expectedActiveLeafId ?? current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null
 			});
+			markCachedSessionStale(sessionId);
 			await refreshSelected(sessionId);
 			if (target.restoreText !== undefined) {
 				composerHandleRef.current?.setValue(target.restoreText);
 			}
-			void loadSessions().catch(() => undefined);
+			scheduleSessionListRefresh();
 			pushNotice("success", target.restoreText !== undefined ? "message restored for editing" : "switched to selected history point");
 		},
-		[api, loadSessions, pushNotice, refreshSelected, requireSelected, snapshot?.active_leaf_id, snapshot?.activity]
+		[api, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, markCachedSessionStale, pushNotice, refreshSelected, requireSelected, scheduleSessionListRefresh]
 	);
 
 	const promoteQueuedInput = useCallback(
@@ -644,9 +809,9 @@ export function App() {
 		async (leafId?: string | null) => {
 			const sessionId = requireSelected();
 			const current = await refreshSelected(sessionId);
-			const activeLeafId = leafId ?? current?.snapshot.active_leaf_id ?? snapshot?.active_leaf_id ?? null;
+			const activeLeafId = leafId ?? current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null;
 			if (!activeLeafId) throw new Error("no terminal turn to resume");
-			if ((current?.snapshot.activity ?? snapshot?.activity) !== "idle") {
+			if ((current?.snapshot.activity ?? loadedSnapshot?.activity) !== "idle") {
 				throw new Error("stop the active turn before retrying");
 			}
 			setResumingTurnId(activeLeafId);
@@ -654,7 +819,7 @@ export function App() {
 				const result = await api.resumeTurn({
 					sessionId,
 					leafId: activeLeafId,
-					expectedActiveLeafId: current?.snapshot.active_leaf_id ?? snapshot?.active_leaf_id ?? null
+					expectedActiveLeafId: current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null
 				});
 				await Promise.all([refreshSelected(sessionId), loadSessions()]);
 				pushNotice("success", result.outcome === "Interrupted" ? "continued turn" : "retry started");
@@ -662,7 +827,7 @@ export function App() {
 				setResumingTurnId(null);
 			}
 		},
-		[api, loadSessions, pushNotice, refreshSelected, requireSelected, snapshot?.active_leaf_id, snapshot?.activity]
+		[api, loadSessions, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, pushNotice, refreshSelected, requireSelected]
 	);
 
 	const executeSlash = useCallback(
@@ -695,24 +860,24 @@ export function App() {
 
 			const sessionId = requireSelected();
 			if (name === "fork") {
-				const refreshed = snapshot?.activity === "running" ? null : await refreshSelected(sessionId);
+				const refreshed = loadedSnapshot?.activity === "running" ? null : await refreshSelected(sessionId);
 				setHistoryDialog({
 					mode: "fork",
-					entries: refreshed?.entries ?? entries,
-					activeLeafId: refreshed?.snapshot.active_leaf_id ?? snapshot?.active_leaf_id ?? null,
+					entries: refreshed?.entries ?? loadedEntries,
+					activeLeafId: refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
 					initialForkTitle: args
 				});
 				return;
 			}
 			if (name === "switch") {
 				const refreshed = await refreshSelected(sessionId);
-				if ((refreshed?.snapshot.activity ?? snapshot?.activity) !== "idle") {
+				if ((refreshed?.snapshot.activity ?? loadedSnapshot?.activity) !== "idle") {
 					throw new Error("stop the active turn before switching history");
 				}
 				setHistoryDialog({
 					mode: "switch",
-					entries: refreshed?.entries ?? entries,
-					activeLeafId: refreshed?.snapshot.active_leaf_id ?? snapshot?.active_leaf_id ?? null
+					entries: refreshed?.entries ?? loadedEntries,
+					activeLeafId: refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null
 				});
 				return;
 			}
@@ -720,8 +885,8 @@ export function App() {
 				const refreshed = await refreshSelected(sessionId);
 				setExportDialog({
 					entries: branchEntriesFor(
-						refreshed?.entries ?? entries,
-						refreshed?.snapshot.active_leaf_id ?? snapshot?.active_leaf_id ?? null
+						refreshed?.entries ?? loadedEntries,
+						refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null
 					)
 				});
 				return;
@@ -735,11 +900,11 @@ export function App() {
 		},
 		[
 			api,
-			entries,
+			loadedEntries,
+			loadedSnapshot,
 			pushNotice,
 			refreshSelected,
-			requireSelected,
-			snapshot
+			requireSelected
 		]
 	);
 
@@ -770,8 +935,8 @@ export function App() {
 	const layoutStyle = {
 		gridTemplateColumns: rightOpen ? "320px minmax(0,1fr) minmax(320px,380px)" : "320px minmax(0,1fr)"
 	};
-	const canStop = !!selectedId && snapshot?.activity === "running";
-	const queuedInputs = snapshot?.queued_inputs ?? [];
+	const canStop = !!selectedId && loadedSnapshot?.activity === "running";
+	const queuedInputs = loadedSnapshot?.queued_inputs ?? [];
 	const handleToggleArchived = useCallback(() => {
 		setShowArchived((show) => !show);
 	}, []);
@@ -780,8 +945,6 @@ export function App() {
 		selectedProjectRef.current = projectId;
 		setSelectedProjectId(projectId);
 		selectSession(null);
-		setSnapshot(null);
-		setEntries([]);
 		setQuery("");
 		composerHandleRef.current?.setValue("");
 	}, [selectSession]);
@@ -825,8 +988,6 @@ export function App() {
 			selectedProjectRef.current = saved.project_id;
 			setSelectedProjectId(saved.project_id);
 			selectSession(null);
-			setSnapshot(null);
-			setEntries([]);
 			pushNotice("success", `${projectDialog.mode === "create" ? "created" : "updated"} project “${truncate(saved.name, 80)}”`);
 			closeProjectDialog();
 		} catch (error) {
@@ -904,8 +1065,9 @@ export function App() {
 
 			<ChatPane
 				session={selectedChatSession}
-				snapshot={snapshot}
-				entries={entries}
+				snapshot={loadedSnapshot}
+				entries={loadedEntries}
+				transcriptLoading={transcriptLoading}
 				modelOptions={MODEL_OPTIONS}
 				modelValue={providerModelKey(activeProvider)}
 				modelLocked={modelLocked}
@@ -938,7 +1100,7 @@ export function App() {
 
 			{rightOpen ? (
 				<aside className="inspector" data-slot="inspector">
-					<Inspector snapshot={snapshot} config={config} tools={tools} />
+					<Inspector snapshot={loadedSnapshot} config={config} tools={tools} />
 				</aside>
 			) : null}
 
@@ -1170,14 +1332,40 @@ function mergeSnapshotIntoSessionList(sessions: SessionSummary[], snapshot: Sess
 	return found ? nextSessions : sessions;
 }
 
-function applySessionActivityEvent(sessions: SessionSummary[], event: string, sessionId: string): SessionSummary[] {
-	const activity = activityForEvent(event);
-	if (!activity) return sessions;
+function patchSessionSummaryList(sessions: SessionSummary[], sessionId: string, patch: Partial<SessionSummary>): SessionSummary[] {
 	let changed = false;
 	const nextSessions = sessions.map((session) => {
-		if (session.session_id !== sessionId || session.activity === activity) return session;
+		if (session.session_id !== sessionId) return session;
 		changed = true;
-		return { ...session, activity };
+		return { ...session, ...patch };
+	});
+	return changed ? nextSessions : sessions;
+}
+
+function snapshotPatchFromSummaryPatch(patch: Partial<SessionSummary>): Partial<CachedSnapshot> {
+	const { created_at: _createdAt, updated_at: _updatedAt, ...snapshotPatch } = patch;
+	void _createdAt;
+	void _updatedAt;
+	return snapshotPatch;
+}
+
+function mergeMetadata(metadata: Record<string, unknown>, patch: Record<string, unknown>, removeKeys: string[] = []): Record<string, unknown> {
+	const next = { ...metadata, ...patch };
+	for (const key of removeKeys) delete next[key];
+	return next;
+}
+
+function patchSessionMetadataInList(
+	sessions: SessionSummary[],
+	sessionId: string,
+	patch: Record<string, unknown>,
+	removeKeys: string[] = []
+): SessionSummary[] {
+	let changed = false;
+	const nextSessions = sessions.map((session) => {
+		if (session.session_id !== sessionId) return session;
+		changed = true;
+		return { ...session, metadata: mergeMetadata(session.metadata, patch, removeKeys) };
 	});
 	return changed ? nextSessions : sessions;
 }
@@ -1220,9 +1408,26 @@ function isSessionListRefreshEvent(event: string): boolean {
 		event === "session.created" ||
 		event === "session.configured" ||
 		event === "history.forked" ||
+		event === "history.rewound" ||
+		event === "history.compacted" ||
 		event === "input.queued" ||
 		event === "input.consumed" ||
+		event === "input.promoted" ||
 		isTerminalActivityEvent(event)
+	);
+}
+
+function shouldRefreshSelectedForEvent(event: EventFrame): boolean {
+	if (event.event === "session.configured") return false;
+	if (event.event === "input.consumed" || event.event === "input.promoted") return false;
+	return (
+		event.event === "transcript.appended" ||
+		event.event === "turn.started" ||
+		event.event === "turn.finished" ||
+		event.event === "assistant.message" ||
+		event.event === "history.rewound" ||
+		event.event === "history.compacted" ||
+		isTerminalActivityEvent(event.event)
 	);
 }
 
@@ -1230,31 +1435,119 @@ function errorMessage(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
 
+function isQueuedInputPatchEvent(event: string): boolean {
+	return event === "input.consumed" || event === "input.promoted";
+}
+
 function applyQueuedInputEvent(
 	event: EventFrame,
 	setSnapshot: Dispatch<SetStateAction<SessionSnapshot | null>>
 ) {
-	if (event.event !== "input.consumed" && event.event !== "input.promoted") return;
+	if (!isQueuedInputPatchEvent(event.event)) return;
+	setSnapshot((current) => applyQueuedInputEventToSnapshot(event, current));
+}
+
+function applyQueuedInputEventToSnapshot<T extends Pick<SessionSnapshot, "session_id" | "queued_inputs">>(event: EventFrame, current: T): T;
+function applyQueuedInputEventToSnapshot<T extends Pick<SessionSnapshot, "session_id" | "queued_inputs">>(event: EventFrame, current: T | null): T | null;
+function applyQueuedInputEventToSnapshot<T extends Pick<SessionSnapshot, "session_id" | "queued_inputs">>(event: EventFrame, current: T | null): T | null {
+	if (!current || current.session_id !== event.session_id) return current;
 	const inputId = typeof event.data.input_id === "string" ? event.data.input_id : null;
-	if (!inputId) return;
-	setSnapshot((current) => {
-		if (!current || current.session_id !== event.session_id) return current;
-		if (event.event === "input.consumed") {
-			const queuedInputs = current.queued_inputs.filter((input) => input.input_id !== inputId);
-			return queuedInputs.length === current.queued_inputs.length ? current : { ...current, queued_inputs: queuedInputs };
-		}
-		const promotedAt = typeof event.data.promoted_at === "string" ? event.data.promoted_at : null;
-		let changed = false;
-		const queuedInputs = current.queued_inputs.map((input) => {
-			if (input.input_id !== inputId) return input;
-			changed = true;
-			return { ...input, priority: "steer" as const, status: "queued" as const, promoted_at: promotedAt };
-		});
-		return changed ? { ...current, queued_inputs: queuedInputs } : current;
+	if (!inputId) return current;
+	if (event.event === "input.consumed") {
+		const queuedInputs = current.queued_inputs.filter((input) => input.input_id !== inputId);
+		return queuedInputs.length === current.queued_inputs.length ? current : { ...current, queued_inputs: queuedInputs };
+	}
+	if (event.event !== "input.promoted") return current;
+	const promotedAt = typeof event.data.promoted_at === "string" ? event.data.promoted_at : null;
+	let changed = false;
+	const queuedInputs = current.queued_inputs.map((input) => {
+		if (input.input_id !== inputId) return input;
+		changed = true;
+		return { ...input, priority: "steer" as const, status: "queued" as const, promoted_at: promotedAt };
 	});
+	return changed ? { ...current, queued_inputs: queuedInputs } : current;
 }
 
 function modelErrorNotice(data: Record<string, unknown>): string {
 	const error = typeof data.error === "string" ? data.error : "model request failed";
 	return `model error: ${truncate(error, 420)}`;
+}
+
+function snapshotWithEntries(snapshot: CachedSnapshot): SessionSnapshot {
+	return { ...snapshot, entries: undefined };
+}
+
+function trimSessionCache(cache: Map<string, CachedSession>) {
+	while (cache.size > MAX_CACHED_SESSIONS) {
+		const oldest = oldestCachedSessionId(cache);
+		if (!oldest) break;
+		cache.delete(oldest);
+	}
+	while (totalCachedEntryCount(cache) > MAX_CACHED_ENTRIES) {
+		const oldest = oldestCachedSessionId(cache);
+		if (!oldest) break;
+		cache.delete(oldest);
+	}
+}
+
+function oldestCachedSessionId(cache: Map<string, CachedSession>): string | null {
+	let oldestId: string | null = null;
+	let oldestAt = Number.POSITIVE_INFINITY;
+	for (const [sessionId, cached] of cache) {
+		if (cached.cachedAt >= oldestAt) continue;
+		oldestId = sessionId;
+		oldestAt = cached.cachedAt;
+	}
+	return oldestId;
+}
+
+function totalCachedEntryCount(cache: Map<string, CachedSession>): number {
+	let total = 0;
+	for (const cached of cache.values()) total += cached.entries.length;
+	return total;
+}
+
+type EventSessionPatch = {
+	metadata?: Record<string, unknown>;
+	metadataRemove: string[];
+	provider?: ProviderConfig;
+	activity?: SessionSummary["activity"];
+	queuedInputPatch: boolean;
+};
+
+function sessionPatchFromEvent(event: EventFrame): EventSessionPatch {
+	const configuredPatch = configuredPatchFromEvent(event);
+	return {
+		...configuredPatch,
+		activity: activityForEvent(event.event) ?? undefined,
+		queuedInputPatch: isQueuedInputPatchEvent(event.event)
+	};
+}
+
+function configuredPatchFromEvent(event: EventFrame): Pick<EventSessionPatch, "metadata" | "metadataRemove" | "provider"> {
+	if (event.event !== "session.configured") return { metadataRemove: [] };
+	const metadata = recordValue(event.data.metadata) ?? recordValue(event.data.metadata_patch);
+	const metadataRemove = Array.isArray(event.data.metadata_remove)
+		? event.data.metadata_remove.filter((key): key is string => typeof key === "string")
+		: [];
+	const provider = providerValue(event.data.provider);
+	return {
+		metadata: metadata ?? titlePatchFromEvent(event),
+		metadataRemove,
+		provider
+	};
+}
+
+function titlePatchFromEvent(event: EventFrame): Record<string, unknown> | undefined {
+	return typeof event.data.title === "string" ? { title: event.data.title } : undefined;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | undefined {
+	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
+}
+
+function providerValue(value: unknown): ProviderConfig | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const candidate = value as Partial<ProviderConfig>;
+	return candidate.kind && candidate.model ? (candidate as ProviderConfig) : undefined;
 }
