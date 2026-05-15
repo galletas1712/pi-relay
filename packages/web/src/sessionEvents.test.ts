@@ -55,6 +55,20 @@ describe("reduceSessionEvent", () => {
 			},
 		]);
 	});
+
+	it("refreshes selected history after compaction completes", () => {
+		const operations = reduceSessionEvent(frame("compaction.completed", { trigger: "auto" }));
+
+		expect(operations).toEqual([
+			{ type: "activity", sessionId: "session_1", activity: "running" },
+			{
+				type: "invalidate_session",
+				sessionId: "session_1",
+				reason: "compaction.completed",
+			},
+			{ type: "invalidate_list", reason: "compaction.completed" },
+		]);
+	});
 });
 
 function frame(event: string, data: Record<string, unknown>): EventFrame {
