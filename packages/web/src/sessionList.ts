@@ -1,6 +1,7 @@
 import type { Activity, SessionSummary } from "./types.ts";
 
 export type SessionListItem = SessionSummary;
+export type SessionDisplayActivity = "idle" | "running";
 
 export function sessionTitle(session: SessionListItem): string {
 	const title = session.metadata?.title;
@@ -11,12 +12,20 @@ export function isArchivedSession(session: SessionListItem): boolean {
 	return session.metadata?.archived === true;
 }
 
-export function tallyActivities(sessions: SessionListItem[]): Record<Activity, number> {
-	return sessions.reduce<Record<Activity, number>>(
+export function sessionDisplayActivity(session: SessionListItem): SessionDisplayActivity {
+	return displayActivity(session.activity);
+}
+
+export function displayActivity(activity: Activity): SessionDisplayActivity {
+	return activity === "idle" ? "idle" : "running";
+}
+
+export function tallyActivities(sessions: SessionListItem[]): Record<SessionDisplayActivity, number> {
+	return sessions.reduce<Record<SessionDisplayActivity, number>>(
 		(counts, session) => {
-			counts[session.activity] += 1;
+			counts[sessionDisplayActivity(session)] += 1;
 			return counts;
 		},
-		{ idle: 0, queued: 0, running: 0 }
+		{ idle: 0, running: 0 }
 	);
 }

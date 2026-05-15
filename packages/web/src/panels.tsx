@@ -11,9 +11,9 @@ import {
 } from "lucide-react";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { COMMANDS } from "./slash.ts";
-import { isArchivedSession, sessionTitle, type SessionListItem } from "./sessionList.ts";
+import { displayActivity, isArchivedSession, sessionDisplayActivity, sessionTitle, type SessionDisplayActivity, type SessionListItem } from "./sessionList.ts";
 import { truncate } from "./text.ts";
-import type { Activity, DaemonConfig, Notice, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
+import type { DaemonConfig, Notice, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
 
 export function SidebarHeader({
 	counts,
@@ -21,28 +21,31 @@ export function SidebarHeader({
 	archived,
 	connection
 }: {
-	counts: Record<Activity, number>;
+	counts: Record<SessionDisplayActivity, number>;
 	total: number;
 	archived: number;
 	connection: string;
 }) {
+	const connected = connection === "open";
 	return (
 		<div className="sidebar-header">
+			<div className="connection-row">
+				<span className={`connection-pill ${connected ? "online" : "offline"}`}>
+					{connected ? "connected" : connection}
+				</span>
+			</div>
 			<div className="masthead">
-				<span className={`dot ${connection === "open" ? "ok" : "warn"}`} />
-				<span className="masthead-title">sessions</span>
+				<span className="masthead-title">Sessions</span>
 				<span className="masthead-count">{total}</span>
 			</div>
 			<div className="activity-counts">
-				{(["running", "queued", "idle"] as Activity[]).map((activity) => (
-					<span className="activity-chip" key={activity}>
-						<span className={`dot ${activity}`} />
+				{(["running", "idle"] as SessionDisplayActivity[]).map((activity) => (
+					<span className={`activity-chip ${activity}`} key={activity}>
 						{activity}
 						<span className="count">{counts[activity] ?? 0}</span>
 					</span>
 				))}
-				<span className="activity-chip">
-					<span className="dot archived" />
+				<span className="activity-chip archived">
 					archived
 					<span className="count">{archived}</span>
 				</span>
@@ -105,12 +108,13 @@ export function SessionRow({
 	onDelete: () => void;
 }) {
 	const archived = isArchivedSession(session);
+	const displayActivity = sessionDisplayActivity(session);
 	const canArchive = session.activity === "idle";
 	const canDelete = session.activity === "idle";
 	const ArchiveIcon = archived ? ArchiveRestore : Archive;
 	return (
 		<button className={`session-row ${selected ? "selected" : ""} ${archived ? "archived" : ""}`} type="button" onClick={onSelect}>
-			<span className={`status-rail ${archived ? "archived" : session.activity}`} />
+			<span className={`status-rail ${archived ? "archived" : displayActivity}`} />
 			<span className="session-main">
 				<span className="session-title">{sessionTitle(session)}</span>
 				<span className="session-sub">
@@ -220,14 +224,17 @@ export function LogHeader({
 		: [reasoningEffort, ...reasoningEfforts];
 	return (
 		<div className="log-header">
-			<span className={`dot ${archived ? "archived" : "ok"}`} />
-			<span>agent-log</span>
+			{session ? (
+				<span className={`session-state ${archived ? "archived" : displayActivity(snapshot?.activity ?? session.activity)}`}>
+					{archived ? "archived" : displayActivity(snapshot?.activity ?? session.activity)}
+				</span>
+			) : null}
 			{session ? (
 				<span className="log-session">
-					{sessionTitle(session)} - {archived ? "archived" : (snapshot?.activity ?? session.activity)}
+					{sessionTitle(session)}
 				</span>
 			) : (
-				<span className="log-session">no session selected</span>
+				<span className="log-session">No session selected</span>
 			)}
 			<div className="log-controls">
 				<label className="header-select">
