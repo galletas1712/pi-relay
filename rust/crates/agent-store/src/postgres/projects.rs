@@ -134,4 +134,3 @@ pub(super) fn project_from_row(row: sqlx::postgres::PgRow) -> Result<Project> {
         updated_at: row.get("updated_at"),
     })
 }
-

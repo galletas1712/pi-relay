@@ -118,10 +118,11 @@ impl PostgresAgentStore {
             });
         }
         sqlx::query(
-            "insert into sessions (id, project_id, active_leaf_id, provider_config, metadata) values ($1, $2, $3::text, $4, $5)",
+            "insert into sessions (id, project_id, starting_cwd, active_leaf_id, provider_config, metadata) values ($1, $2, $3, $4::text, $5, $6)",
         )
         .bind(new_session_id)
         .bind(config.project_id)
+        .bind(&config.starting_cwd)
         .bind(active_leaf_id.as_deref())
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&metadata)

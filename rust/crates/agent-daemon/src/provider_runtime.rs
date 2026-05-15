@@ -112,7 +112,7 @@ pub(crate) async fn run_compaction(
 
 pub(crate) fn dynamic_prompt_context_for_cwd(cwd: &std::path::Path) -> String {
     format!(
-        "Current working directory: {}\n\
+        "Starting working directory for this session: {}\n\
          The bash tool runs each command in a fresh shell rooted here; chain commands with `&&` \
          (or call `cd` inside the command) when you need to scope work to a subdirectory.",
         cwd.display()
@@ -203,5 +203,13 @@ mod tests {
 
         assert!(result.output.len() < 30_000);
         assert!(result.output.contains("[tool output truncated:"));
+    }
+
+    #[test]
+    fn dynamic_prompt_labels_cwd_as_session_starting_point() {
+        let prompt = dynamic_prompt_context_for_cwd(std::path::Path::new("/tmp/project"));
+
+        assert!(prompt.contains("Starting working directory for this session: /tmp/project"));
+        assert!(prompt.contains("fresh shell rooted here"));
     }
 }

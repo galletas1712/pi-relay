@@ -18,6 +18,7 @@ export interface ProviderConfig {
 export interface SessionSummary {
 	session_id: string;
 	project_id: string;
+	starting_cwd: string;
 	activity: Activity;
 	active_leaf_id: string | null;
 	provider: ProviderConfig;
@@ -46,6 +47,7 @@ export interface QueuedInput {
 export interface SessionSnapshot {
 	session_id: string;
 	project_id: string;
+	starting_cwd: string;
 	activity: Activity;
 	active_leaf_id: string | null;
 	provider: ProviderConfig;

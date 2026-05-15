@@ -23,12 +23,13 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
-            insert into sessions (id, project_id, provider_config, metadata)
-            values ($1, $2, $3, $4)
+            insert into sessions (id, project_id, starting_cwd, provider_config, metadata)
+            values ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(session_id)
         .bind(config.project_id)
+        .bind(&config.starting_cwd)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
         .execute(&mut *tx)
@@ -72,14 +73,15 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
             r#"
-                insert into sessions (id, project_id, active_leaf_id, provider_config, metadata)
-                values ($1, $2, $3::text, $4, $5)
+                insert into sessions (id, project_id, starting_cwd, active_leaf_id, provider_config, metadata)
+                values ($1, $2, $3, $4::text, $5, $6)
                 on conflict (id) do nothing
                 returning id
                 "#,
         )
         .bind(session_id)
         .bind(config.project_id)
+        .bind(&config.starting_cwd)
         .bind(active_leaf_id)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
@@ -195,6 +197,7 @@ impl PostgresAgentStore {
                 select
                     s.id,
                     s.project_id,
+                    s.starting_cwd,
                     s.active_leaf_id,
                     s.provider_config,
                     s.metadata,
@@ -239,6 +242,7 @@ impl PostgresAgentStore {
                 Ok(SessionSummary {
                     session_id: id,
                     project_id: row.get("project_id"),
+                    starting_cwd: row.get("starting_cwd"),
                     activity,
                     active_leaf_id: row.get("active_leaf_id"),
                     provider,
@@ -255,18 +259,17 @@ impl PostgresAgentStore {
             r#"
             select
                 s.project_id,
-                coalesce(p.starting_cwd, '') as starting_cwd,
+                s.starting_cwd,
                 s.provider_config,
                 s.metadata
             from sessions s
-            left join projects p on p.id=s.project_id
             where s.id=$1
             "#,
         )
-            .bind(session_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         Ok(SessionConfig {
             project_id: row.get("project_id"),
             starting_cwd: row.get("starting_cwd"),

@@ -70,6 +70,7 @@ enums that serialize to the string values shown below.
 ```text
 id text primary key
 project_id uuid not null references projects(id)
+starting_cwd text not null
 created_at timestamptz not null default now()
 updated_at timestamptz not null default now()
 active_leaf_id text null
@@ -88,8 +89,9 @@ starting_cwd text not null
 metadata jsonb not null default '{}'::jsonb
 ```
 
-Projects are host folders. Every session has a `project_id`; model prompt
-context and local tools use the project's `starting_cwd`.
+Projects are host folders. Every session has a `project_id` and snapshots the
+project `starting_cwd` when the session is created; model prompt context and
+local tools use the session's stored `starting_cwd`.
 
 `provider_config`:
 
@@ -330,8 +332,10 @@ the normal frontend path for a brand-new draft.
 
 The daemon writes `session.created`, `input.accepted`, transcript entries,
 actions, and events in the same session-start transition before dispatching
-provider/tool work. Retrying the same stable `session_id` returns the existing
-session with `"replayed": true` rather than creating a second session.
+provider/tool work. It snapshots the project's current `starting_cwd` into the
+new session row; later `project.update` calls do not change that stored session
+cwd. Retrying the same stable `session_id` returns the existing session with
+`"replayed": true` rather than creating a second session.
 For web drafts, the frontend should always provide both the stable draft-owned
 `session_id` and `client_input_id`.
 
@@ -343,12 +347,12 @@ Lists durable sessions, newest first.
 { "limit": 50 }
 ```
 
-Each row includes `session_id`, `project_id`, `activity`, `active_leaf_id`, `provider`,
-`metadata`, and `updated_at`. Defensive listing hides accidental empty
-web-created rows that have no transcript, queued input, actions, or fork
-provenance. Rows with `metadata.hidden = true` are also omitted from the list;
-this is used for local verification cleanup, not as a core lifecycle state.
-Browser-local drafts are not returned by this RPC.
+Each row includes `session_id`, `project_id`, `starting_cwd`, `activity`,
+`active_leaf_id`, `provider`, `metadata`, and `updated_at`. Defensive listing
+hides accidental empty web-created rows that have no transcript, queued input,
+actions, or fork provenance. Rows with `metadata.hidden = true` are also omitted
+from the list; this is used for local verification cleanup, not as a core
+lifecycle state. Browser-local drafts are not returned by this RPC.
 
 ### `session.get`
 
@@ -364,6 +368,7 @@ Result shape:
 {
   "session_id": "s1",
   "project_id": "f2b0e23c-1fd7-4977-9d60-f6842e25d15b",
+  "starting_cwd": "/Users/me/src/my-repo",
   "activity": "idle",
   "active_leaf_id": "entry_9",
   "provider": { "kind": "codex", "model": "gpt-5.5" },
@@ -393,7 +398,8 @@ Returns visible projects:
 ```
 
 Each project has `project_id`, `name`, `starting_cwd`, `metadata`, `created_at`,
-and `updated_at`.
+and `updated_at`. The project `starting_cwd` is a default for new sessions; each
+session snapshots its own cwd at creation time.
 
 ### `project.create`
 
@@ -407,8 +413,9 @@ and `updated_at`.
 
 ### `project.update`
 
-Renames a project and/or changes the starting cwd used for future session work.
-The cwd must be an existing directory.
+Renames a project and/or changes the starting cwd used for future sessions. The
+cwd must be an existing directory. Updating a project cwd does not change the cwd
+of existing sessions in that project.
 
 ```json
 {

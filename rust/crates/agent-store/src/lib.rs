@@ -202,6 +202,7 @@ pub struct PromoteQueuedInputResult {
 pub struct SessionSummary {
     pub session_id: String,
     pub project_id: Uuid,
+    pub starting_cwd: String,
     pub activity: SessionActivity,
     pub active_leaf_id: Option<String>,
     pub provider: ProviderConfig,
@@ -254,6 +255,7 @@ pub struct QueuedInputRecord {
 pub struct SessionSnapshot {
     pub session_id: String,
     pub project_id: Uuid,
+    pub starting_cwd: String,
     pub activity: SessionActivity,
     pub active_leaf_id: Option<String>,
     pub provider: ProviderConfig,

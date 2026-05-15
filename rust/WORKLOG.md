@@ -8,10 +8,10 @@
   per-project `starting_cwd`; every session now belongs to a project.
 - Added project CRUD/list RPCs and threaded `project_id` through
   `session.start`, `session.list`, `session.get`, and session/fork summaries.
-- Session config now carries the project's `starting_cwd`; model dynamic prompt
-  context and local tool execution use that cwd instead of one daemon-wide
-  workspace. Updating a project cwd affects subsequent turns for sessions in
-  that project.
+- Session config snapshots the project's `starting_cwd` when a session is
+  created; model dynamic prompt context and local tool execution use that
+  session cwd instead of one daemon-wide workspace. Updating a project cwd only
+  changes the default for future sessions.
 - Updated the web UI sidebar to select a project first, then list sessions
   nested under that project. Added project create/edit dialog with rename and
   starting-cwd fields.

@@ -1160,6 +1160,7 @@ function mergeSnapshotIntoSessionList(sessions: SessionSummary[], snapshot: Sess
 		return {
 			...session,
 			project_id: snapshot.project_id,
+			starting_cwd: snapshot.starting_cwd,
 			activity: snapshot.activity,
 			active_leaf_id: snapshot.active_leaf_id,
 			provider: snapshot.provider,

@@ -551,9 +551,7 @@ async fn project_list(state: &AppState) -> std::result::Result<Value, RpcError> 
 
 async fn project_create(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let params: ProjectWriteParams = from_params(params)?;
-    let project_id = params
-        .project_id
-        .unwrap_or_else(|| Uuid::new_v4());
+    let project_id = params.project_id.unwrap_or_else(|| Uuid::new_v4());
     let name = params.name.trim();
     if name.is_empty() {
         return Err(RpcError::new("invalid_params", "project name is required"));
@@ -643,7 +641,10 @@ fn normalize_project_cwd(
     if !normalized.is_dir() {
         return Err(RpcError::new(
             "invalid_project_cwd",
-            format!("project starting_cwd is not a directory: {}", normalized.display()),
+            format!(
+                "project starting_cwd is not a directory: {}",
+                normalized.display()
+            ),
         ));
     }
     Ok(normalized)
