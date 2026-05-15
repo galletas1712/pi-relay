@@ -8,7 +8,8 @@ import {
 	Plus,
 	Search,
 	Settings,
-	Trash2
+	Trash2,
+	X
 } from "lucide-react";
 import { memo } from "react";
 import { COMMANDS } from "./slash.ts";
@@ -24,9 +25,11 @@ import { truncate } from "./text.ts";
 import type { DaemonConfig, Notice, Project, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
 
 export function SidebarHeader({
-	connection
+	connection,
+	onClose
 }: {
 	connection: string;
+	onClose?: () => void;
 }) {
 	const connected = connection === "open";
 	return (
@@ -35,6 +38,9 @@ export function SidebarHeader({
 				<span className={`connection-pill ${connected ? "online" : "offline"}`}>
 					{connected ? "connected" : connection}
 				</span>
+				<button className="icon-button tiny sidebar-close" type="button" onClick={onClose} aria-label="close sidebar">
+					<X size={14} />
+				</button>
 			</div>
 		</div>
 	);
@@ -54,6 +60,7 @@ export interface SidebarProps {
 	onQueryChange: (query: string) => void;
 	onToggleArchived: () => void;
 	onNew: () => void;
+	onClose?: () => void;
 	onSelectProject: (projectId: string) => void;
 	onNewProject: () => void;
 	onEditProject: (project: Project) => void;
@@ -77,6 +84,7 @@ export const Sidebar = memo(function Sidebar({
 	onQueryChange,
 	onToggleArchived,
 	onNew,
+	onClose,
 	onSelectProject,
 	onNewProject,
 	onEditProject,
@@ -87,7 +95,7 @@ export const Sidebar = memo(function Sidebar({
 }: SidebarProps) {
 	return (
 		<aside className="sidebar" data-slot="sidebar">
-			<SidebarHeader connection={connection} />
+			<SidebarHeader connection={connection} onClose={onClose} />
 			<ProjectList
 				projects={projects}
 				selectedProjectId={selectedProjectId}
@@ -440,17 +448,22 @@ export function NoticeStack({ notices, rightOpen }: { notices: Notice[]; rightOp
 export function Inspector({
 	snapshot,
 	config,
-	tools
+	tools,
+	onClose
 }: {
 	snapshot: SessionSnapshot | null;
 	config: DaemonConfig;
 	tools: ToolListing[];
+	onClose?: () => void;
 }) {
 	return (
 		<div className="inspector-inner">
 			<div className="inspector-head">
 				<Settings size={14} />
 				<span>inspector</span>
+				<button className="icon-button tiny inspector-close" type="button" onClick={onClose} aria-label="close inspector">
+					<X size={14} />
+				</button>
 			</div>
 			<section className="inspect-section">
 				<h2>Global</h2>

@@ -1,5 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Menu, PanelRightClose, PanelRightOpen } from "lucide-react";
 import { createAgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
 import { Composer, type ComposerHandle } from "./composer.tsx";
@@ -49,6 +50,24 @@ const NOTICE_TTL_MS = 4000;
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
 const SELECTED_SESSION_REFRESH_DEBOUNCE_MS = 80;
 const SELECTED_SESSION_QUERY_DISABLED_KEY = ["session", null] as const;
+const MEDIUM_PANEL_QUERY = "(min-width: 900px)";
+const WIDE_PANEL_QUERY = "(min-width: 1280px)";
+
+type PanelMode = "compact" | "medium" | "wide";
+
+function panelModeForViewport(): PanelMode {
+	if (typeof window === "undefined" || typeof window.matchMedia !== "function") return "wide";
+	if (window.matchMedia(WIDE_PANEL_QUERY).matches) return "wide";
+	if (window.matchMedia(MEDIUM_PANEL_QUERY).matches) return "medium";
+	return "compact";
+}
+
+function defaultPanelState(mode: PanelMode): { sidebarOpen: boolean; rightOpen: boolean } {
+	return {
+		sidebarOpen: mode === "wide",
+		rightOpen: mode !== "compact",
+	};
+}
 
 type ExportDialogState = {
 	entries: TranscriptEntry[];
@@ -87,7 +106,8 @@ export function App() {
 	const [sending, setSending] = useState(false);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
-	const [rightOpen, setRightOpen] = useState(true);
+	const [sidebarOpen, setSidebarOpen] = useState(() => defaultPanelState(panelModeForViewport()).sidebarOpen);
+	const [rightOpen, setRightOpen] = useState(() => defaultPanelState(panelModeForViewport()).rightOpen);
 	const [showArchived, setShowArchived] = useState(false);
 	const [historyDialog, setHistoryDialog] = useState<HistoryDialogState | null>(null);
 	const [exportDialog, setExportDialog] = useState<ExportDialogState | null>(null);
@@ -103,6 +123,7 @@ export function App() {
 	const selectedProjectRef = useRef<string | null>(null);
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
+	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
 
 	const pushNotice = useCallback((tone: Notice["tone"], text: string) => {
 		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_NOTICES + 1)), { id: randomId("notice"), tone, text }]);
@@ -941,9 +962,6 @@ export function App() {
 		[executeSlash, pushNotice, queueUserInput, sending, startNewSession],
 	);
 
-	const layoutStyle = {
-		gridTemplateColumns: rightOpen ? "320px minmax(0,1fr) minmax(320px,380px)" : "320px minmax(0,1fr)",
-	};
 	const canStop = !!selectedId && loadedSnapshot?.activity === "running";
 	const queuedInputs = loadedSnapshot?.queued_inputs ?? [];
 	const handleToggleArchived = useCallback(() => {
@@ -1038,6 +1056,42 @@ export function App() {
 	const handleToggleRight = useCallback(() => {
 		setRightOpen((open) => !open);
 	}, []);
+	const handleToggleSidebar = useCallback(() => {
+		setSidebarOpen((open) => !open);
+	}, []);
+	const handleCloseDrawers = useCallback(() => {
+		setSidebarOpen(false);
+		setRightOpen(false);
+	}, []);
+	const closeSidebarIfOverlay = useCallback(() => {
+		if (panelModeRef.current !== "wide") setSidebarOpen(false);
+	}, []);
+	useEffect(() => {
+		const onKeyDown = (event: KeyboardEvent) => {
+			if (event.key !== "Escape") return;
+			if (panelModeRef.current !== "wide") setSidebarOpen(false);
+			if (panelModeRef.current === "compact") setRightOpen(false);
+		};
+		window.addEventListener("keydown", onKeyDown);
+		return () => window.removeEventListener("keydown", onKeyDown);
+	}, []);
+	useEffect(() => {
+		if (typeof window.matchMedia !== "function") return;
+		const queries = [window.matchMedia(MEDIUM_PANEL_QUERY), window.matchMedia(WIDE_PANEL_QUERY)];
+		const syncPanelsToViewport = () => {
+			const nextMode = panelModeForViewport();
+			if (nextMode === panelModeRef.current) return;
+			panelModeRef.current = nextMode;
+			const defaults = defaultPanelState(nextMode);
+			setSidebarOpen(defaults.sidebarOpen);
+			setRightOpen(defaults.rightOpen);
+		};
+		for (const query of queries) query.addEventListener("change", syncPanelsToViewport);
+		syncPanelsToViewport();
+		return () => {
+			for (const query of queries) query.removeEventListener("change", syncPanelsToViewport);
+		};
+	}, []);
 	const handleResumeTurn = useCallback(
 		(entryId: string) => {
 			void resumeTerminalTurn(entryId).catch((error) => pushNotice("error", errorMessage(error)));
@@ -1053,9 +1107,44 @@ export function App() {
 		},
 		[promoteQueuedInput, pushNotice],
 	);
+	const mobileTitle = selectedSession
+		? sessionTitle(selectedSession)
+		: selectedProject
+			? projectTitle(selectedProject)
+			: "pi relay";
+	const appClassName = `app-shell ${sidebarOpen ? "sidebar-open" : ""} ${rightOpen ? "inspector-open" : ""}`;
 
 	return (
-		<div className="app-shell" style={layoutStyle}>
+		<div className={appClassName}>
+			<div className="mobile-topbar">
+				<button
+					className="icon-button"
+					type="button"
+					onClick={handleToggleSidebar}
+					aria-label={sidebarOpen ? "close projects and sessions" : "open projects and sessions"}
+					aria-expanded={sidebarOpen}
+				>
+					<Menu size={17} />
+				</button>
+				<div className="mobile-topbar-title">
+					<span>{mobileTitle}</span>
+					<small>{connection === "open" ? "connected" : connection}</small>
+				</div>
+				<button
+					className={`icon-button ${rightOpen ? "pressed" : ""}`}
+					type="button"
+					onClick={handleToggleRight}
+					aria-label={rightOpen ? "close inspector" : "open inspector"}
+					aria-expanded={rightOpen}
+				>
+					{rightOpen ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}
+				</button>
+			</div>
+
+			{sidebarOpen || rightOpen ? (
+				<button className="drawer-scrim" type="button" aria-label="close panel" onClick={handleCloseDrawers} />
+			) : null}
+
 			<Sidebar
 				counts={counts}
 				total={activeSessionItems.length}
@@ -1070,13 +1159,35 @@ export function App() {
 				onQueryChange={setQuery}
 				onToggleArchived={handleToggleArchived}
 				onNew={handleSidebarNew}
-				onSelectProject={handleSelectProject}
-				onNewProject={openCreateProjectDialog}
-				onEditProject={openEditProjectDialog}
-				onSelectSession={selectSession}
-				onRename={openRenameDialog}
-				onArchiveToggle={handleArchiveToggle}
-				onDelete={handleSidebarDelete}
+				onClose={() => setSidebarOpen(false)}
+				onSelectProject={(projectId) => {
+					handleSelectProject(projectId);
+					closeSidebarIfOverlay();
+				}}
+				onNewProject={() => {
+					openCreateProjectDialog();
+					closeSidebarIfOverlay();
+				}}
+				onEditProject={(project) => {
+					openEditProjectDialog(project);
+					closeSidebarIfOverlay();
+				}}
+				onSelectSession={(sessionId) => {
+					selectSession(sessionId);
+					closeSidebarIfOverlay();
+				}}
+				onRename={(session) => {
+					openRenameDialog(session);
+					closeSidebarIfOverlay();
+				}}
+				onArchiveToggle={(session) => {
+					handleArchiveToggle(session);
+					closeSidebarIfOverlay();
+				}}
+				onDelete={(session) => {
+					handleSidebarDelete(session);
+					closeSidebarIfOverlay();
+				}}
 			/>
 
 			<ChatPane
@@ -1114,11 +1225,9 @@ export function App() {
 				/>
 			</footer>
 
-			{rightOpen ? (
-				<aside className="inspector" data-slot="inspector">
-					<Inspector snapshot={loadedSnapshot} config={config} tools={tools} />
-				</aside>
-			) : null}
+			<aside className="inspector" data-slot="inspector" aria-hidden={!rightOpen}>
+				<Inspector snapshot={loadedSnapshot} config={config} tools={tools} onClose={() => setRightOpen(false)} />
+			</aside>
 
 			{renameSessionId ? (
 				<RenameSessionDialog
