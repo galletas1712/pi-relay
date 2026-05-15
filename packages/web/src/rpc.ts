@@ -1,4 +1,4 @@
-import { perfLog, perfNow } from "./perf.ts";
+import { perfEnabled, perfLog, perfNow } from "./perf.ts";
 import type { EventFrame } from "./types.ts";
 
 interface RpcResponse<T> {
@@ -144,14 +144,17 @@ export class AgentRpcClient implements RpcClient {
 
 	private handleMessage(message: MessageEvent<string>): void {
 		let data: RpcResponse<unknown> | EventFrame;
-		const receivedAt = perfNow();
+		const shouldLogPerf = perfEnabled();
+		const receivedAt = shouldLogPerf ? perfNow() : 0;
 		try {
 			data = JSON.parse(message.data) as RpcResponse<unknown> | EventFrame;
-			perfLog("rpc message parsed", {
-				bytes: typeof message.data === "string" ? message.data.length : 0,
-				parseMs: Math.round(perfNow() - receivedAt),
-				kind: "ok" in data ? "response" : "event"
-			});
+			if (shouldLogPerf) {
+				perfLog("rpc message parsed", {
+					bytes: message.data.length,
+					parseMs: Math.round(perfNow() - receivedAt),
+					kind: "ok" in data ? "response" : "event"
+				});
+			}
 		} catch {
 			this.emitStatus("error");
 			return;

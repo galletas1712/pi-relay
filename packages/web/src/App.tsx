@@ -10,6 +10,7 @@ import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
+import { reduceSessionEvent, type SessionPatchOperation } from "./sessionEvents.ts";
 import {
 	DEFAULT_PROVIDER,
 	MODEL_OPTIONS,
@@ -375,6 +376,37 @@ export function App() {
 		}, delayMs);
 	}, [pushNotice, refreshSelected]);
 
+	const applySessionOperation = useCallback(
+		(operation: SessionPatchOperation) => {
+			if (operation.type === "metadata") {
+				patchSessionMetadata(operation.sessionId, operation.patch, operation.remove);
+				return;
+			}
+			if (operation.type === "provider") {
+				patchProvider(operation.sessionId, operation.provider);
+				return;
+			}
+			if (operation.type === "activity") {
+				patchSessionSummary(operation.sessionId, { activity: operation.activity });
+				return;
+			}
+			if (operation.type === "queued_inputs") {
+				patchQueuedInput(operation.event);
+				return;
+			}
+			if (operation.type === "mark_stale") {
+				markCachedSessionStale(operation.sessionId);
+				return;
+			}
+			if (operation.type === "refresh_selected") {
+				if (operation.sessionId === selectedRef.current) scheduleSelectedRefresh(operation.sessionId);
+				return;
+			}
+			scheduleSessionListRefresh();
+		},
+		[markCachedSessionStale, patchProvider, patchQueuedInput, patchSessionMetadata, patchSessionSummary, scheduleSelectedRefresh, scheduleSessionListRefresh]
+	);
+
 	const handleSessionEvent = useCallback(
 		(event: EventFrame) => {
 			const eventSession = sessionsRef.current.get(event.session_id);
@@ -385,20 +417,7 @@ export function App() {
 				lastEventId: Math.max(cached.lastEventId, event.event_id)
 			}));
 
-			const sessionPatch = sessionPatchFromEvent(event);
-			if (sessionPatch.metadata) {
-				patchSessionMetadata(event.session_id, sessionPatch.metadata, sessionPatch.metadataRemove);
-			}
-			if (sessionPatch.provider) {
-				patchProvider(event.session_id, sessionPatch.provider);
-			}
-			if (sessionPatch.activity) patchSessionSummary(event.session_id, { activity: sessionPatch.activity });
-			if (sessionPatch.queuedInputPatch) {
-				patchQueuedInput(event);
-			}
-
-			const shouldRefreshSelected = shouldRefreshSelectedForEvent(event);
-			if (shouldRefreshSelected) markCachedSessionStale(event.session_id);
+			for (const operation of reduceSessionEvent(event)) applySessionOperation(operation);
 
 			if (event.session_id === selectedRef.current) {
 				if (event.event === "model.error") pushNotice("error", modelErrorNotice(event.data));
@@ -407,11 +426,9 @@ export function App() {
 					if (outcome === "Interrupted") pushNotice("info", "turn interrupted");
 					if (outcome === "Crashed") pushNotice("error", "turn crashed");
 				}
-				if (shouldRefreshSelected) scheduleSelectedRefresh(event.session_id);
 			}
-			if (isSessionListRefreshEvent(event.event)) scheduleSessionListRefresh();
 		},
-		[markCachedSessionStale, patchCachedSession, patchProvider, patchQueuedInput, patchSessionMetadata, patchSessionSummary, pushNotice, scheduleSelectedRefresh, scheduleSessionListRefresh]
+		[applySessionOperation, patchCachedSession, pushNotice]
 	);
 
 	useEffect(() => {
@@ -1420,66 +1437,8 @@ function patchSessionMetadataInList(
 	return changed ? nextSessions : sessions;
 }
 
-function activityForEvent(event: string): SessionSummary["activity"] | null {
-	if (event === "session.idle") return "idle";
-	if (event === "input.queued") return "queued";
-	if (
-		event === "input.consumed" ||
-		event === "input.accepted" ||
-		event === "action.requested" ||
-		event === "model.requested" ||
-		event === "tool.requested" ||
-		event === "compaction.requested" ||
-		event === "tool.started"
-	) {
-		return "running";
-	}
-	return null;
-}
-
 function titleFromText(text: string): string {
 	return truncate(firstLine(text).trim() || "New session", 64);
-}
-
-function isTerminalActivityEvent(event: string): boolean {
-	return (
-		event === "session.idle" ||
-		event === "model.completed" ||
-		event === "model.error" ||
-		event === "tool.completed" ||
-		event === "tool.error" ||
-		event === "compaction.completed" ||
-		event === "compaction.error"
-	);
-}
-
-function isSessionListRefreshEvent(event: string): boolean {
-	return (
-		event === "session.created" ||
-		event === "session.configured" ||
-		event === "history.forked" ||
-		event === "history.rewound" ||
-		event === "history.compacted" ||
-		event === "input.queued" ||
-		event === "input.consumed" ||
-		event === "input.promoted" ||
-		isTerminalActivityEvent(event)
-	);
-}
-
-function shouldRefreshSelectedForEvent(event: EventFrame): boolean {
-	if (event.event === "session.configured") return false;
-	if (event.event === "input.consumed" || event.event === "input.promoted") return false;
-	return (
-		event.event === "input.queued" ||
-		event.event === "transcript.appended" ||
-		event.event === "turn.started" ||
-		event.event === "turn.finished" ||
-		event.event === "assistant.message" ||
-		event.event === "history.rewound" ||
-		event.event === "history.compacted" ||
-		isTerminalActivityEvent(event.event)
-	);
 }
 
 function errorMessage(error: unknown): string {
@@ -1556,49 +1515,4 @@ function totalCachedEntryCount(cache: Map<string, CachedSession>): number {
 	let total = 0;
 	for (const cached of cache.values()) total += cached.entries.length;
 	return total;
-}
-
-type EventSessionPatch = {
-	metadata?: Record<string, unknown>;
-	metadataRemove: string[];
-	provider?: ProviderConfig;
-	activity?: SessionSummary["activity"];
-	queuedInputPatch: boolean;
-};
-
-function sessionPatchFromEvent(event: EventFrame): EventSessionPatch {
-	const configuredPatch = configuredPatchFromEvent(event);
-	return {
-		...configuredPatch,
-		activity: activityForEvent(event.event) ?? undefined,
-		queuedInputPatch: isQueuedInputPatchEvent(event.event)
-	};
-}
-
-function configuredPatchFromEvent(event: EventFrame): Pick<EventSessionPatch, "metadata" | "metadataRemove" | "provider"> {
-	if (event.event !== "session.configured") return { metadataRemove: [] };
-	const metadata = recordValue(event.data.metadata) ?? recordValue(event.data.metadata_patch);
-	const metadataRemove = Array.isArray(event.data.metadata_remove)
-		? event.data.metadata_remove.filter((key): key is string => typeof key === "string")
-		: [];
-	const provider = providerValue(event.data.provider);
-	return {
-		metadata: metadata ?? titlePatchFromEvent(event),
-		metadataRemove,
-		provider
-	};
-}
-
-function titlePatchFromEvent(event: EventFrame): Record<string, unknown> | undefined {
-	return typeof event.data.title === "string" ? { title: event.data.title } : undefined;
-}
-
-function recordValue(value: unknown): Record<string, unknown> | undefined {
-	return value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : undefined;
-}
-
-function providerValue(value: unknown): ProviderConfig | undefined {
-	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-	const candidate = value as Partial<ProviderConfig>;
-	return candidate.kind && candidate.model ? (candidate as ProviderConfig) : undefined;
 }
