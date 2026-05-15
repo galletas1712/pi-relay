@@ -91,6 +91,7 @@ export function App() {
 	const nextSessionTitleRef = useRef<string | null>(null);
 	const pendingComposerBySession = useRef(new Map<string, string>());
 	const lastEventIds = useRef(new Map<string, number>());
+	const subscribedEventSessionIds = useRef(new Set<string>());
 
 	useEffect(() => {
 		try {
@@ -165,6 +166,7 @@ export function App() {
 	const handleSessionEvent = useCallback(
 		(event: EventFrame) => {
 			lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
+			setSessions((current) => applySessionActivityEvent(current, event.event, event.session_id));
 			if (event.session_id === selectedRef.current) {
 				applyQueuedInputEvent(event, setSnapshot);
 				if (event.event === "model.error") pushNotice("error", modelErrorNotice(event.data));
@@ -181,7 +183,7 @@ export function App() {
 					}, 350);
 				}
 			}
-			if (event.event === "session.created" || event.event === "session.configured" || event.event === "history.forked" || isTerminalActivityEvent(event.event)) {
+			if (isSessionListRefreshEvent(event.event)) {
 				void loadSessions().catch(() => undefined);
 			}
 		},
@@ -191,30 +193,25 @@ export function App() {
 	useEffect(() => {
 		const offStatus = api.onStatus((status) => {
 			setConnection(status);
-			if (status !== "open") return;
+			if (status !== "open") {
+				subscribedEventSessionIds.current.clear();
+				return;
+			}
+			void Promise.all([loadSessions(), loadGlobal()]).catch((error) => pushNotice("error", errorMessage(error)));
 			const sessionId = selectedRef.current;
 			if (!sessionId) return;
-			void api
-				.subscribeEvents(sessionId, lastEventIds.current.get(sessionId) ?? null)
-				.then((replayed) => {
-					for (const event of replayed) handleSessionEvent(event);
-					return refreshSelected(sessionId);
-				})
-				.catch((error) => pushNotice("error", errorMessage(error)));
+			void refreshSelected(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
 		});
 		const offEvent = api.onEvent(handleSessionEvent);
 		void api
 			.connect()
-			.then(async () => {
-				await Promise.all([loadSessions(), loadGlobal()]);
-			})
 			.catch((error) => pushNotice("error", errorMessage(error)));
 		return () => {
 			offStatus();
 			offEvent();
 			api.close();
 		};
-	}, [api, handleSessionEvent, loadGlobal, loadSessions, pushNotice, refreshSelected, selectSession]);
+	}, [api, handleSessionEvent, loadGlobal, loadSessions, pushNotice, refreshSelected]);
 
 	useEffect(() => {
 		if (!selectedId) {
@@ -225,23 +222,43 @@ export function App() {
 		setComposer(pendingComposerBySession.current.get(selectedId) ?? "");
 		pendingComposerBySession.current.delete(selectedId);
 		let cancelled = false;
-		void api
-			.subscribeEvents(selectedId, lastEventIds.current.get(selectedId) ?? null)
-			.then((replayed) => {
-				if (cancelled) return undefined;
-				for (const event of replayed) handleSessionEvent(event);
-				return refreshSelected(selectedId);
-			})
+		void refreshSelected(selectedId)
 			.catch((error) => {
 				if (!cancelled) pushNotice("error", errorMessage(error));
 			});
 		return () => {
 			cancelled = true;
-			if (api.isOpen()) {
-				void api.unsubscribeEvents(selectedId).catch(() => undefined);
-			}
 		};
-	}, [api, handleSessionEvent, pushNotice, refreshSelected, selectedId]);
+	}, [pushNotice, refreshSelected, selectedId]);
+
+	useEffect(() => {
+		if (connection !== "open") return;
+		const desiredSessionIds = new Set(sessions.map((session) => session.session_id));
+		if (selectedId) desiredSessionIds.add(selectedId);
+		for (const sessionId of Array.from(subscribedEventSessionIds.current)) {
+			if (desiredSessionIds.has(sessionId)) continue;
+			subscribedEventSessionIds.current.delete(sessionId);
+			if (api.isOpen()) {
+				void api.unsubscribeEvents(sessionId).catch(() => undefined);
+			}
+		}
+		for (const sessionId of desiredSessionIds) {
+			if (subscribedEventSessionIds.current.has(sessionId)) continue;
+			subscribedEventSessionIds.current.add(sessionId);
+			void api
+				.subscribeEvents(sessionId, lastEventIds.current.get(sessionId) ?? null)
+				.then((replayed) => {
+					if (!subscribedEventSessionIds.current.has(sessionId)) return undefined;
+					for (const event of replayed) handleSessionEvent(event);
+					if (selectedRef.current === sessionId) return refreshSelected(sessionId);
+					return undefined;
+				})
+				.catch((error) => {
+					subscribedEventSessionIds.current.delete(sessionId);
+					pushNotice("error", errorMessage(error));
+				});
+		}
+	}, [api, connection, handleSessionEvent, pushNotice, refreshSelected, selectedId, sessions]);
 
 	const sessionItems = useMemo<SessionListItem[]>(
 		() => [...sessions].sort(compareSessionsForSidebar),
@@ -982,6 +999,35 @@ function mergeSnapshotIntoSessionList(sessions: SessionSummary[], snapshot: Sess
 	return found ? nextSessions : sessions;
 }
 
+function applySessionActivityEvent(sessions: SessionSummary[], event: string, sessionId: string): SessionSummary[] {
+	const activity = activityForEvent(event);
+	if (!activity) return sessions;
+	let changed = false;
+	const nextSessions = sessions.map((session) => {
+		if (session.session_id !== sessionId || session.activity === activity) return session;
+		changed = true;
+		return { ...session, activity };
+	});
+	return changed ? nextSessions : sessions;
+}
+
+function activityForEvent(event: string): SessionSummary["activity"] | null {
+	if (event === "session.idle") return "idle";
+	if (event === "input.queued") return "queued";
+	if (
+		event === "input.consumed" ||
+		event === "input.accepted" ||
+		event === "action.requested" ||
+		event === "model.requested" ||
+		event === "tool.requested" ||
+		event === "compaction.requested" ||
+		event === "tool.started"
+	) {
+		return "running";
+	}
+	return null;
+}
+
 function titleFromText(text: string): string {
 	return truncate(firstLine(text).trim() || "New session", 64);
 }
@@ -995,6 +1041,17 @@ function isTerminalActivityEvent(event: string): boolean {
 		event === "tool.error" ||
 		event === "compaction.completed" ||
 		event === "compaction.error"
+	);
+}
+
+function isSessionListRefreshEvent(event: string): boolean {
+	return (
+		event === "session.created" ||
+		event === "session.configured" ||
+		event === "history.forked" ||
+		event === "input.queued" ||
+		event === "input.consumed" ||
+		isTerminalActivityEvent(event)
 	);
 }
 
