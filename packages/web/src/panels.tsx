@@ -24,14 +24,8 @@ import { truncate } from "./text.ts";
 import type { DaemonConfig, Notice, Project, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
 
 export function SidebarHeader({
-	counts,
-	total,
-	archived,
 	connection
 }: {
-	counts: Record<SessionDisplayActivity, number>;
-	total: number;
-	archived: number;
 	connection: string;
 }) {
 	const connected = connection === "open";
@@ -40,22 +34,6 @@ export function SidebarHeader({
 			<div className="connection-row">
 				<span className={`connection-pill ${connected ? "online" : "offline"}`}>
 					{connected ? "connected" : connection}
-				</span>
-			</div>
-			<div className="masthead">
-				<span className="masthead-title">Sessions</span>
-				<span className="masthead-count">{total}</span>
-			</div>
-			<div className="activity-counts">
-				{(["running", "idle"] as SessionDisplayActivity[]).map((activity) => (
-					<span className={`activity-chip ${activity}`} key={activity}>
-						{activity}
-						<span className="count">{counts[activity] ?? 0}</span>
-					</span>
-				))}
-				<span className="activity-chip archived">
-					archived
-					<span className="count">{archived}</span>
 				</span>
 			</div>
 		</div>
@@ -109,7 +87,7 @@ export const Sidebar = memo(function Sidebar({
 }: SidebarProps) {
 	return (
 		<aside className="sidebar" data-slot="sidebar">
-			<SidebarHeader counts={counts} total={total} archived={archived} connection={connection} />
+			<SidebarHeader connection={connection} />
 			<ProjectList
 				projects={projects}
 				selectedProjectId={selectedProjectId}
@@ -117,8 +95,14 @@ export const Sidebar = memo(function Sidebar({
 				onNewProject={onNewProject}
 				onEditProject={onEditProject}
 			/>
+			<div className="session-section-head">
+				<span>Sessions</span>
+				<span className="section-count">{total}</span>
+			</div>
 			<SidebarToolbar
 				disabled={!selectedProjectId}
+				counts={counts}
+				archived={archived}
 				query={query}
 				onQueryChange={onQueryChange}
 				showArchived={showArchived}
@@ -213,6 +197,8 @@ export function ProjectList({
 
 export function SidebarToolbar({
 	disabled,
+	counts,
+	archived,
 	query,
 	onQueryChange,
 	showArchived,
@@ -220,6 +206,8 @@ export function SidebarToolbar({
 	onNew
 }: {
 	disabled: boolean;
+	counts: Record<SessionDisplayActivity, number>;
+	archived: number;
 	query: string;
 	onQueryChange: (query: string) => void;
 	showArchived: boolean;
@@ -248,6 +236,18 @@ export function SidebarToolbar({
 				<Search size={14} />
 				<input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="filter sessions..." disabled={disabled} />
 			</label>
+			<div className="activity-counts">
+				{(["running", "idle"] as SessionDisplayActivity[]).map((activity) => (
+					<span className={`activity-chip ${activity}`} key={activity}>
+						{activity}
+						<span className="count">{counts[activity] ?? 0}</span>
+					</span>
+				))}
+				<span className="activity-chip archived">
+					archived
+					<span className="count">{archived}</span>
+				</span>
+			</div>
 		</div>
 	);
 }

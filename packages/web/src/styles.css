@@ -177,10 +177,6 @@ pre {
 	padding-bottom: 2px;
 }
 
-.masthead {
-	height: 32px;
-}
-
 .inspector-head {
 	font-family: var(--font-mono);
 	font-size: 11px;
@@ -204,7 +200,6 @@ pre {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 6px;
-	padding: 0 12px 9px;
 }
 
 .activity-chip {
@@ -273,7 +268,8 @@ pre {
 	padding: 8px;
 }
 
-.project-section-head {
+.project-section-head,
+.session-section-head {
 	display: flex;
 	align-items: center;
 	justify-content: space-between;
@@ -283,6 +279,15 @@ pre {
 	font-size: 10.5px;
 	text-transform: uppercase;
 	color: var(--muted-foreground);
+}
+
+.session-section-head {
+	padding: 10px 12px 0;
+}
+
+.section-count {
+	color: var(--foreground);
+	font-variant-numeric: tabular-nums;
 }
 
 .project-list {
