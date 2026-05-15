@@ -114,7 +114,7 @@ export function SessionRow({
 			<span className="session-main">
 				<span className="session-title">{sessionTitle(session)}</span>
 				<span className="session-sub">
-					{archived ? "archived - " : ""}{session.provider.kind} - {session.provider.model}
+					{archived ? "archived - " : ""}{session.provider.model}
 				</span>
 				<span className="session-leaf">
 					{session.active_leaf_id ? session.active_leaf_id.slice(0, 6) : "root"}
