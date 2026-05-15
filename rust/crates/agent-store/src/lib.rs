@@ -8,7 +8,9 @@ use std::str::FromStr;
 use agent_session::{
     ModelContext, SessionAction, SessionEvent, StoredTranscriptEntry, TranscriptStorageNode,
 };
-use agent_vocab::{ActionId, ProviderConfig, TurnId, UserMessage};
+use agent_vocab::{
+    ActionId, ProviderConfig, ProviderKind, ProviderReplayItem, TurnId, UserMessage,
+};
 pub use postgres::PostgresAgentStore;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -228,6 +230,41 @@ pub struct CompactionJob {
     pub model_context: ModelContext,
     pub tokens_before: Option<usize>,
     pub last_turn_id: TurnId,
+    pub trigger: CompactionTrigger,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    Manual,
+    Auto { reason: String },
+}
+
+impl CompactionTrigger {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Auto { .. } => "auto",
+        }
+    }
+
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Manual => None,
+            Self::Auto { reason } => Some(reason.as_str()),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactionCompletion {
+    pub summary: String,
+    pub summary_kind: String,
+    pub provider_replay: Vec<ProviderReplayItem>,
+    pub remote: bool,
+    pub provider: ProviderKind,
+    pub usage: Option<Value>,
 }
 
 pub struct CreateCompactionResult {
@@ -325,6 +362,14 @@ pub struct QueuedInput {
 }
 
 #[derive(Debug, Clone)]
+pub struct QueuedInputPreview {
+    pub id: String,
+    pub priority: InputPriority,
+    pub content: UserMessage,
+    pub client_input_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct StoredAction {
     pub kind: ActionKind,
     pub action_id: i64,
@@ -339,6 +384,12 @@ pub struct ResumableModelAction {
     pub status: ActionStatus,
     pub context_leaf_id: String,
     pub context_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextUsageSnapshot {
+    pub context_leaf_id: Option<String>,
+    pub input_tokens: usize,
 }
 
 pub struct OutputBatch<'a> {

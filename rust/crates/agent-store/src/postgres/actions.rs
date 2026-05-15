@@ -2,7 +2,10 @@ use anyhow::{anyhow, Result};
 use serde_json::json;
 use sqlx::Row;
 
-use crate::{ActionKind, ActionStatus, EventFrame, EventType, ResumableModelAction, StoredAction};
+use crate::{
+    ActionKind, ActionStatus, ContextUsageSnapshot, EventFrame, EventType, ResumableModelAction,
+    StoredAction,
+};
 
 use super::events::insert_event_tx;
 use super::rows::row_text;
@@ -19,6 +22,56 @@ impl PostgresAgentStore {
             .execute(&self.pool)
             .await?
             .rows_affected())
+    }
+
+    pub async fn latest_context_usage_for_active_path(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ContextUsageSnapshot>> {
+        let active_leaf_id: Option<String> =
+            sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let Some(active_leaf_id) = active_leaf_id else {
+            return Ok(None);
+        };
+        let row = sqlx::query(
+            r#"
+            select payload, result
+            from actions
+            where session_id=$1
+                and kind=$2
+                and status=$3
+                and payload->>'context_leaf_id'=$4
+                and result->'usage'->>'input_tokens' is not null
+            order by updated_at desc, created_at desc
+            limit 1
+            "#,
+        )
+        .bind(session_id)
+        .bind(ActionKind::Model.as_str())
+        .bind(ActionStatus::Completed.as_str())
+        .bind(&active_leaf_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let payload: serde_json::Value = row.get("payload");
+        let result: serde_json::Value = row.get("result");
+        let input_tokens = result
+            .pointer("/usage/input_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| anyhow!("completed model action missing usage.input_tokens"))?;
+        Ok(Some(ContextUsageSnapshot {
+            context_leaf_id: payload
+                .get("context_leaf_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            input_tokens: input_tokens as usize,
+        }))
     }
 
     pub async fn has_unfinished_actions(&self, session_id: &str) -> Result<bool> {

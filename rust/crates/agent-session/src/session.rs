@@ -241,6 +241,10 @@ impl AgentSession {
         self.core.is_ready_to_continue()
     }
 
+    pub fn context_tokens(&self) -> Option<usize> {
+        self.context_tokens
+    }
+
     pub fn transcript_store(&self) -> &TranscriptStore {
         &self.transcript_store
     }

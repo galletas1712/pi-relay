@@ -11,8 +11,9 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 
 use crate::{
-    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError,
-    ProviderResult, ProviderToolProfile, ProviderUsage,
+    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderError, ProviderResult, ProviderTokenCountRequest,
+    ProviderTokenCountResponse, ProviderToolProfile, ProviderUsage,
 };
 
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
@@ -51,6 +52,133 @@ pub struct OpenAiProvider {
     /// lifetime of the provider instance; sent as `x-codex-window-id`.
     window_id: String,
     base_url: String,
+}
+
+fn parse_input_tokens_response(text: &str) -> ProviderResult<ProviderTokenCountResponse> {
+    let response: Value = serde_json::from_str(text).map_err(|error| {
+        ProviderError::Provider(format!(
+            "failed to parse OpenAI input token response JSON: {error}; body: {}",
+            response_excerpt(text)
+        ))
+    })?;
+    let input_tokens = response
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| {
+            ProviderError::Provider("OpenAI input token response missing input_tokens".to_string())
+        })?;
+    Ok(ProviderTokenCountResponse {
+        input_tokens: input_tokens as usize,
+    })
+}
+
+fn parse_compact_response(text: &str) -> ProviderResult<ProviderCompactionResponse> {
+    let response: Value = serde_json::from_str(text).map_err(|error| {
+        ProviderError::Provider(format!(
+            "failed to parse OpenAI compact response JSON: {error}; body: {}",
+            response_excerpt(text)
+        ))
+    })?;
+    let output = response
+        .get("output")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProviderError::Provider("OpenAI compact response missing output array".to_string())
+        })?;
+
+    let mut provider_replay = Vec::new();
+    let mut has_compaction = false;
+    let mut summary_parts = Vec::new();
+    for item in output {
+        if keep_compact_output_item(item) {
+            if item.get("type").and_then(Value::as_str) == Some("compaction") {
+                has_compaction = true;
+            }
+            collect_compact_summary_text(item, &mut summary_parts);
+            provider_replay.push(ProviderReplayItem::new(ProviderKind::OpenAi, item)?);
+        }
+    }
+
+    if provider_replay.is_empty() {
+        return Err(ProviderError::Provider(
+            "OpenAI compact response had no usable replacement history".to_string(),
+        ));
+    }
+    if !has_compaction {
+        return Err(ProviderError::Provider(
+            "OpenAI compact response did not include a compaction item".to_string(),
+        ));
+    }
+
+    let summary = summary_parts.join("").trim().to_string();
+    Ok(ProviderCompactionResponse {
+        summary: (!summary.is_empty()).then_some(summary),
+        provider_replay,
+        usage: response.get("usage").and_then(openai_usage),
+    })
+}
+
+fn keep_compact_output_item(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("compaction") => true,
+        Some("message") => match item.get("role").and_then(Value::as_str) {
+            Some("assistant") => true,
+            Some("user") => compact_user_message_is_real(item),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn compact_user_message_is_real(item: &Value) -> bool {
+    let text = message_text(item).trim().to_string();
+    if text.is_empty() {
+        return false;
+    }
+    !is_synthetic_compact_user_text(&text)
+}
+
+fn is_synthetic_compact_user_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with("starting working directory for this session:")
+        || lower.starts_with("current working directory:")
+        || lower.contains("the bash tool runs each command in a fresh shell rooted here")
+        || lower.starts_with("the conversation history before this point was compacted")
+        || lower.starts_with("x-anthropic-billing-header:")
+}
+
+fn collect_compact_summary_text(item: &Value, summary_parts: &mut Vec<String>) {
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return;
+    }
+    let text = message_text(item);
+    if !text.is_empty() {
+        summary_parts.push(text);
+    }
+}
+
+fn message_text(item: &Value) -> String {
+    item.get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| {
+            let part_type = part.get("type").and_then(Value::as_str);
+            match part_type {
+                Some("output_text") | Some("input_text") | Some("text") => {
+                    part.get("text").and_then(Value::as_str)
+                }
+                _ => None,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn compact_input_items(transcript: &[ModelTranscriptEntry]) -> ProviderResult<Vec<Value>> {
+    transcript_to_response_items(transcript)
 }
 
 impl OpenAiProvider {
@@ -144,6 +272,24 @@ impl ModelProvider for OpenAiProvider {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
         self.complete_responses(request).await
     }
+
+    fn supports_remote_compaction(&self) -> bool {
+        true
+    }
+
+    async fn compact(
+        &self,
+        request: ProviderCompactionRequest,
+    ) -> ProviderResult<ProviderCompactionResponse> {
+        self.compact_responses(request).await
+    }
+
+    async fn count_tokens(
+        &self,
+        request: ProviderTokenCountRequest,
+    ) -> ProviderResult<ProviderTokenCountResponse> {
+        self.count_tokens_responses(request).await
+    }
 }
 
 impl OpenAiProvider {
@@ -174,6 +320,62 @@ impl OpenAiProvider {
         ensure_success(status, &text)?;
 
         parse_responses_sse(&text, ProviderKind::OpenAi)
+    }
+
+    async fn compact_responses(
+        &self,
+        request: ProviderCompactionRequest,
+    ) -> ProviderResult<ProviderCompactionResponse> {
+        let session_id = request
+            .session_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let body = compact_body(request)?;
+
+        let response = self
+            .add_codex_headers(
+                self.client
+                    .post(format!(
+                        "{}/responses/compact",
+                        self.base_url.trim_end_matches('/')
+                    ))
+                    .header(ACCEPT, "application/json"),
+                &session_id,
+            )
+            .json(&body)
+            .send()
+            .await?;
+        let (status, text) = response_text(response).await?;
+        ensure_success(status, &text)?;
+        parse_compact_response(&text)
+    }
+
+    async fn count_tokens_responses(
+        &self,
+        request: ProviderTokenCountRequest,
+    ) -> ProviderResult<ProviderTokenCountResponse> {
+        let session_id = request
+            .session_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let body = input_tokens_body(request)?;
+
+        let response = self
+            .add_codex_headers(
+                self.client
+                    .post(format!(
+                        "{}/responses/input_tokens",
+                        self.base_url.trim_end_matches('/')
+                    ))
+                    .header(ACCEPT, "application/json"),
+                &session_id,
+            )
+            .json(&body)
+            .send()
+            .await?;
+        let (status, text) = response_text(response).await?;
+        ensure_success(status, &text)?;
+        parse_input_tokens_response(&text)
     }
 }
 
@@ -253,6 +455,37 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
         "service_tier": OPENAI_PRIORITY_SERVICE_TIER,
     });
     Ok(body)
+}
+
+fn compact_body(request: ProviderCompactionRequest) -> ProviderResult<Value> {
+    let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
+    let tools = response_tools(request.tool_profile, &request.tools)?;
+    Ok(json!({
+        "model": request.model,
+        "instructions": request.instructions.unwrap_or_default(),
+        "input": compact_input_items(&request.transcript)?,
+        "tools": tools,
+        "parallel_tool_calls": true,
+        "reasoning": {
+            "effort": reasoning_effort,
+        },
+    }))
+}
+
+fn input_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value> {
+    let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
+    let tools = response_tools(request.tool_profile, &request.tools)?;
+    Ok(json!({
+        "model": request.model,
+        "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
+        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.transcript)?,
+        "tools": tools,
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "reasoning": {
+            "effort": reasoning_effort,
+        },
+    }))
 }
 
 fn response_tools(
@@ -364,11 +597,16 @@ fn transcript_to_response_items(items: &[ModelTranscriptEntry]) -> ProviderResul
                 }));
             }
             TranscriptItem::CompactionSummary(summary) => {
-                responses.push(json!({
-                    "type": "message",
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": compaction_summary_text(summary) }],
-                }));
+                let replay_items = openai_replay_items(&entry.provider_replay)?;
+                if !replay_items.is_empty() {
+                    responses.extend(replay_items);
+                } else {
+                    responses.push(json!({
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": compaction_summary_text(summary) }],
+                    }));
+                }
             }
             TranscriptItem::AssistantMessage(message) => {
                 let replay_items = openai_replay_items(&entry.provider_replay)?;
