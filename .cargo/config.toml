@@ -1,0 +1,6 @@
+# On this machine the shell's default `cc` resolves to a Nix profile GCC
+# that cannot find Apple's `libiconv`. Pin the linker to Apple's clang so
+# root-level `cargo --manifest-path rust/Cargo.toml ...` commands work
+# without per-invocation environment overrides.
+[target.aarch64-apple-darwin]
+linker = "/usr/bin/cc"

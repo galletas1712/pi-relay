@@ -328,8 +328,8 @@ fn openai_apply_patch_tool() -> Value {
 }
 
 fn openai_function_from_builtin(name: &str) -> Value {
-    let tool = builtin_tool_definition(name)
-        .unwrap_or_else(|| panic!("{name} tool must be registered"));
+    let tool =
+        builtin_tool_definition(name).unwrap_or_else(|| panic!("{name} tool must be registered"));
     json!({
         "type": "function",
         "name": tool.name,
@@ -718,7 +718,10 @@ mod tests {
         };
 
         // Identity envelope (default_headers in Codex CLI).
-        assert_eq!(header("authorization").as_deref(), Some("Bearer access-token"));
+        assert_eq!(
+            header("authorization").as_deref(),
+            Some("Bearer access-token")
+        );
         assert_eq!(header("originator").as_deref(), Some(CODEX_ORIGINATOR));
         assert!(
             header("user-agent")
@@ -728,7 +731,10 @@ mod tests {
             "user-agent should start with codex_cli_rs/: {:?}",
             header("user-agent")
         );
-        assert_eq!(header(HEADER_RESIDENCY).as_deref(), Some(CODEX_RESIDENCY_US));
+        assert_eq!(
+            header(HEADER_RESIDENCY).as_deref(),
+            Some(CODEX_RESIDENCY_US)
+        );
         assert_eq!(header("chatgpt-account-id").as_deref(), Some("account-id"));
 
         // Codex-specific identity headers.
@@ -784,17 +790,20 @@ mod tests {
 
     #[test]
     fn codex_auth_adds_priority_service_tier() {
-        let body = responses_body(ModelRequest {
-            model: "gpt-5.5".to_string(),
-            prompt: PromptSections::default(),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::Medium,
-            prompt_cache_key: None,
-            session_id: None,
-        }, "test-session")
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::default(),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: None,
+                session_id: None,
+            },
+            "test-session",
+        )
         .expect("responses body renders");
 
         assert_eq!(body["service_tier"], "priority");
@@ -803,30 +812,33 @@ mod tests {
 
     #[test]
     fn responses_body_sets_openai_request_shape() {
-        let body = responses_body(ModelRequest {
-            model: "gpt-5.5".to_string(),
-            prompt: PromptSections::new(
-                Some("static system".to_string()),
-                Some("cwd: /tmp/project".to_string()),
-            ),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::CustomDefinitions,
-            tools: vec![ToolDefinition {
-                name: "read".to_string(),
-                description: "read a file".to_string(),
-                input_schema: json!({
-                    "type": "object",
-                    "properties": {
-                        "path": { "type": "string" }
-                    },
-                    "required": ["path"]
-                }),
-            }],
-            max_tokens: Some(2048),
-            reasoning_effort: ReasoningEffort::High,
-            prompt_cache_key: Some("pi-relay-test".to_string()),
-            session_id: None,
-        }, "test-session")
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::new(
+                    Some("static system".to_string()),
+                    Some("cwd: /tmp/project".to_string()),
+                ),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::CustomDefinitions,
+                tools: vec![ToolDefinition {
+                    name: "read".to_string(),
+                    description: "read a file".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": {
+                            "path": { "type": "string" }
+                        },
+                        "required": ["path"]
+                    }),
+                }],
+                max_tokens: Some(2048),
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: Some("pi-relay-test".to_string()),
+                session_id: None,
+            },
+            "test-session",
+        )
         .expect("responses body renders");
 
         assert_eq!(body["parallel_tool_calls"], true);
@@ -854,35 +866,41 @@ mod tests {
         // Codex CLI's `prompt_cache_key = thread_id.to_string()`. Two
         // requests with the same session id must produce the same cohort
         // even when their dynamic context and transcripts differ.
-        let first = responses_body(ModelRequest {
-            model: "gpt-5.5".to_string(),
-            prompt: PromptSections::new(
-                Some("stable rules".to_string()),
-                Some("cwd: /tmp/one".to_string()),
-            ),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::Medium,
-            prompt_cache_key: None,
-            session_id: None,
-        }, "test-session")
+        let first = responses_body(
+            ModelRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::new(
+                    Some("stable rules".to_string()),
+                    Some("cwd: /tmp/one".to_string()),
+                ),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: None,
+                session_id: None,
+            },
+            "test-session",
+        )
         .expect("responses body renders");
-        let second = responses_body(ModelRequest {
-            model: "gpt-5.5".to_string(),
-            prompt: PromptSections::new(
-                Some("stable rules".to_string()),
-                Some("cwd: /tmp/two".to_string()),
-            ),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("changed")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::High,
-            prompt_cache_key: None,
-            session_id: None,
-        }, "test-session")
+        let second = responses_body(
+            ModelRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::new(
+                    Some("stable rules".to_string()),
+                    Some("cwd: /tmp/two".to_string()),
+                ),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("changed")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+            },
+            "test-session",
+        )
         .expect("responses body renders");
 
         assert_eq!(first["prompt_cache_key"], "test-session");
@@ -898,17 +916,20 @@ mod tests {
         // Explicit override on the request body still wins over the session
         // id fallback, so operators can pin a custom cohort via
         // `ProviderConfig.prompt_cache.key`.
-        let body = responses_body(ModelRequest {
-            model: "gpt-5.5".to_string(),
-            prompt: PromptSections::stable("stable rules"),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::Medium,
-            prompt_cache_key: Some("explicit-cohort".to_string()),
-            session_id: None,
-        }, "session-not-used")
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: Some("explicit-cohort".to_string()),
+                session_id: None,
+            },
+            "session-not-used",
+        )
         .expect("responses body renders");
 
         assert_eq!(body["prompt_cache_key"], "explicit-cohort");
@@ -919,17 +940,20 @@ mod tests {
         // End-to-end check that `ModelRequest.session_id` flows through the
         // ModelProvider trait into the cache key: when the daemon passes a
         // session id, it lands as the prompt_cache_key.
-        let body = responses_body(ModelRequest {
-            model: "gpt-5.5".to_string(),
-            prompt: PromptSections::stable("stable rules"),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::Medium,
-            prompt_cache_key: None,
-            session_id: Some("daemon-session-id".to_string()),
-        }, "daemon-session-id")
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: None,
+                session_id: Some("daemon-session-id".to_string()),
+            },
+            "daemon-session-id",
+        )
         .expect("responses body renders");
 
         assert_eq!(body["prompt_cache_key"], "daemon-session-id");
@@ -937,20 +961,23 @@ mod tests {
 
     #[test]
     fn responses_body_keeps_dynamic_context_out_of_instructions() {
-        let body = responses_body(ModelRequest {
-            model: "gpt-5.5".to_string(),
-            prompt: PromptSections::new(
-                Some("stable agent rules".to_string()),
-                Some("workspace: /tmp/pi".to_string()),
-            ),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::Medium,
-            prompt_cache_key: Some("cache-key".to_string()),
-            session_id: None,
-        }, "test-session")
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::new(
+                    Some("stable agent rules".to_string()),
+                    Some("workspace: /tmp/pi".to_string()),
+                ),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: Some("cache-key".to_string()),
+                session_id: None,
+            },
+            "test-session",
+        )
         .expect("responses body renders");
 
         assert_eq!(body["instructions"], "stable agent rules");
@@ -961,28 +988,31 @@ mod tests {
 
     #[test]
     fn responses_body_sorts_tools_for_cache_stability() {
-        let body = responses_body(ModelRequest {
-            model: "gpt-5.5".to_string(),
-            prompt: PromptSections::stable("stable agent rules"),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::CustomDefinitions,
-            tools: vec![
-                ToolDefinition {
-                    name: "write".to_string(),
-                    description: "write a file".to_string(),
-                    input_schema: json!({ "type": "object" }),
-                },
-                ToolDefinition {
-                    name: "read".to_string(),
-                    description: "read a file".to_string(),
-                    input_schema: json!({ "type": "object" }),
-                },
-            ],
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::Medium,
-            prompt_cache_key: None,
-            session_id: None,
-        }, "test-session")
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::stable("stable agent rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::CustomDefinitions,
+                tools: vec![
+                    ToolDefinition {
+                        name: "write".to_string(),
+                        description: "write a file".to_string(),
+                        input_schema: json!({ "type": "object" }),
+                    },
+                    ToolDefinition {
+                        name: "read".to_string(),
+                        description: "read a file".to_string(),
+                        input_schema: json!({ "type": "object" }),
+                    },
+                ],
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: None,
+                session_id: None,
+            },
+            "test-session",
+        )
         .expect("responses body renders");
 
         assert_eq!(body["tools"][0]["name"], "read");
@@ -991,17 +1021,20 @@ mod tests {
 
     #[test]
     fn responses_body_renders_openai_native_coding_tools() {
-        let body = responses_body(ModelRequest {
-            model: "gpt-5.5".to_string(),
-            prompt: PromptSections::stable("stable agent rules"),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::OpenAiCoding,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::XHigh,
-            prompt_cache_key: None,
-            session_id: None,
-        }, "test-session")
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::stable("stable agent rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::OpenAiCoding,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::XHigh,
+                prompt_cache_key: None,
+                session_id: None,
+            },
+            "test-session",
+        )
         .expect("responses body renders");
 
         assert_eq!(body["tools"][0]["type"], "custom");

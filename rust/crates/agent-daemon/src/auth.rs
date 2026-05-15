@@ -43,7 +43,10 @@ impl Credentials {
 /// Returns `None` when the file is missing or unreadable; the caller can fall
 /// back to omitting the header (Codex backend tolerates its absence).
 fn read_codex_installation_id() -> Option<String> {
-    let path = env::var("HOME").ok().map(PathBuf::from)?.join(".codex/installation_id");
+    let path = env::var("HOME")
+        .ok()
+        .map(PathBuf::from)?
+        .join(".codex/installation_id");
     let contents = std::fs::read_to_string(&path).ok()?;
     let trimmed = contents.trim();
     if trimmed.is_empty() {

@@ -291,7 +291,10 @@ fn anthropic_system_blocks(
     (!blocks.is_empty()).then_some(blocks)
 }
 
-fn attribution_header(prompt: &crate::PromptSections, transcript: &[ModelTranscriptEntry]) -> String {
+fn attribution_header(
+    prompt: &crate::PromptSections,
+    transcript: &[ModelTranscriptEntry],
+) -> String {
     let fingerprint = attribution_fingerprint(prompt, transcript);
     format!(
         "x-anthropic-billing-header: cc_version={CLAUDE_CODE_VERSION}.{fingerprint}; cc_entrypoint=cli;"
@@ -1037,15 +1040,13 @@ mod tests {
             messages_body(ModelRequest {
                 model: "claude-opus-4-7".to_string(),
                 prompt: PromptSections::stable("a stable system prompt long enough to fingerprint"),
-                transcript: vec![
-                    TranscriptItem::UserMessage(UserMessage::text(first_user)).into(),
-                ],
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text(first_user)).into()],
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: None,
-            session_id: None,
+                session_id: None,
             })
             .expect("body renders")
         };
@@ -1069,15 +1070,13 @@ mod tests {
             messages_body(ModelRequest {
                 model: "claude-opus-4-7".to_string(),
                 prompt: PromptSections::stable(stable),
-                transcript: vec![
-                    TranscriptItem::UserMessage(UserMessage::text("anything")).into(),
-                ],
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("anything")).into()],
                 tool_profile: ProviderToolProfile::None,
                 tools: Vec::new(),
                 max_tokens: None,
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: None,
-            session_id: None,
+                session_id: None,
             })
             .expect("body renders")
         };
