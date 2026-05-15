@@ -17,6 +17,7 @@ export interface ProviderConfig {
 
 export interface SessionSummary {
 	session_id: string;
+	project_id: string;
 	activity: Activity;
 	active_leaf_id: string | null;
 	provider: ProviderConfig;
@@ -44,6 +45,7 @@ export interface QueuedInput {
 
 export interface SessionSnapshot {
 	session_id: string;
+	project_id: string;
 	activity: Activity;
 	active_leaf_id: string | null;
 	provider: ProviderConfig;
@@ -56,6 +58,15 @@ export interface SessionSnapshot {
 
 export interface DaemonConfig {
 	system_prompt: string | null;
+}
+
+export interface Project {
+	project_id: string;
+	name: string;
+	starting_cwd: string;
+	metadata: Record<string, unknown>;
+	created_at: string;
+	updated_at: string;
 }
 
 export interface EventFrame {

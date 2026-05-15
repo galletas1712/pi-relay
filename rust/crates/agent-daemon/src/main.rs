@@ -11,7 +11,7 @@ mod types;
 
 use crate::codec::{
     fork_branch_before_user_message, from_params, parse_assistant_message, parse_user_message,
-    recover_fork_branch_tail, required_string, transcript_store_from_stored,
+    recover_fork_branch_tail, required_string, required_uuid, transcript_store_from_stored,
 };
 use crate::config::Config;
 use crate::runtime::*;
@@ -57,7 +57,8 @@ async fn main() -> Result<()> {
         dispatch_tasks: Arc::new(StdMutex::new(Vec::new())),
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
-        tool_context: ToolContext::new(config.workspace),
+        default_tool_context: ToolContext::new(config.workspace.clone()),
+        default_workspace: config.workspace,
     };
 
     let listener = TcpListener::bind(&config.bind).await?;
@@ -232,6 +233,10 @@ async fn dispatch_request(
         RpcMethod::SessionRename => session_rename(state, params).await,
         RpcMethod::SessionConfigure => session_configure(state, params).await,
         RpcMethod::SessionDelete => session_delete(state, params).await,
+        RpcMethod::ProjectList => project_list(state).await,
+        RpcMethod::ProjectCreate => project_create(state, params).await,
+        RpcMethod::ProjectUpdate => project_update(state, params).await,
+        RpcMethod::ProjectDelete => project_delete(state, params).await,
         RpcMethod::ConfigGet => config_get(state).await,
         RpcMethod::ConfigSet => config_set(state, params).await,
         RpcMethod::EventsSubscribe => {
@@ -269,9 +274,17 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
     let session_id = params
         .session_id
         .unwrap_or_else(|| format!("session_{}", Uuid::new_v4()));
+    let project_id = params.project_id;
+    let project = state
+        .repo
+        .get_project(project_id)
+        .await
+        .map_err(anyhow::Error::from)?;
     let priority = params.priority.unwrap_or(InputPriority::FollowUp);
     let content = parse_user_message(params.content)?;
     let config = SessionConfig {
+        project_id,
+        starting_cwd: project.starting_cwd,
         provider: params.provider,
         metadata: params.metadata.unwrap_or_else(|| json!({})),
     };
@@ -286,6 +299,7 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
     {
         return Ok(json!({
             "session_id": session_id,
+            "project_id": project_id,
             "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?,
             "replayed": true,
         }));
@@ -333,6 +347,7 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
 
     Ok(json!({
         "session_id": session_id,
+        "project_id": project_id,
         "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?,
         "replayed": false,
     }))
@@ -341,6 +356,7 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
 #[derive(Debug, Deserialize)]
 struct StartSessionParams {
     session_id: Option<String>,
+    project_id: Uuid,
     provider: ProviderConfig,
     metadata: Option<Value>,
     client_input_id: Option<String>,
@@ -350,9 +366,21 @@ struct StartSessionParams {
 
 async fn session_list(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let limit = params.get("limit").and_then(Value::as_i64).unwrap_or(50);
+    let project_id = params
+        .get("project_id")
+        .and_then(Value::as_str)
+        .map(|value| {
+            Uuid::parse_str(value).map_err(|error| {
+                RpcError::new(
+                    "invalid_params",
+                    format!("project_id must be a UUID: {error}"),
+                )
+            })
+        })
+        .transpose()?;
     let sessions = state
         .repo
-        .list_sessions(limit)
+        .list_sessions(project_id, limit)
         .await
         .map_err(anyhow::Error::from)?;
     Ok(json!({
@@ -482,7 +510,12 @@ async fn session_configure(
             ));
         }
     }
-    let config = SessionConfig { provider, metadata };
+    let config = SessionConfig {
+        project_id: current.project_id,
+        starting_cwd: current.starting_cwd.clone(),
+        provider,
+        metadata,
+    };
     let events = state
         .repo
         .configure_session(&session_id, &config)
@@ -500,6 +533,120 @@ async fn session_configure(
 
 fn provider_model_changed(previous: &ProviderConfig, next: &ProviderConfig) -> bool {
     previous.kind != next.kind || previous.model != next.model
+}
+
+async fn project_list(state: &AppState) -> std::result::Result<Value, RpcError> {
+    let projects = state
+        .repo
+        .list_projects()
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(json!({
+        "projects": projects
+            .into_iter()
+            .map(rpc_views::project)
+            .collect::<Vec<_>>()
+    }))
+}
+
+async fn project_create(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let params: ProjectWriteParams = from_params(params)?;
+    let project_id = params
+        .project_id
+        .unwrap_or_else(|| Uuid::new_v4());
+    let name = params.name.trim();
+    if name.is_empty() {
+        return Err(RpcError::new("invalid_params", "project name is required"));
+    }
+    let starting_cwd = normalize_project_cwd(params.starting_cwd.as_deref(), state)?;
+    let project = state
+        .repo
+        .create_project(
+            project_id,
+            name,
+            &starting_cwd.to_string_lossy(),
+            params.metadata.unwrap_or_else(|| json!({})),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(rpc_views::project(project))
+}
+
+async fn project_update(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let project_id = required_uuid(&params, "project_id")?;
+    let current = state
+        .repo
+        .get_project(project_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or(&current.name);
+    if name.is_empty() {
+        return Err(RpcError::new("invalid_params", "project name is required"));
+    }
+    let starting_cwd = if params.get("starting_cwd").is_some() {
+        normalize_project_cwd(params.get("starting_cwd").and_then(Value::as_str), state)?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        current.starting_cwd
+    };
+    let project = state
+        .repo
+        .update_project(project_id, name, &starting_cwd)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(rpc_views::project(project))
+}
+
+async fn project_delete(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let project_id = required_uuid(&params, "project_id")?;
+    let deleted = state
+        .repo
+        .delete_empty_project(project_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    if !deleted {
+        return Err(RpcError::new(
+            "project_not_empty",
+            "project was not found or still has sessions",
+        ));
+    }
+    Ok(json!({ "project_id": project_id, "deleted": true }))
+}
+
+#[derive(Debug, Deserialize)]
+struct ProjectWriteParams {
+    project_id: Option<Uuid>,
+    name: String,
+    starting_cwd: Option<String>,
+    metadata: Option<Value>,
+}
+
+fn normalize_project_cwd(
+    cwd: Option<&str>,
+    state: &AppState,
+) -> std::result::Result<std::path::PathBuf, RpcError> {
+    let cwd = cwd
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| state.default_workspace.clone());
+    let normalized = if cwd.is_absolute() {
+        cwd
+    } else {
+        state.default_workspace.join(cwd)
+    };
+    if !normalized.is_dir() {
+        return Err(RpcError::new(
+            "invalid_project_cwd",
+            format!("project starting_cwd is not a directory: {}", normalized.display()),
+        ));
+    }
+    Ok(normalized)
 }
 
 async fn config_get(state: &AppState) -> std::result::Result<Value, RpcError> {

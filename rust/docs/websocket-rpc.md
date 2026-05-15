@@ -69,12 +69,27 @@ enums that serialize to the string values shown below.
 
 ```text
 id text primary key
+project_id uuid not null references projects(id)
 created_at timestamptz not null default now()
 updated_at timestamptz not null default now()
 active_leaf_id text null
 provider_config jsonb not null
 metadata jsonb not null default '{}'::jsonb
 ```
+
+### `projects`
+
+```text
+id uuid primary key
+created_at timestamptz not null default now()
+updated_at timestamptz not null default now()
+name text not null
+starting_cwd text not null
+metadata jsonb not null default '{}'::jsonb
+```
+
+Projects are host folders. Every session has a `project_id`; model prompt
+context and local tools use the project's `starting_cwd`.
 
 `provider_config`:
 
@@ -298,6 +313,7 @@ the normal frontend path for a brand-new draft.
 ```json
 {
   "session_id": "optional-stable-id",
+  "project_id": "f2b0e23c-1fd7-4977-9d60-f6842e25d15b",
   "provider": {
     "kind": "codex",
     "model": "gpt-5.5",
@@ -327,7 +343,7 @@ Lists durable sessions, newest first.
 { "limit": 50 }
 ```
 
-Each row includes `session_id`, `activity`, `active_leaf_id`, `provider`,
+Each row includes `session_id`, `project_id`, `activity`, `active_leaf_id`, `provider`,
 `metadata`, and `updated_at`. Defensive listing hides accidental empty
 web-created rows that have no transcript, queued input, actions, or fork
 provenance. Rows with `metadata.hidden = true` are also omitted from the list;
@@ -347,6 +363,7 @@ Result shape:
 ```json
 {
   "session_id": "s1",
+  "project_id": "f2b0e23c-1fd7-4977-9d60-f6842e25d15b",
   "activity": "idle",
   "active_leaf_id": "entry_9",
   "provider": { "kind": "codex", "model": "gpt-5.5" },
@@ -364,6 +381,42 @@ Result shape:
 `entries` is included only when `include_entries` is true. The web UI uses that
 expanded snapshot for normal transcript refreshes so it does not need a second
 round trip.
+
+## Project RPC
+
+### `project.list`
+
+Returns visible projects:
+
+```json
+{ "projects": [] }
+```
+
+Each project has `project_id`, `name`, `starting_cwd`, `metadata`, `created_at`,
+and `updated_at`.
+
+### `project.create`
+
+```json
+{
+  "name": "my repo",
+  "starting_cwd": "/Users/me/src/my-repo",
+  "metadata": { "created_by": "web" }
+}
+```
+
+### `project.update`
+
+Renames a project and/or changes the starting cwd used for future session work.
+The cwd must be an existing directory.
+
+```json
+{
+  "project_id": "f2b0e23c-1fd7-4977-9d60-f6842e25d15b",
+  "name": "pi-relay",
+  "starting_cwd": "/Users/me/src/pi-relay"
+}
+```
 
 ### `session.rename`
 

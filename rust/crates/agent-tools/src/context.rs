@@ -16,6 +16,13 @@ impl ToolContext {
     }
 }
 
+pub fn dynamic_tool_context(base: &ToolContext, cwd: impl Into<PathBuf>) -> ToolContext {
+    ToolContext {
+        cwd: cwd.into(),
+        timeout: base.timeout,
+    }
+}
+
 pub(crate) fn workspace_path(ctx: &ToolContext, path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
     if path.is_absolute() {

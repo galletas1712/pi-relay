@@ -4,8 +4,10 @@ use sqlx::PgPool;
 /// Postgres is the durable source of truth for sessions.
 ///
 /// Tables:
+/// - `projects`: one row per host workspace/project. Sessions belong to a
+///   project and model/tool execution uses the project's `starting_cwd`.
 /// - `sessions`: one row per durable session, including active transcript leaf
-///   and provider/session metadata.
+///   and provider/session metadata. Every session belongs to a project.
 /// - `daemon_config`: singleton key-value config such as the global system
 ///   prompt.
 /// - `transcript_entries`: append-only transcript forest. `parent_id` points
@@ -15,14 +17,27 @@ use sqlx::PgPool;
 /// - `actions`: durable model/tool/compaction/cancel work records.
 /// - `events`: ordered observable event stream for websocket replay.
 const SCHEMA_SQL: &str = r#"
+create table if not exists projects (
+    id uuid primary key,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    name text not null,
+    starting_cwd text not null,
+    metadata jsonb not null default '{}'::jsonb
+);
+
 create table if not exists sessions (
     id text primary key,
+    project_id uuid not null references projects(id),
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     active_leaf_id text null,
     provider_config jsonb not null,
     metadata jsonb not null default '{}'::jsonb
 );
+
+create index if not exists sessions_project_created_idx
+    on sessions(project_id, created_at desc, id desc);
 
 create table if not exists daemon_config (
     key text primary key,

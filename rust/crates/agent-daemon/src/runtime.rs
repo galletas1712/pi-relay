@@ -9,6 +9,7 @@ use agent_store::{
     AcceptedInput, ActionStatus, ActionUpdate, CompactionJob, EventFrame, EventType, InputPriority,
     OutputBatch, PersistedAction, QueueMutationError, QueuedInput, SessionActivity, SessionConfig,
 };
+use agent_tools::dynamic_tool_context;
 use agent_vocab::{
     ProviderReplayItem, ToolResultMessage, ToolResultStatus, TranscriptItem, UserMessage,
 };
@@ -817,7 +818,11 @@ async fn run_tool_turn(
     }
     publish_events(&state, events);
 
-    let result = match state.tools.execute(&tool_call, &state.tool_context).await {
+    let tool_context = dynamic_tool_context(
+        &state.default_tool_context,
+        std::path::PathBuf::from(dispatch.config.starting_cwd.clone()),
+    );
+    let result = match state.tools.execute(&tool_call, &tool_context).await {
         Ok(result) => result,
         Err(error) => ToolResultMessage::error(
             tool_call.id.clone(),

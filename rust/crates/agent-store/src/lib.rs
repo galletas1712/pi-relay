@@ -13,6 +13,7 @@ pub use postgres::PostgresAgentStore;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
+use uuid::Uuid;
 
 macro_rules! text_enum {
     ($(
@@ -145,8 +146,20 @@ text_enum! {
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
+    pub project_id: Uuid,
+    pub starting_cwd: String,
     pub provider: ProviderConfig,
     pub metadata: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct Project {
+    pub project_id: Uuid,
+    pub name: String,
+    pub starting_cwd: String,
+    pub metadata: Value,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +201,7 @@ pub struct PromoteQueuedInputResult {
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub session_id: String,
+    pub project_id: Uuid,
     pub activity: SessionActivity,
     pub active_leaf_id: Option<String>,
     pub provider: ProviderConfig,
@@ -239,6 +253,7 @@ pub struct QueuedInputRecord {
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     pub session_id: String,
+    pub project_id: Uuid,
     pub activity: SessionActivity,
     pub active_leaf_id: Option<String>,
     pub provider: ProviderConfig,

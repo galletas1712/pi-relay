@@ -1,5 +1,26 @@
 # Rust Rewrite Worklog
 
+## 2026-05-15
+
+### Project-Scoped Sessions
+
+- Added a `projects` Postgres table with UUID primary keys, display names, and
+  per-project `starting_cwd`; every session now belongs to a project.
+- Added project CRUD/list RPCs and threaded `project_id` through
+  `session.start`, `session.list`, `session.get`, and session/fork summaries.
+- Session config now carries the project's `starting_cwd`; model dynamic prompt
+  context and local tool execution use that cwd instead of one daemon-wide
+  workspace. Updating a project cwd affects subsequent turns for sessions in
+  that project.
+- Updated the web UI sidebar to select a project first, then list sessions
+  nested under that project. Added project create/edit dialog with rename and
+  starting-cwd fields.
+
+Verification:
+
+- `cargo check --workspace`
+- `npm run build:web --silent`
+
 ## 2026-05-14
 
 ### Unify Shell Tool As `bash` For Both Providers

@@ -1,10 +1,12 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
 import { Loader2, MoveUp, Send, Square } from "lucide-react";
 import { COMMANDS, filterCommands, matchSlashPrefix, type SlashCommandInfo } from "./slash.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
 import type { QueuedInput } from "./types.ts";
 
 const NEW_SESSION_DRAFT_ID = "__new_session__";
+const COMPOSER_MIN_HEIGHT_PX = 44;
+const COMPOSER_MAX_HEIGHT_PX = 180;
 
 export interface ComposerHandle {
 	focus(): void;
@@ -16,6 +18,7 @@ export interface ComposerHandle {
 
 export const Composer = memo(function Composer({
 	selectedId,
+	hasProject,
 	composerHandleRef,
 	sending,
 	canStop,
@@ -26,6 +29,7 @@ export const Composer = memo(function Composer({
 	onPromoteQueued
 }: {
 	selectedId: string | null;
+	hasProject: boolean;
 	composerHandleRef: RefObject<ComposerHandle | null>;
 	sending: boolean;
 	canStop: boolean;
@@ -41,6 +45,18 @@ export const Composer = memo(function Composer({
 	const draftRef = useRef("");
 	const [draft, setDraft] = useState("");
 	const [slashIndex, setSlashIndex] = useState(0);
+
+	const resizeComposer = useCallback(() => {
+		const textArea = textAreaRef.current;
+		if (!textArea) return;
+		textArea.style.height = "auto";
+		const nextHeight = Math.min(
+			Math.max(textArea.scrollHeight, COMPOSER_MIN_HEIGHT_PX),
+			COMPOSER_MAX_HEIGHT_PX
+		);
+		textArea.style.height = `${nextHeight}px`;
+		textArea.style.overflowY = textArea.scrollHeight > COMPOSER_MAX_HEIGHT_PX ? "auto" : "hidden";
+	}, []);
 
 	const draftKey = useCallback((sessionId: string | null) => sessionId ?? NEW_SESSION_DRAFT_ID, []);
 
@@ -105,6 +121,19 @@ export const Composer = memo(function Composer({
 	useEffect(() => {
 		setSlashIndex(0);
 	}, [slashState.commands, slashState.visible]);
+
+	useLayoutEffect(() => {
+		resizeComposer();
+	}, [draft, resizeComposer]);
+
+	useEffect(() => {
+		const textArea = textAreaRef.current;
+		const target = textArea?.parentElement;
+		if (!target || typeof ResizeObserver === "undefined") return;
+		const observer = new ResizeObserver(() => resizeComposer());
+		observer.observe(target);
+		return () => observer.disconnect();
+	}, [resizeComposer]);
 
 	const sendDraft = useCallback(async () => {
 		const text = draftRef.current.trim();
@@ -175,7 +204,7 @@ export const Composer = memo(function Composer({
 				value={draft}
 				onChange={(event) => setDraftValue(event.target.value)}
 				onKeyDown={onKeyDown}
-				placeholder={selectedId ? "Message the session or type /" : "Create or select a session"}
+				placeholder={selectedId ? "Message the session or type /" : hasProject ? "Create or select a session" : "Select a project first"}
 				className="composer"
 				rows={1}
 			/>

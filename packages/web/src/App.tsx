@@ -19,12 +19,13 @@ import {
 	textContent,
 	withReasoningEffort
 } from "./sessionDefaults.ts";
-import { sessionTitle, isArchivedSession, tallyActivities, type SessionListItem } from "./sessionList.ts";
+import { projectTitle, sessionTitle, isArchivedSession, tallyActivities, type SessionListItem } from "./sessionList.ts";
 import { firstLine, truncate } from "./text.ts";
 import type {
 	DaemonConfig,
 	EventFrame,
 	Notice,
+	Project,
 	ProviderConfig,
 	ReasoningEffort,
 	SessionSnapshot,
@@ -52,9 +53,19 @@ type DeleteDialogState = {
 	deleting: boolean;
 };
 
+type ProjectDialogState = {
+	mode: "create" | "edit";
+	projectId?: string;
+	name: string;
+	startingCwd: string;
+	saving: boolean;
+};
+
 export function App() {
 	const api = useMemo(() => createAgentApi(), []);
 	const [connection, setConnection] = useState<ConnectionStatus>("connecting");
+	const [projects, setProjects] = useState<Project[]>([]);
+	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
 	const [sessions, setSessions] = useState<SessionSummary[]>([]);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const selectedRef = useRef<string | null>(null);
@@ -75,10 +86,13 @@ export function App() {
 	const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
 	const [renameValue, setRenameValue] = useState("");
 	const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
+	const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
 
 	const refreshTimer = useRef<number | null>(null);
 	const composerHandleRef = useRef<ComposerHandle | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
+	const selectedProjectRef = useRef<string | null>(null);
+	const sessionsRef = useRef(new Map<string, SessionSummary>());
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
 
@@ -100,6 +114,14 @@ export function App() {
 		selectedRef.current = selectedId;
 	}, [selectedId]);
 
+	useEffect(() => {
+		selectedProjectRef.current = selectedProjectId;
+	}, [selectedProjectId]);
+
+	useEffect(() => {
+		sessionsRef.current = new Map(sessions.map((session) => [session.session_id, session]));
+	}, [sessions]);
+
 	const pushNotice = useCallback((tone: Notice["tone"], text: string) => {
 		setNotices((current) => [
 			...current.slice(Math.max(0, current.length - MAX_NOTICES + 1)),
@@ -115,11 +137,33 @@ export function App() {
 		return () => window.clearTimeout(timer);
 	}, [notices.length]);
 
-	const loadSessions = useCallback(async () => {
-		const nextSessions = await api.listSessions(100);
+	const loadSessions = useCallback(async (projectId = selectedProjectRef.current) => {
+		if (!projectId) {
+			setSessions([]);
+			return [];
+		}
+		const nextSessions = await api.listSessions(100, projectId);
 		setSessions(nextSessions);
 		return nextSessions;
 	}, [api]);
+
+	const loadProjects = useCallback(async () => {
+		const nextProjects = await api.listProjects();
+		setProjects(nextProjects);
+		const currentProjectId = selectedProjectRef.current;
+		const nextSelected =
+			currentProjectId && nextProjects.some((project) => project.project_id === currentProjectId)
+				? currentProjectId
+				: nextProjects[0]?.project_id ?? null;
+		if (nextSelected !== currentProjectId) {
+			selectedProjectRef.current = nextSelected;
+			setSelectedProjectId(nextSelected);
+			selectSession(null);
+			setSnapshot(null);
+			setEntries([]);
+		}
+		return nextProjects;
+	}, [api, selectSession]);
 
 	const loadGlobal = useCallback(async () => {
 		const nextConfig = await api.getConfig();
@@ -135,6 +179,10 @@ export function App() {
 			setSnapshot(nextSnapshot);
 			setEntries(nextSnapshot.entries ?? []);
 			setSessions((current) => mergeSnapshotIntoSessionList(current, nextSnapshot));
+			if (nextSnapshot.project_id !== selectedProjectRef.current) {
+				selectedProjectRef.current = nextSnapshot.project_id;
+				setSelectedProjectId(nextSnapshot.project_id);
+			}
 			return { snapshot: nextSnapshot, entries: nextSnapshot.entries ?? [] };
 		},
 		[api]
@@ -151,6 +199,8 @@ export function App() {
 
 	const handleSessionEvent = useCallback(
 		(event: EventFrame) => {
+			const eventSession = sessionsRef.current.get(event.session_id);
+			if (eventSession?.project_id && eventSession.project_id !== selectedProjectRef.current) return;
 			lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
 			setSessions((current) => applySessionActivityEvent(current, event.event, event.session_id));
 			if (event.session_id === selectedRef.current) {
@@ -183,10 +233,14 @@ export function App() {
 				subscribedEventSessionIds.current.clear();
 				return;
 			}
-			void Promise.all([loadSessions(), loadGlobal()]).catch((error) => pushNotice("error", errorMessage(error)));
-			const sessionId = selectedRef.current;
-			if (!sessionId) return;
-			void refreshSelected(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
+			void loadProjects()
+				.then(() => Promise.all([loadSessions(), loadGlobal()]))
+				.then(() => {
+					const sessionId = selectedRef.current;
+					if (!sessionId) return undefined;
+					return refreshSelected(sessionId);
+				})
+				.catch((error) => pushNotice("error", errorMessage(error)));
 		});
 		const offEvent = api.onEvent(handleSessionEvent);
 		void api
@@ -197,7 +251,11 @@ export function App() {
 			offEvent();
 			api.close();
 		};
-	}, [api, handleSessionEvent, loadGlobal, loadSessions, pushNotice, refreshSelected]);
+	}, [api, handleSessionEvent, loadGlobal, loadProjects, loadSessions, pushNotice, refreshSelected]);
+
+	useEffect(() => {
+		void loadSessions().catch((error) => pushNotice("error", errorMessage(error)));
+	}, [loadSessions, pushNotice, selectedProjectId]);
 
 	useEffect(() => {
 		if (!selectedId) {
@@ -245,15 +303,29 @@ export function App() {
 	}, [api, connection, handleSessionEvent, pushNotice, refreshSelected, selectedId, sessions]);
 
 	const sessionItems: SessionListItem[] = sessions;
+	const selectedProject = useMemo(
+		() => projects.find((project) => project.project_id === selectedProjectId) ?? null,
+		[projects, selectedProjectId]
+	);
 
 	const selectedSession = useMemo(
 		() => sessionItems.find((session) => session.session_id === selectedId) ?? null,
 		[sessionItems, selectedId]
 	);
+
+	useEffect(() => {
+		if (!selectedId) return;
+		if (sessionItems.some((session) => session.session_id === selectedId)) return;
+		selectSession(null);
+		setSnapshot(null);
+		setEntries([]);
+	}, [selectSession, selectedId, sessionItems]);
+
 	const snapshotChatSession = useMemo(() => {
 		if (!selectedId || !snapshot) return null;
 		return {
 			session_id: selectedId,
+			project_id: snapshot.project_id,
 			activity: snapshot.activity,
 			active_leaf_id: snapshot.active_leaf_id,
 			provider: snapshot.provider,
@@ -264,12 +336,13 @@ export function App() {
 		if (!selectedId) return null;
 		return {
 			session_id: selectedId,
+			project_id: selectedSession?.project_id ?? selectedProjectId ?? "",
 			activity: selectedSession?.activity ?? "idle",
 			active_leaf_id: selectedSession?.active_leaf_id ?? null,
 			provider: selectedSession?.provider ?? newSessionProvider,
 			metadata: selectedSession?.metadata ?? {}
 		};
-	}, [newSessionProvider, selectedId, selectedSession]);
+	}, [newSessionProvider, selectedId, selectedProjectId, selectedSession]);
 	const selectedChatSession = snapshotChatSession ?? selectedListChatSession;
 
 	const activeProvider = snapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
@@ -420,6 +493,10 @@ export function App() {
 
 	const createSession = useCallback(
 		(title?: string) => {
+			if (!selectedProjectRef.current) {
+				pushNotice("info", "select a project first");
+				return null;
+			}
 			nextSessionTitleRef.current = title?.trim() || null;
 			selectSession(null);
 			setSnapshot(null);
@@ -428,7 +505,7 @@ export function App() {
 			requestAnimationFrame(() => composerHandleRef.current?.focus());
 			return null;
 		},
-		[selectSession]
+		[pushNotice, selectSession]
 	);
 
 	const requireSelected = useCallback(() => {
@@ -465,16 +542,19 @@ export function App() {
 
 	const startNewSession = useCallback(
 		async (text: string) => {
+			const projectId = selectedProjectRef.current;
+			if (!projectId) throw new Error("select a project first");
 			const sessionId = randomId("session");
 			const title = nextSessionTitleRef.current || titleFromText(text);
 			nextSessionTitleRef.current = null;
-				const result = await api.startSession({
-					sessionId,
-					provider: newSessionProvider,
-					metadata: { title, created_by: "web" },
-					clientInputId: randomId("web_start"),
-					priority: "follow_up",
-					content: textContent(text)
+			const result = await api.startSession({
+				sessionId,
+				projectId,
+				provider: newSessionProvider,
+				metadata: { title, created_by: "web" },
+				clientInputId: randomId("web_start"),
+				priority: "follow_up",
+				content: textContent(text)
 			});
 			await loadSessions();
 			selectSession(result.session_id);
@@ -688,13 +768,72 @@ export function App() {
 	}, [executeSlash, pushNotice, queueUserInput, sending, startNewSession]);
 
 	const layoutStyle = {
-		gridTemplateColumns: rightOpen ? "280px minmax(0,1fr) minmax(320px,380px)" : "280px minmax(0,1fr)"
+		gridTemplateColumns: rightOpen ? "320px minmax(0,1fr) minmax(320px,380px)" : "320px minmax(0,1fr)"
 	};
 	const canStop = !!selectedId && snapshot?.activity === "running";
 	const queuedInputs = snapshot?.queued_inputs ?? [];
 	const handleToggleArchived = useCallback(() => {
 		setShowArchived((show) => !show);
 	}, []);
+	const handleSelectProject = useCallback((projectId: string) => {
+		if (projectId === selectedProjectRef.current) return;
+		selectedProjectRef.current = projectId;
+		setSelectedProjectId(projectId);
+		selectSession(null);
+		setSnapshot(null);
+		setEntries([]);
+		setQuery("");
+		composerHandleRef.current?.setValue("");
+	}, [selectSession]);
+	const openCreateProjectDialog = useCallback(() => {
+		setProjectDialog({
+			mode: "create",
+			name: "",
+			startingCwd: selectedProject?.starting_cwd ?? "",
+			saving: false
+		});
+	}, [selectedProject?.starting_cwd]);
+	const openEditProjectDialog = useCallback((project: Project) => {
+		setProjectDialog({
+			mode: "edit",
+			projectId: project.project_id,
+			name: projectTitle(project),
+			startingCwd: project.starting_cwd,
+			saving: false
+		});
+	}, []);
+	const closeProjectDialog = useCallback(() => {
+		setProjectDialog(null);
+	}, []);
+	const saveProjectDialog = useCallback(async () => {
+		if (!projectDialog || projectDialog.saving) return;
+		const name = projectDialog.name.trim();
+		const startingCwd = projectDialog.startingCwd.trim();
+		if (!name) throw new Error("project name is required");
+		if (!startingCwd) throw new Error("starting cwd is required");
+		setProjectDialog((current) => (current ? { ...current, saving: true } : current));
+		try {
+			const saved =
+				projectDialog.mode === "create"
+					? await api.createProject({ name, startingCwd, metadata: { created_by: "web" } })
+					: await api.updateProject({
+							projectId: projectDialog.projectId ?? "",
+							name,
+							startingCwd
+						});
+			await loadProjects();
+			selectedProjectRef.current = saved.project_id;
+			setSelectedProjectId(saved.project_id);
+			selectSession(null);
+			setSnapshot(null);
+			setEntries([]);
+			pushNotice("success", `${projectDialog.mode === "create" ? "created" : "updated"} project “${truncate(saved.name, 80)}”`);
+			closeProjectDialog();
+		} catch (error) {
+			setProjectDialog((current) => (current ? { ...current, saving: false } : current));
+			throw error;
+		}
+	}, [api, closeProjectDialog, loadProjects, projectDialog, pushNotice, selectSession]);
 	const handleSidebarNew = useCallback(() => {
 		void createSession();
 	}, [createSession]);
@@ -745,6 +884,8 @@ export function App() {
 				total={activeSessionItems.length}
 				archived={archivedCount}
 				connection={connection}
+				projects={projects}
+				selectedProjectId={selectedProjectId}
 				query={query}
 				showArchived={showArchived}
 				filteredSessions={filteredSessions}
@@ -752,6 +893,9 @@ export function App() {
 				onQueryChange={setQuery}
 				onToggleArchived={handleToggleArchived}
 				onNew={handleSidebarNew}
+				onSelectProject={handleSelectProject}
+				onNewProject={openCreateProjectDialog}
+				onEditProject={openEditProjectDialog}
 				onSelectSession={selectSession}
 				onRename={openRenameDialog}
 				onArchiveToggle={handleArchiveToggle}
@@ -780,6 +924,7 @@ export function App() {
 			<footer className="chat-dock" data-slot="chat-box">
 				<Composer
 					selectedId={selectedId}
+					hasProject={!!selectedProjectId}
 					composerHandleRef={composerHandleRef}
 					sending={sending}
 					canStop={canStop}
@@ -815,6 +960,17 @@ export function App() {
 					onClose={closeDeleteDialog}
 					onConfirm={() => {
 						void deleteSession().catch((error) => pushNotice("error", errorMessage(error)));
+					}}
+				/>
+			) : null}
+
+			{projectDialog ? (
+				<ProjectDialog
+					state={projectDialog}
+					onChange={(patch) => setProjectDialog((current) => (current ? { ...current, ...patch } : current))}
+					onClose={closeProjectDialog}
+					onSubmit={() => {
+						void saveProjectDialog().catch((error) => pushNotice("error", errorMessage(error)));
 					}}
 				/>
 			) : null}
@@ -934,6 +1090,68 @@ function DeleteSessionDialog({
 	);
 }
 
+function ProjectDialog({
+	state,
+	onChange,
+	onClose,
+	onSubmit
+}: {
+	state: ProjectDialogState;
+	onChange: (patch: Partial<ProjectDialogState>) => void;
+	onClose: () => void;
+	onSubmit: () => void;
+}) {
+	const title = state.mode === "create" ? "New project" : "Project settings";
+	return (
+		<div className="modal-scrim" role="presentation" onMouseDown={state.saving ? undefined : onClose}>
+			<div className="rename-dialog project-dialog" role="dialog" aria-modal="true" aria-labelledby="project-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+				<div className="rename-dialog-head">
+					<div className="rename-dialog-copy">
+						<h2 id="project-dialog-title">{title}</h2>
+					</div>
+					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close project dialog" disabled={state.saving}>
+						×
+					</button>
+				</div>
+				<form
+					onSubmit={(event) => {
+						event.preventDefault();
+						onSubmit();
+					}}
+				>
+					<label className="rename-field">
+						<span>Project name</span>
+						<input
+							value={state.name}
+							onChange={(event) => onChange({ name: event.target.value })}
+							autoFocus
+							placeholder="Project name"
+							required
+							disabled={state.saving}
+						/>
+					</label>
+					<label className="rename-field">
+						<span>Starting cwd</span>
+						<input
+							value={state.startingCwd}
+							onChange={(event) => onChange({ startingCwd: event.target.value })}
+							placeholder="/path/to/project"
+							required
+							disabled={state.saving}
+						/>
+					</label>
+					<div className="rename-actions">
+						<button type="button" className="secondary-button" onClick={onClose} disabled={state.saving}>Cancel</button>
+						<button type="submit" className="primary-button" disabled={state.saving}>
+							{state.saving ? "Saving..." : "Save"}
+						</button>
+					</div>
+				</form>
+			</div>
+		</div>
+	);
+}
+
 function mergeSnapshotIntoSessionList(sessions: SessionSummary[], snapshot: SessionSnapshot): SessionSummary[] {
 	let found = false;
 	const nextSessions = sessions.map((session) => {
@@ -941,6 +1159,7 @@ function mergeSnapshotIntoSessionList(sessions: SessionSummary[], snapshot: Sess
 		found = true;
 		return {
 			...session,
+			project_id: snapshot.project_id,
 			activity: snapshot.activity,
 			active_leaf_id: snapshot.active_leaf_id,
 			provider: snapshot.provider,

@@ -21,18 +21,25 @@ impl PostgresAgentStore {
         config: &SessionConfig,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("insert into sessions (id, provider_config, metadata) values ($1, $2, $3)")
-            .bind(session_id)
-            .bind(serde_json::to_value(&config.provider)?)
-            .bind(&config.metadata)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            r#"
+            insert into sessions (id, project_id, provider_config, metadata)
+            values ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(session_id)
+        .bind(config.project_id)
+        .bind(serde_json::to_value(&config.provider)?)
+        .bind(&config.metadata)
+        .execute(&mut *tx)
+        .await?;
         let event = insert_event_tx(
             &mut tx,
             session_id,
             EventType::SessionCreated,
             json!({
                 "session_id": session_id,
+                "project_id": config.project_id,
                 "provider": config.provider,
             }),
         )
@@ -65,13 +72,14 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
             r#"
-                insert into sessions (id, active_leaf_id, provider_config, metadata)
-                values ($1, $2::text, $3, $4)
+                insert into sessions (id, project_id, active_leaf_id, provider_config, metadata)
+                values ($1, $2, $3::text, $4, $5)
                 on conflict (id) do nothing
                 returning id
                 "#,
         )
         .bind(session_id)
+        .bind(config.project_id)
         .bind(active_leaf_id)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
@@ -89,6 +97,7 @@ impl PostgresAgentStore {
                 EventType::SessionCreated,
                 json!({
                     "session_id": session_id,
+                    "project_id": config.project_id,
                     "provider": config.provider,
                 }),
             )
@@ -174,13 +183,18 @@ impl PostgresAgentStore {
         Ok(vec![event])
     }
 
-    pub async fn list_sessions(&self, limit: i64) -> Result<Vec<SessionSummary>> {
+    pub async fn list_sessions(
+        &self,
+        project_id: Option<uuid::Uuid>,
+        limit: i64,
+    ) -> Result<Vec<SessionSummary>> {
         let running_actions = action_is_unfinished(Some("a"));
         let active_queue = queued_input_is_active(Some("q"));
         let query = format!(
             r#"
                 select
                     s.id,
+                    s.project_id,
                     s.active_leaf_id,
                     s.provider_config,
                     s.metadata,
@@ -190,6 +204,7 @@ impl PostgresAgentStore {
                     exists(select 1 from queued_inputs q where q.session_id=s.id and {active_queue}) as has_queued_input
                 from sessions s
                 where s.metadata->>'hidden' is distinct from 'true'
+                    and ($2::uuid is null or s.project_id=$2)
                     and not (
                         s.metadata->>'created_by' = 'web'
                         and not exists(select 1 from transcript_entries t where t.session_id=s.id)
@@ -206,6 +221,7 @@ impl PostgresAgentStore {
         );
         let rows = sqlx::query(&query)
             .bind(limit)
+            .bind(project_id)
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter()
@@ -222,6 +238,7 @@ impl PostgresAgentStore {
                 };
                 Ok(SessionSummary {
                     session_id: id,
+                    project_id: row.get("project_id"),
                     activity,
                     active_leaf_id: row.get("active_leaf_id"),
                     provider,
@@ -234,12 +251,25 @@ impl PostgresAgentStore {
     }
 
     pub async fn load_session_config(&self, session_id: &str) -> Result<SessionConfig> {
-        let row = sqlx::query("select provider_config, metadata from sessions where id=$1")
+        let row = sqlx::query(
+            r#"
+            select
+                s.project_id,
+                coalesce(p.starting_cwd, '') as starting_cwd,
+                s.provider_config,
+                s.metadata
+            from sessions s
+            left join projects p on p.id=s.project_id
+            where s.id=$1
+            "#,
+        )
             .bind(session_id)
             .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         Ok(SessionConfig {
+            project_id: row.get("project_id"),
+            starting_cwd: row.get("starting_cwd"),
             provider: serde_json::from_value(row.get("provider_config"))?,
             metadata: row.get("metadata"),
         })

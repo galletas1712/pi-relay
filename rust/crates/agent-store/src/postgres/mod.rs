@@ -3,6 +3,7 @@ mod actions;
 mod compaction;
 mod events;
 mod outputs;
+mod projects;
 mod queue;
 mod rows;
 mod schema;

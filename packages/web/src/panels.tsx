@@ -2,6 +2,7 @@ import {
 	Archive,
 	ArchiveRestore,
 	Edit3,
+	Folder,
 	PanelRightClose,
 	PanelRightOpen,
 	Plus,
@@ -11,9 +12,16 @@ import {
 } from "lucide-react";
 import { memo } from "react";
 import { COMMANDS } from "./slash.ts";
-import { isArchivedSession, sessionDisplayActivity, sessionTitle, type SessionDisplayActivity, type SessionListItem } from "./sessionList.ts";
+import {
+	isArchivedSession,
+	projectTitle,
+	sessionDisplayActivity,
+	sessionTitle,
+	type SessionDisplayActivity,
+	type SessionListItem
+} from "./sessionList.ts";
 import { truncate } from "./text.ts";
-import type { DaemonConfig, Notice, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
+import type { DaemonConfig, Notice, Project, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
 
 export function SidebarHeader({
 	counts,
@@ -59,6 +67,8 @@ export interface SidebarProps {
 	total: number;
 	archived: number;
 	connection: string;
+	projects: Project[];
+	selectedProjectId: string | null;
 	query: string;
 	showArchived: boolean;
 	filteredSessions: SessionListItem[];
@@ -66,6 +76,9 @@ export interface SidebarProps {
 	onQueryChange: (query: string) => void;
 	onToggleArchived: () => void;
 	onNew: () => void;
+	onSelectProject: (projectId: string) => void;
+	onNewProject: () => void;
+	onEditProject: (project: Project) => void;
 	onSelectSession: (sessionId: string) => void;
 	onRename: (session: SessionListItem) => void;
 	onArchiveToggle: (session: SessionListItem) => void;
@@ -77,6 +90,8 @@ export const Sidebar = memo(function Sidebar({
 	total,
 	archived,
 	connection,
+	projects,
+	selectedProjectId,
 	query,
 	showArchived,
 	filteredSessions,
@@ -84,6 +99,9 @@ export const Sidebar = memo(function Sidebar({
 	onQueryChange,
 	onToggleArchived,
 	onNew,
+	onSelectProject,
+	onNewProject,
+	onEditProject,
 	onSelectSession,
 	onRename,
 	onArchiveToggle,
@@ -92,7 +110,15 @@ export const Sidebar = memo(function Sidebar({
 	return (
 		<aside className="sidebar" data-slot="sidebar">
 			<SidebarHeader counts={counts} total={total} archived={archived} connection={connection} />
+			<ProjectList
+				projects={projects}
+				selectedProjectId={selectedProjectId}
+				onSelectProject={onSelectProject}
+				onNewProject={onNewProject}
+				onEditProject={onEditProject}
+			/>
 			<SidebarToolbar
+				disabled={!selectedProjectId}
 				query={query}
 				onQueryChange={onQueryChange}
 				showArchived={showArchived}
@@ -100,30 +126,100 @@ export const Sidebar = memo(function Sidebar({
 				onNew={onNew}
 			/>
 			<div className="session-list" role="listbox" aria-label="sessions">
-				{filteredSessions.map((session) => (
-					<SessionRow
-						key={session.session_id}
-						session={session}
-						selected={session.session_id === selectedId}
-						onSelect={() => onSelectSession(session.session_id)}
-						onRename={() => onRename(session)}
-						onArchiveToggle={() => onArchiveToggle(session)}
-						onDelete={() => onDelete(session)}
-					/>
-				))}
-				{filteredSessions.length === 0 ? <div className="empty-list">No sessions</div> : null}
+				{selectedProjectId ? (
+					<>
+						{filteredSessions.map((session) => (
+							<SessionRow
+								key={session.session_id}
+								session={session}
+								selected={session.session_id === selectedId}
+								onSelect={() => onSelectSession(session.session_id)}
+								onRename={() => onRename(session)}
+								onArchiveToggle={() => onArchiveToggle(session)}
+								onDelete={() => onDelete(session)}
+							/>
+						))}
+						{filteredSessions.length === 0 ? <div className="empty-list">No sessions</div> : null}
+					</>
+				) : (
+					<div className="empty-list">Select a project</div>
+				)}
 			</div>
 		</aside>
 	);
 });
 
+export function ProjectList({
+	projects,
+	selectedProjectId,
+	onSelectProject,
+	onNewProject,
+	onEditProject
+}: {
+	projects: Project[];
+	selectedProjectId: string | null;
+	onSelectProject: (projectId: string) => void;
+	onNewProject: () => void;
+	onEditProject: (project: Project) => void;
+}) {
+	return (
+		<div className="project-section">
+			<div className="project-section-head">
+				<span>Projects</span>
+				<button className="icon-button tiny" type="button" onClick={onNewProject} title="new project" aria-label="new project">
+					<Plus size={13} />
+				</button>
+			</div>
+			<div className="project-list" role="listbox" aria-label="projects">
+				{projects.map((project) => (
+					<button
+						className={`project-row ${project.project_id === selectedProjectId ? "selected" : ""}`}
+						type="button"
+						key={project.project_id}
+						onClick={() => onSelectProject(project.project_id)}
+						title={project.starting_cwd}
+					>
+						<Folder size={14} />
+						<span className="project-main">
+							<span className="project-title">{projectTitle(project)}</span>
+							<span className="project-cwd">{project.starting_cwd}</span>
+						</span>
+						<span
+							className="session-row-action"
+							role="button"
+							tabIndex={0}
+							title="edit project"
+							aria-label={`edit ${projectTitle(project)}`}
+							onClick={(event) => {
+								event.stopPropagation();
+								onEditProject(project);
+							}}
+							onKeyDown={(event) => {
+								if (event.key !== "Enter" && event.key !== " ") return;
+								event.preventDefault();
+								event.stopPropagation();
+								onEditProject(project);
+							}}
+						>
+							<Edit3 size={13} />
+						</span>
+					</button>
+				))}
+				{projects.length === 0 ? <div className="empty-list compact">No projects</div> : null}
+			</div>
+		</div>
+	);
+}
+
 export function SidebarToolbar({
+	disabled,
 	query,
 	onQueryChange,
 	showArchived,
 	onToggleArchived,
 	onNew
 }: {
+	disabled: boolean;
 	query: string;
 	onQueryChange: (query: string) => void;
 	showArchived: boolean;
@@ -133,7 +229,7 @@ export function SidebarToolbar({
 	return (
 		<div className="sidebar-toolbar">
 			<div className="toolbar-actions">
-				<button className="primary-button" type="button" onClick={onNew}>
+				<button className="primary-button" type="button" onClick={onNew} disabled={disabled}>
 					<Plus size={14} />
 					New session
 				</button>
@@ -141,6 +237,7 @@ export function SidebarToolbar({
 					className={`icon-button ${showArchived ? "pressed" : ""}`}
 					type="button"
 					onClick={onToggleArchived}
+					disabled={disabled}
 					aria-label={showArchived ? "hide archived sessions" : "show archived sessions"}
 					title={showArchived ? "hide archived sessions" : "show archived sessions"}
 				>
@@ -149,7 +246,7 @@ export function SidebarToolbar({
 			</div>
 			<label className="search-box">
 				<Search size={14} />
-				<input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="filter sessions..." />
+				<input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="filter sessions..." disabled={disabled} />
 			</label>
 		</div>
 	);

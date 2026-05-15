@@ -6,6 +6,7 @@ import type {
 	EventFrame,
 	HistoryTree,
 	InputPriority,
+	Project,
 	ProviderConfig,
 	QueuedInputStatus,
 	SessionSnapshot,
@@ -24,7 +25,11 @@ export interface AgentApi {
 	isOpen(): boolean;
 	onEvent(handler: EventHandler): () => void;
 	onStatus(handler: StatusHandler): () => void;
-	listSessions(limit?: number): Promise<SessionSummary[]>;
+	listProjects(): Promise<Project[]>;
+	createProject(params: CreateProjectParams): Promise<Project>;
+	updateProject(params: UpdateProjectParams): Promise<Project>;
+	deleteProject(projectId: string): Promise<DeleteProjectResult>;
+	listSessions(limit?: number, projectId?: string | null): Promise<SessionSummary[]>;
 	getConfig(): Promise<DaemonConfig>;
 	setConfig(systemPrompt: string | null): Promise<DaemonConfig>;
 	listTools(provider: string): Promise<ToolListing[]>;
@@ -46,12 +51,30 @@ export interface AgentApi {
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
 }
 
+export interface CreateProjectParams {
+	name: string;
+	startingCwd: string;
+	metadata?: Record<string, unknown>;
+}
+
+export interface UpdateProjectParams {
+	projectId: string;
+	name?: string;
+	startingCwd?: string;
+}
+
+export interface DeleteProjectResult {
+	project_id: string;
+	deleted: boolean;
+}
+
 export interface GetSessionOptions {
 	includeEntries?: boolean;
 }
 
 export interface StartSessionParams {
 	sessionId: string;
+	projectId: string;
 	provider: ProviderConfig;
 	metadata: Record<string, unknown>;
 	clientInputId: string;
@@ -177,8 +200,38 @@ class AgentApiClient implements AgentApi {
 		return this.client.onStatus(handler);
 	}
 
-	async listSessions(limit = 100): Promise<SessionSummary[]> {
-		const result = await this.client.request<{ sessions: SessionSummary[] }>("session.list", { limit });
+	async listProjects(): Promise<Project[]> {
+		const result = await this.client.request<{ projects: Project[] }>("project.list");
+		return result.projects;
+	}
+
+	createProject(params: CreateProjectParams): Promise<Project> {
+		return this.client.request<Project>("project.create", {
+			name: params.name,
+			starting_cwd: params.startingCwd,
+			metadata: params.metadata
+		});
+	}
+
+	updateProject(params: UpdateProjectParams): Promise<Project> {
+		return this.client.request<Project>("project.update", {
+			project_id: params.projectId,
+			name: params.name,
+			starting_cwd: params.startingCwd
+		});
+	}
+
+	deleteProject(projectId: string): Promise<DeleteProjectResult> {
+		return this.client.request<DeleteProjectResult>("project.delete", {
+			project_id: projectId
+		});
+	}
+
+	async listSessions(limit = 100, projectId: string | null = null): Promise<SessionSummary[]> {
+		const result = await this.client.request<{ sessions: SessionSummary[] }>("session.list", {
+			limit,
+			project_id: projectId || undefined
+		});
 		return result.sessions;
 	}
 
@@ -221,6 +274,7 @@ class AgentApiClient implements AgentApi {
 	startSession(params: StartSessionParams): Promise<StartSessionResult> {
 		return this.client.request<StartSessionResult>("session.start", {
 			session_id: params.sessionId,
+			project_id: params.projectId,
 			provider: params.provider,
 			metadata: params.metadata,
 			client_input_id: params.clientInputId,

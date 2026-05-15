@@ -16,6 +16,12 @@ pub(crate) fn parse_user_message(value: Value) -> std::result::Result<UserMessag
     Ok(UserMessage::from_parts(content))
 }
 
+pub(crate) fn required_uuid(params: &Value, key: &str) -> std::result::Result<Uuid, RpcError> {
+    let value = required_string(params, key)?;
+    Uuid::parse_str(&value)
+        .map_err(|error| RpcError::new("invalid_params", format!("{key} must be a UUID: {error}")))
+}
+
 pub(crate) fn parse_assistant_message(
     value: Value,
 ) -> std::result::Result<AssistantMessage, RpcError> {

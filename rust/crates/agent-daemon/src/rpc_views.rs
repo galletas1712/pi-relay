@@ -1,5 +1,5 @@
 use agent_session::StoredTranscriptEntry;
-use agent_store::{GlobalConfig, HistoryTree, SessionSnapshot, SessionSummary};
+use agent_store::{GlobalConfig, HistoryTree, Project, SessionSnapshot, SessionSummary};
 use serde_json::{json, Value};
 
 pub(crate) fn global_config(config: GlobalConfig) -> Value {
@@ -8,9 +8,21 @@ pub(crate) fn global_config(config: GlobalConfig) -> Value {
     })
 }
 
+pub(crate) fn project(project: Project) -> Value {
+    json!({
+        "project_id": project.project_id,
+        "name": project.name,
+        "starting_cwd": project.starting_cwd,
+        "metadata": project.metadata,
+        "created_at": project.created_at,
+        "updated_at": project.updated_at,
+    })
+}
+
 pub(crate) fn session_summary(summary: SessionSummary) -> Value {
     json!({
         "session_id": summary.session_id,
+        "project_id": summary.project_id,
         "activity": summary.activity,
         "active_leaf_id": summary.active_leaf_id,
         "provider": summary.provider,
@@ -54,6 +66,7 @@ pub(crate) fn session_snapshot(
 
     let mut value = json!({
         "session_id": snapshot.session_id,
+        "project_id": snapshot.project_id,
         "activity": snapshot.activity,
         "active_leaf_id": snapshot.active_leaf_id,
         "provider": snapshot.provider,

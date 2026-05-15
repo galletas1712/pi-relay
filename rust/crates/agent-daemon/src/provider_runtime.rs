@@ -24,7 +24,7 @@ pub(crate) async fn run_model(
         model: config.provider.model.clone(),
         prompt: PromptSections::new(
             state.repo.global_system_prompt().await?,
-            Some(dynamic_prompt_context(state)),
+            Some(dynamic_prompt_context(state, config)),
         ),
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
@@ -110,13 +110,18 @@ pub(crate) async fn run_compaction(
     Ok(summary)
 }
 
-fn dynamic_prompt_context(state: &AppState) -> String {
+pub(crate) fn dynamic_prompt_context_for_cwd(cwd: &std::path::Path) -> String {
     format!(
         "Current working directory: {}\n\
          The bash tool runs each command in a fresh shell rooted here; chain commands with `&&` \
          (or call `cd` inside the command) when you need to scope work to a subdirectory.",
-        state.tool_context.cwd.display()
+        cwd.display()
     )
+}
+
+fn dynamic_prompt_context(_state: &AppState, config: &SessionConfig) -> String {
+    let cwd = std::path::Path::new(&config.starting_cwd);
+    dynamic_prompt_context_for_cwd(cwd)
 }
 
 fn provider_transcript(model_context: ModelContext) -> Vec<ModelTranscriptEntry> {

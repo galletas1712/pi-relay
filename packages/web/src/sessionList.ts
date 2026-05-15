@@ -1,7 +1,7 @@
-import type { Activity, SessionSummary } from "./types.ts";
+import type { Activity, Project, SessionSummary } from "./types.ts";
 
 export type SessionListItem = SessionSummary;
-export type SessionDisplayInfo = Pick<SessionSummary, "session_id" | "activity" | "active_leaf_id" | "provider" | "metadata">;
+export type SessionDisplayInfo = Pick<SessionSummary, "session_id" | "project_id" | "activity" | "active_leaf_id" | "provider" | "metadata">;
 export type SessionDisplayActivity = "idle" | "running";
 
 export function sessionTitle(session: SessionDisplayInfo): string {
@@ -29,4 +29,9 @@ export function tallyActivities(sessions: SessionListItem[]): Record<SessionDisp
 		},
 		{ idle: 0, running: 0 }
 	);
+}
+
+export function projectTitle(project: Project): string {
+	const name = project.name.trim();
+	return name || project.project_id.slice(0, 8);
 }

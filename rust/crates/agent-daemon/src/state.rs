@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -18,5 +19,6 @@ pub(crate) struct AppState {
     pub(crate) dispatch_tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
     pub(crate) events: broadcast::Sender<EventFrame>,
     pub(crate) tools: Arc<ToolRegistry>,
-    pub(crate) tool_context: ToolContext,
+    pub(crate) default_tool_context: ToolContext,
+    pub(crate) default_workspace: PathBuf,
 }
