@@ -1,21 +1,14 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent, type SetStateAction } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
 import { createAgentApi } from "./agentApi.ts";
-import { Composer } from "./composer.tsx";
-import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from "./drafts.ts";
+import { ChatPane } from "./chatPane.tsx";
+import { Composer, type ComposerHandle } from "./composer.tsx";
 import { HistoryPickerDialog } from "./historyPicker.tsx";
 import { branchEntriesFor, type HistoryTargetOption } from "./historyTargets.ts";
 import { ExportDialog } from "./exportDialog.tsx";
 import { randomId } from "./ids.ts";
-import {
-	Inspector,
-	LogHeader,
-	NoticeStack,
-	SidebarHeader,
-	SidebarToolbar,
-	SessionRow
-} from "./panels.tsx";
+import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
 import type { ConnectionStatus } from "./rpc.ts";
-import { COMMANDS, filterCommands, findCommand, matchSlashPrefix, parseSlash, type ParsedSlash } from "./slash.ts";
+import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import {
 	DEFAULT_PROVIDER,
 	MODEL_OPTIONS,
@@ -28,7 +21,6 @@ import {
 } from "./sessionDefaults.ts";
 import { sessionTitle, isArchivedSession, tallyActivities, type SessionListItem } from "./sessionList.ts";
 import { firstLine, truncate } from "./text.ts";
-import { MessageList } from "./transcript.tsx";
 import type {
 	DaemonConfig,
 	EventFrame,
@@ -43,7 +35,6 @@ import type {
 
 const MAX_NOTICES = 24;
 const NOTICE_TTL_MS = 4000;
-const OLD_DRAFT_STORAGE_KEYS = ["pi-relay.web.draft-sessions.v1", "pi-relay.web.composer-drafts.v1"];
 
 type ExportDialogState = {
 	entries: TranscriptEntry[];
@@ -73,9 +64,7 @@ export function App() {
 	const [config, setConfig] = useState<DaemonConfig>({ system_prompt: null });
 	const [tools, setTools] = useState<ToolListing[]>([]);
 	const [query, setQuery] = useState("");
-	const [composer, setComposer] = useState(() => loadComposerDraft(null));
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
-	const [slashIndex, setSlashIndex] = useState(0);
 	const [sending, setSending] = useState(false);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
@@ -88,38 +77,14 @@ export function App() {
 	const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
 
 	const refreshTimer = useRef<number | null>(null);
-	const composerRef = useRef<HTMLTextAreaElement | null>(null);
-	const composerValueRef = useRef(composer);
+	const composerHandleRef = useRef<ComposerHandle | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
-	const pendingComposerBySession = useRef(new Map<string, string>());
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
 
-	useEffect(() => {
-		try {
-			for (const key of OLD_DRAFT_STORAGE_KEYS) window.localStorage.removeItem(key);
-		} catch {
-			// Legacy draft cleanup is best-effort; current composer drafts use v2 storage.
-		}
-	}, []);
-
-	const replaceComposer = useCallback((value: string) => {
-		composerValueRef.current = value;
-		setComposer(value);
-	}, []);
-
-	const updateComposerDraft = useCallback((value: string) => {
-		composerValueRef.current = value;
-		setComposer(value);
-		saveComposerDraft(selectedRef.current, value);
-	}, []);
-
 	const selectSession = useCallback(
-		(sessionId: string | null, options: { saveCurrentDraft?: boolean } = {}) => {
+		(sessionId: string | null) => {
 			const previousSessionId = selectedRef.current;
-			if (options.saveCurrentDraft !== false) {
-				saveComposerDraft(previousSessionId, composerValueRef.current);
-			}
 			if (sessionId === previousSessionId) {
 				if (sessionId === null) nextSessionTitleRef.current = null;
 				return;
@@ -127,10 +92,8 @@ export function App() {
 			if (sessionId === null) nextSessionTitleRef.current = null;
 			selectedRef.current = sessionId;
 			setSelectedId(sessionId);
-			const pendingComposer = sessionId ? pendingComposerBySession.current.get(sessionId) : undefined;
-			replaceComposer(pendingComposer ?? loadComposerDraft(sessionId));
 		},
-		[replaceComposer]
+		[]
 	);
 
 	useEffect(() => {
@@ -240,14 +203,8 @@ export function App() {
 		if (!selectedId) {
 			setSnapshot(null);
 			setEntries([]);
-			replaceComposer(loadComposerDraft(null));
 			return;
 		}
-		const pendingComposer = pendingComposerBySession.current.get(selectedId);
-		const nextComposer = pendingComposer ?? loadComposerDraft(selectedId);
-		replaceComposer(nextComposer);
-		if (pendingComposer !== undefined) saveComposerDraft(selectedId, pendingComposer);
-		pendingComposerBySession.current.delete(selectedId);
 		let cancelled = false;
 		void refreshSelected(selectedId)
 			.catch((error) => {
@@ -256,7 +213,7 @@ export function App() {
 		return () => {
 			cancelled = true;
 		};
-	}, [pushNotice, refreshSelected, replaceComposer, selectedId]);
+	}, [pushNotice, refreshSelected, selectedId]);
 
 	useEffect(() => {
 		if (connection !== "open") return;
@@ -293,6 +250,27 @@ export function App() {
 		() => sessionItems.find((session) => session.session_id === selectedId) ?? null,
 		[sessionItems, selectedId]
 	);
+	const snapshotChatSession = useMemo(() => {
+		if (!selectedId || !snapshot) return null;
+		return {
+			session_id: selectedId,
+			activity: snapshot.activity,
+			active_leaf_id: snapshot.active_leaf_id,
+			provider: snapshot.provider,
+			metadata: snapshot.metadata
+		};
+	}, [selectedId, snapshot]);
+	const selectedListChatSession = useMemo(() => {
+		if (!selectedId) return null;
+		return {
+			session_id: selectedId,
+			activity: selectedSession?.activity ?? "idle",
+			active_leaf_id: selectedSession?.active_leaf_id ?? null,
+			provider: selectedSession?.provider ?? newSessionProvider,
+			metadata: selectedSession?.metadata ?? {}
+		};
+	}, [newSessionProvider, selectedId, selectedSession]);
+	const selectedChatSession = snapshotChatSession ?? selectedListChatSession;
 
 	const activeProvider = snapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
 	const activeProviderKind = activeProvider.kind;
@@ -421,15 +399,14 @@ export function App() {
 				refreshTimer.current = null;
 			}
 			lastEventIds.current.delete(sessionId);
-			pendingComposerBySession.current.delete(sessionId);
-			clearComposerDraft(sessionId);
+			composerHandleRef.current?.clearSession(sessionId);
 			setSessions((currentSessions) => currentSessions.filter((session) => session.session_id !== sessionId));
 
 			if (selectedRef.current === sessionId) {
-				selectSession(null, { saveCurrentDraft: false });
+				selectSession(null);
 				setSnapshot(null);
 				setEntries([]);
-				updateComposerDraft("");
+				composerHandleRef.current?.setValue("");
 			}
 
 			closeDeleteDialog();
@@ -439,17 +416,7 @@ export function App() {
 			setDeleteDialog((current) => (current?.session.session_id === sessionId ? { ...current, deleting: false } : current));
 			throw error;
 		}
-	}, [api, closeDeleteDialog, deleteDialog, loadSessions, pushNotice, refreshSelected, selectSession, updateComposerDraft]);
-
-	const slashState = useMemo<{ visible: boolean; commands: typeof COMMANDS }>(() => {
-		const prefix = matchSlashPrefix(composer);
-		if (prefix === null) return { visible: false, commands: [] };
-		return { visible: true, commands: filterCommands(prefix) };
-	}, [composer]);
-
-	useEffect(() => {
-		setSlashIndex(0);
-	}, [slashState.commands, slashState.visible]);
+	}, [api, closeDeleteDialog, deleteDialog, loadSessions, pushNotice, refreshSelected, selectSession]);
 
 	const createSession = useCallback(
 		(title?: string) => {
@@ -457,11 +424,11 @@ export function App() {
 			selectSession(null);
 			setSnapshot(null);
 			setEntries([]);
-			updateComposerDraft("");
-			requestAnimationFrame(() => composerRef.current?.focus());
+			composerHandleRef.current?.setValue("");
+			requestAnimationFrame(() => composerHandleRef.current?.focus());
 			return null;
 		},
-		[selectSession, updateComposerDraft]
+		[selectSession]
 	);
 
 	const requireSelected = useCallback(() => {
@@ -536,8 +503,7 @@ export function App() {
 				});
 			}
 			if (target.restoreText !== undefined) {
-				pendingComposerBySession.current.set(fork.session_id, target.restoreText);
-				saveComposerDraft(fork.session_id, target.restoreText);
+				composerHandleRef.current?.setValueForSession(fork.session_id, target.restoreText);
 			}
 			await loadSessions();
 			selectSession(fork.session_id);
@@ -561,12 +527,12 @@ export function App() {
 			});
 			await refreshSelected(sessionId);
 			if (target.restoreText !== undefined) {
-				updateComposerDraft(target.restoreText);
+				composerHandleRef.current?.setValue(target.restoreText);
 			}
 			void loadSessions().catch(() => undefined);
 			pushNotice("success", target.restoreText !== undefined ? "message restored for editing" : "switched to selected history point");
 		},
-		[api, loadSessions, pushNotice, refreshSelected, requireSelected, snapshot?.active_leaf_id, snapshot?.activity, updateComposerDraft]
+		[api, loadSessions, pushNotice, refreshSelected, requireSelected, snapshot?.active_leaf_id, snapshot?.activity]
 	);
 
 	const promoteQueuedInput = useCallback(
@@ -697,20 +663,10 @@ export function App() {
 		]
 	);
 
-	const sendComposer = useCallback(async () => {
-		const text = composer.trim();
-		if (!text || sending) return;
-		const draftSessionId = selectedRef.current;
+	const submitComposer = useCallback(async (text: string) => {
+		if (!text.trim() || sending) return false;
+		text = text.trim();
 		const slash = parseSlash(text);
-		if (slash) {
-			const command = findCommand(slash.name);
-			if (command?.requiresArgs && !slash.args) {
-				updateComposerDraft(`/${command.name} `);
-				pushNotice("info", `usage: /${command.name} ${command.argumentHint ?? "<args>"}`);
-				requestAnimationFrame(() => composerRef.current?.focus());
-				return;
-			}
-		}
 		setSending(true);
 		try {
 			if (slash) {
@@ -722,144 +678,116 @@ export function App() {
 					await startNewSession(text);
 				}
 			}
-			clearComposerDraft(draftSessionId);
-			clearComposerDraft(selectedRef.current);
-			replaceComposer("");
-			requestAnimationFrame(() => composerRef.current?.focus());
+			return true;
 		} catch (error) {
 			pushNotice("error", errorMessage(error));
+			return false;
 		} finally {
 			setSending(false);
 		}
-	}, [composer, executeSlash, pushNotice, queueUserInput, replaceComposer, sending, startNewSession, updateComposerDraft]);
-
-	const onComposerKeyDown = useCallback(
-		(event: KeyboardEvent<HTMLTextAreaElement>) => {
-			if (slashState.visible && slashState.commands.length > 0) {
-				if (event.key === "ArrowDown") {
-					event.preventDefault();
-					setSlashIndex((index) => (index + 1) % slashState.commands.length);
-					return;
-				}
-				if (event.key === "ArrowUp") {
-					event.preventDefault();
-					setSlashIndex((index) => (index - 1 + slashState.commands.length) % slashState.commands.length);
-					return;
-				}
-				if (event.key === "Tab") {
-					event.preventDefault();
-					const command = slashState.commands[Math.min(slashIndex, slashState.commands.length - 1)];
-					updateComposerDraft(`/${command.name} `);
-					return;
-				}
-				if (event.key === "Enter" && !event.shiftKey) {
-					event.preventDefault();
-					const command = slashState.commands[Math.min(slashIndex, slashState.commands.length - 1)];
-					const typedCommand = matchSlashPrefix(composer) ?? "";
-					if (command.name === typedCommand && !command.requiresArgs) {
-						void sendComposer();
-					} else {
-						updateComposerDraft(`/${command.name} `);
-					}
-					return;
-				}
-			}
-			if (event.key === "Enter" && !event.shiftKey) {
-				event.preventDefault();
-				void sendComposer();
-			}
-		},
-		[composer, sendComposer, slashIndex, slashState.commands, slashState.visible, updateComposerDraft]
-	);
+	}, [executeSlash, pushNotice, queueUserInput, sending, startNewSession]);
 
 	const layoutStyle = {
 		gridTemplateColumns: rightOpen ? "280px minmax(0,1fr) minmax(320px,380px)" : "280px minmax(0,1fr)"
 	};
 	const canStop = !!selectedId && snapshot?.activity === "running";
 	const queuedInputs = snapshot?.queued_inputs ?? [];
+	const handleToggleArchived = useCallback(() => {
+		setShowArchived((show) => !show);
+	}, []);
+	const handleSidebarNew = useCallback(() => {
+		void createSession();
+	}, [createSession]);
+	const handleArchiveToggle = useCallback(
+		(session: SessionListItem) => {
+			void setSessionArchived(session, !isArchivedSession(session)).catch((error) => pushNotice("error", errorMessage(error)));
+		},
+		[pushNotice, setSessionArchived]
+	);
+	const handleSidebarDelete = useCallback((session: SessionListItem) => {
+		setDeleteDialog({ session, deleting: false });
+	}, []);
+	const handleModelChange = useCallback(
+		(value: string) => {
+			void changeModel(value).catch((error) => pushNotice("error", errorMessage(error)));
+		},
+		[changeModel, pushNotice]
+	);
+	const handleReasoningEffortChange = useCallback(
+		(value: ReasoningEffort) => {
+			void changeReasoningEffort(value).catch((error) => pushNotice("error", errorMessage(error)));
+		},
+		[changeReasoningEffort, pushNotice]
+	);
+	const handleToggleRight = useCallback(() => {
+		setRightOpen((open) => !open);
+	}, []);
+	const handleResumeTurn = useCallback(
+		(entryId: string) => {
+			void resumeTerminalTurn(entryId).catch((error) => pushNotice("error", errorMessage(error)));
+		},
+		[pushNotice, resumeTerminalTurn]
+	);
+	const handleStop = useCallback(() => {
+		void stopActiveTurn();
+	}, [stopActiveTurn]);
+	const handlePromoteQueued = useCallback(
+		(inputId: string) => {
+			void promoteQueuedInput(inputId).catch((error) => pushNotice("error", errorMessage(error)));
+		},
+		[promoteQueuedInput, pushNotice]
+	);
 
 	return (
 		<div className="app-shell" style={layoutStyle}>
-			<aside className="sidebar" data-slot="sidebar">
-				<SidebarHeader counts={counts} total={activeSessionItems.length} archived={archivedCount} connection={connection} />
-				<SidebarToolbar
-					query={query}
-					onQueryChange={setQuery}
-					showArchived={showArchived}
-					onToggleArchived={() => setShowArchived((show) => !show)}
-					onNew={() => void createSession()}
-				/>
-				<div className="session-list" role="listbox" aria-label="sessions">
-					{filteredSessions.map((session) => (
-						<SessionRow
-							key={session.session_id}
-							session={session}
-							selected={session.session_id === selectedId}
-							onSelect={() => selectSession(session.session_id)}
-							onRename={() => openRenameDialog(session)}
-							onArchiveToggle={() => {
-								void setSessionArchived(session, !isArchivedSession(session)).catch((error) => pushNotice("error", errorMessage(error)));
-							}}
-							onDelete={() => setDeleteDialog({ session, deleting: false })}
-						/>
-					))}
-					{filteredSessions.length === 0 ? <div className="empty-list">No sessions</div> : null}
-				</div>
-			</aside>
+			<Sidebar
+				counts={counts}
+				total={activeSessionItems.length}
+				archived={archivedCount}
+				connection={connection}
+				query={query}
+				showArchived={showArchived}
+				filteredSessions={filteredSessions}
+				selectedId={selectedId}
+				onQueryChange={setQuery}
+				onToggleArchived={handleToggleArchived}
+				onNew={handleSidebarNew}
+				onSelectSession={selectSession}
+				onRename={openRenameDialog}
+				onArchiveToggle={handleArchiveToggle}
+				onDelete={handleSidebarDelete}
+			/>
 
-			<main className="log-pane" data-slot="agent-log">
-				<LogHeader
-					session={selectedSession}
-					snapshot={snapshot}
-					modelOptions={MODEL_OPTIONS}
-					modelValue={providerModelKey(activeProvider)}
-					modelLocked={modelLocked}
-					modelControlsDisabled={modelControlsDisabled}
-					reasoningEfforts={reasoningEfforts}
-					reasoningEffort={providerReasoningEffort(activeProvider)}
-					onModelChange={(value) => {
-						void changeModel(value).catch((error) => pushNotice("error", errorMessage(error)));
-					}}
-					onReasoningEffortChange={(value) => {
-						void changeReasoningEffort(value).catch((error) => pushNotice("error", errorMessage(error)));
-					}}
-					rightOpen={rightOpen}
-					onToggleRight={() => setRightOpen((open) => !open)}
-				/>
-				<MessageList
-					entries={entries}
-					activeLeafId={snapshot?.active_leaf_id ?? null}
-					isRunning={snapshot?.activity === "running"}
-					hasSession={!!selectedId}
-					sessionId={selectedId}
-					onResumeTurn={(entryId) => {
-						void resumeTerminalTurn(entryId).catch((error) => pushNotice("error", errorMessage(error)));
-					}}
-					resumingTurnId={resumingTurnId}
-				/>
-			</main>
+			<ChatPane
+				session={selectedChatSession}
+				snapshot={snapshot}
+				entries={entries}
+				modelOptions={MODEL_OPTIONS}
+				modelValue={providerModelKey(activeProvider)}
+				modelLocked={modelLocked}
+				modelControlsDisabled={modelControlsDisabled}
+				reasoningEfforts={reasoningEfforts}
+				reasoningEffort={providerReasoningEffort(activeProvider)}
+				rightOpen={rightOpen}
+				selectedId={selectedId}
+				resumingTurnId={resumingTurnId}
+				onModelChange={handleModelChange}
+				onReasoningEffortChange={handleReasoningEffortChange}
+				onToggleRight={handleToggleRight}
+				onResumeTurn={handleResumeTurn}
+			/>
 
 			<footer className="chat-dock" data-slot="chat-box">
 				<Composer
-					value={composer}
 					selectedId={selectedId}
-					textAreaRef={composerRef}
+					composerHandleRef={composerHandleRef}
 					sending={sending}
 					canStop={canStop}
 					stopping={stopping}
-					slashCommands={slashState.commands}
-					slashVisible={slashState.visible}
-					slashIndex={slashIndex}
 					queuedInputs={queuedInputs}
-					onChange={updateComposerDraft}
-					onKeyDown={onComposerKeyDown}
-					onSend={() => void sendComposer()}
-					onStop={() => void stopActiveTurn()}
-					onSetSlashIndex={setSlashIndex}
-					onSelectSlash={(command) => updateComposerDraft(`/${command.name} `)}
-					onPromoteQueued={(inputId) => {
-						void promoteQueuedInput(inputId).catch((error) => pushNotice("error", errorMessage(error)));
-					}}
+					onSubmit={submitComposer}
+					onStop={handleStop}
+					onPromoteQueued={handlePromoteQueued}
 				/>
 			</footer>
 

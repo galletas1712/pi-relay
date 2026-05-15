@@ -9,9 +9,9 @@ import {
 	Settings,
 	Trash2
 } from "lucide-react";
-import type { ModelOption } from "./sessionDefaults.ts";
+import { memo } from "react";
 import { COMMANDS } from "./slash.ts";
-import { displayActivity, isArchivedSession, sessionDisplayActivity, sessionTitle, type SessionDisplayActivity, type SessionListItem } from "./sessionList.ts";
+import { isArchivedSession, sessionDisplayActivity, sessionTitle, type SessionDisplayActivity, type SessionListItem } from "./sessionList.ts";
 import { truncate } from "./text.ts";
 import type { DaemonConfig, Notice, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
 
@@ -53,6 +53,69 @@ export function SidebarHeader({
 		</div>
 	);
 }
+
+export interface SidebarProps {
+	counts: Record<SessionDisplayActivity, number>;
+	total: number;
+	archived: number;
+	connection: string;
+	query: string;
+	showArchived: boolean;
+	filteredSessions: SessionListItem[];
+	selectedId: string | null;
+	onQueryChange: (query: string) => void;
+	onToggleArchived: () => void;
+	onNew: () => void;
+	onSelectSession: (sessionId: string) => void;
+	onRename: (session: SessionListItem) => void;
+	onArchiveToggle: (session: SessionListItem) => void;
+	onDelete: (session: SessionListItem) => void;
+}
+
+export const Sidebar = memo(function Sidebar({
+	counts,
+	total,
+	archived,
+	connection,
+	query,
+	showArchived,
+	filteredSessions,
+	selectedId,
+	onQueryChange,
+	onToggleArchived,
+	onNew,
+	onSelectSession,
+	onRename,
+	onArchiveToggle,
+	onDelete
+}: SidebarProps) {
+	return (
+		<aside className="sidebar" data-slot="sidebar">
+			<SidebarHeader counts={counts} total={total} archived={archived} connection={connection} />
+			<SidebarToolbar
+				query={query}
+				onQueryChange={onQueryChange}
+				showArchived={showArchived}
+				onToggleArchived={onToggleArchived}
+				onNew={onNew}
+			/>
+			<div className="session-list" role="listbox" aria-label="sessions">
+				{filteredSessions.map((session) => (
+					<SessionRow
+						key={session.session_id}
+						session={session}
+						selected={session.session_id === selectedId}
+						onSelect={() => onSelectSession(session.session_id)}
+						onRename={() => onRename(session)}
+						onArchiveToggle={() => onArchiveToggle(session)}
+						onDelete={() => onDelete(session)}
+					/>
+				))}
+				{filteredSessions.length === 0 ? <div className="empty-list">No sessions</div> : null}
+			</div>
+		</aside>
+	);
+});
 
 export function SidebarToolbar({
 	query,
@@ -188,12 +251,13 @@ export function SessionRow({
 }
 
 export function LogHeader({
-	session,
-	snapshot,
+	archived,
+	activity,
+	title,
 	modelOptions,
 	modelValue,
-	modelLocked,
-	modelControlsDisabled,
+	modelDisabled,
+	modelDisabledTitle,
 	reasoningEfforts,
 	reasoningEffort,
 	onModelChange,
@@ -201,12 +265,13 @@ export function LogHeader({
 	rightOpen,
 	onToggleRight
 }: {
-	session: SessionListItem | null;
-	snapshot: SessionSnapshot | null;
-	modelOptions: ModelOption[];
+	archived: boolean;
+	activity: SessionDisplayActivity | null;
+	title: string | null;
+	modelOptions: { id: string; label: string }[];
 	modelValue: string;
-	modelLocked: boolean;
-	modelControlsDisabled: boolean;
+	modelDisabled: boolean;
+	modelDisabledTitle: string;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	onModelChange: (value: string) => void;
@@ -214,24 +279,16 @@ export function LogHeader({
 	rightOpen: boolean;
 	onToggleRight: () => void;
 }) {
-	const archived = session ? isArchivedSession(session) : false;
-	const modelDisabled = modelLocked || modelControlsDisabled;
-	const displayedModelOptions = modelOptions.some((option) => option.id === modelValue)
-		? modelOptions
-		: [{ id: modelValue, label: modelValue }, ...modelOptions];
-	const displayedEfforts = reasoningEfforts.includes(reasoningEffort)
-		? reasoningEfforts
-		: [reasoningEffort, ...reasoningEfforts];
 	return (
 		<div className="log-header">
-			{session ? (
-				<span className={`session-state ${archived ? "archived" : displayActivity(snapshot?.activity ?? session.activity)}`}>
-					{archived ? "archived" : displayActivity(snapshot?.activity ?? session.activity)}
+			{title ? (
+				<span className={`session-state ${archived ? "archived" : activity ?? "idle"}`}>
+					{archived ? "archived" : activity}
 				</span>
 			) : null}
-			{session ? (
+			{title ? (
 				<span className="log-session">
-					{sessionTitle(session)}
+					{title}
 				</span>
 			) : (
 				<span className="log-session">No session selected</span>
@@ -242,10 +299,10 @@ export function LogHeader({
 					<select
 						value={modelValue}
 						disabled={modelDisabled}
-						title={modelLocked ? "model is locked after the first transcript entry" : "model"}
+						title={modelDisabledTitle}
 						onChange={(event) => onModelChange(event.target.value)}
 					>
-						{displayedModelOptions.map((option) => (
+						{modelOptions.map((option) => (
 							<option key={option.id} value={option.id}>{option.label}</option>
 						))}
 					</select>
@@ -257,7 +314,7 @@ export function LogHeader({
 						title="reasoning effort"
 						onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
 					>
-						{displayedEfforts.map((effort) => (
+						{reasoningEfforts.map((effort) => (
 							<option key={effort} value={effort}>{effort}</option>
 						))}
 					</select>

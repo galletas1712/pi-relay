@@ -1,18 +1,19 @@
 import type { Activity, SessionSummary } from "./types.ts";
 
 export type SessionListItem = SessionSummary;
+export type SessionDisplayInfo = Pick<SessionSummary, "session_id" | "activity" | "active_leaf_id" | "provider" | "metadata">;
 export type SessionDisplayActivity = "idle" | "running";
 
-export function sessionTitle(session: SessionListItem): string {
+export function sessionTitle(session: SessionDisplayInfo): string {
 	const title = session.metadata?.title;
 	return typeof title === "string" && title.trim() ? title : session.session_id.slice(0, 13);
 }
 
-export function isArchivedSession(session: SessionListItem): boolean {
+export function isArchivedSession(session: SessionDisplayInfo): boolean {
 	return session.metadata?.archived === true;
 }
 
-export function sessionDisplayActivity(session: SessionListItem): SessionDisplayActivity {
+export function sessionDisplayActivity(session: SessionDisplayInfo): SessionDisplayActivity {
 	return displayActivity(session.activity);
 }
 

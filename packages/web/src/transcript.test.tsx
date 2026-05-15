@@ -78,9 +78,10 @@ function replay(provider: ProviderReplayItem["provider"], raw: unknown, display:
 }
 
 describe("isScrolledAtBottom", () => {
-	it("only treats the exact bottom as pinned", () => {
+	it("treats the exact bottom and sub-pixel distance as pinned", () => {
 		expect(isScrolledAtBottom({ scrollHeight: 1000, scrollTop: 600, clientHeight: 400 })).toBe(true);
-		expect(isScrolledAtBottom({ scrollHeight: 1000, scrollTop: 599, clientHeight: 400 })).toBe(false);
+		expect(isScrolledAtBottom({ scrollHeight: 1000, scrollTop: 599.25, clientHeight: 400 })).toBe(true);
+		expect(isScrolledAtBottom({ scrollHeight: 1000, scrollTop: 598.9, clientHeight: 400 })).toBe(false);
 	});
 
 	it("treats overscroll past the bottom as pinned", () => {

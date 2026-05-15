@@ -2,13 +2,11 @@ export interface SlashCommandInfo {
 	name: string;
 	description: string;
 	argumentHint?: string;
-	requiresArgs?: boolean;
 }
 
 export interface ParsedSlash {
 	name: string;
 	args: string;
-	raw: string;
 }
 
 export const COMMANDS: SlashCommandInfo[] = [
@@ -42,7 +40,6 @@ export function parseSlash(input: string): ParsedSlash | null {
 	const match = trimmed.match(/^\/([^\s]*)(?:\s+([\s\S]*))?$/);
 	return {
 		name: (match?.[1] ?? "").toLowerCase(),
-		args: (match?.[2] ?? "").trim(),
-		raw: trimmed
+		args: (match?.[2] ?? "").trim()
 	};
 }

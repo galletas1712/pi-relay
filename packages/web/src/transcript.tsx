@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useMemo, useRef, useState, type UIEvent } from "react";
+import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type UIEvent } from "react";
 import { AlertTriangle, Check, ChevronDown, Copy, Globe2, Loader2, RotateCcw, Terminal, Wrench } from "lucide-react";
 import rehypeRaw from "rehype-raw";
 import ReactMarkdown from "react-markdown";
@@ -13,12 +13,13 @@ import type { AssistantItem, NoticeTone, ReplayDisplay, TranscriptEntry, Transcr
 type ToolResultItem = Extract<TranscriptItem, { type: "tool_result" }>;
 
 type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
+const STICKY_BOTTOM_EPSILON_PX = 1;
 
 export function isScrolledAtBottom(node: ScrollMetrics): boolean {
-	return node.scrollHeight - node.scrollTop - node.clientHeight <= 0;
+	return node.scrollHeight - node.scrollTop - node.clientHeight <= STICKY_BOTTOM_EPSILON_PX;
 }
 
-export function MessageList({
+export const MessageList = memo(function MessageList({
 	entries,
 	activeLeafId,
 	isRunning,
@@ -36,6 +37,7 @@ export function MessageList({
 	resumingTurnId?: string | null;
 }) {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
+	const contentRef = useRef<HTMLDivElement | null>(null);
 	const shouldStickToBottomRef = useRef(true);
 	const scrollResetKeyRef = useRef<string | null | undefined>(undefined);
 	const visibleEntries = useMemo(
@@ -65,6 +67,19 @@ export function MessageList({
 		if (!shouldStickToBottomRef.current) return;
 		scrollToBottom();
 	}, [isRunning, scrollToBottom, visibleEntries]);
+
+	useLayoutEffect(() => {
+		if (!hasSession || typeof ResizeObserver === "undefined") return;
+		const scroller = scrollRef.current;
+		const content = contentRef.current;
+		if (!scroller || !content) return;
+		const observer = new ResizeObserver(() => {
+			if (shouldStickToBottomRef.current) scrollToBottom();
+		});
+		observer.observe(scroller);
+		observer.observe(content);
+		return () => observer.disconnect();
+	}, [hasSession, scrollToBottom]);
 	const toolIndex = useMemo(() => indexToolEntries(visibleEntries), [visibleEntries]);
 	const modelStepsByEntry = useMemo(() => {
 		const steps = new Map<string, ModelStepView>();
@@ -87,29 +102,31 @@ export function MessageList({
 
 	return (
 		<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
-			{visibleEntries.map((entry) => (
-				<TranscriptEntryView
-					entry={entry}
-					key={entry.id}
-					modelStep={modelStepsByEntry.get(entry.id)}
-					toolIndex={toolIndex}
-					isActiveLeaf={entry.id === activeLeafId}
-					isRunning={isRunning}
-					onResumeTurn={onResumeTurn}
-					resuming={entry.id === resumingTurnId}
-				/>
-			))}
-			{isRunning ? (
-				<div className="activity-indicator">
-					<Loader2 className="spin" size={14} />
-					Agent active
-				</div>
-			) : null}
+			<div className="message-scroll-content" ref={contentRef}>
+				{visibleEntries.map((entry) => (
+					<TranscriptEntryView
+						entry={entry}
+						key={entry.id}
+						modelStep={modelStepsByEntry.get(entry.id)}
+						toolIndex={toolIndex}
+						isActiveLeaf={entry.id === activeLeafId}
+						isRunning={isRunning}
+						onResumeTurn={onResumeTurn}
+						resuming={entry.id === resumingTurnId}
+					/>
+				))}
+				{isRunning ? (
+					<div className="activity-indicator">
+						<Loader2 className="spin" size={14} />
+						Agent active
+					</div>
+				) : null}
+			</div>
 		</div>
 	);
-}
+});
 
-function TranscriptEntryView({
+const TranscriptEntryView = memo(function TranscriptEntryView({
 	entry,
 	modelStep,
 	toolIndex,
@@ -168,18 +185,18 @@ function TranscriptEntryView({
 		return <SystemMessage tone="info" text="compacted history" />;
 	}
 	return null;
-}
+});
 
-function UserBubble({ item, entryId }: { item: Extract<TranscriptItem, { type: "user_message" }>; entryId: string }) {
+const UserBubble = memo(function UserBubble({ item, entryId }: { item: Extract<TranscriptItem, { type: "user_message" }>; entryId: string }) {
 	return (
 		<div className="message-row user-row">
 			<EntryId entryId={entryId} />
 			<div className="user-bubble">{contentBlocksToText(item.content)}</div>
 		</div>
 	);
-}
+});
 
-function AssistantBlock({
+const AssistantBlock = memo(function AssistantBlock({
 	item,
 	providerReplay,
 	modelStep,
@@ -223,7 +240,7 @@ function AssistantBlock({
 			</div>
 		</div>
 	);
-}
+});
 
 export type AssistantRenderPart =
 	| { type: "text"; key: string; item: Extract<AssistantItem, { type: "text" }> }
@@ -330,7 +347,7 @@ function AssistantCopyButton({ text }: { text: string }) {
 	);
 }
 
-function MarkdownText({ text }: { text: string }) {
+const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
 	return (
 		<div className="assistant-markdown">
 			<ReactMarkdown
@@ -348,7 +365,7 @@ function MarkdownText({ text }: { text: string }) {
 			</ReactMarkdown>
 		</div>
 	);
-}
+});
 
 function CitationList({ citations }: { citations: ReturnType<typeof citationsFromReplay> }) {
 	return (
@@ -371,7 +388,7 @@ function CitationList({ citations }: { citations: ReturnType<typeof citationsFro
 	);
 }
 
-function HostedToolCard({ tool }: { tool: ReturnType<typeof hostedToolsFromReplay>[number] }) {
+const HostedToolCard = memo(function HostedToolCard({ tool }: { tool: ReturnType<typeof hostedToolsFromReplay>[number] }) {
 	const [expanded, setExpanded] = useState(false);
 	const failed = tool.status === "error";
 	const ok = tool.status === "completed";
@@ -407,18 +424,18 @@ function HostedToolCard({ tool }: { tool: ReturnType<typeof hostedToolsFromRepla
 			) : null}
 		</div>
 	);
-}
+});
 
-function ToolResultCard({ item, entryId }: { item: Extract<TranscriptItem, { type: "tool_result" }>; entryId: string }) {
+const ToolResultCard = memo(function ToolResultCard({ item, entryId }: { item: Extract<TranscriptItem, { type: "tool_result" }>; entryId: string }) {
 	return (
 		<div className="message-row tool-row">
 			<EntryId entryId={entryId} />
 			<ToolCard toolName={item.tool_name} toolId={item.tool_call_id} result={item} />
 		</div>
 	);
-}
+});
 
-function ToolCard({
+const ToolCard = memo(function ToolCard({
 	toolName,
 	toolId,
 	argsJson,
@@ -482,7 +499,7 @@ function ToolCard({
 			) : null}
 		</div>
 	);
-}
+});
 
 export interface EditToolPreview {
 	header: string;
