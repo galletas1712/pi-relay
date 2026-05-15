@@ -45,9 +45,12 @@ sending the same websocket frames a frontend would send.
    is rejected with `missing_leaf_id`.
 
 7. Tools are always allowed.
-   The daemon runs model-requested tools immediately. There is no approval,
-   denial, or tool-specific cancel RPC. `input.interrupt` is the one user-facing
-   cancellation command and interrupts the active turn.
+   The daemon runs model-requested tools immediately. There is no approval or
+   denial RPC. `input.interrupt` is the one user-facing cancellation command and
+   interrupts active work. The daemon keeps a per-action task registry and
+   aborts registered model, tool, and compaction futures for the interrupted
+   session on a best-effort basis; durable action status remains the source of
+   truth for stale completions.
 
 8. Daemon death is recoverable state.
    On startup, a daemon marks leftover unfinished action rows stale because the
@@ -553,8 +556,11 @@ queued-row race non-fatal. A missing input id still fails with
 
 ### `input.interrupt`
 
-Interrupts current turn work. If the session is idle, the daemon emits
-`input.ignored` and returns `{ "ignored": true }`.
+Interrupts current work. The daemon marks unfinished action rows for the session
+`interrupted`, aborts registered model/tool/compaction task handles on a
+best-effort basis, emits `session.work_cancelled`, and resumes normal queue
+driving. If the session is idle, the daemon emits `input.ignored` and returns
+`{ "ignored": true }`.
 
 Content blocks use `agent-vocab`:
 
@@ -686,7 +692,9 @@ failures.
 Idle-only in the websocket contract. Requests compaction of the active context
 and creates a running compaction action. The daemon runs the configured provider
 for compaction and writes the compacted transcript root transactionally before
-queued follow-ups can advance.
+queued follow-ups can advance. A user stop/`input.interrupt` during compaction
+aborts the registered compaction task, marks the action `interrupted`, and then
+lets queued inputs continue from the original active leaf.
 
 ## Development Harness RPC
 
@@ -875,6 +883,16 @@ branch off the active path, and finish gracefully once the resumed action
 completes. Also verify `turn.resume` rejects an interrupted tool-running turn
 with `not_resumable`.
 
+### 5b. Interrupt Running Compaction
+
+1. Request compaction on an idle non-empty session.
+2. Before the provider returns, send `input.interrupt`.
+3. Optionally queue a follow-up before or immediately after the interrupt.
+
+Verify the compaction action is marked `interrupted`, `session.work_cancelled`
+is emitted, no compaction summary root is appended by a late provider result,
+and queued follow-ups continue from the pre-compaction active leaf.
+
 ### 6. Rewind Lifecycle
 
 1. Create two completed turns and record boundary leaf ids.
@@ -922,7 +940,8 @@ declared order.
    `parent_id = null`, `source_session_id`, `source_leaf_id`, and
    `last_turn_id`.
 4. Queue a normal follow-up while compaction is running and verify it is not
-   consumed until `compaction.completed` or `compaction.error`.
+   consumed until `compaction.completed`, `compaction.error`, or user interrupt
+   of the compaction.
 5. Request compaction while a model action is running.
 
 Verify compaction emits `compaction.completed` and `history.compacted`, the

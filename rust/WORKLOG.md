@@ -1309,3 +1309,24 @@ paths. Changes made from that review:
   including 2 new envelope tests and 2 new cache-key tests),
   `cargo test --manifest-path rust/Cargo.toml -p agent-daemon` (3 tests), and
   `cargo check --manifest-path rust/Cargo.toml --workspace`.
+
+### Compaction Interrupt Cancellation
+
+- Fixed stop/`input.interrupt` while a provider-backed compaction is running and
+  replaced the daemon's coarse dispatch-task list with a per-action task
+  registry for model, tool, and compaction work. Interrupt now aborts registered
+  task handles for the session on a best-effort basis instead of waiting for
+  provider/tool futures to finish naturally.
+- Added `PostgresAgentStore::cancel_unfinished_session_work`, which marks any
+  unfinished model/tool/compaction rows for a session `interrupted` and emits
+  `session.work_cancelled` without needing an active `AgentSession` runtime.
+  This covers the compaction case, where there is no live turn FSM in memory.
+- Updated the interrupt RPC to use that store-level cancellation when there is
+  no active runtime but unfinished work exists, then drive queued inputs forward
+  from the original active leaf. Late compaction completions are guarded by the
+  existing unfinished-action compare-and-set and cannot append a summary root.
+- Documented interruptable compaction semantics in `docs/websocket-rpc.md`.
+- Verified with `cargo test --manifest-path rust/Cargo.toml -p agent-store --lib`
+  (5 tests, including 3 env-gated cancellation tests),
+  `cargo test --manifest-path rust/Cargo.toml -p agent-daemon` (4 tests), and
+  `cargo check --manifest-path rust/Cargo.toml`.

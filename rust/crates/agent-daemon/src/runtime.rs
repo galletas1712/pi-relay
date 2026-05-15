@@ -6,8 +6,9 @@ use agent_session::{
     TranscriptStorageNode, TranscriptStoreError,
 };
 use agent_store::{
-    AcceptedInput, ActionStatus, ActionUpdate, CompactionJob, EventFrame, EventType, InputPriority,
-    OutputBatch, PersistedAction, QueueMutationError, QueuedInput, SessionActivity, SessionConfig,
+    AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionJob, EventFrame, EventType,
+    InputPriority, OutputBatch, PersistedAction, QueueMutationError, QueuedInput, SessionActivity,
+    SessionConfig,
 };
 use agent_tools::dynamic_tool_context;
 use agent_vocab::{
@@ -16,10 +17,11 @@ use agent_vocab::{
 use anyhow::Context;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
+use tokio::task::JoinHandle;
 
 use crate::codec::transcript_store_from_stored;
 use crate::provider_runtime::{run_compaction, run_model};
-use crate::state::AppState;
+use crate::state::{AppState, RunningTask};
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
 pub(crate) async fn ensure_expected_active_leaf(
@@ -591,21 +593,76 @@ pub(crate) fn spawn_compaction(
     job: CompactionJob,
     config: SessionConfig,
 ) {
-    let task_list = state.dispatch_tasks.clone();
+    prune_finished_tasks(state);
+    let action_row_id = job.action_row_id.clone();
     let task_state = state.clone();
+    let task_session_id = session_id.clone();
+    let task_action_row_id = action_row_id.clone();
     let handle = tokio::spawn(async move {
-        if let Err(error) =
-            run_compaction_job(task_state.clone(), session_id.clone(), job, config).await
-        {
+        let action_row_id = job.action_row_id.clone();
+        let result = run_compaction_job(task_state.clone(), session_id.clone(), job, config).await;
+        unregister_task(&task_state, &action_row_id);
+        if let Err(error) = result {
             eprintln!(
                 "compaction task failed {session_id}: {}: {}",
                 error.code, error.message
             );
         }
     });
-    let mut tasks = task_list.lock().expect("dispatch task list lock poisoned");
-    tasks.retain(|task| !task.is_finished());
-    tasks.push(handle);
+    register_task(
+        state,
+        RunningTask {
+            session_id: task_session_id,
+            action_row_id: task_action_row_id,
+            kind: ActionKind::Compaction,
+            handle,
+        },
+    );
+}
+
+pub(crate) fn abort_session_tasks(state: &AppState, session_id: &str) -> Vec<ActionKind> {
+    let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
+    tasks.retain(|_, task| !task.handle.is_finished());
+    let action_row_ids = tasks
+        .iter()
+        .filter_map(|(action_row_id, task)| {
+            (task.session_id == session_id).then(|| action_row_id.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut aborted = Vec::new();
+    for action_row_id in action_row_ids {
+        if let Some(task) = tasks.remove(&action_row_id) {
+            aborted.push(task.kind);
+            task.handle.abort();
+        }
+    }
+    aborted
+}
+
+pub(crate) fn take_tasks(state: &AppState) -> Vec<JoinHandle<()>> {
+    let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
+    tasks.drain().map(|(_, task)| task.handle).collect()
+}
+
+fn register_task(state: &AppState, task: RunningTask) {
+    state
+        .tasks
+        .lock()
+        .expect("task registry lock poisoned")
+        .insert(task.action_row_id.clone(), task);
+}
+
+fn unregister_task(state: &AppState, action_row_id: &str) {
+    state
+        .tasks
+        .lock()
+        .expect("task registry lock poisoned")
+        .remove(action_row_id);
+}
+
+fn prune_finished_tasks(state: &AppState) {
+    let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
+    tasks.retain(|_, task| !task.handle.is_finished());
 }
 
 async fn run_compaction_job(
@@ -649,8 +706,16 @@ fn spawn_dispatch(state: AppState, session_id: String, dispatch: DispatchAction)
         return;
     }
 
-    let task_list = state.dispatch_tasks.clone();
+    prune_finished_tasks(&state);
+    let action_row_id = dispatch.row_id.clone();
+    let action_kind = match &dispatch.action {
+        SessionAction::RequestModel { .. } => ActionKind::Model,
+        SessionAction::RequestTool { .. } => ActionKind::Tool,
+        SessionAction::CancelSessionWork => return,
+    };
     let task_state = state.clone();
+    let task_session_id = session_id.clone();
+    let task_action_row_id = action_row_id.clone();
     let handle = tokio::spawn(async move {
         let row_id = dispatch.row_id.clone();
         let result = match dispatch.action.clone() {
@@ -662,6 +727,7 @@ fn spawn_dispatch(state: AppState, session_id: String, dispatch: DispatchAction)
             }
             SessionAction::CancelSessionWork => Ok(()),
         };
+        unregister_task(&task_state, &row_id);
         if let Err(error) = result {
             eprintln!(
                 "dispatch task failed {session_id}/{row_id}: {}: {}",
@@ -703,9 +769,15 @@ fn spawn_dispatch(state: AppState, session_id: String, dispatch: DispatchAction)
             }
         }
     });
-    let mut tasks = task_list.lock().expect("dispatch task list lock poisoned");
-    tasks.retain(|task| !task.is_finished());
-    tasks.push(handle);
+    register_task(
+        &state,
+        RunningTask {
+            session_id: task_session_id,
+            action_row_id: task_action_row_id,
+            kind: action_kind,
+            handle,
+        },
+    );
 }
 
 async fn run_model_turn(

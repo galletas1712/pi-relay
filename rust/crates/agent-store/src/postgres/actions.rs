@@ -175,4 +175,283 @@ impl PostgresAgentStore {
             .await?;
         Ok(())
     }
+
+    pub async fn cancel_unfinished_session_work(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<Vec<EventFrame>> {
+        let mut tx = self.pool.begin().await?;
+        let unfinished_actions = action_is_unfinished(None);
+        let query = format!(
+            r#"
+            update actions
+            set status=$2::text,
+                result=$3,
+                updated_at=now()
+            where session_id=$1 and {unfinished_actions}
+            "#
+        );
+        let updated = sqlx::query(&query)
+            .bind(session_id)
+            .bind(ActionStatus::Interrupted.as_str())
+            .bind(json!({ "reason": reason }))
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if updated == 0 {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        let event = insert_event_tx(
+            &mut tx,
+            session_id,
+            EventType::SessionWorkCancelled,
+            json!({ "reason": reason, "actions_interrupted": updated }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(vec![event])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use agent_session::{ModelContext, SessionAction};
+    use agent_vocab::{
+        ActionId, ProviderConfig, ProviderKind, ReasoningEffort, ToolCall, ToolCallId, TurnId,
+        UserMessage,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::{InputPriority, SessionActivity, SessionConfig};
+
+    use super::*;
+
+    static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    struct TestDb {
+        store: PostgresAgentStore,
+        admin_url: String,
+        name: String,
+    }
+
+    impl TestDb {
+        async fn cleanup(self) {
+            self.store.close().await;
+            if let Ok(admin) = sqlx::PgPool::connect(&self.admin_url).await {
+                let _ = sqlx::query(&format!(r#"drop database if exists "{}""#, self.name))
+                    .execute(&admin)
+                    .await;
+                admin.close().await;
+            }
+        }
+    }
+
+    async fn test_store() -> Option<TestDb> {
+        let admin_url = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok()?;
+        let name = format!(
+            "pi_relay_cancel_test_{}_{}",
+            std::process::id(),
+            TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let admin = sqlx::PgPool::connect(&admin_url)
+            .await
+            .expect("connect to PI_RELAY_TEST_DATABASE_URL");
+        sqlx::query(&format!(r#"create database "{name}""#))
+            .execute(&admin)
+            .await
+            .expect("create isolated test database");
+        admin.close().await;
+        let database_url = database_url_with_name(&admin_url, &name);
+        let store = PostgresAgentStore::connect(&database_url)
+            .await
+            .expect("connect isolated test database");
+        store
+            .migrate()
+            .await
+            .expect("migrate isolated test database");
+        Some(TestDb {
+            store,
+            admin_url,
+            name,
+        })
+    }
+
+    fn database_url_with_name(base: &str, name: &str) -> String {
+        let (prefix, query) = base
+            .split_once('?')
+            .map(|(prefix, query)| (prefix, format!("?{query}")))
+            .unwrap_or((base, String::new()));
+        let Some((root, _)) = prefix.rsplit_once('/') else {
+            return format!("{base}_{name}");
+        };
+        format!("{root}/{name}{query}")
+    }
+
+    fn session_config(project_id: Uuid) -> SessionConfig {
+        SessionConfig {
+            project_id,
+            starting_cwd: "/tmp".to_string(),
+            provider: ProviderConfig {
+                kind: ProviderKind::OpenAi,
+                model: "test-model".to_string(),
+                reasoning_effort: ReasoningEffort::Medium,
+                max_tokens: None,
+                prompt_cache: None,
+            },
+            metadata: json!({}),
+        }
+    }
+
+    async fn create_session(store: &PostgresAgentStore, session_id: &str) -> SessionConfig {
+        let project_id = Uuid::new_v4();
+        store
+            .create_project(project_id, "test", "/tmp", json!({}))
+            .await
+            .expect("project creates");
+        let config = session_config(project_id);
+        store
+            .start_session_outputs(
+                session_id,
+                &config,
+                &[],
+                None,
+                &[],
+                &[],
+                InputPriority::FollowUp,
+                &UserMessage::text("seed"),
+                None,
+            )
+            .await
+            .expect("session starts");
+        config
+    }
+
+    #[tokio::test]
+    async fn cancel_unfinished_session_work_marks_compaction_idle_without_active_runtime() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "cancel-compaction";
+        create_session(store, session_id).await;
+
+        sqlx::query(
+            r#"
+            insert into actions (id, session_id, turn_id, action_id, attempt_id, kind, status, payload)
+            values ('compaction_1', $1, null, 0, 'attempt_1', 'compaction', 'running', '{}')
+            "#,
+        )
+        .bind(session_id)
+        .execute(&store.pool)
+        .await
+        .expect("insert compaction action");
+
+        let events = store
+            .cancel_unfinished_session_work(session_id, "session interrupted")
+            .await
+            .expect("cancel succeeds");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, EventType::SessionWorkCancelled);
+        assert_eq!(
+            store.activity(session_id).await.unwrap(),
+            SessionActivity::Idle
+        );
+        let status: String =
+            sqlx::query_scalar("select status from actions where id='compaction_1'")
+                .fetch_one(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "interrupted");
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_unfinished_session_work_marks_model_and_tool_interrupted() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "cancel-actions";
+        create_session(store, session_id).await;
+        let actions = vec![
+            SessionAction::RequestModel {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                model_context: ModelContext::default(),
+                context_leaf_id: None,
+                context_tokens: None,
+            },
+            SessionAction::RequestTool {
+                action_id: ActionId(2),
+                turn_id: TurnId(1),
+                tool_call: ToolCall {
+                    id: ToolCallId::from_u64(1),
+                    tool_name: "bash".to_string(),
+                    args_json: "{}".to_string(),
+                },
+            },
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                crate::OutputBatch::new(&[], None, &[], &actions),
+            )
+            .await
+            .expect("actions persist");
+
+        let events = store
+            .cancel_unfinished_session_work(session_id, "session interrupted")
+            .await
+            .expect("cancel succeeds");
+        assert_eq!(events.len(), 1);
+        let statuses: Vec<String> =
+            sqlx::query_scalar("select status from actions where session_id=$1 order by action_id")
+                .bind(session_id)
+                .fetch_all(&store.pool)
+                .await
+                .unwrap();
+        assert_eq!(statuses, vec!["interrupted", "interrupted"]);
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn cancel_unfinished_session_work_is_idempotent_after_first_cancel() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "cancel-idempotent";
+        create_session(store, session_id).await;
+        sqlx::query(
+            r#"
+            insert into actions (id, session_id, turn_id, action_id, attempt_id, kind, status, payload)
+            values ('compaction_1', $1, null, 0, 'attempt_1', 'compaction', 'running', '{}')
+            "#,
+        )
+        .bind(session_id)
+        .execute(&store.pool)
+        .await
+        .expect("insert compaction action");
+
+        let first = store
+            .cancel_unfinished_session_work(session_id, "session interrupted")
+            .await
+            .expect("first cancel succeeds");
+        let second = store
+            .cancel_unfinished_session_work(session_id, "session interrupted")
+            .await
+            .expect("second cancel succeeds");
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+        db.cleanup().await;
+    }
 }

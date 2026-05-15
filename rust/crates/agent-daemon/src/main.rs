@@ -54,7 +54,7 @@ async fn main() -> Result<()> {
         repo,
         active: Arc::new(Mutex::new(HashMap::new())),
         session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
-        dispatch_tasks: Arc::new(StdMutex::new(Vec::new())),
+        tasks: Arc::new(StdMutex::new(HashMap::new())),
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         default_tool_context: ToolContext::new(config.workspace.clone()),
@@ -87,12 +87,7 @@ async fn main() -> Result<()> {
 }
 
 async fn drain_dispatch_tasks(state: &AppState) {
-    let handles = std::mem::take(
-        &mut *state
-            .dispatch_tasks
-            .lock()
-            .expect("dispatch task list lock poisoned"),
-    );
+    let handles = take_tasks(state);
     if handles.is_empty() {
         return;
     }
@@ -874,6 +869,17 @@ async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result
     driver.recover_if_needed().await?;
     let active = driver.active_session().await;
     let Some(active) = active else {
+        let events = state
+            .repo
+            .cancel_unfinished_session_work(&session_id, "session interrupted")
+            .await
+            .map_err(anyhow::Error::from)?;
+        if !events.is_empty() {
+            let aborted_tasks = abort_session_tasks(state, &session_id);
+            publish_events(state, events);
+            driver.drive_until_blocked().await?;
+            return Ok(json!({ "interrupted": true, "aborted_task_kinds": aborted_tasks }));
+        }
         let event = state
             .repo
             .insert_event(
@@ -887,12 +893,13 @@ async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result
         clear_event_buffer_if_idle(state, &session_id).await?;
         return Ok(json!({ "ignored": true }));
     };
+    let aborted_tasks = abort_session_tasks(state, &session_id);
     let dispatches = driver
         .apply_agent_input(active, AgentInput::Interrupt, None, None, Vec::new())
         .await?;
     driver.dispatch(dispatches);
     driver.drive_until_blocked().await?;
-    Ok(json!({ "interrupted": true }))
+    Ok(json!({ "interrupted": true, "aborted_task_kinds": aborted_tasks }))
 }
 
 async fn history_tree(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
