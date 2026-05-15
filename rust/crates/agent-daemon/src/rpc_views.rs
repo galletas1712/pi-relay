@@ -15,6 +15,7 @@ pub(crate) fn session_summary(summary: SessionSummary) -> Value {
         "active_leaf_id": summary.active_leaf_id,
         "provider": summary.provider,
         "metadata": summary.metadata,
+        "created_at": summary.created_at,
         "updated_at": summary.updated_at,
     })
 }

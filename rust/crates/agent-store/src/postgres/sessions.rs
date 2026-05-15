@@ -184,6 +184,7 @@ impl PostgresAgentStore {
                     s.active_leaf_id,
                     s.provider_config,
                     s.metadata,
+                    s.created_at::text as created_at,
                     s.updated_at::text as updated_at,
                     exists(select 1 from actions a where a.session_id=s.id and {running_actions}) as has_running_work,
                     exists(select 1 from queued_inputs q where q.session_id=s.id and {active_queue}) as has_queued_input
@@ -198,7 +199,8 @@ impl PostgresAgentStore {
                     )
                 order by
                     case when s.metadata->>'archived' = 'true' then 1 else 0 end asc,
-                    s.updated_at desc
+                    s.created_at desc,
+                    s.id desc
                 limit $1
                 "#
         );
@@ -224,6 +226,7 @@ impl PostgresAgentStore {
                     active_leaf_id: row.get("active_leaf_id"),
                     provider,
                     metadata: row.get("metadata"),
+                    created_at: row.get("created_at"),
                     updated_at: row.get("updated_at"),
                 })
             })

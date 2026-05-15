@@ -192,6 +192,7 @@ pub struct SessionSummary {
     pub active_leaf_id: Option<String>,
     pub provider: ProviderConfig,
     pub metadata: Value,
+    pub created_at: String,
     pub updated_at: String,
 }
 

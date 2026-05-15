@@ -21,6 +21,7 @@ export interface SessionSummary {
 	active_leaf_id: string | null;
 	provider: ProviderConfig;
 	metadata: Record<string, unknown>;
+	created_at: string;
 	updated_at: string;
 }
 

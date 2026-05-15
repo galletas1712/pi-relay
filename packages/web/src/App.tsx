@@ -260,10 +260,7 @@ export function App() {
 		}
 	}, [api, connection, handleSessionEvent, pushNotice, refreshSelected, selectedId, sessions]);
 
-	const sessionItems = useMemo<SessionListItem[]>(
-		() => [...sessions].sort(compareSessionsForSidebar),
-		[sessions]
-	);
+	const sessionItems: SessionListItem[] = sessions;
 
 	const selectedSession = useMemo(
 		() => sessionItems.find((session) => session.session_id === selectedId) ?? null,
@@ -975,12 +972,6 @@ function DeleteSessionDialog({
 			</div>
 		</div>
 	);
-}
-
-function compareSessionsForSidebar(left: SessionListItem, right: SessionListItem): number {
-	const archivedDelta = Number(isArchivedSession(left)) - Number(isArchivedSession(right));
-	if (archivedDelta !== 0) return archivedDelta;
-	return Date.parse(right.updated_at) - Date.parse(left.updated_at);
 }
 
 function mergeSnapshotIntoSessionList(sessions: SessionSummary[], snapshot: SessionSnapshot): SessionSummary[] {
