@@ -1,5 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { queryKeys } from "./queryKeys.ts";
+import { queuedInputFromEvent } from "./pendingInputs.ts";
 import type { EventFrame, ProviderConfig, QueuedInput, SessionSnapshot, SessionSummary } from "./types.ts";
 
 export function patchSessionList(
@@ -116,6 +117,11 @@ export function applyQueuedInputEventToSnapshot<T extends Pick<SessionSnapshot, 
 	if (current.session_id !== event.session_id) return current;
 	const inputId = typeof event.data.input_id === "string" ? event.data.input_id : null;
 	if (!inputId) return current;
+	if (event.event === "input.queued") {
+		if (current.queued_inputs.some((input) => input.input_id === inputId)) return current;
+		const queuedInput = queuedInputFromEvent(event);
+		return queuedInput ? { ...current, queued_inputs: [...current.queued_inputs, queuedInput] } : current;
+	}
 	if (event.event === "input.consumed") {
 		const queuedInputs = current.queued_inputs.filter((input) => input.input_id !== inputId);
 		return queuedInputs.length === current.queued_inputs.length ? current : { ...current, queued_inputs: queuedInputs };

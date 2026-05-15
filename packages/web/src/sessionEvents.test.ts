@@ -17,16 +17,13 @@ describe("reduceSessionEvent", () => {
 		]);
 	});
 
-	it("treats queued input as an explicit incomplete-payload reconciliation", () => {
-		const operations = reduceSessionEvent(frame("input.queued", { input_id: "input_1" }));
+	it("patches queued input payloads without forcing a selected transcript refresh", () => {
+		const event = frame("input.queued", { input_id: "input_1", client_input_id: "client_1", content: [{ type: "text", text: "queued" }] });
+		const operations = reduceSessionEvent(event);
 
 		expect(operations).toEqual([
 			{ type: "activity", sessionId: "session_1", activity: "queued" },
-			{
-				type: "invalidate_session",
-				sessionId: "session_1",
-				reason: "queued input payload is not a complete queued-input snapshot",
-			},
+			{ type: "queued_inputs", sessionId: "session_1", event },
 			{ type: "invalidate_list", reason: "input.queued" },
 		]);
 	});

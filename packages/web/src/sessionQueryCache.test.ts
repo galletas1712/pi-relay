@@ -62,6 +62,33 @@ describe("session query cache patch helpers", () => {
 			}),
 		]);
 	});
+
+	it("adds queued input events from websocket payloads", () => {
+		const queryClient = seededClient();
+
+		patchQueuedInputsInSnapshot(queryClient, {
+			event_id: 3,
+			event: "input.queued",
+			session_id: sessionId,
+			data: {
+				input_id: "input_2",
+				client_input_id: "client_2",
+				priority: "follow_up",
+				content: [{ type: "text", text: "queued later" }],
+			},
+		});
+
+		expect(queryClient.getQueryData<SessionSnapshot>(queryKeys.session(sessionId, "full_tree"))?.queued_inputs).toEqual([
+			expect.objectContaining({ input_id: "input_1" }),
+			expect.objectContaining({
+				input_id: "input_2",
+				client_input_id: "client_2",
+				priority: "follow_up",
+				status: "queued",
+				content: [{ type: "text", text: "queued later" }],
+			}),
+		]);
+	});
 });
 
 function seededClient(): QueryClient {

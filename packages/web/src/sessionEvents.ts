@@ -87,7 +87,6 @@ function activityForEvent(event: string): SessionSummary["activity"] | null {
 
 function sessionInvalidationReason(event: string): string | null {
 	if (event === "session.configured" || event === "input.consumed" || event === "input.promoted") return null;
-	if (event === "input.queued") return "queued input payload is not a complete queued-input snapshot";
 	if (event === "transcript.appended") return "transcript append event lacks full entry data";
 	if (event === "turn.started" || event === "turn.finished" || event === "assistant.message") return event;
 	if (event === "history.rewound" || event === "history.compacted") return event;
@@ -124,7 +123,7 @@ function isTerminalActivityEvent(event: string): boolean {
 }
 
 function isQueuedInputPatchEvent(event: string): boolean {
-	return event === "input.consumed" || event === "input.promoted";
+	return event === "input.queued" || event === "input.consumed" || event === "input.promoted";
 }
 
 function titlePatchFromEvent(event: EventFrame): Record<string, unknown> | undefined {

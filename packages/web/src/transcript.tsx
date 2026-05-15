@@ -6,6 +6,7 @@ import remarkGfm from "remark-gfm";
 import { branchEntriesFor } from "./historyTargets.ts";
 import { citationsFromReplay, hostedToolsFromReplay, localToolCallIdFromReplay, parsedProviderReplay, replayContainsAssistantText } from "./providerReplay.ts";
 import type { HostedToolView, SourceCitation } from "./providerReplay.ts";
+import type { PendingTranscriptInput } from "./pendingInputs.ts";
 import { contentBlocksToText, firstLine } from "./text.ts";
 import { assistantMessageText, buildTurnViews } from "./turnView.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
@@ -103,6 +104,7 @@ export const MessageList = memo(function MessageList({
 	hasSession,
 	sessionId,
 	entriesSessionId,
+	pendingInputs = [],
 	loadingSession = false,
 	onResumeTurn,
 	resumingTurnId
@@ -114,6 +116,7 @@ export const MessageList = memo(function MessageList({
 	hasSession: boolean;
 	sessionId?: string | null;
 	entriesSessionId?: string | null;
+	pendingInputs?: PendingTranscriptInput[];
 	loadingSession?: boolean;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
@@ -188,7 +191,7 @@ export const MessageList = memo(function MessageList({
 		activeScrollSessionCanSaveRef.current = true;
 		if (!shouldStickToBottomRef.current) return;
 		scrollToBottom();
-	}, [entriesBelongToSelectedSession, isRunning, scrollSessionKey, scrollToBottom, visibleEntries]);
+	}, [entriesBelongToSelectedSession, isRunning, pendingInputs, scrollSessionKey, scrollToBottom, visibleEntries]);
 
 	useLayoutEffect(() => {
 		if (!hasSession || typeof ResizeObserver === "undefined") return;
@@ -250,12 +253,26 @@ export const MessageList = memo(function MessageList({
 						resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
 					/>
 				))}
+				{pendingInputs.map((input) => (
+					<PendingUserBubble input={input} key={input.id} />
+				))}
 				{isRunning ? (
 					<div className="activity-indicator">
 						<Loader2 className="spin" size={14} />
 						Agent active
 					</div>
 				) : null}
+			</div>
+		</div>
+	);
+});
+
+const PendingUserBubble = memo(function PendingUserBubble({ input }: { input: PendingTranscriptInput }) {
+	return (
+		<div className={`message-row user-row pending-user-row ${input.status === "failed" ? "failed" : ""}`}>
+			<div className="user-bubble pending-user-bubble">
+				{contentBlocksToText(input.content)}
+				<span className="pending-user-status">{input.status === "failed" ? input.error ?? "failed to send" : "sending..."}</span>
 			</div>
 		</div>
 	);
