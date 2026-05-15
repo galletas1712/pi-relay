@@ -7,8 +7,13 @@ describe("reduceSessionEvent", () => {
 		const operations = reduceSessionEvent(frame("session.configured", { title: "Renamed" }));
 
 		expect(operations).toEqual([
-			{ type: "metadata", sessionId: "session_1", patch: { title: "Renamed" }, remove: [] },
-			{ type: "refresh_list", reason: "session.configured" }
+			{
+				type: "metadata",
+				sessionId: "session_1",
+				patch: { title: "Renamed" },
+				remove: [],
+			},
+			{ type: "invalidate_list", reason: "session.configured" },
 		]);
 	});
 
@@ -17,19 +22,25 @@ describe("reduceSessionEvent", () => {
 
 		expect(operations).toEqual([
 			{ type: "activity", sessionId: "session_1", activity: "queued" },
-			{ type: "mark_stale", sessionId: "session_1", reason: "queued input payload is not a complete queued-input snapshot" },
-			{ type: "refresh_selected", sessionId: "session_1", reason: "queued input payload is not a complete queued-input snapshot" },
-			{ type: "refresh_list", reason: "input.queued" }
+			{
+				type: "invalidate_session",
+				sessionId: "session_1",
+				reason: "queued input payload is not a complete queued-input snapshot",
+			},
+			{ type: "invalidate_list", reason: "input.queued" },
 		]);
 	});
 
 	it("patches queued-input promotion without forcing a selected transcript refresh", () => {
-		const event = frame("input.promoted", { input_id: "input_1", promoted_at: "now" });
+		const event = frame("input.promoted", {
+			input_id: "input_1",
+			promoted_at: "now",
+		});
 		const operations = reduceSessionEvent(event);
 
 		expect(operations).toEqual([
 			{ type: "queued_inputs", sessionId: "session_1", event },
-			{ type: "refresh_list", reason: "input.promoted" }
+			{ type: "invalidate_list", reason: "input.promoted" },
 		]);
 	});
 
@@ -37,8 +48,11 @@ describe("reduceSessionEvent", () => {
 		const operations = reduceSessionEvent(frame("transcript.appended", { entry_id: "entry_1" }));
 
 		expect(operations).toEqual([
-			{ type: "mark_stale", sessionId: "session_1", reason: "transcript append event lacks full entry data" },
-			{ type: "refresh_selected", sessionId: "session_1", reason: "transcript append event lacks full entry data" }
+			{
+				type: "invalidate_session",
+				sessionId: "session_1",
+				reason: "transcript append event lacks full entry data",
+			},
 		]);
 	});
 });
@@ -48,6 +62,6 @@ function frame(event: string, data: Record<string, unknown>): EventFrame {
 		event_id: 1,
 		event,
 		session_id: "session_1",
-		data
+		data,
 	};
 }

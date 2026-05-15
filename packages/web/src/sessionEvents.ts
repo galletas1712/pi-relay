@@ -1,21 +1,29 @@
 import type { EventFrame, ProviderConfig, SessionSummary } from "./types.ts";
 
 export type SessionPatchOperation =
-	| { type: "metadata"; sessionId: string; patch: Record<string, unknown>; remove: string[] }
+	| {
+			type: "metadata";
+			sessionId: string;
+			patch: Record<string, unknown>;
+			remove: string[];
+	  }
 	| { type: "provider"; sessionId: string; provider: ProviderConfig }
-	| { type: "activity"; sessionId: string; activity: SessionSummary["activity"] }
+	| {
+			type: "activity";
+			sessionId: string;
+			activity: SessionSummary["activity"];
+	  }
 	| { type: "queued_inputs"; sessionId: string; event: EventFrame }
-	| { type: "mark_stale"; sessionId: string; reason: string }
-	| { type: "refresh_selected"; sessionId: string; reason: string }
-	| { type: "refresh_list"; reason: string };
+	| { type: "invalidate_session"; sessionId: string; reason: string }
+	| { type: "invalidate_list"; reason: string };
 
 export function reduceSessionEvent(event: EventFrame): SessionPatchOperation[] {
 	return [
 		...metadataOperations(event),
 		...activityOperations(event),
 		...queuedInputOperations(event),
-		...selectedRefreshOperations(event),
-		...listRefreshOperations(event)
+		...sessionInvalidationOperations(event),
+		...listInvalidationOperations(event),
 	];
 }
 
@@ -26,9 +34,19 @@ function metadataOperations(event: EventFrame): SessionPatchOperation[] {
 	const remove = stringArrayValue(event.data.metadata_remove);
 	const provider = providerValue(event.data.provider);
 	if (metadata || remove.length > 0) {
-		operations.push({ type: "metadata", sessionId: event.session_id, patch: metadata ?? {}, remove });
+		operations.push({
+			type: "metadata",
+			sessionId: event.session_id,
+			patch: metadata ?? {},
+			remove,
+		});
 	}
-	if (provider) operations.push({ type: "provider", sessionId: event.session_id, provider });
+	if (provider)
+		operations.push({
+			type: "provider",
+			sessionId: event.session_id,
+			provider,
+		});
 	return operations;
 }
 
@@ -38,25 +56,16 @@ function activityOperations(event: EventFrame): SessionPatchOperation[] {
 }
 
 function queuedInputOperations(event: EventFrame): SessionPatchOperation[] {
-	return isQueuedInputPatchEvent(event.event)
-		? [{ type: "queued_inputs", sessionId: event.session_id, event }]
-		: [];
+	return isQueuedInputPatchEvent(event.event) ? [{ type: "queued_inputs", sessionId: event.session_id, event }] : [];
 }
 
-function selectedRefreshOperations(event: EventFrame): SessionPatchOperation[] {
-	const reason = selectedRefreshReason(event.event);
-	return reason
-		? [
-				{ type: "mark_stale", sessionId: event.session_id, reason },
-				{ type: "refresh_selected", sessionId: event.session_id, reason }
-			]
-		: [];
+function sessionInvalidationOperations(event: EventFrame): SessionPatchOperation[] {
+	const reason = sessionInvalidationReason(event.event);
+	return reason ? [{ type: "invalidate_session", sessionId: event.session_id, reason }] : [];
 }
 
-function listRefreshOperations(event: EventFrame): SessionPatchOperation[] {
-	return listRefreshReason(event.event)
-		? [{ type: "refresh_list", reason: event.event }]
-		: [];
+function listInvalidationOperations(event: EventFrame): SessionPatchOperation[] {
+	return listInvalidationReason(event.event) ? [{ type: "invalidate_list", reason: event.event }] : [];
 }
 
 function activityForEvent(event: string): SessionSummary["activity"] | null {
@@ -76,7 +85,7 @@ function activityForEvent(event: string): SessionSummary["activity"] | null {
 	return null;
 }
 
-function selectedRefreshReason(event: string): string | null {
+function sessionInvalidationReason(event: string): string | null {
 	if (event === "session.configured" || event === "input.consumed" || event === "input.promoted") return null;
 	if (event === "input.queued") return "queued input payload is not a complete queued-input snapshot";
 	if (event === "transcript.appended") return "transcript append event lacks full entry data";
@@ -85,7 +94,7 @@ function selectedRefreshReason(event: string): string | null {
 	return isTerminalActivityEvent(event) ? event : null;
 }
 
-function listRefreshReason(event: string): string | null {
+function listInvalidationReason(event: string): string | null {
 	if (
 		event === "session.created" ||
 		event === "session.configured" ||

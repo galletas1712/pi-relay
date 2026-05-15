@@ -1,4 +1,5 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createAgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
 import { Composer, type ComposerHandle } from "./composer.tsx";
@@ -8,9 +9,17 @@ import { ExportDialog } from "./exportDialog.tsx";
 import { randomId } from "./ids.ts";
 import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
+import { queryKeys } from "./queryKeys.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import { reduceSessionEvent, type SessionPatchOperation } from "./sessionEvents.ts";
+import {
+	mergeSnapshotIntoSessionList,
+	patchQueuedInputsInSnapshot,
+	patchSessionActivityEverywhere,
+	patchSessionMetadataEverywhere,
+	patchSessionProviderEverywhere,
+} from "./sessionQueryCache.ts";
 import {
 	DEFAULT_PROVIDER,
 	MODEL_OPTIONS,
@@ -19,7 +28,7 @@ import {
 	providerReasoningEffort,
 	reasoningEffortsForProvider,
 	textContent,
-	withReasoningEffort
+	withReasoningEffort,
 } from "./sessionDefaults.ts";
 import { projectTitle, sessionTitle, isArchivedSession, tallyActivities, type SessionListItem } from "./sessionList.ts";
 import { firstLine, truncate } from "./text.ts";
@@ -30,29 +39,16 @@ import type {
 	Project,
 	ProviderConfig,
 	ReasoningEffort,
-	SessionSnapshot,
 	SessionSummary,
 	ToolListing,
-	TranscriptEntry
+	TranscriptEntry,
 } from "./types.ts";
 
 const MAX_NOTICES = 24;
 const NOTICE_TTL_MS = 4000;
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
-const MAX_CACHED_SESSIONS = 20;
-const MAX_CACHED_ENTRIES = 8_000;
-
-type EntryScope = "active_branch" | "full_tree";
-type CachedSnapshot = Omit<SessionSnapshot, "entries">;
-
-type CachedSession = {
-	snapshot: CachedSnapshot;
-	entries: TranscriptEntry[];
-	entryScope: EntryScope;
-	cachedAt: number;
-	lastEventId: number;
-	stale: boolean;
-};
+const SELECTED_SESSION_REFRESH_DEBOUNCE_MS = 80;
+const SELECTED_SESSION_QUERY_DISABLED_KEY = ["session", null] as const;
 
 type ExportDialogState = {
 	entries: TranscriptEntry[];
@@ -80,17 +76,12 @@ type ProjectDialogState = {
 
 export function App() {
 	const api = useMemo(() => createAgentApi(), []);
+	const queryClient = useQueryClient();
 	const [connection, setConnection] = useState<ConnectionStatus>("connecting");
-	const [projects, setProjects] = useState<Project[]>([]);
 	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-	const [sessions, setSessions] = useState<SessionSummary[]>([]);
 	const [selectedId, setSelectedId] = useState<string | null>(null);
 	const selectedRef = useRef<string | null>(null);
-	const [snapshot, setSnapshot] = useState<SessionSnapshot | null>(null);
-	const [entries, setEntries] = useState<TranscriptEntry[]>([]);
 	const [notices, setNotices] = useState<Notice[]>([]);
-	const [config, setConfig] = useState<DaemonConfig>({ system_prompt: null });
-	const [tools, setTools] = useState<ToolListing[]>([]);
 	const [query, setQuery] = useState("");
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
 	const [sending, setSending] = useState(false);
@@ -110,150 +101,12 @@ export function App() {
 	const composerHandleRef = useRef<ComposerHandle | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
 	const selectedProjectRef = useRef<string | null>(null);
-	const sessionsRef = useRef(new Map<string, SessionSummary>());
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
-	const sessionCacheRef = useRef(new Map<string, CachedSession>());
-	const selectedRequestGeneration = useRef(0);
-	const sessionListGeneration = useRef(0);
 
-	const writeCachedSession = useCallback((sessionId: string, nextSnapshot: SessionSnapshot, nextEntries: TranscriptEntry[], entryScope: EntryScope) => {
-		const { entries: _ignored, ...snapshotWithoutEntries } = nextSnapshot;
-		sessionCacheRef.current.set(sessionId, {
-			snapshot: snapshotWithoutEntries,
-			entries: nextEntries,
-			entryScope,
-			cachedAt: Date.now(),
-			lastEventId: nextSnapshot.last_event_id,
-			stale: false
-		});
-		trimSessionCache(sessionCacheRef.current);
+	const pushNotice = useCallback((tone: Notice["tone"], text: string) => {
+		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_NOTICES + 1)), { id: randomId("notice"), tone, text }]);
 	}, []);
-
-	const patchCachedSession = useCallback((sessionId: string, patcher: (cached: CachedSession) => CachedSession) => {
-		const cached = sessionCacheRef.current.get(sessionId);
-		if (!cached) return;
-		sessionCacheRef.current.set(sessionId, patcher(cached));
-	}, []);
-
-	const markCachedSessionStale = useCallback((sessionId: string) => {
-		patchCachedSession(sessionId, (cached) => ({ ...cached, stale: true }));
-	}, [patchCachedSession]);
-
-	const deleteCachedSession = useCallback((sessionId: string) => {
-		sessionCacheRef.current.delete(sessionId);
-	}, []);
-
-	const applySessionSummaries = useCallback(
-		(nextSessions: SessionSummary[]) => {
-			const nextSessionMap = new Map(nextSessions.map((session) => [session.session_id, session]));
-			sessionsRef.current = nextSessionMap;
-			setSessions(nextSessions);
-			setSnapshot((current) => {
-				if (!current) return current;
-				const summary = nextSessionMap.get(current.session_id);
-				return summary ? { ...current, ...snapshotPatchFromSummary(summary) } : current;
-			});
-			for (const summary of nextSessions) {
-				patchCachedSession(summary.session_id, (cached) => ({
-					...cached,
-					snapshot: { ...cached.snapshot, ...snapshotPatchFromSummary(summary) }
-				}));
-			}
-		},
-		[patchCachedSession]
-	);
-
-	const clearSelectedSessionState = useCallback(() => {
-		selectedRequestGeneration.current += 1;
-		setSnapshot(null);
-		setEntries([]);
-	}, []);
-
-	const patchSessionSummary = useCallback(
-		(sessionId: string, patch: Partial<SessionSummary>) => {
-			setSessions((current) => {
-				const nextSessions = patchSessionSummaryList(current, sessionId, patch);
-				if (nextSessions !== current) sessionsRef.current = new Map(nextSessions.map((session) => [session.session_id, session]));
-				return nextSessions;
-			});
-			setSnapshot((current) => {
-				if (!current || current.session_id !== sessionId) return current;
-				return { ...current, ...snapshotPatchFromSummaryPatch(patch) };
-			});
-			patchCachedSession(sessionId, (cached) => ({
-				...cached,
-				snapshot: { ...cached.snapshot, ...snapshotPatchFromSummaryPatch(patch) }
-			}));
-		},
-		[patchCachedSession]
-	);
-
-	const patchSessionMetadata = useCallback(
-		(sessionId: string, patch: Record<string, unknown>, removeKeys: string[] = []) => {
-			setSessions((current) => {
-				const nextSessions = patchSessionMetadataInList(current, sessionId, patch, removeKeys);
-				if (nextSessions !== current) sessionsRef.current = new Map(nextSessions.map((session) => [session.session_id, session]));
-				return nextSessions;
-			});
-			setSnapshot((current) => {
-				if (!current || current.session_id !== sessionId) return current;
-				return { ...current, metadata: mergeMetadata(current.metadata, patch, removeKeys) };
-			});
-			patchCachedSession(sessionId, (cached) => ({
-				...cached,
-				snapshot: {
-					...cached.snapshot,
-					metadata: mergeMetadata(cached.snapshot.metadata, patch, removeKeys)
-				}
-			}));
-		},
-		[patchCachedSession]
-	);
-
-	const patchProvider = useCallback(
-		(sessionId: string, provider: ProviderConfig) => patchSessionSummary(sessionId, { provider }),
-		[patchSessionSummary]
-	);
-
-	const patchQueuedInput = useCallback(
-		(event: EventFrame) => {
-			applyQueuedInputEvent(event, setSnapshot);
-			patchCachedSession(event.session_id, (cached) => ({
-				...cached,
-				snapshot: applyQueuedInputEventToSnapshot(event, cached.snapshot)
-			}));
-		},
-		[patchCachedSession]
-	);
-
-	const selectSession = useCallback(
-		(sessionId: string | null) => {
-			const previousSessionId = selectedRef.current;
-			if (sessionId === previousSessionId) {
-				if (sessionId === null) nextSessionTitleRef.current = null;
-				return;
-			}
-			if (sessionId === null) nextSessionTitleRef.current = null;
-			selectedRequestGeneration.current += 1;
-			selectedRef.current = sessionId;
-			setSelectedId(sessionId);
-			if (!sessionId) {
-				setSnapshot(null);
-				setEntries([]);
-				return;
-			}
-			const cached = sessionCacheRef.current.get(sessionId);
-			if (cached && !cached.stale) {
-				setSnapshot(snapshotWithEntries(cached.snapshot));
-				setEntries(cached.entries);
-				return;
-			}
-			setSnapshot(null);
-			setEntries([]);
-		},
-		[]
-	);
 
 	useEffect(() => {
 		selectedRef.current = selectedId;
@@ -264,17 +117,6 @@ export function App() {
 	}, [selectedProjectId]);
 
 	useEffect(() => {
-		sessionsRef.current = new Map(sessions.map((session) => [session.session_id, session]));
-	}, [sessions]);
-
-	const pushNotice = useCallback((tone: Notice["tone"], text: string) => {
-		setNotices((current) => [
-			...current.slice(Math.max(0, current.length - MAX_NOTICES + 1)),
-			{ id: randomId("notice"), tone, text }
-		]);
-	}, []);
-
-	useEffect(() => {
 		if (notices.length === 0) return;
 		const timer = window.setTimeout(() => {
 			setNotices((current) => current.slice(1));
@@ -282,140 +124,245 @@ export function App() {
 		return () => window.clearTimeout(timer);
 	}, [notices.length]);
 
-	const loadSessions = useCallback(async (projectId = selectedProjectRef.current) => {
-		const generation = ++sessionListGeneration.current;
-		const expectedProjectId = projectId;
-		if (!expectedProjectId) {
-			applySessionSummaries([]);
-			return [];
+	const projectsQuery = useQuery({
+		queryKey: queryKeys.projects,
+		queryFn: () => api.listProjects(),
+		enabled: connection === "open",
+	});
+	const projects = projectsQuery.data ?? [];
+
+	const sessionsQuery = useQuery({
+		queryKey: queryKeys.sessions(selectedProjectId),
+		queryFn: () => api.listSessions(100, selectedProjectId),
+		enabled: connection === "open" && !!selectedProjectId,
+	});
+	const sessions = sessionsQuery.data ?? [];
+
+	const selectedSessionQuery = useQuery({
+		queryKey: selectedId ? queryKeys.session(selectedId, "full_tree") : SELECTED_SESSION_QUERY_DISABLED_KEY,
+		queryFn: async () => {
+			if (!selectedId) throw new Error("missing selected session id");
+			const shouldLogPerf = perfEnabled();
+			const startedAt = perfNow();
+			if (shouldLogPerf)
+				perfLog("session.get start", {
+					sessionId: selectedId,
+					source: "query",
+				});
+			const nextSnapshot = await api.getSession(selectedId, {
+				includeEntries: true,
+			});
+			if (shouldLogPerf) {
+				const rpcMs = perfNow() - startedAt;
+				perfLog("session.get end", {
+					sessionId: selectedId,
+					entries: nextSnapshot.entries?.length ?? 0,
+					approxBytes: approximateJsonSize(nextSnapshot),
+					rpcMs: Math.round(rpcMs),
+					entryScope: "full_tree",
+				});
+			}
+			return nextSnapshot;
+		},
+		enabled: connection === "open" && !!selectedId,
+		placeholderData: undefined,
+	});
+
+	const configQuery = useQuery({
+		queryKey: queryKeys.config,
+		queryFn: () => api.getConfig(),
+		enabled: connection === "open",
+	});
+	const config: DaemonConfig = configQuery.data ?? { system_prompt: null };
+
+	const sessionItems: SessionListItem[] = sessions;
+	const selectedProject = useMemo(
+		() => projects.find((project) => project.project_id === selectedProjectId) ?? null,
+		[projects, selectedProjectId],
+	);
+
+	const selectedSession = useMemo(
+		() => sessionItems.find((session) => session.session_id === selectedId) ?? null,
+		[sessionItems, selectedId],
+	);
+
+	const rawSnapshot = selectedSessionQuery.data ?? null;
+	const loadedSnapshot = rawSnapshot?.session_id === selectedId ? rawSnapshot : null;
+	const loadedEntries = loadedSnapshot ? (loadedSnapshot.entries ?? []) : [];
+	const transcriptLoading = !!selectedId && !loadedSnapshot && selectedSessionQuery.isFetching;
+
+	const snapshotChatSession = useMemo(() => {
+		if (!selectedId || !loadedSnapshot) return null;
+		return {
+			session_id: selectedId,
+			project_id: loadedSnapshot.project_id,
+			activity: loadedSnapshot.activity,
+			active_leaf_id: loadedSnapshot.active_leaf_id,
+			provider: loadedSnapshot.provider,
+			metadata: loadedSnapshot.metadata,
+		};
+	}, [loadedSnapshot, selectedId]);
+	const selectedListChatSession = useMemo(() => {
+		if (!selectedId) return null;
+		return {
+			session_id: selectedId,
+			project_id: selectedSession?.project_id ?? selectedProjectId ?? "",
+			activity: selectedSession?.activity ?? "idle",
+			active_leaf_id: selectedSession?.active_leaf_id ?? null,
+			provider: selectedSession?.provider ?? newSessionProvider,
+			metadata: selectedSession?.metadata ?? {},
+		};
+	}, [newSessionProvider, selectedId, selectedProjectId, selectedSession]);
+	const selectedChatSession = snapshotChatSession ?? selectedListChatSession;
+
+	const activeProvider = loadedSnapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
+	const activeProviderKind = activeProvider.kind;
+	const toolsQuery = useQuery({
+		queryKey: queryKeys.tools(activeProviderKind),
+		queryFn: () => api.listTools(activeProviderKind),
+		enabled: connection === "open",
+	});
+	const tools: ToolListing[] = toolsQuery.data ?? [];
+	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
+	const modelLocked = !!selectedId && !!loadedSnapshot && (loadedEntries.length > 0 || loadedSnapshot.active_leaf_id !== null);
+	const modelControlsDisabled = !!selectedId && (!loadedSnapshot || loadedSnapshot.activity !== "idle");
+
+	const selectSession = useCallback((sessionId: string | null) => {
+		const previousSessionId = selectedRef.current;
+		if (sessionId === previousSessionId) {
+			if (sessionId === null) nextSessionTitleRef.current = null;
+			return;
 		}
-		const nextSessions = await api.listSessions(100, expectedProjectId);
-		if (generation !== sessionListGeneration.current || selectedProjectRef.current !== expectedProjectId) return nextSessions;
-		applySessionSummaries(nextSessions);
-		return nextSessions;
-	}, [api, applySessionSummaries]);
+		if (sessionId === null) nextSessionTitleRef.current = null;
+		selectedRef.current = sessionId;
+		setSelectedId(sessionId);
+	}, []);
+
+	const invalidateSessionList = useCallback(
+		(projectId = selectedProjectRef.current) => {
+			void queryClient.invalidateQueries({
+				queryKey: queryKeys.sessions(projectId),
+			});
+		},
+		[queryClient],
+	);
 
 	const scheduleSessionListRefresh = useCallback(
 		(delayMs = SESSION_LIST_REFRESH_DEBOUNCE_MS) => {
 			if (sessionListRefreshTimer.current !== null) return;
 			sessionListRefreshTimer.current = window.setTimeout(() => {
 				sessionListRefreshTimer.current = null;
-				void loadSessions().catch(() => undefined);
+				invalidateSessionList();
 			}, delayMs);
 		},
-		[loadSessions]
+		[invalidateSessionList],
 	);
 
-	const loadProjects = useCallback(async () => {
-		const nextProjects = await api.listProjects();
-		setProjects(nextProjects);
-		const currentProjectId = selectedProjectRef.current;
-		const nextSelected =
-			currentProjectId && nextProjects.some((project) => project.project_id === currentProjectId)
-				? currentProjectId
-				: nextProjects[0]?.project_id ?? null;
-		if (nextSelected !== currentProjectId) {
-			selectedProjectRef.current = nextSelected;
-			setSelectedProjectId(nextSelected);
-			selectSession(null);
-			setQuery("");
-			composerHandleRef.current?.setValue("");
-		}
-		return nextProjects;
-	}, [api, selectSession]);
+	const invalidateSelectedSession = useCallback(
+		(sessionId = selectedRef.current) => {
+			if (!sessionId) return;
+			void queryClient.invalidateQueries({
+				queryKey: queryKeys.session(sessionId, "full_tree"),
+			});
+		},
+		[queryClient],
+	);
 
-	const loadGlobal = useCallback(async () => {
-		const nextConfig = await api.getConfig();
-		setConfig(nextConfig);
-	}, [api]);
+	const scheduleSelectedRefresh = useCallback(
+		(sessionId = selectedRef.current, delayMs = SELECTED_SESSION_REFRESH_DEBOUNCE_MS) => {
+			if (!sessionId || sessionId !== selectedRef.current) return;
+			if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
+			refreshTimer.current = window.setTimeout(() => {
+				refreshTimer.current = null;
+				invalidateSelectedSession(sessionId);
+			}, delayMs);
+		},
+		[invalidateSelectedSession],
+	);
+
+	const getFreshSession = useCallback(
+		async (sessionId: string) => {
+			const snapshot = await queryClient.fetchQuery({
+				queryKey: queryKeys.session(sessionId, "full_tree"),
+				queryFn: async () => {
+					const shouldLogPerf = perfEnabled();
+					const startedAt = perfNow();
+					if (shouldLogPerf) perfLog("session.get start", { sessionId, source: "fetch" });
+					const nextSnapshot = await api.getSession(sessionId, {
+						includeEntries: true,
+					});
+					if (shouldLogPerf) {
+						const rpcMs = perfNow() - startedAt;
+						perfLog("session.get end", {
+							sessionId,
+							entries: nextSnapshot.entries?.length ?? 0,
+							approxBytes: approximateJsonSize(nextSnapshot),
+							rpcMs: Math.round(rpcMs),
+							entryScope: "full_tree",
+						});
+					}
+					return nextSnapshot;
+				},
+				staleTime: 0,
+			});
+			lastEventIds.current.set(sessionId, snapshot.last_event_id);
+			queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(snapshot.project_id), (current) =>
+				mergeSnapshotIntoSessionList(current, snapshot),
+			);
+			if (snapshot.project_id !== selectedProjectRef.current) {
+				selectedProjectRef.current = snapshot.project_id;
+				setSelectedProjectId(snapshot.project_id);
+			}
+			return { snapshot, entries: snapshot.entries ?? [] };
+		},
+		[api, queryClient],
+	);
 
 	const refreshSelected = useCallback(
-		async (sessionId = selectedRef.current, options: { entryScope?: EntryScope; force?: boolean } = {}) => {
+		async (sessionId = selectedRef.current) => {
 			if (!sessionId) return null;
-			const generation = ++selectedRequestGeneration.current;
-			const shouldLogPerf = perfEnabled();
-			const startedAt = perfNow();
-			if (shouldLogPerf) perfLog("session.get start", { sessionId, source: options.force ? "force" : "refresh" });
-			const nextSnapshot = await api.getSession(sessionId, { includeEntries: true });
-			const nextEntries = nextSnapshot.entries ?? [];
-			if (shouldLogPerf) {
-				const rpcMs = perfNow() - startedAt;
-				perfLog("session.get end", {
-					sessionId,
-					entries: nextEntries.length,
-					approxBytes: approximateJsonSize(nextSnapshot),
-					rpcMs: Math.round(rpcMs),
-					entryScope: options.entryScope ?? "full_tree"
-				});
-			}
-			if (selectedRef.current !== sessionId || generation !== selectedRequestGeneration.current) return null;
-			lastEventIds.current.set(sessionId, nextSnapshot.last_event_id);
-			writeCachedSession(sessionId, nextSnapshot, nextEntries, options.entryScope ?? "full_tree");
-			setSnapshot(nextSnapshot);
-			setEntries(nextEntries);
-			setSessions((current) => {
-				const nextSessions = mergeSnapshotIntoSessionList(current, nextSnapshot);
-				sessionsRef.current = new Map(nextSessions.map((session) => [session.session_id, session]));
-				return nextSessions;
-			});
-			if (nextSnapshot.project_id !== selectedProjectRef.current) {
-				selectedProjectRef.current = nextSnapshot.project_id;
-				setSelectedProjectId(nextSnapshot.project_id);
-			}
-			return { snapshot: nextSnapshot, entries: nextEntries };
+			return getFreshSession(sessionId);
 		},
-		[api, writeCachedSession]
+		[getFreshSession],
 	);
-
-	const scheduleSelectedRefresh = useCallback((sessionId = selectedRef.current, delayMs = 80) => {
-		if (!sessionId || sessionId !== selectedRef.current) return;
-		if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
-		refreshTimer.current = window.setTimeout(() => {
-			refreshTimer.current = null;
-			void refreshSelected(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
-		}, delayMs);
-	}, [pushNotice, refreshSelected]);
 
 	const applySessionOperation = useCallback(
 		(operation: SessionPatchOperation) => {
 			if (operation.type === "metadata") {
-				patchSessionMetadata(operation.sessionId, operation.patch, operation.remove);
+				patchSessionMetadataEverywhere(queryClient, selectedProjectRef.current, operation.sessionId, operation.patch, operation.remove);
 				return;
 			}
 			if (operation.type === "provider") {
-				patchProvider(operation.sessionId, operation.provider);
+				patchSessionProviderEverywhere(queryClient, selectedProjectRef.current, operation.sessionId, operation.provider);
 				return;
 			}
 			if (operation.type === "activity") {
-				patchSessionSummary(operation.sessionId, { activity: operation.activity });
+				patchSessionActivityEverywhere(queryClient, selectedProjectRef.current, operation.sessionId, operation.activity);
 				return;
 			}
 			if (operation.type === "queued_inputs") {
-				patchQueuedInput(operation.event);
+				patchQueuedInputsInSnapshot(queryClient, operation.event);
 				return;
 			}
-			if (operation.type === "mark_stale") {
-				markCachedSessionStale(operation.sessionId);
-				return;
-			}
-			if (operation.type === "refresh_selected") {
+			if (operation.type === "invalidate_session") {
 				if (operation.sessionId === selectedRef.current) scheduleSelectedRefresh(operation.sessionId);
+				else
+					void queryClient.invalidateQueries({
+						queryKey: queryKeys.session(operation.sessionId, "full_tree"),
+					});
 				return;
 			}
 			scheduleSessionListRefresh();
 		},
-		[markCachedSessionStale, patchProvider, patchQueuedInput, patchSessionMetadata, patchSessionSummary, scheduleSelectedRefresh, scheduleSessionListRefresh]
+		[queryClient, scheduleSelectedRefresh, scheduleSessionListRefresh],
 	);
 
 	const handleSessionEvent = useCallback(
 		(event: EventFrame) => {
-			const eventSession = sessionsRef.current.get(event.session_id);
+			const currentSessions = queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(selectedProjectRef.current));
+			const eventSession = currentSessions?.find((session) => session.session_id === event.session_id);
 			if (eventSession?.project_id && eventSession.project_id !== selectedProjectRef.current) return;
 			lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
-			patchCachedSession(event.session_id, (cached) => ({
-				...cached,
-				lastEventId: Math.max(cached.lastEventId, event.event_id)
-			}));
 
 			for (const operation of reduceSessionEvent(event)) applySessionOperation(operation);
 
@@ -428,7 +375,7 @@ export function App() {
 				}
 			}
 		},
-		[applySessionOperation, patchCachedSession, pushNotice]
+		[applySessionOperation, pushNotice, queryClient],
 	);
 
 	useEffect(() => {
@@ -436,22 +383,18 @@ export function App() {
 			setConnection(status);
 			if (status !== "open") {
 				subscribedEventSessionIds.current.clear();
-				for (const sessionId of sessionCacheRef.current.keys()) markCachedSessionStale(sessionId);
 				return;
 			}
-			void loadProjects()
-				.then(() => Promise.all([loadSessions(), loadGlobal()]))
-				.then(() => {
-					const sessionId = selectedRef.current;
-					if (!sessionId) return undefined;
-					return refreshSelected(sessionId);
-				})
-				.catch((error) => pushNotice("error", errorMessage(error)));
+			void Promise.all([
+				queryClient.invalidateQueries({ queryKey: queryKeys.projects }),
+				queryClient.invalidateQueries({ queryKey: queryKeys.config }),
+				queryClient.invalidateQueries({
+					queryKey: queryKeys.sessions(selectedProjectRef.current),
+				}),
+			]).catch((error) => pushNotice("error", errorMessage(error)));
 		});
 		const offEvent = api.onEvent(handleSessionEvent);
-		void api
-			.connect()
-			.catch((error) => pushNotice("error", errorMessage(error)));
+		void api.connect().catch((error) => pushNotice("error", errorMessage(error)));
 		return () => {
 			offStatus();
 			offEvent();
@@ -459,27 +402,54 @@ export function App() {
 			if (sessionListRefreshTimer.current !== null) window.clearTimeout(sessionListRefreshTimer.current);
 			api.close();
 		};
-	}, [api, handleSessionEvent, loadGlobal, loadProjects, loadSessions, markCachedSessionStale, pushNotice, refreshSelected]);
+	}, [api, handleSessionEvent, pushNotice, queryClient]);
 
 	useEffect(() => {
-		void loadSessions().catch((error) => pushNotice("error", errorMessage(error)));
-	}, [loadSessions, pushNotice, selectedProjectId]);
+		if (projectsQuery.error) pushNotice("error", errorMessage(projectsQuery.error));
+	}, [projectsQuery.error, pushNotice]);
+	useEffect(() => {
+		if (sessionsQuery.error) pushNotice("error", errorMessage(sessionsQuery.error));
+	}, [sessionsQuery.error, pushNotice]);
+	useEffect(() => {
+		if (selectedSessionQuery.error) pushNotice("error", errorMessage(selectedSessionQuery.error));
+	}, [selectedSessionQuery.error, pushNotice]);
+	useEffect(() => {
+		if (configQuery.error) pushNotice("error", errorMessage(configQuery.error));
+	}, [configQuery.error, pushNotice]);
+	useEffect(() => {
+		if (toolsQuery.error) pushNotice("error", errorMessage(toolsQuery.error));
+	}, [toolsQuery.error, pushNotice]);
 
 	useEffect(() => {
-		if (!selectedId) {
-			clearSelectedSessionState();
-			return;
-		}
-		const cached = sessionCacheRef.current.get(selectedId);
-		if (cached && !cached.stale) {
-			setSnapshot(snapshotWithEntries(cached.snapshot));
-			setEntries(cached.entries);
-			return;
-		}
-		setSnapshot(null);
-		setEntries([]);
-		void refreshSelected(selectedId).catch((error) => pushNotice("error", errorMessage(error)));
-	}, [clearSelectedSessionState, pushNotice, refreshSelected, selectedId]);
+		if (projectsQuery.status !== "success") return;
+		const currentProjectId = selectedProjectRef.current;
+		const nextSelected =
+			currentProjectId && projects.some((project) => project.project_id === currentProjectId)
+				? currentProjectId
+				: (projects[0]?.project_id ?? null);
+		if (nextSelected === currentProjectId) return;
+		selectedProjectRef.current = nextSelected;
+		setSelectedProjectId(nextSelected);
+		selectSession(null);
+		setQuery("");
+		composerHandleRef.current?.setValue("");
+	}, [projects, projectsQuery.status, selectSession]);
+
+	useEffect(() => {
+		if (!selectedId) return;
+		if (sessionItems.some((session) => session.session_id === selectedId)) return;
+		if (selectedSessionQuery.fetchStatus === "fetching") return;
+		if (loadedSnapshot?.session_id === selectedId) return;
+		selectSession(null);
+	}, [loadedSnapshot?.session_id, selectSession, selectedId, selectedSessionQuery.fetchStatus, sessionItems]);
+
+	useEffect(() => {
+		if (!loadedSnapshot) return;
+		lastEventIds.current.set(loadedSnapshot.session_id, loadedSnapshot.last_event_id);
+		queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(loadedSnapshot.project_id), (current) =>
+			mergeSnapshotIntoSessionList(current, loadedSnapshot),
+		);
+	}, [loadedSnapshot, queryClient]);
 
 	useEffect(() => {
 		if (connection !== "open") return;
@@ -500,7 +470,10 @@ export function App() {
 				.then((replayed) => {
 					if (!subscribedEventSessionIds.current.has(sessionId)) return undefined;
 					for (const event of replayed) handleSessionEvent(event);
-					if (selectedRef.current === sessionId) return refreshSelected(sessionId);
+					if (selectedRef.current === sessionId)
+						return queryClient.invalidateQueries({
+							queryKey: queryKeys.session(sessionId, "full_tree"),
+						});
 					return undefined;
 				})
 				.catch((error) => {
@@ -508,58 +481,7 @@ export function App() {
 					pushNotice("error", errorMessage(error));
 				});
 		}
-	}, [api, connection, handleSessionEvent, pushNotice, refreshSelected, selectedId, sessions]);
-
-	const sessionItems: SessionListItem[] = sessions;
-	const selectedProject = useMemo(
-		() => projects.find((project) => project.project_id === selectedProjectId) ?? null,
-		[projects, selectedProjectId]
-	);
-
-	const selectedSession = useMemo(
-		() => sessionItems.find((session) => session.session_id === selectedId) ?? null,
-		[sessionItems, selectedId]
-	);
-
-	useEffect(() => {
-		if (!selectedId) return;
-		if (sessionItems.some((session) => session.session_id === selectedId)) return;
-		selectSession(null);
-	}, [selectSession, selectedId, sessionItems]);
-
-	const loadedSnapshot = snapshot?.session_id === selectedId ? snapshot : null;
-	const loadedEntries = loadedSnapshot ? entries : [];
-	const transcriptLoading = !!selectedId && !loadedSnapshot;
-
-	const snapshotChatSession = useMemo(() => {
-		if (!selectedId || !loadedSnapshot) return null;
-		return {
-			session_id: selectedId,
-			project_id: loadedSnapshot.project_id,
-			activity: loadedSnapshot.activity,
-			active_leaf_id: loadedSnapshot.active_leaf_id,
-			provider: loadedSnapshot.provider,
-			metadata: loadedSnapshot.metadata
-		};
-	}, [loadedSnapshot, selectedId]);
-	const selectedListChatSession = useMemo(() => {
-		if (!selectedId) return null;
-		return {
-			session_id: selectedId,
-			project_id: selectedSession?.project_id ?? selectedProjectId ?? "",
-			activity: selectedSession?.activity ?? "idle",
-			active_leaf_id: selectedSession?.active_leaf_id ?? null,
-			provider: selectedSession?.provider ?? newSessionProvider,
-			metadata: selectedSession?.metadata ?? {}
-		};
-	}, [newSessionProvider, selectedId, selectedProjectId, selectedSession]);
-	const selectedChatSession = snapshotChatSession ?? selectedListChatSession;
-
-	const activeProvider = loadedSnapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
-	const activeProviderKind = activeProvider.kind;
-	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
-	const modelLocked = !!selectedId && !!loadedSnapshot && (loadedEntries.length > 0 || loadedSnapshot.active_leaf_id !== null);
-	const modelControlsDisabled = !!selectedId && (!loadedSnapshot || loadedSnapshot.activity !== "idle");
+	}, [api, connection, handleSessionEvent, pushNotice, queryClient, selectedId, sessions]);
 
 	const configureProvider = useCallback(
 		async (provider: ProviderConfig) => {
@@ -569,27 +491,11 @@ export function App() {
 				return;
 			}
 			await api.configureSession({ sessionId, provider });
-			patchProvider(sessionId, provider);
-			scheduleSessionListRefresh();
+			patchSessionProviderEverywhere(queryClient, selectedProjectRef.current, sessionId, provider);
+			invalidateSessionList();
 		},
-		[api, patchProvider, scheduleSessionListRefresh]
+		[api, invalidateSessionList, queryClient],
 	);
-
-	useEffect(() => {
-		if (connection !== "open") return;
-		let cancelled = false;
-		void api
-			.listTools(activeProviderKind)
-			.then((nextTools) => {
-				if (!cancelled) setTools(nextTools);
-			})
-			.catch((error) => {
-				if (!cancelled) pushNotice("error", errorMessage(error));
-			});
-		return () => {
-			cancelled = true;
-		};
-	}, [activeProviderKind, api, connection, pushNotice]);
 
 	const changeModel = useCallback(
 		async (modelKey: string) => {
@@ -599,14 +505,14 @@ export function App() {
 			}
 			await configureProvider(providerFromModelKey(modelKey, activeProvider));
 		},
-		[activeProvider, configureProvider, modelLocked, pushNotice]
+		[activeProvider, configureProvider, modelLocked, pushNotice],
 	);
 
 	const changeReasoningEffort = useCallback(
 		async (effort: ReasoningEffort) => {
 			await configureProvider(withReasoningEffort(activeProvider, effort));
 		},
-		[activeProvider, configureProvider]
+		[activeProvider, configureProvider],
 	);
 
 	const filteredSessions = useMemo(() => {
@@ -638,11 +544,11 @@ export function App() {
 		const title = renameValue.trim();
 		if (!title) throw new Error("session title is required");
 		await api.renameSession(renameSessionId, title);
-		patchSessionMetadata(renameSessionId, { title });
-		scheduleSessionListRefresh();
+		patchSessionMetadataEverywhere(queryClient, selectedProjectRef.current, renameSessionId, { title });
+		invalidateSessionList();
 		pushNotice("success", `renamed session to “${truncate(title, 80)}”`);
 		closeRenameDialog();
-	}, [api, closeRenameDialog, patchSessionMetadata, pushNotice, renameSessionId, renameValue, scheduleSessionListRefresh]);
+	}, [api, closeRenameDialog, invalidateSessionList, pushNotice, queryClient, renameSessionId, renameValue]);
 
 	const setSessionArchived = useCallback(
 		async (session: SessionListItem, archived: boolean) => {
@@ -656,13 +562,22 @@ export function App() {
 			await api.configureSession({
 				sessionId,
 				provider: currentSnapshot?.provider ?? session.provider,
-				metadata
+				metadata,
 			});
-			patchSessionMetadata(sessionId, archived ? { archived: true } : {}, archived ? [] : ["archived"]);
-			scheduleSessionListRefresh();
-			pushNotice("success", archived ? `archived “${truncate(sessionTitle(session), 80)}”` : `unarchived “${truncate(sessionTitle(session), 80)}”`);
+			patchSessionMetadataEverywhere(
+				queryClient,
+				selectedProjectRef.current,
+				sessionId,
+				archived ? { archived: true } : {},
+				archived ? [] : ["archived"],
+			);
+			invalidateSessionList();
+			pushNotice(
+				"success",
+				archived ? `archived “${truncate(sessionTitle(session), 80)}”` : `unarchived “${truncate(sessionTitle(session), 80)}”`,
+			);
 		},
-		[api, loadedSnapshot, patchSessionMetadata, pushNotice, scheduleSessionListRefresh]
+		[api, invalidateSessionList, loadedSnapshot, pushNotice, queryClient],
 	);
 
 	const closeDeleteDialog = useCallback(() => {
@@ -686,13 +601,13 @@ export function App() {
 				refreshTimer.current = null;
 			}
 			lastEventIds.current.delete(sessionId);
-			deleteCachedSession(sessionId);
-			composerHandleRef.current?.clearSession(sessionId);
-			setSessions((currentSessions) => {
-				const nextSessions = currentSessions.filter((candidate) => candidate.session_id !== sessionId);
-				sessionsRef.current = new Map(nextSessions.map((candidate) => [candidate.session_id, candidate]));
-				return nextSessions;
+			queryClient.removeQueries({
+				queryKey: queryKeys.session(sessionId, "full_tree"),
 			});
+			queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(selectedProjectRef.current), (current) =>
+				current?.filter((candidate) => candidate.session_id !== sessionId),
+			);
+			composerHandleRef.current?.clearSession(sessionId);
 
 			if (selectedRef.current === sessionId) {
 				selectSession(null);
@@ -700,13 +615,13 @@ export function App() {
 			}
 
 			closeDeleteDialog();
-			scheduleSessionListRefresh(0);
+			invalidateSessionList();
 			pushNotice("success", `deleted “${truncate(title, 80)}”`);
 		} catch (error) {
 			setDeleteDialog((current) => (current?.session.session_id === sessionId ? { ...current, deleting: false } : current));
 			throw error;
 		}
-	}, [api, closeDeleteDialog, deleteCachedSession, deleteDialog, pushNotice, refreshSelected, scheduleSessionListRefresh, selectSession]);
+	}, [api, closeDeleteDialog, deleteDialog, invalidateSessionList, pushNotice, queryClient, refreshSelected, selectSession]);
 
 	const createSession = useCallback(
 		(title?: string) => {
@@ -720,7 +635,7 @@ export function App() {
 			requestAnimationFrame(() => composerHandleRef.current?.focus());
 			return null;
 		},
-		[pushNotice, selectSession]
+		[pushNotice, selectSession],
 	);
 
 	const requireSelected = useCallback(() => {
@@ -744,20 +659,20 @@ export function App() {
 				await api.configureSession({
 					sessionId,
 					provider: current?.provider ?? selectedSession.provider,
-					metadata
+					metadata,
 				});
-				patchSessionMetadata(sessionId, {}, ["archived"]);
-				scheduleSessionListRefresh();
+				patchSessionMetadataEverywhere(queryClient, selectedProjectRef.current, sessionId, {}, ["archived"]);
+				invalidateSessionList();
 			}
 			const clientInputId = randomId("web_input");
 			await api.queueFollowUp({
 				sessionId,
 				clientInputId,
 				expectedActiveLeafId: loadedSnapshot?.activity === "idle" ? (loadedSnapshot.active_leaf_id ?? null) : undefined,
-				content: textContent(text)
+				content: textContent(text),
 			});
 		},
-		[api, loadedSnapshot, patchSessionMetadata, refreshSelected, requireSelected, scheduleSessionListRefresh, selectedSession]
+		[api, invalidateSessionList, loadedSnapshot, queryClient, refreshSelected, requireSelected, selectedSession],
 	);
 
 	const startNewSession = useCallback(
@@ -774,13 +689,15 @@ export function App() {
 				metadata: { title, created_by: "web" },
 				clientInputId: randomId("web_start"),
 				priority: "follow_up",
-				content: textContent(text)
+				content: textContent(text),
 			});
-			await loadSessions();
+			await queryClient.invalidateQueries({
+				queryKey: queryKeys.sessions(projectId),
+			});
 			selectSession(result.session_id);
 			return result.session_id;
 		},
-		[api, loadSessions, newSessionProvider, selectSession]
+		[api, newSessionProvider, queryClient, selectSession],
 	);
 
 	const forkFromTarget = useCallback(
@@ -789,7 +706,7 @@ export function App() {
 			const fork = await api.forkHistory({
 				sessionId,
 				leafId: target.sourceEntryId ?? target.id,
-				placement: target.placement ?? "at"
+				placement: target.placement ?? "at",
 			});
 			const normalizedTitle = title?.trim();
 			if (normalizedTitle) {
@@ -798,19 +715,19 @@ export function App() {
 					provider: loadedSnapshot?.provider ?? selectedSession?.provider ?? DEFAULT_PROVIDER,
 					metadata: {
 						...(loadedSnapshot?.metadata ?? selectedSession?.metadata ?? {}),
-						title: normalizedTitle
-					}
+						title: normalizedTitle,
+					},
 				});
 			}
 			if (target.restoreText !== undefined) {
 				composerHandleRef.current?.setValueForSession(fork.session_id, target.restoreText);
 			}
-			await loadSessions();
+			invalidateSessionList();
 			selectSession(fork.session_id);
 			pushNotice("success", `forked ${fork.session_id}`);
 			return fork.session_id;
 		},
-		[api, loadSessions, loadedSnapshot, pushNotice, requireSelected, selectedSession, selectSession]
+		[api, invalidateSessionList, loadedSnapshot, pushNotice, requireSelected, selectedSession, selectSession],
 	);
 
 	const switchToTarget = useCallback(
@@ -823,29 +740,52 @@ export function App() {
 			await api.rewindHistory({
 				sessionId,
 				leafId: target.actionLeafId,
-				expectedActiveLeafId: target.expectedActiveLeafId ?? current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null
+				expectedActiveLeafId: target.expectedActiveLeafId ?? current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
 			});
-			markCachedSessionStale(sessionId);
-			await refreshSelected(sessionId);
+			await queryClient.invalidateQueries({
+				queryKey: queryKeys.session(sessionId, "full_tree"),
+			});
 			if (target.restoreText !== undefined) {
 				composerHandleRef.current?.setValue(target.restoreText);
 			}
-			scheduleSessionListRefresh();
+			invalidateSessionList();
 			pushNotice("success", target.restoreText !== undefined ? "message restored for editing" : "switched to selected history point");
 		},
-		[api, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, markCachedSessionStale, pushNotice, refreshSelected, requireSelected, scheduleSessionListRefresh]
+		[
+			api,
+			invalidateSessionList,
+			loadedSnapshot?.active_leaf_id,
+			loadedSnapshot?.activity,
+			pushNotice,
+			queryClient,
+			refreshSelected,
+			requireSelected,
+		],
 	);
 
 	const promoteQueuedInput = useCallback(
 		async (inputId: string) => {
 			const sessionId = requireSelected();
 			const result = await api.promoteQueuedInput(sessionId, inputId);
-			await Promise.all([refreshSelected(sessionId), loadSessions()]);
+			patchQueuedInputsInSnapshot(queryClient, {
+				event_id: 0,
+				event: "input.promoted",
+				session_id: sessionId,
+				data: { input_id: inputId },
+			});
+			await Promise.all([
+				queryClient.invalidateQueries({
+					queryKey: queryKeys.session(sessionId, "full_tree"),
+				}),
+				queryClient.invalidateQueries({
+					queryKey: queryKeys.sessions(selectedProjectRef.current),
+				}),
+			]);
 			if (!result.promoted && result.status !== "queued") {
 				pushNotice("info", "message is already being processed");
 			}
 		},
-		[api, loadSessions, pushNotice, refreshSelected, requireSelected]
+		[api, pushNotice, queryClient, requireSelected],
 	);
 
 	const stopActiveTurn = useCallback(async () => {
@@ -853,13 +793,20 @@ export function App() {
 		setStopping(true);
 		try {
 			await api.interrupt(sessionId);
-			await Promise.all([refreshSelected(sessionId), loadSessions()]);
+			await Promise.all([
+				queryClient.invalidateQueries({
+					queryKey: queryKeys.session(sessionId, "full_tree"),
+				}),
+				queryClient.invalidateQueries({
+					queryKey: queryKeys.sessions(selectedProjectRef.current),
+				}),
+			]);
 		} catch (error) {
 			pushNotice("error", errorMessage(error));
 		} finally {
 			setStopping(false);
 		}
-	}, [api, loadSessions, pushNotice, refreshSelected, requireSelected]);
+	}, [api, pushNotice, queryClient, requireSelected]);
 
 	const resumeTerminalTurn = useCallback(
 		async (leafId?: string | null) => {
@@ -875,15 +822,22 @@ export function App() {
 				const result = await api.resumeTurn({
 					sessionId,
 					leafId: activeLeafId,
-					expectedActiveLeafId: current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null
+					expectedActiveLeafId: current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
 				});
-				await Promise.all([refreshSelected(sessionId), loadSessions()]);
+				await Promise.all([
+					queryClient.invalidateQueries({
+						queryKey: queryKeys.session(sessionId, "full_tree"),
+					}),
+					queryClient.invalidateQueries({
+						queryKey: queryKeys.sessions(selectedProjectRef.current),
+					}),
+				]);
 				pushNotice("success", result.outcome === "Interrupted" ? "continued turn" : "retry started");
 			} finally {
 				setResumingTurnId(null);
 			}
 		},
-		[api, loadSessions, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, pushNotice, refreshSelected, requireSelected]
+		[api, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, pushNotice, queryClient, refreshSelected, requireSelected],
 	);
 
 	const executeSlash = useCallback(
@@ -902,14 +856,17 @@ export function App() {
 			}
 			if (name === "system") {
 				if (!args) {
-					const next = await api.getConfig();
-					setConfig(next);
+					const next = await queryClient.fetchQuery({
+						queryKey: queryKeys.config,
+						queryFn: () => api.getConfig(),
+						staleTime: 0,
+					});
 					pushActionNotice("info", next.system_prompt ? `system: ${truncate(next.system_prompt, 320)}` : "system prompt is empty");
 					return;
 				}
 				const systemPrompt = args === "clear" ? null : args;
 				const next = await api.setConfig(systemPrompt);
-				setConfig(next);
+				queryClient.setQueryData(queryKeys.config, next);
 				pushActionNotice("success", systemPrompt ? "global system prompt updated" : "global system prompt cleared");
 				return;
 			}
@@ -921,7 +878,7 @@ export function App() {
 					mode: "fork",
 					entries: refreshed?.entries ?? loadedEntries,
 					activeLeafId: refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
-					initialForkTitle: args
+					initialForkTitle: args,
 				});
 				return;
 			}
@@ -933,7 +890,7 @@ export function App() {
 				setHistoryDialog({
 					mode: "switch",
 					entries: refreshed?.entries ?? loadedEntries,
-					activeLeafId: refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null
+					activeLeafId: refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
 				});
 				return;
 			}
@@ -942,8 +899,8 @@ export function App() {
 				setExportDialog({
 					entries: branchEntriesFor(
 						refreshed?.entries ?? loadedEntries,
-						refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null
-					)
+						refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
+					),
 				});
 				return;
 			}
@@ -954,62 +911,61 @@ export function App() {
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[
-			api,
-			loadedEntries,
-			loadedSnapshot,
-			pushNotice,
-			refreshSelected,
-			requireSelected
-		]
+		[api, loadedEntries, loadedSnapshot, pushNotice, queryClient, refreshSelected, requireSelected],
 	);
 
-	const submitComposer = useCallback(async (text: string) => {
-		if (!text.trim() || sending) return false;
-		text = text.trim();
-		const slash = parseSlash(text);
-		setSending(true);
-		try {
-			if (slash) {
-				await executeSlash(slash);
-			} else {
-				if (selectedRef.current) {
-					await queueUserInput(text);
+	const submitComposer = useCallback(
+		async (text: string) => {
+			if (!text.trim() || sending) return false;
+			text = text.trim();
+			const slash = parseSlash(text);
+			setSending(true);
+			try {
+				if (slash) {
+					await executeSlash(slash);
 				} else {
-					await startNewSession(text);
+					if (selectedRef.current) {
+						await queueUserInput(text);
+					} else {
+						await startNewSession(text);
+					}
 				}
+				return true;
+			} catch (error) {
+				pushNotice("error", errorMessage(error));
+				return false;
+			} finally {
+				setSending(false);
 			}
-			return true;
-		} catch (error) {
-			pushNotice("error", errorMessage(error));
-			return false;
-		} finally {
-			setSending(false);
-		}
-	}, [executeSlash, pushNotice, queueUserInput, sending, startNewSession]);
+		},
+		[executeSlash, pushNotice, queueUserInput, sending, startNewSession],
+	);
 
 	const layoutStyle = {
-		gridTemplateColumns: rightOpen ? "320px minmax(0,1fr) minmax(320px,380px)" : "320px minmax(0,1fr)"
+		gridTemplateColumns: rightOpen ? "320px minmax(0,1fr) minmax(320px,380px)" : "320px minmax(0,1fr)",
 	};
 	const canStop = !!selectedId && loadedSnapshot?.activity === "running";
 	const queuedInputs = loadedSnapshot?.queued_inputs ?? [];
 	const handleToggleArchived = useCallback(() => {
 		setShowArchived((show) => !show);
 	}, []);
-	const handleSelectProject = useCallback((projectId: string) => {
-		if (projectId === selectedProjectRef.current) return;
-		selectedProjectRef.current = projectId;
-		setSelectedProjectId(projectId);
-		selectSession(null);
-		setQuery("");
-		composerHandleRef.current?.setValue("");
-	}, [selectSession]);
+	const handleSelectProject = useCallback(
+		(projectId: string) => {
+			if (projectId === selectedProjectRef.current) return;
+			selectedProjectRef.current = projectId;
+			setSelectedProjectId(projectId);
+			selectSession(null);
+			setQuery("");
+			composerHandleRef.current?.setValue("");
+		},
+		[selectSession],
+	);
 	const openCreateProjectDialog = useCallback(() => {
 		setProjectDialog({
 			mode: "create",
 			name: "",
 			startingCwd: selectedProject?.starting_cwd ?? "",
-			saving: false
+			saving: false,
 		});
 	}, [selectedProject?.starting_cwd]);
 	const openEditProjectDialog = useCallback((project: Project) => {
@@ -1018,7 +974,7 @@ export function App() {
 			projectId: project.project_id,
 			name: projectTitle(project),
 			startingCwd: project.starting_cwd,
-			saving: false
+			saving: false,
 		});
 	}, []);
 	const closeProjectDialog = useCallback(() => {
@@ -1034,13 +990,17 @@ export function App() {
 		try {
 			const saved =
 				projectDialog.mode === "create"
-					? await api.createProject({ name, startingCwd, metadata: { created_by: "web" } })
+					? await api.createProject({
+							name,
+							startingCwd,
+							metadata: { created_by: "web" },
+						})
 					: await api.updateProject({
 							projectId: projectDialog.projectId ?? "",
 							name,
-							startingCwd
+							startingCwd,
 						});
-			await loadProjects();
+			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
 			selectedProjectRef.current = saved.project_id;
 			setSelectedProjectId(saved.project_id);
 			selectSession(null);
@@ -1050,7 +1010,7 @@ export function App() {
 			setProjectDialog((current) => (current ? { ...current, saving: false } : current));
 			throw error;
 		}
-	}, [api, closeProjectDialog, loadProjects, projectDialog, pushNotice, selectSession]);
+	}, [api, closeProjectDialog, projectDialog, pushNotice, queryClient, selectSession]);
 	const handleSidebarNew = useCallback(() => {
 		void createSession();
 	}, [createSession]);
@@ -1058,7 +1018,7 @@ export function App() {
 		(session: SessionListItem) => {
 			void setSessionArchived(session, !isArchivedSession(session)).catch((error) => pushNotice("error", errorMessage(error)));
 		},
-		[pushNotice, setSessionArchived]
+		[pushNotice, setSessionArchived],
 	);
 	const handleSidebarDelete = useCallback((session: SessionListItem) => {
 		setDeleteDialog({ session, deleting: false });
@@ -1067,13 +1027,13 @@ export function App() {
 		(value: string) => {
 			void changeModel(value).catch((error) => pushNotice("error", errorMessage(error)));
 		},
-		[changeModel, pushNotice]
+		[changeModel, pushNotice],
 	);
 	const handleReasoningEffortChange = useCallback(
 		(value: ReasoningEffort) => {
 			void changeReasoningEffort(value).catch((error) => pushNotice("error", errorMessage(error)));
 		},
-		[changeReasoningEffort, pushNotice]
+		[changeReasoningEffort, pushNotice],
 	);
 	const handleToggleRight = useCallback(() => {
 		setRightOpen((open) => !open);
@@ -1082,7 +1042,7 @@ export function App() {
 		(entryId: string) => {
 			void resumeTerminalTurn(entryId).catch((error) => pushNotice("error", errorMessage(error)));
 		},
-		[pushNotice, resumeTerminalTurn]
+		[pushNotice, resumeTerminalTurn],
 	);
 	const handleStop = useCallback(() => {
 		void stopActiveTurn();
@@ -1091,7 +1051,7 @@ export function App() {
 		(inputId: string) => {
 			void promoteQueuedInput(inputId).catch((error) => pushNotice("error", errorMessage(error)));
 		},
-		[promoteQueuedInput, pushNotice]
+		[promoteQueuedInput, pushNotice],
 	);
 
 	return (
@@ -1226,11 +1186,24 @@ export function App() {
 	);
 }
 
+function titleFromText(text: string): string {
+	return truncate(firstLine(text).trim() || "New session", 64);
+}
+
+function errorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function modelErrorNotice(data: Record<string, unknown>): string {
+	const error = typeof data.error === "string" ? data.error : "model request failed";
+	return `model error: ${truncate(error, 420)}`;
+}
+
 function RenameSessionDialog({
 	value,
 	onChange,
 	onClose,
-	onSubmit
+	onSubmit,
 }: {
 	value: string;
 	onChange: (value: string) => void;
@@ -1239,7 +1212,13 @@ function RenameSessionDialog({
 }) {
 	return (
 		<div className="modal-scrim" role="presentation" onMouseDown={onClose}>
-			<div className="rename-dialog" role="dialog" aria-modal="true" aria-labelledby="rename-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+			<div
+				className="rename-dialog"
+				role="dialog"
+				aria-modal="true"
+				aria-labelledby="rename-dialog-title"
+				onMouseDown={(event) => event.stopPropagation()}
+			>
 				<div className="rename-dialog-head">
 					<div className="rename-dialog-copy">
 						<h2 id="rename-dialog-title">Rename session</h2>
@@ -1259,8 +1238,12 @@ function RenameSessionDialog({
 						<input value={value} onChange={(event) => onChange(event.target.value)} autoFocus placeholder="Session title" required />
 					</label>
 					<div className="rename-actions">
-						<button type="button" className="secondary-button" onClick={onClose}>Cancel</button>
-						<button type="submit" className="primary-button">Save</button>
+						<button type="button" className="secondary-button" onClick={onClose}>
+							Cancel
+						</button>
+						<button type="submit" className="primary-button">
+							Save
+						</button>
 					</div>
 				</form>
 			</div>
@@ -1272,7 +1255,7 @@ function DeleteSessionDialog({
 	session,
 	deleting,
 	onClose,
-	onConfirm
+	onConfirm,
 }: {
 	session: SessionListItem;
 	deleting: boolean;
@@ -1282,7 +1265,13 @@ function DeleteSessionDialog({
 	const title = sessionTitle(session);
 	return (
 		<div className="modal-scrim" role="presentation" onMouseDown={deleting ? undefined : onClose}>
-			<div className="rename-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+			<div
+				className="rename-dialog"
+				role="dialog"
+				aria-modal="true"
+				aria-labelledby="delete-dialog-title"
+				onMouseDown={(event) => event.stopPropagation()}
+			>
 				<div className="rename-dialog-head">
 					<div className="rename-dialog-copy">
 						<h2 id="delete-dialog-title">Delete session</h2>
@@ -1298,7 +1287,9 @@ function DeleteSessionDialog({
 					<p className="muted">This removes the transcript, queued inputs, actions, and events for this session. This cannot be undone.</p>
 				</div>
 				<div className="rename-actions">
-					<button type="button" className="secondary-button" onClick={onClose} disabled={deleting}>Cancel</button>
+					<button type="button" className="secondary-button" onClick={onClose} disabled={deleting}>
+						Cancel
+					</button>
 					<button type="button" className="primary-button destructive" onClick={onConfirm} disabled={deleting}>
 						{deleting ? "Deleting..." : "Delete"}
 					</button>
@@ -1312,7 +1303,7 @@ function ProjectDialog({
 	state,
 	onChange,
 	onClose,
-	onSubmit
+	onSubmit,
 }: {
 	state: ProjectDialogState;
 	onChange: (patch: Partial<ProjectDialogState>) => void;
@@ -1322,7 +1313,13 @@ function ProjectDialog({
 	const title = state.mode === "create" ? "New project" : "Project settings";
 	return (
 		<div className="modal-scrim" role="presentation" onMouseDown={state.saving ? undefined : onClose}>
-			<div className="rename-dialog project-dialog" role="dialog" aria-modal="true" aria-labelledby="project-dialog-title" onMouseDown={(event) => event.stopPropagation()}>
+			<div
+				className="rename-dialog project-dialog"
+				role="dialog"
+				aria-modal="true"
+				aria-labelledby="project-dialog-title"
+				onMouseDown={(event) => event.stopPropagation()}
+			>
 				<div className="rename-dialog-head">
 					<div className="rename-dialog-copy">
 						<h2 id="project-dialog-title">{title}</h2>
@@ -1359,7 +1356,9 @@ function ProjectDialog({
 						/>
 					</label>
 					<div className="rename-actions">
-						<button type="button" className="secondary-button" onClick={onClose} disabled={state.saving}>Cancel</button>
+						<button type="button" className="secondary-button" onClick={onClose} disabled={state.saving}>
+							Cancel
+						</button>
 						<button type="submit" className="primary-button" disabled={state.saving}>
 							{state.saving ? "Saving..." : "Save"}
 						</button>
@@ -1368,151 +1367,4 @@ function ProjectDialog({
 			</div>
 		</div>
 	);
-}
-
-function mergeSnapshotIntoSessionList(sessions: SessionSummary[], snapshot: SessionSnapshot): SessionSummary[] {
-	let found = false;
-	const nextSessions = sessions.map((session) => {
-		if (session.session_id !== snapshot.session_id) return session;
-		found = true;
-		return {
-			...session,
-			project_id: snapshot.project_id,
-			starting_cwd: snapshot.starting_cwd,
-			activity: snapshot.activity,
-			active_leaf_id: snapshot.active_leaf_id,
-			provider: snapshot.provider,
-			metadata: snapshot.metadata
-		};
-	});
-	return found ? nextSessions : sessions;
-}
-
-function patchSessionSummaryList(sessions: SessionSummary[], sessionId: string, patch: Partial<SessionSummary>): SessionSummary[] {
-	let changed = false;
-	const nextSessions = sessions.map((session) => {
-		if (session.session_id !== sessionId) return session;
-		changed = true;
-		return { ...session, ...patch };
-	});
-	return changed ? nextSessions : sessions;
-}
-
-function snapshotPatchFromSummary(summary: SessionSummary): Partial<CachedSnapshot> {
-	return {
-		project_id: summary.project_id,
-		starting_cwd: summary.starting_cwd,
-		activity: summary.activity,
-		active_leaf_id: summary.active_leaf_id,
-		provider: summary.provider,
-		metadata: summary.metadata
-	};
-}
-
-function snapshotPatchFromSummaryPatch(patch: Partial<SessionSummary>): Partial<CachedSnapshot> {
-	const { created_at: _createdAt, updated_at: _updatedAt, ...snapshotPatch } = patch;
-	void _createdAt;
-	void _updatedAt;
-	return snapshotPatch;
-}
-
-function mergeMetadata(metadata: Record<string, unknown>, patch: Record<string, unknown>, removeKeys: string[] = []): Record<string, unknown> {
-	const next = { ...metadata, ...patch };
-	for (const key of removeKeys) delete next[key];
-	return next;
-}
-
-function patchSessionMetadataInList(
-	sessions: SessionSummary[],
-	sessionId: string,
-	patch: Record<string, unknown>,
-	removeKeys: string[] = []
-): SessionSummary[] {
-	let changed = false;
-	const nextSessions = sessions.map((session) => {
-		if (session.session_id !== sessionId) return session;
-		changed = true;
-		return { ...session, metadata: mergeMetadata(session.metadata, patch, removeKeys) };
-	});
-	return changed ? nextSessions : sessions;
-}
-
-function titleFromText(text: string): string {
-	return truncate(firstLine(text).trim() || "New session", 64);
-}
-
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
-function isQueuedInputPatchEvent(event: string): boolean {
-	return event === "input.consumed" || event === "input.promoted";
-}
-
-function applyQueuedInputEvent(
-	event: EventFrame,
-	setSnapshot: Dispatch<SetStateAction<SessionSnapshot | null>>
-) {
-	if (!isQueuedInputPatchEvent(event.event)) return;
-	setSnapshot((current) => applyQueuedInputEventToSnapshot(event, current));
-}
-
-function applyQueuedInputEventToSnapshot<T extends Pick<SessionSnapshot, "session_id" | "queued_inputs">>(event: EventFrame, current: T): T;
-function applyQueuedInputEventToSnapshot<T extends Pick<SessionSnapshot, "session_id" | "queued_inputs">>(event: EventFrame, current: T | null): T | null;
-function applyQueuedInputEventToSnapshot<T extends Pick<SessionSnapshot, "session_id" | "queued_inputs">>(event: EventFrame, current: T | null): T | null {
-	if (!current || current.session_id !== event.session_id) return current;
-	const inputId = typeof event.data.input_id === "string" ? event.data.input_id : null;
-	if (!inputId) return current;
-	if (event.event === "input.consumed") {
-		const queuedInputs = current.queued_inputs.filter((input) => input.input_id !== inputId);
-		return queuedInputs.length === current.queued_inputs.length ? current : { ...current, queued_inputs: queuedInputs };
-	}
-	if (event.event !== "input.promoted") return current;
-	const promotedAt = typeof event.data.promoted_at === "string" ? event.data.promoted_at : null;
-	let changed = false;
-	const queuedInputs = current.queued_inputs.map((input) => {
-		if (input.input_id !== inputId) return input;
-		changed = true;
-		return { ...input, priority: "steer" as const, status: "queued" as const, promoted_at: promotedAt };
-	});
-	return changed ? { ...current, queued_inputs: queuedInputs } : current;
-}
-
-function modelErrorNotice(data: Record<string, unknown>): string {
-	const error = typeof data.error === "string" ? data.error : "model request failed";
-	return `model error: ${truncate(error, 420)}`;
-}
-
-function snapshotWithEntries(snapshot: CachedSnapshot): SessionSnapshot {
-	return { ...snapshot, entries: undefined };
-}
-
-function trimSessionCache(cache: Map<string, CachedSession>) {
-	while (cache.size > MAX_CACHED_SESSIONS) {
-		const oldest = oldestCachedSessionId(cache);
-		if (!oldest) break;
-		cache.delete(oldest);
-	}
-	while (totalCachedEntryCount(cache) > MAX_CACHED_ENTRIES) {
-		const oldest = oldestCachedSessionId(cache);
-		if (!oldest) break;
-		cache.delete(oldest);
-	}
-}
-
-function oldestCachedSessionId(cache: Map<string, CachedSession>): string | null {
-	let oldestId: string | null = null;
-	let oldestAt = Number.POSITIVE_INFINITY;
-	for (const [sessionId, cached] of cache) {
-		if (cached.cachedAt >= oldestAt) continue;
-		oldestId = sessionId;
-		oldestAt = cached.cachedAt;
-	}
-	return oldestId;
-}
-
-function totalCachedEntryCount(cache: Map<string, CachedSession>): number {
-	let total = 0;
-	for (const cached of cache.values()) total += cached.entries.length;
-	return total;
 }
