@@ -7,7 +7,7 @@ import { branchEntriesFor, type HistoryTargetOption } from "./historyTargets.ts"
 import { ExportDialog } from "./exportDialog.tsx";
 import { randomId } from "./ids.ts";
 import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
-import { approximateJsonSize, perfLog, perfNow } from "./perf.ts";
+import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import {
@@ -143,6 +143,26 @@ export function App() {
 		sessionCacheRef.current.delete(sessionId);
 	}, []);
 
+	const applySessionSummaries = useCallback(
+		(nextSessions: SessionSummary[]) => {
+			const nextSessionMap = new Map(nextSessions.map((session) => [session.session_id, session]));
+			sessionsRef.current = nextSessionMap;
+			setSessions(nextSessions);
+			setSnapshot((current) => {
+				if (!current) return current;
+				const summary = nextSessionMap.get(current.session_id);
+				return summary ? { ...current, ...snapshotPatchFromSummary(summary) } : current;
+			});
+			for (const summary of nextSessions) {
+				patchCachedSession(summary.session_id, (cached) => ({
+					...cached,
+					snapshot: { ...cached.snapshot, ...snapshotPatchFromSummary(summary) }
+				}));
+			}
+		},
+		[patchCachedSession]
+	);
+
 	const clearSelectedSessionState = useCallback(() => {
 		selectedRequestGeneration.current += 1;
 		setSnapshot(null);
@@ -151,7 +171,11 @@ export function App() {
 
 	const patchSessionSummary = useCallback(
 		(sessionId: string, patch: Partial<SessionSummary>) => {
-			setSessions((current) => patchSessionSummaryList(current, sessionId, patch));
+			setSessions((current) => {
+				const nextSessions = patchSessionSummaryList(current, sessionId, patch);
+				if (nextSessions !== current) sessionsRef.current = new Map(nextSessions.map((session) => [session.session_id, session]));
+				return nextSessions;
+			});
 			setSnapshot((current) => {
 				if (!current || current.session_id !== sessionId) return current;
 				return { ...current, ...snapshotPatchFromSummaryPatch(patch) };
@@ -166,7 +190,11 @@ export function App() {
 
 	const patchSessionMetadata = useCallback(
 		(sessionId: string, patch: Record<string, unknown>, removeKeys: string[] = []) => {
-			setSessions((current) => patchSessionMetadataInList(current, sessionId, patch, removeKeys));
+			setSessions((current) => {
+				const nextSessions = patchSessionMetadataInList(current, sessionId, patch, removeKeys);
+				if (nextSessions !== current) sessionsRef.current = new Map(nextSessions.map((session) => [session.session_id, session]));
+				return nextSessions;
+			});
 			setSnapshot((current) => {
 				if (!current || current.session_id !== sessionId) return current;
 				return { ...current, metadata: mergeMetadata(current.metadata, patch, removeKeys) };
@@ -257,14 +285,14 @@ export function App() {
 		const generation = ++sessionListGeneration.current;
 		const expectedProjectId = projectId;
 		if (!expectedProjectId) {
-			setSessions([]);
+			applySessionSummaries([]);
 			return [];
 		}
 		const nextSessions = await api.listSessions(100, expectedProjectId);
 		if (generation !== sessionListGeneration.current || selectedProjectRef.current !== expectedProjectId) return nextSessions;
-		setSessions(nextSessions);
+		applySessionSummaries(nextSessions);
 		return nextSessions;
-	}, [api]);
+	}, [api, applySessionSummaries]);
 
 	const scheduleSessionListRefresh = useCallback(
 		(delayMs = SESSION_LIST_REFRESH_DEBOUNCE_MS) => {
@@ -304,24 +332,31 @@ export function App() {
 		async (sessionId = selectedRef.current, options: { entryScope?: EntryScope; force?: boolean } = {}) => {
 			if (!sessionId) return null;
 			const generation = ++selectedRequestGeneration.current;
+			const shouldLogPerf = perfEnabled();
 			const startedAt = perfNow();
-			perfLog("session.get start", { sessionId, source: options.force ? "force" : "refresh" });
+			if (shouldLogPerf) perfLog("session.get start", { sessionId, source: options.force ? "force" : "refresh" });
 			const nextSnapshot = await api.getSession(sessionId, { includeEntries: true });
 			const nextEntries = nextSnapshot.entries ?? [];
-			const rpcMs = perfNow() - startedAt;
-			perfLog("session.get end", {
-				sessionId,
-				entries: nextEntries.length,
-				approxBytes: approximateJsonSize(nextSnapshot),
-				rpcMs: Math.round(rpcMs),
-				entryScope: options.entryScope ?? "full_tree"
-			});
+			if (shouldLogPerf) {
+				const rpcMs = perfNow() - startedAt;
+				perfLog("session.get end", {
+					sessionId,
+					entries: nextEntries.length,
+					approxBytes: approximateJsonSize(nextSnapshot),
+					rpcMs: Math.round(rpcMs),
+					entryScope: options.entryScope ?? "full_tree"
+				});
+			}
 			if (selectedRef.current !== sessionId || generation !== selectedRequestGeneration.current) return null;
 			lastEventIds.current.set(sessionId, nextSnapshot.last_event_id);
 			writeCachedSession(sessionId, nextSnapshot, nextEntries, options.entryScope ?? "full_tree");
 			setSnapshot(nextSnapshot);
 			setEntries(nextEntries);
-			setSessions((current) => mergeSnapshotIntoSessionList(current, nextSnapshot));
+			setSessions((current) => {
+				const nextSessions = mergeSnapshotIntoSessionList(current, nextSnapshot);
+				sessionsRef.current = new Map(nextSessions.map((session) => [session.session_id, session]));
+				return nextSessions;
+			});
 			if (nextSnapshot.project_id !== selectedProjectRef.current) {
 				selectedProjectRef.current = nextSnapshot.project_id;
 				setSelectedProjectId(nextSnapshot.project_id);
@@ -636,7 +671,11 @@ export function App() {
 			lastEventIds.current.delete(sessionId);
 			deleteCachedSession(sessionId);
 			composerHandleRef.current?.clearSession(sessionId);
-			setSessions((currentSessions) => currentSessions.filter((candidate) => candidate.session_id !== sessionId));
+			setSessions((currentSessions) => {
+				const nextSessions = currentSessions.filter((candidate) => candidate.session_id !== sessionId);
+				sessionsRef.current = new Map(nextSessions.map((candidate) => [candidate.session_id, candidate]));
+				return nextSessions;
+			});
 
 			if (selectedRef.current === sessionId) {
 				selectSession(null);
@@ -1342,6 +1381,17 @@ function patchSessionSummaryList(sessions: SessionSummary[], sessionId: string, 
 	return changed ? nextSessions : sessions;
 }
 
+function snapshotPatchFromSummary(summary: SessionSummary): Partial<CachedSnapshot> {
+	return {
+		project_id: summary.project_id,
+		starting_cwd: summary.starting_cwd,
+		activity: summary.activity,
+		active_leaf_id: summary.active_leaf_id,
+		provider: summary.provider,
+		metadata: summary.metadata
+	};
+}
+
 function snapshotPatchFromSummaryPatch(patch: Partial<SessionSummary>): Partial<CachedSnapshot> {
 	const { created_at: _createdAt, updated_at: _updatedAt, ...snapshotPatch } = patch;
 	void _createdAt;
@@ -1421,6 +1471,7 @@ function shouldRefreshSelectedForEvent(event: EventFrame): boolean {
 	if (event.event === "session.configured") return false;
 	if (event.event === "input.consumed" || event.event === "input.promoted") return false;
 	return (
+		event.event === "input.queued" ||
 		event.event === "transcript.appended" ||
 		event.event === "turn.started" ||
 		event.event === "turn.finished" ||

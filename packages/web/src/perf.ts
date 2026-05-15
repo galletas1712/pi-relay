@@ -1,7 +1,13 @@
 const PERF_STORAGE_KEY = "piRelayPerf";
 
 export function perfEnabled(): boolean {
-	return import.meta.env.DEV || (typeof window !== "undefined" && window.localStorage?.getItem(PERF_STORAGE_KEY) === "1");
+	if (import.meta.env.DEV) return true;
+	if (typeof window === "undefined") return false;
+	try {
+		return window.localStorage?.getItem(PERF_STORAGE_KEY) === "1";
+	} catch {
+		return false;
+	}
 }
 
 export function perfNow(): number {
