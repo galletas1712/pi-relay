@@ -1,5 +1,6 @@
 import { memo } from "react";
 import { LogHeader } from "./panels.tsx";
+import type { PendingTranscriptInput } from "./pendingInputs.ts";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { displayActivity, isArchivedSession, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
 import { MessageList } from "./transcript.tsx";
@@ -9,6 +10,7 @@ export interface ChatPaneProps {
 	session: SessionDisplayInfo | null;
 	snapshot: SessionSnapshot | null;
 	entries: TranscriptEntry[];
+	pendingTranscriptInputs: PendingTranscriptInput[];
 	transcriptLoading: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
@@ -29,6 +31,7 @@ export const ChatPane = memo(function ChatPane({
 	session,
 	snapshot,
 	entries,
+	pendingTranscriptInputs,
 	transcriptLoading,
 	modelOptions,
 	modelValue,
@@ -68,6 +71,7 @@ export const ChatPane = memo(function ChatPane({
 				hasSession={!!selectedId}
 				sessionId={selectedId}
 				entriesSessionId={snapshot?.session_id ?? null}
+				pendingInputs={pendingTranscriptInputs}
 				loadingSession={transcriptLoading}
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}

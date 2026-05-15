@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { Loader2, MoveUp, Send, Square } from "lucide-react";
 import { COMMANDS, filterCommands, matchSlashPrefix, type SlashCommandInfo } from "./slash.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
-import type { QueuedInput } from "./types.ts";
+import type { QueuePaneInput } from "./pendingInputs.ts";
 
 const NEW_SESSION_DRAFT_ID = "__new_session__";
 const COMPOSER_MIN_HEIGHT_PX = 44;
@@ -14,6 +14,7 @@ export interface ComposerHandle {
 	setValue(value: string): void;
 	setValueForSession(sessionId: string | null, value: string): void;
 	clearSession(sessionId: string | null): void;
+	restoreSubmittedDraft(sessionId: string | null, value: string): void;
 }
 
 export const Composer = memo(function Composer({
@@ -34,7 +35,7 @@ export const Composer = memo(function Composer({
 	sending: boolean;
 	canStop: boolean;
 	stopping: boolean;
-	queuedInputs: QueuedInput[];
+	queuedInputs: QueuePaneInput[];
 	onSubmit: (text: string) => Promise<boolean> | boolean;
 	onStop: () => void;
 	onPromoteQueued: (inputId: string) => void;
@@ -97,6 +98,13 @@ export const Composer = memo(function Composer({
 					setDraft(value);
 				}
 			},
+			restoreSubmittedDraft: (sessionId, value) => {
+				storeDraft(sessionId, value);
+				if (selectedIdRef.current === sessionId && !draftRef.current.trim()) {
+					draftRef.current = value;
+					setDraft(value);
+				}
+			},
 			clearSession: (sessionId) => {
 				storeDraft(sessionId, "");
 				if (selectedIdRef.current === sessionId) {
@@ -139,11 +147,11 @@ export const Composer = memo(function Composer({
 		const text = draftRef.current.trim();
 		if (!text || sending) return;
 		const submittedSessionId = selectedIdRef.current;
-		const accepted = await onSubmit(text);
-		if (!accepted) return;
 		storeDraft(submittedSessionId, "");
 		setDraftValue("");
 		requestAnimationFrame(() => textAreaRef.current?.focus());
+		const accepted = await onSubmit(text);
+		if (!accepted && !draftRef.current.trim()) setDraftValue(text);
 	}, [onSubmit, sending, setDraftValue, storeDraft]);
 
 	const onKeyDown = useCallback(
@@ -230,7 +238,7 @@ export function QueuedInputPane({
 	visible,
 	onPromote
 }: {
-	inputs: QueuedInput[];
+	inputs: QueuePaneInput[];
 	visible: boolean;
 	onPromote: (inputId: string) => void;
 }) {
@@ -243,9 +251,9 @@ export function QueuedInputPane({
 			</div>
 			<div className="queue-list">
 				{inputs.map((input) => {
-					const canPromote = input.priority === "follow_up" && input.status === "queued";
+					const canPromote = !input.pending && input.priority === "follow_up" && input.status === "queued";
 					return (
-						<div className="queue-row" key={input.input_id}>
+						<div className={`queue-row ${input.pending ? "pending" : ""}`} key={input.input_id}>
 							<span className={`queue-priority ${input.priority === "steer" ? "steer" : ""}`}>
 								{input.priority === "steer" ? "steer" : "follow-up"}
 							</span>
@@ -258,7 +266,7 @@ export function QueuedInputPane({
 								title={canPromote ? "promote to steer" : "already steering"}
 							>
 								<MoveUp size={13} />
-								<span>{input.priority === "steer" ? "steering" : "steer"}</span>
+								<span>{input.pending ? "sending" : input.priority === "steer" ? "steering" : "steer"}</span>
 							</button>
 						</div>
 					);

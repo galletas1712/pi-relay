@@ -9,6 +9,16 @@ import { branchEntriesFor, type HistoryTargetOption } from "./historyTargets.ts"
 import { ExportDialog } from "./exportDialog.tsx";
 import { randomId } from "./ids.ts";
 import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
+import {
+	eventClientInputId,
+	eventContentBlocks,
+	eventInputId,
+	pendingInputIsReflected,
+	pendingInputMatchesEvent,
+	queuedInputFromPending,
+	queuedInputMatchesPending,
+	type PendingInput,
+} from "./pendingInputs.ts";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
 import type { ConnectionStatus } from "./rpc.ts";
@@ -106,6 +116,7 @@ export function App() {
 	const [sending, setSending] = useState(false);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
+	const [pendingInputs, setPendingInputs] = useState<PendingInput[]>([]);
 	const [sidebarOpen, setSidebarOpen] = useState(() => defaultPanelState(panelModeForViewport()).sidebarOpen);
 	const [rightOpen, setRightOpen] = useState(() => defaultPanelState(panelModeForViewport()).rightOpen);
 	const [showArchived, setShowArchived] = useState(false);
@@ -211,6 +222,22 @@ export function App() {
 	const loadedSnapshot = rawSnapshot?.session_id === selectedId ? rawSnapshot : null;
 	const loadedEntries = loadedSnapshot ? (loadedSnapshot.entries ?? []) : [];
 	const transcriptLoading = !!selectedId && !loadedSnapshot && selectedSessionQuery.isFetching;
+	const selectedPendingInputs = useMemo(
+		() => pendingInputs.filter((input) => input.sessionId === selectedId),
+		[pendingInputs, selectedId],
+	);
+	const pendingTranscriptInputs = useMemo(
+		() =>
+			selectedPendingInputs
+				.filter((input) => input.placement === "transcript")
+				.map((input) => ({
+					id: input.id,
+					content: input.content,
+					status: input.status,
+					error: input.error,
+				})),
+		[selectedPendingInputs],
+	);
 
 	const snapshotChatSession = useMemo(() => {
 		if (!selectedId || !loadedSnapshot) return null;
@@ -347,6 +374,47 @@ export function App() {
 		[getFreshSession],
 	);
 
+	const reconcilePendingInputEvent = useCallback((event: EventFrame) => {
+		if (event.event !== "input.queued" && event.event !== "input.accepted" && event.event !== "input.consumed" && event.event !== "input.promoted") return;
+		const inputId = eventInputId(event);
+		const clientInputId = eventClientInputId(event);
+		const content = eventContentBlocks(event);
+		setPendingInputs((current) => {
+			let changed = false;
+			const next = current.flatMap((input) => {
+				if (input.sessionId !== event.session_id || !pendingInputMatchesEvent(input, event)) return [input];
+				changed = true;
+				if (event.event === "input.consumed") return [];
+				if (event.event === "input.promoted") {
+					return [{ ...input, inputId: inputId ?? input.inputId, placement: "queue" as const, priority: "steer" as const, status: "queued" as const }];
+				}
+				if (event.event === "input.queued") {
+					return [
+						{
+							...input,
+							inputId: inputId ?? input.inputId,
+							clientInputId: clientInputId ?? input.clientInputId,
+							content: content ?? input.content,
+							placement: "queue" as const,
+							status: "queued" as const,
+						},
+					];
+				}
+				return [
+					{
+						...input,
+						inputId: inputId ?? input.inputId,
+						clientInputId: clientInputId ?? input.clientInputId,
+						content: content ?? input.content,
+						placement: "transcript" as const,
+						status: "accepted" as const,
+					},
+				];
+			});
+			return changed ? next : current;
+		});
+	}, []);
+
 	const applySessionOperation = useCallback(
 		(operation: SessionPatchOperation) => {
 			if (operation.type === "metadata") {
@@ -384,6 +452,7 @@ export function App() {
 			const eventSession = currentSessions?.find((session) => session.session_id === event.session_id);
 			if (eventSession?.project_id && eventSession.project_id !== selectedProjectRef.current) return;
 			lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
+			reconcilePendingInputEvent(event);
 
 			for (const operation of reduceSessionEvent(event)) applySessionOperation(operation);
 
@@ -396,7 +465,7 @@ export function App() {
 				}
 			}
 		},
-		[applySessionOperation, pushNotice, queryClient],
+		[applySessionOperation, pushNotice, queryClient, reconcilePendingInputEvent],
 	);
 
 	useEffect(() => {
@@ -469,6 +538,9 @@ export function App() {
 		lastEventIds.current.set(loadedSnapshot.session_id, loadedSnapshot.last_event_id);
 		queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(loadedSnapshot.project_id), (current) =>
 			mergeSnapshotIntoSessionList(current, loadedSnapshot),
+		);
+		setPendingInputs((current) =>
+			current.filter((input) => input.sessionId !== loadedSnapshot.session_id || !pendingInputIsReflected(input, loadedSnapshot)),
 		);
 	}, [loadedSnapshot, queryClient]);
 
@@ -686,12 +758,60 @@ export function App() {
 				invalidateSessionList();
 			}
 			const clientInputId = randomId("web_input");
-			await api.queueFollowUp({
-				sessionId,
-				clientInputId,
-				expectedActiveLeafId: loadedSnapshot?.activity === "idle" ? (loadedSnapshot.active_leaf_id ?? null) : undefined,
-				content: textContent(text),
-			});
+			const content = textContent(text);
+			const pendingId = randomId("pending_input");
+			const initialPlacement = loadedSnapshot?.activity === "idle" ? "transcript" : "queue";
+			setPendingInputs((current) => [
+				...current,
+				{
+					id: pendingId,
+					sessionId,
+					clientInputId,
+					content,
+					placement: initialPlacement,
+					priority: "follow_up",
+					status: "sending",
+					submittedAt: Date.now(),
+				},
+			]);
+			try {
+				const result = await api.queueFollowUp({
+					sessionId,
+					clientInputId,
+					expectedActiveLeafId: loadedSnapshot?.activity === "idle" ? (loadedSnapshot.active_leaf_id ?? null) : undefined,
+					content,
+				});
+				setPendingInputs((current) =>
+					current.map((input) =>
+						input.id === pendingId
+							? {
+									...input,
+									inputId: result.input_id ?? input.inputId,
+									placement: result.queued ? "queue" : "transcript",
+									status: result.queued ? "queued" : "accepted",
+								}
+							: input,
+					),
+				);
+				void queryClient.invalidateQueries({
+					queryKey: queryKeys.session(sessionId, "full_tree"),
+				});
+				if (result.queued) invalidateSessionList();
+			} catch (error) {
+				setPendingInputs((current) =>
+					current.map((input) =>
+						input.id === pendingId
+							? {
+									...input,
+									status: "failed",
+									error: errorMessage(error),
+								}
+							: input,
+					),
+				);
+				composerHandleRef.current?.restoreSubmittedDraft(sessionId, text);
+				throw error;
+			}
 		},
 		[api, invalidateSessionList, loadedSnapshot, queryClient, refreshSelected, requireSelected, selectedSession],
 	);
@@ -893,35 +1013,30 @@ export function App() {
 			}
 
 			const sessionId = requireSelected();
+			if (!loadedSnapshot) throw new Error("session is still loading");
 			if (name === "fork") {
-				const refreshed = loadedSnapshot?.activity === "running" ? null : await refreshSelected(sessionId);
 				setHistoryDialog({
 					mode: "fork",
-					entries: refreshed?.entries ?? loadedEntries,
-					activeLeafId: refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
+					entries: loadedEntries,
+					activeLeafId: loadedSnapshot.active_leaf_id,
 					initialForkTitle: args,
 				});
 				return;
 			}
 			if (name === "switch") {
-				const refreshed = await refreshSelected(sessionId);
-				if ((refreshed?.snapshot.activity ?? loadedSnapshot?.activity) !== "idle") {
+				if (loadedSnapshot.activity !== "idle") {
 					throw new Error("stop the active turn before switching history");
 				}
 				setHistoryDialog({
 					mode: "switch",
-					entries: refreshed?.entries ?? loadedEntries,
-					activeLeafId: refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
+					entries: loadedEntries,
+					activeLeafId: loadedSnapshot.active_leaf_id,
 				});
 				return;
 			}
 			if (name === "export") {
-				const refreshed = await refreshSelected(sessionId);
 				setExportDialog({
-					entries: branchEntriesFor(
-						refreshed?.entries ?? loadedEntries,
-						refreshed?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
-					),
+					entries: branchEntriesFor(loadedEntries, loadedSnapshot.active_leaf_id),
 				});
 				return;
 			}
@@ -963,7 +1078,13 @@ export function App() {
 	);
 
 	const canStop = !!selectedId && loadedSnapshot?.activity === "running";
-	const queuedInputs = loadedSnapshot?.queued_inputs ?? [];
+	const queuedInputs = useMemo(() => {
+		const serverInputs = loadedSnapshot?.queued_inputs ?? [];
+		const pendingQueuedInputs = selectedPendingInputs
+			.filter((input) => input.placement === "queue" && !serverInputs.some((queued) => queuedInputMatchesPending(queued, input)))
+			.map(queuedInputFromPending);
+		return [...serverInputs, ...pendingQueuedInputs];
+	}, [loadedSnapshot?.queued_inputs, selectedPendingInputs]);
 	const handleToggleArchived = useCallback(() => {
 		setShowArchived((show) => !show);
 	}, []);
@@ -1194,6 +1315,7 @@ export function App() {
 				session={selectedChatSession}
 				snapshot={loadedSnapshot}
 				entries={loadedEntries}
+				pendingTranscriptInputs={pendingTranscriptInputs}
 				transcriptLoading={transcriptLoading}
 				modelOptions={MODEL_OPTIONS}
 				modelValue={providerModelKey(activeProvider)}
