@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent, type SetStateAction } from "react";
 import { createAgentApi } from "./agentApi.ts";
 import { Composer } from "./composer.tsx";
+import { clearComposerDraft, loadComposerDraft, saveComposerDraft } from "./drafts.ts";
 import { HistoryPickerDialog } from "./historyPicker.tsx";
 import { branchEntriesFor, type HistoryTargetOption } from "./historyTargets.ts";
 import { ExportDialog } from "./exportDialog.tsx";
@@ -72,7 +73,7 @@ export function App() {
 	const [config, setConfig] = useState<DaemonConfig>({ system_prompt: null });
 	const [tools, setTools] = useState<ToolListing[]>([]);
 	const [query, setQuery] = useState("");
-	const [composer, setComposer] = useState("");
+	const [composer, setComposer] = useState(() => loadComposerDraft(null));
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
 	const [slashIndex, setSlashIndex] = useState(0);
 	const [sending, setSending] = useState(false);
@@ -88,6 +89,7 @@ export function App() {
 
 	const refreshTimer = useRef<number | null>(null);
 	const composerRef = useRef<HTMLTextAreaElement | null>(null);
+	const composerValueRef = useRef(composer);
 	const nextSessionTitleRef = useRef<string | null>(null);
 	const pendingComposerBySession = useRef(new Map<string, string>());
 	const lastEventIds = useRef(new Map<string, number>());
@@ -97,17 +99,38 @@ export function App() {
 		try {
 			for (const key of OLD_DRAFT_STORAGE_KEYS) window.localStorage.removeItem(key);
 		} catch {
-			// Local draft cleanup is best-effort; the app no longer reads these keys.
+			// Legacy draft cleanup is best-effort; current composer drafts use v2 storage.
 		}
 	}, []);
 
+	const replaceComposer = useCallback((value: string) => {
+		composerValueRef.current = value;
+		setComposer(value);
+	}, []);
+
+	const updateComposerDraft = useCallback((value: string) => {
+		composerValueRef.current = value;
+		setComposer(value);
+		saveComposerDraft(selectedRef.current, value);
+	}, []);
+
 	const selectSession = useCallback(
-		(sessionId: string | null) => {
+		(sessionId: string | null, options: { saveCurrentDraft?: boolean } = {}) => {
+			const previousSessionId = selectedRef.current;
+			if (options.saveCurrentDraft !== false) {
+				saveComposerDraft(previousSessionId, composerValueRef.current);
+			}
+			if (sessionId === previousSessionId) {
+				if (sessionId === null) nextSessionTitleRef.current = null;
+				return;
+			}
 			if (sessionId === null) nextSessionTitleRef.current = null;
 			selectedRef.current = sessionId;
 			setSelectedId(sessionId);
+			const pendingComposer = sessionId ? pendingComposerBySession.current.get(sessionId) : undefined;
+			replaceComposer(pendingComposer ?? loadComposerDraft(sessionId));
 		},
-		[]
+		[replaceComposer]
 	);
 
 	useEffect(() => {
@@ -217,9 +240,13 @@ export function App() {
 		if (!selectedId) {
 			setSnapshot(null);
 			setEntries([]);
+			replaceComposer(loadComposerDraft(null));
 			return;
 		}
-		setComposer(pendingComposerBySession.current.get(selectedId) ?? "");
+		const pendingComposer = pendingComposerBySession.current.get(selectedId);
+		const nextComposer = pendingComposer ?? loadComposerDraft(selectedId);
+		replaceComposer(nextComposer);
+		if (pendingComposer !== undefined) saveComposerDraft(selectedId, pendingComposer);
 		pendingComposerBySession.current.delete(selectedId);
 		let cancelled = false;
 		void refreshSelected(selectedId)
@@ -229,7 +256,7 @@ export function App() {
 		return () => {
 			cancelled = true;
 		};
-	}, [pushNotice, refreshSelected, selectedId]);
+	}, [pushNotice, refreshSelected, replaceComposer, selectedId]);
 
 	useEffect(() => {
 		if (connection !== "open") return;
@@ -395,13 +422,14 @@ export function App() {
 			}
 			lastEventIds.current.delete(sessionId);
 			pendingComposerBySession.current.delete(sessionId);
+			clearComposerDraft(sessionId);
 			setSessions((currentSessions) => currentSessions.filter((session) => session.session_id !== sessionId));
 
 			if (selectedRef.current === sessionId) {
-				selectSession(null);
+				selectSession(null, { saveCurrentDraft: false });
 				setSnapshot(null);
 				setEntries([]);
-				setComposer("");
+				updateComposerDraft("");
 			}
 
 			closeDeleteDialog();
@@ -411,7 +439,7 @@ export function App() {
 			setDeleteDialog((current) => (current?.session.session_id === sessionId ? { ...current, deleting: false } : current));
 			throw error;
 		}
-	}, [api, closeDeleteDialog, deleteDialog, loadSessions, pushNotice, refreshSelected, selectSession]);
+	}, [api, closeDeleteDialog, deleteDialog, loadSessions, pushNotice, refreshSelected, selectSession, updateComposerDraft]);
 
 	const slashState = useMemo<{ visible: boolean; commands: typeof COMMANDS }>(() => {
 		const prefix = matchSlashPrefix(composer);
@@ -429,11 +457,11 @@ export function App() {
 			selectSession(null);
 			setSnapshot(null);
 			setEntries([]);
-			setComposer("");
+			updateComposerDraft("");
 			requestAnimationFrame(() => composerRef.current?.focus());
 			return null;
 		},
-		[selectSession]
+		[selectSession, updateComposerDraft]
 	);
 
 	const requireSelected = useCallback(() => {
@@ -509,6 +537,7 @@ export function App() {
 			}
 			if (target.restoreText !== undefined) {
 				pendingComposerBySession.current.set(fork.session_id, target.restoreText);
+				saveComposerDraft(fork.session_id, target.restoreText);
 			}
 			await loadSessions();
 			selectSession(fork.session_id);
@@ -532,12 +561,12 @@ export function App() {
 			});
 			await refreshSelected(sessionId);
 			if (target.restoreText !== undefined) {
-				setComposer(target.restoreText);
+				updateComposerDraft(target.restoreText);
 			}
 			void loadSessions().catch(() => undefined);
 			pushNotice("success", target.restoreText !== undefined ? "message restored for editing" : "switched to selected history point");
 		},
-		[api, loadSessions, pushNotice, refreshSelected, requireSelected, snapshot?.active_leaf_id, snapshot?.activity]
+		[api, loadSessions, pushNotice, refreshSelected, requireSelected, snapshot?.active_leaf_id, snapshot?.activity, updateComposerDraft]
 	);
 
 	const promoteQueuedInput = useCallback(
@@ -671,11 +700,12 @@ export function App() {
 	const sendComposer = useCallback(async () => {
 		const text = composer.trim();
 		if (!text || sending) return;
+		const draftSessionId = selectedRef.current;
 		const slash = parseSlash(text);
 		if (slash) {
 			const command = findCommand(slash.name);
 			if (command?.requiresArgs && !slash.args) {
-				setComposer(`/${command.name} `);
+				updateComposerDraft(`/${command.name} `);
 				pushNotice("info", `usage: /${command.name} ${command.argumentHint ?? "<args>"}`);
 				requestAnimationFrame(() => composerRef.current?.focus());
 				return;
@@ -692,14 +722,16 @@ export function App() {
 					await startNewSession(text);
 				}
 			}
-			setComposer("");
+			clearComposerDraft(draftSessionId);
+			clearComposerDraft(selectedRef.current);
+			replaceComposer("");
 			requestAnimationFrame(() => composerRef.current?.focus());
 		} catch (error) {
 			pushNotice("error", errorMessage(error));
 		} finally {
 			setSending(false);
 		}
-	}, [composer, executeSlash, pushNotice, queueUserInput, sending, startNewSession]);
+	}, [composer, executeSlash, pushNotice, queueUserInput, replaceComposer, sending, startNewSession, updateComposerDraft]);
 
 	const onComposerKeyDown = useCallback(
 		(event: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -717,7 +749,7 @@ export function App() {
 				if (event.key === "Tab") {
 					event.preventDefault();
 					const command = slashState.commands[Math.min(slashIndex, slashState.commands.length - 1)];
-					setComposer(`/${command.name} `);
+					updateComposerDraft(`/${command.name} `);
 					return;
 				}
 				if (event.key === "Enter" && !event.shiftKey) {
@@ -727,7 +759,7 @@ export function App() {
 					if (command.name === typedCommand && !command.requiresArgs) {
 						void sendComposer();
 					} else {
-						setComposer(`/${command.name} `);
+						updateComposerDraft(`/${command.name} `);
 					}
 					return;
 				}
@@ -737,7 +769,7 @@ export function App() {
 				void sendComposer();
 			}
 		},
-		[composer, sendComposer, slashIndex, slashState.commands, slashState.visible]
+		[composer, sendComposer, slashIndex, slashState.commands, slashState.visible, updateComposerDraft]
 	);
 
 	const layoutStyle = {
@@ -819,12 +851,12 @@ export function App() {
 					slashVisible={slashState.visible}
 					slashIndex={slashIndex}
 					queuedInputs={queuedInputs}
-					onChange={setComposer}
+					onChange={updateComposerDraft}
 					onKeyDown={onComposerKeyDown}
 					onSend={() => void sendComposer()}
 					onStop={() => void stopActiveTurn()}
 					onSetSlashIndex={setSlashIndex}
-					onSelectSlash={(command) => setComposer(`/${command.name} `)}
+					onSelectSlash={(command) => updateComposerDraft(`/${command.name} `)}
 					onPromoteQueued={(inputId) => {
 						void promoteQueuedInput(inputId).catch((error) => pushNotice("error", errorMessage(error)));
 					}}
