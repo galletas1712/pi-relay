@@ -351,18 +351,19 @@ Lists durable sessions, newest first.
 ```
 
 Each row includes `session_id`, `project_id`, `starting_cwd`, `activity`,
-`active_leaf_id`, `provider`, `metadata`, and `updated_at`. Defensive listing
-hides accidental empty web-created rows that have no transcript, queued input,
-actions, or fork provenance. Rows with `metadata.hidden = true` are also omitted
-from the list; this is used for local verification cleanup, not as a core
-lifecycle state. Browser-local drafts are not returned by this RPC.
+`active_leaf_id`, `provider`, `metadata`, `updated_at`, and
+`has_transcript_entries`. Defensive listing hides accidental empty web-created
+rows that have no transcript, queued input, actions, or fork provenance. Rows
+with `metadata.hidden = true` are also omitted from the list; this is used for
+local verification cleanup, not as a core lifecycle state. Browser-local drafts
+are not returned by this RPC.
 
 ### `session.get`
 
 Recovers the session if needed, then returns a durable snapshot.
 
 ```json
-{ "session_id": "s1", "include_entries": true }
+{ "session_id": "s1", "include_entries": true, "entries_scope": "active_branch" }
 ```
 
 Result shape:
@@ -379,6 +380,7 @@ Result shape:
   "pending_actions": [],
   "queued_inputs": [],
   "last_event_id": 42,
+  "has_transcript_entries": true,
   "entries": []
 }
 ```
@@ -386,9 +388,12 @@ Result shape:
 `queued_inputs` contains live queued or consuming user inputs with `input_id`,
 `priority`, `status`, `content`, `client_input_id`, `created_at`, and optional
 `promoted_at`. The web UI uses it for the composer-adjacent queue pane.
-`entries` is included only when `include_entries` is true. The web UI uses that
-expanded snapshot for normal transcript refreshes so it does not need a second
-round trip.
+`entries` is included only when `include_entries` is true. `entries_scope` may
+be `"active_branch"` or `"full_tree"` and defaults to `"full_tree"` for
+compatibility. The web UI can use the active-branch scope for normal display and
+reserve the full tree for fork/switch/history UI. `has_transcript_entries`
+allows provider/model lock checks even when the active branch is empty after a
+root rewind.
 
 ## Project RPC
 
@@ -443,18 +448,26 @@ Request:
 Response:
 
 ```json
-{ "session_id": "s1", "title": "Production deploy notes", "activity": "idle" }
+{
+  "session_id": "s1",
+  "title": "Production deploy notes",
+  "metadata": { "title": "Production deploy notes" },
+  "activity": "idle"
+}
 ```
 
-Emits `session.configured`, so subscribed clients should refresh lists/snapshots.
+Emits `session.configured` with patchable `metadata`/`title` fields so
+subscribed clients can update lists/snapshots without a transcript refresh.
 
 ### `session.configure`
 
-Idle-only. Replaces provider config and/or metadata. Once a session has any
-transcript entry, `provider.kind` and `provider.model` are locked; clients may
-still change provider-adjacent knobs such as `reasoning_effort` during or
-between turns. Runtime changes apply to subsequently created provider requests,
-not to an already in-flight request.
+Idle-only for metadata or model/source-changing updates. Replaces provider
+config and/or metadata. Once a session has any transcript entry, `provider.kind`
+and `provider.model` are locked; clients may still change provider-adjacent
+knobs such as `reasoning_effort` during or between turns. Runtime changes apply
+to subsequently created provider requests, not to an already in-flight request.
+Responses and `session.configured` events include `provider`, `metadata`, and
+`activity` so clients can patch cached summaries and selected snapshots.
 
 ## Config RPC
 

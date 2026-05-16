@@ -2,10 +2,10 @@ import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
 import { queryKeys } from "./queryKeys.ts";
 import {
-	patchQueuedInputsInSnapshot,
-	patchSessionActivityEverywhere,
-	patchSessionMetadataEverywhere,
-	patchSessionProviderEverywhere,
+	mergeSnapshotIntoSessionList,
+	patchSessionListActivity,
+	patchSessionListMetadata,
+	patchSessionListProvider,
 } from "./sessionQueryCache.ts";
 import type { ProviderConfig, SessionSnapshot, SessionSummary } from "./types.ts";
 
@@ -17,84 +17,58 @@ const nextProvider: ProviderConfig = {
 	model: "claude-sonnet-5",
 };
 
-describe("session query cache patch helpers", () => {
-	it("patches metadata in the session list and session snapshot", () => {
+describe("session query cache helpers", () => {
+	it("patches metadata only in the session list", () => {
 		const queryClient = seededClient();
 
-		patchSessionMetadataEverywhere(queryClient, projectId, sessionId, { title: "Renamed" }, ["archived"]);
+		patchSessionListMetadata(queryClient, projectId, sessionId, { title: "Renamed" }, ["archived"]);
 
 		expect(queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(projectId))?.[0].metadata).toEqual({ title: "Renamed" });
-		expect(queryClient.getQueryData<SessionSnapshot>(queryKeys.session(sessionId, "full_tree"))?.metadata).toEqual({ title: "Renamed" });
+		expect(queryClient.getQueryData<SessionSnapshot>(queryKeys.session(sessionId, "active_branch"))?.metadata).toEqual({
+			title: "Old",
+			archived: true,
+		});
 	});
 
-	it("patches provider and activity in both cached session shapes", () => {
+	it("can replace metadata in the session list", () => {
 		const queryClient = seededClient();
 
-		patchSessionProviderEverywhere(queryClient, projectId, sessionId, nextProvider);
-		patchSessionActivityEverywhere(queryClient, projectId, sessionId, "running");
+		patchSessionListMetadata(queryClient, projectId, sessionId, { title: "Only" }, [], true);
+
+		expect(queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(projectId))?.[0].metadata).toEqual({ title: "Only" });
+	});
+
+	it("patches provider and activity only in the session list", () => {
+		const queryClient = seededClient();
+
+		patchSessionListProvider(queryClient, projectId, sessionId, nextProvider);
+		patchSessionListActivity(queryClient, projectId, sessionId, "running");
 
 		expect(queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(projectId))?.[0]).toMatchObject({
 			provider: nextProvider,
 			activity: "running",
 		});
-		expect(queryClient.getQueryData<SessionSnapshot>(queryKeys.session(sessionId, "full_tree"))).toMatchObject({
-			provider: nextProvider,
+		expect(queryClient.getQueryData<SessionSnapshot>(queryKeys.session(sessionId, "active_branch"))).toMatchObject({
+			provider,
+			activity: "idle",
+		});
+	});
+
+	it("merges authoritative selected snapshots into the session list", () => {
+		const sessions = [summary()];
+		const snapshot = { ...snapshotFixture(), activity: "running" as const, metadata: { title: "Snapshot" } };
+
+		expect(mergeSnapshotIntoSessionList(sessions, snapshot)?.[0]).toMatchObject({
 			activity: "running",
+			metadata: { title: "Snapshot" },
 		});
-	});
-
-	it("patches queued-input events only on the matching session snapshot", () => {
-		const queryClient = seededClient();
-
-		patchQueuedInputsInSnapshot(queryClient, {
-			event_id: 2,
-			event: "input.promoted",
-			session_id: sessionId,
-			data: { input_id: "input_1", promoted_at: "now" },
-		});
-
-		expect(queryClient.getQueryData<SessionSnapshot>(queryKeys.session(sessionId, "full_tree"))?.queued_inputs).toEqual([
-			expect.objectContaining({
-				input_id: "input_1",
-				priority: "steer",
-				status: "queued",
-				promoted_at: "now",
-			}),
-		]);
-	});
-
-	it("adds queued input events from websocket payloads", () => {
-		const queryClient = seededClient();
-
-		patchQueuedInputsInSnapshot(queryClient, {
-			event_id: 3,
-			event: "input.queued",
-			session_id: sessionId,
-			data: {
-				input_id: "input_2",
-				client_input_id: "client_2",
-				priority: "follow_up",
-				content: [{ type: "text", text: "queued later" }],
-			},
-		});
-
-		expect(queryClient.getQueryData<SessionSnapshot>(queryKeys.session(sessionId, "full_tree"))?.queued_inputs).toEqual([
-			expect.objectContaining({ input_id: "input_1" }),
-			expect.objectContaining({
-				input_id: "input_2",
-				client_input_id: "client_2",
-				priority: "follow_up",
-				status: "queued",
-				content: [{ type: "text", text: "queued later" }],
-			}),
-		]);
 	});
 });
 
 function seededClient(): QueryClient {
 	const queryClient = new QueryClient();
 	queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(projectId), [summary()]);
-	queryClient.setQueryData<SessionSnapshot>(queryKeys.session(sessionId, "full_tree"), snapshot());
+	queryClient.setQueryData<SessionSnapshot>(queryKeys.session(sessionId, "active_branch"), snapshotFixture());
 	return queryClient;
 }
 
@@ -109,10 +83,11 @@ function summary(): SessionSummary {
 		metadata: { title: "Old", archived: true },
 		created_at: "2026-01-01T00:00:00Z",
 		updated_at: "2026-01-01T00:00:00Z",
+		has_transcript_entries: false,
 	};
 }
 
-function snapshot(): SessionSnapshot {
+function snapshotFixture(): SessionSnapshot {
 	return {
 		session_id: sessionId,
 		project_id: projectId,
@@ -122,6 +97,7 @@ function snapshot(): SessionSnapshot {
 		provider,
 		metadata: { title: "Old", archived: true },
 		pending_actions: [],
+		has_transcript_entries: false,
 		queued_inputs: [
 			{
 				input_id: "input_1",

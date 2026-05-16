@@ -12,7 +12,9 @@ use crate::{
     CompleteCompactionResult, CreateCompactionResult, EventFrame, EventType,
 };
 
-use super::events::{insert_event_tx, insert_transcript_item_events_tx};
+use super::events::{
+    insert_event_tx, insert_event_with_activity_tx, insert_transcript_item_events_tx,
+};
 use super::rows::row_to_stored_entry;
 use super::sql::action_is_unfinished;
 use super::transcript::insert_stored_entry_tx;
@@ -92,7 +94,7 @@ impl PostgresAgentStore {
         .await?;
 
         let events = vec![
-            insert_event_tx(
+            insert_event_with_activity_tx(
                 &mut tx,
                 session_id,
                 EventType::ActionRequested,
@@ -104,7 +106,7 @@ impl PostgresAgentStore {
                 }),
             )
             .await?,
-            insert_event_tx(
+            insert_event_with_activity_tx(
                 &mut tx,
                 session_id,
                 EventType::CompactionRequested,
@@ -247,6 +249,7 @@ impl PostgresAgentStore {
         let mut events = insert_transcript_item_events_tx(
             &mut tx,
             &job.source_session_id,
+            Some(&entry),
             &new_root_id,
             &entry.item,
         )
@@ -271,13 +274,14 @@ impl PostgresAgentStore {
             .await?,
         );
         events.push(
-            insert_event_tx(
+            insert_event_with_activity_tx(
                 &mut tx,
                 &job.source_session_id,
                 EventType::CompactionCompleted,
                 json!({
                     "action_row_id": job.action_row_id,
                     "new_root_id": new_root_id,
+                    "active_leaf_id": new_root_id,
                     "trigger": job.trigger.as_str(),
                     "reason": job.reason,
                     "remote": completion.remote,
@@ -347,7 +351,7 @@ impl PostgresAgentStore {
             return Ok(Vec::new());
         }
         Ok(vec![
-            insert_event_tx(
+            insert_event_with_activity_tx(
                 tx,
                 &job.source_session_id,
                 EventType::CompactionError,

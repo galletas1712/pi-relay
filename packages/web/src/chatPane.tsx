@@ -12,6 +12,7 @@ export interface ChatPaneProps {
 	entries: TranscriptEntry[];
 	pendingTranscriptInputs: PendingTranscriptInput[];
 	transcriptLoading: boolean;
+	snapshotRefreshing: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
 	modelLocked: boolean;
@@ -33,6 +34,7 @@ export const ChatPane = memo(function ChatPane({
 	entries,
 	pendingTranscriptInputs,
 	transcriptLoading,
+	snapshotRefreshing,
 	modelOptions,
 	modelValue,
 	modelLocked,
@@ -56,6 +58,7 @@ export const ChatPane = memo(function ChatPane({
 				modelValue={modelValue}
 				modelLocked={modelLocked}
 				modelControlsDisabled={modelControlsDisabled}
+				snapshotRefreshing={snapshotRefreshing}
 				reasoningEfforts={reasoningEfforts}
 				reasoningEffort={reasoningEffort}
 				rightOpen={rightOpen}
@@ -87,6 +90,7 @@ interface ChatHeaderProps {
 	modelValue: string;
 	modelLocked: boolean;
 	modelControlsDisabled: boolean;
+	snapshotRefreshing: boolean;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	rightOpen: boolean;
@@ -102,6 +106,7 @@ const ChatHeader = memo(function ChatHeader({
 	modelValue,
 	modelLocked,
 	modelControlsDisabled,
+	snapshotRefreshing,
 	reasoningEfforts,
 	reasoningEffort,
 	rightOpen,
@@ -126,6 +131,7 @@ const ChatHeader = memo(function ChatHeader({
 			modelValue={modelValue}
 			modelDisabled={modelDisabled}
 			modelDisabledTitle={modelLocked ? "model is locked after the first transcript entry" : "model"}
+			snapshotRefreshing={snapshotRefreshing}
 			reasoningEfforts={displayedEfforts}
 			reasoningEffort={reasoningEffort}
 			rightOpen={rightOpen}

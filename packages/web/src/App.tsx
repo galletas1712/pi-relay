@@ -23,13 +23,12 @@ import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
-import { reduceSessionEvent, type SessionPatchOperation } from "./sessionEvents.ts";
+import { refreshPlanForEvent } from "./sessionEvents.ts";
 import {
 	mergeSnapshotIntoSessionList,
-	patchQueuedInputsInSnapshot,
-	patchSessionActivityEverywhere,
-	patchSessionMetadataEverywhere,
-	patchSessionProviderEverywhere,
+	patchSessionListActivity,
+	patchSessionListMetadata,
+	patchSessionListProvider,
 } from "./sessionQueryCache.ts";
 import {
 	DEFAULT_PROVIDER,
@@ -59,7 +58,8 @@ const MAX_NOTICES = 24;
 const NOTICE_TTL_MS = 4000;
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
 const SELECTED_SESSION_REFRESH_DEBOUNCE_MS = 80;
-const SELECTED_SESSION_QUERY_DISABLED_KEY = ["session", null] as const;
+const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
+const SELECTED_SESSION_QUERY_DISABLED_KEY = ["session", null, SELECTED_SESSION_DISPLAY_SCOPE] as const;
 const MEDIUM_PANEL_QUERY = "(min-width: 900px)";
 const WIDE_PANEL_QUERY = "(min-width: 1280px)";
 
@@ -84,10 +84,13 @@ type ExportDialogState = {
 };
 
 type HistoryDialogState = {
+	sessionId: string;
 	mode: "fork" | "switch";
 	entries: TranscriptEntry[];
 	activeLeafId: string | null;
 	initialForkTitle?: string;
+	loading?: boolean;
+	error?: string | null;
 };
 
 type DeleteDialogState = {
@@ -116,6 +119,7 @@ export function App() {
 	const [sending, setSending] = useState(false);
 	const [stopping, setStopping] = useState(false);
 	const [resumingTurnId, setResumingTurnId] = useState<string | null>(null);
+	const [historySwitchingSessionId, setHistorySwitchingSessionId] = useState<string | null>(null);
 	const [pendingInputs, setPendingInputs] = useState<PendingInput[]>([]);
 	const [sidebarOpen, setSidebarOpen] = useState(() => defaultPanelState(panelModeForViewport()).sidebarOpen);
 	const [rightOpen, setRightOpen] = useState(() => defaultPanelState(panelModeForViewport()).rightOpen);
@@ -171,7 +175,7 @@ export function App() {
 	const sessions = sessionsQuery.data ?? [];
 
 	const selectedSessionQuery = useQuery({
-		queryKey: selectedId ? queryKeys.session(selectedId, "full_tree") : SELECTED_SESSION_QUERY_DISABLED_KEY,
+		queryKey: selectedId ? queryKeys.session(selectedId, SELECTED_SESSION_DISPLAY_SCOPE) : SELECTED_SESSION_QUERY_DISABLED_KEY,
 		queryFn: async () => {
 			if (!selectedId) throw new Error("missing selected session id");
 			const shouldLogPerf = perfEnabled();
@@ -183,6 +187,7 @@ export function App() {
 				});
 			const nextSnapshot = await api.getSession(selectedId, {
 				includeEntries: true,
+				entryScope: SELECTED_SESSION_DISPLAY_SCOPE,
 			});
 			if (shouldLogPerf) {
 				const rpcMs = perfNow() - startedAt;
@@ -191,7 +196,7 @@ export function App() {
 					entries: nextSnapshot.entries?.length ?? 0,
 					approxBytes: approximateJsonSize(nextSnapshot),
 					rpcMs: Math.round(rpcMs),
-					entryScope: "full_tree",
+					entryScope: SELECTED_SESSION_DISPLAY_SCOPE,
 				});
 			}
 			return nextSnapshot;
@@ -221,7 +226,9 @@ export function App() {
 	const rawSnapshot = selectedSessionQuery.data ?? null;
 	const loadedSnapshot = rawSnapshot?.session_id === selectedId ? rawSnapshot : null;
 	const loadedEntries = loadedSnapshot ? (loadedSnapshot.entries ?? []) : [];
-	const transcriptLoading = !!selectedId && !loadedSnapshot && selectedSessionQuery.isFetching;
+	const historySwitchingSelectedSession = !!selectedId && historySwitchingSessionId === selectedId;
+	const transcriptLoading = !!selectedId && ((!loadedSnapshot && selectedSessionQuery.isFetching) || historySwitchingSelectedSession);
+	const snapshotRefreshing = !!selectedId && !!loadedSnapshot && (selectedSessionQuery.isFetching || historySwitchingSelectedSession);
 	const selectedPendingInputs = useMemo(
 		() => pendingInputs.filter((input) => input.sessionId === selectedId),
 		[pendingInputs, selectedId],
@@ -272,7 +279,11 @@ export function App() {
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
-	const modelLocked = !!selectedId && !!loadedSnapshot && (loadedEntries.length > 0 || loadedSnapshot.active_leaf_id !== null);
+	const hasTranscriptEntries =
+		loadedSnapshot?.has_transcript_entries ??
+		selectedSession?.has_transcript_entries ??
+		(loadedSnapshot ? loadedEntries.length > 0 || loadedSnapshot.active_leaf_id !== null : false);
+	const modelLocked = !!selectedId && !!loadedSnapshot && hasTranscriptEntries;
 	const modelControlsDisabled = !!selectedId && (!loadedSnapshot || loadedSnapshot.activity !== "idle");
 
 	const selectSession = useCallback((sessionId: string | null) => {
@@ -310,7 +321,7 @@ export function App() {
 		(sessionId = selectedRef.current) => {
 			if (!sessionId) return;
 			void queryClient.invalidateQueries({
-				queryKey: queryKeys.session(sessionId, "full_tree"),
+				queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
 			});
 		},
 		[queryClient],
@@ -331,13 +342,14 @@ export function App() {
 	const getFreshSession = useCallback(
 		async (sessionId: string) => {
 			const snapshot = await queryClient.fetchQuery({
-				queryKey: queryKeys.session(sessionId, "full_tree"),
+				queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
 				queryFn: async () => {
 					const shouldLogPerf = perfEnabled();
 					const startedAt = perfNow();
 					if (shouldLogPerf) perfLog("session.get start", { sessionId, source: "fetch" });
 					const nextSnapshot = await api.getSession(sessionId, {
 						includeEntries: true,
+						entryScope: SELECTED_SESSION_DISPLAY_SCOPE,
 					});
 					if (shouldLogPerf) {
 						const rpcMs = perfNow() - startedAt;
@@ -346,7 +358,7 @@ export function App() {
 							entries: nextSnapshot.entries?.length ?? 0,
 							approxBytes: approximateJsonSize(nextSnapshot),
 							rpcMs: Math.round(rpcMs),
-							entryScope: "full_tree",
+							entryScope: SELECTED_SESSION_DISPLAY_SCOPE,
 						});
 					}
 					return nextSnapshot;
@@ -357,6 +369,7 @@ export function App() {
 			queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(snapshot.project_id), (current) =>
 				mergeSnapshotIntoSessionList(current, snapshot),
 			);
+			queryClient.setQueryData(queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE), snapshot);
 			if (snapshot.project_id !== selectedProjectRef.current) {
 				selectedProjectRef.current = snapshot.project_id;
 				setSelectedProjectId(snapshot.project_id);
@@ -415,37 +428,6 @@ export function App() {
 		});
 	}, []);
 
-	const applySessionOperation = useCallback(
-		(operation: SessionPatchOperation) => {
-			if (operation.type === "metadata") {
-				patchSessionMetadataEverywhere(queryClient, selectedProjectRef.current, operation.sessionId, operation.patch, operation.remove);
-				return;
-			}
-			if (operation.type === "provider") {
-				patchSessionProviderEverywhere(queryClient, selectedProjectRef.current, operation.sessionId, operation.provider);
-				return;
-			}
-			if (operation.type === "activity") {
-				patchSessionActivityEverywhere(queryClient, selectedProjectRef.current, operation.sessionId, operation.activity);
-				return;
-			}
-			if (operation.type === "queued_inputs") {
-				patchQueuedInputsInSnapshot(queryClient, operation.event);
-				return;
-			}
-			if (operation.type === "invalidate_session") {
-				if (operation.sessionId === selectedRef.current) scheduleSelectedRefresh(operation.sessionId);
-				else
-					void queryClient.invalidateQueries({
-						queryKey: queryKeys.session(operation.sessionId, "full_tree"),
-					});
-				return;
-			}
-			scheduleSessionListRefresh();
-		},
-		[queryClient, scheduleSelectedRefresh, scheduleSessionListRefresh],
-	);
-
 	const handleSessionEvent = useCallback(
 		(event: EventFrame) => {
 			const currentSessions = queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(selectedProjectRef.current));
@@ -454,7 +436,15 @@ export function App() {
 			lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
 			reconcilePendingInputEvent(event);
 
-			for (const operation of reduceSessionEvent(event)) applySessionOperation(operation);
+			const refreshPlan = refreshPlanForEvent(event);
+			if (refreshPlan.refreshSession && event.session_id === selectedRef.current) {
+				scheduleSelectedRefresh(event.session_id);
+			}
+			if (refreshPlan.refreshList) {
+				const activity = activityFromEvent(event);
+				if (activity) patchSessionListActivity(queryClient, selectedProjectRef.current, event.session_id, activity);
+				scheduleSessionListRefresh();
+			}
 
 			if (event.session_id === selectedRef.current) {
 				if (event.event === "model.error") pushNotice("error", modelErrorNotice(event.data));
@@ -468,7 +458,7 @@ export function App() {
 				}
 			}
 		},
-		[applySessionOperation, pushNotice, queryClient, reconcilePendingInputEvent],
+		[pushNotice, queryClient, reconcilePendingInputEvent, scheduleSelectedRefresh, scheduleSessionListRefresh],
 	);
 
 	useEffect(() => {
@@ -568,7 +558,7 @@ export function App() {
 					for (const event of replayed) handleSessionEvent(event);
 					if (selectedRef.current === sessionId)
 						return queryClient.invalidateQueries({
-							queryKey: queryKeys.session(sessionId, "full_tree"),
+							queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
 						});
 					return undefined;
 				})
@@ -587,10 +577,11 @@ export function App() {
 				return;
 			}
 			await api.configureSession({ sessionId, provider });
-			patchSessionProviderEverywhere(queryClient, selectedProjectRef.current, sessionId, provider);
+			patchSessionListProvider(queryClient, selectedProjectRef.current, sessionId, provider);
+			invalidateSelectedSession(sessionId);
 			invalidateSessionList();
 		},
-		[api, invalidateSessionList, queryClient],
+		[api, invalidateSelectedSession, invalidateSessionList, queryClient],
 	);
 
 	const changeModel = useCallback(
@@ -640,11 +631,12 @@ export function App() {
 		const title = renameValue.trim();
 		if (!title) throw new Error("session title is required");
 		await api.renameSession(renameSessionId, title);
-		patchSessionMetadataEverywhere(queryClient, selectedProjectRef.current, renameSessionId, { title });
+		patchSessionListMetadata(queryClient, selectedProjectRef.current, renameSessionId, { title });
+		if (renameSessionId === selectedRef.current) invalidateSelectedSession(renameSessionId);
 		invalidateSessionList();
 		pushNotice("success", `renamed session to “${truncate(title, 80)}”`);
 		closeRenameDialog();
-	}, [api, closeRenameDialog, invalidateSessionList, pushNotice, queryClient, renameSessionId, renameValue]);
+	}, [api, closeRenameDialog, invalidateSelectedSession, invalidateSessionList, pushNotice, queryClient, renameSessionId, renameValue]);
 
 	const setSessionArchived = useCallback(
 		async (session: SessionListItem, archived: boolean) => {
@@ -660,20 +652,21 @@ export function App() {
 				provider: currentSnapshot?.provider ?? session.provider,
 				metadata,
 			});
-			patchSessionMetadataEverywhere(
+			patchSessionListMetadata(
 				queryClient,
 				selectedProjectRef.current,
 				sessionId,
 				archived ? { archived: true } : {},
 				archived ? [] : ["archived"],
 			);
+			if (sessionId === selectedRef.current) invalidateSelectedSession(sessionId);
 			invalidateSessionList();
 			pushNotice(
 				"success",
 				archived ? `archived “${truncate(sessionTitle(session), 80)}”` : `unarchived “${truncate(sessionTitle(session), 80)}”`,
 			);
 		},
-		[api, invalidateSessionList, loadedSnapshot, pushNotice, queryClient],
+		[api, invalidateSelectedSession, invalidateSessionList, loadedSnapshot, pushNotice, queryClient],
 	);
 
 	const closeDeleteDialog = useCallback(() => {
@@ -697,6 +690,9 @@ export function App() {
 				refreshTimer.current = null;
 			}
 			lastEventIds.current.delete(sessionId);
+			queryClient.removeQueries({
+				queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
+			});
 			queryClient.removeQueries({
 				queryKey: queryKeys.session(sessionId, "full_tree"),
 			});
@@ -757,7 +753,8 @@ export function App() {
 					provider: current?.provider ?? selectedSession.provider,
 					metadata,
 				});
-				patchSessionMetadataEverywhere(queryClient, selectedProjectRef.current, sessionId, {}, ["archived"]);
+				patchSessionListMetadata(queryClient, selectedProjectRef.current, sessionId, {}, ["archived"]);
+				invalidateSelectedSession(sessionId);
 				invalidateSessionList();
 			}
 			const clientInputId = randomId("web_input");
@@ -797,7 +794,7 @@ export function App() {
 					),
 				);
 				void queryClient.invalidateQueries({
-					queryKey: queryKeys.session(sessionId, "full_tree"),
+					queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
 				});
 				if (result.queued) invalidateSessionList();
 			} catch (error) {
@@ -816,7 +813,7 @@ export function App() {
 				throw error;
 			}
 		},
-		[api, invalidateSessionList, loadedSnapshot, queryClient, refreshSelected, requireSelected, selectedSession],
+		[api, invalidateSelectedSession, invalidateSessionList, loadedSnapshot, queryClient, refreshSelected, requireSelected, selectedSession],
 	);
 
 	const startNewSession = useCallback(
@@ -887,7 +884,7 @@ export function App() {
 				expectedActiveLeafId: target.expectedActiveLeafId ?? current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
 			});
 			await queryClient.invalidateQueries({
-				queryKey: queryKeys.session(sessionId, "full_tree"),
+				queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
 			});
 			if (target.restoreText !== undefined) {
 				composerHandleRef.current?.setValue(target.restoreText);
@@ -907,19 +904,29 @@ export function App() {
 		],
 	);
 
+	const handleSwitchHistoryTarget = useCallback(
+		(target: HistoryTargetOption) => {
+			const sessionId = selectedRef.current;
+			setHistoryDialog(null);
+			if (sessionId) setHistorySwitchingSessionId(sessionId);
+			void switchToTarget(target)
+				.catch((error) => pushNotice("error", errorMessage(error)))
+				.finally(() => {
+					if (sessionId) {
+						setHistorySwitchingSessionId((current) => (current === sessionId ? null : current));
+					}
+				});
+		},
+		[pushNotice, switchToTarget],
+	);
+
 	const promoteQueuedInput = useCallback(
 		async (inputId: string) => {
 			const sessionId = requireSelected();
 			const result = await api.promoteQueuedInput(sessionId, inputId);
-			patchQueuedInputsInSnapshot(queryClient, {
-				event_id: 0,
-				event: "input.promoted",
-				session_id: sessionId,
-				data: { input_id: inputId },
-			});
 			await Promise.all([
 				queryClient.invalidateQueries({
-					queryKey: queryKeys.session(sessionId, "full_tree"),
+					queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
 				}),
 				queryClient.invalidateQueries({
 					queryKey: queryKeys.sessions(selectedProjectRef.current),
@@ -939,7 +946,7 @@ export function App() {
 			await api.interrupt(sessionId);
 			await Promise.all([
 				queryClient.invalidateQueries({
-					queryKey: queryKeys.session(sessionId, "full_tree"),
+					queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
 				}),
 				queryClient.invalidateQueries({
 					queryKey: queryKeys.sessions(selectedProjectRef.current),
@@ -970,7 +977,7 @@ export function App() {
 				});
 				await Promise.all([
 					queryClient.invalidateQueries({
-						queryKey: queryKeys.session(sessionId, "full_tree"),
+						queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
 					}),
 					queryClient.invalidateQueries({
 						queryKey: queryKeys.sessions(selectedProjectRef.current),
@@ -982,6 +989,55 @@ export function App() {
 			}
 		},
 		[api, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, pushNotice, queryClient, refreshSelected, requireSelected],
+	);
+
+	const openHistoryDialog = useCallback(
+		(mode: "fork" | "switch", initialForkTitle?: string) => {
+			if (!loadedSnapshot) throw new Error("session is still loading");
+			if (mode === "switch" && loadedSnapshot.activity !== "idle") {
+				throw new Error("stop the active turn before switching history");
+			}
+			const sessionId = loadedSnapshot.session_id;
+			setHistoryDialog({
+				sessionId,
+				mode,
+				entries: loadedEntries,
+				activeLeafId: loadedSnapshot.active_leaf_id,
+				initialForkTitle,
+				loading: true,
+				error: null,
+			});
+			void queryClient
+				.fetchQuery({
+					queryKey: queryKeys.session(sessionId, "full_tree"),
+					queryFn: () => api.getSession(sessionId, { includeEntries: true, entryScope: "full_tree" }),
+					staleTime: 0,
+					gcTime: 0,
+				})
+				.then((snapshot) => {
+					setHistoryDialog((current) => {
+						if (!current || current.mode !== mode || current.sessionId !== sessionId) return current;
+						return {
+							...current,
+							entries: snapshot.entries ?? [],
+							activeLeafId: snapshot.active_leaf_id,
+							loading: false,
+							error: null,
+						};
+					});
+				})
+				.catch((error) => {
+					setHistoryDialog((current) => {
+						if (!current || current.mode !== mode || current.sessionId !== sessionId) return current;
+						return {
+							...current,
+							loading: false,
+							error: errorMessage(error),
+						};
+					});
+				});
+		},
+		[api, loadedEntries, loadedSnapshot, queryClient],
 	);
 
 	const executeSlash = useCallback(
@@ -1018,28 +1074,22 @@ export function App() {
 			const sessionId = requireSelected();
 			if (!loadedSnapshot) throw new Error("session is still loading");
 			if (name === "fork") {
-				setHistoryDialog({
-					mode: "fork",
-					entries: loadedEntries,
-					activeLeafId: loadedSnapshot.active_leaf_id,
-					initialForkTitle: args,
-				});
+				openHistoryDialog("fork", args);
 				return;
 			}
 			if (name === "switch") {
-				if (loadedSnapshot.activity !== "idle") {
-					throw new Error("stop the active turn before switching history");
-				}
-				setHistoryDialog({
-					mode: "switch",
-					entries: loadedEntries,
-					activeLeafId: loadedSnapshot.active_leaf_id,
-				});
+				openHistoryDialog("switch");
 				return;
 			}
 			if (name === "export") {
+				const current = await queryClient.fetchQuery({
+					queryKey: queryKeys.session(sessionId, "full_tree"),
+					queryFn: () => api.getSession(sessionId, { includeEntries: true, entryScope: "full_tree" }),
+					staleTime: 0,
+					gcTime: 0,
+				});
 				setExportDialog({
-					entries: branchEntriesFor(loadedEntries, loadedSnapshot.active_leaf_id),
+					entries: branchEntriesFor(current.entries ?? [], current.active_leaf_id),
 				});
 				return;
 			}
@@ -1050,7 +1100,7 @@ export function App() {
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[api, loadedEntries, loadedSnapshot, pushNotice, queryClient, refreshSelected, requireSelected],
+		[api, loadedSnapshot, openHistoryDialog, pushNotice, queryClient, requireSelected],
 	);
 
 	const submitComposer = useCallback(
@@ -1320,6 +1370,7 @@ export function App() {
 				entries={loadedEntries}
 				pendingTranscriptInputs={pendingTranscriptInputs}
 				transcriptLoading={transcriptLoading}
+				snapshotRefreshing={snapshotRefreshing}
 				modelOptions={MODEL_OPTIONS}
 				modelValue={providerModelKey(activeProvider)}
 				modelLocked={modelLocked}
@@ -1393,17 +1444,15 @@ export function App() {
 					entries={historyDialog.entries}
 					activeLeafId={historyDialog.activeLeafId}
 					initialForkTitle={historyDialog.initialForkTitle}
+					loading={historyDialog.loading}
+					error={historyDialog.error}
 					onClose={() => setHistoryDialog(null)}
 					onFork={(target, title) => {
 						void forkFromTarget(target, title)
 							.then(() => setHistoryDialog(null))
 							.catch((error) => pushNotice("error", errorMessage(error)));
 					}}
-					onSwitch={(target) => {
-						void switchToTarget(target)
-							.then(() => setHistoryDialog(null))
-							.catch((error) => pushNotice("error", errorMessage(error)));
-					}}
+					onSwitch={handleSwitchHistoryTarget}
 				/>
 			) : null}
 			{exportDialog ? (
@@ -1451,6 +1500,27 @@ function compactionCompletedNotice(data: Record<string, unknown>): string {
 function compactionErrorNotice(data: Record<string, unknown>): string {
 	const error = typeof data.error === "string" ? data.error : "compaction failed";
 	return `compaction error: ${truncate(error, 420)}`;
+}
+
+function activityFromEvent(event: EventFrame): SessionSummary["activity"] | null {
+	const activity = event.data.activity;
+	if (activity === "idle" || activity === "queued" || activity === "running") return activity;
+	if (event.event === "session.idle") return "idle";
+	if (event.event === "input.queued") return "queued";
+	if (
+		event.event === "input.consumed" ||
+		event.event === "input.accepted" ||
+		event.event === "action.requested" ||
+		event.event === "model.requested" ||
+		event.event === "tool.requested" ||
+		event.event === "tool.started" ||
+		event.event === "compaction.requested" ||
+		event.event === "compaction.completed" ||
+		event.event === "compaction.error"
+	) {
+		return "running";
+	}
+	return null;
 }
 
 function RenameSessionDialog({

@@ -71,30 +71,8 @@ export function eventClientInputId(event: EventFrame): string | null {
 	return stringValue(event.data.client_input_id);
 }
 
-export function eventPriority(event: EventFrame): InputPriority {
-	const priority = stringValue(event.data.priority);
-	return priority === "steer" ? "steer" : "follow_up";
-}
-
 export function eventContentBlocks(event: EventFrame): ContentBlock[] | null {
 	return contentBlocksFromUnknown(event.data.content);
-}
-
-export function queuedInputFromEvent(event: EventFrame): QueuedInput | null {
-	const inputId = eventInputId(event);
-	const content = eventContentBlocks(event);
-	if (!inputId || !content) return null;
-	const priority = eventPriority(event);
-	const createdAt = stringValue(event.data.created_at) ?? new Date().toISOString();
-	return {
-		input_id: inputId,
-		priority,
-		status: "queued",
-		content,
-		client_input_id: eventClientInputId(event),
-		created_at: createdAt,
-		promoted_at: priority === "steer" ? (stringValue(event.data.promoted_at) ?? createdAt) : null,
-	};
 }
 
 function contentFingerprint(content: ContentBlock[]): string {

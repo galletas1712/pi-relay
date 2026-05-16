@@ -9,7 +9,7 @@ use crate::{
     QueueMutationError, QueuedInput, QueuedInputPreview, QueuedInputStatus,
 };
 
-use super::events::insert_event_tx;
+use super::events::insert_event_with_activity_tx;
 use super::rows::row_text;
 use super::sql::{queued_input_is_active, queued_input_is_editable, QUEUED_INPUT_DISPATCH_ORDER};
 use super::PostgresAgentStore;
@@ -68,7 +68,7 @@ impl PostgresAgentStore {
         };
 
         let input_id = inserted.get("id");
-        let event = insert_event_tx(
+        let event = insert_event_with_activity_tx(
             &mut tx,
             session_id,
             EventType::InputQueued,
@@ -267,7 +267,7 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok(result);
         };
-        let event = insert_event_tx(
+        let event = insert_event_with_activity_tx(
             &mut tx,
             session_id,
             EventType::InputPromoted,

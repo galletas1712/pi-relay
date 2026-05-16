@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use agent_session::{StoredSession, StoredTranscriptEntry, TranscriptStorageNode};
+use agent_vocab::TranscriptItem;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Row, Transaction};
@@ -19,12 +20,7 @@ impl PostgresAgentStore {
             .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-        let rows = sqlx::query(
-            "select id, parent_id, timestamp_ms, item, provider_replay from transcript_entries where session_id=$1 order by sequence",
-        )
-        .bind(session_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let entries = self.transcript_entries(session_id).await?;
         let mut metadata = BTreeMap::new();
         if let Value::Object(map) = session_row.get::<Value, _>("metadata") {
             for (key, value) in map {
@@ -37,20 +33,117 @@ impl PostgresAgentStore {
             session_id: session_id.to_string(),
             active_leaf_id: session_row.get("active_leaf_id"),
             metadata,
-            entries: rows
-                .into_iter()
-                .map(|row| row_to_stored_entry(&row))
-                .collect::<Result<Vec<_>>>()?,
+            entries,
         })
     }
 
+    pub async fn has_transcript_entries(&self, session_id: &str) -> Result<bool> {
+        Ok(sqlx::query_scalar(
+            "select exists(select 1 from transcript_entries where session_id=$1)",
+        )
+        .bind(session_id)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
+    pub async fn active_leaf_is_turn_boundary(&self, session_id: &str) -> Result<bool> {
+        let active_leaf_id: Option<String> =
+            sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let Some(active_leaf_id) = active_leaf_id else {
+            return Ok(true);
+        };
+        let item: Option<Value> = sqlx::query_scalar(
+            "select item from transcript_entries where session_id=$1 and id=$2::text",
+        )
+        .bind(session_id)
+        .bind(&active_leaf_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(item) = item else {
+            return Ok(false);
+        };
+        let item: TranscriptItem = serde_json::from_value(item)?;
+        Ok(matches!(
+            item,
+            TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_)
+        ))
+    }
+
     pub async fn history_tree(&self, session_id: &str) -> Result<HistoryTree> {
-        let stored = self.load_stored_session(session_id).await?;
+        let active_leaf_id = self.active_leaf_id(session_id).await?;
+        let entries = self.transcript_entries(session_id).await?;
         Ok(HistoryTree {
             session_id: session_id.to_string(),
-            active_leaf_id: stored.active_leaf_id,
-            entries: stored.entries,
+            active_leaf_id,
+            entries,
         })
+    }
+
+    pub async fn active_branch(&self, session_id: &str) -> Result<HistoryTree> {
+        let active_leaf_id = self.active_leaf_id(session_id).await?;
+        let entries = match active_leaf_id.as_deref() {
+            Some(_) => self.active_branch_entries(session_id).await?,
+            None => Vec::new(),
+        };
+        Ok(HistoryTree {
+            session_id: session_id.to_string(),
+            active_leaf_id,
+            entries,
+        })
+    }
+
+    async fn active_leaf_id(&self, session_id: &str) -> Result<Option<String>> {
+        sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow!("session not found: {session_id}"))
+    }
+
+    async fn transcript_entries(&self, session_id: &str) -> Result<Vec<StoredTranscriptEntry>> {
+        let rows = sqlx::query(
+            "select id, parent_id, timestamp_ms, item, provider_replay from transcript_entries where session_id=$1 order by sequence",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row_to_stored_entry(&row))
+            .collect()
+    }
+
+    async fn active_branch_entries(&self, session_id: &str) -> Result<Vec<StoredTranscriptEntry>> {
+        let rows = sqlx::query(
+            r#"
+            with recursive branch as (
+                select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence
+                from transcript_entries t
+                join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
+                where t.session_id = $1
+
+                union all
+
+                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence
+                from transcript_entries parent
+                join branch child
+                  on parent.session_id = $1
+                 and parent.id = child.parent_id
+            )
+            select id, parent_id, timestamp_ms, item, provider_replay
+            from branch
+            order by sequence
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row_to_stored_entry(&row))
+            .collect()
     }
 
     pub async fn set_active_leaf(
@@ -80,7 +173,7 @@ impl PostgresAgentStore {
             &mut tx,
             session_id,
             EventType::HistoryRewound,
-            json!({ "active_leaf_id": leaf_id }),
+            json!({ "active_leaf_id": leaf_id, "activity": "idle" }),
         )
         .await?;
         tx.commit().await?;
@@ -170,8 +263,14 @@ impl PostgresAgentStore {
         for entry in entries {
             insert_stored_entry_tx(&mut tx, session_id, entry).await?;
             frames.extend(
-                insert_transcript_item_events_tx(&mut tx, session_id, &entry.id, &entry.item)
-                    .await?,
+                insert_transcript_item_events_tx(
+                    &mut tx,
+                    session_id,
+                    Some(entry),
+                    &entry.id,
+                    &entry.item,
+                )
+                .await?,
             );
         }
         let unfinished_actions = action_is_unfinished(None);

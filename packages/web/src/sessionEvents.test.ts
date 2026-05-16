@@ -1,78 +1,37 @@
 import { describe, expect, it } from "vitest";
-import { reduceSessionEvent } from "./sessionEvents.ts";
-import type { EventFrame } from "./types.ts";
+import { refreshPlanForEvent } from "./sessionEvents.ts";
 
-describe("reduceSessionEvent", () => {
-	it("patches rename metadata and reconciles the list without refreshing selected transcript", () => {
-		const operations = reduceSessionEvent(frame("session.configured", { title: "Renamed" }));
-
-		expect(operations).toEqual([
-			{
-				type: "metadata",
-				sessionId: "session_1",
-				patch: { title: "Renamed" },
-				remove: [],
-			},
-			{ type: "invalidate_list", reason: "session.configured" },
-		]);
-	});
-
-	it("patches queued input payloads without forcing a selected transcript refresh", () => {
-		const event = frame("input.queued", { input_id: "input_1", client_input_id: "client_1", content: [{ type: "text", text: "queued" }] });
-		const operations = reduceSessionEvent(event);
-
-		expect(operations).toEqual([
-			{ type: "activity", sessionId: "session_1", activity: "queued" },
-			{ type: "queued_inputs", sessionId: "session_1", event },
-			{ type: "invalidate_list", reason: "input.queued" },
-		]);
-	});
-
-	it("patches queued-input promotion without forcing a selected transcript refresh", () => {
-		const event = frame("input.promoted", {
-			input_id: "input_1",
-			promoted_at: "now",
+describe("refreshPlanForEvent", () => {
+	it("refreshes both the selected session and session list for common state changes", () => {
+		expect(refreshPlanForEvent({ event: "session.configured" })).toEqual({
+			refreshSession: true,
+			refreshList: true,
 		});
-		const operations = reduceSessionEvent(event);
-
-		expect(operations).toEqual([
-			{ type: "queued_inputs", sessionId: "session_1", event },
-			{ type: "invalidate_list", reason: "input.promoted" },
-		]);
+		expect(refreshPlanForEvent({ event: "input.queued" })).toEqual({
+			refreshSession: true,
+			refreshList: true,
+		});
+		expect(refreshPlanForEvent({ event: "history.rewound" })).toEqual({
+			refreshSession: true,
+			refreshList: true,
+		});
 	});
 
-	it("marks transcript append events stale because current payloads lack full entries", () => {
-		const operations = reduceSessionEvent(frame("transcript.appended", { entry_id: "entry_1" }));
-
-		expect(operations).toEqual([
-			{
-				type: "invalidate_session",
-				sessionId: "session_1",
-				reason: "transcript append event lacks full entry data",
-			},
-		]);
+	it("refreshes the selected session for transcript-only updates", () => {
+		expect(refreshPlanForEvent({ event: "transcript.appended" })).toEqual({
+			refreshSession: true,
+			refreshList: false,
+		});
+		expect(refreshPlanForEvent({ event: "assistant.message" })).toEqual({
+			refreshSession: true,
+			refreshList: false,
+		});
 	});
 
-	it("refreshes selected history after compaction completes", () => {
-		const operations = reduceSessionEvent(frame("compaction.completed", { trigger: "auto" }));
-
-		expect(operations).toEqual([
-			{ type: "activity", sessionId: "session_1", activity: "running" },
-			{
-				type: "invalidate_session",
-				sessionId: "session_1",
-				reason: "compaction.completed",
-			},
-			{ type: "invalidate_list", reason: "compaction.completed" },
-		]);
+	it("ignores unknown events", () => {
+		expect(refreshPlanForEvent({ event: "unknown.event" })).toEqual({
+			refreshSession: false,
+			refreshList: false,
+		});
 	});
 });
-
-function frame(event: string, data: Record<string, unknown>): EventFrame {
-	return {
-		event_id: 1,
-		event,
-		session_id: "session_1",
-		data,
-	};
-}

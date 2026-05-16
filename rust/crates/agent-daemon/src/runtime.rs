@@ -100,6 +100,16 @@ impl SessionDriver {
         &self,
     ) -> std::result::Result<(), RpcError> {
         self.recover_if_needed().await?;
+        self.ensure_idle_without_recovery().await
+    }
+
+    pub(crate) async fn ensure_idle_for_metadata_mutation(
+        &self,
+    ) -> std::result::Result<(), RpcError> {
+        self.ensure_idle_without_recovery().await
+    }
+
+    async fn ensure_idle_without_recovery(&self) -> std::result::Result<(), RpcError> {
         if self
             .state
             .active
@@ -121,7 +131,7 @@ impl SessionDriver {
         {
             return Err(RpcError::new(
                 "session_busy",
-                "source-mutating history operations require an idle session",
+                "this operation requires an idle session",
             ));
         }
         Ok(())
@@ -142,6 +152,15 @@ impl SessionDriver {
             .reset_abandoned_consuming_inputs(&self.session_id)
             .await
             .map_err(anyhow::Error::from)?;
+        if self
+            .state
+            .repo
+            .active_leaf_is_turn_boundary(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?
+        {
+            return Ok(());
+        }
         let stored = self
             .state
             .repo

@@ -7,7 +7,7 @@ use crate::{
     StoredAction,
 };
 
-use super::events::insert_event_tx;
+use super::events::insert_event_with_activity_tx;
 use super::rows::row_text;
 use super::sql::action_is_unfinished;
 use super::PostgresAgentStore;
@@ -205,7 +205,7 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok(Vec::new());
         }
-        let event = insert_event_tx(
+        let event = insert_event_with_activity_tx(
             &mut tx,
             session_id,
             event_type,
@@ -256,7 +256,7 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok(Vec::new());
         }
-        let event = insert_event_tx(
+        let event = insert_event_with_activity_tx(
             &mut tx,
             session_id,
             EventType::SessionWorkCancelled,

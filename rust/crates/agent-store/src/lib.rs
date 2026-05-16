@@ -211,6 +211,7 @@ pub struct SessionSummary {
     pub metadata: Value,
     pub created_at: String,
     pub updated_at: String,
+    pub has_transcript_entries: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -300,6 +301,7 @@ pub struct SessionSnapshot {
     pub pending_actions: Vec<PendingActionRecord>,
     pub queued_inputs: Vec<QueuedInputRecord>,
     pub last_event_id: i64,
+    pub has_transcript_entries: bool,
 }
 
 #[derive(Debug, Clone)]

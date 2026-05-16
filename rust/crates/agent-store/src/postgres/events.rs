@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
-use agent_session::{SessionAction, SessionActionKind, SessionEvent};
+use agent_session::{SessionAction, SessionActionKind, SessionEvent, StoredTranscriptEntry};
 use agent_vocab::TranscriptItem;
 use anyhow::Result;
 use serde_json::{json, Value};
 use sqlx::{Executor, Postgres, Transaction};
 
-use crate::{EventFrame, EventType};
+use crate::{EventFrame, EventType, SessionActivity};
 
 use super::action_records::{action_payload, ActionKey};
 use super::rows::row_to_event;
@@ -64,6 +64,20 @@ pub(super) async fn insert_event_tx(
     insert_event_row(&mut **tx, session_id, event_type, payload).await
 }
 
+pub(super) async fn insert_event_with_activity_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    event_type: EventType,
+    mut payload: Value,
+) -> Result<EventFrame> {
+    if let Some(activity) = event_activity_hint(event_type) {
+        ensure_payload_object(&mut payload)
+            .entry("activity".to_string())
+            .or_insert_with(|| serde_json::to_value(activity).unwrap_or(Value::Null));
+    }
+    insert_event_tx(tx, session_id, event_type, payload).await
+}
+
 async fn insert_event_row<'e, E>(
     executor: E,
     session_id: &str,
@@ -84,25 +98,63 @@ where
     row_to_event(row)
 }
 
+fn ensure_payload_object(value: &mut Value) -> &mut serde_json::Map<String, Value> {
+    if !value.is_object() {
+        *value = json!({});
+    }
+    value.as_object_mut().expect("value was forced to object")
+}
+
+fn event_activity_hint(event_type: EventType) -> Option<SessionActivity> {
+    match event_type {
+        EventType::InputQueued => Some(SessionActivity::Queued),
+        EventType::InputAccepted
+        | EventType::InputConsumed
+        | EventType::ActionRequested
+        | EventType::ModelRequested
+        | EventType::ToolRequested
+        | EventType::ToolStarted
+        | EventType::CompactionRequested
+        | EventType::CompactionCompleted
+        | EventType::CompactionError => Some(SessionActivity::Running),
+        EventType::SessionIdle => Some(SessionActivity::Idle),
+        _ => None,
+    }
+}
+
 pub(super) async fn insert_session_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     event: &SessionEvent,
+    entries_by_id: &HashMap<&str, StoredTranscriptEntry>,
     action_rows: &HashMap<ActionKey, String>,
 ) -> Result<Vec<EventFrame>> {
     match event {
         SessionEvent::TranscriptItemAppended { entry_id, item } => {
-            insert_transcript_item_events_tx(tx, session_id, entry_id, item).await
+            insert_transcript_item_events_tx(
+                tx,
+                session_id,
+                entries_by_id.get(entry_id.as_str()),
+                entry_id,
+                item,
+            )
+            .await
         }
         SessionEvent::ActionRequested {
             action: SessionAction::CancelSessionWork,
         } => Ok(vec![
-            insert_event_tx(tx, session_id, EventType::SessionWorkCancelled, json!({})).await?,
+            insert_event_with_activity_tx(
+                tx,
+                session_id,
+                EventType::SessionWorkCancelled,
+                json!({}),
+            )
+            .await?,
         ]),
         SessionEvent::ActionRequested { action } => {
             let (kind, action_id, _, payload) = action_payload(action)?;
             let row_id = action_rows.get(&ActionKey::new(kind, action_id)).cloned();
-            let mut frames = vec![insert_event_tx(
+            let mut frames = vec![insert_event_with_activity_tx(
                 tx,
                 session_id,
                 EventType::ActionRequested,
@@ -116,7 +168,7 @@ pub(super) async fn insert_session_event_tx(
             };
             if let Some(event_name) = event_name {
                 frames.push(
-                    insert_event_tx(
+                    insert_event_with_activity_tx(
                         tx,
                         session_id,
                         event_name,
@@ -133,7 +185,13 @@ pub(super) async fn insert_session_event_tx(
                 SessionActionKind::Tool => EventType::ToolCompleted,
             };
             Ok(vec![
-                insert_event_tx(tx, session_id, event_name, json!({ "action_id": id })).await?,
+                insert_event_with_activity_tx(
+                    tx,
+                    session_id,
+                    event_name,
+                    json!({ "action_id": id }),
+                )
+                .await?,
             ])
         }
         SessionEvent::ActionFailed { kind, id, error } => {
@@ -142,7 +200,7 @@ pub(super) async fn insert_session_event_tx(
                 SessionActionKind::Tool => EventType::ToolError,
             };
             Ok(vec![
-                insert_event_tx(
+                insert_event_with_activity_tx(
                     tx,
                     session_id,
                     event_name,
@@ -160,22 +218,32 @@ pub(super) async fn insert_session_event_tx(
 pub(super) async fn insert_transcript_item_events_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
+    entry: Option<&StoredTranscriptEntry>,
     entry_id: &str,
     item: &TranscriptItem,
 ) -> Result<Vec<EventFrame>> {
+    let entry_payload = entry.map(|entry| {
+        json!({
+            "id": entry.id,
+            "parent_id": entry.parent_id,
+            "timestamp_ms": entry.timestamp_ms,
+            "item": entry.item,
+            "provider_replay": entry.provider_replay,
+        })
+    });
     let mut frames = vec![
-        insert_event_tx(
+        insert_event_with_activity_tx(
             tx,
             session_id,
             EventType::TranscriptAppended,
-            json!({ "entry_id": entry_id, "item": item }),
+            json!({ "entry_id": entry_id, "item": item, "entry": entry_payload }),
         )
         .await?,
     ];
     match item {
         TranscriptItem::TurnStarted { turn_id } => {
             frames.push(
-                insert_event_tx(
+                insert_event_with_activity_tx(
                     tx,
                     session_id,
                     EventType::TurnStarted,
@@ -186,7 +254,7 @@ pub(super) async fn insert_transcript_item_events_tx(
         }
         TranscriptItem::TurnFinished { turn_id, outcome } => {
             frames.push(
-                insert_event_tx(
+                insert_event_with_activity_tx(
                     tx,
                     session_id,
                     EventType::TurnFinished,
@@ -197,7 +265,7 @@ pub(super) async fn insert_transcript_item_events_tx(
         }
         TranscriptItem::AssistantMessage(message) => {
             frames.push(
-                insert_event_tx(
+                insert_event_with_activity_tx(
                     tx,
                     session_id,
                     EventType::AssistantMessage,

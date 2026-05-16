@@ -15,6 +15,7 @@ import type {
 	TranscriptItem
 } from "./types.ts";
 import type { HistoryPlacement } from "./historyTargets.ts";
+import type { EntryScope } from "./queryKeys.ts";
 
 type EventHandler = (event: EventFrame) => void;
 type StatusHandler = (status: ConnectionStatus) => void;
@@ -70,6 +71,7 @@ export interface DeleteProjectResult {
 
 export interface GetSessionOptions {
 	includeEntries?: boolean;
+	entryScope?: EntryScope;
 }
 
 export interface StartSessionParams {
@@ -251,7 +253,8 @@ class AgentApiClient implements AgentApi {
 	getSession(sessionId: string, options: GetSessionOptions = {}): Promise<SessionSnapshot> {
 		return this.client.request<SessionSnapshot>("session.get", {
 			session_id: sessionId,
-			include_entries: options.includeEntries || undefined
+			include_entries: options.includeEntries || undefined,
+			entries_scope: options.entryScope
 		});
 	}
 

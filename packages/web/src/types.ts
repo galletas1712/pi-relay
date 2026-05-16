@@ -25,6 +25,7 @@ export interface SessionSummary {
 	metadata: Record<string, unknown>;
 	created_at: string;
 	updated_at: string;
+	has_transcript_entries?: boolean;
 }
 
 export interface PendingAction {
@@ -55,6 +56,7 @@ export interface SessionSnapshot {
 	pending_actions: PendingAction[];
 	queued_inputs: QueuedInput[];
 	last_event_id: number;
+	has_transcript_entries?: boolean;
 	entries?: TranscriptEntry[];
 }
 

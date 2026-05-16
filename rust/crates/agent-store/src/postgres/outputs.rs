@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use agent_session::{SessionAction, SessionEvent};
+use agent_session::{SessionAction, SessionEvent, StoredTranscriptEntry};
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use sqlx::{Postgres, Row, Transaction};
@@ -9,7 +9,7 @@ use uuid::Uuid;
 use crate::{ActionStatus, ActionUpdate, EventFrame, EventType, OutputBatch, PersistedAction};
 
 use super::action_records::{action_event_matches_row, action_payload, ActionKey};
-use super::events::{insert_event_tx, insert_session_event_tx};
+use super::events::{insert_event_with_activity_tx, insert_session_event_tx};
 use super::rows::row_text;
 use super::sql::action_is_unfinished;
 use super::transcript::insert_entry_tx;
@@ -80,7 +80,7 @@ pub(super) async fn persist_outputs_tx(
             return Err(anyhow!("queued input was already consumed: {}", input.id));
         }
         frames.push(
-            insert_event_tx(
+            insert_event_with_activity_tx(
                 tx,
                 session_id,
                 EventType::InputConsumed,
@@ -123,7 +123,7 @@ pub(super) async fn persist_outputs_tx(
         }
 
         frames.push(
-            insert_event_tx(
+            insert_event_with_activity_tx(
                 tx,
                 session_id,
                 EventType::InputAccepted,
@@ -192,9 +192,24 @@ pub(super) async fn persist_outputs_tx(
         });
     }
 
+    let entries_by_id = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.id.as_str(),
+                StoredTranscriptEntry {
+                    id: entry.id.clone(),
+                    parent_id: entry.parent_id.clone(),
+                    timestamp_ms: entry.timestamp_ms,
+                    item: entry.item.clone(),
+                    provider_replay: entry.provider_replay.clone(),
+                },
+            )
+        })
+        .collect::<HashMap<_, _>>();
     for event in session_events {
         frames.extend(
-            insert_session_event_tx(tx, session_id, event, &action_rows)
+            insert_session_event_tx(tx, session_id, event, &entries_by_id, &action_rows)
                 .await
                 .with_context(|| format!("insert session event {event:?}"))?,
         );

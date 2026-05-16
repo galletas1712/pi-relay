@@ -31,6 +31,7 @@ pub(crate) fn session_summary(summary: SessionSummary) -> Value {
         "metadata": summary.metadata,
         "created_at": summary.created_at,
         "updated_at": summary.updated_at,
+        "has_transcript_entries": summary.has_transcript_entries,
     })
 }
 
@@ -77,6 +78,7 @@ pub(crate) fn session_snapshot(
         "pending_actions": pending_actions,
         "queued_inputs": queued_inputs,
         "last_event_id": snapshot.last_event_id,
+        "has_transcript_entries": snapshot.has_transcript_entries,
     });
     if let Some(entries) = entries {
         value["entries"] = json!(redact_entries(entries));

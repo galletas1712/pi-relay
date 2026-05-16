@@ -1,5 +1,5 @@
 import { useMemo, useState, type CSSProperties } from "react";
-import { ChevronRight, GitFork, RotateCcw, X } from "lucide-react";
+import { ChevronRight, GitFork, Loader2, RotateCcw, X } from "lucide-react";
 import {
 	branchEntriesFor,
 	historyForkOptions,
@@ -24,6 +24,8 @@ export function HistoryPickerDialog({
 	entries,
 	activeLeafId,
 	initialForkTitle = "",
+	loading = false,
+	error = null,
 	onClose,
 	onFork,
 	onSwitch
@@ -32,6 +34,8 @@ export function HistoryPickerDialog({
 	entries: TranscriptEntry[];
 	activeLeafId: string | null;
 	initialForkTitle?: string;
+	loading?: boolean;
+	error?: string | null;
 	onClose: () => void;
 	onFork: (target: HistoryTargetOption, title: string) => void;
 	onSwitch: (target: HistoryTargetOption) => void;
@@ -118,62 +122,71 @@ export function HistoryPickerDialog({
 				) : null}
 
 				<div className="history-options tree" role="tree" aria-label={`${mode} targets`}>
-					{renderedRows.map((row) => {
-						const display = row.option;
-						const isCollapsedBranch = hiddenBranchIds.has(row.entry.id);
-						const canCollapse = row.isBranchRoot && !row.isOnActivePath;
-						const outcomeClass = nonGracefulOutcomeClass(display.outcome);
-						return (
-							<div
-								key={row.entry.id}
-								className={`history-tree-item ${row.isOnActivePath ? "on-active-path" : ""} ${isCollapsedBranch ? "collapsed" : ""} ${outcomeClass}`}
-								style={{ "--tree-depth": row.depth } as CSSProperties}
-							>
-								{canCollapse ? (
-									<button
-										className="branch-toggle"
-										type="button"
-										onClick={() => toggleBranch(row.entry.id)}
-										aria-label={isCollapsedBranch ? "expand branch" : "collapse branch"}
-										aria-expanded={!isCollapsedBranch}
-									>
-										<ChevronRight size={13} />
-									</button>
-								) : null}
-								<button
-									className="history-option tree-row"
-									type="button"
-									role="treeitem"
-									aria-selected={row.isActive}
-									onClick={() => {
-										if (mode === "fork") {
-											onFork(row.option, forkTitle);
-										} else {
-											onSwitch(row.option);
-										}
-									}}
+					{loading ? (
+						<div className="history-loading">
+							<Loader2 className="spin" size={16} />
+							<span>Loading full history...</span>
+						</div>
+					) : error ? (
+						<div className="history-empty error">{error}</div>
+					) : (
+						renderedRows.map((row) => {
+							const display = row.option;
+							const isCollapsedBranch = hiddenBranchIds.has(row.entry.id);
+							const canCollapse = row.isBranchRoot && !row.isOnActivePath;
+							const outcomeClass = nonGracefulOutcomeClass(display.outcome);
+							return (
+								<div
+									key={row.entry.id}
+									className={`history-tree-item ${row.isOnActivePath ? "on-active-path" : ""} ${isCollapsedBranch ? "collapsed" : ""} ${outcomeClass}`}
+									style={{ "--tree-depth": row.depth } as CSSProperties}
 								>
-									<span className="tree-guides" aria-hidden="true" />
-									<span className={`history-option-icon ${row.entry.parent_id ? "" : "root"}`}>
-										{display.turnLabel}
-									</span>
-									<span className="history-option-main">
-										<span className="history-option-title">
-											{display.title}
-											{row.isActive ? <span className="history-badge">current</span> : null}
-											{isCollapsedBranch ? <span className="history-badge muted">{row.descendantCount} hidden</span> : null}
-											{display.outcome && display.outcome !== "Graceful" ? (
-												<span className="history-badge danger">{display.outcome.toLowerCase()}</span>
-											) : null}
+									{canCollapse ? (
+										<button
+											className="branch-toggle"
+											type="button"
+											onClick={() => toggleBranch(row.entry.id)}
+											aria-label={isCollapsedBranch ? "expand branch" : "collapse branch"}
+											aria-expanded={!isCollapsedBranch}
+										>
+											<ChevronRight size={13} />
+										</button>
+									) : null}
+									<button
+										className="history-option tree-row"
+										type="button"
+										role="treeitem"
+										aria-selected={row.isActive}
+										onClick={() => {
+											if (mode === "fork") {
+												onFork(row.option, forkTitle);
+											} else {
+												onSwitch(row.option);
+											}
+										}}
+									>
+										<span className="tree-guides" aria-hidden="true" />
+										<span className={`history-option-icon ${row.entry.parent_id ? "" : "root"}`}>
+											{display.turnLabel}
 										</span>
-										<span className="history-option-preview">{display.preview}</span>
-									</span>
-									<span className="history-option-meta">{display.meta}</span>
-								</button>
-							</div>
-						);
-					})}
-					{targetCount === 0 ? (
+										<span className="history-option-main">
+											<span className="history-option-title">
+												{display.title}
+												{row.isActive ? <span className="history-badge">current</span> : null}
+												{isCollapsedBranch ? <span className="history-badge muted">{row.descendantCount} hidden</span> : null}
+												{display.outcome && display.outcome !== "Graceful" ? (
+													<span className="history-badge danger">{display.outcome.toLowerCase()}</span>
+												) : null}
+											</span>
+											<span className="history-option-preview">{display.preview}</span>
+										</span>
+										<span className="history-option-meta">{display.meta}</span>
+									</button>
+								</div>
+							);
+						})
+					)}
+					{!loading && !error && targetCount === 0 ? (
 						<div className="history-empty">
 							{mode === "fork"
 								? "No transcript entries yet."

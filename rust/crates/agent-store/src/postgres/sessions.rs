@@ -244,27 +244,34 @@ impl PostgresAgentStore {
 
     pub async fn rename_session(&self, session_id: &str, title: &str) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
+        let row = sqlx::query(
             r#"
                 update sessions
                 set metadata = jsonb_set(metadata, '{title}', to_jsonb($2::text), true),
                     updated_at = now()
                 where id = $1
+                returning provider_config, metadata
             "#,
         )
         .bind(session_id)
         .bind(title)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
+        let Some(row) = row else {
             return Err(anyhow!("session not found: {session_id}"));
-        }
+        };
+        let provider: ProviderConfig = serde_json::from_value(row.get("provider_config"))?;
+        let metadata: Value = row.get("metadata");
+        let activity = self.activity(session_id).await?;
         let event = insert_event_tx(
             &mut tx,
             session_id,
             EventType::SessionConfigured,
             json!({
                 "title": title,
+                "metadata": metadata,
+                "provider": provider,
+                "activity": activity,
             }),
         )
         .await?;
@@ -286,23 +293,27 @@ impl PostgresAgentStore {
         config: &SessionConfig,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            "update sessions set provider_config=$2, metadata=$3, updated_at=now() where id=$1",
+        let row = sqlx::query(
+            "update sessions set provider_config=$2, metadata=$3, updated_at=now() where id=$1 returning metadata",
         )
         .bind(session_id)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
-        if result.rows_affected() == 0 {
+        let Some(row) = row else {
             return Err(anyhow!("session not found: {session_id}"));
-        }
+        };
+        let metadata: Value = row.get("metadata");
+        let activity = self.activity(session_id).await?;
         let event = insert_event_tx(
             &mut tx,
             session_id,
             EventType::SessionConfigured,
             json!({
                 "provider": config.provider,
+                "metadata": metadata,
+                "activity": activity,
             }),
         )
         .await?;
@@ -329,7 +340,8 @@ impl PostgresAgentStore {
                     s.created_at::text as created_at,
                     s.updated_at::text as updated_at,
                     exists(select 1 from actions a where a.session_id=s.id and {running_actions}) as has_running_work,
-                    exists(select 1 from queued_inputs q where q.session_id=s.id and {active_queue}) as has_queued_input
+                    exists(select 1 from queued_inputs q where q.session_id=s.id and {active_queue}) as has_queued_input,
+                    exists(select 1 from transcript_entries t where t.session_id=s.id) as has_transcript_entries
                 from sessions s
                 where s.metadata->>'hidden' is distinct from 'true'
                     and ($2::uuid is null or s.project_id=$2)
@@ -374,6 +386,7 @@ impl PostgresAgentStore {
                     metadata: row.get("metadata"),
                     created_at: row.get("created_at"),
                     updated_at: row.get("updated_at"),
+                    has_transcript_entries: row.get("has_transcript_entries"),
                 })
             })
             .collect()

@@ -68,6 +68,8 @@ impl PostgresAgentStore {
             .fetch_all(&self.pool)
             .await?;
 
+        let has_transcript_entries = self.has_transcript_entries(session_id).await?;
+
         let activity = if !actions.is_empty() {
             SessionActivity::Running
         } else if queued {
@@ -110,6 +112,7 @@ impl PostgresAgentStore {
                 })
                 .collect::<Result<Vec<_>>>()?,
             last_event_id,
+            has_transcript_entries,
         })
     }
 }

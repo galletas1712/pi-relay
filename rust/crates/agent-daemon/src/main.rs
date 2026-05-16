@@ -392,6 +392,16 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
         .get("include_entries")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let entries_scope = params
+        .get("entries_scope")
+        .and_then(Value::as_str)
+        .unwrap_or("full_tree");
+    if !matches!(entries_scope, "full_tree" | "active_branch") {
+        return Err(RpcError::new(
+            "invalid_params",
+            "entries_scope must be 'full_tree' or 'active_branch'",
+        ));
+    }
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.recover_if_needed().await?;
     let snapshot = state
@@ -400,14 +410,20 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
         .await
         .map_err(anyhow::Error::from)?;
     let entries = if include_entries {
-        Some(
+        let tree = if entries_scope == "active_branch" {
+            state
+                .repo
+                .active_branch(&session_id)
+                .await
+                .map_err(anyhow::Error::from)?
+        } else {
             state
                 .repo
                 .history_tree(&session_id)
                 .await
                 .map_err(anyhow::Error::from)?
-                .entries,
-        )
+        };
+        Some(tree.entries)
     } else {
         None
     };
@@ -431,6 +447,7 @@ async fn session_rename(state: &AppState, params: Value) -> std::result::Result<
     Ok(json!({
         "session_id": session_id,
         "title": title,
+        "metadata": state.repo.load_session_config(&session_id).await.map_err(anyhow::Error::from)?.metadata,
         "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?
     }))
 }
@@ -489,21 +506,21 @@ async fn session_configure(
         .unwrap_or_else(|| current.metadata.clone());
     let model_changed = provider_model_changed(&current.provider, &provider);
     let metadata_changed = metadata != current.metadata;
-    if model_changed || metadata_changed {
-        driver.ensure_idle_for_source_mutation().await?;
-    }
     if model_changed {
-        let stored = state
+        driver.ensure_idle_for_source_mutation().await?;
+        if state
             .repo
-            .load_stored_session(&session_id)
+            .has_transcript_entries(&session_id)
             .await
-            .map_err(anyhow::Error::from)?;
-        if !stored.entries.is_empty() {
+            .map_err(anyhow::Error::from)?
+        {
             return Err(RpcError::new(
                 "provider_locked",
                 "session model cannot be changed after the first transcript entry",
             ));
         }
+    } else if metadata_changed {
+        driver.ensure_idle_for_metadata_mutation().await?;
     }
     let config = SessionConfig {
         project_id: current.project_id,
@@ -521,9 +538,12 @@ async fn session_configure(
     }
     publish_events(state, events);
     clear_event_buffer_if_idle(state, &session_id).await?;
-    Ok(
-        json!({ "session_id": session_id, "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)? }),
-    )
+    Ok(json!({
+        "session_id": session_id,
+        "provider": config.provider,
+        "metadata": config.metadata,
+        "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?
+    }))
 }
 
 fn provider_model_changed(previous: &ProviderConfig, next: &ProviderConfig) -> bool {
@@ -960,9 +980,14 @@ async fn history_rewind(state: &AppState, params: Value) -> std::result::Result<
         .set_active_leaf(&session_id, leaf_id)
         .await
         .map_err(anyhow::Error::from)?;
+    let activity = state
+        .repo
+        .activity(&session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
     publish_events(state, events);
     clear_event_buffer_if_idle(state, &session_id).await?;
-    Ok(json!({ "session_id": session_id, "active_leaf_id": leaf_id }))
+    Ok(json!({ "session_id": session_id, "active_leaf_id": leaf_id, "activity": activity }))
 }
 
 async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
