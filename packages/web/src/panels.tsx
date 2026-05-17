@@ -441,9 +441,17 @@ export function LogHeader({
 					</select>
 				</label>
 			</div>
-			<button className="icon-button tiny" type="button" onClick={onToggleRight} title={rightOpen ? "close inspector" : "open inspector"}>
-				{rightOpen ? <PanelRightClose size={14} /> : <PanelRightOpen size={14} />}
-			</button>
+			{rightOpen ? null : (
+				<button
+					className="icon-button tiny"
+					type="button"
+					onClick={onToggleRight}
+					title="open inspector"
+					aria-label="open inspector"
+				>
+					<PanelRightOpen size={14} />
+				</button>
+			)}
 		</div>
 	);
 }

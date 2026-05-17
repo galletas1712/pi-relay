@@ -2209,8 +2209,18 @@ pre {
 	transition: transform 180ms ease, box-shadow 180ms ease;
 }
 
-.app-shell.inspector-open .inspector {
-	transform: none;
+/* At static-grid widths (>=900px) the inspector lives in a grid column;
+   when closed, drop the column entirely so chat reclaims the space. The
+   `display: none` keeps the panel out of the layout and a11y tree, and the
+   `grid-template-columns` overrides resize the shell accordingly. */
+@media (min-width: 900px) {
+	.app-shell:not(.inspector-open) .inspector {
+		display: none;
+	}
+
+	.app-shell:not(.inspector-open) {
+		grid-template-columns: minmax(0, 1fr);
+	}
 }
 
 @media (max-width: 1279px) {
@@ -2222,12 +2232,6 @@ pre {
 		box-shadow: 18px 0 52px color-mix(in oklch, var(--foreground) 18%, transparent);
 	}
 
-	/* the mobile-topbar already has an inspector toggle in this range,
-	   so don't render a second one inside the chat header */
-	.log-header > .icon-button {
-		display: none;
-	}
-
 	/* the mobile-topbar already shows the session title and activity status,
 	   so don't repeat them inside the log header on mobile/medium */
 	.log-header > .log-session,
@@ -2236,9 +2240,21 @@ pre {
 	}
 }
 
+@media (max-width: 899px) {
+	/* at compact widths the mobile-topbar has the open-inspector button
+	   already, so the chat-header one would be redundant */
+	.log-header > .icon-button {
+		display: none;
+	}
+}
+
 @media (min-width: 1280px) {
 	.app-shell {
 		grid-template-columns: 320px minmax(0, 1fr) minmax(320px, 380px);
+	}
+
+	.app-shell:not(.inspector-open) {
+		grid-template-columns: 320px minmax(0, 1fr);
 	}
 
 	.mobile-topbar {
@@ -2274,14 +2290,6 @@ pre {
 	.inspector {
 		grid-column: 3;
 		grid-row: 1 / span 3;
-	}
-}
-
-@media (min-width: 900px) {
-	/* inspector is part of the static grid at medium and wide, so its
-	   close X would just slide a permanent panel off-screen */
-	.inspector-close {
-		display: none;
 	}
 }
 

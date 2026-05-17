@@ -1334,15 +1334,15 @@ export function App() {
 						) : null}
 					</div>
 				</div>
-				{inspectorIsOverlay ? (
+				{inspectorIsOverlay && !rightOpen ? (
 					<button
-						className={`icon-button ${rightOpen ? "pressed" : ""}`}
+						className="icon-button"
 						type="button"
 						onClick={handleToggleRight}
-						aria-label={rightOpen ? "close inspector" : "open inspector"}
+						aria-label="open inspector"
 						aria-expanded={rightOpen}
 					>
-						{rightOpen ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}
+						<PanelRightOpen size={17} />
 					</button>
 				) : null}
 			</div>
