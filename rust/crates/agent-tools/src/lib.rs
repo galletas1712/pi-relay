@@ -12,3 +12,4 @@ pub use display::{tool_display, ToolDisplayInput};
 pub use error::{ToolError, ToolResult};
 pub use output::limit_tool_output;
 pub use registry::{builtin_tool_definition, AgentTool, ToolListing, ToolRegistry};
+pub use tools::APPLY_PATCH_LARK_GRAMMAR;

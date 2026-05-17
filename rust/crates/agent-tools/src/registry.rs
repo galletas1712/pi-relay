@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 
 use crate::context::ToolContext;
 use crate::error::{ToolError, ToolResult};
-use crate::tools::{ApplyPatchTool, BashTool, GrepTool, TextEditorTool};
+use crate::tools::{ApplyPatchTool, BashTool, GrepTool, TextEditorTool, APPLY_PATCH_LARK_GRAMMAR};
 
 #[async_trait]
 pub trait AgentTool: Send + Sync {
@@ -29,6 +29,24 @@ pub fn builtin_tool_definition(name: &str) -> Option<ToolDefinition> {
         "Bash" => Some(BashTool.definition()),
         "Grep" => Some(GrepTool.definition()),
         _ => None,
+    }
+}
+
+fn openai_edit_listing() -> ToolListing {
+    ToolListing {
+        name: "Edit".to_string(),
+        kind: ReplayDisplayKind::LocalTool,
+        description:
+            "Apply a freeform patch to files in the workspace. Emit the raw patch body, not JSON."
+                .to_string(),
+        input_schema: json!({
+            "type": "custom",
+            "format": {
+                "type": "grammar",
+                "syntax": "lark",
+                "definition": APPLY_PATCH_LARK_GRAMMAR,
+            },
+        }),
     }
 }
 
@@ -119,6 +137,9 @@ impl ToolRegistry {
 
     fn local_listing(&self, provider: ProviderKind, name: &str) -> ToolListing {
         let definition = self.definition(provider, name);
+        if provider == ProviderKind::OpenAi && name == "Edit" {
+            return openai_edit_listing();
+        }
         ToolListing {
             name: definition.name,
             kind: ReplayDisplayKind::LocalTool,
@@ -229,5 +250,27 @@ mod tests {
 
         assert_eq!(openai, ["Edit", "Bash", "Grep", "WebSearch"]);
         assert_eq!(claude, ["Bash", "Grep", "Edit", "WebSearch", "WebFetch"]);
+    }
+
+    #[test]
+    fn edit_listing_is_provider_specific() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let openai_edit = registry
+            .listings_for_provider(ProviderKind::OpenAi)
+            .into_iter()
+            .find(|listing| listing.name == "Edit")
+            .expect("OpenAI Edit listing");
+        let claude_edit = registry
+            .listings_for_provider(ProviderKind::Claude)
+            .into_iter()
+            .find(|listing| listing.name == "Edit")
+            .expect("Claude Edit listing");
+
+        assert_eq!(openai_edit.input_schema["type"], "custom");
+        assert_eq!(openai_edit.input_schema["format"]["syntax"], "lark");
+        assert_eq!(claude_edit.input_schema["type"], "object");
+        assert!(claude_edit.input_schema["properties"]
+            .get("command")
+            .is_some());
     }
 }
