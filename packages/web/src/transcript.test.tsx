@@ -6,11 +6,11 @@ import type { AssistantItem, ProviderReplayItem, TranscriptEntry } from "./types
 describe("assistantRenderParts", () => {
 	it("uses local replay display metadata even when no hosted tools are present", () => {
 		const parts = assistantRenderParts(
-			[toolCall("call_1", "str_replace_based_edit_tool")],
+			[toolCall("call_1", "Edit")],
 			[
 				replay(
 					"claude",
-					{ type: "tool_use", id: "call_1", name: "str_replace_based_edit_tool" },
+					{ type: "tool_use", id: "call_1", name: "Edit" },
 					{ kind: "local_tool", pretty_name: "Edit", input_summary: "view tmp/file.txt" }
 				)
 			]
@@ -27,8 +27,8 @@ describe("assistantRenderParts", () => {
 		]);
 	});
 
-	it("renders apply_patch as an edit diff preview", () => {
-		const preview = editToolPreview("apply_patch", {
+	it("renders canonical OpenAI Edit as an edit diff preview", () => {
+		const preview = editToolPreview("Edit", {
 			input: "*** Begin Patch\n*** Add File: tmp/example.txt\n+hello\n*** End Patch\n"
 		});
 
@@ -43,8 +43,8 @@ describe("assistantRenderParts", () => {
 		});
 	});
 
-	it("renders Claude str_replace as an edit diff preview", () => {
-		const preview = editToolPreview("str_replace_based_edit_tool", {
+	it("renders canonical Claude Edit as an edit diff preview", () => {
+		const preview = editToolPreview("Edit", {
 			command: "str_replace",
 			path: "/repo/tmp/example.txt",
 			old_str: "alpha\n",

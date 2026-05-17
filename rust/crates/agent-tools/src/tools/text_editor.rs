@@ -32,11 +32,10 @@ struct TextEditorArgs {
 #[async_trait]
 impl AgentTool for TextEditorTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "str_replace_based_edit_tool".to_string(),
-            description: "View and edit workspace text files with Claude's text editor schema."
-                .to_string(),
-            input_schema: json!({
+        ToolDefinition::new(
+            "Edit",
+            "View and edit workspace text files with Claude's text editor schema.".to_string(),
+            json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string" },
@@ -53,7 +52,7 @@ impl AgentTool for TextEditorTool {
                 "required": ["command", "path"],
                 "additionalProperties": false
             }),
-        }
+        )
     }
 
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {

@@ -1,6 +1,9 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Menu, PanelRightClose, PanelRightOpen } from "lucide-react";
+import ReactMarkdown from "react-markdown";
+import rehypeRaw from "rehype-raw";
+import remarkGfm from "remark-gfm";
 import { createAgentApi } from "./agentApi.ts";
 import { ChatPane } from "./chatPane.tsx";
 import { Composer, type ComposerHandle } from "./composer.tsx";
@@ -43,7 +46,6 @@ import {
 import { projectTitle, sessionTitle, isArchivedSession, displayActivity, tallyActivities, type SessionListItem } from "./sessionList.ts";
 import { firstLine, truncate } from "./text.ts";
 import type {
-	DaemonConfig,
 	EventFrame,
 	Notice,
 	Project,
@@ -106,6 +108,14 @@ type ProjectDialogState = {
 	saving: boolean;
 };
 
+type PromptDialogState = {
+	loading: boolean;
+	template: string;
+	rendered: string | null;
+	view: "rendered" | "template";
+	error: string | null;
+};
+
 export function App() {
 	const api = useMemo(() => createAgentApi(), []);
 	const queryClient = useQueryClient();
@@ -131,6 +141,7 @@ export function App() {
 	const [renameValue, setRenameValue] = useState("");
 	const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
 	const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
+	const [promptDialog, setPromptDialog] = useState<PromptDialogState | null>(null);
 
 	const refreshTimer = useRef<number | null>(null);
 	const sessionListRefreshTimer = useRef<number | null>(null);
@@ -206,12 +217,6 @@ export function App() {
 		placeholderData: undefined,
 	});
 
-	const configQuery = useQuery({
-		queryKey: queryKeys.config,
-		queryFn: () => api.getConfig(),
-		enabled: connection === "open",
-	});
-	const config: DaemonConfig = configQuery.data ?? { system_prompt: null };
 
 	const sessionItems: SessionListItem[] = sessions;
 	const selectedProject = useMemo(
@@ -471,7 +476,7 @@ export function App() {
 			}
 			void Promise.all([
 				queryClient.invalidateQueries({ queryKey: queryKeys.projects }),
-				queryClient.invalidateQueries({ queryKey: queryKeys.config }),
+				queryClient.invalidateQueries({ queryKey: queryKeys.systemPrompt }),
 				queryClient.invalidateQueries({
 					queryKey: queryKeys.sessions(selectedProjectRef.current),
 				}),
@@ -497,9 +502,6 @@ export function App() {
 	useEffect(() => {
 		if (selectedSessionQuery.error) pushNotice("error", errorMessage(selectedSessionQuery.error));
 	}, [selectedSessionQuery.error, pushNotice]);
-	useEffect(() => {
-		if (configQuery.error) pushNotice("error", errorMessage(configQuery.error));
-	}, [configQuery.error, pushNotice]);
 	useEffect(() => {
 		if (toolsQuery.error) pushNotice("error", errorMessage(toolsQuery.error));
 	}, [toolsQuery.error, pushNotice]);
@@ -1066,19 +1068,26 @@ export function App() {
 				throw new Error(`unknown command: /${name}`);
 			}
 			if (name === "system") {
-				if (!args) {
-					const next = await queryClient.fetchQuery({
-						queryKey: queryKeys.config,
-						queryFn: () => api.getConfig(),
-						staleTime: 0,
-					});
-					pushActionNotice("info", next.system_prompt ? `system: ${truncate(next.system_prompt, 320)}` : "system prompt is empty");
+				if (args) {
+					pushActionNotice("info", "/system is read-only; edit PI.md in the repo to change the prompt");
 					return;
 				}
-				const systemPrompt = args === "clear" ? null : args;
-				const next = await api.setConfig(systemPrompt);
-				queryClient.setQueryData(queryKeys.config, next);
-				pushActionNotice("success", systemPrompt ? "global system prompt updated" : "global system prompt cleared");
+				setPromptDialog({ loading: true, template: "", rendered: null, view: "rendered", error: null });
+				try {
+					const promptRequest = loadedSnapshot
+						? { sessionId: loadedSnapshot.session_id }
+						: selectedProject
+							? { projectId: selectedProject.project_id, provider: activeProvider }
+							: undefined;
+					const next = await queryClient.fetchQuery({
+						queryKey: queryKeys.systemPrompt,
+						queryFn: () => api.getSystemPrompt(promptRequest),
+						staleTime: 0,
+					});
+					setPromptDialog({ loading: false, template: next.template, rendered: next.rendered, view: next.rendered ? "rendered" : "template", error: null });
+				} catch (error) {
+					setPromptDialog({ loading: false, template: "", rendered: null, view: "template", error: errorMessage(error) });
+				}
 				return;
 			}
 
@@ -1111,7 +1120,7 @@ export function App() {
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[api, loadedSnapshot, openHistoryDialog, pushNotice, queryClient, requireSelected],
+		[activeProvider, api, loadedSnapshot, openHistoryDialog, pushNotice, queryClient, requireSelected, selectedProject],
 	);
 
 	const submitComposer = useCallback(
@@ -1435,7 +1444,7 @@ export function App() {
 			</footer>
 
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
-				<Inspector snapshot={loadedSnapshot} config={config} tools={tools} onClose={() => setRightOpen(false)} />
+				<Inspector snapshot={loadedSnapshot} tools={tools} onClose={() => setRightOpen(false)} />
 			</aside>
 
 			{renameSessionId ? (
@@ -1469,6 +1478,10 @@ export function App() {
 						void saveProjectDialog().catch((error) => pushNotice("error", errorMessage(error)));
 					}}
 				/>
+			) : null}
+
+			{promptDialog ? (
+				<SystemPromptDialog state={promptDialog} onChangeView={(view) => setPromptDialog((current) => (current ? { ...current, view } : current))} onClose={() => setPromptDialog(null)} />
 			) : null}
 
 			{historyDialog ? (
@@ -1556,6 +1569,75 @@ function activityFromEvent(event: EventFrame): SessionSummary["activity"] | null
 	}
 	return null;
 }
+
+function SystemPromptDialog({
+	state,
+	onChangeView,
+	onClose,
+}: {
+	state: PromptDialogState;
+	onChangeView: (view: "rendered" | "template") => void;
+	onClose: () => void;
+}) {
+	const text = state.view === "rendered" ? (state.rendered ?? "") : state.template;
+	return (
+		<div className="modal-scrim" role="presentation" onMouseDown={onClose}>
+			<div
+				className="rename-dialog system-prompt-dialog"
+				role="dialog"
+				aria-modal="true"
+				aria-labelledby="system-prompt-dialog-title"
+				onMouseDown={(event) => event.stopPropagation()}
+			>
+				<div className="rename-dialog-head">
+					<div className="rename-dialog-copy">
+						<h2 id="system-prompt-dialog-title">PI.md</h2>
+						<p>Rendered prompt and source template.</p>
+					</div>
+					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close system prompt dialog">
+						×
+					</button>
+				</div>
+				<div className="system-prompt-tabs" role="tablist" aria-label="PI.md view">
+					<button type="button" className={state.view === "rendered" ? "selected" : ""} onClick={() => onChangeView("rendered")} disabled={!state.rendered}>
+						Rendered
+					</button>
+					<button type="button" className={state.view === "template" ? "selected" : ""} onClick={() => onChangeView("template")}>
+						Template
+					</button>
+				</div>
+				<div className="system-prompt-body">
+					{state.loading ? <p className="muted">Loading PI.md…</p> : null}
+					{state.error ? <p className="error-text">{state.error}</p> : null}
+					{!state.loading && !state.error ? (
+						state.view === "rendered" ? <MarkdownView text={text} /> : <pre>{text}</pre>
+					) : null}
+				</div>
+			</div>
+		</div>
+	);
+}
+
+
+const MarkdownView = memo(function MarkdownView({ text }: { text: string }) {
+	return (
+		<div className="assistant-markdown system-prompt-markdown">
+			<ReactMarkdown
+				rehypePlugins={[rehypeRaw]}
+				remarkPlugins={[remarkGfm]}
+				components={{
+					a: ({ href, children, ...props }) => (
+						<a href={href} target="_blank" rel="noreferrer" {...props}>
+							{children}
+						</a>
+					)
+				}}
+			>
+				{text}
+			</ReactMarkdown>
+		</div>
+	);
+});
 
 function RenameSessionDialog({
 	value,

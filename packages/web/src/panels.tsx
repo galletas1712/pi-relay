@@ -23,7 +23,7 @@ import {
 	type SessionListItem
 } from "./sessionList.ts";
 import { truncate } from "./text.ts";
-import type { DaemonConfig, Notice, Project, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
+import type { Notice, Project, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
 
 export function SidebarHeader({
 	connection,
@@ -471,12 +471,10 @@ export function NoticeStack({ notices, rightOpen }: { notices: Notice[]; rightOp
 
 export function Inspector({
 	snapshot,
-	config,
 	tools,
 	onClose
 }: {
 	snapshot: SessionSnapshot | null;
-	config: DaemonConfig;
 	tools: ToolListing[];
 	onClose?: () => void;
 }) {
@@ -489,13 +487,6 @@ export function Inspector({
 					<X size={14} />
 				</button>
 			</div>
-			<section className="inspect-section">
-				<h2>Global</h2>
-				<div className="kv">
-					<span>system</span>
-					<strong>{config.system_prompt ? truncate(config.system_prompt, 80) : "empty"}</strong>
-				</div>
-			</section>
 			<section className="inspect-section">
 				<h2>Session</h2>
 				{snapshot ? (
@@ -540,7 +531,7 @@ export function Inspector({
 				<h2>Tools</h2>
 				<div className="tool-list">
 					{tools.map((tool) => (
-						<span key={tool.name} title={tool.name}>{tool.pretty_name}</span>
+						<span key={`${tool.kind}:${tool.name}`} title={tool.description || tool.name}>{tool.name}</span>
 					))}
 				</div>
 			</section>

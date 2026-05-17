@@ -4,10 +4,10 @@ members = [
     "crates/agent-core",
     "crates/agent-session",
     "crates/agent-store",
+    "crates/agent-prompt",
     "crates/agent-provider",
     "crates/agent-tools",
     "crates/agent-daemon",
-    "crates/pi-cli",
 ]
 resolver = "2"
 
@@ -20,6 +20,7 @@ agent-vocab = { path = "crates/agent-vocab" }
 agent-core = { path = "crates/agent-core" }
 agent-session = { path = "crates/agent-session" }
 agent-store = { path = "crates/agent-store" }
+agent-prompt = { path = "crates/agent-prompt" }
 agent-provider = { path = "crates/agent-provider" }
 agent-tools = { path = "crates/agent-tools" }
 anyhow = "1"

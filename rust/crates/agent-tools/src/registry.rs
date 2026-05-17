@@ -6,7 +6,6 @@ use serde::Serialize;
 use serde_json::{json, Value};
 
 use crate::context::ToolContext;
-use crate::display::{tool_pretty_name, ToolDisplayInput};
 use crate::error::{ToolError, ToolResult};
 use crate::tools::{ApplyPatchTool, BashTool, GrepTool, TextEditorTool};
 
@@ -19,7 +18,6 @@ pub trait AgentTool: Send + Sync {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolListing {
     pub name: String,
-    pub pretty_name: String,
     pub kind: ReplayDisplayKind,
     pub description: String,
     pub input_schema: Value,
@@ -27,10 +25,9 @@ pub struct ToolListing {
 
 pub fn builtin_tool_definition(name: &str) -> Option<ToolDefinition> {
     match name {
-        "apply_patch" => Some(ApplyPatchTool.definition()),
-        "bash" => Some(BashTool.definition()),
-        "grep" => Some(GrepTool.definition()),
-        "str_replace_based_edit_tool" => Some(TextEditorTool.definition()),
+        "Edit" => Some(ApplyPatchTool.definition()),
+        "Bash" => Some(BashTool.definition()),
+        "Grep" => Some(GrepTool.definition()),
         _ => None,
     }
 }
@@ -44,10 +41,10 @@ struct RegisteredTool {
     tool: Box<dyn AgentTool>,
 }
 
-const OPENAI_LOCAL_TOOL_NAMES: &[&str] = &["apply_patch", "bash", "grep"];
-const CLAUDE_LOCAL_TOOL_NAMES: &[&str] = &["bash", "grep", "str_replace_based_edit_tool"];
-const OPENAI_HOSTED_TOOL_NAMES: &[&str] = &["web_search"];
-const CLAUDE_HOSTED_TOOL_NAMES: &[&str] = &["web_search", "web_fetch"];
+const OPENAI_LOCAL_TOOL_NAMES: &[&str] = &["Edit", "Bash", "Grep"];
+const CLAUDE_LOCAL_TOOL_NAMES: &[&str] = &["Bash", "Grep", "Edit"];
+const OPENAI_HOSTED_TOOL_NAMES: &[&str] = &["WebSearch"];
+const CLAUDE_HOSTED_TOOL_NAMES: &[&str] = &["WebSearch", "WebFetch"];
 
 impl ToolRegistry {
     pub fn new() -> Self {
@@ -56,16 +53,23 @@ impl ToolRegistry {
 
     pub fn with_builtin_tools() -> Self {
         let mut registry = Self::new();
-        registry.register(BashTool);
-        registry.register(GrepTool);
-        registry.register(ApplyPatchTool);
-        registry.register(TextEditorTool);
+        registry.register_for_provider(ProviderKind::OpenAi, ApplyPatchTool);
+        registry.register_for_provider(ProviderKind::OpenAi, BashTool);
+        registry.register_for_provider(ProviderKind::OpenAi, GrepTool);
+        registry.register_for_provider(ProviderKind::Claude, BashTool);
+        registry.register_for_provider(ProviderKind::Claude, GrepTool);
+        registry.register_for_provider(ProviderKind::Claude, TextEditorTool);
         registry
     }
 
-    pub fn register(&mut self, tool: impl AgentTool + 'static) {
+    pub fn register_for_provider(
+        &mut self,
+        provider: ProviderKind,
+        tool: impl AgentTool + 'static,
+    ) {
+        let definition = tool.definition();
         self.tools.insert(
-            tool.definition().name,
+            provider_tool_key(provider, &definition.name),
             RegisteredTool {
                 tool: Box::new(tool),
             },
@@ -75,7 +79,7 @@ impl ToolRegistry {
     pub fn definitions_for_provider(&self, provider: ProviderKind) -> Vec<ToolDefinition> {
         self.local_tool_names_for_provider(provider)
             .iter()
-            .map(|name| self.definition(name))
+            .map(|name| self.definition(provider, name))
             .collect()
     }
 
@@ -105,21 +109,18 @@ impl ToolRegistry {
         }
     }
 
-    fn definition(&self, name: &str) -> ToolDefinition {
+    fn definition(&self, provider: ProviderKind, name: &str) -> ToolDefinition {
         self.tools
-            .get(name)
-            .unwrap_or_else(|| panic!("registered provider tool {name} is missing"))
+            .get(&provider_tool_key(provider, name))
+            .unwrap_or_else(|| panic!("registered provider tool {name} is missing for {provider}"))
             .tool
             .definition()
     }
 
     fn local_listing(&self, provider: ProviderKind, name: &str) -> ToolListing {
-        let definition = self.definition(name);
-        let pretty_name = tool_pretty_name(provider, &definition.name, ToolDisplayInput::LocalTool)
-            .unwrap_or_else(|| panic!("registered tool {} needs a pretty name", definition.name));
+        let definition = self.definition(provider, name);
         ToolListing {
             name: definition.name,
-            pretty_name: pretty_name.to_string(),
             kind: ReplayDisplayKind::LocalTool,
             description: definition.description,
             input_schema: definition.input_schema,
@@ -128,35 +129,48 @@ impl ToolRegistry {
 
     pub async fn execute(
         &self,
+        provider: ProviderKind,
         call: &ToolCall,
         ctx: &ToolContext,
     ) -> ToolResult<ToolResultMessage> {
         let tool = self
             .tools
-            .get(&call.tool_name)
+            .get(&provider_tool_key(provider, &call.tool_name))
             .map(|registered| registered.tool.as_ref())
             .ok_or_else(|| ToolError::UnknownTool(call.tool_name.clone()))?;
         tool.execute(call, ctx).await
     }
 }
 
+fn provider_tool_key(provider: ProviderKind, name: &str) -> String {
+    format!("{}:{name}", provider.as_str())
+}
+
 fn hosted_listing(provider: ProviderKind, name: &str) -> ToolListing {
-    let pretty_name = tool_pretty_name(provider, name, ToolDisplayInput::HostedTool)
-        .unwrap_or_else(|| panic!("hosted tool {name} needs a pretty name"));
+    let _ = provider;
     ToolListing {
         name: name.to_string(),
-        pretty_name: pretty_name.to_string(),
         kind: ReplayDisplayKind::HostedTool,
         description: hosted_tool_description(name).to_string(),
-        input_schema: json!({}),
+        input_schema: hosted_tool_schema(name),
     }
 }
 
 fn hosted_tool_description(name: &str) -> &'static str {
     match name {
-        "web_search" => "Provider-hosted web search.",
-        "web_fetch" => "Provider-hosted web fetch.",
+        "WebSearch" => "Provider-hosted web search.",
+        "WebFetch" => "Provider-hosted web fetch.",
         other => panic!("hosted tool {other} needs a description"),
+    }
+}
+
+fn hosted_tool_schema(name: &str) -> Value {
+    match name {
+        "WebSearch" => json!({ "type": "provider_hosted", "description": "Search the web." }),
+        "WebFetch" => {
+            json!({ "type": "provider_hosted", "description": "Fetch a specific web page." })
+        }
+        other => panic!("hosted tool {other} needs a schema"),
     }
 }
 
@@ -176,10 +190,9 @@ mod tests {
         .map(|definition| definition.name)
         .collect::<Vec<_>>();
 
-        assert!(names.contains(&"bash".to_string()));
-        assert!(names.contains(&"apply_patch".to_string()));
-        assert!(names.contains(&"grep".to_string()));
-        assert!(names.contains(&"str_replace_based_edit_tool".to_string()));
+        assert!(names.contains(&"Bash".to_string()));
+        assert!(names.contains(&"Edit".to_string()));
+        assert!(names.contains(&"Grep".to_string()));
     }
 
     #[test]
@@ -196,45 +209,25 @@ mod tests {
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(openai, ["apply_patch", "bash", "grep"]);
-        assert_eq!(claude, ["bash", "grep", "str_replace_based_edit_tool"]);
+        assert_eq!(openai, ["Edit", "Bash", "Grep"]);
+        assert_eq!(claude, ["Bash", "Grep", "Edit"]);
     }
 
     #[test]
-    fn listings_for_provider_include_pretty_names() {
+    fn listings_for_provider_use_model_facing_names() {
         let registry = ToolRegistry::with_builtin_tools();
         let openai = registry
             .listings_for_provider(ProviderKind::OpenAi)
             .into_iter()
-            .map(|listing| (listing.name, listing.pretty_name))
+            .map(|listing| listing.name)
             .collect::<Vec<_>>();
         let claude = registry
             .listings_for_provider(ProviderKind::Claude)
             .into_iter()
-            .map(|listing| (listing.name, listing.pretty_name))
+            .map(|listing| listing.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(
-            openai,
-            [
-                ("apply_patch".to_string(), "Edit".to_string()),
-                ("bash".to_string(), "Bash".to_string()),
-                ("grep".to_string(), "Grep".to_string()),
-                ("web_search".to_string(), "Web search".to_string()),
-            ]
-        );
-        assert_eq!(
-            claude,
-            [
-                ("bash".to_string(), "Bash".to_string()),
-                ("grep".to_string(), "Grep".to_string()),
-                (
-                    "str_replace_based_edit_tool".to_string(),
-                    "Edit".to_string()
-                ),
-                ("web_search".to_string(), "Web search".to_string()),
-                ("web_fetch".to_string(), "Web fetch".to_string()),
-            ]
-        );
+        assert_eq!(openai, ["Edit", "Bash", "Grep", "WebSearch"]);
+        assert_eq!(claude, ["Bash", "Grep", "Edit", "WebSearch", "WebFetch"]);
     }
 }

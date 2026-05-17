@@ -27,11 +27,10 @@ struct GrepArgs {
 #[async_trait]
 impl AgentTool for GrepTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "grep".to_string(),
-            description: "Search workspace files with ripgrep and return matching lines."
-                .to_string(),
-            input_schema: json!({
+        ToolDefinition::new(
+            "Grep",
+            "Search workspace files with ripgrep and return matching lines.".to_string(),
+            json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string" },
@@ -43,7 +42,7 @@ impl AgentTool for GrepTool {
                 "required": ["pattern"],
                 "additionalProperties": false
             }),
-        }
+        )
     }
 
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {

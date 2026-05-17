@@ -357,11 +357,6 @@ pub struct HistoryTree {
     pub entries: Vec<StoredTranscriptEntry>,
 }
 
-#[derive(Debug, Clone)]
-pub struct GlobalConfig {
-    pub system_prompt: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueMutationError {
     input_id: String,

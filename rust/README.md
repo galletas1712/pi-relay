@@ -21,7 +21,6 @@ choices and invisible runtime/storage decisions.
 | `agent-provider` | `ModelProvider` plus OpenAI and Anthropic adapters. |
 | `agent-tools` | `AgentTool`, `ToolRegistry`, and builtin `read`/`write`/`edit`/`bash` tools. |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch. |
-| `pi-cli` | Minimal `pi-rs` driver for one local session. |
 
 ## Running
 
@@ -82,13 +81,7 @@ Session provider config supports `reasoning_effort`, an optional explicit
 `medium`, `high`, `xhigh`, and `max`. The daemon does not add a default OpenAI output
 cap. Claude Opus 4.7 uses adaptive thinking with `output_config.effort` and a
 64k default `max_tokens` value because the Messages API requires that field.
-The system prompt is global daemon configuration exposed over websocket
-`config.get` / `config.set`, not per-session state.
-
-Provider requests render the prompt in two sections: the global system prompt
-as a stable prefix first, then daemon-generated dynamic context such as the
-current workspace. Conversation transcript and tool results come after those
-prompt sections.
+The model system prompt is rendered from the repo-level `PI.md` template. Project-specific instructions enter through `AGENTS.md`, which `PI.md` composes explicitly. The daemon does not inject date, time, or cwd unless the template asks for it.
 
 ## Web UI
 
@@ -110,12 +103,3 @@ stop button; new, rename, archive, and unarchive use sidebar controls; queued
 follow-ups can be promoted to steer from the queue pane above the composer.
 Crashed or interrupted terminal model turns can be retried/continued directly
 from the transcript row.
-
-## CLI Composition Check
-
-```sh
-ANTHROPIC_API_KEY=... cargo run --manifest-path rust/Cargo.toml -p pi-cli -- claude claude-sonnet-4-5 "hello"
-# Or omit ANTHROPIC_API_KEY when Claude Code has a primaryApiKey in ~/.claude.
-cargo run --manifest-path rust/Cargo.toml -p pi-cli -- claude claude-sonnet-4-5 "hello"
-cargo run --manifest-path rust/Cargo.toml -p pi-cli -- openai gpt-5.5 "hello"
-```

@@ -2,7 +2,7 @@ import { AgentRpcClient, defaultWsUrl, type ConnectionStatus, type RpcClient } f
 import type {
 	Activity,
 	ContentBlock,
-	DaemonConfig,
+	SystemPromptResponse,
 	EventFrame,
 	HistoryTree,
 	InputPriority,
@@ -31,8 +31,7 @@ export interface AgentApi {
 	updateProject(params: UpdateProjectParams): Promise<Project>;
 	deleteProject(projectId: string): Promise<DeleteProjectResult>;
 	listSessions(limit?: number, projectId?: string | null): Promise<SessionSummary[]>;
-	getConfig(): Promise<DaemonConfig>;
-	setConfig(systemPrompt: string | null): Promise<DaemonConfig>;
+	getSystemPrompt(params?: { sessionId?: string; projectId?: string; provider?: ProviderConfig }): Promise<SystemPromptResponse>;
 	listTools(provider: string): Promise<ToolListing[]>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
 	getHistoryTree(sessionId: string): Promise<HistoryTree>;
@@ -237,12 +236,12 @@ class AgentApiClient implements AgentApi {
 		return result.sessions;
 	}
 
-	getConfig(): Promise<DaemonConfig> {
-		return this.client.request<DaemonConfig>("config.get");
-	}
-
-	setConfig(systemPrompt: string | null): Promise<DaemonConfig> {
-		return this.client.request<DaemonConfig>("config.set", { system_prompt: systemPrompt });
+	getSystemPrompt(params: { sessionId?: string; projectId?: string; provider?: ProviderConfig } = {}): Promise<SystemPromptResponse> {
+		return this.client.request<SystemPromptResponse>("system.prompt", {
+			session_id: params.sessionId,
+			project_id: params.projectId,
+			provider: params.provider
+		});
 	}
 
 	async listTools(provider: string): Promise<ToolListing[]> {

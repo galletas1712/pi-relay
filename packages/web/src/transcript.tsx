@@ -828,12 +828,11 @@ function resumeBoundaryIdForNode(node: TranscriptDisplayNode, turns: TurnView[])
 
 function prettyToolName(toolName: string): string {
 	switch (toolName) {
-		case "apply_patch":
-		case "str_replace_based_edit_tool":
+		case "Edit":
 			return "Edit";
-		case "bash":
+		case "Bash":
 			return "Bash";
-		case "grep":
+		case "Grep":
 			return "Grep";
 		case "web_search":
 			return "Web search";
@@ -848,13 +847,13 @@ function prettyToolName(toolName: string): string {
 
 function inputSummaryFromInput(toolName: string, input: Record<string, unknown> | null): string | null {
 	if (!input) return null;
-	if (toolName === "bash") {
+	if (toolName === "Bash") {
 		const command = input.command;
 		if (typeof command === "string") return firstLine(command);
 		if (Array.isArray(command)) return firstLine(command.filter((part): part is string => typeof part === "string").join(" "));
 	}
-	if (toolName === "grep") return [stringValue(input.pattern), stringValue(input.path)].filter(Boolean).join(" ") || null;
-	if (toolName === "str_replace_based_edit_tool") return [stringValue(input.command), stringValue(input.path)].filter(Boolean).join(" ") || null;
+	if (toolName === "Grep") return [stringValue(input.pattern), stringValue(input.path)].filter(Boolean).join(" ") || null;
+	if (toolName === "Edit" && typeof input.command === "string") return [stringValue(input.command), stringValue(input.path)].filter(Boolean).join(" ") || null;
 	return null;
 }
 
@@ -1174,12 +1173,12 @@ export function editToolPreview(
 	input: Record<string, unknown> | null,
 	result?: ToolResultItem
 ): EditToolPreview | null {
-	if (toolName === "apply_patch") {
+	if (isApplyPatchEdit(toolName, input)) {
 		const patch = stringValue(input?.input) ?? result?.output ?? null;
 		return patch ? applyPatchPreview(patch) : null;
 	}
 
-	if (toolName !== "str_replace_based_edit_tool" || !input) return null;
+	if (!isTextEditorEdit(toolName, input)) return null;
 	const command = stringValue(input.command);
 	const path = stringValue(input.path);
 	if (command === "view") {
@@ -1215,6 +1214,19 @@ export function editToolPreview(
 			: diffPreview(`Edited after line ${insertLine ?? "?"}`, path, linesToRows(newStr, "add"), true);
 	}
 	return null;
+}
+
+function isApplyPatchEdit(toolName: string, input: Record<string, unknown> | null): boolean {
+	return toolName === "Edit" && typeof input?.input === "string";
+}
+
+function isTextEditorEdit(toolName: string, input: Record<string, unknown> | null): input is Record<string, unknown> {
+	return (
+		toolName === "Edit" &&
+		!!input &&
+		typeof input.command === "string" &&
+		typeof input.path === "string"
+	);
 }
 
 function EditToolView({ preview }: { preview: EditToolPreview }) {

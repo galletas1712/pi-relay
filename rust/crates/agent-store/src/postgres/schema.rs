@@ -9,8 +9,7 @@ use sqlx::PgPool;
 /// - `sessions`: one row per durable session, including active transcript leaf
 ///   and provider/session metadata. Every session belongs to a project and
 ///   snapshots the project cwd at creation time.
-/// - `daemon_config`: singleton key-value config such as the global system
-///   prompt.
+/// - `daemon_config`: reserved daemon key-value config.
 /// - `transcript_entries`: append-only transcript forest. `parent_id` points
 ///   within the same session, while `sequence` preserves insertion order.
 /// - `queued_inputs`: user inputs waiting to be consumed by a session turn.

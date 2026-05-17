@@ -129,7 +129,7 @@ with adaptive thinking and `output_config.effort`.
 
 ### `daemon_config`
 
-Global daemon configuration:
+Reserved daemon key-value configuration table.
 
 ```text
 key text primary key
@@ -137,7 +137,7 @@ value jsonb not null
 updated_at timestamptz not null default now()
 ```
 
-The global `system_prompt` entry is read for provider requests. It is not
+The `PI.md` is the prompt composition template. It is not
 stored per session. The provider request renders that global prompt as the
 stable prefix, followed by daemon-generated dynamic context such as the current
 workspace, then transcript history.
@@ -469,22 +469,14 @@ to subsequently created provider requests, not to an already in-flight request.
 Responses and `session.configured` events include `provider`, `metadata`, and
 `activity` so clients can patch cached summaries and selected snapshots.
 
-## Config RPC
+## System Prompt RPC
 
-### `config.get`
+### `system.prompt`
 
-Returns global daemon configuration:
-
-```json
-{ "system_prompt": "optional or null" }
-```
-
-### `config.set`
-
-Updates global daemon configuration. Send `null` to clear the prompt.
+Returns the repo-level `PI.md` prompt composition template. `/system` in the web UI displays this content read-only; edit `PI.md` in the repo to change it.
 
 ```json
-{ "system_prompt": "Reply briefly." }
+{ "pi_md": "contents of PI.md" }
 ```
 
 ## Subscription RPC
@@ -831,15 +823,12 @@ Verify:
 - Initial subscribe with `after_event_id: null` does not replay historical
   events; it only attaches to future live events.
 
-### 2. Global System Prompt Configuration
+### 2. PI.md Prompt Preview
 
-1. Call `config.get`.
-2. Call `config.set` with a string prompt.
-3. Create and complete a harness or real-provider turn.
-4. Call `config.set` with `"system_prompt": null`.
+1. Call `system.prompt`.
+2. Verify the response contains the repo-level `PI.md` template.
+3. In the web UI, type `/system` and verify the same template is displayed read-only.
 
-Verify the prompt is global daemon configuration, not session metadata, and
-`session.get` never returns a per-session prompt.
 
 ### 3. Image Input Persistence
 
@@ -1012,12 +1001,12 @@ With `~/.codex/auth.json` or `CODEX_ACCESS_TOKEN` available:
 }
 ```
 
-Set the global prompt separately if needed:
+Inspect the prompt template if needed:
 
 ```json
 {
-  "method": "config.set",
-  "params": { "system_prompt": "Reply exactly and briefly." }
+  "method": "system.prompt",
+  "params": {}
 }
 ```
 

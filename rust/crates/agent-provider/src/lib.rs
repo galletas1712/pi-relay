@@ -1,11 +1,12 @@
 #![forbid(unsafe_code)]
 
 use agent_vocab::{
-    AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolDefinition,
+    AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, ToolDefinition,
     TranscriptItem,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 pub mod anthropic;
@@ -87,6 +88,59 @@ impl ProviderToolProfile {
             ProviderKind::Claude => Self::AnthropicCoding,
         }
     }
+}
+
+impl ModelTranscriptEntry {
+    pub fn provider_replay_for(&self, provider: ProviderKind) -> Vec<ProviderReplayItem> {
+        self.provider_replay
+            .iter()
+            .filter(|record| record.provider == provider)
+            .filter_map(|record| canonical_provider_replay(record, provider))
+            .collect()
+    }
+
+    pub fn item(&self) -> &TranscriptItem {
+        &self.item
+    }
+}
+
+pub fn canonical_tool_call_for_provider(provider: ProviderKind, call: &ToolCall) -> ToolCall {
+    let tool_name = canonical_tool_name_for_provider(provider, &call.tool_name);
+    if tool_name == call.tool_name {
+        return call.clone();
+    }
+    ToolCall {
+        id: call.id.clone(),
+        tool_name: tool_name.to_string(),
+        args_json: call.args_json.clone(),
+    }
+}
+
+pub fn canonical_tool_name_for_provider(provider: ProviderKind, name: &str) -> &str {
+    match provider {
+        ProviderKind::OpenAi => match name {
+            "apply_patch" => "Edit",
+            other => other,
+        },
+        ProviderKind::Claude => match name {
+            "str_replace_based_edit_tool" => "Edit",
+            other => other,
+        },
+    }
+}
+
+fn canonical_provider_replay(
+    record: &ProviderReplayItem,
+    provider: ProviderKind,
+) -> Option<ProviderReplayItem> {
+    let mut raw = record.raw_value().ok()?;
+    if let Some(name) = raw.get("name").and_then(Value::as_str) {
+        let canonical = canonical_tool_name_for_provider(provider, name);
+        if canonical != name {
+            raw["name"] = Value::String(canonical.to_string());
+        }
+    }
+    ProviderReplayItem::new_with_display(provider, &raw, record.display.clone()).ok()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

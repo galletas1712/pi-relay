@@ -4,8 +4,8 @@ use serde_json::{json, Map, Value};
 use sqlx::Row;
 
 use crate::{
-    AcceptedInput, EventFrame, EventType, GlobalConfig, InputPriority, OutputBatch,
-    PersistedAction, SessionActivity, SessionConfig, SessionSummary,
+    AcceptedInput, EventFrame, EventType, InputPriority, OutputBatch, PersistedAction,
+    SessionActivity, SessionConfig, SessionSummary,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 
@@ -414,35 +414,6 @@ impl PostgresAgentStore {
             provider: serde_json::from_value(row.get("provider_config"))?,
             metadata: row.get("metadata"),
         })
-    }
-
-    pub async fn global_config(&self) -> Result<GlobalConfig> {
-        Ok(GlobalConfig {
-            system_prompt: self.global_system_prompt().await?,
-        })
-    }
-
-    pub async fn global_system_prompt(&self) -> Result<Option<String>> {
-        let row = sqlx::query("select value from daemon_config where key='system_prompt'")
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.and_then(|row| row.get::<Value, _>("value").as_str().map(str::to_string)))
-    }
-
-    pub async fn set_global_system_prompt(&self, system_prompt: Option<&str>) -> Result<()> {
-        let value = system_prompt.map_or(Value::Null, |value| json!(value));
-        sqlx::query(
-            r#"
-                insert into daemon_config (key, value, updated_at)
-                values ('system_prompt', $1, now())
-                on conflict (key) do update
-                set value=excluded.value, updated_at=now()
-                "#,
-        )
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
     }
 
     pub async fn activity(&self, session_id: &str) -> Result<SessionActivity> {

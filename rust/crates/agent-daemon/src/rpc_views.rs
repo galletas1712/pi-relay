@@ -1,13 +1,7 @@
 use agent_session::StoredTranscriptEntry;
-use agent_store::{GlobalConfig, HistoryTree, Project, SessionSnapshot, SessionSummary};
+use agent_store::{HistoryTree, Project, SessionSnapshot, SessionSummary};
 use agent_vocab::TranscriptItem;
 use serde_json::{json, Value};
-
-pub(crate) fn global_config(config: GlobalConfig) -> Value {
-    json!({
-        "system_prompt": config.system_prompt,
-    })
-}
 
 pub(crate) fn project(project: Project) -> Value {
     json!({

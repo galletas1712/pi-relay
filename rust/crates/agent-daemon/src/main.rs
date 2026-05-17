@@ -15,6 +15,7 @@ use crate::codec::{
     recover_fork_branch_tail, required_string, required_uuid, transcript_store_from_stored,
 };
 use crate::config::Config;
+use crate::provider_runtime::rendered_pi_prompt;
 use crate::runtime::*;
 use crate::state::AppState;
 use crate::types::*;
@@ -23,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_core::AgentInput;
+use agent_prompt::pi_md;
 use agent_session::AgentSession;
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
@@ -233,8 +235,7 @@ async fn dispatch_request(
         RpcMethod::ProjectCreate => project_create(state, params).await,
         RpcMethod::ProjectUpdate => project_update(state, params).await,
         RpcMethod::ProjectDelete => project_delete(state, params).await,
-        RpcMethod::ConfigGet => config_get(state).await,
-        RpcMethod::ConfigSet => config_set(state, params).await,
+        RpcMethod::SystemPrompt => system_prompt(state, params).await,
         RpcMethod::EventsSubscribe => {
             events_subscribe(state, subscriptions, event_high_water, params).await
         }
@@ -666,35 +667,55 @@ fn normalize_project_cwd(
     Ok(normalized)
 }
 
-async fn config_get(state: &AppState) -> std::result::Result<Value, RpcError> {
-    let config = state
-        .repo
-        .global_config()
-        .await
-        .map_err(anyhow::Error::from)?;
-    Ok(rpc_views::global_config(config))
-}
-
-async fn config_set(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
-    let system_prompt = match params.get("system_prompt") {
-        Some(Value::Null) => None,
-        Some(Value::String(value)) => Some(value.clone()),
-        Some(_) => {
-            return Err(RpcError::new(
+async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let rendered = if let Some(session_id) = params.get("session_id").and_then(Value::as_str) {
+        let config = state
+            .repo
+            .load_session_config(session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        Some(rendered_pi_prompt(state, &config))
+    } else if let Some(project_id) = params.get("project_id").and_then(Value::as_str) {
+        let project_id = Uuid::parse_str(project_id).map_err(|error| {
+            RpcError::new(
                 "invalid_params",
-                "system_prompt must be a string or null",
-            ))
-        }
-        None => return Err(RpcError::new("invalid_params", "system_prompt is required")),
+                format!("project_id must be a UUID: {error}"),
+            )
+        })?;
+        let project = state
+            .repo
+            .get_project(project_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let provider = params
+            .get("provider")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
+            .unwrap_or_else(default_provider_config);
+        let config = SessionConfig {
+            project_id,
+            starting_cwd: project.starting_cwd,
+            provider,
+            metadata: json!({}),
+        };
+        Some(rendered_pi_prompt(state, &config))
+    } else {
+        None
     };
-    state
-        .repo
-        .set_global_system_prompt(system_prompt.as_deref())
-        .await
-        .map_err(anyhow::Error::from)?;
-    config_get(state).await
+    Ok(json!({ "template": pi_md(), "rendered": rendered }))
 }
 
+fn default_provider_config() -> ProviderConfig {
+    ProviderConfig {
+        kind: ProviderKind::Claude,
+        model: "claude-opus-4-7".to_string(),
+        reasoning_effort: agent_vocab::ReasoningEffort::XHigh,
+        max_tokens: None,
+        prompt_cache: None,
+    }
+}
 async fn events_subscribe(
     state: &AppState,
     subscriptions: &mut BTreeSet<String>,

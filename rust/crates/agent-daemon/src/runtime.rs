@@ -1447,7 +1447,11 @@ async fn run_tool_turn(
         &state.default_tool_context,
         std::path::PathBuf::from(dispatch.config.starting_cwd.clone()),
     );
-    let result = match state.tools.execute(&tool_call, &tool_context).await {
+    let result = match state
+        .tools
+        .execute(dispatch.config.provider.kind, &tool_call, &tool_context)
+        .await
+    {
         Ok(result) => result,
         Err(error) => ToolResultMessage::error(
             tool_call.id.clone(),

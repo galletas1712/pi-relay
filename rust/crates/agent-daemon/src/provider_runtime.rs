@@ -1,14 +1,19 @@
+use std::path::{Path, PathBuf};
+
+use agent_prompt::{render_compaction_prompt, render_prompt, PromptContext, Skill, ToolSpec};
 use agent_provider::anthropic::AnthropicProvider;
 use agent_provider::openai::OpenAiProvider;
 use agent_provider::{
-    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, PromptSections,
-    ProviderCompactionRequest, ProviderCompactionResponse, ProviderError,
-    ProviderTokenCountRequest, ProviderToolProfile,
+    canonical_tool_call_for_provider, ModelProvider, ModelRequest, ModelResponse,
+    ModelTranscriptEntry, PromptSections, ProviderCompactionRequest, ProviderCompactionResponse,
+    ProviderError, ProviderTokenCountRequest, ProviderToolProfile,
 };
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
 use agent_tools::limit_tool_output;
-use agent_vocab::{ProviderKind, ProviderReplayItem, TranscriptItem, UserMessage};
+use agent_vocab::{
+    ProviderKind, ProviderReplayItem, ReplayDisplayKind, TranscriptItem, UserMessage,
+};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -23,12 +28,10 @@ pub(crate) async fn run_model(
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<ModelResponse> {
+    let prompt = assemble_agent_prompt(state, config).await?;
     let request = ModelRequest {
         model: config.provider.model.clone(),
-        prompt: PromptSections::new(
-            state.repo.global_system_prompt().await?,
-            Some(dynamic_prompt_context(state, config)),
-        ),
+        prompt,
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools: state.tools.definitions_for_provider(config.provider.kind),
@@ -74,12 +77,10 @@ pub(crate) async fn count_model_input_tokens(
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<usize> {
+    let prompt = assemble_agent_prompt(state, config).await?;
     let request = ProviderTokenCountRequest {
         model: config.provider.model.clone(),
-        prompt: PromptSections::new(
-            state.repo.global_system_prompt().await?,
-            Some(dynamic_prompt_context(state, config)),
-        ),
+        prompt,
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools: state.tools.definitions_for_provider(config.provider.kind),
@@ -150,15 +151,6 @@ fn generic_remote_compaction_summary(provider: ProviderKind) -> String {
         }
     }
 }
-
-const COMPACTION_SYSTEM_PROMPT: &str = "\
-Produce a concise continuation summary under 6,000 tokens. Prefer bullet
-points. Do not quote large files or logs. Preserve only actionable state,
-decisions, constraints, file paths, commands run, tool results needed to
-continue, and open tasks.";
-
-const COMPACTION_USER_PROMPT: &str = "\
-Summarize the transcript above into a compact continuation context under 6,000 tokens.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactionSummaryKind {
@@ -389,10 +381,7 @@ async fn remote_compaction_request(
 ) -> Result<ProviderCompactionRequest> {
     Ok(ProviderCompactionRequest {
         model: config.provider.model.clone(),
-        prompt: PromptSections::new(
-            state.repo.global_system_prompt().await?,
-            Some(dynamic_prompt_context(state, config)),
-        ),
+        prompt: assemble_agent_prompt(state, config).await?,
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools: state.tools.definitions_for_provider(config.provider.kind),
@@ -462,12 +451,12 @@ fn local_summary_request(
     session_id: &str,
     mut transcript: Vec<ModelTranscriptEntry>,
 ) -> ModelRequest {
-    transcript.push(TranscriptItem::UserMessage(UserMessage::text(COMPACTION_USER_PROMPT)).into());
-    let dynamic_context = (config.provider.kind == ProviderKind::Claude)
-        .then(|| dynamic_prompt_context(state, config));
+    let prompt_ctx = prompt_context(state, config);
+    let compaction_request = render_compaction_prompt(&prompt_ctx);
+    transcript.push(TranscriptItem::UserMessage(UserMessage::text(compaction_request)).into());
     ModelRequest {
         model: config.provider.model.clone(),
-        prompt: PromptSections::new(Some(COMPACTION_SYSTEM_PROMPT.to_string()), dynamic_context),
+        prompt: PromptSections::stable(render_prompt(&prompt_ctx)),
         transcript,
         tool_profile: ProviderToolProfile::None,
         tools: Vec::new(),
@@ -622,18 +611,142 @@ pub(crate) fn provider_error_is_context_overflow(error: &ProviderError) -> bool 
     false
 }
 
-pub(crate) fn dynamic_prompt_context_for_cwd(cwd: &std::path::Path) -> String {
-    format!(
-        "Starting working directory for this session: {}\n\
-         The bash tool runs each command in a fresh shell rooted here; chain commands with `&&` \
-         (or call `cd` inside the command) when you need to scope work to a subdirectory.",
-        cwd.display()
-    )
+async fn assemble_agent_prompt(state: &AppState, config: &SessionConfig) -> Result<PromptSections> {
+    let ctx = prompt_context(state, config);
+    Ok(PromptSections::stable(render_prompt(&ctx)))
 }
 
-fn dynamic_prompt_context(_state: &AppState, config: &SessionConfig) -> String {
-    let cwd = std::path::Path::new(&config.starting_cwd);
-    dynamic_prompt_context_for_cwd(cwd)
+pub(crate) fn rendered_pi_prompt(state: &AppState, config: &SessionConfig) -> String {
+    render_prompt(&prompt_context(state, config))
+}
+
+pub(crate) fn prompt_context(state: &AppState, config: &SessionConfig) -> PromptContext {
+    PromptContext {
+        cwd: PathBuf::from(&config.starting_cwd),
+        tools: tool_specs(state, config.provider.kind),
+        skills: load_prompt_skills(config),
+    }
+}
+
+fn tool_specs(state: &AppState, provider: ProviderKind) -> Vec<ToolSpec> {
+    let tools = state
+        .tools
+        .listings_for_provider(provider)
+        .into_iter()
+        .map(|listing| {
+            ToolSpec::new(
+                listing.name,
+                listing.description,
+                listing.input_schema,
+                listing.kind == ReplayDisplayKind::HostedTool,
+            )
+        })
+        .collect();
+    tools
+}
+
+fn load_prompt_skills(config: &SessionConfig) -> Vec<Skill> {
+    let mut skills = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let project_skill_dir = PathBuf::from(&config.starting_cwd).join(".pi/skills");
+    collect_skills_from_dir(&project_skill_dir, &mut skills, &mut seen);
+    skills
+}
+
+fn collect_skills_from_dir(
+    dir: &Path,
+    skills: &mut Vec<Skill>,
+    seen: &mut std::collections::BTreeSet<String>,
+) {
+    if !dir.exists() {
+        return;
+    }
+    let skill_file = dir.join("SKILL.md");
+    if skill_file.is_file() {
+        if let Some(skill) = load_skill_file(&skill_file) {
+            add_skill(skill, skills, seen);
+        }
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with('.') || name == "node_modules" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_skills_from_dir(&path, skills, seen);
+        } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+            if let Some(skill) = load_skill_file(&path) {
+                add_skill(skill, skills, seen);
+            }
+        }
+    }
+}
+
+fn add_skill(skill: Skill, skills: &mut Vec<Skill>, seen: &mut std::collections::BTreeSet<String>) {
+    if seen.insert(skill.name.clone()) {
+        skills.push(skill);
+    }
+}
+
+fn load_skill_file(path: &Path) -> Option<Skill> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let (frontmatter, _body) = split_frontmatter(&raw);
+    let frontmatter = parse_simple_frontmatter(frontmatter.unwrap_or_default());
+    let fallback_name = path.parent()?.file_name()?.to_string_lossy().to_string();
+    let name = frontmatter
+        .get("name")
+        .cloned()
+        .unwrap_or(fallback_name)
+        .trim()
+        .to_string();
+    let description = frontmatter.get("description")?.trim().to_string();
+    if name.is_empty() || description.is_empty() {
+        return None;
+    }
+    Some(Skill::new(name, description, path.to_path_buf()))
+}
+
+fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
+    let Some(rest) = raw.strip_prefix("---\n") else {
+        return (None, raw);
+    };
+    let Some(end) = rest.find("\n---") else {
+        return (None, raw);
+    };
+    let mut body = &rest[end + "\n---".len()..];
+    if let Some(stripped) = body.strip_prefix("\r\n") {
+        body = stripped;
+    } else if let Some(stripped) = body.strip_prefix('\n') {
+        body = stripped;
+    }
+    (Some(&rest[..end]), body)
+}
+
+fn parse_simple_frontmatter(frontmatter: &str) -> std::collections::BTreeMap<String, String> {
+    let mut map = std::collections::BTreeMap::new();
+    for line in frontmatter.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        map.insert(
+            key.trim().to_string(),
+            value
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string(),
+        );
+    }
+    map
 }
 
 fn provider_transcript(model_context: ModelContext) -> Vec<ModelTranscriptEntry> {
@@ -641,7 +754,10 @@ fn provider_transcript(model_context: ModelContext) -> Vec<ModelTranscriptEntry>
         .into_entries()
         .into_iter()
         .map(|entry| ModelTranscriptEntry {
-            item: limit_transcript_tool_output(entry.item),
+            item: normalize_transcript_item_for_provider(
+                limit_transcript_tool_output(entry.item),
+                entry.provider_replay.as_slice(),
+            ),
             provider_replay: entry.provider_replay,
         })
         .collect()
@@ -653,6 +769,30 @@ fn limit_transcript_tool_output(item: TranscriptItem) -> TranscriptItem {
             result.output = limit_tool_output(result.output);
             TranscriptItem::ToolResult(result)
         }
+        item => item,
+    }
+}
+
+fn normalize_transcript_item_for_provider(
+    item: TranscriptItem,
+    provider_replay: &[ProviderReplayItem],
+) -> TranscriptItem {
+    let Some(provider) = provider_replay.first().map(|record| record.provider) else {
+        return item;
+    };
+    match item {
+        TranscriptItem::AssistantMessage(mut message) => {
+            for item in &mut message.items {
+                if let agent_vocab::AssistantItem::ToolCall(call) = item {
+                    *call = canonical_tool_call_for_provider(provider, call);
+                }
+            }
+            TranscriptItem::AssistantMessage(message)
+        }
+        TranscriptItem::ToolCallStarted { turn_id, tool_call } => TranscriptItem::ToolCallStarted {
+            turn_id,
+            tool_call: canonical_tool_call_for_provider(provider, &tool_call),
+        },
         item => item,
     }
 }
@@ -715,14 +855,6 @@ mod tests {
 
         assert!(result.output.len() < 30_000);
         assert!(result.output.contains("[tool output truncated:"));
-    }
-
-    #[test]
-    fn dynamic_prompt_labels_cwd_as_session_starting_point() {
-        let prompt = dynamic_prompt_context_for_cwd(std::path::Path::new("/tmp/project"));
-
-        assert!(prompt.contains("Starting working directory for this session: /tmp/project"));
-        assert!(prompt.contains("fresh shell rooted here"));
     }
 
     fn test_config(kind: ProviderKind, model: &str, metadata: Value) -> SessionConfig {

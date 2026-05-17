@@ -1,4 +1,4 @@
-use agent_vocab::{ProviderKind, ReplayDisplay, ReplayDisplayKind};
+use agent_vocab::{ReplayDisplay, ReplayDisplayKind};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolDisplayInput {
@@ -9,15 +9,13 @@ pub enum ToolDisplayInput {
 #[derive(Debug, Clone, Copy)]
 struct ToolDisplaySpec {
     name: &'static str,
-    provider: Option<ProviderKind>,
     kind: ToolDisplayInput,
-    pretty_name: &'static str,
+    display_name: &'static str,
     summary: ToolSummary,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ToolSummary {
-    None,
     Field(&'static str),
     ShellCommand,
     Grep,
@@ -27,105 +25,68 @@ enum ToolSummary {
 
 const TOOL_DISPLAY_SPECS: &[ToolDisplaySpec] = &[
     ToolDisplaySpec {
-        name: "apply_patch",
-        provider: Some(ProviderKind::OpenAi),
+        name: "Edit",
         kind: ToolDisplayInput::LocalTool,
-        pretty_name: "Edit",
-        summary: ToolSummary::None,
-    },
-    ToolDisplaySpec {
-        name: "bash",
-        provider: None,
-        kind: ToolDisplayInput::LocalTool,
-        pretty_name: "Bash",
-        summary: ToolSummary::ShellCommand,
-    },
-    ToolDisplaySpec {
-        name: "grep",
-        provider: None,
-        kind: ToolDisplayInput::LocalTool,
-        pretty_name: "Grep",
-        summary: ToolSummary::Grep,
-    },
-    ToolDisplaySpec {
-        name: "open_page",
-        provider: Some(ProviderKind::OpenAi),
-        kind: ToolDisplayInput::HostedTool,
-        pretty_name: "Open page",
-        summary: ToolSummary::Field("url"),
-    },
-    ToolDisplaySpec {
-        name: "str_replace_based_edit_tool",
-        provider: Some(ProviderKind::Claude),
-        kind: ToolDisplayInput::LocalTool,
-        pretty_name: "Edit",
+        display_name: "Edit",
         summary: ToolSummary::TextEditor,
     },
     ToolDisplaySpec {
-        name: "web_fetch",
-        provider: Some(ProviderKind::Claude),
+        name: "Bash",
+        kind: ToolDisplayInput::LocalTool,
+        display_name: "Bash",
+        summary: ToolSummary::ShellCommand,
+    },
+    ToolDisplaySpec {
+        name: "Grep",
+        kind: ToolDisplayInput::LocalTool,
+        display_name: "Grep",
+        summary: ToolSummary::Grep,
+    },
+    ToolDisplaySpec {
+        name: "OpenPage",
         kind: ToolDisplayInput::HostedTool,
-        pretty_name: "Web fetch",
+        display_name: "OpenPage",
         summary: ToolSummary::Field("url"),
     },
     ToolDisplaySpec {
-        name: "web_search",
-        provider: None,
+        name: "WebFetch",
         kind: ToolDisplayInput::HostedTool,
-        pretty_name: "Web search",
+        display_name: "WebFetch",
+        summary: ToolSummary::Field("url"),
+    },
+    ToolDisplaySpec {
+        name: "WebSearch",
+        kind: ToolDisplayInput::HostedTool,
+        display_name: "WebSearch",
         summary: ToolSummary::WebSearchQuery,
     },
 ];
 
 pub fn tool_display(
-    provider: ProviderKind,
     name: &str,
     kind: ToolDisplayInput,
     input: Option<&serde_json::Value>,
 ) -> Option<ReplayDisplay> {
-    let spec = tool_display_spec(provider, name, kind)?;
+    let spec = tool_display_spec(name, kind)?;
     Some(ReplayDisplay {
         kind: match kind {
             ToolDisplayInput::LocalTool => ReplayDisplayKind::LocalTool,
             ToolDisplayInput::HostedTool => ReplayDisplayKind::HostedTool,
         },
-        pretty_name: spec.pretty_name.to_string(),
+        pretty_name: spec.display_name.to_string(),
         input_summary: tool_summary(spec.summary, input),
     })
 }
 
-pub fn tool_pretty_name(
-    provider: ProviderKind,
-    name: &str,
-    kind: ToolDisplayInput,
-) -> Option<&'static str> {
-    tool_display_spec(provider, name, kind).map(|spec| spec.pretty_name)
-}
-
-fn tool_display_spec(
-    provider: ProviderKind,
-    name: &str,
-    kind: ToolDisplayInput,
-) -> Option<&'static ToolDisplaySpec> {
-    TOOL_DISPLAY_SPECS.iter().find(|spec| {
-        spec.name == name && spec.kind == kind && provider_matches(spec.provider, provider)
-    })
-}
-
-fn provider_matches(spec_provider: Option<ProviderKind>, provider: ProviderKind) -> bool {
-    match spec_provider {
-        None => true,
-        Some(ProviderKind::OpenAi) => {
-            matches!(provider, ProviderKind::OpenAi)
-        }
-        Some(kind) => kind == provider,
-    }
+fn tool_display_spec(name: &str, kind: ToolDisplayInput) -> Option<&'static ToolDisplaySpec> {
+    TOOL_DISPLAY_SPECS
+        .iter()
+        .find(|spec| spec.name == name && spec.kind == kind)
 }
 
 fn tool_summary(summary: ToolSummary, input: Option<&serde_json::Value>) -> Option<String> {
     let input = input?;
     let text = match summary {
-        ToolSummary::None => return None,
         ToolSummary::Field(key) => string_field(input, key),
         ToolSummary::ShellCommand => shell_command_summary(input),
         ToolSummary::Grep => joined_fields(input, &["pattern", "path"]),
@@ -201,38 +162,27 @@ mod tests {
     fn display_registry_labels_hosted_tools() {
         assert_eq!(
             tool_display(
-                ProviderKind::Claude,
-                "web_search",
+                "WebSearch",
                 ToolDisplayInput::HostedTool,
                 Some(&json!({ "type": "search", "query": "OpenAI Responses API" })),
             ),
             Some(ReplayDisplay {
                 kind: ReplayDisplayKind::HostedTool,
-                pretty_name: "Web search".to_string(),
+                pretty_name: "WebSearch".to_string(),
                 input_summary: Some("OpenAI Responses API".to_string()),
             })
         );
         assert_eq!(
             tool_display(
-                ProviderKind::OpenAi,
-                "open_page",
+                "OpenPage",
                 ToolDisplayInput::HostedTool,
-                Some(&json!({ "type": "open_page", "url": "https://example.com" })),
+                Some(&json!({ "type": "OpenPage", "url": "https://example.com" })),
             ),
             Some(ReplayDisplay {
                 kind: ReplayDisplayKind::HostedTool,
-                pretty_name: "Open page".to_string(),
+                pretty_name: "OpenPage".to_string(),
                 input_summary: Some("https://example.com".to_string()),
             })
-        );
-        assert_eq!(
-            tool_display(
-                ProviderKind::Claude,
-                "open_page",
-                ToolDisplayInput::HostedTool,
-                Some(&json!({ "type": "open_page", "url": "https://example.com" })),
-            ),
-            None
         );
     }
 
@@ -240,8 +190,7 @@ mod tests {
     fn display_registry_labels_local_tools() {
         assert_eq!(
             tool_display(
-                ProviderKind::Claude,
-                "str_replace_based_edit_tool",
+                "Edit",
                 ToolDisplayInput::LocalTool,
                 Some(&json!({ "command": "view", "path": "src/main.rs" })),
             ),
@@ -253,8 +202,7 @@ mod tests {
         );
         assert_eq!(
             tool_display(
-                ProviderKind::OpenAi,
-                "bash",
+                "Bash",
                 ToolDisplayInput::LocalTool,
                 Some(&json!({ "command": ["pwd"] })),
             ),
@@ -266,8 +214,7 @@ mod tests {
         );
         assert_eq!(
             tool_display(
-                ProviderKind::Claude,
-                "bash",
+                "Bash",
                 ToolDisplayInput::LocalTool,
                 Some(&json!({ "command": "pwd && ls" })),
             ),

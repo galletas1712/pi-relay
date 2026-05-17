@@ -60,8 +60,9 @@ export interface SessionSnapshot {
 	entries?: TranscriptEntry[];
 }
 
-export interface DaemonConfig {
-	system_prompt: string | null;
+export interface SystemPromptResponse {
+	template: string;
+	rendered: string | null;
 }
 
 export interface Project {
@@ -165,7 +166,6 @@ export interface ToolDefinition {
 }
 
 export interface ToolListing extends ToolDefinition {
-	pretty_name: string;
 	kind: "local_tool" | "hosted_tool";
 }
 

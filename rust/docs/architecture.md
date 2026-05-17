@@ -24,9 +24,6 @@ tools, and a Postgres-backed websocket control plane.
 agent-daemon
   websocket RPC + provider/tool dispatch
 
-pi-cli
-  minimal one-shot local composition check
-
 agent-session
   AgentSession, TranscriptStore, ModelContext,
   resume/rewind/fork, storage snapshots
@@ -113,8 +110,7 @@ Implemented user-facing behavior:
 - Idle-only compaction request with structural validation.
 - Daemon restart recovery for open transcript tails.
 - Stale action rejection through persisted `attempt_id`.
-- Global daemon system prompt through `config.get` / `config.set`, including
-  clearing with JSON `null`.
+- Repo-level `PI.md` prompt composition, with project `AGENTS.md` included by the template.
 - Provider config with `max_tokens` and `prompt_cache.key`.
 - Real Codex provider path through `~/.codex/auth.json` or
   `CODEX_ACCESS_TOKEN`.
@@ -327,24 +323,12 @@ Postgres. It owns:
 - Websocket request routing.
 - Reconnect event replay.
 - Session recovery before first touch.
-- Global daemon configuration for the system prompt.
 - Provider credential loading.
 - Automatic tool dispatch.
 - Development harness methods for deterministic model/compaction edges.
 
 The implemented RPC contract is documented in
 [`websocket-rpc.md`](websocket-rpc.md).
-
-## CLI
-
-`pi-cli` remains a minimal composition binary:
-
-```text
-pi-rs [claude|openai] [model] <prompt>
-```
-
-It proves that session, provider, and tool crates compose, but the websocket
-daemon is now the main frontend integration path.
 
 ## Removed Pieces
 

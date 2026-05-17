@@ -14,7 +14,7 @@ export const COMMANDS: SlashCommandInfo[] = [
 	{ name: "fork", description: "Open the fork picker.", argumentHint: "[title]" },
 	{ name: "switch", description: "Switch branches or edit a historical message." },
 	{ name: "compact", description: "Request context compaction." },
-	{ name: "system", description: "Read or set global system prompt.", argumentHint: "[clear|prompt...]" },
+	{ name: "system", description: "Show PI.md prompt template." },
 	{ name: "export", description: "Export assistant messages from the current branch." }
 ];
 

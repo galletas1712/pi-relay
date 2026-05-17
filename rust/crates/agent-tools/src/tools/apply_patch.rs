@@ -22,16 +22,16 @@ struct ApplyPatchArgs {
 #[async_trait]
 impl AgentTool for ApplyPatchTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "apply_patch".to_string(),
-            description: "Apply a freeform patch to files in the workspace.".to_string(),
-            input_schema: json!({
+        ToolDefinition::new(
+            "Edit",
+            "Apply a freeform patch to files in the workspace.".to_string(),
+            json!({
                 "type": "object",
                 "properties": { "input": { "type": "string" } },
                 "required": ["input"],
                 "additionalProperties": false
             }),
-        }
+        )
     }
 
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {
@@ -315,7 +315,7 @@ mod tests {
     fn call(input: &str) -> ToolCall {
         ToolCall {
             id: ToolCallId("call_patch".to_string()),
-            tool_name: "apply_patch".to_string(),
+            tool_name: "Edit".to_string(),
             args_json: json!({ "input": input }).to_string(),
         }
     }

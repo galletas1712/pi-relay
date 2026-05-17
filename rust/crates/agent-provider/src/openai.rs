@@ -45,7 +45,7 @@ pub struct OpenAiProvider {
     /// Persistent Codex installation identifier (UUID), read from
     /// `~/.codex/installation_id` by the daemon and passed through as the
     /// `x-codex-installation-id` header on every request. Optional because
-    /// pi-cli and tests may not have a Codex install.
+    /// tests may not have a Codex install.
     installation_id: Option<String>,
     /// Per-process window id, matching Codex CLI's behavior. Stable for the
     /// lifetime of the provider instance; sent as `x-codex-window-id`.
@@ -419,7 +419,7 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
     //      `~/codex/codex-rs/core/src/client.rs`). One bucket per pi-relay
     //      session keeps us well under OpenAI's ~15 RPM-per-shard ceiling
     //      while still maximising in-session prefix reuse.
-    //   3. Deterministic config-hash fallback for tests / pi-cli that don't
+    //   3. Deterministic config-hash fallback for tests that don't
     //      supply a session id.
     let prompt_cache_key = request
         .prompt_cache_key
@@ -427,7 +427,7 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
     let body = json!({
         "model": request.model,
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
-        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.transcript)?,
+        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
         "tools": tools,
         "tool_choice": "auto",
         "parallel_tool_calls": true,
@@ -454,7 +454,7 @@ fn compact_body(request: ProviderCompactionRequest) -> ProviderResult<Value> {
     Ok(json!({
         "model": request.model,
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
-        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.transcript)?,
+        "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.prompt, &request.transcript)?,
         "tools": tools,
         "parallel_tool_calls": true,
         "reasoning": {
@@ -512,9 +512,9 @@ eof_line: "*** End of File" LF
 
 fn openai_coding_tools() -> Vec<Value> {
     vec![
-        openai_apply_patch_tool(),
-        openai_function_from_builtin("bash"),
-        openai_function_from_builtin("grep"),
+        openai_edit_tool(),
+        openai_function_from_builtin("Bash"),
+        openai_function_from_builtin("Grep"),
         json!({
             "type": "web_search",
             "search_context_size": "high",
@@ -522,11 +522,11 @@ fn openai_coding_tools() -> Vec<Value> {
     ]
 }
 
-fn openai_apply_patch_tool() -> Value {
+fn openai_edit_tool() -> Value {
     json!({
         "type": "custom",
-        "name": "apply_patch",
-        "description": "Use apply_patch to edit files. This is a freeform grammar tool; emit the raw patch body, not JSON.",
+        "name": "Edit",
+        "description": "Edit files by applying a freeform patch. Emit the raw patch body, not JSON.",
         "format": {
             "type": "grammar",
             "syntax": "lark",
@@ -560,10 +560,13 @@ fn openai_reasoning_effort(effort: ReasoningEffort) -> ProviderResult<&'static s
     }
 }
 
-fn transcript_to_response_items(items: &[ModelTranscriptEntry]) -> ProviderResult<Vec<Value>> {
+fn transcript_to_response_items(
+    prompt: &crate::PromptSections,
+    items: &[ModelTranscriptEntry],
+) -> ProviderResult<Vec<Value>> {
     let mut responses = Vec::new();
     for entry in items {
-        match &entry.item {
+        match entry.item() {
             TranscriptItem::UserMessage(message) => {
                 responses.push(json!({
                     "type": "message",
@@ -572,19 +575,21 @@ fn transcript_to_response_items(items: &[ModelTranscriptEntry]) -> ProviderResul
                 }));
             }
             TranscriptItem::CompactionSummary(summary) => {
-                let replay_items = openai_replay_items(&entry.provider_replay)?;
+                let replay_items =
+                    openai_replay_items(&entry.provider_replay_for(ProviderKind::OpenAi))?;
                 if !replay_items.is_empty() {
                     responses.extend(replay_items);
                 } else {
                     responses.push(json!({
                         "type": "message",
                         "role": "user",
-                        "content": [{ "type": "input_text", "text": compaction_summary_text(summary) }],
+                        "content": [{ "type": "input_text", "text": compaction_summary_text(summary, prompt) }],
                     }));
                 }
             }
             TranscriptItem::AssistantMessage(message) => {
-                let replay_items = openai_replay_items(&entry.provider_replay)?;
+                let replay_items =
+                    openai_replay_items(&entry.provider_replay_for(ProviderKind::OpenAi))?;
                 if !replay_items.is_empty() {
                     responses.extend(replay_items);
                 } else {
@@ -613,7 +618,7 @@ fn transcript_to_response_items(items: &[ModelTranscriptEntry]) -> ProviderResul
 }
 
 fn response_tool_call_item(call: &ToolCall) -> Value {
-    if call.tool_name == "apply_patch" {
+    if call.tool_name == "Edit" {
         let input = call
             .args_value()
             .ok()
@@ -641,7 +646,7 @@ fn response_tool_call_item(call: &ToolCall) -> Value {
 }
 
 fn response_tool_result_item(result: &agent_vocab::ToolResultMessage) -> Value {
-    if result.tool_name == "apply_patch" {
+    if result.tool_name == "Edit" {
         json!({
             "type": "custom_tool_call_output",
             "call_id": result.tool_call_id.as_str(),
@@ -658,6 +663,7 @@ fn response_tool_result_item(result: &agent_vocab::ToolResultMessage) -> Value {
 
 fn response_input_items(
     dynamic_context: Option<&str>,
+    prompt: &crate::PromptSections,
     transcript: &[ModelTranscriptEntry],
 ) -> ProviderResult<Vec<Value>> {
     let mut items = Vec::new();
@@ -668,7 +674,7 @@ fn response_input_items(
             "content": [{ "type": "input_text", "text": dynamic_context }],
         }));
     }
-    items.extend(transcript_to_response_items(transcript)?);
+    items.extend(transcript_to_response_items(prompt, transcript)?);
     Ok(items)
 }
 
@@ -699,11 +705,25 @@ fn responses_user_content(message: &UserMessage) -> Vec<Value> {
         .collect()
 }
 
-fn compaction_summary_text(summary: &CompactionSummary) -> String {
-    format!(
-        "The conversation history before this point was compacted into this summary:\n\n{}",
-        summary.summary
-    )
+fn compaction_summary_text(summary: &CompactionSummary, prompt: &crate::PromptSections) -> String {
+    match &prompt.stable_prefix {
+        Some(pi_prompt) if !pi_prompt.trim().is_empty() => format!(
+            "The active PI.md system prompt is included below because it still applies after this compaction.
+
+{}
+
+The conversation history before this point was compacted into this summary:
+
+{}",
+            pi_prompt, summary.summary
+        ),
+        _ => format!(
+            "The conversation history before this point was compacted into this summary:
+
+{}",
+            summary.summary
+        ),
+    }
 }
 
 fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<ModelResponse> {
@@ -762,7 +782,7 @@ fn parse_response_output_item(
         .get("type")
         .and_then(Value::as_str)
         .ok_or_else(|| ProviderError::Provider("OpenAI output item missing type".to_string()))?;
-    let display = openai_provider_replay_display(provider, item);
+    let display = openai_provider_replay_display(item);
     provider_replay.push(ProviderReplayItem::new_with_display(
         provider, item, display,
     )?);
@@ -829,21 +849,16 @@ fn parse_response_output_item(
     Ok(())
 }
 
-fn openai_provider_replay_display(provider: ProviderKind, item: &Value) -> Option<ReplayDisplay> {
+fn openai_provider_replay_display(item: &Value) -> Option<ReplayDisplay> {
     match item.get("type").and_then(Value::as_str)? {
         "web_search_call" => {
             let action = item.get("action")?;
             let tool_name = match action.get("type").and_then(Value::as_str)? {
-                "search" => "web_search",
-                "open_page" => "open_page",
+                "search" => "WebSearch",
+                "open_page" => "OpenPage",
                 _ => return None,
             };
-            tool_display(
-                provider,
-                tool_name,
-                ToolDisplayInput::HostedTool,
-                Some(action),
-            )
+            tool_display(tool_name, ToolDisplayInput::HostedTool, Some(action))
         }
         "function_call" => {
             let name = item.get("name").and_then(Value::as_str)?;
@@ -851,16 +866,11 @@ fn openai_provider_replay_display(provider: ProviderKind, item: &Value) -> Optio
                 .get("arguments")
                 .and_then(Value::as_str)
                 .and_then(|raw| serde_json::from_str::<Value>(raw).ok())?;
-            tool_display(
-                provider,
-                name,
-                ToolDisplayInput::LocalTool,
-                Some(&arguments),
-            )
+            tool_display(name, ToolDisplayInput::LocalTool, Some(&arguments))
         }
         "custom_tool_call" => {
             let name = item.get("name").and_then(Value::as_str)?;
-            tool_display(provider, name, ToolDisplayInput::LocalTool, None)
+            tool_display(name, ToolDisplayInput::LocalTool, None)
         }
         _ => None,
     }
@@ -1323,11 +1333,11 @@ mod tests {
         .expect("responses body renders");
 
         assert_eq!(body["tools"][0]["type"], "custom");
-        assert_eq!(body["tools"][0]["name"], "apply_patch");
+        assert_eq!(body["tools"][0]["name"], "Edit");
         assert_eq!(body["tools"][1]["type"], "function");
-        assert_eq!(body["tools"][1]["name"], "bash");
+        assert_eq!(body["tools"][1]["name"], "Bash");
         assert_eq!(body["tools"][2]["type"], "function");
-        assert_eq!(body["tools"][2]["name"], "grep");
+        assert_eq!(body["tools"][2]["name"], "Grep");
         assert_eq!(body["tools"][3]["type"], "web_search");
         assert_eq!(body["tools"][3]["search_context_size"], "high");
     }
@@ -1339,18 +1349,21 @@ mod tests {
             tool_name: "read".to_string(),
             args_json: "{\"path\":\"README.md\"}".to_string(),
         };
-        let items = transcript_to_response_items(&[
-            TranscriptItem::AssistantMessage(AssistantMessage {
-                items: vec![AssistantItem::ToolCall(tool_call.clone())],
-            })
-            .into(),
-            TranscriptItem::ToolResult(ToolResultMessage::success(
-                tool_call.id,
-                "read",
-                "contents",
-            ))
-            .into(),
-        ])
+        let items = transcript_to_response_items(
+            &crate::PromptSections::default(),
+            &[
+                TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::ToolCall(tool_call.clone())],
+                })
+                .into(),
+                TranscriptItem::ToolResult(ToolResultMessage::success(
+                    tool_call.id,
+                    "read",
+                    "contents",
+                ))
+                .into(),
+            ],
+        )
         .expect("tool transcript should render");
 
         assert_eq!(items[0]["type"], "function_call");
@@ -1389,8 +1402,8 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
 
     #[test]
     fn responses_sse_parses_custom_and_function_calls() {
-        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}
-data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_bash","name":"bash","arguments":"{\"command\":[\"pwd\"],\"timeout_ms\":120000}","status":"completed"}}
+        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_patch","name":"Edit","input":"*** Begin Patch\n*** End Patch\n"}}
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_bash","name":"Bash","arguments":"{\"command\":[\"pwd\"],\"timeout_ms\":120000}","status":"completed"}}
 data: {"type":"response.completed","response":{"id":"resp_1"}}
 "#;
 
@@ -1398,12 +1411,12 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
         let calls = response.assistant.tool_calls().collect::<Vec<_>>();
 
         assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].tool_name, "apply_patch");
+        assert_eq!(calls[0].tool_name, "Edit");
         assert_eq!(
             calls[0].args_value().unwrap()["input"],
             "*** Begin Patch\n*** End Patch\n"
         );
-        assert_eq!(calls[1].tool_name, "bash");
+        assert_eq!(calls[1].tool_name, "Bash");
         assert_eq!(calls[1].args_value().unwrap()["command"], json!(["pwd"]));
         assert_eq!(calls[1].args_value().unwrap()["timeout_ms"], 120000);
     }
@@ -1431,12 +1444,15 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
             "content": [{ "type": "output_text", "text": "hello", "annotations": [] }],
             "status": "completed",
         });
-        let items = transcript_to_response_items(&[ModelTranscriptEntry {
-            item: TranscriptItem::AssistantMessage(AssistantMessage {
-                items: vec![AssistantItem::Text("hello".to_string())],
-            }),
-            provider_replay: vec![ProviderReplayItem::new(ProviderKind::OpenAi, &raw).unwrap()],
-        }])
+        let items = transcript_to_response_items(
+            &crate::PromptSections::default(),
+            &[ModelTranscriptEntry {
+                item: TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::Text("hello".to_string())],
+                }),
+                provider_replay: vec![ProviderReplayItem::new(ProviderKind::OpenAi, &raw).unwrap()],
+            }],
+        )
         .expect("responses input renders");
 
         assert_eq!(items, vec![raw]);
@@ -1444,24 +1460,27 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
 
     #[test]
     fn responses_input_preserves_images_and_tool_results() {
-        let items = transcript_to_response_items(&[
-            TranscriptItem::UserMessage(UserMessage::from_parts(vec![
-                ContentBlock::text("look"),
-                ContentBlock::Image {
-                    image: agent_vocab::ImageContent {
-                        mime_type: "image/png".to_string(),
-                        source: agent_vocab::ImageSource::Base64("abc".to_string()),
+        let items = transcript_to_response_items(
+            &crate::PromptSections::default(),
+            &[
+                TranscriptItem::UserMessage(UserMessage::from_parts(vec![
+                    ContentBlock::text("look"),
+                    ContentBlock::Image {
+                        image: agent_vocab::ImageContent {
+                            mime_type: "image/png".to_string(),
+                            source: agent_vocab::ImageSource::Base64("abc".to_string()),
+                        },
                     },
-                },
-            ]))
-            .into(),
-            TranscriptItem::ToolResult(ToolResultMessage::success(
-                ToolCallId::new("call_1"),
-                "read",
-                "contents",
-            ))
-            .into(),
-        ])
+                ]))
+                .into(),
+                TranscriptItem::ToolResult(ToolResultMessage::success(
+                    ToolCallId::new("call_1"),
+                    "read",
+                    "contents",
+                ))
+                .into(),
+            ],
+        )
         .expect("responses input renders");
 
         assert_eq!(items[0]["type"], "message");

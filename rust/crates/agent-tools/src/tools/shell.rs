@@ -10,7 +10,7 @@ use crate::error::{ToolError, ToolResult};
 use crate::output::limit_tool_output;
 use crate::registry::AgentTool;
 
-/// Single shell tool, registered as `bash` for both providers.
+/// Single shell tool, registered as `Bash` for both providers.
 ///
 /// Each call runs in a fresh `sh -lc` subprocess rooted at the daemon
 /// workspace. There is no persistent shell state across calls and no
@@ -37,13 +37,13 @@ enum ShellCommand {
 #[async_trait]
 impl AgentTool for BashTool {
     fn definition(&self) -> ToolDefinition {
-        ToolDefinition {
-            name: "bash".to_string(),
-            description: "Run a shell command in the daemon workspace and return stdout/stderr. \
+        ToolDefinition::new(
+            "Bash",
+            "Run a shell command in the daemon workspace and return stdout/stderr. \
                 Each call runs in a fresh shell rooted at the workspace; chain commands with `&&` \
                 (or call `cd` inside the command) when you need to scope work to a subdirectory."
                 .to_string(),
-            input_schema: json!({
+            json!({
                 "type": "object",
                 "properties": {
                     "command": {
@@ -61,7 +61,7 @@ impl AgentTool for BashTool {
                 "required": ["command"],
                 "additionalProperties": false
             }),
-        }
+        )
     }
 
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage> {

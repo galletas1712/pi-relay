@@ -185,7 +185,7 @@ struct AnthropicRequestBodyInput {
 }
 
 fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Value> {
-    let mut messages = transcript_to_messages(&input.transcript)?;
+    let mut messages = transcript_to_messages(&input.prompt, &input.transcript)?;
     if input.cache_transcript {
         add_transcript_cache_breakpoints(&mut messages);
     }
@@ -340,12 +340,12 @@ fn anthropic_tool(tool: &ToolDefinition) -> Value {
 
 fn anthropic_coding_tools() -> Vec<Value> {
     vec![
-        anthropic_tool(&builtin_tool_definition("bash").expect("bash tool must be registered")),
+        anthropic_tool(&builtin_tool_definition("Bash").expect("Bash tool must be registered")),
         json!({
             "type": "text_editor_20250728",
-            "name": "str_replace_based_edit_tool",
+            "name": "Edit",
         }),
-        anthropic_tool(&builtin_tool_definition("grep").expect("grep tool must be registered")),
+        anthropic_tool(&builtin_tool_definition("Grep").expect("Grep tool must be registered")),
         json!({
             "type": "web_search_20250305",
             "name": "web_search",
@@ -424,7 +424,7 @@ fn attribution_header(
 /// never share the cache entry.
 ///
 /// Deriving from `stable_prefix` instead means every pi-relay session with the
-/// same global system prompt produces the same fingerprint and therefore the
+/// same stable system prompt produces the same fingerprint and therefore the
 /// same cached prefix, enabling true cross-session reuse of the stable-system
 /// cache. We fall back to a digest of the first user text only when no stable
 /// prefix is configured (e.g. compaction calls), so the header is never empty.
@@ -453,7 +453,7 @@ fn attribution_fingerprint(
 }
 
 fn first_user_text(transcript: &[ModelTranscriptEntry]) -> Option<&str> {
-    transcript.iter().find_map(|entry| match &entry.item {
+    transcript.iter().find_map(|entry| match entry.item() {
         TranscriptItem::UserMessage(message) => message.as_text(),
         _ => None,
     })
@@ -585,10 +585,13 @@ fn is_cacheable_transcript_block(block: &Value) -> bool {
     )
 }
 
-fn transcript_to_messages(items: &[ModelTranscriptEntry]) -> ProviderResult<Vec<Value>> {
+fn transcript_to_messages(
+    prompt: &crate::PromptSections,
+    items: &[ModelTranscriptEntry],
+) -> ProviderResult<Vec<Value>> {
     let mut messages = Vec::new();
     for entry in items {
-        match &entry.item {
+        match entry.item() {
             TranscriptItem::UserMessage(message) => {
                 messages
                     .push(json!({ "role": "user", "content": anthropic_user_content(message) }));
@@ -596,11 +599,12 @@ fn transcript_to_messages(items: &[ModelTranscriptEntry]) -> ProviderResult<Vec<
             TranscriptItem::CompactionSummary(summary) => {
                 messages.push(json!({
                     "role": "user",
-                    "content": [{ "type": "text", "text": compaction_summary_text(summary) }],
+                    "content": [{ "type": "text", "text": compaction_summary_text(summary, prompt) }],
                 }));
             }
             TranscriptItem::AssistantMessage(message) => {
-                let mut content = anthropic_replay_blocks(&entry.provider_replay)?;
+                let mut content =
+                    anthropic_replay_blocks(&entry.provider_replay_for(ProviderKind::Claude))?;
                 if content.is_empty() {
                     for item in &message.items {
                         match item {
@@ -647,11 +651,25 @@ fn anthropic_replay_blocks(replay: &[ProviderReplayItem]) -> ProviderResult<Vec<
         .collect()
 }
 
-fn compaction_summary_text(summary: &CompactionSummary) -> String {
-    format!(
-        "The conversation history before this point was compacted into this summary:\n\n{}",
-        summary.summary
-    )
+fn compaction_summary_text(summary: &CompactionSummary, prompt: &crate::PromptSections) -> String {
+    match &prompt.stable_prefix {
+        Some(pi_prompt) if !pi_prompt.trim().is_empty() => format!(
+            "The active PI.md system prompt is included below because it still applies after this compaction.
+
+{}
+
+The conversation history before this point was compacted into this summary:
+
+{}",
+            pi_prompt, summary.summary
+        ),
+        _ => format!(
+            "The conversation history before this point was compacted into this summary:
+
+{}",
+            summary.summary
+        ),
+    }
 }
 
 fn anthropic_user_content(message: &UserMessage) -> Value {
@@ -711,6 +729,7 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
                 let name = block.get("name").and_then(Value::as_str).ok_or_else(|| {
                     ProviderError::Provider("Claude tool_use missing name".to_string())
                 })?;
+                let name = canonical_anthropic_tool_name(name);
                 let input = block.get("input").cloned().ok_or_else(|| {
                     ProviderError::Provider("Claude tool_use missing input".to_string())
                 })?;
@@ -730,21 +749,20 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
     })
 }
 
+fn canonical_anthropic_tool_name(name: &str) -> &str {
+    match name {
+        // Anthropic currently accepts `name: "Edit"` in the request but still
+        // returns its trained native text-editor name in tool_use blocks.
+        "str_replace_based_edit_tool" => "Edit",
+        other => other,
+    }
+}
+
 fn anthropic_provider_replay_display(block: &Value) -> Option<ReplayDisplay> {
-    let name = block.get("name").and_then(Value::as_str)?;
+    let name = canonical_anthropic_tool_name(block.get("name").and_then(Value::as_str)?);
     match block.get("type").and_then(Value::as_str)? {
-        "server_tool_use" => tool_display(
-            ProviderKind::Claude,
-            name,
-            ToolDisplayInput::HostedTool,
-            block.get("input"),
-        ),
-        "tool_use" => tool_display(
-            ProviderKind::Claude,
-            name,
-            ToolDisplayInput::LocalTool,
-            block.get("input"),
-        ),
+        "server_tool_use" => tool_display(name, ToolDisplayInput::HostedTool, block.get("input")),
+        "tool_use" => tool_display(name, ToolDisplayInput::LocalTool, block.get("input")),
         _ => None,
     }
 }
@@ -947,9 +965,9 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect();
-        assert!(names.contains(&"bash"));
-        assert!(names.contains(&"str_replace_based_edit_tool"));
-        assert!(names.contains(&"grep"));
+        assert!(names.contains(&"Bash"));
+        assert!(names.contains(&"Edit"));
+        assert!(names.contains(&"Grep"));
     }
 
     #[test]
@@ -967,11 +985,11 @@ mod tests {
         })
         .expect("body renders");
 
-        assert_eq!(body["tools"][0]["name"], "bash");
+        assert_eq!(body["tools"][0]["name"], "Bash");
         assert!(body["tools"][0].get("type").is_none());
         assert_eq!(body["tools"][1]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][1]["name"], "str_replace_based_edit_tool");
-        assert_eq!(body["tools"][2]["name"], "grep");
+        assert_eq!(body["tools"][1]["name"], "Edit");
+        assert_eq!(body["tools"][2]["name"], "Grep");
         assert!(body["tools"][2].get("type").is_none());
         assert_eq!(body["tools"][3]["type"], "web_search_20250305");
         assert_eq!(body["tools"][4]["type"], "web_fetch_20250910");
@@ -1027,7 +1045,7 @@ mod tests {
                 { "type": "thinking", "thinking": "private", "signature": "sig" },
                 { "type": "redacted_thinking", "data": "opaque" },
                 { "type": "text", "text": "hello" },
-                { "type": "tool_use", "id": "toolu_1", "name": "read", "input": { "path": "README.md" } }
+                { "type": "tool_use", "id": "toolu_1", "name": "str_replace_based_edit_tool", "input": { "path": "README.md" } }
             ]
         });
 
@@ -1038,7 +1056,7 @@ mod tests {
         let calls = assistant.tool_calls().collect::<Vec<_>>();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id.as_str(), "toolu_1");
-        assert_eq!(calls[0].tool_name, "read");
+        assert_eq!(calls[0].tool_name, "Edit");
         assert_eq!(response.provider_replay.len(), 4);
         assert_eq!(response.provider_replay[0].provider, ProviderKind::Claude);
         assert_eq!(
@@ -1052,6 +1070,13 @@ mod tests {
         assert_eq!(
             response.provider_replay[3].raw_type().as_deref(),
             Some("tool_use")
+        );
+        assert_eq!(
+            response.provider_replay[3]
+                .display
+                .as_ref()
+                .map(|display| display.pretty_name.as_str()),
+            Some("Edit")
         );
     }
 
@@ -1082,12 +1107,15 @@ mod tests {
     #[test]
     fn anthropic_serializer_prefers_replay_blocks() {
         let raw = json!({ "type": "thinking", "thinking": "private", "signature": "sig" });
-        let messages = transcript_to_messages(&[ModelTranscriptEntry {
-            item: TranscriptItem::AssistantMessage(AssistantMessage {
-                items: vec![AssistantItem::Text("visible".to_string())],
-            }),
-            provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
-        }])
+        let messages = transcript_to_messages(
+            &crate::PromptSections::default(),
+            &[ModelTranscriptEntry {
+                item: TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::Text("visible".to_string())],
+                }),
+                provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
+            }],
+        )
         .expect("messages render");
 
         assert_eq!(messages[0]["content"], json!([raw]));
