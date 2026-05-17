@@ -22,49 +22,11 @@ use super::transcript::insert_stored_entry_tx;
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
-    pub async fn block_running_model_action_for_compaction(
-        &self,
-        session_id: &str,
-        model_action_row_id: &str,
-        model_attempt_id: &str,
-        trigger: CompactionTrigger,
-        tokens_before: Option<usize>,
-        auto_limit_tokens: Option<usize>,
-    ) -> Result<CreateCompactionResult> {
-        self.block_model_action_for_compaction_with_status(
-            session_id,
-            model_action_row_id,
-            model_attempt_id,
-            ActionStatus::Running,
-            trigger,
-            tokens_before,
-            auto_limit_tokens,
-        )
-        .await
-    }
-
+    /// Transition a model action from `expected_status` (Pending pre-dispatch
+    /// or Running post-dispatch) to Blocked and create a sibling Compaction
+    /// action. Callers pick the status based on whether the gate fired before
+    /// or after the model call started.
     pub async fn block_model_action_for_compaction(
-        &self,
-        session_id: &str,
-        model_action_row_id: &str,
-        model_attempt_id: &str,
-        trigger: CompactionTrigger,
-        tokens_before: Option<usize>,
-        auto_limit_tokens: Option<usize>,
-    ) -> Result<CreateCompactionResult> {
-        self.block_model_action_for_compaction_with_status(
-            session_id,
-            model_action_row_id,
-            model_attempt_id,
-            ActionStatus::Pending,
-            trigger,
-            tokens_before,
-            auto_limit_tokens,
-        )
-        .await
-    }
-
-    async fn block_model_action_for_compaction_with_status(
         &self,
         session_id: &str,
         model_action_row_id: &str,

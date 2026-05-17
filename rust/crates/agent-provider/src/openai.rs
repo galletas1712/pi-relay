@@ -299,12 +299,11 @@ impl ModelProvider for OpenAiProvider {
         self.compact_responses(request).await
     }
 
-    // `supports_token_counting` stays at the trait default (`false`): the
-    // codex backend has no `/responses/input_tokens` route (Cloudflare
-    // responds 403 with a challenge interstitial). pi-relay reads
-    // `usage.input_tokens` off the streaming `response.completed` event
-    // instead, and the runtime skips the pre-dispatch token gate for OpenAI
-    // sessions until that usage arrives.
+    // No `count_tokens` impl: the codex backend has no `/responses/input_tokens`
+    // route (Cloudflare responds 403 with a challenge interstitial). pi-relay
+    // reads `usage.input_tokens` off the streaming `response.completed` event
+    // and the runtime gate falls through to the reactive overflow recovery
+    // path for OpenAI sessions.
 }
 
 impl OpenAiProvider {
@@ -364,7 +363,6 @@ impl OpenAiProvider {
         ensure_success(status, &text)?;
         parse_compact_response(&text)
     }
-
 }
 
 async fn response_text(response: reqwest::Response) -> ProviderResult<(StatusCode, String)> {

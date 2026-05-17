@@ -12,7 +12,8 @@ use agent_store::{
 };
 use agent_tools::dynamic_tool_context;
 use agent_vocab::{
-    ProviderReplayItem, ToolResultMessage, ToolResultStatus, TranscriptItem, UserMessage,
+    ProviderKind, ProviderReplayItem, ToolResultMessage, ToolResultStatus, TranscriptItem,
+    UserMessage,
 };
 use anyhow::Context;
 use serde_json::{json, Value};
@@ -22,8 +23,7 @@ use tokio::task::JoinHandle;
 use crate::codec::transcript_store_from_stored;
 use crate::provider_runtime::{
     auto_limit_tokens, compaction_auto_state, compaction_config, count_model_input_tokens,
-    provider_error_is_context_overflow, provider_supports_token_counting, run_compaction,
-    run_model,
+    provider_error_is_context_overflow, run_compaction, run_model,
 };
 use crate::state::{AppState, RunningTask};
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
@@ -574,35 +574,23 @@ impl SessionDriver {
         &self,
         dispatch: &DispatchAction,
     ) -> std::result::Result<bool, RpcError> {
+        let Some(eligible) = check_compaction_eligible(dispatch) else {
+            return Ok(true);
+        };
+        let Some(limit) = eligible.limit else {
+            return Ok(true);
+        };
         let SessionAction::RequestModel {
             model_context,
-            context_leaf_id,
             context_tokens,
             ..
         } = &dispatch.action
         else {
             return Ok(true);
         };
-        if session_uses_harness(&dispatch.config) {
-            return Ok(true);
-        }
-
-        let compaction_config = compaction_config(&dispatch.config);
-        if !compaction_config.auto_enabled {
-            return Ok(true);
-        }
-        let Some(limit) = auto_limit_tokens(&compaction_config) else {
-            return Ok(true);
-        };
-        let Some(source_leaf_id) = context_leaf_id.clone() else {
-            return Ok(true);
-        };
-        let auto_state = compaction_auto_state(&dispatch.config);
-        if auto_state.suppressed
-            || auto_state.last_failure_leaf_id.as_deref() == Some(source_leaf_id.as_str())
-        {
-            return Ok(true);
-        }
+        // Just-compacted contexts always start with a CompactionSummary as the
+        // last item; the next dispatch is the resumed model action that
+        // shouldn't immediately compact again.
         if matches!(
             model_context.transcript_items().last(),
             Some(TranscriptItem::CompactionSummary(_))
@@ -612,66 +600,157 @@ impl SessionDriver {
 
         let tokens = match context_tokens {
             Some(tokens) => *tokens,
-            None if !provider_supports_token_counting(&dispatch.config) => {
+            None if !provider_can_estimate_input_tokens(&dispatch.config) => {
                 // Codex backend has no token-counting endpoint; the next
                 // turn's `usage.input_tokens` from `response.completed` will
                 // populate `context_tokens` and gate compaction then.
                 return Ok(true);
             }
-            None => {
-                match count_model_input_tokens(
-                    &self.state,
-                    &dispatch.config,
-                    &self.session_id,
-                    model_context.clone(),
-                )
-                .await
-                {
-                    Ok(tokens) => tokens,
-                    Err(error) => {
-                        let provider_error = error.downcast_ref::<agent_provider::ProviderError>();
-                        if provider_error.is_some_and(provider_error_is_context_overflow) {
-                            limit
-                        } else {
-                            return Err(anyhow::Error::from(error).into());
-                        }
+            None => match count_model_input_tokens(
+                &self.state,
+                &dispatch.config,
+                &self.session_id,
+                model_context.clone(),
+            )
+            .await
+            {
+                Ok(tokens) => tokens,
+                Err(error) => {
+                    let provider_error = error.downcast_ref::<agent_provider::ProviderError>();
+                    if provider_error.is_some_and(provider_error_is_context_overflow) {
+                        limit
+                    } else {
+                        return Err(anyhow::Error::from(error).into());
                     }
                 }
-            }
+            },
         };
         if tokens < limit {
             return Ok(true);
         }
 
-        let reason =
-            format!("threshold: model_context_tokens {tokens} >= auto_limit_tokens {limit}");
-        let created = self
-            .state
-            .repo
-            .block_model_action_for_compaction(
-                &self.session_id,
-                &dispatch.row_id,
-                &dispatch.attempt_id,
-                CompactionTrigger::Auto {
-                    reason: reason.clone(),
-                },
-                Some(tokens),
-                Some(limit),
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        publish_events(&self.state, created.events);
-        if matches!(created.job.scope, CompactionScope::Boundary { .. }) {
-            self.state.active.lock().await.remove(&self.session_id);
-        }
-        spawn_compaction(
+        block_and_spawn_auto_compaction(
             &self.state,
-            self.session_id.clone(),
-            created.job,
-            dispatch.config.clone(),
-        );
+            &self.session_id,
+            dispatch,
+            ActionStatus::Pending,
+            AutoCompactionReason::Threshold { tokens, limit },
+            Some(tokens),
+            Some(limit),
+        )
+        .await?;
         Ok(false)
     }
+}
+
+/// Two callsites (`gate_model_dispatch` and
+/// `recover_model_context_overflow_with_compaction`) need the same set of
+/// eligibility guards before they're allowed to dispatch compaction. This
+/// captures the common decision in one place.
+struct CompactionEligible {
+    /// Resolved compaction threshold in tokens. `None` means the model has no
+    /// known context window and we can't compute a proactive limit; the
+    /// reactive overflow path can still fire because the provider error tells
+    /// us the model itself rejected the input.
+    limit: Option<usize>,
+}
+
+fn check_compaction_eligible(dispatch: &DispatchAction) -> Option<CompactionEligible> {
+    let SessionAction::RequestModel {
+        context_leaf_id, ..
+    } = &dispatch.action
+    else {
+        return None;
+    };
+    if session_uses_harness(&dispatch.config) {
+        return None;
+    }
+    let config = compaction_config(&dispatch.config);
+    if !config.auto_enabled {
+        return None;
+    }
+    let source_leaf_id = context_leaf_id.as_deref()?;
+    let auto_state = compaction_auto_state(&dispatch.config);
+    if auto_state.suppressed || auto_state.last_failure_leaf_id.as_deref() == Some(source_leaf_id) {
+        return None;
+    }
+    Some(CompactionEligible {
+        limit: auto_limit_tokens(&config),
+    })
+}
+
+/// Anthropic exposes `/messages/count_tokens` so the gate can size the
+/// transcript before dispatch. Codex has no such endpoint, so the gate must
+/// fall through and rely on the reactive overflow recovery path.
+fn provider_can_estimate_input_tokens(config: &SessionConfig) -> bool {
+    matches!(config.provider.kind, ProviderKind::Claude)
+}
+
+/// Typed reason for an auto-compaction trigger. Serialized to a stable string
+/// for the wire payload (`payload.reason`) so the web renderer doesn't need
+/// to change.
+enum AutoCompactionReason {
+    /// Pre-dispatch gate: the measured/estimated context exceeded the
+    /// configured auto-compaction threshold.
+    Threshold { tokens: usize, limit: usize },
+    /// Post-dispatch recovery: the provider rejected the request with a
+    /// context-window overflow error.
+    Overflow { provider_error: String },
+}
+
+impl AutoCompactionReason {
+    fn into_trigger_reason(self) -> String {
+        match self {
+            Self::Threshold { tokens, limit } => {
+                format!("threshold: model_context_tokens {tokens} >= auto_limit_tokens {limit}")
+            }
+            Self::Overflow { provider_error } => {
+                format!("provider context overflow before model completion: {provider_error}")
+            }
+        }
+    }
+}
+
+/// Shared "block this model action and spawn a compaction job" path used by
+/// both the proactive gate (Pending → Blocked) and the reactive overflow
+/// recovery (Running → Blocked). Centralizes event publishing, the
+/// boundary-scope active-session cleanup, and the spawn handoff.
+async fn block_and_spawn_auto_compaction(
+    state: &AppState,
+    session_id: &str,
+    dispatch: &DispatchAction,
+    expected_status: ActionStatus,
+    reason: AutoCompactionReason,
+    tokens_before: Option<usize>,
+    limit: Option<usize>,
+) -> std::result::Result<(), RpcError> {
+    let trigger = CompactionTrigger::Auto {
+        reason: reason.into_trigger_reason(),
+    };
+    let created = state
+        .repo
+        .block_model_action_for_compaction(
+            session_id,
+            &dispatch.row_id,
+            &dispatch.attempt_id,
+            expected_status,
+            trigger,
+            tokens_before,
+            limit,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    publish_events(state, created.events);
+    if matches!(created.job.scope, CompactionScope::Boundary { .. }) {
+        state.active.lock().await.remove(session_id);
+    }
+    spawn_compaction(
+        state,
+        session_id.to_string(),
+        created.job,
+        dispatch.config.clone(),
+    );
+    Ok(())
 }
 
 pub(crate) fn agent_input_from_queued_priority(
@@ -1316,49 +1395,22 @@ async fn recover_model_context_overflow_with_compaction(
     if !provider_error_is_context_overflow(provider_error) {
         return Ok(false);
     }
-    if session_uses_harness(&dispatch.config) {
-        return Ok(false);
-    }
-    let compaction_config = compaction_config(&dispatch.config);
-    if !compaction_config.auto_enabled {
-        return Ok(false);
-    }
-    let SessionAction::RequestModel {
-        context_leaf_id, ..
-    } = &dispatch.action
-    else {
+    let Some(eligible) = check_compaction_eligible(dispatch) else {
         return Ok(false);
     };
-    let Some(source_leaf_id) = context_leaf_id.as_deref() else {
-        return Ok(false);
-    };
-    let auto_state = compaction_auto_state(&dispatch.config);
-    if auto_state.suppressed || auto_state.last_failure_leaf_id.as_deref() == Some(source_leaf_id) {
-        return Ok(false);
-    }
 
-    let reason = format!("provider context overflow before model completion: {provider_error}");
-    let created = state
-        .repo
-        .block_running_model_action_for_compaction(
-            session_id,
-            &dispatch.row_id,
-            &dispatch.attempt_id,
-            CompactionTrigger::Auto {
-                reason: reason.clone(),
-            },
-            None,
-            auto_limit_tokens(&compaction_config),
-        )
-        .await
-        .map_err(anyhow::Error::from)?;
-    publish_events(state, created.events);
-    spawn_compaction(
+    block_and_spawn_auto_compaction(
         state,
-        session_id.to_string(),
-        created.job,
-        dispatch.config.clone(),
-    );
+        session_id,
+        dispatch,
+        ActionStatus::Running,
+        AutoCompactionReason::Overflow {
+            provider_error: provider_error.to_string(),
+        },
+        None,
+        eligible.limit,
+    )
+    .await?;
     Ok(true)
 }
 

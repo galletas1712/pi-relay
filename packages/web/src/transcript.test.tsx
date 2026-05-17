@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { assistantRenderParts, captureScrollPosition, editToolPreview, isScrolledAtBottom, MessageList, restoreScrollPosition } from "./transcript.tsx";
+import { assistantRenderParts, captureScrollPosition, editToolPreview, formatElapsed, isScrolledAtBottom, MessageList, restoreScrollPosition } from "./transcript.tsx";
 import type { AssistantItem, ProviderReplayItem, TranscriptEntry } from "./types.ts";
 
 describe("assistantRenderParts", () => {
@@ -129,12 +129,79 @@ describe("MessageList session loading guard", () => {
 	});
 });
 
+describe("MessageList Working indicator", () => {
+	it("renders a Working… row at the transcript tail when the session is running", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[turnStartedEntry("entry_turn", 1, Date.now() - 5_000)]}
+				activeLeafId="entry_turn"
+				isRunning
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain("Working…");
+	});
+
+	it("omits the Working… row when the session is idle", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[turnStartedEntry("entry_turn", 1, Date.now() - 5_000)]}
+				activeLeafId="entry_turn"
+				isRunning={false}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).not.toContain("Working…");
+	});
+});
+
+describe("formatElapsed", () => {
+	it("formats sub-minute durations as seconds", () => {
+		expect(formatElapsed(0)).toBe("0s");
+		expect(formatElapsed(999)).toBe("0s");
+		expect(formatElapsed(1500)).toBe("1s");
+		expect(formatElapsed(59_500)).toBe("59s");
+	});
+
+	it("formats minute-scale durations with zero-padded seconds", () => {
+		expect(formatElapsed(60_000)).toBe("1m 00s");
+		expect(formatElapsed(65_000)).toBe("1m 05s");
+		expect(formatElapsed(59 * 60_000 + 12_000)).toBe("59m 12s");
+	});
+
+	it("formats hour-scale durations with zero-padded minutes and seconds", () => {
+		expect(formatElapsed(60 * 60_000)).toBe("1h 00m 00s");
+		expect(formatElapsed(2 * 60 * 60_000 + 3 * 60_000 + 7_000)).toBe("2h 03m 07s");
+	});
+
+	it("clamps negative inputs to zero", () => {
+		expect(formatElapsed(-1)).toBe("0s");
+		expect(formatElapsed(-60_000)).toBe("0s");
+	});
+});
+
 function userEntry(id: string, text: string): TranscriptEntry {
 	return {
 		id,
 		parent_id: null,
 		timestamp_ms: 0,
 		item: { type: "user_message", content: [{ type: "text", text }] },
+		provider_replay: []
+	};
+}
+
+function turnStartedEntry(id: string, turnId: number, timestampMs: number): TranscriptEntry {
+	return {
+		id,
+		parent_id: null,
+		timestamp_ms: timestampMs,
+		item: { type: "turn_started", turn_id: turnId },
 		provider_replay: []
 	};
 }

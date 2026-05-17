@@ -40,7 +40,7 @@ import {
 	textContent,
 	withReasoningEffort,
 } from "./sessionDefaults.ts";
-import { projectTitle, sessionTitle, isArchivedSession, tallyActivities, type SessionListItem } from "./sessionList.ts";
+import { projectTitle, sessionTitle, isArchivedSession, displayActivity, tallyActivities, type SessionListItem } from "./sessionList.ts";
 import { firstLine, truncate } from "./text.ts";
 import type {
 	DaemonConfig,
@@ -123,6 +123,7 @@ export function App() {
 	const [pendingInputs, setPendingInputs] = useState<PendingInput[]>([]);
 	const [sidebarOpen, setSidebarOpen] = useState(() => defaultPanelState(panelModeForViewport()).sidebarOpen);
 	const [rightOpen, setRightOpen] = useState(() => defaultPanelState(panelModeForViewport()).rightOpen);
+	const [panelMode, setPanelMode] = useState<PanelMode>(() => panelModeForViewport());
 	const [showArchived, setShowArchived] = useState(false);
 	const [historyDialog, setHistoryDialog] = useState<HistoryDialogState | null>(null);
 	const [exportDialog, setExportDialog] = useState<ExportDialogState | null>(null);
@@ -1244,8 +1245,8 @@ export function App() {
 		setSidebarOpen((open) => !open);
 	}, []);
 	const handleCloseDrawers = useCallback(() => {
-		setSidebarOpen(false);
-		setRightOpen(false);
+		if (panelModeRef.current !== "wide") setSidebarOpen(false);
+		if (panelModeRef.current === "compact") setRightOpen(false);
 	}, []);
 	const closeSidebarIfOverlay = useCallback(() => {
 		if (panelModeRef.current !== "wide") setSidebarOpen(false);
@@ -1266,6 +1267,7 @@ export function App() {
 			const nextMode = panelModeForViewport();
 			if (nextMode === panelModeRef.current) return;
 			panelModeRef.current = nextMode;
+			setPanelMode(nextMode);
 			const defaults = defaultPanelState(nextMode);
 			setSidebarOpen(defaults.sidebarOpen);
 			setRightOpen(defaults.rightOpen);
@@ -1296,6 +1298,17 @@ export function App() {
 		: selectedProject
 			? projectTitle(selectedProject)
 			: "pi relay";
+	const mobileActivity = selectedSession
+		? displayActivity(loadedSnapshot?.activity ?? selectedSession.activity)
+		: null;
+	const mobileArchived = selectedSession ? isArchivedSession(selectedSession) : false;
+	const mobileSessionStatus = selectedSession ? (mobileArchived ? "archived" : mobileActivity) : null;
+	const sidebarIsOverlay = panelMode !== "wide";
+	const inspectorIsOverlay = panelMode === "compact";
+	const sidebarOverlayOpen = sidebarIsOverlay && sidebarOpen;
+	const inspectorOverlayOpen = inspectorIsOverlay && rightOpen;
+	const sidebarInert = sidebarIsOverlay && !sidebarOpen;
+	const inspectorInert = inspectorIsOverlay && !rightOpen;
 	const appClassName = `app-shell ${sidebarOpen ? "sidebar-open" : ""} ${rightOpen ? "inspector-open" : ""}`;
 
 	return (
@@ -1312,20 +1325,29 @@ export function App() {
 				</button>
 				<div className="mobile-topbar-title">
 					<span>{mobileTitle}</span>
-					<small>{connection === "open" ? "connected" : connection}</small>
+					<div className="mobile-topbar-status">
+						<span className={`connection-pill ${connection === "open" ? "online" : "offline"}`}>
+							{connection === "open" ? "connected" : connection}
+						</span>
+						{mobileSessionStatus ? (
+							<span className={`session-state ${mobileSessionStatus}`}>{mobileSessionStatus}</span>
+						) : null}
+					</div>
 				</div>
-				<button
-					className={`icon-button ${rightOpen ? "pressed" : ""}`}
-					type="button"
-					onClick={handleToggleRight}
-					aria-label={rightOpen ? "close inspector" : "open inspector"}
-					aria-expanded={rightOpen}
-				>
-					{rightOpen ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}
-				</button>
+				{inspectorIsOverlay ? (
+					<button
+						className={`icon-button ${rightOpen ? "pressed" : ""}`}
+						type="button"
+						onClick={handleToggleRight}
+						aria-label={rightOpen ? "close inspector" : "open inspector"}
+						aria-expanded={rightOpen}
+					>
+						{rightOpen ? <PanelRightClose size={17} /> : <PanelRightOpen size={17} />}
+					</button>
+				) : null}
 			</div>
 
-			{sidebarOpen || rightOpen ? (
+			{sidebarOverlayOpen || inspectorOverlayOpen ? (
 				<button className="drawer-scrim" type="button" aria-label="close panel" onClick={handleCloseDrawers} />
 			) : null}
 
@@ -1340,6 +1362,7 @@ export function App() {
 				showArchived={showArchived}
 				filteredSessions={filteredSessions}
 				selectedId={selectedId}
+				inert={sidebarInert}
 				onQueryChange={setQuery}
 				onToggleArchived={handleToggleArchived}
 				onNew={handleSidebarNew}
@@ -1411,7 +1434,7 @@ export function App() {
 				/>
 			</footer>
 
-			<aside className="inspector" data-slot="inspector" aria-hidden={!rightOpen}>
+			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
 				<Inspector snapshot={loadedSnapshot} config={config} tools={tools} onClose={() => setRightOpen(false)} />
 			</aside>
 

@@ -73,7 +73,8 @@ Provider credential loading:
   `~/.codex/auth.json`, including `tokens.account_id` when present.
 - `provider.kind = "openai"` uses the same ChatGPT/Codex subscription auth
   path. pi-relay does not support plain OpenAI API-key auth for OpenAI models.
-- `provider.kind = "anthropic"` or `"claude"` uses `ANTHROPIC_API_KEY`.
+- `provider.kind = "anthropic"` or `"claude"` uses `ANTHROPIC_API_KEY` or
+  Claude Code's `primaryApiKey` from `~/.claude/config.json` / `~/.claude.json`.
 
 Session provider config supports `reasoning_effort`, an optional explicit
 `max_tokens` cap, and `prompt_cache: { "key": "..." }`. OpenAI accepts
@@ -114,5 +115,7 @@ from the transcript row.
 
 ```sh
 ANTHROPIC_API_KEY=... cargo run --manifest-path rust/Cargo.toml -p pi-cli -- claude claude-sonnet-4-5 "hello"
+# Or omit ANTHROPIC_API_KEY when Claude Code has a primaryApiKey in ~/.claude.
+cargo run --manifest-path rust/Cargo.toml -p pi-cli -- claude claude-sonnet-4-5 "hello"
 cargo run --manifest-path rust/Cargo.toml -p pi-cli -- openai gpt-5.5 "hello"
 ```

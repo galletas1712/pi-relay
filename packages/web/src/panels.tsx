@@ -58,6 +58,7 @@ export interface SidebarProps {
 	showArchived: boolean;
 	filteredSessions: SessionListItem[];
 	selectedId: string | null;
+	inert?: boolean;
 	onQueryChange: (query: string) => void;
 	onToggleArchived: () => void;
 	onNew: () => void;
@@ -82,6 +83,7 @@ export const Sidebar = memo(function Sidebar({
 	showArchived,
 	filteredSessions,
 	selectedId,
+	inert,
 	onQueryChange,
 	onToggleArchived,
 	onNew,
@@ -95,7 +97,7 @@ export const Sidebar = memo(function Sidebar({
 	onDelete
 }: SidebarProps) {
 	return (
-		<aside className="sidebar" data-slot="sidebar">
+		<aside className="sidebar" data-slot="sidebar" inert={inert}>
 			<SidebarHeader connection={connection} onClose={onClose} />
 			<ProjectList
 				projects={projects}

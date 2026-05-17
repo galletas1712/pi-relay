@@ -105,10 +105,6 @@ impl ModelProvider for AnthropicProvider {
         parse_anthropic_message(&response)
     }
 
-    fn supports_token_counting(&self) -> bool {
-        true
-    }
-
     async fn count_tokens(
         &self,
         request: ProviderTokenCountRequest,
@@ -153,13 +149,16 @@ fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
         max_tokens: Some(request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
         reasoning_effort: Some(request.reasoning_effort),
         cache_transcript: true,
+        for_count_tokens: false,
     })
 }
 
 fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value> {
     // Keep this as close as possible to `messages_body`: Anthropic's token
     // count endpoint accepts the same input-shaping fields (system, tools,
-    // thinking/output config) but does not need a generation budget.
+    // thinking/output config) but does not need a generation budget. Server
+    // tools (`web_search`, `web_fetch`) are rejected by /count_tokens with
+    // HTTP 400; drop them so the count still reflects everything else.
     anthropic_request_body(AnthropicRequestBodyInput {
         model: request.model,
         prompt: request.prompt,
@@ -169,6 +168,7 @@ fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value
         max_tokens: request.max_tokens,
         reasoning_effort: Some(request.reasoning_effort),
         cache_transcript: false,
+        for_count_tokens: true,
     })
 }
 
@@ -181,6 +181,7 @@ struct AnthropicRequestBodyInput {
     max_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
     cache_transcript: bool,
+    for_count_tokens: bool,
 }
 
 fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Value> {
@@ -209,7 +210,10 @@ fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Va
     if let Some(system_blocks) = anthropic_system_blocks(&input.prompt, &input.transcript) {
         body["system"] = Value::Array(system_blocks);
     }
-    let tools = anthropic_tools(input.tool_profile, &input.tools)?;
+    let mut tools = anthropic_tools(input.tool_profile, &input.tools)?;
+    if input.for_count_tokens {
+        tools.retain(|tool| !is_anthropic_server_tool(tool));
+    }
     if !tools.is_empty() {
         // Intentionally no tool-level `cache_control` breakpoint. Anthropic
         // hashes the cumulative prefix in `tools -> system -> messages` order,
@@ -221,6 +225,15 @@ fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Va
         body["tool_choice"] = json!({ "type": "auto" });
     }
     Ok(body)
+}
+
+/// Server tools execute on Anthropic's infrastructure (web_search, web_fetch).
+/// /messages/count_tokens returns 400 if any are present in the body.
+fn is_anthropic_server_tool(tool: &Value) -> bool {
+    let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    tool_type.starts_with("web_search_") || tool_type.starts_with("web_fetch_")
 }
 
 fn client_request_id() -> String {
@@ -899,6 +912,44 @@ mod tests {
         // No tools-level breakpoints regardless of how many tools there are.
         assert!(body["tools"][0].get("cache_control").is_none());
         assert!(body["tools"][1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn count_tokens_body_drops_anthropic_server_tools() {
+        // The /messages/count_tokens endpoint rejects server tools
+        // (web_search, web_fetch) with HTTP 400. The runtime gate previously
+        // misclassified those as context-overflow, triggering compaction on
+        // every Anthropic turn.
+        let body = count_tokens_body(ProviderTokenCountRequest {
+            model: "claude-opus-4-7".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hi")).into()],
+            tool_profile: ProviderToolProfile::AnthropicCoding,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::XHigh,
+            prompt_cache_key: None,
+            session_id: None,
+        })
+        .expect("count body renders");
+
+        let tools = body["tools"].as_array().expect("tools array");
+        for tool in tools {
+            let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
+            assert!(
+                !tool_type.starts_with("web_search_") && !tool_type.starts_with("web_fetch_"),
+                "server tool {tool_type} must be filtered for count_tokens"
+            );
+        }
+        // The remaining client tools are still present so the count covers
+        // the same tool surface the model actually sees.
+        let names: Vec<&str> = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+            .collect();
+        assert!(names.contains(&"bash"));
+        assert!(names.contains(&"str_replace_based_edit_tool"));
+        assert!(names.contains(&"grep"));
     }
 
     #[test]

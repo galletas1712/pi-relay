@@ -1,4 +1,5 @@
 use std::env;
+use std::path::Path;
 use std::sync::Arc;
 
 use agent_core::AgentInput;
@@ -41,7 +42,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             // tolerates the header being absent.
             Arc::new(OpenAiProvider::codex(access_token, account_id, None))
         }
-        ProviderKind::Claude => Arc::new(AnthropicProvider::new(env::var("ANTHROPIC_API_KEY")?)),
+        ProviderKind::Claude => Arc::new(AnthropicProvider::new(read_anthropic_api_key()?)),
     };
 
     let mut session = AgentSession::new();
@@ -124,6 +125,46 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn read_anthropic_api_key() -> Result<String, Box<dyn std::error::Error>> {
+    if let Ok(key) = env::var("ANTHROPIC_API_KEY") {
+        return Ok(key);
+    }
+
+    if let Some(key) = read_claude_code_config_api_key() {
+        return Ok(key);
+    }
+
+    Err("ANTHROPIC_API_KEY not found and Claude Code primaryApiKey not found in ~/.claude/config.json or ~/.claude.json".into())
+}
+
+fn read_claude_code_config_api_key() -> Option<String> {
+    let home = env::var("HOME").ok().filter(|value| !value.is_empty())?;
+    let paths = [
+        Path::new(&home).join(".claude/config.json"),
+        Path::new(&home).join(".claude.json"),
+    ];
+
+    for path in paths {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&contents) else {
+            continue;
+        };
+        let Some(key) = value
+            .get("primaryApiKey")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|key| key.starts_with("sk-ant-"))
+        else {
+            continue;
+        };
+        return Some(key.to_string());
+    }
+
+    None
 }
 
 fn read_codex_auth() -> Result<(String, Option<String>), Box<dyn std::error::Error>> {

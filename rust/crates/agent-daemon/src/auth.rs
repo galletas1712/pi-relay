@@ -1,7 +1,6 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    process::Command,
 };
 
 use anyhow::{anyhow, Result};
@@ -30,7 +29,7 @@ impl Credentials {
             codex_installation_id: read_codex_installation_id(),
             anthropic_api_key: env::var("ANTHROPIC_API_KEY")
                 .ok()
-                .or_else(read_claude_code_keychain_api_key),
+                .or_else(read_claude_code_config_api_key),
         }
     }
 }
@@ -56,31 +55,33 @@ fn read_codex_installation_id() -> Option<String> {
     }
 }
 
-fn read_claude_code_keychain_api_key() -> Option<String> {
-    if !cfg!(target_os = "macos") {
-        return None;
+fn read_claude_code_config_api_key() -> Option<String> {
+    let home = env::var("HOME").ok().filter(|value| !value.is_empty())?;
+    read_claude_code_config_api_key_from_home(Path::new(&home))
+}
+
+fn read_claude_code_config_api_key_from_home(home: &Path) -> Option<String> {
+    let paths = [home.join(".claude/config.json"), home.join(".claude.json")];
+
+    for path in paths {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&contents) else {
+            continue;
+        };
+        let Some(key) = value
+            .get("primaryApiKey")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|key| key.starts_with("sk-ant-"))
+        else {
+            continue;
+        };
+        return Some(key.to_string());
     }
 
-    let username = env::var("USER").ok().filter(|value| !value.is_empty())?;
-    let output = Command::new("security")
-        .args([
-            "find-generic-password",
-            "-a",
-            &username,
-            "-w",
-            "-s",
-            "Claude Code",
-        ])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|key| key.trim().to_string())
-        .filter(|key| key.starts_with("sk-ant-"))
+    None
 }
 
 #[derive(Debug, Default)]
@@ -262,5 +263,69 @@ fn refresh_error_message(body: &str) -> String {
         "empty response body".to_string()
     } else {
         trimmed.chars().take(240).collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_home() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("pi-relay-auth-test-{nanos}"))
+    }
+
+    #[test]
+    fn reads_claude_code_config_primary_api_key() {
+        let home = temp_home();
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("create claude dir");
+        std::fs::write(
+            claude_dir.join("config.json"),
+            r#"{"primaryApiKey":"sk-ant-test-config"}"#,
+        )
+        .expect("write config");
+
+        let key = read_claude_code_config_api_key_from_home(&home);
+
+        assert_eq!(key.as_deref(), Some("sk-ant-test-config"));
+        std::fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn falls_back_to_root_claude_json() {
+        let home = temp_home();
+        std::fs::create_dir_all(&home).expect("create temp home");
+        std::fs::write(
+            home.join(".claude.json"),
+            r#"{"primaryApiKey":"sk-ant-test-root"}"#,
+        )
+        .expect("write claude json");
+
+        let key = read_claude_code_config_api_key_from_home(&home);
+
+        assert_eq!(key.as_deref(), Some("sk-ant-test-root"));
+        std::fs::remove_dir_all(home).expect("remove temp home");
+    }
+
+    #[test]
+    fn ignores_non_anthropic_primary_key() {
+        let home = temp_home();
+        let claude_dir = home.join(".claude");
+        std::fs::create_dir_all(&claude_dir).expect("create claude dir");
+        std::fs::write(
+            claude_dir.join("config.json"),
+            r#"{"primaryApiKey":"not-an-anthropic-key"}"#,
+        )
+        .expect("write config");
+
+        let key = read_claude_code_config_api_key_from_home(&home);
+
+        assert_eq!(key, None);
+        std::fs::remove_dir_all(home).expect("remove temp home");
     }
 }

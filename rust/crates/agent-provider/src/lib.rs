@@ -190,10 +190,6 @@ pub trait ModelProvider: Send + Sync {
         ))
     }
 
-    fn supports_token_counting(&self) -> bool {
-        false
-    }
-
     async fn count_tokens(
         &self,
         _request: ProviderTokenCountRequest,

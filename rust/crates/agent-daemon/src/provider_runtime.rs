@@ -68,13 +68,6 @@ async fn count_tokens_with_auth_retry(
     }
 }
 
-pub(crate) fn provider_supports_token_counting(config: &SessionConfig) -> bool {
-    let credentials = Credentials::load();
-    provider_for_config(config, &credentials)
-        .map(|provider| provider.provider.supports_token_counting())
-        .unwrap_or(false)
-}
-
 pub(crate) async fn count_model_input_tokens(
     state: &AppState,
     config: &SessionConfig,
@@ -593,6 +586,11 @@ fn trim_oldest_complete_group(groups: &mut Vec<TranscriptGroup>) -> bool {
 }
 
 pub(crate) fn provider_error_is_context_overflow(error: &ProviderError) -> bool {
+    // We only match HTTP errors whose message clearly identifies a
+    // context-window overflow. The previous "any 400/413" heuristic
+    // misclassified Anthropic's `count_tokens` schema-validation 400
+    // (server tools are rejected on that endpoint) as overflow and triggered
+    // auto-compaction every turn.
     let status = provider_error_status(error);
     let message = match error {
         ProviderError::Status { message, .. } | ProviderError::Provider(message) => message.clone(),
@@ -600,12 +598,28 @@ pub(crate) fn provider_error_is_context_overflow(error: &ProviderError) -> bool 
         ProviderError::Json(_) => return false,
     };
     let lower = message.to_ascii_lowercase();
-    matches!(status, Some(400 | 413))
-        || (lower.contains("context")
-            && (lower.contains("length")
-                || lower.contains("too large")
-                || lower.contains("exceed")
-                || lower.contains("maximum")))
+    // Vertex variant of Anthropic returns 413 for prompt-too-long.
+    if status == Some(413) {
+        return true;
+    }
+    // Anthropic direct API: "prompt is too long: N tokens > M maximum"
+    if lower.contains("prompt is too long") {
+        return true;
+    }
+    // OpenAI/Codex Responses: "context_length_exceeded" code or "context window"/"context length" phrasing.
+    if lower.contains("context_length_exceeded") {
+        return true;
+    }
+    if lower.contains("context")
+        && (lower.contains("length")
+            || lower.contains("window")
+            || lower.contains("too large")
+            || lower.contains("exceed")
+            || lower.contains("maximum"))
+    {
+        return true;
+    }
+    false
 }
 
 pub(crate) fn dynamic_prompt_context_for_cwd(cwd: &std::path::Path) -> String {
@@ -666,7 +680,7 @@ fn provider_for_config(
         ProviderKind::Claude => ProviderHandle {
             provider: Box::new(AnthropicProvider::new(
                 credentials.anthropic_api_key.clone().ok_or_else(|| {
-                    anyhow!("ANTHROPIC_API_KEY not found in env or Claude Code keychain")
+                    anyhow!("ANTHROPIC_API_KEY not found in env or Claude Code config")
                 })?,
             )),
             uses_codex_auth: false,
@@ -773,6 +787,49 @@ mod tests {
         assert_eq!(resolved.context_window, Some(123));
         assert_eq!(resolved.auto_limit_tokens, Some(77));
         assert_eq!(resolved.remote_mode, RemoteCompactionMode::Auto);
+    }
+
+    #[test]
+    fn context_overflow_classifier_matches_known_provider_messages() {
+        // Anthropic direct API: 400 with "prompt is too long" body.
+        assert!(provider_error_is_context_overflow(&ProviderError::Status {
+            status: 400,
+            message: "invalid_request_error: prompt is too long: 1100000 tokens > 1000000 maximum"
+                .to_string(),
+        }));
+        // Vertex Anthropic returns 413 with arbitrary body for the same case.
+        assert!(provider_error_is_context_overflow(&ProviderError::Status {
+            status: 413,
+            message: "request entity too large".to_string(),
+        }));
+        // OpenAI Responses uses the code "context_length_exceeded".
+        assert!(provider_error_is_context_overflow(&ProviderError::Status {
+            status: 400,
+            message: "context_length_exceeded: input is too long".to_string(),
+        }));
+        // The Codex CLI sometimes phrases the overflow as a longer sentence.
+        assert!(provider_error_is_context_overflow(
+            &ProviderError::Provider(
+                "Your input exceeds the context window of this model.".to_string(),
+            )
+        ));
+        // A schema-validation 400 must NOT be treated as overflow — this was
+        // the original bug: Anthropic /count_tokens rejects server tools with
+        // a 400 that has nothing to do with the context window.
+        assert!(!provider_error_is_context_overflow(&ProviderError::Status {
+            status: 400,
+            message:
+                "invalid_request_error: Server tools are not supported in the count_tokens endpoint: web_fetch_20250910, web_search_20250305."
+                    .to_string(),
+        }));
+        // Other random 400s also must not trigger compaction.
+        assert!(!provider_error_is_context_overflow(
+            &ProviderError::Status {
+                status: 400,
+                message: "invalid_request_error: messages: at least one message is required"
+                    .to_string(),
+            }
+        ));
     }
 
     #[test]

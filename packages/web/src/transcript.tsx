@@ -257,6 +257,27 @@ export const MessageList = memo(function MessageList({
 		return result;
 	}, [compactionHiddenCounts, displayNodes, expandedCompactions]);
 
+	// While a turn is running we show a single "Working…" row at the end of
+	// the transcript instead of a sticky pill, so the user can see how long
+	// the agent has been thinking. We anchor the clock to the most recent
+	// `turn_started` entry on the active branch — that timestamp is stable
+	// across re-renders and across reconnections (the entry is persisted),
+	// so the duration doesn't reset just because state churned.
+	const workingFallbackStartRef = useRef<number | null>(null);
+	if (!isRunning && workingFallbackStartRef.current !== null) {
+		workingFallbackStartRef.current = null;
+	}
+	const workingStartMs = useMemo(() => {
+		if (!isRunning) return null;
+		for (let index = visibleEntries.length - 1; index >= 0; index -= 1) {
+			const entry = visibleEntries[index];
+			if (entry.item.type === "turn_started") return entry.timestamp_ms;
+			if (entry.item.type === "turn_finished") break;
+		}
+		if (workingFallbackStartRef.current === null) workingFallbackStartRef.current = Date.now();
+		return workingFallbackStartRef.current;
+	}, [isRunning, visibleEntries]);
+
 	if (!hasSession) {
 		return (
 			<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
@@ -300,11 +321,8 @@ export const MessageList = memo(function MessageList({
 				{pendingInputs.map((input) => (
 					<PendingUserBubble input={input} key={input.id} />
 				))}
-				{isRunning ? (
-					<div className="activity-indicator">
-						<Loader2 className="spin" size={14} />
-						Agent active
-					</div>
+				{isRunning && workingStartMs != null ? (
+					<WorkingIndicator startMs={workingStartMs} />
 				) : null}
 			</div>
 		</div>
@@ -321,6 +339,35 @@ const PendingUserBubble = memo(function PendingUserBubble({ input }: { input: Pe
 		</div>
 	);
 });
+
+const WorkingIndicator = memo(function WorkingIndicator({ startMs }: { startMs: number }) {
+	const [elapsedMs, setElapsedMs] = useState(() => Math.max(0, Date.now() - startMs));
+	useEffect(() => {
+		setElapsedMs(Math.max(0, Date.now() - startMs));
+		const interval = window.setInterval(() => {
+			setElapsedMs(Math.max(0, Date.now() - startMs));
+		}, 1000);
+		return () => window.clearInterval(interval);
+	}, [startMs]);
+	return (
+		<SystemMessage
+			tone="info"
+			text={`Working… ${formatElapsed(elapsedMs)}`}
+			loading
+		/>
+	);
+});
+
+export function formatElapsed(ms: number): string {
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	if (minutes < 60) return `${minutes}m ${seconds.toString().padStart(2, "0")}s`;
+	const hours = Math.floor(minutes / 60);
+	const remainingMinutes = minutes % 60;
+	return `${hours}h ${remainingMinutes.toString().padStart(2, "0")}m ${seconds.toString().padStart(2, "0")}s`;
+}
 
 const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	node,
@@ -882,21 +929,35 @@ const AssistantTextBlock = memo(function AssistantTextBlock({ node }: { node: Ex
 });
 
 const ToolRunGroup = memo(function ToolRunGroup({ node }: { node: Extract<TranscriptDisplayNode, { type: "tool_group" }> }) {
-	const defaultExpanded = shouldDefaultExpandGroup(node);
-	const [expanded, setExpanded] = useState(defaultExpanded);
-	useEffect(() => {
-		setExpanded(defaultExpanded);
-	}, [defaultExpanded, node.id]);
+	// Three-mode card: "collapsed" hides every item, "recent" shows just the
+	// last N items with a link to expand, "all" shows every item with a link
+	// to shrink back. The default tracks `isLive` (working → recent, done →
+	// collapsed); once the user touches anything we stash an override so
+	// later state churn (tool statuses changing, new items streaming in)
+	// doesn't blow away their selection — that was the existing bug.
+	const computedDefault = defaultToolGroupMode(node);
+	const [override, setOverride] = useState<ToolGroupMode | null>(null);
+	const mode: ToolGroupMode = override ?? computedDefault;
 
 	const status = groupStatus(node.items);
-	const visibleItems = visibleToolItems(node, expanded);
-	const hiddenEarlierCount = hiddenEarlierToolCount(node, visibleItems);
+	const totalItems = node.items.length;
+	const recentItems = useMemo(() => node.items.slice(-RECENT_TOOL_ROW_COUNT), [node.items]);
+	const hiddenCount = Math.max(0, totalItems - recentItems.length);
+	const isOpen = mode !== "collapsed";
+	const visibleItems = mode === "all" ? node.items : recentItems;
+
+	const handleHeadToggle = useCallback(() => {
+		setOverride(isOpen ? "collapsed" : "recent");
+	}, [isOpen]);
+	const handleShowAll = useCallback(() => setOverride("all"), []);
+	const handleShowRecent = useCallback(() => setOverride("recent"), []);
+
 	const icon = status === "running" ? <Loader2 className="spin" size={14} /> : <Check size={14} />;
 
 	return (
 		<div className="message-row assistant-row">
-			<div className={`tool-run-group ${status} ${expanded ? "expanded" : "collapsed"} ${node.isLive ? "live" : ""}`}>
-				<button className="tool-run-group-head" type="button" onClick={() => setExpanded((open) => !open)} aria-expanded={expanded}>
+			<div className={`tool-run-group ${status} ${mode} ${node.isLive ? "live" : ""}`}>
+				<button className="tool-run-group-head" type="button" onClick={handleHeadToggle} aria-expanded={isOpen}>
 					<span className="tool-run-status-icon" aria-hidden="true">
 						{icon}
 					</span>
@@ -908,16 +969,23 @@ const ToolRunGroup = memo(function ToolRunGroup({ node }: { node: Extract<Transc
 							))}
 						</span>
 					</span>
-					<ChevronDown size={14} className={`tool-chevron ${expanded ? "open" : ""}`} />
+					<ChevronDown size={14} className={`tool-chevron ${isOpen ? "open" : ""}`} />
 				</button>
-				{expanded || visibleItems.length ? (
+				{isOpen && totalItems > 0 ? (
 					<div className="tool-run-detail">
-						{hiddenEarlierCount ? (
-							<div className="tool-run-detail-line hidden">
-								<span className="tool-run-detail-icon">…</span>
-								<span>{hiddenEarlierCount} earlier {plural(hiddenEarlierCount, "tool")}</span>
-								<span>hidden</span>
-							</div>
+						{hiddenCount > 0 ? (
+							<button
+								type="button"
+								className="tool-run-show-link"
+								onClick={mode === "recent" ? handleShowAll : handleShowRecent}
+							>
+								<span className="tool-run-detail-icon" aria-hidden="true">…</span>
+								<span>
+									{mode === "recent"
+										? `See ${hiddenCount} other tool ${plural(hiddenCount, "use")}`
+										: "Show recent only"}
+								</span>
+							</button>
 						) : null}
 						{visibleItems.map((item) => (
 							<ToolRunDetailItem item={item} key={item.key} />
@@ -1016,9 +1084,14 @@ function HostedToolRunBody({ item }: { item: Extract<ToolRunItem, { source: "hos
 	);
 }
 
-function shouldDefaultExpandGroup(node: Extract<TranscriptDisplayNode, { type: "tool_group" }>): boolean {
-	if (node.isLive) return true;
-	return node.items.some((item) => item.statusKind === "running");
+type ToolGroupMode = "collapsed" | "recent" | "all";
+
+function defaultToolGroupMode(node: Extract<TranscriptDisplayNode, { type: "tool_group" }>): ToolGroupMode {
+	// Working: keep the last N visible so users can watch progress.
+	// Done: collapse so the transcript stays calm.
+	if (node.isLive) return "recent";
+	if (groupStatus(node.items) === "running") return "recent";
+	return "collapsed";
 }
 
 function groupStatus(items: ToolRunItem[]): "complete" | "running" {
@@ -1043,15 +1116,6 @@ function groupSummaryPills(items: ToolRunItem[]): string[] {
 		.sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
 		.slice(0, 5)
 		.map(([name, count]) => `${count} ${name}`);
-}
-
-function visibleToolItems(node: Extract<TranscriptDisplayNode, { type: "tool_group" }>, expanded: boolean): ToolRunItem[] {
-	if (expanded && !node.isLive) return node.items;
-	return node.items.slice(-RECENT_TOOL_ROW_COUNT);
-}
-
-function hiddenEarlierToolCount(node: Extract<TranscriptDisplayNode, { type: "tool_group" }>, visibleItems: ToolRunItem[]): number {
-	return Math.max(0, node.items.length - visibleItems.length);
 }
 
 function isEditToolRunItem(item: ToolRunItem): item is Extract<ToolRunItem, { source: "local" }> & { editPreview: EditToolPreview } {

@@ -173,35 +173,43 @@ pre {
 	min-width: 0;
 	flex: 1;
 	flex-direction: column;
+	align-items: center;
+	gap: 2px;
 	line-height: 1.15;
 	text-align: center;
 }
 
-.mobile-topbar-title span,
-.mobile-topbar-title small {
+.mobile-topbar-title > span {
+	max-width: 100%;
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-}
-
-.mobile-topbar-title span {
 	color: var(--foreground);
 	font-size: 13px;
 	font-weight: 600;
 }
 
-.mobile-topbar-title small {
-	margin-top: 2px;
-	color: var(--muted-foreground);
-	font-family: var(--font-mono);
-	font-size: 10.5px;
+.mobile-topbar-status {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: center;
+	align-items: center;
+	gap: 4px;
+	max-width: 100%;
+}
+
+.mobile-topbar-status .connection-pill,
+.mobile-topbar-status .session-state {
+	font-size: 10px;
+	line-height: 1.3;
+	padding: 1px 6px;
 }
 
 .drawer-scrim {
 	position: fixed;
 	inset: 0;
 	z-index: 35;
-	display: none;
+	display: block;
 	border: 0;
 	background: color-mix(in oklch, var(--foreground) 18%, transparent);
 	padding: 0;
@@ -233,7 +241,6 @@ pre {
 }
 
 .connection-row,
-.masthead,
 .log-header,
 .inspector-head {
 	display: flex;
@@ -255,7 +262,6 @@ pre {
 	margin-left: auto;
 }
 
-.masthead,
 .log-header {
 	font-family: var(--font-sans);
 	font-size: 13px;
@@ -269,17 +275,6 @@ pre {
 	font-weight: 500;
 	text-transform: uppercase;
 	letter-spacing: 0.04em;
-}
-
-.masthead-title {
-	color: var(--foreground);
-	font-weight: 600;
-}
-
-.masthead-count {
-	margin-left: auto;
-	font-weight: 500;
-	font-variant-numeric: tabular-nums;
 }
 
 .activity-counts {
@@ -1120,6 +1115,7 @@ pre {
 	font-family: var(--font-mono);
 	font-size: 11px;
 	color: var(--muted-foreground);
+	font-variant-numeric: tabular-nums;
 }
 
 .system-message.success {
@@ -1336,17 +1332,41 @@ pre {
 	color: var(--muted-foreground);
 }
 
-.tool-run-detail-line.hidden {
-	color: var(--muted-foreground);
-}
-
 .tool-run-detail-icon {
 	text-align: center;
 }
 
-.tool-run-item + .tool-run-item,
-.tool-run-detail-line + .tool-run-item,
-.tool-run-item + .tool-run-hidden-note {
+.tool-run-show-link {
+	display: grid;
+	grid-template-columns: 24px minmax(0, 1fr);
+	gap: 8px;
+	align-items: center;
+	width: 100%;
+	border: 0;
+	background: transparent;
+	padding: 6px 10px;
+	text-align: left;
+	font-family: var(--font-mono);
+	font-size: 11.5px;
+	color: var(--muted-foreground);
+	cursor: pointer;
+}
+
+.tool-run-show-link:hover {
+	background: color-mix(in oklch, var(--muted) 45%, transparent);
+	color: var(--foreground);
+}
+
+.tool-run-show-link:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: -2px;
+}
+
+.tool-run-show-link + .tool-run-item {
+	border-top: 1px solid color-mix(in oklch, var(--border) 72%, transparent);
+}
+
+.tool-run-item + .tool-run-item {
 	border-top: 1px solid color-mix(in oklch, var(--border) 72%, transparent);
 }
 
@@ -1395,13 +1415,6 @@ pre {
 .tool-run-item-body {
 	border-top: 1px solid color-mix(in oklch, var(--border) 72%, transparent);
 	background: color-mix(in oklch, var(--background) 82%, transparent);
-}
-
-.tool-run-hidden-note {
-	padding: 7px 10px 5px 42px;
-	font-family: var(--font-mono);
-	font-size: 10.5px;
-	color: var(--muted-foreground);
 }
 
 .tool-card.stand-alone {
@@ -1963,24 +1976,6 @@ pre {
 	font-weight: 500;
 }
 
-.activity-indicator {
-	display: inline-flex;
-	position: sticky;
-	bottom: 10px;
-	left: 50%;
-	transform: translateX(-50%);
-	align-items: center;
-	gap: 7px;
-	border: 1px solid var(--border);
-	border-radius: 999px;
-	background: var(--card);
-	padding: 6px 10px;
-	font-family: var(--font-mono);
-	font-size: 11px;
-	color: var(--muted-foreground);
-	box-shadow: 0 4px 18px color-mix(in oklch, var(--foreground) 12%, transparent);
-}
-
 .chat-dock {
 	grid-column: 1;
 	grid-row: 3;
@@ -2223,16 +2218,21 @@ pre {
 		grid-template-columns: minmax(0, 1fr) minmax(320px, 380px);
 	}
 
-	.drawer-scrim {
-		display: block;
+	.sidebar {
+		box-shadow: 18px 0 52px color-mix(in oklch, var(--foreground) 18%, transparent);
 	}
 
-	.app-shell.inspector-open .drawer-scrim {
+	/* the mobile-topbar already has an inspector toggle in this range,
+	   so don't render a second one inside the chat header */
+	.log-header > .icon-button {
 		display: none;
 	}
 
-	.sidebar {
-		box-shadow: 18px 0 52px color-mix(in oklch, var(--foreground) 18%, transparent);
+	/* the mobile-topbar already shows the session title and activity status,
+	   so don't repeat them inside the log header on mobile/medium */
+	.log-header > .log-session,
+	.log-header > .session-state {
+		display: none;
 	}
 }
 
@@ -2256,8 +2256,8 @@ pre {
 		transform: none;
 	}
 
-	.sidebar-close,
-	.inspector-close {
+	/* sidebar is part of the static grid here, so its close X is meaningless */
+	.sidebar-close {
 		display: none;
 	}
 
@@ -2277,13 +2277,17 @@ pre {
 	}
 }
 
+@media (min-width: 900px) {
+	/* inspector is part of the static grid at medium and wide, so its
+	   close X would just slide a permanent panel off-screen */
+	.inspector-close {
+		display: none;
+	}
+}
+
 @media (max-width: 899px) {
 	.app-shell {
 		grid-template-columns: minmax(0, 1fr);
-	}
-
-	.drawer-scrim {
-		display: block;
 	}
 
 	.inspector {
@@ -2601,33 +2605,14 @@ pre {
 	}
 
 	.log-header {
-		align-items: flex-start;
-		flex-wrap: wrap;
-		gap: 6px;
-	}
-
-	.log-session {
-		flex-basis: calc(100% - 88px);
-		order: 1;
-		padding-top: 2px;
-	}
-
-	.session-state {
-		order: 0;
-	}
-
-	.session-refresh-indicator {
-		order: 0;
-	}
-
-	.log-header > .icon-button {
-		order: 0;
-		margin-left: auto;
+		align-items: center;
+		gap: 8px;
+		min-height: 44px;
 	}
 
 	.log-controls {
-		order: 2;
-		width: 100%;
+		flex: 1;
+		min-width: 0;
 		margin-left: 0;
 		display: grid;
 		grid-template-columns: minmax(0, 1fr) minmax(0, 0.72fr);
@@ -2712,6 +2697,7 @@ pre {
 	}
 
 	.tool-run-detail-line,
+	.tool-run-show-link,
 	.tool-run-item-toggle {
 		gap: 7px;
 	}
@@ -2897,10 +2883,6 @@ pre {
 @media (max-width: 430px) {
 	.mobile-topbar {
 		height: 46px;
-	}
-
-	.log-controls {
-		grid-template-columns: minmax(0, 1fr);
 	}
 
 	.header-select select,
