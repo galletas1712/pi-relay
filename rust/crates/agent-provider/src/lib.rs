@@ -36,11 +36,12 @@ pub struct ModelRequest {
 #[derive(Debug, Clone)]
 pub struct ProviderCompactionRequest {
     pub model: String,
-    pub instructions: Option<String>,
+    pub prompt: PromptSections,
     pub transcript: Vec<ModelTranscriptEntry>,
     pub tool_profile: ProviderToolProfile,
     pub tools: Vec<ToolDefinition>,
     pub reasoning_effort: ReasoningEffort,
+    pub prompt_cache_key: Option<String>,
     pub session_id: Option<String>,
 }
 
@@ -60,7 +61,9 @@ pub struct ProviderTokenCountRequest {
     pub transcript: Vec<ModelTranscriptEntry>,
     pub tool_profile: ProviderToolProfile,
     pub tools: Vec<ToolDefinition>,
+    pub max_tokens: Option<u32>,
     pub reasoning_effort: ReasoningEffort,
+    pub prompt_cache_key: Option<String>,
     pub session_id: Option<String>,
 }
 
@@ -185,6 +188,10 @@ pub trait ModelProvider: Send + Sync {
         Err(ProviderError::Provider(
             "provider does not support remote compaction".to_string(),
         ))
+    }
+
+    fn supports_token_counting(&self) -> bool {
+        false
     }
 
     async fn count_tokens(

@@ -60,7 +60,8 @@ type TranscriptDisplayNode =
 	| { type: "tool_group"; key: string; id: string; items: ToolRunItem[]; turnId: number | null; turnOpen: boolean; isLive: boolean }
 	| { type: "turn_finished"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "turn_finished" }> } }
 	| { type: "tool_result"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "tool_result" }> } }
-	| { type: "compaction_summary"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "compaction_summary" }> } };
+	| { type: "compaction_summary"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "compaction_summary" }> } }
+	| { type: "compaction_in_progress"; key: string; trigger: "auto" | "manual"; reason: string | null };
 
 type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
 const STICKY_BOTTOM_EPSILON_PX = 1;
@@ -210,12 +211,51 @@ export const MessageList = memo(function MessageList({
 	const toolIndex = useMemo(() => indexToolEntries(visibleEntries), [visibleEntries]);
 	const turnViews = useMemo(() => buildTurnViews(visibleEntries), [visibleEntries]);
 	const displayNodes = useMemo(() => deriveTranscriptDisplayNodes(visibleEntries, turnViews, toolIndex.results, pendingActions), [pendingActions, toolIndex.results, turnViews, visibleEntries]);
-	const runningCompaction = useMemo(() => pendingActions?.find((action) => action.kind === "compaction" && action.status === "running") ?? null, [pendingActions]);
 	const resumeEntryIdByNode = useMemo(() => {
 		const ids = new Map<string, string>();
 		for (const node of displayNodes) ids.set(node.key, resumeBoundaryIdForNode(node, turnViews) ?? nodeLeafId(node));
 		return ids;
 	}, [displayNodes, turnViews]);
+	// Each compaction collapses the display nodes between itself and the
+	// previous compaction (or session start). The count is precomputed so the
+	// marker's "show N hidden" label stays accurate as turns stream in.
+	const compactionHiddenCounts = useMemo(() => {
+		const counts = new Map<string, number>();
+		let segmentStart = 0;
+		displayNodes.forEach((node, index) => {
+			if (node.type !== "compaction_summary") return;
+			counts.set(node.key, index - segmentStart);
+			segmentStart = index + 1;
+		});
+		return counts;
+	}, [displayNodes]);
+	const [expandedCompactions, setExpandedCompactions] = useState<ReadonlySet<string>>(() => new Set());
+	useEffect(() => {
+		setExpandedCompactions(new Set());
+	}, [sessionId]);
+	const toggleCompaction = useCallback((key: string) => {
+		setExpandedCompactions((prev) => {
+			const next = new Set(prev);
+			if (next.has(key)) next.delete(key);
+			else next.add(key);
+			return next;
+		});
+	}, []);
+	const visibleDisplayNodes = useMemo(() => {
+		if (compactionHiddenCounts.size === 0) return displayNodes;
+		const result: TranscriptDisplayNode[] = [];
+		let segmentStart = 0;
+		displayNodes.forEach((node, index) => {
+			if (node.type !== "compaction_summary") return;
+			if (expandedCompactions.has(node.key)) {
+				for (let j = segmentStart; j < index; j++) result.push(displayNodes[j]);
+			}
+			result.push(node);
+			segmentStart = index + 1;
+		});
+		for (let j = segmentStart; j < displayNodes.length; j++) result.push(displayNodes[j]);
+		return result;
+	}, [compactionHiddenCounts, displayNodes, expandedCompactions]);
 
 	if (!hasSession) {
 		return (
@@ -242,16 +282,19 @@ export const MessageList = memo(function MessageList({
 	return (
 		<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 			<div className="message-scroll-content" ref={contentRef}>
-				{displayNodes.map((node) => (
+				{visibleDisplayNodes.map((node) => (
 					<TranscriptDisplayNodeView
 						node={node}
 						key={node.key}
 						toolIndex={toolIndex}
-						isActiveLeaf={resumeEntryIdByNode.get(node.key) === activeLeafId}
+						isActiveLeaf={nodeLeafId(node) === activeLeafId}
 						isRunning={isRunning}
 						onResumeTurn={onResumeTurn}
 						resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
 						resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
+						compactionHiddenCount={compactionHiddenCounts.get(node.key) ?? 0}
+						compactionExpanded={expandedCompactions.has(node.key)}
+						onToggleCompaction={toggleCompaction}
 					/>
 				))}
 				{pendingInputs.map((input) => (
@@ -260,7 +303,7 @@ export const MessageList = memo(function MessageList({
 				{isRunning ? (
 					<div className="activity-indicator">
 						<Loader2 className="spin" size={14} />
-						{runningCompaction ? compactionActivityText(runningCompaction) : "Agent active"}
+						Agent active
 					</div>
 				) : null}
 			</div>
@@ -286,7 +329,10 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	isRunning,
 	onResumeTurn,
 	resumeEntryId,
-	resuming
+	resuming,
+	compactionHiddenCount,
+	compactionExpanded,
+	onToggleCompaction
 }: {
 	node: TranscriptDisplayNode;
 	toolIndex: ReturnType<typeof indexToolEntries>;
@@ -295,6 +341,9 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumeEntryId: string;
 	resuming: boolean;
+	compactionHiddenCount: number;
+	compactionExpanded: boolean;
+	onToggleCompaction: (key: string) => void;
 }) {
 	if (node.type === "user") {
 		return <UserBubble item={node.entry.item} entryId={node.entry.id} />;
@@ -333,7 +382,30 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 		return <ToolResultCard item={item} entryId={node.entry.id} />;
 	}
 	if (node.type === "compaction_summary") {
-		return <SystemMessage tone="info" text="compacted history" />;
+		const item = node.entry.item;
+		const tokens = typeof item.tokens_before === "number" ? formatCompactionTokens(item.tokens_before) : null;
+		const parts = [`Context compacted through turn ${item.last_turn_id}`];
+		if (tokens) parts.push(`${tokens} tokens summarized`);
+		if (compactionHiddenCount > 0 && !compactionExpanded) parts.push(`${compactionHiddenCount} prior entr${compactionHiddenCount === 1 ? "y" : "ies"} hidden`);
+		return (
+			<SystemMessage
+				tone="info"
+				text={parts.join(" · ")}
+				action={
+					compactionHiddenCount > 0
+						? {
+								label: compactionExpanded ? "Hide prior" : "Show prior",
+								onClick: () => onToggleCompaction(node.key)
+							}
+						: undefined
+				}
+			/>
+		);
+	}
+	if (node.type === "compaction_in_progress") {
+		const label = node.trigger === "auto" ? "Auto-compacting history" : "Compacting history";
+		const text = node.reason ? `${label} · ${node.reason}` : `${label}…`;
+		return <SystemMessage tone="info" text={text} loading />;
 	}
 	return null;
 });
@@ -472,6 +544,7 @@ class TranscriptDisplayBuilder {
 		for (const entry of this.entries) this.appendEntry(entry);
 		this.flushGroup();
 		this.appendPendingToolRuns();
+		this.appendPendingCompactions();
 		return markLiveToolGroups(this.nodes);
 	}
 
@@ -573,6 +646,21 @@ class TranscriptDisplayBuilder {
 		this.pendingGroup = null;
 	}
 
+	private appendPendingCompactions() {
+		for (const action of this.pendingActions) {
+			if (action.kind !== "compaction") continue;
+			if (action.status !== "running" && action.status !== "pending") continue;
+			const trigger = action.payload.trigger === "manual" ? "manual" : "auto";
+			const reason = typeof action.payload.reason === "string" ? action.payload.reason : null;
+			this.nodes.push({
+				type: "compaction_in_progress",
+				key: `compaction-pending-${action.action_row_id}`,
+				trigger,
+				reason
+			});
+		}
+	}
+
 	private appendPendingToolRuns() {
 		const pendingTools = this.pendingActions
 			.filter((action) => action.kind === "tool" && action.status === "running")
@@ -621,13 +709,6 @@ function toolRunItemFromPendingAction(action: PendingAction): ToolRunItem | null
 		input,
 		editPreview
 	};
-}
-
-function compactionActivityText(action: PendingAction): string {
-	const trigger = typeof action.payload.trigger === "string" ? action.payload.trigger : null;
-	const reason = typeof action.payload.reason === "string" ? action.payload.reason : null;
-	if (trigger === "auto") return reason ? `Auto-compacting history (${reason})` : "Auto-compacting history";
-	return "Compacting history";
 }
 
 function markLiveToolGroups(nodes: TranscriptDisplayNode[]): TranscriptDisplayNode[] {
@@ -687,6 +768,7 @@ function hostedToolRunItem(entryId: string, part: Extract<AssistantRenderPart, {
 
 function nodeLeafId(node: TranscriptDisplayNode): string {
 	if (node.type === "tool_group") return node.items.at(-1)?.entryId ?? node.id;
+	if (node.type === "compaction_in_progress") return node.key;
 	return node.entry.id;
 }
 
@@ -976,6 +1058,12 @@ function isEditToolRunItem(item: ToolRunItem): item is Extract<ToolRunItem, { so
 	return item.source === "local" && !!item.editPreview;
 }
 
+function formatCompactionTokens(tokens: number): string {
+	if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+	if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}k`;
+	return tokens.toString();
+}
+
 function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
 	return count === 1 ? singular : pluralForm;
 }
@@ -1155,16 +1243,19 @@ function SystemMessage({
 	tone,
 	text,
 	entryId,
-	action
+	action,
+	loading
 }: {
 	tone: NoticeTone;
 	text: string;
 	entryId?: string;
 	action?: { label: string; disabled?: boolean; onClick: () => void };
+	loading?: boolean;
 }) {
 	return (
 		<div className={`system-message ${tone}`}>
 			{entryId ? <EntryId entryId={entryId} inline /> : null}
+			{loading ? <Loader2 className="spin" size={12} /> : null}
 			<span>{text}</span>
 			{action ? (
 				<button type="button" className="system-message-action" onClick={action.onClick} disabled={action.disabled}>

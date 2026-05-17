@@ -6,18 +6,16 @@ export interface ModelOption {
 	provider: ProviderConfig;
 }
 
-const PROMPT_CACHE = { key: "pi-relay-web" };
-
 export const MODEL_OPTIONS: ModelOption[] = [
 	{
 		id: "openai:gpt-5.5",
 		label: "OpenAI GPT-5.5",
-		provider: { kind: "openai", model: "gpt-5.5", reasoning_effort: "xhigh", prompt_cache: PROMPT_CACHE }
+		provider: { kind: "openai", model: "gpt-5.5", reasoning_effort: "xhigh" }
 	},
 	{
 		id: "claude:claude-opus-4-7",
 		label: "Claude Opus 4.7",
-		provider: { kind: "claude", model: "claude-opus-4-7", reasoning_effort: "xhigh", prompt_cache: PROMPT_CACHE }
+		provider: { kind: "claude", model: "claude-opus-4-7", reasoning_effort: "xhigh" }
 	}
 ];
 
@@ -27,8 +25,7 @@ export const CLAUDE_REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "hi
 export const DEFAULT_PROVIDER: ProviderConfig = {
 	kind: "openai",
 	model: "gpt-5.5",
-	reasoning_effort: "xhigh",
-	prompt_cache: PROMPT_CACHE
+	reasoning_effort: "xhigh"
 };
 
 export function textContent(text: string): ContentBlock[] {

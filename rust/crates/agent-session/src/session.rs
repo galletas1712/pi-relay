@@ -8,7 +8,7 @@ use crate::outstanding_actions::OutstandingActions;
 use crate::storage::StoredSession;
 use crate::transcript_store::{TranscriptStore, TranscriptStoreError};
 use agent_core::{AgentAction, AgentCoreLoop, AgentInput};
-use agent_vocab::{ActionId, TranscriptItem, TurnId};
+use agent_vocab::{ActionId, CompactionSummary, ProviderReplayItem, TranscriptItem, TurnId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryOperationError {
@@ -19,6 +19,20 @@ pub enum HistoryOperationError {
     /// An underlying transcript-store error: entry not found or not at a turn
     /// boundary.
     Store(TranscriptStoreError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionCheckpoint {
+    pub summary: String,
+    pub provider_replay: Vec<ProviderReplayItem>,
+    pub continuation_suffix: Vec<crate::transcript_store::TranscriptStorageNode>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledCompaction {
+    pub new_root_id: String,
+    pub active_leaf_id: String,
+    pub entries: Vec<crate::transcript_store::TranscriptStorageNode>,
 }
 
 /// Session shell around the pure core loop.
@@ -118,6 +132,21 @@ impl AgentSession {
     ) -> Result<Self, HistoryOperationError> {
         Self::close_transcript_store_open_turn(&mut transcript_store, OpenTurnClosure::Crashed)?;
 
+        let model_context = transcript_store.model_context();
+        let last_turn_id = model_context.last_turn_id();
+        let mut session = Self::new();
+        session.core = AgentCoreLoop::resume_at(last_turn_id, ActionId::first());
+        session.transcript_store = transcript_store;
+        Ok(session)
+    }
+
+    pub fn from_stored_session_preserving_open_turn(
+        stored: StoredSession,
+    ) -> Result<Self, HistoryOperationError> {
+        let entries = stored.entries.into_iter().map(Into::into).collect();
+        let transcript_store =
+            TranscriptStore::from_storage_entries(entries, stored.active_leaf_id)
+                .map_err(HistoryOperationError::Store)?;
         let model_context = transcript_store.model_context();
         let last_turn_id = model_context.last_turn_id();
         let mut session = Self::new();
@@ -328,6 +357,75 @@ impl AgentSession {
             return Ok(AgentSession::from_model_context(model_context));
         }
         AgentSession::from_transcript_store(transcript_store)
+    }
+
+    pub fn install_compaction_checkpoint(
+        &mut self,
+        source_session_id: impl Into<String>,
+        source_leaf_id: impl Into<String>,
+        tokens_before: Option<usize>,
+        last_turn_id: TurnId,
+        checkpoint: CompactionCheckpoint,
+    ) -> InstalledCompaction {
+        let root_item = TranscriptItem::CompactionSummary(CompactionSummary::new(
+            source_session_id,
+            source_leaf_id,
+            checkpoint.summary,
+            tokens_before,
+            last_turn_id,
+        ));
+        let new_root_id = self
+            .transcript_store
+            .append_root_item(root_item, checkpoint.provider_replay);
+        let mut entry_ids = vec![new_root_id.clone()];
+        let mut suffix_parent = Some(new_root_id.clone());
+        for mut suffix in checkpoint.continuation_suffix {
+            suffix.parent_id = suffix_parent.clone();
+            let suffix_id = suffix.id.clone();
+            entry_ids.push(self.transcript_store.append_storage_node(suffix));
+            suffix_parent = Some(suffix_id);
+        }
+        self.context_tokens = None;
+        self.pending_model_context_tokens = PendingModelContextTokens::Empty;
+        let active_leaf_id = self
+            .transcript_store
+            .active_leaf_id()
+            .map(str::to_string)
+            .unwrap_or_else(|| new_root_id.clone());
+        let entries = entry_ids
+            .iter()
+            .filter_map(|id| self.transcript_store.get_entry(id).cloned())
+            .collect();
+        InstalledCompaction {
+            new_root_id,
+            active_leaf_id,
+            entries,
+        }
+    }
+
+    pub fn restore_compacted_runtime(
+        &mut self,
+        active_leaf_id: &str,
+        turn_id: TurnId,
+        action_id: ActionId,
+    ) -> Result<(), HistoryOperationError> {
+        self.transcript_store
+            .set_active_leaf_to_entry(active_leaf_id)
+            .map_err(HistoryOperationError::Store)?;
+        self.core = AgentCoreLoop::resume_running_model(turn_id, action_id);
+        self.outstanding_actions.clear();
+        self.action_outbox.clear();
+        let action = SessionAction::RequestModel {
+            action_id,
+            turn_id,
+            model_context: self.model_context(),
+            context_leaf_id: Some(active_leaf_id.to_string()),
+            context_tokens: None,
+        };
+        self.outstanding_actions.track_session_action(&action);
+        self.context_tokens = None;
+        self.pending_model_context_tokens = PendingModelContextTokens::Empty;
+        Ok(())
     }
 
     /// Resume a terminal crashed/interrupted model turn from its original

@@ -1,4 +1,4 @@
-const UNFINISHED_ACTION_STATUSES: &str = "'pending','running'";
+const UNFINISHED_ACTION_STATUSES: &str = "'pending','blocked','running'";
 const ACTIVE_QUEUED_INPUT_STATUSES: &str = "'queued','consuming'";
 
 pub(super) const QUEUED_INPUT_DISPATCH_ORDER: &str = r#"

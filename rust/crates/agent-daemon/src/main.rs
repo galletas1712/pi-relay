@@ -3,6 +3,7 @@
 mod auth;
 mod codec;
 mod config;
+mod model_metadata;
 mod provider_runtime;
 mod rpc_views;
 mod runtime;
@@ -338,7 +339,7 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
         .await
         .insert(session_id.clone(), Arc::new(Mutex::new(runtime)));
     publish_events(state, frames);
-    driver.dispatch(dispatches);
+    driver.dispatch(dispatches).await?;
 
     Ok(json!({
         "session_id": session_id,
@@ -840,7 +841,7 @@ async fn input_user(
 
     match outcome {
         InputOutcome::Accepted(dispatches) => {
-            driver.dispatch(dispatches);
+            driver.dispatch(dispatches).await?;
             Ok(json!({ "accepted": true, "queued": false }))
         }
         InputOutcome::Queued {
@@ -917,7 +918,7 @@ async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result
     let dispatches = driver
         .apply_agent_input(active, AgentInput::Interrupt, None, None, Vec::new())
         .await?;
-    driver.dispatch(dispatches);
+    driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
     Ok(json!({ "interrupted": true, "aborted_task_kinds": aborted_tasks }))
 }
@@ -1165,7 +1166,7 @@ async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Val
             action.context_tokens,
         )
         .await?;
-    driver.dispatch(dispatches);
+    driver.dispatch(dispatches).await?;
     Ok(json!({
         "session_id": session_id,
         "turn_id": turn_id.0,
@@ -1243,7 +1244,7 @@ async fn harness_model_complete(
             Vec::new(),
         )
         .await?;
-    driver.dispatch(dispatches);
+    driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
     Ok(json!({ "completed": true }))
 }
@@ -1286,7 +1287,7 @@ async fn harness_model_fail(
             Vec::new(),
         )
         .await?;
-    driver.dispatch(dispatches);
+    driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
     Ok(json!({ "failed": true }))
 }

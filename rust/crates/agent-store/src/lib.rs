@@ -101,6 +101,8 @@ text_enum! {
     }
 
     pub enum ActionStatus {
+        Pending => "pending",
+        Blocked => "blocked",
         Running => "running",
         Completed => "completed",
         Error => "error",
@@ -187,6 +189,13 @@ pub struct PersistedAction {
     pub action: SessionAction,
 }
 
+#[derive(Debug, Clone)]
+pub struct PendingDispatchAction {
+    pub row_id: String,
+    pub attempt_id: String,
+    pub action: SessionAction,
+}
+
 pub struct EnqueueUserInputResult {
     pub input_id: String,
     pub event: Option<EventFrame>,
@@ -229,10 +238,44 @@ pub struct CompactionJob {
     pub source_session_id: String,
     pub source_leaf_id: String,
     pub model_context: ModelContext,
+    pub compaction_context: ModelContext,
     pub tokens_before: Option<usize>,
     pub last_turn_id: TurnId,
     pub trigger: CompactionTrigger,
     pub reason: Option<String>,
+    pub scope: CompactionScope,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case")]
+pub enum CompactionScope {
+    Boundary {
+        source_leaf_id: String,
+    },
+    MidTurn {
+        source_leaf_id: String,
+        turn_id: TurnId,
+        blocked_model_action_id: ActionId,
+        blocked_model_action_row_id: String,
+        blocked_model_attempt_id: String,
+    },
+}
+
+impl CompactionScope {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Boundary { .. } => "boundary",
+            Self::MidTurn { .. } => "mid_turn",
+        }
+    }
+
+    pub fn source_leaf_id(&self) -> &str {
+        match self {
+            Self::Boundary { source_leaf_id } | Self::MidTurn { source_leaf_id, .. } => {
+                source_leaf_id
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -266,6 +309,7 @@ pub struct CompactionCompletion {
     pub remote: bool,
     pub provider: ProviderKind,
     pub usage: Option<Value>,
+    pub continuation_suffix: Vec<TranscriptStorageNode>,
 }
 
 pub struct CreateCompactionResult {
@@ -275,6 +319,8 @@ pub struct CreateCompactionResult {
 
 pub struct CompleteCompactionResult {
     pub new_root_id: Option<String>,
+    pub active_leaf_id: Option<String>,
+    pub resumed_model_action: Option<PersistedAction>,
     pub events: Vec<EventFrame>,
 }
 

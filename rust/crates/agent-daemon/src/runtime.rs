@@ -7,8 +7,8 @@ use agent_session::{
 };
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionCompletion, CompactionJob,
-    CompactionTrigger, EventFrame, EventType, InputPriority, OutputBatch, PersistedAction,
-    QueueMutationError, QueuedInput, SessionActivity, SessionConfig,
+    CompactionScope, CompactionTrigger, EventFrame, EventType, InputPriority, OutputBatch,
+    PersistedAction, QueueMutationError, QueuedInput, SessionActivity, SessionConfig,
 };
 use agent_tools::dynamic_tool_context;
 use agent_vocab::{
@@ -22,7 +22,8 @@ use tokio::task::JoinHandle;
 use crate::codec::transcript_store_from_stored;
 use crate::provider_runtime::{
     auto_limit_tokens, compaction_auto_state, compaction_config, count_model_input_tokens,
-    run_compaction, run_model,
+    provider_error_is_context_overflow, provider_supports_token_counting, run_compaction,
+    run_model,
 };
 use crate::state::{AppState, RunningTask};
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
@@ -256,8 +257,13 @@ impl SessionDriver {
             if let Some(dispatched) = self.consume_ready_steer(active.clone()).await? {
                 let has_dispatched_work = !dispatched.is_empty();
                 dispatched_all.extend(dispatched.clone());
-                self.dispatch(dispatched);
+                self.dispatch(dispatched).await?;
                 if has_dispatched_work {
+                    break;
+                }
+                let pending_dispatched = self.dispatch_ready_actions().await?;
+                if !pending_dispatched.is_empty() {
+                    dispatched_all.extend(pending_dispatched);
                     break;
                 }
                 continue;
@@ -267,8 +273,13 @@ impl SessionDriver {
                 .await?;
             let has_dispatched_work = !dispatched.is_empty();
             dispatched_all.extend(dispatched.clone());
-            self.dispatch(dispatched);
+            self.dispatch(dispatched).await?;
             if has_dispatched_work {
+                break;
+            }
+            let pending_dispatched = self.dispatch_ready_actions().await?;
+            if !pending_dispatched.is_empty() {
+                dispatched_all.extend(pending_dispatched);
                 break;
             }
 
@@ -279,10 +290,6 @@ impl SessionDriver {
                 .await
                 .map_err(anyhow::Error::from)?
             {
-                break;
-            }
-
-            if self.maybe_start_auto_compaction(active.clone()).await? {
                 break;
             }
 
@@ -314,8 +321,13 @@ impl SessionDriver {
                         .await?;
                     let has_dispatched_work = !dispatched.is_empty();
                     dispatched_all.extend(dispatched.clone());
-                    self.dispatch(dispatched);
+                    self.dispatch(dispatched).await?;
                     if has_dispatched_work {
+                        break;
+                    }
+                    let pending_dispatched = self.dispatch_ready_actions().await?;
+                    if !pending_dispatched.is_empty() {
+                        dispatched_all.extend(pending_dispatched);
                         break;
                     }
                 }
@@ -334,107 +346,6 @@ impl SessionDriver {
             break;
         }
         Ok(dispatched_all)
-    }
-
-    async fn maybe_start_auto_compaction(
-        &self,
-        active: Arc<Mutex<RuntimeSession>>,
-    ) -> std::result::Result<bool, RpcError> {
-        let (config, model_context, live_context_tokens, is_boundary, active_leaf_id) = {
-            let runtime = active.lock().await;
-            (
-                runtime.config.clone(),
-                runtime.session.model_context(),
-                runtime.session.context_tokens(),
-                runtime.session.transcript_store().is_turn_boundary(),
-                runtime
-                    .session
-                    .transcript_store()
-                    .active_leaf_id()
-                    .map(str::to_string),
-            )
-        };
-        if !is_boundary {
-            return Ok(false);
-        }
-        let Some(active_leaf_id) = active_leaf_id else {
-            return Ok(false);
-        };
-        if matches!(
-            model_context.transcript_items().last(),
-            Some(TranscriptItem::CompactionSummary(_))
-        ) {
-            return Ok(false);
-        }
-
-        let compaction_config = compaction_config(&config);
-        if !compaction_config.auto_enabled {
-            return Ok(false);
-        }
-        let auto_state = compaction_auto_state(&config);
-        if auto_state.suppressed
-            || auto_state.last_failure_leaf_id.as_deref() == Some(active_leaf_id.as_str())
-        {
-            return Ok(false);
-        }
-        let Some(limit) = auto_limit_tokens(&compaction_config) else {
-            return Ok(false);
-        };
-
-        let next_input = self
-            .state
-            .repo
-            .peek_next_queued_input(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-        let projected = if let Some(next_input) = next_input.as_ref() {
-            let projected_context =
-                projected_context_with_input(model_context.clone(), next_input.content.clone());
-            count_model_input_tokens(&self.state, &config, &self.session_id, projected_context)
-                .await
-                .map_err(anyhow::Error::from)?
-        } else if let Some(tokens) = live_context_tokens {
-            tokens
-        } else if let Some(snapshot) = self
-            .state
-            .repo
-            .latest_context_usage_for_active_path(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?
-            .filter(|snapshot| snapshot.context_leaf_id.as_deref() == Some(&active_leaf_id))
-        {
-            snapshot.input_tokens
-        } else {
-            count_model_input_tokens(
-                &self.state,
-                &config,
-                &self.session_id,
-                model_context.clone(),
-            )
-            .await
-            .map_err(anyhow::Error::from)?
-        };
-        if projected < limit {
-            return Ok(false);
-        }
-
-        let reason =
-            format!("threshold: projected_context_tokens {projected} >= auto_limit_tokens {limit}");
-        let created = self
-            .state
-            .repo
-            .create_compaction_action(
-                &self.session_id,
-                CompactionTrigger::Auto {
-                    reason: reason.clone(),
-                },
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        publish_events(&self.state, created.events);
-        self.state.active.lock().await.remove(&self.session_id);
-        spawn_compaction(&self.state, self.session_id.clone(), created.job, config);
-        Ok(true)
     }
 
     async fn consume_ready_steer(
@@ -604,8 +515,162 @@ impl SessionDriver {
         Ok(attach_dispatch_config(persisted_actions, &config))
     }
 
-    pub(crate) fn dispatch(&self, dispatches: Vec<DispatchAction>) {
-        dispatch_all(&self.state, &self.session_id, dispatches);
+    pub(crate) async fn dispatch(
+        &self,
+        dispatches: Vec<DispatchAction>,
+    ) -> std::result::Result<(), RpcError> {
+        self.dispatch_pending_or_direct(dispatches).await
+    }
+
+    pub(crate) async fn dispatch_ready_actions(
+        &self,
+    ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
+        let pending = self
+            .state
+            .repo
+            .pending_actions_for_dispatch(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let config = self
+            .state
+            .repo
+            .load_session_config(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let resolved = pending
+            .into_iter()
+            .map(|action| DispatchAction {
+                row_id: action.row_id,
+                attempt_id: action.attempt_id,
+                action: action.action,
+                config: config.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.dispatch_pending_or_direct(resolved.clone()).await?;
+        Ok(resolved)
+    }
+
+    async fn dispatch_pending_or_direct(
+        &self,
+        dispatches: Vec<DispatchAction>,
+    ) -> std::result::Result<(), RpcError> {
+        let mut ready = Vec::new();
+        for dispatch in dispatches {
+            match &dispatch.action {
+                SessionAction::RequestModel { .. } => {
+                    if self.gate_model_dispatch(&dispatch).await? {
+                        ready.push(dispatch);
+                    }
+                }
+                SessionAction::RequestTool { .. } => ready.push(dispatch),
+                SessionAction::CancelSessionWork => {}
+            }
+        }
+        dispatch_all(&self.state, &self.session_id, ready);
+        Ok(())
+    }
+
+    async fn gate_model_dispatch(
+        &self,
+        dispatch: &DispatchAction,
+    ) -> std::result::Result<bool, RpcError> {
+        let SessionAction::RequestModel {
+            model_context,
+            context_leaf_id,
+            context_tokens,
+            ..
+        } = &dispatch.action
+        else {
+            return Ok(true);
+        };
+        if session_uses_harness(&dispatch.config) {
+            return Ok(true);
+        }
+
+        let compaction_config = compaction_config(&dispatch.config);
+        if !compaction_config.auto_enabled {
+            return Ok(true);
+        }
+        let Some(limit) = auto_limit_tokens(&compaction_config) else {
+            return Ok(true);
+        };
+        let Some(source_leaf_id) = context_leaf_id.clone() else {
+            return Ok(true);
+        };
+        let auto_state = compaction_auto_state(&dispatch.config);
+        if auto_state.suppressed
+            || auto_state.last_failure_leaf_id.as_deref() == Some(source_leaf_id.as_str())
+        {
+            return Ok(true);
+        }
+        if matches!(
+            model_context.transcript_items().last(),
+            Some(TranscriptItem::CompactionSummary(_))
+        ) {
+            return Ok(true);
+        }
+
+        let tokens = match context_tokens {
+            Some(tokens) => *tokens,
+            None if !provider_supports_token_counting(&dispatch.config) => {
+                // Codex backend has no token-counting endpoint; the next
+                // turn's `usage.input_tokens` from `response.completed` will
+                // populate `context_tokens` and gate compaction then.
+                return Ok(true);
+            }
+            None => {
+                match count_model_input_tokens(
+                    &self.state,
+                    &dispatch.config,
+                    &self.session_id,
+                    model_context.clone(),
+                )
+                .await
+                {
+                    Ok(tokens) => tokens,
+                    Err(error) => {
+                        let provider_error = error.downcast_ref::<agent_provider::ProviderError>();
+                        if provider_error.is_some_and(provider_error_is_context_overflow) {
+                            limit
+                        } else {
+                            return Err(anyhow::Error::from(error).into());
+                        }
+                    }
+                }
+            }
+        };
+        if tokens < limit {
+            return Ok(true);
+        }
+
+        let reason =
+            format!("threshold: model_context_tokens {tokens} >= auto_limit_tokens {limit}");
+        let created = self
+            .state
+            .repo
+            .block_model_action_for_compaction(
+                &self.session_id,
+                &dispatch.row_id,
+                &dispatch.attempt_id,
+                CompactionTrigger::Auto {
+                    reason: reason.clone(),
+                },
+                Some(tokens),
+                Some(limit),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        publish_events(&self.state, created.events);
+        if matches!(created.job.scope, CompactionScope::Boundary { .. }) {
+            self.state.active.lock().await.remove(&self.session_id);
+        }
+        spawn_compaction(
+            &self.state,
+            self.session_id.clone(),
+            created.job,
+            dispatch.config.clone(),
+        );
+        Ok(false)
     }
 }
 
@@ -617,25 +682,6 @@ pub(crate) fn agent_input_from_queued_priority(
         InputPriority::Steer => AgentInput::steer_message(content),
         InputPriority::FollowUp => AgentInput::follow_up_message(content),
     }
-}
-
-fn projected_context_with_input(
-    model_context: agent_session::ModelContext,
-    input: UserMessage,
-) -> agent_session::ModelContext {
-    let next_turn_id = model_context.last_turn_id().next();
-    let mut entries = model_context.into_entries();
-    entries.push(agent_session::ModelContextEntry {
-        item: TranscriptItem::TurnStarted {
-            turn_id: next_turn_id,
-        },
-        provider_replay: Vec::new(),
-    });
-    entries.push(agent_session::ModelContextEntry {
-        item: TranscriptItem::UserMessage(input),
-        provider_replay: Vec::new(),
-    });
-    agent_session::ModelContext::from_entries(entries)
 }
 
 pub(crate) fn collect_runtime_outputs(
@@ -817,9 +863,10 @@ async fn run_compaction_job(
     job: CompactionJob,
     config: SessionConfig,
 ) -> std::result::Result<(), RpcError> {
-    let result = run_compaction(&state, &config, &session_id, job.model_context.clone()).await;
-    let events = match result {
+    let result = run_compaction(&state, &config, &session_id, job.compaction_context.clone()).await;
+    let (events, resumed) = match result {
         Ok(output) => {
+            let continuation_suffix = continuation_suffix_for_scope(&job)?;
             let completion = CompactionCompletion {
                 summary: output.summary,
                 summary_kind: output.summary_kind.as_str().to_string(),
@@ -827,6 +874,7 @@ async fn run_compaction_job(
                 remote: output.remote,
                 provider: output.provider,
                 usage: output.usage,
+                continuation_suffix,
             };
             let result = state
                 .repo
@@ -843,8 +891,19 @@ async fn run_compaction_job(
                     )
                     .await
                     .map_err(anyhow::Error::from)?;
+                if matches!(job.scope, CompactionScope::MidTurn { .. }) {
+                    install_runtime_compaction_checkpoint(
+                        &state,
+                        &session_id,
+                        &job,
+                        String::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .await?;
+                }
             }
-            result.events
+            (result.events, result.resumed_model_action)
         }
         Err(error) => {
             let error = error.to_string();
@@ -860,32 +919,207 @@ async fn run_compaction_job(
                     .await
                     .map_err(anyhow::Error::from)?;
             }
-            state
-                .repo
-                .fail_compaction_action(&job, error)
-                .await
-                .map_err(anyhow::Error::from)?
+            fail_blocked_model_for_compaction_error(&state, &session_id, &job, &error).await?;
+            (
+                state
+                    .repo
+                    .fail_compaction_action(&job, error)
+                    .await
+                    .map_err(anyhow::Error::from)?,
+                None,
+            )
         }
     };
     publish_events(&state, events);
 
     let driver = SessionDriver::acquire(&state, &session_id).await;
+    if let Some(resumed) = resumed {
+        let dispatch = DispatchAction {
+            row_id: resumed.row_id,
+            attempt_id: resumed.attempt_id,
+            action: resumed.action,
+            config: config.clone(),
+        };
+        if state
+            .repo
+            .claim_pending_model_action(&session_id, &dispatch.row_id, &dispatch.attempt_id)
+            .await
+            .map_err(anyhow::Error::from)?
+        {
+            spawn_model_dispatch(state.clone(), session_id.clone(), dispatch, true);
+        }
+    }
     driver.drive_until_blocked().await?;
     Ok(())
 }
 
+fn continuation_suffix_for_scope(
+    job: &CompactionJob,
+) -> std::result::Result<Vec<TranscriptStorageNode>, RpcError> {
+    match &job.scope {
+        CompactionScope::Boundary { .. } => Ok(Vec::new()),
+        CompactionScope::MidTurn { .. } => {
+            let mut parent_id: Option<String> = None;
+            Ok(job
+                .model_context
+                .split_before_open_turn()
+                .map(|(_, suffix)| suffix)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| {
+                    let node = TranscriptStorageNode {
+                        id: format!("entry_{}", uuid::Uuid::new_v4()),
+                        parent_id: parent_id.clone(),
+                        timestamp_ms: crate::codec::now_ms(),
+                        item: entry.item,
+                        provider_replay: entry.provider_replay,
+                    };
+                    parent_id = Some(node.id.clone());
+                    node
+                })
+                .collect())
+        }
+    }
+}
+
+async fn install_runtime_compaction_checkpoint(
+    state: &AppState,
+    session_id: &str,
+    job: &CompactionJob,
+    _summary: String,
+    _provider_replay: Vec<ProviderReplayItem>,
+    _suffix_nodes: Vec<TranscriptStorageNode>,
+) -> std::result::Result<(), RpcError> {
+    let Some(active) = state.active.lock().await.get(session_id).cloned() else {
+        return Ok(());
+    };
+    let stored = state
+        .repo
+        .load_stored_session(session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let session = AgentSession::from_stored_session_preserving_open_turn(stored)
+        .map_err(history_error_to_rpc)?;
+    let mut runtime = active.lock().await;
+    runtime.session = session;
+    if let CompactionScope::MidTurn {
+        turn_id,
+        blocked_model_action_id,
+        ..
+    } = &job.scope
+    {
+        let action_id = *blocked_model_action_id;
+        let active_leaf_id = runtime
+            .session
+            .transcript_store()
+            .active_leaf_id()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                RpcError::new("invalid_compaction", "compaction produced no active leaf")
+            })?;
+        runtime
+            .session
+            .restore_compacted_runtime(&active_leaf_id, *turn_id, action_id)
+            .map_err(history_error_to_rpc)?;
+    }
+    Ok(())
+}
+
+async fn fail_blocked_model_for_compaction_error(
+    state: &AppState,
+    session_id: &str,
+    job: &CompactionJob,
+    error: &str,
+) -> std::result::Result<(), RpcError> {
+    let CompactionScope::MidTurn {
+        turn_id,
+        blocked_model_action_id,
+        blocked_model_action_row_id,
+        blocked_model_attempt_id,
+        ..
+    } = &job.scope
+    else {
+        return Ok(());
+    };
+    let model_error = format!("compaction failed before model dispatch: {error}");
+    let events = state
+        .repo
+        .fail_blocked_or_pending_model_action(
+            session_id,
+            blocked_model_action_row_id,
+            blocked_model_attempt_id,
+            &model_error,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    publish_events(state, events);
+    let Some(active) = state.active.lock().await.get(session_id).cloned() else {
+        return Ok(());
+    };
+    let action_id = *blocked_model_action_id;
+    let driver = SessionDriver::acquire(state, session_id).await;
+    let dispatches = driver
+        .apply_agent_input(
+            active,
+            AgentInput::ModelFailed {
+                action_id,
+                turn_id: *turn_id,
+                error: model_error.clone(),
+            },
+            None,
+            None,
+            Vec::new(),
+        )
+        .await?;
+    driver.dispatch(dispatches).await?;
+    Ok(())
+}
+
 fn spawn_dispatch(state: AppState, session_id: String, dispatch: DispatchAction) {
+    if matches!(&dispatch.action, SessionAction::RequestModel { .. }) {
+        spawn_model_dispatch(state, session_id, dispatch, false);
+    } else {
+        spawn_claimed_dispatch(state, session_id, dispatch);
+    }
+}
+
+fn spawn_model_dispatch(
+    state: AppState,
+    session_id: String,
+    dispatch: DispatchAction,
+    already_claimed: bool,
+) {
+    if session_uses_harness(&dispatch.config) {
+        return;
+    }
+    if !already_claimed {
+        let state = state.clone();
+        let session_id = session_id.clone();
+        tokio::spawn(async move {
+            let run = state
+                .repo
+                .claim_pending_model_action(&session_id, &dispatch.row_id, &dispatch.attempt_id)
+                .await;
+            match run {
+                Ok(true) => spawn_model_dispatch(state, session_id, dispatch, true),
+                Ok(false) => {}
+                Err(error) => eprintln!(
+                    "failed to claim model action {session_id}/{}: {error:#}",
+                    dispatch.row_id
+                ),
+            }
+        });
+        return;
+    }
+    spawn_claimed_dispatch(state, session_id, dispatch);
+}
+
+fn spawn_claimed_dispatch(state: AppState, session_id: String, dispatch: DispatchAction) {
     let event_type = match &dispatch.action {
         SessionAction::RequestModel { .. } => EventType::ModelError,
         SessionAction::RequestTool { .. } => EventType::ToolError,
         SessionAction::CancelSessionWork => return,
     };
-    if matches!(&dispatch.action, SessionAction::RequestModel { .. })
-        && session_uses_harness(&dispatch.config)
-    {
-        return;
-    }
-
     prune_finished_tasks(&state);
     let action_row_id = dispatch.row_id.clone();
     let action_kind = match &dispatch.action {
@@ -965,14 +1199,26 @@ async fn run_model_turn(
     session_id: String,
     dispatch: DispatchAction,
 ) -> std::result::Result<(), RpcError> {
+    let original_action = dispatch.action.clone();
     let SessionAction::RequestModel {
         action_id,
         turn_id,
         model_context,
-        ..
-    } = dispatch.action
+        context_leaf_id,
+        context_tokens,
+    } = original_action
     else {
         return Ok(());
+    };
+    let dispatch = DispatchAction {
+        action: SessionAction::RequestModel {
+            action_id,
+            turn_id,
+            model_context: model_context.clone(),
+            context_leaf_id,
+            context_tokens,
+        },
+        ..dispatch
     };
 
     let result = run_model(&state, &dispatch.config, &session_id, model_context).await;
@@ -1015,6 +1261,16 @@ async fn run_model_turn(
             )
         }
         Err(error) => {
+            if recover_model_context_overflow_with_compaction(
+                &state,
+                &session_id,
+                &dispatch,
+                &error,
+            )
+            .await?
+            {
+                return Ok(());
+            }
             let message = error.to_string();
             (
                 AgentInput::ModelFailed {
@@ -1043,9 +1299,67 @@ async fn run_model_turn(
             provider_replay,
         )
         .await?;
-    driver.dispatch(dispatches);
+    driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
     Ok(())
+}
+
+async fn recover_model_context_overflow_with_compaction(
+    state: &AppState,
+    session_id: &str,
+    dispatch: &DispatchAction,
+    error: &anyhow::Error,
+) -> std::result::Result<bool, RpcError> {
+    let Some(provider_error) = error.downcast_ref::<agent_provider::ProviderError>() else {
+        return Ok(false);
+    };
+    if !provider_error_is_context_overflow(provider_error) {
+        return Ok(false);
+    }
+    if session_uses_harness(&dispatch.config) {
+        return Ok(false);
+    }
+    let compaction_config = compaction_config(&dispatch.config);
+    if !compaction_config.auto_enabled {
+        return Ok(false);
+    }
+    let SessionAction::RequestModel {
+        context_leaf_id, ..
+    } = &dispatch.action
+    else {
+        return Ok(false);
+    };
+    let Some(source_leaf_id) = context_leaf_id.as_deref() else {
+        return Ok(false);
+    };
+    let auto_state = compaction_auto_state(&dispatch.config);
+    if auto_state.suppressed || auto_state.last_failure_leaf_id.as_deref() == Some(source_leaf_id) {
+        return Ok(false);
+    }
+
+    let reason = format!("provider context overflow before model completion: {provider_error}");
+    let created = state
+        .repo
+        .block_running_model_action_for_compaction(
+            session_id,
+            &dispatch.row_id,
+            &dispatch.attempt_id,
+            CompactionTrigger::Auto {
+                reason: reason.clone(),
+            },
+            None,
+            auto_limit_tokens(&compaction_config),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    publish_events(state, created.events);
+    spawn_compaction(
+        state,
+        session_id.to_string(),
+        created.job,
+        dispatch.config.clone(),
+    );
+    Ok(true)
 }
 
 async fn run_tool_turn(
@@ -1166,7 +1480,7 @@ async fn run_tool_turn(
             Vec::new(),
         )
         .await?;
-    driver.dispatch(dispatches);
+    driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
     Ok(())
 }

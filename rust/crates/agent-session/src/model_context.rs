@@ -96,6 +96,45 @@ impl ModelContext {
             .unwrap_or_default()
     }
 
+    pub fn open_turn_user_suffix(&self) -> Vec<TranscriptItem> {
+        let Some((_, turn_start)) = Self::open_turn_start(&self.items) else {
+            return Vec::new();
+        };
+        self.items[turn_start..]
+            .iter()
+            .filter_map(|item| match item {
+                TranscriptItem::TurnStarted { .. } | TranscriptItem::UserMessage(_) => {
+                    Some(item.clone())
+                }
+                TranscriptItem::AssistantMessage(_)
+                | TranscriptItem::ToolCallStarted { .. }
+                | TranscriptItem::ToolResult(_)
+                | TranscriptItem::TurnFinished { .. }
+                | TranscriptItem::CompactionSummary(_) => None,
+            })
+            .collect()
+    }
+
+    pub fn split_before_open_turn(&self) -> Option<(Self, Vec<ModelContextEntry>)> {
+        let Some((_, turn_start)) = Self::open_turn_start(&self.items) else {
+            return None;
+        };
+        let prefix = Self {
+            items: self.items[..turn_start].to_vec(),
+            provider_replay: self.provider_replay[..turn_start].to_vec(),
+        };
+        let suffix = self.items[turn_start..]
+            .iter()
+            .cloned()
+            .zip(self.provider_replay[turn_start..].iter().cloned())
+            .map(|(item, provider_replay)| ModelContextEntry {
+                item,
+                provider_replay,
+            })
+            .collect();
+        Some((prefix, suffix))
+    }
+
     fn close_open_turn_items(items: &mut Vec<TranscriptItem>, closure: OpenTurnClosure) {
         let Some((turn_id, turn_start)) = Self::open_turn_start(items) else {
             return;
@@ -243,6 +282,77 @@ mod tests {
             )]);
         assert!(transcript.is_turn_boundary());
         assert_eq!(transcript.last_turn_id(), TurnId(3));
+    }
+
+    #[test]
+    fn split_before_open_turn_preserves_whole_open_turn_suffix() {
+        let replay = ProviderReplayItem {
+            provider: agent_vocab::ProviderKind::OpenAi,
+            raw_json: r#"{"type":"message","role":"assistant","content":[{"type":"output_text","text":"tool please"}]}"#
+                .to_string(),
+            display: None,
+        };
+        let tool = tool_call(1, "bash");
+        let context = ModelContext::from_entries(vec![
+            ModelContextEntry {
+                item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                provider_replay: Vec::new(),
+            },
+            ModelContextEntry {
+                item: TranscriptItem::UserMessage(UserMessage::text("old")),
+                provider_replay: Vec::new(),
+            },
+            ModelContextEntry {
+                item: TranscriptItem::TurnFinished {
+                    turn_id: TurnId(1),
+                    outcome: TurnOutcome::Graceful,
+                },
+                provider_replay: Vec::new(),
+            },
+            ModelContextEntry {
+                item: TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+                provider_replay: Vec::new(),
+            },
+            ModelContextEntry {
+                item: TranscriptItem::UserMessage(UserMessage::text("current")),
+                provider_replay: Vec::new(),
+            },
+            ModelContextEntry {
+                item: TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::ToolCall(tool.clone())],
+                }),
+                provider_replay: vec![replay.clone()],
+            },
+            ModelContextEntry {
+                item: TranscriptItem::ToolCallStarted {
+                    turn_id: TurnId(2),
+                    tool_call: tool,
+                },
+                provider_replay: Vec::new(),
+            },
+        ]);
+
+        let (prefix, suffix) = context
+            .split_before_open_turn()
+            .expect("open turn should split");
+
+        assert_eq!(prefix.last_turn_id(), TurnId(1));
+        assert_eq!(prefix.transcript_items().len(), 3);
+        assert_eq!(suffix.len(), 4);
+        assert!(matches!(
+            suffix[0].item,
+            TranscriptItem::TurnStarted { turn_id: TurnId(2) }
+        ));
+        assert!(matches!(suffix[1].item, TranscriptItem::UserMessage(_)));
+        assert!(matches!(
+            suffix[2].item,
+            TranscriptItem::AssistantMessage(_)
+        ));
+        assert_eq!(suffix[2].provider_replay, vec![replay]);
+        assert!(matches!(
+            suffix[3].item,
+            TranscriptItem::ToolCallStarted { .. }
+        ));
     }
 
     #[test]

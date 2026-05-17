@@ -105,6 +105,10 @@ impl ModelProvider for AnthropicProvider {
         parse_anthropic_message(&response)
     }
 
+    fn supports_token_counting(&self) -> bool {
+        true
+    }
+
     async fn count_tokens(
         &self,
         request: ProviderTokenCountRequest,
@@ -140,31 +144,72 @@ impl ModelProvider for AnthropicProvider {
 }
 
 fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
-    let effort = anthropic_reasoning_effort(request.reasoning_effort)?;
-    let max_tokens = request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
-    let mut messages = transcript_to_messages(&request.transcript)?;
-    add_transcript_cache_breakpoints(&mut messages);
+    anthropic_request_body(AnthropicRequestBodyInput {
+        model: request.model,
+        prompt: request.prompt,
+        transcript: request.transcript,
+        tool_profile: request.tool_profile,
+        tools: request.tools,
+        max_tokens: Some(request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
+        reasoning_effort: Some(request.reasoning_effort),
+        cache_transcript: true,
+    })
+}
+
+fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value> {
+    // Keep this as close as possible to `messages_body`: Anthropic's token
+    // count endpoint accepts the same input-shaping fields (system, tools,
+    // thinking/output config) but does not need a generation budget.
+    anthropic_request_body(AnthropicRequestBodyInput {
+        model: request.model,
+        prompt: request.prompt,
+        transcript: request.transcript,
+        tool_profile: request.tool_profile,
+        tools: request.tools,
+        max_tokens: request.max_tokens,
+        reasoning_effort: Some(request.reasoning_effort),
+        cache_transcript: false,
+    })
+}
+
+struct AnthropicRequestBodyInput {
+    model: String,
+    prompt: crate::PromptSections,
+    transcript: Vec<ModelTranscriptEntry>,
+    tool_profile: ProviderToolProfile,
+    tools: Vec<ToolDefinition>,
+    max_tokens: Option<u32>,
+    reasoning_effort: Option<ReasoningEffort>,
+    cache_transcript: bool,
+}
+
+fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Value> {
+    let mut messages = transcript_to_messages(&input.transcript)?;
+    if input.cache_transcript {
+        add_transcript_cache_breakpoints(&mut messages);
+    }
     let mut body = json!({
-        "model": request.model,
-        "max_tokens": max_tokens,
+        "model": input.model,
         "messages": messages,
+    });
+    if let Some(max_tokens) = input.max_tokens {
+        body["max_tokens"] = json!(max_tokens);
+    }
+    if let Some(reasoning_effort) = input.reasoning_effort {
+        let effort = anthropic_reasoning_effort(reasoning_effort)?;
         // Adaptive thinking is intentionally hard-coded and must not become a
         // per-request toggle: Anthropic invalidates the message-content cache
         // whenever the `thinking` parameter changes (enabling/disabling or
         // budget changes). Reasoning effort lives in `output_config` instead,
         // which is documented not to affect the messages-level cache.
         // See: https://docs.claude.com/en/docs/build-with-claude/prompt-caching
-        "thinking": {
-            "type": "adaptive",
-        },
-        "output_config": {
-            "effort": effort,
-        },
-    });
-    if let Some(system_blocks) = anthropic_system_blocks(&request.prompt, &request.transcript) {
+        body["thinking"] = json!({ "type": "adaptive" });
+        body["output_config"] = json!({ "effort": effort });
+    }
+    if let Some(system_blocks) = anthropic_system_blocks(&input.prompt, &input.transcript) {
         body["system"] = Value::Array(system_blocks);
     }
-    let tools = anthropic_tools(request.tool_profile, &request.tools)?;
+    let tools = anthropic_tools(input.tool_profile, &input.tools)?;
     if !tools.is_empty() {
         // Intentionally no tool-level `cache_control` breakpoint. Anthropic
         // hashes the cumulative prefix in `tools -> system -> messages` order,
@@ -172,23 +217,6 @@ fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
         // tools array via the cumulative hash. Spending one of the 4 allowed
         // breakpoints on the last tool would buy zero additional caching and
         // costs us a slot we use for the deep-history transcript marker.
-        body["tools"] = Value::Array(tools);
-        body["tool_choice"] = json!({ "type": "auto" });
-    }
-    Ok(body)
-}
-
-fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value> {
-    let messages = transcript_to_messages(&request.transcript)?;
-    let mut body = json!({
-        "model": request.model,
-        "messages": messages,
-    });
-    if let Some(system_blocks) = anthropic_system_blocks(&request.prompt, &request.transcript) {
-        body["system"] = Value::Array(system_blocks);
-    }
-    let tools = anthropic_tools(request.tool_profile, &request.tools)?;
-    if !tools.is_empty() {
         body["tools"] = Value::Array(tools);
         body["tool_choice"] = json!({ "type": "auto" });
     }
@@ -802,6 +830,42 @@ mod tests {
                 "type": "ephemeral",
             })
         );
+    }
+
+    #[test]
+    fn count_tokens_body_matches_message_input_shape_without_generation_budget_by_default() {
+        let request = ProviderTokenCountRequest {
+            model: "claude-opus-4-7".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::CustomDefinitions,
+            tools: vec![ToolDefinition {
+                name: "read".to_string(),
+                description: "read a file".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+            }],
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+            session_id: None,
+        };
+        let body = count_tokens_body(request).expect("count body renders");
+
+        assert_eq!(body["model"], "claude-opus-4-7");
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["system"][1]["text"], "stable rules");
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "medium");
+        assert_eq!(body["tool_choice"]["type"], "auto");
+        assert_eq!(body["tools"][0]["name"], "read");
+        assert!(body.get("max_tokens").is_none());
+        assert!(body["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]

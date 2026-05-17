@@ -195,6 +195,21 @@ impl TranscriptStore {
         )
     }
 
+    pub fn append_root_item(
+        &mut self,
+        item: TranscriptItem,
+        provider_replay: Vec<ProviderReplayItem>,
+    ) -> String {
+        let entry = TranscriptStorageNode {
+            id: Uuid::new_v4().to_string(),
+            parent_id: None,
+            timestamp_ms: now_ms(),
+            item,
+            provider_replay,
+        };
+        self.append_entry(entry)
+    }
+
     pub(crate) fn append_transcript_item(&mut self, item: TranscriptItem) -> String {
         let entry = TranscriptStorageNode {
             id: Uuid::new_v4().to_string(),
@@ -203,6 +218,10 @@ impl TranscriptStore {
             item,
             provider_replay: Vec::new(),
         };
+        self.append_entry(entry)
+    }
+
+    pub fn append_storage_node(&mut self, entry: TranscriptStorageNode) -> String {
         self.append_entry(entry)
     }
 

@@ -827,7 +827,17 @@ export function App() {
 				sessionId,
 				projectId,
 				provider: newSessionProvider,
-				metadata: { title, created_by: "web" },
+				metadata: {
+					title,
+					created_by: "web",
+					compaction: {
+						config: {
+							auto_enabled: true,
+							remote_mode: "auto",
+							max_consecutive_failures: 3,
+						},
+					},
+				},
 				clientInputId: randomId("web_start"),
 				priority: "follow_up",
 				content: textContent(text),
@@ -1499,7 +1509,8 @@ function compactionCompletedNotice(data: Record<string, unknown>): string {
 
 function compactionErrorNotice(data: Record<string, unknown>): string {
 	const error = typeof data.error === "string" ? data.error : "compaction failed";
-	return `compaction error: ${truncate(error, 420)}`;
+	const label = data.trigger === "auto" ? "auto-compaction error" : "compaction error";
+	return `${label}: ${truncate(error, 420)}`;
 }
 
 function activityFromEvent(event: EventFrame): SessionSummary["activity"] | null {

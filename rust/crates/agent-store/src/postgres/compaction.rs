@@ -1,15 +1,16 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_session::{StoredTranscriptEntry, TranscriptStore};
-use agent_vocab::{CompactionSummary, TranscriptItem};
+use agent_session::{ModelContext, StoredTranscriptEntry, TranscriptStore};
+use agent_vocab::{CompactionSummary, TranscriptItem, TurnId};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    ActionKind, ActionStatus, CompactionCompletion, CompactionJob, CompactionTrigger,
-    CompleteCompactionResult, CreateCompactionResult, EventFrame, EventType,
+    ActionKind, ActionStatus, CompactionCompletion, CompactionJob, CompactionScope,
+    CompactionTrigger, CompleteCompactionResult, CreateCompactionResult, EventFrame, EventType,
+    PersistedAction,
 };
 
 use super::events::{
@@ -21,6 +22,230 @@ use super::transcript::insert_stored_entry_tx;
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
+    pub async fn block_running_model_action_for_compaction(
+        &self,
+        session_id: &str,
+        model_action_row_id: &str,
+        model_attempt_id: &str,
+        trigger: CompactionTrigger,
+        tokens_before: Option<usize>,
+        auto_limit_tokens: Option<usize>,
+    ) -> Result<CreateCompactionResult> {
+        self.block_model_action_for_compaction_with_status(
+            session_id,
+            model_action_row_id,
+            model_attempt_id,
+            ActionStatus::Running,
+            trigger,
+            tokens_before,
+            auto_limit_tokens,
+        )
+        .await
+    }
+
+    pub async fn block_model_action_for_compaction(
+        &self,
+        session_id: &str,
+        model_action_row_id: &str,
+        model_attempt_id: &str,
+        trigger: CompactionTrigger,
+        tokens_before: Option<usize>,
+        auto_limit_tokens: Option<usize>,
+    ) -> Result<CreateCompactionResult> {
+        self.block_model_action_for_compaction_with_status(
+            session_id,
+            model_action_row_id,
+            model_attempt_id,
+            ActionStatus::Pending,
+            trigger,
+            tokens_before,
+            auto_limit_tokens,
+        )
+        .await
+    }
+
+    async fn block_model_action_for_compaction_with_status(
+        &self,
+        session_id: &str,
+        model_action_row_id: &str,
+        model_attempt_id: &str,
+        expected_status: ActionStatus,
+        trigger: CompactionTrigger,
+        tokens_before: Option<usize>,
+        auto_limit_tokens: Option<usize>,
+    ) -> Result<CreateCompactionResult> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            r#"
+            select action_id, turn_id, payload
+            from actions
+            where session_id=$1
+                and id=$2::text
+                and attempt_id=$3::text
+                and kind=$4::text
+                and status=$5::text
+            for update
+            "#,
+        )
+        .bind(session_id)
+        .bind(model_action_row_id)
+        .bind(model_attempt_id)
+        .bind(ActionKind::Model.as_str())
+        .bind(expected_status.as_str())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "{} model action not found: {model_action_row_id}",
+                expected_status.as_str()
+            )
+        })?;
+
+        let payload: Value = row.get("payload");
+        let model_context = model_context_from_action_payload(&payload)?;
+        if model_context.transcript_items().is_empty() {
+            return Err(anyhow!("cannot compact an empty model context"));
+        }
+        let source_leaf_id = payload
+            .get("context_leaf_id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| anyhow!("model action has no compaction source leaf"))?;
+        let action_id = agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64);
+        let turn_id = TurnId(row.get::<i64, _>("turn_id") as u64);
+        let scope = if model_context.is_turn_boundary() {
+            CompactionScope::Boundary {
+                source_leaf_id: source_leaf_id.clone(),
+            }
+        } else {
+            CompactionScope::MidTurn {
+                source_leaf_id: source_leaf_id.clone(),
+                turn_id,
+                blocked_model_action_id: action_id,
+                blocked_model_action_row_id: model_action_row_id.to_string(),
+                blocked_model_attempt_id: model_attempt_id.to_string(),
+            }
+        };
+        let last_turn_id = model_context.last_turn_id();
+        let trigger_name = trigger.as_str();
+        let reason = trigger.reason().map(str::to_string);
+        let action_row_id = format!("action_{}", Uuid::new_v4());
+        let attempt_id = Uuid::new_v4().to_string();
+        let scope_value = serde_json::to_value(&scope)?;
+        let compaction_payload = json!({
+            "source_session_id": session_id,
+            "source_leaf_id": source_leaf_id,
+            "last_turn_id": last_turn_id.0,
+            "context_tokens": tokens_before,
+            "auto_limit_tokens": auto_limit_tokens,
+            "trigger": trigger_name,
+            "reason": reason,
+            "scope": scope_value,
+            "blocked_model_action_row_id": model_action_row_id,
+            "blocked_model_attempt_id": model_attempt_id,
+        });
+
+        let block_result = json!({
+            "blocked_by_compaction": action_row_id,
+            "reason": reason,
+            "context_tokens": tokens_before,
+            "auto_limit_tokens": auto_limit_tokens,
+        });
+        let updated = sqlx::query(
+            r#"
+            update actions
+            set status=$4::text,
+                result=$5,
+                updated_at=now()
+            where session_id=$1
+                and id=$2::text
+                and attempt_id=$3::text
+                and kind='model'
+                and status=$6::text
+            "#,
+        )
+        .bind(session_id)
+        .bind(model_action_row_id)
+        .bind(model_attempt_id)
+        .bind(ActionStatus::Blocked.as_str())
+        .bind(&block_result)
+        .bind(expected_status.as_str())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(anyhow!(
+                "{} model action was not blocked: {model_action_row_id}",
+                expected_status.as_str()
+            ));
+        }
+
+        sqlx::query(
+            r#"
+            insert into actions (id, session_id, turn_id, action_id, attempt_id, kind, status, payload)
+            values ($1::text, $2::text, null, 0, $3::text, $4::text, $5::text, $6)
+            "#,
+        )
+        .bind(&action_row_id)
+        .bind(session_id)
+        .bind(&attempt_id)
+        .bind(ActionKind::Compaction.as_str())
+        .bind(ActionStatus::Running.as_str())
+        .bind(&compaction_payload)
+        .execute(&mut *tx)
+        .await?;
+
+        let events = vec![
+            insert_event_with_activity_tx(
+                &mut tx,
+                session_id,
+                EventType::ActionRequested,
+                json!({
+                    "kind": ActionKind::Compaction,
+                    "action_id": 0,
+                    "action_row_id": action_row_id,
+                    "payload": compaction_payload,
+                }),
+            )
+            .await?,
+            insert_event_with_activity_tx(
+                &mut tx,
+                session_id,
+                EventType::CompactionRequested,
+                json!({
+                    "action_row_id": action_row_id,
+                    "source_session_id": session_id,
+                    "source_leaf_id": source_leaf_id,
+                    "trigger": trigger_name,
+                    "reason": reason,
+                    "scope": scope.kind(),
+                    "tokens_before": tokens_before,
+                    "auto_limit_tokens": auto_limit_tokens,
+                    "blocked_model_action_row_id": model_action_row_id,
+                }),
+            )
+            .await?,
+        ];
+        tx.commit().await?;
+
+        Ok(CreateCompactionResult {
+            job: CompactionJob {
+                action_row_id,
+                attempt_id,
+                source_session_id: session_id.to_string(),
+                source_leaf_id,
+                compaction_context: compaction_context_for_scope(&model_context, &scope),
+                model_context,
+                tokens_before,
+                last_turn_id,
+                trigger,
+                reason,
+                scope,
+            },
+            events,
+        })
+    }
+
     pub async fn create_compaction_action(
         &self,
         session_id: &str,
@@ -71,6 +296,9 @@ impl PostgresAgentStore {
         let reason = trigger.reason().map(str::to_string);
         let action_row_id = format!("action_{}", Uuid::new_v4());
         let attempt_id = Uuid::new_v4().to_string();
+        let scope = CompactionScope::Boundary {
+            source_leaf_id: source_leaf_id.clone(),
+        };
         let payload = json!({
             "source_session_id": session_id,
             "source_leaf_id": source_leaf_id,
@@ -78,17 +306,19 @@ impl PostgresAgentStore {
             "context_tokens": tokens_before,
             "trigger": trigger_name,
             "reason": reason,
+            "scope": scope,
         });
         sqlx::query(
             r#"
             insert into actions (id, session_id, turn_id, action_id, attempt_id, kind, status, payload)
-            values ($1::text, $2::text, null, 0, $3::text, $4::text, 'running', $5)
+            values ($1::text, $2::text, null, 0, $3::text, $4::text, $5::text, $6)
             "#,
         )
         .bind(&action_row_id)
         .bind(session_id)
         .bind(&attempt_id)
         .bind(ActionKind::Compaction.as_str())
+        .bind(ActionStatus::Running.as_str())
         .bind(&payload)
         .execute(&mut *tx)
         .await?;
@@ -116,6 +346,7 @@ impl PostgresAgentStore {
                     "source_leaf_id": source_leaf_id,
                     "trigger": trigger_name,
                     "reason": reason,
+                    "scope": scope.kind(),
                 }),
             )
             .await?,
@@ -128,11 +359,13 @@ impl PostgresAgentStore {
                 attempt_id,
                 source_session_id: session_id.to_string(),
                 source_leaf_id,
+                compaction_context: model_context.clone(),
                 model_context,
                 tokens_before,
                 last_turn_id,
                 trigger,
                 reason,
+                scope,
             },
             events,
         })
@@ -166,6 +399,8 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok(CompleteCompactionResult {
                 new_root_id: None,
+                active_leaf_id: None,
+                resumed_model_action: None,
                 events: Vec::new(),
             });
         }
@@ -175,23 +410,53 @@ impl PostgresAgentStore {
                 .bind(&job.source_session_id)
                 .fetch_one(&mut *tx)
                 .await?;
-        if active_leaf_id.as_deref() != Some(job.source_leaf_id.as_str()) {
+        let source_leaf_changed = active_leaf_id.as_deref() != Some(job.source_leaf_id.as_str());
+        let blocked_model_still_blocked = match &job.scope {
+            CompactionScope::MidTurn {
+                blocked_model_action_row_id,
+                blocked_model_attempt_id,
+                ..
+            } => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                select exists(
+                    select 1
+                    from actions
+                    where session_id=$1
+                        and id=$2::text
+                        and attempt_id=$3::text
+                        and kind='model'
+                        and status='blocked'
+                )
+                "#,
+                )
+                .bind(&job.source_session_id)
+                .bind(blocked_model_action_row_id)
+                .bind(blocked_model_attempt_id)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+            CompactionScope::Boundary { .. } => false,
+        };
+        if source_leaf_changed && !blocked_model_still_blocked {
             let events = self
                 .mark_compaction_stale_tx(
                     &mut tx,
                     job,
-                    "source leaf changed before compaction completed",
+                    "source leaf changed before compaction completed and blocked model action is no longer blocked",
                 )
                 .await?;
             tx.commit().await?;
             return Ok(CompleteCompactionResult {
                 new_root_id: None,
+                active_leaf_id: None,
+                resumed_model_action: None,
                 events,
             });
         }
 
         let new_root_id = format!("entry_{}", Uuid::new_v4());
-        let entry = StoredTranscriptEntry {
+        let root_entry = StoredTranscriptEntry {
             id: new_root_id.clone(),
             parent_id: None,
             timestamp_ms: now_ms(),
@@ -204,23 +469,95 @@ impl PostgresAgentStore {
             )),
             provider_replay: completion.provider_replay.clone(),
         };
-        insert_stored_entry_tx(&mut tx, &job.source_session_id, &entry).await?;
+        insert_stored_entry_tx(&mut tx, &job.source_session_id, &root_entry).await?;
+
+        let mut installed_entries = vec![root_entry.clone()];
+        let mut parent_id = new_root_id.clone();
+        for mut suffix in completion.continuation_suffix {
+            suffix.parent_id = Some(parent_id.clone());
+            parent_id = suffix.id.clone();
+            let stored = StoredTranscriptEntry::from(suffix);
+            insert_stored_entry_tx(&mut tx, &job.source_session_id, &stored).await?;
+            installed_entries.push(stored);
+        }
+        let installed_active_leaf_id = parent_id;
+
         sqlx::query("update sessions set active_leaf_id=$2::text, updated_at=now() where id=$1")
             .bind(&job.source_session_id)
-            .bind(&new_root_id)
+            .bind(&installed_active_leaf_id)
             .execute(&mut *tx)
             .await?;
+
+        let mut resumed_model_action = None;
+        if let CompactionScope::MidTurn {
+            blocked_model_action_row_id,
+            blocked_model_attempt_id,
+            ..
+        } = &job.scope
+        {
+            let new_model_context = model_context_from_installed_entries(&installed_entries);
+            let context_leaf_id = Some(installed_active_leaf_id.clone());
+            let payload =
+                action_payload_from_model_context(new_model_context, context_leaf_id, None)?;
+            let updated = sqlx::query(
+                r#"
+                update actions
+                set status=$4::text,
+                    payload = payload || $5::jsonb,
+                    result=null,
+                    updated_at=now()
+                where session_id=$1
+                    and id=$2::text
+                    and attempt_id=$3::text
+                    and kind='model'
+                    and status='blocked'
+                "#,
+            )
+            .bind(&job.source_session_id)
+            .bind(blocked_model_action_row_id)
+            .bind(blocked_model_attempt_id)
+            .bind(ActionStatus::Pending.as_str())
+            .bind(&payload)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if updated == 1 {
+                if let Some(row) = sqlx::query(
+                    r#"
+                    select id, attempt_id, kind, action_id, turn_id, payload
+                    from actions
+                    where session_id=$1 and id=$2::text and attempt_id=$3::text
+                    "#,
+                )
+                .bind(&job.source_session_id)
+                .bind(blocked_model_action_row_id)
+                .bind(blocked_model_attempt_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                {
+                    resumed_model_action = Some(PersistedAction {
+                        row_id: row.get("id"),
+                        attempt_id: row.get("attempt_id"),
+                        action: session_action_from_model_row(row)?,
+                    });
+                }
+            }
+        }
+
         let result_payload = json!({
             "new_root_id": new_root_id,
+            "active_leaf_id": installed_active_leaf_id,
             "source_session_id": job.source_session_id,
             "source_leaf_id": job.source_leaf_id,
             "trigger": job.trigger.as_str(),
             "reason": job.reason,
+            "scope": job.scope.kind(),
             "remote": completion.remote,
             "provider": completion.provider,
             "summary_kind": completion.summary_kind,
             "usage": completion.usage,
             "provider_replay_items": completion.provider_replay.len(),
+            "continuation_suffix_items": installed_entries.len().saturating_sub(1),
         });
         let updated = sqlx::query(
             r#"
@@ -246,21 +583,28 @@ impl PostgresAgentStore {
             ));
         }
 
-        let mut events = insert_transcript_item_events_tx(
-            &mut tx,
-            &job.source_session_id,
-            Some(&entry),
-            &new_root_id,
-            &entry.item,
-        )
-        .await?;
+        let mut events = Vec::new();
+        for entry in &installed_entries {
+            events.extend(
+                insert_transcript_item_events_tx(
+                    &mut tx,
+                    &job.source_session_id,
+                    Some(entry),
+                    &entry.id,
+                    &entry.item,
+                )
+                .await?,
+            );
+        }
         events.push(
             insert_event_tx(
                 &mut tx,
                 &job.source_session_id,
                 EventType::HistoryCompacted,
                 json!({
+                    "scope": job.scope.kind(),
                     "new_root_id": new_root_id,
+                    "active_leaf_id": installed_active_leaf_id,
                     "source_session_id": job.source_session_id,
                     "source_leaf_id": job.source_leaf_id,
                     "tokens_before": job.tokens_before,
@@ -280,8 +624,9 @@ impl PostgresAgentStore {
                 EventType::CompactionCompleted,
                 json!({
                     "action_row_id": job.action_row_id,
+                    "scope": job.scope.kind(),
                     "new_root_id": new_root_id,
-                    "active_leaf_id": new_root_id,
+                    "active_leaf_id": installed_active_leaf_id,
                     "trigger": job.trigger.as_str(),
                     "reason": job.reason,
                     "remote": completion.remote,
@@ -294,6 +639,8 @@ impl PostgresAgentStore {
         tx.commit().await?;
         Ok(CompleteCompactionResult {
             new_root_id: Some(new_root_id),
+            active_leaf_id: Some(installed_active_leaf_id),
+            resumed_model_action,
             events,
         })
     }
@@ -350,20 +697,96 @@ impl PostgresAgentStore {
         if updated != 1 {
             return Ok(Vec::new());
         }
+        let mut payload = json!({
+            "action_row_id": job.action_row_id,
+            "error": error,
+            "status": status,
+            "scope": job.scope.kind(),
+            "trigger": job.trigger.as_str(),
+        });
+        if let Some(reason) = job.trigger.reason() {
+            payload["reason"] = json!(reason);
+        }
         Ok(vec![
             insert_event_with_activity_tx(
                 tx,
                 &job.source_session_id,
                 EventType::CompactionError,
-                json!({
-                    "action_row_id": job.action_row_id,
-                    "error": error,
-                    "status": status,
-                }),
+                payload,
             )
             .await?,
         ])
     }
+}
+
+fn model_context_from_action_payload(payload: &Value) -> Result<ModelContext> {
+    let items: Vec<TranscriptItem> = serde_json::from_value(
+        payload
+            .get("model_context")
+            .cloned()
+            .ok_or_else(|| anyhow!("model action missing model_context"))?,
+    )?;
+    Ok(ModelContext::from_transcript_items(items))
+}
+
+fn compaction_context_for_scope(
+    model_context: &ModelContext,
+    scope: &CompactionScope,
+) -> ModelContext {
+    match scope {
+        CompactionScope::Boundary { .. } => model_context.clone(),
+        CompactionScope::MidTurn { .. } => model_context
+            .split_before_open_turn()
+            .map(|(prefix, _)| prefix)
+            .unwrap_or_else(|| model_context.clone()),
+    }
+}
+
+fn action_payload_from_model_context(
+    model_context: ModelContext,
+    context_leaf_id: Option<String>,
+    context_tokens: Option<usize>,
+) -> Result<Value> {
+    Ok(json!({
+        "model_context": model_context.transcript_items(),
+        "context_leaf_id": context_leaf_id,
+        "context_tokens": context_tokens,
+    }))
+}
+
+fn model_context_from_installed_entries(entries: &[StoredTranscriptEntry]) -> ModelContext {
+    ModelContext::from_entries(
+        entries
+            .iter()
+            .cloned()
+            .map(|entry| agent_session::ModelContextEntry {
+                item: entry.item,
+                provider_replay: entry.provider_replay,
+            })
+            .collect(),
+    )
+}
+
+fn session_action_from_model_row(
+    row: sqlx::postgres::PgRow,
+) -> Result<agent_session::SessionAction> {
+    let payload: Value = row.get("payload");
+    let model_context = model_context_from_action_payload(&payload)?;
+    let context_leaf_id = payload
+        .get("context_leaf_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let context_tokens = payload
+        .get("context_tokens")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    Ok(agent_session::SessionAction::RequestModel {
+        action_id: agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64),
+        turn_id: agent_vocab::TurnId(row.get::<i64, _>("turn_id") as u64),
+        model_context,
+        context_leaf_id,
+        context_tokens,
+    })
 }
 
 pub(super) async fn latest_context_usage_tx(

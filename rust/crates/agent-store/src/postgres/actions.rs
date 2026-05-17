@@ -3,8 +3,8 @@ use serde_json::json;
 use sqlx::Row;
 
 use crate::{
-    ActionKind, ActionStatus, ContextUsageSnapshot, EventFrame, EventType, ResumableModelAction,
-    StoredAction,
+    ActionKind, ActionStatus, ContextUsageSnapshot, EventFrame, EventType, PendingDispatchAction,
+    ResumableModelAction, StoredAction,
 };
 
 use super::events::insert_event_with_activity_tx;
@@ -86,16 +86,14 @@ impl PostgresAgentStore {
     }
 
     pub async fn load_action(&self, session_id: &str, action_row_id: &str) -> Result<StoredAction> {
-        let unfinished_actions = action_is_unfinished(None);
-        let query = format!(
-            "select kind, action_id, turn_id, attempt_id from actions where session_id=$1 and id=$2::text and {unfinished_actions}",
-        );
-        let row = sqlx::query(&query)
+        let row = sqlx::query(
+            "select kind, action_id, turn_id, attempt_id from actions where session_id=$1 and id=$2::text and status='running'",
+        )
             .bind(session_id)
             .bind(action_row_id)
             .fetch_optional(&self.pool)
             .await?
-            .ok_or_else(|| anyhow!("action not found or not running: {action_row_id}"))?;
+            .ok_or_else(|| anyhow!("action not found or not active: {action_row_id}"))?;
         Ok(StoredAction {
             kind: row_text::<ActionKind>(&row, "kind")?,
             action_id: row.get("action_id"),
@@ -164,16 +162,16 @@ impl PostgresAgentStore {
         action_row_id: &str,
         attempt_id: &str,
     ) -> Result<bool> {
-        let unfinished_actions = action_is_unfinished(None);
-        let query = format!(
-            r#"
+        let query = r#"
                 select exists(
                     select 1
                     from actions
-                    where session_id=$1 and id=$2::text and attempt_id=$3::text and {unfinished_actions}
+                    where session_id=$1
+                        and id=$2::text
+                        and attempt_id=$3::text
+                        and status='running'
                 )
-                "#
-        );
+                "#;
         Ok(sqlx::query_scalar(&query)
             .bind(session_id)
             .bind(action_row_id)
@@ -190,10 +188,7 @@ impl PostgresAgentStore {
         event_type: EventType,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
-        let unfinished_actions = action_is_unfinished(None);
-        let query = format!(
-            "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and {unfinished_actions}",
-        );
+        let query = "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and status='pending'";
         let updated = sqlx::query(&query)
             .bind(session_id)
             .bind(action_row_id)
@@ -227,6 +222,97 @@ impl PostgresAgentStore {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn pending_actions_for_dispatch(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PendingDispatchAction>> {
+        let rows = sqlx::query(
+            r#"
+            select id, attempt_id, kind, action_id, turn_id, payload
+            from actions
+            where session_id=$1 and status='pending'
+            order by created_at
+            "#,
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .filter_map(|row| match row_text::<ActionKind>(&row, "kind") {
+                Ok(ActionKind::Model) => Some(pending_model_dispatch_from_row(row)),
+                Ok(ActionKind::Tool) => Some(pending_tool_dispatch_from_row(row)),
+                Ok(ActionKind::Compaction) => None,
+                Err(error) => Some(Err(anyhow!(error))),
+            })
+            .collect()
+    }
+
+    pub async fn claim_pending_model_action(
+        &self,
+        session_id: &str,
+        action_row_id: &str,
+        attempt_id: &str,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and kind='model' and status='pending'",
+        )
+        .bind(session_id)
+        .bind(action_row_id)
+        .bind(attempt_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    pub async fn fail_blocked_or_pending_model_action(
+        &self,
+        session_id: &str,
+        action_row_id: &str,
+        attempt_id: &str,
+        error: &str,
+    ) -> Result<Vec<EventFrame>> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
+            r#"
+            update actions
+            set status=$4::text,
+                result=$5,
+                updated_at=now()
+            where session_id=$1
+                and id=$2::text
+                and attempt_id=$3::text
+                and kind='model'
+                and status in ('pending','blocked')
+            "#,
+        )
+        .bind(session_id)
+        .bind(action_row_id)
+        .bind(attempt_id)
+        .bind(ActionStatus::Error.as_str())
+        .bind(serde_json::json!({ "error": error }))
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        let event = insert_event_with_activity_tx(
+            &mut tx,
+            session_id,
+            EventType::ModelError,
+            serde_json::json!({
+                "action_row_id": action_row_id,
+                "error": error,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(vec![event])
     }
 
     pub async fn cancel_unfinished_session_work(
@@ -266,6 +352,47 @@ impl PostgresAgentStore {
         tx.commit().await?;
         Ok(vec![event])
     }
+}
+
+fn pending_model_dispatch_from_row(row: sqlx::postgres::PgRow) -> Result<PendingDispatchAction> {
+    let payload: serde_json::Value = row.get("payload");
+    let model_context = payload
+        .get("model_context")
+        .cloned()
+        .ok_or_else(|| anyhow!("pending model action missing model_context"))?;
+    let items: Vec<agent_vocab::TranscriptItem> = serde_json::from_value(model_context)?;
+    let context_leaf_id = payload
+        .get("context_leaf_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    let context_tokens = payload
+        .get("context_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .map(|value| value as usize);
+    Ok(PendingDispatchAction {
+        row_id: row.get("id"),
+        attempt_id: row.get("attempt_id"),
+        action: agent_session::SessionAction::RequestModel {
+            action_id: agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64),
+            turn_id: agent_vocab::TurnId(row.get::<i64, _>("turn_id") as u64),
+            model_context: agent_session::ModelContext::from_transcript_items(items),
+            context_leaf_id,
+            context_tokens,
+        },
+    })
+}
+
+fn pending_tool_dispatch_from_row(row: sqlx::postgres::PgRow) -> Result<PendingDispatchAction> {
+    let payload: serde_json::Value = row.get("payload");
+    Ok(PendingDispatchAction {
+        row_id: row.get("id"),
+        attempt_id: row.get("attempt_id"),
+        action: agent_session::SessionAction::RequestTool {
+            action_id: agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64),
+            turn_id: agent_vocab::TurnId(row.get::<i64, _>("turn_id") as u64),
+            tool_call: serde_json::from_value(payload)?,
+        },
+    })
 }
 
 #[cfg(test)]

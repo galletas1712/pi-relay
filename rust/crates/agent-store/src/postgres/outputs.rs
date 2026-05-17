@@ -6,7 +6,9 @@ use serde_json::json;
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
-use crate::{ActionStatus, ActionUpdate, EventFrame, EventType, OutputBatch, PersistedAction};
+use crate::{
+    ActionKind, ActionStatus, ActionUpdate, EventFrame, EventType, OutputBatch, PersistedAction,
+};
 
 use super::action_records::{action_event_matches_row, action_payload, ActionKey};
 use super::events::{insert_event_with_activity_tx, insert_session_event_tx};
@@ -171,7 +173,7 @@ pub(super) async fn persist_outputs_tx(
         sqlx::query(
             r#"
             insert into actions (id, session_id, turn_id, action_id, attempt_id, kind, status, payload)
-            values ($1::text, $2::text, $3::bigint, $4, $5::text, $6::text, 'running', $7)
+            values ($1::text, $2::text, $3::bigint, $4, $5::text, $6::text, $7::text, $8)
             "#,
         )
         .bind(&row_id)
@@ -180,6 +182,7 @@ pub(super) async fn persist_outputs_tx(
         .bind(action_id)
         .bind(&attempt_id)
         .bind(kind.as_str())
+        .bind(initial_action_status(kind).as_str())
         .bind(&payload)
         .execute(&mut **tx)
         .await
@@ -217,20 +220,27 @@ pub(super) async fn persist_outputs_tx(
     Ok((frames, dispatch))
 }
 
+fn initial_action_status(kind: ActionKind) -> ActionStatus {
+    match kind {
+        ActionKind::Model | ActionKind::Tool => ActionStatus::Pending,
+        ActionKind::Compaction => ActionStatus::Running,
+    }
+}
+
 async fn complete_action_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     update: &mut ActionUpdate,
     session_events: &[SessionEvent],
 ) -> Result<()> {
-    let unfinished_actions = action_is_unfinished(None);
-    let select_query = format!(
-        r#"
+    let select_query = r#"
             select kind, action_id
             from actions
-            where session_id=$1 and id=$2::text and attempt_id=$3::text and {unfinished_actions}
-            "#
-    );
+            where session_id=$1
+                and id=$2::text
+                and attempt_id=$3::text
+                and status in ('pending','running')
+            "#;
     if let Some(row) = sqlx::query(&select_query)
         .bind(session_id)
         .bind(&update.row_id)
@@ -259,14 +269,14 @@ async fn complete_action_tx(
         }
     }
 
-    let unfinished_actions = action_is_unfinished(None);
-    let update_query = format!(
-        r#"
+    let update_query = r#"
             update actions
             set status=$4, result=$5, updated_at=now()
-            where session_id=$1 and id=$2::text and attempt_id=$3::text and {unfinished_actions}
-            "#
-    );
+            where session_id=$1
+                and id=$2::text
+                and attempt_id=$3::text
+                and status in ('pending','running')
+            "#;
     let updated = sqlx::query(&update_query)
         .bind(session_id)
         .bind(&update.row_id)

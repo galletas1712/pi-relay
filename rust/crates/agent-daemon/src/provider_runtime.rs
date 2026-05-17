@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auth::{refresh_codex_credentials, Credentials};
+use crate::model_metadata;
 use crate::state::AppState;
 
 pub(crate) async fn run_model(
@@ -67,6 +68,13 @@ async fn count_tokens_with_auth_retry(
     }
 }
 
+pub(crate) fn provider_supports_token_counting(config: &SessionConfig) -> bool {
+    let credentials = Credentials::load();
+    provider_for_config(config, &credentials)
+        .map(|provider| provider.provider.supports_token_counting())
+        .unwrap_or(false)
+}
+
 pub(crate) async fn count_model_input_tokens(
     state: &AppState,
     config: &SessionConfig,
@@ -82,7 +90,15 @@ pub(crate) async fn count_model_input_tokens(
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools: state.tools.definitions_for_provider(config.provider.kind),
+        max_tokens: config.provider.max_tokens,
         reasoning_effort: config.provider.reasoning_effort,
+        prompt_cache_key: config
+            .provider
+            .prompt_cache
+            .as_ref()
+            .and_then(|value| value.get("key"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         session_id: Some(session_id.to_string()),
     };
 
@@ -143,12 +159,13 @@ fn generic_remote_compaction_summary(provider: ProviderKind) -> String {
 }
 
 const COMPACTION_SYSTEM_PROMPT: &str = "\
-Summarize the conversation transcript for future continuation. Preserve concrete
-files, commands, constraints, decisions, unresolved work, and user preferences.
-Do not mention that you are summarizing unless it is useful context.";
+Produce a concise continuation summary under 6,000 tokens. Prefer bullet
+points. Do not quote large files or logs. Preserve only actionable state,
+decisions, constraints, file paths, commands run, tool results needed to
+continue, and open tasks.";
 
 const COMPACTION_USER_PROMPT: &str = "\
-Summarize the transcript above into a compact continuation context.";
+Summarize the transcript above into a compact continuation context under 6,000 tokens.";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CompactionSummaryKind {
@@ -235,6 +252,12 @@ pub(crate) struct CompactionAutoState {
 }
 
 pub(crate) fn compaction_config(config: &SessionConfig) -> CompactionConfig {
+    resolve_compaction_config(config)
+}
+
+pub(crate) fn resolve_compaction_config(config: &SessionConfig) -> CompactionConfig {
+    let metadata_configured = config.metadata.pointer("/compaction/config").is_some()
+        || config.metadata.get("compaction").is_some();
     let auto_enabled_configured = config
         .metadata
         .pointer("/compaction/config/auto_enabled")
@@ -244,6 +267,7 @@ pub(crate) fn compaction_config(config: &SessionConfig) -> CompactionConfig {
             .get("compaction")
             .and_then(|value| value.get("auto_enabled"))
             .is_some();
+
     let mut resolved: CompactionConfig = config
         .metadata
         .pointer("/compaction/config")
@@ -251,11 +275,36 @@ pub(crate) fn compaction_config(config: &SessionConfig) -> CompactionConfig {
         .or_else(|| config.metadata.get("compaction").cloned())
         .and_then(|value| serde_json::from_value(value).ok())
         .unwrap_or_default();
-    if !auto_enabled_configured
-        && (resolved.context_window.is_some() || resolved.auto_limit_tokens.is_some())
-    {
-        resolved.auto_enabled = true;
+
+    let default_window =
+        model_metadata::context_window(config.provider.kind, &config.provider.model);
+    if resolved.context_window.is_none() {
+        resolved.context_window = default_window;
     }
+    if resolved.auto_limit_tokens.is_none() {
+        resolved.auto_limit_tokens =
+            model_metadata::default_auto_limit(config.provider.kind, &config.provider.model);
+    }
+
+    if !metadata_configured {
+        resolved.remote_mode = match config.provider.kind {
+            ProviderKind::OpenAi => RemoteCompactionMode::Always,
+            ProviderKind::Claude => RemoteCompactionMode::Never,
+        };
+    } else if matches!(config.provider.kind, ProviderKind::OpenAi)
+        && resolved.remote_mode == RemoteCompactionMode::Auto
+    {
+        // OpenAI/Codex provider-native compaction is the safe default: do not
+        // silently hide remote parser/provider failures behind local summary
+        // fallback unless the operator explicitly sets remote_mode="never".
+        resolved.remote_mode = RemoteCompactionMode::Always;
+    }
+
+    if !auto_enabled_configured {
+        resolved.auto_enabled =
+            resolved.auto_limit_tokens.is_some() || resolved.context_window.is_some();
+    }
+
     resolved
 }
 
@@ -270,8 +319,8 @@ pub(crate) fn compaction_auto_state(config: &SessionConfig) -> CompactionAutoSta
 
 pub(crate) fn auto_limit_tokens(config: &CompactionConfig) -> Option<usize> {
     match (config.context_window, config.auto_limit_tokens) {
-        (Some(window), Some(limit)) => Some(limit.min(window.saturating_mul(9) / 10)),
-        (Some(window), None) => Some(window.saturating_mul(9) / 10),
+        (Some(window), Some(limit)) => Some(limit.min(window)),
+        (Some(window), None) => Some(window.saturating_mul(85) / 100),
         (None, Some(limit)) => Some(limit),
         (None, None) => None,
     }
@@ -321,7 +370,10 @@ pub(crate) async fn run_compaction(
                         .and_then(|usage| serde_json::to_value(usage).ok()),
                 });
             }
-            Err(error) if remote_mode == RemoteCompactionMode::Auto => {
+            Err(error)
+                if remote_mode == RemoteCompactionMode::Auto
+                    && config.provider.kind != ProviderKind::OpenAi =>
+            {
                 eprintln!("remote compaction failed for {session_id}; falling back to local summary: {error}");
             }
             Err(error) => return Err(anyhow::Error::from(error)),
@@ -344,11 +396,21 @@ async fn remote_compaction_request(
 ) -> Result<ProviderCompactionRequest> {
     Ok(ProviderCompactionRequest {
         model: config.provider.model.clone(),
-        instructions: state.repo.global_system_prompt().await?,
+        prompt: PromptSections::new(
+            state.repo.global_system_prompt().await?,
+            Some(dynamic_prompt_context(state, config)),
+        ),
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools: state.tools.definitions_for_provider(config.provider.kind),
         reasoning_effort: config.provider.reasoning_effort,
+        prompt_cache_key: config
+            .provider
+            .prompt_cache
+            .as_ref()
+            .and_then(|value| value.get("key"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         session_id: Some(session_id.to_string()),
     })
 }
@@ -372,7 +434,7 @@ async fn run_local_summary_compaction(
             Ok(response) => response,
             Err(error)
                 if attempt + 1 < MAX_LOCAL_COMPACTION_ATTEMPTS
-                    && provider_error_is_context_too_large(&error)
+                    && provider_error_is_context_overflow(&error)
                     && trim_oldest_complete_group(&mut groups) =>
             {
                 last_context_error = Some(error.to_string());
@@ -530,7 +592,7 @@ fn trim_oldest_complete_group(groups: &mut Vec<TranscriptGroup>) -> bool {
     true
 }
 
-fn provider_error_is_context_too_large(error: &ProviderError) -> bool {
+pub(crate) fn provider_error_is_context_overflow(error: &ProviderError) -> bool {
     let status = provider_error_status(error);
     let message = match error {
         ProviderError::Status { message, .. } | ProviderError::Provider(message) => message.clone(),
@@ -647,5 +709,83 @@ mod tests {
 
         assert!(prompt.contains("Starting working directory for this session: /tmp/project"));
         assert!(prompt.contains("fresh shell rooted here"));
+    }
+
+    fn test_config(kind: ProviderKind, model: &str, metadata: Value) -> SessionConfig {
+        SessionConfig {
+            project_id: uuid::Uuid::nil(),
+            starting_cwd: "/tmp".to_string(),
+            provider: agent_vocab::ProviderConfig {
+                kind,
+                model: model.to_string(),
+                reasoning_effort: agent_vocab::ReasoningEffort::Medium,
+                max_tokens: None,
+                prompt_cache: None,
+            },
+            metadata,
+        }
+    }
+
+    #[test]
+    fn resolved_compaction_config_uses_known_rust_defaults() {
+        let config = test_config(
+            ProviderKind::OpenAi,
+            "gpt-5.1-codex-max",
+            serde_json::json!({}),
+        );
+        let resolved = resolve_compaction_config(&config);
+
+        assert!(resolved.auto_enabled);
+        assert_eq!(resolved.context_window, Some(272_000));
+        assert_eq!(resolved.auto_limit_tokens, Some(231_200));
+        assert_eq!(resolved.remote_mode, RemoteCompactionMode::Always);
+    }
+
+    #[test]
+    fn resolved_compaction_config_unknown_model_needs_explicit_limit() {
+        let config = test_config(ProviderKind::OpenAi, "unknown", serde_json::json!({}));
+        let resolved = resolve_compaction_config(&config);
+
+        assert!(!resolved.auto_enabled);
+        assert_eq!(resolved.context_window, None);
+        assert_eq!(resolved.auto_limit_tokens, None);
+    }
+
+    #[test]
+    fn resolved_compaction_config_respects_explicit_overrides() {
+        let config = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-4-5",
+            serde_json::json!({
+                "compaction": {
+                    "config": {
+                        "auto_enabled": true,
+                        "context_window": 123,
+                        "auto_limit_tokens": 77,
+                        "remote_mode": "auto"
+                    }
+                }
+            }),
+        );
+        let resolved = resolve_compaction_config(&config);
+
+        assert!(resolved.auto_enabled);
+        assert_eq!(resolved.context_window, Some(123));
+        assert_eq!(resolved.auto_limit_tokens, Some(77));
+        assert_eq!(resolved.remote_mode, RemoteCompactionMode::Auto);
+    }
+
+    #[test]
+    fn resolved_compaction_config_respects_explicit_auto_disabled() {
+        let config = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-4-5",
+            serde_json::json!({ "compaction": { "config": { "auto_enabled": false } } }),
+        );
+        let resolved = resolve_compaction_config(&config);
+
+        assert!(!resolved.auto_enabled);
+        assert_eq!(resolved.context_window, Some(200_000));
+        assert_eq!(resolved.auto_limit_tokens, Some(170_000));
     }
 }

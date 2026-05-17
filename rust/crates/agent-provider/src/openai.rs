@@ -12,8 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderError, ProviderResult, ProviderTokenCountRequest,
-    ProviderTokenCountResponse, ProviderToolProfile, ProviderUsage,
+    ProviderCompactionResponse, ProviderError, ProviderResult, ProviderToolProfile, ProviderUsage,
 };
 
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
@@ -54,24 +53,6 @@ pub struct OpenAiProvider {
     base_url: String,
 }
 
-fn parse_input_tokens_response(text: &str) -> ProviderResult<ProviderTokenCountResponse> {
-    let response: Value = serde_json::from_str(text).map_err(|error| {
-        ProviderError::Provider(format!(
-            "failed to parse OpenAI input token response JSON: {error}; body: {}",
-            response_excerpt(text)
-        ))
-    })?;
-    let input_tokens = response
-        .get("input_tokens")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| {
-            ProviderError::Provider("OpenAI input token response missing input_tokens".to_string())
-        })?;
-    Ok(ProviderTokenCountResponse {
-        input_tokens: input_tokens as usize,
-    })
-}
-
 fn parse_compact_response(text: &str) -> ProviderResult<ProviderCompactionResponse> {
     let response: Value = serde_json::from_str(text).map_err(|error| {
         ProviderError::Provider(format!(
@@ -91,7 +72,7 @@ fn parse_compact_response(text: &str) -> ProviderResult<ProviderCompactionRespon
     let mut summary_parts = Vec::new();
     for item in output {
         if keep_compact_output_item(item) {
-            if item.get("type").and_then(Value::as_str) == Some("compaction") {
+            if is_compaction_item(item) {
                 has_compaction = true;
             }
             collect_compact_summary_text(item, &mut summary_parts);
@@ -105,9 +86,10 @@ fn parse_compact_response(text: &str) -> ProviderResult<ProviderCompactionRespon
         ));
     }
     if !has_compaction {
-        return Err(ProviderError::Provider(
-            "OpenAI compact response did not include a compaction item".to_string(),
-        ));
+        return Err(ProviderError::Provider(format!(
+            "OpenAI compact response did not include a compaction item; output item types: {}",
+            compact_output_type_summary(output)
+        )));
     }
 
     let summary = summary_parts.join("").trim().to_string();
@@ -118,9 +100,46 @@ fn parse_compact_response(text: &str) -> ProviderResult<ProviderCompactionRespon
     })
 }
 
+fn compact_output_type_summary(output: &[Value]) -> String {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for item in output {
+        let ty = item
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("<missing>");
+        let role = item.get("role").and_then(Value::as_str);
+        let key = role
+            .map(|role| format!("{ty}:{role}"))
+            .unwrap_or_else(|| ty.to_string());
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    if counts.is_empty() {
+        "<empty>".to_string()
+    } else {
+        counts
+            .into_iter()
+            .map(|(key, count)| format!("{key}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+// Codex's wire type for the opaque encrypted summary item has shifted over
+// time. The current backend emits `compaction_summary`; older builds emitted
+// `compaction`. Codex CLI's own `ResponseItem::Compaction` variant aliases
+// both (see `~/codex/codex-rs/protocol/src/models.rs`), so we accept either.
+fn is_compaction_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("compaction") | Some("compaction_summary")
+    )
+}
+
 fn keep_compact_output_item(item: &Value) -> bool {
+    if is_compaction_item(item) {
+        return true;
+    }
     match item.get("type").and_then(Value::as_str) {
-        Some("compaction") => true,
         Some("message") => match item.get("role").and_then(Value::as_str) {
             Some("assistant") => true,
             Some("user") => compact_user_message_is_real(item),
@@ -175,10 +194,6 @@ fn message_text(item: &Value) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
-}
-
-fn compact_input_items(transcript: &[ModelTranscriptEntry]) -> ProviderResult<Vec<Value>> {
-    transcript_to_response_items(transcript)
 }
 
 impl OpenAiProvider {
@@ -284,12 +299,12 @@ impl ModelProvider for OpenAiProvider {
         self.compact_responses(request).await
     }
 
-    async fn count_tokens(
-        &self,
-        request: ProviderTokenCountRequest,
-    ) -> ProviderResult<ProviderTokenCountResponse> {
-        self.count_tokens_responses(request).await
-    }
+    // `supports_token_counting` stays at the trait default (`false`): the
+    // codex backend has no `/responses/input_tokens` route (Cloudflare
+    // responds 403 with a challenge interstitial). pi-relay reads
+    // `usage.input_tokens` off the streaming `response.completed` event
+    // instead, and the runtime skips the pre-dispatch token gate for OpenAI
+    // sessions until that usage arrives.
 }
 
 impl OpenAiProvider {
@@ -350,33 +365,6 @@ impl OpenAiProvider {
         parse_compact_response(&text)
     }
 
-    async fn count_tokens_responses(
-        &self,
-        request: ProviderTokenCountRequest,
-    ) -> ProviderResult<ProviderTokenCountResponse> {
-        let session_id = request
-            .session_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let body = input_tokens_body(request)?;
-
-        let response = self
-            .add_codex_headers(
-                self.client
-                    .post(format!(
-                        "{}/responses/input_tokens",
-                        self.base_url.trim_end_matches('/')
-                    ))
-                    .header(ACCEPT, "application/json"),
-                &session_id,
-            )
-            .json(&body)
-            .send()
-            .await?;
-        let (status, text) = response_text(response).await?;
-        ensure_success(status, &text)?;
-        parse_input_tokens_response(&text)
-    }
 }
 
 async fn response_text(response: reqwest::Response) -> ProviderResult<(StatusCode, String)> {
@@ -457,22 +445,12 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
     Ok(body)
 }
 
+// Mirrors Codex CLI's `CompactionInput` (see
+// `~/codex/codex-rs/codex-api/src/common.rs`). The codex compaction endpoint
+// is unary and rejects the streaming `/responses` envelope — sending
+// `stream`, `store`, `include`, `tool_choice`, `prompt_cache_key`, or
+// `service_tier` causes a 400 (`{"detail":"Stream must be set to true"}`).
 fn compact_body(request: ProviderCompactionRequest) -> ProviderResult<Value> {
-    let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
-    let tools = response_tools(request.tool_profile, &request.tools)?;
-    Ok(json!({
-        "model": request.model,
-        "instructions": request.instructions.unwrap_or_default(),
-        "input": compact_input_items(&request.transcript)?,
-        "tools": tools,
-        "parallel_tool_calls": true,
-        "reasoning": {
-            "effort": reasoning_effort,
-        },
-    }))
-}
-
-fn input_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value> {
     let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
     let tools = response_tools(request.tool_profile, &request.tools)?;
     Ok(json!({
@@ -480,7 +458,6 @@ fn input_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
         "input": response_input_items(request.prompt.dynamic_context.as_deref(), &request.transcript)?,
         "tools": tools,
-        "tool_choice": "auto",
         "parallel_tool_calls": true,
         "reasoning": {
             "effort": reasoning_effort,
@@ -1024,6 +1001,78 @@ mod tests {
         assert!(request.headers().get("authorization").is_some());
         assert!(request.headers().get("originator").is_some());
         assert!(request.headers().get(HEADER_WINDOW_ID).is_some());
+    }
+
+    #[test]
+    fn compact_body_matches_codex_cli_compaction_input_shape() {
+        // The codex backend's `/responses/compact` rejects the
+        // streaming-responses envelope; the body must match codex CLI's
+        // `CompactionInput` exactly (model/instructions/input/tools/
+        // parallel_tool_calls/reasoning). Any extra streaming-only field
+        // here triggers `{"detail":"Stream must be set to true"}`.
+        let body = compact_body(ProviderCompactionRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::new(
+                Some("stable rules".to_string()),
+                Some("cwd: /tmp/project".to_string()),
+            ),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+            session_id: Some("session-1".to_string()),
+        })
+        .expect("compact body renders");
+
+        assert_eq!(body["model"], "gpt-5.5");
+        assert_eq!(body["instructions"], "stable rules");
+        assert_eq!(body["input"][0]["content"][0]["text"], "cwd: /tmp/project");
+        assert_eq!(body["input"][1]["content"][0]["text"], "hello");
+        assert_eq!(body["tools"], json!([]));
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(body["reasoning"]["effort"], "high");
+
+        for forbidden in [
+            "tool_choice",
+            "store",
+            "stream",
+            "include",
+            "prompt_cache_key",
+            "service_tier",
+            "text",
+        ] {
+            assert!(
+                body.get(forbidden).is_none(),
+                "compact body must not include `{forbidden}`"
+            );
+        }
+    }
+
+    #[test]
+    fn compact_parser_requires_compaction_item_with_type_diagnostics() {
+        let error = parse_compact_response(
+            r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]},{"type":"reasoning"}]}"#,
+        )
+        .expect_err("missing compaction item should fail");
+        let message = error.to_string();
+        assert!(message.contains("did not include a compaction item"));
+        assert!(message.contains("message:assistant=1"));
+        assert!(message.contains("reasoning=1"));
+    }
+
+    #[test]
+    fn compact_parser_accepts_compaction_summary_alias() {
+        // The current codex backend emits `compaction_summary`; codex CLI's
+        // `ResponseItem` aliases this to its `Compaction` variant. Pi-relay
+        // must accept it identically to avoid spurious "missing compaction
+        // item" errors after a successful 200 from /responses/compact.
+        let response = parse_compact_response(
+            r#"{"output":[{"id":"msg_1","type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},{"id":"cmp_1","type":"compaction_summary","encrypted_content":"opaque"}]}"#,
+        )
+        .expect("compaction_summary should be accepted");
+        assert_eq!(response.provider_replay.len(), 2);
+        assert!(response.summary.is_none());
     }
 
     #[test]
