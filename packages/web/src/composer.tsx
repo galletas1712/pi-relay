@@ -8,6 +8,12 @@ const NEW_SESSION_DRAFT_ID = "__new_session__";
 const COMPOSER_MIN_HEIGHT_PX = 44;
 const COMPOSER_MAX_HEIGHT_PX = 180;
 
+type ComposerSubmitShortcutEvent = Pick<KeyboardEvent<HTMLTextAreaElement>, "ctrlKey" | "key" | "metaKey">;
+
+export function isComposerSubmitShortcut(event: ComposerSubmitShortcutEvent): boolean {
+	return event.key === "Enter" && (event.metaKey || event.ctrlKey);
+}
+
 export interface ComposerHandle {
 	focus(): void;
 	getValue(): string;
@@ -173,20 +179,17 @@ export const Composer = memo(function Composer({
 					setDraftValue(`/${command.name} `);
 					return;
 				}
-				if (event.key === "Enter" && !event.shiftKey) {
-					event.preventDefault();
+			}
+			if (isComposerSubmitShortcut(event)) {
+				event.preventDefault();
+				if (slashState.visible && slashState.commands.length > 0) {
 					const command = slashState.commands[Math.min(slashIndex, slashState.commands.length - 1)];
 					const typedCommand = matchSlashPrefix(draftRef.current) ?? "";
-					if (command.name === typedCommand) {
-						void sendDraft();
-					} else {
+					if (command.name !== typedCommand) {
 						setDraftValue(`/${command.name} `);
+						return;
 					}
-					return;
 				}
-			}
-			if (event.key === "Enter" && !event.shiftKey) {
-				event.preventDefault();
 				void sendDraft();
 			}
 		},
@@ -215,6 +218,8 @@ export const Composer = memo(function Composer({
 				placeholder={selectedId ? "Message the session or type /" : hasProject ? "Create or select a session" : "Select a project first"}
 				className="composer"
 				rows={1}
+				enterKeyHint="enter"
+				title="Enter for newline. Cmd+Enter to send."
 			/>
 			<button
 				className="stop-button"
@@ -226,7 +231,14 @@ export const Composer = memo(function Composer({
 			>
 				{stopping ? <Loader2 className="spin" size={15} /> : <Square size={14} />}
 			</button>
-			<button className="send-button" type="button" onClick={() => void sendDraft()} disabled={sending || !draft.trim()}>
+			<button
+				className="send-button"
+				type="button"
+				onClick={() => void sendDraft()}
+				disabled={sending || !draft.trim()}
+				title="send (Cmd+Enter)"
+				aria-label="send message"
+			>
 				{sending ? <Loader2 className="spin" size={16} /> : <Send size={16} />}
 			</button>
 		</div>
