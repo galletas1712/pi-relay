@@ -152,6 +152,7 @@ id text not null
 parent_id text null
 timestamp_ms bigint not null
 item jsonb not null
+provider_replay jsonb not null default '[]'::jsonb
 turn_id bigint null
 sequence bigserial not null
 primary key (session_id, id)
@@ -159,6 +160,13 @@ primary key (session_id, id)
 
 The active context is the root-to-`active_leaf_id` path. Rewind moves the active
 leaf; it does not delete rows.
+
+`provider_replay` is a sidecar for provider-native replay records, aligned one
+to one with the visible transcript entry. It is not rendered as a visible
+transcript item. When the daemon builds a model request, it materializes a
+`ModelContext` from the selected root-to-leaf path as `{ item, provider_replay }`
+entries, so OpenAI/Anthropic continuation state follows rewind, switch, fork,
+and compaction branches without being duplicated in action payloads.
 
 ### `queued_inputs`
 
@@ -212,6 +220,45 @@ updated_at timestamptz not null default now()
 
 `attempt_id` prevents stale completions from a prior daemon attempt from
 mutating the transcript after interrupt/recovery.
+
+#### Model action payloads
+
+Model actions store a context leaf reference, not a full replay of the model
+context:
+
+```json
+{
+  "context_leaf_id": "entry_...",
+  "context_tokens": 123
+}
+```
+
+`context_leaf_id` is the transcript entry that was active when the model request
+was created. The full provider request context is derived from
+`transcript_entries` by walking the parent chain from that leaf and preserving
+each entry's `provider_replay` sidecar. This keeps normal `actions` rows,
+`action.requested` events, and reconnect snapshots small while retaining exact
+restart/recovery semantics.
+
+Live dispatch is still zero-extra-fetch: the persisted action returned from
+`persist_outputs` carries the in-memory `SessionAction::RequestModel`, including
+its already-materialized `ModelContext`. The context-leaf reconstruction path is
+used only when a pending/blocked model action has to be rebuilt from Postgres,
+such as daemon restart, pending-action dispatch recovery, or mid-turn
+compaction resume.
+
+History operations remain transcript-driven:
+
+- switch/rewind updates `sessions.active_leaf_id`; existing model action rows
+  keep their explicit `context_leaf_id`, so recovery never depends on a mutable
+  active leaf;
+- fork copies transcript entries, including `provider_replay`, into the child
+  session; later child model actions point at child transcript leaf ids;
+- export reads transcript branches and visible transcript items, not model
+  action payloads, so provider-native replay state stays out of exported text.
+
+The old embedded `model_context` payloads have been migrated away. Model action
+recovery now requires `context_leaf_id`.
 
 ### `events`
 

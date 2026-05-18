@@ -8,7 +8,7 @@ use sqlx::{Executor, Postgres, Transaction};
 
 use crate::{EventFrame, EventType, SessionActivity};
 
-use super::action_records::{action_payload, ActionKey};
+use super::action_records::{action_payload, model_action_payload, ActionKey};
 use super::rows::row_to_event;
 use super::PostgresAgentStore;
 
@@ -152,7 +152,15 @@ pub(super) async fn insert_session_event_tx(
             .await?,
         ]),
         SessionEvent::ActionRequested { action } => {
-            let (kind, action_id, _, payload) = action_payload(action)?;
+            let (kind, action_id, _, mut payload) = action_payload(action)?;
+            if let SessionAction::RequestModel {
+                context_leaf_id,
+                context_tokens,
+                ..
+            } = action
+            {
+                payload = model_action_payload(context_leaf_id.as_deref(), *context_tokens);
+            }
             let row_id = action_rows.get(&ActionKey::new(kind, action_id)).cloned();
             let mut frames = vec![insert_event_with_activity_tx(
                 tx,

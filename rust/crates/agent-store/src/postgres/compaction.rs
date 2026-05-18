@@ -13,12 +13,15 @@ use crate::{
     PersistedAction,
 };
 
+use super::action_records::{
+    model_action_context_leaf_id, model_action_context_tokens, model_action_payload,
+};
 use super::events::{
     insert_event_tx, insert_event_with_activity_tx, insert_transcript_item_events_tx,
 };
 use super::rows::row_to_stored_entry;
 use super::sql::action_is_unfinished;
-use super::transcript::insert_stored_entry_tx;
+use super::transcript::{insert_stored_entry_tx, model_context_from_entries};
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
@@ -64,15 +67,14 @@ impl PostgresAgentStore {
         })?;
 
         let payload: Value = row.get("payload");
-        let model_context = model_context_from_action_payload(&payload)?;
+        let source_leaf_id = model_action_context_leaf_id(&payload)
+            .ok_or_else(|| anyhow!("model action has no compaction source leaf"))?;
+        let model_context = self
+            .model_context_for_leaf(session_id, &source_leaf_id)
+            .await?;
         if model_context.transcript_items().is_empty() {
             return Err(anyhow!("cannot compact an empty model context"));
         }
-        let source_leaf_id = payload
-            .get("context_leaf_id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| anyhow!("model action has no compaction source leaf"))?;
         let action_id = agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64);
         let turn_id = TurnId(row.get::<i64, _>("turn_id") as u64);
         let scope = if model_context.is_turn_boundary() {
@@ -457,10 +459,7 @@ impl PostgresAgentStore {
             ..
         } = &job.scope
         {
-            let new_model_context = model_context_from_installed_entries(&installed_entries);
-            let context_leaf_id = Some(installed_active_leaf_id.clone());
-            let payload =
-                action_payload_from_model_context(new_model_context, context_leaf_id, None)?;
+            let payload = model_action_payload(Some(&installed_active_leaf_id), None);
             let updated = sqlx::query(
                 r#"
                 update actions
@@ -497,10 +496,12 @@ impl PostgresAgentStore {
                 .fetch_optional(&mut *tx)
                 .await?
                 {
+                    let new_model_context =
+                        model_context_from_installed_entries(&installed_entries);
                     resumed_model_action = Some(PersistedAction {
                         row_id: row.get("id"),
                         attempt_id: row.get("attempt_id"),
-                        action: session_action_from_model_row(row)?,
+                        action: session_action_from_model_row(row, new_model_context)?,
                     });
                 }
             }
@@ -681,16 +682,6 @@ impl PostgresAgentStore {
     }
 }
 
-fn model_context_from_action_payload(payload: &Value) -> Result<ModelContext> {
-    let items: Vec<TranscriptItem> = serde_json::from_value(
-        payload
-            .get("model_context")
-            .cloned()
-            .ok_or_else(|| anyhow!("model action missing model_context"))?,
-    )?;
-    Ok(ModelContext::from_transcript_items(items))
-}
-
 fn compaction_context_for_scope(
     model_context: &ModelContext,
     scope: &CompactionScope,
@@ -704,44 +695,17 @@ fn compaction_context_for_scope(
     }
 }
 
-fn action_payload_from_model_context(
-    model_context: ModelContext,
-    context_leaf_id: Option<String>,
-    context_tokens: Option<usize>,
-) -> Result<Value> {
-    Ok(json!({
-        "model_context": model_context.transcript_items(),
-        "context_leaf_id": context_leaf_id,
-        "context_tokens": context_tokens,
-    }))
-}
-
 fn model_context_from_installed_entries(entries: &[StoredTranscriptEntry]) -> ModelContext {
-    ModelContext::from_entries(
-        entries
-            .iter()
-            .cloned()
-            .map(|entry| agent_session::ModelContextEntry {
-                item: entry.item,
-                provider_replay: entry.provider_replay,
-            })
-            .collect(),
-    )
+    model_context_from_entries(entries.to_vec())
 }
 
 fn session_action_from_model_row(
     row: sqlx::postgres::PgRow,
+    model_context: ModelContext,
 ) -> Result<agent_session::SessionAction> {
     let payload: Value = row.get("payload");
-    let model_context = model_context_from_action_payload(&payload)?;
-    let context_leaf_id = payload
-        .get("context_leaf_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let context_tokens = payload
-        .get("context_tokens")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize);
+    let context_leaf_id = model_action_context_leaf_id(&payload);
+    let context_tokens = model_action_context_tokens(&payload);
     Ok(agent_session::SessionAction::RequestModel {
         action_id: agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64),
         turn_id: agent_vocab::TurnId(row.get::<i64, _>("turn_id") as u64),

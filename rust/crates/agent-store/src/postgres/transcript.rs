@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 
-use agent_session::{StoredSession, StoredTranscriptEntry, TranscriptStorageNode};
+use agent_session::{
+    ModelContext, ModelContextEntry, StoredSession, StoredTranscriptEntry, TranscriptStorageNode,
+};
 use agent_vocab::TranscriptItem;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
@@ -96,6 +98,18 @@ impl PostgresAgentStore {
         })
     }
 
+    pub async fn model_context_for_leaf(
+        &self,
+        session_id: &str,
+        leaf_id: &str,
+    ) -> Result<ModelContext> {
+        let entries = self.branch_entries_to_leaf(session_id, leaf_id).await?;
+        if entries.is_empty() {
+            return Err(anyhow!("transcript leaf not found: {leaf_id}"));
+        }
+        Ok(model_context_from_entries(entries))
+    }
+
     async fn active_leaf_id(&self, session_id: &str) -> Result<Option<String>> {
         sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
             .bind(session_id)
@@ -139,6 +153,41 @@ impl PostgresAgentStore {
             "#,
         )
         .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row_to_stored_entry(&row))
+            .collect()
+    }
+
+    pub(crate) async fn branch_entries_to_leaf(
+        &self,
+        session_id: &str,
+        leaf_id: &str,
+    ) -> Result<Vec<StoredTranscriptEntry>> {
+        let rows = sqlx::query(
+            r#"
+            with recursive branch as (
+                select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence
+                from transcript_entries t
+                where t.session_id = $1
+                  and t.id = $2::text
+
+                union all
+
+                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence
+                from transcript_entries parent
+                join branch child
+                  on parent.session_id = $1
+                 and parent.id = child.parent_id
+            )
+            select id, parent_id, timestamp_ms, item, provider_replay
+            from branch
+            order by sequence
+            "#,
+        )
+        .bind(session_id)
+        .bind(leaf_id)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
@@ -338,4 +387,16 @@ pub(super) async fn insert_stored_entry_tx(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+pub(super) fn model_context_from_entries(entries: Vec<StoredTranscriptEntry>) -> ModelContext {
+    ModelContext::from_entries(
+        entries
+            .into_iter()
+            .map(|entry| ModelContextEntry {
+                item: entry.item,
+                provider_replay: entry.provider_replay,
+            })
+            .collect(),
+    )
 }

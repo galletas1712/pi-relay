@@ -37,6 +37,12 @@ typed compacted root.
 - `RequestTool`
 - `CancelSessionWork`
 
+`RequestModel` carries a materialized `ModelContext` for immediate live
+dispatch plus the `context_leaf_id` that names the canonical transcript
+checkpoint. The durable Postgres action row stores only that leaf reference and
+context-token metadata; recovery can rebuild the full context from
+`StoredTranscriptEntry` values, including each entry's provider replay sidecar.
+
 `SessionInput` contains only model completions with optional context-token
 updates and direct context-token updates. Plain core inputs use
 `AgentSession::enqueue_input`.

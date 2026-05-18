@@ -7,6 +7,7 @@ use crate::{
     ResumableModelAction, StoredAction,
 };
 
+use super::action_records::{model_action_context_leaf_id, model_action_context_tokens};
 use super::events::insert_event_with_activity_tx;
 use super::rows::row_text;
 use super::sql::action_is_unfinished;
@@ -230,7 +231,7 @@ impl PostgresAgentStore {
     ) -> Result<Vec<PendingDispatchAction>> {
         let rows = sqlx::query(
             r#"
-            select id, attempt_id, kind, action_id, turn_id, payload
+            select session_id, id, attempt_id, kind, action_id, turn_id, payload
             from actions
             where session_id=$1 and status='pending'
             order by created_at
@@ -240,14 +241,42 @@ impl PostgresAgentStore {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
-            .filter_map(|row| match row_text::<ActionKind>(&row, "kind") {
-                Ok(ActionKind::Model) => Some(pending_model_dispatch_from_row(row)),
-                Ok(ActionKind::Tool) => Some(pending_tool_dispatch_from_row(row)),
-                Ok(ActionKind::Compaction) => None,
-                Err(error) => Some(Err(anyhow!(error))),
-            })
-            .collect()
+        let mut actions = Vec::new();
+        for row in rows {
+            match row_text::<ActionKind>(&row, "kind") {
+                Ok(ActionKind::Model) => {
+                    actions.push(self.pending_model_dispatch_from_row(row).await?)
+                }
+                Ok(ActionKind::Tool) => actions.push(pending_tool_dispatch_from_row(row)?),
+                Ok(ActionKind::Compaction) => {}
+                Err(error) => return Err(anyhow!(error)),
+            }
+        }
+        Ok(actions)
+    }
+
+    async fn pending_model_dispatch_from_row(
+        &self,
+        row: sqlx::postgres::PgRow,
+    ) -> Result<PendingDispatchAction> {
+        let payload: serde_json::Value = row.get("payload");
+        let context_leaf_id = model_action_context_leaf_id(&payload)
+            .ok_or_else(|| anyhow!("pending model action missing context_leaf_id"))?;
+        let model_context = self
+            .model_context_for_leaf(row.get("session_id"), &context_leaf_id)
+            .await?;
+        let context_tokens = model_action_context_tokens(&payload);
+        Ok(PendingDispatchAction {
+            row_id: row.get("id"),
+            attempt_id: row.get("attempt_id"),
+            action: agent_session::SessionAction::RequestModel {
+                action_id: agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64),
+                turn_id: agent_vocab::TurnId(row.get::<i64, _>("turn_id") as u64),
+                model_context,
+                context_leaf_id: Some(context_leaf_id),
+                context_tokens,
+            },
+        })
     }
 
     pub async fn claim_pending_model_action(
@@ -352,34 +381,6 @@ impl PostgresAgentStore {
         tx.commit().await?;
         Ok(vec![event])
     }
-}
-
-fn pending_model_dispatch_from_row(row: sqlx::postgres::PgRow) -> Result<PendingDispatchAction> {
-    let payload: serde_json::Value = row.get("payload");
-    let model_context = payload
-        .get("model_context")
-        .cloned()
-        .ok_or_else(|| anyhow!("pending model action missing model_context"))?;
-    let items: Vec<agent_vocab::TranscriptItem> = serde_json::from_value(model_context)?;
-    let context_leaf_id = payload
-        .get("context_leaf_id")
-        .and_then(serde_json::Value::as_str)
-        .map(str::to_string);
-    let context_tokens = payload
-        .get("context_tokens")
-        .and_then(serde_json::Value::as_u64)
-        .map(|value| value as usize);
-    Ok(PendingDispatchAction {
-        row_id: row.get("id"),
-        attempt_id: row.get("attempt_id"),
-        action: agent_session::SessionAction::RequestModel {
-            action_id: agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64),
-            turn_id: agent_vocab::TurnId(row.get::<i64, _>("turn_id") as u64),
-            model_context: agent_session::ModelContext::from_transcript_items(items),
-            context_leaf_id,
-            context_tokens,
-        },
-    })
 }
 
 fn pending_tool_dispatch_from_row(row: sqlx::postgres::PgRow) -> Result<PendingDispatchAction> {
