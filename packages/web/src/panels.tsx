@@ -11,7 +11,7 @@ import {
 	X,
 	Loader2
 } from "lucide-react";
-import { memo } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { COMMANDS } from "./slash.ts";
 import {
 	isArchivedSession,
@@ -107,12 +107,10 @@ export const Sidebar = memo(function Sidebar({
 			/>
 			<div className="session-section-head">
 				<span>Sessions</span>
-				<span className="section-count">{total}</span>
+				<ActivityCounts counts={counts} archived={archived} />
 			</div>
 			<SidebarToolbar
 				disabled={!selectedProjectId}
-				counts={counts}
-				archived={archived}
 				query={query}
 				onQueryChange={onQueryChange}
 				showArchived={showArchived}
@@ -212,8 +210,6 @@ export function ProjectList({
 
 export function SidebarToolbar({
 	disabled,
-	counts,
-	archived,
 	query,
 	onQueryChange,
 	showArchived,
@@ -221,20 +217,65 @@ export function SidebarToolbar({
 	onNew
 }: {
 	disabled: boolean;
-	counts: Record<SessionDisplayActivity, number>;
-	archived: number;
 	query: string;
 	onQueryChange: (query: string) => void;
 	showArchived: boolean;
 	onToggleArchived: () => void;
 	onNew: () => void;
 }) {
+	const [searchOpen, setSearchOpen] = useState(false);
+	const searchInputRef = useRef<HTMLInputElement | null>(null);
+	const searchVisible = searchOpen || !!query.trim();
+
+	useEffect(() => {
+		if (!searchOpen || disabled) return;
+		const frame = requestAnimationFrame(() => searchInputRef.current?.focus());
+		return () => cancelAnimationFrame(frame);
+	}, [disabled, searchOpen]);
+
+	useEffect(() => {
+		if (disabled || searchOpen) return;
+		const handleKeyDown = (event: KeyboardEvent) => {
+			const target = event.target as HTMLElement | null;
+			const activeElement = document.activeElement as HTMLElement | null;
+			const isTypingTarget =
+				target instanceof HTMLInputElement ||
+				target instanceof HTMLTextAreaElement ||
+				target?.isContentEditable;
+			if (isTypingTarget) return;
+			if (!activeElement?.closest('[data-slot="sidebar"]')) return;
+			if (event.key === "/" || ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "f")) {
+				event.preventDefault();
+				setSearchOpen(true);
+			}
+		};
+		window.addEventListener("keydown", handleKeyDown);
+		return () => window.removeEventListener("keydown", handleKeyDown);
+	}, [disabled, searchOpen]);
+
 	return (
 		<div className="sidebar-toolbar">
 			<div className="toolbar-actions">
 				<button className="primary-button" type="button" onClick={onNew} disabled={disabled}>
 					<Plus size={14} />
 					New session
+				</button>
+				<button
+					className={`icon-button ${searchVisible ? "pressed" : ""}`}
+					type="button"
+					onClick={() => {
+						if (searchVisible) {
+							onQueryChange("");
+							setSearchOpen(false);
+						} else {
+							setSearchOpen(true);
+						}
+					}}
+					disabled={disabled}
+					aria-label={searchVisible ? "Close Filter Sessions" : "Filter Sessions"}
+					title={searchVisible ? "Close Filter Sessions" : "Filter Sessions"}
+				>
+					<Search size={14} />
 				</button>
 				<button
 					className={`icon-button ${showArchived ? "pressed" : ""}`}
@@ -247,22 +288,60 @@ export function SidebarToolbar({
 					<Archive size={14} />
 				</button>
 			</div>
-			<label className="search-box">
-				<Search size={14} />
-				<input value={query} onChange={(event) => onQueryChange(event.target.value)} placeholder="filter sessions..." disabled={disabled} />
-			</label>
-			<div className="activity-counts">
-				{(["running", "idle"] as SessionDisplayActivity[]).map((activity) => (
-					<span className={`activity-chip ${activity}`} key={activity}>
-						{activity}
-						<span className="count">{counts[activity] ?? 0}</span>
-					</span>
-				))}
-				<span className="activity-chip archived">
-					archived
-					<span className="count">{archived}</span>
+			{searchVisible ? (
+				<label
+					className="search-box"
+					onBlur={(event) => {
+						if (event.currentTarget.contains(event.relatedTarget)) return;
+						if (!query.trim()) setSearchOpen(false);
+					}}
+				>
+					<input
+						ref={searchInputRef}
+						value={query}
+						onChange={(event) => onQueryChange(event.target.value)}
+						onKeyDown={(event) => {
+							if (event.key !== "Escape") return;
+							event.preventDefault();
+							if (query.trim()) onQueryChange("");
+							else setSearchOpen(false);
+						}}
+						placeholder="Filter Sessions..."
+						disabled={disabled}
+					/>
+					{query ? (
+						<button
+							className="search-clear-button"
+							type="button"
+							onClick={() => {
+								onQueryChange("");
+								searchInputRef.current?.focus();
+							}}
+							aria-label="clear session filter"
+							title="Clear Filter Sessions"
+						>
+							<X size={13} />
+						</button>
+					) : null}
+				</label>
+			) : null}
+		</div>
+	);
+}
+
+function ActivityCounts({ counts, archived }: { counts: Record<SessionDisplayActivity, number>; archived: number }) {
+	return (
+		<div className="activity-counts">
+			{(["running", "idle"] as SessionDisplayActivity[]).map((activity) => (
+				<span className={`activity-chip ${activity}`} key={activity}>
+					{activity}
+					<span className="count">{counts[activity] ?? 0}</span>
 				</span>
-			</div>
+			))}
+			<span className="activity-chip archived">
+				archived
+				<span className="count">{archived}</span>
+			</span>
 		</div>
 	);
 }

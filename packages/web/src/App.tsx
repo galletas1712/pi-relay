@@ -1301,6 +1301,7 @@ export function App() {
 	}, [api, closeProjectDialog, projectDialog, pushNotice, queryClient, selectSession]);
 	const handleSidebarNew = useCallback(() => {
 		void createSession();
+		if (panelModeRef.current !== "wide") setSidebarOpen(false);
 	}, [createSession]);
 	const handleArchiveToggle = useCallback(
 		(session: SessionListItem) => {
@@ -1454,7 +1455,6 @@ export function App() {
 				onClose={() => setSidebarOpen(false)}
 				onSelectProject={(projectId) => {
 					handleSelectProject(projectId);
-					closeSidebarIfOverlay();
 				}}
 				onNewProject={() => {
 					openCreateProjectDialog();

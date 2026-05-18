@@ -275,6 +275,7 @@ pre {
 .activity-counts {
 	display: flex;
 	flex-wrap: wrap;
+	min-width: 0;
 	gap: 6px;
 }
 
@@ -282,8 +283,11 @@ pre {
 	display: inline-flex;
 	align-items: center;
 	gap: 5px;
-	font-family: var(--font-mono);
+	font-family: var(--font-sans);
 	font-size: 10.5px;
+	font-weight: 500;
+	letter-spacing: 0;
+	text-transform: lowercase;
 	color: var(--muted-foreground);
 }
 
@@ -358,12 +362,14 @@ pre {
 }
 
 .session-section-head {
-	padding: 10px 12px 0;
+	justify-content: flex-start;
+	gap: 8px;
+	padding: 10px 12px 8px;
+	border-bottom: 1px solid var(--border);
 }
 
-.section-count {
-	color: var(--foreground);
-	font-variant-numeric: tabular-nums;
+.session-section-head > span:first-child {
+	flex: 0 0 auto;
 }
 
 .project-list {
@@ -513,6 +519,28 @@ pre {
 	background: transparent;
 	color: var(--foreground);
 	font-size: 12.5px;
+}
+
+.search-clear-button {
+	display: inline-flex;
+	flex: 0 0 auto;
+	align-items: center;
+	justify-content: center;
+	width: 22px;
+	height: 22px;
+	border: 0;
+	border-radius: 5px;
+	background: transparent;
+	padding: 0;
+	color: var(--muted-foreground);
+	cursor: pointer;
+}
+
+.search-clear-button:hover,
+.search-clear-button:focus-visible {
+	background: var(--muted);
+	color: var(--foreground);
+	outline: none;
 }
 
 .session-list {
@@ -718,6 +746,7 @@ pre {
 	align-items: center;
 	gap: 6px;
 	min-width: 0;
+	font-size: inherit;
 	font-weight: 500;
 	letter-spacing: 0;
 }
@@ -735,7 +764,7 @@ pre {
 	color: var(--foreground);
 	padding: 0 24px 0 8px;
 	font-family: var(--font-sans);
-	font-size: 13.5px;
+	font-size: inherit;
 	font-weight: 400;
 	line-height: 1.45;
 	letter-spacing: 0;
@@ -2567,6 +2596,11 @@ pre {
 
 .session-row-action.disabled {
 	cursor: default;
+	opacity: 0;
+}
+
+.session-row:hover .session-row-action.disabled,
+.session-row:focus-visible .session-row-action.disabled {
 	opacity: 0.32;
 }
 
