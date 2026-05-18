@@ -13,9 +13,7 @@ use crate::{
     PersistedAction,
 };
 
-use super::action_records::{
-    model_action_context_leaf_id, model_action_context_tokens, model_action_payload,
-};
+use super::action_records::{model_action_context_leaf_id, model_action_payload};
 use super::events::{
     insert_event_tx, insert_event_with_activity_tx, insert_transcript_item_events_tx,
 };
@@ -459,7 +457,7 @@ impl PostgresAgentStore {
             ..
         } = &job.scope
         {
-            let payload = model_action_payload(Some(&installed_active_leaf_id), None);
+            let payload = model_action_payload(Some(&installed_active_leaf_id));
             let updated = sqlx::query(
                 r#"
                 update actions
@@ -711,13 +709,11 @@ fn session_action_from_model_row(
 ) -> Result<agent_session::SessionAction> {
     let payload: Value = row.get("payload");
     let context_leaf_id = model_action_context_leaf_id(&payload);
-    let context_tokens = model_action_context_tokens(&payload);
     Ok(agent_session::SessionAction::RequestModel {
         action_id: agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64),
         turn_id: agent_vocab::TurnId(row.get::<i64, _>("turn_id") as u64),
         model_context,
         context_leaf_id,
-        context_tokens,
     })
 }
 

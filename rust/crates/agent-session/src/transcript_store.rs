@@ -211,12 +211,20 @@ impl TranscriptStore {
     }
 
     pub(crate) fn append_transcript_item(&mut self, item: TranscriptItem) -> String {
+        self.append_item(item, Vec::new())
+    }
+
+    pub(crate) fn append_item(
+        &mut self,
+        item: TranscriptItem,
+        provider_replay: Vec<ProviderReplayItem>,
+    ) -> String {
         let entry = TranscriptStorageNode {
             id: Uuid::new_v4().to_string(),
             parent_id: self.active_leaf_id.clone(),
             timestamp_ms: now_ms(),
             item,
-            provider_replay: Vec::new(),
+            provider_replay,
         };
         self.append_entry(entry)
     }

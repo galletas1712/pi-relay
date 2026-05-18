@@ -937,7 +937,7 @@ async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result
     };
     let aborted_tasks = abort_session_tasks(state, &session_id);
     let dispatches = driver
-        .apply_agent_input(active, AgentInput::Interrupt, None, None, Vec::new())
+        .apply_agent_input(active, AgentInput::Interrupt, None, Vec::new())
         .await?;
     driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
@@ -1180,12 +1180,7 @@ async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Val
     }
 
     let dispatches = driver
-        .resume_model_turn(
-            &action.context_leaf_id,
-            action.turn_id,
-            action.action_id,
-            action.context_tokens,
-        )
+        .resume_model_turn(&action.context_leaf_id, action.turn_id, action.action_id)
         .await?;
     driver.dispatch(dispatches).await?;
     Ok(json!({
@@ -1261,7 +1256,6 @@ async fn harness_model_complete(
                 status: ActionStatus::Completed,
                 result: json!({ "source": "harness" }),
             }),
-            None,
             Vec::new(),
         )
         .await?;
@@ -1304,7 +1298,6 @@ async fn harness_model_fail(
                 status: ActionStatus::Error,
                 result: json!({ "error": error }),
             }),
-            None,
             Vec::new(),
         )
         .await?;

@@ -37,13 +37,12 @@ pub(super) fn action_payload(
             action_id,
             turn_id,
             context_leaf_id,
-            context_tokens,
             ..
         } => Ok((
             ActionKind::Model,
             action_id.0 as i64,
             Some(turn_id.0 as i64),
-            model_action_payload(context_leaf_id.as_deref(), *context_tokens),
+            model_action_payload(context_leaf_id.as_deref()),
         )),
         SessionAction::RequestTool {
             action_id,
@@ -65,13 +64,9 @@ pub(super) fn action_payload(
 /// immutable transcript leaf, not the full model context. Live dispatch still
 /// receives the in-memory `SessionAction::RequestModel`; restart/recovery can
 /// reconstruct the context by walking `transcript_entries` from this leaf.
-pub(super) fn model_action_payload(
-    context_leaf_id: Option<&str>,
-    context_tokens: Option<usize>,
-) -> Value {
+pub(super) fn model_action_payload(context_leaf_id: Option<&str>) -> Value {
     json!({
         "context_leaf_id": context_leaf_id,
-        "context_tokens": context_tokens,
     })
 }
 
@@ -80,13 +75,6 @@ pub(super) fn model_action_context_leaf_id(payload: &Value) -> Option<String> {
         .get("context_leaf_id")
         .and_then(Value::as_str)
         .map(str::to_string)
-}
-
-pub(super) fn model_action_context_tokens(payload: &Value) -> Option<usize> {
-    payload
-        .get("context_tokens")
-        .and_then(Value::as_u64)
-        .map(|value| value as usize)
 }
 
 #[cfg(test)]
@@ -102,7 +90,6 @@ mod tests {
             turn_id: TurnId(3),
             model_context: ModelContext::from_transcript_items(Vec::new()),
             context_leaf_id: Some("entry_leaf".to_string()),
-            context_tokens: Some(42),
         };
 
         let (_, _, _, payload) = action_payload(&action).expect("payload builds");
@@ -111,10 +98,7 @@ mod tests {
             payload.get("context_leaf_id").and_then(Value::as_str),
             Some("entry_leaf")
         );
-        assert_eq!(
-            payload.get("context_tokens").and_then(Value::as_u64),
-            Some(42)
-        );
+        assert!(payload.get("context_tokens").is_none());
         assert!(payload.get("model_context").is_none());
     }
 }

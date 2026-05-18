@@ -1,22 +1,24 @@
 use std::fmt;
 
-use agent_vocab::{ActionId, AssistantMessage, TurnId};
+use agent_vocab::{ActionId, AssistantMessage, ProviderReplayItem, TurnId};
 
 /// External input to a live `AgentSession`.
 ///
-/// Session-level model completions can refresh the harness-provided context
-/// token count. Plain core inputs use `AgentSession::enqueue_input`.
+/// Session-level model completions carry provider sidecars that the pure core
+/// loop does not understand. Plain core inputs use `AgentSession::enqueue_input`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionInput {
     ModelCompleted {
         action_id: ActionId,
         turn_id: TurnId,
         assistant: AssistantMessage,
-        context_tokens: Option<usize>,
     },
-    ContextTokensUpdated {
-        context_leaf_id: Option<String>,
-        context_tokens: usize,
+    ModelMaxOutputTokens {
+        action_id: ActionId,
+        turn_id: TurnId,
+        assistant: AssistantMessage,
+        provider_replay: Vec<ProviderReplayItem>,
+        error: String,
     },
 }
 

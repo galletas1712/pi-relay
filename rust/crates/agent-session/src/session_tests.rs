@@ -2,8 +2,8 @@ use super::*;
 use crate::SessionActionKind;
 use agent_core::AgentInput;
 use agent_vocab::{
-    ActionId, AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage,
-    ToolResultStatus, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+    ActionId, AssistantItem, AssistantMessage, ProviderReplayItem, ToolCall, ToolCallId,
+    ToolResultMessage, ToolResultStatus, TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 
 fn finished_model_context(input: &str) -> ModelContext {
@@ -184,7 +184,6 @@ fn history_operation_preserves_queued_user_inputs_and_drops_queued_completions()
             assistant: AssistantMessage {
                 items: vec![AssistantItem::Text("stale".to_string())],
             },
-            context_tokens: None,
         })
         .expect("stale completion is valid input");
 
@@ -214,7 +213,6 @@ fn history_operation_preserves_queued_user_inputs_and_drops_queued_completions()
             action_id: ActionId(1),
             turn_id: TurnId(1),
             assistant: AssistantMessage { items: Vec::new() },
-            context_tokens: None,
         })
         .expect("matching model completion is valid");
     session.drive();
@@ -252,7 +250,6 @@ fn drive_drains_core_items_into_the_session_context() {
             action_id: ActionId(1),
             turn_id: TurnId(1),
             assistant: assistant.clone(),
-            context_tokens: None,
         })
         .expect("matching model completion is valid");
     session.drive();
@@ -412,125 +409,6 @@ fn stored_session_round_trips_the_active_branch() {
 }
 
 #[test]
-fn restore_closes_open_turn_and_remains_quiescent() {
-    let mut items = Vec::new();
-    items.extend(finished_turn(
-        1,
-        "first user message with enough text to count",
-        "first assistant message with enough text to count",
-    ));
-    items.extend(finished_turn(
-        2,
-        "second user message with enough text to count",
-        "second assistant message with enough text to count",
-    ));
-    items.push(TranscriptItem::TurnStarted { turn_id: TurnId(3) });
-    items.push(TranscriptItem::UserMessage(UserMessage::text(
-        "open turn before process death",
-    )));
-
-    let mut session = AgentSession::from_model_context(ModelContext::from_transcript_items(items));
-
-    assert!(session.drain_actions().is_empty());
-    assert!(matches!(
-        session.model_context().transcript_items().last(),
-        Some(TranscriptItem::TurnFinished {
-            turn_id: TurnId(3),
-            outcome: TurnOutcome::Crashed,
-        })
-    ));
-
-    session
-        .enqueue_session_input(SessionInput::ContextTokensUpdated {
-            context_leaf_id: session
-                .transcript_store()
-                .active_leaf_id()
-                .map(str::to_string),
-            context_tokens: 101,
-        })
-        .expect("token update should be valid");
-    session.drive();
-    assert!(session.drain_actions().is_empty());
-
-    session
-        .enqueue_input(AgentInput::follow_up("after restore"))
-        .expect("plain follow-up is valid");
-    session.drive();
-    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(4));
-}
-
-#[test]
-fn context_token_count_is_cleared_when_context_changes() {
-    let mut items = Vec::new();
-    items.extend(finished_turn(
-        1,
-        "first user message",
-        "first assistant message",
-    ));
-    items.extend(finished_turn(
-        2,
-        "second user message",
-        "second assistant message",
-    ));
-    let mut session = AgentSession::from_model_context(ModelContext::from_transcript_items(items));
-    session
-        .enqueue_session_input(SessionInput::ContextTokensUpdated {
-            context_leaf_id: session
-                .transcript_store()
-                .active_leaf_id()
-                .map(str::to_string),
-            context_tokens: 123,
-        })
-        .expect("token update should be valid");
-
-    session
-        .enqueue_input(AgentInput::follow_up("third user message"))
-        .expect("plain follow-up is valid");
-    session.drive();
-
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModel { context_tokens, .. }] = actions.as_slice() else {
-        panic!("expected one RequestModel action, got {actions:?}");
-    };
-    assert_eq!(*context_tokens, None);
-}
-
-#[test]
-fn model_completion_context_tokens_do_not_attach_to_next_turn_started_in_same_drive() {
-    let mut session = AgentSession::new();
-    session
-        .enqueue_input(AgentInput::follow_up("first"))
-        .expect("plain follow-up is valid");
-    session.drive();
-    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
-
-    session
-        .enqueue_session_input(SessionInput::ModelCompleted {
-            action_id: ActionId(1),
-            turn_id: TurnId(1),
-            assistant: empty_assistant(),
-            context_tokens: Some(77),
-        })
-        .expect("session model completion should be valid");
-    session
-        .enqueue_input(AgentInput::follow_up("second"))
-        .expect("plain follow-up is valid");
-    session.drive();
-
-    let actions = session.drain_actions();
-    let [SessionAction::RequestModel {
-        turn_id,
-        context_tokens,
-        ..
-    }] = actions.as_slice()
-    else {
-        panic!("expected one RequestModel action, got {actions:?}");
-    };
-    assert_eq!(*turn_id, TurnId(2));
-    assert_eq!(*context_tokens, None);
-}
-
-#[test]
 fn unmatched_tool_completion_before_tool_request_is_ignored() {
     let mut session = AgentSession::new();
     let tool_call = ToolCall {
@@ -552,7 +430,6 @@ fn unmatched_tool_completion_before_tool_request_is_ignored() {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
             },
-            context_tokens: None,
         })
         .expect("matching model completion is valid");
     session
@@ -600,7 +477,6 @@ fn completion_event_is_not_emitted_when_interrupt_wins_before_drive() {
             action_id: ActionId(1),
             turn_id: TurnId(1),
             assistant: empty_assistant(),
-            context_tokens: Some(77),
         })
         .expect("session model completion should be valid");
     session
@@ -675,7 +551,6 @@ fn history_operation_can_interrupt_drained_model_action() {
             action_id: ActionId(1),
             turn_id: TurnId(1),
             assistant: AssistantMessage { items: Vec::new() },
-            context_tokens: None,
         })
         .expect("late model completion is valid but stale");
     session.drive();
@@ -702,7 +577,6 @@ fn tool_crash_result_records_failure_and_continues_turn() {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
             },
-            context_tokens: None,
         })
         .expect("matching model completion is valid");
     session.drive();
@@ -804,7 +678,7 @@ fn terminal_model_turn_can_resume_from_original_checkpoint_without_duplicate_use
     ));
 
     session
-        .resume_model_turn(&checkpoint_id, TurnId(1), ActionId(1), Some(55))
+        .resume_model_turn(&checkpoint_id, TurnId(1), ActionId(1))
         .expect("crashed model turn can be resumed from its checkpoint");
     let resumed_context =
         assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
@@ -827,7 +701,6 @@ fn terminal_model_turn_can_resume_from_original_checkpoint_without_duplicate_use
             assistant: AssistantMessage {
                 items: vec![AssistantItem::Text("resumed".to_string())],
             },
-            context_tokens: None,
         })
         .expect("matching resumed model completion is valid");
     session.drive();
@@ -874,6 +747,69 @@ fn terminal_model_turn_can_resume_from_original_checkpoint_without_duplicate_use
 }
 
 #[test]
+fn max_output_tokens_persists_partial_assistant_then_crashed_boundary() {
+    let mut session = AgentSession::new();
+    session
+        .enqueue_input(AgentInput::follow_up("hi"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
+
+    let provider_replay = vec![ProviderReplayItem::new(
+        agent_vocab::ProviderKind::OpenAi,
+        &serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "partial" }],
+        }),
+    )
+    .expect("replay serializes")];
+    session
+        .enqueue_session_input(SessionInput::ModelMaxOutputTokens {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::Text("partial".to_string())],
+            },
+            provider_replay: provider_replay.clone(),
+            error: "provider response hit max_output_tokens".to_string(),
+        })
+        .expect("max-output completion should be valid");
+    session.drive();
+
+    assert!(session.drain_actions().is_empty());
+    let context = session.model_context();
+    assert_eq!(
+        context.transcript_items(),
+        &[
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            TranscriptItem::UserMessage(UserMessage::text("hi")),
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("partial".to_string())],
+            }),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Crashed,
+            },
+        ]
+    );
+    let entries = session.transcript_store().entries();
+    let assistant_entry = entries
+        .iter()
+        .find(|entry| matches!(entry.item, TranscriptItem::AssistantMessage(_)))
+        .expect("assistant entry should persist");
+    assert_eq!(assistant_entry.provider_replay, provider_replay);
+    assert!(session.drain_events().iter().any(|event| matches!(
+        event,
+        SessionEvent::ActionFailed {
+            kind: SessionActionKind::Model,
+            id,
+            error,
+        } if id == "1" && error == "provider response hit max_output_tokens"
+    )));
+}
+
+#[test]
 fn late_action_drain_does_not_leave_completed_request_pending() {
     let mut session = AgentSession::new();
     session
@@ -886,7 +822,6 @@ fn late_action_drain_does_not_leave_completed_request_pending() {
             action_id: ActionId(1),
             turn_id: TurnId(1),
             assistant: AssistantMessage { items: Vec::new() },
-            context_tokens: None,
         })
         .expect("matching model completion is valid");
     session.drive();
@@ -912,7 +847,6 @@ fn stale_completion_after_history_operation_cannot_attach_to_reused_turn_id() {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::Text("old response".to_string())],
             },
-            context_tokens: None,
         })
         .expect("matching model completion is valid");
     session.drive();
@@ -933,7 +867,6 @@ fn stale_completion_after_history_operation_cannot_attach_to_reused_turn_id() {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::Text("stale old response".to_string())],
             },
-            context_tokens: None,
         })
         .expect("well-formed stale completion is valid input");
     session.drive();
@@ -958,7 +891,6 @@ fn stale_completion_after_history_operation_cannot_attach_to_reused_turn_id() {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::Text("new response".to_string())],
             },
-            context_tokens: None,
         })
         .expect("matching model completion is valid");
     session.drive();
@@ -1035,7 +967,6 @@ fn history_operation_interrupts_active_tool_work_before_applying() {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
             },
-            context_tokens: None,
         })
         .expect("matching model completion is valid");
     session.drive();
@@ -1087,7 +1018,6 @@ fn mismatched_tool_completion_does_not_clear_live_tool_work() {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
             },
-            context_tokens: None,
         })
         .expect("matching model completion is valid");
     session.drive();
@@ -1141,7 +1071,6 @@ fn interrupt_emits_session_work_cancellation_and_unblocks_edits() {
             assistant: AssistantMessage {
                 items: vec![AssistantItem::Text("late".to_string())],
             },
-            context_tokens: None,
         })
         .expect("late model completion is still well-formed input");
     session.drive();

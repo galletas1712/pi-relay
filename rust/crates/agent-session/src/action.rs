@@ -7,8 +7,7 @@ use crate::model_context::ModelContext;
 ///
 /// Model/tool actions are produced by `agent-core` and surfaced here with the
 /// same correlation ids. `RequestModel` includes the supplied model-context
-/// snapshot, the transcript leaf that snapshot was materialized from, and the
-/// latest harness-provided token count for that context, if one is available.
+/// snapshot and the transcript leaf that snapshot was materialized from.
 ///
 /// `CancelSessionWork` is a session-wide invalidation barrier. A harness should
 /// treat every outstanding model or tool request for this session as
@@ -21,7 +20,6 @@ pub enum SessionAction {
         turn_id: TurnId,
         model_context: ModelContext,
         context_leaf_id: Option<String>,
-        context_tokens: Option<usize>,
     },
     RequestTool {
         action_id: ActionId,

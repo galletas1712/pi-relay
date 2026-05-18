@@ -8,7 +8,7 @@ use agent_provider::{
     ModelTranscriptEntry, PromptSections, ProviderCompactionRequest, ProviderCompactionResponse,
     ProviderError, ProviderTokenCountRequest, ProviderToolProfile,
 };
-use agent_session::ModelContext;
+use agent_session::{ModelContext, ModelContextEntry, TranscriptStorageNode};
 use agent_store::SessionConfig;
 use agent_tools::limit_tool_output;
 use agent_vocab::{
@@ -22,6 +22,8 @@ use serde_json::Value;
 use crate::auth::{refresh_codex_credentials, Credentials};
 use crate::model_metadata;
 use crate::state::AppState;
+
+const MAX_COMPACTION_CONTEXT_ATTEMPTS: usize = 4;
 
 pub(crate) async fn run_model(
     state: &AppState,
@@ -72,7 +74,31 @@ async fn count_tokens_with_auth_retry(
     }
 }
 
-pub(crate) async fn count_model_input_tokens(
+pub(crate) async fn model_input_tokens_for_gate(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+    context_leaf_id: Option<&str>,
+    model_context: ModelContext,
+) -> Result<usize> {
+    match config.provider.kind {
+        ProviderKind::Claude => {
+            count_model_input_tokens(state, config, session_id, model_context).await
+        }
+        ProviderKind::OpenAi => {
+            estimate_openai_model_input_tokens(
+                state,
+                config,
+                session_id,
+                context_leaf_id,
+                model_context,
+            )
+            .await
+        }
+    }
+}
+
+async fn count_model_input_tokens(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
@@ -102,6 +128,70 @@ pub(crate) async fn count_model_input_tokens(
     Ok(count_tokens_with_auth_retry(config, provider, request)
         .await?
         .input_tokens)
+}
+
+async fn estimate_openai_model_input_tokens(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+    context_leaf_id: Option<&str>,
+    model_context: ModelContext,
+) -> Result<usize> {
+    if let Some(context_leaf_id) = context_leaf_id {
+        if let Some(usage) = state
+            .repo
+            .latest_model_token_usage_estimate(session_id, context_leaf_id)
+            .await?
+        {
+            let suffix_entries =
+                suffix_after_first_model_generated_item(usage.suffix_entries.clone());
+            let suffix_context = ModelContext::from_entries(
+                suffix_entries
+                    .into_iter()
+                    .map(|entry| ModelContextEntry {
+                        item: entry.item,
+                        provider_replay: entry.provider_replay,
+                    })
+                    .collect(),
+            );
+            let suffix_transcript = provider_transcript(suffix_context);
+            let suffix_tokens = agent_provider::estimate_transcript_tokens(
+                &suffix_transcript,
+                config.provider.kind,
+            )
+            .tokens;
+            return Ok(usage
+                .with_estimated_suffix_tokens(suffix_tokens)
+                .total_tokens);
+        }
+    }
+
+    estimate_model_input_tokens_locally(state, config, model_context).await
+}
+
+fn suffix_after_first_model_generated_item(
+    entries: Vec<TranscriptStorageNode>,
+) -> Vec<TranscriptStorageNode> {
+    let start = entries
+        .iter()
+        .position(|entry| matches!(entry.item, TranscriptItem::AssistantMessage(_)))
+        .map(|index| index.saturating_add(1))
+        .unwrap_or(0);
+    entries.into_iter().skip(start).collect()
+}
+
+async fn estimate_model_input_tokens_locally(
+    state: &AppState,
+    config: &SessionConfig,
+    model_context: ModelContext,
+) -> Result<usize> {
+    let prompt = assemble_agent_prompt(state, config).await?;
+    let transcript = provider_transcript(model_context);
+    Ok(agent_provider::estimate_model_input_tokens(
+        &prompt,
+        &transcript,
+        config.provider.kind,
+    ))
 }
 
 async fn complete_with_auth_retry(
@@ -331,38 +421,17 @@ pub(crate) async fn run_compaction(
 
     if remote_mode != RemoteCompactionMode::Never && provider.provider.supports_remote_compaction()
     {
-        let request =
-            remote_compaction_request(state, config, session_id, model_context.clone()).await?;
-        match compact_with_auth_retry(config, provider, request).await {
-            Ok(result) => {
-                let (summary, summary_kind) = match result.summary {
-                    Some(summary) if !summary.trim().is_empty() => (
-                        summary.trim().to_string(),
-                        CompactionSummaryKind::ProviderText,
-                    ),
-                    _ => (
-                        generic_remote_compaction_summary(config.provider.kind),
-                        CompactionSummaryKind::Generic,
-                    ),
-                };
-                return Ok(CompactionOutput {
-                    summary,
-                    summary_kind,
-                    provider_replay: result.provider_replay,
-                    remote: true,
-                    provider: config.provider.kind,
-                    usage: result
-                        .usage
-                        .and_then(|usage| serde_json::to_value(usage).ok()),
-                });
-            }
+        match run_remote_compaction_with_trimming(state, config, session_id, model_context.clone())
+            .await
+        {
+            Ok(output) => return Ok(output),
             Err(error)
                 if remote_mode == RemoteCompactionMode::Auto
                     && config.provider.kind != ProviderKind::OpenAi =>
             {
                 eprintln!("remote compaction failed for {session_id}; falling back to local summary: {error}");
             }
-            Err(error) => return Err(anyhow::Error::from(error)),
+            Err(error) => return Err(error),
         }
     } else if remote_mode == RemoteCompactionMode::Always {
         return Err(anyhow!(
@@ -374,16 +443,79 @@ pub(crate) async fn run_compaction(
     run_local_summary_compaction(state, config, session_id, model_context).await
 }
 
-async fn remote_compaction_request(
+async fn run_remote_compaction_with_trimming(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
     model_context: ModelContext,
+) -> Result<CompactionOutput> {
+    let base_transcript = provider_transcript(model_context);
+    let mut groups = transcript_groups(base_transcript);
+    let mut last_context_error = None;
+    for attempt in 0..MAX_COMPACTION_CONTEXT_ATTEMPTS {
+        let request =
+            remote_compaction_request(state, config, session_id, entries_from_groups(&groups))
+                .await?;
+        let credentials = Credentials::load();
+        let provider = provider_for_config(config, &credentials)?;
+        match compact_with_auth_retry(config, provider, request).await {
+            Ok(result) => return Ok(remote_compaction_output(config.provider.kind, result)),
+            Err(error)
+                if attempt + 1 < MAX_COMPACTION_CONTEXT_ATTEMPTS
+                    && provider_error_is_context_overflow(&error)
+                    && trim_oldest_complete_group(&mut groups) =>
+            {
+                last_context_error = Some(error.to_string());
+                eprintln!(
+                    "remote compaction for {session_id} exceeded context; retrying with older transcript group trimmed"
+                );
+                continue;
+            }
+            Err(error) => return Err(anyhow::Error::from(error)),
+        }
+    }
+    Err(anyhow!(
+        "remote compaction still exceeded context limits after trimming: {}",
+        last_context_error.unwrap_or_else(|| "unknown context-length error".to_string())
+    ))
+}
+
+fn remote_compaction_output(
+    provider: ProviderKind,
+    result: ProviderCompactionResponse,
+) -> CompactionOutput {
+    let (summary, summary_kind) = match result.summary {
+        Some(summary) if !summary.trim().is_empty() => (
+            summary.trim().to_string(),
+            CompactionSummaryKind::ProviderText,
+        ),
+        _ => (
+            generic_remote_compaction_summary(provider),
+            CompactionSummaryKind::Generic,
+        ),
+    };
+    CompactionOutput {
+        summary,
+        summary_kind,
+        provider_replay: result.provider_replay,
+        remote: true,
+        provider,
+        usage: result
+            .usage
+            .and_then(|usage| serde_json::to_value(usage).ok()),
+    }
+}
+
+async fn remote_compaction_request(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+    transcript: Vec<ModelTranscriptEntry>,
 ) -> Result<ProviderCompactionRequest> {
     Ok(ProviderCompactionRequest {
         model: config.provider.model.clone(),
         prompt: assemble_agent_prompt(state, config).await?,
-        transcript: provider_transcript(model_context),
+        transcript,
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools: state.tools.definitions_for_provider(config.provider.kind),
         reasoning_effort: config.provider.reasoning_effort,
@@ -404,11 +536,10 @@ async fn run_local_summary_compaction(
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<CompactionOutput> {
-    const MAX_LOCAL_COMPACTION_ATTEMPTS: usize = 4;
     let base_transcript = provider_transcript(model_context);
     let mut groups = transcript_groups(base_transcript);
     let mut last_context_error = None;
-    for attempt in 0..MAX_LOCAL_COMPACTION_ATTEMPTS {
+    for attempt in 0..MAX_COMPACTION_CONTEXT_ATTEMPTS {
         let request =
             local_summary_request(state, config, session_id, entries_from_groups(&groups));
         let credentials = Credentials::load();
@@ -416,7 +547,7 @@ async fn run_local_summary_compaction(
         let response = match complete_with_auth_retry(config, provider, request).await {
             Ok(response) => response,
             Err(error)
-                if attempt + 1 < MAX_LOCAL_COMPACTION_ATTEMPTS
+                if attempt + 1 < MAX_COMPACTION_CONTEXT_ATTEMPTS
                     && provider_error_is_context_overflow(&error)
                     && trim_oldest_complete_group(&mut groups) =>
             {

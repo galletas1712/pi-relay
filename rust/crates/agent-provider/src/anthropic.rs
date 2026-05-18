@@ -10,9 +10,9 @@ use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::{
-    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderError,
-    ProviderResult, ProviderTokenCountRequest, ProviderTokenCountResponse, ProviderToolProfile,
-    ProviderUsage,
+    ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
+    ProviderError, ProviderResult, ProviderTokenCountRequest, ProviderTokenCountResponse,
+    ProviderToolProfile, ProviderUsage,
 };
 
 const DEFAULT_MAX_TOKENS: u32 = 65_536;
@@ -749,7 +749,15 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
         assistant: AssistantMessage { items },
         provider_replay,
         usage: response.get("usage").and_then(anthropic_usage),
+        stop_reason: anthropic_stop_reason(response),
     })
+}
+
+fn anthropic_stop_reason(response: &Value) -> ModelStopReason {
+    match response.get("stop_reason").and_then(Value::as_str) {
+        Some("max_tokens") => ModelStopReason::MaxOutputTokens,
+        _ => ModelStopReason::Complete,
+    }
 }
 
 fn canonical_anthropic_tool_name(name: &str) -> &str {
@@ -1113,6 +1121,21 @@ mod tests {
         assert_eq!(usage.total_tokens, None);
         assert_eq!(usage.cache_read_input_tokens, Some(75));
         assert_eq!(usage.cache_creation_input_tokens, Some(25));
+    }
+
+    #[test]
+    fn anthropic_parser_maps_max_tokens_stop_reason() {
+        let response = json!({
+            "content": [
+                { "type": "text", "text": "partial" }
+            ],
+            "stop_reason": "max_tokens"
+        });
+
+        let response = parse_anthropic_message(&response).expect("message parses");
+
+        assert_eq!(response.assistant.text(), "partial");
+        assert_eq!(response.stop_reason, ModelStopReason::MaxOutputTokens);
     }
 
     #[test]

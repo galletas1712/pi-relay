@@ -13,8 +13,9 @@ use std::sync::OnceLock;
 use uuid::Uuid;
 
 use crate::{
-    ModelProvider, ModelRequest, ModelResponse, ModelTranscriptEntry, ProviderCompactionRequest,
-    ProviderCompactionResponse, ProviderError, ProviderResult, ProviderToolProfile, ProviderUsage,
+    ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
+    ProviderCompactionRequest, ProviderCompactionResponse, ProviderError, ProviderResult,
+    ProviderToolProfile, ProviderUsage,
 };
 
 const RESPONSES_REASONING_INCLUDE: &str = "reasoning.encrypted_content";
@@ -716,6 +717,7 @@ fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<Mod
     let mut items = Vec::new();
     let mut provider_replay = Vec::new();
     let mut usage = None;
+    let mut stop_reason = ModelStopReason::Complete;
     for data in sse_data_events(text) {
         let event: Value = serde_json::from_str(data)?;
         match event.get("type").and_then(Value::as_str) {
@@ -734,7 +736,13 @@ fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<Mod
             Some("response.incomplete") => {
                 let message = event
                     .pointer("/response/incomplete_details/reason")
-                    .and_then(Value::as_str)
+                    .and_then(Value::as_str);
+                if message == Some("max_output_tokens") {
+                    stop_reason = ModelStopReason::MaxOutputTokens;
+                    usage = event.pointer("/response/usage").and_then(openai_usage);
+                    continue;
+                }
+                let message = message
                     .map(|reason| format!("response incomplete: {reason}"))
                     .unwrap_or_else(|| "response incomplete".to_string());
                 return Err(ProviderError::Provider(message));
@@ -749,6 +757,7 @@ fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<Mod
         assistant: AssistantMessage { items },
         provider_replay,
         usage,
+        stop_reason,
     })
 }
 
@@ -1422,6 +1431,25 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
         assert_eq!(usage.total_tokens, Some(120));
         assert_eq!(usage.cache_read_input_tokens, Some(80));
         assert_eq!(usage.cache_creation_input_tokens, None);
+    }
+
+    #[test]
+    fn responses_sse_keeps_partial_output_on_max_output_tokens() {
+        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}}
+data: {"type":"response.incomplete","response":{"id":"resp_1","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":100,"output_tokens":64,"total_tokens":164,"input_tokens_details":{"cached_tokens":80}}}}
+"#;
+
+        let response = parse_responses_sse(sse, ProviderKind::OpenAi)
+            .expect("max-output incomplete should parse as partial response");
+
+        assert_eq!(response.assistant.text(), "partial");
+        assert_eq!(response.provider_replay.len(), 1);
+        assert_eq!(response.stop_reason, ModelStopReason::MaxOutputTokens);
+        let usage = response.usage.expect("usage should be parsed");
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(64));
+        assert_eq!(usage.total_tokens, Some(164));
+        assert_eq!(usage.cache_read_input_tokens, Some(80));
     }
 
     #[test]

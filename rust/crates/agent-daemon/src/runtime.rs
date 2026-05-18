@@ -13,8 +13,7 @@ use agent_store::{
 };
 use agent_tools::dynamic_tool_context;
 use agent_vocab::{
-    ProviderKind, ProviderReplayItem, ToolResultMessage, ToolResultStatus, TranscriptItem,
-    UserMessage,
+    ProviderReplayItem, ToolResultMessage, ToolResultStatus, TranscriptItem, UserMessage,
 };
 use anyhow::Context;
 use serde_json::{json, Value};
@@ -23,8 +22,8 @@ use tokio::task::JoinHandle;
 
 use crate::codec::transcript_store_from_stored;
 use crate::provider_runtime::{
-    auto_limit_tokens, compaction_auto_state, compaction_config, count_model_input_tokens,
-    load_skill_result, provider_error_is_context_overflow, run_compaction, run_model,
+    auto_limit_tokens, compaction_auto_state, compaction_config, load_skill_result,
+    model_input_tokens_for_gate, provider_error_is_context_overflow, run_compaction, run_model,
 };
 use crate::state::{AppState, RunningTask};
 use crate::types::{DispatchAction, LiveEventFrame, RpcError, RuntimeSession};
@@ -399,7 +398,6 @@ impl SessionDriver {
         active: Arc<Mutex<RuntimeSession>>,
         input: AgentInput,
         action_update: Option<ActionUpdate>,
-        context_tokens: Option<usize>,
         provider_replay: Vec<ProviderReplayItem>,
     ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
         if let Some(update) = &action_update {
@@ -417,9 +415,31 @@ impl SessionDriver {
                 ));
             }
         }
-        {
+        let persist_provider_replay = {
             let mut runtime = active.lock().await;
+            let max_output_tokens =
+                Self::action_update_stop_reason(&action_update) == Some("max_output_tokens");
+            let persist_provider_replay = !max_output_tokens;
             match input {
+                AgentInput::ModelCompleted {
+                    action_id,
+                    turn_id,
+                    assistant,
+                } if max_output_tokens => runtime
+                    .session
+                    .enqueue_session_input(SessionInput::ModelMaxOutputTokens {
+                        action_id,
+                        turn_id,
+                        assistant,
+                        provider_replay: provider_replay.clone(),
+                        error: action_update
+                            .as_ref()
+                            .and_then(|update| update.result.get("error"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("provider response hit max_output_tokens")
+                            .to_string(),
+                    })
+                    .map_err(|error| RpcError::new("invalid_input", error.to_string()))?,
                 AgentInput::ModelCompleted {
                     action_id,
                     turn_id,
@@ -430,7 +450,6 @@ impl SessionDriver {
                         action_id,
                         turn_id,
                         assistant,
-                        context_tokens,
                     })
                     .map_err(|error| RpcError::new("invalid_input", error.to_string()))?,
                 other => runtime
@@ -438,9 +457,22 @@ impl SessionDriver {
                     .enqueue_input(other)
                     .map_err(|error| RpcError::new("invalid_input", error.to_string()))?,
             }
-        }
+            persist_provider_replay
+        };
+        let provider_replay = if persist_provider_replay {
+            provider_replay
+        } else {
+            Vec::new()
+        };
         self.persist_active_outputs(active, action_update, None, None, provider_replay)
             .await
+    }
+
+    fn action_update_stop_reason(action_update: &Option<ActionUpdate>) -> Option<&str> {
+        action_update
+            .as_ref()
+            .and_then(|update| update.result.get("stop_reason"))
+            .and_then(Value::as_str)
     }
 
     pub(crate) async fn resume_model_turn(
@@ -448,7 +480,6 @@ impl SessionDriver {
         checkpoint_leaf_id: &str,
         turn_id: agent_vocab::TurnId,
         action_id: agent_vocab::ActionId,
-        context_tokens: Option<usize>,
     ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
         let config = self
             .state
@@ -465,7 +496,7 @@ impl SessionDriver {
         let mut session = AgentSession::from_stored_session(stored)
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         session
-            .resume_model_turn(checkpoint_leaf_id, turn_id, action_id, context_tokens)
+            .resume_model_turn(checkpoint_leaf_id, turn_id, action_id)
             .map_err(history_error_to_rpc)?;
 
         let active = Arc::new(Mutex::new(RuntimeSession { session, config }));
@@ -587,7 +618,7 @@ impl SessionDriver {
         };
         let SessionAction::RequestModel {
             model_context,
-            context_tokens,
+            context_leaf_id,
             ..
         } = &dispatch.action
         else {
@@ -603,32 +634,24 @@ impl SessionDriver {
             return Ok(true);
         }
 
-        let tokens = match context_tokens {
-            Some(tokens) => *tokens,
-            None if !provider_can_estimate_input_tokens(&dispatch.config) => {
-                // Codex backend has no token-counting endpoint; the next
-                // turn's `usage.input_tokens` from `response.completed` will
-                // populate `context_tokens` and gate compaction then.
-                return Ok(true);
-            }
-            None => match count_model_input_tokens(
-                &self.state,
-                &dispatch.config,
-                &self.session_id,
-                model_context.clone(),
-            )
-            .await
-            {
-                Ok(tokens) => tokens,
-                Err(error) => {
-                    let provider_error = error.downcast_ref::<agent_provider::ProviderError>();
-                    if provider_error.is_some_and(provider_error_is_context_overflow) {
-                        limit
-                    } else {
-                        return Err(anyhow::Error::from(error).into());
-                    }
+        let tokens = match model_input_tokens_for_gate(
+            &self.state,
+            &dispatch.config,
+            &self.session_id,
+            context_leaf_id.as_deref(),
+            model_context.clone(),
+        )
+        .await
+        {
+            Ok(tokens) => tokens,
+            Err(error) => {
+                let provider_error = error.downcast_ref::<agent_provider::ProviderError>();
+                if provider_error.is_some_and(provider_error_is_context_overflow) {
+                    limit
+                } else {
+                    return Err(anyhow::Error::from(error).into());
                 }
-            },
+            }
         };
         if tokens < limit {
             return Ok(true);
@@ -682,13 +705,6 @@ fn check_compaction_eligible(dispatch: &DispatchAction) -> Option<CompactionElig
     Some(CompactionEligible {
         limit: auto_limit_tokens(&config),
     })
-}
-
-/// Anthropic exposes `/messages/count_tokens` so the gate can size the
-/// transcript before dispatch. Codex has no such endpoint, so the gate must
-/// fall through and rely on the reactive overflow recovery path.
-fn provider_can_estimate_input_tokens(config: &SessionConfig) -> bool {
-    matches!(config.provider.kind, ProviderKind::Claude)
 }
 
 /// Typed reason for an auto-compaction trigger. Serialized to a stable string
@@ -1180,7 +1196,6 @@ async fn fail_blocked_model_for_compaction_error(
                 error: model_error.clone(),
             },
             None,
-            None,
             Vec::new(),
         )
         .await?;
@@ -1318,7 +1333,6 @@ async fn run_model_turn(
         turn_id,
         model_context,
         context_leaf_id,
-        context_tokens,
     } = original_action
     else {
         return Ok(());
@@ -1329,7 +1343,6 @@ async fn run_model_turn(
             turn_id,
             model_context: model_context.clone(),
             context_leaf_id,
-            context_tokens,
         },
         ..dispatch
     };
@@ -1348,29 +1361,47 @@ async fn run_model_turn(
         .active_session()
         .await
         .ok_or_else(|| RpcError::new("stale_action", "session is not active"))?;
-    let (input, status, update_result, provider_replay, context_tokens) = match result {
+    let (input, status, update_result, provider_replay) = match result {
         Ok(response) => {
-            let context_tokens = response.usage.as_ref().and_then(|usage| usage.input_tokens);
-            if context_tokens.is_some() {
+            let has_usage = response.usage.is_some();
+            if has_usage {
                 state
                     .repo
                     .reset_auto_compaction_failures(&session_id)
                     .await
                     .map_err(anyhow::Error::from)?;
             }
+            let stop_reason = response.stop_reason;
+            let update_status = if matches!(
+                stop_reason,
+                agent_provider::ModelStopReason::MaxOutputTokens
+            ) {
+                ActionStatus::Error
+            } else {
+                ActionStatus::Completed
+            };
+            let update_error = if matches!(
+                stop_reason,
+                agent_provider::ModelStopReason::MaxOutputTokens
+            ) {
+                Some("provider response hit max_output_tokens")
+            } else {
+                None
+            };
             (
                 AgentInput::ModelCompleted {
                     action_id,
                     turn_id,
                     assistant: response.assistant,
                 },
-                ActionStatus::Completed,
+                update_status,
                 json!({
                     "source": "provider",
                     "usage": response.usage,
+                    "stop_reason": stop_reason,
+                    "error": update_error,
                 }),
                 response.provider_replay,
-                context_tokens,
             )
         }
         Err(error) => {
@@ -1394,7 +1425,6 @@ async fn run_model_turn(
                 ActionStatus::Error,
                 json!({ "error": message }),
                 Vec::new(),
-                None,
             )
         }
     };
@@ -1408,7 +1438,6 @@ async fn run_model_turn(
                 status,
                 result: update_result,
             }),
-            context_tokens,
             provider_replay,
         )
         .await?;

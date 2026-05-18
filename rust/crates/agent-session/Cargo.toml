@@ -8,4 +8,5 @@ publish = false
 agent-core = { workspace = true }
 agent-vocab = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 uuid = { workspace = true }

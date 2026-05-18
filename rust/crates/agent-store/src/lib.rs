@@ -469,7 +469,38 @@ pub struct ResumableModelAction {
     pub turn_id: TurnId,
     pub status: ActionStatus,
     pub context_leaf_id: String,
-    pub context_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenUsageEstimate {
+    pub total_tokens: usize,
+    pub base_tokens: usize,
+    pub estimated_suffix_tokens: usize,
+    pub suffix_start_leaf_id: Option<String>,
+    pub suffix_entries: Vec<TranscriptStorageNode>,
+}
+
+impl TokenUsageEstimate {
+    pub fn from_full_estimate(total_tokens: usize) -> Self {
+        Self {
+            total_tokens,
+            base_tokens: 0,
+            estimated_suffix_tokens: total_tokens,
+            suffix_start_leaf_id: None,
+            suffix_entries: Vec::new(),
+        }
+    }
+
+    pub fn with_estimated_suffix_tokens(mut self, estimated_suffix_tokens: usize) -> Self {
+        self.estimated_suffix_tokens = estimated_suffix_tokens;
+        self.total_tokens = self.base_tokens.saturating_add(estimated_suffix_tokens);
+        self
+    }
+
+    pub fn with_suffix_entries(mut self, suffix_entries: Vec<TranscriptStorageNode>) -> Self {
+        self.suffix_entries = suffix_entries;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -478,12 +509,6 @@ pub struct ResumableToolAction {
     pub turn_id: TurnId,
     pub status: ActionStatus,
     pub tool_call: agent_vocab::ToolCall,
-}
-
-#[derive(Debug, Clone)]
-pub struct ContextUsageSnapshot {
-    pub context_leaf_id: Option<String>,
-    pub input_tokens: usize,
 }
 
 pub struct OutputBatch<'a> {

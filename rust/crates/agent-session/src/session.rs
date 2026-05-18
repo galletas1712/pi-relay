@@ -50,8 +50,6 @@ pub struct AgentSession {
     outstanding_actions: OutstandingActions,
     action_outbox: VecDeque<SessionAction>,
     event_outbox: VecDeque<SessionEvent>,
-    context_tokens: Option<usize>,
-    pending_model_context_tokens: PendingModelContextTokens,
 }
 
 impl Default for AgentSession {
@@ -68,8 +66,6 @@ impl AgentSession {
             outstanding_actions: OutstandingActions::default(),
             action_outbox: VecDeque::new(),
             event_outbox: VecDeque::new(),
-            context_tokens: None,
-            pending_model_context_tokens: PendingModelContextTokens::default(),
         }
     }
 
@@ -206,7 +202,7 @@ impl AgentSession {
         if matches!(input, AgentInput::ModelCompleted { .. }) {
             return Err(SessionInputError::ModelCompletionRequiresSessionInput);
         }
-        if !self.accept_agent_input(&input, None) {
+        if !self.accept_agent_input(&input) {
             return Ok(());
         }
         self.core.enqueue_input(input);
@@ -219,31 +215,37 @@ impl AgentSession {
                 action_id,
                 turn_id,
                 assistant,
-                context_tokens,
             } => {
                 let input = AgentInput::ModelCompleted {
                     action_id,
                     turn_id,
                     assistant,
                 };
-                if self.accept_agent_input(&input, context_tokens) {
+                if self.accept_agent_input(&input) {
                     self.core.enqueue_input(input);
                 }
                 Ok(())
             }
-            SessionInput::ContextTokensUpdated {
-                context_leaf_id,
-                context_tokens,
+            SessionInput::ModelMaxOutputTokens {
+                action_id,
+                turn_id,
+                assistant,
+                provider_replay,
+                error,
             } => {
-                if self.transcript_store.active_leaf_id().map(str::to_string) == context_leaf_id {
-                    self.context_tokens = Some(context_tokens);
-                }
+                self.accept_model_max_output_tokens(
+                    action_id,
+                    turn_id,
+                    assistant,
+                    provider_replay,
+                    error,
+                );
                 Ok(())
             }
         }
     }
 
-    fn accept_agent_input(&mut self, input: &AgentInput, context_tokens: Option<usize>) -> bool {
+    fn accept_agent_input(&mut self, input: &AgentInput) -> bool {
         if matches!(input, AgentInput::Interrupt) {
             self.invalidate_session_work("interrupted");
         }
@@ -257,15 +259,57 @@ impl AgentSession {
             if !self.outstanding_actions.accept_completion(input) {
                 return false;
             }
-            if let AgentInput::ModelCompleted { turn_id, .. } = input {
-                self.pending_model_context_tokens =
-                    PendingModelContextTokens::ModelTokenUpdatePendingAcceptance {
-                        turn_id: *turn_id,
-                        context_tokens,
-                    };
-            }
             self.drop_completed_action_from_outbox(input);
         }
+        true
+    }
+
+    fn accept_model_max_output_tokens(
+        &mut self,
+        action_id: ActionId,
+        turn_id: TurnId,
+        assistant: agent_vocab::AssistantMessage,
+        provider_replay: Vec<ProviderReplayItem>,
+        error: String,
+    ) -> bool {
+        let input = AgentInput::ModelCompleted {
+            action_id,
+            turn_id,
+            assistant: assistant.clone(),
+        };
+        if !self.outstanding_actions.accept_completion(&input) {
+            return false;
+        }
+        self.drop_completed_action_from_outbox(&input);
+        let assistant_item = TranscriptItem::AssistantMessage(assistant);
+        let entry_id = self
+            .transcript_store
+            .append_item(assistant_item.clone(), provider_replay);
+        self.event_outbox
+            .push_back(SessionEvent::TranscriptItemAppended {
+                entry_id,
+                item: assistant_item,
+            });
+        let entry_id = self.transcript_store.append_item(
+            TranscriptItem::TurnFinished {
+                turn_id,
+                outcome: agent_vocab::TurnOutcome::Crashed,
+            },
+            Vec::new(),
+        );
+        self.event_outbox
+            .push_back(SessionEvent::TranscriptItemAppended {
+                entry_id,
+                item: TranscriptItem::TurnFinished {
+                    turn_id,
+                    outcome: agent_vocab::TurnOutcome::Crashed,
+                },
+            });
+        self.event_outbox.push_back(SessionEvent::ActionFailed {
+            kind: crate::event::SessionActionKind::Model,
+            id: action_id.0.to_string(),
+            error,
+        });
         true
     }
 
@@ -277,10 +321,6 @@ impl AgentSession {
 
     pub fn is_ready_to_continue(&self) -> bool {
         self.core.is_ready_to_continue()
-    }
-
-    pub fn context_tokens(&self) -> Option<usize> {
-        self.context_tokens
     }
 
     pub fn transcript_store(&self) -> &TranscriptStore {
@@ -394,8 +434,6 @@ impl AgentSession {
             entry_ids.push(self.transcript_store.append_storage_node(suffix));
             suffix_parent = Some(suffix_id);
         }
-        self.context_tokens = None;
-        self.pending_model_context_tokens = PendingModelContextTokens::Empty;
         let active_leaf_id = self
             .transcript_store
             .active_leaf_id()
@@ -429,11 +467,8 @@ impl AgentSession {
             turn_id,
             model_context: self.model_context(),
             context_leaf_id: Some(active_leaf_id.to_string()),
-            context_tokens: None,
         };
         self.outstanding_actions.track_session_action(&action);
-        self.context_tokens = None;
-        self.pending_model_context_tokens = PendingModelContextTokens::Empty;
         Ok(())
     }
 
@@ -448,7 +483,6 @@ impl AgentSession {
         checkpoint_leaf_id: &str,
         turn_id: TurnId,
         action_id: ActionId,
-        context_tokens: Option<usize>,
     ) -> Result<(), HistoryOperationError> {
         if !self.transcript_store.contains_entry(checkpoint_leaf_id) {
             return Err(HistoryOperationError::Store(
@@ -470,15 +504,12 @@ impl AgentSession {
         self.outstanding_actions.clear();
         self.action_outbox
             .retain(|action| matches!(action, SessionAction::CancelSessionWork));
-        self.context_tokens = context_tokens;
-        self.pending_model_context_tokens = PendingModelContextTokens::Empty;
 
         let action = SessionAction::RequestModel {
             action_id,
             turn_id,
             model_context: self.model_context(),
             context_leaf_id: Some(checkpoint_leaf_id.to_string()),
-            context_tokens,
         };
         self.outstanding_actions.track_session_action(&action);
         self.queue_session_action(action);
@@ -489,19 +520,15 @@ impl AgentSession {
     fn drain_core_transcript_items(&mut self) {
         let items = self.core.drain_transcript_items();
         if items.is_empty() {
-            self.pending_model_context_tokens = PendingModelContextTokens::Empty;
             self.outstanding_actions
                 .emit_events_after_core_accepts(&items, &mut self.event_outbox);
             return;
         }
-        self.context_tokens = None;
         let entry_ids = self.transcript_store.append_transcript_items(items.clone());
         for (entry_id, item) in entry_ids.into_iter().zip(items.iter().cloned()) {
             self.event_outbox
                 .push_back(SessionEvent::TranscriptItemAppended { entry_id, item });
         }
-        self.pending_model_context_tokens
-            .apply_if_accepted_by(&items, &mut self.context_tokens);
         self.outstanding_actions
             .emit_events_after_core_accepts(&items, &mut self.event_outbox);
     }
@@ -530,7 +557,6 @@ impl AgentSession {
                 turn_id,
                 model_context: self.model_context(),
                 context_leaf_id: self.transcript_store.active_leaf_id().map(str::to_string),
-                context_tokens: self.context_tokens,
             },
             AgentAction::RequestTool {
                 action_id,
@@ -568,8 +594,6 @@ impl AgentSession {
             .any(|action| matches!(action, SessionAction::CancelSessionWork));
 
         self.outstanding_actions.clear();
-        self.context_tokens = None;
-        self.pending_model_context_tokens = PendingModelContextTokens::Empty;
         self.action_outbox
             .retain(|action| matches!(action, SessionAction::CancelSessionWork));
 
@@ -598,8 +622,6 @@ impl AgentSession {
         self.outstanding_actions.clear();
         self.action_outbox
             .retain(|action| matches!(action, SessionAction::CancelSessionWork));
-        self.context_tokens = None;
-        self.pending_model_context_tokens = PendingModelContextTokens::Empty;
     }
 
     fn close_transcript_store_open_turn(
@@ -643,35 +665,6 @@ impl AgentSession {
             Err(HistoryOperationError::Store(
                 TranscriptStoreError::NotTurnBoundary,
             ))
-        }
-    }
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-enum PendingModelContextTokens {
-    #[default]
-    Empty,
-    ModelTokenUpdatePendingAcceptance {
-        turn_id: TurnId,
-        context_tokens: Option<usize>,
-    },
-}
-
-impl PendingModelContextTokens {
-    fn apply_if_accepted_by(
-        &mut self,
-        items: &[TranscriptItem],
-        current_context_tokens: &mut Option<usize>,
-    ) {
-        let Self::ModelTokenUpdatePendingAcceptance {
-            turn_id,
-            context_tokens,
-        } = std::mem::take(self)
-        else {
-            return;
-        };
-        if items.iter().rev().find_map(TranscriptItem::turn_id) == Some(turn_id) {
-            *current_context_tokens = context_tokens;
         }
     }
 }

@@ -233,6 +233,8 @@ async fn complete_action_tx(
     update: &mut ActionUpdate,
     session_events: &[SessionEvent],
 ) -> Result<()> {
+    let explicit_status = update.status;
+    let explicit_result = update.result.clone();
     let select_query = r#"
             select kind, action_id
             from actions
@@ -251,21 +253,26 @@ async fn complete_action_tx(
     {
         let row_kind = row_text(&row, "kind")?;
         let row_action_id: i64 = row.get("action_id");
-        for event in session_events {
-            match event {
-                SessionEvent::ActionCompleted { kind, id }
-                    if action_event_matches_row(row_kind, row_action_id, kind, id) =>
-                {
-                    update.status = ActionStatus::Completed;
+        if !matches!(explicit_status, ActionStatus::Error) {
+            for event in session_events {
+                match event {
+                    SessionEvent::ActionCompleted { kind, id }
+                        if action_event_matches_row(row_kind, row_action_id, kind, id) =>
+                    {
+                        update.status = ActionStatus::Completed;
+                    }
+                    SessionEvent::ActionFailed { kind, id, error }
+                        if action_event_matches_row(row_kind, row_action_id, kind, id) =>
+                    {
+                        update.status = ActionStatus::Error;
+                        update.result = json!({ "error": error });
+                    }
+                    _ => {}
                 }
-                SessionEvent::ActionFailed { kind, id, error }
-                    if action_event_matches_row(row_kind, row_action_id, kind, id) =>
-                {
-                    update.status = ActionStatus::Error;
-                    update.result = json!({ "error": error });
-                }
-                _ => {}
             }
+        } else {
+            update.status = explicit_status;
+            update.result = explicit_result;
         }
     }
 
