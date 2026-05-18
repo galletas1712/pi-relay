@@ -334,11 +334,18 @@ const PendingUserBubble = memo(function PendingUserBubble({ input }: { input: Pe
 		<div className={`message-row user-row pending-user-row ${input.status === "failed" ? "failed" : ""}`}>
 			<div className="user-bubble pending-user-bubble">
 				{contentBlocksToText(input.content)}
-				<span className="pending-user-status">{input.status === "failed" ? input.error ?? "failed to send" : "sending..."}</span>
+				<span className="pending-user-status">{pendingUserStatusLabel(input)}</span>
 			</div>
 		</div>
 	);
 });
+
+function pendingUserStatusLabel(input: PendingTranscriptInput): string {
+	if (input.status === "failed") return input.error ?? "failed to send";
+	if (input.status === "queued") return "queued";
+	if (input.status === "accepted") return "syncing...";
+	return "sending...";
+}
 
 const WorkingIndicator = memo(function WorkingIndicator({ startMs }: { startMs: number }) {
 	const [elapsedMs, setElapsedMs] = useState(() => Math.max(0, Date.now() - startMs));

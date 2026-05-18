@@ -28,6 +28,7 @@ import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
 import {
+	applyServerViewUpdate,
 	mergeSnapshotIntoSessionList,
 	patchSessionListActivity,
 	patchSessionListMetadata,
@@ -51,6 +52,7 @@ import type {
 	Project,
 	ProviderConfig,
 	ReasoningEffort,
+	SessionSnapshot,
 	SessionSummary,
 	ToolListing,
 	TranscriptEntry,
@@ -144,6 +146,7 @@ export function App() {
 	const [promptDialog, setPromptDialog] = useState<PromptDialogState | null>(null);
 
 	const refreshTimer = useRef<number | null>(null);
+	const overviewRefreshTimer = useRef<number | null>(null);
 	const sessionListRefreshTimer = useRef<number | null>(null);
 	const composerHandleRef = useRef<ComposerHandle | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
@@ -345,30 +348,77 @@ export function App() {
 		[invalidateSelectedSession],
 	);
 
+	const fetchSessionSnapshot = useCallback(
+		async (sessionId: string, includeEntries: boolean, source: string) => {
+			const shouldLogPerf = perfEnabled();
+			const startedAt = perfNow();
+			if (shouldLogPerf) perfLog("session.get start", { sessionId, source, includeEntries });
+			const nextSnapshot = await api.getSession(sessionId, {
+				includeEntries,
+				entryScope: includeEntries ? SELECTED_SESSION_DISPLAY_SCOPE : undefined,
+			});
+			if (shouldLogPerf) {
+				const rpcMs = perfNow() - startedAt;
+				perfLog("session.get end", {
+					sessionId,
+					entries: nextSnapshot.entries?.length ?? 0,
+					approxBytes: approximateJsonSize(nextSnapshot),
+					rpcMs: Math.round(rpcMs),
+					entryScope: includeEntries ? SELECTED_SESSION_DISPLAY_SCOPE : "none",
+				});
+			}
+			return nextSnapshot;
+		},
+		[api],
+	);
+
+	const mergeSessionOverview = useCallback(
+		(sessionId: string, overview: SessionSnapshot) => {
+			queryClient.setQueryData<SessionSnapshot>(queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE), (current) => {
+				if (!current || current.session_id !== sessionId) return overview;
+				return {
+					...current,
+					...overview,
+					entries: current.entries,
+				};
+			});
+		},
+		[queryClient],
+	);
+
+	const reloadSessionOverview = useCallback(
+		async (sessionId: string) => {
+			const overview = await fetchSessionSnapshot(sessionId, false, "overview");
+			lastEventIds.current.set(sessionId, overview.last_event_id);
+			mergeSessionOverview(sessionId, overview);
+			queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(overview.project_id), (current) =>
+				mergeSnapshotIntoSessionList(current, overview),
+			);
+			setPendingInputs((current) =>
+				current.filter((input) => input.sessionId !== overview.session_id || !pendingInputIsReflected(input, overview)),
+			);
+			return overview;
+		},
+		[fetchSessionSnapshot, mergeSessionOverview, queryClient],
+	);
+
+	const scheduleOverviewRefresh = useCallback(
+		(sessionId = selectedRef.current, delayMs = SELECTED_SESSION_REFRESH_DEBOUNCE_MS) => {
+			if (!sessionId || sessionId !== selectedRef.current) return;
+			if (overviewRefreshTimer.current !== null) window.clearTimeout(overviewRefreshTimer.current);
+			overviewRefreshTimer.current = window.setTimeout(() => {
+				overviewRefreshTimer.current = null;
+				void reloadSessionOverview(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
+			}, delayMs);
+		},
+		[pushNotice, reloadSessionOverview],
+	);
+
 	const getFreshSession = useCallback(
 		async (sessionId: string) => {
 			const snapshot = await queryClient.fetchQuery({
 				queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
-				queryFn: async () => {
-					const shouldLogPerf = perfEnabled();
-					const startedAt = perfNow();
-					if (shouldLogPerf) perfLog("session.get start", { sessionId, source: "fetch" });
-					const nextSnapshot = await api.getSession(sessionId, {
-						includeEntries: true,
-						entryScope: SELECTED_SESSION_DISPLAY_SCOPE,
-					});
-					if (shouldLogPerf) {
-						const rpcMs = perfNow() - startedAt;
-						perfLog("session.get end", {
-							sessionId,
-							entries: nextSnapshot.entries?.length ?? 0,
-							approxBytes: approximateJsonSize(nextSnapshot),
-							rpcMs: Math.round(rpcMs),
-							entryScope: SELECTED_SESSION_DISPLAY_SCOPE,
-						});
-					}
-					return nextSnapshot;
-				},
+				queryFn: () => fetchSessionSnapshot(sessionId, true, "fetch"),
 				staleTime: 0,
 			});
 			lastEventIds.current.set(sessionId, snapshot.last_event_id);
@@ -382,7 +432,7 @@ export function App() {
 			}
 			return { snapshot, entries: snapshot.entries ?? [] };
 		},
-		[api, queryClient],
+		[fetchSessionSnapshot, queryClient],
 	);
 
 	const refreshSelected = useCallback(
@@ -439,12 +489,33 @@ export function App() {
 			const currentSessions = queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(selectedProjectRef.current));
 			const eventSession = currentSessions?.find((session) => session.session_id === event.session_id);
 			if (eventSession?.project_id && eventSession.project_id !== selectedProjectRef.current) return;
-			lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
 			reconcilePendingInputEvent(event);
 
 			const refreshPlan = refreshPlanForEvent(event);
 			if (refreshPlan.refreshSession && event.session_id === selectedRef.current) {
-				scheduleSelectedRefresh(event.session_id);
+				const snapshot = queryClient.getQueryData<SessionSnapshot>(queryKeys.session(event.session_id, SELECTED_SESSION_DISPLAY_SCOPE));
+				const updateResult = applyServerViewUpdate(snapshot, event);
+				if (updateResult === "reload_active_branch" || (updateResult === "reload_overview" && refreshPlan.refreshActiveBranch)) {
+					scheduleSelectedRefresh(event.session_id);
+				} else if (updateResult === "reload_overview") {
+					lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
+					scheduleOverviewRefresh(event.session_id);
+				} else {
+					lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
+					if (updateResult === "applied") {
+						queryClient.setQueryData<SessionSnapshot>(queryKeys.session(event.session_id, SELECTED_SESSION_DISPLAY_SCOPE), snapshot);
+						if (snapshot) {
+							queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(snapshot.project_id), (current) =>
+								mergeSnapshotIntoSessionList(current, snapshot),
+							);
+							setPendingInputs((current) =>
+								current.filter((input) => input.sessionId !== snapshot.session_id || !pendingInputIsReflected(input, snapshot)),
+							);
+						}
+					}
+				}
+			} else {
+				lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
 			}
 			if (refreshPlan.refreshList) {
 				const activity = activityFromEvent(event);
@@ -464,7 +535,14 @@ export function App() {
 				}
 			}
 		},
-		[pushNotice, queryClient, reconcilePendingInputEvent, scheduleSelectedRefresh, scheduleSessionListRefresh],
+		[
+			pushNotice,
+			queryClient,
+			reconcilePendingInputEvent,
+			scheduleOverviewRefresh,
+			scheduleSelectedRefresh,
+			scheduleSessionListRefresh,
+		],
 	);
 
 	useEffect(() => {
@@ -488,6 +566,7 @@ export function App() {
 			offStatus();
 			offEvent();
 			if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
+			if (overviewRefreshTimer.current !== null) window.clearTimeout(overviewRefreshTimer.current);
 			if (sessionListRefreshTimer.current !== null) window.clearTimeout(sessionListRefreshTimer.current);
 			api.close();
 		};
@@ -559,10 +638,7 @@ export function App() {
 				.then((replayed) => {
 					if (!subscribedEventSessionIds.current.has(sessionId)) return undefined;
 					for (const event of replayed) handleSessionEvent(event);
-					if (selectedRef.current === sessionId)
-						return queryClient.invalidateQueries({
-							queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
-						});
+					if (selectedRef.current === sessionId) return refreshSelected(sessionId);
 					return undefined;
 				})
 				.catch((error) => {
@@ -570,7 +646,7 @@ export function App() {
 					pushNotice("error", errorMessage(error));
 				});
 		}
-	}, [api, connection, handleSessionEvent, pushNotice, queryClient, selectedId, sessions]);
+	}, [api, connection, handleSessionEvent, pushNotice, refreshSelected, selectedId, sessions]);
 
 	const configureProvider = useCallback(
 		async (provider: ProviderConfig) => {

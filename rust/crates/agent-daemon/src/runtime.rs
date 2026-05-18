@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use agent_core::AgentInput;
@@ -23,10 +24,10 @@ use tokio::task::JoinHandle;
 use crate::codec::transcript_store_from_stored;
 use crate::provider_runtime::{
     auto_limit_tokens, compaction_auto_state, compaction_config, count_model_input_tokens,
-    provider_error_is_context_overflow, run_compaction, run_model,
+    load_skill_result, provider_error_is_context_overflow, run_compaction, run_model,
 };
 use crate::state::{AppState, RunningTask};
-use crate::types::{DispatchAction, RpcError, RuntimeSession};
+use crate::types::{DispatchAction, LiveEventFrame, RpcError, RuntimeSession};
 
 pub(crate) async fn ensure_expected_active_leaf(
     state: &AppState,
@@ -461,6 +462,41 @@ impl SessionDriver {
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         session
             .resume_model_turn(checkpoint_leaf_id, turn_id, action_id, context_tokens)
+            .map_err(history_error_to_rpc)?;
+
+        let active = Arc::new(Mutex::new(RuntimeSession { session, config }));
+        self.state
+            .active
+            .lock()
+            .await
+            .insert(self.session_id.clone(), active.clone());
+        self.persist_active_outputs(active, None, None, None, Vec::new())
+            .await
+    }
+
+    pub(crate) async fn resume_tool_turn(
+        &self,
+        checkpoint_leaf_id: &str,
+        turn_id: agent_vocab::TurnId,
+        action_id: agent_vocab::ActionId,
+        tool_call: agent_vocab::ToolCall,
+    ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
+        let config = self
+            .state
+            .repo
+            .load_session_config(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let stored = self
+            .state
+            .repo
+            .load_stored_session(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let mut session = AgentSession::from_stored_session(stored)
+            .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
+        session
+            .resume_tool_turn(checkpoint_leaf_id, turn_id, action_id, tool_call)
             .map_err(history_error_to_rpc)?;
 
         let active = Arc::new(Mutex::new(RuntimeSession { session, config }));
@@ -1447,17 +1483,22 @@ async fn run_tool_turn(
         &state.default_tool_context,
         std::path::PathBuf::from(dispatch.config.starting_cwd.clone()),
     );
-    let result = match state
-        .tools
-        .execute(dispatch.config.provider.kind, &tool_call, &tool_context)
-        .await
-    {
-        Ok(result) => result,
-        Err(error) => ToolResultMessage::error(
-            tool_call.id.clone(),
-            tool_call.tool_name.clone(),
-            error.to_string(),
-        ),
+    let result = if tool_call.tool_name == "LoadSkill" {
+        let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
+        load_skill_result(&tool_context.cwd, &loaded_skills, &tool_call)
+    } else {
+        match state
+            .tools
+            .execute(dispatch.config.provider.kind, &tool_call, &tool_context)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => ToolResultMessage::error(
+                tool_call.id.clone(),
+                tool_call.tool_name.clone(),
+                error.to_string(),
+            ),
+        }
     };
     let status = if matches!(result.status, ToolResultStatus::Success) {
         ActionStatus::Completed
@@ -1541,6 +1582,40 @@ async fn run_tool_turn(
     Ok(())
 }
 
+async fn loaded_skills_for_session(state: &AppState, session_id: &str) -> BTreeSet<String> {
+    let Some(active) = state.active.lock().await.get(session_id).cloned() else {
+        return BTreeSet::new();
+    };
+    let runtime = active.lock().await;
+    runtime
+        .session
+        .model_context()
+        .transcript_items()
+        .iter()
+        .filter_map(|item| match item {
+            TranscriptItem::ToolResult(result) if result.tool_name == "LoadSkill" => {
+                loaded_skill_name(&result.output)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn loaded_skill_name(output: &str) -> Option<String> {
+    let rest = output.strip_prefix("<loaded_skill>\n<name>")?;
+    let end = rest.find("</name>")?;
+    Some(xml_unescape(&rest[..end]))
+}
+
+fn xml_unescape(input: &str) -> String {
+    input
+        .replace("&apos;", "'")
+        .replace("&quot;", "\"")
+        .replace("&gt;", ">")
+        .replace("&lt;", "<")
+        .replace("&amp;", "&")
+}
+
 fn session_uses_harness(config: &SessionConfig) -> bool {
     config
         .metadata
@@ -1551,7 +1626,7 @@ fn session_uses_harness(config: &SessionConfig) -> bool {
 
 pub(crate) fn publish_events(state: &AppState, events: Vec<EventFrame>) {
     for event in events {
-        let _ = state.events.send(event);
+        let _ = state.events.send(LiveEventFrame::from_event(event));
     }
 }
 

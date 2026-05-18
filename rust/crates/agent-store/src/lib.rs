@@ -148,6 +148,49 @@ text_enum! {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventViewUpdatePolicy {
+    AppendActiveBranchEntry,
+    ReloadActiveBranch,
+    OverviewChanged,
+    Noop,
+}
+
+impl EventType {
+    pub fn view_update_policy(self) -> EventViewUpdatePolicy {
+        match self {
+            EventType::TranscriptAppended => EventViewUpdatePolicy::AppendActiveBranchEntry,
+            EventType::SessionRecovered
+            | EventType::HistoryRewound
+            | EventType::HistoryCompacted
+            | EventType::CompactionCompleted => EventViewUpdatePolicy::ReloadActiveBranch,
+            EventType::SessionCreated
+            | EventType::SessionConfigured
+            | EventType::SessionIdle
+            | EventType::SessionWorkCancelled
+            | EventType::InputQueued
+            | EventType::InputPromoted
+            | EventType::InputConsumed
+            | EventType::InputAccepted
+            | EventType::InputIgnored
+            | EventType::ActionRequested
+            | EventType::ModelRequested
+            | EventType::ModelCompleted
+            | EventType::ModelError
+            | EventType::ToolRequested
+            | EventType::ToolStarted
+            | EventType::ToolCompleted
+            | EventType::ToolError
+            | EventType::CompactionRequested
+            | EventType::CompactionError
+            | EventType::TurnStarted
+            | EventType::TurnFinished
+            | EventType::AssistantMessage => EventViewUpdatePolicy::OverviewChanged,
+            EventType::HistoryForked => EventViewUpdatePolicy::Noop,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub project_id: Uuid,
@@ -427,6 +470,14 @@ pub struct ResumableModelAction {
     pub status: ActionStatus,
     pub context_leaf_id: String,
     pub context_tokens: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ResumableToolAction {
+    pub action_id: ActionId,
+    pub turn_id: TurnId,
+    pub status: ActionStatus,
+    pub tool_call: agent_vocab::ToolCall,
 }
 
 #[derive(Debug, Clone)]

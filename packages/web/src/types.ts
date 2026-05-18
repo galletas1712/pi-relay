@@ -79,7 +79,25 @@ export interface EventFrame {
 	event: string;
 	session_id: string;
 	data: Record<string, unknown>;
+	view_update?: SessionViewUpdate;
 }
+
+export interface SessionViewUpdate {
+	overview?: Partial<SessionOverview>;
+	active_branch?: ActiveBranchViewUpdate;
+}
+
+export type ActiveBranchViewUpdate =
+	| {
+			kind: "append_entry";
+			entry: TranscriptEntry;
+	  }
+	| {
+			kind: "reload_required";
+			reason?: string | null;
+	  };
+
+export type SessionOverview = Omit<SessionSnapshot, "entries">;
 
 export type ContentBlock =
 	| { type: "text"; text: string }
