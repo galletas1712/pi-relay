@@ -213,9 +213,9 @@ export const MessageList = memo(function MessageList({
 	const displayNodes = useMemo(() => deriveTranscriptDisplayNodes(visibleEntries, turnViews, toolIndex.results, pendingActions), [pendingActions, toolIndex.results, turnViews, visibleEntries]);
 	const resumeEntryIdByNode = useMemo(() => {
 		const ids = new Map<string, string>();
-		for (const node of displayNodes) ids.set(node.key, resumeBoundaryIdForNode(node, turnViews) ?? nodeLeafId(node));
+		for (const node of displayNodes) ids.set(node.key, nodeLeafId(node));
 		return ids;
-	}, [displayNodes, turnViews]);
+	}, [displayNodes]);
 	// Each compaction collapses the display nodes between itself and the
 	// previous compaction (or session start). The count is precomputed so the
 	// marker's "show N hidden" label stays accurate as turns stream in.
@@ -817,13 +817,6 @@ function nodeLeafId(node: TranscriptDisplayNode): string {
 	if (node.type === "tool_group") return node.items.at(-1)?.entryId ?? node.id;
 	if (node.type === "compaction_in_progress") return node.key;
 	return node.entry.id;
-}
-
-function resumeBoundaryIdForNode(node: TranscriptDisplayNode, turns: TurnView[]): string | null {
-	if (node.type !== "turn_finished") return null;
-	const turn = turns.find((candidate) => candidate.boundaryEntry?.id === node.entry.id);
-	const lastModelEntryId = turn?.modelSteps.at(-1)?.entry.id ?? null;
-	return lastModelEntryId ?? node.entry.id;
 }
 
 function prettyToolName(toolName: string): string {

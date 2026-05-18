@@ -161,6 +161,30 @@ describe("MessageList Working indicator", () => {
 	});
 });
 
+describe("MessageList terminal turn resume actions", () => {
+	it("passes the crashed turn boundary id to the resume handler", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[
+					turnStartedEntry("start", 1, 1),
+					userEntryWithParent("user", "start", "do it"),
+					assistantEntry("assistant", "user", "partial"),
+					turnFinishedEntry("finish", "assistant", 1, "Crashed")
+				]}
+				activeLeafId="finish"
+				isRunning={false}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onResumeTurn={() => {}}
+				resumingTurnId="finish"
+			/>
+		);
+
+		expect(html).toContain("Starting");
+	});
+});
+
 describe("formatElapsed", () => {
 	it("formats sub-minute durations as seconds", () => {
 		expect(formatElapsed(0)).toBe("0s");
@@ -192,6 +216,36 @@ function userEntry(id: string, text: string): TranscriptEntry {
 		parent_id: null,
 		timestamp_ms: 0,
 		item: { type: "user_message", content: [{ type: "text", text }] },
+		provider_replay: []
+	};
+}
+
+function userEntryWithParent(id: string, parentId: string | null, text: string): TranscriptEntry {
+	return {
+		id,
+		parent_id: parentId,
+		timestamp_ms: 0,
+		item: { type: "user_message", content: [{ type: "text", text }] },
+		provider_replay: []
+	};
+}
+
+function assistantEntry(id: string, parentId: string | null, text: string): TranscriptEntry {
+	return {
+		id,
+		parent_id: parentId,
+		timestamp_ms: 0,
+		item: { type: "assistant_message", items: [{ type: "text", text }] },
+		provider_replay: []
+	};
+}
+
+function turnFinishedEntry(id: string, parentId: string | null, turnId: number, outcome: "Graceful" | "Interrupted" | "Crashed"): TranscriptEntry {
+	return {
+		id,
+		parent_id: parentId,
+		timestamp_ms: 0,
+		item: { type: "turn_finished", turn_id: turnId, outcome },
 		provider_replay: []
 	};
 }
