@@ -754,6 +754,11 @@ fn canonical_anthropic_tool_name(name: &str) -> &str {
         // Anthropic currently accepts `name: "Edit"` in the request but still
         // returns its trained native text-editor name in tool_use blocks.
         "str_replace_based_edit_tool" => "Edit",
+        // Server tools keep provider-native wire names in the actual Messages
+        // request/replay, but pi-relay display and PI.md capabilities use the
+        // pretty names.
+        "web_search" => "WebSearch",
+        "web_fetch" => "WebFetch",
         other => other,
     }
 }

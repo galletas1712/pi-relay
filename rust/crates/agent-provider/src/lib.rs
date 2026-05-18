@@ -120,10 +120,13 @@ pub fn canonical_tool_name_for_provider(provider: ProviderKind, name: &str) -> &
     match provider {
         ProviderKind::OpenAi => match name {
             "apply_patch" => "Edit",
+            "web_search" => "WebSearch",
             other => other,
         },
         ProviderKind::Claude => match name {
             "str_replace_based_edit_tool" => "Edit",
+            "web_search" => "WebSearch",
+            "web_fetch" => "WebFetch",
             other => other,
         },
     }

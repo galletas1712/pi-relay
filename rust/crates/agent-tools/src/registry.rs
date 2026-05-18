@@ -168,30 +168,36 @@ fn provider_tool_key(provider: ProviderKind, name: &str) -> String {
 }
 
 fn hosted_listing(provider: ProviderKind, name: &str) -> ToolListing {
-    let _ = provider;
-    ToolListing {
-        name: name.to_string(),
-        kind: ReplayDisplayKind::HostedTool,
-        description: hosted_tool_description(name).to_string(),
-        input_schema: hosted_tool_schema(name),
-    }
-}
-
-fn hosted_tool_description(name: &str) -> &'static str {
-    match name {
-        "WebSearch" => "Provider-hosted web search.",
-        "WebFetch" => "Provider-hosted web fetch.",
-        other => panic!("hosted tool {other} needs a description"),
-    }
-}
-
-fn hosted_tool_schema(name: &str) -> Value {
-    match name {
-        "WebSearch" => json!({ "type": "provider_hosted", "description": "Search the web." }),
-        "WebFetch" => {
-            json!({ "type": "provider_hosted", "description": "Fetch a specific web page." })
-        }
-        other => panic!("hosted tool {other} needs a schema"),
+    match (provider, name) {
+        (ProviderKind::OpenAi, "WebSearch") => ToolListing {
+            name: "WebSearch".to_string(),
+            kind: ReplayDisplayKind::HostedTool,
+            description: "OpenAI-hosted web search. The provider executes the search and returns web_search_call replay items with actions and citations when available.".to_string(),
+            input_schema: json!({
+                "type": "web_search",
+                "search_context_size": "high"
+            }),
+        },
+        (ProviderKind::Claude, "WebSearch") => ToolListing {
+            name: "WebSearch".to_string(),
+            kind: ReplayDisplayKind::HostedTool,
+            description: "Anthropic-hosted web search. The provider executes the server tool; pi-relay does not execute it locally.".to_string(),
+            input_schema: json!({
+                "type": "web_search_20250305",
+                "name": "WebSearch"
+            }),
+        },
+        (ProviderKind::Claude, "WebFetch") => ToolListing {
+            name: "WebFetch".to_string(),
+            kind: ReplayDisplayKind::HostedTool,
+            description: "Anthropic-hosted web fetch. The provider fetches a specific web page and returns citations when available.".to_string(),
+            input_schema: json!({
+                "type": "web_fetch_20250910",
+                "name": "WebFetch",
+                "citations": { "enabled": true }
+            }),
+        },
+        _ => panic!("hosted tool {name} is not registered for {provider}"),
     }
 }
 
@@ -272,5 +278,33 @@ mod tests {
         assert!(claude_edit.input_schema["properties"]
             .get("command")
             .is_some());
+    }
+
+    #[test]
+    fn hosted_listings_are_provider_specific() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let openai_web = registry
+            .listings_for_provider(ProviderKind::OpenAi)
+            .into_iter()
+            .find(|listing| listing.name == "WebSearch")
+            .expect("OpenAI WebSearch listing");
+        let claude_web = registry
+            .listings_for_provider(ProviderKind::Claude)
+            .into_iter()
+            .find(|listing| listing.name == "WebSearch")
+            .expect("Claude WebSearch listing");
+        let claude_fetch = registry
+            .listings_for_provider(ProviderKind::Claude)
+            .into_iter()
+            .find(|listing| listing.name == "WebFetch")
+            .expect("Claude WebFetch listing");
+
+        assert_eq!(openai_web.input_schema["type"], "web_search");
+        assert_eq!(openai_web.input_schema["search_context_size"], "high");
+        assert_eq!(claude_web.input_schema["type"], "web_search_20250305");
+        assert_eq!(claude_web.input_schema["name"], "WebSearch");
+        assert_eq!(claude_fetch.input_schema["type"], "web_fetch_20250910");
+        assert_eq!(claude_fetch.input_schema["name"], "WebFetch");
+        assert_eq!(claude_fetch.input_schema["citations"]["enabled"], true);
     }
 }
