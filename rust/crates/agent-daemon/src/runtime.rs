@@ -1042,27 +1042,56 @@ fn continuation_suffix_for_scope(
 ) -> std::result::Result<Vec<TranscriptStorageNode>, RpcError> {
     match &job.scope {
         CompactionScope::Boundary { .. } => Ok(Vec::new()),
-        CompactionScope::MidTurn { .. } => {
-            let mut parent_id: Option<String> = None;
-            Ok(job
-                .model_context
-                .split_before_open_turn()
-                .map(|(_, suffix)| suffix)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|entry| {
-                    let node = TranscriptStorageNode {
-                        id: format!("entry_{}", uuid::Uuid::new_v4()),
-                        parent_id: parent_id.clone(),
-                        timestamp_ms: crate::codec::now_ms(),
-                        item: entry.item,
-                        provider_replay: entry.provider_replay,
-                    };
-                    parent_id = Some(node.id.clone());
-                    node
-                })
-                .collect())
+        // Mid-turn auto-compaction is used to recover from provider
+        // context-overflow. Reinstalling the raw open-turn suffix would put
+        // the same large tool outputs back into the next request and can
+        // produce an endless compact/retry/overflow loop. The compaction
+        // summary is the replacement checkpoint; resume the blocked model from
+        // that compacted root without appending the pre-compaction suffix.
+        CompactionScope::MidTurn { .. } => Ok(Vec::new()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_session::ModelContext;
+    use agent_vocab::{ActionId, TurnId};
+
+    fn mid_turn_job_with_open_suffix() -> CompactionJob {
+        let model_context = ModelContext::from_transcript_items(vec![
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            TranscriptItem::UserMessage(UserMessage::text("large current turn")),
+        ]);
+        CompactionJob {
+            action_row_id: "compaction_action".to_string(),
+            attempt_id: "compaction_attempt".to_string(),
+            source_session_id: "session".to_string(),
+            source_leaf_id: "leaf".to_string(),
+            model_context: model_context.clone(),
+            compaction_context: model_context,
+            tokens_before: Some(250_000),
+            last_turn_id: TurnId(1),
+            trigger: CompactionTrigger::Auto {
+                reason: "provider context overflow before model completion".to_string(),
+            },
+            reason: Some("provider context overflow before model completion".to_string()),
+            scope: CompactionScope::MidTurn {
+                source_leaf_id: "leaf".to_string(),
+                turn_id: TurnId(1),
+                blocked_model_action_id: ActionId(1),
+                blocked_model_action_row_id: "model_action".to_string(),
+                blocked_model_attempt_id: "model_attempt".to_string(),
+            },
         }
+    }
+
+    #[test]
+    fn mid_turn_overflow_compaction_does_not_reinstall_raw_open_turn_suffix() {
+        let suffix =
+            continuation_suffix_for_scope(&mid_turn_job_with_open_suffix()).expect("suffix builds");
+
+        assert!(suffix.is_empty());
     }
 }
 

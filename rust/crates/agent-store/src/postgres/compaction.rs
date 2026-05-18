@@ -688,10 +688,16 @@ fn compaction_context_for_scope(
 ) -> ModelContext {
     match scope {
         CompactionScope::Boundary { .. } => model_context.clone(),
-        CompactionScope::MidTurn { .. } => model_context
-            .split_before_open_turn()
-            .map(|(prefix, _)| prefix)
-            .unwrap_or_else(|| model_context.clone()),
+        CompactionScope::MidTurn { .. } => {
+            // Reactive overflow can happen after a long tool-heavy turn has
+            // already started. Summarizing only the pre-turn prefix and then
+            // replaying the whole open-turn suffix is a no-op for context
+            // size, because the large tool outputs are exactly the suffix. The
+            // compaction request must summarize the full model-visible
+            // context; the daemon will resume from the compacted root instead
+            // of reinstalling the raw open-turn suffix.
+            model_context.clone()
+        }
     }
 }
 
@@ -751,4 +757,81 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_vocab::{
+        ActionId, AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage,
+        ToolResultStatus, TurnOutcome, UserMessage,
+    };
+
+    fn tool_call(id: u64, name: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId::from_u64(id),
+            tool_name: name.to_string(),
+            args_json: "{}".to_string(),
+        }
+    }
+
+    fn successful_tool_result(tool_call: &ToolCall, output: &str) -> ToolResultMessage {
+        ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.tool_name.clone(),
+            output: output.to_string(),
+            status: ToolResultStatus::Success,
+        }
+    }
+
+    #[test]
+    fn mid_turn_compaction_summarizes_the_full_open_turn() {
+        let tool_call = tool_call(7, "Bash");
+        let context = ModelContext::from_transcript_items(vec![
+            TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            TranscriptItem::UserMessage(UserMessage::text("previous")),
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("done".to_string())],
+            }),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+            TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+            TranscriptItem::UserMessage(UserMessage::text("current task")),
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call.clone())],
+            }),
+            TranscriptItem::ToolCallStarted {
+                turn_id: TurnId(2),
+                tool_call: tool_call.clone(),
+            },
+            TranscriptItem::ToolResult(successful_tool_result(
+                &tool_call,
+                "large tool output that caused overflow",
+            )),
+        ]);
+        let scope = CompactionScope::MidTurn {
+            source_leaf_id: "leaf".to_string(),
+            turn_id: TurnId(2),
+            blocked_model_action_id: ActionId(3),
+            blocked_model_action_row_id: "model_action".to_string(),
+            blocked_model_attempt_id: "attempt".to_string(),
+        };
+
+        let compaction_context = compaction_context_for_scope(&context, &scope);
+
+        assert_eq!(
+            compaction_context.transcript_items(),
+            context.transcript_items()
+        );
+        assert!(compaction_context
+            .transcript_items()
+            .iter()
+            .any(|item| matches!(
+                item,
+                TranscriptItem::ToolResult(result)
+                    if result.output.contains("caused overflow")
+            )));
+    }
 }
