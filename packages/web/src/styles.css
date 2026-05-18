@@ -1306,11 +1306,12 @@ pre {
 }
 
 .tool-chevron {
+	transform: rotate(90deg);
 	transition: transform 140ms ease;
 }
 
 .tool-chevron.open {
-	transform: rotate(180deg);
+	transform: rotate(0deg);
 }
 
 .tool-run-detail,
