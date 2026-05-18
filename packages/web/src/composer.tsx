@@ -5,6 +5,7 @@ import { contentBlocksToText, firstLine, truncate } from "./text.ts";
 import type { QueuePaneInput } from "./pendingInputs.ts";
 
 const NEW_SESSION_DRAFT_ID = "__new_session__";
+const COMPOSER_DRAFTS_STORAGE_KEY = "piRelayComposerDrafts:v1";
 const COMPOSER_MIN_HEIGHT_PX = 44;
 const COMPOSER_MAX_HEIGHT_PX = 180;
 
@@ -22,6 +23,8 @@ export interface ComposerHandle {
 	clearSession(sessionId: string | null): void;
 	restoreSubmittedDraft(sessionId: string | null, value: string): void;
 }
+
+export type ComposerDraftStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
 export const Composer = memo(function Composer({
 	selectedId,
@@ -48,10 +51,15 @@ export const Composer = memo(function Composer({
 }) {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
 	const selectedIdRef = useRef<string | null>(selectedId);
-	const draftsRef = useRef(new Map<string, string>());
+	const draftsRef = useRef(loadComposerDrafts());
 	const draftRef = useRef("");
-	const [draft, setDraft] = useState("");
+	const initialDraft = draftsRef.current.get(composerDraftKey(selectedId)) ?? "";
+	const [draft, setDraft] = useState(initialDraft);
 	const [slashIndex, setSlashIndex] = useState(0);
+
+	useEffect(() => {
+		draftRef.current = initialDraft;
+	}, [initialDraft]);
 
 	const resizeComposer = useCallback(() => {
 		const textArea = textAreaRef.current;
@@ -65,15 +73,14 @@ export const Composer = memo(function Composer({
 		textArea.style.overflowY = textArea.scrollHeight > COMPOSER_MAX_HEIGHT_PX ? "auto" : "hidden";
 	}, []);
 
-	const draftKey = useCallback((sessionId: string | null) => sessionId ?? NEW_SESSION_DRAFT_ID, []);
-
 	const storeDraft = useCallback(
 		(sessionId: string | null, value: string) => {
-			const key = draftKey(sessionId);
+			const key = composerDraftKey(sessionId);
 			if (value.trim()) draftsRef.current.set(key, value);
 			else draftsRef.current.delete(key);
+			saveComposerDrafts(draftsRef.current);
 		},
-		[draftKey]
+		[]
 	);
 
 	const setDraftValue = useCallback(
@@ -87,10 +94,10 @@ export const Composer = memo(function Composer({
 
 	useEffect(() => {
 		selectedIdRef.current = selectedId;
-		const nextDraft = draftsRef.current.get(draftKey(selectedId)) ?? "";
+		const nextDraft = draftsRef.current.get(composerDraftKey(selectedId)) ?? "";
 		draftRef.current = nextDraft;
 		setDraft(nextDraft);
-	}, [draftKey, selectedId]);
+	}, [selectedId]);
 
 	useEffect(() => {
 		composerHandleRef.current = {
@@ -284,6 +291,64 @@ export function QueuedInputPane({
 		</div>
 	);
 }
+
+export function composerDraftKey(sessionId: string | null): string {
+	return sessionId ?? NEW_SESSION_DRAFT_ID;
+}
+
+export function loadComposerDrafts(storage = browserStorage()): Map<string, string> {
+	const drafts = new Map<string, string>();
+	if (!storage) return drafts;
+	try {
+		const raw = storage.getItem(COMPOSER_DRAFTS_STORAGE_KEY);
+		if (!raw) return drafts;
+		const parsed = JSON.parse(raw) as unknown;
+		if (!isRecord(parsed)) return drafts;
+		const rawDrafts = parsed.drafts;
+		if (!isRecord(rawDrafts)) return drafts;
+		for (const [key, value] of Object.entries(rawDrafts)) {
+			if (key && typeof value === "string" && value.trim()) drafts.set(key, value);
+		}
+	} catch {
+		return new Map();
+	}
+	return drafts;
+}
+
+export function saveComposerDrafts(drafts: Map<string, string>, storage = browserStorage()): void {
+	if (!storage) return;
+	try {
+		const entries = Array.from(drafts.entries()).filter(([key, value]) => key && value.trim());
+		if (entries.length === 0) {
+			storage.removeItem(COMPOSER_DRAFTS_STORAGE_KEY);
+			return;
+		}
+		storage.setItem(
+			COMPOSER_DRAFTS_STORAGE_KEY,
+			JSON.stringify({
+				drafts: Object.fromEntries(entries),
+				updatedAt: Date.now(),
+			}),
+		);
+	} catch {
+		// localStorage can be unavailable or full; draft persistence is best-effort.
+	}
+}
+
+function browserStorage(): ComposerDraftStorage | null {
+	if (typeof window === "undefined") return null;
+	try {
+		return window.localStorage ?? null;
+	} catch {
+		return null;
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export { COMPOSER_DRAFTS_STORAGE_KEY };
 
 export function SlashMenu({
 	commands,

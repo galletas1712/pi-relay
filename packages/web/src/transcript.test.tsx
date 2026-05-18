@@ -1,6 +1,19 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { assistantRenderParts, captureScrollPosition, editToolPreview, formatElapsed, isScrolledAtBottom, MessageList, restoreScrollPosition, ToolOutput } from "./transcript.tsx";
+import {
+	assistantRenderParts,
+	captureScrollPosition,
+	editToolPreview,
+	formatElapsed,
+	isScrolledAtBottom,
+	loadTranscriptScrollPositions,
+	MessageList,
+	restoreScrollPosition,
+	saveTranscriptScrollPositions,
+	TRANSCRIPT_SCROLL_STORAGE_KEY,
+	type TranscriptScrollStorage,
+	ToolOutput,
+} from "./transcript.tsx";
 import type { AssistantItem, ProviderReplayItem, TranscriptEntry } from "./types.ts";
 
 describe("assistantRenderParts", () => {
@@ -108,6 +121,26 @@ describe("scroll position snapshots", () => {
 
 		expect(node.scrollTop).toBe(1000);
 		expect(sticky).toBe(true);
+	});
+
+	it("persists transcript scroll positions by session key", () => {
+		const storage = memoryStorage();
+		const positions = new Map([
+			["session_a", { scrollTop: 250, sticky: false }],
+			["session_b", { scrollTop: 900, sticky: true }],
+		]);
+
+		saveTranscriptScrollPositions(positions, storage);
+
+		expect(loadTranscriptScrollPositions(storage)).toEqual(positions);
+	});
+
+	it("clears persisted transcript scroll positions when none remain", () => {
+		const storage = memoryStorage();
+
+		saveTranscriptScrollPositions(new Map(), storage);
+
+		expect(storage.getItem(TRANSCRIPT_SCROLL_STORAGE_KEY)).toBeNull();
 	});
 });
 
@@ -246,6 +279,19 @@ function userEntry(id: string, text: string): TranscriptEntry {
 		timestamp_ms: 0,
 		item: { type: "user_message", content: [{ type: "text", text }] },
 		provider_replay: []
+	};
+}
+
+function memoryStorage(): TranscriptScrollStorage {
+	const data = new Map<string, string>();
+	return {
+		getItem: (key) => data.get(key) ?? null,
+		setItem: (key, value) => {
+			data.set(key, value);
+		},
+		removeItem: (key) => {
+			data.delete(key);
+		}
 	};
 }
 

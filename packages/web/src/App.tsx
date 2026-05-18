@@ -46,6 +46,12 @@ import {
 } from "./sessionDefaults.ts";
 import { projectTitle, sessionTitle, isArchivedSession, displayActivity, tallyActivities, type SessionListItem } from "./sessionList.ts";
 import { firstLine, truncate } from "./text.ts";
+import {
+	loadUiSelection,
+	rememberSelectedSession,
+	rememberUiSelection,
+	selectedSessionForProject,
+} from "./uiResume.ts";
 import type {
 	EventFrame,
 	Notice,
@@ -121,10 +127,11 @@ type PromptDialogState = {
 export function App() {
 	const api = useMemo(() => createAgentApi(), []);
 	const queryClient = useQueryClient();
+	const initialUiSelection = useMemo(() => loadUiSelection(), []);
 	const [connection, setConnection] = useState<ConnectionStatus>("connecting");
-	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
-	const [selectedId, setSelectedId] = useState<string | null>(null);
-	const selectedRef = useRef<string | null>(null);
+	const [selectedProjectId, setSelectedProjectId] = useState<string | null>(initialUiSelection.projectId);
+	const [selectedId, setSelectedId] = useState<string | null>(initialUiSelection.sessionId);
+	const selectedRef = useRef<string | null>(initialUiSelection.sessionId);
 	const [notices, setNotices] = useState<Notice[]>([]);
 	const [query, setQuery] = useState("");
 	const [newSessionProvider, setNewSessionProvider] = useState<ProviderConfig>(DEFAULT_PROVIDER);
@@ -150,7 +157,7 @@ export function App() {
 	const sessionListRefreshTimer = useRef<number | null>(null);
 	const composerHandleRef = useRef<ComposerHandle | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
-	const selectedProjectRef = useRef<string | null>(null);
+	const selectedProjectRef = useRef<string | null>(initialUiSelection.projectId);
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
@@ -160,11 +167,11 @@ export function App() {
 	}, []);
 
 	useEffect(() => {
-		selectedRef.current = selectedId;
+		if (selectedRef.current !== selectedId) selectedRef.current = selectedId;
 	}, [selectedId]);
 
 	useEffect(() => {
-		selectedProjectRef.current = selectedProjectId;
+		if (selectedProjectRef.current !== selectedProjectId) selectedProjectRef.current = selectedProjectId;
 	}, [selectedProjectId]);
 
 	useEffect(() => {
@@ -304,6 +311,15 @@ export function App() {
 		if (sessionId === null) nextSessionTitleRef.current = null;
 		selectedRef.current = sessionId;
 		setSelectedId(sessionId);
+		rememberSelectedSession(selectedProjectRef.current, sessionId);
+	}, []);
+
+	const selectProjectSession = useCallback((projectId: string | null, sessionId: string | null) => {
+		selectedProjectRef.current = projectId;
+		selectedRef.current = sessionId;
+		setSelectedProjectId(projectId);
+		setSelectedId(sessionId);
+		rememberUiSelection(projectId, sessionId);
 	}, []);
 
 	const invalidateSessionList = useCallback(
@@ -427,12 +443,11 @@ export function App() {
 			);
 			queryClient.setQueryData(queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE), snapshot);
 			if (snapshot.project_id !== selectedProjectRef.current) {
-				selectedProjectRef.current = snapshot.project_id;
-				setSelectedProjectId(snapshot.project_id);
+				selectProjectSession(snapshot.project_id, sessionId);
 			}
 			return { snapshot, entries: snapshot.entries ?? [] };
 		},
-		[fetchSessionSnapshot, queryClient],
+		[fetchSessionSnapshot, queryClient, selectProjectSession],
 	);
 
 	const refreshSelected = useCallback(
@@ -593,12 +608,11 @@ export function App() {
 				? currentProjectId
 				: (projects[0]?.project_id ?? null);
 		if (nextSelected === currentProjectId) return;
-		selectedProjectRef.current = nextSelected;
-		setSelectedProjectId(nextSelected);
-		selectSession(null);
+		const nextSessionId = selectedSessionForProject(nextSelected);
+		selectProjectSession(nextSelected, nextSessionId);
 		setQuery("");
-		composerHandleRef.current?.setValue("");
-	}, [projects, projectsQuery.status, selectSession]);
+		if (!nextSessionId) composerHandleRef.current?.setValue("");
+	}, [projects, projectsQuery.status, selectProjectSession]);
 
 	useEffect(() => {
 		if (!selectedId) return;
@@ -1240,13 +1254,12 @@ export function App() {
 	const handleSelectProject = useCallback(
 		(projectId: string) => {
 			if (projectId === selectedProjectRef.current) return;
-			selectedProjectRef.current = projectId;
-			setSelectedProjectId(projectId);
-			selectSession(null);
+			const nextSessionId = selectedSessionForProject(projectId);
+			selectProjectSession(projectId, nextSessionId);
 			setQuery("");
-			composerHandleRef.current?.setValue("");
+			if (!nextSessionId) composerHandleRef.current?.setValue("");
 		},
-		[selectSession],
+		[selectProjectSession],
 	);
 	const openCreateProjectDialog = useCallback(() => {
 		setProjectDialog({
@@ -1289,16 +1302,14 @@ export function App() {
 							startingCwd,
 						});
 			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
-			selectedProjectRef.current = saved.project_id;
-			setSelectedProjectId(saved.project_id);
-			selectSession(null);
+			selectProjectSession(saved.project_id, null);
 			pushNotice("success", `${projectDialog.mode === "create" ? "created" : "updated"} project “${truncate(saved.name, 80)}”`);
 			closeProjectDialog();
 		} catch (error) {
 			setProjectDialog((current) => (current ? { ...current, saving: false } : current));
 			throw error;
 		}
-	}, [api, closeProjectDialog, projectDialog, pushNotice, queryClient, selectSession]);
+	}, [api, closeProjectDialog, projectDialog, pushNotice, queryClient, selectProjectSession]);
 	const handleSidebarNew = useCallback(() => {
 		void createSession();
 		if (panelModeRef.current !== "wide") setSidebarOpen(false);

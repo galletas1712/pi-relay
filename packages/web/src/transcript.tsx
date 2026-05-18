@@ -68,12 +68,15 @@ type TranscriptDisplayNode =
 type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
 const STICKY_BOTTOM_EPSILON_PX = 1;
 const ACTIVE_SESSION_SCROLL_KEY = "__active_session__";
+const TRANSCRIPT_SCROLL_STORAGE_KEY = "piRelayTranscriptScroll:v1";
 const RECENT_TOOL_ROW_COUNT = 3;
 
 export interface ScrollPositionSnapshot {
 	scrollTop: number;
 	sticky: boolean;
 }
+
+export type TranscriptScrollStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
 export function isScrolledAtBottom(node: ScrollMetrics): boolean {
 	return node.scrollHeight - node.scrollTop - node.clientHeight <= STICKY_BOTTOM_EPSILON_PX;
@@ -98,6 +101,62 @@ export function restoreScrollPosition(node: ScrollMetrics, position: ScrollPosit
 	}
 	return isScrolledAtBottom(node);
 }
+
+export function loadTranscriptScrollPositions(storage = browserStorage()): Map<string, ScrollPositionSnapshot> {
+	const positions = new Map<string, ScrollPositionSnapshot>();
+	if (!storage) return positions;
+	try {
+		const raw = storage.getItem(TRANSCRIPT_SCROLL_STORAGE_KEY);
+		if (!raw) return positions;
+		const parsed = JSON.parse(raw) as unknown;
+		if (!isRecord(parsed) || !isRecord(parsed.positions)) return positions;
+		for (const [key, value] of Object.entries(parsed.positions)) {
+			if (!key || !isRecord(value)) continue;
+			const scrollTop = value.scrollTop;
+			const sticky = value.sticky;
+			if (typeof scrollTop !== "number" || !Number.isFinite(scrollTop) || typeof sticky !== "boolean") continue;
+			positions.set(key, { scrollTop: Math.max(0, scrollTop), sticky });
+		}
+	} catch {
+		return new Map();
+	}
+	return positions;
+}
+
+export function saveTranscriptScrollPositions(positions: Map<string, ScrollPositionSnapshot>, storage = browserStorage()): void {
+	if (!storage) return;
+	try {
+		const entries = Array.from(positions.entries()).filter(([key]) => key);
+		if (entries.length === 0) {
+			storage.removeItem(TRANSCRIPT_SCROLL_STORAGE_KEY);
+			return;
+		}
+		storage.setItem(
+			TRANSCRIPT_SCROLL_STORAGE_KEY,
+			JSON.stringify({
+				positions: Object.fromEntries(entries),
+				updatedAt: Date.now(),
+			}),
+		);
+	} catch {
+		// localStorage can be unavailable or full; scroll persistence is best-effort.
+	}
+}
+
+function browserStorage(): TranscriptScrollStorage | null {
+	if (typeof window === "undefined") return null;
+	try {
+		return window.localStorage ?? null;
+	} catch {
+		return null;
+	}
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export { TRANSCRIPT_SCROLL_STORAGE_KEY };
 
 export const MessageList = memo(function MessageList({
 	entries,
@@ -130,7 +189,7 @@ export const MessageList = memo(function MessageList({
 	const activeScrollSessionKeyRef = useRef<string | null>(null);
 	const activeScrollSessionCanSaveRef = useRef(false);
 	const pendingScrollRestoreRef = useRef<{ key: string; position: ScrollPositionSnapshot } | null>(null);
-	const scrollPositionsRef = useRef(new Map<string, ScrollPositionSnapshot>());
+	const scrollPositionsRef = useRef(loadTranscriptScrollPositions());
 	const scrollSessionKey = hasSession ? (sessionId ?? ACTIVE_SESSION_SCROLL_KEY) : null;
 	const entriesBelongToSelectedSession = !hasSession || !sessionId || entriesSessionId === sessionId;
 	const effectiveEntries = entriesBelongToSelectedSession ? entries : [];
@@ -145,7 +204,10 @@ export const MessageList = memo(function MessageList({
 		node.scrollTop = bottomScrollTop(node);
 		shouldStickToBottomRef.current = true;
 		const key = activeScrollSessionKeyRef.current;
-		if (key && activeScrollSessionCanSaveRef.current) scrollPositionsRef.current.set(key, { scrollTop: node.scrollTop, sticky: true });
+		if (key && activeScrollSessionCanSaveRef.current) {
+			scrollPositionsRef.current.set(key, { scrollTop: node.scrollTop, sticky: true });
+			saveTranscriptScrollPositions(scrollPositionsRef.current);
+		}
 	}, []);
 
 	const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
@@ -153,14 +215,20 @@ export const MessageList = memo(function MessageList({
 		const position = captureScrollPosition(event.currentTarget);
 		shouldStickToBottomRef.current = position.sticky;
 		const key = activeScrollSessionKeyRef.current;
-		if (key && activeScrollSessionCanSaveRef.current) scrollPositionsRef.current.set(key, position);
+		if (key && activeScrollSessionCanSaveRef.current) {
+			scrollPositionsRef.current.set(key, position);
+			saveTranscriptScrollPositions(scrollPositionsRef.current);
+		}
 	}, []);
 
 	useLayoutEffect(() => {
 		if (activeScrollSessionKeyRef.current === scrollSessionKey) return;
 		const node = scrollRef.current;
 		const previousKey = activeScrollSessionKeyRef.current;
-		if (previousKey && node && activeScrollSessionCanSaveRef.current) scrollPositionsRef.current.set(previousKey, captureScrollPosition(node));
+		if (previousKey && node && activeScrollSessionCanSaveRef.current) {
+			scrollPositionsRef.current.set(previousKey, captureScrollPosition(node));
+			saveTranscriptScrollPositions(scrollPositionsRef.current);
+		}
 		activeScrollSessionKeyRef.current = scrollSessionKey;
 		activeScrollSessionCanSaveRef.current = false;
 		if (!scrollSessionKey) {
@@ -184,7 +252,10 @@ export const MessageList = memo(function MessageList({
 			if (node) {
 				const sticky = restoreScrollPosition(node, pendingRestore.position);
 				shouldStickToBottomRef.current = sticky;
-				if (scrollSessionKey) scrollPositionsRef.current.set(scrollSessionKey, { scrollTop: node.scrollTop, sticky });
+				if (scrollSessionKey) {
+					scrollPositionsRef.current.set(scrollSessionKey, { scrollTop: node.scrollTop, sticky });
+					saveTranscriptScrollPositions(scrollPositionsRef.current);
+				}
 			}
 			activeScrollSessionCanSaveRef.current = true;
 			pendingScrollRestoreRef.current = null;
