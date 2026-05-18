@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use agent_core::AgentInput;
 use agent_session::{
-    AgentSession, HistoryOperationError, SessionAction, SessionEvent, SessionInput,
+    AgentSession, HistoryOperationError, ModelContext, SessionAction, SessionEvent, SessionInput,
     TranscriptStorageNode, TranscriptStoreError,
 };
 use agent_store::{
@@ -27,6 +27,8 @@ use crate::provider_runtime::{
 };
 use crate::state::{AppState, RunningTask};
 use crate::types::{DispatchAction, LiveEventFrame, RpcError, RuntimeSession};
+
+const MODEL_PROVIDER_MAX_ATTEMPTS: usize = 3;
 
 pub(crate) async fn ensure_expected_active_leaf(
     state: &AppState,
@@ -1323,7 +1325,13 @@ async fn run_model_turn(
         ..dispatch
     };
 
-    let result = run_model(&state, &dispatch.config, &session_id, model_context).await;
+    let result = run_model_for_action_with_retries(
+        &state,
+        &session_id,
+        &dispatch,
+        model_context,
+    )
+    .await?;
     let driver = SessionDriver::acquire(&state, &session_id).await;
     if !state
         .repo
@@ -1408,13 +1416,14 @@ async fn run_model_turn(
                 &state,
                 &session_id,
                 &dispatch,
-                &error,
+                &error.error,
             )
             .await?
             {
                 return Ok(());
             }
-            let message = error.to_string();
+            let message = error.error.to_string();
+            let update_result = model_failure_update_result(&error);
             driver
                 .apply_agent_input(
                     active,
@@ -1427,7 +1436,7 @@ async fn run_model_turn(
                         row_id: dispatch.row_id,
                         attempt_id: dispatch.attempt_id,
                         status: ActionStatus::Error,
-                        result: json!({ "error": message }),
+                        result: update_result,
                     }),
                 )
                 .await?
@@ -1438,15 +1447,122 @@ async fn run_model_turn(
     Ok(())
 }
 
+async fn run_model_for_action_with_retries(
+    state: &AppState,
+    session_id: &str,
+    dispatch: &DispatchAction,
+    model_context: ModelContext,
+) -> std::result::Result<
+    std::result::Result<agent_provider::ModelResponse, ModelProviderFailure>,
+    RpcError,
+> {
+    for attempt in 1..=MODEL_PROVIDER_MAX_ATTEMPTS {
+        if attempt > 1
+            && !state
+                .repo
+                .action_can_complete(session_id, &dispatch.row_id, &dispatch.attempt_id)
+                .await
+                .map_err(anyhow::Error::from)?
+        {
+            return Err(RpcError::new(
+                "stale_action",
+                "action attempt is no longer running",
+            ));
+        }
+        let result = run_model(
+            state,
+            &dispatch.config,
+            session_id,
+            model_context.clone(),
+        )
+        .await;
+        match result {
+            Ok(response) => return Ok(Ok(response)),
+            Err(error) => {
+                let Some(provider_error) = error.downcast_ref::<agent_provider::ProviderError>()
+                else {
+                    return Err(anyhow::Error::from(error).into());
+                };
+                let retryable = provider_error.is_retryable_transient();
+                if attempt >= MODEL_PROVIDER_MAX_ATTEMPTS || !retryable {
+                    let error = provider_error_from_anyhow(error);
+                    let attempts = if retryable { attempt } else { 1 };
+                    return Ok(Err(ModelProviderFailure {
+                        error,
+                        attempts,
+                    }));
+                }
+                if !state
+                    .repo
+                    .action_can_complete(session_id, &dispatch.row_id, &dispatch.attempt_id)
+                    .await
+                    .map_err(anyhow::Error::from)?
+                {
+                    return Err(RpcError::new(
+                        "stale_action",
+                        "action attempt is no longer running",
+                    ));
+                }
+                let message = provider_error_retry_diagnostic(&error);
+                eprintln!(
+                    "model provider transient error for {session_id}/{} on attempt {attempt}/{MODEL_PROVIDER_MAX_ATTEMPTS}; retrying: {message}",
+                    dispatch.row_id
+                );
+                tokio::time::sleep(model_retry_backoff(attempt)).await;
+            }
+        }
+    }
+
+    unreachable!("retry loop either returns provider result or stale action")
+}
+
+struct ModelProviderFailure {
+    error: agent_provider::ProviderError,
+    attempts: usize,
+}
+
+fn provider_error_from_anyhow(error: anyhow::Error) -> agent_provider::ProviderError {
+    match error.downcast::<agent_provider::ProviderError>() {
+        Ok(error) => error,
+        Err(error) => agent_provider::ProviderError::Provider(error.to_string()),
+    }
+}
+
+fn model_failure_update_result(failure: &ModelProviderFailure) -> Value {
+    let mut result = json!({ "error": failure.error.to_string() });
+    if failure.attempts > 1 {
+        result["provider_retry_attempts"] = json!(failure.attempts);
+    }
+    if failure.attempts > 1 || failure.error.is_retryable_transient() {
+        if let Some(diagnostic) = failure.error.retry_diagnostic() {
+            result["provider_error_diagnostic"] = json!(diagnostic);
+        }
+    }
+    result
+}
+
+fn provider_error_retry_diagnostic(error: &anyhow::Error) -> String {
+    error
+        .downcast_ref::<agent_provider::ProviderError>()
+        .and_then(agent_provider::ProviderError::retry_diagnostic)
+        .unwrap_or_else(|| error.to_string())
+}
+
+fn model_retry_backoff(completed_attempt: usize) -> std::time::Duration {
+    let millis = match completed_attempt {
+        1 => 250,
+        2 => 1_000,
+        _ => 3_000,
+    };
+    std::time::Duration::from_millis(millis)
+}
+
 async fn recover_model_context_overflow_with_compaction(
     state: &AppState,
     session_id: &str,
     dispatch: &DispatchAction,
-    error: &anyhow::Error,
+    provider_error: &agent_provider::ProviderError,
 ) -> std::result::Result<bool, RpcError> {
-    let Some(provider_error) = error.downcast_ref::<agent_provider::ProviderError>() else {
-        return Ok(false);
-    };
     if !provider_error.is_context_overflow() {
         return Ok(false);
     }

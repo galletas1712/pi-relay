@@ -254,6 +254,64 @@ impl ProviderError {
         }
     }
 
+    pub fn is_retryable_transient(&self) -> bool {
+        if self.is_context_overflow() {
+            return false;
+        }
+
+        if self
+            .status_code()
+            .is_some_and(is_retryable_transient_status)
+        {
+            return true;
+        }
+
+        match self {
+            ProviderError::Http(error) => {
+                error.is_timeout()
+                    || error.is_connect()
+                    || error.is_request()
+                    || error.is_body()
+                    || error.is_decode()
+            }
+            ProviderError::Status { .. } | ProviderError::Provider(_) | ProviderError::Json(_) => {
+                false
+            }
+        }
+    }
+
+    pub fn retry_diagnostic(&self) -> Option<String> {
+        match self {
+            ProviderError::Http(error) => {
+                let flags = [
+                    ("timeout", error.is_timeout()),
+                    ("connect", error.is_connect()),
+                    ("request", error.is_request()),
+                    ("body", error.is_body()),
+                    ("decode", error.is_decode()),
+                    ("status", error.is_status()),
+                ]
+                .into_iter()
+                .filter_map(|(name, enabled)| enabled.then_some(name))
+                .collect::<Vec<_>>();
+                let mut parts = Vec::new();
+                if !flags.is_empty() {
+                    parts.push(format!("reqwest_flags={}", flags.join(",")));
+                }
+                if let Some(status) = error.status() {
+                    parts.push(format!("status={}", status.as_u16()));
+                }
+                let source_chain = error_source_chain(error);
+                if !source_chain.is_empty() {
+                    parts.push(format!("sources={}", source_chain.join(" <- ")));
+                }
+                (!parts.is_empty()).then(|| parts.join("; "))
+            }
+            ProviderError::Status { status, .. } => Some(format!("status={status}")),
+            ProviderError::Provider(_) | ProviderError::Json(_) => None,
+        }
+    }
+
     pub fn is_context_overflow(&self) -> bool {
         // Only match errors whose message clearly identifies a context-window
         // overflow. A plain 400 is not enough: Anthropic /count_tokens, for
@@ -283,6 +341,20 @@ impl ProviderError {
                 || lower.contains("exceed")
                 || lower.contains("maximum"))
     }
+}
+
+fn is_retryable_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn error_source_chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
+    let mut chain = Vec::new();
+    let mut source = error.source();
+    while let Some(error) = source {
+        chain.push(error.to_string());
+        source = error.source();
+    }
+    chain
 }
 
 #[cfg(test)]
@@ -324,6 +396,40 @@ mod provider_error_tests {
                 .to_string(),
         }
         .is_context_overflow());
+    }
+
+    #[test]
+    fn retryable_transient_classifier_matches_retryable_statuses_only() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(
+                ProviderError::Status {
+                    status,
+                    message: "transient".to_string(),
+                }
+                .is_retryable_transient(),
+                "status {status} should be retryable"
+            );
+        }
+
+        for status in [400, 401, 403, 404, 409, 413, 422] {
+            assert!(
+                !ProviderError::Status {
+                    status,
+                    message: "not transient".to_string(),
+                }
+                .is_retryable_transient(),
+                "status {status} should not be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn retryable_transient_classifier_excludes_context_overflow() {
+        assert!(!ProviderError::Status {
+            status: 413,
+            message: "request entity too large".to_string(),
+        }
+        .is_retryable_transient());
     }
 }
 
