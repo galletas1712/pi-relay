@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use crate::codec::transcript_store_from_stored;
 use crate::provider_runtime::{
     auto_limit_tokens, compaction_auto_state, compaction_config, load_skill_result,
-    model_input_tokens_for_gate, provider_error_is_context_overflow, run_compaction, run_model,
+    model_input_tokens_for_gate, run_compaction, run_model,
 };
 use crate::state::{AppState, RunningTask};
 use crate::types::{DispatchAction, LiveEventFrame, RpcError, RuntimeSession};
@@ -398,9 +398,43 @@ impl SessionDriver {
         active: Arc<Mutex<RuntimeSession>>,
         input: AgentInput,
         action_update: Option<ActionUpdate>,
+    ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
+        self.ensure_action_can_complete(&action_update).await?;
+        {
+            let mut runtime = active.lock().await;
+            runtime
+                .session
+                .enqueue_input(input)
+                .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
+        }
+        self.persist_active_outputs(active, action_update, None, None, Vec::new())
+            .await
+    }
+
+    pub(crate) async fn apply_session_input(
+        &self,
+        active: Arc<Mutex<RuntimeSession>>,
+        input: SessionInput,
+        action_update: Option<ActionUpdate>,
         provider_replay: Vec<ProviderReplayItem>,
     ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
-        if let Some(update) = &action_update {
+        self.ensure_action_can_complete(&action_update).await?;
+        {
+            let mut runtime = active.lock().await;
+            runtime
+                .session
+                .enqueue_session_input(input)
+                .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
+        }
+        self.persist_active_outputs(active, action_update, None, None, provider_replay)
+            .await
+    }
+
+    async fn ensure_action_can_complete(
+        &self,
+        action_update: &Option<ActionUpdate>,
+    ) -> std::result::Result<(), RpcError> {
+        if let Some(update) = action_update {
             if !self
                 .state
                 .repo
@@ -415,64 +449,7 @@ impl SessionDriver {
                 ));
             }
         }
-        let persist_provider_replay = {
-            let mut runtime = active.lock().await;
-            let max_output_tokens =
-                Self::action_update_stop_reason(&action_update) == Some("max_output_tokens");
-            let persist_provider_replay = !max_output_tokens;
-            match input {
-                AgentInput::ModelCompleted {
-                    action_id,
-                    turn_id,
-                    assistant,
-                } if max_output_tokens => runtime
-                    .session
-                    .enqueue_session_input(SessionInput::ModelMaxOutputTokens {
-                        action_id,
-                        turn_id,
-                        assistant,
-                        provider_replay: provider_replay.clone(),
-                        error: action_update
-                            .as_ref()
-                            .and_then(|update| update.result.get("error"))
-                            .and_then(Value::as_str)
-                            .unwrap_or("provider response hit max_output_tokens")
-                            .to_string(),
-                    })
-                    .map_err(|error| RpcError::new("invalid_input", error.to_string()))?,
-                AgentInput::ModelCompleted {
-                    action_id,
-                    turn_id,
-                    assistant,
-                } => runtime
-                    .session
-                    .enqueue_session_input(SessionInput::ModelCompleted {
-                        action_id,
-                        turn_id,
-                        assistant,
-                    })
-                    .map_err(|error| RpcError::new("invalid_input", error.to_string()))?,
-                other => runtime
-                    .session
-                    .enqueue_input(other)
-                    .map_err(|error| RpcError::new("invalid_input", error.to_string()))?,
-            }
-            persist_provider_replay
-        };
-        let provider_replay = if persist_provider_replay {
-            provider_replay
-        } else {
-            Vec::new()
-        };
-        self.persist_active_outputs(active, action_update, None, None, provider_replay)
-            .await
-    }
-
-    fn action_update_stop_reason(action_update: &Option<ActionUpdate>) -> Option<&str> {
-        action_update
-            .as_ref()
-            .and_then(|update| update.result.get("stop_reason"))
-            .and_then(Value::as_str)
+        Ok(())
     }
 
     pub(crate) async fn resume_model_turn(
@@ -646,7 +623,7 @@ impl SessionDriver {
             Ok(tokens) => tokens,
             Err(error) => {
                 let provider_error = error.downcast_ref::<agent_provider::ProviderError>();
-                if provider_error.is_some_and(provider_error_is_context_overflow) {
+                if provider_error.is_some_and(agent_provider::ProviderError::is_context_overflow) {
                     limit
                 } else {
                     return Err(anyhow::Error::from(error).into());
@@ -1196,7 +1173,6 @@ async fn fail_blocked_model_for_compaction_error(
                 error: model_error.clone(),
             },
             None,
-            Vec::new(),
         )
         .await?;
     driver.dispatch(dispatches).await?;
@@ -1361,10 +1337,9 @@ async fn run_model_turn(
         .active_session()
         .await
         .ok_or_else(|| RpcError::new("stale_action", "session is not active"))?;
-    let (input, status, update_result, provider_replay) = match result {
+    let dispatches = match result {
         Ok(response) => {
-            let has_usage = response.usage.is_some();
-            if has_usage {
+            if response.usage.is_some() {
                 state
                     .repo
                     .reset_auto_compaction_failures(&session_id)
@@ -1372,37 +1347,61 @@ async fn run_model_turn(
                     .map_err(anyhow::Error::from)?;
             }
             let stop_reason = response.stop_reason;
-            let update_status = if matches!(
+            let max_output_tokens = matches!(
                 stop_reason,
                 agent_provider::ModelStopReason::MaxOutputTokens
-            ) {
-                ActionStatus::Error
-            } else {
-                ActionStatus::Completed
-            };
-            let update_error = if matches!(
-                stop_reason,
-                agent_provider::ModelStopReason::MaxOutputTokens
-            ) {
-                Some("provider response hit max_output_tokens")
-            } else {
-                None
-            };
-            (
-                AgentInput::ModelCompleted {
-                    action_id,
-                    turn_id,
-                    assistant: response.assistant,
+            );
+            let error = max_output_tokens.then_some("provider response hit max_output_tokens");
+            let action_update = Some(ActionUpdate {
+                row_id: dispatch.row_id,
+                attempt_id: dispatch.attempt_id,
+                status: if max_output_tokens {
+                    ActionStatus::Error
+                } else {
+                    ActionStatus::Completed
                 },
-                update_status,
-                json!({
+                result: json!({
                     "source": "provider",
                     "usage": response.usage,
                     "stop_reason": stop_reason,
-                    "error": update_error,
+                    "error": error,
                 }),
-                response.provider_replay,
-            )
+            });
+            let provider_replay = response.provider_replay;
+            match stop_reason {
+                agent_provider::ModelStopReason::Complete => {
+                    driver
+                        .apply_session_input(
+                            active,
+                            SessionInput::ModelCompleted {
+                                action_id,
+                                turn_id,
+                                assistant: response.assistant,
+                            },
+                            action_update,
+                            provider_replay,
+                        )
+                        .await?
+                }
+                agent_provider::ModelStopReason::MaxOutputTokens => {
+                    driver
+                        .apply_session_input(
+                            active,
+                            SessionInput::ModelMaxOutputTokens {
+                                action_id,
+                                turn_id,
+                                assistant: response.assistant,
+                                provider_replay,
+                                error: error
+                                    .unwrap_or("provider response hit max_output_tokens")
+                                    .to_string(),
+                            },
+                            action_update,
+                            Vec::new(),
+                        )
+                        .await?
+                }
+            }
         }
         Err(error) => {
             if recover_model_context_overflow_with_compaction(
@@ -1416,31 +1415,24 @@ async fn run_model_turn(
                 return Ok(());
             }
             let message = error.to_string();
-            (
-                AgentInput::ModelFailed {
-                    action_id,
-                    turn_id,
-                    error: message.clone(),
-                },
-                ActionStatus::Error,
-                json!({ "error": message }),
-                Vec::new(),
-            )
+            driver
+                .apply_agent_input(
+                    active,
+                    AgentInput::ModelFailed {
+                        action_id,
+                        turn_id,
+                        error: message.clone(),
+                    },
+                    Some(ActionUpdate {
+                        row_id: dispatch.row_id,
+                        attempt_id: dispatch.attempt_id,
+                        status: ActionStatus::Error,
+                        result: json!({ "error": message }),
+                    }),
+                )
+                .await?
         }
     };
-    let dispatches = driver
-        .apply_agent_input(
-            active,
-            input,
-            Some(ActionUpdate {
-                row_id: dispatch.row_id,
-                attempt_id: dispatch.attempt_id,
-                status,
-                result: update_result,
-            }),
-            provider_replay,
-        )
-        .await?;
     driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
     Ok(())
@@ -1455,7 +1447,7 @@ async fn recover_model_context_overflow_with_compaction(
     let Some(provider_error) = error.downcast_ref::<agent_provider::ProviderError>() else {
         return Ok(false);
     };
-    if !provider_error_is_context_overflow(provider_error) {
+    if !provider_error.is_context_overflow() {
         return Ok(false);
     }
     let Some(eligible) = check_compaction_eligible(dispatch) else {

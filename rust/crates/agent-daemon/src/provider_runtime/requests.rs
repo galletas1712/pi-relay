@@ -1,0 +1,43 @@
+use agent_provider::{ModelRequest, ModelResponse, ProviderToolProfile};
+use agent_session::ModelContext;
+use agent_store::SessionConfig;
+use anyhow::Result;
+use serde_json::Value;
+
+use crate::auth::Credentials;
+use crate::state::AppState;
+
+use super::auth_retry::complete_with_auth_retry;
+use super::prompt::assemble_agent_prompt;
+use super::provider::provider_for_config;
+use super::transcript::provider_transcript;
+
+pub(crate) async fn run_model(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+    model_context: ModelContext,
+) -> Result<ModelResponse> {
+    let prompt = assemble_agent_prompt(state, config).await?;
+    let request = ModelRequest {
+        model: config.provider.model.clone(),
+        prompt,
+        transcript: provider_transcript(model_context),
+        tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
+        tools: state.tools.definitions_for_provider(config.provider.kind),
+        max_tokens: config.provider.max_tokens,
+        reasoning_effort: config.provider.reasoning_effort,
+        prompt_cache_key: config
+            .provider
+            .prompt_cache
+            .as_ref()
+            .and_then(|value| value.get("key"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        session_id: Some(session_id.to_string()),
+    };
+
+    let credentials = Credentials::load();
+    let provider = provider_for_config(config, &credentials)?;
+    Ok(complete_with_auth_retry(config, provider, request).await?)
+}

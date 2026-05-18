@@ -25,7 +25,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_core::AgentInput;
 use agent_prompt::pi_md;
-use agent_session::AgentSession;
+use agent_session::{AgentSession, SessionInput};
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
     EventType, InputPriority, PostgresAgentStore, QueuedInputStatus, SessionConfig,
@@ -937,7 +937,7 @@ async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result
     };
     let aborted_tasks = abort_session_tasks(state, &session_id);
     let dispatches = driver
-        .apply_agent_input(active, AgentInput::Interrupt, None, Vec::new())
+        .apply_agent_input(active, AgentInput::Interrupt, None)
         .await?;
     driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
@@ -1243,9 +1243,9 @@ async fn harness_model_complete(
         .require_active_session("stale_action", "session is not active")
         .await?;
     let dispatches = driver
-        .apply_agent_input(
+        .apply_session_input(
             active,
-            AgentInput::ModelCompleted {
+            SessionInput::ModelCompleted {
                 action_id: ActionId(action.action_id as u64),
                 turn_id: TurnId(action.turn_id.unwrap_or_default() as u64),
                 assistant,
@@ -1298,7 +1298,6 @@ async fn harness_model_fail(
                 status: ActionStatus::Error,
                 result: json!({ "error": error }),
             }),
-            Vec::new(),
         )
         .await?;
     driver.dispatch(dispatches).await?;

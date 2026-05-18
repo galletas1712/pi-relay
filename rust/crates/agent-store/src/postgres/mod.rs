@@ -10,6 +10,7 @@ mod schema;
 mod sessions;
 mod snapshots;
 mod sql;
+mod token_usage;
 mod transcript;
 
 use anyhow::Result;
