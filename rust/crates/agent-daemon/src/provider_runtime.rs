@@ -12,7 +12,8 @@ use agent_session::ModelContext;
 use agent_store::SessionConfig;
 use agent_tools::limit_tool_output;
 use agent_vocab::{
-    ProviderKind, ProviderReplayItem, ReplayDisplayKind, TranscriptItem, UserMessage,
+    ProviderKind, ProviderReplayItem, ReplayDisplayKind, ToolCall, ToolResultMessage,
+    TranscriptItem, UserMessage,
 };
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -646,11 +647,7 @@ fn tool_specs(state: &AppState, provider: ProviderKind) -> Vec<ToolSpec> {
 }
 
 fn load_prompt_skills(config: &SessionConfig) -> Vec<Skill> {
-    let mut skills = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let project_skill_dir = PathBuf::from(&config.starting_cwd).join(".pi/skills");
-    collect_skills_from_dir(&project_skill_dir, &mut skills, &mut seen);
-    skills
+    load_skills_for_cwd(&PathBuf::from(&config.starting_cwd))
 }
 
 fn collect_skills_from_dir(
@@ -693,6 +690,64 @@ fn add_skill(skill: Skill, skills: &mut Vec<Skill>, seen: &mut std::collections:
     }
 }
 
+pub(crate) fn load_skill_result(
+    cwd: &Path,
+    loaded_skills: &std::collections::BTreeSet<String>,
+    call: &ToolCall,
+) -> ToolResultMessage {
+    match load_skill_output(cwd, loaded_skills, call) {
+        Ok(output) => ToolResultMessage::success(call.id.clone(), "LoadSkill", output),
+        Err(error) => ToolResultMessage::error(call.id.clone(), "LoadSkill", error.to_string()),
+    }
+}
+
+fn load_skill_output(
+    cwd: &Path,
+    loaded_skills: &std::collections::BTreeSet<String>,
+    call: &ToolCall,
+) -> Result<String> {
+    let args: LoadSkillArgs = serde_json::from_str(&call.args_json)?;
+    let name = args.name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("skill name cannot be empty"));
+    }
+    if loaded_skills.contains(name) {
+        return Ok("skill already loaded".to_string());
+    }
+    let skills = load_skills_for_cwd(cwd);
+    let Some(skill) = skills.into_iter().find(|skill| skill.name == name) else {
+        return Err(anyhow!("skill not found: {name}"));
+    };
+    let content = std::fs::read_to_string(&skill.file_path)?;
+    Ok(format!(
+        "<loaded_skill>\n<name>{}</name>\n<content>\n{}\n</content>\n</loaded_skill>",
+        xml_escape(&skill.name),
+        content.trim()
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct LoadSkillArgs {
+    name: String,
+}
+
+fn load_skills_for_cwd(cwd: &Path) -> Vec<Skill> {
+    let mut skills = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let project_skill_dir = cwd.join(".agents/skills");
+    collect_skills_from_dir(&project_skill_dir, &mut skills, &mut seen);
+    skills
+}
+
+fn xml_escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 fn load_skill_file(path: &Path) -> Option<Skill> {
     let raw = std::fs::read_to_string(path).ok()?;
     let (frontmatter, _body) = split_frontmatter(&raw);
@@ -709,6 +764,55 @@ fn load_skill_file(path: &Path) -> Option<Skill> {
         return None;
     }
     Some(Skill::new(name, description, path.to_path_buf()))
+}
+
+#[cfg(test)]
+mod skill_tests {
+    use super::*;
+    use agent_vocab::ToolCallId;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn load_skill_result_loads_content_once() {
+        let cwd = make_temp_dir("load-skill");
+        let skill_dir = cwd.join(".agents/skills/rust-refactor");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: rust-refactor\ndescription: Use for Rust refactors.\n---\n\nPrefer small, tested changes.\n",
+        )
+        .expect("skill file");
+
+        let call = ToolCall {
+            id: ToolCallId::from_u64(1),
+            tool_name: "LoadSkill".to_string(),
+            args_json: r#"{"name":"rust-refactor"}"#.to_string(),
+        };
+        let mut loaded = std::collections::BTreeSet::new();
+
+        let first = load_skill_result(&cwd, &loaded, &call);
+        assert_eq!(first.status, agent_vocab::ToolResultStatus::Success);
+        assert!(first.output.contains("<name>rust-refactor</name>"));
+        assert!(first.output.contains("Prefer small, tested changes."));
+
+        loaded.insert("rust-refactor".to_string());
+        let second = load_skill_result(&cwd, &loaded, &call);
+        assert_eq!(second.status, agent_vocab::ToolResultStatus::Success);
+        assert_eq!(second.output, "skill already loaded");
+
+        std::fs::remove_dir_all(cwd).ok();
+    }
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("pi-relay-{prefix}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
 }
 
 fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
@@ -845,7 +949,7 @@ mod tests {
     #[test]
     fn provider_transcript_bounds_historical_tool_results() {
         let model_context = ModelContext::from_transcript_items(vec![TranscriptItem::ToolResult(
-            ToolResultMessage::success(ToolCallId::from_u64(1), "bash", "x".repeat(30_000)),
+            ToolResultMessage::success(ToolCallId::from_u64(1), "bash", "x".repeat(50_000)),
         )]);
 
         let transcript = provider_transcript(model_context);
@@ -853,7 +957,7 @@ mod tests {
             panic!("expected tool result");
         };
 
-        assert!(result.output.len() < 30_000);
+        assert!(result.output.len() < 50_000);
         assert!(result.output.contains("[tool output truncated:"));
     }
 

@@ -497,6 +497,7 @@ fn response_custom_definition_tools(tools: &[agent_vocab::ToolDefinition]) -> Ve
 
 fn openai_coding_tools() -> Vec<Value> {
     vec![
+        openai_function_from_builtin("LoadSkill"),
         openai_edit_tool(),
         openai_function_from_builtin("Bash"),
         openai_function_from_builtin("Grep"),
@@ -1317,14 +1318,16 @@ mod tests {
         )
         .expect("responses body renders");
 
-        assert_eq!(body["tools"][0]["type"], "custom");
-        assert_eq!(body["tools"][0]["name"], "Edit");
-        assert_eq!(body["tools"][1]["type"], "function");
-        assert_eq!(body["tools"][1]["name"], "Bash");
+        assert_eq!(body["tools"][0]["type"], "function");
+        assert_eq!(body["tools"][0]["name"], "LoadSkill");
+        assert_eq!(body["tools"][1]["type"], "custom");
+        assert_eq!(body["tools"][1]["name"], "Edit");
         assert_eq!(body["tools"][2]["type"], "function");
-        assert_eq!(body["tools"][2]["name"], "Grep");
-        assert_eq!(body["tools"][3]["type"], "web_search");
-        assert_eq!(body["tools"][3]["search_context_size"], "high");
+        assert_eq!(body["tools"][2]["name"], "Bash");
+        assert_eq!(body["tools"][3]["type"], "function");
+        assert_eq!(body["tools"][3]["name"], "Grep");
+        assert_eq!(body["tools"][4]["type"], "web_search");
+        assert_eq!(body["tools"][4]["search_context_size"], "high");
     }
 
     #[test]

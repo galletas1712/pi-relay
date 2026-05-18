@@ -10,6 +10,6 @@ mod tools;
 pub use context::{dynamic_tool_context, ToolContext};
 pub use display::{tool_display, ToolDisplayInput};
 pub use error::{ToolError, ToolResult};
-pub use output::limit_tool_output;
+pub use output::{limit_tool_output, limit_tool_output_with_max_tokens};
 pub use registry::{builtin_tool_definition, AgentTool, ToolListing, ToolRegistry};
 pub use tools::APPLY_PATCH_LARK_GRAMMAR;

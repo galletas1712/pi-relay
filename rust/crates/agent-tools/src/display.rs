@@ -20,10 +20,17 @@ enum ToolSummary {
     ShellCommand,
     Grep,
     TextEditor,
+    SkillName,
     WebSearchQuery,
 }
 
 const TOOL_DISPLAY_SPECS: &[ToolDisplaySpec] = &[
+    ToolDisplaySpec {
+        name: "LoadSkill",
+        kind: ToolDisplayInput::LocalTool,
+        display_name: "LoadSkill",
+        summary: ToolSummary::SkillName,
+    },
     ToolDisplaySpec {
         name: "Edit",
         kind: ToolDisplayInput::LocalTool,
@@ -91,6 +98,7 @@ fn tool_summary(summary: ToolSummary, input: Option<&serde_json::Value>) -> Opti
         ToolSummary::ShellCommand => shell_command_summary(input),
         ToolSummary::Grep => joined_fields(input, &["pattern", "path"]),
         ToolSummary::TextEditor => joined_fields(input, &["command", "path"]),
+        ToolSummary::SkillName => string_field(input, "name"),
         ToolSummary::WebSearchQuery => web_search_query(input),
     }?;
     nonempty_summary(first_line(&text).to_string())
@@ -222,6 +230,18 @@ mod tests {
                 kind: ReplayDisplayKind::LocalTool,
                 pretty_name: "Bash".to_string(),
                 input_summary: Some("pwd && ls".to_string()),
+            })
+        );
+        assert_eq!(
+            tool_display(
+                "LoadSkill",
+                ToolDisplayInput::LocalTool,
+                Some(&json!({ "name": "rust-refactor" })),
+            ),
+            Some(ReplayDisplay {
+                kind: ReplayDisplayKind::LocalTool,
+                pretty_name: "LoadSkill".to_string(),
+                input_summary: Some("rust-refactor".to_string()),
             })
         );
     }

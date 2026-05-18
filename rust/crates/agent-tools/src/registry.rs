@@ -25,11 +25,30 @@ pub struct ToolListing {
 
 pub fn builtin_tool_definition(name: &str) -> Option<ToolDefinition> {
     match name {
+        "LoadSkill" => Some(load_skill_definition()),
         "Edit" => Some(ApplyPatchTool.definition()),
         "Bash" => Some(BashTool.definition()),
         "Grep" => Some(GrepTool.definition()),
         _ => None,
     }
+}
+
+fn load_skill_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "LoadSkill",
+        "Activate one of the available skills by name. Use this when a task matches a skill description; pi-relay will inject that skill's instructions into the model context. If the skill is already loaded, the tool reports that it is already loaded.",
+        json!({
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The exact skill name from skills.index."
+                }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+        }),
+    )
 }
 
 fn openai_edit_listing() -> ToolListing {
@@ -59,8 +78,8 @@ struct RegisteredTool {
     tool: Box<dyn AgentTool>,
 }
 
-const OPENAI_LOCAL_TOOL_NAMES: &[&str] = &["Edit", "Bash", "Grep"];
-const CLAUDE_LOCAL_TOOL_NAMES: &[&str] = &["Bash", "Grep", "Edit"];
+const OPENAI_LOCAL_TOOL_NAMES: &[&str] = &["LoadSkill", "Edit", "Bash", "Grep"];
+const CLAUDE_LOCAL_TOOL_NAMES: &[&str] = &["LoadSkill", "Bash", "Grep", "Edit"];
 const OPENAI_HOSTED_TOOL_NAMES: &[&str] = &["WebSearch"];
 const CLAUDE_HOSTED_TOOL_NAMES: &[&str] = &["WebSearch", "WebFetch"];
 
@@ -128,6 +147,9 @@ impl ToolRegistry {
     }
 
     fn definition(&self, provider: ProviderKind, name: &str) -> ToolDefinition {
+        if name == "LoadSkill" {
+            return load_skill_definition();
+        }
         self.tools
             .get(&provider_tool_key(provider, name))
             .unwrap_or_else(|| panic!("registered provider tool {name} is missing for {provider}"))
@@ -236,8 +258,8 @@ mod tests {
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(openai, ["Edit", "Bash", "Grep"]);
-        assert_eq!(claude, ["Bash", "Grep", "Edit"]);
+        assert_eq!(openai, ["LoadSkill", "Edit", "Bash", "Grep"]);
+        assert_eq!(claude, ["LoadSkill", "Bash", "Grep", "Edit"]);
     }
 
     #[test]
@@ -254,8 +276,11 @@ mod tests {
             .map(|listing| listing.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(openai, ["Edit", "Bash", "Grep", "WebSearch"]);
-        assert_eq!(claude, ["Bash", "Grep", "Edit", "WebSearch", "WebFetch"]);
+        assert_eq!(openai, ["LoadSkill", "Edit", "Bash", "Grep", "WebSearch"]);
+        assert_eq!(
+            claude,
+            ["LoadSkill", "Bash", "Grep", "Edit", "WebSearch", "WebFetch"]
+        );
     }
 
     #[test]

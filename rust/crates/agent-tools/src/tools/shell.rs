@@ -7,7 +7,7 @@ use serde_json::json;
 
 use crate::context::ToolContext;
 use crate::error::{ToolError, ToolResult};
-use crate::output::limit_tool_output;
+use crate::output::limit_tool_output_with_max_tokens;
 use crate::registry::AgentTool;
 
 /// Single shell tool, registered as `Bash` for both providers.
@@ -25,6 +25,8 @@ struct BashArgs {
     command: ShellCommand,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    max_output_tokens: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +58,10 @@ impl AgentTool for BashTool {
                     "timeout_ms": {
                         "type": "integer",
                         "description": "Optional command timeout in milliseconds."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": "Maximum number of tokens to return. Excess output will be truncated. Defaults to 10000."
                     }
                 },
                 "required": ["command"],
@@ -106,7 +112,7 @@ async fn run_bash(
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = limit_tool_output(text);
+    let text = limit_tool_output_with_max_tokens(text, args.max_output_tokens);
     let result = if output.status.success() {
         ToolResultMessage::success(call.id.clone(), &call.tool_name, text)
     } else {

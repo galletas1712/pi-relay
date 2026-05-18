@@ -340,6 +340,9 @@ fn anthropic_tool(tool: &ToolDefinition) -> Value {
 
 fn anthropic_coding_tools() -> Vec<Value> {
     vec![
+        anthropic_tool(
+            &builtin_tool_definition("LoadSkill").expect("LoadSkill tool must be registered"),
+        ),
         anthropic_tool(&builtin_tool_definition("Bash").expect("Bash tool must be registered")),
         json!({
             "type": "text_editor_20250728",
@@ -970,6 +973,7 @@ mod tests {
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect();
+        assert!(names.contains(&"LoadSkill"));
         assert!(names.contains(&"Bash"));
         assert!(names.contains(&"Edit"));
         assert!(names.contains(&"Grep"));
@@ -990,18 +994,20 @@ mod tests {
         })
         .expect("body renders");
 
-        assert_eq!(body["tools"][0]["name"], "Bash");
+        assert_eq!(body["tools"][0]["name"], "LoadSkill");
         assert!(body["tools"][0].get("type").is_none());
-        assert_eq!(body["tools"][1]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][1]["name"], "Edit");
-        assert_eq!(body["tools"][2]["name"], "Grep");
-        assert!(body["tools"][2].get("type").is_none());
-        assert_eq!(body["tools"][3]["type"], "web_search_20250305");
-        assert_eq!(body["tools"][4]["type"], "web_fetch_20250910");
-        assert_eq!(body["tools"][4]["citations"]["enabled"], true);
+        assert_eq!(body["tools"][1]["name"], "Bash");
+        assert!(body["tools"][1].get("type").is_none());
+        assert_eq!(body["tools"][2]["type"], "text_editor_20250728");
+        assert_eq!(body["tools"][2]["name"], "Edit");
+        assert_eq!(body["tools"][3]["name"], "Grep");
+        assert!(body["tools"][3].get("type").is_none());
+        assert_eq!(body["tools"][4]["type"], "web_search_20250305");
+        assert_eq!(body["tools"][5]["type"], "web_fetch_20250910");
+        assert_eq!(body["tools"][5]["citations"]["enabled"], true);
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
-        for index in 0..5 {
+        for index in 0..6 {
             assert!(
                 body["tools"][index].get("cache_control").is_none(),
                 "tool {index} should not carry cache_control"

@@ -140,10 +140,6 @@ fn skills_index_xml(skills: &[Skill]) -> String {
             "    <description>{}</description>",
             escape_xml(&skill.description)
         ));
-        lines.push(format!(
-            "    <location>{}</location>",
-            escape_xml(&path_display(&skill.file_path))
-        ));
         lines.push("  </skill>".to_string());
     }
     lines.push("</available_skills>".to_string());
@@ -222,7 +218,7 @@ mod tests {
     #[test]
     fn renders_repo_pi_as_static_prompt() {
         let rendered = render_prompt(&ctx(vec!["Bash", "Grep", "Edit"], Vec::new()));
-        assert!(rendered.contains("You are an expert coding assistant"));
+        assert!(rendered.contains("You are a helpful assitant"));
         assert!(rendered.contains("### Bash"));
         assert!(rendered.contains("### Edit"));
         assert!(!rendered.contains("Current date"));
@@ -234,12 +230,13 @@ mod tests {
         let skill = Skill::new(
             "rust-refactor",
             "Use for Rust refactors.",
-            "/tmp/project/.pi/skills/rust-refactor/SKILL.md",
+            "/tmp/project/.agents/skills/rust-refactor/SKILL.md",
         );
         let rendered = render_prompt(&ctx(vec!["Bash"], vec![skill]));
         assert!(rendered.contains("<available_skills>"));
         assert!(rendered.contains("rust-refactor"));
         assert!(!rendered.contains("<base_dir>"));
+        assert!(!rendered.contains("<location>"));
     }
 
     #[test]

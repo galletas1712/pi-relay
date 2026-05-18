@@ -73,15 +73,12 @@ impl SessionViewUpdate {
                 if entry.is_null() {
                     return None;
                 }
-                let overview = entry
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(|entry_id| {
-                        json!({
-                            "active_leaf_id": entry_id,
-                            "has_transcript_entries": true,
-                        })
-                    });
+                let overview = entry.get("id").and_then(Value::as_str).map(|entry_id| {
+                    json!({
+                        "active_leaf_id": entry_id,
+                        "has_transcript_entries": true,
+                    })
+                });
                 Some(Self {
                     overview,
                     active_branch: Some(ActiveBranchViewUpdate::AppendEntry { entry }),
@@ -102,7 +99,9 @@ impl SessionViewUpdate {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum ActiveBranchViewUpdate {
-    AppendEntry { entry: Value },
+    AppendEntry {
+        entry: Value,
+    },
     ReloadRequired {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
@@ -276,8 +275,14 @@ mod tests {
         let value = serde_json::to_value(live).expect("live event serializes");
 
         assert_eq!(value["data"]["view_update"], Value::Null);
-        assert_eq!(value["view_update"]["active_branch"]["kind"], "append_entry");
-        assert_eq!(value["view_update"]["active_branch"]["entry"]["id"], "entry_2");
+        assert_eq!(
+            value["view_update"]["active_branch"]["kind"],
+            "append_entry"
+        );
+        assert_eq!(
+            value["view_update"]["active_branch"]["entry"]["id"],
+            "entry_2"
+        );
     }
 
     #[test]
@@ -292,7 +297,12 @@ mod tests {
         let live = LiveEventFrame::from_event(event);
         let value = serde_json::to_value(live).expect("live event serializes");
 
-        assert_eq!(value["view_update"]["active_branch"]["kind"], "reload_required");
-        assert!(value["view_update"]["active_branch"].get("entries").is_none());
+        assert_eq!(
+            value["view_update"]["active_branch"]["kind"],
+            "reload_required"
+        );
+        assert!(value["view_update"]["active_branch"]
+            .get("entries")
+            .is_none());
     }
 }
