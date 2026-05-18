@@ -228,6 +228,7 @@ async fn dispatch_request(
         RpcMethod::SessionStart => session_start(state, params).await,
         RpcMethod::SessionList => session_list(state, params).await,
         RpcMethod::SessionGet => session_get(state, params).await,
+        RpcMethod::SessionSyncActiveBranch => session_sync_active_branch(state, params).await,
         RpcMethod::SessionRename => session_rename(state, params).await,
         RpcMethod::SessionConfigure => session_configure(state, params).await,
         RpcMethod::SessionDelete => session_delete(state, params).await,
@@ -430,6 +431,27 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
         None
     };
     Ok(rpc_views::session_snapshot(snapshot, entries))
+}
+
+async fn session_sync_active_branch(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let base_leaf_id = params.get("base_leaf_id").and_then(Value::as_str);
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.recover_if_needed().await?;
+    let sync = state
+        .repo
+        .sync_active_branch(&session_id, base_leaf_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let overview = state
+        .repo
+        .session_snapshot(&session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(rpc_views::active_branch_sync(sync, overview))
 }
 
 async fn session_rename(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

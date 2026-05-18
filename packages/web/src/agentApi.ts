@@ -1,6 +1,7 @@
 import { AgentRpcClient, defaultWsUrl, type ConnectionStatus, type RpcClient } from "./rpc.ts";
 import type {
 	Activity,
+	ActiveBranchSyncResponse,
 	ContentBlock,
 	SystemPromptResponse,
 	EventFrame,
@@ -34,6 +35,7 @@ export interface AgentApi {
 	getSystemPrompt(params?: { sessionId?: string; projectId?: string; provider?: ProviderConfig }): Promise<SystemPromptResponse>;
 	listTools(provider: string): Promise<ToolListing[]>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
+	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse>;
 	getHistoryTree(sessionId: string): Promise<HistoryTree>;
 	subscribeEvents(sessionId: string, afterEventId: number | null): Promise<EventFrame[]>;
 	unsubscribeEvents(sessionId: string): Promise<void>;
@@ -254,6 +256,13 @@ class AgentApiClient implements AgentApi {
 			session_id: sessionId,
 			include_entries: options.includeEntries || undefined,
 			entries_scope: options.entryScope
+		});
+	}
+
+	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse> {
+		return this.client.request<ActiveBranchSyncResponse>("session.sync_active_branch", {
+			session_id: sessionId,
+			base_leaf_id: baseLeafId,
 		});
 	}
 

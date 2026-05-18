@@ -2,13 +2,13 @@ import { QueryClient } from "@tanstack/react-query";
 import { describe, expect, it } from "vitest";
 import { queryKeys } from "./queryKeys.ts";
 import {
-	applyServerViewUpdate,
+	applyActiveBranchSync,
 	mergeSnapshotIntoSessionList,
 	patchSessionListActivity,
 	patchSessionListMetadata,
 	patchSessionListProvider,
 } from "./sessionQueryCache.ts";
-import type { EventFrame, ProviderConfig, SessionSnapshot, SessionSummary, TranscriptEntry } from "./types.ts";
+import type { ActiveBranchSyncResponse, ProviderConfig, SessionSnapshot, SessionSummary, TranscriptEntry } from "./types.ts";
 
 const projectId = "project_1";
 const sessionId = "session_1";
@@ -65,46 +65,45 @@ describe("session query cache helpers", () => {
 		});
 	});
 
-	it("applies an append_entry view update when it extends the active branch", () => {
+	it("applies an active branch sync suffix when it extends the cached leaf", () => {
 		const snapshot = snapshotFixture();
 		snapshot.active_leaf_id = "entry_1";
 		snapshot.entries = [entry("entry_1", null, "first")];
 		const next = entry("entry_2", "entry_1", "second");
 
-		expect(applyServerViewUpdate(snapshot, appendEvent(next, 2))).toBe("applied");
+		expect(applyActiveBranchSync(snapshot, syncResponse("extended", [next], "entry_2", 2))).toBe("applied");
 
 		expect(snapshot.active_leaf_id).toBe("entry_2");
 		expect(snapshot.entries?.map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
 		expect(snapshot.last_event_id).toBe(2);
 	});
 
-	it("asks for active branch reload when append_entry does not extend the cached leaf", () => {
+	it("asks for a reload when a sync suffix does not extend the cached leaf", () => {
 		const snapshot = snapshotFixture();
 		snapshot.active_leaf_id = "entry_other";
 		snapshot.entries = [entry("entry_other", null, "other")];
 
-		expect(applyServerViewUpdate(snapshot, appendEvent(entry("entry_2", "entry_1", "second"), 2))).toBe("reload_active_branch");
+		expect(applyActiveBranchSync(snapshot, syncResponse("extended", [entry("entry_2", "entry_1", "second")], "entry_2", 2))).toBe("reload");
 		expect(snapshot.active_leaf_id).toBe("entry_other");
 	});
 
-	it("uses persisted transcript.appended entry as a replay fallback", () => {
+	it("keeps entries and applies overview when active branch is unchanged", () => {
 		const snapshot = snapshotFixture();
 		snapshot.active_leaf_id = "entry_1";
 		snapshot.entries = [entry("entry_1", null, "first")];
-		const next = entry("entry_2", "entry_1", "second");
+		const response = syncResponse("unchanged", [], "entry_1", 3);
+		response.overview.activity = "running";
 
-		expect(applyServerViewUpdate(snapshot, { ...appendEvent(next, 2), view_update: undefined })).toBe("applied");
-		expect(snapshot.active_leaf_id).toBe("entry_2");
+		expect(applyActiveBranchSync(snapshot, response)).toBe("applied");
+		expect(snapshot.active_leaf_id).toBe("entry_1");
+		expect(snapshot.entries?.map((candidate) => candidate.id)).toEqual(["entry_1"]);
+		expect(snapshot.activity).toBe("running");
+		expect(snapshot.last_event_id).toBe(3);
 	});
 
-	it("requests overview reload for state events without a live view update", () => {
+	it("asks for a reload when the server reports a branch change", () => {
 		const snapshot = snapshotFixture();
-		expect(applyServerViewUpdate(snapshot, event("tool.started", 2, { activity: "running" }))).toBe("reload_overview");
-	});
-
-	it("ignores old events", () => {
-		const snapshot = { ...snapshotFixture(), last_event_id: 3 };
-		expect(applyServerViewUpdate(snapshot, event("tool.started", 2, { activity: "running" }))).toBe("ignored");
+		expect(applyActiveBranchSync(snapshot, syncResponse("branch_changed", [], "entry_new", 4))).toBe("reload");
 	});
 });
 
@@ -139,31 +138,6 @@ function entry(id: string, parentId: string | null, text: string): TranscriptEnt
 	};
 }
 
-function event(name: string, eventId: number, data: EventFrame["data"]): EventFrame {
-	return {
-		event_id: eventId,
-		event: name,
-		session_id: sessionId,
-		data,
-	};
-}
-
-function appendEvent(entry: TranscriptEntry, eventId: number): EventFrame {
-	return {
-		...event("transcript.appended", eventId, { entry_id: entry.id, entry }),
-		view_update: {
-			overview: {
-				active_leaf_id: entry.id,
-				has_transcript_entries: true,
-			},
-			active_branch: {
-				kind: "append_entry",
-				entry,
-			},
-		},
-	};
-}
-
 function snapshotFixture(): SessionSnapshot {
 	return {
 		session_id: sessionId,
@@ -186,5 +160,26 @@ function snapshotFixture(): SessionSnapshot {
 		],
 		last_event_id: 1,
 		entries: [],
+	};
+}
+
+function syncResponse(
+	status: ActiveBranchSyncResponse["status"],
+	entries: TranscriptEntry[],
+	activeLeafId: string | null,
+	eventId: number,
+): ActiveBranchSyncResponse {
+	return {
+		session_id: sessionId,
+		base_leaf_id: "entry_1",
+		active_leaf_id: activeLeafId,
+		status,
+		entries,
+		overview: {
+			...snapshotFixture(),
+			active_leaf_id: activeLeafId,
+			last_event_id: eventId,
+			has_transcript_entries: Boolean(activeLeafId),
+		},
 	};
 }

@@ -116,6 +116,12 @@ text_enum! {
         Running => "running",
     }
 
+    pub enum ActiveBranchSyncStatus {
+        Unchanged => "unchanged",
+        Extended => "extended",
+        BranchChanged => "branch_changed",
+    }
+
     pub enum EventType {
         SessionCreated => "session.created",
         SessionConfigured => "session.configured",
@@ -145,49 +151,6 @@ text_enum! {
         TurnStarted => "turn.started",
         TurnFinished => "turn.finished",
         AssistantMessage => "assistant.message",
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EventViewUpdatePolicy {
-    AppendActiveBranchEntry,
-    ReloadActiveBranch,
-    OverviewChanged,
-    Noop,
-}
-
-impl EventType {
-    pub fn view_update_policy(self) -> EventViewUpdatePolicy {
-        match self {
-            EventType::TranscriptAppended => EventViewUpdatePolicy::AppendActiveBranchEntry,
-            EventType::SessionRecovered
-            | EventType::HistoryRewound
-            | EventType::HistoryCompacted
-            | EventType::CompactionCompleted => EventViewUpdatePolicy::ReloadActiveBranch,
-            EventType::SessionCreated
-            | EventType::SessionConfigured
-            | EventType::SessionIdle
-            | EventType::SessionWorkCancelled
-            | EventType::InputQueued
-            | EventType::InputPromoted
-            | EventType::InputConsumed
-            | EventType::InputAccepted
-            | EventType::InputIgnored
-            | EventType::ActionRequested
-            | EventType::ModelRequested
-            | EventType::ModelCompleted
-            | EventType::ModelError
-            | EventType::ToolRequested
-            | EventType::ToolStarted
-            | EventType::ToolCompleted
-            | EventType::ToolError
-            | EventType::CompactionRequested
-            | EventType::CompactionError
-            | EventType::TurnStarted
-            | EventType::TurnFinished
-            | EventType::AssistantMessage => EventViewUpdatePolicy::OverviewChanged,
-            EventType::HistoryForked => EventViewUpdatePolicy::Noop,
-        }
     }
 }
 
@@ -397,6 +360,15 @@ pub struct SessionSnapshot {
 pub struct HistoryTree {
     pub session_id: String,
     pub active_leaf_id: Option<String>,
+    pub entries: Vec<StoredTranscriptEntry>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveBranchSync {
+    pub session_id: String,
+    pub base_leaf_id: Option<String>,
+    pub active_leaf_id: Option<String>,
+    pub status: ActiveBranchSyncStatus,
     pub entries: Vec<StoredTranscriptEntry>,
 }
 

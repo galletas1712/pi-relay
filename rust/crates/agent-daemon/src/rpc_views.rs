@@ -1,5 +1,5 @@
 use agent_session::StoredTranscriptEntry;
-use agent_store::{HistoryTree, Project, SessionSnapshot, SessionSummary};
+use agent_store::{ActiveBranchSync, HistoryTree, Project, SessionSnapshot, SessionSummary};
 use agent_vocab::TranscriptItem;
 use serde_json::{json, Value};
 
@@ -85,6 +85,21 @@ pub(crate) fn history_tree(tree: HistoryTree) -> Value {
         "session_id": tree.session_id,
         "active_leaf_id": tree.active_leaf_id,
         "entries": redact_entries(tree.entries),
+    })
+}
+
+pub(crate) fn active_branch_sync(sync: ActiveBranchSync, overview: SessionSnapshot) -> Value {
+    let base_leaf_id = sync.base_leaf_id;
+    let active_leaf_id = sync.active_leaf_id;
+    let status = sync.status;
+    let entries = sync.entries;
+    json!({
+        "session_id": sync.session_id,
+        "base_leaf_id": base_leaf_id,
+        "active_leaf_id": active_leaf_id,
+        "status": status,
+        "entries": redact_entries(entries),
+        "overview": session_snapshot(overview, None),
     })
 }
 

@@ -4,12 +4,12 @@ use std::{
     sync::{Arc, Mutex as StdMutex},
 };
 
-use agent_store::{ActionKind, PostgresAgentStore};
+use agent_store::{ActionKind, EventFrame, PostgresAgentStore};
 use agent_tools::{ToolContext, ToolRegistry};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
-use crate::types::{LiveEventFrame, RuntimeSession};
+use crate::types::RuntimeSession;
 
 pub(crate) struct RunningTask {
     pub(crate) session_id: String,
@@ -24,7 +24,7 @@ pub(crate) struct AppState {
     pub(crate) active: Arc<Mutex<HashMap<String, Arc<Mutex<RuntimeSession>>>>>,
     pub(crate) session_driver_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     pub(crate) tasks: Arc<StdMutex<HashMap<String, RunningTask>>>,
-    pub(crate) events: broadcast::Sender<LiveEventFrame>,
+    pub(crate) events: broadcast::Sender<EventFrame>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) default_tool_context: ToolContext,
     pub(crate) default_workspace: PathBuf,

@@ -28,7 +28,7 @@ import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
 import {
-	applyServerViewUpdate,
+	applyActiveBranchSync,
 	mergeSnapshotIntoSessionList,
 	patchSessionListActivity,
 	patchSessionListMetadata,
@@ -152,8 +152,7 @@ export function App() {
 	const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
 	const [promptDialog, setPromptDialog] = useState<PromptDialogState | null>(null);
 
-	const refreshTimer = useRef<number | null>(null);
-	const overviewRefreshTimer = useRef<number | null>(null);
+	const selectedSyncTimer = useRef<number | null>(null);
 	const sessionListRefreshTimer = useRef<number | null>(null);
 	const composerHandleRef = useRef<ComposerHandle | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
@@ -342,28 +341,6 @@ export function App() {
 		[invalidateSessionList],
 	);
 
-	const invalidateSelectedSession = useCallback(
-		(sessionId = selectedRef.current) => {
-			if (!sessionId) return;
-			void queryClient.invalidateQueries({
-				queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
-			});
-		},
-		[queryClient],
-	);
-
-	const scheduleSelectedRefresh = useCallback(
-		(sessionId = selectedRef.current, delayMs = SELECTED_SESSION_REFRESH_DEBOUNCE_MS) => {
-			if (!sessionId || sessionId !== selectedRef.current) return;
-			if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
-			refreshTimer.current = window.setTimeout(() => {
-				refreshTimer.current = null;
-				invalidateSelectedSession(sessionId);
-			}, delayMs);
-		},
-		[invalidateSelectedSession],
-	);
-
 	const fetchSessionSnapshot = useCallback(
 		async (sessionId: string, includeEntries: boolean, source: string) => {
 			const shouldLogPerf = perfEnabled();
@@ -388,46 +365,14 @@ export function App() {
 		[api],
 	);
 
-	const mergeSessionOverview = useCallback(
-		(sessionId: string, overview: SessionSnapshot) => {
-			queryClient.setQueryData<SessionSnapshot>(queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE), (current) => {
-				if (!current || current.session_id !== sessionId) return overview;
-				return {
-					...current,
-					...overview,
-					entries: current.entries,
-				};
+	const invalidateSelectedSession = useCallback(
+		(sessionId = selectedRef.current) => {
+			if (!sessionId) return;
+			void queryClient.invalidateQueries({
+				queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
 			});
 		},
 		[queryClient],
-	);
-
-	const reloadSessionOverview = useCallback(
-		async (sessionId: string) => {
-			const overview = await fetchSessionSnapshot(sessionId, false, "overview");
-			lastEventIds.current.set(sessionId, overview.last_event_id);
-			mergeSessionOverview(sessionId, overview);
-			queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(overview.project_id), (current) =>
-				mergeSnapshotIntoSessionList(current, overview),
-			);
-			setPendingInputs((current) =>
-				current.filter((input) => input.sessionId !== overview.session_id || !pendingInputIsReflected(input, overview)),
-			);
-			return overview;
-		},
-		[fetchSessionSnapshot, mergeSessionOverview, queryClient],
-	);
-
-	const scheduleOverviewRefresh = useCallback(
-		(sessionId = selectedRef.current, delayMs = SELECTED_SESSION_REFRESH_DEBOUNCE_MS) => {
-			if (!sessionId || sessionId !== selectedRef.current) return;
-			if (overviewRefreshTimer.current !== null) window.clearTimeout(overviewRefreshTimer.current);
-			overviewRefreshTimer.current = window.setTimeout(() => {
-				overviewRefreshTimer.current = null;
-				void reloadSessionOverview(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
-			}, delayMs);
-		},
-		[pushNotice, reloadSessionOverview],
 	);
 
 	const getFreshSession = useCallback(
@@ -448,6 +393,41 @@ export function App() {
 			return { snapshot, entries: snapshot.entries ?? [] };
 		},
 		[fetchSessionSnapshot, queryClient, selectProjectSession],
+	);
+
+	const syncActiveBranch = useCallback(
+		async (sessionId: string) => {
+			if (sessionId !== selectedRef.current) return null;
+			const key = queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE);
+			const snapshot = queryClient.getQueryData<SessionSnapshot>(key);
+			if (!snapshot || snapshot.session_id !== sessionId) return getFreshSession(sessionId);
+			const sync = await api.syncActiveBranch(sessionId, snapshot.active_leaf_id ?? null);
+			lastEventIds.current.set(sessionId, sync.overview.last_event_id);
+			if (applyActiveBranchSync(snapshot, sync) === "applied") {
+				queryClient.setQueryData<SessionSnapshot>(key, snapshot);
+				queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(sync.overview.project_id), (current) =>
+					mergeSnapshotIntoSessionList(current, snapshot),
+				);
+				setPendingInputs((current) =>
+					current.filter((input) => input.sessionId !== snapshot.session_id || !pendingInputIsReflected(input, snapshot)),
+				);
+				return { snapshot, entries: snapshot.entries ?? [] };
+			}
+			return getFreshSession(sessionId);
+		},
+		[api, getFreshSession, queryClient],
+	);
+
+	const scheduleActiveBranchSync = useCallback(
+		(sessionId = selectedRef.current, delayMs = SELECTED_SESSION_REFRESH_DEBOUNCE_MS) => {
+			if (!sessionId || sessionId !== selectedRef.current) return;
+			if (selectedSyncTimer.current !== null) window.clearTimeout(selectedSyncTimer.current);
+			selectedSyncTimer.current = window.setTimeout(() => {
+				selectedSyncTimer.current = null;
+				void syncActiveBranch(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
+			}, delayMs);
+		},
+		[pushNotice, syncActiveBranch],
 	);
 
 	const refreshSelected = useCallback(
@@ -507,28 +487,9 @@ export function App() {
 			reconcilePendingInputEvent(event);
 
 			const refreshPlan = refreshPlanForEvent(event);
-			if (refreshPlan.refreshSession && event.session_id === selectedRef.current) {
-				const snapshot = queryClient.getQueryData<SessionSnapshot>(queryKeys.session(event.session_id, SELECTED_SESSION_DISPLAY_SCOPE));
-				const updateResult = applyServerViewUpdate(snapshot, event);
-				if (updateResult === "reload_active_branch" || (updateResult === "reload_overview" && refreshPlan.refreshActiveBranch)) {
-					scheduleSelectedRefresh(event.session_id);
-				} else if (updateResult === "reload_overview") {
-					lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
-					scheduleOverviewRefresh(event.session_id);
-				} else {
-					lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
-					if (updateResult === "applied") {
-						queryClient.setQueryData<SessionSnapshot>(queryKeys.session(event.session_id, SELECTED_SESSION_DISPLAY_SCOPE), snapshot);
-						if (snapshot) {
-							queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(snapshot.project_id), (current) =>
-								mergeSnapshotIntoSessionList(current, snapshot),
-							);
-							setPendingInputs((current) =>
-								current.filter((input) => input.sessionId !== snapshot.session_id || !pendingInputIsReflected(input, snapshot)),
-							);
-						}
-					}
-				}
+			if (refreshPlan.syncSelected && event.session_id === selectedRef.current) {
+				lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
+				scheduleActiveBranchSync(event.session_id);
 			} else {
 				lastEventIds.current.set(event.session_id, Math.max(lastEventIds.current.get(event.session_id) ?? 0, event.event_id));
 			}
@@ -552,10 +513,8 @@ export function App() {
 		},
 		[
 			pushNotice,
-			queryClient,
 			reconcilePendingInputEvent,
-			scheduleOverviewRefresh,
-			scheduleSelectedRefresh,
+			scheduleActiveBranchSync,
 			scheduleSessionListRefresh,
 		],
 	);
@@ -580,8 +539,7 @@ export function App() {
 		return () => {
 			offStatus();
 			offEvent();
-			if (refreshTimer.current !== null) window.clearTimeout(refreshTimer.current);
-			if (overviewRefreshTimer.current !== null) window.clearTimeout(overviewRefreshTimer.current);
+			if (selectedSyncTimer.current !== null) window.clearTimeout(selectedSyncTimer.current);
 			if (sessionListRefreshTimer.current !== null) window.clearTimeout(sessionListRefreshTimer.current);
 			api.close();
 		};
@@ -652,7 +610,13 @@ export function App() {
 				.then((replayed) => {
 					if (!subscribedEventSessionIds.current.has(sessionId)) return undefined;
 					for (const event of replayed) handleSessionEvent(event);
-					if (selectedRef.current === sessionId) return refreshSelected(sessionId);
+					if (selectedRef.current === sessionId) {
+						if (selectedSyncTimer.current !== null) {
+							window.clearTimeout(selectedSyncTimer.current);
+							selectedSyncTimer.current = null;
+						}
+						return syncActiveBranch(sessionId);
+					}
 					return undefined;
 				})
 				.catch((error) => {
@@ -660,7 +624,7 @@ export function App() {
 					pushNotice("error", errorMessage(error));
 				});
 		}
-	}, [api, connection, handleSessionEvent, pushNotice, refreshSelected, selectedId, sessions]);
+	}, [api, connection, handleSessionEvent, pushNotice, selectedId, sessions, syncActiveBranch]);
 
 	const configureProvider = useCallback(
 		async (provider: ProviderConfig) => {
@@ -778,9 +742,9 @@ export function App() {
 			if (activity !== "idle") throw new Error("only idle sessions can be deleted");
 
 			await api.deleteSession(sessionId);
-			if (refreshTimer.current !== null) {
-				window.clearTimeout(refreshTimer.current);
-				refreshTimer.current = null;
+			if (selectedSyncTimer.current !== null) {
+				window.clearTimeout(selectedSyncTimer.current);
+				selectedSyncTimer.current = null;
 			}
 			lastEventIds.current.delete(sessionId);
 			queryClient.removeQueries({
@@ -886,9 +850,7 @@ export function App() {
 							: input,
 					),
 				);
-				void queryClient.invalidateQueries({
-					queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
-				});
+				void syncActiveBranch(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
 				if (result.queued) invalidateSessionList();
 			} catch (error) {
 				setPendingInputs((current) =>
@@ -906,7 +868,7 @@ export function App() {
 				throw error;
 			}
 		},
-		[api, invalidateSelectedSession, invalidateSessionList, loadedSnapshot, queryClient, refreshSelected, requireSelected, selectedSession],
+		[api, invalidateSessionList, loadedSnapshot, pushNotice, refreshSelected, requireSelected, selectedSession, syncActiveBranch],
 	);
 
 	const startNewSession = useCallback(
@@ -1027,19 +989,12 @@ export function App() {
 		async (inputId: string) => {
 			const sessionId = requireSelected();
 			const result = await api.promoteQueuedInput(sessionId, inputId);
-			await Promise.all([
-				queryClient.invalidateQueries({
-					queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
-				}),
-				queryClient.invalidateQueries({
-					queryKey: queryKeys.sessions(selectedProjectRef.current),
-				}),
-			]);
+			await Promise.all([syncActiveBranch(sessionId), queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) })]);
 			if (!result.promoted && result.status !== "queued") {
 				pushNotice("info", "message is already being processed");
 			}
 		},
-		[api, pushNotice, queryClient, requireSelected],
+		[api, pushNotice, queryClient, requireSelected, syncActiveBranch],
 	);
 
 	const stopActiveTurn = useCallback(async () => {
@@ -1047,20 +1002,13 @@ export function App() {
 		setStopping(true);
 		try {
 			await api.interrupt(sessionId);
-			await Promise.all([
-				queryClient.invalidateQueries({
-					queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
-				}),
-				queryClient.invalidateQueries({
-					queryKey: queryKeys.sessions(selectedProjectRef.current),
-				}),
-			]);
+			await Promise.all([syncActiveBranch(sessionId), queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) })]);
 		} catch (error) {
 			pushNotice("error", errorMessage(error));
 		} finally {
 			setStopping(false);
 		}
-	}, [api, pushNotice, queryClient, requireSelected]);
+	}, [api, pushNotice, queryClient, requireSelected, syncActiveBranch]);
 
 	const resumeTerminalTurn = useCallback(
 		async (leafId?: string | null) => {
@@ -1078,20 +1026,13 @@ export function App() {
 					leafId: activeLeafId,
 					expectedActiveLeafId: current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
 				});
-				await Promise.all([
-					queryClient.invalidateQueries({
-						queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
-					}),
-					queryClient.invalidateQueries({
-						queryKey: queryKeys.sessions(selectedProjectRef.current),
-					}),
-				]);
+				await Promise.all([syncActiveBranch(sessionId), queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) })]);
 				pushNotice("success", result.outcome === "Interrupted" ? "continued turn" : "retry started");
 			} finally {
 				setResumingTurnId(null);
 			}
 		},
-		[api, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, pushNotice, queryClient, refreshSelected, requireSelected],
+		[api, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, pushNotice, queryClient, refreshSelected, requireSelected, syncActiveBranch],
 	);
 
 	const openHistoryDialog = useCallback(

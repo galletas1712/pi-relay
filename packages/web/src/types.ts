@@ -79,25 +79,18 @@ export interface EventFrame {
 	event: string;
 	session_id: string;
 	data: Record<string, unknown>;
-	view_update?: SessionViewUpdate;
 }
-
-export interface SessionViewUpdate {
-	overview?: Partial<SessionOverview>;
-	active_branch?: ActiveBranchViewUpdate;
-}
-
-export type ActiveBranchViewUpdate =
-	| {
-			kind: "append_entry";
-			entry: TranscriptEntry;
-	  }
-	| {
-			kind: "reload_required";
-			reason?: string | null;
-	  };
 
 export type SessionOverview = Omit<SessionSnapshot, "entries">;
+
+export interface ActiveBranchSyncResponse {
+	session_id: string;
+	base_leaf_id: string | null;
+	active_leaf_id: string | null;
+	status: "unchanged" | "extended" | "branch_changed";
+	entries: TranscriptEntry[];
+	overview: SessionOverview;
+}
 
 export type ContentBlock =
 	| { type: "text"; text: string }

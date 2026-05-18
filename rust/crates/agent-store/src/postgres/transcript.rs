@@ -8,7 +8,9 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Row, Transaction};
 
-use crate::{EventFrame, EventType, HistoryTree, SessionConfig};
+use crate::{
+    ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree, SessionConfig,
+};
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
 use super::rows::row_to_stored_entry;
@@ -35,6 +37,50 @@ impl PostgresAgentStore {
             session_id: session_id.to_string(),
             active_leaf_id: session_row.get("active_leaf_id"),
             metadata,
+            entries,
+        })
+    }
+
+    pub async fn sync_active_branch(
+        &self,
+        session_id: &str,
+        base_leaf_id: Option<&str>,
+    ) -> Result<ActiveBranchSync> {
+        let active_leaf_id = self.active_leaf_id(session_id).await?;
+        if active_leaf_id.as_deref() == base_leaf_id {
+            return Ok(ActiveBranchSync {
+                session_id: session_id.to_string(),
+                base_leaf_id: base_leaf_id.map(ToOwned::to_owned),
+                active_leaf_id,
+                status: ActiveBranchSyncStatus::Unchanged,
+                entries: Vec::new(),
+            });
+        }
+        let Some(active_leaf_id) = active_leaf_id else {
+            return Ok(ActiveBranchSync {
+                session_id: session_id.to_string(),
+                base_leaf_id: base_leaf_id.map(ToOwned::to_owned),
+                active_leaf_id: None,
+                status: ActiveBranchSyncStatus::BranchChanged,
+                entries: Vec::new(),
+            });
+        };
+        let entries = match base_leaf_id {
+            Some(base_leaf_id) => {
+                self.active_branch_entries_after(session_id, base_leaf_id)
+                    .await?
+            }
+            None => self.active_branch_entries(session_id).await?,
+        };
+        let status = match base_leaf_id {
+            Some(_) if entries.is_empty() => ActiveBranchSyncStatus::BranchChanged,
+            _ => ActiveBranchSyncStatus::Extended,
+        };
+        Ok(ActiveBranchSync {
+            session_id: session_id.to_string(),
+            base_leaf_id: base_leaf_id.map(ToOwned::to_owned),
+            active_leaf_id: Some(active_leaf_id),
+            status,
             entries,
         })
     }
@@ -123,6 +169,46 @@ impl PostgresAgentStore {
             "select id, parent_id, timestamp_ms, item, provider_replay from transcript_entries where session_id=$1 order by sequence",
         )
         .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row_to_stored_entry(&row))
+            .collect()
+    }
+
+    async fn active_branch_entries_after(
+        &self,
+        session_id: &str,
+        base_leaf_id: &str,
+    ) -> Result<Vec<StoredTranscriptEntry>> {
+        let rows = sqlx::query(
+            r#"
+            with recursive branch as (
+                select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence, 0 as depth
+                from transcript_entries t
+                join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
+                where t.session_id = $1
+
+                union all
+
+                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence, child.depth + 1
+                from transcript_entries parent
+                join branch child
+                  on parent.session_id = $1
+                 and parent.id = child.parent_id
+                where child.id <> $2::text
+            ),
+            base as (
+                select depth from branch where id = $2::text
+            )
+            select branch.id, branch.parent_id, branch.timestamp_ms, branch.item, branch.provider_replay
+            from branch, base
+            where branch.depth < base.depth
+            order by branch.depth desc
+            "#,
+        )
+        .bind(session_id)
+        .bind(base_leaf_id)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()

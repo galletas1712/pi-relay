@@ -26,7 +26,7 @@ use crate::provider_runtime::{
     model_input_tokens_for_gate, run_compaction, run_model,
 };
 use crate::state::{AppState, RunningTask};
-use crate::types::{DispatchAction, LiveEventFrame, RpcError, RuntimeSession};
+use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
 const MODEL_PROVIDER_MAX_ATTEMPTS: usize = 3;
 
@@ -1757,7 +1757,7 @@ fn session_uses_harness(config: &SessionConfig) -> bool {
 
 pub(crate) fn publish_events(state: &AppState, events: Vec<EventFrame>) {
     for event in events {
-        let _ = state.events.send(LiveEventFrame::from_event(event));
+        let _ = state.events.send(event);
     }
 }
 
