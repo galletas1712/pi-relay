@@ -58,6 +58,12 @@ impl ModelContext {
         self
     }
 
+    pub(crate) fn recover_open_turn(mut self, closure: OpenTurnClosure) -> Self {
+        Self::recover_open_turn_items(&mut self.items, closure);
+        self.provider_replay.resize_with(self.items.len(), Vec::new);
+        self
+    }
+
     pub fn transcript_items(&self) -> &[TranscriptItem] {
         &self.items
     }
@@ -135,16 +141,30 @@ impl ModelContext {
         Some((prefix, suffix))
     }
 
+    pub fn open_turn_ready_to_continue(&self) -> Option<TurnId> {
+        Self::open_turn_ready_to_continue_items(&self.items)
+    }
+
     fn close_open_turn_items(items: &mut Vec<TranscriptItem>, closure: OpenTurnClosure) {
         let Some((turn_id, turn_start)) = Self::open_turn_start(items) else {
             return;
         };
 
         Self::complete_open_tool_calls(items, turn_start, turn_id, closure);
+        if Self::open_turn_ready_to_continue_items(items).is_some() {
+            return;
+        }
         items.push(TranscriptItem::TurnFinished {
             turn_id,
             outcome: closure.turn_outcome(),
         });
+    }
+
+    fn recover_open_turn_items(items: &mut Vec<TranscriptItem>, closure: OpenTurnClosure) {
+        let Some((turn_id, turn_start)) = Self::open_turn_start(items) else {
+            return;
+        };
+        Self::complete_open_tool_calls(items, turn_start, turn_id, closure);
     }
 
     fn open_turn_start(items: &[TranscriptItem]) -> Option<(TurnId, usize)> {
@@ -214,6 +234,34 @@ impl ModelContext {
             }
         }
     }
+
+    fn open_turn_ready_to_continue_items(items: &[TranscriptItem]) -> Option<TurnId> {
+        let (turn_id, turn_start) = Self::open_turn_start(items)?;
+        let mut tool_calls = Vec::<ToolCall>::new();
+        let mut tool_results = Vec::<ToolResultMessage>::new();
+        for item in &items[turn_start..] {
+            match item {
+                TranscriptItem::AssistantMessage(message) => {
+                    tool_calls.extend(message.tool_calls().cloned());
+                }
+                TranscriptItem::ToolResult(result) => tool_results.push(result.clone()),
+                TranscriptItem::TurnStarted { .. }
+                | TranscriptItem::UserMessage(_)
+                | TranscriptItem::ToolCallStarted { .. }
+                | TranscriptItem::TurnFinished { .. }
+                | TranscriptItem::CompactionSummary(_) => {}
+            }
+        }
+        if tool_calls.is_empty() {
+            return None;
+        }
+        let all_tools_have_results = tool_calls.into_iter().all(|tool_call| {
+            tool_results.iter().any(|result| {
+                result.tool_call_id == tool_call.id && result.tool_name == tool_call.tool_name
+            })
+        });
+        all_tools_have_results.then_some(turn_id)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,10 +279,7 @@ impl OpenTurnClosure {
     }
 
     fn missing_tool_result(self, tool_call: ToolCall) -> ToolResultMessage {
-        match self {
-            Self::Crashed => ToolResultMessage::crashed(tool_call.id, tool_call.tool_name),
-            Self::Interrupted => ToolResultMessage::interrupted(tool_call.id, tool_call.tool_name),
-        }
+        ToolResultMessage::crashed(tool_call.id, tool_call.tool_name)
     }
 }
 
@@ -383,15 +428,16 @@ mod tests {
 
         assert_eq!(
             transcript.transcript_items().last(),
-            Some(&TranscriptItem::TurnFinished {
-                turn_id: TurnId(7),
-                outcome: TurnOutcome::Crashed,
-            })
+            Some(&TranscriptItem::ToolResult(ToolResultMessage::crashed(
+                second.id.clone(),
+                "read"
+            )))
         );
         assert_eq!(
             transcript.transcript_items()[6],
             TranscriptItem::ToolResult(ToolResultMessage::crashed(second.id.clone(), "read"))
         );
+        assert_eq!(transcript.open_turn_ready_to_continue(), Some(TurnId(7)));
     }
 
     #[test]
@@ -418,12 +464,7 @@ mod tests {
             transcript.transcript_items()[4],
             TranscriptItem::ToolResult(ToolResultMessage::crashed(tool_call.id.clone(), "bash"))
         );
-        assert_eq!(
-            transcript.transcript_items()[5],
-            TranscriptItem::TurnFinished {
-                turn_id: TurnId(8),
-                outcome: TurnOutcome::Crashed,
-            }
-        );
+        assert_eq!(transcript.transcript_items().len(), 5);
+        assert_eq!(transcript.open_turn_ready_to_continue(), Some(TurnId(8)));
     }
 }

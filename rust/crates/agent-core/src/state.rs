@@ -285,7 +285,7 @@ impl AgentState {
                 let mut items = Vec::new();
                 for tool in tools.into_iter().skip(next_result_index) {
                     let result = tool.result.unwrap_or_else(|| {
-                        ToolResultMessage::interrupted(tool.call.id, tool.call.tool_name)
+                        ToolResultMessage::crashed(tool.call.id, tool.call.tool_name)
                     });
                     items.push(TranscriptItem::ToolResult(result));
                 }
@@ -578,7 +578,7 @@ mod tests {
         assert_eq!(
             items,
             vec![
-                TranscriptItem::ToolResult(ToolResultMessage::interrupted(
+                TranscriptItem::ToolResult(ToolResultMessage::crashed(
                     ToolCallId::from_u64(1),
                     "bash"
                 )),

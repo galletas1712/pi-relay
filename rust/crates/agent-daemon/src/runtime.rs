@@ -175,6 +175,7 @@ impl SessionDriver {
         }
         let recovered = AgentSession::from_stored_session(stored.clone())
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
+        let should_continue = recovered.is_ready_to_continue();
         let recovered_stored = recovered.to_stored_session(&self.session_id);
         let new_entries = recovered_stored
             .entries
@@ -194,6 +195,9 @@ impl SessionDriver {
             .map_err(anyhow::Error::from)?;
         publish_events(&self.state, events);
         clear_event_buffer_if_idle(&self.state, &self.session_id).await?;
+        if should_continue {
+            self.drive_until_blocked().await?;
+        }
         Ok(())
     }
 
@@ -462,41 +466,6 @@ impl SessionDriver {
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         session
             .resume_model_turn(checkpoint_leaf_id, turn_id, action_id, context_tokens)
-            .map_err(history_error_to_rpc)?;
-
-        let active = Arc::new(Mutex::new(RuntimeSession { session, config }));
-        self.state
-            .active
-            .lock()
-            .await
-            .insert(self.session_id.clone(), active.clone());
-        self.persist_active_outputs(active, None, None, None, Vec::new())
-            .await
-    }
-
-    pub(crate) async fn resume_tool_turn(
-        &self,
-        checkpoint_leaf_id: &str,
-        turn_id: agent_vocab::TurnId,
-        action_id: agent_vocab::ActionId,
-        tool_call: agent_vocab::ToolCall,
-    ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
-        let config = self
-            .state
-            .repo
-            .load_session_config(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-        let stored = self
-            .state
-            .repo
-            .load_stored_session(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-        let mut session = AgentSession::from_stored_session(stored)
-            .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
-        session
-            .resume_tool_turn(checkpoint_leaf_id, turn_id, action_id, tool_call)
             .map_err(history_error_to_rpc)?;
 
         let active = Arc::new(Mutex::new(RuntimeSession { session, config }));
@@ -1493,11 +1462,7 @@ async fn run_tool_turn(
             .await
         {
             Ok(result) => result,
-            Err(error) => ToolResultMessage::error(
-                tool_call.id.clone(),
-                tool_call.tool_name.clone(),
-                error.to_string(),
-            ),
+            Err(_) => ToolResultMessage::crashed(tool_call.id.clone(), tool_call.tool_name.clone()),
         }
     };
     let status = if matches!(result.status, ToolResultStatus::Success) {

@@ -346,7 +346,7 @@ fn from_model_context_closes_open_turn_as_crashed() {
 }
 
 #[test]
-fn from_transcript_store_closes_an_open_tool_turn_as_crashed() {
+fn from_transcript_store_repairs_open_tool_turn_and_continues() {
     let tool_call = ToolCall {
         id: ToolCallId::from_u64(1),
         tool_name: "read".to_string(),
@@ -365,7 +365,7 @@ fn from_transcript_store_closes_an_open_tool_turn_as_crashed() {
     ]));
 
     let session = AgentSession::from_transcript_store(store)
-        .expect("store restore should close an open turn as crashed");
+        .expect("store restore should repair an open tool turn");
 
     assert_eq!(
         session.model_context().transcript_items(),
@@ -383,12 +383,9 @@ fn from_transcript_store_closes_an_open_tool_turn_as_crashed() {
                 tool_call.id,
                 tool_call.tool_name,
             )),
-            TranscriptItem::TurnFinished {
-                turn_id: TurnId(7),
-                outcome: TurnOutcome::Crashed,
-            },
         ]
     );
+    assert!(session.is_ready_to_continue());
 }
 
 #[test]
@@ -682,6 +679,57 @@ fn history_operation_can_interrupt_drained_model_action() {
         })
         .expect("late model completion is valid but stale");
     session.drive();
+}
+
+#[test]
+fn tool_crash_result_records_failure_and_continues_turn() {
+    let mut session = AgentSession::new();
+    session
+        .enqueue_input(AgentInput::follow_up("hi"))
+        .expect("plain follow-up is valid");
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(1), TurnId(1));
+
+    let tool_call = ToolCall {
+        id: ToolCallId::from_u64(1),
+        tool_name: "bash".to_string(),
+        args_json: "{}".to_string(),
+    };
+    session
+        .enqueue_session_input(SessionInput::ModelCompleted {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::ToolCall(tool_call.clone())],
+            },
+            context_tokens: None,
+        })
+        .expect("matching model completion is valid");
+    session.drive();
+    session.drain_actions();
+
+    session
+        .enqueue_input(AgentInput::ToolCompleted {
+            action_id: ActionId(2),
+            turn_id: TurnId(1),
+            result: ToolResultMessage {
+                tool_call_id: tool_call.id,
+                tool_name: tool_call.tool_name,
+                output: "tool runner crashed".to_string(),
+                status: ToolResultStatus::Crashed,
+            },
+        })
+        .expect("matching tool completion is valid");
+    session.drive();
+
+    assert!(session.is_ready_to_continue());
+    assert!(matches!(
+        session.model_context().transcript_items().last(),
+        Some(TranscriptItem::ToolResult(result)) if result.status == ToolResultStatus::Crashed
+    ));
+
+    session.drive();
+    assert_single_request_model(session.drain_actions(), ActionId(3), TurnId(1));
 }
 
 #[test]

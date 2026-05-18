@@ -122,7 +122,10 @@ impl AgentSession {
         let last_turn_id = model_context.last_turn_id();
         let transcript_store = TranscriptStore::from_model_context(&model_context);
         let mut session = Self::new();
-        session.core = AgentCoreLoop::resume_at(last_turn_id, ActionId::first());
+        session.core = match model_context.open_turn_ready_to_continue() {
+            Some(turn_id) => AgentCoreLoop::resume_ready_to_continue(turn_id, ActionId::first()),
+            None => AgentCoreLoop::resume_at(last_turn_id, ActionId::first()),
+        };
         session.transcript_store = transcript_store;
         session
     }
@@ -135,7 +138,10 @@ impl AgentSession {
         let model_context = transcript_store.model_context();
         let last_turn_id = model_context.last_turn_id();
         let mut session = Self::new();
-        session.core = AgentCoreLoop::resume_at(last_turn_id, ActionId::first());
+        session.core = match model_context.open_turn_ready_to_continue() {
+            Some(turn_id) => AgentCoreLoop::resume_ready_to_continue(turn_id, ActionId::first()),
+            None => AgentCoreLoop::resume_at(last_turn_id, ActionId::first()),
+        };
         session.transcript_store = transcript_store;
         Ok(session)
     }
@@ -150,7 +156,10 @@ impl AgentSession {
         let model_context = transcript_store.model_context();
         let last_turn_id = model_context.last_turn_id();
         let mut session = Self::new();
-        session.core = AgentCoreLoop::resume_at(last_turn_id, ActionId::first());
+        session.core = match model_context.open_turn_ready_to_continue() {
+            Some(turn_id) => AgentCoreLoop::resume_ready_to_continue(turn_id, ActionId::first()),
+            None => AgentCoreLoop::resume_at(last_turn_id, ActionId::first()),
+        };
         session.transcript_store = transcript_store;
         Ok(session)
     }
@@ -597,15 +606,25 @@ impl AgentSession {
         transcript_store: &mut TranscriptStore,
         closure: OpenTurnClosure,
     ) -> Result<(), HistoryOperationError> {
-        if transcript_store.is_turn_boundary() {
+        if transcript_store.is_turn_boundary()
+            || transcript_store
+                .model_context()
+                .open_turn_ready_to_continue()
+                .is_some()
+        {
             return Ok(());
         }
 
         let items = transcript_store.model_context().into_transcript_items();
         let original_len = items.len();
-        let recovered = ModelContext::from_transcript_items(items)
-            .close_open_turn(closure)
-            .into_transcript_items();
+        let recovered_context =
+            ModelContext::from_transcript_items(items).recover_open_turn(closure);
+        let recovered_context = if recovered_context.open_turn_ready_to_continue().is_some() {
+            recovered_context
+        } else {
+            recovered_context.close_open_turn(closure)
+        };
+        let recovered = recovered_context.into_transcript_items();
         if recovered.len() == original_len {
             return Err(HistoryOperationError::Store(
                 TranscriptStoreError::NotTurnBoundary,
@@ -613,7 +632,12 @@ impl AgentSession {
         }
 
         transcript_store.append_transcript_items(recovered.into_iter().skip(original_len));
-        if transcript_store.is_turn_boundary() {
+        if transcript_store.is_turn_boundary()
+            || transcript_store
+                .model_context()
+                .open_turn_ready_to_continue()
+                .is_some()
+        {
             Ok(())
         } else {
             Err(HistoryOperationError::Store(

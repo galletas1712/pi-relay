@@ -67,6 +67,19 @@ impl AgentCoreLoop {
         }
     }
 
+    /// Resume at the point after a tool batch has produced all results and
+    /// before the follow-up model request has been dispatched.
+    pub fn resume_ready_to_continue(turn_id: TurnId, next_action_id: ActionId) -> Self {
+        Self {
+            mailbox: Mailbox::default(),
+            state: AgentState::ReadyToContinue { turn_id },
+            last_turn_id: turn_id,
+            next_action_id,
+            action_outbox: VecDeque::new(),
+            transcript_item_outbox: VecDeque::new(),
+        }
+    }
+
     pub fn enqueue_input(&mut self, input: AgentInput) {
         self.mailbox.push_input(input)
     }
@@ -181,6 +194,15 @@ mod tests {
             tool_name: tool_name.to_string(),
             output: "ok".to_string(),
             status: ToolResultStatus::Success,
+        }
+    }
+
+    fn crashed_tool_result(tool_call_id: ToolCallId, tool_name: &str) -> ToolResultMessage {
+        ToolResultMessage {
+            tool_call_id,
+            tool_name: tool_name.to_string(),
+            output: "crashed".to_string(),
+            status: ToolResultStatus::Crashed,
         }
     }
 
@@ -358,6 +380,50 @@ mod tests {
                 action_id: ActionId(3),
                 turn_id: TurnId(1)
             }
+        );
+    }
+
+    #[test]
+    fn crashed_tool_result_is_recorded_and_resumes_the_model() {
+        let mut loop_state = AgentCoreLoop::new();
+        let mut next_tool_call_id = ToolCallId::first();
+        drive_collect(&mut loop_state, AgentInput::follow_up("hello"));
+        loop_state.drain_actions();
+
+        let tool_call = tool_call(&mut next_tool_call_id, "bash");
+        drive_collect(
+            &mut loop_state,
+            AgentInput::ModelCompleted {
+                action_id: ActionId(1),
+                turn_id: TurnId(1),
+                assistant: assistant_message(vec![AssistantItem::ToolCall(tool_call.clone())]),
+            },
+        );
+        loop_state.drain_actions();
+
+        let result = crashed_tool_result(tool_call.id.clone(), "bash");
+        let items = drive_collect(
+            &mut loop_state,
+            AgentInput::ToolCompleted {
+                action_id: ActionId(2),
+                turn_id: TurnId(1),
+                result: result.clone(),
+            },
+        );
+
+        assert_eq!(items, vec![TranscriptItem::ToolResult(result)]);
+        assert_eq!(
+            loop_state.state,
+            AgentState::ReadyToContinue { turn_id: TurnId(1) }
+        );
+
+        loop_state.drive();
+        assert_eq!(
+            loop_state.drain_actions(),
+            vec![AgentAction::RequestModel {
+                action_id: ActionId(3),
+                turn_id: TurnId(1)
+            }]
         );
     }
 
@@ -564,7 +630,7 @@ mod tests {
                     turn_id: TurnId(1),
                     tool_call: tool_call.clone(),
                 },
-                TranscriptItem::ToolResult(ToolResultMessage::interrupted(
+                TranscriptItem::ToolResult(ToolResultMessage::crashed(
                     tool_call.id.clone(),
                     "bash",
                 )),
@@ -638,7 +704,7 @@ mod tests {
         );
         assert_eq!(
             items[5],
-            TranscriptItem::ToolResult(ToolResultMessage::interrupted(first.id.clone(), "bash"))
+            TranscriptItem::ToolResult(ToolResultMessage::crashed(first.id.clone(), "bash"))
         );
         assert_eq!(items[6], TranscriptItem::ToolResult(second_result));
         assert_eq!(
