@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Download, FileText } from "lucide-react";
+import { Download, FileText, X } from "lucide-react";
 import {
 	assistantExportBlocks,
 	buildExportBlocks,
@@ -81,7 +81,9 @@ export function ExportDialog({
 						<h2 id="export-dialog-title">Export messages</h2>
 						<p>Select model steps from the current branch. User inputs from the containing turn are included once.</p>
 					</div>
-					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close export dialog">×</button>
+					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close export dialog">
+						<X size={16} />
+					</button>
 				</div>
 
 				<div className="export-toolbar">

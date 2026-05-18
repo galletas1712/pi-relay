@@ -254,9 +254,6 @@ export function QueuedInputPane({
 					const canPromote = !input.pending && input.priority === "follow_up" && input.status === "queued";
 					return (
 						<div className={`queue-row ${input.pending ? "pending" : ""}`} key={input.input_id}>
-							<span className={`queue-priority ${input.priority === "steer" ? "steer" : ""}`}>
-								{input.priority === "steer" ? "steer" : "follow-up"}
-							</span>
 							<span className="queue-preview">{truncate(firstLine(contentBlocksToText(input.content)) || "(empty)", 96)}</span>
 							<button
 								className="queue-steer-button"

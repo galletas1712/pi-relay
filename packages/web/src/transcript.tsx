@@ -1,7 +1,9 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type UIEvent } from "react";
 import { AlertTriangle, Check, ChevronDown, Copy, Loader2, RotateCcw, Terminal } from "lucide-react";
 import rehypeRaw from "rehype-raw";
+import rehypeHighlight from "rehype-highlight";
 import ReactMarkdown from "react-markdown";
+import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { branchEntriesFor } from "./historyTargets.ts";
 import { citationsFromReplay, hostedToolsFromReplay, localToolCallIdFromReplay, parsedProviderReplay, replayContainsAssistantText } from "./providerReplay.ts";
@@ -874,19 +876,28 @@ function AssistantCopyButton({ text }: { text: string }) {
 	);
 }
 
+const markdownComponents: Components = {
+	a: ({ href, children, ...props }) => (
+		<a href={href} target="_blank" rel="noreferrer" {...props}>
+			{children}
+		</a>
+	),
+	pre: ({ node, children, ...props }) => {
+		return (
+			<pre {...props}>
+				{children}
+			</pre>
+		);
+	}
+};
+
 const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
 	return (
 		<div className="assistant-markdown">
 			<ReactMarkdown
-				rehypePlugins={[rehypeRaw]}
+				rehypePlugins={[rehypeRaw, [rehypeHighlight, { detect: true }]]}
 				remarkPlugins={[remarkGfm]}
-				components={{
-					a: ({ href, children, ...props }) => (
-						<a href={href} target="_blank" rel="noreferrer" {...props}>
-							{children}
-						</a>
-					)
-				}}
+				components={markdownComponents}
 			>
 				{text}
 			</ReactMarkdown>
@@ -1307,12 +1318,9 @@ function diffMarker(kind: EditDiffRow["kind"]): string {
 	return " ";
 }
 
-function ToolOutput({ result }: { result: ToolResultItem }) {
+export function ToolOutput({ result }: { result: ToolResultItem }) {
 	const output = result.output || "(empty)";
-	const lines = output.split("\n");
-	const isLong = lines.length > 28;
-	const display = isLong ? `${lines.slice(0, 28).join("\n")}\n...` : output;
-	return <pre className={result.status === "Success" ? "" : "tool-output-error"}>{display}</pre>;
+	return <pre className={result.status === "Success" ? "" : "tool-output-error"}>{output}</pre>;
 }
 
 function SystemMessage({

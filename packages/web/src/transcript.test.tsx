@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { assistantRenderParts, captureScrollPosition, editToolPreview, formatElapsed, isScrolledAtBottom, MessageList, restoreScrollPosition } from "./transcript.tsx";
+import { assistantRenderParts, captureScrollPosition, editToolPreview, formatElapsed, isScrolledAtBottom, MessageList, restoreScrollPosition, ToolOutput } from "./transcript.tsx";
 import type { AssistantItem, ProviderReplayItem, TranscriptEntry } from "./types.ts";
 
 describe("assistantRenderParts", () => {
@@ -126,6 +126,35 @@ describe("MessageList session loading guard", () => {
 
 		expect(html).toContain("Loading session");
 		expect(html).not.toContain("stale transcript text");
+	});
+});
+
+describe("MessageList markdown code rendering", () => {
+	it("renders inline code and syntax-highlighted code blocks", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[assistantEntry("assistant", null, "Inline `value`.\n\n```js\nconst value = 1;\n```")]}
+				activeLeafId="assistant"
+				isRunning={false}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain("<code>value</code>");
+		expect(html).not.toContain("code-language-label");
+		expect(html).toContain("hljs-keyword");
+	});
+});
+
+describe("ToolOutput", () => {
+	it("does not truncate long output text in markup", () => {
+		const output = Array.from({ length: 60 }, (_, index) => `line ${index + 1}`).join("\n");
+		const html = renderToStaticMarkup(<ToolOutput result={{ type: "tool_result", tool_call_id: "call_1", tool_name: "Bash", status: "Success", output }} />);
+
+		expect(html).toContain("line 60");
+		expect(html).not.toContain("\\n...");
 	});
 });
 
@@ -259,3 +288,4 @@ function turnStartedEntry(id: string, turnId: number, timestampMs: number): Tran
 		provider_replay: []
 	};
 }
+

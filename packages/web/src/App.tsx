@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Menu, PanelRightClose, PanelRightOpen } from "lucide-react";
+import { Menu, PanelRightOpen, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
@@ -1670,8 +1670,8 @@ function SystemPromptDialog({
 						<h2 id="system-prompt-dialog-title">PI.md</h2>
 						<p>Rendered prompt and source template.</p>
 					</div>
-					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close system prompt dialog">
-						×
+					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close system prompt dialog">
+						<X size={16} />
 					</button>
 				</div>
 				<div className="system-prompt-tabs" role="tablist" aria-label="PI.md view">
@@ -1739,8 +1739,8 @@ function RenameSessionDialog({
 					<div className="rename-dialog-copy">
 						<h2 id="rename-dialog-title">Rename session</h2>
 					</div>
-					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close rename dialog">
-						×
+					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close rename dialog">
+						<X size={16} />
 					</button>
 				</div>
 				<form
@@ -1792,8 +1792,8 @@ function DeleteSessionDialog({
 					<div className="rename-dialog-copy">
 						<h2 id="delete-dialog-title">Delete session</h2>
 					</div>
-					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close delete dialog" disabled={deleting}>
-						×
+					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close delete dialog" disabled={deleting}>
+						<X size={16} />
 					</button>
 				</div>
 				<div className="delete-dialog-body">
@@ -1840,8 +1840,8 @@ function ProjectDialog({
 					<div className="rename-dialog-copy">
 						<h2 id="project-dialog-title">{title}</h2>
 					</div>
-					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close project dialog" disabled={state.saving}>
-						×
+					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close project dialog" disabled={state.saving}>
+						<X size={16} />
 					</button>
 				</div>
 				<form

@@ -3,7 +3,6 @@ import {
 	ArchiveRestore,
 	Edit3,
 	Folder,
-	PanelRightClose,
 	PanelRightOpen,
 	Plus,
 	Search,
@@ -39,7 +38,7 @@ export function SidebarHeader({
 				<span className={`connection-pill ${connected ? "online" : "offline"}`}>
 					{connected ? "connected" : connection}
 				</span>
-				<button className="icon-button tiny sidebar-close" type="button" onClick={onClose} aria-label="close sidebar">
+				<button className="plain-close-button sidebar-close" type="button" onClick={onClose} aria-label="close sidebar">
 					<X size={14} />
 				</button>
 			</div>
@@ -483,7 +482,7 @@ export function Inspector({
 			<div className="inspector-head">
 				<Settings size={14} />
 				<span>inspector</span>
-				<button className="icon-button tiny inspector-close" type="button" onClick={onClose} aria-label="close inspector">
+				<button className="plain-close-button inspector-close" type="button" onClick={onClose} aria-label="close inspector">
 					<X size={14} />
 				</button>
 			</div>

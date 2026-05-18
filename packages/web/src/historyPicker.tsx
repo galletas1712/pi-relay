@@ -104,7 +104,7 @@ export function HistoryPickerDialog({
 						<h2 id="history-dialog-title">{title}</h2>
 						<p>{description}</p>
 					</div>
-					<button className="icon-button tiny" type="button" onClick={onClose} aria-label="close picker">
+					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close picker">
 						<X size={14} />
 					</button>
 				</div>
