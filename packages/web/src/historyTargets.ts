@@ -45,22 +45,22 @@ export interface HistoryEntryDisplay {
 }
 
 export function historyForkOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
-	const options: HistoryTargetOption[] = [];
-	for (const entry of entries) {
-		if (entry.item.type === "turn_started") continue;
-		const branch = branchEntriesFor(entries, entry.id);
-		const index = branch.length - 1;
-		const option = forkOptionForEntry(entry, branch, index, turnIdAt(branch, index), activeLeafId);
-		if (option) options.push(option);
-	}
-	return options.reverse();
+	return historyBranchPointOptions(entries, activeLeafId, "fork");
 }
 
 export function historySwitchOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
+	return historyBranchPointOptions(entries, activeLeafId, "switch");
+}
+
+function historyBranchPointOptions(
+	entries: TranscriptEntry[],
+	activeLeafId: string | null,
+	mode: "fork" | "switch"
+): HistoryTargetOption[] {
 	const options: HistoryTargetOption[] = [];
 	for (const entry of entries) {
 		const branch = branchEntriesFor(entries, entry.id);
-		const option = switchOptionForEntry(entry, branch, branch.length - 1, turnIdAt(branch, branch.length - 1), activeLeafId);
+		const option = branchPointOptionForEntry(entry, branch, branch.length - 1, turnIdAt(branch, branch.length - 1), activeLeafId, mode);
 		if (option) options.push(option);
 	}
 	return options.reverse();
@@ -262,12 +262,13 @@ function forkOptionForEntry(
 	return null;
 }
 
-function switchOptionForEntry(
+function branchPointOptionForEntry(
 	entry: TranscriptEntry,
 	entries: TranscriptEntry[],
 	index: number,
 	currentTurnId: number | null,
-	activeLeafId: string | null
+	activeLeafId: string | null,
+	mode: "fork" | "switch"
 ): HistoryTargetOption | null {
 	const item = entry.item;
 	const time = formatTimestamp(entry.timestamp_ms);
@@ -277,13 +278,14 @@ function switchOptionForEntry(
 		return {
 			id: entry.id,
 			actionLeafId,
-			expectedActiveLeafId: activeLeafId,
+			expectedActiveLeafId: mode === "switch" ? activeLeafId : undefined,
 			sourceEntryId: entry.id,
+			placement: mode === "fork" ? "before" : undefined,
 			restoreText: text,
 			turnLabel: currentTurnId ? `u${currentTurnId}` : "user",
 			title: "User message",
 			preview: truncate(text.trim() || "Empty user message.", 96),
-			meta: `edit · ${time}`,
+			meta: `${mode === "fork" ? "fork" : "edit"} · ${time}`,
 			isActive: false
 		};
 	}
@@ -293,12 +295,13 @@ function switchOptionForEntry(
 		return {
 			id: entry.id,
 			actionLeafId: entry.id,
-			expectedActiveLeafId: activeLeafId,
+			expectedActiveLeafId: mode === "switch" ? activeLeafId : undefined,
 			sourceEntryId: entry.id,
+			placement: mode === "fork" ? "at" : undefined,
 			turnLabel: `t${item.turn_id}`,
 			title: step ? modelStepTitle(step) : `End of turn ${item.turn_id}`,
 			preview: step ? modelStepPreview(step) : `${item.outcome.toLowerCase()} turn completed.`,
-			meta: `switch · ${time}`,
+			meta: `${mode} · ${time}`,
 			isActive: activeLeafId === entry.id,
 			outcome: item.outcome
 		};
@@ -308,12 +311,13 @@ function switchOptionForEntry(
 	return {
 		id: entry.id,
 		actionLeafId: entry.id,
-		expectedActiveLeafId: activeLeafId,
+		expectedActiveLeafId: mode === "switch" ? activeLeafId : undefined,
 		sourceEntryId: entry.id,
+		placement: mode === "fork" ? "at" : undefined,
 		turnLabel: display.turnLabel,
 		title: display.title,
 		preview: display.preview,
-		meta: display.meta,
+		meta: mode === "fork" ? `fork · ${time}` : display.meta,
 		isActive: activeLeafId === entry.id
 	};
 }
