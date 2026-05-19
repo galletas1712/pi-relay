@@ -1006,12 +1006,22 @@ export function App() {
 				leafId: target.actionLeafId,
 				expectedActiveLeafId: target.expectedActiveLeafId ?? loadedSnapshot.active_leaf_id ?? null,
 			});
-			await getFreshSession(sessionId);
 			if (target.restoreText !== undefined) {
 				composerHandleRef.current?.setValue(target.restoreText);
 			}
+			const refreshError = await getFreshSession(sessionId)
+				.then(() => null)
+				.catch((error: unknown) => {
+					void queryClient.invalidateQueries({
+						queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
+					});
+					return error;
+				});
 			invalidateSessionList();
 			pushNotice("success", target.restoreText !== undefined ? "message restored for editing" : "switched to selected history point");
+			if (refreshError) {
+				pushNotice("error", `history switched, but failed to refresh session: ${errorMessage(refreshError)}`);
+			}
 		},
 		[
 			api,
@@ -1019,6 +1029,7 @@ export function App() {
 			invalidateSessionList,
 			loadedSnapshot,
 			pushNotice,
+			queryClient,
 			requireSelected,
 		],
 	);
