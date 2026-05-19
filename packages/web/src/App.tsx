@@ -995,18 +995,18 @@ export function App() {
 	const switchToTarget = useCallback(
 		async (target: HistoryTargetOption) => {
 			const sessionId = requireSelected();
-			const current = await refreshSelected(sessionId);
-			if ((current?.snapshot.activity ?? loadedSnapshot?.activity) !== "idle") {
+			if (!loadedSnapshot || loadedSnapshot.session_id !== sessionId) {
+				throw new Error("session is still loading");
+			}
+			if (loadedSnapshot.activity !== "idle") {
 				throw new Error("stop the active turn before switching history");
 			}
 			await api.rewindHistory({
 				sessionId,
 				leafId: target.actionLeafId,
-				expectedActiveLeafId: target.expectedActiveLeafId ?? current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
+				expectedActiveLeafId: target.expectedActiveLeafId ?? loadedSnapshot.active_leaf_id ?? null,
 			});
-			await queryClient.invalidateQueries({
-				queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
-			});
+			await getFreshSession(sessionId);
 			if (target.restoreText !== undefined) {
 				composerHandleRef.current?.setValue(target.restoreText);
 			}
@@ -1015,12 +1015,10 @@ export function App() {
 		},
 		[
 			api,
+			getFreshSession,
 			invalidateSessionList,
-			loadedSnapshot?.active_leaf_id,
-			loadedSnapshot?.activity,
+			loadedSnapshot,
 			pushNotice,
-			queryClient,
-			refreshSelected,
 			requireSelected,
 		],
 	);
@@ -1118,18 +1116,18 @@ export function App() {
 			});
 			void queryClient
 				.fetchQuery({
-					queryKey: queryKeys.session(sessionId, "full_tree"),
-					queryFn: () => api.getSession(sessionId, { includeEntries: true, entryScope: "full_tree" }),
+					queryKey: ["history-tree", sessionId],
+					queryFn: () => api.getHistoryTree(sessionId),
 					staleTime: 0,
 					gcTime: 0,
 				})
-				.then((snapshot) => {
+				.then((tree) => {
 					setHistoryDialog((current) => {
 						if (!current || current.mode !== mode || current.sessionId !== sessionId) return current;
 						return {
 							...current,
-							entries: snapshot.entries ?? [],
-							activeLeafId: snapshot.active_leaf_id,
+							entries: tree.entries,
+							activeLeafId: tree.active_leaf_id,
 							loading: false,
 							error: null,
 						};
