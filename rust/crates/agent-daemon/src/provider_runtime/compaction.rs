@@ -306,7 +306,9 @@ async fn remote_compaction_request(
         prompt: assemble_agent_prompt(state, config).await?,
         transcript,
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: state.tools.definitions_for_provider(config.provider.kind),
+        tools: state
+            .tools
+            .provider_tools_for_provider(config.provider.kind),
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config
             .provider

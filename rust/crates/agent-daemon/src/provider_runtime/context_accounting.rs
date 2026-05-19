@@ -49,7 +49,9 @@ async fn count_model_input_tokens(
         prompt,
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: state.tools.definitions_for_provider(config.provider.kind),
+        tools: state
+            .tools
+            .provider_tools_for_provider(config.provider.kind),
         max_tokens: config.provider.max_tokens,
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config

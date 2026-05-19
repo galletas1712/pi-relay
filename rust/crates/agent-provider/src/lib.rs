@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
+use agent_tools::{ProviderTool, ToolRegistry};
 use agent_vocab::{
-    AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, ToolDefinition,
-    TranscriptItem,
+    AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, TranscriptItem,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ pub struct ModelRequest {
     pub prompt: PromptSections,
     pub transcript: Vec<ModelTranscriptEntry>,
     pub tool_profile: ProviderToolProfile,
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Vec<ProviderTool>,
     pub max_tokens: Option<u32>,
     pub reasoning_effort: ReasoningEffort,
     /// Explicit override for the provider's prompt-cache routing key. When
@@ -49,7 +49,7 @@ pub struct ProviderCompactionRequest {
     pub prompt: PromptSections,
     pub transcript: Vec<ModelTranscriptEntry>,
     pub tool_profile: ProviderToolProfile,
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Vec<ProviderTool>,
     pub reasoning_effort: ReasoningEffort,
     pub prompt_cache_key: Option<String>,
     pub session_id: Option<String>,
@@ -70,7 +70,7 @@ pub struct ProviderTokenCountRequest {
     pub prompt: PromptSections,
     pub transcript: Vec<ModelTranscriptEntry>,
     pub tool_profile: ProviderToolProfile,
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Vec<ProviderTool>,
     pub max_tokens: Option<u32>,
     pub reasoning_effort: ReasoningEffort,
     pub prompt_cache_key: Option<String>,
@@ -96,6 +96,24 @@ impl ProviderToolProfile {
             ProviderKind::OpenAi => Self::OpenAiCoding,
             ProviderKind::Claude => Self::AnthropicCoding,
         }
+    }
+}
+
+fn effective_provider_tools(
+    profile: ProviderToolProfile,
+    tools: Vec<ProviderTool>,
+) -> Vec<ProviderTool> {
+    if !tools.is_empty() {
+        return tools;
+    }
+    match profile {
+        ProviderToolProfile::OpenAiCoding => {
+            ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::OpenAi)
+        }
+        ProviderToolProfile::AnthropicCoding => {
+            ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::Claude)
+        }
+        ProviderToolProfile::None | ProviderToolProfile::CustomDefinitions => Vec::new(),
     }
 }
 

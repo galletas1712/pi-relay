@@ -305,16 +305,23 @@ fn tool_call_wire(call: &ToolCall, provider: ProviderKind) -> Value {
         json!({
             "type": "custom_tool_call",
             "call_id": call.id.as_str(),
-            "name": tool_name,
+            "name": openai_wire_tool_name(tool_name),
             "input": input,
         })
     } else {
         json!({
             "type": "function_call",
             "call_id": call.id.as_str(),
-            "name": tool_name,
+            "name": openai_wire_tool_name(tool_name),
             "arguments": call.args_json,
         })
+    }
+}
+
+fn openai_wire_tool_name(canonical_name: &str) -> &str {
+    match canonical_name {
+        "Edit" => "apply_patch",
+        other => other,
     }
 }
 

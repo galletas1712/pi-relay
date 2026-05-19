@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use agent_prompt::{render_prompt, PromptContext, Skill, ToolSpec};
 use agent_store::SessionConfig;
-use agent_vocab::{ProviderKind, ReplayDisplayKind};
+use agent_vocab::ProviderKind;
 
 use crate::state::AppState;
 
@@ -29,14 +29,16 @@ pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> Prompt
 fn tool_specs(state: &AppState, provider: ProviderKind) -> Vec<ToolSpec> {
     state
         .tools
-        .listings_for_provider(provider)
+        .provider_tools_for_provider(provider)
         .into_iter()
-        .map(|listing| {
+        .map(|tool| {
             ToolSpec::new(
-                listing.name,
-                listing.description,
-                listing.input_schema,
-                listing.kind == ReplayDisplayKind::HostedTool,
+                tool.name,
+                tool.description,
+                tool.input_schema,
+                tool.execution.is_hosted(),
+                tool.canonical_name,
+                tool.prompt_alias.unwrap_or_else(|| "other".to_string()),
             )
         })
         .collect()
