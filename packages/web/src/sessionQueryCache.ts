@@ -1,5 +1,5 @@
 import type { QueryClient } from "@tanstack/react-query";
-import { queryKeys } from "./queryKeys.ts";
+import { queryKeys, type EntryScope } from "./queryKeys.ts";
 import type { ActiveBranchSyncResponse, EventFrame, SessionSnapshot, SessionSummary } from "./types.ts";
 
 export function patchSessionList(
@@ -61,6 +61,18 @@ export function patchSessionListActivity(
 		...session,
 		activity,
 	}));
+}
+
+export function patchSessionSnapshot(
+	queryClient: QueryClient,
+	sessionId: string,
+	scope: EntryScope,
+	patcher: (snapshot: SessionSnapshot) => SessionSnapshot,
+) {
+	queryClient.setQueryData<SessionSnapshot>(queryKeys.session(sessionId, scope), (current) => {
+		if (!current || current.session_id !== sessionId) return current;
+		return patcher(current);
+	});
 }
 
 export function mergeSnapshotIntoSessionList(

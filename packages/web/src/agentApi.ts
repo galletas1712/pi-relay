@@ -146,6 +146,7 @@ export interface RenameSessionResult {
 	session_id: string;
 	title: string;
 	activity: Activity;
+	metadata?: Record<string, unknown>;
 }
 
 export interface DeleteSessionResult {
@@ -156,6 +157,8 @@ export interface DeleteSessionResult {
 export interface ConfigureSessionResult {
 	session_id: string;
 	activity: Activity;
+	provider?: ProviderConfig;
+	metadata?: Record<string, unknown>;
 }
 
 export interface RewindHistoryParams {

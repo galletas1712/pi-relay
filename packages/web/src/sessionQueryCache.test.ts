@@ -7,6 +7,7 @@ import {
 	patchSessionListActivity,
 	patchSessionListMetadata,
 	patchSessionListProvider,
+	patchSessionSnapshot,
 } from "./sessionQueryCache.ts";
 import type { ActiveBranchSyncResponse, ProviderConfig, SessionSnapshot, SessionSummary, TranscriptEntry } from "./types.ts";
 
@@ -51,6 +52,29 @@ describe("session query cache helpers", () => {
 		});
 		expect(queryClient.getQueryData<SessionSnapshot>(queryKeys.session(sessionId, "active_branch"))).toMatchObject({
 			provider,
+			activity: "idle",
+		});
+	});
+
+	it("patches selected snapshots without touching transcript entries", () => {
+		const queryClient = seededClient();
+
+		patchSessionSnapshot(queryClient, sessionId, "active_branch", (snapshot) => ({
+			...snapshot,
+			provider: nextProvider,
+			metadata: { title: "Patched" },
+			activity: "running",
+		}));
+
+		expect(queryClient.getQueryData<SessionSnapshot>(queryKeys.session(sessionId, "active_branch"))).toMatchObject({
+			provider: nextProvider,
+			metadata: { title: "Patched" },
+			activity: "running",
+			entries: [],
+		});
+		expect(queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(projectId))?.[0]).toMatchObject({
+			provider,
+			metadata: { title: "Old", archived: true },
 			activity: "idle",
 		});
 	});

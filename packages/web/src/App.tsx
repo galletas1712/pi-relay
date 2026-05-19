@@ -33,6 +33,7 @@ import {
 	patchSessionListActivity,
 	patchSessionListMetadata,
 	patchSessionListProvider,
+	patchSessionSnapshot,
 } from "./sessionQueryCache.ts";
 import {
 	DEFAULT_PROVIDER,
@@ -365,16 +366,6 @@ export function App() {
 		[api],
 	);
 
-	const invalidateSelectedSession = useCallback(
-		(sessionId = selectedRef.current) => {
-			if (!sessionId) return;
-			void queryClient.invalidateQueries({
-				queryKey: queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE),
-			});
-		},
-		[queryClient],
-	);
-
 	const getFreshSession = useCallback(
 		async (sessionId: string) => {
 			const snapshot = await queryClient.fetchQuery({
@@ -395,12 +386,23 @@ export function App() {
 		[fetchSessionSnapshot, queryClient, selectProjectSession],
 	);
 
+	const patchSelectedSnapshot = useCallback(
+		(
+			sessionId: string,
+			patcher: (snapshot: SessionSnapshot) => SessionSnapshot,
+		) => {
+			if (sessionId !== selectedRef.current) return;
+			patchSessionSnapshot(queryClient, sessionId, SELECTED_SESSION_DISPLAY_SCOPE, patcher);
+		},
+		[queryClient],
+	);
+
 	const syncActiveBranch = useCallback(
 		async (sessionId: string) => {
 			if (sessionId !== selectedRef.current) return null;
 			const key = queryKeys.session(sessionId, SELECTED_SESSION_DISPLAY_SCOPE);
 			const snapshot = queryClient.getQueryData<SessionSnapshot>(key);
-			if (!snapshot || snapshot.session_id !== sessionId) return getFreshSession(sessionId);
+			if (!snapshot || snapshot.session_id !== sessionId) return null;
 			const sync = await api.syncActiveBranch(sessionId, snapshot.active_leaf_id ?? null);
 			lastEventIds.current.set(sessionId, sync.overview.last_event_id);
 			if (applyActiveBranchSync(snapshot, sync) === "applied") {
@@ -416,6 +418,17 @@ export function App() {
 			return getFreshSession(sessionId);
 		},
 		[api, getFreshSession, queryClient],
+	);
+
+	const syncActiveBranchNow = useCallback(
+		(sessionId: string) => {
+			if (selectedSyncTimer.current !== null) {
+				window.clearTimeout(selectedSyncTimer.current);
+				selectedSyncTimer.current = null;
+			}
+			return syncActiveBranch(sessionId);
+		},
+		[syncActiveBranch],
 	);
 
 	const scheduleActiveBranchSync = useCallback(
@@ -582,19 +595,29 @@ export function App() {
 
 	useEffect(() => {
 		if (!loadedSnapshot) return;
-		lastEventIds.current.set(loadedSnapshot.session_id, loadedSnapshot.last_event_id);
+		const observedEventId = lastEventIds.current.get(loadedSnapshot.session_id) ?? 0;
+		lastEventIds.current.set(loadedSnapshot.session_id, Math.max(observedEventId, loadedSnapshot.last_event_id));
 		queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(loadedSnapshot.project_id), (current) =>
 			mergeSnapshotIntoSessionList(current, loadedSnapshot),
 		);
 		setPendingInputs((current) =>
 			current.filter((input) => input.sessionId !== loadedSnapshot.session_id || !pendingInputIsReflected(input, loadedSnapshot)),
 		);
-	}, [loadedSnapshot, queryClient]);
+		if (observedEventId > loadedSnapshot.last_event_id) {
+			void syncActiveBranchNow(loadedSnapshot.session_id).catch((error) => pushNotice("error", errorMessage(error)));
+		}
+	}, [loadedSnapshot, pushNotice, queryClient, syncActiveBranchNow]);
 
 	useEffect(() => {
 		if (connection !== "open") return;
-		const desiredSessionIds = new Set(sessions.map((session) => session.session_id));
-		if (selectedId) desiredSessionIds.add(selectedId);
+		const selectedHasEventCursor =
+			!!selectedId && (lastEventIds.current.has(selectedId) || loadedSnapshot?.session_id === selectedId);
+		const desiredSessionIds = new Set<string>();
+		for (const session of sessions) {
+			if (session.session_id === selectedId && !selectedHasEventCursor) continue;
+			desiredSessionIds.add(session.session_id);
+		}
+		if (selectedId && selectedHasEventCursor) desiredSessionIds.add(selectedId);
 		for (const sessionId of Array.from(subscribedEventSessionIds.current)) {
 			if (desiredSessionIds.has(sessionId)) continue;
 			subscribedEventSessionIds.current.delete(sessionId);
@@ -605,18 +628,14 @@ export function App() {
 		for (const sessionId of desiredSessionIds) {
 			if (subscribedEventSessionIds.current.has(sessionId)) continue;
 			subscribedEventSessionIds.current.add(sessionId);
+			const afterEventId =
+				lastEventIds.current.get(sessionId) ?? (loadedSnapshot?.session_id === sessionId ? loadedSnapshot.last_event_id : null);
 			void api
-				.subscribeEvents(sessionId, lastEventIds.current.get(sessionId) ?? null)
+				.subscribeEvents(sessionId, afterEventId)
 				.then((replayed) => {
 					if (!subscribedEventSessionIds.current.has(sessionId)) return undefined;
 					for (const event of replayed) handleSessionEvent(event);
-					if (selectedRef.current === sessionId) {
-						if (selectedSyncTimer.current !== null) {
-							window.clearTimeout(selectedSyncTimer.current);
-							selectedSyncTimer.current = null;
-						}
-						return syncActiveBranch(sessionId);
-					}
+					if (selectedRef.current === sessionId) return syncActiveBranchNow(sessionId);
 					return undefined;
 				})
 				.catch((error) => {
@@ -624,7 +643,17 @@ export function App() {
 					pushNotice("error", errorMessage(error));
 				});
 		}
-	}, [api, connection, handleSessionEvent, pushNotice, selectedId, sessions, syncActiveBranch]);
+	}, [
+		api,
+		connection,
+		handleSessionEvent,
+		loadedSnapshot?.last_event_id,
+		loadedSnapshot?.session_id,
+		pushNotice,
+		selectedId,
+		sessions,
+		syncActiveBranchNow,
+	]);
 
 	const configureProvider = useCallback(
 		async (provider: ProviderConfig) => {
@@ -633,12 +662,17 @@ export function App() {
 				setNewSessionProvider(provider);
 				return;
 			}
-			await api.configureSession({ sessionId, provider });
+			const result = await api.configureSession({ sessionId, provider });
 			patchSessionListProvider(queryClient, selectedProjectRef.current, sessionId, provider);
-			invalidateSelectedSession(sessionId);
+			patchSelectedSnapshot(sessionId, (snapshot) => ({
+				...snapshot,
+				provider,
+				metadata: result.metadata ?? snapshot.metadata,
+				activity: result.activity,
+			}));
 			invalidateSessionList();
 		},
-		[api, invalidateSelectedSession, invalidateSessionList, queryClient],
+		[api, invalidateSessionList, patchSelectedSnapshot, queryClient],
 	);
 
 	const changeModel = useCallback(
@@ -687,13 +721,17 @@ export function App() {
 		if (!renameSessionId) return;
 		const title = renameValue.trim();
 		if (!title) throw new Error("session title is required");
-		await api.renameSession(renameSessionId, title);
+		const result = await api.renameSession(renameSessionId, title);
 		patchSessionListMetadata(queryClient, selectedProjectRef.current, renameSessionId, { title });
-		if (renameSessionId === selectedRef.current) invalidateSelectedSession(renameSessionId);
+		patchSelectedSnapshot(renameSessionId, (snapshot) => ({
+			...snapshot,
+			metadata: result.metadata ?? { ...snapshot.metadata, title },
+			activity: result.activity,
+		}));
 		invalidateSessionList();
 		pushNotice("success", `renamed session to “${truncate(title, 80)}”`);
 		closeRenameDialog();
-	}, [api, closeRenameDialog, invalidateSelectedSession, invalidateSessionList, pushNotice, queryClient, renameSessionId, renameValue]);
+	}, [api, closeRenameDialog, invalidateSessionList, patchSelectedSnapshot, pushNotice, queryClient, renameSessionId, renameValue]);
 
 	const setSessionArchived = useCallback(
 		async (session: SessionListItem, archived: boolean) => {
@@ -704,7 +742,7 @@ export function App() {
 			const metadata = { ...(currentSnapshot?.metadata ?? session.metadata) };
 			if (archived) metadata.archived = true;
 			else delete metadata.archived;
-			await api.configureSession({
+			const result = await api.configureSession({
 				sessionId,
 				provider: currentSnapshot?.provider ?? session.provider,
 				metadata,
@@ -716,14 +754,18 @@ export function App() {
 				archived ? { archived: true } : {},
 				archived ? [] : ["archived"],
 			);
-			if (sessionId === selectedRef.current) invalidateSelectedSession(sessionId);
+			patchSelectedSnapshot(sessionId, (snapshot) => ({
+				...snapshot,
+				metadata: result.metadata ?? metadata,
+				activity: result.activity,
+			}));
 			invalidateSessionList();
 			pushNotice(
 				"success",
 				archived ? `archived “${truncate(sessionTitle(session), 80)}”` : `unarchived “${truncate(sessionTitle(session), 80)}”`,
 			);
 		},
-		[api, invalidateSelectedSession, invalidateSessionList, loadedSnapshot, pushNotice, queryClient],
+		[api, invalidateSessionList, loadedSnapshot, patchSelectedSnapshot, pushNotice, queryClient],
 	);
 
 	const closeDeleteDialog = useCallback(() => {
@@ -805,13 +847,17 @@ export function App() {
 				}
 				const metadata = { ...(current?.metadata ?? selectedSession.metadata) };
 				delete metadata.archived;
-				await api.configureSession({
+				const result = await api.configureSession({
 					sessionId,
 					provider: current?.provider ?? selectedSession.provider,
 					metadata,
 				});
 				patchSessionListMetadata(queryClient, selectedProjectRef.current, sessionId, {}, ["archived"]);
-				invalidateSelectedSession(sessionId);
+				patchSelectedSnapshot(sessionId, (snapshot) => ({
+					...snapshot,
+					metadata: result.metadata ?? metadata,
+					activity: result.activity,
+				}));
 				invalidateSessionList();
 			}
 			const clientInputId = randomId("web_input");
@@ -850,7 +896,7 @@ export function App() {
 							: input,
 					),
 				);
-				void syncActiveBranch(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
+				void syncActiveBranchNow(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
 				if (result.queued) invalidateSessionList();
 			} catch (error) {
 				setPendingInputs((current) =>
@@ -868,7 +914,17 @@ export function App() {
 				throw error;
 			}
 		},
-		[api, invalidateSessionList, loadedSnapshot, pushNotice, refreshSelected, requireSelected, selectedSession, syncActiveBranch],
+		[
+			api,
+			invalidateSessionList,
+			loadedSnapshot,
+			patchSelectedSnapshot,
+			pushNotice,
+			refreshSelected,
+			requireSelected,
+			selectedSession,
+			syncActiveBranchNow,
+		],
 	);
 
 	const startNewSession = useCallback(
@@ -989,12 +1045,15 @@ export function App() {
 		async (inputId: string) => {
 			const sessionId = requireSelected();
 			const result = await api.promoteQueuedInput(sessionId, inputId);
-			await Promise.all([syncActiveBranch(sessionId), queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) })]);
+			await Promise.all([
+				syncActiveBranchNow(sessionId),
+				queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) }),
+			]);
 			if (!result.promoted && result.status !== "queued") {
 				pushNotice("info", "message is already being processed");
 			}
 		},
-		[api, pushNotice, queryClient, requireSelected, syncActiveBranch],
+		[api, pushNotice, queryClient, requireSelected, syncActiveBranchNow],
 	);
 
 	const stopActiveTurn = useCallback(async () => {
@@ -1002,13 +1061,16 @@ export function App() {
 		setStopping(true);
 		try {
 			await api.interrupt(sessionId);
-			await Promise.all([syncActiveBranch(sessionId), queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) })]);
+			await Promise.all([
+				syncActiveBranchNow(sessionId),
+				queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) }),
+			]);
 		} catch (error) {
 			pushNotice("error", errorMessage(error));
 		} finally {
 			setStopping(false);
 		}
-	}, [api, pushNotice, queryClient, requireSelected, syncActiveBranch]);
+	}, [api, pushNotice, queryClient, requireSelected, syncActiveBranchNow]);
 
 	const resumeTerminalTurn = useCallback(
 		async (leafId?: string | null) => {
@@ -1026,13 +1088,16 @@ export function App() {
 					leafId: activeLeafId,
 					expectedActiveLeafId: current?.snapshot.active_leaf_id ?? loadedSnapshot?.active_leaf_id ?? null,
 				});
-				await Promise.all([syncActiveBranch(sessionId), queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) })]);
+				await Promise.all([
+					syncActiveBranchNow(sessionId),
+					queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) }),
+				]);
 				pushNotice("success", result.outcome === "Interrupted" ? "continued turn" : "retry started");
 			} finally {
 				setResumingTurnId(null);
 			}
 		},
-		[api, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, pushNotice, queryClient, refreshSelected, requireSelected, syncActiveBranch],
+		[api, loadedSnapshot?.active_leaf_id, loadedSnapshot?.activity, pushNotice, queryClient, refreshSelected, requireSelected, syncActiveBranchNow],
 	);
 
 	const openHistoryDialog = useCallback(
