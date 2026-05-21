@@ -819,11 +819,17 @@ fn openai_provider_replay_display(item: &Value) -> Option<ReplayDisplay> {
         }
         "function_call" => {
             let name = item.get("name").and_then(Value::as_str)?;
+            let canonical_name =
+                crate::canonical_tool_name_for_provider(ProviderKind::OpenAi, name);
             let arguments = item
                 .get("arguments")
                 .and_then(Value::as_str)
                 .and_then(|raw| serde_json::from_str::<Value>(raw).ok())?;
-            tool_display(name, ToolDisplayInput::LocalTool, Some(&arguments))
+            tool_display(
+                canonical_name,
+                ToolDisplayInput::LocalTool,
+                Some(&arguments),
+            )
         }
         "custom_tool_call" => {
             let name = item.get("name").and_then(Value::as_str)?;
@@ -838,6 +844,8 @@ fn openai_provider_replay_display(item: &Value) -> Option<ReplayDisplay> {
 fn openai_wire_tool_name(canonical_name: &str) -> &str {
     match canonical_name {
         "Edit" => "apply_patch",
+        "WebFetch" => "web_fetch",
+        "WebSearch" => "web_search",
         other => other,
     }
 }
@@ -1322,8 +1330,10 @@ mod tests {
         assert_eq!(body["tools"][2]["name"], "Grep");
         assert_eq!(body["tools"][3]["type"], "function");
         assert_eq!(body["tools"][3]["name"], "LoadSkill");
-        assert_eq!(body["tools"][4]["type"], "web_search");
-        assert_eq!(body["tools"][4]["search_context_size"], "high");
+        assert_eq!(body["tools"][4]["type"], "function");
+        assert_eq!(body["tools"][4]["name"], "web_fetch");
+        assert_eq!(body["tools"][5]["type"], "function");
+        assert_eq!(body["tools"][5]["name"], "web_search");
     }
 
     #[test]

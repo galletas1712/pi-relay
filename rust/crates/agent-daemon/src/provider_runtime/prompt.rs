@@ -36,7 +36,6 @@ fn tool_specs(state: &AppState, provider: ProviderKind) -> Vec<ToolSpec> {
                 tool.name,
                 tool.description,
                 tool.input_schema,
-                tool.execution.is_hosted(),
                 tool.canonical_name,
                 tool.prompt_alias.unwrap_or_else(|| "other".to_string()),
             )

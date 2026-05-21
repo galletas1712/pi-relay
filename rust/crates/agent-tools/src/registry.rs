@@ -7,7 +7,10 @@ use serde_json::{json, Value};
 
 use crate::context::ToolContext;
 use crate::error::{ToolError, ToolResult};
-use crate::tools::{ApplyPatchTool, BashTool, GrepTool, TextEditorTool, APPLY_PATCH_LARK_GRAMMAR};
+use crate::tools::{
+    ApplyPatchTool, BashTool, GrepTool, TextEditorTool, WebFetchTool, WebSearchTool,
+    APPLY_PATCH_LARK_GRAMMAR,
+};
 
 #[async_trait]
 pub trait AgentTool: Send + Sync {
@@ -15,27 +18,15 @@ pub trait AgentTool: Send + Sync {
     async fn execute(&self, call: &ToolCall, ctx: &ToolContext) -> ToolResult<ToolResultMessage>;
 }
 
-/// Where/how a provider tool executes.
+/// The local-call payload shape pi-relay needs to round-trip calls/results.
 ///
-/// The raw provider declaration carries provider-specific shape. This enum only
-/// captures the execution boundary and local-call payload shape pi-relay needs
-/// to round-trip calls/results.
+/// Provider-native details still live in `ProviderTool::declaration`; execution
+/// is always owned by pi-relay.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolExecution {
     LocalJson,
     LocalFreeformText,
-    Hosted,
-}
-
-impl ToolExecution {
-    pub fn is_local(self) -> bool {
-        matches!(self, Self::LocalJson | Self::LocalFreeformText)
-    }
-
-    pub fn is_hosted(self) -> bool {
-        matches!(self, Self::Hosted)
-    }
 }
 
 /// One provider-facing form of a canonical pi-relay tool.
@@ -114,21 +105,6 @@ impl ProviderTool {
             ProviderKind::OpenAi => Self::openai_function(&definition),
             ProviderKind::Claude => Self::anthropic_client(&definition),
         }
-    }
-
-    pub fn hosted(
-        name: impl Into<String>,
-        description: impl Into<String>,
-        input_schema: Value,
-        declaration: Value,
-    ) -> Self {
-        Self::new(
-            name,
-            description,
-            input_schema,
-            declaration,
-            ToolExecution::Hosted,
-        )
     }
 }
 
@@ -272,7 +248,6 @@ impl ToolRegistry {
     pub fn definitions_for_provider(&self, provider: ProviderKind) -> Vec<ToolDefinition> {
         self.provider_tools_for_provider(provider)
             .into_iter()
-            .filter(|tool| tool.execution.is_local())
             .map(|tool| {
                 ToolDefinition::new(tool.canonical_name, tool.description, tool.input_schema)
             })
@@ -332,6 +307,8 @@ pub fn builtin_tool_definition(name: &str) -> Option<ToolDefinition> {
         "Edit" | "apply_patch" => Some(ApplyPatchTool.definition()),
         "Bash" => Some(BashTool.definition()),
         "Grep" => Some(GrepTool.definition()),
+        "WebFetch" | "web_fetch" => Some(WebFetchTool.definition()),
+        "WebSearch" | "web_search" => Some(WebSearchTool.definition()),
         _ => None,
     }
 }
@@ -475,63 +452,38 @@ fn register_grep(registry: &mut ToolRegistry) {
 }
 
 fn register_web_search(registry: &mut ToolRegistry) {
+    let definition = WebSearchTool.definition();
     registry.register_tool(
         ToolDescriptor::new("WebSearch")
             .prompt_alias("web_search")
             .provider(
                 ProviderKind::OpenAi,
-                ProviderTool::hosted(
-                    "web_search",
-                    "OpenAI-hosted web search. The provider executes the search and returns web_search_call replay items with actions and citations when available.",
-                    json!({
-                        "type": "web_search",
-                        "search_context_size": "high",
-                    }),
-                    json!({
-                        "type": "web_search",
-                        "search_context_size": "high",
-                    }),
-                ),
+                ProviderTool::openai_function(&definition),
             )
             .provider(
                 ProviderKind::Claude,
-                ProviderTool::hosted(
-                    "web_search",
-                    "Anthropic-hosted web search. The provider executes the server tool; pi-relay does not execute it locally.",
-                    json!({
-                        "type": "web_search_20250305",
-                        "name": "web_search",
-                    }),
-                    json!({
-                        "type": "web_search_20250305",
-                        "name": "web_search",
-                    }),
-                ),
-            ),
+                ProviderTool::anthropic_client(&definition),
+            )
+            .executor(ProviderKind::OpenAi, WebSearchTool)
+            .executor(ProviderKind::Claude, WebSearchTool),
     );
 }
 
 fn register_web_fetch(registry: &mut ToolRegistry) {
+    let definition = WebFetchTool.definition();
     registry.register_tool(
         ToolDescriptor::new("WebFetch")
             .prompt_alias("web_fetch")
             .provider(
+                ProviderKind::OpenAi,
+                ProviderTool::openai_function(&definition),
+            )
+            .provider(
                 ProviderKind::Claude,
-                ProviderTool::hosted(
-                    "web_fetch",
-                    "Anthropic-hosted web fetch. The provider fetches a specific web page and returns citations when available.",
-                    json!({
-                        "type": "web_fetch_20250910",
-                        "name": "web_fetch",
-                        "citations": { "enabled": true },
-                    }),
-                    json!({
-                        "type": "web_fetch_20250910",
-                        "name": "web_fetch",
-                        "citations": { "enabled": true },
-                    }),
-                ),
-            ),
+                ProviderTool::anthropic_client(&definition),
+            )
+            .executor(ProviderKind::OpenAi, WebFetchTool)
+            .executor(ProviderKind::Claude, WebFetchTool),
     );
 }
 
@@ -570,8 +522,14 @@ mod tests {
             .map(|definition| definition.name)
             .collect::<Vec<_>>();
 
-        assert_eq!(openai, ["Edit", "Bash", "Grep", "LoadSkill"]);
-        assert_eq!(claude, ["Bash", "Edit", "Grep", "LoadSkill"]);
+        assert_eq!(
+            openai,
+            ["Edit", "Bash", "Grep", "LoadSkill", "WebFetch", "WebSearch"]
+        );
+        assert_eq!(
+            claude,
+            ["Bash", "Edit", "Grep", "LoadSkill", "WebFetch", "WebSearch"]
+        );
     }
 
     #[test]
@@ -590,7 +548,14 @@ mod tests {
 
         assert_eq!(
             openai,
-            ["apply_patch", "Bash", "Grep", "LoadSkill", "web_search"]
+            [
+                "apply_patch",
+                "Bash",
+                "Grep",
+                "LoadSkill",
+                "web_fetch",
+                "web_search"
+            ]
         );
         assert_eq!(
             claude,
@@ -632,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn hosted_tools_are_provider_specific() {
+    fn web_tools_are_local_json_tools_for_each_provider() {
         let registry = ToolRegistry::with_builtin_tools();
         let openai_web = registry
             .provider_tools_for_provider(ProviderKind::OpenAi)
@@ -651,18 +616,16 @@ mod tests {
             .expect("Claude WebFetch tool");
 
         assert_eq!(openai_web.name, "web_search");
-        assert_eq!(openai_web.execution, ToolExecution::Hosted);
-        assert_eq!(openai_web.input_schema["type"], "web_search");
-        assert_eq!(openai_web.input_schema["search_context_size"], "high");
+        assert_eq!(openai_web.execution, ToolExecution::LocalJson);
+        assert_eq!(openai_web.input_schema["type"], "object");
+        assert!(openai_web.input_schema["properties"].get("query").is_some());
         assert_eq!(claude_web.name, "web_search");
-        assert_eq!(claude_web.execution, ToolExecution::Hosted);
-        assert_eq!(claude_web.input_schema["type"], "web_search_20250305");
-        assert_eq!(claude_web.input_schema["name"], "web_search");
+        assert_eq!(claude_web.execution, ToolExecution::LocalJson);
+        assert!(claude_web.declaration.get("type").is_none());
         assert_eq!(claude_fetch.name, "web_fetch");
-        assert_eq!(claude_fetch.execution, ToolExecution::Hosted);
-        assert_eq!(claude_fetch.input_schema["type"], "web_fetch_20250910");
-        assert_eq!(claude_fetch.input_schema["name"], "web_fetch");
-        assert_eq!(claude_fetch.input_schema["citations"]["enabled"], true);
+        assert_eq!(claude_fetch.execution, ToolExecution::LocalJson);
+        assert_eq!(claude_fetch.input_schema["type"], "object");
+        assert!(claude_fetch.input_schema["properties"].get("url").is_some());
     }
 
     #[test]

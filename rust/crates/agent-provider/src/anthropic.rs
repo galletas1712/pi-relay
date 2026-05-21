@@ -39,6 +39,14 @@ pub struct AnthropicProvider {
     base_url: String,
 }
 
+fn anthropic_wire_tool_name(canonical_name: &str) -> &str {
+    match canonical_name {
+        "WebFetch" => "web_fetch",
+        "WebSearch" => "web_search",
+        other => other,
+    }
+}
+
 fn parse_anthropic_count_tokens(text: &str) -> ProviderResult<ProviderTokenCountResponse> {
     let response: Value = serde_json::from_str(text).map_err(|error| {
         ProviderError::Provider(format!(
@@ -150,16 +158,13 @@ fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
         max_tokens: Some(request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
         reasoning_effort: Some(request.reasoning_effort),
         cache_transcript: true,
-        for_count_tokens: false,
     })
 }
 
 fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value> {
     // Keep this as close as possible to `messages_body`: Anthropic's token
     // count endpoint accepts the same input-shaping fields (system, tools,
-    // thinking/output config) but does not need a generation budget. Server
-    // tools (`web_search`, `web_fetch`) are rejected by /count_tokens with
-    // HTTP 400; drop them so the count still reflects everything else.
+    // thinking/output config) but does not need a generation budget.
     let tool_profile = request.tool_profile;
     anthropic_request_body(AnthropicRequestBodyInput {
         model: request.model,
@@ -170,7 +175,6 @@ fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value
         max_tokens: request.max_tokens,
         reasoning_effort: Some(request.reasoning_effort),
         cache_transcript: false,
-        for_count_tokens: true,
     })
 }
 
@@ -183,7 +187,6 @@ struct AnthropicRequestBodyInput {
     max_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
     cache_transcript: bool,
-    for_count_tokens: bool,
 }
 
 fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Value> {
@@ -212,7 +215,7 @@ fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Va
     if let Some(system_blocks) = anthropic_system_blocks(&input.prompt, &input.transcript) {
         body["system"] = Value::Array(system_blocks);
     }
-    let tools = anthropic_tools(input.tool_profile, &input.tools, input.for_count_tokens)?;
+    let tools = anthropic_tools(input.tool_profile, &input.tools)?;
     if !tools.is_empty() {
         // Intentionally no tool-level `cache_control` breakpoint. Anthropic
         // hashes the cumulative prefix in `tools -> system -> messages` order,
@@ -303,12 +306,11 @@ fn response_excerpt(body: &str) -> String {
 fn anthropic_tools(
     profile: ProviderToolProfile,
     tools: &[ProviderTool],
-    for_count_tokens: bool,
 ) -> ProviderResult<Vec<Value>> {
     match profile {
         ProviderToolProfile::None => Ok(Vec::new()),
         ProviderToolProfile::CustomDefinitions | ProviderToolProfile::AnthropicCoding => {
-            Ok(anthropic_provider_tools(tools, for_count_tokens))
+            Ok(anthropic_provider_tools(tools))
         }
         ProviderToolProfile::OpenAiCoding => Err(ProviderError::Provider(
             "OpenAI coding tools cannot be sent to Claude".to_string(),
@@ -316,11 +318,8 @@ fn anthropic_tools(
     }
 }
 
-fn anthropic_provider_tools(tools: &[ProviderTool], for_count_tokens: bool) -> Vec<Value> {
+fn anthropic_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
     let mut tools = tools.to_vec();
-    if for_count_tokens {
-        tools.retain(|tool| !tool.execution.is_hosted());
-    }
     tools.sort_by(|left, right| {
         left.name
             .to_ascii_lowercase()
@@ -587,7 +586,7 @@ fn transcript_to_messages(
                             AssistantItem::ToolCall(call) => content.push(json!({
                                 "type": "tool_use",
                                 "id": call.id.as_str(),
-                                "name": call.tool_name,
+                                "name": anthropic_wire_tool_name(&call.tool_name),
                                 "input": call.args_value().unwrap_or_else(|_| json!({})),
                             })),
                         }
@@ -936,11 +935,7 @@ mod tests {
     }
 
     #[test]
-    fn count_tokens_body_drops_anthropic_server_tools() {
-        // The /messages/count_tokens endpoint rejects server tools
-        // (web_search, web_fetch) with HTTP 400. The runtime gate previously
-        // misclassified those as context-overflow, triggering compaction on
-        // every Anthropic turn.
+    fn count_tokens_body_counts_the_same_local_tool_surface() {
         let body = count_tokens_body(ProviderTokenCountRequest {
             model: "claude-opus-4-7".to_string(),
             prompt: PromptSections::stable("stable rules"),
@@ -955,23 +950,28 @@ mod tests {
         .expect("count body renders");
 
         let tools = body["tools"].as_array().expect("tools array");
-        for tool in tools {
-            let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
-            assert!(
-                !tool_type.starts_with("web_search_") && !tool_type.starts_with("web_fetch_"),
-                "server tool {tool_type} must be filtered for count_tokens"
-            );
-        }
-        // The remaining client tools are still present so the count covers
-        // the same tool surface the model actually sees.
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect();
-        assert!(names.contains(&"LoadSkill"));
-        assert!(names.contains(&"Bash"));
-        assert!(names.contains(&"Edit"));
-        assert!(names.contains(&"Grep"));
+        assert_eq!(
+            names,
+            [
+                "Bash",
+                "Edit",
+                "Grep",
+                "LoadSkill",
+                "web_fetch",
+                "web_search"
+            ]
+        );
+        for tool in tools {
+            let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
+            assert!(
+                !tool_type.starts_with("web_search_") && !tool_type.starts_with("web_fetch_"),
+                "main-loop web tools must remain local JSON tools, not Anthropic server tools"
+            );
+        }
     }
 
     #[test]
@@ -997,9 +997,10 @@ mod tests {
         assert!(body["tools"][2].get("type").is_none());
         assert_eq!(body["tools"][3]["name"], "LoadSkill");
         assert!(body["tools"][3].get("type").is_none());
-        assert_eq!(body["tools"][4]["type"], "web_fetch_20250910");
-        assert_eq!(body["tools"][4]["citations"]["enabled"], true);
-        assert_eq!(body["tools"][5]["type"], "web_search_20250305");
+        assert_eq!(body["tools"][4]["name"], "web_fetch");
+        assert!(body["tools"][4].get("type").is_none());
+        assert_eq!(body["tools"][5]["name"], "web_search");
+        assert!(body["tools"][5].get("type").is_none());
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
         for index in 0..6 {

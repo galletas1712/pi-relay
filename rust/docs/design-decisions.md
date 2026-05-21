@@ -379,8 +379,10 @@ Coding tools split into two posture buckets:
   schemas are semantically rich enough that paraphrasing them as generic
   function tools would lose information the provider's training already
   encodes.
-- **Hosted** for `web_search` and `web_fetch` — pi-relay does not execute
-  these, so the provider owns the schema by definition.
+- **Local JSON wrappers** for `web_search` and `web_fetch`. The main model turn
+  always sees ordinary client-executed tools, which keeps transcript replay and
+  token accounting on one surface. The tool runtime can still delegate to a
+  provider-native web backend in a sidecar call when that backend exists.
 
 The daemon workspace is fixed at process launch. `bash` does not accept a
 `workdir` override; the model relies on the announced cwd in the dynamic

@@ -269,7 +269,6 @@ fn tools_list(state: &AppState, params: Value) -> std::result::Result<Value, Rpc
         .provider_tools_for_provider(provider)
         .into_iter()
         .map(|tool| {
-            let hosted = tool.execution.is_hosted();
             json!({
                 "name": tool.name,
                 "description": tool.description,
@@ -277,8 +276,7 @@ fn tools_list(state: &AppState, params: Value) -> std::result::Result<Value, Rpc
                 "canonical_name": tool.canonical_name,
                 "prompt_alias": tool.prompt_alias,
                 "execution": tool.execution,
-                "hosted": hosted,
-                "kind": if hosted { "hosted_tool" } else { "local_tool" },
+                "kind": "local_tool",
             })
         })
         .collect::<Vec<_>>();

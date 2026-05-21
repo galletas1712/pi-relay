@@ -3,6 +3,8 @@ use agent_vocab::{ReplayDisplay, ReplayDisplayKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolDisplayInput {
     LocalTool,
+    /// Legacy provider-replay display only. The tool-extension execution API
+    /// no longer has a hosted execution mode.
     HostedTool,
 }
 
@@ -48,6 +50,18 @@ const TOOL_DISPLAY_SPECS: &[ToolDisplaySpec] = &[
         kind: ToolDisplayInput::LocalTool,
         display_name: "Grep",
         summary: ToolSummary::Grep,
+    },
+    ToolDisplaySpec {
+        name: "WebFetch",
+        kind: ToolDisplayInput::LocalTool,
+        display_name: "WebFetch",
+        summary: ToolSummary::Field("url"),
+    },
+    ToolDisplaySpec {
+        name: "WebSearch",
+        kind: ToolDisplayInput::LocalTool,
+        display_name: "WebSearch",
+        summary: ToolSummary::WebSearchQuery,
     },
     ToolDisplaySpec {
         name: "OpenPage",
@@ -242,6 +256,30 @@ mod tests {
                 kind: ReplayDisplayKind::LocalTool,
                 pretty_name: "LoadSkill".to_string(),
                 input_summary: Some("rust-refactor".to_string()),
+            })
+        );
+        assert_eq!(
+            tool_display(
+                "WebSearch",
+                ToolDisplayInput::LocalTool,
+                Some(&json!({ "query": "OpenAI Responses API" })),
+            ),
+            Some(ReplayDisplay {
+                kind: ReplayDisplayKind::LocalTool,
+                pretty_name: "WebSearch".to_string(),
+                input_summary: Some("OpenAI Responses API".to_string()),
+            })
+        );
+        assert_eq!(
+            tool_display(
+                "WebFetch",
+                ToolDisplayInput::LocalTool,
+                Some(&json!({ "url": "https://example.com" })),
+            ),
+            Some(ReplayDisplay {
+                kind: ReplayDisplayKind::LocalTool,
+                pretty_name: "WebFetch".to_string(),
+                input_summary: Some("https://example.com".to_string()),
             })
         );
     }

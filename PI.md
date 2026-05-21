@@ -17,7 +17,6 @@ You may use the following tools to help you accomplish your tasks:
 - Use the exact tool names shown above when calling tools.
 - For JSON function tools, the `input_schema` describes the params to pass.
 - For freeform/custom tools, the `format` describes the required raw input.
-- For hosted tools, the spec describes the provider-hosted tool registration rather than local params.
 - Prefer purpose-built tools over ad hoc shell commands:
   - Use `{{ tools.aliases.workspace_search | default(value="Grep") }}` instead of calling `grep` or `rg` directly via `{{ tools.aliases.shell | default(value="Bash") }}`.
   - Use `{{ tools.aliases.edit | default(value="Edit") }}` instead of manually editing files via `{{ tools.aliases.shell | default(value="Bash") }}` commands.
