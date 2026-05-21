@@ -43,7 +43,7 @@ export interface AgentApi {
 	queueFollowUp(params: QueueFollowUpParams): Promise<FollowUpResult>;
 	interrupt(sessionId: string): Promise<InterruptResult>;
 	resumeTurn(params: ResumeTurnParams): Promise<ResumeTurnResult>;
-	rewindHistory(params: RewindHistoryParams): Promise<RewindHistoryResult>;
+	switchHistory(params: SwitchHistoryParams): Promise<SwitchHistoryResult>;
 	forkHistory(params: ForkHistoryParams): Promise<ForkHistoryResult>;
 	renameSession(sessionId: string, title: string): Promise<RenameSessionResult>;
 	deleteSession(sessionId: string): Promise<DeleteSessionResult>;
@@ -123,7 +123,7 @@ export interface ResumeTurnResult {
 	checkpoint_leaf_id: string;
 }
 
-export interface RewindHistoryResult {
+export interface SwitchHistoryResult {
 	session_id: string;
 	active_leaf_id: string | null;
 }
@@ -161,7 +161,7 @@ export interface ConfigureSessionResult {
 	metadata?: Record<string, unknown>;
 }
 
-export interface RewindHistoryParams {
+export interface SwitchHistoryParams {
 	sessionId: string;
 	leafId: string | null;
 	expectedActiveLeafId: string | null;
@@ -318,8 +318,8 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	rewindHistory(params: RewindHistoryParams): Promise<RewindHistoryResult> {
-		return this.client.request<RewindHistoryResult>("history.rewind", {
+	switchHistory(params: SwitchHistoryParams): Promise<SwitchHistoryResult> {
+		return this.client.request<SwitchHistoryResult>("history.switch", {
 			session_id: params.sessionId,
 			leaf_id: params.leafId,
 			expected_active_leaf_id: params.expectedActiveLeafId

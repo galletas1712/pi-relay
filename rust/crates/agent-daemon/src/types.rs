@@ -63,7 +63,7 @@ pub(crate) enum RpcMethod {
     InputInterrupt,
     HistoryTree,
     HistoryContext,
-    HistoryRewind,
+    HistorySwitch,
     HistoryFork,
     TurnResume,
     ToolsList,
@@ -94,7 +94,7 @@ impl RpcMethod {
             "input.interrupt" => Some(Self::InputInterrupt),
             "history.tree" => Some(Self::HistoryTree),
             "history.context" => Some(Self::HistoryContext),
-            "history.rewind" => Some(Self::HistoryRewind),
+            "history.switch" => Some(Self::HistorySwitch),
             "history.fork" => Some(Self::HistoryFork),
             "turn.resume" => Some(Self::TurnResume),
             "tools.list" => Some(Self::ToolsList),
@@ -169,6 +169,11 @@ mod tests {
             Some(RpcMethod::SessionSyncActiveBranch)
         );
         assert_eq!(RpcMethod::parse("turn.resume"), Some(RpcMethod::TurnResume));
+        assert_eq!(
+            RpcMethod::parse("history.switch"),
+            Some(RpcMethod::HistorySwitch)
+        );
+        assert_eq!(RpcMethod::parse("history.rewind"), None);
         assert_eq!(RpcMethod::parse("input.fly"), None);
     }
 
