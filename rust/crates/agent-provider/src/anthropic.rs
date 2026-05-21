@@ -1,8 +1,8 @@
-use agent_tools::{builtin_tool_definition, tool_display, ToolDisplayInput};
+use agent_tools::{tool_display, ProviderTool, ToolDisplayInput};
 use agent_vocab::{
     AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
-    ProviderReplayItem, ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, ToolDefinition,
-    TranscriptItem, UserMessage,
+    ProviderReplayItem, ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem,
+    UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::StatusCode;
@@ -37,6 +37,14 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+}
+
+fn anthropic_wire_tool_name(canonical_name: &str) -> &str {
+    match canonical_name {
+        "WebFetch" => "web_fetch",
+        "WebSearch" => "web_search",
+        other => other,
+    }
 }
 
 fn parse_anthropic_count_tokens(text: &str) -> ProviderResult<ProviderTokenCountResponse> {
@@ -140,35 +148,33 @@ impl ModelProvider for AnthropicProvider {
 }
 
 fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
+    let tool_profile = request.tool_profile;
     anthropic_request_body(AnthropicRequestBodyInput {
         model: request.model,
         prompt: request.prompt,
         transcript: request.transcript,
-        tool_profile: request.tool_profile,
-        tools: request.tools,
+        tool_profile,
+        tools: crate::effective_provider_tools(tool_profile, request.tools),
         max_tokens: Some(request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
         reasoning_effort: Some(request.reasoning_effort),
         cache_transcript: true,
-        for_count_tokens: false,
     })
 }
 
 fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value> {
     // Keep this as close as possible to `messages_body`: Anthropic's token
     // count endpoint accepts the same input-shaping fields (system, tools,
-    // thinking/output config) but does not need a generation budget. Server
-    // tools (`web_search`, `web_fetch`) are rejected by /count_tokens with
-    // HTTP 400; drop them so the count still reflects everything else.
+    // thinking/output config) but does not need a generation budget.
+    let tool_profile = request.tool_profile;
     anthropic_request_body(AnthropicRequestBodyInput {
         model: request.model,
         prompt: request.prompt,
         transcript: request.transcript,
-        tool_profile: request.tool_profile,
-        tools: request.tools,
+        tool_profile,
+        tools: crate::effective_provider_tools(tool_profile, request.tools),
         max_tokens: request.max_tokens,
         reasoning_effort: Some(request.reasoning_effort),
         cache_transcript: false,
-        for_count_tokens: true,
     })
 }
 
@@ -177,11 +183,10 @@ struct AnthropicRequestBodyInput {
     prompt: crate::PromptSections,
     transcript: Vec<ModelTranscriptEntry>,
     tool_profile: ProviderToolProfile,
-    tools: Vec<ToolDefinition>,
+    tools: Vec<ProviderTool>,
     max_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
     cache_transcript: bool,
-    for_count_tokens: bool,
 }
 
 fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Value> {
@@ -210,10 +215,7 @@ fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Va
     if let Some(system_blocks) = anthropic_system_blocks(&input.prompt, &input.transcript) {
         body["system"] = Value::Array(system_blocks);
     }
-    let mut tools = anthropic_tools(input.tool_profile, &input.tools)?;
-    if input.for_count_tokens {
-        tools.retain(|tool| !is_anthropic_server_tool(tool));
-    }
+    let tools = anthropic_tools(input.tool_profile, &input.tools)?;
     if !tools.is_empty() {
         // Intentionally no tool-level `cache_control` breakpoint. Anthropic
         // hashes the cumulative prefix in `tools -> system -> messages` order,
@@ -225,15 +227,6 @@ fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Va
         body["tool_choice"] = json!({ "type": "auto" });
     }
     Ok(body)
-}
-
-/// Server tools execute on Anthropic's infrastructure (web_search, web_fetch).
-/// /messages/count_tokens returns 400 if any are present in the body.
-fn is_anthropic_server_tool(tool: &Value) -> bool {
-    let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
-        return false;
-    };
-    tool_type.starts_with("web_search_") || tool_type.starts_with("web_fetch_")
 }
 
 fn client_request_id() -> String {
@@ -312,53 +305,29 @@ fn response_excerpt(body: &str) -> String {
 
 fn anthropic_tools(
     profile: ProviderToolProfile,
-    tools: &[ToolDefinition],
+    tools: &[ProviderTool],
 ) -> ProviderResult<Vec<Value>> {
     match profile {
         ProviderToolProfile::None => Ok(Vec::new()),
-        ProviderToolProfile::CustomDefinitions => Ok(anthropic_custom_definition_tools(tools)),
-        ProviderToolProfile::AnthropicCoding => Ok(anthropic_coding_tools()),
+        ProviderToolProfile::CustomDefinitions | ProviderToolProfile::AnthropicCoding => {
+            Ok(anthropic_provider_tools(tools))
+        }
         ProviderToolProfile::OpenAiCoding => Err(ProviderError::Provider(
             "OpenAI coding tools cannot be sent to Claude".to_string(),
         )),
     }
 }
 
-fn anthropic_custom_definition_tools(tools: &[ToolDefinition]) -> Vec<Value> {
+fn anthropic_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
     let mut tools = tools.to_vec();
-    tools.sort_by(|left, right| left.name.cmp(&right.name));
-    tools.iter().map(anthropic_tool).collect()
-}
-
-fn anthropic_tool(tool: &ToolDefinition) -> Value {
-    json!({
-        "name": tool.name,
-        "description": tool.description,
-        "input_schema": tool.input_schema,
-    })
-}
-
-fn anthropic_coding_tools() -> Vec<Value> {
-    vec![
-        anthropic_tool(
-            &builtin_tool_definition("LoadSkill").expect("LoadSkill tool must be registered"),
-        ),
-        anthropic_tool(&builtin_tool_definition("Bash").expect("Bash tool must be registered")),
-        json!({
-            "type": "text_editor_20250728",
-            "name": "Edit",
-        }),
-        anthropic_tool(&builtin_tool_definition("Grep").expect("Grep tool must be registered")),
-        json!({
-            "type": "web_search_20250305",
-            "name": "web_search",
-        }),
-        json!({
-            "type": "web_fetch_20250910",
-            "name": "web_fetch",
-            "citations": { "enabled": true },
-        }),
-    ]
+    tools.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.canonical_name.cmp(&right.canonical_name))
+    });
+    tools.iter().map(|tool| tool.declaration.clone()).collect()
 }
 
 /// 1-hour ephemeral cache control. Use only on prefixes that are stable enough
@@ -617,7 +586,7 @@ fn transcript_to_messages(
                             AssistantItem::ToolCall(call) => content.push(json!({
                                 "type": "tool_use",
                                 "id": call.id.as_str(),
-                                "name": call.tool_name,
+                                "name": anthropic_wire_tool_name(&call.tool_name),
                                 "input": call.args_value().unwrap_or_else(|_| json!({})),
                             })),
                         }
@@ -821,6 +790,19 @@ mod tests {
     use super::*;
     use crate::PromptSections;
 
+    fn test_tool(
+        provider: ProviderKind,
+        name: &str,
+        description: &str,
+        input_schema: Value,
+    ) -> ProviderTool {
+        ProviderTool::function_json_named(provider, name, description, input_schema)
+    }
+
+    fn first_party_tools(provider: ProviderKind) -> Vec<ProviderTool> {
+        agent_tools::ToolRegistry::with_builtin_tools().provider_tools_for_provider(provider)
+    }
+
     #[test]
     fn messages_body_enables_thinking_and_auto_tools() {
         let body = messages_body(ModelRequest {
@@ -828,15 +810,16 @@ mod tests {
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::CustomDefinitions,
-            tools: vec![ToolDefinition {
-                name: "read".to_string(),
-                description: "read a file".to_string(),
-                input_schema: json!({
+            tools: vec![test_tool(
+                ProviderKind::Claude,
+                "read",
+                "read a file",
+                json!({
                     "type": "object",
                     "properties": { "path": { "type": "string" } },
                     "required": ["path"]
                 }),
-            }],
+            )],
             max_tokens: Some(2048),
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
@@ -886,15 +869,16 @@ mod tests {
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::CustomDefinitions,
-            tools: vec![ToolDefinition {
-                name: "read".to_string(),
-                description: "read a file".to_string(),
-                input_schema: json!({
+            tools: vec![test_tool(
+                ProviderKind::Claude,
+                "read",
+                "read a file",
+                json!({
                     "type": "object",
                     "properties": { "path": { "type": "string" } },
                     "required": ["path"]
                 }),
-            }],
+            )],
             max_tokens: None,
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
@@ -923,16 +907,18 @@ mod tests {
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::CustomDefinitions,
             tools: vec![
-                ToolDefinition {
-                    name: "write".to_string(),
-                    description: "write a file".to_string(),
-                    input_schema: json!({ "type": "object" }),
-                },
-                ToolDefinition {
-                    name: "read".to_string(),
-                    description: "read a file".to_string(),
-                    input_schema: json!({ "type": "object" }),
-                },
+                test_tool(
+                    ProviderKind::Claude,
+                    "write",
+                    "write a file",
+                    json!({ "type": "object" }),
+                ),
+                test_tool(
+                    ProviderKind::Claude,
+                    "read",
+                    "read a file",
+                    json!({ "type": "object" }),
+                ),
             ],
             max_tokens: None,
             reasoning_effort: ReasoningEffort::XHigh,
@@ -949,17 +935,13 @@ mod tests {
     }
 
     #[test]
-    fn count_tokens_body_drops_anthropic_server_tools() {
-        // The /messages/count_tokens endpoint rejects server tools
-        // (web_search, web_fetch) with HTTP 400. The runtime gate previously
-        // misclassified those as context-overflow, triggering compaction on
-        // every Anthropic turn.
+    fn count_tokens_body_counts_the_same_local_tool_surface() {
         let body = count_tokens_body(ProviderTokenCountRequest {
             model: "claude-opus-4-7".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hi")).into()],
             tool_profile: ProviderToolProfile::AnthropicCoding,
-            tools: Vec::new(),
+            tools: first_party_tools(ProviderKind::Claude),
             max_tokens: None,
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
@@ -968,23 +950,28 @@ mod tests {
         .expect("count body renders");
 
         let tools = body["tools"].as_array().expect("tools array");
-        for tool in tools {
-            let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
-            assert!(
-                !tool_type.starts_with("web_search_") && !tool_type.starts_with("web_fetch_"),
-                "server tool {tool_type} must be filtered for count_tokens"
-            );
-        }
-        // The remaining client tools are still present so the count covers
-        // the same tool surface the model actually sees.
         let names: Vec<&str> = tools
             .iter()
             .filter_map(|tool| tool.get("name").and_then(Value::as_str))
             .collect();
-        assert!(names.contains(&"LoadSkill"));
-        assert!(names.contains(&"Bash"));
-        assert!(names.contains(&"Edit"));
-        assert!(names.contains(&"Grep"));
+        assert_eq!(
+            names,
+            [
+                "Bash",
+                "Edit",
+                "Grep",
+                "LoadSkill",
+                "web_fetch",
+                "web_search"
+            ]
+        );
+        for tool in tools {
+            let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or("");
+            assert!(
+                !tool_type.starts_with("web_search_") && !tool_type.starts_with("web_fetch_"),
+                "main-loop web tools must remain local JSON tools, not Anthropic server tools"
+            );
+        }
     }
 
     #[test]
@@ -994,7 +981,7 @@ mod tests {
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::AnthropicCoding,
-            tools: Vec::new(),
+            tools: first_party_tools(ProviderKind::Claude),
             max_tokens: None,
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
@@ -1002,17 +989,18 @@ mod tests {
         })
         .expect("body renders");
 
-        assert_eq!(body["tools"][0]["name"], "LoadSkill");
+        assert_eq!(body["tools"][0]["name"], "Bash");
         assert!(body["tools"][0].get("type").is_none());
-        assert_eq!(body["tools"][1]["name"], "Bash");
-        assert!(body["tools"][1].get("type").is_none());
-        assert_eq!(body["tools"][2]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][2]["name"], "Edit");
-        assert_eq!(body["tools"][3]["name"], "Grep");
+        assert_eq!(body["tools"][1]["type"], "text_editor_20250728");
+        assert_eq!(body["tools"][1]["name"], "Edit");
+        assert_eq!(body["tools"][2]["name"], "Grep");
+        assert!(body["tools"][2].get("type").is_none());
+        assert_eq!(body["tools"][3]["name"], "LoadSkill");
         assert!(body["tools"][3].get("type").is_none());
-        assert_eq!(body["tools"][4]["type"], "web_search_20250305");
-        assert_eq!(body["tools"][5]["type"], "web_fetch_20250910");
-        assert_eq!(body["tools"][5]["citations"]["enabled"], true);
+        assert_eq!(body["tools"][4]["name"], "web_fetch");
+        assert!(body["tools"][4].get("type").is_none());
+        assert_eq!(body["tools"][5]["name"], "web_search");
+        assert!(body["tools"][5].get("type").is_none());
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
         for index in 0..6 {

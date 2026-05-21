@@ -22,10 +22,10 @@ pub(crate) async fn model_input_tokens_for_gate(
 ) -> Result<usize> {
     match config.provider.kind {
         ProviderKind::Claude => {
-            count_model_input_tokens(state, config, session_id, model_context).await
+            count_claude_model_input_tokens_remotely(state, config, session_id, model_context).await
         }
         ProviderKind::OpenAi => {
-            estimate_openai_model_input_tokens(
+            estimate_codex_model_input_tokens_from_usage_anchor(
                 state,
                 config,
                 session_id,
@@ -37,19 +37,24 @@ pub(crate) async fn model_input_tokens_for_gate(
     }
 }
 
-async fn count_model_input_tokens(
+async fn count_claude_model_input_tokens_remotely(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
     model_context: ModelContext,
 ) -> Result<usize> {
+    // Claude has an authoritative remote preflight backend. Count the exact
+    // local tool surface sent on the next /messages call, including web
+    // wrappers now that they are normal client JSON tools.
     let prompt = assemble_agent_prompt(state, config).await?;
     let request = ProviderTokenCountRequest {
         model: config.provider.model.clone(),
         prompt,
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: state.tools.definitions_for_provider(config.provider.kind),
+        tools: state
+            .tools
+            .provider_tools_for_provider(config.provider.kind),
         max_tokens: config.provider.max_tokens,
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config
@@ -69,13 +74,19 @@ async fn count_model_input_tokens(
         .input_tokens)
 }
 
-async fn estimate_openai_model_input_tokens(
+async fn estimate_codex_model_input_tokens_from_usage_anchor(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
     context_leaf_id: Option<&str>,
     model_context: ModelContext,
 ) -> Result<usize> {
+    // The Codex/ChatGPT backend has no usable remote count endpoint: probing
+    // /responses/input_tokens returns a Cloudflare challenge instead of a
+    // count. Mirror Codex CLI's practical backend: anchor on the latest
+    // provider-reported usage from a completed response, estimate only local
+    // transcript suffixes appended after that point, and let reactive
+    // compaction/retry handle rare overflow misses.
     if let Some(context_leaf_id) = context_leaf_id {
         if let Some(usage) = state
             .repo
@@ -105,7 +116,7 @@ async fn estimate_openai_model_input_tokens(
         }
     }
 
-    estimate_model_input_tokens_locally(state, config, model_context).await
+    estimate_model_input_tokens_from_local_heuristic(state, config, model_context).await
 }
 
 fn suffix_after_first_model_generated_item(
@@ -119,7 +130,7 @@ fn suffix_after_first_model_generated_item(
     entries.into_iter().skip(start).collect()
 }
 
-async fn estimate_model_input_tokens_locally(
+async fn estimate_model_input_tokens_from_local_heuristic(
     state: &AppState,
     config: &SessionConfig,
     model_context: ModelContext,

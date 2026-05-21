@@ -264,7 +264,23 @@ fn tools_list(state: &AppState, params: Value) -> std::result::Result<Value, Rpc
             format!("invalid provider for tools.list: {error}"),
         )
     })?;
-    Ok(json!({ "tools": state.tools.listings_for_provider(provider) }))
+    let tools = state
+        .tools
+        .provider_tools_for_provider(provider)
+        .into_iter()
+        .map(|tool| {
+            json!({
+                "name": tool.name,
+                "description": tool.description,
+                "input_schema": tool.input_schema,
+                "canonical_name": tool.canonical_name,
+                "prompt_alias": tool.prompt_alias,
+                "execution": tool.execution,
+                "kind": "local_tool",
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({ "tools": tools }))
 }
 
 async fn session_start(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

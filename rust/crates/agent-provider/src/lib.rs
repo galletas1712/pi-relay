@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
+use agent_tools::{ProviderTool, ToolRegistry};
 use agent_vocab::{
-    AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, ToolDefinition,
-    TranscriptItem,
+    AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, TranscriptItem,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -27,7 +27,7 @@ pub struct ModelRequest {
     pub prompt: PromptSections,
     pub transcript: Vec<ModelTranscriptEntry>,
     pub tool_profile: ProviderToolProfile,
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Vec<ProviderTool>,
     pub max_tokens: Option<u32>,
     pub reasoning_effort: ReasoningEffort,
     /// Explicit override for the provider's prompt-cache routing key. When
@@ -49,7 +49,7 @@ pub struct ProviderCompactionRequest {
     pub prompt: PromptSections,
     pub transcript: Vec<ModelTranscriptEntry>,
     pub tool_profile: ProviderToolProfile,
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Vec<ProviderTool>,
     pub reasoning_effort: ReasoningEffort,
     pub prompt_cache_key: Option<String>,
     pub session_id: Option<String>,
@@ -70,7 +70,7 @@ pub struct ProviderTokenCountRequest {
     pub prompt: PromptSections,
     pub transcript: Vec<ModelTranscriptEntry>,
     pub tool_profile: ProviderToolProfile,
-    pub tools: Vec<ToolDefinition>,
+    pub tools: Vec<ProviderTool>,
     pub max_tokens: Option<u32>,
     pub reasoning_effort: ReasoningEffort,
     pub prompt_cache_key: Option<String>,
@@ -96,6 +96,24 @@ impl ProviderToolProfile {
             ProviderKind::OpenAi => Self::OpenAiCoding,
             ProviderKind::Claude => Self::AnthropicCoding,
         }
+    }
+}
+
+fn effective_provider_tools(
+    profile: ProviderToolProfile,
+    tools: Vec<ProviderTool>,
+) -> Vec<ProviderTool> {
+    if !tools.is_empty() {
+        return tools;
+    }
+    match profile {
+        ProviderToolProfile::OpenAiCoding => {
+            ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::OpenAi)
+        }
+        ProviderToolProfile::AnthropicCoding => {
+            ToolRegistry::with_builtin_tools().provider_tools_for_provider(ProviderKind::Claude)
+        }
+        ProviderToolProfile::None | ProviderToolProfile::CustomDefinitions => Vec::new(),
     }
 }
 
@@ -130,6 +148,7 @@ pub fn canonical_tool_name_for_provider(provider: ProviderKind, name: &str) -> &
         ProviderKind::OpenAi => match name {
             "apply_patch" => "Edit",
             "web_search" => "WebSearch",
+            "web_fetch" => "WebFetch",
             other => other,
         },
         ProviderKind::Claude => match name {
@@ -148,7 +167,15 @@ fn canonical_provider_replay(
     let mut raw = record.raw_value().ok()?;
     if let Some(name) = raw.get("name").and_then(Value::as_str) {
         let canonical = canonical_tool_name_for_provider(provider, name);
-        if canonical != name {
+        // Local client-tool calls are stored internally under canonical
+        // pi-relay names. Provider-hosted/server replay blocks keep their
+        // provider-native names so a later stateless request can replay them
+        // byte-for-byte and the web UI can still pair provider result blocks.
+        let is_provider_hosted_replay = matches!(
+            raw.get("type").and_then(Value::as_str),
+            Some("server_tool_use" | "web_search_call")
+        );
+        if canonical != name && !is_provider_hosted_replay {
             raw["name"] = Value::String(canonical.to_string());
         }
     }
@@ -360,6 +387,8 @@ fn error_source_chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> 
 #[cfg(test)]
 mod provider_error_tests {
     use super::*;
+    use agent_vocab::{ReplayDisplay, ReplayDisplayKind};
+    use serde_json::json;
 
     #[test]
     fn context_overflow_classifier_matches_known_provider_messages() {
@@ -430,6 +459,46 @@ mod provider_error_tests {
             message: "request entity too large".to_string(),
         }
         .is_retryable_transient());
+    }
+
+    #[test]
+    fn provider_replay_canonicalizes_local_tool_names_only() {
+        let local = ProviderReplayItem::new(
+            ProviderKind::OpenAi,
+            &json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "web_search",
+                "arguments": "{\"query\":\"rust\"}",
+            }),
+        )
+        .unwrap();
+        let local = canonical_provider_replay(&local, ProviderKind::OpenAi)
+            .unwrap()
+            .raw_value()
+            .unwrap();
+        assert_eq!(local["name"], "WebSearch");
+
+        let hosted = ProviderReplayItem::new_with_display(
+            ProviderKind::Claude,
+            &json!({
+                "type": "server_tool_use",
+                "id": "srv_1",
+                "name": "web_fetch",
+                "input": { "url": "https://example.com" },
+            }),
+            Some(ReplayDisplay {
+                kind: ReplayDisplayKind::HostedTool,
+                pretty_name: "WebFetch".to_string(),
+                input_summary: Some("https://example.com".to_string()),
+            }),
+        )
+        .unwrap();
+        let hosted = canonical_provider_replay(&hosted, ProviderKind::Claude)
+            .unwrap()
+            .raw_value()
+            .unwrap();
+        assert_eq!(hosted["name"], "web_fetch");
     }
 }
 

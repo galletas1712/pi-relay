@@ -281,7 +281,7 @@ fn anthropic_assistant_wire(message: &AssistantMessage) -> Value {
             agent_vocab::AssistantItem::ToolCall(call) => json!({
                 "type": "tool_use",
                 "id": call.id.as_str(),
-                "name": call.tool_name,
+                "name": anthropic_wire_tool_name(&call.tool_name),
                 "input": call.args_value().unwrap_or_else(|_| json!({})),
             }),
         })
@@ -305,16 +305,33 @@ fn tool_call_wire(call: &ToolCall, provider: ProviderKind) -> Value {
         json!({
             "type": "custom_tool_call",
             "call_id": call.id.as_str(),
-            "name": tool_name,
+            "name": openai_wire_tool_name(tool_name),
             "input": input,
         })
     } else {
         json!({
             "type": "function_call",
             "call_id": call.id.as_str(),
-            "name": tool_name,
+            "name": openai_wire_tool_name(tool_name),
             "arguments": call.args_json,
         })
+    }
+}
+
+fn openai_wire_tool_name(canonical_name: &str) -> &str {
+    match canonical_name {
+        "Edit" => "apply_patch",
+        "WebFetch" => "web_fetch",
+        "WebSearch" => "web_search",
+        other => other,
+    }
+}
+
+fn anthropic_wire_tool_name(canonical_name: &str) -> &str {
+    match canonical_name {
+        "WebFetch" => "web_fetch",
+        "WebSearch" => "web_search",
+        other => other,
     }
 }
 

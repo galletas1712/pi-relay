@@ -1,6 +1,4 @@
-use agent_tools::{
-    builtin_tool_definition, tool_display, ToolDisplayInput, APPLY_PATCH_LARK_GRAMMAR,
-};
+use agent_tools::{tool_display, ProviderTool, ToolDisplayInput};
 use agent_vocab::{
     AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
     ProviderReplayItem, ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem,
@@ -413,7 +411,9 @@ fn response_excerpt(body: &str) -> String {
 
 fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Value> {
     let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
-    let tools = response_tools(request.tool_profile, &request.tools)?;
+    let tool_profile = request.tool_profile;
+    let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
+    let tools = response_tools(tool_profile, &request_tools)?;
     // Cache cohort priority, highest to lowest:
     //   1. Explicit override from `ProviderConfig.prompt_cache.key` (lets
     //      operators force a particular bucket from config).
@@ -453,7 +453,9 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
 // `service_tier` causes a 400 (`{"detail":"Stream must be set to true"}`).
 fn compact_body(request: ProviderCompactionRequest) -> ProviderResult<Value> {
     let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
-    let tools = response_tools(request.tool_profile, &request.tools)?;
+    let tool_profile = request.tool_profile;
+    let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
+    let tools = response_tools(tool_profile, &request_tools)?;
     Ok(json!({
         "model": request.model,
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
@@ -468,69 +470,29 @@ fn compact_body(request: ProviderCompactionRequest) -> ProviderResult<Value> {
 
 fn response_tools(
     profile: ProviderToolProfile,
-    tools: &[agent_vocab::ToolDefinition],
+    tools: &[ProviderTool],
 ) -> ProviderResult<Vec<Value>> {
     match profile {
         ProviderToolProfile::None => Ok(Vec::new()),
-        ProviderToolProfile::CustomDefinitions => Ok(response_custom_definition_tools(tools)),
-        ProviderToolProfile::OpenAiCoding => Ok(openai_coding_tools()),
+        ProviderToolProfile::CustomDefinitions | ProviderToolProfile::OpenAiCoding => {
+            Ok(response_provider_tools(tools))
+        }
         ProviderToolProfile::AnthropicCoding => Err(ProviderError::Provider(
             "Anthropic coding tools cannot be sent to OpenAI".to_string(),
         )),
     }
 }
 
-fn response_custom_definition_tools(tools: &[agent_vocab::ToolDefinition]) -> Vec<Value> {
+fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
     let mut tools = tools.to_vec();
-    tools.sort_by(|left, right| left.name.cmp(&right.name));
-    tools
-        .iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.input_schema,
-            })
-        })
-        .collect()
-}
-
-fn openai_coding_tools() -> Vec<Value> {
-    vec![
-        openai_function_from_builtin("LoadSkill"),
-        openai_edit_tool(),
-        openai_function_from_builtin("Bash"),
-        openai_function_from_builtin("Grep"),
-        json!({
-            "type": "web_search",
-            "search_context_size": "high",
-        }),
-    ]
-}
-
-fn openai_edit_tool() -> Value {
-    json!({
-        "type": "custom",
-        "name": "Edit",
-        "description": "Edit files by applying a freeform patch. Emit the raw patch body, not JSON.",
-        "format": {
-            "type": "grammar",
-            "syntax": "lark",
-            "definition": APPLY_PATCH_LARK_GRAMMAR,
-        },
-    })
-}
-
-fn openai_function_from_builtin(name: &str) -> Value {
-    let tool =
-        builtin_tool_definition(name).unwrap_or_else(|| panic!("{name} tool must be registered"));
-    json!({
-        "type": "function",
-        "name": tool.name,
-        "description": tool.description,
-        "parameters": tool.input_schema,
-    })
+    tools.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.name.cmp(&right.name))
+            .then_with(|| left.canonical_name.cmp(&right.canonical_name))
+    });
+    tools.iter().map(|tool| tool.declaration.clone()).collect()
 }
 
 fn openai_reasoning_effort(effort: ReasoningEffort) -> ProviderResult<&'static str> {
@@ -619,14 +581,14 @@ fn response_tool_call_item(call: &ToolCall) -> Value {
         json!({
             "type": "custom_tool_call",
             "call_id": call.id.as_str(),
-            "name": call.tool_name,
+            "name": openai_wire_tool_name(&call.tool_name),
             "input": input,
         })
     } else {
         json!({
             "type": "function_call",
             "call_id": call.id.as_str(),
-            "name": call.tool_name,
+            "name": openai_wire_tool_name(&call.tool_name),
             "arguments": call.args_json,
         })
     }
@@ -814,7 +776,7 @@ fn parse_response_output_item(
                 })?;
             items.push(AssistantItem::ToolCall(ToolCall {
                 id: ToolCallId::new(call_id),
-                tool_name: name.to_string(),
+                tool_name: crate::canonical_tool_name_for_provider(provider, name).to_string(),
                 args_json: arguments.to_string(),
             }));
         }
@@ -834,7 +796,7 @@ fn parse_response_output_item(
             })?;
             items.push(AssistantItem::ToolCall(ToolCall {
                 id: ToolCallId::new(call_id),
-                tool_name: name.to_string(),
+                tool_name: crate::canonical_tool_name_for_provider(provider, name).to_string(),
                 args_json: json!({ "input": input }).to_string(),
             }));
         }
@@ -857,17 +819,34 @@ fn openai_provider_replay_display(item: &Value) -> Option<ReplayDisplay> {
         }
         "function_call" => {
             let name = item.get("name").and_then(Value::as_str)?;
+            let canonical_name =
+                crate::canonical_tool_name_for_provider(ProviderKind::OpenAi, name);
             let arguments = item
                 .get("arguments")
                 .and_then(Value::as_str)
                 .and_then(|raw| serde_json::from_str::<Value>(raw).ok())?;
-            tool_display(name, ToolDisplayInput::LocalTool, Some(&arguments))
+            tool_display(
+                canonical_name,
+                ToolDisplayInput::LocalTool,
+                Some(&arguments),
+            )
         }
         "custom_tool_call" => {
             let name = item.get("name").and_then(Value::as_str)?;
-            tool_display(name, ToolDisplayInput::LocalTool, None)
+            let canonical_name =
+                crate::canonical_tool_name_for_provider(ProviderKind::OpenAi, name);
+            tool_display(canonical_name, ToolDisplayInput::LocalTool, None)
         }
         _ => None,
+    }
+}
+
+fn openai_wire_tool_name(canonical_name: &str) -> &str {
+    match canonical_name {
+        "Edit" => "apply_patch",
+        "WebFetch" => "web_fetch",
+        "WebSearch" => "web_search",
+        other => other,
     }
 }
 
@@ -908,7 +887,20 @@ fn openai_usage(value: &Value) -> Option<ProviderUsage> {
 mod tests {
     use super::*;
     use crate::PromptSections;
-    use agent_vocab::{ToolCall, ToolDefinition, ToolResultMessage};
+    use agent_vocab::{ToolCall, ToolResultMessage};
+
+    fn test_tool(
+        provider: ProviderKind,
+        name: &str,
+        description: &str,
+        input_schema: Value,
+    ) -> ProviderTool {
+        ProviderTool::function_json_named(provider, name, description, input_schema)
+    }
+
+    fn first_party_tools(provider: ProviderKind) -> Vec<ProviderTool> {
+        agent_tools::ToolRegistry::with_builtin_tools().provider_tools_for_provider(provider)
+    }
 
     #[test]
     fn codex_headers_match_codex_cli_envelope() {
@@ -1111,17 +1103,18 @@ mod tests {
                 ),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tool_profile: ProviderToolProfile::CustomDefinitions,
-                tools: vec![ToolDefinition {
-                    name: "read".to_string(),
-                    description: "read a file".to_string(),
-                    input_schema: json!({
+                tools: vec![test_tool(
+                    ProviderKind::OpenAi,
+                    "read",
+                    "read a file",
+                    json!({
                         "type": "object",
                         "properties": {
                             "path": { "type": "string" }
                         },
                         "required": ["path"]
                     }),
-                }],
+                )],
                 max_tokens: Some(2048),
                 reasoning_effort: ReasoningEffort::High,
                 prompt_cache_key: Some("pi-relay-test".to_string()),
@@ -1285,16 +1278,18 @@ mod tests {
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tool_profile: ProviderToolProfile::CustomDefinitions,
                 tools: vec![
-                    ToolDefinition {
-                        name: "write".to_string(),
-                        description: "write a file".to_string(),
-                        input_schema: json!({ "type": "object" }),
-                    },
-                    ToolDefinition {
-                        name: "read".to_string(),
-                        description: "read a file".to_string(),
-                        input_schema: json!({ "type": "object" }),
-                    },
+                    test_tool(
+                        ProviderKind::OpenAi,
+                        "write",
+                        "write a file",
+                        json!({ "type": "object" }),
+                    ),
+                    test_tool(
+                        ProviderKind::OpenAi,
+                        "read",
+                        "read a file",
+                        json!({ "type": "object" }),
+                    ),
                 ],
                 max_tokens: None,
                 reasoning_effort: ReasoningEffort::Medium,
@@ -1317,7 +1312,7 @@ mod tests {
                 prompt: PromptSections::stable("stable agent rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tool_profile: ProviderToolProfile::OpenAiCoding,
-                tools: Vec::new(),
+                tools: first_party_tools(ProviderKind::OpenAi),
                 max_tokens: None,
                 reasoning_effort: ReasoningEffort::XHigh,
                 prompt_cache_key: None,
@@ -1327,16 +1322,18 @@ mod tests {
         )
         .expect("responses body renders");
 
-        assert_eq!(body["tools"][0]["type"], "function");
-        assert_eq!(body["tools"][0]["name"], "LoadSkill");
-        assert_eq!(body["tools"][1]["type"], "custom");
-        assert_eq!(body["tools"][1]["name"], "Edit");
+        assert_eq!(body["tools"][0]["type"], "custom");
+        assert_eq!(body["tools"][0]["name"], "apply_patch");
+        assert_eq!(body["tools"][1]["type"], "function");
+        assert_eq!(body["tools"][1]["name"], "Bash");
         assert_eq!(body["tools"][2]["type"], "function");
-        assert_eq!(body["tools"][2]["name"], "Bash");
+        assert_eq!(body["tools"][2]["name"], "Grep");
         assert_eq!(body["tools"][3]["type"], "function");
-        assert_eq!(body["tools"][3]["name"], "Grep");
-        assert_eq!(body["tools"][4]["type"], "web_search");
-        assert_eq!(body["tools"][4]["search_context_size"], "high");
+        assert_eq!(body["tools"][3]["name"], "LoadSkill");
+        assert_eq!(body["tools"][4]["type"], "function");
+        assert_eq!(body["tools"][4]["name"], "web_fetch");
+        assert_eq!(body["tools"][5]["type"], "function");
+        assert_eq!(body["tools"][5]["name"], "web_search");
     }
 
     #[test]
@@ -1399,7 +1396,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
 
     #[test]
     fn responses_sse_parses_custom_and_function_calls() {
-        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_patch","name":"Edit","input":"*** Begin Patch\n*** End Patch\n"}}
+        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}
 data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_bash","name":"Bash","arguments":"{\"command\":[\"pwd\"],\"timeout_ms\":120000}","status":"completed"}}
 data: {"type":"response.completed","response":{"id":"resp_1"}}
 "#;

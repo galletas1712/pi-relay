@@ -13,7 +13,8 @@ pub struct ToolSpec {
     pub name: String,
     pub description: String,
     pub input_schema: Value,
-    pub hosted: bool,
+    pub canonical_name: String,
+    pub prompt_alias: String,
 }
 
 impl ToolSpec {
@@ -21,13 +22,15 @@ impl ToolSpec {
         name: impl Into<String>,
         description: impl Into<String>,
         input_schema: Value,
-        hosted: bool,
+        canonical_name: impl Into<String>,
+        prompt_alias: impl Into<String>,
     ) -> Self {
         Self {
             name: name.into(),
             description: description.into(),
             input_schema,
-            hosted,
+            canonical_name: canonical_name.into(),
+            prompt_alias: prompt_alias.into(),
         }
     }
 }
@@ -97,6 +100,7 @@ fn template_context(ctx: &PromptContext) -> Value {
         },
         "tools": {
             "specs": tools_specs_markdown(&ctx.tools),
+            "aliases": tools_aliases_json(&ctx.tools),
         },
         "skills": {
             "index": skills_index_xml(&ctx.skills),
@@ -124,6 +128,14 @@ fn tools_specs_markdown(tools: &[ToolSpec]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+fn tools_aliases_json(tools: &[ToolSpec]) -> Value {
+    let mut map = serde_json::Map::new();
+    for tool in tools {
+        map.insert(tool.prompt_alias.clone(), Value::String(tool.name.clone()));
+    }
+    Value::Object(map)
 }
 
 fn skills_index_xml(skills: &[Skill]) -> String {
@@ -207,7 +219,8 @@ mod tests {
                         name,
                         format!("{name} description"),
                         json!({"type":"object"}),
-                        false,
+                        name,
+                        name.to_ascii_lowercase(),
                     )
                 })
                 .collect(),

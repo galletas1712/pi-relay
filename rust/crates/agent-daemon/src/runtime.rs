@@ -22,8 +22,8 @@ use tokio::task::JoinHandle;
 
 use crate::codec::transcript_store_from_stored;
 use crate::provider_runtime::{
-    auto_limit_tokens, compaction_auto_state, compaction_config, load_skill_result,
-    model_input_tokens_for_gate, run_compaction, run_model,
+    auto_limit_tokens, compaction_auto_state, compaction_config, is_web_tool_name,
+    load_skill_result, model_input_tokens_for_gate, run_compaction, run_model, run_web_tool,
 };
 use crate::state::{AppState, RunningTask};
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
@@ -1325,13 +1325,8 @@ async fn run_model_turn(
         ..dispatch
     };
 
-    let result = run_model_for_action_with_retries(
-        &state,
-        &session_id,
-        &dispatch,
-        model_context,
-    )
-    .await?;
+    let result =
+        run_model_for_action_with_retries(&state, &session_id, &dispatch, model_context).await?;
     let driver = SessionDriver::acquire(&state, &session_id).await;
     if !state
         .repo
@@ -1469,13 +1464,7 @@ async fn run_model_for_action_with_retries(
                 "action attempt is no longer running",
             ));
         }
-        let result = run_model(
-            state,
-            &dispatch.config,
-            session_id,
-            model_context.clone(),
-        )
-        .await;
+        let result = run_model(state, &dispatch.config, session_id, model_context.clone()).await;
         match result {
             Ok(response) => return Ok(Ok(response)),
             Err(error) => {
@@ -1487,10 +1476,7 @@ async fn run_model_for_action_with_retries(
                 if attempt >= MODEL_PROVIDER_MAX_ATTEMPTS || !retryable {
                     let error = provider_error_from_anyhow(error);
                     let attempts = if retryable { attempt } else { 1 };
-                    return Ok(Err(ModelProviderFailure {
-                        error,
-                        attempts,
-                    }));
+                    return Ok(Err(ModelProviderFailure { error, attempts }));
                 }
                 if !state
                     .repo
@@ -1621,6 +1607,15 @@ async fn run_tool_turn(
     let result = if tool_call.tool_name == "LoadSkill" {
         let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
         load_skill_result(&tool_context.cwd, &loaded_skills, &tool_call)
+    } else if is_web_tool_name(&tool_call.tool_name) {
+        run_web_tool(
+            &state,
+            &dispatch.config,
+            &session_id,
+            &tool_call,
+            &tool_context,
+        )
+        .await
     } else {
         match state
             .tools
