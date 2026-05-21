@@ -1,14 +1,14 @@
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
+import { perfEnabled, perfLog, perfNow } from "./perf.ts";
 import {
 	buildTurnViews,
-	modelStepForEntry,
 	modelStepPhaseLabel,
 	modelStepPreview,
 	modelStepTitle,
-	terminalModelStep,
-	turnForBoundaryEntry
+	terminalModelStep
 } from "./turnView.ts";
 import type { TranscriptEntry, TurnOutcome } from "./types.ts";
+import type { ModelStepView, TurnView } from "./turnView.ts";
 
 export type HistoryPlacement = "at" | "before";
 
@@ -45,47 +45,55 @@ export interface HistoryEntryDisplay {
 }
 
 export function historyForkOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
-	return historyBranchPointOptions(entries, activeLeafId, "fork");
+	return measureHistoryDerivation("historyForkOptions", entries, () => historyBranchPointOptions(entries, activeLeafId, "fork"));
 }
 
 export function historySwitchOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
-	return historyBranchPointOptions(entries, activeLeafId, "switch");
+	return measureHistoryDerivation("historySwitchOptions", entries, () => historyBranchPointOptions(entries, activeLeafId, "switch"));
 }
+
+interface HistoryIndex {
+	byId: Map<string, TranscriptEntry>;
+	children: Map<string | null, TranscriptEntry[]>;
+	metaById: Map<string, EntryMeta>;
+	modelStepByEntryId: Map<string, ModelStepView>;
+	turnByBoundaryEntryId: Map<string, TurnView>;
+	branchFor: (leafId: string | null) => TranscriptEntry[];
+}
+
+interface EntryMeta {
+	turnId: number | null;
+	turnIdForChildren: number | null;
+	previousBoundaryId: string | null;
+}
+
+const indexCache = new WeakMap<TranscriptEntry[], HistoryIndex>();
 
 function historyBranchPointOptions(
 	entries: TranscriptEntry[],
 	activeLeafId: string | null,
 	mode: "fork" | "switch"
 ): HistoryTargetOption[] {
+	const index = createHistoryIndex(entries);
 	const options: HistoryTargetOption[] = [];
 	for (const entry of entries) {
-		const branch = branchEntriesFor(entries, entry.id);
-		const option = branchPointOptionForEntry(entry, branch, branch.length - 1, turnIdAt(branch, branch.length - 1), activeLeafId, mode);
+		const option = branchPointOptionForEntry(index, entry, index.metaById.get(entry.id), activeLeafId, mode);
 		if (option) options.push(option);
 	}
 	return options.reverse();
 }
 
 export function historyTreeRows(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTreeRow[] {
-	const byId = new Map(entries.map((entry) => [entry.id, entry]));
-	const order = new Map(entries.map((entry, index) => [entry.id, index]));
-	const children = new Map<string | null, TranscriptEntry[]>();
-	for (const entry of entries) {
-		const parentId = entry.parent_id && byId.has(entry.parent_id) ? entry.parent_id : null;
-		const siblings = children.get(parentId) ?? [];
-		siblings.push(entry);
-		children.set(parentId, siblings);
-	}
-	for (const siblings of children.values()) {
-		siblings.sort((left, right) => (order.get(left.id) ?? 0) - (order.get(right.id) ?? 0));
-	}
+	return measureHistoryDerivation("historyTreeRows", entries, () => historyTreeRowsIndexed(createHistoryIndex(entries), activeLeafId));
+}
 
-	const activePath = new Set(branchEntriesFor(entries, activeLeafId).map((entry) => entry.id));
+function historyTreeRowsIndexed(index: HistoryIndex, activeLeafId: string | null): HistoryTreeRow[] {
+	const activePath = new Set(index.branchFor(activeLeafId).map((entry) => entry.id));
 	const sizeCache = new Map<string, number>();
 	const branchSize = (entryId: string): number => {
 		const cached = sizeCache.get(entryId);
 		if (cached !== undefined) return cached;
-		const size = 1 + (children.get(entryId) ?? []).reduce((sum, child) => sum + branchSize(child.id), 0);
+		const size = 1 + (index.children.get(entryId) ?? []).reduce((sum, child) => sum + branchSize(child.id), 0);
 		sizeCache.set(entryId, size);
 		return size;
 	};
@@ -100,7 +108,7 @@ export function historyTreeRows(entries: TranscriptEntry[], activeLeafId: string
 			isBranchRoot,
 			descendantCount: branchSize(entry.id) - 1
 		});
-		const entryChildren = children.get(entry.id) ?? [];
+		const entryChildren = index.children.get(entry.id) ?? [];
 		const hasSplit = entryChildren.length > 1;
 		const activeChild = entryChildren.find((child) => activePath.has(child.id));
 		for (const child of entryChildren) {
@@ -108,14 +116,17 @@ export function historyTreeRows(entries: TranscriptEntry[], activeLeafId: string
 			visit(child, depth + (isAlternateBranch ? 1 : 0), entry.id, hasSplit);
 		}
 	};
-	for (const root of children.get(null) ?? []) visit(root, 0, null, false);
+	for (const root of index.children.get(null) ?? []) visit(root, 0, null, false);
 	return rows;
 }
 
 export function historyEntryDisplay(entry: TranscriptEntry, entries: TranscriptEntry[]): HistoryEntryDisplay {
-	const branch = branchEntriesFor(entries, entry.id);
-	const index = branch.length - 1;
-	const currentTurnId = turnIdAt(branch, index);
+	return historyEntryDisplayIndexed(createHistoryIndex(entries), entry);
+}
+
+function historyEntryDisplayIndexed(index: HistoryIndex, entry: TranscriptEntry): HistoryEntryDisplay {
+	const meta = index.metaById.get(entry.id);
+	const currentTurnId = meta?.turnId ?? null;
 	const time = formatTimestamp(entry.timestamp_ms);
 	const item = entry.item;
 	if (item.type === "turn_started") {
@@ -126,7 +137,7 @@ export function historyEntryDisplay(entry: TranscriptEntry, entries: TranscriptE
 			meta: time
 		};
 	}
-	const forkOption = forkOptionForEntry(entry, branch, index, currentTurnId, null);
+	const forkOption = forkOptionForEntry(index, entry, meta, null);
 	if (forkOption) {
 		return {
 			turnLabel: forkOption.turnLabel,
@@ -152,49 +163,99 @@ export function historyEntryDisplay(entry: TranscriptEntry, entries: TranscriptE
 }
 
 export function branchEntriesFor(entries: TranscriptEntry[], leafId: string | null): TranscriptEntry[] {
-	if (!leafId) return [];
-	const byId = new Map(entries.map((entry) => [entry.id, entry]));
-	const branch: TranscriptEntry[] = [];
-	const seen = new Set<string>();
-	let cursor: string | null = leafId;
-	while (cursor && !seen.has(cursor)) {
-		const entry = byId.get(cursor);
-		if (!entry) break;
-		branch.push(entry);
-		seen.add(cursor);
-		cursor = entry.parent_id;
-	}
-	return branch.reverse();
+	return createHistoryIndex(entries).branchFor(leafId);
 }
 
-function turnIdAt(entries: TranscriptEntry[], index: number): number | null {
-	const item = entries[index]?.item;
-	if (item?.type === "turn_finished") return item.turn_id;
-	if (item?.type === "compaction_summary") return item.last_turn_id;
-	for (let cursor = index; cursor >= 0; cursor -= 1) {
-		const candidate = entries[cursor].item;
-		if (candidate.type === "turn_started") return candidate.turn_id;
-		if (cursor !== index && candidate.type === "turn_finished") return null;
-		if (candidate.type === "compaction_summary") return candidate.last_turn_id;
+function createHistoryIndex(entries: TranscriptEntry[]): HistoryIndex {
+	const cached = indexCache.get(entries);
+	if (cached) return cached;
+	const byId = new Map(entries.map((entry) => [entry.id, entry]));
+	const children = new Map<string | null, TranscriptEntry[]>();
+	const metaById = new Map<string, EntryMeta>();
+	for (const entry of entries) {
+		const parentId = entry.parent_id && byId.has(entry.parent_id) ? entry.parent_id : null;
+		const siblings = children.get(parentId) ?? [];
+		siblings.push(entry);
+		children.set(parentId, siblings);
+		const parent = parentId ? byId.get(parentId) : null;
+		const parentMeta = parentId ? metaById.get(parentId) : null;
+		const previousBoundaryId = parent && isHistoryBoundary(parent) ? parent.id : (parentMeta?.previousBoundaryId ?? null);
+		const turnId = turnIdForEntry(entry, parentMeta?.turnIdForChildren ?? null);
+		const turnIdForChildren = turnIdForChildEntries(entry, turnId);
+		metaById.set(entry.id, { turnId, turnIdForChildren, previousBoundaryId });
 	}
+	const branchCache = new Map<string | null, TranscriptEntry[]>();
+	const branchFor = (leafId: string | null): TranscriptEntry[] => {
+		if (!leafId) return [];
+		const cached = branchCache.get(leafId);
+		if (cached) return cached;
+		const branch: TranscriptEntry[] = [];
+		const seen = new Set<string>();
+		let cursor: string | null = leafId;
+		while (cursor && !seen.has(cursor)) {
+			const entry = byId.get(cursor);
+			if (!entry) break;
+			branch.push(entry);
+			seen.add(cursor);
+			cursor = entry.parent_id;
+		}
+		branch.reverse();
+		branchCache.set(leafId, branch);
+		return branch;
+	};
+	const turnViews = buildTurnViews(entries);
+	const modelStepByEntryId = new Map<string, ModelStepView>();
+	const turnByBoundaryEntryId = new Map<string, TurnView>();
+	for (const turn of turnViews) {
+		if (turn.boundaryEntry) turnByBoundaryEntryId.set(turn.boundaryEntry.id, turn);
+		for (const step of turn.modelSteps) modelStepByEntryId.set(step.entry.id, step);
+	}
+	const index = { byId, children, metaById, modelStepByEntryId, turnByBoundaryEntryId, branchFor };
+	indexCache.set(entries, index);
+	return index;
+}
+
+function isHistoryBoundary(entry: TranscriptEntry): boolean {
+	return entry.item.type === "turn_finished" || entry.item.type === "compaction_summary";
+}
+
+function turnIdForEntry(entry: TranscriptEntry, inheritedTurnId: number | null): number | null {
+	const item = entry.item;
+	if (item.type === "turn_finished") return item.turn_id;
+	if (item.type === "compaction_summary") return item.last_turn_id;
+	if (item.type === "turn_started") return item.turn_id;
+	return inheritedTurnId;
+}
+
+function turnIdForChildEntries(entry: TranscriptEntry, currentTurnId: number | null): number | null {
+	const item = entry.item;
+	if (item.type === "turn_finished") return null;
+	if (item.type === "compaction_summary") return item.last_turn_id;
+	if (item.type === "turn_started") return item.turn_id;
+	return currentTurnId;
+}
+
+function previousTurnBoundaryId(index: HistoryIndex, meta: EntryMeta | undefined): string | null {
+	const boundaryId = meta?.previousBoundaryId ?? null;
+	if (!boundaryId || index.byId.has(boundaryId)) return boundaryId;
 	return null;
 }
 
 function forkOptionForEntry(
+	index: HistoryIndex,
 	entry: TranscriptEntry,
-	entries: TranscriptEntry[],
-	index: number,
-	currentTurnId: number | null,
+	meta: EntryMeta | undefined,
 	activeLeafId: string | null
 ): HistoryTargetOption | null {
 	const item = entry.item;
 	const time = formatTimestamp(entry.timestamp_ms);
 	const isActive = activeLeafId === entry.id;
+	const currentTurnId = meta?.turnId ?? null;
 	if (item.type === "user_message") {
 		const text = contentBlocksToText(item.content);
 		return {
 			id: entry.id,
-			actionLeafId: previousTurnBoundaryId(entries, index),
+			actionLeafId: previousTurnBoundaryId(index, meta),
 			sourceEntryId: entry.id,
 			placement: "before",
 			restoreText: text,
@@ -206,7 +267,7 @@ function forkOptionForEntry(
 		};
 	}
 	if (item.type === "assistant_message") {
-		const step = modelStepForEntry(buildTurnViews(entries), entry.id);
+		const step = index.modelStepByEntryId.get(entry.id) ?? null;
 		return {
 			id: entry.id,
 			actionLeafId: entry.id,
@@ -263,18 +324,18 @@ function forkOptionForEntry(
 }
 
 function branchPointOptionForEntry(
+	index: HistoryIndex,
 	entry: TranscriptEntry,
-	entries: TranscriptEntry[],
-	index: number,
-	currentTurnId: number | null,
+	meta: EntryMeta | undefined,
 	activeLeafId: string | null,
 	mode: "fork" | "switch"
 ): HistoryTargetOption | null {
 	const item = entry.item;
 	const time = formatTimestamp(entry.timestamp_ms);
+	const currentTurnId = meta?.turnId ?? null;
 	if (item.type === "user_message") {
 		const text = contentBlocksToText(item.content);
-		const actionLeafId = previousTurnBoundaryId(entries, index);
+		const actionLeafId = previousTurnBoundaryId(index, meta);
 		return {
 			id: entry.id,
 			actionLeafId,
@@ -290,7 +351,7 @@ function branchPointOptionForEntry(
 		};
 	}
 	if (item.type === "turn_finished") {
-		const turn = turnForBoundaryEntry(buildTurnViews(entries), entry.id);
+		const turn = index.turnByBoundaryEntryId.get(entry.id) ?? null;
 		const step = turn ? terminalModelStep(turn) : null;
 		return {
 			id: entry.id,
@@ -307,7 +368,7 @@ function branchPointOptionForEntry(
 		};
 	}
 	if (item.type !== "compaction_summary") return null;
-	const display = historyEntryDisplay(entry, entries);
+	const display = historyEntryDisplayIndexed(index, entry);
 	return {
 		id: entry.id,
 		actionLeafId: entry.id,
@@ -322,13 +383,17 @@ function branchPointOptionForEntry(
 	};
 }
 
-function previousTurnBoundaryId(entries: TranscriptEntry[], beforeIndex: number): string | null {
-	for (let index = beforeIndex - 1; index >= 0; index -= 1) {
-		const entry = entries[index];
-		if (entry.item.type === "turn_finished") return entry.id;
-		if (entry.item.type === "compaction_summary") return entry.id;
-	}
-	return null;
+function measureHistoryDerivation<T>(label: string, entries: TranscriptEntry[], derive: () => T): T {
+	if (!perfEnabled()) return derive();
+	const startedAt = perfNow();
+	const result = derive();
+	const count = Array.isArray(result) ? result.length : undefined;
+	perfLog(label, {
+		entries: entries.length,
+		resultCount: count,
+		deriveMs: Math.round(perfNow() - startedAt)
+	});
+	return result;
 }
 
 function formatTimestamp(timestampMs: number): string {

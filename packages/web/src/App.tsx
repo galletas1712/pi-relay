@@ -71,6 +71,7 @@ const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
 const SELECTED_SESSION_REFRESH_DEBOUNCE_MS = 80;
 const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
 const SELECTED_SESSION_QUERY_DISABLED_KEY = ["session", null, SELECTED_SESSION_DISPLAY_SCOPE] as const;
+const HISTORY_TREE_CACHE_MS = 5 * 60 * 1000;
 const MEDIUM_PANEL_QUERY = "(min-width: 900px)";
 const WIDE_PANEL_QUERY = "(min-width: 1280px)";
 
@@ -1116,6 +1117,7 @@ export function App() {
 				throw new Error("stop the active turn before switching history");
 			}
 			const sessionId = loadedSnapshot.session_id;
+			const lastEventId = loadedSnapshot.last_event_id;
 			setHistoryDialog({
 				sessionId,
 				mode,
@@ -1127,10 +1129,26 @@ export function App() {
 			});
 			void queryClient
 				.fetchQuery({
-					queryKey: ["history-tree", sessionId],
-					queryFn: () => api.getHistoryTree(sessionId),
-					staleTime: 0,
-					gcTime: 0,
+					queryKey: queryKeys.historyTree(sessionId, lastEventId),
+					queryFn: async () => {
+						const shouldLogPerf = perfEnabled();
+						const startedAt = perfNow();
+						if (shouldLogPerf) perfLog("history.tree start", { sessionId, mode, lastEventId });
+						const tree = await api.getHistoryTree(sessionId);
+						if (shouldLogPerf) {
+							perfLog("history.tree end", {
+								sessionId,
+								mode,
+								lastEventId,
+								entries: tree.entries.length,
+								approxBytes: approximateJsonSize(tree),
+								rpcMs: Math.round(perfNow() - startedAt),
+							});
+						}
+						return tree;
+					},
+					staleTime: Infinity,
+					gcTime: HISTORY_TREE_CACHE_MS,
 				})
 				.then((tree) => {
 					setHistoryDialog((current) => {
