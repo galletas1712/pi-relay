@@ -15,9 +15,12 @@ use crate::{
     ProviderToolProfile, ProviderUsage,
 };
 
-const DEFAULT_MAX_TOKENS: u32 = 65_536;
-const ANTHROPIC_BETA_HEADER: &str =
-    "claude-code-20250219,fine-grained-tool-streaming-2025-05-14,interleaved-thinking-2025-05-14,extended-cache-ttl-2025-04-11,web-fetch-2025-09-10,context-management-2025-06-27";
+const DEFAULT_MAX_TOKENS: u32 = 64_000;
+const BASE_ANTHROPIC_BETA_HEADER: &str =
+    "claude-code-20250219,fine-grained-tool-streaming-2025-05-14,extended-cache-ttl-2025-04-11,web-fetch-2025-09-10";
+const CONTEXT_MANAGEMENT_BETA: &str = "context-management-2025-06-27";
+const EFFORT_BETA: &str = "effort-2025-11-24";
+const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const CLAUDE_CODE_VERSION: &str = "2.1.75";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75 (external, cli)";
 const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
@@ -39,8 +42,49 @@ pub struct AnthropicProvider {
     base_url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnthropicModelCapabilities {
+    adaptive_thinking: bool,
+    context_management: bool,
+    effort: bool,
+    interleaved_thinking: bool,
+}
+
+fn anthropic_capabilities(model: &str) -> AnthropicModelCapabilities {
+    let model = model.to_ascii_lowercase();
+    let is_claude_4 = model.contains("claude-")
+        && (model.contains("opus-4") || model.contains("sonnet-4") || model.contains("haiku-4"));
+    let is_adaptive =
+        model.contains("opus-4-6") || model.contains("sonnet-4-6") || model.contains("opus-4-7");
+    AnthropicModelCapabilities {
+        adaptive_thinking: is_adaptive,
+        context_management: is_claude_4,
+        effort: is_adaptive,
+        interleaved_thinking: is_claude_4 && !is_adaptive,
+    }
+}
+
+fn anthropic_beta_header(model: &str) -> String {
+    let capabilities = anthropic_capabilities(model);
+    let mut betas = BASE_ANTHROPIC_BETA_HEADER
+        .split(',')
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    if capabilities.interleaved_thinking {
+        betas.push(INTERLEAVED_THINKING_BETA.to_string());
+    }
+    if capabilities.context_management {
+        betas.push(CONTEXT_MANAGEMENT_BETA.to_string());
+    }
+    if capabilities.effort {
+        betas.push(EFFORT_BETA.to_string());
+    }
+    betas.join(",")
+}
+
 fn anthropic_wire_tool_name(canonical_name: &str) -> &str {
     match canonical_name {
+        "Edit" => "str_replace_based_edit_tool",
         "WebFetch" => "web_fetch",
         "WebSearch" => "web_search",
         other => other,
@@ -84,6 +128,7 @@ impl ModelProvider for AnthropicProvider {
             .prompt_cache_key
             .clone()
             .unwrap_or_else(|| "pi-relay".to_string());
+        let beta_header = anthropic_beta_header(&request.model);
         let body = messages_body(request)?;
 
         let response = self
@@ -92,7 +137,7 @@ impl ModelProvider for AnthropicProvider {
             .header("accept", "application/json")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", ANTHROPIC_BETA_HEADER)
+            .header("anthropic-beta", beta_header)
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("User-Agent", CLAUDE_CODE_USER_AGENT)
             .header("x-app", "cli")
@@ -121,6 +166,7 @@ impl ModelProvider for AnthropicProvider {
             .session_id
             .clone()
             .unwrap_or_else(|| "pi-relay".to_string());
+        let beta_header = anthropic_beta_header(&request.model);
         let body = count_tokens_body(request)?;
 
         let response = self
@@ -132,7 +178,7 @@ impl ModelProvider for AnthropicProvider {
             .header("accept", "application/json")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", ANTHROPIC_BETA_HEADER)
+            .header("anthropic-beta", beta_header)
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("User-Agent", CLAUDE_CODE_USER_AGENT)
             .header("x-app", "cli")
@@ -190,6 +236,7 @@ struct AnthropicRequestBodyInput {
 }
 
 fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Value> {
+    let capabilities = anthropic_capabilities(&input.model);
     let mut messages = transcript_to_messages(&input.prompt, &input.transcript)?;
     if input.cache_transcript {
         add_transcript_cache_breakpoints(&mut messages);
@@ -201,8 +248,11 @@ fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Va
     if let Some(max_tokens) = input.max_tokens {
         body["max_tokens"] = json!(max_tokens);
     }
-    if let Some(reasoning_effort) = input.reasoning_effort {
-        let effort = anthropic_reasoning_effort(reasoning_effort)?;
+    if let Some(reasoning_effort) = input
+        .reasoning_effort
+        .filter(|_| capabilities.adaptive_thinking)
+    {
+        let effort = anthropic_reasoning_effort(input.model.as_str(), reasoning_effort)?;
         // Adaptive thinking is intentionally hard-coded and must not become a
         // per-request toggle: Anthropic invalidates the message-content cache
         // whenever the `thinking` parameter changes (enabling/disabling or
@@ -237,13 +287,19 @@ fn client_request_id() -> String {
     format!("pi-relay-{nanos}")
 }
 
-fn anthropic_reasoning_effort(effort: ReasoningEffort) -> ProviderResult<&'static str> {
+fn anthropic_reasoning_effort(
+    model: &str,
+    effort: ReasoningEffort,
+) -> ProviderResult<&'static str> {
     match effort {
         ReasoningEffort::Low
         | ReasoningEffort::Medium
         | ReasoningEffort::High
-        | ReasoningEffort::XHigh
         | ReasoningEffort::Max => Ok(effort.as_str()),
+        ReasoningEffort::XHigh if model.to_ascii_lowercase().contains("opus-4-7") => {
+            Ok(effort.as_str())
+        }
+        ReasoningEffort::XHigh => Ok("high"),
         ReasoningEffort::None | ReasoningEffort::Minimal => Err(ProviderError::Provider(
             "reasoning effort is not supported by Claude".to_string(),
         )),
@@ -804,7 +860,7 @@ mod tests {
     }
 
     #[test]
-    fn messages_body_enables_thinking_and_auto_tools() {
+    fn messages_body_omits_adaptive_thinking_for_non_adaptive_models() {
         let body = messages_body(ModelRequest {
             model: "claude-sonnet-4-5".to_string(),
             prompt: PromptSections::stable("stable rules"),
@@ -843,8 +899,8 @@ mod tests {
                 },
             })
         );
-        assert_eq!(body["thinking"]["type"], "adaptive");
-        assert_eq!(body["output_config"]["effort"], "medium");
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
         assert_eq!(body["max_tokens"], 2048);
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tools"][0]["name"], "read");
@@ -860,6 +916,48 @@ mod tests {
                 "type": "ephemeral",
             })
         );
+    }
+
+    #[test]
+    fn messages_body_enables_adaptive_thinking_for_adaptive_models() {
+        let body = messages_body(ModelRequest {
+            model: "claude-opus-4-7".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::CustomDefinitions,
+            tools: vec![test_tool(
+                ProviderKind::Claude,
+                "read",
+                "read a file",
+                json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }),
+            )],
+            max_tokens: Some(2048),
+            reasoning_effort: ReasoningEffort::XHigh,
+            prompt_cache_key: None,
+            session_id: None,
+        })
+        .expect("body renders");
+
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "xhigh");
+        assert_eq!(body["max_tokens"], 2048);
+    }
+
+    #[test]
+    fn beta_header_is_gated_by_model_capabilities() {
+        let legacy = anthropic_beta_header("claude-sonnet-4-5");
+        assert!(legacy.contains(INTERLEAVED_THINKING_BETA));
+        assert!(legacy.contains(CONTEXT_MANAGEMENT_BETA));
+        assert!(!legacy.contains(EFFORT_BETA));
+
+        let adaptive = anthropic_beta_header("claude-opus-4-7");
+        assert!(!adaptive.contains(INTERLEAVED_THINKING_BETA));
+        assert!(adaptive.contains(CONTEXT_MANAGEMENT_BETA));
+        assert!(adaptive.contains(EFFORT_BETA));
     }
 
     #[test]
@@ -958,9 +1056,9 @@ mod tests {
             names,
             [
                 "Bash",
-                "Edit",
                 "Grep",
                 "LoadSkill",
+                "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search"
             ]
@@ -991,12 +1089,12 @@ mod tests {
 
         assert_eq!(body["tools"][0]["name"], "Bash");
         assert!(body["tools"][0].get("type").is_none());
-        assert_eq!(body["tools"][1]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][1]["name"], "Edit");
-        assert_eq!(body["tools"][2]["name"], "Grep");
+        assert_eq!(body["tools"][1]["name"], "Grep");
+        assert!(body["tools"][1].get("type").is_none());
+        assert_eq!(body["tools"][2]["name"], "LoadSkill");
         assert!(body["tools"][2].get("type").is_none());
-        assert_eq!(body["tools"][3]["name"], "LoadSkill");
-        assert!(body["tools"][3].get("type").is_none());
+        assert_eq!(body["tools"][3]["type"], "text_editor_20250728");
+        assert_eq!(body["tools"][3]["name"], "str_replace_based_edit_tool");
         assert_eq!(body["tools"][4]["name"], "web_fetch");
         assert!(body["tools"][4].get("type").is_none());
         assert_eq!(body["tools"][5]["name"], "web_search");
