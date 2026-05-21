@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
 	branchEntriesFor,
+	historyEntryDisplay,
 	historyForkOptions,
 	historySwitchOptions,
 	historyTreeRows
@@ -69,6 +70,29 @@ describe("branchEntriesFor", () => {
 			"assistant2",
 			"finish2"
 		]);
+	});
+
+	it("returns the ancestry for sibling branch leaves", () => {
+		expect(branchEntriesFor(fixtureEntries(), "sibling").map((item) => item.id)).toEqual([
+			"start1",
+			"user1",
+			"assistant1",
+			"finish1",
+			"sibling"
+		]);
+	});
+});
+
+describe("historyEntryDisplay", () => {
+	it("derives user-message labels from tree ancestry rather than array adjacency", () => {
+		const entries = fixtureEntries();
+		const sibling = entries.find((item) => item.id === "sibling")!;
+
+		expect(historyEntryDisplay(sibling, entries)).toMatchObject({
+			turnLabel: "user",
+			title: "User message",
+			preview: "alternate branch"
+		});
 	});
 });
 

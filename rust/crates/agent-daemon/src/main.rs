@@ -22,6 +22,7 @@ use crate::types::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Instant;
 
 use agent_core::AgentInput;
 use agent_prompt::pi_md;
@@ -968,14 +969,29 @@ async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result
 
 async fn history_tree(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
+    let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
+    let recovered_ms = started_at.elapsed().as_millis();
     let tree = state
         .repo
         .history_tree(&session_id)
         .await
         .map_err(anyhow::Error::from)?;
-    Ok(rpc_views::history_tree(tree))
+    let loaded_ms = started_at.elapsed().as_millis();
+    let entry_count = tree.entries.len();
+    let value = rpc_views::history_tree(tree);
+    let total_ms = started_at.elapsed().as_millis();
+    if std::env::var_os("PI_RELAY_PERF").is_some() {
+        eprintln!(
+            "perf history.tree session={session_id} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
+            recovered_ms.saturating_sub(acquired_ms),
+            loaded_ms.saturating_sub(recovered_ms),
+            total_ms.saturating_sub(loaded_ms),
+        );
+    }
+    Ok(value)
 }
 
 async fn history_context(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

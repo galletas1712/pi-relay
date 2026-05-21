@@ -6,6 +6,7 @@ import {
 	historySwitchOptions,
 	type HistoryTargetOption
 } from "./historyTargets.ts";
+import { perfEnabled, perfLog, perfNow } from "./perf.ts";
 import type { TranscriptEntry } from "./types.ts";
 
 interface VisibleHistoryRow {
@@ -50,7 +51,20 @@ export function HistoryPickerDialog({
 		[activeLeafId, entries, mode]
 	);
 	const visibleRows = useMemo(
-		() => historyPickerRows(entries, options, activeLeafId),
+		() => {
+			const shouldLogPerf = perfEnabled();
+			const startedAt = perfNow();
+			const rows = historyPickerRows(entries, options, activeLeafId);
+			if (shouldLogPerf) {
+				perfLog("historyPickerRows", {
+					entries: entries.length,
+					options: options.length,
+					rows: rows.length,
+					deriveMs: Math.round(perfNow() - startedAt)
+				});
+			}
+			return rows;
+		},
 		[activeLeafId, entries, options]
 	);
 	const hiddenBranchIds = useMemo(() => {
@@ -210,16 +224,18 @@ function historyPickerRows(
 	const visibleEntries = entries.filter((entry) => optionById.has(entry.id));
 	const visibleIds = new Set(visibleEntries.map((entry) => entry.id));
 	const activePath = new Set(branchEntriesFor(entries, activeLeafId).map((entry) => entry.id));
+	const visibleAncestorCache = new Map<string, string | null>();
 
 	const nearestVisibleAncestor = (entry: TranscriptEntry): string | null => {
-		let cursor = entry.parent_id;
-		const seen = new Set<string>();
-		while (cursor && !seen.has(cursor)) {
-			seen.add(cursor);
-			if (visibleIds.has(cursor)) return cursor;
-			cursor = byId.get(cursor)?.parent_id ?? null;
+		const cached = visibleAncestorCache.get(entry.id);
+		if (cached !== undefined) return cached;
+		const parentId = entry.parent_id && byId.has(entry.parent_id) ? entry.parent_id : null;
+		let ancestor: string | null = null;
+		if (parentId) {
+			ancestor = visibleIds.has(parentId) ? parentId : nearestVisibleAncestor(byId.get(parentId)!);
 		}
-		return null;
+		visibleAncestorCache.set(entry.id, ancestor);
+		return ancestor;
 	};
 
 	const children = new Map<string | null, TranscriptEntry[]>();
