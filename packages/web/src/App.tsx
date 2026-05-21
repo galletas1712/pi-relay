@@ -1002,7 +1002,7 @@ export function App() {
 			if (loadedSnapshot.activity !== "idle") {
 				throw new Error("stop the active turn before switching history");
 			}
-			await api.rewindHistory({
+			await api.switchHistory({
 				sessionId,
 				leafId: target.actionLeafId,
 				expectedActiveLeafId: target.expectedActiveLeafId ?? loadedSnapshot.active_leaf_id ?? null,
