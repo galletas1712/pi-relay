@@ -373,12 +373,12 @@ fn register_edit(registry: &mut ToolRegistry) {
             .provider(
                 ProviderKind::Claude,
                 ProviderTool::new(
-                    "Edit",
+                    "str_replace_based_edit_tool",
                     claude_definition.description,
                     claude_definition.input_schema,
                     json!({
                         "type": "text_editor_20250728",
-                        "name": "Edit",
+                        "name": "str_replace_based_edit_tool",
                     }),
                     ToolExecution::LocalJson,
                 ),
@@ -528,7 +528,7 @@ mod tests {
         );
         assert_eq!(
             claude,
-            ["Bash", "Edit", "Grep", "LoadSkill", "WebFetch", "WebSearch"]
+            ["Bash", "Grep", "LoadSkill", "Edit", "WebFetch", "WebSearch"]
         );
     }
 
@@ -561,9 +561,9 @@ mod tests {
             claude,
             [
                 "Bash",
-                "Edit",
                 "Grep",
                 "LoadSkill",
+                "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search"
             ]
@@ -588,7 +588,7 @@ mod tests {
         assert_eq!(openai_edit.execution, ToolExecution::LocalFreeformText);
         assert_eq!(openai_edit.input_schema["type"], "custom");
         assert_eq!(openai_edit.input_schema["format"]["syntax"], "lark");
-        assert_eq!(claude_edit.name, "Edit");
+        assert_eq!(claude_edit.name, "str_replace_based_edit_tool");
         assert_eq!(claude_edit.execution, ToolExecution::LocalJson);
         assert_eq!(claude_edit.input_schema["type"], "object");
         assert!(claude_edit.input_schema["properties"]
@@ -645,8 +645,12 @@ mod tests {
         assert_eq!(openai_edit.name, "apply_patch");
         assert_eq!(openai_edit.declaration["name"], "apply_patch");
         assert_eq!(openai_edit.execution, ToolExecution::LocalFreeformText);
-        assert_eq!(claude_edit.name, "Edit");
+        assert_eq!(claude_edit.name, "str_replace_based_edit_tool");
         assert_eq!(claude_edit.declaration["type"], "text_editor_20250728");
+        assert_eq!(
+            claude_edit.declaration["name"],
+            "str_replace_based_edit_tool"
+        );
     }
 
     #[test]

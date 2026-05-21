@@ -9,6 +9,8 @@ use agent_vocab::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 
 use crate::auth::Credentials;
 use crate::state::AppState;
@@ -27,6 +29,13 @@ struct WebSearchArgs {
     blocked_domains: Option<Vec<String>>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
+}
+
+fn web_sidecar_session_id(session_id: &str, call_id: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    session_id.hash(&mut hasher);
+    call_id.hash(&mut hasher);
+    format!("web-{:016x}", hasher.finish())
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +193,7 @@ async fn run_provider_web_sidecar(
     user_prompt: String,
     max_output_tokens: Option<usize>,
 ) -> ToolResultMessage {
+    let sidecar_session_id = web_sidecar_session_id(session_id, call.id.as_str());
     let request = ModelRequest {
         model: config.provider.model.clone(),
         prompt: PromptSections::stable(
@@ -196,8 +206,8 @@ async fn run_provider_web_sidecar(
         tools: vec![tool],
         max_tokens: Some(config.provider.max_tokens.unwrap_or(8_192).min(8_192)),
         reasoning_effort: config.provider.reasoning_effort,
-        prompt_cache_key: None,
-        session_id: Some(format!("{}:{}", session_id, call.id.as_str())),
+        prompt_cache_key: Some(sidecar_session_id.clone()),
+        session_id: Some(sidecar_session_id),
     };
 
     let credentials = Credentials::load();
@@ -452,5 +462,29 @@ fn summarize_openai_search_call(raw: &Value, lines: &mut Vec<String>) {
 fn summarize_json_block(label: &str, raw: &Value, lines: &mut Vec<String>) {
     if let Ok(serialized) = serde_json::to_string(raw) {
         lines.push(format!("{label}: {serialized}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sidecar_session_id_is_short_enough_for_openai_prompt_cache_key() {
+        let id = web_sidecar_session_id(
+            "session_00000000-0000-0000-0000-000000000000",
+            "call_0123456789abcdefghijklmnopqrstuvwxyz",
+        );
+
+        assert!(id.len() <= 64);
+        assert!(id.starts_with("web-"));
+    }
+
+    #[test]
+    fn sidecar_session_id_varies_by_tool_call() {
+        let first = web_sidecar_session_id("session", "call_a");
+        let second = web_sidecar_session_id("session", "call_b");
+
+        assert_ne!(first, second);
     }
 }
