@@ -34,7 +34,7 @@ sending the same websocket frames a frontend would send.
    turn outcomes, not session statuses.
 
 5. Source-mutating history writes are idle-only.
-   `history.rewind`, `session.configure`, and `compaction.request` fail with
+   `history.switch`, `session.configure`, and `compaction.request` fail with
    `session_busy` while work is active or queued. Here idle means there are no
    unfinished actions and no queued inputs waiting to become transcript. A
    frontend should send `input.interrupt`, wait for idle, then retry.
@@ -158,15 +158,15 @@ sequence bigserial not null
 primary key (session_id, id)
 ```
 
-The active context is the root-to-`active_leaf_id` path. Rewind moves the active
-leaf; it does not delete rows.
+The active context is the root-to-`active_leaf_id` path. History switch moves the
+active leaf; it does not delete rows.
 
 `provider_replay` is a sidecar for provider-native replay records, aligned one
 to one with the visible transcript entry. It is not rendered as a visible
 transcript item. When the daemon builds a model request, it materializes a
 `ModelContext` from the selected root-to-leaf path as `{ item, provider_replay }`
-entries, so OpenAI/Anthropic continuation state follows rewind, switch, fork,
-and compaction branches without being duplicated in action payloads.
+entries, so OpenAI/Anthropic continuation state follows switch, fork, and
+compaction branches without being duplicated in action payloads.
 
 ### `queued_inputs`
 
@@ -193,7 +193,7 @@ cannot lose accepted input that has not yet appeared in the transcript.
 
 Before a queued input is materialized, the daemon claims it by moving it to
 `consuming` and recording a claim id in `origin`. The user-facing edit path is
-`input.interrupt` followed by picker-driven rewind or fork; queued rows can be
+`input.interrupt` followed by picker-driven switch or fork; queued rows can be
 promoted to steer priority but are not edited or cancelled through websocket
 RPC. The daemon marks the row `consumed` in the same transaction that appends
 the corresponding transcript/action events, and validates the claim id before
@@ -249,7 +249,7 @@ compaction resume.
 
 History operations remain transcript-driven:
 
-- switch/rewind updates `sessions.active_leaf_id`; existing model action rows
+- switch updates `sessions.active_leaf_id`; existing model action rows
   keep their explicit `context_leaf_id`, so recovery never depends on a mutable
   active leaf;
 - fork copies transcript entries, including `provider_replay`, into the child
@@ -305,7 +305,7 @@ Invalid states should not be produced by the websocket service:
 - A closed turn with missing tool results.
 - A tool result without a matching assistant tool call.
 - A model request built from an open tool tail.
-- Rewind to a non-boundary transcript entry.
+- Switch to a non-boundary transcript entry.
 - Transcript rows committed without the matching action/event updates.
 
 Forking to a non-boundary entry is valid because the source is not mutated; the
@@ -440,7 +440,7 @@ be `"active_branch"` or `"full_tree"` and defaults to `"full_tree"` for
 compatibility. The web UI can use the active-branch scope for normal display and
 reserve the full tree for fork/switch/history UI. `has_transcript_entries`
 allows provider/model lock checks even when the active branch is empty after a
-root rewind.
+root switch.
 
 ## Project RPC
 
@@ -642,19 +642,19 @@ Returns all transcript entries plus `active_leaf_id`.
 Returns the materialized model context for `leaf_id`, or the active leaf when
 omitted.
 
-### `history.rewind`
+### `history.switch`
 
 Idle-only. Moves the active leaf to a committed turn boundary or to root.
 This is the one source-mutating history operation: frontends use the same RPC
-both for "rewind and edit this user message" and for "switch the active view to
-this completed branch or compaction root." The RPC never creates a session and
-never deletes abandoned branches.
+both for "switch to the boundary before editing this user message" and for
+"switch the active view to this completed branch or compaction root." The RPC
+never creates a session and never deletes abandoned branches.
 
 ```json
 { "session_id": "s1", "leaf_id": "entry_4", "expected_active_leaf_id": "entry_9" }
 ```
 
-Root rewind:
+Root switch:
 
 ```json
 { "session_id": "s1", "leaf_id": null }
@@ -662,7 +662,7 @@ Root rewind:
 
 Running sessions fail with `session_busy`; non-boundaries fail with
 `not_turn_boundary`. If `expected_active_leaf_id` is supplied and the session
-has moved since the picker was opened, rewind fails with `history_changed`.
+has moved since the picker was opened, switch fails with `history_changed`.
 
 ### `history.fork`
 
@@ -942,16 +942,16 @@ Verify the compaction action is marked `interrupted`, `session.work_cancelled`
 is emitted, no compaction summary root is appended by a late provider result,
 and queued follow-ups continue from the pre-compaction active leaf.
 
-### 6. Rewind Lifecycle
+### 6. History Switch Lifecycle
 
 1. Create two completed turns and record boundary leaf ids.
 2. Start a third pending turn.
-3. Attempt `history.rewind` to the first boundary.
-4. Interrupt, wait for idle, then rewind again.
-5. Attempt rewind to a user-message entry.
+3. Attempt `history.switch` to the first boundary.
+4. Interrupt, wait for idle, then switch again.
+5. Attempt switch to a user-message entry.
 
-Verify running rewind fails with `session_busy`, post-interrupt rewind succeeds,
-descendant rows are preserved, and non-boundary rewind fails with
+Verify running switch fails with `session_busy`, post-interrupt switch succeeds,
+descendant rows are preserved, and non-boundary switch fails with
 `not_turn_boundary`. Also verify stale picker requests with a mismatched
 `expected_active_leaf_id` fail with `history_changed`.
 
@@ -1021,7 +1021,7 @@ Verify:
   historical text into the composer; switching to a completed turn or
   compaction root changes the active leaf inside the same session.
 - `/new`, `/retry`, `/continue`, `/rename`, `/archive`, `/unarchive`,
-  `/rewind`, and `/tree` are not part of the user-facing slash surface.
+  `/tree` are not part of the user-facing slash surface.
 - Crashed and interrupted terminal model turns show Retry/Continue actions that
   invoke the `turn.resume` RPC.
 - Fork from a user-message target creates a child and restores the historical

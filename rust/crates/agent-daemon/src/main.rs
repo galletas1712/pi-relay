@@ -247,7 +247,7 @@ async fn dispatch_request(
         RpcMethod::InputInterrupt => input_interrupt(state, params).await,
         RpcMethod::HistoryTree => history_tree(state, params).await,
         RpcMethod::HistoryContext => history_context(state, params).await,
-        RpcMethod::HistoryRewind => history_rewind(state, params).await,
+        RpcMethod::HistorySwitch => history_switch(state, params).await,
         RpcMethod::HistoryFork => history_fork(state, params).await,
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params),
@@ -1017,7 +1017,7 @@ async fn history_context(state: &AppState, params: Value) -> std::result::Result
     Ok(json!({ "items": items }))
 }
 
-async fn history_rewind(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+async fn history_switch(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.ensure_idle_for_source_mutation().await?;
@@ -1032,7 +1032,7 @@ async fn history_rewind(state: &AppState, params: Value) -> std::result::Result<
     if !store.is_turn_boundary_at(leaf_id) {
         return Err(RpcError::new(
             "not_turn_boundary",
-            "history.rewind requires a turn boundary",
+            "history.switch requires a turn boundary",
         ));
     }
     let events = state
