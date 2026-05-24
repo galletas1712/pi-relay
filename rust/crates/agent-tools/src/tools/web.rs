@@ -54,7 +54,7 @@ impl AgentTool for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "web_search",
-            "Search the web for current information and return concise, cited results. This local tool is provider-neutral; pi-relay executes the search outside the main model turn."
+            "Search the web for current information and return concise, cited results."
                 .to_string(),
             json!({
                 "type": "object",
