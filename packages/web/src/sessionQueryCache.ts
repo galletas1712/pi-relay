@@ -85,10 +85,11 @@ export function mergeSnapshotIntoSessionList(
 		if (session.session_id !== snapshot.session_id) return session;
 		found = true;
 		return {
-			...session,
-			project_id: snapshot.project_id,
-			starting_cwd: snapshot.starting_cwd,
-			activity: snapshot.activity,
+				...session,
+				project_id: snapshot.project_id,
+				outer_cwd: snapshot.outer_cwd,
+				workspaces: snapshot.workspaces,
+				activity: snapshot.activity,
 			active_leaf_id: snapshot.active_leaf_id,
 			provider: snapshot.provider,
 			metadata: snapshot.metadata,

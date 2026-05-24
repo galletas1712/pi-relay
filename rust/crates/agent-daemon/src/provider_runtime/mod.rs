@@ -14,5 +14,5 @@ pub(crate) use compaction::{
 pub(crate) use context_accounting::model_input_tokens_for_gate;
 pub(crate) use prompt::rendered_pi_prompt;
 pub(crate) use requests::run_model;
-pub(crate) use skills::load_skill_result;
+pub(crate) use skills::{load_skill_result, skill_identifier};
 pub(crate) use web_tools::{is_web_tool_name, run_web_tool};

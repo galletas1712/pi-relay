@@ -320,9 +320,13 @@ fn load_skill_definition() -> ToolDefinition {
         json!({
             "type": "object",
             "properties": {
+                "workspace": {
+                    "type": "string",
+                    "description": "For workspace skills, the exact workspace directory shown for the skill in the system prompt. Omit this for global skills."
+                },
                 "name": {
                     "type": "string",
-                    "description": "The exact skill name from skills.index."
+                    "description": "The exact skill name from the available skills listed in the system prompt."
                 }
             },
             "required": ["name"],

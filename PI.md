@@ -6,6 +6,21 @@ You are a helpful assitant.
 {{ project.agents_md }}
 {% endif %}
 
+## Workspace
+
+Current working directory: {{ session.cwd }}
+{% if session.has_project %}
+
+Workspace subdirectories of the current working directory:
+{{ session.workspace_dirs_markdown }}
+
+Each of the above workspace subdirectories typically correspond to different modules/checkouts of git repos that the project involves.
+When doing feature development/bug fixing etc for work that you want to eventually land in the git repo, modify files in the workspace subdirectory directly.
+
+The only artifacts that you can put in the current working directory directly are those that shouldn't end up in the repo.
+Typically these are things like uv/python virtual environments, etc that are host/user/session specific, as well as any temporary artifacts.
+{% endif %}
+
 ## Tools
 
 You may use the following tools to help you accomplish your tasks:
@@ -32,4 +47,6 @@ Here is the full list of skills available to you:
 
 When a task surfaces that matches one (or more) of the available skills, call `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` for each skill you want to gain.
 Each invocation of `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` will insert useful context about the chosen domain in your context before acting, which makes you more knowledgeable!
+The `<workspace>` tag means the skill is specific to the specified workspace subdirectory and should only be invoked if it is relevant and you read/write to that workspace subdirectory.
+Skills without the `<workspace>` tag are globally available.
 {% endif %}

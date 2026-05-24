@@ -24,6 +24,10 @@ import {
 import { truncate } from "./text.ts";
 import type { Notice, Project, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
 
+function projectWorkspaceSummary(project: Project): string {
+	return project.workspaces.map((workspace) => `${workspace.mount_dir}: ${workspace.source_path}`).join("\n");
+}
+
 export function SidebarHeader({
 	connection,
 	onClose
@@ -62,7 +66,7 @@ export interface SidebarProps {
 	onToggleArchived: () => void;
 	onNew: () => void;
 	onClose?: () => void;
-	onSelectProject: (projectId: string) => void;
+	onSelectProject: (projectId: string | null) => void;
 	onNewProject: () => void;
 	onEditProject: (project: Project) => void;
 	onSelectSession: (sessionId: string) => void;
@@ -155,7 +159,7 @@ export function ProjectList({
 }: {
 	projects: Project[];
 	selectedProjectId: string | null;
-	onSelectProject: (projectId: string) => void;
+	onSelectProject: (projectId: string | null) => void;
 	onNewProject: () => void;
 	onEditProject: (project: Project) => void;
 }) {
@@ -168,18 +172,30 @@ export function ProjectList({
 				</button>
 			</div>
 			<div className="project-list" role="listbox" aria-label="projects">
+				<button
+					className={`project-row ${selectedProjectId === null ? "selected" : ""}`}
+					type="button"
+					onClick={() => onSelectProject(null)}
+					title="Ephemeral host sessions start from your home directory"
+				>
+					<Folder size={14} />
+					<span className="project-main">
+						<span className="project-title">Host</span>
+						<span className="project-cwd">Ephemeral sessions</span>
+					</span>
+				</button>
 				{projects.map((project) => (
 					<button
 						className={`project-row ${project.project_id === selectedProjectId ? "selected" : ""}`}
-						type="button"
-						key={project.project_id}
-						onClick={() => onSelectProject(project.project_id)}
-						title={project.starting_cwd}
-					>
+							type="button"
+							key={project.project_id}
+							onClick={() => onSelectProject(project.project_id)}
+							title={projectWorkspaceSummary(project)}
+						>
 						<Folder size={14} />
 						<span className="project-main">
-							<span className="project-title">{projectTitle(project)}</span>
-							<span className="project-cwd">{project.starting_cwd}</span>
+								<span className="project-title">{projectTitle(project)}</span>
+								<span className="project-cwd">{project.workspaces.length} workspaces</span>
 						</span>
 						<span
 							className="session-row-action"
@@ -202,7 +218,7 @@ export function ProjectList({
 						</span>
 					</button>
 				))}
-				{projects.length === 0 ? <div className="empty-list compact">No projects</div> : null}
+
 			</div>
 		</div>
 	);

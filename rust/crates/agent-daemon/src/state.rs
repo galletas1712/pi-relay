@@ -9,6 +9,7 @@ use agent_tools::{ToolContext, ToolRegistry};
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::overlay::OverlayManager;
 use crate::types::RuntimeSession;
 
 pub(crate) struct RunningTask {
@@ -26,6 +27,7 @@ pub(crate) struct AppState {
     pub(crate) tasks: Arc<StdMutex<HashMap<String, RunningTask>>>,
     pub(crate) events: broadcast::Sender<EventFrame>,
     pub(crate) tools: Arc<ToolRegistry>,
+    pub(crate) overlays: OverlayManager,
     pub(crate) default_tool_context: ToolContext,
     pub(crate) default_workspace: PathBuf,
 }

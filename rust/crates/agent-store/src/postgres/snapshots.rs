@@ -15,7 +15,7 @@ use super::PostgresAgentStore;
 impl PostgresAgentStore {
     pub async fn session_snapshot(&self, session_id: &str) -> Result<SessionSnapshot> {
         let session = sqlx::query(
-            "select id, project_id, starting_cwd, active_leaf_id, provider_config, metadata from sessions where id=$1",
+            "select id, project_id, outer_cwd, workspaces, active_leaf_id, provider_config, metadata from sessions where id=$1",
         )
         .bind(session_id)
         .fetch_one(&self.pool)
@@ -80,7 +80,8 @@ impl PostgresAgentStore {
         Ok(SessionSnapshot {
             session_id: session.get("id"),
             project_id: session.get("project_id"),
-            starting_cwd: session.get("starting_cwd"),
+            outer_cwd: session.get("outer_cwd"),
+            workspaces: serde_json::from_value(session.get::<Value, _>("workspaces"))?,
             activity,
             active_leaf_id: session.get("active_leaf_id"),
             provider,

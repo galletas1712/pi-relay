@@ -156,17 +156,34 @@ text_enum! {
 
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    pub project_id: Uuid,
-    pub starting_cwd: String,
+    pub project_id: Option<Uuid>,
+    pub outer_cwd: String,
+    pub workspaces: Vec<WorkspaceMount>,
     pub provider: ProviderConfig,
     pub metadata: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspaceMount {
+    pub mount_dir: String,
+    pub source_path: String,
+}
+
+impl WorkspaceMount {
+    pub fn prompt_workspace_dirs(workspaces: &[Self]) -> Vec<String> {
+        workspaces
+            .iter()
+            .filter(|workspace| workspace.mount_dir != ".")
+            .map(|workspace| workspace.mount_dir.clone())
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct Project {
     pub project_id: Uuid,
     pub name: String,
-    pub starting_cwd: String,
+    pub workspaces: Vec<WorkspaceMount>,
     pub metadata: Value,
     pub created_at: String,
     pub updated_at: String,
@@ -218,8 +235,9 @@ pub struct PromoteQueuedInputResult {
 #[derive(Debug, Clone)]
 pub struct SessionSummary {
     pub session_id: String,
-    pub project_id: Uuid,
-    pub starting_cwd: String,
+    pub project_id: Option<Uuid>,
+    pub outer_cwd: String,
+    pub workspaces: Vec<WorkspaceMount>,
     pub activity: SessionActivity,
     pub active_leaf_id: Option<String>,
     pub provider: ProviderConfig,
@@ -344,8 +362,9 @@ pub struct QueuedInputRecord {
 #[derive(Debug, Clone)]
 pub struct SessionSnapshot {
     pub session_id: String,
-    pub project_id: Uuid,
-    pub starting_cwd: String,
+    pub project_id: Option<Uuid>,
+    pub outer_cwd: String,
+    pub workspaces: Vec<WorkspaceMount>,
     pub activity: SessionActivity,
     pub active_leaf_id: Option<String>,
     pub provider: ProviderConfig,

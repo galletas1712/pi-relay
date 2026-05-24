@@ -503,8 +503,9 @@ mod tests {
 
     fn test_config(kind: ProviderKind, model: &str, metadata: Value) -> SessionConfig {
         SessionConfig {
-            project_id: uuid::Uuid::nil(),
-            starting_cwd: "/tmp".to_string(),
+            project_id: None,
+            outer_cwd: "/tmp".to_string(),
+            workspaces: Vec::new(),
             provider: agent_vocab::ProviderConfig {
                 kind,
                 model: model.to_string(),

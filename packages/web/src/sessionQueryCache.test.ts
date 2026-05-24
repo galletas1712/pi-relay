@@ -140,9 +140,10 @@ function seededClient(): QueryClient {
 
 function summary(): SessionSummary {
 	return {
-		session_id: sessionId,
-		project_id: projectId,
-		starting_cwd: "/repo",
+			session_id: sessionId,
+			project_id: projectId,
+			outer_cwd: "/repo",
+			workspaces: [],
 		activity: "idle",
 		active_leaf_id: null,
 		provider,
@@ -164,9 +165,10 @@ function entry(id: string, parentId: string | null, text: string): TranscriptEnt
 
 function snapshotFixture(): SessionSnapshot {
 	return {
-		session_id: sessionId,
-		project_id: projectId,
-		starting_cwd: "/repo",
+			session_id: sessionId,
+			project_id: projectId,
+			outer_cwd: "/repo",
+			workspaces: [],
 		activity: "idle",
 		active_leaf_id: null,
 		provider,

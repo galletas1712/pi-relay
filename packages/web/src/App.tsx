@@ -63,6 +63,7 @@ import type {
 	SessionSummary,
 	ToolListing,
 	TranscriptEntry,
+	WorkspaceMount,
 } from "./types.ts";
 
 const MAX_NOTICES = 24;
@@ -114,7 +115,7 @@ type ProjectDialogState = {
 	mode: "create" | "edit";
 	projectId?: string;
 	name: string;
-	startingCwd: string;
+	workspacesText: string;
 	saving: boolean;
 };
 
@@ -125,6 +126,29 @@ type PromptDialogState = {
 	view: "rendered" | "template";
 	error: string | null;
 };
+
+function formatWorkspaces(workspaces: WorkspaceMount[]): string {
+	return workspaces.map((workspace) => `${workspace.mount_dir}=${workspace.source_path}`).join("\n");
+}
+
+function parseWorkspacesText(text: string): WorkspaceMount[] {
+	return text
+		.split(/\r?\n/)
+		.map((line) => line.trim())
+		.filter(Boolean)
+		.map((line) => {
+			const equalsIndex = line.indexOf("=");
+			const parts =
+				equalsIndex === -1
+					? line.split(/\s+/, 2)
+					: [line.slice(0, equalsIndex).trim(), line.slice(equalsIndex + 1).trim()];
+			const [mount_dir, source_path] = parts;
+			if (!mount_dir || !source_path) {
+				throw new Error("workspace lines must be mount_dir=/absolute/source_path");
+			}
+			return { mount_dir, source_path };
+		});
+}
 
 export function App() {
 	const api = useMemo(() => createAgentApi(), []);
@@ -193,7 +217,7 @@ export function App() {
 	const sessionsQuery = useQuery({
 		queryKey: queryKeys.sessions(selectedProjectId),
 		queryFn: () => api.listSessions(100, selectedProjectId),
-		enabled: connection === "open" && !!selectedProjectId,
+		enabled: connection === "open",
 	});
 	const sessions = sessionsQuery.data ?? [];
 
@@ -278,7 +302,7 @@ export function App() {
 		if (!selectedId) return null;
 		return {
 			session_id: selectedId,
-			project_id: selectedSession?.project_id ?? selectedProjectId ?? "",
+			project_id: selectedSession?.project_id ?? selectedProjectId,
 			activity: selectedSession?.activity ?? "idle",
 			active_leaf_id: selectedSession?.active_leaf_id ?? null,
 			provider: selectedSession?.provider ?? newSessionProvider,
@@ -497,7 +521,7 @@ export function App() {
 		(event: EventFrame) => {
 			const currentSessions = queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(selectedProjectRef.current));
 			const eventSession = currentSessions?.find((session) => session.session_id === event.session_id);
-			if (eventSession?.project_id && eventSession.project_id !== selectedProjectRef.current) return;
+			if (eventSession && eventSession.project_id !== selectedProjectRef.current) return;
 			reconcilePendingInputEvent(event);
 
 			const refreshPlan = refreshPlanForEvent(event);
@@ -575,15 +599,10 @@ export function App() {
 	useEffect(() => {
 		if (projectsQuery.status !== "success") return;
 		const currentProjectId = selectedProjectRef.current;
-		const nextSelected =
-			currentProjectId && projects.some((project) => project.project_id === currentProjectId)
-				? currentProjectId
-				: (projects[0]?.project_id ?? null);
-		if (nextSelected === currentProjectId) return;
-		const nextSessionId = selectedSessionForProject(nextSelected);
-		selectProjectSession(nextSelected, nextSessionId);
+		if (currentProjectId === null || projects.some((project) => project.project_id === currentProjectId)) return;
+		selectProjectSession(null, null);
 		setQuery("");
-		if (!nextSessionId) composerHandleRef.current?.setValue("");
+		composerHandleRef.current?.setValue("");
 	}, [projects, projectsQuery.status, selectProjectSession]);
 
 	useEffect(() => {
@@ -817,17 +836,13 @@ export function App() {
 
 	const createSession = useCallback(
 		(title?: string) => {
-			if (!selectedProjectRef.current) {
-				pushNotice("info", "select a project first");
-				return null;
-			}
 			nextSessionTitleRef.current = title?.trim() || null;
 			selectSession(null);
 			composerHandleRef.current?.setValue("");
 			requestAnimationFrame(() => composerHandleRef.current?.focus());
 			return null;
 		},
-		[pushNotice, selectSession],
+		[selectSession],
 	);
 
 	const requireSelected = useCallback(() => {
@@ -931,7 +946,6 @@ export function App() {
 	const startNewSession = useCallback(
 		async (text: string) => {
 			const projectId = selectedProjectRef.current;
-			if (!projectId) throw new Error("select a project first");
 			const sessionId = randomId("session");
 			const title = nextSessionTitleRef.current || titleFromText(text);
 			nextSessionTitleRef.current = null;
@@ -1201,7 +1215,7 @@ export function App() {
 						? { sessionId: loadedSnapshot.session_id }
 						: selectedProject
 							? { projectId: selectedProject.project_id, provider: activeProvider }
-							: undefined;
+							: { projectId: null, provider: activeProvider };
 					const next = await queryClient.fetchQuery({
 						queryKey: queryKeys.systemPrompt,
 						queryFn: () => api.getSystemPrompt(promptRequest),
@@ -1285,7 +1299,7 @@ export function App() {
 		setShowArchived((show) => !show);
 	}, []);
 	const handleSelectProject = useCallback(
-		(projectId: string) => {
+		(projectId: string | null) => {
 			if (projectId === selectedProjectRef.current) return;
 			const nextSessionId = selectedSessionForProject(projectId);
 			selectProjectSession(projectId, nextSessionId);
@@ -1298,16 +1312,16 @@ export function App() {
 		setProjectDialog({
 			mode: "create",
 			name: "",
-			startingCwd: selectedProject?.starting_cwd ?? "",
+			workspacesText: selectedProject ? formatWorkspaces(selectedProject.workspaces) : "",
 			saving: false,
 		});
-	}, [selectedProject?.starting_cwd]);
+	}, [selectedProject]);
 	const openEditProjectDialog = useCallback((project: Project) => {
 		setProjectDialog({
 			mode: "edit",
 			projectId: project.project_id,
 			name: projectTitle(project),
-			startingCwd: project.starting_cwd,
+			workspacesText: formatWorkspaces(project.workspaces),
 			saving: false,
 		});
 	}, []);
@@ -1317,22 +1331,22 @@ export function App() {
 	const saveProjectDialog = useCallback(async () => {
 		if (!projectDialog || projectDialog.saving) return;
 		const name = projectDialog.name.trim();
-		const startingCwd = projectDialog.startingCwd.trim();
+		const workspaces = parseWorkspacesText(projectDialog.workspacesText);
 		if (!name) throw new Error("project name is required");
-		if (!startingCwd) throw new Error("starting cwd is required");
+		if (!workspaces.length) throw new Error("at least one workspace is required");
 		setProjectDialog((current) => (current ? { ...current, saving: true } : current));
 		try {
 			const saved =
 				projectDialog.mode === "create"
 					? await api.createProject({
 							name,
-							startingCwd,
+							workspaces,
 							metadata: { created_by: "web" },
 						})
 					: await api.updateProject({
 							projectId: projectDialog.projectId ?? "",
 							name,
-							startingCwd,
+							workspaces,
 						});
 			await queryClient.invalidateQueries({ queryKey: queryKeys.projects });
 			selectProjectSession(saved.project_id, null);
@@ -1551,7 +1565,6 @@ export function App() {
 			<footer className="chat-dock" data-slot="chat-box">
 				<Composer
 					selectedId={selectedId}
-					hasProject={!!selectedProjectId}
 					composerHandleRef={composerHandleRef}
 					sending={sending}
 					canStop={canStop}
@@ -1906,11 +1919,11 @@ function ProjectDialog({
 						/>
 					</label>
 					<label className="rename-field">
-						<span>Starting cwd</span>
-						<input
-							value={state.startingCwd}
-							onChange={(event) => onChange({ startingCwd: event.target.value })}
-							placeholder="/path/to/project"
+						<span>Workspaces</span>
+						<textarea
+							value={state.workspacesText}
+							onChange={(event) => onChange({ workspacesText: event.target.value })}
+							placeholder={"dynamo=/home/me/dynamo/dynamo\nnixl=/home/me/dynamo/nixl"}
 							required
 							disabled={state.saving}
 						/>

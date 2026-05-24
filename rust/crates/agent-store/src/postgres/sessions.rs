@@ -42,13 +42,14 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
-            insert into sessions (id, project_id, starting_cwd, provider_config, metadata)
-            values ($1, $2, $3, $4, $5)
+            insert into sessions (id, project_id, outer_cwd, workspaces, provider_config, metadata)
+            values ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(session_id)
         .bind(config.project_id)
-        .bind(&config.starting_cwd)
+        .bind(&config.outer_cwd)
+        .bind(serde_json::to_value(&config.workspaces)?)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
         .execute(&mut *tx)
@@ -198,15 +199,16 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
             r#"
-                insert into sessions (id, project_id, starting_cwd, active_leaf_id, provider_config, metadata)
-                values ($1, $2, $3, $4::text, $5, $6)
+                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, provider_config, metadata)
+                values ($1, $2, $3, $4, $5::text, $6, $7)
                 on conflict (id) do nothing
                 returning id
                 "#,
         )
         .bind(session_id)
         .bind(config.project_id)
-        .bind(&config.starting_cwd)
+        .bind(&config.outer_cwd)
+        .bind(serde_json::to_value(&config.workspaces)?)
         .bind(active_leaf_id)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
@@ -333,7 +335,8 @@ impl PostgresAgentStore {
                 select
                     s.id,
                     s.project_id,
-                    s.starting_cwd,
+                    s.outer_cwd,
+                    s.workspaces,
                     s.active_leaf_id,
                     s.provider_config,
                     s.metadata,
@@ -344,7 +347,10 @@ impl PostgresAgentStore {
                     exists(select 1 from transcript_entries t where t.session_id=s.id) as has_transcript_entries
                 from sessions s
                 where s.metadata->>'hidden' is distinct from 'true'
-                    and ($2::uuid is null or s.project_id=$2)
+                    and (
+                        ($2::uuid is null and s.project_id is null)
+                        or ($2::uuid is not null and s.project_id=$2)
+                    )
                     and not (
                         s.metadata->>'created_by' = 'web'
                         and not exists(select 1 from transcript_entries t where t.session_id=s.id)
@@ -379,7 +385,8 @@ impl PostgresAgentStore {
                 Ok(SessionSummary {
                     session_id: id,
                     project_id: row.get("project_id"),
-                    starting_cwd: row.get("starting_cwd"),
+                    outer_cwd: row.get("outer_cwd"),
+                    workspaces: serde_json::from_value(row.get::<Value, _>("workspaces"))?,
                     activity,
                     active_leaf_id: row.get("active_leaf_id"),
                     provider,
@@ -397,7 +404,8 @@ impl PostgresAgentStore {
             r#"
             select
                 s.project_id,
-                s.starting_cwd,
+                s.outer_cwd,
+                s.workspaces,
                 s.provider_config,
                 s.metadata
             from sessions s
@@ -410,7 +418,8 @@ impl PostgresAgentStore {
         .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         Ok(SessionConfig {
             project_id: row.get("project_id"),
-            starting_cwd: row.get("starting_cwd"),
+            outer_cwd: row.get("outer_cwd"),
+            workspaces: serde_json::from_value(row.get::<Value, _>("workspaces"))?,
             provider: serde_json::from_value(row.get("provider_config"))?,
             metadata: row.get("metadata"),
         })

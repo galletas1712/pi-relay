@@ -15,10 +15,16 @@ export interface ProviderConfig {
 	prompt_cache?: Record<string, unknown>;
 }
 
+export interface WorkspaceMount {
+	mount_dir: string;
+	source_path: string;
+}
+
 export interface SessionSummary {
 	session_id: string;
-	project_id: string;
-	starting_cwd: string;
+	project_id: string | null;
+	outer_cwd: string;
+	workspaces: WorkspaceMount[];
 	activity: Activity;
 	active_leaf_id: string | null;
 	provider: ProviderConfig;
@@ -47,8 +53,9 @@ export interface QueuedInput {
 
 export interface SessionSnapshot {
 	session_id: string;
-	project_id: string;
-	starting_cwd: string;
+	project_id: string | null;
+	outer_cwd: string;
+	workspaces: WorkspaceMount[];
 	activity: Activity;
 	active_leaf_id: string | null;
 	provider: ProviderConfig;
@@ -68,7 +75,7 @@ export interface SystemPromptResponse {
 export interface Project {
 	project_id: string;
 	name: string;
-	starting_cwd: string;
+	workspaces: WorkspaceMount[];
 	metadata: Record<string, unknown>;
 	created_at: string;
 	updated_at: string;

@@ -37,6 +37,7 @@ impl ToolSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skill {
+    pub workspace: Option<String>,
     pub name: String,
     pub description: String,
     pub file_path: PathBuf,
@@ -48,7 +49,30 @@ impl Skill {
         description: impl Into<String>,
         file_path: impl Into<PathBuf>,
     ) -> Self {
+        Self::global(name, description, file_path)
+    }
+
+    pub fn global(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        file_path: impl Into<PathBuf>,
+    ) -> Self {
         Self {
+            workspace: None,
+            name: name.into(),
+            description: description.into(),
+            file_path: file_path.into(),
+        }
+    }
+
+    pub fn workspace(
+        workspace: impl Into<String>,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        file_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            workspace: Some(workspace.into()),
             name: name.into(),
             description: description.into(),
             file_path: file_path.into(),
@@ -59,6 +83,8 @@ impl Skill {
 #[derive(Debug, Clone)]
 pub struct PromptContext {
     pub cwd: PathBuf,
+    pub has_project: bool,
+    pub workspace_dirs: Vec<String>,
     pub tools: Vec<ToolSpec>,
     pub skills: Vec<Skill>,
 }
@@ -88,12 +114,19 @@ fn render(template: &str, ctx: &PromptContext) -> String {
 }
 
 fn template_context(ctx: &PromptContext) -> Value {
-    let agents_md = find_upward(&ctx.cwd, "AGENTS.md")
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .unwrap_or_default();
+    let agents_md = if ctx.has_project {
+        find_upward(&ctx.cwd, "AGENTS.md")
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     json!({
         "session": {
             "cwd": path_display(&ctx.cwd),
+            "has_project": ctx.has_project,
+            "workspace_dirs": ctx.workspace_dirs,
+            "workspace_dirs_markdown": workspace_dirs_markdown(&ctx.workspace_dirs),
         },
         "project": {
             "agents_md": agents_md,
@@ -130,6 +163,17 @@ fn tools_specs_markdown(tools: &[ToolSpec]) -> String {
         .join("\n\n")
 }
 
+fn workspace_dirs_markdown(workspace_dirs: &[String]) -> String {
+    if workspace_dirs.is_empty() {
+        return "No workspace directories are configured for this session.".to_string();
+    }
+    workspace_dirs
+        .iter()
+        .map(|dir| format!("- {dir}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn tools_aliases_json(tools: &[ToolSpec]) -> Value {
     let mut map = serde_json::Map::new();
     for tool in tools {
@@ -143,10 +187,20 @@ fn skills_index_xml(skills: &[Skill]) -> String {
         return String::new();
     }
     let mut skills = skills.iter().collect::<Vec<_>>();
-    skills.sort_by(|left, right| left.name.cmp(&right.name));
+    skills.sort_by(|left, right| {
+        left.workspace
+            .cmp(&right.workspace)
+            .then_with(|| left.name.cmp(&right.name))
+    });
     let mut lines = vec!["<available_skills>".to_string()];
     for skill in skills {
         lines.push("  <skill>".to_string());
+        if let Some(workspace) = &skill.workspace {
+            lines.push(format!(
+                "    <workspace>{}</workspace>",
+                escape_xml(workspace)
+            ));
+        }
         lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
         lines.push(format!(
             "    <description>{}</description>",
@@ -212,6 +266,8 @@ mod tests {
     fn ctx(tools: Vec<&str>, skills: Vec<Skill>) -> PromptContext {
         PromptContext {
             cwd: PathBuf::from("/tmp/project"),
+            has_project: true,
+            workspace_dirs: Vec::new(),
             tools: tools
                 .into_iter()
                 .map(|name| {
@@ -240,14 +296,21 @@ mod tests {
 
     #[test]
     fn skills_are_available_to_pi_template() {
-        let skill = Skill::new(
+        let global_skill = Skill::new(
             "rust-refactor",
             "Use for Rust refactors.",
             "/tmp/project/.agents/skills/rust-refactor/SKILL.md",
         );
-        let rendered = render_prompt(&ctx(vec!["Bash"], vec![skill]));
+        let workspace_skill = Skill::workspace(
+            "repo",
+            "rust-refactor",
+            "Use for repo Rust refactors.",
+            "/tmp/project/repo/.agents/skills/rust-refactor/SKILL.md",
+        );
+        let rendered = render_prompt(&ctx(vec!["Bash"], vec![global_skill, workspace_skill]));
         assert!(rendered.contains("<available_skills>"));
         assert!(rendered.contains("rust-refactor"));
+        assert!(rendered.contains("<workspace>repo</workspace>"));
         assert!(!rendered.contains("<base_dir>"));
         assert!(!rendered.contains("<location>"));
     }
@@ -255,11 +318,22 @@ mod tests {
     #[test]
     fn custom_template_data_can_choose_to_include_cwd() {
         let rendered = render(
-            "cwd={{ session.cwd }}\n\n{{ tools.specs }}",
+            "cwd={{ session.cwd }}\nworkspaces={{ session.workspace_dirs_markdown }}\n\n{{ tools.specs }}",
             &ctx(vec!["Bash"], Vec::new()),
         );
         assert!(rendered.contains("cwd=/tmp/project"));
+        assert!(rendered.contains("No workspace directories"));
         assert!(rendered.contains("Parameters:"));
+    }
+
+    #[test]
+    fn pi_template_gates_ephemeral_workspace_copy() {
+        let mut ctx = ctx(vec!["Bash"], Vec::new());
+        ctx.has_project = false;
+        ctx.cwd = PathBuf::from("/home/tester");
+        let rendered = render_prompt(&ctx);
+        assert!(rendered.contains("Current working directory: /home/tester"));
+        assert!(!rendered.contains("Workspace subdirectories"));
     }
 
     #[test]

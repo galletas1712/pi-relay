@@ -4,11 +4,11 @@ use sqlx::PgPool;
 /// Postgres is the durable source of truth for sessions.
 ///
 /// Tables:
-/// - `projects`: one row per host workspace/project. Its `starting_cwd` is the
-///   default for new sessions.
+/// - `projects`: one row per host project. Its workspace mounts are the
+///   defaults for new sessions.
 /// - `sessions`: one row per durable session, including active transcript leaf
-///   and provider/session metadata. Every session belongs to a project and
-///   snapshots the project cwd at creation time.
+///   and provider/session metadata. Sessions snapshot the project workspace
+///   sources and get their own overlay-backed outer cwd.
 /// - `daemon_config`: reserved daemon key-value config.
 /// - `transcript_entries`: append-only transcript forest. `parent_id` points
 ///   within the same session, while `sequence` preserves insertion order.
@@ -22,14 +22,15 @@ create table if not exists projects (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     name text not null,
-    starting_cwd text not null,
+    workspaces jsonb not null default '[]'::jsonb,
     metadata jsonb not null default '{}'::jsonb
 );
 
 create table if not exists sessions (
     id text primary key,
-    project_id uuid not null references projects(id),
-    starting_cwd text not null,
+    project_id uuid null references projects(id),
+    outer_cwd text not null,
+    workspaces jsonb not null default '[]'::jsonb,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     active_leaf_id text null,
@@ -106,21 +107,5 @@ create index if not exists events_session_id_idx on events(session_id, id);
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {
     sqlx::raw_sql(SCHEMA_SQL).execute(pool).await?;
-    sqlx::raw_sql(
-        r#"
-        alter table sessions add column if not exists starting_cwd text;
-        update sessions s
-        set starting_cwd = coalesce(p.starting_cwd, '')
-        from projects p
-        where s.project_id = p.id
-            and s.starting_cwd is null;
-        update sessions
-        set starting_cwd = ''
-        where starting_cwd is null;
-        alter table sessions alter column starting_cwd set not null;
-        "#,
-    )
-    .execute(pool)
-    .await?;
     Ok(())
 }

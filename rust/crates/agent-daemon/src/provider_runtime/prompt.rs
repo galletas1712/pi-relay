@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use agent_prompt::{render_prompt, PromptContext, Skill, ToolSpec};
-use agent_store::SessionConfig;
+use agent_store::{SessionConfig, WorkspaceMount};
 use agent_vocab::ProviderKind;
 
 use crate::state::AppState;
@@ -20,7 +20,9 @@ pub(crate) fn rendered_pi_prompt(state: &AppState, config: &SessionConfig) -> St
 
 pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> PromptContext {
     PromptContext {
-        cwd: PathBuf::from(&config.starting_cwd),
+        cwd: PathBuf::from(&config.outer_cwd),
+        has_project: config.project_id.is_some(),
+        workspace_dirs: WorkspaceMount::prompt_workspace_dirs(&config.workspaces),
         tools: tool_specs(state, config.provider.kind),
         skills: load_prompt_skills(config),
     }
@@ -44,72 +46,131 @@ fn tool_specs(state: &AppState, provider: ProviderKind) -> Vec<ToolSpec> {
 }
 
 fn load_prompt_skills(config: &SessionConfig) -> Vec<Skill> {
-    load_skills_for_cwd(&PathBuf::from(&config.starting_cwd))
+    load_skills_for_workspace_mounts(&PathBuf::from(&config.outer_cwd), &config.workspaces)
 }
 
-pub(super) fn load_skills_for_cwd(cwd: &Path) -> Vec<Skill> {
+#[cfg(test)]
+pub(super) fn load_skills_for_workspace_roots(
+    outer_cwd: &Path,
+    workspace_dirs: &[String],
+) -> Vec<Skill> {
+    let workspaces = workspace_dirs
+        .iter()
+        .map(|workspace_dir| WorkspaceMount {
+            mount_dir: workspace_dir.clone(),
+            source_path: String::new(),
+        })
+        .collect::<Vec<_>>();
+    load_skills_for_workspace_mounts_with_home(outer_cwd, &workspaces, home_dir().as_deref())
+}
+
+pub(super) fn load_skills_for_workspace_mounts(
+    outer_cwd: &Path,
+    workspaces: &[WorkspaceMount],
+) -> Vec<Skill> {
+    load_skills_for_workspace_mounts_with_home(outer_cwd, workspaces, home_dir().as_deref())
+}
+
+#[cfg(test)]
+pub(super) fn load_skills_for_workspace_roots_with_home(
+    outer_cwd: &Path,
+    workspace_dirs: &[String],
+    home: Option<&Path>,
+) -> Vec<Skill> {
+    let workspaces = workspace_dirs
+        .iter()
+        .map(|workspace_dir| WorkspaceMount {
+            mount_dir: workspace_dir.clone(),
+            source_path: String::new(),
+        })
+        .collect::<Vec<_>>();
+    load_skills_for_workspace_mounts_with_home(outer_cwd, &workspaces, home)
+}
+
+pub(super) fn load_skills_for_workspace_mounts_with_home(
+    outer_cwd: &Path,
+    workspaces: &[WorkspaceMount],
+    home: Option<&Path>,
+) -> Vec<Skill> {
+    let outer_cwd = normalize_existing_dir(outer_cwd);
     let mut skills = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    collect_skills_from_dir(&cwd.join(".agents/skills"), &mut skills, &mut seen);
+
+    if let Some(home) = home {
+        let home_skills_dir = home.join(".agents/skills");
+        add_skills_from_agents_dir(&home_skills_dir, None, &mut skills);
+    }
+
+    for workspace in workspaces {
+        let workspace_root = if workspace.mount_dir == "." {
+            outer_cwd.clone()
+        } else {
+            outer_cwd.join(&workspace.mount_dir)
+        };
+        let skills_dir = workspace_root.join(".agents/skills");
+        let workspace_name = if workspace.mount_dir == "." {
+            None
+        } else {
+            Some(workspace.mount_dir.as_str())
+        };
+        add_skills_from_agents_dir(&skills_dir, workspace_name, &mut skills);
+    }
+
     skills
 }
 
-fn collect_skills_from_dir(
-    dir: &Path,
-    skills: &mut Vec<Skill>,
-    seen: &mut std::collections::BTreeSet<String>,
-) {
-    if !dir.exists() {
+fn home_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    if home.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(home))
+}
+
+fn normalize_existing_dir(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn add_skills_from_agents_dir(dir: &Path, workspace: Option<&str>, skills: &mut Vec<Skill>) {
+    if !dir.is_dir() {
         return;
     }
-    let skill_file = dir.join("SKILL.md");
-    if skill_file.is_file() {
-        if let Some(skill) = load_skill_file(&skill_file) {
-            add_skill(skill, skills, seen);
-        }
-        return;
-    }
+
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    for entry in entries.flatten() {
+    let mut entries = entries.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
         let path = entry.path();
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with('.') || name == "node_modules" {
+        if name.to_string_lossy().starts_with('.') || !path.is_dir() {
             continue;
         }
-        if path.is_dir() {
-            collect_skills_from_dir(&path, skills, seen);
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
-            if let Some(skill) = load_skill_file(&path) {
-                add_skill(skill, skills, seen);
-            }
+        let skill_file = path.join("SKILL.md");
+        if !skill_file.is_file() {
+            continue;
+        }
+        if let Some(skill) = load_skill_file(&skill_file, workspace) {
+            skills.push(skill);
         }
     }
 }
 
-fn add_skill(skill: Skill, skills: &mut Vec<Skill>, seen: &mut std::collections::BTreeSet<String>) {
-    if seen.insert(skill.name.clone()) {
-        skills.push(skill);
-    }
-}
-
-fn load_skill_file(path: &Path) -> Option<Skill> {
+fn load_skill_file(path: &Path, workspace: Option<&str>) -> Option<Skill> {
     let raw = std::fs::read_to_string(path).ok()?;
     let (frontmatter, _body) = split_frontmatter(&raw);
     let frontmatter = parse_simple_frontmatter(frontmatter.unwrap_or_default());
-    let fallback_name = path.parent()?.file_name()?.to_string_lossy().to_string();
-    let name = frontmatter
-        .get("name")
-        .cloned()
-        .unwrap_or(fallback_name)
-        .trim()
-        .to_string();
+    let name = frontmatter.get("name").cloned()?.trim().to_string();
     let description = frontmatter.get("description")?.trim().to_string();
     if name.is_empty() || description.is_empty() {
         return None;
     }
-    Some(Skill::new(name, description, path.to_path_buf()))
+    let skill = match workspace {
+        Some(workspace) => Skill::workspace(workspace.to_string(), name, description, path),
+        None => Skill::global(name, description, path),
+    };
+    Some(skill)
 }
 
 fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
@@ -148,4 +209,124 @@ fn parse_simple_frontmatter(frontmatter: &str) -> std::collections::BTreeMap<Str
         );
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn discovers_home_and_workspace_agents_skills_without_recursive_workspace_scan() {
+        let root = make_temp_dir("skills-discovery");
+        let home = root.join("home");
+        let outer = root.join("outer");
+        let dynamo = outer.join("dynamo");
+        let nccl = outer.join("NCCL");
+        std::fs::create_dir_all(&dynamo).expect("dynamo dir");
+        std::fs::create_dir_all(&nccl).expect("NCCL dir");
+
+        write_skill(
+            &home.join(".agents/skills/global-only/SKILL.md"),
+            "global-only",
+            "from home",
+        );
+        write_skill(
+            &outer.join(".agents/skills/outer-only/SKILL.md"),
+            "outer-only",
+            "not discovered because outer cwd is not a workspace",
+        );
+        write_skill(
+            &dynamo.join(".agents/skills/shared/SKILL.md"),
+            "shared",
+            "from dynamo",
+        );
+        write_skill(
+            &nccl.join(".agents/skills/shared/SKILL.md"),
+            "shared",
+            "from NCCL",
+        );
+        write_skill(
+            &dynamo.join("child/.agents/skills/child-only/SKILL.md"),
+            "child-only",
+            "not discovered without recursive workspace scanning",
+        );
+        write_skill(
+            &dynamo.join(".agents/skills/group/deep/SKILL.md"),
+            "deep",
+            "not discovered because skill packages are immediate children only",
+        );
+
+        let skills = load_skills_for_workspace_roots_with_home(
+            &outer,
+            &["dynamo".to_string(), "NCCL".to_string()],
+            Some(&home),
+        );
+        assert!(skills
+            .iter()
+            .any(|skill| skill.workspace.is_none() && skill.name == "global-only"));
+        assert!(skills.iter().any(|skill| {
+            skill.workspace.as_deref() == Some("dynamo")
+                && skill.name == "shared"
+                && skill.description == "from dynamo"
+        }));
+        assert!(skills.iter().any(|skill| {
+            skill.workspace.as_deref() == Some("NCCL")
+                && skill.name == "shared"
+                && skill.description == "from NCCL"
+        }));
+        assert!(!skills.iter().any(|skill| skill.name == "outer-only"));
+        assert!(!skills.iter().any(|skill| skill.name == "child-only"));
+        assert!(!skills.iter().any(|skill| skill.name == "deep"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn only_loads_skill_directories_under_agents_skills() {
+        let root = make_temp_dir("skills-root-files");
+        let outer = root.join("outer");
+        let workspace = outer.join("repo");
+        std::fs::create_dir_all(workspace.join(".agents/skills")).expect("skills dir");
+        std::fs::write(
+            workspace.join(".agents/skills/root-file.md"),
+            "---\nname: root-file\ndescription: ignored\n---\n",
+        )
+        .expect("root skill file");
+        write_skill(
+            &workspace.join(".agents/skills/nested/SKILL.md"),
+            "nested",
+            "loaded",
+        );
+
+        let skills = load_skills_for_workspace_roots_with_home(&outer, &["repo".to_string()], None);
+        assert!(skills
+            .iter()
+            .any(|skill| skill.workspace.as_deref() == Some("repo") && skill.name == "nested"));
+        assert!(!skills.iter().any(|skill| skill.name == "root-file"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn write_skill(path: &Path, name: &str, description: &str) {
+        std::fs::create_dir_all(path.parent().expect("skill parent")).expect("skill dir");
+        std::fs::write(
+            path,
+            format!(
+                "---\nname: {name}\ndescription: {description}\nignored: true\n---\n\n# {name}\n"
+            ),
+        )
+        .expect("write skill");
+    }
+
+    fn make_temp_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("pi-relay-{prefix}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
 }

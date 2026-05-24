@@ -218,6 +218,11 @@ impl SessionDriver {
             .load_session_config(&self.session_id)
             .await
             .map_err(anyhow::Error::from)?;
+        self.state
+            .overlays
+            .ensure_session(&self.session_id, &config)
+            .await
+            .map_err(anyhow::Error::from)?;
         let stored = self
             .state
             .repo
@@ -466,6 +471,11 @@ impl SessionDriver {
             .load_session_config(&self.session_id)
             .await
             .map_err(anyhow::Error::from)?;
+        self.state
+            .overlays
+            .ensure_session(&self.session_id, &config)
+            .await
+            .map_err(anyhow::Error::from)?;
         let stored = self
             .state
             .repo
@@ -550,6 +560,11 @@ impl SessionDriver {
             .state
             .repo
             .load_session_config(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        self.state
+            .overlays
+            .ensure_session(&self.session_id, &config)
             .await
             .map_err(anyhow::Error::from)?;
         let resolved = pending
@@ -1599,14 +1614,24 @@ async fn run_tool_turn(
         return Ok(());
     }
     publish_events(&state, events);
+    state
+        .overlays
+        .ensure_session(&session_id, &dispatch.config)
+        .await
+        .map_err(anyhow::Error::from)?;
 
     let tool_context = dynamic_tool_context(
         &state.default_tool_context,
-        std::path::PathBuf::from(dispatch.config.starting_cwd.clone()),
+        std::path::PathBuf::from(dispatch.config.outer_cwd.clone()),
     );
     let result = if tool_call.tool_name == "LoadSkill" {
         let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
-        load_skill_result(&tool_context.cwd, &loaded_skills, &tool_call)
+        load_skill_result(
+            &tool_context.cwd,
+            &dispatch.config.workspaces,
+            &loaded_skills,
+            &tool_call,
+        )
     } else if is_web_tool_name(&tool_call.tool_name) {
         run_web_tool(
             &state,
@@ -1720,17 +1745,28 @@ async fn loaded_skills_for_session(state: &AppState, session_id: &str) -> BTreeS
         .iter()
         .filter_map(|item| match item {
             TranscriptItem::ToolResult(result) if result.tool_name == "LoadSkill" => {
-                loaded_skill_name(&result.output)
+                loaded_skill_identifier(&result.output)
             }
             _ => None,
         })
         .collect()
 }
 
-fn loaded_skill_name(output: &str) -> Option<String> {
+fn loaded_skill_identifier(output: &str) -> Option<String> {
     let rest = output.strip_prefix("<loaded_skill>\n<name>")?;
     let end = rest.find("</name>")?;
-    Some(xml_unescape(&rest[..end]))
+    let name = xml_unescape(&rest[..end]);
+    let after_name = &rest[end + "</name>".len()..];
+    let workspace = if let Some(workspace_rest) = after_name.strip_prefix("\n<workspace>") {
+        let workspace_end = workspace_rest.find("</workspace>")?;
+        Some(xml_unescape(&workspace_rest[..workspace_end]))
+    } else {
+        None
+    };
+    Some(crate::provider_runtime::skill_identifier(
+        workspace.as_deref(),
+        &name,
+    ))
 }
 
 fn xml_unescape(input: &str) -> String {

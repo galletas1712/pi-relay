@@ -72,8 +72,9 @@ enums that serialize to the string values shown below.
 
 ```text
 id text primary key
-project_id uuid not null references projects(id)
-starting_cwd text not null
+project_id uuid null references projects(id)
+outer_cwd text not null
+workspaces jsonb not null default '[]'::jsonb
 created_at timestamptz not null default now()
 updated_at timestamptz not null default now()
 active_leaf_id text null
@@ -88,13 +89,15 @@ id uuid primary key
 created_at timestamptz not null default now()
 updated_at timestamptz not null default now()
 name text not null
-starting_cwd text not null
 metadata jsonb not null default '{}'::jsonb
+workspaces jsonb not null default '[]'::jsonb
 ```
 
-Projects are host folders. Every session has a `project_id` and snapshots the
-project `starting_cwd` when the session is created; model prompt context and
-local tools use the session's stored `starting_cwd`.
+Projects define source workspaces as `{ mount_dir, source_path }` records. Each
+session has its own `outer_cwd` under the pi-relay state directory and snapshots
+the source workspaces it should mount there. Ephemeral host sessions have
+`project_id: null` and use a root workspace mount over `$HOME`.
+Model prompt context and local tools use the session's stored `outer_cwd`.
 
 `provider_config`:
 
@@ -380,12 +383,16 @@ the normal frontend path for a brand-new draft.
 }
 ```
 
+Omit `project_id` to start an ephemeral host session. Ephemeral sessions are not
+assigned to a project and get a root overlay mount over `$HOME`.
+
 The daemon writes `session.created`, `input.accepted`, transcript entries,
 actions, and events in the same session-start transition before dispatching
-provider/tool work. It snapshots the project's current `starting_cwd` into the
-new session row; later `project.update` calls do not change that stored session
-cwd. Retrying the same stable `session_id` returns the existing session with
-`"replayed": true` rather than creating a second session.
+provider/tool work. For project sessions it snapshots the project's current
+`workspaces` into the new session row and assigns a per-session `outer_cwd`;
+later `project.update` calls do not change existing sessions. Retrying the same stable
+`session_id` returns the
+existing session with `"replayed": true` rather than creating a second session.
 For web drafts, the frontend should always provide both the stable draft-owned
 `session_id` and `client_input_id`.
 
@@ -397,8 +404,11 @@ Lists durable sessions, newest first.
 { "limit": 50 }
 ```
 
-Each row includes `session_id`, `project_id`, `starting_cwd`, `activity`,
-`active_leaf_id`, `provider`, `metadata`, `updated_at`, and
+Pass a `project_id` to list that project's sessions. Omit `project_id` to list
+ephemeral host sessions.
+
+Each row includes `session_id`, nullable `project_id`, `outer_cwd`, `workspaces`,
+`activity`, `active_leaf_id`, `provider`, `metadata`, `updated_at`, and
 `has_transcript_entries`. Defensive listing hides accidental empty web-created
 rows that have no transcript, queued input, actions, or fork provenance. Rows
 with `metadata.hidden = true` are also omitted from the list; this is used for
@@ -419,7 +429,11 @@ Result shape:
 {
   "session_id": "s1",
   "project_id": "f2b0e23c-1fd7-4977-9d60-f6842e25d15b",
-  "starting_cwd": "/Users/me/src/my-repo",
+  "outer_cwd": "/home/me/.local/state/pi-relay/sessions/s1/cwd",
+  "workspaces": [
+    { "mount_dir": "repo-a", "source_path": "/Users/me/src/repo-a" },
+    { "mount_dir": "repo-b", "source_path": "/Users/me/src/repo-b" }
+  ],
   "activity": "idle",
   "active_leaf_id": "entry_9",
   "provider": { "kind": "codex", "model": "gpt-5.5" },
@@ -452,31 +466,37 @@ Returns visible projects:
 { "projects": [] }
 ```
 
-Each project has `project_id`, `name`, `starting_cwd`, `metadata`, `created_at`,
-and `updated_at`. The project `starting_cwd` is a default for new sessions; each
-session snapshots its own cwd at creation time.
+Each project has `project_id`, `name`, `workspaces`, `metadata`, `created_at`,
+and `updated_at`. Project workspaces are defaults for new sessions; each session
+snapshots its own values at creation time.
 
 ### `project.create`
 
 ```json
 {
   "name": "my repo",
-  "starting_cwd": "/Users/me/src/my-repo",
+  "workspaces": [
+    { "mount_dir": "repo-a", "source_path": "/Users/me/src/repo-a" },
+    { "mount_dir": "repo-b", "source_path": "/Users/me/src/repo-b" }
+  ],
   "metadata": { "created_by": "web" }
 }
 ```
 
 ### `project.update`
 
-Renames a project and/or changes the starting cwd used for future sessions. The
-cwd must be an existing directory. Updating a project cwd does not change the cwd
-of existing sessions in that project.
+Renames a project and/or changes the workspace sources used for future sessions.
+Each `mount_dir` must be a direct child name, and each `source_path` must be an
+existing real repository directory. Updating a project does not change existing
+sessions in that project.
 
 ```json
 {
   "project_id": "f2b0e23c-1fd7-4977-9d60-f6842e25d15b",
   "name": "pi-relay",
-  "starting_cwd": "/Users/me/src/pi-relay"
+  "workspaces": [
+    { "mount_dir": "pi-relay", "source_path": "/Users/me/src/pi-relay" }
+  ]
 }
 ```
 
@@ -520,10 +540,17 @@ Responses and `session.configured` events include `provider`, `metadata`, and
 
 ### `system.prompt`
 
-Returns the repo-level `PI.md` prompt composition template. `/system` in the web UI displays this content read-only; edit `PI.md` in the repo to change it.
+Returns the repo-level `PI.md` prompt composition template and, when enough
+context is available, the rendered prompt. Pass `session_id` to render from an
+existing session's frozen config. Pass `project_id` plus optional `provider` to
+preview a new project session. Omit `project_id` to preview an ephemeral host
+session from `$HOME`.
 
 ```json
-{ "pi_md": "contents of PI.md" }
+{
+  "template": "contents of PI.md",
+  "rendered": "rendered prompt text"
+}
 ```
 
 ## Subscription RPC
@@ -873,8 +900,10 @@ Verify:
 ### 2. PI.md Prompt Preview
 
 1. Call `system.prompt`.
-2. Verify the response contains the repo-level `PI.md` template.
-3. In the web UI, type `/system` and verify the same template is displayed read-only.
+2. Verify the response contains the repo-level `PI.md` template and a rendered
+   prompt for the requested session/project/host context.
+3. In the web UI, type `/system` and verify the same prompt preview is displayed
+   read-only.
 
 
 ### 3. Image Input Persistence

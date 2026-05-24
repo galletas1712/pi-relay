@@ -13,7 +13,8 @@ import type {
 	SessionSnapshot,
 	SessionSummary,
 	ToolListing,
-	TranscriptItem
+	TranscriptItem,
+	WorkspaceMount
 } from "./types.ts";
 import type { HistoryPlacement } from "./historyTargets.ts";
 import type { EntryScope } from "./queryKeys.ts";
@@ -32,7 +33,7 @@ export interface AgentApi {
 	updateProject(params: UpdateProjectParams): Promise<Project>;
 	deleteProject(projectId: string): Promise<DeleteProjectResult>;
 	listSessions(limit?: number, projectId?: string | null): Promise<SessionSummary[]>;
-	getSystemPrompt(params?: { sessionId?: string; projectId?: string; provider?: ProviderConfig }): Promise<SystemPromptResponse>;
+	getSystemPrompt(params?: { sessionId?: string; projectId?: string | null; provider?: ProviderConfig }): Promise<SystemPromptResponse>;
 	listTools(provider: string): Promise<ToolListing[]>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
 	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse>;
@@ -55,14 +56,14 @@ export interface AgentApi {
 
 export interface CreateProjectParams {
 	name: string;
-	startingCwd: string;
+	workspaces: WorkspaceMount[];
 	metadata?: Record<string, unknown>;
 }
 
 export interface UpdateProjectParams {
 	projectId: string;
 	name?: string;
-	startingCwd?: string;
+	workspaces?: WorkspaceMount[];
 }
 
 export interface DeleteProjectResult {
@@ -77,7 +78,7 @@ export interface GetSessionOptions {
 
 export interface StartSessionParams {
 	sessionId: string;
-	projectId: string;
+	projectId?: string | null;
 	provider: ProviderConfig;
 	metadata: Record<string, unknown>;
 	clientInputId: string;
@@ -214,7 +215,7 @@ class AgentApiClient implements AgentApi {
 	createProject(params: CreateProjectParams): Promise<Project> {
 		return this.client.request<Project>("project.create", {
 			name: params.name,
-			starting_cwd: params.startingCwd,
+			workspaces: params.workspaces,
 			metadata: params.metadata
 		});
 	}
@@ -223,7 +224,7 @@ class AgentApiClient implements AgentApi {
 		return this.client.request<Project>("project.update", {
 			project_id: params.projectId,
 			name: params.name,
-			starting_cwd: params.startingCwd
+			workspaces: params.workspaces
 		});
 	}
 
@@ -241,10 +242,10 @@ class AgentApiClient implements AgentApi {
 		return result.sessions;
 	}
 
-	getSystemPrompt(params: { sessionId?: string; projectId?: string; provider?: ProviderConfig } = {}): Promise<SystemPromptResponse> {
+	getSystemPrompt(params: { sessionId?: string; projectId?: string | null; provider?: ProviderConfig } = {}): Promise<SystemPromptResponse> {
 		return this.client.request<SystemPromptResponse>("system.prompt", {
 			session_id: params.sessionId,
-			project_id: params.projectId,
+			project_id: params.projectId || undefined,
 			provider: params.provider
 		});
 	}
@@ -288,7 +289,7 @@ class AgentApiClient implements AgentApi {
 	startSession(params: StartSessionParams): Promise<StartSessionResult> {
 		return this.client.request<StartSessionResult>("session.start", {
 			session_id: params.sessionId,
-			project_id: params.projectId,
+			project_id: params.projectId || undefined,
 			provider: params.provider,
 			metadata: params.metadata,
 			client_input_id: params.clientInputId,

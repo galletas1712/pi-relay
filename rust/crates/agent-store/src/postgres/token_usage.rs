@@ -192,8 +192,9 @@ mod tests {
 
     fn session_config(project_id: Uuid) -> SessionConfig {
         SessionConfig {
-            project_id,
-            starting_cwd: "/tmp".to_string(),
+            project_id: Some(project_id),
+            outer_cwd: "/tmp".to_string(),
+            workspaces: Vec::new(),
             provider: ProviderConfig {
                 kind: ProviderKind::OpenAi,
                 model: "test-model".to_string(),
@@ -214,7 +215,7 @@ mod tests {
         let session_id = "token-usage-estimate-session";
         let project_id = Uuid::new_v4();
         store
-            .create_project(project_id, "token usage test", "/tmp", json!({}))
+            .create_project(project_id, "token usage test", &[], json!({}))
             .await
             .expect("project creates");
         let config = session_config(project_id);

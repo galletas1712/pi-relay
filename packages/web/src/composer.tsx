@@ -28,7 +28,6 @@ export type ComposerDraftStorage = Pick<Storage, "getItem" | "setItem" | "remove
 
 export const Composer = memo(function Composer({
 	selectedId,
-	hasProject,
 	composerHandleRef,
 	sending,
 	canStop,
@@ -39,7 +38,6 @@ export const Composer = memo(function Composer({
 	onPromoteQueued
 }: {
 	selectedId: string | null;
-	hasProject: boolean;
 	composerHandleRef: RefObject<ComposerHandle | null>;
 	sending: boolean;
 	canStop: boolean;
@@ -222,7 +220,7 @@ export const Composer = memo(function Composer({
 				value={draft}
 				onChange={(event) => setDraftValue(event.target.value)}
 				onKeyDown={onKeyDown}
-				placeholder={selectedId ? "Message the session or type /" : hasProject ? "Create or select a session" : "Select a project first"}
+				placeholder={selectedId ? "Message the session or type /" : "Create or select a session"}
 				className="composer"
 				rows={1}
 				enterKeyHint="enter"

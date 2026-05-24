@@ -3,7 +3,7 @@ use serde_json::Value;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::Project;
+use crate::{Project, WorkspaceMount};
 
 use super::PostgresAgentStore;
 
@@ -12,17 +12,17 @@ impl PostgresAgentStore {
         &self,
         project_id: Uuid,
         name: &str,
-        starting_cwd: &str,
+        workspaces: &[WorkspaceMount],
         metadata: Value,
     ) -> Result<Project> {
         let row = sqlx::query(
             r#"
-            insert into projects (id, name, starting_cwd, metadata)
+            insert into projects (id, name, workspaces, metadata)
             values ($1, $2, $3, $4)
             returning
                 id,
                 name,
-                starting_cwd,
+                workspaces,
                 metadata,
                 created_at::text as created_at,
                 updated_at::text as updated_at
@@ -30,7 +30,7 @@ impl PostgresAgentStore {
         )
         .bind(project_id)
         .bind(name)
-        .bind(starting_cwd)
+        .bind(serde_json::to_value(workspaces)?)
         .bind(metadata)
         .fetch_one(&self.pool)
         .await?;
@@ -43,7 +43,7 @@ impl PostgresAgentStore {
             select
                 id,
                 name,
-                starting_cwd,
+                workspaces,
                 metadata,
                 created_at::text as created_at,
                 updated_at::text as updated_at
@@ -65,7 +65,7 @@ impl PostgresAgentStore {
             select
                 id,
                 name,
-                starting_cwd,
+                workspaces,
                 metadata,
                 created_at::text as created_at,
                 updated_at::text as updated_at
@@ -84,17 +84,17 @@ impl PostgresAgentStore {
         &self,
         project_id: Uuid,
         name: &str,
-        starting_cwd: &str,
+        workspaces: &[WorkspaceMount],
     ) -> Result<Project> {
         let row = sqlx::query(
             r#"
             update projects
-            set name=$2, starting_cwd=$3, updated_at=now()
+            set name=$2, workspaces=$3, updated_at=now()
             where id=$1
             returning
                 id,
                 name,
-                starting_cwd,
+                workspaces,
                 metadata,
                 created_at::text as created_at,
                 updated_at::text as updated_at
@@ -102,7 +102,7 @@ impl PostgresAgentStore {
         )
         .bind(project_id)
         .bind(name)
-        .bind(starting_cwd)
+        .bind(serde_json::to_value(workspaces)?)
         .fetch_optional(&self.pool)
         .await?
         .ok_or_else(|| anyhow!("project not found: {project_id}"))?;
@@ -128,7 +128,7 @@ pub(super) fn project_from_row(row: sqlx::postgres::PgRow) -> Result<Project> {
     Ok(Project {
         project_id: row.get("id"),
         name: row.get("name"),
-        starting_cwd: row.get("starting_cwd"),
+        workspaces: serde_json::from_value(row.get::<Value, _>("workspaces"))?,
         metadata: row.get::<Value, _>("metadata"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),

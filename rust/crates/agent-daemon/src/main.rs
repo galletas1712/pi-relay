@@ -4,6 +4,7 @@ mod auth;
 mod codec;
 mod config;
 mod model_metadata;
+mod overlay;
 mod provider_runtime;
 mod rpc_views;
 mod runtime;
@@ -15,12 +16,14 @@ use crate::codec::{
     recover_fork_branch_tail, required_string, required_uuid, transcript_store_from_stored,
 };
 use crate::config::Config;
+use crate::overlay::OverlayManager;
 use crate::provider_runtime::rendered_pi_prompt;
 use crate::runtime::*;
 use crate::state::AppState;
 use crate::types::*;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
@@ -29,7 +32,7 @@ use agent_prompt::pi_md;
 use agent_session::{AgentSession, SessionInput};
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
-    EventType, InputPriority, PostgresAgentStore, QueuedInputStatus, SessionConfig,
+    EventType, InputPriority, PostgresAgentStore, QueuedInputStatus, SessionConfig, WorkspaceMount,
 };
 use agent_tools::{ToolContext, ToolRegistry};
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -54,6 +57,7 @@ async fn main() -> Result<()> {
     }
 
     let (events, _) = broadcast::channel(1024);
+    let overlays = OverlayManager::from_default_state_dir()?;
     let state = AppState {
         repo,
         active: Arc::new(Mutex::new(HashMap::new())),
@@ -61,6 +65,7 @@ async fn main() -> Result<()> {
         tasks: Arc::new(StdMutex::new(HashMap::new())),
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        overlays,
         default_tool_context: ToolContext::new(config.workspace.clone()),
         default_workspace: config.workspace,
     };
@@ -290,16 +295,27 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
         .session_id
         .unwrap_or_else(|| format!("session_{}", Uuid::new_v4()));
     let project_id = params.project_id;
-    let project = state
-        .repo
-        .get_project(project_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let workspaces = if let Some(project_id) = project_id {
+        let project = state
+            .repo
+            .get_project(project_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        project.workspaces
+    } else {
+        vec![WorkspaceMount {
+            mount_dir: ".".to_string(),
+            source_path: home_dir_for_ephemeral_session()?
+                .to_string_lossy()
+                .into_owned(),
+        }]
+    };
     let priority = params.priority.unwrap_or(InputPriority::FollowUp);
     let content = parse_user_message(params.content)?;
     let config = SessionConfig {
         project_id,
-        starting_cwd: project.starting_cwd,
+        outer_cwd: state.overlays.session_cwd(&session_id),
+        workspaces,
         provider: params.provider,
         metadata: params.metadata.unwrap_or_else(|| json!({})),
     };
@@ -312,6 +328,16 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
         .await
         .map_err(anyhow::Error::from)?
     {
+        let current = state
+            .repo
+            .load_session_config(&session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        state
+            .overlays
+            .ensure_session(&session_id, &current)
+            .await
+            .map_err(anyhow::Error::from)?;
         return Ok(json!({
             "session_id": session_id,
             "project_id": project_id,
@@ -319,6 +345,12 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
             "replayed": true,
         }));
     }
+
+    state
+        .overlays
+        .ensure_session(&session_id, &config)
+        .await
+        .map_err(anyhow::Error::from)?;
 
     let mut session = AgentSession::new();
     session
@@ -371,7 +403,7 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
 #[derive(Debug, Deserialize)]
 struct StartSessionParams {
     session_id: Option<String>,
-    project_id: Uuid,
+    project_id: Option<Uuid>,
     provider: ProviderConfig,
     metadata: Option<Value>,
     client_input_id: Option<String>,
@@ -516,6 +548,9 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
     if !deleted {
         return Err(RpcError::new("session_not_found", "session not found"));
     }
+    if let Err(error) = state.overlays.remove_session_dir(&session_id).await {
+        eprintln!("failed to remove overlay state for {session_id}: {error:#}");
+    }
 
     Ok(json!({
         "session_id": session_id,
@@ -565,7 +600,8 @@ async fn session_configure(
     }
     let config = SessionConfig {
         project_id: current.project_id,
-        starting_cwd: current.starting_cwd.clone(),
+        outer_cwd: current.outer_cwd.clone(),
+        workspaces: current.workspaces.clone(),
         provider,
         metadata,
     };
@@ -612,13 +648,13 @@ async fn project_create(state: &AppState, params: Value) -> std::result::Result<
     if name.is_empty() {
         return Err(RpcError::new("invalid_params", "project name is required"));
     }
-    let starting_cwd = normalize_project_cwd(params.starting_cwd.as_deref(), state)?;
+    let workspaces = validate_project_workspaces(&params.workspaces, state)?;
     let project = state
         .repo
         .create_project(
             project_id,
             name,
-            &starting_cwd.to_string_lossy(),
+            &workspaces,
             params.metadata.unwrap_or_else(|| json!({})),
         )
         .await
@@ -641,16 +677,21 @@ async fn project_update(state: &AppState, params: Value) -> std::result::Result<
     if name.is_empty() {
         return Err(RpcError::new("invalid_params", "project name is required"));
     }
-    let starting_cwd = if params.get("starting_cwd").is_some() {
-        normalize_project_cwd(params.get("starting_cwd").and_then(Value::as_str), state)?
-            .to_string_lossy()
-            .into_owned()
+    let workspaces = if params.get("workspaces").is_some() {
+        let workspaces = params
+            .get("workspaces")
+            .cloned()
+            .map(serde_json::from_value::<Vec<WorkspaceMount>>)
+            .transpose()
+            .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
+            .unwrap_or_default();
+        validate_project_workspaces(&workspaces, state)?
     } else {
-        current.starting_cwd
+        current.workspaces
     };
     let project = state
         .repo
-        .update_project(project_id, name, &starting_cwd)
+        .update_project(project_id, name, &workspaces)
         .await
         .map_err(anyhow::Error::from)?;
     Ok(rpc_views::project(project))
@@ -676,34 +717,112 @@ async fn project_delete(state: &AppState, params: Value) -> std::result::Result<
 struct ProjectWriteParams {
     project_id: Option<Uuid>,
     name: String,
-    starting_cwd: Option<String>,
+    #[serde(default)]
+    workspaces: Vec<WorkspaceMount>,
     metadata: Option<Value>,
 }
 
-fn normalize_project_cwd(
-    cwd: Option<&str>,
+fn validate_project_workspaces(
+    workspaces: &[WorkspaceMount],
     state: &AppState,
-) -> std::result::Result<std::path::PathBuf, RpcError> {
-    let cwd = cwd
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| state.default_workspace.clone());
-    let normalized = if cwd.is_absolute() {
-        cwd
-    } else {
-        state.default_workspace.join(cwd)
-    };
-    if !normalized.is_dir() {
+) -> std::result::Result<Vec<WorkspaceMount>, RpcError> {
+    if workspaces.is_empty() {
         return Err(RpcError::new(
-            "invalid_project_cwd",
-            format!(
-                "project starting_cwd is not a directory: {}",
-                normalized.display()
-            ),
+            "invalid_workspace",
+            "projects require at least one workspace",
         ));
     }
+    let mut seen_mounts = BTreeSet::new();
+    let mut seen_sources = BTreeSet::new();
+    let mut normalized = Vec::new();
+    for workspace in workspaces {
+        let mount_dir = workspace.mount_dir.trim();
+        let source_path = workspace.source_path.trim();
+        if mount_dir.is_empty() || source_path.is_empty() {
+            return Err(RpcError::new(
+                "invalid_workspace",
+                "workspace mount_dir and source_path are required",
+            ));
+        }
+        if mount_dir == "." {
+            return Err(RpcError::new(
+                "invalid_workspace",
+                "project workspace mount_dir must be a direct child name",
+            ));
+        }
+        let mount_path = Path::new(mount_dir);
+        let mut components = mount_path.components();
+        let valid_single_component =
+            matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none();
+        if mount_path.is_absolute() || !valid_single_component {
+            return Err(RpcError::new(
+                "invalid_workspace",
+                format!("workspace mount_dir must be a direct child name: {mount_dir}"),
+            ));
+        }
+        if !seen_mounts.insert(mount_dir.to_string()) {
+            return Err(RpcError::new(
+                "invalid_workspace",
+                format!("duplicate workspace mount_dir: {mount_dir}"),
+            ));
+        }
+        let source = PathBuf::from(source_path);
+        let source = if source.is_absolute() {
+            source
+        } else {
+            state.default_workspace.join(source)
+        };
+        let source = source.canonicalize().map_err(|_| {
+            RpcError::new(
+                "invalid_workspace",
+                format!("workspace source is not a directory: {}", source.display()),
+            )
+        })?;
+        if !source.is_dir() {
+            return Err(RpcError::new(
+                "invalid_workspace",
+                format!("workspace source is not a directory: {}", source.display()),
+            ));
+        }
+        if source.join(".git").is_file() {
+            return Err(RpcError::new(
+                "invalid_workspace",
+                format!(
+                    "workspace source is a linked worktree; use a real repository directory: {}",
+                    source.display()
+                ),
+            ));
+        }
+        let source_path = source.to_string_lossy().into_owned();
+        if !seen_sources.insert(source_path.clone()) {
+            return Err(RpcError::new(
+                "invalid_workspace",
+                format!("duplicate workspace source: {source_path}"),
+            ));
+        }
+        normalized.push(WorkspaceMount {
+            mount_dir: mount_dir.to_string(),
+            source_path,
+        });
+    }
     Ok(normalized)
+}
+
+fn home_dir_for_ephemeral_session() -> std::result::Result<PathBuf, RpcError> {
+    let Some(home) = std::env::var_os("HOME").filter(|value| !value.is_empty()) else {
+        return Err(RpcError::new(
+            "home_unavailable",
+            "HOME is required for ephemeral sessions",
+        ));
+    };
+    let home = PathBuf::from(home);
+    if !home.is_dir() {
+        return Err(RpcError::new(
+            "home_unavailable",
+            format!("HOME is not a directory: {}", home.display()),
+        ));
+    }
+    Ok(home)
 }
 
 async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
@@ -711,6 +830,11 @@ async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<V
         let config = state
             .repo
             .load_session_config(session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        state
+            .overlays
+            .ensure_session(session_id, &config)
             .await
             .map_err(anyhow::Error::from)?;
         Some(rendered_pi_prompt(state, &config))
@@ -726,24 +850,46 @@ async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<V
             .get_project(project_id)
             .await
             .map_err(anyhow::Error::from)?;
-        let provider = params
-            .get("provider")
-            .cloned()
-            .map(serde_json::from_value)
-            .transpose()
-            .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
-            .unwrap_or_else(default_provider_config);
+        let provider = prompt_provider_config(&params)?;
+        let prompt_session_id = format!("project_prompt_{project_id}");
         let config = SessionConfig {
-            project_id,
-            starting_cwd: project.starting_cwd,
+            project_id: Some(project_id),
+            outer_cwd: state.overlays.session_cwd(&prompt_session_id),
+            workspaces: project.workspaces,
             provider,
             metadata: json!({}),
         };
+        state
+            .overlays
+            .ensure_session(&prompt_session_id, &config)
+            .await
+            .map_err(anyhow::Error::from)?;
         Some(rendered_pi_prompt(state, &config))
     } else {
-        None
+        let home = home_dir_for_ephemeral_session()?;
+        let config = SessionConfig {
+            project_id: None,
+            outer_cwd: home.to_string_lossy().into_owned(),
+            workspaces: vec![WorkspaceMount {
+                mount_dir: ".".to_string(),
+                source_path: home.to_string_lossy().into_owned(),
+            }],
+            provider: prompt_provider_config(&params)?,
+            metadata: json!({}),
+        };
+        Some(rendered_pi_prompt(state, &config))
     };
     Ok(json!({ "template": pi_md(), "rendered": rendered }))
+}
+
+fn prompt_provider_config(params: &Value) -> std::result::Result<ProviderConfig, RpcError> {
+    params
+        .get("provider")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| RpcError::new("invalid_params", error.to_string()))
+        .map(|provider| provider.unwrap_or_else(default_provider_config))
 }
 
 fn default_provider_config() -> ProviderConfig {
@@ -1092,11 +1238,12 @@ async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Va
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("session_{}", Uuid::new_v4()));
-    let config = state
+    let mut config = state
         .repo
         .load_session_config(&session_id)
         .await
         .map_err(anyhow::Error::from)?;
+    config.outer_cwd = state.overlays.session_cwd(&new_session_id);
     let stored = state
         .repo
         .load_stored_session(&session_id)
@@ -1143,6 +1290,11 @@ async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Va
         }
     };
     let child_active_leaf_id = active_leaf_id.clone();
+    state
+        .overlays
+        .ensure_session(&new_session_id, &config)
+        .await
+        .map_err(anyhow::Error::from)?;
     let events = state
         .repo
         .create_fork(
@@ -1256,6 +1408,11 @@ async fn compaction_request(
     let config = state
         .repo
         .load_session_config(&session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    state
+        .overlays
+        .ensure_session(&session_id, &config)
         .await
         .map_err(anyhow::Error::from)?;
     let created = state
