@@ -193,5 +193,7 @@ export class AgentRpcClient implements RpcClient {
 export function defaultWsUrl(): string {
 	const configured = import.meta.env.VITE_PI_AGENT_WS as string | undefined;
 	if (configured) return configured;
-	return "ws://127.0.0.1:8787";
+	const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+	const port = window.location.port ? `:${window.location.port}` : "";
+	return `${proto}//${window.location.hostname}${port}/ws`;
 }
