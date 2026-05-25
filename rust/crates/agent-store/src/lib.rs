@@ -158,32 +158,32 @@ text_enum! {
 pub struct SessionConfig {
     pub project_id: Option<Uuid>,
     pub outer_cwd: String,
-    pub workspaces: Vec<WorkspaceMount>,
+    pub workspaces: Vec<SessionWorkspace>,
     pub provider: ProviderConfig,
     pub metadata: Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct WorkspaceMount {
-    pub mount_dir: String,
-    pub source_path: String,
+pub struct ProjectWorkspace {
+    pub workspace_dir: String,
+    pub remote_url: String,
+    pub remote_branch: String,
 }
 
-impl WorkspaceMount {
-    pub fn prompt_workspace_dirs(workspaces: &[Self]) -> Vec<String> {
-        workspaces
-            .iter()
-            .filter(|workspace| workspace.mount_dir != ".")
-            .map(|workspace| workspace.mount_dir.clone())
-            .collect()
-    }
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionWorkspace {
+    pub workspace_dir: String,
+    pub remote_url: String,
+    pub remote_branch: String,
+    pub base_sha: String,
+    pub local_branch: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct Project {
     pub project_id: Uuid,
     pub name: String,
-    pub workspaces: Vec<WorkspaceMount>,
+    pub workspaces: Vec<ProjectWorkspace>,
     pub metadata: Value,
     pub created_at: String,
     pub updated_at: String,
@@ -237,7 +237,7 @@ pub struct SessionSummary {
     pub session_id: String,
     pub project_id: Option<Uuid>,
     pub outer_cwd: String,
-    pub workspaces: Vec<WorkspaceMount>,
+    pub workspaces: Vec<SessionWorkspace>,
     pub activity: SessionActivity,
     pub active_leaf_id: Option<String>,
     pub provider: ProviderConfig,
@@ -364,7 +364,7 @@ pub struct SessionSnapshot {
     pub session_id: String,
     pub project_id: Option<Uuid>,
     pub outer_cwd: String,
-    pub workspaces: Vec<WorkspaceMount>,
+    pub workspaces: Vec<SessionWorkspace>,
     pub activity: SessionActivity,
     pub active_leaf_id: Option<String>,
     pub provider: ProviderConfig,

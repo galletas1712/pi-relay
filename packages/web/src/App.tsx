@@ -63,7 +63,7 @@ import type {
 	SessionSummary,
 	ToolListing,
 	TranscriptEntry,
-	WorkspaceMount,
+	ProjectWorkspace,
 } from "./types.ts";
 
 const MAX_NOTICES = 24;
@@ -127,26 +127,23 @@ type PromptDialogState = {
 	error: string | null;
 };
 
-function formatWorkspaces(workspaces: WorkspaceMount[]): string {
-	return workspaces.map((workspace) => `${workspace.mount_dir}=${workspace.source_path}`).join("\n");
+function formatWorkspaces(workspaces: ProjectWorkspace[]): string {
+	return workspaces
+		.map((workspace) => `${workspace.workspace_dir} ${workspace.remote_url} ${workspace.remote_branch}`)
+		.join("\n");
 }
 
-function parseWorkspacesText(text: string): WorkspaceMount[] {
+function parseWorkspacesText(text: string): ProjectWorkspace[] {
 	return text
 		.split(/\r?\n/)
 		.map((line) => line.trim())
 		.filter(Boolean)
 		.map((line) => {
-			const equalsIndex = line.indexOf("=");
-			const parts =
-				equalsIndex === -1
-					? line.split(/\s+/, 2)
-					: [line.slice(0, equalsIndex).trim(), line.slice(equalsIndex + 1).trim()];
-			const [mount_dir, source_path] = parts;
-			if (!mount_dir || !source_path) {
-				throw new Error("workspace lines must be mount_dir=/absolute/source_path");
+			const [workspace_dir, remote_url, remote_branch] = line.split(/\s+/, 3);
+			if (!workspace_dir || !remote_url || !remote_branch) {
+				throw new Error("workspace lines must be: workspace_dir remote_url remote_branch");
 			}
-			return { mount_dir, source_path };
+			return { workspace_dir, remote_url, remote_branch };
 		});
 }
 
@@ -1923,7 +1920,9 @@ function ProjectDialog({
 						<textarea
 							value={state.workspacesText}
 							onChange={(event) => onChange({ workspacesText: event.target.value })}
-							placeholder={"dynamo=/home/me/dynamo/dynamo\nnixl=/home/me/dynamo/nixl"}
+							placeholder={
+								"pi-relay https://github.com/galletas1712/pi-relay.git main\nagent-config git@github.com:me/agent-config.git main"
+							}
 							required
 							disabled={state.saving}
 						/>

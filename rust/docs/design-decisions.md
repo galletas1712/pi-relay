@@ -384,7 +384,7 @@ Coding tools split into two posture buckets:
   token accounting on one surface. The tool runtime can still delegate to a
   provider-native web backend in a sidecar call when that backend exists.
 
-The daemon workspace is fixed at process launch. `bash` does not accept a
+The tool workspace is the session `outer_cwd`. `bash` does not accept a
 `workdir` override; the model relies on the announced cwd in the dynamic
 prompt context and uses `&&` chaining or inline `cd` for subdirectory work.
 Any future persistent-shell runtime would add session-level cwd state

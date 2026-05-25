@@ -81,10 +81,19 @@ impl Skill {
 }
 
 #[derive(Debug, Clone)]
+pub struct PromptWorkspace {
+    pub workspace_dir: String,
+    pub remote_url: String,
+    pub remote_branch: String,
+    pub base_sha: String,
+    pub local_branch: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct PromptContext {
     pub cwd: PathBuf,
     pub has_project: bool,
-    pub workspace_dirs: Vec<String>,
+    pub workspaces: Vec<PromptWorkspace>,
     pub tools: Vec<ToolSpec>,
     pub skills: Vec<Skill>,
 }
@@ -115,9 +124,7 @@ fn render(template: &str, ctx: &PromptContext) -> String {
 
 fn template_context(ctx: &PromptContext) -> Value {
     let agents_md = if ctx.has_project {
-        find_upward(&ctx.cwd, "AGENTS.md")
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .unwrap_or_default()
+        agents_md_for_workspaces(&ctx.cwd, &ctx.workspaces)
     } else {
         String::new()
     };
@@ -125,8 +132,8 @@ fn template_context(ctx: &PromptContext) -> Value {
         "session": {
             "cwd": path_display(&ctx.cwd),
             "has_project": ctx.has_project,
-            "workspace_dirs": ctx.workspace_dirs,
-            "workspace_dirs_markdown": workspace_dirs_markdown(&ctx.workspace_dirs),
+            "workspaces": workspaces_json(&ctx.workspaces),
+            "workspaces_markdown": workspaces_markdown(&ctx.workspaces),
         },
         "project": {
             "agents_md": agents_md,
@@ -163,13 +170,39 @@ fn tools_specs_markdown(tools: &[ToolSpec]) -> String {
         .join("\n\n")
 }
 
-fn workspace_dirs_markdown(workspace_dirs: &[String]) -> String {
-    if workspace_dirs.is_empty() {
-        return "No workspace directories are configured for this session.".to_string();
+fn workspaces_json(workspaces: &[PromptWorkspace]) -> Value {
+    Value::Array(
+        workspaces
+            .iter()
+            .map(|workspace| {
+                json!({
+                    "workspace_dir": workspace.workspace_dir,
+                    "remote_url": workspace.remote_url,
+                    "remote_branch": workspace.remote_branch,
+                    "base_sha": workspace.base_sha,
+                    "local_branch": workspace.local_branch,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn workspaces_markdown(workspaces: &[PromptWorkspace]) -> String {
+    if workspaces.is_empty() {
+        return "No project workspaces are configured for this session.".to_string();
     }
-    workspace_dirs
+    workspaces
         .iter()
-        .map(|dir| format!("- {dir}"))
+        .map(|workspace| {
+            format!(
+                "- {dir}\n  - remote: {remote}\n  - remote branch: origin/{branch}\n  - base commit: {base}\n  - local session branch: {local}",
+                dir = workspace.workspace_dir,
+                remote = workspace.remote_url,
+                branch = workspace.remote_branch,
+                base = workspace.base_sha,
+                local = workspace.local_branch,
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -212,19 +245,23 @@ fn skills_index_xml(skills: &[Skill]) -> String {
     lines.join("\n")
 }
 
-fn find_upward(start: &Path, filename: &str) -> Option<PathBuf> {
-    let mut current = if start.is_dir() {
-        start
-    } else {
-        start.parent()?
-    };
-    loop {
-        let candidate = current.join(filename);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        current = current.parent()?;
-    }
+fn agents_md_for_workspaces(cwd: &Path, workspaces: &[PromptWorkspace]) -> String {
+    workspaces
+        .iter()
+        .filter_map(|workspace| {
+            let path = cwd.join(&workspace.workspace_dir).join("AGENTS.md");
+            let content = std::fs::read_to_string(path).ok()?;
+            if content.trim().is_empty() {
+                return None;
+            }
+            Some(format!(
+                "### {}\n\n{}",
+                workspace.workspace_dir,
+                content.trim()
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 fn escape_xml(value: &str) -> String {
@@ -267,7 +304,13 @@ mod tests {
         PromptContext {
             cwd: PathBuf::from("/tmp/project"),
             has_project: true,
-            workspace_dirs: Vec::new(),
+            workspaces: vec![PromptWorkspace {
+                workspace_dir: "repo".to_string(),
+                remote_url: "https://example.com/repo.git".to_string(),
+                remote_branch: "main".to_string(),
+                base_sha: "abc123".to_string(),
+                local_branch: "pi/session/test/repo".to_string(),
+            }],
             tools: tools
                 .into_iter()
                 .map(|name| {
@@ -318,11 +361,11 @@ mod tests {
     #[test]
     fn custom_template_data_can_choose_to_include_cwd() {
         let rendered = render(
-            "cwd={{ session.cwd }}\nworkspaces={{ session.workspace_dirs_markdown }}\n\n{{ tools.specs }}",
+            "cwd={{ session.cwd }}\nworkspaces={{ session.workspaces_markdown }}\n\n{{ tools.specs }}",
             &ctx(vec!["Bash"], Vec::new()),
         );
         assert!(rendered.contains("cwd=/tmp/project"));
-        assert!(rendered.contains("No workspace directories"));
+        assert!(rendered.contains("base commit: abc123"));
         assert!(rendered.contains("Parameters:"));
     }
 
@@ -330,6 +373,7 @@ mod tests {
     fn pi_template_gates_ephemeral_workspace_copy() {
         let mut ctx = ctx(vec!["Bash"], Vec::new());
         ctx.has_project = false;
+        ctx.workspaces = Vec::new();
         ctx.cwd = PathBuf::from("/home/tester");
         let rendered = render_prompt(&ctx);
         assert!(rendered.contains("Current working directory: /home/tester"));

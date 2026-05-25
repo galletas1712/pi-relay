@@ -39,10 +39,11 @@ sending the same websocket frames a frontend would send.
    unfinished actions and no queued inputs waiting to become transcript. A
    frontend should send `input.interrupt`, wait for idle, then retry.
 
-6. Fork is source-non-mutating.
-   `history.fork` is allowed while the source session is running as long as the
-   target `leaf_id` is an explicit existing transcript entry. Fork from `null`
-   is rejected with `missing_leaf_id`.
+6. Fork is transcript-source-non-mutating.
+   `history.fork` copies the source transcript forest and never rewrites the
+   source session history. Fork from `null` is rejected with `missing_leaf_id`.
+   Sessions with Git workspaces must be idle before fork so the daemon can copy
+   a coherent checkout; ephemeral host sessions have no workspace state to copy.
 
 7. Tools are always allowed.
    The daemon runs model-requested tools immediately. There is no approval or
@@ -93,11 +94,13 @@ metadata jsonb not null default '{}'::jsonb
 workspaces jsonb not null default '[]'::jsonb
 ```
 
-Projects define source workspaces as `{ mount_dir, source_path }` records. Each
-session has its own `outer_cwd` under the pi-relay state directory and snapshots
-the source workspaces it should mount there. Ephemeral host sessions have
-`project_id: null` and use a root workspace mount over `$HOME`.
-Model prompt context and local tools use the session's stored `outer_cwd`.
+Projects define Git workspaces as `{ workspace_dir, remote_url, remote_branch }`
+records. When a project session starts, the daemon fetches each listed remote
+branch, creates a private Git checkout under the session `outer_cwd`, records
+the fetched base commit, and switches that checkout to a session-local branch.
+Ephemeral host sessions have `project_id: null`, no project workspaces, and use
+`$HOME` as `outer_cwd`. Model prompt context and local tools use the session's
+stored `outer_cwd`.
 
 `provider_config`:
 
@@ -384,7 +387,8 @@ the normal frontend path for a brand-new draft.
 ```
 
 Omit `project_id` to start an ephemeral host session. Ephemeral sessions are not
-assigned to a project and get a root overlay mount over `$HOME`.
+assigned to a project, have no project workspace records, and use `$HOME` as
+their `outer_cwd`.
 
 The daemon writes `session.created`, `input.accepted`, transcript entries,
 actions, and events in the same session-start transition before dispatching
@@ -431,8 +435,20 @@ Result shape:
   "project_id": "f2b0e23c-1fd7-4977-9d60-f6842e25d15b",
   "outer_cwd": "/home/me/.local/state/pi-relay/sessions/s1/cwd",
   "workspaces": [
-    { "mount_dir": "repo-a", "source_path": "/Users/me/src/repo-a" },
-    { "mount_dir": "repo-b", "source_path": "/Users/me/src/repo-b" }
+    {
+      "workspace_dir": "repo-a",
+      "remote_url": "https://github.com/me/repo-a.git",
+      "remote_branch": "main",
+      "base_sha": "8e9b2f4b7c2c7f0ef2e3b6f0e5ef4f1b18b3b111",
+      "local_branch": "pi/session/s1/repo-a"
+    },
+    {
+      "workspace_dir": "repo-b",
+      "remote_url": "git@github.com:me/repo-b.git",
+      "remote_branch": "staging",
+      "base_sha": "9f7a2b4b2c3d4e5f60718293a4b5c6d7e8f90123",
+      "local_branch": "pi/session/s1/repo-b"
+    }
   ],
   "activity": "idle",
   "active_leaf_id": "entry_9",
@@ -476,8 +492,16 @@ snapshots its own values at creation time.
 {
   "name": "my repo",
   "workspaces": [
-    { "mount_dir": "repo-a", "source_path": "/Users/me/src/repo-a" },
-    { "mount_dir": "repo-b", "source_path": "/Users/me/src/repo-b" }
+    {
+      "workspace_dir": "repo-a",
+      "remote_url": "https://github.com/me/repo-a.git",
+      "remote_branch": "main"
+    },
+    {
+      "workspace_dir": "repo-b",
+      "remote_url": "git@github.com:me/repo-b.git",
+      "remote_branch": "staging"
+    }
   ],
   "metadata": { "created_by": "web" }
 }
@@ -486,16 +510,21 @@ snapshots its own values at creation time.
 ### `project.update`
 
 Renames a project and/or changes the workspace sources used for future sessions.
-Each `mount_dir` must be a direct child name, and each `source_path` must be an
-existing real repository directory. Updating a project does not change existing
-sessions in that project.
+Each `workspace_dir` must be a direct child name and must not start with `.`.
+Each `remote_url` must be reachable by `git ls-remote`, and each
+`remote_branch` must name an existing branch on that remote. Updating a project
+does not change existing sessions in that project.
 
 ```json
 {
   "project_id": "f2b0e23c-1fd7-4977-9d60-f6842e25d15b",
   "name": "pi-relay",
   "workspaces": [
-    { "mount_dir": "pi-relay", "source_path": "/Users/me/src/pi-relay" }
+    {
+      "workspace_dir": "pi-relay",
+      "remote_url": "https://github.com/galletas1712/pi-relay.git",
+      "remote_branch": "main"
+    }
   ]
 }
 ```
@@ -694,7 +723,9 @@ has moved since the picker was opened, switch fails with `history_changed`.
 ### `history.fork`
 
 Creates a new durable session from any existing transcript entry. This does not
-mutate the source, so it can run while the source is busy. The child receives a
+mutate the source transcript. Sessions with Git workspaces must be idle so the
+daemon can copy a coherent checkout; ephemeral host sessions have no workspace
+state to copy. The child receives a
 snapshot of the source session's full transcript forest, then its active leaf is
 set to the requested fork target. That means compaction roots and
 pre-compaction branches remain navigable in the child session. If the target

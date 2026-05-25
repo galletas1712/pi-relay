@@ -110,7 +110,8 @@ Implemented user-facing behavior:
 - Idle-only compaction request with structural validation.
 - Daemon restart recovery for open transcript tails.
 - Stale action rejection through persisted `attempt_id`.
-- Repo-level `PI.md` prompt composition, with project `AGENTS.md` included by the template.
+- Repo-level `PI.md` prompt composition, with each workspace checkout's
+  `AGENTS.md` included by the template.
 - Provider config with `max_tokens` and `prompt_cache.key`.
 - Real Codex provider path through `~/.codex/auth.json` or
   `CODEX_ACCESS_TOKEN`.
@@ -306,10 +307,10 @@ the session.
 
 Current builtins:
 
-- `read`: read UTF-8 text from the workspace.
-- `write`: write UTF-8 text, creating parent directories.
-- `edit`: replace exact UTF-8 text once.
-- `bash`: run `sh -lc` in the workspace with a 30-second timeout.
+- `Grep`: search files under the session `outer_cwd`.
+- `Edit`/`apply_patch`: view or edit files under the session `outer_cwd`.
+- `Bash`: run a fresh command under the session `outer_cwd` with a 30-second
+  default timeout.
 
 Tools are intentionally unsandboxed personal-use primitives. Tool calls are
 always allowed, and there is no approval interface.

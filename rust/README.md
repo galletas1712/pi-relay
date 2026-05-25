@@ -60,8 +60,7 @@ SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
 RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/clang' \
 cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
   --database-url postgres://postgres:postgres@127.0.0.1:55432/pi_relay \
-  --bind 127.0.0.1:8787 \
-  --workspace /Users/schwinns/.codex/worktrees/45d5/pi-relay
+  --bind 127.0.0.1:8787
 ```
 
 The websocket endpoint is `ws://127.0.0.1:8787`.
@@ -81,7 +80,7 @@ Session provider config supports `reasoning_effort`, an optional explicit
 `medium`, `high`, `xhigh`, and `max`. The daemon does not add a default OpenAI output
 cap. Claude Opus 4.7 uses adaptive thinking with `output_config.effort` and a
 64k default `max_tokens` value because the Messages API requires that field.
-The model system prompt is rendered from the repo-level `PI.md` template. Project-specific instructions enter through `AGENTS.md`, which `PI.md` composes explicitly. The daemon does not inject date, time, or cwd unless the template asks for it.
+The model system prompt is rendered from the repo-level `PI.md` template. Project-specific instructions enter through `AGENTS.md` files in the session's workspace checkouts, which `PI.md` composes explicitly. The daemon does not inject date, time, or cwd unless the template asks for it.
 
 ## Web UI
 

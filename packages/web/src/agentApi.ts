@@ -14,7 +14,7 @@ import type {
 	SessionSummary,
 	ToolListing,
 	TranscriptItem,
-	WorkspaceMount
+	ProjectWorkspace,
 } from "./types.ts";
 import type { HistoryPlacement } from "./historyTargets.ts";
 import type { EntryScope } from "./queryKeys.ts";
@@ -56,14 +56,14 @@ export interface AgentApi {
 
 export interface CreateProjectParams {
 	name: string;
-	workspaces: WorkspaceMount[];
+	workspaces: ProjectWorkspace[];
 	metadata?: Record<string, unknown>;
 }
 
 export interface UpdateProjectParams {
 	projectId: string;
 	name?: string;
-	workspaces?: WorkspaceMount[];
+	workspaces?: ProjectWorkspace[];
 }
 
 export interface DeleteProjectResult {

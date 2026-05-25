@@ -5,7 +5,7 @@ use sqlx::Row;
 
 use crate::{
     ActionKind, ActionStatus, PendingActionRecord, QueuedInputRecord, QueuedInputStatus,
-    SessionActivity, SessionSnapshot,
+    SessionActivity, SessionSnapshot, SessionWorkspace,
 };
 
 use super::rows::{queued_input_record_content, row_text};
@@ -81,7 +81,9 @@ impl PostgresAgentStore {
             session_id: session.get("id"),
             project_id: session.get("project_id"),
             outer_cwd: session.get("outer_cwd"),
-            workspaces: serde_json::from_value(session.get::<Value, _>("workspaces"))?,
+            workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
+                session.get::<Value, _>("workspaces"),
+            )?,
             activity,
             active_leaf_id: session.get("active_leaf_id"),
             provider,

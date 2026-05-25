@@ -11,7 +11,7 @@ use agent_store::{
     CompactionScope, CompactionTrigger, EventFrame, EventType, InputPriority, OutputBatch,
     PersistedAction, QueueMutationError, QueuedInput, SessionActivity, SessionConfig,
 };
-use agent_tools::dynamic_tool_context;
+use agent_tools::ToolContext;
 use agent_vocab::{
     ProviderReplayItem, ToolResultMessage, ToolResultStatus, TranscriptItem, UserMessage,
 };
@@ -219,8 +219,8 @@ impl SessionDriver {
             .await
             .map_err(anyhow::Error::from)?;
         self.state
-            .overlays
-            .ensure_session(&self.session_id, &config)
+            .workspaces
+            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
             .await
             .map_err(anyhow::Error::from)?;
         let stored = self
@@ -472,8 +472,8 @@ impl SessionDriver {
             .await
             .map_err(anyhow::Error::from)?;
         self.state
-            .overlays
-            .ensure_session(&self.session_id, &config)
+            .workspaces
+            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
             .await
             .map_err(anyhow::Error::from)?;
         let stored = self
@@ -563,8 +563,8 @@ impl SessionDriver {
             .await
             .map_err(anyhow::Error::from)?;
         self.state
-            .overlays
-            .ensure_session(&self.session_id, &config)
+            .workspaces
+            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
             .await
             .map_err(anyhow::Error::from)?;
         let resolved = pending
@@ -1619,15 +1619,17 @@ async fn run_tool_turn(
     }
     publish_events(&state, events);
     state
-        .overlays
-        .ensure_session(&session_id, &dispatch.config)
+        .workspaces
+        .ensure_session(
+            &session_id,
+            &dispatch.config.outer_cwd,
+            &dispatch.config.workspaces,
+        )
         .await
         .map_err(anyhow::Error::from)?;
 
-    let tool_context = dynamic_tool_context(
-        &state.default_tool_context,
-        std::path::PathBuf::from(dispatch.config.outer_cwd.clone()),
-    );
+    let tool_context =
+        ToolContext::new(std::path::PathBuf::from(dispatch.config.outer_cwd.clone()));
     let result = if tool_call.tool_name == "LoadSkill" {
         let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
         load_skill_result(

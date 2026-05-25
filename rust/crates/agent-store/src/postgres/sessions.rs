@@ -5,7 +5,7 @@ use sqlx::Row;
 
 use crate::{
     AcceptedInput, EventFrame, EventType, InputPriority, OutputBatch, PersistedAction,
-    SessionActivity, SessionConfig, SessionSummary,
+    SessionActivity, SessionConfig, SessionSummary, SessionWorkspace,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 
@@ -386,7 +386,9 @@ impl PostgresAgentStore {
                     session_id: id,
                     project_id: row.get("project_id"),
                     outer_cwd: row.get("outer_cwd"),
-                    workspaces: serde_json::from_value(row.get::<Value, _>("workspaces"))?,
+                    workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
+                        row.get::<Value, _>("workspaces"),
+                    )?,
                     activity,
                     active_leaf_id: row.get("active_leaf_id"),
                     provider,
@@ -419,7 +421,9 @@ impl PostgresAgentStore {
         Ok(SessionConfig {
             project_id: row.get("project_id"),
             outer_cwd: row.get("outer_cwd"),
-            workspaces: serde_json::from_value(row.get::<Value, _>("workspaces"))?,
+            workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
+                row.get::<Value, _>("workspaces"),
+            )?,
             provider: serde_json::from_value(row.get("provider_config"))?,
             metadata: row.get("metadata"),
         })

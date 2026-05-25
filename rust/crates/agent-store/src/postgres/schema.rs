@@ -4,11 +4,12 @@ use sqlx::PgPool;
 /// Postgres is the durable source of truth for sessions.
 ///
 /// Tables:
-/// - `projects`: one row per host project. Its workspace mounts are the
-///   defaults for new sessions.
+/// - `projects`: one row per project. Its Git workspace remotes/branches are
+///   the defaults for new sessions.
 /// - `sessions`: one row per durable session, including active transcript leaf
 ///   and provider/session metadata. Sessions snapshot the project workspace
-///   sources and get their own overlay-backed outer cwd.
+///   remote branches, base commits, and local branch names; project sessions
+///   get their own private Git checkouts under `outer_cwd`.
 /// - `daemon_config`: reserved daemon key-value config.
 /// - `transcript_entries`: append-only transcript forest. `parent_id` points
 ///   within the same session, while `sequence` preserves insertion order.

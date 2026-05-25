@@ -1,9 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde_json::Value;
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::{Project, WorkspaceMount};
+use crate::{Project, ProjectWorkspace};
 
 use super::PostgresAgentStore;
 
@@ -12,7 +12,7 @@ impl PostgresAgentStore {
         &self,
         project_id: Uuid,
         name: &str,
-        workspaces: &[WorkspaceMount],
+        workspaces: &[ProjectWorkspace],
         metadata: Value,
     ) -> Result<Project> {
         let row = sqlx::query(
@@ -84,7 +84,7 @@ impl PostgresAgentStore {
         &self,
         project_id: Uuid,
         name: &str,
-        workspaces: &[WorkspaceMount],
+        workspaces: &[ProjectWorkspace],
     ) -> Result<Project> {
         let row = sqlx::query(
             r#"
@@ -125,10 +125,14 @@ impl PostgresAgentStore {
 }
 
 pub(super) fn project_from_row(row: sqlx::postgres::PgRow) -> Result<Project> {
+    let project_id = row.get("id");
     Ok(Project {
-        project_id: row.get("id"),
+        project_id,
         name: row.get("name"),
-        workspaces: serde_json::from_value(row.get::<Value, _>("workspaces"))?,
+        workspaces: serde_json::from_value::<Vec<ProjectWorkspace>>(
+            row.get::<Value, _>("workspaces"),
+        )
+        .with_context(|| format!("decode project workspaces for {}", project_id))?,
         metadata: row.get::<Value, _>("metadata"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
