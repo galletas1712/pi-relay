@@ -97,7 +97,7 @@ describe("historyEntryDisplay", () => {
 });
 
 describe("historyForkOptions", () => {
-	it("uses the same visible targets as switch, with before-placement composer restoration for user messages", () => {
+	it("uses the same actionable turn-boundary targets as switch", () => {
 		const options = historyForkOptions(fixtureEntries(), "finish2");
 		const userTarget = options.find((option) => option.id === "user2");
 		const boundaryTarget = options.find((option) => option.id === "finish2");
@@ -105,7 +105,7 @@ describe("historyForkOptions", () => {
 		expect(options.map((option) => option.id)).toEqual(["sibling", "finish2", "user2", "finish1", "user1"]);
 		expect(userTarget).toMatchObject({
 			actionLeafId: "finish1",
-			placement: "before",
+			expectedActiveLeafId: "finish2",
 			restoreText: "second question",
 			sourceEntryId: "user2",
 			turnLabel: "u2",
@@ -113,7 +113,7 @@ describe("historyForkOptions", () => {
 		});
 		expect(boundaryTarget).toMatchObject({
 			actionLeafId: "finish2",
-			placement: "at",
+			expectedActiveLeafId: "finish2",
 			isActive: true,
 			turnLabel: "t2",
 			meta: expect.stringContaining("fork ·")

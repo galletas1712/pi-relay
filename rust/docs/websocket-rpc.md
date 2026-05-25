@@ -41,9 +41,9 @@ sending the same websocket frames a frontend would send.
 
 6. Fork is transcript-source-non-mutating.
    `history.fork` copies the source transcript forest and never rewrites the
-   source session history. Fork from `null` is rejected with `missing_leaf_id`.
-   Sessions with Git workspaces must be idle before fork so the daemon can copy
-   a coherent checkout; ephemeral host sessions have no workspace state to copy.
+   source session history. It is idle-only and accepts the same turn-boundary
+   targets as `history.switch` so workspace copies always reflect a coherent
+   source state.
 
 7. Tools are always allowed.
    The daemon runs model-requested tools immediately. There is no approval or
@@ -314,10 +314,9 @@ Invalid states should not be produced by the websocket service:
 - Switch to a non-boundary transcript entry.
 - Transcript rows committed without the matching action/event updates.
 
-Forking to a non-boundary entry is valid because the source is not mutated; the
-new session owns the copied partial path. The daemon closes that copied partial
-tail as `Interrupted` in the child so it is immediately runnable and does not
-look like daemon crash recovery.
+Forking to a non-boundary entry is invalid for the websocket service. Fork uses
+the same target rule as `history.switch`, which keeps copied Git workspaces and
+the child transcript on a completed turn boundary.
 
 Accepted transitions commit transcript rows, action updates, queued-input
 updates, active-leaf changes, and events in one transaction.
@@ -722,41 +721,27 @@ has moved since the picker was opened, switch fails with `history_changed`.
 
 ### `history.fork`
 
-Creates a new durable session from any existing transcript entry. This does not
-mutate the source transcript. Sessions with Git workspaces must be idle so the
-daemon can copy a coherent checkout; ephemeral host sessions have no workspace
-state to copy. The child receives a
-snapshot of the source session's full transcript forest, then its active leaf is
-set to the requested fork target. That means compaction roots and
-pre-compaction branches remain navigable in the child session. If the target
-entry is inside an open turn, the child receives an interrupted turn finish on
-that copied branch.
+Creates a new durable session from a turn boundary. This does not mutate the
+source transcript. The source session must be idle so the daemon can copy a
+coherent checkout for project sessions. The child receives a snapshot of the
+source session's full transcript forest, then its active leaf is set to the
+requested boundary. That means compaction roots and pre-compaction branches
+remain navigable in the child session.
 
 ```json
 {
   "session_id": "s1",
   "leaf_id": "entry_4",
-  "placement": "at",
+  "expected_active_leaf_id": "entry_current",
   "new_session_id": "optional"
 }
 ```
 
-Returns the new session id, the requested source leaf, and the child active
-leaf. For non-boundary forks, the child active leaf is the appended interrupted
-turn finish.
-
-For a user-message target, the frontend can request:
-
-```json
-{ "session_id": "s1", "leaf_id": "entry_user_1", "placement": "before" }
-```
-
-That creates the child from the previous completed turn boundary, or from root
-for the first user message. The selected user message itself remains a
-frontend composer draft, not transcript state in the child.
-
-`leaf_id: null` fails with `missing_leaf_id`; unknown entries fail with
-`entry_not_found`.
+Returns the new session id, the requested source leaf, and the child active leaf.
+`leaf_id: null` forks from the empty-log sentinel. Unknown entries and
+non-boundaries fail with `not_turn_boundary`. If `expected_active_leaf_id` is
+supplied and the session has moved since the picker was opened, fork fails with
+`history_changed`.
 
 ### `turn.resume`
 
@@ -1018,13 +1003,15 @@ descendant rows are preserved, and non-boundary switch fails with
 ### 7. Fork Lifecycle
 
 1. Start a pending turn on a session that has older transcript entries.
-2. Fork from an older boundary into a new session.
-3. Try fork with `leaf_id: null`.
-4. Fork from a non-boundary/open-turn entry.
+2. Attempt `history.fork` to an older boundary.
+3. Interrupt, wait for idle, then fork again.
+4. Try fork with `leaf_id: null`.
+5. Fork from a non-boundary/open-turn entry.
 
-Verify running-safe fork succeeds without mutating the source active leaf,
-fork-from-null fails with `missing_leaf_id`, and fork from open/non-boundary
-history succeeds as a copied branch in the new session.
+Verify running fork fails with `session_busy`, post-interrupt fork succeeds
+without mutating the source active leaf, fork-from-null creates a child rooted at
+the empty-log sentinel, and fork from open/non-boundary history fails with
+`not_turn_boundary`.
 
 ### 8. Real Tools
 

@@ -16,7 +16,6 @@ import type {
 	TranscriptItem,
 	ProjectWorkspace,
 } from "./types.ts";
-import type { HistoryPlacement } from "./historyTargets.ts";
 import type { EntryScope } from "./queryKeys.ts";
 
 type EventHandler = (event: EventFrame) => void;
@@ -131,8 +130,7 @@ export interface SwitchHistoryResult {
 
 export interface ForkHistoryResult {
 	session_id: string;
-	source_leaf_id: string;
-	placement: HistoryPlacement;
+	source_leaf_id: string | null;
 	active_leaf_id: string | null;
 }
 
@@ -171,7 +169,7 @@ export interface SwitchHistoryParams {
 export interface ForkHistoryParams {
 	sessionId: string;
 	leafId: string | null;
-	placement: HistoryPlacement;
+	expectedActiveLeafId: string | null;
 }
 
 export interface ConfigureSessionParams {
@@ -331,7 +329,7 @@ class AgentApiClient implements AgentApi {
 		return this.client.request<ForkHistoryResult>("history.fork", {
 			session_id: params.sessionId,
 			leaf_id: params.leafId,
-			placement: params.placement
+			expected_active_leaf_id: params.expectedActiveLeafId
 		});
 	}
 

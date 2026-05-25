@@ -10,14 +10,11 @@ import {
 import type { TranscriptEntry, TurnOutcome } from "./types.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
 
-export type HistoryPlacement = "at" | "before";
-
 export interface HistoryTargetOption {
 	id: string | null;
 	actionLeafId: string | null;
 	expectedActiveLeafId?: string | null;
 	sourceEntryId?: string;
-	placement?: HistoryPlacement;
 	restoreText?: string;
 	turnLabel: string;
 	title: string;
@@ -257,7 +254,6 @@ function forkOptionForEntry(
 			id: entry.id,
 			actionLeafId: previousTurnBoundaryId(index, meta),
 			sourceEntryId: entry.id,
-			placement: "before",
 			restoreText: text,
 			turnLabel: currentTurnId ? `u${currentTurnId}` : "user",
 			title: currentTurnId ? `User message in turn ${currentTurnId}` : "User message",
@@ -272,7 +268,6 @@ function forkOptionForEntry(
 			id: entry.id,
 			actionLeafId: entry.id,
 			sourceEntryId: entry.id,
-			placement: "at",
 			turnLabel: currentTurnId ? `a${currentTurnId}` : "asst",
 			title: step ? modelStepTitle(step) : currentTurnId ? `Assistant message in turn ${currentTurnId}` : "Assistant message",
 			preview: step ? modelStepPreview(step) : "Assistant message.",
@@ -285,7 +280,6 @@ function forkOptionForEntry(
 			id: entry.id,
 			actionLeafId: entry.id,
 			sourceEntryId: entry.id,
-			placement: "at",
 			turnLabel: "tool",
 			title: `Tool result: ${item.tool_name}`,
 			preview: `${item.status.toLowerCase()}: ${truncate(firstLine(item.output) || "(empty)", 84)}`,
@@ -298,7 +292,6 @@ function forkOptionForEntry(
 			id: entry.id,
 			actionLeafId: entry.id,
 			sourceEntryId: entry.id,
-			placement: "at",
 			turnLabel: `t${item.turn_id}`,
 			title: `End of turn ${item.turn_id}`,
 			preview: `${item.outcome.toLowerCase()} turn boundary.`,
@@ -312,7 +305,6 @@ function forkOptionForEntry(
 			id: entry.id,
 			actionLeafId: entry.id,
 			sourceEntryId: entry.id,
-			placement: "at",
 			turnLabel: `c${item.last_turn_id}`,
 			title: "Compacted history",
 			preview: truncate(item.summary, 96),
@@ -339,9 +331,8 @@ function branchPointOptionForEntry(
 		return {
 			id: entry.id,
 			actionLeafId,
-			expectedActiveLeafId: mode === "switch" ? activeLeafId : undefined,
+			expectedActiveLeafId: activeLeafId,
 			sourceEntryId: entry.id,
-			placement: mode === "fork" ? "before" : undefined,
 			restoreText: text,
 			turnLabel: currentTurnId ? `u${currentTurnId}` : "user",
 			title: "User message",
@@ -356,9 +347,8 @@ function branchPointOptionForEntry(
 		return {
 			id: entry.id,
 			actionLeafId: entry.id,
-			expectedActiveLeafId: mode === "switch" ? activeLeafId : undefined,
+			expectedActiveLeafId: activeLeafId,
 			sourceEntryId: entry.id,
-			placement: mode === "fork" ? "at" : undefined,
 			turnLabel: `t${item.turn_id}`,
 			title: step ? modelStepTitle(step) : `End of turn ${item.turn_id}`,
 			preview: step ? modelStepPreview(step) : `${item.outcome.toLowerCase()} turn completed.`,
@@ -372,9 +362,8 @@ function branchPointOptionForEntry(
 	return {
 		id: entry.id,
 		actionLeafId: entry.id,
-		expectedActiveLeafId: mode === "switch" ? activeLeafId : undefined,
+		expectedActiveLeafId: activeLeafId,
 		sourceEntryId: entry.id,
-		placement: mode === "fork" ? "at" : undefined,
 		turnLabel: display.turnLabel,
 		title: display.title,
 		preview: display.preview,

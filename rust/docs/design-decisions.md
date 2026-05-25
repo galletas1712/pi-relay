@@ -168,10 +168,10 @@ and event type. They serialize to the same Postgres/websocket strings as
 before, so the wire contract stays stable while invalid database values fail
 at decode time.
 
-`agent-daemon` also parses websocket method names and fork placement into
-daemon-local enums before dispatching. JSON content blocks, image sources, and
-assistant items use the serde-tagged vocabulary types from `agent-vocab`
-instead of hand-matching `"type"` and `"kind"` strings in the codec.
+`agent-daemon` also parses websocket method names into daemon-local enums before
+dispatching. JSON content blocks, image sources, and assistant items use the
+serde-tagged vocabulary types from `agent-vocab` instead of hand-matching
+`"type"` and `"kind"` strings in the codec.
 
 Provider request bodies still contain provider-specific string fields such as
 OpenAI/Anthropic `role` and `model`; those are external API wire values rather

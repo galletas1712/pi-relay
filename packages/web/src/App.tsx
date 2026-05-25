@@ -977,18 +977,29 @@ export function App() {
 	const forkFromTarget = useCallback(
 		async (target: HistoryTargetOption, title?: string) => {
 			const sessionId = requireSelected();
+			if (!loadedSnapshot || loadedSnapshot.session_id !== sessionId) {
+				throw new Error("session is still loading");
+			}
+			if (loadedSnapshot.activity !== "idle") {
+				throw new Error("stop the active turn before forking history");
+			}
 			const fork = await api.forkHistory({
 				sessionId,
-				leafId: target.sourceEntryId ?? target.id,
-				placement: target.placement ?? "at",
+				leafId: target.actionLeafId,
+				expectedActiveLeafId: target.expectedActiveLeafId ?? loadedSnapshot.active_leaf_id ?? null,
 			});
 			const normalizedTitle = title?.trim();
 			if (normalizedTitle) {
 				await api.configureSession({
 					sessionId: fork.session_id,
-					provider: loadedSnapshot?.provider ?? selectedSession?.provider ?? DEFAULT_PROVIDER,
+					provider: loadedSnapshot.provider,
 					metadata: {
-						...(loadedSnapshot?.metadata ?? selectedSession?.metadata ?? {}),
+						...loadedSnapshot.metadata,
+						fork: {
+							source_session_id: sessionId,
+							source_leaf_id: fork.source_leaf_id,
+							active_leaf_id: fork.active_leaf_id,
+						},
 						title: normalizedTitle,
 					},
 				});
@@ -1001,7 +1012,7 @@ export function App() {
 			pushNotice("success", `forked ${fork.session_id}`);
 			return fork.session_id;
 		},
-		[api, invalidateSessionList, loadedSnapshot, pushNotice, requireSelected, selectedSession, selectSession],
+		[api, invalidateSessionList, loadedSnapshot, pushNotice, requireSelected, selectSession],
 	);
 
 	const switchToTarget = useCallback(

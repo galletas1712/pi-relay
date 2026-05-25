@@ -12,8 +12,8 @@ mod types;
 mod workspaces;
 
 use crate::codec::{
-    fork_branch_before_user_message, from_params, parse_assistant_message, parse_user_message,
-    recover_fork_branch_tail, required_string, required_uuid, transcript_store_from_stored,
+    from_params, parse_assistant_message, parse_user_message, required_string, required_uuid,
+    transcript_store_from_stored,
 };
 use crate::config::Config;
 use crate::provider_runtime::{rendered_pi_prompt, ProviderConnectionRegistry};
@@ -1166,38 +1166,62 @@ async fn history_switch(state: &AppState, params: Value) -> std::result::Result<
 
 async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
-    let Some(leaf_id) = params.get("leaf_id").and_then(Value::as_str) else {
-        return Err(RpcError::new(
-            "missing_leaf_id",
-            "history.fork requires an explicit transcript entry",
-        ));
+    let leaf_id = match params.get("leaf_id") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) => Some(value.as_str()),
+        Some(_) => {
+            return Err(RpcError::new(
+                "invalid_params",
+                "leaf_id must be a string or null",
+            ))
+        }
     };
-    let placement = params
-        .get("placement")
-        .and_then(Value::as_str)
-        .map(|value| {
-            ForkPlacement::parse(value).ok_or_else(|| {
-                RpcError::new(
-                    "invalid_placement",
-                    "history.fork placement must be 'at' or 'before'",
-                )
-            })
-        })
-        .transpose()?
-        .unwrap_or(ForkPlacement::At);
     let new_session_id = params
         .get("new_session_id")
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(|| format!("session_{}", Uuid::new_v4()));
+
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.ensure_idle_for_source_mutation().await?;
+
+    let stored = state
+        .repo
+        .load_stored_session(&session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    ensure_expected_active_leaf_matches(&stored.active_leaf_id, &params)?;
+    let store = transcript_store_from_stored(&stored)?;
+    if !store.is_turn_boundary_at(leaf_id) {
+        return Err(RpcError::new(
+            "not_turn_boundary",
+            "history.fork requires a turn boundary",
+        ));
+    }
+    if state
+        .repo
+        .session_exists(&new_session_id)
+        .await
+        .map_err(anyhow::Error::from)?
+    {
+        return Err(RpcError::new(
+            "session_exists",
+            format!("session already exists: {new_session_id}"),
+        ));
+    }
+
     let mut config = state
         .repo
         .load_session_config(&session_id)
         .await
         .map_err(anyhow::Error::from)?;
+    let mut copied_workspace = false;
     if !config.workspaces.is_empty() {
-        let driver = SessionDriver::acquire(state, &session_id).await;
-        driver.ensure_idle_for_source_mutation().await?;
+        state
+            .workspaces
+            .ensure_session(&session_id, &config.outer_cwd, &config.workspaces)
+            .await
+            .map_err(anyhow::Error::from)?;
         let (outer_cwd, forked_workspaces) = state
             .workspaces
             .fork_session(&session_id, &new_session_id, &config.workspaces)
@@ -1205,54 +1229,17 @@ async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Va
             .map_err(anyhow::Error::from)?;
         config.outer_cwd = outer_cwd;
         config.workspaces = forked_workspaces;
+        copied_workspace = true;
     }
-    let stored = state
-        .repo
-        .load_stored_session(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let store = transcript_store_from_stored(&stored)?;
-    if !store.contains_entry(leaf_id) {
-        return Err(RpcError::new(
-            "entry_not_found",
-            "history.fork target is not in the transcript",
-        ));
-    }
-    let mut fork_entries = stored
+    let fork_entries = stored
         .entries
         .iter()
         .cloned()
         .map(Into::into)
         .collect::<Vec<_>>();
-    let active_leaf_id = match placement {
-        ForkPlacement::Before => {
-            let Some(target) = store.get_entry(leaf_id) else {
-                return Err(RpcError::new(
-                    "entry_not_found",
-                    "history.fork target is not in the transcript",
-                ));
-            };
-            if !matches!(target.item, TranscriptItem::UserMessage(_)) {
-                return Err(RpcError::new(
-                    "invalid_placement",
-                    "placement='before' is only valid for user messages",
-                ));
-            }
-            fork_branch_before_user_message(&store, leaf_id)
-                .last()
-                .map(|entry| entry.id.clone())
-        }
-        ForkPlacement::At => {
-            let branch = store.path_entries_to(leaf_id);
-            let original_len = branch.len();
-            let recovered = recover_fork_branch_tail(branch);
-            let active_leaf_id = recovered.last().map(|entry| entry.id.clone());
-            fork_entries.extend(recovered.into_iter().skip(original_len));
-            active_leaf_id
-        }
-    };
+    let active_leaf_id = leaf_id.map(str::to_string);
     let child_active_leaf_id = active_leaf_id.clone();
-    let events = state
+    let fork_result = state
         .repo
         .create_fork(
             &session_id,
@@ -1262,15 +1249,28 @@ async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Va
             leaf_id,
             active_leaf_id,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await;
+    let events = match fork_result {
+        Ok(events) => events,
+        Err(error) => {
+            if copied_workspace {
+                if let Err(cleanup_error) =
+                    state.workspaces.remove_session_dir(&new_session_id).await
+                {
+                    eprintln!(
+                        "failed to remove fork workspace state for {new_session_id}: {cleanup_error:#}"
+                    );
+                }
+            }
+            return Err(error.into());
+        }
+    };
     publish_events(state, events);
     clear_event_buffer_if_idle(state, &session_id).await?;
     clear_event_buffer_if_idle(state, &new_session_id).await?;
     Ok(json!({
         "session_id": new_session_id,
         "source_leaf_id": leaf_id,
-        "placement": placement.as_str(),
         "active_leaf_id": child_active_leaf_id,
     }))
 }

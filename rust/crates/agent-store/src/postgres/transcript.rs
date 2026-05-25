@@ -321,7 +321,7 @@ impl PostgresAgentStore {
         new_session_id: &str,
         config: &SessionConfig,
         entries: &[TranscriptStorageNode],
-        target_leaf_id: &str,
+        target_leaf_id: Option<&str>,
         active_leaf_id: Option<String>,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
@@ -332,7 +332,7 @@ impl PostgresAgentStore {
                 json!({
                     "source_session_id": source_session_id,
                     "source_leaf_id": target_leaf_id,
-                    "active_leaf_id": active_leaf_id,
+                    "active_leaf_id": active_leaf_id.as_deref(),
                 }),
             );
         } else {
@@ -340,7 +340,7 @@ impl PostgresAgentStore {
                 "fork": {
                     "source_session_id": source_session_id,
                     "source_leaf_id": target_leaf_id,
-                    "active_leaf_id": active_leaf_id,
+                    "active_leaf_id": active_leaf_id.as_deref(),
                 },
                 "source_metadata": config.metadata.clone(),
             });
@@ -367,7 +367,7 @@ impl PostgresAgentStore {
             json!({
                 "new_session_id": new_session_id,
                 "leaf_id": target_leaf_id,
-                "active_leaf_id": active_leaf_id,
+                "active_leaf_id": active_leaf_id.as_deref(),
             }),
         )
         .await?;
@@ -380,7 +380,7 @@ impl PostgresAgentStore {
                 "project_id": config.project_id,
                 "forked_from": source_session_id,
                 "source_leaf_id": target_leaf_id,
-                "active_leaf_id": active_leaf_id,
+                "active_leaf_id": active_leaf_id.as_deref(),
             }),
         )
         .await?;

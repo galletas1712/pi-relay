@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use agent_store::{ProjectWorkspace, SessionWorkspace};
@@ -95,18 +96,43 @@ impl WorkspaceManager {
         let source_cwd = self.session_root(source_session_id).join("cwd");
         let new_root = self.session_root(new_session_id);
         if new_root.exists() {
-            tokio::fs::remove_dir_all(&new_root).await?;
+            bail!(
+                "target session workspace state already exists: {}",
+                new_root.display()
+            );
         }
         let new_cwd = new_root.join("cwd");
-        copy_dir(&source_cwd, &new_cwd).await?;
-        let mut forked = Vec::with_capacity(workspaces.len());
-        for workspace in workspaces {
-            let mut workspace = workspace.clone();
-            workspace.local_branch = local_branch(new_session_id, &workspace.workspace_dir);
-            let workspace_path = new_cwd.join(&workspace.workspace_dir);
-            run_git(&workspace_path, ["branch", "-M", &workspace.local_branch]).await?;
-            forked.push(workspace);
+        let forked: Result<Vec<SessionWorkspace>> = async {
+            copy_dir(&source_cwd, &new_cwd).await?;
+            let mut forked = Vec::with_capacity(workspaces.len());
+            for workspace in workspaces {
+                let mut workspace = workspace.clone();
+                workspace.local_branch = local_branch(new_session_id, &workspace.workspace_dir);
+                let workspace_path = new_cwd.join(&workspace.workspace_dir);
+                run_git(&workspace_path, ["branch", "-M", &workspace.local_branch]).await?;
+                forked.push(workspace);
+            }
+            Ok(forked)
         }
+        .await;
+        let forked = match forked {
+            Ok(forked) => forked,
+            Err(error) => {
+                match tokio::fs::remove_dir_all(&new_root).await {
+                    Ok(()) => {}
+                    Err(cleanup_error) if cleanup_error.kind() == ErrorKind::NotFound => {}
+                    Err(cleanup_error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "failed to remove partial fork workspace state at {}: {cleanup_error:#}",
+                                new_root.display()
+                            )
+                        });
+                    }
+                }
+                return Err(error);
+            }
+        };
         Ok((new_cwd.to_string_lossy().into_owned(), forked))
     }
 
@@ -186,7 +212,7 @@ pub(crate) async fn validate_remote_branch(remote_url: &str, remote_branch: &str
     if remote_branch.is_empty() {
         bail!("workspace remote_branch is required");
     }
-    let branch_check = Command::new("git")
+    let branch_check = git_command()
         .arg("check-ref-format")
         .arg("--branch")
         .arg(remote_branch)
@@ -196,7 +222,7 @@ pub(crate) async fn validate_remote_branch(remote_url: &str, remote_branch: &str
     if !branch_check.status.success() {
         bail!("workspace remote_branch is not a valid git branch name: {remote_branch}");
     }
-    let output = Command::new("git")
+    let output = git_command()
         .arg("ls-remote")
         .arg("--heads")
         .arg(remote_url)
@@ -249,7 +275,7 @@ fn local_branch(session_id: &str, workspace_dir: &str) -> String {
 }
 
 async fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<()> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -266,7 +292,7 @@ async fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<()> {
 }
 
 async fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {
-    let output = Command::new("git")
+    let output = git_command()
         .args(args)
         .current_dir(cwd)
         .output()
@@ -280,6 +306,12 @@ async fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<Strin
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn git_command() -> Command {
+    let mut command = Command::new("git");
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    command
 }
 
 async fn copy_dir(source: &Path, dest: &Path) -> Result<()> {

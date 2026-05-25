@@ -105,8 +105,8 @@ Implemented user-facing behavior:
   original model checkpoint and appends a sibling branch instead of duplicating
   the user message.
 - Idle-only rewind.
-- Running-safe fork from any explicit transcript entry, with user-message
-  "fork before" support.
+- Idle-only fork from turn-boundary targets, using the same target rule as
+  `history.switch`.
 - Idle-only compaction request with structural validation.
 - Daemon restart recovery for open transcript tails.
 - Stale action rejection through persisted `attempt_id`.
