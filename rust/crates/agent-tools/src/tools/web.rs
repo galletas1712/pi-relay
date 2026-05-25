@@ -54,8 +54,7 @@ impl AgentTool for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "web_search",
-            "Search the web for current information and return concise, cited results."
-                .to_string(),
+            "Search the web for current information and return concise, cited results.".to_string(),
             json!({
                 "type": "object",
                 "properties": {

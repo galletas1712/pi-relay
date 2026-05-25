@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
 	branchEntriesFor,
 	historyEntryDisplay,
-	historyForkOptions,
 	historySwitchOptions,
 	historyTreeRows
 } from "../src/historyTargets.ts";
@@ -93,32 +92,6 @@ describe("historyEntryDisplay", () => {
 			title: "User message",
 			preview: "alternate branch"
 		});
-	});
-});
-
-describe("historyForkOptions", () => {
-	it("uses the same visible targets as switch, with before-placement composer restoration for user messages", () => {
-		const options = historyForkOptions(fixtureEntries(), "finish2");
-		const userTarget = options.find((option) => option.id === "user2");
-		const boundaryTarget = options.find((option) => option.id === "finish2");
-
-		expect(options.map((option) => option.id)).toEqual(["sibling", "finish2", "user2", "finish1", "user1"]);
-		expect(userTarget).toMatchObject({
-			actionLeafId: "finish1",
-			placement: "before",
-			restoreText: "second question",
-			sourceEntryId: "user2",
-			turnLabel: "u2",
-			meta: expect.stringContaining("fork ·")
-		});
-		expect(boundaryTarget).toMatchObject({
-			actionLeafId: "finish2",
-			placement: "at",
-			isActive: true,
-			turnLabel: "t2",
-			meta: expect.stringContaining("fork ·")
-		});
-		expect(options.some((option) => option.id === "assistant2")).toBe(false);
 	});
 });
 

@@ -12,8 +12,8 @@ use crate::registry::AgentTool;
 
 /// Single shell tool, registered as `Bash` for both providers.
 ///
-/// Each call runs in a fresh `sh -lc` subprocess rooted at the daemon
-/// workspace. There is no persistent shell state across calls and no
+/// Each call runs in a fresh `sh -lc` subprocess rooted at the session
+/// current working directory. There is no persistent shell state across calls and no
 /// per-call working-directory override — the model is told to chain with
 /// `&&` (or call `cd` inside the command) when it needs to scope work to a
 /// subdirectory.
@@ -41,8 +41,8 @@ impl AgentTool for BashTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "Bash",
-            "Run a shell command in the daemon workspace and return stdout/stderr. \
-                Each call runs in a fresh shell rooted at the workspace; chain commands with `&&` \
+            "Run a shell command in the session current working directory and return stdout/stderr. \
+                Each call runs in a fresh shell rooted at that cwd; chain commands with `&&` \
                 (or call `cd` inside the command) when you need to scope work to a subdirectory."
                 .to_string(),
             json!({

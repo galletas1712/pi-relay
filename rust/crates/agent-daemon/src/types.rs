@@ -64,7 +64,6 @@ pub(crate) enum RpcMethod {
     HistoryTree,
     HistoryContext,
     HistorySwitch,
-    HistoryFork,
     TurnResume,
     ToolsList,
     CompactionRequest,
@@ -95,36 +94,12 @@ impl RpcMethod {
             "history.tree" => Some(Self::HistoryTree),
             "history.context" => Some(Self::HistoryContext),
             "history.switch" => Some(Self::HistorySwitch),
-            "history.fork" => Some(Self::HistoryFork),
             "turn.resume" => Some(Self::TurnResume),
             "tools.list" => Some(Self::ToolsList),
             "compaction.request" => Some(Self::CompactionRequest),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
             _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ForkPlacement {
-    At,
-    Before,
-}
-
-impl ForkPlacement {
-    pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value {
-            "at" => Some(Self::At),
-            "before" => Some(Self::Before),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::At => "at",
-            Self::Before => "before",
         }
     }
 }
@@ -175,13 +150,6 @@ mod tests {
         );
         assert_eq!(RpcMethod::parse("history.rewind"), None);
         assert_eq!(RpcMethod::parse("input.fly"), None);
-    }
-
-    #[test]
-    fn fork_placement_has_explicit_wire_values() {
-        assert_eq!(ForkPlacement::parse("before"), Some(ForkPlacement::Before));
-        assert_eq!(ForkPlacement::Before.as_str(), "before");
-        assert_eq!(ForkPlacement::parse("root"), None);
     }
 
     #[test]

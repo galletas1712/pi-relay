@@ -41,29 +41,27 @@ Sending the first normal message from that draft calls `session.start`, which
 creates the durable session and immediately materializes the first user input.
 After the backend accepts it, the UI removes the local draft and selects the
 durable session. Empty web-created durable rows are also hidden defensively in
-`session.list` unless they have transcript, queued input, actions, or fork
-provenance. `metadata.hidden = true` is a separate list-filtering convention
+`session.list` unless they have transcript, queued input, or actions.
+`metadata.hidden = true` is a separate list-filtering convention
 for local verification cleanup; it is not a lifecycle state and does not delete
 or mutate transcript history.
 
 Composer drafts for existing sessions are also web-owned `localStorage` state.
-They are used for restored historical user messages after switch or fork, and
-are deliberately not stored in `sessions.metadata` or transcript rows.
+They are used for restored historical user messages after switch, and are
+deliberately not stored in `sessions.metadata` or transcript rows.
 
 ### Slash Commands Are Thin RPC Calls
 
 Slash commands exist to expose real websocket operations that do not already
 have dedicated UI controls, without adding a second frontend command model.
 
-- `/fork [title]` opens a picker of visible fork targets and can prefill the
-  fork title. User-message targets fork from before the message and restore
-  that message into the child composer.
 - `/switch` opens the same-session history picker. It is idle-only. User
   message targets move the active leaf to the previous safe boundary and
   restore that message into the composer for editing; completed turn and
   compaction-summary targets simply become the active leaf.
 - `/compact` requests context compaction.
-- `/system [clear|prompt...]` reads or writes the global daemon system prompt.
+- `/system` shows the selected session's rendered PI.md prompt and source
+  template. It is unavailable before a durable session exists.
 
 Model selection is not a slash command. The web top bar exposes the small model
 picker and provider-specific reasoning effort picker. Provider/model identity is
@@ -88,9 +86,9 @@ it is not a transcript event and was visually misleading while the agent was
 still running. Errors still surface, while real conversation progress comes
 from transcript entries and activity/tool state.
 
-Switch and fork do not accept raw transcript ids in the web UI. The picker is
-the only user-facing path, so history mutations are chosen from visible turn
-context rather than opaque storage identifiers.
+Switch does not accept raw transcript ids in the web UI. The picker is the only
+user-facing path, so history mutations are chosen from visible turn context
+rather than opaque storage identifiers.
 
 Turn-start, graceful turn-finish, and tool-call-start bookkeeping entries are
 not rendered as transcript messages. Assistant tool calls render as compact
@@ -100,16 +98,17 @@ folded into the tool row instead of appearing as a separate raw event.
 The central transcript renders only the active root-to-leaf branch. Switch does
 not delete abandoned rows from Postgres, but those off-branch rows disappear
 from the main conversation view. They remain available to the history tree and
-fork picker.
+switch picker.
 
 ### Global System Prompt
 
-The system prompt is daemon-global configuration, not per-session state. The UI
-shows it in the inspector and edits it through `/system`, which calls
-`config.get` and `config.set`.
+The system prompt is repo-level `PI.md`, not per-session state. The UI exposes
+`/system` only for selected sessions because project workspaces must be
+materialized before the rendered prompt can include workspace instructions and
+skills.
 
-Sessions keep provider and metadata only. This avoids hidden prompt drift across
-forks and makes the daemon's behavior easier to reason about for personal use.
+Sessions keep provider and metadata only. This avoids hidden prompt drift and
+makes the daemon's behavior easier to reason about for personal use.
 
 ### No Approval UI
 
@@ -168,10 +167,10 @@ and event type. They serialize to the same Postgres/websocket strings as
 before, so the wire contract stays stable while invalid database values fail
 at decode time.
 
-`agent-daemon` also parses websocket method names and fork placement into
-daemon-local enums before dispatching. JSON content blocks, image sources, and
-assistant items use the serde-tagged vocabulary types from `agent-vocab`
-instead of hand-matching `"type"` and `"kind"` strings in the codec.
+`agent-daemon` also parses websocket method names into daemon-local enums before
+dispatching. JSON content blocks, image sources, and assistant items use the
+serde-tagged vocabulary types from `agent-vocab` instead of hand-matching
+`"type"` and `"kind"` strings in the codec.
 
 Provider request bodies still contain provider-specific string fields such as
 OpenAI/Anthropic `role` and `model`; those are external API wire values rather
@@ -216,12 +215,11 @@ model again, the daemon claims one queued steer before continuing and appends it
 as a same-turn `user_message` after the tool results. Follow-ups are not
 eligible for that mid-turn slot. During compaction there is no same-turn slot,
 so queued steers wait behind the compaction action and become the next turn from
-the compacted root. Rewind/switch remain idle-only, and fork copies transcript
-history without moving the source session's queued inputs.
+the compacted root. Switch remains idle-only.
 Before the daemon materializes a queued row, it claims the row as `consuming`.
 The websocket surface only exposes queued promotion; editing historical input
-uses interrupt plus rewind/fork picker semantics. The daemon only marks a
-claimed input `consumed` in the transaction that also appends the corresponding
+uses interrupt plus switch picker semantics. The daemon only marks a claimed
+input `consumed` in the transaction that also appends the corresponding
 transcript and action events.
 
 That choice prevents a daemon-death gap where accepted user input has been moved
@@ -242,27 +240,23 @@ For brand-new draft starts, the browser stores a stable future `session_id` on
 the draft. Retrying `session.start` with that id returns the existing durable
 session instead of creating another one.
 
-### Fork, Rewind, And History Targets
+### Switch And History Targets
 
-Rewind operates on committed transcript boundaries or root. The UI presents
-rewind targets as visible user messages and completed turns, then maps them to
-the boundary-only backend operation. Forking is broader: it can branch from any
-existing transcript entry because it creates a new session and does not mutate
-the source branch. Forking from nothing is rejected. When the selected fork
-point is not already a boundary, the child session closes that copied partial
-tail as `Interrupted`, which keeps the child runnable without pretending daemon
-recovery crashed.
+Switch operates on committed transcript boundaries or root. The UI presents
+targets as visible user messages and completed turns, then maps them to the
+boundary-only backend operation. It does not checkpoint or restore workspace
+files; project sessions keep their current private Git checkouts.
 
 Picker actions carry expected active-leaf information for source-mutating
-rewind and for sending restored composer drafts. If the session moved since the
+switch and for sending restored composer drafts. If the session moved since the
 visible choice was made, the daemon returns `history_changed` and the UI
 refreshes instead of applying the edit to a different branch.
 
-Rewind mutates the selected session's active branch, so it remains idle-only.
+Switch mutates the selected session's active branch, so it remains idle-only.
 For websocket RPC, idle means no unfinished action and no queued input waiting
 to become transcript. In the normal user flow, that is the point after a turn
-has finished and the queue has drained. If a user wants to rewind during a turn,
-they should interrupt first, then rewind after the interrupted tail has been
+has finished and the queue has drained. If a user wants to switch during a turn,
+they should interrupt first, then switch after the interrupted tail has been
 committed.
 
 ### Recovery Keeps Transcript Semantics
@@ -278,7 +272,6 @@ lifecycle states. The session activity enum stays small: `idle`, `queued`, and
 
 ### Compaction Is A Typed Root, Not A Replacement Transcript
 
-Compaction follows the proposal in `rust/docs/compaction-and-history-forest.md`.
 The daemon summarizes only the dynamic transcript/model context for the active
 leaf. It does not summarize or rewrite the global stable system prompt, which
 remains provider configuration rendered before transcript history on normal
@@ -302,11 +295,10 @@ Only Postgres-backed sessions appear in the sidebar. Starting a new chat is a
 composer state: the selected session is cleared, and the first non-command send
 creates the durable session through `session.start`.
 
-This keeps the UI aligned with the append-only transcript forest. Rewind and
-fork are tree operations over durable transcript entries; their only extra UI
+This keeps the UI aligned with the append-only transcript forest. Switch is a
+tree operation over durable transcript entries; its only extra UI
 convenience is restoring a selected user message into the composer for editing.
-That restored text is transient visible state, not a second session model or a
-localStorage-backed branch.
+That restored text is transient visible state, not a second session model.
 
 ### Provider Scope Is Intentionally Small
 
@@ -384,7 +376,7 @@ Coding tools split into two posture buckets:
   token accounting on one surface. The tool runtime can still delegate to a
   provider-native web backend in a sidecar call when that backend exists.
 
-The daemon workspace is fixed at process launch. `bash` does not accept a
+The tool workspace is the session `outer_cwd`. `bash` does not accept a
 `workdir` override; the model relies on the announced cwd in the dynamic
 prompt context and uses `&&` chaining or inline `cd` for subdirectory work.
 Any future persistent-shell runtime would add session-level cwd state
@@ -400,8 +392,9 @@ not need to grow just to share message data shapes.
 ### `agent-session` Replaces The Orchestrator Role
 
 The old orchestration shape has been demoted into session semantics. The session
-crate owns transcript branches, model context materialization, fork/rewind,
-queued input ordering, and restoration from stored session data. Compaction
+crate owns transcript branches, model context materialization, active-leaf
+switching, queued input ordering, and restoration from stored session data.
+Compaction
 installation lives in `agent-store` because it is a durable Postgres
 transaction.
 
@@ -416,11 +409,11 @@ The highest-value tests are real behavioral exercises, not stub-heavy checks:
   restoration, and stale completion invariants.
 - Manual websocket scripts exercise real Postgres transitions, transient
   reconnect event replay, global config, input idempotency, steer/follow-up
-  ordering, fork, rewind, interrupt, recovery, tools, and real Codex provider
+  ordering, switch, interrupt, recovery, tools, and real Codex provider
   calls.
 - The web app is built with TypeScript/Vite and then run against the same
   websocket daemon used for manual RPC exercises. Browser checks cover markdown
-  and raw HTML rendering, slash autocomplete, picker-only rewind/fork, restored
+  and raw HTML rendering, slash autocomplete, picker-only switch, restored
   composer drafts, and local draft survival across refresh.
 
 The manual websocket tests intentionally inspect both user-visible transcript
@@ -450,6 +443,6 @@ not durable notifications.
 The web composer uses an imperative selected-session ref so queued sends do not
 wait for a React render to find their target. Any code path that changes the
 selected session must update that ref and the React state together. This matters
-for new-session and fork flows: the next Enter key after creating a session
-should target the new durable session immediately, not the session that happened
-to be selected one render earlier.
+for new-session flows: the next Enter key after creating a session should target
+the new durable session immediately, not the session that happened to be
+selected one render earlier.

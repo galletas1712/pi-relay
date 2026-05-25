@@ -41,7 +41,8 @@ impl AgentTool for ApplyPatchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "Edit",
-            "Apply a freeform patch to files in the workspace.".to_string(),
+            "Apply a freeform patch to files under the session current working directory."
+                .to_string(),
             json!({
                 "type": "object",
                 "properties": { "input": { "type": "string" } },

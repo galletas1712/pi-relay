@@ -38,8 +38,8 @@ pub struct InstalledCompaction {
 /// Session shell around the pure core loop.
 ///
 /// `agent-core` owns deterministic state transitions. `agent-session` owns the
-/// point at which the session's history can be safely forked, rewound, or
-/// resumed after consulting external model/tool work. The
+/// point at which the session's history can be safely restored or resumed after
+/// consulting external model/tool work. The
 /// `TranscriptStore` is the sole owner of durable transcript items; the core
 /// only buffers items produced in the current run until the session drains
 /// them.
@@ -69,12 +69,7 @@ impl AgentSession {
         }
     }
 
-    /// Rewind the active transcript path to a prior turn boundary.
-    ///
-    /// `leaf_id = Some(id)` moves the active leaf to `id`; `leaf_id = None`
-    /// resets the session to the empty root. Rewind is a stop-the-world edit
-    /// that preserves queued user inputs while invalidating obsolete
-    /// outstanding work.
+    #[cfg(test)]
     pub fn rewind(&mut self, leaf_id: Option<&str>) -> Result<(), HistoryOperationError> {
         match leaf_id {
             Some(leaf_id) if !self.transcript_store.contains_entry(leaf_id) => {
@@ -109,7 +104,6 @@ impl AgentSession {
 
         self.reset_runtime_to_active_leaf();
         self.restore_queued_user_inputs(queued_user_inputs);
-        self.event_outbox.push_back(SessionEvent::HistoryRewound);
         Ok(())
     }
 
@@ -388,26 +382,6 @@ impl AgentSession {
         }
     }
 
-    /// Produce an unregistered `AgentSession` whose context branches from an
-    /// existing transcript entry. The source session is unchanged; the caller
-    /// is responsible for registering the fork if desired.
-    ///
-    /// Fork is separate from `rewind` because it reads the context and produces
-    /// a new session rather than mutating the source in place.
-    pub fn fork(&self, leaf_id: &str) -> Result<AgentSession, HistoryOperationError> {
-        let transcript_store = self
-            .transcript_store
-            .copy_path_to_entry(leaf_id)
-            .map_err(HistoryOperationError::Store)?;
-        if !transcript_store.is_turn_boundary() {
-            let model_context = transcript_store
-                .model_context()
-                .close_open_turn(OpenTurnClosure::Interrupted);
-            return Ok(AgentSession::from_model_context(model_context));
-        }
-        AgentSession::from_transcript_store(transcript_store)
-    }
-
     pub fn install_compaction_checkpoint(
         &mut self,
         source_session_id: impl Into<String>,
@@ -612,6 +586,7 @@ impl AgentSession {
         }
     }
 
+    #[cfg(test)]
     fn reset_runtime_to_active_leaf(&mut self) {
         let last_turn_id = self.transcript_store.model_context().last_turn_id();
         let next_action_id = self.core.next_action_id();

@@ -59,7 +59,7 @@ fn empty_assistant() -> AssistantMessage {
 }
 
 #[test]
-fn rewind_requires_boundaries_while_fork_accepts_any_existing_entry() {
+fn rewind_requires_boundaries() {
     let mut session = AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(1) },
         TranscriptItem::UserMessage(UserMessage::text("first")),
@@ -83,62 +83,10 @@ fn rewind_requires_boundaries_while_fork_accepts_any_existing_entry() {
             TranscriptStoreError::NotTurnBoundary
         ))
     );
-    let mid_turn_fork = session
-        .fork(&mid_turn_id)
-        .expect("fork can branch from a non-boundary entry");
-    assert_eq!(mid_turn_fork.model_context().last_turn_id(), TurnId(1));
-    assert!(matches!(
-        mid_turn_fork.model_context().transcript_items().last(),
-        Some(TranscriptItem::TurnFinished {
-            turn_id: TurnId(1),
-            outcome: TurnOutcome::Interrupted,
-        })
-    ));
-    assert_eq!(
-        session.fork("missing-entry").map(|_| ()),
-        Err(HistoryOperationError::Store(
-            TranscriptStoreError::EntryNotFound
-        ))
-    );
-
     session
         .rewind(Some(&turn_one_end_id))
         .expect("turn end is a valid rewind point");
     assert_eq!(session.model_context().last_turn_id(), TurnId(1));
-
-    let fork = session
-        .fork(&turn_one_end_id)
-        .expect("turn end is a valid fork point");
-    assert_eq!(fork.model_context().last_turn_id(), TurnId(1));
-}
-
-#[test]
-fn fork_can_copy_a_boundary_path_while_source_session_is_running() {
-    let mut session = AgentSession::from_model_context(finished_model_context("hello"));
-    let boundary_id = session
-        .transcript_store()
-        .entries()
-        .last()
-        .expect("finished context has a boundary entry")
-        .id
-        .clone();
-
-    session
-        .enqueue_input(AgentInput::follow_up("new work"))
-        .expect("plain follow-up is valid");
-    session.drive();
-
-    let fork = session
-        .fork(&boundary_id)
-        .expect("fork only copies the requested boundary path");
-    assert_eq!(fork.model_context().last_turn_id(), TurnId(1));
-    assert!(matches!(
-        fork.model_context().transcript_items().last(),
-        Some(TranscriptItem::TurnFinished {
-            turn_id: TurnId(1),
-            outcome: TurnOutcome::Graceful,
-        })
-    ));
 }
 
 #[test]

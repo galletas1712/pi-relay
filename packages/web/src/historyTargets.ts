@@ -10,14 +10,11 @@ import {
 import type { TranscriptEntry, TurnOutcome } from "./types.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
 
-export type HistoryPlacement = "at" | "before";
-
 export interface HistoryTargetOption {
 	id: string | null;
 	actionLeafId: string | null;
 	expectedActiveLeafId?: string | null;
 	sourceEntryId?: string;
-	placement?: HistoryPlacement;
 	restoreText?: string;
 	turnLabel: string;
 	title: string;
@@ -44,12 +41,8 @@ export interface HistoryEntryDisplay {
 	meta: string;
 }
 
-export function historyForkOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
-	return measureHistoryDerivation("historyForkOptions", entries, () => historyBranchPointOptions(entries, activeLeafId, "fork"));
-}
-
 export function historySwitchOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
-	return measureHistoryDerivation("historySwitchOptions", entries, () => historyBranchPointOptions(entries, activeLeafId, "switch"));
+	return measureHistoryDerivation("historySwitchOptions", entries, () => historyBranchPointOptions(entries, activeLeafId));
 }
 
 interface HistoryIndex {
@@ -71,13 +64,12 @@ const indexCache = new WeakMap<TranscriptEntry[], HistoryIndex>();
 
 function historyBranchPointOptions(
 	entries: TranscriptEntry[],
-	activeLeafId: string | null,
-	mode: "fork" | "switch"
+	activeLeafId: string | null
 ): HistoryTargetOption[] {
 	const index = createHistoryIndex(entries);
 	const options: HistoryTargetOption[] = [];
 	for (const entry of entries) {
-		const option = branchPointOptionForEntry(index, entry, index.metaById.get(entry.id), activeLeafId, mode);
+		const option = branchPointOptionForEntry(index, entry, index.metaById.get(entry.id), activeLeafId);
 		if (option) options.push(option);
 	}
 	return options.reverse();
@@ -137,13 +129,13 @@ function historyEntryDisplayIndexed(index: HistoryIndex, entry: TranscriptEntry)
 			meta: time
 		};
 	}
-	const forkOption = forkOptionForEntry(index, entry, meta, null);
-	if (forkOption) {
+	const option = displayOptionForEntry(index, entry, meta, null);
+	if (option) {
 		return {
-			turnLabel: forkOption.turnLabel,
-			title: forkOption.title,
-			preview: forkOption.preview,
-			meta: forkOption.meta
+			turnLabel: option.turnLabel,
+			title: option.title,
+			preview: option.preview,
+			meta: option.meta
 		};
 	}
 	if (item.type === "tool_call_started") {
@@ -241,7 +233,7 @@ function previousTurnBoundaryId(index: HistoryIndex, meta: EntryMeta | undefined
 	return null;
 }
 
-function forkOptionForEntry(
+function displayOptionForEntry(
 	index: HistoryIndex,
 	entry: TranscriptEntry,
 	meta: EntryMeta | undefined,
@@ -257,7 +249,6 @@ function forkOptionForEntry(
 			id: entry.id,
 			actionLeafId: previousTurnBoundaryId(index, meta),
 			sourceEntryId: entry.id,
-			placement: "before",
 			restoreText: text,
 			turnLabel: currentTurnId ? `u${currentTurnId}` : "user",
 			title: currentTurnId ? `User message in turn ${currentTurnId}` : "User message",
@@ -272,7 +263,6 @@ function forkOptionForEntry(
 			id: entry.id,
 			actionLeafId: entry.id,
 			sourceEntryId: entry.id,
-			placement: "at",
 			turnLabel: currentTurnId ? `a${currentTurnId}` : "asst",
 			title: step ? modelStepTitle(step) : currentTurnId ? `Assistant message in turn ${currentTurnId}` : "Assistant message",
 			preview: step ? modelStepPreview(step) : "Assistant message.",
@@ -285,7 +275,6 @@ function forkOptionForEntry(
 			id: entry.id,
 			actionLeafId: entry.id,
 			sourceEntryId: entry.id,
-			placement: "at",
 			turnLabel: "tool",
 			title: `Tool result: ${item.tool_name}`,
 			preview: `${item.status.toLowerCase()}: ${truncate(firstLine(item.output) || "(empty)", 84)}`,
@@ -298,7 +287,6 @@ function forkOptionForEntry(
 			id: entry.id,
 			actionLeafId: entry.id,
 			sourceEntryId: entry.id,
-			placement: "at",
 			turnLabel: `t${item.turn_id}`,
 			title: `End of turn ${item.turn_id}`,
 			preview: `${item.outcome.toLowerCase()} turn boundary.`,
@@ -312,7 +300,6 @@ function forkOptionForEntry(
 			id: entry.id,
 			actionLeafId: entry.id,
 			sourceEntryId: entry.id,
-			placement: "at",
 			turnLabel: `c${item.last_turn_id}`,
 			title: "Compacted history",
 			preview: truncate(item.summary, 96),
@@ -327,8 +314,7 @@ function branchPointOptionForEntry(
 	index: HistoryIndex,
 	entry: TranscriptEntry,
 	meta: EntryMeta | undefined,
-	activeLeafId: string | null,
-	mode: "fork" | "switch"
+	activeLeafId: string | null
 ): HistoryTargetOption | null {
 	const item = entry.item;
 	const time = formatTimestamp(entry.timestamp_ms);
@@ -339,14 +325,13 @@ function branchPointOptionForEntry(
 		return {
 			id: entry.id,
 			actionLeafId,
-			expectedActiveLeafId: mode === "switch" ? activeLeafId : undefined,
+			expectedActiveLeafId: activeLeafId,
 			sourceEntryId: entry.id,
-			placement: mode === "fork" ? "before" : undefined,
 			restoreText: text,
 			turnLabel: currentTurnId ? `u${currentTurnId}` : "user",
 			title: "User message",
 			preview: truncate(text.trim() || "Empty user message.", 96),
-			meta: `${mode === "fork" ? "fork" : "edit"} · ${time}`,
+			meta: `edit · ${time}`,
 			isActive: false
 		};
 	}
@@ -356,13 +341,12 @@ function branchPointOptionForEntry(
 		return {
 			id: entry.id,
 			actionLeafId: entry.id,
-			expectedActiveLeafId: mode === "switch" ? activeLeafId : undefined,
+			expectedActiveLeafId: activeLeafId,
 			sourceEntryId: entry.id,
-			placement: mode === "fork" ? "at" : undefined,
 			turnLabel: `t${item.turn_id}`,
 			title: step ? modelStepTitle(step) : `End of turn ${item.turn_id}`,
 			preview: step ? modelStepPreview(step) : `${item.outcome.toLowerCase()} turn completed.`,
-			meta: `${mode} · ${time}`,
+			meta: `switch · ${time}`,
 			isActive: activeLeafId === entry.id,
 			outcome: item.outcome
 		};
@@ -372,13 +356,12 @@ function branchPointOptionForEntry(
 	return {
 		id: entry.id,
 		actionLeafId: entry.id,
-		expectedActiveLeafId: mode === "switch" ? activeLeafId : undefined,
+		expectedActiveLeafId: activeLeafId,
 		sourceEntryId: entry.id,
-		placement: mode === "fork" ? "at" : undefined,
 		turnLabel: display.turnLabel,
 		title: display.title,
 		preview: display.preview,
-		meta: mode === "fork" ? `fork · ${time}` : display.meta,
+		meta: display.meta,
 		isActive: activeLeafId === entry.id
 	};
 }

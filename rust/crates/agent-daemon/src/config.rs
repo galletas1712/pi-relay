@@ -1,4 +1,4 @@
-use std::{env, path::PathBuf};
+use std::env;
 
 use anyhow::{anyhow, Result};
 
@@ -6,14 +6,12 @@ use anyhow::{anyhow, Result};
 pub(crate) struct Config {
     pub(crate) database_url: String,
     pub(crate) bind: String,
-    pub(crate) workspace: PathBuf,
 }
 
 impl Config {
     pub(crate) fn from_env_and_args() -> Result<Self> {
         let mut database_url = env::var("DATABASE_URL").unwrap_or_default();
         let mut bind = env::var("PI_AGENTD_BIND").unwrap_or_else(|_| "127.0.0.1:8787".into());
-        let mut workspace = env::current_dir()?;
 
         let mut args = env::args().skip(1);
         while let Some(arg) = args.next() {
@@ -28,15 +26,9 @@ impl Config {
                         .next()
                         .ok_or_else(|| anyhow!("--bind requires a value"))?;
                 }
-                "--workspace" => {
-                    workspace = PathBuf::from(
-                        args.next()
-                            .ok_or_else(|| anyhow!("--workspace requires a value"))?,
-                    );
-                }
                 "--help" | "-h" => {
                     println!(
-                        "usage: pi-agentd --database-url postgres://... [--bind 127.0.0.1:8787] [--workspace .]"
+                        "usage: pi-agentd --database-url postgres://... [--bind 127.0.0.1:8787]"
                     );
                     std::process::exit(0);
                 }
@@ -50,10 +42,6 @@ impl Config {
             ));
         }
 
-        Ok(Self {
-            database_url,
-            bind,
-            workspace,
-        })
+        Ok(Self { database_url, bind })
     }
 }

@@ -29,7 +29,7 @@ impl AgentTool for GrepTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "Grep",
-            "Search workspace files with ripgrep and return matching lines.".to_string(),
+            "Search files under the session current working directory with ripgrep and return matching lines.".to_string(),
             json!({
                 "type": "object",
                 "properties": {

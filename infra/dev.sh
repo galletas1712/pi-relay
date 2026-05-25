@@ -30,8 +30,7 @@ docker compose -f infra/docker-compose.yml up -d --wait
 
 cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
   --database-url "$DATABASE_URL" \
-  --bind "$DAEMON_BIND" \
-  --workspace "$REPO_ROOT" &
+  --bind "$DAEMON_BIND" &
 DAEMON_PID=$!
 
 ( cd packages/web && \

@@ -1,7 +1,7 @@
 # Rust Agent Stack
 
 Personal-use Rust rewrite of the core pi-style agent runtime. The design keeps
-the good local semantics around resume, rewind, fork, and compaction while
+the good local semantics around resume, switch, and compaction while
 removing the hierarchical subagent machinery from the TypeScript fork.
 
 See [`docs/architecture.md`](docs/architecture.md) for the detailed design.
@@ -16,7 +16,7 @@ choices and invisible runtime/storage decisions.
 | --- | --- |
 | `agent-vocab` | Shared serializable ids, message blocks, images, assistant items, tool calls/results, and transcript items. |
 | `agent-core` | Pure deterministic FSM for one agent turn loop. No I/O. |
-| `agent-session` | Durable transcript forest, model context materialization, resume/rewind/fork/compaction, and storage snapshots. |
+| `agent-session` | Durable transcript forest, model context materialization, resume, compaction, and storage snapshots. |
 | `agent-store` | Postgres-only session/event/action/input persistence for the daemon. |
 | `agent-provider` | `ModelProvider` plus OpenAI and Anthropic adapters. |
 | `agent-tools` | `AgentTool`, `ToolRegistry`, and builtin `read`/`write`/`edit`/`bash` tools. |
@@ -60,8 +60,7 @@ SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
 RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/clang' \
 cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
   --database-url postgres://postgres:postgres@127.0.0.1:55432/pi_relay \
-  --bind 127.0.0.1:8787 \
-  --workspace /Users/schwinns/.codex/worktrees/45d5/pi-relay
+  --bind 127.0.0.1:8787
 ```
 
 The websocket endpoint is `ws://127.0.0.1:8787`.
@@ -81,7 +80,7 @@ Session provider config supports `reasoning_effort`, an optional explicit
 `medium`, `high`, `xhigh`, and `max`. The daemon does not add a default OpenAI output
 cap. Claude Opus 4.7 uses adaptive thinking with `output_config.effort` and a
 64k default `max_tokens` value because the Messages API requires that field.
-The model system prompt is rendered from the repo-level `PI.md` template. Project-specific instructions enter through `AGENTS.md`, which `PI.md` composes explicitly. The daemon does not inject date, time, or cwd unless the template asks for it.
+The model system prompt is rendered from the repo-level `PI.md` template. Project-specific instructions enter through `AGENTS.md` files in the session's workspace checkouts, which `PI.md` composes explicitly. The daemon does not inject date, time, or cwd unless the template asks for it.
 
 ## Web UI
 
@@ -98,7 +97,7 @@ model picker and provider-specific reasoning effort picker. The model is locked
 once the session has transcript history; reasoning effort can still be changed
 during or between turns and applies to subsequently created provider requests.
 Slash commands expose operations that do not already have dedicated controls:
-`/fork`, `/switch`, `/compact`, `/system`, and `/export`. Active turns use the
+`/switch`, `/compact`, `/system`, and `/export`. Active turns use the
 stop button; new, rename, archive, and unarchive use sidebar controls; queued
 follow-ups can be promoted to steer from the queue pane above the composer.
 Crashed or interrupted terminal model turns can be retried/continued directly

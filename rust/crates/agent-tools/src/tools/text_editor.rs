@@ -34,7 +34,7 @@ impl AgentTool for TextEditorTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition::new(
             "Edit",
-            "View and edit workspace text files with Claude's text editor schema.".to_string(),
+            "View and edit text files under the session current working directory with Claude's text editor schema.".to_string(),
             json!({
                 "type": "object",
                 "properties": {

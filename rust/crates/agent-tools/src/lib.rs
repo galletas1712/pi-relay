@@ -7,7 +7,7 @@ mod output;
 mod registry;
 mod tools;
 
-pub use context::{dynamic_tool_context, ToolContext};
+pub use context::ToolContext;
 pub use display::{tool_display, ToolDisplayInput};
 pub use error::{ToolError, ToolResult};
 pub use output::{limit_tool_output, limit_tool_output_with_max_tokens};

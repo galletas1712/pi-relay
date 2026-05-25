@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use agent_prompt::{render_prompt, PromptContext, Skill, ToolSpec};
-use agent_store::{SessionConfig, WorkspaceMount};
+use agent_prompt::{render_prompt, PromptContext, PromptWorkspace, Skill, ToolSpec};
+use agent_store::{SessionConfig, SessionWorkspace};
 use agent_vocab::ProviderKind;
 
 use crate::state::AppState;
@@ -22,7 +22,17 @@ pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> Prompt
     PromptContext {
         cwd: PathBuf::from(&config.outer_cwd),
         has_project: config.project_id.is_some(),
-        workspace_dirs: WorkspaceMount::prompt_workspace_dirs(&config.workspaces),
+        workspaces: config
+            .workspaces
+            .iter()
+            .map(|workspace| PromptWorkspace {
+                workspace_dir: workspace.workspace_dir.clone(),
+                remote_url: workspace.remote_url.clone(),
+                remote_branch: workspace.remote_branch.clone(),
+                base_sha: workspace.base_sha.clone(),
+                local_branch: workspace.local_branch.clone(),
+            })
+            .collect(),
         tools: tool_specs(state, config.provider.kind),
         skills: load_prompt_skills(config),
     }
@@ -46,29 +56,33 @@ fn tool_specs(state: &AppState, provider: ProviderKind) -> Vec<ToolSpec> {
 }
 
 fn load_prompt_skills(config: &SessionConfig) -> Vec<Skill> {
-    load_skills_for_workspace_mounts(&PathBuf::from(&config.outer_cwd), &config.workspaces)
+    load_skills_for_session_workspaces(&PathBuf::from(&config.outer_cwd), &config.workspaces)
 }
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn load_skills_for_workspace_roots(
     outer_cwd: &Path,
     workspace_dirs: &[String],
 ) -> Vec<Skill> {
     let workspaces = workspace_dirs
         .iter()
-        .map(|workspace_dir| WorkspaceMount {
-            mount_dir: workspace_dir.clone(),
-            source_path: String::new(),
+        .map(|workspace_dir| SessionWorkspace {
+            workspace_dir: workspace_dir.clone(),
+            remote_url: String::new(),
+            remote_branch: String::new(),
+            base_sha: String::new(),
+            local_branch: String::new(),
         })
         .collect::<Vec<_>>();
-    load_skills_for_workspace_mounts_with_home(outer_cwd, &workspaces, home_dir().as_deref())
+    load_skills_for_session_workspaces_with_home(outer_cwd, &workspaces, home_dir().as_deref())
 }
 
-pub(super) fn load_skills_for_workspace_mounts(
+pub(super) fn load_skills_for_session_workspaces(
     outer_cwd: &Path,
-    workspaces: &[WorkspaceMount],
+    workspaces: &[SessionWorkspace],
 ) -> Vec<Skill> {
-    load_skills_for_workspace_mounts_with_home(outer_cwd, workspaces, home_dir().as_deref())
+    load_skills_for_session_workspaces_with_home(outer_cwd, workspaces, home_dir().as_deref())
 }
 
 #[cfg(test)]
@@ -79,17 +93,20 @@ pub(super) fn load_skills_for_workspace_roots_with_home(
 ) -> Vec<Skill> {
     let workspaces = workspace_dirs
         .iter()
-        .map(|workspace_dir| WorkspaceMount {
-            mount_dir: workspace_dir.clone(),
-            source_path: String::new(),
+        .map(|workspace_dir| SessionWorkspace {
+            workspace_dir: workspace_dir.clone(),
+            remote_url: String::new(),
+            remote_branch: String::new(),
+            base_sha: String::new(),
+            local_branch: String::new(),
         })
         .collect::<Vec<_>>();
-    load_skills_for_workspace_mounts_with_home(outer_cwd, &workspaces, home)
+    load_skills_for_session_workspaces_with_home(outer_cwd, &workspaces, home)
 }
 
-pub(super) fn load_skills_for_workspace_mounts_with_home(
+pub(super) fn load_skills_for_session_workspaces_with_home(
     outer_cwd: &Path,
-    workspaces: &[WorkspaceMount],
+    workspaces: &[SessionWorkspace],
     home: Option<&Path>,
 ) -> Vec<Skill> {
     let outer_cwd = normalize_existing_dir(outer_cwd);
@@ -101,18 +118,13 @@ pub(super) fn load_skills_for_workspace_mounts_with_home(
     }
 
     for workspace in workspaces {
-        let workspace_root = if workspace.mount_dir == "." {
-            outer_cwd.clone()
-        } else {
-            outer_cwd.join(&workspace.mount_dir)
-        };
+        let workspace_root = outer_cwd.join(&workspace.workspace_dir);
         let skills_dir = workspace_root.join(".agents/skills");
-        let workspace_name = if workspace.mount_dir == "." {
-            None
-        } else {
-            Some(workspace.mount_dir.as_str())
-        };
-        add_skills_from_agents_dir(&skills_dir, workspace_name, &mut skills);
+        add_skills_from_agents_dir(
+            &skills_dir,
+            Some(workspace.workspace_dir.as_str()),
+            &mut skills,
+        );
     }
 
     skills

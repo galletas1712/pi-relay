@@ -374,7 +374,7 @@
 					<tr>
 						<td><code>agent-session</code></td>
 							<td><code>ModelContext</code> materializes path entries with transcript item plus replay sidecar.</td>
-							<td>Fork/switch/compact must preserve both lanes along a selected branch.</td>
+							<td>Switch/compact must preserve both lanes along a selected branch.</td>
 							<td>Use <code>ModelContextEntry</code> so provider replay remains entry-aligned.</td>
 						</tr>
 						<tr>
@@ -462,7 +462,7 @@ struct ModelTranscriptEntry {
 				<li>
 					<strong>Phase 4: Update session context building</strong>
 					Teach <code>agent-session</code> to build model context from the selected branch plus
-					compaction roots. Fork/switch should carry replay records with the branch. Compaction should
+					compaction roots. Switch should carry replay records with the branch. Compaction should
 					summarize completed history but leave active tool-loop replay records intact.
 				</li>
 				<li>
@@ -627,18 +627,12 @@ struct ModelTranscriptEntry {
 
 		<section class="grid">
 			<article class="card span-6">
-				<h2>Compaction, fork, switch</h2>
+				<h2>Compaction and switch</h2>
 				<ul class="checklist">
 					<li>
 						<strong>Compaction</strong>
 						Compaction creates a new context root inside the same session. It summarizes completed
 						visible history and completed replay history, but must not summarize the open tool loop.
-					</li>
-					<li>
-						<strong>Fork</strong>
-						Fork can branch from any transcript point. The new branch inherits replay records along the
-						path to that point. If the point is inside an open provider trajectory, only valid ancestor
-						records are included.
 					</li>
 					<li>
 						<strong>Switch</strong>
@@ -658,8 +652,8 @@ struct ModelTranscriptEntry {
 				<ul class="checklist">
 					<li>
 						<strong>During active turn</strong>
-						Follow-ups can queue, steers can be promoted before consumption, fork is allowed from a
-						stable prior point, switch/compact are blocked until idle or interrupt.
+						Follow-ups can queue, steers can be promoted before consumption, and switch/compact are
+						blocked until idle or interrupt.
 					</li>
 					<li>
 						<strong>During tool execution</strong>
@@ -704,7 +698,7 @@ struct ModelTranscriptEntry {
 					</tr>
 					<tr>
 						<td>Websocket/manual flows</td>
-						<td>Real daemon + Postgres + browser flows: multi-tool turn, follow-up queue, steer promotion, fork while active, switch after idle, manual compact, daemon restart mid-tool, and provider error display.</td>
+						<td>Real daemon + Postgres + browser flows: multi-tool turn, follow-up queue, steer promotion, switch after idle, manual compact, daemon restart mid-tool, and provider error display.</td>
 					</tr>
 					<tr>
 						<td>Provider smoke</td>
@@ -778,8 +772,8 @@ struct ModelTranscriptEntry {
 				</li>
 				<li>
 					<strong>History operations</strong>
-					Done at the WebSocket/storage layer: fork while active, switch blocking while active,
-					fork continuation, manual compaction, and switching between a compaction root and
+					Done at the WebSocket/storage layer: switch blocking while active,
+					manual compaction, and switching between a compaction root and
 					pre-compaction branch all preserve visible transcript and replay records.
 				</li>
 				<li>

@@ -63,7 +63,7 @@ import type {
 	SessionSummary,
 	ToolListing,
 	TranscriptEntry,
-	WorkspaceMount,
+	ProjectWorkspace,
 } from "./types.ts";
 
 const MAX_NOTICES = 24;
@@ -98,10 +98,8 @@ type ExportDialogState = {
 
 type HistoryDialogState = {
 	sessionId: string;
-	mode: "fork" | "switch";
 	entries: TranscriptEntry[];
 	activeLeafId: string | null;
-	initialForkTitle?: string;
 	loading?: boolean;
 	error?: string | null;
 };
@@ -127,26 +125,23 @@ type PromptDialogState = {
 	error: string | null;
 };
 
-function formatWorkspaces(workspaces: WorkspaceMount[]): string {
-	return workspaces.map((workspace) => `${workspace.mount_dir}=${workspace.source_path}`).join("\n");
+function formatWorkspaces(workspaces: ProjectWorkspace[]): string {
+	return workspaces
+		.map((workspace) => `${workspace.workspace_dir} ${workspace.remote_url} ${workspace.remote_branch}`)
+		.join("\n");
 }
 
-function parseWorkspacesText(text: string): WorkspaceMount[] {
+function parseWorkspacesText(text: string): ProjectWorkspace[] {
 	return text
 		.split(/\r?\n/)
 		.map((line) => line.trim())
 		.filter(Boolean)
 		.map((line) => {
-			const equalsIndex = line.indexOf("=");
-			const parts =
-				equalsIndex === -1
-					? line.split(/\s+/, 2)
-					: [line.slice(0, equalsIndex).trim(), line.slice(equalsIndex + 1).trim()];
-			const [mount_dir, source_path] = parts;
-			if (!mount_dir || !source_path) {
-				throw new Error("workspace lines must be mount_dir=/absolute/source_path");
+			const [workspace_dir, remote_url, remote_branch] = line.split(/\s+/, 3);
+			if (!workspace_dir || !remote_url || !remote_branch) {
+				throw new Error("workspace lines must be: workspace_dir remote_url remote_branch");
 			}
-			return { mount_dir, source_path };
+			return { workspace_dir, remote_url, remote_branch };
 		});
 }
 
@@ -566,7 +561,7 @@ export function App() {
 			}
 			void Promise.all([
 				queryClient.invalidateQueries({ queryKey: queryKeys.projects }),
-				queryClient.invalidateQueries({ queryKey: queryKeys.systemPrompt }),
+				queryClient.invalidateQueries({ queryKey: queryKeys.systemPromptRoot }),
 				queryClient.invalidateQueries({
 					queryKey: queryKeys.sessions(selectedProjectRef.current),
 				}),
@@ -977,36 +972,6 @@ export function App() {
 		[api, newSessionProvider, queryClient, selectSession],
 	);
 
-	const forkFromTarget = useCallback(
-		async (target: HistoryTargetOption, title?: string) => {
-			const sessionId = requireSelected();
-			const fork = await api.forkHistory({
-				sessionId,
-				leafId: target.sourceEntryId ?? target.id,
-				placement: target.placement ?? "at",
-			});
-			const normalizedTitle = title?.trim();
-			if (normalizedTitle) {
-				await api.configureSession({
-					sessionId: fork.session_id,
-					provider: loadedSnapshot?.provider ?? selectedSession?.provider ?? DEFAULT_PROVIDER,
-					metadata: {
-						...(loadedSnapshot?.metadata ?? selectedSession?.metadata ?? {}),
-						title: normalizedTitle,
-					},
-				});
-			}
-			if (target.restoreText !== undefined) {
-				composerHandleRef.current?.setValueForSession(fork.session_id, target.restoreText);
-			}
-			invalidateSessionList();
-			selectSession(fork.session_id);
-			pushNotice("success", `forked ${fork.session_id}`);
-			return fork.session_id;
-		},
-		[api, invalidateSessionList, loadedSnapshot, pushNotice, requireSelected, selectedSession, selectSession],
-	);
-
 	const switchToTarget = useCallback(
 		async (target: HistoryTargetOption) => {
 			const sessionId = requireSelected();
@@ -1125,19 +1090,17 @@ export function App() {
 	);
 
 	const openHistoryDialog = useCallback(
-		(mode: "fork" | "switch", initialForkTitle?: string) => {
+		() => {
 			if (!loadedSnapshot) throw new Error("session is still loading");
-			if (mode === "switch" && loadedSnapshot.activity !== "idle") {
+			if (loadedSnapshot.activity !== "idle") {
 				throw new Error("stop the active turn before switching history");
 			}
 			const sessionId = loadedSnapshot.session_id;
 			const lastEventId = loadedSnapshot.last_event_id;
 			setHistoryDialog({
 				sessionId,
-				mode,
 				entries: loadedEntries,
 				activeLeafId: loadedSnapshot.active_leaf_id,
-				initialForkTitle,
 				loading: true,
 				error: null,
 			});
@@ -1147,12 +1110,11 @@ export function App() {
 					queryFn: async () => {
 						const shouldLogPerf = perfEnabled();
 						const startedAt = perfNow();
-						if (shouldLogPerf) perfLog("history.tree start", { sessionId, mode, lastEventId });
+						if (shouldLogPerf) perfLog("history.tree start", { sessionId, lastEventId });
 						const tree = await api.getHistoryTree(sessionId);
 						if (shouldLogPerf) {
 							perfLog("history.tree end", {
 								sessionId,
-								mode,
 								lastEventId,
 								entries: tree.entries.length,
 								approxBytes: approximateJsonSize(tree),
@@ -1166,7 +1128,7 @@ export function App() {
 				})
 				.then((tree) => {
 					setHistoryDialog((current) => {
-						if (!current || current.mode !== mode || current.sessionId !== sessionId) return current;
+						if (!current || current.sessionId !== sessionId) return current;
 						return {
 							...current,
 							entries: tree.entries,
@@ -1178,7 +1140,7 @@ export function App() {
 				})
 				.catch((error) => {
 					setHistoryDialog((current) => {
-						if (!current || current.mode !== mode || current.sessionId !== sessionId) return current;
+						if (!current || current.sessionId !== sessionId) return current;
 						return {
 							...current,
 							loading: false,
@@ -1209,16 +1171,14 @@ export function App() {
 					pushActionNotice("info", "/system is read-only; edit PI.md in the repo to change the prompt");
 					return;
 				}
+				if (!loadedSnapshot) {
+					throw new Error("/system requires a selected session");
+				}
 				setPromptDialog({ loading: true, template: "", rendered: null, view: "rendered", error: null });
 				try {
-					const promptRequest = loadedSnapshot
-						? { sessionId: loadedSnapshot.session_id }
-						: selectedProject
-							? { projectId: selectedProject.project_id, provider: activeProvider }
-							: { projectId: null, provider: activeProvider };
 					const next = await queryClient.fetchQuery({
-						queryKey: queryKeys.systemPrompt,
-						queryFn: () => api.getSystemPrompt(promptRequest),
+						queryKey: queryKeys.systemPrompt(loadedSnapshot.session_id),
+						queryFn: () => api.getSystemPrompt(loadedSnapshot.session_id),
 						staleTime: 0,
 					});
 					setPromptDialog({ loading: false, template: next.template, rendered: next.rendered, view: next.rendered ? "rendered" : "template", error: null });
@@ -1230,12 +1190,8 @@ export function App() {
 
 			const sessionId = requireSelected();
 			if (!loadedSnapshot) throw new Error("session is still loading");
-			if (name === "fork") {
-				openHistoryDialog("fork", args);
-				return;
-			}
 			if (name === "switch") {
-				openHistoryDialog("switch");
+				openHistoryDialog();
 				return;
 			}
 			if (name === "export") {
@@ -1257,7 +1213,7 @@ export function App() {
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[activeProvider, api, loadedSnapshot, openHistoryDialog, pushNotice, queryClient, requireSelected, selectedProject],
+		[api, loadedSnapshot, openHistoryDialog, pushNotice, queryClient, requireSelected],
 	);
 
 	const submitComposer = useCallback(
@@ -1619,18 +1575,11 @@ export function App() {
 
 			{historyDialog ? (
 				<HistoryPickerDialog
-					mode={historyDialog.mode}
 					entries={historyDialog.entries}
 					activeLeafId={historyDialog.activeLeafId}
-					initialForkTitle={historyDialog.initialForkTitle}
 					loading={historyDialog.loading}
 					error={historyDialog.error}
 					onClose={() => setHistoryDialog(null)}
-					onFork={(target, title) => {
-						void forkFromTarget(target, title)
-							.then(() => setHistoryDialog(null))
-							.catch((error) => pushNotice("error", errorMessage(error)));
-					}}
 					onSwitch={handleSwitchHistoryTarget}
 				/>
 			) : null}
@@ -1923,7 +1872,9 @@ function ProjectDialog({
 						<textarea
 							value={state.workspacesText}
 							onChange={(event) => onChange({ workspacesText: event.target.value })}
-							placeholder={"dynamo=/home/me/dynamo/dynamo\nnixl=/home/me/dynamo/nixl"}
+							placeholder={
+								"pi-relay https://github.com/galletas1712/pi-relay.git main\nagent-config git@github.com:me/agent-config.git main"
+							}
 							required
 							disabled={state.saving}
 						/>

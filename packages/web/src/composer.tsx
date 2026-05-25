@@ -19,7 +19,6 @@ export interface ComposerHandle {
 	focus(): void;
 	getValue(): string;
 	setValue(value: string): void;
-	setValueForSession(sessionId: string | null, value: string): void;
 	clearSession(sessionId: string | null): void;
 	restoreSubmittedDraft(sessionId: string | null, value: string): void;
 }
@@ -102,13 +101,6 @@ export const Composer = memo(function Composer({
 			focus: () => textAreaRef.current?.focus(),
 			getValue: () => draftRef.current,
 			setValue: (value) => setDraftValue(value),
-			setValueForSession: (sessionId, value) => {
-				storeDraft(sessionId, value);
-				if (selectedIdRef.current === sessionId) {
-					draftRef.current = value;
-					setDraft(value);
-				}
-			},
 			restoreSubmittedDraft: (sessionId, value) => {
 				storeDraft(sessionId, value);
 				if (selectedIdRef.current === sessionId && !draftRef.current.trim()) {

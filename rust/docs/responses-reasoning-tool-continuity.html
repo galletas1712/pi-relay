@@ -867,9 +867,9 @@ struct ProviderReplayItem {
 					open chain of reasoning/thinking -> tool call -> tool output.
 				</li>
 				<li>
-					<strong>Fork and switch should branch replay state too.</strong>
-					If a user branches from a point inside a provider tool loop, the branch must include the
-					replay records that are ancestors of that point.
+					<strong>Switch should move replay state too.</strong>
+					If a user switches to another point inside a provider tool loop, the active branch must include
+					the replay records that are ancestors of that point.
 				</li>
 				<li>
 					<strong>UI should render only human-meaningful items.</strong>
@@ -886,7 +886,7 @@ struct ProviderReplayItem {
 					The model may treat an intermediate preamble as a completed answer, fail to connect a tool
 					result to the reasoning that requested it, repeat a tool call, lose track of whether it was
 					in a planning/commentary phase, reject a request because a thinking signature changed, or
-					behave differently after a fork/compact even though the visible transcript looks equivalent.
+					behave differently after a switch/compact even though the visible transcript looks equivalent.
 				</p>
 			</article>
 

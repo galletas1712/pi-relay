@@ -1,15 +1,17 @@
 use std::path::Path;
 
-use agent_store::WorkspaceMount;
+use agent_store::SessionWorkspace;
 use agent_vocab::{ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Result};
 use serde::Deserialize;
 
-use super::prompt::{load_skills_for_workspace_mounts, load_skills_for_workspace_mounts_with_home};
+use super::prompt::{
+    load_skills_for_session_workspaces, load_skills_for_session_workspaces_with_home,
+};
 
 pub(crate) fn load_skill_result(
     outer_cwd: &Path,
-    workspaces: &[WorkspaceMount],
+    workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
 ) -> ToolResultMessage {
@@ -21,7 +23,7 @@ pub(crate) fn load_skill_result(
 
 fn load_skill_output(
     outer_cwd: &Path,
-    workspaces: &[WorkspaceMount],
+    workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
 ) -> Result<String> {
@@ -30,7 +32,7 @@ fn load_skill_output(
 
 fn load_skill_output_with_home(
     outer_cwd: &Path,
-    workspaces: &[WorkspaceMount],
+    workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
     home: Option<&Path>,
@@ -50,8 +52,10 @@ fn load_skill_output_with_home(
         return Ok("skill already loaded".to_string());
     }
     let skills = match home {
-        Some(home) => load_skills_for_workspace_mounts_with_home(outer_cwd, workspaces, Some(home)),
-        None => load_skills_for_workspace_mounts(outer_cwd, workspaces),
+        Some(home) => {
+            load_skills_for_session_workspaces_with_home(outer_cwd, workspaces, Some(home))
+        }
+        None => load_skills_for_session_workspaces(outer_cwd, workspaces),
     };
     let Some(skill) = skills
         .into_iter()
@@ -123,9 +127,12 @@ mod tests {
             args_json: r#"{"workspace":"repo","name":"rust-refactor"}"#.to_string(),
         };
         let mut loaded = std::collections::BTreeSet::new();
-        let workspaces = vec![WorkspaceMount {
-            mount_dir: "repo".to_string(),
-            source_path: String::new(),
+        let workspaces = vec![SessionWorkspace {
+            workspace_dir: "repo".to_string(),
+            remote_url: String::new(),
+            remote_branch: String::new(),
+            base_sha: String::new(),
+            local_branch: String::new(),
         }];
 
         let first = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);

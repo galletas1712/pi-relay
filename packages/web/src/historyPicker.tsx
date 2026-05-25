@@ -1,8 +1,7 @@
 import { useMemo, useState, type CSSProperties } from "react";
-import { ChevronRight, GitFork, Loader2, RotateCcw, X } from "lucide-react";
+import { ChevronRight, Loader2, RotateCcw, X } from "lucide-react";
 import {
 	branchEntriesFor,
-	historyForkOptions,
 	historySwitchOptions,
 	type HistoryTargetOption
 } from "./historyTargets.ts";
@@ -21,34 +20,24 @@ interface VisibleHistoryRow {
 }
 
 export function HistoryPickerDialog({
-	mode,
 	entries,
 	activeLeafId,
-	initialForkTitle = "",
 	loading = false,
 	error = null,
 	onClose,
-	onFork,
 	onSwitch
 }: {
-	mode: "fork" | "switch";
 	entries: TranscriptEntry[];
 	activeLeafId: string | null;
-	initialForkTitle?: string;
 	loading?: boolean;
 	error?: string | null;
 	onClose: () => void;
-	onFork: (target: HistoryTargetOption, title: string) => void;
 	onSwitch: (target: HistoryTargetOption) => void;
 }) {
-	const [forkTitle, setForkTitle] = useState(initialForkTitle);
 	const [expandedBranches, setExpandedBranches] = useState<Set<string>>(() => new Set());
 	const options = useMemo(
-		() => {
-			if (mode === "fork") return historyForkOptions(entries, activeLeafId);
-			return historySwitchOptions(entries, activeLeafId);
-		},
-		[activeLeafId, entries, mode]
+		() => historySwitchOptions(entries, activeLeafId),
+		[activeLeafId, entries]
 	);
 	const visibleRows = useMemo(
 		() => {
@@ -94,12 +83,6 @@ export function HistoryPickerDialog({
 		});
 	};
 	const targetCount = visibleRows.length;
-	const title = mode === "fork" ? "Fork session" : "Switch branch";
-	const description =
-		mode === "fork"
-			? "Pick a user message, completed turn, or compaction root to branch from."
-			: "Pick a user message to edit, or a completed turn or compaction root to make active.";
-	const Icon = mode === "fork" ? GitFork : RotateCcw;
 
 	return (
 		<div className="modal-scrim" role="presentation" onMouseDown={onClose}>
@@ -112,30 +95,18 @@ export function HistoryPickerDialog({
 			>
 				<div className="history-dialog-head">
 					<span className="history-dialog-icon">
-						<Icon size={15} />
+						<RotateCcw size={15} />
 					</span>
 					<div className="history-dialog-copy">
-						<h2 id="history-dialog-title">{title}</h2>
-						<p>{description}</p>
+						<h2 id="history-dialog-title">Switch branch</h2>
+						<p>Pick a user message to edit, or a completed turn or compaction root to make active.</p>
 					</div>
 					<button className="plain-close-button" type="button" onClick={onClose} aria-label="close picker">
 						<X size={14} />
 					</button>
 				</div>
 
-				{mode === "fork" ? (
-					<label className="history-title-field">
-						<span>Fork title</span>
-						<input
-							value={forkTitle}
-							onChange={(event) => setForkTitle(event.target.value)}
-							placeholder="Optional title"
-							autoFocus
-						/>
-					</label>
-				) : null}
-
-				<div className="history-options tree" role="tree" aria-label={`${mode} targets`}>
+				<div className="history-options tree" role="tree" aria-label="switch targets">
 					{loading ? (
 						<div className="history-loading">
 							<Loader2 className="spin" size={16} />
@@ -171,13 +142,7 @@ export function HistoryPickerDialog({
 										type="button"
 										role="treeitem"
 										aria-selected={row.isActive}
-										onClick={() => {
-											if (mode === "fork") {
-												onFork(row.option, forkTitle);
-											} else {
-												onSwitch(row.option);
-											}
-										}}
+										onClick={() => onSwitch(row.option)}
 									>
 										<span className="tree-guides" aria-hidden="true" />
 										<span className={`history-option-icon ${row.entry.parent_id ? "" : "root"}`}>
@@ -202,9 +167,7 @@ export function HistoryPickerDialog({
 					)}
 					{!loading && !error && targetCount === 0 ? (
 						<div className="history-empty">
-							{mode === "fork"
-								? "No user messages, completed turns, or compaction roots yet."
-								: "No editable messages, completed turns, or compaction roots yet."}
+							No editable messages, completed turns, or compaction roots yet.
 						</div>
 					) : null}
 				</div>

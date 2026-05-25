@@ -234,7 +234,7 @@
       <li>OpenAI: send two similar Responses requests through the daemon in one session. Assert the second response reports non-zero <code>cached_tokens</code> once the prompt is above the minimum.</li>
       <li>Anthropic: send two similar Messages requests through the daemon. Assert first request creates cache tokens and the second reads cache tokens.</li>
       <li>Run a multi-tool turn and verify Anthropic thinking/replay blocks are preserved while cache metrics remain sensible.</li>
-      <li>Run fork/switch/compact after cached turns and verify no cache metadata appears in the visible transcript tree.</li>
+      <li>Run switch/compact after cached turns and verify no cache metadata appears in the visible transcript tree.</li>
     </ol>
   </div>
 
