@@ -7,7 +7,7 @@ use sqlx::PgPool;
 /// - `projects`: one row per project. Its Git workspace remotes/branches are
 ///   the defaults for new sessions.
 /// - `sessions`: one row per durable session, including active transcript leaf
-///   and provider/session metadata. Sessions snapshot the project workspace
+///   and the rendered system prompt. Sessions snapshot the project workspace
 ///   remote branches, base commits, and local branch names; project sessions
 ///   get their own private Git checkouts under `outer_cwd`.
 /// - `daemon_config`: reserved daemon key-value config.
@@ -35,9 +35,12 @@ create table if not exists sessions (
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
     active_leaf_id text null,
+    system_prompt text not null,
     provider_config jsonb not null,
     metadata jsonb not null default '{}'::jsonb
 );
+
+alter table sessions add column if not exists system_prompt text not null default '';
 
 create index if not exists sessions_project_created_idx
     on sessions(project_id, created_at desc, id desc);

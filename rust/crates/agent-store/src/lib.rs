@@ -158,6 +158,7 @@ pub struct SessionConfig {
     pub project_id: Option<Uuid>,
     pub outer_cwd: String,
     pub workspaces: Vec<SessionWorkspace>,
+    pub system_prompt: String,
     pub provider: ProviderConfig,
     pub metadata: Value,
 }

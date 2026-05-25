@@ -195,6 +195,7 @@ mod tests {
             project_id: Some(project_id),
             outer_cwd: "/tmp".to_string(),
             workspaces: Vec::new(),
+            system_prompt: "test prompt".to_string(),
             provider: ProviderConfig {
                 kind: ProviderKind::OpenAi,
                 model: "test-model".to_string(),

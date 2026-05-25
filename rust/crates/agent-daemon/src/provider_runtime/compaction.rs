@@ -1,4 +1,3 @@
-use agent_prompt::{render_compaction_prompt, render_prompt};
 use agent_provider::{
     ModelRequest, ModelTranscriptEntry, PromptSections, ProviderCompactionRequest,
     ProviderCompactionResponse, ProviderToolProfile,
@@ -15,7 +14,7 @@ use crate::model_metadata;
 use crate::state::AppState;
 
 use super::auth_retry::{compact_with_auth_retry, complete_with_auth_retry};
-use super::prompt::{assemble_agent_prompt, prompt_context};
+use super::prompt::{assemble_agent_prompt, render_pi_compaction_prompt};
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
 
@@ -338,7 +337,7 @@ async fn run_local_summary_compaction(
             session_id,
             &compaction_session_id,
             entries_from_groups(&groups),
-        );
+        )?;
         let credentials = Credentials::load();
         let provider =
             provider_for_config(state, config, &credentials, &compaction_session_id).await?;
@@ -389,13 +388,12 @@ fn local_summary_request(
     _session_id: &str,
     compaction_session_id: &str,
     mut transcript: Vec<ModelTranscriptEntry>,
-) -> ModelRequest {
-    let prompt_ctx = prompt_context(state, config);
-    let compaction_request = render_compaction_prompt(&prompt_ctx);
+) -> Result<ModelRequest> {
+    let compaction_request = render_pi_compaction_prompt(state, config)?;
     transcript.push(TranscriptItem::UserMessage(UserMessage::text(compaction_request)).into());
-    ModelRequest {
+    Ok(ModelRequest {
         model: config.provider.model.clone(),
-        prompt: PromptSections::stable(render_prompt(&prompt_ctx)),
+        prompt: PromptSections::stable(config.system_prompt.clone()),
         transcript,
         tool_profile: ProviderToolProfile::None,
         tools: Vec::new(),
@@ -411,7 +409,7 @@ fn local_summary_request(
         // Local summary compaction uses an isolated compaction session id and
         // prompt-cache key. Remote OpenAI compaction intentionally does not.
         session_id: Some(compaction_session_id.to_string()),
-    }
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -522,6 +520,7 @@ mod tests {
             project_id: None,
             outer_cwd: "/tmp".to_string(),
             workspaces: Vec::new(),
+            system_prompt: "test prompt".to_string(),
             provider: agent_vocab::ProviderConfig {
                 kind,
                 model: model.to_string(),

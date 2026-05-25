@@ -42,14 +42,15 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         sqlx::query(
             r#"
-            insert into sessions (id, project_id, outer_cwd, workspaces, provider_config, metadata)
-            values ($1, $2, $3, $4, $5, $6)
+            insert into sessions (id, project_id, outer_cwd, workspaces, system_prompt, provider_config, metadata)
+            values ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(session_id)
         .bind(config.project_id)
         .bind(&config.outer_cwd)
         .bind(serde_json::to_value(&config.workspaces)?)
+        .bind(&config.system_prompt)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
         .execute(&mut *tx)
@@ -199,8 +200,8 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
             r#"
-                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, provider_config, metadata)
-                values ($1, $2, $3, $4, $5::text, $6, $7)
+                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, system_prompt, provider_config, metadata)
+                values ($1, $2, $3, $4, $5::text, $6, $7, $8)
                 on conflict (id) do nothing
                 returning id
                 "#,
@@ -210,6 +211,7 @@ impl PostgresAgentStore {
         .bind(&config.outer_cwd)
         .bind(serde_json::to_value(&config.workspaces)?)
         .bind(active_leaf_id)
+        .bind(&config.system_prompt)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
         .fetch_optional(&mut *tx)
@@ -407,6 +409,7 @@ impl PostgresAgentStore {
                 s.project_id,
                 s.outer_cwd,
                 s.workspaces,
+                s.system_prompt,
                 s.provider_config,
                 s.metadata
             from sessions s
@@ -423,6 +426,7 @@ impl PostgresAgentStore {
             workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
                 row.get::<Value, _>("workspaces"),
             )?,
+            system_prompt: row.get("system_prompt"),
             provider: serde_json::from_value(row.get("provider_config"))?,
             metadata: row.get("metadata"),
         })
