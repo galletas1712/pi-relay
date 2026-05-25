@@ -1,7 +1,7 @@
 # Rust Agent Stack
 
 Personal-use Rust rewrite of the core pi-style agent runtime. The design keeps
-the good local semantics around resume, rewind, fork, and compaction while
+the good local semantics around resume, switch, and compaction while
 removing the hierarchical subagent machinery from the TypeScript fork.
 
 See [`docs/architecture.md`](docs/architecture.md) for the detailed design.
@@ -16,7 +16,7 @@ choices and invisible runtime/storage decisions.
 | --- | --- |
 | `agent-vocab` | Shared serializable ids, message blocks, images, assistant items, tool calls/results, and transcript items. |
 | `agent-core` | Pure deterministic FSM for one agent turn loop. No I/O. |
-| `agent-session` | Durable transcript forest, model context materialization, resume/rewind/fork/compaction, and storage snapshots. |
+| `agent-session` | Durable transcript forest, model context materialization, resume, compaction, and storage snapshots. |
 | `agent-store` | Postgres-only session/event/action/input persistence for the daemon. |
 | `agent-provider` | `ModelProvider` plus OpenAI and Anthropic adapters. |
 | `agent-tools` | `AgentTool`, `ToolRegistry`, and builtin `read`/`write`/`edit`/`bash` tools. |
@@ -97,7 +97,7 @@ model picker and provider-specific reasoning effort picker. The model is locked
 once the session has transcript history; reasoning effort can still be changed
 during or between turns and applies to subsequently created provider requests.
 Slash commands expose operations that do not already have dedicated controls:
-`/fork`, `/switch`, `/compact`, `/system`, and `/export`. Active turns use the
+`/switch`, `/compact`, `/system`, and `/export`. Active turns use the
 stop button; new, rename, archive, and unarchive use sidebar controls; queued
 follow-ups can be promoted to steer from the queue pane above the composer.
 Crashed or interrupted terminal model turns can be retried/continued directly

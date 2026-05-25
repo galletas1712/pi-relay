@@ -43,9 +43,8 @@ checkpoint. The durable Postgres action row stores only that leaf reference and
 context-token metadata; recovery can rebuild the full context from
 `StoredTranscriptEntry` values, including each entry's provider replay sidecar.
 
-`SessionInput` contains only model completions with optional context-token
-updates and direct context-token updates. Plain core inputs use
-`AgentSession::enqueue_input`.
+`SessionInput` contains session-level model completion forms. Plain core inputs
+use `AgentSession::enqueue_input`.
 
 `SessionEvent` is live-only activity: transcript append and action
 requested/completed/failed. Durable compaction and history-switch events are

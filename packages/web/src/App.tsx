@@ -561,7 +561,7 @@ export function App() {
 			}
 			void Promise.all([
 				queryClient.invalidateQueries({ queryKey: queryKeys.projects }),
-				queryClient.invalidateQueries({ queryKey: queryKeys.systemPrompt }),
+				queryClient.invalidateQueries({ queryKey: queryKeys.systemPromptRoot }),
 				queryClient.invalidateQueries({
 					queryKey: queryKeys.sessions(selectedProjectRef.current),
 				}),
@@ -1177,7 +1177,7 @@ export function App() {
 				setPromptDialog({ loading: true, template: "", rendered: null, view: "rendered", error: null });
 				try {
 					const next = await queryClient.fetchQuery({
-						queryKey: queryKeys.systemPrompt,
+						queryKey: queryKeys.systemPrompt(loadedSnapshot.session_id),
 						queryFn: () => api.getSystemPrompt(loadedSnapshot.session_id),
 						staleTime: 0,
 					});

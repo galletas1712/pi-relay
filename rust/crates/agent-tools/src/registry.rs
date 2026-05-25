@@ -403,7 +403,7 @@ fn openai_apply_patch_tool() -> ProviderTool {
     });
     ProviderTool::new(
         "apply_patch",
-        "Apply a freeform patch to files in the workspace. Emit the raw patch body, not JSON.",
+        "Apply a freeform patch to files under the session current working directory. Emit the raw patch body, not JSON.",
         input_schema,
         json!({
             "type": "custom",

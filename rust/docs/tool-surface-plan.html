@@ -237,7 +237,7 @@
       <li>Keep <code>grep</code> as a custom JSON tool because its inputs are small and its output can be bounded aggressively.</li>
       <li>Do not expose generic <code>write_file(content)</code> or patch-as-JSON-string tools in the normal coding profile.</li>
       <li>Optimize tool result sizes as much as tool call syntax: bounded search/read output saves more context than shaving a few JSON tokens from small calls.</li>
-      <li>Keep the provider replay model structured. Token-efficient tool calls are not worth losing clean fork, switch, compaction, and retry semantics.</li>
+      <li>Keep the provider replay model structured. Token-efficient tool calls are not worth losing clean switch, compaction, and retry semantics.</li>
     </ul>
   </div>
 
@@ -534,7 +534,7 @@ AnthropicToolSpec
   HostedToolUse { id, provider, name, input, result, status }
   Reasoning
   UnknownReplayable { raw }</code></pre>
-    <p>This avoids pretending that Anthropic <code>server_tool_use</code> or OpenAI <code>web_search_call</code> is a local action. It also keeps fork, switch, compaction, and retry semantics clean because provider-hosted events remain append-only transcript/replay data.</p>
+    <p>This avoids pretending that Anthropic <code>server_tool_use</code> or OpenAI <code>web_search_call</code> is a local action. It also keeps switch, compaction, and retry semantics clean because provider-hosted events remain append-only transcript/replay data.</p>
   </div>
 
   <h2>Flow Diagrams</h2>
