@@ -258,6 +258,16 @@ pub struct ProviderUsage {
     pub total_tokens: Option<usize>,
     pub cache_read_input_tokens: Option<usize>,
     pub cache_creation_input_tokens: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf_ray: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_turn_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_included: Option<bool>,
 }
 
 #[derive(Debug, Error)]

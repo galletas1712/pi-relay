@@ -5,9 +5,12 @@ use agent_vocab::{
     UserMessage,
 };
 use async_trait::async_trait;
-use reqwest::{header::ACCEPT, StatusCode};
+use reqwest::{
+    header::{HeaderMap, ACCEPT, CONTENT_ENCODING, CONTENT_TYPE},
+    StatusCode,
+};
 use serde_json::{json, Value};
-use std::sync::OnceLock;
+use std::{io::Cursor, sync::OnceLock, time::Duration};
 use uuid::Uuid;
 
 use crate::{
@@ -30,6 +33,12 @@ const HEADER_CHATGPT_ACCOUNT: &str = "ChatGPT-Account-ID";
 const HEADER_INSTALLATION_ID: &str = "x-codex-installation-id";
 const HEADER_WINDOW_ID: &str = "x-codex-window-id";
 const HEADER_CLIENT_REQUEST_ID: &str = "x-client-request-id";
+const HEADER_CODEX_TURN_STATE: &str = "x-codex-turn-state";
+const HEADER_REQUEST_ID: &str = "x-request-id";
+const HEADER_CF_RAY: &str = "cf-ray";
+const HEADER_OPENAI_MODEL: &str = "openai-model";
+const HEADER_OPENAI_MODEL_LEGACY: &str = "x-openai-model";
+const HEADER_REASONING_INCLUDED: &str = "x-reasoning-included";
 
 // The Codex CLI's `originator` is the literal string `codex_cli_rs`. Sending
 // this from pi-relay is deliberate: the ChatGPT backend uses it for routing
@@ -37,6 +46,8 @@ const HEADER_CLIENT_REQUEST_ID: &str = "x-client-request-id";
 // source). Diverging from this label is what causes throttling.
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_RESIDENCY_US: &str = "us";
+const CODEX_REQUEST_COMPRESSION_LEVEL: i32 = 3;
+const CODEX_COMPACT_REQUEST_TIMEOUT_SECS: u64 = 20 * 60;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -48,10 +59,50 @@ pub struct OpenAiProvider {
     /// `x-codex-installation-id` header on every request. Optional because
     /// tests may not have a Codex install.
     installation_id: Option<String>,
-    /// Per-process window id, matching Codex CLI's behavior. Stable for the
-    /// lifetime of the provider instance; sent as `x-codex-window-id`.
-    window_id: String,
     base_url: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OpenAiResponseHeaders {
+    upstream_request_id: Option<String>,
+    cf_ray: Option<String>,
+    server_model: Option<String>,
+    codex_turn_state: Option<String>,
+    reasoning_included: Option<bool>,
+}
+
+impl OpenAiResponseHeaders {
+    fn from_headers(headers: &HeaderMap) -> Self {
+        Self {
+            upstream_request_id: header_value(headers, HEADER_REQUEST_ID),
+            cf_ray: header_value(headers, HEADER_CF_RAY),
+            server_model: header_value(headers, HEADER_OPENAI_MODEL)
+                .or_else(|| header_value(headers, HEADER_OPENAI_MODEL_LEGACY)),
+            codex_turn_state: header_value(headers, HEADER_CODEX_TURN_STATE),
+            reasoning_included: headers
+                .contains_key(HEADER_REASONING_INCLUDED)
+                .then_some(true),
+        }
+    }
+
+    fn attach_to_usage(self, usage: &mut Option<ProviderUsage>) {
+        let Some(usage) = usage.as_mut() else {
+            return;
+        };
+        usage.upstream_request_id = self.upstream_request_id;
+        usage.cf_ray = self.cf_ray;
+        usage.server_model = self.server_model;
+        usage.codex_turn_state = self.codex_turn_state;
+        usage.reasoning_included = self.reasoning_included;
+    }
+}
+
+fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn parse_compact_response(text: &str) -> ProviderResult<ProviderCompactionResponse> {
@@ -208,7 +259,6 @@ impl OpenAiProvider {
             access_token: access_token.into(),
             account_id,
             installation_id,
-            window_id: Uuid::new_v4().to_string(),
             base_url: "https://chatgpt.com/backend-api/codex".to_string(),
         }
     }
@@ -222,6 +272,7 @@ impl OpenAiProvider {
         &self,
         request: reqwest::RequestBuilder,
         session_id: &str,
+        window_id: &str,
     ) -> reqwest::RequestBuilder {
         let mut request = request
             // Identity (default_headers in Codex CLI).
@@ -232,7 +283,7 @@ impl OpenAiProvider {
             .bearer_auth(&self.access_token)
             // Codex installation + window identity. Both are documented as
             // observability/routing hints in core/src/client.rs.
-            .header(HEADER_WINDOW_ID, &self.window_id)
+            .header(HEADER_WINDOW_ID, window_id)
             // Per-request and per-session routing. Codex emits all four
             // (`session_id`/`session-id`/`thread_id`/`thread-id`) — we send
             // both spellings of each because the backend currently parses
@@ -319,22 +370,28 @@ impl OpenAiProvider {
             .session_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
+        let window_id = codex_window_id(&session_id, &request.transcript);
         let body = responses_body(request, &session_id)?;
 
-        let text = self
-            .add_codex_headers(
+        let response = zstd_json_request(
+            self.add_codex_headers(
                 self.client
                     .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
                     .header(ACCEPT, "text/event-stream"),
                 &session_id,
-            )
-            .json(&body)
-            .send()
-            .await?;
-        let (status, text) = response_text(text).await?;
+                &window_id,
+            ),
+            &body,
+        )?
+        .send()
+        .await?;
+        let response_headers = OpenAiResponseHeaders::from_headers(response.headers());
+        let (status, text) = response_text(response).await?;
         ensure_success(status, &text)?;
 
-        parse_responses_sse(&text, ProviderKind::OpenAi)
+        let mut parsed = parse_responses_sse(&text, ProviderKind::OpenAi)?;
+        response_headers.attach_to_usage(&mut parsed.usage);
+        Ok(parsed)
     }
 
     async fn compact_responses(
@@ -345,7 +402,8 @@ impl OpenAiProvider {
             .session_id
             .clone()
             .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let body = compact_body(request)?;
+        let window_id = codex_window_id(&session_id, &request.transcript);
+        let body = compact_body(request, &session_id)?;
 
         let response = self
             .add_codex_headers(
@@ -356,20 +414,67 @@ impl OpenAiProvider {
                     ))
                     .header(ACCEPT, "application/json"),
                 &session_id,
+                &window_id,
             )
+            .timeout(Duration::from_secs(CODEX_COMPACT_REQUEST_TIMEOUT_SECS))
             .json(&body)
             .send()
             .await?;
+        let response_headers = OpenAiResponseHeaders::from_headers(response.headers());
         let (status, text) = response_text(response).await?;
         ensure_success(status, &text)?;
-        parse_compact_response(&text)
+        let mut parsed = parse_compact_response(&text)?;
+        response_headers.attach_to_usage(&mut parsed.usage);
+        Ok(parsed)
     }
+}
+
+fn zstd_json_request(
+    request: reqwest::RequestBuilder,
+    body: &Value,
+) -> ProviderResult<reqwest::RequestBuilder> {
+    let json = serde_json::to_vec(body)?;
+    let compressed =
+        match zstd::stream::encode_all(Cursor::new(json), CODEX_REQUEST_COMPRESSION_LEVEL) {
+            Ok(compressed) => compressed,
+            Err(error) => {
+                return Err(ProviderError::Provider(format!(
+                    "failed to zstd-compress OpenAI request body: {error}"
+                )));
+            }
+        };
+    Ok(request
+        .header(CONTENT_TYPE, "application/json")
+        .header(CONTENT_ENCODING, "zstd")
+        .body(compressed))
 }
 
 async fn response_text(response: reqwest::Response) -> ProviderResult<(StatusCode, String)> {
     let status = response.status();
     let bytes = response.bytes().await?;
     Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
+}
+
+fn codex_window_id(session_id: &str, transcript: &[ModelTranscriptEntry]) -> String {
+    format!("{session_id}:{}", codex_window_generation(transcript))
+}
+
+fn codex_window_generation(transcript: &[ModelTranscriptEntry]) -> u64 {
+    // Codex CLI stores an explicit per-session window generation and increments
+    // it after replacing history with a compacted transcript. Pi-relay's Rust
+    // provider is currently re-created per request, so an agent-provider-only
+    // implementation derives a stable generation from the active transcript:
+    // 0 before compaction, then the latest compacted turn id after compaction.
+    // This preserves the backend-visible "new window after compaction" signal
+    // without requiring daemon/session state.
+    transcript
+        .iter()
+        .filter_map(|entry| match entry.item() {
+            TranscriptItem::CompactionSummary(summary) => Some(summary.last_turn_id.0),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 fn ensure_success(status: StatusCode, body: &str) -> ProviderResult<()> {
@@ -446,16 +551,19 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
     Ok(body)
 }
 
-// Mirrors Codex CLI's `CompactionInput` (see
-// `~/codex/codex-rs/codex-api/src/common.rs`). The codex compaction endpoint
-// is unary and rejects the streaming `/responses` envelope — sending
-// `stream`, `store`, `include`, `tool_choice`, `prompt_cache_key`, or
-// `service_tier` causes a 400 (`{"detail":"Stream must be set to true"}`).
-fn compact_body(request: ProviderCompactionRequest) -> ProviderResult<Value> {
+// Mirrors Codex CLI's current `CompactionInput` (see
+// `~/codex/codex-rs/codex-api/src/common.rs`). The compaction endpoint is
+// unary, so keep streaming-only `/responses` fields (`stream`, `store`,
+// `include`, `tool_choice`) out, but preserve the same request-affinity fields
+// Codex now carries into compaction (`prompt_cache_key`, `service_tier`).
+fn compact_body(request: ProviderCompactionRequest, session_id: &str) -> ProviderResult<Value> {
     let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
     let tool_profile = request.tool_profile;
     let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
     let tools = response_tools(tool_profile, &request_tools)?;
+    let prompt_cache_key = request
+        .prompt_cache_key
+        .unwrap_or_else(|| session_id.to_string());
     Ok(json!({
         "model": request.model,
         "instructions": request.prompt.stable_prefix.clone().unwrap_or_default(),
@@ -465,6 +573,8 @@ fn compact_body(request: ProviderCompactionRequest) -> ProviderResult<Value> {
         "reasoning": {
             "effort": reasoning_effort,
         },
+        "service_tier": OPENAI_PRIORITY_SERVICE_TIER,
+        "prompt_cache_key": prompt_cache_key,
     }))
 }
 
@@ -880,6 +990,7 @@ fn openai_usage(value: &Value) -> Option<ProviderUsage> {
             .and_then(Value::as_u64)
             .map(|value| value as usize),
         cache_creation_input_tokens: None,
+        ..ProviderUsage::default()
     })
 }
 
@@ -887,7 +998,8 @@ fn openai_usage(value: &Value) -> Option<ProviderUsage> {
 mod tests {
     use super::*;
     use crate::PromptSections;
-    use agent_vocab::{ToolCall, ToolResultMessage};
+    use agent_vocab::{ToolCall, ToolResultMessage, TurnId};
+    use reqwest::header::HeaderValue;
 
     fn test_tool(
         provider: ProviderKind,
@@ -915,6 +1027,7 @@ mod tests {
                     .client
                     .post("https://chatgpt.com/backend-api/codex/responses"),
                 "session-uuid-abcd",
+                "session-uuid-abcd:0",
             )
             .build()
             .expect("request builds");
@@ -952,13 +1065,9 @@ mod tests {
             header(HEADER_INSTALLATION_ID).as_deref(),
             Some("install-uuid-1234")
         );
-        assert!(
-            header(HEADER_WINDOW_ID)
-                .as_deref()
-                .map(|value| Uuid::parse_str(value).is_ok())
-                .unwrap_or(false),
-            "window id should be a UUID: {:?}",
-            header(HEADER_WINDOW_ID)
+        assert_eq!(
+            header(HEADER_WINDOW_ID).as_deref(),
+            Some("session-uuid-abcd:0")
         );
 
         // Session routing headers — all four spellings, all pinned to the
@@ -986,6 +1095,7 @@ mod tests {
                     .client
                     .post("https://chatgpt.com/backend-api/codex/responses"),
                 "session-xyz",
+                "session-xyz:0",
             )
             .build()
             .expect("request builds");
@@ -999,25 +1109,95 @@ mod tests {
     }
 
     #[test]
+    fn zstd_json_request_sets_codex_compression_headers_and_body() {
+        let provider = OpenAiProvider::codex("access-token", None, None);
+        let body = json!({
+            "model": "gpt-5.5",
+            "input": ["hello"],
+            "padding": "x".repeat(1024),
+        });
+
+        let request =
+            zstd_json_request(provider.client.post("https://example.com/responses"), &body)
+                .expect("request should compress")
+                .build()
+                .expect("request builds");
+
+        assert_eq!(
+            request
+                .headers()
+                .get(CONTENT_ENCODING)
+                .and_then(|value| value.to_str().ok()),
+            Some("zstd")
+        );
+        assert_eq!(
+            request
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let encoded = request
+            .body()
+            .and_then(reqwest::Body::as_bytes)
+            .expect("compressed body should be buffered");
+        let decoded = zstd::stream::decode_all(std::io::Cursor::new(encoded))
+            .expect("compressed body should decode");
+        let decoded: Value = serde_json::from_slice(&decoded).expect("decoded body should be JSON");
+        assert_eq!(decoded, body);
+    }
+
+    #[test]
+    fn openai_response_headers_attach_debug_metadata_to_usage() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_REQUEST_ID, HeaderValue::from_static("req-123"));
+        headers.insert(HEADER_CF_RAY, HeaderValue::from_static("cf-ray-456"));
+        headers.insert(
+            HEADER_OPENAI_MODEL,
+            HeaderValue::from_static("gpt-5.5-fast"),
+        );
+        headers.insert(
+            HEADER_CODEX_TURN_STATE,
+            HeaderValue::from_static("turn-state"),
+        );
+        headers.insert(HEADER_REASONING_INCLUDED, HeaderValue::from_static("true"));
+
+        let mut usage = Some(ProviderUsage {
+            input_tokens: Some(10),
+            ..ProviderUsage::default()
+        });
+        OpenAiResponseHeaders::from_headers(&headers).attach_to_usage(&mut usage);
+        let usage = usage.expect("usage remains present");
+
+        assert_eq!(usage.upstream_request_id.as_deref(), Some("req-123"));
+        assert_eq!(usage.cf_ray.as_deref(), Some("cf-ray-456"));
+        assert_eq!(usage.server_model.as_deref(), Some("gpt-5.5-fast"));
+        assert_eq!(usage.codex_turn_state.as_deref(), Some("turn-state"));
+        assert_eq!(usage.reasoning_included, Some(true));
+        assert_eq!(usage.input_tokens, Some(10));
+    }
+
+    #[test]
     fn compact_body_matches_codex_cli_compaction_input_shape() {
-        // The codex backend's `/responses/compact` rejects the
-        // streaming-responses envelope; the body must match codex CLI's
-        // `CompactionInput` exactly (model/instructions/input/tools/
-        // parallel_tool_calls/reasoning). Any extra streaming-only field
-        // here triggers `{"detail":"Stream must be set to true"}`.
-        let body = compact_body(ProviderCompactionRequest {
-            model: "gpt-5.5".to_string(),
-            prompt: PromptSections::new(
-                Some("stable rules".to_string()),
-                Some("cwd: /tmp/project".to_string()),
-            ),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            reasoning_effort: ReasoningEffort::High,
-            prompt_cache_key: None,
-            session_id: Some("session-1".to_string()),
-        })
+        // The codex backend's `/responses/compact` is unary, so the body must
+        // stay on Codex CLI's `CompactionInput` shape rather than the full
+        // streaming `/responses` envelope.
+        let body = compact_body(
+            ProviderCompactionRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::new(
+                    Some("stable rules".to_string()),
+                    Some("cwd: /tmp/project".to_string()),
+                ),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: Some("session-1".to_string()),
+            },
+            "session-1",
+        )
         .expect("compact body renders");
 
         assert_eq!(body["model"], "gpt-5.5");
@@ -1027,21 +1207,60 @@ mod tests {
         assert_eq!(body["tools"], json!([]));
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["prompt_cache_key"], "session-1");
+        assert_eq!(body["service_tier"], OPENAI_PRIORITY_SERVICE_TIER);
 
-        for forbidden in [
-            "tool_choice",
-            "store",
-            "stream",
-            "include",
-            "prompt_cache_key",
-            "service_tier",
-            "text",
-        ] {
+        for forbidden in ["tool_choice", "store", "stream", "include", "text"] {
             assert!(
                 body.get(forbidden).is_none(),
                 "compact body must not include `{forbidden}`"
             );
         }
+    }
+
+    #[test]
+    fn compact_body_prefers_explicit_prompt_cache_key_override() {
+        let body = compact_body(
+            ProviderCompactionRequest {
+                model: "gpt-5.5".to_string(),
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                reasoning_effort: ReasoningEffort::Medium,
+                prompt_cache_key: Some("explicit-compact-cohort".to_string()),
+                session_id: Some("session-1".to_string()),
+            },
+            "session-1",
+        )
+        .expect("compact body renders");
+
+        assert_eq!(body["prompt_cache_key"], "explicit-compact-cohort");
+        assert_eq!(body["service_tier"], OPENAI_PRIORITY_SERVICE_TIER);
+    }
+
+    #[test]
+    fn codex_window_id_uses_session_and_zero_before_compaction() {
+        let transcript = vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()];
+
+        assert_eq!(codex_window_id("thread-1", &transcript), "thread-1:0");
+    }
+
+    #[test]
+    fn codex_window_id_advances_after_compaction_summary() {
+        let transcript = vec![
+            TranscriptItem::CompactionSummary(CompactionSummary::new(
+                "session-1",
+                "leaf-1",
+                "summary",
+                Some(1024),
+                TurnId(42),
+            ))
+            .into(),
+            TranscriptItem::UserMessage(UserMessage::text("after compaction")).into(),
+        ];
+
+        assert_eq!(codex_window_id("thread-1", &transcript), "thread-1:42");
     }
 
     #[test]
