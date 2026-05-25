@@ -1182,7 +1182,8 @@ async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Va
         .map(str::to_string)
         .unwrap_or_else(|| format!("session_{}", Uuid::new_v4()));
 
-    let driver = SessionDriver::acquire(state, &session_id).await;
+    let (driver, _target_session_lock) =
+        SessionDriver::acquire_with_additional_lock(state, &session_id, &new_session_id).await;
     driver.ensure_idle_for_source_mutation().await?;
 
     let stored = state

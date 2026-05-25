@@ -33,9 +33,9 @@ Then the user-facing operations are small variations:
 
 - rewind: choose a safe point in the current session and set it active. Sending
   the next message creates a new child branch from that point.
-- fork: choose any explicit transcript point and create a new branch, usually
-  in a new session, with an editable restored user message when the selected
-  point is a user message.
+- fork: choose root, a completed turn, or a compaction root and create a new
+  session from that boundary, with an editable restored user message when the
+  selected point is a user message.
 - compaction: choose the current active leaf as the source, summarize the model
   context reachable from it, create a new compacted root, and set that compacted
   root active.
@@ -226,16 +226,15 @@ Rewind and fork should share the picker/tree backing model:
   into the composer"
 - rewind is restricted to points that can become a valid active source for a
   future turn
-- fork can target any explicit transcript entry by closing/recovering an open
-  turn suffix as interrupted in the copied branch
+- fork uses the same root/completed-turn/compaction-root target rule as rewind,
+  so copied child sessions always start from a runnable boundary
 
 The main transcript view should render only the active root-to-leaf path. The
 tree view should render inactive branches and compacted roots.
 
-The current web rewind picker only scans the active branch, while fork can scan
-all entries. To make pre-compaction history reachable after compaction, rewind
-must move to the tree-backed picker as well. Otherwise the backend may support
-rewinding to old branches while the UI hides those targets.
+The web picker should scan the full transcript tree for both rewind/switch and
+fork. That keeps pre-compaction history reachable after compaction without
+allowing either operation to target a non-boundary entry.
 
 ## Compaction Schemes
 

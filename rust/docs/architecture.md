@@ -192,10 +192,9 @@ Important operations:
   are recovered as crashed before the session is exposed as idle.
 - Rewind: move the active leaf to a prior turn boundary without deleting rows.
 - Fork: copy the source session's transcript forest snapshot into a new
-  independent session, then set the child active leaf to the selected entry.
-  If the selected entry is not already a boundary, the child gets an appended
-  interrupted tail on that branch. Copying the whole forest keeps prior
-  compaction roots and pre-compaction branches navigable inside the fork.
+  independent session, then set the child active leaf to the selected turn
+  boundary or root. Copying the whole forest keeps prior compaction roots and
+  pre-compaction branches navigable inside the fork.
 - Compaction: the daemon asks the provider to summarize the active
   `ModelContext`; `agent-store` atomically appends a
   `TranscriptItem::CompactionSummary` root and makes that root active. The old

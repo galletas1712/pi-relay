@@ -379,7 +379,7 @@
     <h3>Phase 2: Enforce Rust-owned structural invariants</h3>
     <ol>
       <li>Rust should reject source mutations that target invalid switch boundaries. Switch remains root, <code>TurnFinished</code>, or compaction root/summary only.</li>
-      <li>Rust should reject fork targets that do not exist. Fork may target any existing transcript entry, but never "nothing".</li>
+      <li>Rust should reject fork targets that are not root, <code>TurnFinished</code>, or <code>CompactionSummary</code>.</li>
       <li>Rust should preserve atomic active-leaf movement when appending transcript rows, switching, forking, compacting, or consuming queued input.</li>
       <li>Rust should continue ensuring that model tool calls become <code>ToolCallStarted</code> rows before tool results are appended.</li>
       <li>Rust recovery should close open non-live tails as <code>Crashed</code>, while explicit user stop closes as <code>Interrupted</code>.</li>
@@ -471,10 +471,10 @@ type TurnView = {
     <p>Rust should enforce the facts that protect the append-only transcript tree. It should not enforce UI labels such as progress versus final answer.</p>
     <ul>
       <li><code>history.rewind</code> and <code>history.switch</code>-style source movement remain boundary-only: empty root, <code>TurnFinished</code>, or <code>CompactionSummary</code>.</li>
-      <li><code>history.fork</code> requires an explicit existing transcript entry and may target any entry. <code>placement="before"</code> remains valid only for user messages.</li>
+      <li><code>history.fork</code> is idle-only and accepts the same root, <code>TurnFinished</code>, or <code>CompactionSummary</code> targets as switch.</li>
       <li>Compaction remains boundary-only and appends a compaction summary root inside the same session tree/forest.</li>
       <li>Provider replay stays sidecar-only and is stored on transcript rows without becoming visible transcript content.</li>
-      <li>Existing Rust tests already cover the key fork/rewind split: rewind rejects non-boundaries, fork accepts existing non-boundaries, and fork from a running source copies only the requested path.</li>
+      <li>Rust tests cover the shared fork/rewind boundary rule: non-boundaries are rejected and fork requires an idle source.</li>
     </ul>
   </div>
 

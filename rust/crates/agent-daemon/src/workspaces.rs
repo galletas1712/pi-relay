@@ -321,20 +321,93 @@ async fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
             source.display()
         );
     }
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent).await?;
+    let mut pending = vec![(source.to_path_buf(), dest.to_path_buf())];
+    let mut copied_dirs = Vec::new();
+    while let Some((source_dir, dest_dir)) = pending.pop() {
+        tokio::fs::create_dir_all(&dest_dir)
+            .await
+            .with_context(|| format!("create copy destination {}", dest_dir.display()))?;
+        copied_dirs.push((source_dir.clone(), dest_dir.clone()));
+
+        let mut entries = tokio::fs::read_dir(&source_dir)
+            .await
+            .with_context(|| format!("read directory {}", source_dir.display()))?;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .with_context(|| format!("read entry in {}", source_dir.display()))?
+        {
+            let source_path = entry.path();
+            let dest_path = dest_dir.join(PathBuf::from(entry.file_name()));
+            let file_type = entry
+                .file_type()
+                .await
+                .with_context(|| format!("read file type for {}", source_path.display()))?;
+            if file_type.is_dir() {
+                pending.push((source_path, dest_path));
+            } else if file_type.is_symlink() {
+                copy_symlink(&source_path, &dest_path).await?;
+            } else if file_type.is_file() {
+                tokio::fs::copy(&source_path, &dest_path)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "copy file {} to {}",
+                            source_path.display(),
+                            dest_path.display()
+                        )
+                    })?;
+                let permissions = tokio::fs::metadata(&source_path)
+                    .await
+                    .with_context(|| format!("read permissions for {}", source_path.display()))?
+                    .permissions();
+                tokio::fs::set_permissions(&dest_path, permissions)
+                    .await
+                    .with_context(|| format!("set permissions on {}", dest_path.display()))?;
+            } else {
+                bail!(
+                    "unsupported filesystem entry in session workspace copy: {}",
+                    source_path.display()
+                );
+            }
+        }
     }
-    let status = Command::new("cp")
-        .arg("-a")
-        .arg("--reflink=auto")
-        .arg(source.join("."))
-        .arg(dest)
-        .status()
+    for (source_dir, dest_dir) in copied_dirs.into_iter().rev() {
+        let permissions = tokio::fs::metadata(&source_dir)
+            .await
+            .with_context(|| format!("read permissions for {}", source_dir.display()))?
+            .permissions();
+        tokio::fs::set_permissions(&dest_dir, permissions)
+            .await
+            .with_context(|| format!("set permissions on {}", dest_dir.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn copy_symlink(source: &Path, dest: &Path) -> Result<()> {
+    let target = tokio::fs::read_link(source)
         .await
-        .with_context(|| format!("copy {} to {}", source.display(), dest.display()))?;
-    if !status.success() {
-        bail!("failed to copy session cwd to {}", dest.display());
+        .with_context(|| format!("read symlink {}", source.display()))?;
+    std::os::unix::fs::symlink(&target, dest)
+        .with_context(|| format!("copy symlink {} to {}", source.display(), dest.display()))?;
+    Ok(())
+}
+
+#[cfg(windows)]
+async fn copy_symlink(source: &Path, dest: &Path) -> Result<()> {
+    let target = tokio::fs::read_link(source)
+        .await
+        .with_context(|| format!("read symlink {}", source.display()))?;
+    let metadata = tokio::fs::metadata(source)
+        .await
+        .with_context(|| format!("read symlink target metadata {}", source.display()))?;
+    if metadata.is_dir() {
+        std::os::windows::fs::symlink_dir(&target, dest)
+    } else {
+        std::os::windows::fs::symlink_file(&target, dest)
     }
+    .with_context(|| format!("copy symlink {} to {}", source.display(), dest.display()))?;
     Ok(())
 }
 

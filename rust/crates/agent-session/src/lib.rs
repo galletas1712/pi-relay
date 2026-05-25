@@ -4,8 +4,8 @@
 //! forest of entries with branch-aware navigation). It is the sole owner of
 //! durable transcript items — every item flows from the core into the store via
 //! `session.drive()`. The session exposes `rewind` for immediate history
-//! navigation and `fork(entry)` for creating a new unregistered session from
-//! any existing transcript entry.
+//! navigation and `fork(boundary)` for creating a new unregistered session from
+//! a turn boundary.
 //! See `rust/docs/architecture.md`.
 
 #![forbid(unsafe_code)]

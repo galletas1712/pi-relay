@@ -388,24 +388,32 @@ impl AgentSession {
         }
     }
 
-    /// Produce an unregistered `AgentSession` whose context branches from an
-    /// existing transcript entry. The source session is unchanged; the caller
-    /// is responsible for registering the fork if desired.
+    /// Produce an unregistered `AgentSession` whose context branches from a
+    /// turn boundary. The source session is unchanged; the caller is
+    /// responsible for registering the fork if desired.
     ///
     /// Fork is separate from `rewind` because it reads the context and produces
     /// a new session rather than mutating the source in place.
-    pub fn fork(&self, leaf_id: &str) -> Result<AgentSession, HistoryOperationError> {
-        let transcript_store = self
-            .transcript_store
-            .copy_path_to_entry(leaf_id)
-            .map_err(HistoryOperationError::Store)?;
-        if !transcript_store.is_turn_boundary() {
-            let model_context = transcript_store
-                .model_context()
-                .close_open_turn(OpenTurnClosure::Interrupted);
-            return Ok(AgentSession::from_model_context(model_context));
+    pub fn fork(&self, leaf_id: Option<&str>) -> Result<AgentSession, HistoryOperationError> {
+        if !self.core.is_idle() || !self.transcript_store.is_turn_boundary() {
+            return Err(HistoryOperationError::Busy);
         }
-        AgentSession::from_transcript_store(transcript_store)
+        match leaf_id {
+            Some(leaf_id) if !self.transcript_store.contains_entry(leaf_id) => Err(
+                HistoryOperationError::Store(TranscriptStoreError::EntryNotFound),
+            ),
+            leaf_id if !self.transcript_store.is_turn_boundary_at(leaf_id) => Err(
+                HistoryOperationError::Store(TranscriptStoreError::NotTurnBoundary),
+            ),
+            Some(leaf_id) => {
+                let transcript_store = self
+                    .transcript_store
+                    .copy_path_to_entry(leaf_id)
+                    .map_err(HistoryOperationError::Store)?;
+                AgentSession::from_transcript_store(transcript_store)
+            }
+            None => Ok(AgentSession::new()),
+        }
     }
 
     pub fn install_compaction_checkpoint(

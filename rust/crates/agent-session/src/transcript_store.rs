@@ -474,7 +474,7 @@ mod tests {
 
         let forked = ctx
             .copy_path_to_entry(user_message_id)
-            .expect("any existing transcript entry can be copied for fork");
+            .expect("existing transcript entry can be copied");
         assert_eq!(forked.active_leaf_id(), Some(user_message_id.as_str()));
         assert!(!forked.is_turn_boundary());
 

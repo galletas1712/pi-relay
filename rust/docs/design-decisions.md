@@ -246,12 +246,10 @@ session instead of creating another one.
 
 Rewind operates on committed transcript boundaries or root. The UI presents
 rewind targets as visible user messages and completed turns, then maps them to
-the boundary-only backend operation. Forking is broader: it can branch from any
-existing transcript entry because it creates a new session and does not mutate
-the source branch. Forking from nothing is rejected. When the selected fork
-point is not already a boundary, the child session closes that copied partial
-tail as `Interrupted`, which keeps the child runnable without pretending daemon
-recovery crashed.
+the boundary-only backend operation. Fork uses the same source-session and
+target rules: the source must be idle, targets must be root, a completed turn,
+or a compaction root, and user-message choices map to the previous boundary
+with the selected text restored as a composer draft in the child.
 
 Picker actions carry expected active-leaf information for source-mutating
 rewind and for sending restored composer drafts. If the session moved since the

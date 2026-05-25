@@ -95,9 +95,10 @@ edits or cancels queued rows directly. The visible edit path is interrupt plus
 rewind/fork picker semantics; queued rows can only be promoted to steer
 priority before the daemon claims them.
 
-`history.fork { placement: "before" }` is acceptable in Rust because it is a
-core branch operation from an explicit transcript entry. The UI draft restored
-after that fork remains UI-owned.
+`history.fork` belongs in Rust because it creates durable session provenance
+and, for project sessions, copies workspace state. It uses the same root and
+turn-boundary targets as switch; user-message choices map to the previous
+boundary and the restored draft remains UI-owned.
 
 `restore this text into the composer` does not belong in Rust. It is a UI
 consequence of choosing a historical user message.
@@ -261,20 +262,12 @@ User-message target:
 - The child is still a real durable session because it has fork metadata and a
   local composer draft in the UI that created it.
 
-Assistant-message target:
+Completed-turn or compaction-root target:
 
-- Create the child through that exact assistant entry.
-- If that point is inside an open or partial turn, close the child tail as
-  `Interrupted` so the child is runnable.
+- Create the child at that exact boundary.
 - Composer remains empty.
-
-Tool-result or mid-turn target:
-
-- Preserve the current "fork from anywhere" capability.
-- Copy transcript entries through that point.
-- If the copied path is inside an open turn, close the child tail as
-  `Interrupted` so the child is runnable.
-- Composer is empty unless the target is a user message.
+- Assistant-message, tool-result, and other mid-turn entries are not valid fork
+  targets.
 
 Core provenance should be represented by core events, not by a UI draft blob.
 For a fork from the first user message, the child may have no transcript rows,
@@ -298,15 +291,12 @@ The UI draft store can then attach the editable message to the child:
 
 RPC shape for user-message fork targets:
 
-- Keep the current `history.fork` behavior for the default "fork at this entry"
-  case.
-- Extend it with an explicit "before user message" mode, for example
-  `{ "leaf_id": "entry_user_1", "placement": "before" }`.
-- The backend must verify that `leaf_id` points at an existing user message,
-  compute the previous safe boundary or root, and create the child from that
-  context.
-- This does not re-allow generic fork-from-null. The source user entry remains
-  explicit.
+- The frontend computes the previous safe boundary or root and sends that as
+  `leaf_id`.
+- `leaf_id: null` means fork from root.
+- `expected_active_leaf_id` protects the picker choice from stale source
+  history.
+- The selected user entry itself remains a UI draft, not child transcript state.
 
 ## Empty Session Pruning
 
@@ -333,8 +323,8 @@ Implemented:
 
 - `session.start`
   - Atomically creates a session and first materialized input.
-- Optional `placement: "before"` support on `history.fork` for user-message
-  fork targets.
+- `history.fork` accepts root or turn-boundary targets and rejects non-boundary
+  entries.
 - Optional `expected_active_leaf_id` on user input and rewind RPCs for stale
   picker/draft protection.
 - Durable consumed input ledger rows for idle accepted inputs that include
@@ -460,8 +450,8 @@ Invariant:
   the session is still idle and at the expected active leaf.
 - If the active leaf changed, return `history_changed`; the UI refreshes the
   tree and asks the user to pick again.
-- Fork may remain source-non-mutating, but it still validates the source entry
-  type for special modes such as `placement='before'`.
+- Fork is source-non-mutating, but it still validates the expected active leaf
+  and rejects non-boundary targets.
 
 ### UI Draft Sent Into The Wrong Context
 
@@ -585,14 +575,13 @@ Manual browser/RPC tests should cover real behavior, not stub-only checks:
    - UI draft store contains the selected historical message for the child.
    - Child is not considered empty/prunable.
 
-7. Fork from an assistant message.
-   - Child has transcript through the selected assistant entry.
+7. Fork from a completed turn.
+   - Child active leaf is the selected boundary.
    - Composer is empty.
 
 8. Fork from mid-turn tool/result point.
-   - Child transcript copies through target.
-   - Open child tail is closed as `Interrupted`.
-   - Child can receive a new input.
+   - Backend rejects the target as `not_turn_boundary`.
+   - The child session is not created.
 
 9. Prune existing empties.
    - Candidate list excludes sessions with transcript entries, queued inputs,
