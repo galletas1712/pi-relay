@@ -206,7 +206,7 @@ pub(crate) async fn run_compaction(
         ));
     }
     let credentials = Credentials::load();
-    let provider = provider_for_config(config, &credentials)?;
+    let provider = provider_for_config(state, config, &credentials, session_id).await?;
 
     if remote_mode != RemoteCompactionMode::Never && provider.provider.supports_remote_compaction()
     {
@@ -246,8 +246,8 @@ async fn run_remote_compaction_with_trimming(
             remote_compaction_request(state, config, session_id, entries_from_groups(&groups))
                 .await?;
         let credentials = Credentials::load();
-        let provider = provider_for_config(config, &credentials)?;
-        match compact_with_auth_retry(config, provider, request).await {
+        let provider = provider_for_config(state, config, &credentials, session_id).await?;
+        match compact_with_auth_retry(state, config, session_id, provider, request).await {
             Ok(result) => return Ok(remote_compaction_output(config.provider.kind, result)),
             Err(error)
                 if attempt + 1 < MAX_COMPACTION_CONTEXT_ATTEMPTS
@@ -331,11 +331,26 @@ async fn run_local_summary_compaction(
     let mut groups = transcript_groups(base_transcript);
     let mut last_context_error = None;
     for attempt in 0..MAX_COMPACTION_CONTEXT_ATTEMPTS {
-        let request =
-            local_summary_request(state, config, session_id, entries_from_groups(&groups));
+        let compaction_session_id = format!("{session_id}:compaction");
+        let request = local_summary_request(
+            state,
+            config,
+            session_id,
+            &compaction_session_id,
+            entries_from_groups(&groups),
+        );
         let credentials = Credentials::load();
-        let provider = provider_for_config(config, &credentials)?;
-        let response = match complete_with_auth_retry(config, provider, request).await {
+        let provider =
+            provider_for_config(state, config, &credentials, &compaction_session_id).await?;
+        let response = match complete_with_auth_retry(
+            state,
+            config,
+            &compaction_session_id,
+            provider,
+            request,
+        )
+        .await
+        {
             Ok(response) => response,
             Err(error)
                 if attempt + 1 < MAX_COMPACTION_CONTEXT_ATTEMPTS
@@ -371,7 +386,8 @@ async fn run_local_summary_compaction(
 fn local_summary_request(
     state: &AppState,
     config: &SessionConfig,
-    session_id: &str,
+    _session_id: &str,
+    compaction_session_id: &str,
     mut transcript: Vec<ModelTranscriptEntry>,
 ) -> ModelRequest {
     let prompt_ctx = prompt_context(state, config);
@@ -394,7 +410,7 @@ fn local_summary_request(
             .map(|key| format!("{key}:compaction")),
         // Local summary compaction uses an isolated compaction session id and
         // prompt-cache key. Remote OpenAI compaction intentionally does not.
-        session_id: Some(format!("{session_id}:compaction")),
+        session_id: Some(compaction_session_id.to_string()),
     }
 }
 

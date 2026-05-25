@@ -985,6 +985,10 @@ async fn run_compaction_job(
                     )
                     .await
                     .map_err(anyhow::Error::from)?;
+                state
+                    .provider_connections
+                    .mark_compacted(&session_id, config.provider.kind, job.last_turn_id.0)
+                    .await;
                 if matches!(job.scope, CompactionScope::MidTurn { .. }) {
                     install_runtime_compaction_checkpoint(
                         &state,

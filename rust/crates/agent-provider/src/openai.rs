@@ -10,7 +10,14 @@ use reqwest::{
     StatusCode,
 };
 use serde_json::{json, Value};
-use std::{io::Cursor, sync::OnceLock, time::Duration};
+use std::{
+    io::Cursor,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+    time::Duration,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -52,6 +59,7 @@ const CODEX_COMPACT_REQUEST_TIMEOUT_SECS: u64 = 20 * 60;
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
     client: reqwest::Client,
+    session_state: Option<Arc<OpenAiCodexSessionState>>,
     access_token: String,
     account_id: Option<String>,
     /// Persistent Codex installation identifier (UUID), read from
@@ -60,6 +68,52 @@ pub struct OpenAiProvider {
     /// tests may not have a Codex install.
     installation_id: Option<String>,
     base_url: String,
+}
+
+#[derive(Debug)]
+pub struct OpenAiCodexSessionState {
+    session_id: String,
+    window_generation: AtomicU64,
+}
+
+impl OpenAiCodexSessionState {
+    pub fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            window_generation: AtomicU64::new(0),
+        }
+    }
+
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub fn window_generation(&self) -> u64 {
+        self.window_generation.load(Ordering::Relaxed)
+    }
+
+    pub fn set_window_generation(&self, generation: u64) {
+        self.window_generation.store(generation, Ordering::Relaxed);
+    }
+
+    pub fn observe_transcript_generation(&self, generation: u64) {
+        let mut current = self.window_generation();
+        while generation > current {
+            match self.window_generation.compare_exchange_weak(
+                current,
+                generation,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    pub fn window_id(&self) -> String {
+        format!("{}:{}", self.session_id, self.window_generation())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -254,8 +308,40 @@ impl OpenAiProvider {
         account_id: Option<String>,
         installation_id: Option<String>,
     ) -> Self {
+        Self::codex_with_client(
+            reqwest::Client::new(),
+            access_token,
+            account_id,
+            installation_id,
+        )
+    }
+
+    pub fn codex_with_client(
+        client: reqwest::Client,
+        access_token: impl Into<String>,
+        account_id: Option<String>,
+        installation_id: Option<String>,
+    ) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client,
+            session_state: None,
+            access_token: access_token.into(),
+            account_id,
+            installation_id,
+            base_url: "https://chatgpt.com/backend-api/codex".to_string(),
+        }
+    }
+
+    pub fn codex_with_client_and_session(
+        client: reqwest::Client,
+        session_state: Arc<OpenAiCodexSessionState>,
+        access_token: impl Into<String>,
+        account_id: Option<String>,
+        installation_id: Option<String>,
+    ) -> Self {
+        Self {
+            client,
+            session_state: Some(session_state),
             access_token: access_token.into(),
             account_id,
             installation_id,
@@ -366,11 +452,12 @@ impl OpenAiProvider {
         // and as every routing header (session_id, x-client-request-id,
         // etc.). Falling back to a fresh UUID keeps the CLI / test paths
         // functional, but the daemon always supplies a real session id.
-        let session_id = request
-            .session_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let window_id = codex_window_id(&session_id, &request.transcript);
+        let session_id = openai_session_id(&request.session_id, self.session_state.as_deref());
+        let window_id = openai_window_id(
+            &session_id,
+            self.session_state.as_deref(),
+            &request.transcript,
+        );
         let body = responses_body(request, &session_id)?;
 
         let response = zstd_json_request(
@@ -398,11 +485,12 @@ impl OpenAiProvider {
         &self,
         request: ProviderCompactionRequest,
     ) -> ProviderResult<ProviderCompactionResponse> {
-        let session_id = request
-            .session_id
-            .clone()
-            .unwrap_or_else(|| Uuid::new_v4().to_string());
-        let window_id = codex_window_id(&session_id, &request.transcript);
+        let session_id = openai_session_id(&request.session_id, self.session_state.as_deref());
+        let window_id = openai_window_id(
+            &session_id,
+            self.session_state.as_deref(),
+            &request.transcript,
+        );
         let body = compact_body(request, &session_id)?;
 
         let response = self
@@ -426,6 +514,30 @@ impl OpenAiProvider {
         let mut parsed = parse_compact_response(&text)?;
         response_headers.attach_to_usage(&mut parsed.usage);
         Ok(parsed)
+    }
+}
+
+fn openai_session_id(
+    request_session_id: &Option<String>,
+    session_state: Option<&OpenAiCodexSessionState>,
+) -> String {
+    request_session_id
+        .clone()
+        .or_else(|| session_state.map(|state| state.session_id().to_string()))
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
+}
+
+fn openai_window_id(
+    session_id: &str,
+    session_state: Option<&OpenAiCodexSessionState>,
+    transcript: &[ModelTranscriptEntry],
+) -> String {
+    let transcript_generation = codex_window_generation(transcript);
+    if let Some(state) = session_state.filter(|state| state.session_id() == session_id) {
+        state.observe_transcript_generation(transcript_generation);
+        state.window_id()
+    } else {
+        format!("{session_id}:{transcript_generation}")
     }
 }
 
@@ -453,10 +565,6 @@ async fn response_text(response: reqwest::Response) -> ProviderResult<(StatusCod
     let status = response.status();
     let bytes = response.bytes().await?;
     Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
-}
-
-fn codex_window_id(session_id: &str, transcript: &[ModelTranscriptEntry]) -> String {
-    format!("{session_id}:{}", codex_window_generation(transcript))
 }
 
 fn codex_window_generation(transcript: &[ModelTranscriptEntry]) -> u64 {
@@ -1243,7 +1351,10 @@ mod tests {
     fn codex_window_id_uses_session_and_zero_before_compaction() {
         let transcript = vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()];
 
-        assert_eq!(codex_window_id("thread-1", &transcript), "thread-1:0");
+        assert_eq!(
+            openai_window_id("thread-1", None, &transcript),
+            "thread-1:0"
+        );
     }
 
     #[test]
@@ -1260,7 +1371,10 @@ mod tests {
             TranscriptItem::UserMessage(UserMessage::text("after compaction")).into(),
         ];
 
-        assert_eq!(codex_window_id("thread-1", &transcript), "thread-1:42");
+        assert_eq!(
+            openai_window_id("thread-1", None, &transcript),
+            "thread-1:42"
+        );
     }
 
     #[test]
