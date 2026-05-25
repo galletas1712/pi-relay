@@ -22,6 +22,26 @@ describe("ui resume storage", () => {
 		expect(selectedSessionForProject("project_b", storage)).toBe("session_b");
 	});
 
+	it("remembers the selected host session", () => {
+		const storage = memoryStorage();
+
+		rememberUiSelection(null, "session_host", storage);
+		rememberUiSelection("project_a", "session_a", storage);
+
+		expect(selectedSessionForProject(null, storage)).toBe("session_host");
+		expect(loadUiSelection(storage)).toMatchObject({
+			projectId: "project_a",
+			sessionId: "session_a",
+		});
+
+		rememberUiSelection(null, selectedSessionForProject(null, storage), storage);
+
+		expect(loadUiSelection(storage)).toMatchObject({
+			projectId: null,
+			sessionId: "session_host",
+		});
+	});
+
 	it("clears only the current project's remembered session", () => {
 		const storage = memoryStorage();
 

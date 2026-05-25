@@ -1,4 +1,5 @@
 const UI_RESUME_STORAGE_KEY = "piRelayUiResume:v1";
+const HOST_PROJECT_SESSION_KEY = "__host__";
 
 export type UiResumeStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
 
@@ -32,8 +33,7 @@ export function selectedSessionForProject(
 	storage = browserStorage(),
 	state = readUiResumeState(storage),
 ): string | null {
-	if (!projectId) return null;
-	return state.selectedSessionIdByProject[projectId] ?? null;
+	return state.selectedSessionIdByProject[projectSessionKey(projectId)] ?? null;
 }
 
 export function rememberUiSelection(projectId: string | null, sessionId: string | null, storage = browserStorage()): void {
@@ -75,9 +75,13 @@ function writeUiResumeState(state: UiResumeState, storage: UiResumeStorage | nul
 }
 
 function writeProjectSession(state: UiResumeState, projectId: string | null, sessionId: string | null): void {
-	if (!projectId) return;
-	if (sessionId) state.selectedSessionIdByProject[projectId] = sessionId;
-	else delete state.selectedSessionIdByProject[projectId];
+	const key = projectSessionKey(projectId);
+	if (sessionId) state.selectedSessionIdByProject[key] = sessionId;
+	else delete state.selectedSessionIdByProject[key];
+}
+
+function projectSessionKey(projectId: string | null): string {
+	return projectId ?? HOST_PROJECT_SESSION_KEY;
 }
 
 function normalizeState(value: unknown): UiResumeState {
