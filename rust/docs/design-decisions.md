@@ -246,10 +246,9 @@ session instead of creating another one.
 
 Rewind operates on committed transcript boundaries or root. The UI presents
 rewind targets as visible user messages and completed turns, then maps them to
-the boundary-only backend operation. Fork uses the same source-session and
-target rules: the source must be idle, targets must be root, a completed turn,
-or a compaction root, and user-message choices map to the previous boundary
-with the selected text restored as a composer draft in the child.
+the boundary-only backend operation. Fork is narrower while Git-backed
+workspaces are copied from the live checkout: the source must be idle and the
+target must be the current active completed turn or compaction root.
 
 Picker actions carry expected active-leaf information for source-mutating
 rewind and for sending restored composer drafts. If the session moved since the

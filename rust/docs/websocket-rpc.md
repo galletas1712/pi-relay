@@ -41,9 +41,8 @@ sending the same websocket frames a frontend would send.
 
 6. Fork is transcript-source-non-mutating.
    `history.fork` copies the source transcript forest and never rewrites the
-   source session history. It is idle-only and accepts the same turn-boundary
-   targets as `history.switch` so workspace copies always reflect a coherent
-   source state.
+   source session history. It is idle-only and only accepts the current active
+   turn boundary, so copied Git workspaces match the child transcript state.
 
 7. Tools are always allowed.
    The daemon runs model-requested tools immediately. There is no approval or
@@ -314,9 +313,9 @@ Invalid states should not be produced by the websocket service:
 - Switch to a non-boundary transcript entry.
 - Transcript rows committed without the matching action/event updates.
 
-Forking to a non-boundary entry is invalid for the websocket service. Fork uses
-the same target rule as `history.switch`, which keeps copied Git workspaces and
-the child transcript on a completed turn boundary.
+Forking to a non-boundary or historical entry is invalid for the websocket
+service. Fork only accepts the current active turn boundary, which keeps copied
+Git workspaces and the child transcript on the same completed state.
 
 Accepted transitions commit transcript rows, action updates, queued-input
 updates, active-leaf changes, and events in one transaction.
@@ -721,12 +720,12 @@ has moved since the picker was opened, switch fails with `history_changed`.
 
 ### `history.fork`
 
-Creates a new durable session from a turn boundary. This does not mutate the
-source transcript. The source session must be idle so the daemon can copy a
-coherent checkout for project sessions. The child receives a snapshot of the
-source session's full transcript forest, then its active leaf is set to the
-requested boundary. That means compaction roots and pre-compaction branches
-remain navigable in the child session.
+Creates a new durable session from the current active turn boundary. This does
+not mutate the source transcript. The source session must be idle so the daemon
+can copy a coherent checkout for project sessions. The child receives a
+snapshot of the source session's full transcript forest and keeps the same
+active leaf as the source. That means compaction roots and pre-compaction
+branches remain navigable in the child session.
 
 ```json
 {
@@ -738,10 +737,12 @@ remain navigable in the child session.
 ```
 
 Returns the new session id, the requested source leaf, and the child active leaf.
-`leaf_id: null` forks from the empty-log sentinel. Unknown entries and
-non-boundaries fail with `not_turn_boundary`. If `expected_active_leaf_id` is
-supplied and the session has moved since the picker was opened, fork fails with
-`history_changed`.
+`leaf_id` must equal the source session's current `active_leaf_id`; older
+boundaries, unknown entries, and `leaf_id: null` requests against a non-empty
+session fail with `not_active_leaf`. The current active leaf must also be a turn
+boundary; otherwise fork fails with `not_turn_boundary`. If
+`expected_active_leaf_id` is supplied and the session has moved since the picker
+was opened, fork fails with `history_changed`.
 
 ### `turn.resume`
 
@@ -1009,9 +1010,9 @@ descendant rows are preserved, and non-boundary switch fails with
 5. Fork from a non-boundary/open-turn entry.
 
 Verify running fork fails with `session_busy`, post-interrupt fork succeeds
-without mutating the source active leaf, fork-from-null creates a child rooted at
-the empty-log sentinel, and fork from open/non-boundary history fails with
-`not_turn_boundary`.
+without mutating the source active leaf, older-boundary and fork-from-null
+requests fail with `not_active_leaf` when a source leaf is active, and
+fork from a current open/non-boundary leaf fails with `not_turn_boundary`.
 
 ### 8. Real Tools
 
@@ -1067,12 +1068,12 @@ Verify:
 - `/switch` is idle-only. Switching to a user-message target restores that
   historical text into the composer; switching to a completed turn or
   compaction root changes the active leaf inside the same session.
+- `/fork` is idle-only and creates a child from the current completed turn or
+  compaction root.
 - `/new`, `/retry`, `/continue`, `/rename`, `/archive`, `/unarchive`,
   `/tree` are not part of the user-facing slash surface.
 - Crashed and interrupted terminal model turns show Retry/Continue actions that
   invoke the `turn.resume` RPC.
-- Fork from a user-message target creates a child and restores the historical
-  text into the child composer.
 - A brand-new local draft survives browser refresh without creating a durable
   empty session.
 

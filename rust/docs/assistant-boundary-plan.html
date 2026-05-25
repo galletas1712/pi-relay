@@ -471,7 +471,7 @@ type TurnView = {
     <p>Rust should enforce the facts that protect the append-only transcript tree. It should not enforce UI labels such as progress versus final answer.</p>
     <ul>
       <li><code>history.rewind</code> and <code>history.switch</code>-style source movement remain boundary-only: empty root, <code>TurnFinished</code>, or <code>CompactionSummary</code>.</li>
-      <li><code>history.fork</code> is idle-only and accepts the same root, <code>TurnFinished</code>, or <code>CompactionSummary</code> targets as switch.</li>
+      <li><code>history.fork</code> is idle-only and accepts only the current active <code>TurnFinished</code> or <code>CompactionSummary</code> target while Git workspaces are copied from the live checkout.</li>
       <li>Compaction remains boundary-only and appends a compaction summary root inside the same session tree/forest.</li>
       <li>Provider replay stays sidecar-only and is stored on transcript rows without becoming visible transcript content.</li>
       <li>Rust tests cover the shared fork/rewind boundary rule: non-boundaries are rejected and fork requires an idle source.</li>

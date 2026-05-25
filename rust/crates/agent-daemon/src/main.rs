@@ -1193,6 +1193,7 @@ async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Va
         .map_err(anyhow::Error::from)?;
     ensure_expected_active_leaf_matches(&stored.active_leaf_id, &params)?;
     let store = transcript_store_from_stored(&stored)?;
+    ensure_fork_target_is_active_leaf(leaf_id, stored.active_leaf_id.as_deref())?;
     if !store.is_turn_boundary_at(leaf_id) {
         return Err(RpcError::new(
             "not_turn_boundary",
@@ -1274,6 +1275,19 @@ async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Va
         "source_leaf_id": leaf_id,
         "active_leaf_id": child_active_leaf_id,
     }))
+}
+
+fn ensure_fork_target_is_active_leaf(
+    target_leaf_id: Option<&str>,
+    active_leaf_id: Option<&str>,
+) -> std::result::Result<(), RpcError> {
+    if target_leaf_id != active_leaf_id {
+        return Err(RpcError::new(
+            "not_active_leaf",
+            "history.fork can only fork the current active turn boundary",
+        ));
+    }
+    Ok(())
 }
 
 async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
@@ -1472,4 +1486,23 @@ async fn harness_model_fail(
     driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
     Ok(json!({ "failed": true }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fork_target_must_be_active_leaf() {
+        assert!(ensure_fork_target_is_active_leaf(Some("leaf"), Some("leaf")).is_ok());
+        assert!(ensure_fork_target_is_active_leaf(None, None).is_ok());
+
+        let error = ensure_fork_target_is_active_leaf(Some("old-leaf"), Some("leaf"))
+            .expect_err("older boundary should be rejected");
+        assert_eq!(error.code, "not_active_leaf");
+
+        let error = ensure_fork_target_is_active_leaf(None, Some("leaf"))
+            .expect_err("root fork should be rejected when a leaf is active");
+        assert_eq!(error.code, "not_active_leaf");
+    }
 }

@@ -105,8 +105,7 @@ Implemented user-facing behavior:
   original model checkpoint and appends a sibling branch instead of duplicating
   the user message.
 - Idle-only rewind.
-- Idle-only fork from turn-boundary targets, using the same target rule as
-  `history.switch`.
+- Idle-only fork from the current active turn boundary.
 - Idle-only compaction request with structural validation.
 - Daemon restart recovery for open transcript tails.
 - Stale action rejection through persisted `attempt_id`.
@@ -191,10 +190,11 @@ Important operations:
 - Restore/resume: build an idle core from stored transcript history. Open tails
   are recovered as crashed before the session is exposed as idle.
 - Rewind: move the active leaf to a prior turn boundary without deleting rows.
-- Fork: copy the source session's transcript forest snapshot into a new
-  independent session, then set the child active leaf to the selected turn
-  boundary or root. Copying the whole forest keeps prior compaction roots and
-  pre-compaction branches navigable inside the fork.
+- Fork: copy the source session's transcript forest snapshot and current Git
+  workspaces into a new independent session. Fork is limited to the current
+  active turn boundary so the copied workspaces match the child active leaf.
+  Copying the whole forest keeps prior compaction roots and pre-compaction
+  branches navigable inside the fork.
 - Compaction: the daemon asks the provider to summarize the active
   `ModelContext`; `agent-store` atomically appends a
   `TranscriptItem::CompactionSummary` root and makes that root active. The old

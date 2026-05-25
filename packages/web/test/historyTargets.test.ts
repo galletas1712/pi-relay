@@ -97,20 +97,11 @@ describe("historyEntryDisplay", () => {
 });
 
 describe("historyForkOptions", () => {
-	it("uses the same actionable turn-boundary targets as switch", () => {
+	it("only offers the current active turn boundary", () => {
 		const options = historyForkOptions(fixtureEntries(), "finish2");
-		const userTarget = options.find((option) => option.id === "user2");
 		const boundaryTarget = options.find((option) => option.id === "finish2");
 
-		expect(options.map((option) => option.id)).toEqual(["sibling", "finish2", "user2", "finish1", "user1"]);
-		expect(userTarget).toMatchObject({
-			actionLeafId: "finish1",
-			expectedActiveLeafId: "finish2",
-			restoreText: "second question",
-			sourceEntryId: "user2",
-			turnLabel: "u2",
-			meta: expect.stringContaining("fork ·")
-		});
+		expect(options.map((option) => option.id)).toEqual(["finish2"]);
 		expect(boundaryTarget).toMatchObject({
 			actionLeafId: "finish2",
 			expectedActiveLeafId: "finish2",
@@ -119,6 +110,10 @@ describe("historyForkOptions", () => {
 			meta: expect.stringContaining("fork ·")
 		});
 		expect(options.some((option) => option.id === "assistant2")).toBe(false);
+	});
+
+	it("does not offer fork targets when the active leaf is not a boundary", () => {
+		expect(historyForkOptions(fixtureEntries(), "user2")).toEqual([]);
 	});
 });
 

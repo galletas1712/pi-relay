@@ -97,7 +97,7 @@ export function HistoryPickerDialog({
 	const title = mode === "fork" ? "Fork session" : "Switch branch";
 	const description =
 		mode === "fork"
-			? "Pick a user message, completed turn, or compaction root to branch from."
+			? "Fork the current completed turn or compaction root."
 			: "Pick a user message to edit, or a completed turn or compaction root to make active.";
 	const Icon = mode === "fork" ? GitFork : RotateCcw;
 
@@ -203,7 +203,7 @@ export function HistoryPickerDialog({
 					{!loading && !error && targetCount === 0 ? (
 						<div className="history-empty">
 							{mode === "fork"
-								? "No user messages, completed turns, or compaction roots yet."
+								? "No current completed turn or compaction root to fork yet."
 								: "No editable messages, completed turns, or compaction roots yet."}
 						</div>
 					) : null}

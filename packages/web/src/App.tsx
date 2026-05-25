@@ -1135,8 +1135,12 @@ export function App() {
 	const openHistoryDialog = useCallback(
 		(mode: "fork" | "switch", initialForkTitle?: string) => {
 			if (!loadedSnapshot) throw new Error("session is still loading");
-			if (mode === "switch" && loadedSnapshot.activity !== "idle") {
-				throw new Error("stop the active turn before switching history");
+			if (loadedSnapshot.activity !== "idle") {
+				throw new Error(
+					mode === "fork"
+						? "stop the active turn before forking history"
+						: "stop the active turn before switching history"
+				);
 			}
 			const sessionId = loadedSnapshot.session_id;
 			const lastEventId = loadedSnapshot.last_event_id;

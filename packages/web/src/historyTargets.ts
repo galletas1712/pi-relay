@@ -42,7 +42,7 @@ export interface HistoryEntryDisplay {
 }
 
 export function historyForkOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
-	return measureHistoryDerivation("historyForkOptions", entries, () => historyBranchPointOptions(entries, activeLeafId, "fork"));
+	return measureHistoryDerivation("historyForkOptions", entries, () => currentForkOptions(entries, activeLeafId));
 }
 
 export function historySwitchOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
@@ -78,6 +78,16 @@ function historyBranchPointOptions(
 		if (option) options.push(option);
 	}
 	return options.reverse();
+}
+
+function currentForkOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
+	if (!activeLeafId) return [];
+	const index = createHistoryIndex(entries);
+	const entry = index.byId.get(activeLeafId);
+	if (!entry) return [];
+	const option = branchPointOptionForEntry(index, entry, index.metaById.get(entry.id), activeLeafId, "fork");
+	if (!option || option.actionLeafId !== activeLeafId) return [];
+	return [option];
 }
 
 export function historyTreeRows(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTreeRow[] {

@@ -444,3 +444,157 @@ fn branch_component(value: &str) -> String {
         component
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_store::ProjectWorkspace;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn materialize_and_fork_session_workspaces_from_local_remote() {
+        let temp = TempDir::new("workspace-manager");
+        let remote = temp.path().join("remote.git");
+        let seed = temp.path().join("seed");
+        std::fs::create_dir_all(&seed).expect("seed dir");
+
+        git(
+            temp.path(),
+            ["init", "--bare", remote.to_str().expect("remote path")],
+        );
+        git(&seed, ["init"]);
+        git(&seed, ["config", "user.email", "pi-relay@example.test"]);
+        git(&seed, ["config", "user.name", "pi relay"]);
+        std::fs::write(seed.join("README.md"), "hello\n").expect("seed file");
+        git(&seed, ["add", "README.md"]);
+        git(&seed, ["commit", "-m", "initial"]);
+        git(&seed, ["branch", "-M", "main"]);
+        git(
+            &seed,
+            [
+                "remote",
+                "add",
+                "origin",
+                remote.to_str().expect("remote path"),
+            ],
+        );
+        git(&seed, ["push", "origin", "main"]);
+
+        let manager = WorkspaceManager {
+            state_root: temp.path().join("state"),
+        };
+        let project_workspaces = vec![ProjectWorkspace {
+            workspace_dir: "repo".to_string(),
+            remote_url: remote.to_string_lossy().into_owned(),
+            remote_branch: "main".to_string(),
+        }];
+
+        let (cwd, workspaces) = manager
+            .materialize_session("session-1", &project_workspaces)
+            .await
+            .expect("materialize session");
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace_dir, "repo");
+        assert_eq!(workspaces[0].remote_branch, "main");
+        assert_eq!(workspaces[0].local_branch, "pi/session/session-1/repo");
+        assert_eq!(
+            git_stdout(
+                Path::new(&cwd).join("repo").as_path(),
+                ["branch", "--show-current"]
+            ),
+            "pi/session/session-1/repo"
+        );
+
+        std::fs::write(Path::new(&cwd).join("repo/README.md"), "forked\n")
+            .expect("modify session workspace");
+        let (fork_cwd, forked_workspaces) = manager
+            .fork_session("session-1", "session-2", &workspaces)
+            .await
+            .expect("fork session");
+
+        assert_eq!(
+            forked_workspaces[0].local_branch,
+            "pi/session/session-2/repo"
+        );
+        assert_eq!(
+            git_stdout(
+                Path::new(&fork_cwd).join("repo").as_path(),
+                ["branch", "--show-current"]
+            ),
+            "pi/session/session-2/repo"
+        );
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&fork_cwd).join("repo/README.md"))
+                .expect("forked file"),
+            "forked\n"
+        );
+    }
+
+    #[test]
+    fn workspace_dir_validation_rejects_paths_and_hidden_dirs() {
+        assert!(validate_workspace_dir("repo").is_ok());
+        assert!(validate_workspace_dir("repo_1").is_ok());
+        assert!(validate_workspace_dir(".repo").is_err());
+        assert!(validate_workspace_dir("nested/repo").is_err());
+        assert!(validate_workspace_dir("../repo").is_err());
+        assert!(validate_workspace_dir("repo.name").is_err());
+    }
+
+    fn git<const N: usize>(cwd: &Path, args: [&str; N]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout<const N: usize>(cwd: &Path, args: [&str; N]) -> String {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .output()
+            .expect("run git");
+        assert!(
+            output.status.success(),
+            "git failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    struct TempDir {
+        path: PathBuf,
+    }
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos();
+            let path = std::env::temp_dir()
+                .join(format!("pi-relay-{prefix}-{}-{nanos}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}

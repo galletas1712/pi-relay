@@ -96,9 +96,9 @@ rewind/fork picker semantics; queued rows can only be promoted to steer
 priority before the daemon claims them.
 
 `history.fork` belongs in Rust because it creates durable session provenance
-and, for project sessions, copies workspace state. It uses the same root and
-turn-boundary targets as switch; user-message choices map to the previous
-boundary and the restored draft remains UI-owned.
+and, for project sessions, copies workspace state. While workspace state is
+copied from the live checkout, fork is limited to the current active completed
+turn or compaction root.
 
 `restore this text into the composer` does not belong in Rust. It is a UI
 consequence of choosing a historical user message.
@@ -249,54 +249,23 @@ Backend shape:
 
 ## Fork Semantics
 
-The picker should present one action: **Fork from here**.
+The picker should present one action: **Fork current state**.
 
-Semantics depend on the visible target:
+Fork only targets the current active completed turn or compaction root. It
+creates the child at that same boundary and starts with an empty composer.
+Historical user-message, older-boundary, assistant-message, tool-result, and
+other mid-turn entries are not valid fork targets until workspace checkpointing
+exists.
 
-User-message target:
+Core provenance should be represented by core events. A forked child's
+`session.created` event should identify the source session and source entry.
 
-- Create a child session at the context before that message.
-- Put that user message in the child composer via the UI draft store.
-- For the first user message, child `active_leaf_id` is `null` and the child may
-  have no transcript entries.
-- The child is still a real durable session because it has fork metadata and a
-  local composer draft in the UI that created it.
+RPC shape:
 
-Completed-turn or compaction-root target:
-
-- Create the child at that exact boundary.
-- Composer remains empty.
-- Assistant-message, tool-result, and other mid-turn entries are not valid fork
-  targets.
-
-Core provenance should be represented by core events, not by a UI draft blob.
-For a fork from the first user message, the child may have no transcript rows,
-but its `session.created` event should identify the source session and source
-entry. That makes it a meaningful durable fork rather than an accidental empty
-session.
-
-The UI draft store can then attach the editable message to the child:
-
-```json
-{
-  "session_id": "child_session_...",
-  "draft": {
-    "content": [{ "type": "text", "text": "historical message" }],
-    "source_session_id": "source_session_...",
-    "source_entry_id": "entry_...",
-    "source": "fork"
-  }
-}
-```
-
-RPC shape for user-message fork targets:
-
-- The frontend computes the previous safe boundary or root and sends that as
-  `leaf_id`.
-- `leaf_id: null` means fork from root.
+- The frontend sends the current `active_leaf_id` as `leaf_id`.
 - `expected_active_leaf_id` protects the picker choice from stale source
   history.
-- The selected user entry itself remains a UI draft, not child transcript state.
+- The backend rejects older boundaries with `not_active_leaf`.
 
 ## Empty Session Pruning
 
@@ -323,8 +292,8 @@ Implemented:
 
 - `session.start`
   - Atomically creates a session and first materialized input.
-- `history.fork` accepts root or turn-boundary targets and rejects non-boundary
-  entries.
+- `history.fork` accepts only the current active turn boundary and rejects older
+  boundaries or non-boundary entries.
 - Optional `expected_active_leaf_id` on user input and rewind RPCs for stale
   picker/draft protection.
 - Durable consumed input ledger rows for idle accepted inputs that include
@@ -345,8 +314,8 @@ Consider:
 - On successful `session.start`, replace draft selection with real session id.
 - Hydrate composer from the UI draft store for durable sessions.
 - Clear UI draft state after the restored draft is sent.
-- Update rewind/fork picker options to visible transcript points.
-- Use the same picker label for fork targets: "Fork from here."
+- Update rewind picker options to visible transcript points.
+- Keep fork picker options limited to the current active boundary.
 - Historical user messages replace current composer contents.
 
 ## Interrupt To Edit Last Message
@@ -568,15 +537,11 @@ Manual browser/RPC tests should cover real behavior, not stub-only checks:
    - `active_leaf_id` becomes the previous completed turn boundary.
    - Composer is replaced by the selected historical message.
 
-6. Fork from first user message.
-   - Child is durable.
-   - Child may have zero transcript entries.
-   - Child has durable fork metadata.
-   - UI draft store contains the selected historical message for the child.
-   - Child is not considered empty/prunable.
+6. Fork from an older boundary.
+   - Backend rejects the target as `not_active_leaf`.
 
 7. Fork from a completed turn.
-   - Child active leaf is the selected boundary.
+   - Child active leaf is the same current boundary.
    - Composer is empty.
 
 8. Fork from mid-turn tool/result point.
