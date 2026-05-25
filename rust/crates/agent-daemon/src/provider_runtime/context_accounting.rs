@@ -68,10 +68,12 @@ async fn count_claude_model_input_tokens_remotely(
     };
 
     let credentials = Credentials::load();
-    let provider = provider_for_config(config, &credentials)?;
-    Ok(count_tokens_with_auth_retry(config, provider, request)
-        .await?
-        .input_tokens)
+    let provider = provider_for_config(state, config, &credentials, session_id).await?;
+    Ok(
+        count_tokens_with_auth_retry(state, config, session_id, provider, request)
+            .await?
+            .input_tokens,
+    )
 }
 
 async fn estimate_codex_model_input_tokens_from_usage_anchor(

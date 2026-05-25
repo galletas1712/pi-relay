@@ -113,8 +113,12 @@ fn parse_anthropic_count_tokens(text: &str) -> ProviderResult<ProviderTokenCount
 
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
+        Self::new_with_client(reqwest::Client::new(), api_key)
+    }
+
+    pub fn new_with_client(client: reqwest::Client, api_key: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client,
             api_key: api_key.into(),
             base_url: "https://api.anthropic.com/v1".to_string(),
         }
@@ -125,8 +129,9 @@ impl AnthropicProvider {
 impl ModelProvider for AnthropicProvider {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
         let session_id = request
-            .prompt_cache_key
+            .session_id
             .clone()
+            .or_else(|| request.prompt_cache_key.clone())
             .unwrap_or_else(|| "pi-relay".to_string());
         let beta_header = anthropic_beta_header(&request.model);
         let body = messages_body(request)?;
@@ -165,6 +170,7 @@ impl ModelProvider for AnthropicProvider {
         let session_id = request
             .session_id
             .clone()
+            .or_else(|| request.prompt_cache_key.clone())
             .unwrap_or_else(|| "pi-relay".to_string());
         let beta_header = anthropic_beta_header(&request.model);
         let body = count_tokens_body(request)?;
@@ -218,7 +224,10 @@ fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value
         transcript: request.transcript,
         tool_profile,
         tools: crate::effective_provider_tools(tool_profile, request.tools),
-        max_tokens: request.max_tokens,
+        // Anthropic's /messages/count_tokens endpoint accepts the same prompt,
+        // message, thinking, and tool-shaping fields as /messages, but rejects
+        // generation-only budgets such as max_tokens.
+        max_tokens: None,
         reasoning_effort: Some(request.reasoning_effort),
         cache_transcript: false,
     })
@@ -996,6 +1005,25 @@ mod tests {
         assert!(body["messages"][0]["content"][0]
             .get("cache_control")
             .is_none());
+    }
+
+    #[test]
+    fn count_tokens_body_omits_generation_budget_even_when_configured() {
+        let request = ProviderTokenCountRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: Some(80),
+            reasoning_effort: ReasoningEffort::None,
+            prompt_cache_key: None,
+            session_id: None,
+        };
+
+        let body = count_tokens_body(request).expect("count body renders");
+
+        assert!(body.get("max_tokens").is_none());
     }
 
     #[test]

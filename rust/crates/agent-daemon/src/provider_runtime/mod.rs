@@ -1,5 +1,6 @@
 mod auth_retry;
 mod compaction;
+mod connections;
 mod context_accounting;
 mod prompt;
 mod provider;
@@ -11,6 +12,7 @@ mod web_tools;
 pub(crate) use compaction::{
     auto_limit_tokens, compaction_auto_state, compaction_config, run_compaction,
 };
+pub(crate) use connections::ProviderConnectionRegistry;
 pub(crate) use context_accounting::model_input_tokens_for_gate;
 pub(crate) use prompt::rendered_pi_prompt;
 pub(crate) use requests::run_model;

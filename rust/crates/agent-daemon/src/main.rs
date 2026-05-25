@@ -17,7 +17,7 @@ use crate::codec::{
 };
 use crate::config::Config;
 use crate::overlay::OverlayManager;
-use crate::provider_runtime::rendered_pi_prompt;
+use crate::provider_runtime::{rendered_pi_prompt, ProviderConnectionRegistry};
 use crate::runtime::*;
 use crate::state::AppState;
 use crate::types::*;
@@ -66,6 +66,7 @@ async fn main() -> Result<()> {
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         overlays,
+        provider_connections: ProviderConnectionRegistry::new(),
         default_tool_context: ToolContext::new(config.workspace.clone()),
         default_workspace: config.workspace,
     };
@@ -551,6 +552,7 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
     if let Err(error) = state.overlays.remove_session_dir(&session_id).await {
         eprintln!("failed to remove overlay state for {session_id}: {error:#}");
     }
+    state.provider_connections.remove_session(&session_id).await;
 
     Ok(json!({
         "session_id": session_id,

@@ -59,7 +59,7 @@ pub(crate) async fn run_web_tool(
     ctx: &ToolContext,
 ) -> ToolResultMessage {
     match canonical_web_tool_name(&call.tool_name) {
-        Some("WebSearch") => run_web_search(config, session_id, call).await,
+        Some("WebSearch") => run_web_search(state, config, session_id, call).await,
         Some("WebFetch") => run_web_fetch(state, config, session_id, call, ctx).await,
         _ => ToolResultMessage::error(
             call.id.clone(),
@@ -78,6 +78,7 @@ fn canonical_web_tool_name(name: &str) -> Option<&'static str> {
 }
 
 async fn run_web_search(
+    state: &AppState,
     config: &SessionConfig,
     session_id: &str,
     call: &ToolCall,
@@ -106,6 +107,7 @@ async fn run_web_search(
     };
     let prompt = web_search_sidecar_prompt(&args);
     run_provider_web_sidecar(
+        state,
         config,
         session_id,
         call,
@@ -146,6 +148,7 @@ async fn run_web_fetch(
             let tool = anthropic_web_fetch_tool();
             let prompt = web_fetch_sidecar_prompt(&args);
             match run_provider_web_sidecar(
+                state,
                 config,
                 session_id,
                 call,
@@ -186,6 +189,7 @@ async fn run_web_fetch(
 }
 
 async fn run_provider_web_sidecar(
+    state: &AppState,
     config: &SessionConfig,
     session_id: &str,
     call: &ToolCall,
@@ -207,11 +211,12 @@ async fn run_provider_web_sidecar(
         max_tokens: Some(config.provider.max_tokens.unwrap_or(8_192).min(8_192)),
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: Some(sidecar_session_id.clone()),
-        session_id: Some(sidecar_session_id),
+        session_id: Some(sidecar_session_id.clone()),
     };
 
     let credentials = Credentials::load();
-    let provider = match provider_for_config(config, &credentials) {
+    let provider = match provider_for_config(state, config, &credentials, &sidecar_session_id).await
+    {
         Ok(provider) => provider,
         Err(error) => {
             return ToolResultMessage::error(
@@ -222,7 +227,7 @@ async fn run_provider_web_sidecar(
         }
     };
 
-    match complete_with_auth_retry(config, provider, request).await {
+    match complete_with_auth_retry(state, config, &sidecar_session_id, provider, request).await {
         Ok(response) => sidecar_response_to_tool_result(call, response, max_output_tokens),
         Err(error) => ToolResultMessage::error(
             call.id.clone(),

@@ -40,6 +40,6 @@ pub(crate) async fn run_model(
     };
 
     let credentials = Credentials::load();
-    let provider = provider_for_config(config, &credentials)?;
-    Ok(complete_with_auth_retry(config, provider, request).await?)
+    let provider = provider_for_config(state, config, &credentials, session_id).await?;
+    Ok(complete_with_auth_retry(state, config, session_id, provider, request).await?)
 }
