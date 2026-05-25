@@ -838,6 +838,7 @@ fn anthropic_usage(value: &Value) -> Option<ProviderUsage> {
             .get("cache_creation_input_tokens")
             .and_then(Value::as_u64)
             .map(|value| value as usize),
+        ..ProviderUsage::default()
     })
 }
 
