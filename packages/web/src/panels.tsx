@@ -114,7 +114,7 @@ export const Sidebar = memo(function Sidebar({
 				<ActivityCounts counts={counts} archived={archived} />
 			</div>
 			<SidebarToolbar
-				disabled={!selectedProjectId}
+				disabled={false}
 				query={query}
 				onQueryChange={onQueryChange}
 				showArchived={showArchived}
@@ -122,24 +122,18 @@ export const Sidebar = memo(function Sidebar({
 				onNew={onNew}
 			/>
 			<div className="session-list" role="listbox" aria-label="sessions">
-				{selectedProjectId ? (
-					<>
-						{filteredSessions.map((session) => (
-							<SessionRow
-								key={session.session_id}
-								session={session}
-								selected={session.session_id === selectedId}
-								onSelect={() => onSelectSession(session.session_id)}
-								onRename={() => onRename(session)}
-								onArchiveToggle={() => onArchiveToggle(session)}
-								onDelete={() => onDelete(session)}
-							/>
-						))}
-						{filteredSessions.length === 0 ? <div className="empty-list">No sessions</div> : null}
-					</>
-				) : (
-					<div className="empty-list">Select a project</div>
-				)}
+				{filteredSessions.map((session) => (
+					<SessionRow
+						key={session.session_id}
+						session={session}
+						selected={session.session_id === selectedId}
+						onSelect={() => onSelectSession(session.session_id)}
+						onRename={() => onRename(session)}
+						onArchiveToggle={() => onArchiveToggle(session)}
+						onDelete={() => onDelete(session)}
+					/>
+				))}
+				{filteredSessions.length === 0 ? <div className="empty-list">No sessions</div> : null}
 			</div>
 		</aside>
 	);
