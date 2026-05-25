@@ -41,12 +41,8 @@ export interface HistoryEntryDisplay {
 	meta: string;
 }
 
-export function historyForkOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
-	return measureHistoryDerivation("historyForkOptions", entries, () => currentForkOptions(entries, activeLeafId));
-}
-
 export function historySwitchOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
-	return measureHistoryDerivation("historySwitchOptions", entries, () => historyBranchPointOptions(entries, activeLeafId, "switch"));
+	return measureHistoryDerivation("historySwitchOptions", entries, () => historyBranchPointOptions(entries, activeLeafId));
 }
 
 interface HistoryIndex {
@@ -68,26 +64,15 @@ const indexCache = new WeakMap<TranscriptEntry[], HistoryIndex>();
 
 function historyBranchPointOptions(
 	entries: TranscriptEntry[],
-	activeLeafId: string | null,
-	mode: "fork" | "switch"
+	activeLeafId: string | null
 ): HistoryTargetOption[] {
 	const index = createHistoryIndex(entries);
 	const options: HistoryTargetOption[] = [];
 	for (const entry of entries) {
-		const option = branchPointOptionForEntry(index, entry, index.metaById.get(entry.id), activeLeafId, mode);
+		const option = branchPointOptionForEntry(index, entry, index.metaById.get(entry.id), activeLeafId);
 		if (option) options.push(option);
 	}
 	return options.reverse();
-}
-
-function currentForkOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
-	if (!activeLeafId) return [];
-	const index = createHistoryIndex(entries);
-	const entry = index.byId.get(activeLeafId);
-	if (!entry) return [];
-	const option = branchPointOptionForEntry(index, entry, index.metaById.get(entry.id), activeLeafId, "fork");
-	if (!option || option.actionLeafId !== activeLeafId) return [];
-	return [option];
 }
 
 export function historyTreeRows(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTreeRow[] {
@@ -144,13 +129,13 @@ function historyEntryDisplayIndexed(index: HistoryIndex, entry: TranscriptEntry)
 			meta: time
 		};
 	}
-	const forkOption = forkOptionForEntry(index, entry, meta, null);
-	if (forkOption) {
+	const option = displayOptionForEntry(index, entry, meta, null);
+	if (option) {
 		return {
-			turnLabel: forkOption.turnLabel,
-			title: forkOption.title,
-			preview: forkOption.preview,
-			meta: forkOption.meta
+			turnLabel: option.turnLabel,
+			title: option.title,
+			preview: option.preview,
+			meta: option.meta
 		};
 	}
 	if (item.type === "tool_call_started") {
@@ -248,7 +233,7 @@ function previousTurnBoundaryId(index: HistoryIndex, meta: EntryMeta | undefined
 	return null;
 }
 
-function forkOptionForEntry(
+function displayOptionForEntry(
 	index: HistoryIndex,
 	entry: TranscriptEntry,
 	meta: EntryMeta | undefined,
@@ -329,8 +314,7 @@ function branchPointOptionForEntry(
 	index: HistoryIndex,
 	entry: TranscriptEntry,
 	meta: EntryMeta | undefined,
-	activeLeafId: string | null,
-	mode: "fork" | "switch"
+	activeLeafId: string | null
 ): HistoryTargetOption | null {
 	const item = entry.item;
 	const time = formatTimestamp(entry.timestamp_ms);
@@ -347,7 +331,7 @@ function branchPointOptionForEntry(
 			turnLabel: currentTurnId ? `u${currentTurnId}` : "user",
 			title: "User message",
 			preview: truncate(text.trim() || "Empty user message.", 96),
-			meta: `${mode === "fork" ? "fork" : "edit"} · ${time}`,
+			meta: `edit · ${time}`,
 			isActive: false
 		};
 	}
@@ -362,7 +346,7 @@ function branchPointOptionForEntry(
 			turnLabel: `t${item.turn_id}`,
 			title: step ? modelStepTitle(step) : `End of turn ${item.turn_id}`,
 			preview: step ? modelStepPreview(step) : `${item.outcome.toLowerCase()} turn completed.`,
-			meta: `${mode} · ${time}`,
+			meta: `switch · ${time}`,
 			isActive: activeLeafId === entry.id,
 			outcome: item.outcome
 		};
@@ -377,7 +361,7 @@ function branchPointOptionForEntry(
 		turnLabel: display.turnLabel,
 		title: display.title,
 		preview: display.preview,
-		meta: mode === "fork" ? `fork · ${time}` : display.meta,
+		meta: display.meta,
 		isActive: activeLeafId === entry.id
 	};
 }

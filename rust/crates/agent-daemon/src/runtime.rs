@@ -87,10 +87,6 @@ pub(crate) struct SessionDriver {
     _guard: OwnedMutexGuard<()>,
 }
 
-pub(crate) struct SessionLockGuard {
-    _guard: OwnedMutexGuard<()>,
-}
-
 impl SessionDriver {
     pub(crate) async fn acquire(state: &AppState, session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
@@ -100,58 +96,6 @@ impl SessionDriver {
             state: state.clone(),
             session_id,
             _guard: guard,
-        }
-    }
-
-    pub(crate) async fn acquire_with_additional_lock(
-        state: &AppState,
-        session_id: impl Into<String>,
-        additional_session_id: impl Into<String>,
-    ) -> (Self, Option<SessionLockGuard>) {
-        let session_id = session_id.into();
-        let additional_session_id = additional_session_id.into();
-        if session_id == additional_session_id {
-            return (Self::acquire(state, session_id).await, None);
-        }
-
-        let session_first = session_id < additional_session_id;
-        let first_id = if session_first {
-            &session_id
-        } else {
-            &additional_session_id
-        };
-        let second_id = if session_first {
-            &additional_session_id
-        } else {
-            &session_id
-        };
-        let first_lock = session_driver_lock(state, first_id).await;
-        let first_guard = first_lock.lock_owned().await;
-        let second_lock = session_driver_lock(state, second_id).await;
-        let second_guard = second_lock.lock_owned().await;
-
-        if session_first {
-            (
-                Self {
-                    state: state.clone(),
-                    session_id,
-                    _guard: first_guard,
-                },
-                Some(SessionLockGuard {
-                    _guard: second_guard,
-                }),
-            )
-        } else {
-            (
-                Self {
-                    state: state.clone(),
-                    session_id,
-                    _guard: second_guard,
-                },
-                Some(SessionLockGuard {
-                    _guard: first_guard,
-                }),
-            )
         }
     }
 

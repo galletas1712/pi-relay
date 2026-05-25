@@ -59,7 +59,7 @@ fn empty_assistant() -> AssistantMessage {
 }
 
 #[test]
-fn rewind_and_fork_require_boundaries() {
+fn rewind_requires_boundaries() {
     let mut session = AgentSession::from_model_context(ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted { turn_id: TurnId(1) },
         TranscriptItem::UserMessage(UserMessage::text("first")),
@@ -83,53 +83,10 @@ fn rewind_and_fork_require_boundaries() {
             TranscriptStoreError::NotTurnBoundary
         ))
     );
-    assert_eq!(
-        session.fork(Some(&mid_turn_id)).map(|_| ()),
-        Err(HistoryOperationError::Store(
-            TranscriptStoreError::NotTurnBoundary
-        ))
-    );
-    assert_eq!(
-        session.fork(Some("missing-entry")).map(|_| ()),
-        Err(HistoryOperationError::Store(
-            TranscriptStoreError::EntryNotFound
-        ))
-    );
-
     session
         .rewind(Some(&turn_one_end_id))
         .expect("turn end is a valid rewind point");
     assert_eq!(session.model_context().last_turn_id(), TurnId(1));
-
-    let fork = session
-        .fork(Some(&turn_one_end_id))
-        .expect("turn end is a valid fork point");
-    assert_eq!(fork.model_context().last_turn_id(), TurnId(1));
-
-    let root_fork = session.fork(None).expect("root is a valid fork point");
-    assert!(root_fork.model_context().transcript_items().is_empty());
-}
-
-#[test]
-fn fork_requires_idle_source_session() {
-    let mut session = AgentSession::from_model_context(finished_model_context("hello"));
-    let boundary_id = session
-        .transcript_store()
-        .entries()
-        .last()
-        .expect("finished context has a boundary entry")
-        .id
-        .clone();
-
-    session
-        .enqueue_input(AgentInput::follow_up("new work"))
-        .expect("plain follow-up is valid");
-    session.drive();
-
-    assert_eq!(
-        session.fork(Some(&boundary_id)).map(|_| ()),
-        Err(HistoryOperationError::Busy)
-    );
 }
 
 #[test]

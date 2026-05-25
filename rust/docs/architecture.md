@@ -3,13 +3,13 @@
 This is the Rust rewrite of the core pi-style runtime in this repo. It is not a
 literal port of the local TypeScript fork's hierarchical subagent work. The
 Rust stack keeps the semantics that are useful for personal agent work:
-branch-aware transcript history, rewind, fork, compaction, automatic local
-tools, and a Postgres-backed websocket control plane.
+branch-aware transcript history, switch, compaction, automatic local tools, and
+a Postgres-backed websocket control plane.
 
 ## Goals
 
 1. Keep the runtime small enough to understand and change quickly.
-2. Preserve branch-aware session history: implicit resume, rewind, fork, and
+2. Preserve branch-aware session history: implicit resume, switch, and
    compaction are core semantics.
 3. Make the frontend protocol durable and recoverable by treating Postgres as
    the websocket source of truth.
@@ -26,7 +26,7 @@ agent-daemon
 
 agent-session
   AgentSession, TranscriptStore, ModelContext,
-  resume/rewind/fork, storage snapshots
+  resume/switch, storage snapshots
 
 agent-core
   deterministic FSM for one turn loop; no I/O
@@ -104,8 +104,7 @@ Implemented user-facing behavior:
 - Idle-only retry/continue for terminal model turns. This resumes from the
   original model checkpoint and appends a sibling branch instead of duplicating
   the user message.
-- Idle-only rewind.
-- Idle-only fork from the current active turn boundary.
+- Idle-only active-branch switch.
 - Idle-only compaction request with structural validation.
 - Daemon restart recovery for open transcript tails.
 - Stale action rejection through persisted `attempt_id`.
@@ -189,19 +188,15 @@ Important operations:
 
 - Restore/resume: build an idle core from stored transcript history. Open tails
   are recovered as crashed before the session is exposed as idle.
-- Rewind: move the active leaf to a prior turn boundary without deleting rows.
-- Fork: copy the source session's transcript forest snapshot and current Git
-  workspaces into a new independent session. Fork is limited to the current
-  active turn boundary so the copied workspaces match the child active leaf.
-  Copying the whole forest keeps prior compaction roots and pre-compaction
-  branches navigable inside the fork.
+- Switch: move the active leaf to a prior turn boundary without deleting rows.
+  This is transcript-only; workspace files are not checkpointed or restored.
 - Compaction: the daemon asks the provider to summarize the active
   `ModelContext`; `agent-store` atomically appends a
   `TranscriptItem::CompactionSummary` root and makes that root active. The old
-  branch remains available for fork, same-session active-leaf switching,
-  rewind, and tree inspection. Compaction is not a session boundary.
+  branch remains available for same-session active-leaf switching and tree
+  inspection. Compaction is not a session boundary.
 
-The session primitive can invalidate active work during a local rewind. The
+The session primitive can invalidate active work during a local switch. The
 websocket contract is stricter: source-mutating history writes are idle-only so
 frontend lifecycle rules are easy to reason about and test.
 

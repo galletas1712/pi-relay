@@ -120,6 +120,7 @@ impl TranscriptStore {
             .collect()
     }
 
+    #[cfg(test)]
     pub fn set_active_leaf_to_boundary(
         &mut self,
         entry_id: &str,
@@ -142,6 +143,7 @@ impl TranscriptStore {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn reset_active_leaf(&mut self) {
         self.active_leaf_id = None;
     }
@@ -168,16 +170,6 @@ impl TranscriptStore {
 
         path.reverse();
         path
-    }
-
-    pub fn copy_path_to_entry(&self, entry_id: &str) -> Result<Self, TranscriptStoreError> {
-        if !self.contains_entry(entry_id) {
-            return Err(TranscriptStoreError::EntryNotFound);
-        }
-        Ok(Self::from_trusted_entries(
-            self.path_entries_to(entry_id),
-            Some(entry_id.to_string()),
-        ))
     }
 
     /// Materialize the active branch into a `ModelContext`.
@@ -392,7 +384,7 @@ mod tests {
         let original_second_ids = ctx.append_transcript_items(turn(2, "second", "done"));
 
         ctx.set_active_leaf_to_boundary(&first_ids[3])
-            .expect("T1 boundary is a valid fork point");
+            .expect("T1 boundary is a valid branch point");
         let alternate_second_ids = ctx.append_transcript_items(turn(3, "alternate", "done"));
 
         let children = ctx.child_ids(Some(&first_ids[3]));
@@ -464,23 +456,5 @@ mod tests {
 
         assert!(store.is_turn_boundary());
         assert_eq!(store.model_context().last_turn_id(), TurnId(4));
-    }
-
-    #[test]
-    fn branched_store_can_end_at_any_existing_entry() {
-        let mut ctx = TranscriptStore::new();
-        let ids = ctx.append_transcript_items(turn(1, "hi", "done"));
-        let user_message_id = &ids[1];
-
-        let forked = ctx
-            .copy_path_to_entry(user_message_id)
-            .expect("existing transcript entry can be copied");
-        assert_eq!(forked.active_leaf_id(), Some(user_message_id.as_str()));
-        assert!(!forked.is_turn_boundary());
-
-        assert_eq!(
-            ctx.copy_path_to_entry("missing-entry").err(),
-            Some(TranscriptStoreError::EntryNotFound)
-        );
     }
 }

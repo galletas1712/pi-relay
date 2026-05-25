@@ -98,10 +98,8 @@ type ExportDialogState = {
 
 type HistoryDialogState = {
 	sessionId: string;
-	mode: "fork" | "switch";
 	entries: TranscriptEntry[];
 	activeLeafId: string | null;
-	initialForkTitle?: string;
 	loading?: boolean;
 	error?: string | null;
 };
@@ -974,47 +972,6 @@ export function App() {
 		[api, newSessionProvider, queryClient, selectSession],
 	);
 
-	const forkFromTarget = useCallback(
-		async (target: HistoryTargetOption, title?: string) => {
-			const sessionId = requireSelected();
-			if (!loadedSnapshot || loadedSnapshot.session_id !== sessionId) {
-				throw new Error("session is still loading");
-			}
-			if (loadedSnapshot.activity !== "idle") {
-				throw new Error("stop the active turn before forking history");
-			}
-			const fork = await api.forkHistory({
-				sessionId,
-				leafId: target.actionLeafId,
-				expectedActiveLeafId: target.expectedActiveLeafId ?? loadedSnapshot.active_leaf_id ?? null,
-			});
-			const normalizedTitle = title?.trim();
-			if (normalizedTitle) {
-				await api.configureSession({
-					sessionId: fork.session_id,
-					provider: loadedSnapshot.provider,
-					metadata: {
-						...loadedSnapshot.metadata,
-						fork: {
-							source_session_id: sessionId,
-							source_leaf_id: fork.source_leaf_id,
-							active_leaf_id: fork.active_leaf_id,
-						},
-						title: normalizedTitle,
-					},
-				});
-			}
-			if (target.restoreText !== undefined) {
-				composerHandleRef.current?.setValueForSession(fork.session_id, target.restoreText);
-			}
-			invalidateSessionList();
-			selectSession(fork.session_id);
-			pushNotice("success", `forked ${fork.session_id}`);
-			return fork.session_id;
-		},
-		[api, invalidateSessionList, loadedSnapshot, pushNotice, requireSelected, selectSession],
-	);
-
 	const switchToTarget = useCallback(
 		async (target: HistoryTargetOption) => {
 			const sessionId = requireSelected();
@@ -1133,23 +1090,17 @@ export function App() {
 	);
 
 	const openHistoryDialog = useCallback(
-		(mode: "fork" | "switch", initialForkTitle?: string) => {
+		() => {
 			if (!loadedSnapshot) throw new Error("session is still loading");
 			if (loadedSnapshot.activity !== "idle") {
-				throw new Error(
-					mode === "fork"
-						? "stop the active turn before forking history"
-						: "stop the active turn before switching history"
-				);
+				throw new Error("stop the active turn before switching history");
 			}
 			const sessionId = loadedSnapshot.session_id;
 			const lastEventId = loadedSnapshot.last_event_id;
 			setHistoryDialog({
 				sessionId,
-				mode,
 				entries: loadedEntries,
 				activeLeafId: loadedSnapshot.active_leaf_id,
-				initialForkTitle,
 				loading: true,
 				error: null,
 			});
@@ -1159,12 +1110,11 @@ export function App() {
 					queryFn: async () => {
 						const shouldLogPerf = perfEnabled();
 						const startedAt = perfNow();
-						if (shouldLogPerf) perfLog("history.tree start", { sessionId, mode, lastEventId });
+						if (shouldLogPerf) perfLog("history.tree start", { sessionId, lastEventId });
 						const tree = await api.getHistoryTree(sessionId);
 						if (shouldLogPerf) {
 							perfLog("history.tree end", {
 								sessionId,
-								mode,
 								lastEventId,
 								entries: tree.entries.length,
 								approxBytes: approximateJsonSize(tree),
@@ -1178,7 +1128,7 @@ export function App() {
 				})
 				.then((tree) => {
 					setHistoryDialog((current) => {
-						if (!current || current.mode !== mode || current.sessionId !== sessionId) return current;
+						if (!current || current.sessionId !== sessionId) return current;
 						return {
 							...current,
 							entries: tree.entries,
@@ -1190,7 +1140,7 @@ export function App() {
 				})
 				.catch((error) => {
 					setHistoryDialog((current) => {
-						if (!current || current.mode !== mode || current.sessionId !== sessionId) return current;
+						if (!current || current.sessionId !== sessionId) return current;
 						return {
 							...current,
 							loading: false,
@@ -1221,16 +1171,14 @@ export function App() {
 					pushActionNotice("info", "/system is read-only; edit PI.md in the repo to change the prompt");
 					return;
 				}
+				if (!loadedSnapshot) {
+					throw new Error("/system requires a selected session");
+				}
 				setPromptDialog({ loading: true, template: "", rendered: null, view: "rendered", error: null });
 				try {
-					const promptRequest = loadedSnapshot
-						? { sessionId: loadedSnapshot.session_id }
-						: selectedProject
-							? { projectId: selectedProject.project_id, provider: activeProvider }
-							: { projectId: null, provider: activeProvider };
 					const next = await queryClient.fetchQuery({
 						queryKey: queryKeys.systemPrompt,
-						queryFn: () => api.getSystemPrompt(promptRequest),
+						queryFn: () => api.getSystemPrompt(loadedSnapshot.session_id),
 						staleTime: 0,
 					});
 					setPromptDialog({ loading: false, template: next.template, rendered: next.rendered, view: next.rendered ? "rendered" : "template", error: null });
@@ -1242,12 +1190,8 @@ export function App() {
 
 			const sessionId = requireSelected();
 			if (!loadedSnapshot) throw new Error("session is still loading");
-			if (name === "fork") {
-				openHistoryDialog("fork", args);
-				return;
-			}
 			if (name === "switch") {
-				openHistoryDialog("switch");
+				openHistoryDialog();
 				return;
 			}
 			if (name === "export") {
@@ -1269,7 +1213,7 @@ export function App() {
 			}
 			throw new Error(`unknown command: /${name}`);
 		},
-		[activeProvider, api, loadedSnapshot, openHistoryDialog, pushNotice, queryClient, requireSelected, selectedProject],
+		[api, loadedSnapshot, openHistoryDialog, pushNotice, queryClient, requireSelected],
 	);
 
 	const submitComposer = useCallback(
@@ -1631,18 +1575,11 @@ export function App() {
 
 			{historyDialog ? (
 				<HistoryPickerDialog
-					mode={historyDialog.mode}
 					entries={historyDialog.entries}
 					activeLeafId={historyDialog.activeLeafId}
-					initialForkTitle={historyDialog.initialForkTitle}
 					loading={historyDialog.loading}
 					error={historyDialog.error}
 					onClose={() => setHistoryDialog(null)}
-					onFork={(target, title) => {
-						void forkFromTarget(target, title)
-							.then(() => setHistoryDialog(null))
-							.catch((error) => pushNotice("error", errorMessage(error)));
-					}}
 					onSwitch={handleSwitchHistoryTarget}
 				/>
 			) : null}

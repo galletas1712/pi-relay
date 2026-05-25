@@ -25,7 +25,6 @@ pub enum SessionEvent {
         id: String,
         error: String,
     },
-    HistoryRewound,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -28,8 +28,8 @@ typed compacted root.
 ## Public Interface
 
 `AgentSession` exposes `drive`, `enqueue_input`, `enqueue_session_input`,
-`rewind`, `fork`, `drain_actions`, `drain_events`, `drain_pending_inputs`,
-`model_context`, and `transcript_store`.
+`drain_actions`, `drain_events`, `drain_pending_inputs`, `model_context`, and
+`transcript_store`.
 
 `SessionAction` contains only:
 
@@ -47,9 +47,9 @@ context-token metadata; recovery can rebuild the full context from
 updates and direct context-token updates. Plain core inputs use
 `AgentSession::enqueue_input`.
 
-`SessionEvent` is live-only activity: transcript append, action
-requested/completed/failed, and history rewind. Durable compaction events are
-emitted by `agent-store` when it installs a compacted root.
+`SessionEvent` is live-only activity: transcript append and action
+requested/completed/failed. Durable compaction and history-switch events are
+emitted by `agent-store`.
 
 `StoredSession` and `StoredTranscriptEntry` are session snapshot types. They
 belong here because they describe how to rehydrate session semantics; they are
@@ -61,11 +61,6 @@ Each `TranscriptStorageNode` has a UUID string id, an optional parent id,
 timestamp, and one `TranscriptItem`. Entries form a forest. The active session
 view is exactly one root-to-leaf path, and `ModelContext` is derived by walking
 that path.
-
-Rewind moves the active leaf to an existing turn boundary without deleting
-rows. Fork copies a path ending at any existing transcript entry into a new
-independent session; if the copied tail is mid-turn, it is closed as
-interrupted so the child is runnable.
 
 `TranscriptItem::CompactionSummary` is a valid boundary root. It stores
 lineage to the summarized source session/leaf plus the last source turn id so
@@ -79,10 +74,8 @@ quiescent. Open transcript turns are closed as crashed, the core is rebuilt
 idle at that boundary, and unfinished external action rows are handled by the
 daemon/store recovery layer.
 
-The session primitive can invalidate active work during a local rewind. The
-websocket daemon applies stricter lifecycle rules: source-mutating history
-writes are idle-only, while fork is allowed against explicit transcript points
-because it does not mutate the source.
+The websocket daemon applies strict lifecycle rules: source-mutating history
+writes are idle-only.
 
 ## Module Map
 
@@ -93,7 +86,7 @@ because it does not mutate the source.
 | `src/input.rs` | `SessionInput`, `SessionInputError`. |
 | `src/event.rs` | Runtime-only `SessionEvent`, `SessionActionKind`. |
 | `src/outstanding_actions.rs` | Private model/tool request tracking. |
-| `src/session.rs` | `AgentSession`, drive/input/action lifecycle, rewind, restore rehydration. |
+| `src/session.rs` | `AgentSession`, drive/input/action lifecycle, restore rehydration. |
 | `src/session_tests.rs` | Session lifecycle tests. |
 | `src/model_context.rs` | `ModelContext` read-only view and open-turn closure. |
 | `src/transcript_store.rs` | Transcript forest, indexes, materialization, boundary checks. |

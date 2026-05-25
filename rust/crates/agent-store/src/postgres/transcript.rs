@@ -8,9 +8,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Row, Transaction};
 
-use crate::{
-    ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree, SessionConfig,
-};
+use crate::{ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree};
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
 use super::rows::row_to_stored_entry;
@@ -307,85 +305,12 @@ impl PostgresAgentStore {
         let event = insert_event_tx(
             &mut tx,
             session_id,
-            EventType::HistoryRewound,
+            EventType::HistorySwitched,
             json!({ "active_leaf_id": leaf_id, "activity": "idle" }),
         )
         .await?;
         tx.commit().await?;
         Ok(vec![event])
-    }
-
-    pub async fn create_fork(
-        &self,
-        source_session_id: &str,
-        new_session_id: &str,
-        config: &SessionConfig,
-        entries: &[TranscriptStorageNode],
-        target_leaf_id: Option<&str>,
-        active_leaf_id: Option<String>,
-    ) -> Result<Vec<EventFrame>> {
-        let mut tx = self.pool.begin().await?;
-        let mut metadata = config.metadata.clone();
-        if let Some(metadata) = metadata.as_object_mut() {
-            metadata.insert(
-                "fork".to_string(),
-                json!({
-                    "source_session_id": source_session_id,
-                    "source_leaf_id": target_leaf_id,
-                    "active_leaf_id": active_leaf_id.as_deref(),
-                }),
-            );
-        } else {
-            metadata = json!({
-                "fork": {
-                    "source_session_id": source_session_id,
-                    "source_leaf_id": target_leaf_id,
-                    "active_leaf_id": active_leaf_id.as_deref(),
-                },
-                "source_metadata": config.metadata.clone(),
-            });
-        }
-        sqlx::query(
-            "insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, provider_config, metadata) values ($1, $2, $3, $4, $5::text, $6, $7)",
-        )
-        .bind(new_session_id)
-        .bind(config.project_id)
-        .bind(&config.outer_cwd)
-        .bind(serde_json::to_value(&config.workspaces)?)
-        .bind(active_leaf_id.as_deref())
-        .bind(serde_json::to_value(&config.provider)?)
-        .bind(&metadata)
-        .execute(&mut *tx)
-        .await?;
-        for entry in entries {
-            insert_entry_tx(&mut tx, new_session_id, entry).await?;
-        }
-        let event = insert_event_tx(
-            &mut tx,
-            source_session_id,
-            EventType::HistoryForked,
-            json!({
-                "new_session_id": new_session_id,
-                "leaf_id": target_leaf_id,
-                "active_leaf_id": active_leaf_id.as_deref(),
-            }),
-        )
-        .await?;
-        let created = insert_event_tx(
-            &mut tx,
-            new_session_id,
-            EventType::SessionCreated,
-            json!({
-                "session_id": new_session_id,
-                "project_id": config.project_id,
-                "forked_from": source_session_id,
-                "source_leaf_id": target_leaf_id,
-                "active_leaf_id": active_leaf_id.as_deref(),
-            }),
-        )
-        .await?;
-        tx.commit().await?;
-        Ok(vec![event, created])
     }
 
     pub async fn recover_session(

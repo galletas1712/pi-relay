@@ -39,12 +39,7 @@ sending the same websocket frames a frontend would send.
    unfinished actions and no queued inputs waiting to become transcript. A
    frontend should send `input.interrupt`, wait for idle, then retry.
 
-6. Fork is transcript-source-non-mutating.
-   `history.fork` copies the source transcript forest and never rewrites the
-   source session history. It is idle-only and only accepts the current active
-   turn boundary, so copied Git workspaces match the child transcript state.
-
-7. Tools are always allowed.
+6. Tools are always allowed.
    The daemon runs model-requested tools immediately. There is no approval or
    denial RPC. `input.interrupt` is the one user-facing cancellation command and
    interrupts active work. The daemon keeps a per-action task registry and
@@ -52,7 +47,7 @@ sending the same websocket frames a frontend would send.
    session on a best-effort basis; durable action status remains the source of
    truth for stale completions.
 
-8. Daemon death is recoverable state.
+7. Daemon death is recoverable state.
    On startup, a daemon marks leftover unfinished action rows stale because the
    provider/tool futures from the previous process cannot resume. If the daemon
    died with an open turn, first touch then repairs the session by appending a
@@ -170,7 +165,7 @@ active leaf; it does not delete rows.
 to one with the visible transcript entry. It is not rendered as a visible
 transcript item. When the daemon builds a model request, it materializes a
 `ModelContext` from the selected root-to-leaf path as `{ item, provider_replay }`
-entries, so OpenAI/Anthropic continuation state follows switch, fork, and
+entries, so OpenAI/Anthropic continuation state follows switch and
 compaction branches without being duplicated in action payloads.
 
 ### `queued_inputs`
@@ -198,7 +193,7 @@ cannot lose accepted input that has not yet appeared in the transcript.
 
 Before a queued input is materialized, the daemon claims it by moving it to
 `consuming` and recording a claim id in `origin`. The user-facing edit path is
-`input.interrupt` followed by picker-driven switch or fork; queued rows can be
+`input.interrupt` followed by picker-driven switch; queued rows can be
 promoted to steer priority but are not edited or cancelled through websocket
 RPC. The daemon marks the row `consumed` in the same transaction that appends
 the corresponding transcript/action events, and validates the claim id before
@@ -257,8 +252,6 @@ History operations remain transcript-driven:
 - switch updates `sessions.active_leaf_id`; existing model action rows
   keep their explicit `context_leaf_id`, so recovery never depends on a mutable
   active leaf;
-- fork copies transcript entries, including `provider_replay`, into the child
-  session; later child model actions point at child transcript leaf ids;
 - export reads transcript branches and visible transcript items, not model
   action payloads, so provider-native replay state stays out of exported text.
 
@@ -285,8 +278,8 @@ omitted, it starts at the current event head and returns no historical events;
 clients should load durable state through `session.get`/`history.tree` instead.
 When a session reaches idle, the daemon publishes `session.idle` to live
 subscribers and then clears that session's event rows. Idle-only mutations such
-as configuration changes, same-session history switching, and child fork
-creation also clear their session event buffers after live publication. Durable
+as configuration changes and same-session history switching also clear their
+session event buffers after live publication. Durable
 session state lives in `sessions`, `transcript_entries`, `queued_inputs`, and
 `actions`; old toast-worthy events such as `model.error` are not retained as
 history.
@@ -312,10 +305,6 @@ Invalid states should not be produced by the websocket service:
 - A model request built from an open tool tail.
 - Switch to a non-boundary transcript entry.
 - Transcript rows committed without the matching action/event updates.
-
-Forking to a non-boundary or historical entry is invalid for the websocket
-service. Fork only accepts the current active turn boundary, which keeps copied
-Git workspaces and the child transcript on the same completed state.
 
 Accepted transitions commit transcript rows, action updates, queued-input
 updates, active-leaf changes, and events in one transaction.
@@ -412,7 +401,7 @@ ephemeral host sessions.
 Each row includes `session_id`, nullable `project_id`, `outer_cwd`, `workspaces`,
 `activity`, `active_leaf_id`, `provider`, `metadata`, `updated_at`, and
 `has_transcript_entries`. Defensive listing hides accidental empty web-created
-rows that have no transcript, queued input, actions, or fork provenance. Rows
+rows that have no transcript, queued input, or actions. Rows
 with `metadata.hidden = true` are also omitted from the list; this is used for
 local verification cleanup, not as a core lifecycle state. Browser-local drafts
 are not returned by this RPC.
@@ -466,7 +455,7 @@ Result shape:
 `entries` is included only when `include_entries` is true. `entries_scope` may
 be `"active_branch"` or `"full_tree"` and defaults to `"full_tree"` for
 compatibility. The web UI can use the active-branch scope for normal display and
-reserve the full tree for fork/switch/history UI. `has_transcript_entries`
+reserve the full tree for switch/history UI. `has_transcript_entries`
 allows provider/model lock checks even when the active branch is empty after a
 root switch.
 
@@ -567,11 +556,10 @@ Responses and `session.configured` events include `provider`, `metadata`, and
 
 ### `system.prompt`
 
-Returns the repo-level `PI.md` prompt composition template and, when enough
-context is available, the rendered prompt. Pass `session_id` to render from an
-existing session's frozen config. Pass `project_id` plus optional `provider` to
-preview a new project session. Omit `project_id` to preview an ephemeral host
-session from `$HOME`.
+Returns the repo-level `PI.md` prompt composition template and the rendered
+prompt for an existing session's frozen config. `session_id` is required; the
+RPC does not preview project prompts before the project workspaces have been
+materialized by `session.start`.
 
 ```json
 {
@@ -718,32 +706,6 @@ Running sessions fail with `session_busy`; non-boundaries fail with
 `not_turn_boundary`. If `expected_active_leaf_id` is supplied and the session
 has moved since the picker was opened, switch fails with `history_changed`.
 
-### `history.fork`
-
-Creates a new durable session from the current active turn boundary. This does
-not mutate the source transcript. The source session must be idle so the daemon
-can copy a coherent checkout for project sessions. The child receives a
-snapshot of the source session's full transcript forest and keeps the same
-active leaf as the source. That means compaction roots and pre-compaction
-branches remain navigable in the child session.
-
-```json
-{
-  "session_id": "s1",
-  "leaf_id": "entry_4",
-  "expected_active_leaf_id": "entry_current",
-  "new_session_id": "optional"
-}
-```
-
-Returns the new session id, the requested source leaf, and the child active leaf.
-`leaf_id` must equal the source session's current `active_leaf_id`; older
-boundaries, unknown entries, and `leaf_id: null` requests against a non-empty
-session fail with `not_active_leaf`. The current active leaf must also be a turn
-boundary; otherwise fork fails with `not_turn_boundary`. If
-`expected_active_leaf_id` is supplied and the session has moved since the picker
-was opened, fork fails with `history_changed`.
-
 ### `turn.resume`
 
 Idle-only. Restarts the active terminal turn when that turn ended as
@@ -857,8 +819,7 @@ tool.error
 compaction.requested
 compaction.completed
 compaction.error
-history.rewound
-history.forked
+history.switched
 history.compacted
 session.work_cancelled
 session.recovered
@@ -916,9 +877,9 @@ Verify:
 
 ### 2. PI.md Prompt Preview
 
-1. Call `system.prompt`.
+1. Call `system.prompt` with a real `session_id`.
 2. Verify the response contains the repo-level `PI.md` template and a rendered
-   prompt for the requested session/project/host context.
+   prompt for the requested session.
 3. In the web UI, type `/system` and verify the same prompt preview is displayed
    read-only.
 
@@ -1001,20 +962,7 @@ descendant rows are preserved, and non-boundary switch fails with
 `not_turn_boundary`. Also verify stale picker requests with a mismatched
 `expected_active_leaf_id` fail with `history_changed`.
 
-### 7. Fork Lifecycle
-
-1. Start a pending turn on a session that has older transcript entries.
-2. Attempt `history.fork` to an older boundary.
-3. Interrupt, wait for idle, then fork again.
-4. Try fork with `leaf_id: null`.
-5. Fork from a non-boundary/open-turn entry.
-
-Verify running fork fails with `session_busy`, post-interrupt fork succeeds
-without mutating the source active leaf, older-boundary and fork-from-null
-requests fail with `not_active_leaf` when a source leaf is active, and
-fork from a current open/non-boundary leaf fails with `not_turn_boundary`.
-
-### 8. Real Tools
+### 7. Real Tools
 
 Use `harness.model.complete` to request real tools:
 
@@ -1029,7 +977,7 @@ tool-returned errors append error `ToolResult`s, action rows for tool failures
 are `error`, and the next model request sees tool results in the assistant's
 declared order.
 
-### 9. Compaction Validity
+### 8. Compaction Validity
 
 1. Request compaction on an idle session.
 2. Observe `compaction.requested`, then let the daemon/provider complete it.
@@ -1045,7 +993,7 @@ Verify compaction emits `compaction.completed` and `history.compacted`, the
 old source branch remains in `history.tree`, and running compaction requests
 fail with `session_busy`.
 
-### 10. Daemon Death Recovery
+### 9. Daemon Death Recovery
 
 1. Start a harness turn and leave the model action running.
 2. Kill the daemon process.
@@ -1056,7 +1004,7 @@ Verify unfinished actions are stale, recovery appends a crashed turn tail,
 `turn.finished` and `session.recovered` are replayable, and no explicit resume
 RPC is needed.
 
-### 11. Browser User Flows
+### 10. Browser User Flows
 
 Run the TypeScript web UI against the same daemon and Postgres database.
 
@@ -1064,12 +1012,10 @@ Verify:
 
 - Markdown and raw HTML assistant text render in the transcript.
 - Slash autocomplete uses Enter once to complete and the next Enter to execute.
-- `/switch` and `/fork` open pickers; there is no raw-id path in the UI.
+- `/switch` opens the picker; there is no raw-id path in the UI.
 - `/switch` is idle-only. Switching to a user-message target restores that
   historical text into the composer; switching to a completed turn or
   compaction root changes the active leaf inside the same session.
-- `/fork` is idle-only and creates a child from the current completed turn or
-  compaction root.
 - `/new`, `/retry`, `/continue`, `/rename`, `/archive`, `/unarchive`,
   `/tree` are not part of the user-facing slash surface.
 - Crashed and interrupted terminal model turns show Retry/Continue actions that
@@ -1077,7 +1023,7 @@ Verify:
 - A brand-new local draft survives browser refresh without creating a durable
   empty session.
 
-### 12. Real Codex Provider
+### 11. Real Codex Provider
 
 With `~/.codex/auth.json` or `CODEX_ACCESS_TOKEN` available:
 
@@ -1101,7 +1047,7 @@ Inspect the prompt template if needed:
 ```json
 {
   "method": "system.prompt",
-  "params": {}
+  "params": { "session_id": "s1" }
 }
 ```
 

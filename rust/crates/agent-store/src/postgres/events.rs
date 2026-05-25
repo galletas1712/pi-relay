@@ -209,9 +209,6 @@ pub(super) async fn insert_session_event_tx(
                 .await?,
             ])
         }
-        SessionEvent::HistoryRewound => Ok(vec![
-            insert_event_tx(tx, session_id, EventType::HistoryRewound, json!({})).await?,
-        ]),
     }
 }
 

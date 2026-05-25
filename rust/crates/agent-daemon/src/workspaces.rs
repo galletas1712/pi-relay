@@ -1,4 +1,3 @@
-use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use agent_store::{ProjectWorkspace, SessionWorkspace};
@@ -25,13 +24,6 @@ impl WorkspaceManager {
         Ok(Self {
             state_root: state_home.join("pi-relay"),
         })
-    }
-
-    pub(crate) fn session_cwd(&self, session_id: &str) -> String {
-        self.session_root(session_id)
-            .join("cwd")
-            .to_string_lossy()
-            .into_owned()
     }
 
     pub(crate) async fn materialize_session(
@@ -85,55 +77,6 @@ impl WorkspaceManager {
             }
         }
         Ok(())
-    }
-
-    pub(crate) async fn fork_session(
-        &self,
-        source_session_id: &str,
-        new_session_id: &str,
-        workspaces: &[SessionWorkspace],
-    ) -> Result<(String, Vec<SessionWorkspace>)> {
-        let source_cwd = self.session_root(source_session_id).join("cwd");
-        let new_root = self.session_root(new_session_id);
-        if new_root.exists() {
-            bail!(
-                "target session workspace state already exists: {}",
-                new_root.display()
-            );
-        }
-        let new_cwd = new_root.join("cwd");
-        let forked: Result<Vec<SessionWorkspace>> = async {
-            copy_dir(&source_cwd, &new_cwd).await?;
-            let mut forked = Vec::with_capacity(workspaces.len());
-            for workspace in workspaces {
-                let mut workspace = workspace.clone();
-                workspace.local_branch = local_branch(new_session_id, &workspace.workspace_dir);
-                let workspace_path = new_cwd.join(&workspace.workspace_dir);
-                run_git(&workspace_path, ["branch", "-M", &workspace.local_branch]).await?;
-                forked.push(workspace);
-            }
-            Ok(forked)
-        }
-        .await;
-        let forked = match forked {
-            Ok(forked) => forked,
-            Err(error) => {
-                match tokio::fs::remove_dir_all(&new_root).await {
-                    Ok(()) => {}
-                    Err(cleanup_error) if cleanup_error.kind() == ErrorKind::NotFound => {}
-                    Err(cleanup_error) => {
-                        return Err(error).with_context(|| {
-                            format!(
-                                "failed to remove partial fork workspace state at {}: {cleanup_error:#}",
-                                new_root.display()
-                            )
-                        });
-                    }
-                }
-                return Err(error);
-            }
-        };
-        Ok((new_cwd.to_string_lossy().into_owned(), forked))
     }
 
     pub(crate) async fn remove_session_dir(&self, session_id: &str) -> Result<()> {
@@ -314,103 +257,6 @@ fn git_command() -> Command {
     command
 }
 
-async fn copy_dir(source: &Path, dest: &Path) -> Result<()> {
-    if !source.is_dir() {
-        bail!(
-            "source session cwd is not a directory: {}",
-            source.display()
-        );
-    }
-    let mut pending = vec![(source.to_path_buf(), dest.to_path_buf())];
-    let mut copied_dirs = Vec::new();
-    while let Some((source_dir, dest_dir)) = pending.pop() {
-        tokio::fs::create_dir_all(&dest_dir)
-            .await
-            .with_context(|| format!("create copy destination {}", dest_dir.display()))?;
-        copied_dirs.push((source_dir.clone(), dest_dir.clone()));
-
-        let mut entries = tokio::fs::read_dir(&source_dir)
-            .await
-            .with_context(|| format!("read directory {}", source_dir.display()))?;
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .with_context(|| format!("read entry in {}", source_dir.display()))?
-        {
-            let source_path = entry.path();
-            let dest_path = dest_dir.join(PathBuf::from(entry.file_name()));
-            let file_type = entry
-                .file_type()
-                .await
-                .with_context(|| format!("read file type for {}", source_path.display()))?;
-            if file_type.is_dir() {
-                pending.push((source_path, dest_path));
-            } else if file_type.is_symlink() {
-                copy_symlink(&source_path, &dest_path).await?;
-            } else if file_type.is_file() {
-                tokio::fs::copy(&source_path, &dest_path)
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "copy file {} to {}",
-                            source_path.display(),
-                            dest_path.display()
-                        )
-                    })?;
-                let permissions = tokio::fs::metadata(&source_path)
-                    .await
-                    .with_context(|| format!("read permissions for {}", source_path.display()))?
-                    .permissions();
-                tokio::fs::set_permissions(&dest_path, permissions)
-                    .await
-                    .with_context(|| format!("set permissions on {}", dest_path.display()))?;
-            } else {
-                bail!(
-                    "unsupported filesystem entry in session workspace copy: {}",
-                    source_path.display()
-                );
-            }
-        }
-    }
-    for (source_dir, dest_dir) in copied_dirs.into_iter().rev() {
-        let permissions = tokio::fs::metadata(&source_dir)
-            .await
-            .with_context(|| format!("read permissions for {}", source_dir.display()))?
-            .permissions();
-        tokio::fs::set_permissions(&dest_dir, permissions)
-            .await
-            .with_context(|| format!("set permissions on {}", dest_dir.display()))?;
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-async fn copy_symlink(source: &Path, dest: &Path) -> Result<()> {
-    let target = tokio::fs::read_link(source)
-        .await
-        .with_context(|| format!("read symlink {}", source.display()))?;
-    std::os::unix::fs::symlink(&target, dest)
-        .with_context(|| format!("copy symlink {} to {}", source.display(), dest.display()))?;
-    Ok(())
-}
-
-#[cfg(windows)]
-async fn copy_symlink(source: &Path, dest: &Path) -> Result<()> {
-    let target = tokio::fs::read_link(source)
-        .await
-        .with_context(|| format!("read symlink {}", source.display()))?;
-    let metadata = tokio::fs::metadata(source)
-        .await
-        .with_context(|| format!("read symlink target metadata {}", source.display()))?;
-    if metadata.is_dir() {
-        std::os::windows::fs::symlink_dir(&target, dest)
-    } else {
-        std::os::windows::fs::symlink_file(&target, dest)
-    }
-    .with_context(|| format!("copy symlink {} to {}", source.display(), dest.display()))?;
-    Ok(())
-}
-
 fn path_component(value: &str) -> String {
     let encoded: String = value
         .bytes()
@@ -452,7 +298,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
-    async fn materialize_and_fork_session_workspaces_from_local_remote() {
+    async fn materialize_session_workspaces_from_local_remote() {
         let temp = TempDir::new("workspace-manager");
         let remote = temp.path().join("remote.git");
         let seed = temp.path().join("seed");
@@ -505,28 +351,10 @@ mod tests {
             "pi/session/session-1/repo"
         );
 
-        std::fs::write(Path::new(&cwd).join("repo/README.md"), "forked\n")
-            .expect("modify session workspace");
-        let (fork_cwd, forked_workspaces) = manager
-            .fork_session("session-1", "session-2", &workspaces)
-            .await
-            .expect("fork session");
-
         assert_eq!(
-            forked_workspaces[0].local_branch,
-            "pi/session/session-2/repo"
-        );
-        assert_eq!(
-            git_stdout(
-                Path::new(&fork_cwd).join("repo").as_path(),
-                ["branch", "--show-current"]
-            ),
-            "pi/session/session-2/repo"
-        );
-        assert_eq!(
-            std::fs::read_to_string(Path::new(&fork_cwd).join("repo/README.md"))
-                .expect("forked file"),
-            "forked\n"
+            std::fs::read_to_string(Path::new(&cwd).join("repo/README.md"))
+                .expect("workspace file"),
+            "hello\n"
         );
     }
 

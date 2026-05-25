@@ -63,6 +63,6 @@ The core never performs those actions. It only requests them.
 ## Relationship To Other Crates
 
 - `agent-vocab` owns the shared message/transcript shapes.
-- `agent-session` owns durable history, resume, rewind, fork, and session
+- `agent-session` owns durable history, resume, switch, and session
   integration. Compaction is installed durably by `agent-store`.
 - Providers and tools live above the core.

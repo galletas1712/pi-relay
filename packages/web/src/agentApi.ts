@@ -32,7 +32,7 @@ export interface AgentApi {
 	updateProject(params: UpdateProjectParams): Promise<Project>;
 	deleteProject(projectId: string): Promise<DeleteProjectResult>;
 	listSessions(limit?: number, projectId?: string | null): Promise<SessionSummary[]>;
-	getSystemPrompt(params?: { sessionId?: string; projectId?: string | null; provider?: ProviderConfig }): Promise<SystemPromptResponse>;
+	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse>;
 	listTools(provider: string): Promise<ToolListing[]>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
 	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse>;
@@ -44,7 +44,6 @@ export interface AgentApi {
 	interrupt(sessionId: string): Promise<InterruptResult>;
 	resumeTurn(params: ResumeTurnParams): Promise<ResumeTurnResult>;
 	switchHistory(params: SwitchHistoryParams): Promise<SwitchHistoryResult>;
-	forkHistory(params: ForkHistoryParams): Promise<ForkHistoryResult>;
 	renameSession(sessionId: string, title: string): Promise<RenameSessionResult>;
 	deleteSession(sessionId: string): Promise<DeleteSessionResult>;
 	configureSession(params: ConfigureSessionParams): Promise<ConfigureSessionResult>;
@@ -128,12 +127,6 @@ export interface SwitchHistoryResult {
 	active_leaf_id: string | null;
 }
 
-export interface ForkHistoryResult {
-	session_id: string;
-	source_leaf_id: string | null;
-	active_leaf_id: string | null;
-}
-
 export interface PromoteQueuedResult {
 	input_id: string;
 	priority: InputPriority;
@@ -161,12 +154,6 @@ export interface ConfigureSessionResult {
 }
 
 export interface SwitchHistoryParams {
-	sessionId: string;
-	leafId: string | null;
-	expectedActiveLeafId: string | null;
-}
-
-export interface ForkHistoryParams {
 	sessionId: string;
 	leafId: string | null;
 	expectedActiveLeafId: string | null;
@@ -240,11 +227,9 @@ class AgentApiClient implements AgentApi {
 		return result.sessions;
 	}
 
-	getSystemPrompt(params: { sessionId?: string; projectId?: string | null; provider?: ProviderConfig } = {}): Promise<SystemPromptResponse> {
+	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse> {
 		return this.client.request<SystemPromptResponse>("system.prompt", {
-			session_id: params.sessionId,
-			project_id: params.projectId || undefined,
-			provider: params.provider
+			session_id: sessionId
 		});
 	}
 
@@ -319,14 +304,6 @@ class AgentApiClient implements AgentApi {
 
 	switchHistory(params: SwitchHistoryParams): Promise<SwitchHistoryResult> {
 		return this.client.request<SwitchHistoryResult>("history.switch", {
-			session_id: params.sessionId,
-			leaf_id: params.leafId,
-			expected_active_leaf_id: params.expectedActiveLeafId
-		});
-	}
-
-	forkHistory(params: ForkHistoryParams): Promise<ForkHistoryResult> {
-		return this.client.request<ForkHistoryResult>("history.fork", {
 			session_id: params.sessionId,
 			leaf_id: params.leafId,
 			expected_active_leaf_id: params.expectedActiveLeafId

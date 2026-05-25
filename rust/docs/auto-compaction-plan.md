@@ -1003,7 +1003,7 @@ provider replay.
 - [ ] Pre-compaction transcript ancestors are not on the active model path.
 - [ ] Post-compaction turns append after the compacted root.
 - [ ] Rewind to compaction root preserves stored `provider_replay` in daemon/store state.
-- [ ] Fork from compaction root preserves stored `provider_replay` in daemon/store state.
+- [ ] Switch from compaction root preserves stored `provider_replay` in daemon/store state.
 - [ ] Manual compaction rejects exact active-leaf `CompactionSummary` no-ops.
 
 ### Provider replay
@@ -1109,7 +1109,7 @@ provider replay.
 
 - Compaction root remains a turn boundary.
 - Rehydrate session from compaction root works.
-- Fork/rewind around compaction root preserves daemon/store replay state.
+- Switch around compaction root preserves daemon/store replay state.
 - Shared transcript grouping identifies complete turns and compaction roots.
 
 ### Auto-compaction

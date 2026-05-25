@@ -356,7 +356,6 @@ impl PostgresAgentStore {
                         and not exists(select 1 from transcript_entries t where t.session_id=s.id)
                         and not exists(select 1 from queued_inputs q where q.session_id=s.id and q.status <> 'cancelled')
                         and not exists(select 1 from actions a where a.session_id=s.id)
-                        and not (s.metadata ? 'fork')
                     )
                 order by
                     case when s.metadata->>'archived' = 'true' then 1 else 0 end asc,

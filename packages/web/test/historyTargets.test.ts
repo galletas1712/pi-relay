@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest";
 import {
 	branchEntriesFor,
 	historyEntryDisplay,
-	historyForkOptions,
 	historySwitchOptions,
 	historyTreeRows
 } from "../src/historyTargets.ts";
@@ -93,27 +92,6 @@ describe("historyEntryDisplay", () => {
 			title: "User message",
 			preview: "alternate branch"
 		});
-	});
-});
-
-describe("historyForkOptions", () => {
-	it("only offers the current active turn boundary", () => {
-		const options = historyForkOptions(fixtureEntries(), "finish2");
-		const boundaryTarget = options.find((option) => option.id === "finish2");
-
-		expect(options.map((option) => option.id)).toEqual(["finish2"]);
-		expect(boundaryTarget).toMatchObject({
-			actionLeafId: "finish2",
-			expectedActiveLeafId: "finish2",
-			isActive: true,
-			turnLabel: "t2",
-			meta: expect.stringContaining("fork ·")
-		});
-		expect(options.some((option) => option.id === "assistant2")).toBe(false);
-	});
-
-	it("does not offer fork targets when the active leaf is not a boundary", () => {
-		expect(historyForkOptions(fixtureEntries(), "user2")).toEqual([]);
 	});
 });
 

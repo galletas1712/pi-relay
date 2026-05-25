@@ -33,7 +33,7 @@ use agent_session::{AgentSession, SessionInput};
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
     EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputStatus,
-    SessionConfig, SessionWorkspace,
+    SessionConfig,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -253,7 +253,6 @@ async fn dispatch_request(
         RpcMethod::HistoryTree => history_tree(state, params).await,
         RpcMethod::HistoryContext => history_context(state, params).await,
         RpcMethod::HistorySwitch => history_switch(state, params).await,
-        RpcMethod::HistoryFork => history_fork(state, params).await,
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
@@ -774,85 +773,24 @@ fn home_dir_for_ephemeral_session() -> std::result::Result<PathBuf, RpcError> {
 }
 
 async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
-    let rendered = if let Some(session_id) = params.get("session_id").and_then(Value::as_str) {
-        let config = state
-            .repo
-            .load_session_config(session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-        state
-            .workspaces
-            .ensure_session(session_id, &config.outer_cwd, &config.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
-        Some(rendered_pi_prompt(state, &config))
-    } else if let Some(project_id) = params.get("project_id").and_then(Value::as_str) {
-        let project_id = Uuid::parse_str(project_id).map_err(|error| {
-            RpcError::new(
-                "invalid_params",
-                format!("project_id must be a UUID: {error}"),
-            )
-        })?;
-        let project = state
-            .repo
-            .get_project(project_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-        let provider = prompt_provider_config(&params)?;
-        let preview_workspaces = project
-            .workspaces
-            .into_iter()
-            .map(|workspace| SessionWorkspace {
-                workspace_dir: workspace.workspace_dir,
-                remote_url: workspace.remote_url,
-                remote_branch: workspace.remote_branch,
-                base_sha: "not resolved until session start".to_string(),
-                local_branch: "created at session start".to_string(),
-            })
-            .collect();
-        let config = SessionConfig {
-            project_id: Some(project_id),
-            outer_cwd: state
-                .workspaces
-                .session_cwd(&format!("project_prompt_{project_id}")),
-            workspaces: preview_workspaces,
-            provider,
-            metadata: json!({}),
-        };
-        Some(rendered_pi_prompt(state, &config))
-    } else {
-        let home = home_dir_for_ephemeral_session()?;
-        let config = SessionConfig {
-            project_id: None,
-            outer_cwd: home.to_string_lossy().into_owned(),
-            workspaces: Vec::new(),
-            provider: prompt_provider_config(&params)?,
-            metadata: json!({}),
-        };
-        Some(rendered_pi_prompt(state, &config))
-    };
+    let session_id = params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| RpcError::new("session_required", "system.prompt requires session_id"))?;
+    let config = state
+        .repo
+        .load_session_config(session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    state
+        .workspaces
+        .ensure_session(session_id, &config.outer_cwd, &config.workspaces)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let rendered = Some(rendered_pi_prompt(state, &config));
     Ok(json!({ "template": pi_md(), "rendered": rendered }))
 }
 
-fn prompt_provider_config(params: &Value) -> std::result::Result<ProviderConfig, RpcError> {
-    params
-        .get("provider")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|error| RpcError::new("invalid_params", error.to_string()))
-        .map(|provider| provider.unwrap_or_else(default_provider_config))
-}
-
-fn default_provider_config() -> ProviderConfig {
-    ProviderConfig {
-        kind: ProviderKind::Claude,
-        model: "claude-opus-4-7".to_string(),
-        reasoning_effort: agent_vocab::ReasoningEffort::XHigh,
-        max_tokens: None,
-        prompt_cache: None,
-    }
-}
 async fn events_subscribe(
     state: &AppState,
     subscriptions: &mut BTreeSet<String>,
@@ -1164,132 +1102,6 @@ async fn history_switch(state: &AppState, params: Value) -> std::result::Result<
     Ok(json!({ "session_id": session_id, "active_leaf_id": leaf_id, "activity": activity }))
 }
 
-async fn history_fork(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
-    let session_id = required_string(&params, "session_id")?;
-    let leaf_id = match params.get("leaf_id") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) => Some(value.as_str()),
-        Some(_) => {
-            return Err(RpcError::new(
-                "invalid_params",
-                "leaf_id must be a string or null",
-            ))
-        }
-    };
-    let new_session_id = params
-        .get("new_session_id")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("session_{}", Uuid::new_v4()));
-
-    let (driver, _target_session_lock) =
-        SessionDriver::acquire_with_additional_lock(state, &session_id, &new_session_id).await;
-    driver.ensure_idle_for_source_mutation().await?;
-
-    let stored = state
-        .repo
-        .load_stored_session(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
-    ensure_expected_active_leaf_matches(&stored.active_leaf_id, &params)?;
-    let store = transcript_store_from_stored(&stored)?;
-    ensure_fork_target_is_active_leaf(leaf_id, stored.active_leaf_id.as_deref())?;
-    if !store.is_turn_boundary_at(leaf_id) {
-        return Err(RpcError::new(
-            "not_turn_boundary",
-            "history.fork requires a turn boundary",
-        ));
-    }
-    if state
-        .repo
-        .session_exists(&new_session_id)
-        .await
-        .map_err(anyhow::Error::from)?
-    {
-        return Err(RpcError::new(
-            "session_exists",
-            format!("session already exists: {new_session_id}"),
-        ));
-    }
-
-    let mut config = state
-        .repo
-        .load_session_config(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let mut copied_workspace = false;
-    if !config.workspaces.is_empty() {
-        state
-            .workspaces
-            .ensure_session(&session_id, &config.outer_cwd, &config.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
-        let (outer_cwd, forked_workspaces) = state
-            .workspaces
-            .fork_session(&session_id, &new_session_id, &config.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
-        config.outer_cwd = outer_cwd;
-        config.workspaces = forked_workspaces;
-        copied_workspace = true;
-    }
-    let fork_entries = stored
-        .entries
-        .iter()
-        .cloned()
-        .map(Into::into)
-        .collect::<Vec<_>>();
-    let active_leaf_id = leaf_id.map(str::to_string);
-    let child_active_leaf_id = active_leaf_id.clone();
-    let fork_result = state
-        .repo
-        .create_fork(
-            &session_id,
-            &new_session_id,
-            &config,
-            &fork_entries,
-            leaf_id,
-            active_leaf_id,
-        )
-        .await;
-    let events = match fork_result {
-        Ok(events) => events,
-        Err(error) => {
-            if copied_workspace {
-                if let Err(cleanup_error) =
-                    state.workspaces.remove_session_dir(&new_session_id).await
-                {
-                    eprintln!(
-                        "failed to remove fork workspace state for {new_session_id}: {cleanup_error:#}"
-                    );
-                }
-            }
-            return Err(error.into());
-        }
-    };
-    publish_events(state, events);
-    clear_event_buffer_if_idle(state, &session_id).await?;
-    clear_event_buffer_if_idle(state, &new_session_id).await?;
-    Ok(json!({
-        "session_id": new_session_id,
-        "source_leaf_id": leaf_id,
-        "active_leaf_id": child_active_leaf_id,
-    }))
-}
-
-fn ensure_fork_target_is_active_leaf(
-    target_leaf_id: Option<&str>,
-    active_leaf_id: Option<&str>,
-) -> std::result::Result<(), RpcError> {
-    if target_leaf_id != active_leaf_id {
-        return Err(RpcError::new(
-            "not_active_leaf",
-            "history.fork can only fork the current active turn boundary",
-        ));
-    }
-    Ok(())
-}
-
 async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let driver = SessionDriver::acquire(state, &session_id).await;
@@ -1486,23 +1298,4 @@ async fn harness_model_fail(
     driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
     Ok(json!({ "failed": true }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn fork_target_must_be_active_leaf() {
-        assert!(ensure_fork_target_is_active_leaf(Some("leaf"), Some("leaf")).is_ok());
-        assert!(ensure_fork_target_is_active_leaf(None, None).is_ok());
-
-        let error = ensure_fork_target_is_active_leaf(Some("old-leaf"), Some("leaf"))
-            .expect_err("older boundary should be rejected");
-        assert_eq!(error.code, "not_active_leaf");
-
-        let error = ensure_fork_target_is_active_leaf(None, Some("leaf"))
-            .expect_err("root fork should be rejected when a leaf is active");
-        assert_eq!(error.code, "not_active_leaf");
-    }
 }
