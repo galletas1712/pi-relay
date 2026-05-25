@@ -5,9 +5,6 @@ use std::path::{Path, PathBuf};
 use minijinja::Environment;
 use serde_json::{json, Value};
 
-const PI_MD: &str = include_str!("../../../../PI.md");
-const PI_COMPACTION_MD: &str = include_str!("../../../../PI.compaction.md");
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSpec {
     pub name: String,
@@ -98,16 +95,20 @@ pub struct PromptContext {
     pub skills: Vec<Skill>,
 }
 
-pub fn pi_md() -> &'static str {
-    PI_MD
+pub fn load_pi_md(repo_root: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(repo_root.join("PI.md"))
 }
 
-pub fn render_prompt(ctx: &PromptContext) -> String {
-    render(PI_MD, ctx)
+pub fn load_pi_compaction_md(repo_root: &Path) -> std::io::Result<String> {
+    std::fs::read_to_string(repo_root.join("PI.compaction.md"))
 }
 
-pub fn render_compaction_prompt(ctx: &PromptContext) -> String {
-    render(PI_COMPACTION_MD, ctx)
+pub fn render_prompt(template: &str, ctx: &PromptContext) -> String {
+    render(template, ctx)
+}
+
+pub fn render_compaction_prompt(template: &str, ctx: &PromptContext) -> String {
+    render(template, ctx)
 }
 
 fn render(template: &str, ctx: &PromptContext) -> String {
@@ -300,6 +301,9 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const TEST_PI_MD: &str = include_str!("../../../../PI.md");
+    const TEST_PI_COMPACTION_MD: &str = include_str!("../../../../PI.compaction.md");
+
     fn ctx(tools: Vec<&str>, skills: Vec<Skill>) -> PromptContext {
         PromptContext {
             cwd: PathBuf::from("/tmp/project"),
@@ -329,7 +333,7 @@ mod tests {
 
     #[test]
     fn renders_repo_pi_as_static_prompt() {
-        let rendered = render_prompt(&ctx(vec!["Bash", "Grep", "Edit"], Vec::new()));
+        let rendered = render_prompt(TEST_PI_MD, &ctx(vec!["Bash", "Grep", "Edit"], Vec::new()));
         assert!(rendered.contains("You are a helpful assitant"));
         assert!(rendered.contains("### Bash"));
         assert!(rendered.contains("### Edit"));
@@ -350,7 +354,10 @@ mod tests {
             "Use for repo Rust refactors.",
             "/tmp/project/repo/.agents/skills/rust-refactor/SKILL.md",
         );
-        let rendered = render_prompt(&ctx(vec!["Bash"], vec![global_skill, workspace_skill]));
+        let rendered = render_prompt(
+            TEST_PI_MD,
+            &ctx(vec!["Bash"], vec![global_skill, workspace_skill]),
+        );
         assert!(rendered.contains("<available_skills>"));
         assert!(rendered.contains("rust-refactor"));
         assert!(rendered.contains("<workspace>repo</workspace>"));
@@ -375,14 +382,15 @@ mod tests {
         ctx.has_project = false;
         ctx.workspaces = Vec::new();
         ctx.cwd = PathBuf::from("/home/tester");
-        let rendered = render_prompt(&ctx);
+        let rendered = render_prompt(TEST_PI_MD, &ctx);
         assert!(rendered.contains("Current working directory: /home/tester"));
         assert!(!rendered.contains("Workspace subdirectories"));
     }
 
     #[test]
     fn renders_compaction_prompt() {
-        let rendered = render_compaction_prompt(&ctx(vec!["Bash"], Vec::new()));
+        let rendered =
+            render_compaction_prompt(TEST_PI_COMPACTION_MD, &ctx(vec!["Bash"], Vec::new()));
         assert!(rendered.starts_with("Produce a concise continuation summary"));
         assert!(!rendered.contains("You are an expert coding assistant"));
     }

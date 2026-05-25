@@ -16,7 +16,7 @@ use crate::codec::{
     transcript_store_from_stored,
 };
 use crate::config::Config;
-use crate::provider_runtime::{rendered_pi_prompt, ProviderConnectionRegistry};
+use crate::provider_runtime::{current_pi_template, render_pi_prompt, ProviderConnectionRegistry};
 use crate::runtime::*;
 use crate::state::AppState;
 use crate::types::*;
@@ -28,7 +28,6 @@ use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Instant;
 
 use agent_core::AgentInput;
-use agent_prompt::pi_md;
 use agent_session::{AgentSession, SessionInput};
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
@@ -59,6 +58,7 @@ async fn main() -> Result<()> {
 
     let (events, _) = broadcast::channel(1024);
     let workspaces = WorkspaceManager::from_default_state_dir()?;
+    let prompt_root = find_prompt_root(std::env::current_dir()?)?;
     let state = AppState {
         repo,
         active: Arc::new(Mutex::new(HashMap::new())),
@@ -68,6 +68,7 @@ async fn main() -> Result<()> {
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         provider_connections: ProviderConnectionRegistry::new(),
         workspaces,
+        prompt_root,
     };
 
     let listener = TcpListener::bind(&config.bind).await?;
@@ -93,6 +94,18 @@ async fn main() -> Result<()> {
     drain_dispatch_tasks(&state).await;
     state.repo.close().await;
     Ok(())
+}
+
+fn find_prompt_root(start: PathBuf) -> Result<PathBuf> {
+    for path in start.ancestors() {
+        if path.join("PI.md").is_file() {
+            return Ok(path.to_path_buf());
+        }
+    }
+    Err(anyhow::anyhow!(
+        "could not find PI.md from {}",
+        start.display()
+    ))
 }
 
 async fn drain_dispatch_tasks(state: &AppState) {
@@ -340,13 +353,15 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
             .into_owned();
         (cwd, Vec::new())
     };
-    let config = SessionConfig {
+    let mut config = SessionConfig {
         project_id,
         outer_cwd,
         workspaces,
+        system_prompt: String::new(),
         provider: params.provider,
         metadata: params.metadata.unwrap_or_else(|| json!({})),
     };
+    config.system_prompt = render_pi_prompt(state, &config).map_err(anyhow::Error::from)?;
 
     let mut session = AgentSession::new();
     session
@@ -600,6 +615,7 @@ async fn session_configure(
         project_id: current.project_id,
         outer_cwd: current.outer_cwd.clone(),
         workspaces: current.workspaces.clone(),
+        system_prompt: current.system_prompt.clone(),
         provider,
         metadata,
     };
@@ -787,8 +803,10 @@ async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<V
         .ensure_session(session_id, &config.outer_cwd, &config.workspaces)
         .await
         .map_err(anyhow::Error::from)?;
-    let rendered = Some(rendered_pi_prompt(state, &config));
-    Ok(json!({ "template": pi_md(), "rendered": rendered }))
+    Ok(json!({
+        "template": current_pi_template(state).map_err(anyhow::Error::from)?,
+        "rendered": config.system_prompt,
+    }))
 }
 
 async fn events_subscribe(

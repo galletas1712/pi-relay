@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, Mutex as StdMutex},
 };
 
@@ -29,4 +30,5 @@ pub(crate) struct AppState {
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) provider_connections: ProviderConnectionRegistry,
     pub(crate) workspaces: WorkspaceManager,
+    pub(crate) prompt_root: PathBuf,
 }

@@ -1,21 +1,41 @@
 use std::path::{Path, PathBuf};
 
-use agent_prompt::{render_prompt, PromptContext, PromptWorkspace, Skill, ToolSpec};
+use agent_prompt::{
+    load_pi_compaction_md, load_pi_md, render_compaction_prompt, render_prompt, PromptContext,
+    PromptWorkspace, Skill, ToolSpec,
+};
 use agent_store::{SessionConfig, SessionWorkspace};
 use agent_vocab::ProviderKind;
 
 use crate::state::AppState;
 
 pub(super) async fn assemble_agent_prompt(
-    state: &AppState,
+    _state: &AppState,
     config: &SessionConfig,
 ) -> anyhow::Result<agent_provider::PromptSections> {
-    let ctx = prompt_context(state, config);
-    Ok(agent_provider::PromptSections::stable(render_prompt(&ctx)))
+    Ok(agent_provider::PromptSections::stable(
+        config.system_prompt.clone(),
+    ))
 }
 
-pub(crate) fn rendered_pi_prompt(state: &AppState, config: &SessionConfig) -> String {
-    render_prompt(&prompt_context(state, config))
+pub(crate) fn render_pi_prompt(state: &AppState, config: &SessionConfig) -> anyhow::Result<String> {
+    let template = load_pi_md(&state.prompt_root)?;
+    Ok(render_prompt(&template, &prompt_context(state, config)))
+}
+
+pub(crate) fn current_pi_template(state: &AppState) -> anyhow::Result<String> {
+    Ok(load_pi_md(&state.prompt_root)?)
+}
+
+pub(super) fn render_pi_compaction_prompt(
+    state: &AppState,
+    config: &SessionConfig,
+) -> anyhow::Result<String> {
+    let template = load_pi_compaction_md(&state.prompt_root)?;
+    Ok(render_compaction_prompt(
+        &template,
+        &prompt_context(state, config),
+    ))
 }
 
 pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> PromptContext {
