@@ -163,6 +163,7 @@ export const MessageList = memo(function MessageList({
 	pendingActions,
 	activeLeafId,
 	isRunning,
+	serverTimeMs,
 	hasSession,
 	sessionId,
 	entriesSessionId,
@@ -175,6 +176,7 @@ export const MessageList = memo(function MessageList({
 	pendingActions?: PendingAction[];
 	activeLeafId: string | null;
 	isRunning: boolean;
+	serverTimeMs: number | null;
 	hasSession: boolean;
 	sessionId?: string | null;
 	entriesSessionId?: string | null;
@@ -332,24 +334,16 @@ export const MessageList = memo(function MessageList({
 
 	// While a turn is running we show a single "Working…" row at the end of
 	// the transcript instead of a sticky pill, so the user can see how long
-	// the agent has been thinking. We anchor the clock to the most recent
-	// `turn_started` entry on the active branch — that timestamp is stable
-	// across re-renders and across reconnections (the entry is persisted),
-	// so the duration doesn't reset just because state churned.
-	const workingFallbackStartRef = useRef<number | null>(null);
-	if (!isRunning && workingFallbackStartRef.current !== null) {
-		workingFallbackStartRef.current = null;
-	}
-	const workingStartMs = useMemo(() => {
+	// the agent has been thinking. The clock is anchored only to durable
+	// server data: either the active branch's `turn_started` entry, or a
+	// mid-turn compaction summary that remembers the original turn start after
+	// compaction replaced the raw open-turn suffix. We deliberately do not
+	// synthesize a local start time; a running turn without this anchor is a
+	// protocol/storage bug, not something the UI can make correct.
+	const workingClock = useMemo(() => {
 		if (!isRunning) return null;
-		for (let index = visibleEntries.length - 1; index >= 0; index -= 1) {
-			const entry = visibleEntries[index];
-			if (entry.item.type === "turn_started") return entry.timestamp_ms;
-			if (entry.item.type === "turn_finished") break;
-		}
-		if (workingFallbackStartRef.current === null) workingFallbackStartRef.current = Date.now();
-		return workingFallbackStartRef.current;
-	}, [isRunning, visibleEntries]);
+		return runningTurnClockAnchor(visibleEntries, serverTimeMs);
+	}, [isRunning, serverTimeMs, visibleEntries]);
 
 	if (!hasSession) {
 		return (
@@ -394,13 +388,52 @@ export const MessageList = memo(function MessageList({
 				{pendingInputs.map((input) => (
 					<PendingUserBubble input={input} key={input.id} />
 				))}
-				{isRunning && workingStartMs != null ? (
-					<WorkingIndicator startMs={workingStartMs} />
+				{isRunning && workingClock != null ? (
+					<WorkingIndicator clock={workingClock} />
 				) : null}
 			</div>
 		</div>
 	);
 });
+
+function workingElapsedMs(clock: WorkingClockAnchor): number {
+	return Math.max(0, clock.serverAnchorMs + (performance.now() - clock.clientAnchorMs) - clock.startMs);
+}
+
+export interface WorkingClockAnchor {
+	startMs: number;
+	serverAnchorMs: number;
+	clientAnchorMs: number;
+}
+
+export function runningTurnStartMs(entries: TranscriptEntry[]): number | null {
+	for (let index = entries.length - 1; index >= 0; index -= 1) {
+		const entry = entries[index];
+		if (entry.item.type === "turn_started") return entry.timestamp_ms;
+		if (entry.item.type === "compaction_summary") {
+			const turnStartedAtMs = entry.item.turn_started_at_ms;
+			if (typeof turnStartedAtMs === "number" && Number.isFinite(turnStartedAtMs) && turnStartedAtMs >= 0) {
+				return turnStartedAtMs;
+			}
+		}
+		if (entry.item.type === "turn_finished") break;
+	}
+	return null;
+}
+
+export function runningTurnClockAnchor(
+	entries: TranscriptEntry[],
+	serverTimeMs: number | null
+): WorkingClockAnchor | null {
+	if (typeof serverTimeMs !== "number" || !Number.isFinite(serverTimeMs)) return null;
+	const startMs = runningTurnStartMs(entries);
+	if (startMs === null) return null;
+	return {
+		startMs,
+		serverAnchorMs: serverTimeMs,
+		clientAnchorMs: performance.now(),
+	};
+}
 
 const PendingUserBubble = memo(function PendingUserBubble({ input }: { input: PendingTranscriptInput }) {
 	return (
@@ -420,15 +453,15 @@ function pendingUserStatusLabel(input: PendingTranscriptInput): string {
 	return "sending...";
 }
 
-const WorkingIndicator = memo(function WorkingIndicator({ startMs }: { startMs: number }) {
-	const [elapsedMs, setElapsedMs] = useState(() => Math.max(0, Date.now() - startMs));
+const WorkingIndicator = memo(function WorkingIndicator({ clock }: { clock: WorkingClockAnchor }) {
+	const [elapsedMs, setElapsedMs] = useState(() => workingElapsedMs(clock));
 	useEffect(() => {
-		setElapsedMs(Math.max(0, Date.now() - startMs));
+		setElapsedMs(workingElapsedMs(clock));
 		const interval = window.setInterval(() => {
-			setElapsedMs(Math.max(0, Date.now() - startMs));
+			setElapsedMs(workingElapsedMs(clock));
 		}, 1000);
 		return () => window.clearInterval(interval);
-	}, [startMs]);
+	}, [clock]);
 	return (
 		<SystemMessage
 			tone="info"

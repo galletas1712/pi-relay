@@ -185,6 +185,7 @@ function snapshotFixture(): SessionSnapshot {
 			},
 		],
 		last_event_id: 1,
+		server_time_ms: 1_700_000_000_000,
 		entries: [],
 	};
 }

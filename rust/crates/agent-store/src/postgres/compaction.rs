@@ -67,9 +67,12 @@ impl PostgresAgentStore {
         let payload: Value = row.get("payload");
         let source_leaf_id = model_action_context_leaf_id(&payload)
             .ok_or_else(|| anyhow!("model action has no compaction source leaf"))?;
-        let model_context = self
-            .model_context_for_leaf(session_id, &source_leaf_id)
-            .await?;
+        let source_entries =
+            branch_entries_to_leaf_tx(&mut tx, session_id, &source_leaf_id).await?;
+        if source_entries.is_empty() {
+            return Err(anyhow!("transcript leaf not found: {source_leaf_id}"));
+        }
+        let model_context = model_context_from_entries(source_entries.clone());
         if model_context.transcript_items().is_empty() {
             return Err(anyhow!("cannot compact an empty model context"));
         }
@@ -89,6 +92,17 @@ impl PostgresAgentStore {
             }
         };
         let last_turn_id = model_context.last_turn_id();
+        let turn_started_at_ms = match &scope {
+            CompactionScope::MidTurn { turn_id, .. } => Some(
+                turn_started_at_ms_for_turn(&source_entries, *turn_id).ok_or_else(|| {
+                    anyhow!(
+                        "mid-turn compaction source is missing turn_started for turn {}",
+                        turn_id.0
+                    )
+                })?,
+            ),
+            CompactionScope::Boundary { .. } => None,
+        };
         let trigger_name = trigger.as_str();
         let reason = trigger.reason().map(str::to_string);
         let action_row_id = format!("action_{}", Uuid::new_v4());
@@ -100,6 +114,7 @@ impl PostgresAgentStore {
             "last_turn_id": last_turn_id.0,
             "context_tokens": tokens_before,
             "auto_limit_tokens": auto_limit_tokens,
+            "turn_started_at_ms": turn_started_at_ms,
             "trigger": trigger_name,
             "reason": reason,
             "scope": scope_value,
@@ -183,6 +198,7 @@ impl PostgresAgentStore {
                     "scope": scope.kind(),
                     "tokens_before": tokens_before,
                     "auto_limit_tokens": auto_limit_tokens,
+                    "turn_started_at_ms": turn_started_at_ms,
                     "blocked_model_action_row_id": model_action_row_id,
                 }),
             )
@@ -200,6 +216,7 @@ impl PostgresAgentStore {
                 model_context,
                 tokens_before,
                 last_turn_id,
+                turn_started_at_ms,
                 trigger,
                 reason,
                 scope,
@@ -325,6 +342,7 @@ impl PostgresAgentStore {
                 model_context,
                 tokens_before,
                 last_turn_id,
+                turn_started_at_ms: None,
                 trigger,
                 reason,
                 scope,
@@ -422,13 +440,16 @@ impl PostgresAgentStore {
             id: new_root_id.clone(),
             parent_id: None,
             timestamp_ms: now_ms(),
-            item: TranscriptItem::CompactionSummary(CompactionSummary::new(
-                job.source_session_id.clone(),
-                job.source_leaf_id.clone(),
-                completion.summary.clone(),
-                job.tokens_before,
-                job.last_turn_id,
-            )),
+            item: TranscriptItem::CompactionSummary(
+                CompactionSummary::new(
+                    job.source_session_id.clone(),
+                    job.source_leaf_id.clone(),
+                    completion.summary.clone(),
+                    job.tokens_before,
+                    job.last_turn_id,
+                )
+                .with_turn_started_at_ms(job.turn_started_at_ms),
+            ),
             provider_replay: completion.provider_replay.clone(),
         };
         insert_stored_entry_tx(&mut tx, &job.source_session_id, &root_entry).await?;
@@ -703,6 +724,18 @@ fn model_context_from_installed_entries(entries: &[StoredTranscriptEntry]) -> Mo
     model_context_from_entries(entries.to_vec())
 }
 
+fn turn_started_at_ms_for_turn(entries: &[StoredTranscriptEntry], turn_id: TurnId) -> Option<u64> {
+    entries.iter().rev().find_map(|entry| match &entry.item {
+        TranscriptItem::TurnStarted {
+            turn_id: entry_turn_id,
+        } if *entry_turn_id == turn_id => Some(entry.timestamp_ms),
+        TranscriptItem::CompactionSummary(summary) if summary.last_turn_id == turn_id => {
+            summary.turn_started_at_ms
+        }
+        _ => None,
+    })
+}
+
 fn session_action_from_model_row(
     row: sqlx::postgres::PgRow,
     model_context: ModelContext,
@@ -748,6 +781,41 @@ pub(super) async fn latest_context_usage_tx(
     }))
 }
 
+async fn branch_entries_to_leaf_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+    leaf_id: &str,
+) -> Result<Vec<StoredTranscriptEntry>> {
+    let rows = sqlx::query(
+        r#"
+        with recursive branch as (
+            select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence
+            from transcript_entries t
+            where t.session_id = $1
+              and t.id = $2::text
+
+            union all
+
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence
+            from transcript_entries parent
+            join branch child
+              on parent.session_id = $1
+             and parent.id = child.parent_id
+        )
+        select id, parent_id, timestamp_ms, item, provider_replay
+        from branch
+        order by sequence
+        "#,
+    )
+    .bind(session_id)
+    .bind(leaf_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| row_to_stored_entry(&row))
+        .collect()
+}
+
 fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -759,8 +827,8 @@ fn now_ms() -> u64 {
 mod tests {
     use super::*;
     use agent_vocab::{
-        ActionId, AssistantItem, AssistantMessage, ToolCall, ToolCallId, ToolResultMessage,
-        ToolResultStatus, TurnOutcome, UserMessage,
+        ActionId, AssistantItem, AssistantMessage, CompactionSummary, ToolCall, ToolCallId,
+        ToolResultMessage, ToolResultStatus, TurnOutcome, UserMessage,
     };
 
     fn tool_call(id: u64, name: &str) -> ToolCall {
@@ -778,6 +846,71 @@ mod tests {
             output: output.to_string(),
             status: ToolResultStatus::Success,
         }
+    }
+
+    fn stored_entry(id: &str, timestamp_ms: u64, item: TranscriptItem) -> StoredTranscriptEntry {
+        StoredTranscriptEntry {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp_ms,
+            item,
+            provider_replay: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mid_turn_compaction_uses_persisted_turn_start_timestamp() {
+        let entries = vec![
+            stored_entry(
+                "start_1",
+                1_000,
+                TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            ),
+            stored_entry(
+                "user_1",
+                1_100,
+                TranscriptItem::UserMessage(UserMessage::text("go")),
+            ),
+        ];
+
+        assert_eq!(
+            turn_started_at_ms_for_turn(&entries, TurnId(1)),
+            Some(1_000)
+        );
+    }
+
+    #[test]
+    fn repeated_mid_turn_compaction_uses_prior_compaction_turn_start() {
+        let entries = vec![stored_entry(
+            "compact_1",
+            5_000,
+            TranscriptItem::CompactionSummary(
+                CompactionSummary::new("session", "source", "summary", None, TurnId(7))
+                    .with_turn_started_at_ms(Some(1_234)),
+            ),
+        )];
+
+        assert_eq!(
+            turn_started_at_ms_for_turn(&entries, TurnId(7)),
+            Some(1_234)
+        );
+    }
+
+    #[test]
+    fn mid_turn_compaction_has_no_timestamp_without_a_persisted_anchor() {
+        let entries = vec![stored_entry(
+            "compact_1",
+            5_000,
+            TranscriptItem::CompactionSummary(CompactionSummary::new(
+                "session",
+                "source",
+                "summary",
+                None,
+                TurnId(7),
+            )),
+        )];
+
+        assert_eq!(turn_started_at_ms_for_turn(&entries, TurnId(7)), None);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use agent_session::StoredTranscriptEntry;
 use agent_store::{ActiveBranchSync, HistoryTree, Project, SessionSnapshot, SessionSummary};
 use agent_vocab::TranscriptItem;
@@ -75,6 +77,7 @@ pub(crate) fn session_snapshot(
         "queued_inputs": queued_inputs,
         "last_event_id": snapshot.last_event_id,
         "has_transcript_entries": snapshot.has_transcript_entries,
+        "server_time_ms": now_ms(),
     });
     if let Some(entries) = entries {
         value["entries"] = json!(redact_entries(entries));
@@ -115,4 +118,11 @@ fn redact_entries(entries: Vec<StoredTranscriptEntry>) -> Vec<StoredTranscriptEn
             entry
         })
         .collect()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or_default()
 }

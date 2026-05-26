@@ -1,5 +1,5 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
 	assistantRenderParts,
 	captureScrollPosition,
@@ -9,6 +9,8 @@ import {
 	loadTranscriptScrollPositions,
 	MessageList,
 	restoreScrollPosition,
+	runningTurnClockAnchor,
+	runningTurnStartMs,
 	saveTranscriptScrollPositions,
 	TRANSCRIPT_SCROLL_STORAGE_KEY,
 	type TranscriptScrollStorage,
@@ -151,6 +153,7 @@ describe("MessageList session loading guard", () => {
 				entries={[userEntry("entry_1", "stale transcript text")]}
 				activeLeafId="entry_1"
 				isRunning={false}
+				serverTimeMs={null}
 				hasSession
 				sessionId="session_b"
 				entriesSessionId="session_a"
@@ -169,6 +172,7 @@ describe("MessageList markdown code rendering", () => {
 				entries={[assistantEntry("assistant", null, "Inline `value`.\n\n```js\nconst value = 1;\n```")]}
 				activeLeafId="assistant"
 				isRunning={false}
+				serverTimeMs={null}
 				hasSession
 				sessionId="session_a"
 				entriesSessionId="session_a"
@@ -192,12 +196,46 @@ describe("ToolOutput", () => {
 });
 
 describe("MessageList Working indicator", () => {
+	it("uses the persisted turn_started timestamp for the running turn", () => {
+		expect(runningTurnStartMs([turnStartedEntry("entry_turn", 1, 1234)])).toBe(1234);
+	});
+
+	it("uses a mid-turn compaction summary turn start when the turn start is no longer on the active branch", () => {
+		expect(runningTurnStartMs([compactionSummaryEntry("compact", null, 1, 5_000, 1234)])).toBe(1234);
+	});
+
+	it("does not walk past a finished turn", () => {
+		expect(runningTurnStartMs([
+			turnStartedEntry("start", 1, 1000),
+			turnFinishedEntry("finish", "start", 1, "Graceful"),
+		])).toBeNull();
+	});
+
+	it("anchors elapsed time to the server clock for cross-machine display", () => {
+		const nowSpy = vi.spyOn(performance, "now").mockReturnValue(12_000);
+		try {
+			expect(runningTurnClockAnchor([turnStartedEntry("entry_turn", 1, 1_000)], 10_000)).toEqual({
+				startMs: 1_000,
+				serverAnchorMs: 10_000,
+				clientAnchorMs: 12_000,
+			});
+		} finally {
+			nowSpy.mockRestore();
+		}
+	});
+
+	it("does not synthesize a local clock when the server time is missing", () => {
+		expect(runningTurnClockAnchor([turnStartedEntry("entry_turn", 1, 1_000)], null)).toBeNull();
+	});
+
 	it("renders a Working… row at the transcript tail when the session is running", () => {
+		const now = Date.now();
 		const html = renderToStaticMarkup(
 			<MessageList
-				entries={[turnStartedEntry("entry_turn", 1, Date.now() - 5_000)]}
+				entries={[turnStartedEntry("entry_turn", 1, now - 5_000)]}
 				activeLeafId="entry_turn"
 				isRunning
+				serverTimeMs={now}
 				hasSession
 				sessionId="session_a"
 				entriesSessionId="session_a"
@@ -213,6 +251,7 @@ describe("MessageList Working indicator", () => {
 				entries={[turnStartedEntry("entry_turn", 1, Date.now() - 5_000)]}
 				activeLeafId="entry_turn"
 				isRunning={false}
+				serverTimeMs={null}
 				hasSession
 				sessionId="session_a"
 				entriesSessionId="session_a"
@@ -235,6 +274,7 @@ describe("MessageList terminal turn resume actions", () => {
 				]}
 				activeLeafId="finish"
 				isRunning={false}
+				serverTimeMs={null}
 				hasSession
 				sessionId="session_a"
 				entriesSessionId="session_a"
@@ -331,6 +371,30 @@ function turnStartedEntry(id: string, turnId: number, timestampMs: number): Tran
 		parent_id: null,
 		timestamp_ms: timestampMs,
 		item: { type: "turn_started", turn_id: turnId },
+		provider_replay: []
+	};
+}
+
+function compactionSummaryEntry(
+	id: string,
+	parentId: string | null,
+	lastTurnId: number,
+	timestampMs: number,
+	turnStartedAtMs?: number | null,
+): TranscriptEntry {
+	return {
+		id,
+		parent_id: parentId,
+		timestamp_ms: timestampMs,
+		item: {
+			type: "compaction_summary",
+			source_session_id: "session_a",
+			source_leaf_id: "source_leaf",
+			summary: "summary",
+			tokens_before: null,
+			last_turn_id: lastTurnId,
+			turn_started_at_ms: turnStartedAtMs,
+		},
 		provider_replay: []
 	};
 }

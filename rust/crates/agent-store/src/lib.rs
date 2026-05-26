@@ -265,6 +265,7 @@ pub struct CompactionJob {
     pub compaction_context: ModelContext,
     pub tokens_before: Option<usize>,
     pub last_turn_id: TurnId,
+    pub turn_started_at_ms: Option<u64>,
     pub trigger: CompactionTrigger,
     pub reason: Option<String>,
     pub scope: CompactionScope,

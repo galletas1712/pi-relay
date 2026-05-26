@@ -69,6 +69,7 @@ export interface SessionSnapshot {
 	pending_actions: PendingAction[];
 	queued_inputs: QueuedInput[];
 	last_event_id: number;
+	server_time_ms: number;
 	has_transcript_entries?: boolean;
 	entries?: TranscriptEntry[];
 }
@@ -167,6 +168,7 @@ export type TranscriptItem =
 			summary: string;
 			tokens_before?: number | null;
 			last_turn_id: number;
+			turn_started_at_ms?: number | null;
 	  };
 
 export interface TranscriptEntry {
