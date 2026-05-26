@@ -23,7 +23,8 @@ use uuid::Uuid;
 #[cfg(test)]
 use crate::sse::read_json_sse_text;
 use crate::{
-    sse::{read_json_sse_response, SseControl, SseEvent},
+    http::send_provider_generation_request,
+    sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
     ProviderCompactionRequest, ProviderCompactionResponse, ProviderError, ProviderResult,
     ProviderToolProfile, ProviderUsage,
@@ -58,7 +59,6 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_RESIDENCY_US: &str = "us";
 const CODEX_REQUEST_COMPRESSION_LEVEL: i32 = 3;
 const CODEX_COMPACT_REQUEST_TIMEOUT_SECS: u64 = 20 * 60;
-const CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -505,29 +505,34 @@ impl OpenAiProvider {
             .and_then(|state| state.turn_state_for_request(turn_id));
         let body = responses_body(request, &session_id)?;
 
-        let response = zstd_json_request(
-            self.add_codex_headers(
-                self.client
-                    .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
-                    .header(ACCEPT, "text/event-stream"),
-                &session_id,
-                &window_id,
-                codex_turn_state.as_deref(),
-            ),
-            &body,
-        )?
-        .send()
+        let response = send_provider_generation_request(
+            zstd_json_request(
+                self.add_codex_headers(
+                    self.client
+                        .post(format!("{}/responses", self.base_url.trim_end_matches('/')))
+                        .header(ACCEPT, "text/event-stream"),
+                    &session_id,
+                    &window_id,
+                    codex_turn_state.as_deref(),
+                ),
+                &body,
+            )?,
+            "OpenAI /responses",
+        )
         .await?;
+        let response_success = response.status().is_success();
         let response_headers = OpenAiResponseHeaders::from_headers(response.headers());
-        let mut parsed = parse_responses_stream(response, ProviderKind::OpenAi).await?;
         if let (Some(turn_state), Some(session_state)) = (
-            response_headers.codex_turn_state.clone(),
+            response_success
+                .then(|| response_headers.codex_turn_state.clone())
+                .flatten(),
             self.session_state
                 .as_deref()
                 .filter(|state| state.session_id() == session_id),
         ) {
             session_state.record_turn_state(turn_id, turn_state);
         }
+        let mut parsed = parse_responses_stream(response, ProviderKind::OpenAi).await?;
         response_headers.attach_to_usage(&mut parsed.usage);
         Ok(parsed)
     }
@@ -950,12 +955,9 @@ async fn parse_responses_stream(
     provider: ProviderKind,
 ) -> ProviderResult<ModelResponse> {
     let mut state = ResponsesStreamState::new(provider);
-    read_json_sse_response(
+    read_provider_json_sse_response(
         response,
-        Duration::from_secs(CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS),
-        format!(
-            "OpenAI response stream was idle for {CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS} seconds"
-        ),
+        "OpenAI response stream",
         response_error_message,
         |event| state.process_sse_event(event),
     )
@@ -1019,11 +1021,18 @@ impl ResponsesStreamState {
                 Ok(SseControl::Continue)
             }
             Some("response.failed") => {
-                let message = event
-                    .pointer("/response/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("response.failed");
-                Err(ProviderError::Provider(message.to_string()))
+                let code = event
+                    .pointer("/response/error/code")
+                    .and_then(Value::as_str);
+                let message = openai_error_message(
+                    code,
+                    event
+                        .pointer("/response/error/message")
+                        .and_then(Value::as_str)
+                        .or(Some("response.failed")),
+                    event,
+                );
+                Err(openai_provider_error_from_code(code, message))
             }
             Some("response.incomplete") => {
                 let message = event
@@ -1044,16 +1053,59 @@ impl ResponsesStreamState {
                 Ok(SseControl::Stop)
             }
             Some("error") => {
-                let message = event
-                    .get("message")
-                    .or_else(|| event.get("code"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| event.to_string());
-                Err(ProviderError::Provider(format!("Codex error: {message}")))
+                let code = event.get("code").and_then(Value::as_str);
+                let message = openai_error_message(
+                    code,
+                    event
+                        .get("message")
+                        .or_else(|| event.get("code"))
+                        .and_then(Value::as_str),
+                    event,
+                );
+                Err(openai_provider_error_from_code(
+                    code,
+                    format!("Codex error: {message}"),
+                ))
             }
             _ => Ok(SseControl::Continue),
         }
+    }
+}
+
+fn openai_error_message(code: Option<&str>, message: Option<&str>, event: &Value) -> String {
+    let message = message
+        .map(str::to_string)
+        .unwrap_or_else(|| event.to_string());
+    if let Some(code) = code {
+        if !message.contains(code) {
+            return format!("{code}: {message}");
+        }
+    }
+    message
+}
+
+fn openai_provider_error_from_code(code: Option<&str>, message: String) -> ProviderError {
+    match code {
+        Some("rate_limit_exceeded") => ProviderError::Status {
+            status: 429,
+            message,
+        },
+        Some("internal_error" | "server_error") => ProviderError::Status {
+            status: 500,
+            message,
+        },
+        Some("overloaded_error" | "server_is_overloaded" | "slow_down") => ProviderError::Status {
+            status: 529,
+            message,
+        },
+        Some(
+            "context_length_exceeded"
+            | "cyber_policy"
+            | "insufficient_quota"
+            | "invalid_prompt"
+            | "usage_not_included",
+        ) => ProviderError::Provider(message),
+        Some(_) | None => ProviderError::Transient(message),
     }
 }
 
@@ -2069,6 +2121,41 @@ data: [DONE]
 
         assert_eq!(response.assistant.text(), "done");
         assert_eq!(response.provider_replay.len(), 1);
+    }
+
+    #[test]
+    fn responses_sse_maps_transient_failed_events_to_retryable_status() {
+        let sse = r#"data: {"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"retry later"}}}
+"#;
+
+        let error = parse_responses_sse(sse, ProviderKind::OpenAi).expect_err("sse should fail");
+
+        assert!(error.is_retryable_transient());
+        match &error {
+            ProviderError::Status { status, message } => {
+                assert_eq!(*status, 429);
+                assert!(message.contains("rate_limit_exceeded"));
+                assert!(message.contains("retry later"));
+            }
+            _ => panic!("expected retryable status error, got {error:?}"),
+        }
+    }
+
+    #[test]
+    fn responses_sse_maps_unknown_failed_events_to_retryable_transient_error() {
+        let sse = r#"data: {"type":"response.failed","response":{"error":{"code":"backend_restart","message":"try again"}}}
+"#;
+
+        let error = parse_responses_sse(sse, ProviderKind::OpenAi).expect_err("sse should fail");
+
+        assert!(error.is_retryable_transient());
+        match &error {
+            ProviderError::Transient(message) => {
+                assert!(message.contains("backend_restart"));
+                assert!(message.contains("try again"));
+            }
+            _ => panic!("expected retryable transient error, got {error:?}"),
+        }
     }
 
     #[test]

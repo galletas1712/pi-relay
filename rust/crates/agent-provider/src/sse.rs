@@ -4,6 +4,8 @@ use serde_json::Value;
 
 use crate::{ProviderError, ProviderResult};
 
+const PROVIDER_SSE_STREAM_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SseEvent {
     Json(Value),
@@ -22,10 +24,9 @@ pub(crate) enum SseStreamEnd {
     Eof,
 }
 
-pub(crate) async fn read_json_sse_response(
+pub(crate) async fn read_provider_json_sse_response(
     mut response: reqwest::Response,
-    idle_timeout: Duration,
-    idle_error_message: String,
+    stream_name: &str,
     response_error_message: fn(&str) -> String,
     mut on_event: impl FnMut(SseEvent) -> ProviderResult<SseControl>,
 ) -> ProviderResult<SseStreamEnd> {
@@ -39,11 +40,14 @@ pub(crate) async fn read_json_sse_response(
         });
     }
 
+    let idle_timeout = Duration::from_secs(PROVIDER_SSE_STREAM_IDLE_TIMEOUT_SECS);
+    let idle_error_message =
+        format!("{stream_name} was idle for {PROVIDER_SSE_STREAM_IDLE_TIMEOUT_SECS} seconds");
     let mut buffer = Vec::new();
     loop {
         let chunk = match tokio::time::timeout(idle_timeout, response.chunk()).await {
             Ok(chunk) => chunk?,
-            Err(_) => return Err(ProviderError::Provider(idle_error_message)),
+            Err(_) => return Err(ProviderError::Timeout(idle_error_message)),
         };
         let Some(chunk) = chunk else {
             break;
