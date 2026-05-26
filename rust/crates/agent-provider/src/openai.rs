@@ -55,6 +55,7 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_RESIDENCY_US: &str = "us";
 const CODEX_REQUEST_COMPRESSION_LEVEL: i32 = 3;
 const CODEX_COMPACT_REQUEST_TIMEOUT_SECS: u64 = 20 * 60;
+const CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -473,10 +474,7 @@ impl OpenAiProvider {
         .send()
         .await?;
         let response_headers = OpenAiResponseHeaders::from_headers(response.headers());
-        let (status, text) = response_text(response).await?;
-        ensure_success(status, &text)?;
-
-        let mut parsed = parse_responses_sse(&text, ProviderKind::OpenAi)?;
+        let mut parsed = parse_responses_stream(response, ProviderKind::OpenAi).await?;
         response_headers.attach_to_usage(&mut parsed.usage);
         Ok(parsed)
     }
@@ -893,58 +891,209 @@ The conversation history before this point was compacted into this summary:
     }
 }
 
+async fn parse_responses_stream(
+    mut response: reqwest::Response,
+    provider: ProviderKind,
+) -> ProviderResult<ModelResponse> {
+    let status = response.status();
+    if !status.is_success() {
+        let bytes = response.bytes().await?;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        return Err(ProviderError::Status {
+            status: status.as_u16(),
+            message: response_error_message(&text),
+        });
+    }
+
+    let mut state = ResponsesStreamState::new(provider);
+    let mut buffer = Vec::new();
+    loop {
+        let chunk = match tokio::time::timeout(
+            Duration::from_secs(CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS),
+            response.chunk(),
+        )
+        .await
+        {
+            Ok(chunk) => chunk?,
+            Err(_) => {
+                return Err(ProviderError::Provider(format!(
+                    "OpenAI response stream was idle for {CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS} seconds"
+                )));
+            }
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
+        buffer.extend_from_slice(&chunk);
+        if process_complete_sse_frames(&mut buffer, &mut state)? {
+            return Ok(state.finish());
+        }
+    }
+    if process_final_sse_frame(&buffer, &mut state)? {
+        return Ok(state.finish());
+    }
+    Ok(state.finish())
+}
+
+#[cfg(test)]
 fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<ModelResponse> {
-    let mut items = Vec::new();
-    let mut provider_replay = Vec::new();
-    let mut usage = None;
-    let mut stop_reason = ModelStopReason::Complete;
-    for data in sse_data_events(text) {
-        let event: Value = serde_json::from_str(data)?;
+    let mut state = ResponsesStreamState::new(provider);
+    let mut buffer = text.as_bytes().to_vec();
+    if process_complete_sse_frames(&mut buffer, &mut state)? {
+        return Ok(state.finish());
+    }
+    process_final_sse_frame(&buffer, &mut state)?;
+    Ok(state.finish())
+}
+
+struct ResponsesStreamState {
+    provider: ProviderKind,
+    items: Vec<AssistantItem>,
+    provider_replay: Vec<ProviderReplayItem>,
+    usage: Option<ProviderUsage>,
+    stop_reason: ModelStopReason,
+}
+
+impl ResponsesStreamState {
+    fn new(provider: ProviderKind) -> Self {
+        Self {
+            provider,
+            items: Vec::new(),
+            provider_replay: Vec::new(),
+            usage: None,
+            stop_reason: ModelStopReason::Complete,
+        }
+    }
+
+    fn finish(self) -> ModelResponse {
+        ModelResponse {
+            assistant: AssistantMessage { items: self.items },
+            provider_replay: self.provider_replay,
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+        }
+    }
+
+    fn process_event(&mut self, event: &Value) -> ProviderResult<bool> {
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_item.done") => {
                 if let Some(item) = event.get("item") {
-                    parse_response_output_item(item, &mut items, &mut provider_replay, provider)?;
+                    parse_response_output_item(
+                        item,
+                        &mut self.items,
+                        &mut self.provider_replay,
+                        self.provider,
+                    )?;
                 }
+                Ok(false)
             }
             Some("response.failed") => {
                 let message = event
                     .pointer("/response/error/message")
                     .and_then(Value::as_str)
                     .unwrap_or("response.failed");
-                return Err(ProviderError::Provider(message.to_string()));
+                Err(ProviderError::Provider(message.to_string()))
             }
             Some("response.incomplete") => {
                 let message = event
                     .pointer("/response/incomplete_details/reason")
                     .and_then(Value::as_str);
                 if message == Some("max_output_tokens") {
-                    stop_reason = ModelStopReason::MaxOutputTokens;
-                    usage = event.pointer("/response/usage").and_then(openai_usage);
-                    continue;
+                    self.stop_reason = ModelStopReason::MaxOutputTokens;
+                    self.usage = event.pointer("/response/usage").and_then(openai_usage);
+                    return Ok(true);
                 }
                 let message = message
                     .map(|reason| format!("response incomplete: {reason}"))
                     .unwrap_or_else(|| "response incomplete".to_string());
-                return Err(ProviderError::Provider(message));
+                Err(ProviderError::Provider(message))
             }
-            Some("response.completed") => {
-                usage = event.pointer("/response/usage").and_then(openai_usage);
+            Some("response.completed" | "response.done") => {
+                self.usage = event.pointer("/response/usage").and_then(openai_usage);
+                Ok(true)
             }
-            _ => {}
+            Some("error") => {
+                let message = event
+                    .get("message")
+                    .or_else(|| event.get("code"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| event.to_string());
+                Err(ProviderError::Provider(format!("Codex error: {message}")))
+            }
+            _ => Ok(false),
         }
     }
-    Ok(ModelResponse {
-        assistant: AssistantMessage { items },
-        provider_replay,
-        usage,
-        stop_reason,
-    })
 }
 
-fn sse_data_events(text: &str) -> impl Iterator<Item = &str> {
-    text.lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter(|line| !line.trim().is_empty() && *line != "[DONE]")
+fn process_complete_sse_frames(
+    buffer: &mut Vec<u8>,
+    state: &mut ResponsesStreamState,
+) -> ProviderResult<bool> {
+    while let Some((frame_end, separator_len)) = sse_frame_boundary(buffer) {
+        let frame = buffer[..frame_end].to_vec();
+        buffer.drain(..frame_end + separator_len);
+        if process_sse_frame(&frame, state)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn process_final_sse_frame(frame: &[u8], state: &mut ResponsesStreamState) -> ProviderResult<bool> {
+    if frame.iter().all(u8::is_ascii_whitespace) {
+        return Ok(false);
+    }
+    process_sse_frame(frame, state)
+}
+
+fn process_sse_frame(frame: &[u8], state: &mut ResponsesStreamState) -> ProviderResult<bool> {
+    match sse_frame_data(frame) {
+        Some(SseFrame::Json(data)) => {
+            let Ok(event) = serde_json::from_str::<Value>(&data) else {
+                // Match the legacy TS parser, which skips malformed SSE data
+                // chunks rather than failing the whole stream.
+                return Ok(false);
+            };
+            state.process_event(&event)
+        }
+        Some(SseFrame::Done) => Ok(true),
+        None => Ok(false),
+    }
+}
+
+enum SseFrame {
+    Json(String),
+    Done,
+}
+
+fn sse_frame_data(frame: &[u8]) -> Option<SseFrame> {
+    let frame = String::from_utf8_lossy(frame);
+    let data = frame
+        .lines()
+        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let data = data.trim();
+    if data.is_empty() {
+        None
+    } else if data == "[DONE]" {
+        Some(SseFrame::Done)
+    } else {
+        Some(SseFrame::Json(data.to_string()))
+    }
+}
+
+fn sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
+    let lf = buffer.windows(2).position(|window| window == b"\n\n");
+    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
+    match (lf, crlf) {
+        (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
+        (Some(_), Some(crlf)) => Some((crlf, 4)),
+        (Some(lf), None) => Some((lf, 2)),
+        (None, Some(crlf)) => Some((crlf, 4)),
+        (None, None) => None,
+    }
 }
 
 fn parse_response_output_item(
@@ -1703,7 +1852,9 @@ mod tests {
     #[test]
     fn responses_sse_parses_text_and_tool_calls() {
         let sse = r#"data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}
+
 data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_1","name":"read","arguments":"{\"path\":\"README.md\"}"}}
+
 data: {"type":"response.completed","response":{"id":"resp_1"}}
 "#;
 
@@ -1730,7 +1881,9 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     #[test]
     fn responses_sse_parses_custom_and_function_calls() {
         let sse = r#"data: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}
+
 data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_bash","name":"Bash","arguments":"{\"command\":[\"pwd\"],\"timeout_ms\":120000}","status":"completed"}}
+
 data: {"type":"response.completed","response":{"id":"resp_1"}}
 "#;
 
@@ -1766,6 +1919,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     #[test]
     fn responses_sse_keeps_partial_output_on_max_output_tokens() {
         let sse = r#"data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]}}
+
 data: {"type":"response.incomplete","response":{"id":"resp_1","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":100,"output_tokens":64,"total_tokens":164,"input_tokens_details":{"cached_tokens":80}}}}
 "#;
 
@@ -1780,6 +1934,35 @@ data: {"type":"response.incomplete","response":{"id":"resp_1","incomplete_detail
         assert_eq!(usage.output_tokens, Some(64));
         assert_eq!(usage.total_tokens, Some(164));
         assert_eq!(usage.cache_read_input_tokens, Some(80));
+    }
+
+    #[test]
+    fn responses_sse_stops_at_completed_even_with_trailing_partial_frame() {
+        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+
+data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":1,"output_tokens":2,"total_tokens":3}}}
+
+data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"should not be parsed"}]}}"#;
+
+        let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
+
+        assert_eq!(response.assistant.text(), "done");
+        assert_eq!(response.provider_replay.len(), 1);
+        let usage = response.usage.expect("usage should be parsed");
+        assert_eq!(usage.total_tokens, Some(3));
+    }
+
+    #[test]
+    fn responses_sse_accepts_done_sentinel() {
+        let sse = r#"data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"done"}]}}
+
+data: [DONE]
+"#;
+
+        let response = parse_responses_sse(sse, ProviderKind::OpenAi).expect("sse parses");
+
+        assert_eq!(response.assistant.text(), "done");
+        assert_eq!(response.provider_replay.len(), 1);
     }
 
     #[test]
