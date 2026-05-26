@@ -88,10 +88,13 @@ metadata jsonb not null default '{}'::jsonb
 workspaces jsonb not null default '[]'::jsonb
 ```
 
-Projects define Git workspaces as `{ workspace_dir, remote_url, remote_branch }`
-records. When a project session starts, the daemon fetches each listed remote
-branch, creates a private Git checkout under the session `outer_cwd`, records
-the fetched base commit, and switches that checkout to a session-local branch.
+Projects define workspace sources. Git workspaces use
+`{ kind: "git", workspace_dir, remote_url, remote_branch }`; local folder
+workspaces use `{ kind: "local", workspace_dir, source_path }`. Legacy Git
+records without `kind` are treated as `kind: "git"`. When a project session
+starts, the daemon creates private workspace directories under the session
+`outer_cwd`: Git workspaces are fetched from their configured remote branch and
+local folder workspaces are copied from their configured source path.
 Ephemeral host sessions have `project_id: null`, no project workspaces, and use
 `$HOME` as `outer_cwd`. Model prompt context and local tools use the session's
 stored `outer_cwd`.
@@ -480,14 +483,15 @@ snapshots its own values at creation time.
   "name": "my repo",
   "workspaces": [
     {
+      "kind": "git",
       "workspace_dir": "repo-a",
       "remote_url": "https://github.com/me/repo-a.git",
       "remote_branch": "main"
     },
     {
-      "workspace_dir": "repo-b",
-      "remote_url": "git@github.com:me/repo-b.git",
-      "remote_branch": "staging"
+      "kind": "local",
+      "workspace_dir": "reference-docs",
+      "source_path": "/home/me/reference-docs"
     }
   ],
   "metadata": { "created_by": "web" }
@@ -498,9 +502,10 @@ snapshots its own values at creation time.
 
 Renames a project and/or changes the workspace sources used for future sessions.
 Each `workspace_dir` must be a direct child name and must not start with `.`.
-Each `remote_url` must be reachable by `git ls-remote`, and each
-`remote_branch` must name an existing branch on that remote. Updating a project
-does not change existing sessions in that project.
+For Git workspaces, `remote_url` must be reachable by `git ls-remote`, and
+`remote_branch` must name an existing branch on that remote. For local folder
+workspaces, `source_path` must be an existing directory on the daemon host.
+Updating a project does not change existing sessions in that project.
 
 ```json
 {
@@ -508,6 +513,7 @@ does not change existing sessions in that project.
   "name": "pi-relay",
   "workspaces": [
     {
+      "kind": "git",
       "workspace_dir": "pi-relay",
       "remote_url": "https://github.com/galletas1712/pi-relay.git",
       "remote_branch": "main"

@@ -16,14 +16,16 @@ export interface ProviderConfig {
 }
 
 export interface ProjectWorkspace {
+	kind?: "git" | "local";
 	workspace_dir: string;
-	remote_url: string;
-	remote_branch: string;
+	remote_url?: string;
+	remote_branch?: string;
+	source_path?: string;
 }
 
 export interface SessionWorkspace extends ProjectWorkspace {
-	base_sha: string;
-	local_branch: string;
+	base_sha?: string;
+	local_branch?: string;
 }
 
 export interface SessionSummary {

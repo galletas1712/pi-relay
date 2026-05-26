@@ -109,11 +109,32 @@ type DeleteDialogState = {
 	deleting: boolean;
 };
 
+type WorkspaceDraft =
+	| {
+			kind: "git";
+			workspace_dir: string;
+			remote_url: string;
+			remote_branch: string;
+	  }
+	| {
+			kind: "local";
+			workspace_dir: string;
+			source_path: string;
+	  };
+
+type WorkspaceDraftPatch = {
+	kind?: "git" | "local";
+	workspace_dir?: string;
+	remote_url?: string;
+	remote_branch?: string;
+	source_path?: string;
+};
+
 type ProjectDialogState = {
 	mode: "create" | "edit";
 	projectId?: string;
 	name: string;
-	workspacesText: string;
+	workspaces: WorkspaceDraft[];
 	saving: boolean;
 };
 
@@ -125,24 +146,66 @@ type PromptDialogState = {
 	error: string | null;
 };
 
-function formatWorkspaces(workspaces: ProjectWorkspace[]): string {
-	return workspaces
-		.map((workspace) => `${workspace.workspace_dir} ${workspace.remote_url} ${workspace.remote_branch}`)
-		.join("\n");
+function workspaceDraftFromProject(workspace: ProjectWorkspace): WorkspaceDraft {
+	const kind = workspace.kind ?? "git";
+	if (kind === "local") {
+		return {
+			kind,
+			workspace_dir: workspace.workspace_dir,
+			source_path: workspace.source_path ?? ""
+		};
+	}
+	return {
+		kind: "git",
+		workspace_dir: workspace.workspace_dir,
+		remote_url: workspace.remote_url ?? "",
+		remote_branch: workspace.remote_branch ?? ""
+	};
 }
 
-function parseWorkspacesText(text: string): ProjectWorkspace[] {
-	return text
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter(Boolean)
-		.map((line) => {
-			const [workspace_dir, remote_url, remote_branch] = line.split(/\s+/, 3);
-			if (!workspace_dir || !remote_url || !remote_branch) {
-				throw new Error("workspace lines must be: workspace_dir remote_url remote_branch");
-			}
-			return { workspace_dir, remote_url, remote_branch };
-		});
+function newWorkspaceDraft(kind: "git" | "local" = "git"): WorkspaceDraft {
+	return kind === "local"
+		? { kind: "local", workspace_dir: "", source_path: "" }
+		: { kind: "git", workspace_dir: "", remote_url: "", remote_branch: "main" };
+}
+
+function updateWorkspaceDraft(current: WorkspaceDraft, patch: WorkspaceDraftPatch): WorkspaceDraft {
+	const nextKind = patch.kind ?? current.kind;
+	if (nextKind === "local") {
+		return {
+			kind: "local",
+			workspace_dir: patch.workspace_dir ?? current.workspace_dir,
+			source_path: patch.source_path ?? (current.kind === "local" ? current.source_path : "")
+		};
+	}
+	return {
+		kind: "git",
+		workspace_dir: patch.workspace_dir ?? current.workspace_dir,
+		remote_url: patch.remote_url ?? (current.kind === "git" ? current.remote_url : ""),
+		remote_branch: patch.remote_branch ?? (current.kind === "git" ? current.remote_branch : "main")
+	};
+}
+
+function projectWorkspacesFromDrafts(workspaces: WorkspaceDraft[]): ProjectWorkspace[] {
+	return workspaces.map((workspace, index) => {
+		if (!workspace.workspace_dir.trim()) throw new Error(`workspace ${index + 1}: name is required`);
+		if (workspace.kind === "local") {
+			if (!workspace.source_path.trim()) throw new Error(`workspace ${index + 1}: source path is required`);
+			return {
+				kind: "local",
+				workspace_dir: workspace.workspace_dir.trim(),
+				source_path: workspace.source_path.trim()
+			};
+		}
+		if (!workspace.remote_url.trim()) throw new Error(`workspace ${index + 1}: remote URL is required`);
+		if (!workspace.remote_branch.trim()) throw new Error(`workspace ${index + 1}: branch is required`);
+		return {
+			kind: "git",
+			workspace_dir: workspace.workspace_dir.trim(),
+			remote_url: workspace.remote_url.trim(),
+			remote_branch: workspace.remote_branch.trim()
+		};
+	});
 }
 
 export function App() {
@@ -1268,7 +1331,7 @@ export function App() {
 		setProjectDialog({
 			mode: "create",
 			name: "",
-			workspacesText: selectedProject ? formatWorkspaces(selectedProject.workspaces) : "",
+			workspaces: selectedProject ? selectedProject.workspaces.map(workspaceDraftFromProject) : [newWorkspaceDraft()],
 			saving: false,
 		});
 	}, [selectedProject]);
@@ -1277,7 +1340,7 @@ export function App() {
 			mode: "edit",
 			projectId: project.project_id,
 			name: projectTitle(project),
-			workspacesText: formatWorkspaces(project.workspaces),
+			workspaces: project.workspaces.map(workspaceDraftFromProject),
 			saving: false,
 		});
 	}, []);
@@ -1287,7 +1350,7 @@ export function App() {
 	const saveProjectDialog = useCallback(async () => {
 		if (!projectDialog || projectDialog.saving) return;
 		const name = projectDialog.name.trim();
-		const workspaces = parseWorkspacesText(projectDialog.workspacesText);
+		const workspaces = projectWorkspacesFromDrafts(projectDialog.workspaces);
 		if (!name) throw new Error("project name is required");
 		if (!workspaces.length) throw new Error("at least one workspace is required");
 		setProjectDialog((current) => (current ? { ...current, saving: true } : current));
@@ -1833,6 +1896,19 @@ function ProjectDialog({
 	onSubmit: () => void;
 }) {
 	const title = state.mode === "create" ? "New project" : "Project settings";
+	const updateWorkspace = (index: number, patch: WorkspaceDraftPatch) => {
+		onChange({
+			workspaces: state.workspaces.map((workspace, workspaceIndex) =>
+				workspaceIndex === index ? updateWorkspaceDraft(workspace, patch) : workspace,
+			),
+		});
+	};
+	const removeWorkspace = (index: number) => {
+		onChange({ workspaces: state.workspaces.filter((_, workspaceIndex) => workspaceIndex !== index) });
+	};
+	const addWorkspace = () => {
+		onChange({ workspaces: [...state.workspaces, newWorkspaceDraft()] });
+	};
 	return (
 		<div className="modal-scrim" role="presentation" onMouseDown={state.saving ? undefined : onClose}>
 			<div
@@ -1867,18 +1943,88 @@ function ProjectDialog({
 							disabled={state.saving}
 						/>
 					</label>
-					<label className="rename-field">
-						<span>Workspaces</span>
-						<textarea
-							value={state.workspacesText}
-							onChange={(event) => onChange({ workspacesText: event.target.value })}
-							placeholder={
-								"pi-relay https://github.com/galletas1712/pi-relay.git main\nagent-config git@github.com:me/agent-config.git main"
-							}
-							required
-							disabled={state.saving}
-						/>
-					</label>
+					<div className="workspace-editor">
+						<div className="workspace-editor-head">
+							<span>Workspaces</span>
+							<button type="button" className="secondary-button" onClick={addWorkspace} disabled={state.saving}>
+								Add workspace
+							</button>
+						</div>
+						<div className="workspace-editor-list">
+							{state.workspaces.map((workspace, index) => {
+								return (
+									<div className="workspace-card" key={index}>
+										<div className="workspace-row">
+											<label>
+												<span>Type</span>
+												<select
+													value={workspace.kind}
+													onChange={(event) => updateWorkspace(index, { kind: event.target.value as "git" | "local" })}
+													disabled={state.saving}
+												>
+													<option value="git">Git repo</option>
+													<option value="local">Local folder</option>
+												</select>
+											</label>
+											<label>
+												<span>Name</span>
+												<input
+													value={workspace.workspace_dir}
+													onChange={(event) => updateWorkspace(index, { workspace_dir: event.target.value })}
+													placeholder={workspace.kind === "local" ? "docs" : "pi-relay"}
+													required
+													disabled={state.saving}
+												/>
+											</label>
+											<button
+												type="button"
+												className="secondary-button workspace-remove"
+												onClick={() => removeWorkspace(index)}
+												disabled={state.saving || state.workspaces.length <= 1}
+											>
+												Remove
+											</button>
+										</div>
+										{workspace.kind === "local" ? (
+											<label className="workspace-full-field">
+												<span>Source path</span>
+												<input
+													value={workspace.source_path}
+													onChange={(event) => updateWorkspace(index, { source_path: event.target.value })}
+													placeholder="/Users/me/reference-docs"
+													required
+													disabled={state.saving}
+												/>
+											</label>
+										) : (
+											<div className="workspace-row git-fields">
+												<label>
+													<span>Remote URL</span>
+													<input
+														value={workspace.remote_url}
+														onChange={(event) => updateWorkspace(index, { remote_url: event.target.value })}
+														placeholder="https://github.com/me/pi-relay.git"
+														required
+														disabled={state.saving}
+													/>
+												</label>
+												<label>
+													<span>Branch</span>
+													<input
+														value={workspace.remote_branch}
+														onChange={(event) => updateWorkspace(index, { remote_branch: event.target.value })}
+														placeholder="main"
+														required
+														disabled={state.saving}
+													/>
+												</label>
+											</div>
+										)}
+									</div>
+								);
+							})}
+						</div>
+					</div>
 					<div className="rename-actions">
 						<button type="button" className="secondary-button" onClick={onClose} disabled={state.saving}>
 							Cancel

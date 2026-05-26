@@ -108,7 +108,7 @@ Implemented user-facing behavior:
 - Idle-only compaction request with structural validation.
 - Daemon restart recovery for open transcript tails.
 - Stale action rejection through persisted `attempt_id`.
-- Repo-level `PI.md` prompt composition, with each workspace checkout's
+- Repo-level `PI.md` prompt composition, with each workspace directory's
   `AGENTS.md` included by the template.
 - Provider config with `max_tokens` and `prompt_cache.key`.
 - Real Codex provider path through `~/.codex/auth.json` or
