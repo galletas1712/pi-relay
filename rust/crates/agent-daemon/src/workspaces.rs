@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use agent_store::{ProjectWorkspace, SessionWorkspace};
+use agent_store::{ProjectWorkspace, SessionWorkspace, WorkspaceKind};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::process::Command;
 
@@ -69,11 +69,11 @@ impl WorkspaceManager {
         for workspace in workspaces {
             validate_workspace_dir(&workspace.workspace_dir)?;
             let target = cwd.join(&workspace.workspace_dir);
-            if !target.join(".git").exists() {
-                bail!(
-                    "session workspace is missing or is not a git checkout: {}",
-                    target.display()
-                );
+            if !target.is_dir() {
+                bail!("session workspace is missing: {}", target.display());
+            }
+            if workspace.kind == WorkspaceKind::Git && !target.join(".git").exists() {
+                bail!("session git workspace is missing .git: {}", target.display());
             }
         }
         Ok(())
@@ -99,26 +99,29 @@ impl WorkspaceManager {
         cwd: &Path,
         workspace: &ProjectWorkspace,
     ) -> Result<SessionWorkspace> {
+        match workspace.kind {
+            WorkspaceKind::Git => {
+                self.materialize_git_workspace(session_id, cwd, workspace)
+                    .await
+            }
+            WorkspaceKind::Local => self.materialize_local_workspace(cwd, workspace).await,
+        }
+    }
+
+    async fn materialize_git_workspace(
+        &self,
+        session_id: &str,
+        cwd: &Path,
+        workspace: &ProjectWorkspace,
+    ) -> Result<SessionWorkspace> {
         validate_workspace_dir(&workspace.workspace_dir)?;
-        if workspace.remote_url.trim().is_empty() {
-            bail!(
-                "workspace remote_url is required: {}",
-                workspace.workspace_dir
-            );
-        }
-        if workspace.remote_branch.trim().is_empty() {
-            bail!(
-                "workspace remote_branch is required: {}",
-                workspace.workspace_dir
-            );
-        }
+        let remote_url = required_git_field(workspace.remote_url.as_deref(), "remote_url")?;
+        let branch = required_git_field(workspace.remote_branch.as_deref(), "remote_branch")?;
         let workspace_dir = workspace.workspace_dir.trim();
         let target = cwd.join(workspace_dir);
         if target.exists() {
             bail!("session workspace already exists: {}", target.display());
         }
-        let branch = workspace.remote_branch.trim();
-        let remote_url = workspace.remote_url.trim();
         let local_branch = local_branch(session_id, workspace_dir);
         let branch_refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
 
@@ -129,21 +132,154 @@ impl WorkspaceManager {
         let origin_ref = format!("refs/remotes/origin/{branch}");
         let base_sha = git_output(&target, ["rev-parse", &origin_ref]).await?;
         run_git(&target, ["switch", "-c", &local_branch, &base_sha]).await?;
-        let upstream = format!("origin/{branch}");
-        run_git(
-            &target,
-            ["branch", "--set-upstream-to", &upstream, &local_branch],
-        )
-        .await?;
 
-        Ok(SessionWorkspace {
-            workspace_dir: workspace_dir.to_string(),
-            remote_url: remote_url.to_string(),
-            remote_branch: branch.to_string(),
+        Ok(SessionWorkspace::git(
+            workspace_dir,
+            remote_url,
+            branch,
             base_sha,
             local_branch,
-        })
+        ))
     }
+
+    async fn materialize_local_workspace(
+        &self,
+        cwd: &Path,
+        workspace: &ProjectWorkspace,
+    ) -> Result<SessionWorkspace> {
+        validate_workspace_dir(&workspace.workspace_dir)?;
+        let source_path = required_local_field(workspace.source_path.as_deref(), "source_path")?;
+        let source = PathBuf::from(source_path);
+        if !source.is_dir() {
+            bail!(
+                "local workspace source_path is not a directory: {}",
+                source.display()
+            );
+        }
+        let workspace_dir = workspace.workspace_dir.trim();
+        let target = cwd.join(workspace_dir);
+        if target.exists() {
+            bail!("session workspace already exists: {}", target.display());
+        }
+        copy_dir_all(&source, &target).await?;
+        Ok(SessionWorkspace::local(
+            workspace_dir,
+            source.to_string_lossy().into_owned(),
+        ))
+    }
+}
+
+async fn copy_dir_all(source: &Path, target: &Path) -> Result<()> {
+    let source = source.to_path_buf();
+    let target = target.to_path_buf();
+    tokio::task::spawn_blocking(move || copy_dir_all_blocking(&source, &target))
+        .await
+        .context("copy local workspace task failed")?
+}
+
+fn copy_dir_all_blocking(source: &Path, target: &Path) -> Result<()> {
+    std::fs::create_dir_all(target)
+        .with_context(|| format!("create local workspace copy {}", target.display()))?;
+    for entry in std::fs::read_dir(source)
+        .with_context(|| format!("read local workspace source {}", source.display()))?
+    {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_all_blocking(&source_path, &target_path)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&source_path, &target_path).with_context(|| {
+                format!(
+                    "copy local workspace file {} to {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        } else if file_type.is_symlink() {
+            copy_symlink_target(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn is_safe_relative_symlink(target: &Path) -> bool {
+    !target.is_absolute()
+        && target
+            .components()
+            .all(|component| matches!(component, Component::Normal(_) | Component::CurDir))
+}
+
+fn copy_symlink_target(source_path: &Path, target_path: &Path) -> Result<()> {
+    let target = std::fs::read_link(source_path)
+        .with_context(|| format!("read symlink {}", source_path.display()))?;
+    if !is_safe_relative_symlink(&target) {
+        std::fs::write(
+            target_path,
+            format!(
+                "pi-relay local workspace copy skipped external symlink target: {}\n",
+                target.display()
+            ),
+        )
+        .with_context(|| format!("write skipped symlink marker {}", target_path.display()))?;
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&target, target_path).with_context(|| {
+            format!(
+                "copy symlink {} to {}",
+                source_path.display(),
+                target_path.display()
+            )
+        })?;
+    }
+    #[cfg(windows)]
+    {
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            source_path
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .join(target)
+        };
+        if resolved.is_dir() {
+            std::os::windows::fs::symlink_dir(&resolved, target_path).with_context(|| {
+                format!(
+                    "copy directory symlink {} to {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        } else {
+            std::os::windows::fs::symlink_file(&resolved, target_path).with_context(|| {
+                format!(
+                    "copy file symlink {} to {}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn required_git_field<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str> {
+    let value = value.unwrap_or("").trim();
+    if value.is_empty() {
+        bail!("git workspace {field} is required");
+    }
+    Ok(value)
+}
+
+fn required_local_field<'a>(value: Option<&'a str>, field: &str) -> Result<&'a str> {
+    let value = value.unwrap_or("").trim();
+    if value.is_empty() {
+        bail!("local workspace {field} is required");
+    }
+    Ok(value)
 }
 
 pub(crate) async fn validate_remote_branch(remote_url: &str, remote_branch: &str) -> Result<()> {
@@ -329,11 +465,11 @@ mod tests {
         let manager = WorkspaceManager {
             state_root: temp.path().join("state"),
         };
-        let project_workspaces = vec![ProjectWorkspace {
-            workspace_dir: "repo".to_string(),
-            remote_url: remote.to_string_lossy().into_owned(),
-            remote_branch: "main".to_string(),
-        }];
+        let project_workspaces = vec![ProjectWorkspace::git(
+            "repo",
+            remote.to_string_lossy(),
+            "main",
+        )];
 
         let (cwd, workspaces) = manager
             .materialize_session("session-1", &project_workspaces)
@@ -341,8 +477,12 @@ mod tests {
             .expect("materialize session");
         assert_eq!(workspaces.len(), 1);
         assert_eq!(workspaces[0].workspace_dir, "repo");
-        assert_eq!(workspaces[0].remote_branch, "main");
-        assert_eq!(workspaces[0].local_branch, "pi/session/session-1/repo");
+        assert_eq!(workspaces[0].kind, WorkspaceKind::Git);
+        assert_eq!(workspaces[0].remote_branch.as_deref(), Some("main"));
+        assert_eq!(
+            workspaces[0].local_branch.as_deref(),
+            Some("pi/session/session-1/repo")
+        );
         assert_eq!(
             git_stdout(
                 Path::new(&cwd).join("repo").as_path(),

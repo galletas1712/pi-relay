@@ -2,9 +2,9 @@ use std::path::{Path, PathBuf};
 
 use agent_prompt::{
     load_pi_compaction_md, load_pi_md, render_compaction_prompt, render_prompt, PromptContext,
-    PromptWorkspace, Skill, ToolSpec,
+    PromptWorkspace, PromptWorkspaceKind, Skill, ToolSpec,
 };
-use agent_store::{SessionConfig, SessionWorkspace};
+use agent_store::{SessionConfig, SessionWorkspace, WorkspaceKind};
 use agent_vocab::ProviderKind;
 
 use crate::state::AppState;
@@ -46,9 +46,14 @@ pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> Prompt
             .workspaces
             .iter()
             .map(|workspace| PromptWorkspace {
+                kind: match workspace.kind {
+                    WorkspaceKind::Git => PromptWorkspaceKind::Git,
+                    WorkspaceKind::Local => PromptWorkspaceKind::Local,
+                },
                 workspace_dir: workspace.workspace_dir.clone(),
                 remote_url: workspace.remote_url.clone(),
                 remote_branch: workspace.remote_branch.clone(),
+                source_path: workspace.source_path.clone(),
                 base_sha: workspace.base_sha.clone(),
                 local_branch: workspace.local_branch.clone(),
             })
@@ -87,13 +92,7 @@ pub(super) fn load_skills_for_workspace_roots(
 ) -> Vec<Skill> {
     let workspaces = workspace_dirs
         .iter()
-        .map(|workspace_dir| SessionWorkspace {
-            workspace_dir: workspace_dir.clone(),
-            remote_url: String::new(),
-            remote_branch: String::new(),
-            base_sha: String::new(),
-            local_branch: String::new(),
-        })
+        .map(|workspace_dir| SessionWorkspace::local(workspace_dir.clone(), String::new()))
         .collect::<Vec<_>>();
     load_skills_for_session_workspaces_with_home(outer_cwd, &workspaces, home_dir().as_deref())
 }
@@ -113,13 +112,7 @@ pub(super) fn load_skills_for_workspace_roots_with_home(
 ) -> Vec<Skill> {
     let workspaces = workspace_dirs
         .iter()
-        .map(|workspace_dir| SessionWorkspace {
-            workspace_dir: workspace_dir.clone(),
-            remote_url: String::new(),
-            remote_branch: String::new(),
-            base_sha: String::new(),
-            local_branch: String::new(),
-        })
+        .map(|workspace_dir| SessionWorkspace::local(workspace_dir.clone(), String::new()))
         .collect::<Vec<_>>();
     load_skills_for_session_workspaces_with_home(outer_cwd, &workspaces, home)
 }

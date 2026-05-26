@@ -127,13 +127,7 @@ mod tests {
             args_json: r#"{"workspace":"repo","name":"rust-refactor"}"#.to_string(),
         };
         let mut loaded = std::collections::BTreeSet::new();
-        let workspaces = vec![SessionWorkspace {
-            workspace_dir: "repo".to_string(),
-            remote_url: String::new(),
-            remote_branch: String::new(),
-            base_sha: String::new(),
-            local_branch: String::new(),
-        }];
+        let workspaces = vec![SessionWorkspace::local("repo", "")];
 
         let first = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
         assert_eq!(first.status, agent_vocab::ToolResultStatus::Success);

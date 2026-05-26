@@ -14,8 +14,8 @@ Current working directory: {{ session.cwd }}
 Workspace subdirectories of the current working directory:
 {{ session.workspaces_markdown }}
 
-Each workspace subdirectory is a private Git checkout for this session. It was created from the listed remote branch at the listed base commit and is currently on the listed local session branch.
-When doing feature development/bug fixing etc for work that you want to eventually land in the git repo, modify files in the workspace subdirectory directly. You may amend, rebase, or otherwise rewrite the local session branch as needed. Push to whatever remote branch the task requires.
+Git workspace subdirectories are private clones for this session. When doing feature development/bug fixing etc for work that you want to eventually land in the git repo, modify files in the Git workspace subdirectory directly. Before publishing changes, create a new descriptive branch and push that branch to the configured remote.
+Local folder workspace subdirectories are private copies for this session. Treat them as read-only reference/context by default. If you modify them anyway, those changes are disposable and will not be persisted back to the original source folder.
 
 The only artifacts that you can put in the current working directory directly are those that shouldn't end up in the repo.
 Typically these are things like uv/python virtual environments, etc that are host/user/session specific, as well as any temporary artifacts.

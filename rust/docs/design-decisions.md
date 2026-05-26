@@ -245,7 +245,7 @@ session instead of creating another one.
 Switch operates on committed transcript boundaries or root. The UI presents
 targets as visible user messages and completed turns, then maps them to the
 boundary-only backend operation. It does not checkpoint or restore workspace
-files; project sessions keep their current private Git checkouts.
+files; project sessions keep their current private workspace directories.
 
 Picker actions carry expected active-leaf information for source-mutating
 switch and for sending restored composer drafts. If the session moved since the

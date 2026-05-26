@@ -77,13 +77,21 @@ impl Skill {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptWorkspaceKind {
+    Git,
+    Local,
+}
+
 #[derive(Debug, Clone)]
 pub struct PromptWorkspace {
+    pub kind: PromptWorkspaceKind,
     pub workspace_dir: String,
-    pub remote_url: String,
-    pub remote_branch: String,
-    pub base_sha: String,
-    pub local_branch: String,
+    pub remote_url: Option<String>,
+    pub remote_branch: Option<String>,
+    pub source_path: Option<String>,
+    pub base_sha: Option<String>,
+    pub local_branch: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -177,9 +185,11 @@ fn workspaces_json(workspaces: &[PromptWorkspace]) -> Value {
             .iter()
             .map(|workspace| {
                 json!({
+                    "kind": workspace_kind(workspace.kind),
                     "workspace_dir": workspace.workspace_dir,
                     "remote_url": workspace.remote_url,
                     "remote_branch": workspace.remote_branch,
+                    "source_path": workspace.source_path,
                     "base_sha": workspace.base_sha,
                     "local_branch": workspace.local_branch,
                 })
@@ -195,17 +205,27 @@ fn workspaces_markdown(workspaces: &[PromptWorkspace]) -> String {
     workspaces
         .iter()
         .map(|workspace| {
-            format!(
-                "- {dir}\n  - remote: {remote}\n  - remote branch: origin/{branch}\n  - base commit: {base}\n  - local session branch: {local}",
-                dir = workspace.workspace_dir,
-                remote = workspace.remote_url,
-                branch = workspace.remote_branch,
-                base = workspace.base_sha,
-                local = workspace.local_branch,
-            )
+            match workspace.kind {
+                PromptWorkspaceKind::Git => format!(
+                    "- {dir}\n  - type: Git\n  - remote: {remote}\n  - starting branch: {branch}",
+                    dir = workspace.workspace_dir,
+                    remote = workspace.remote_url.as_deref().unwrap_or(""),
+                    branch = workspace.remote_branch.as_deref().unwrap_or(""),
+                ),
+                PromptWorkspaceKind::Local => {
+                    format!("- {dir}\n  - type: local folder copy", dir = workspace.workspace_dir)
+                }
+            }
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn workspace_kind(kind: PromptWorkspaceKind) -> &'static str {
+    match kind {
+        PromptWorkspaceKind::Git => "git",
+        PromptWorkspaceKind::Local => "local",
+    }
 }
 
 fn tools_aliases_json(tools: &[ToolSpec]) -> Value {
@@ -309,11 +329,13 @@ mod tests {
             cwd: PathBuf::from("/tmp/project"),
             has_project: true,
             workspaces: vec![PromptWorkspace {
+                kind: PromptWorkspaceKind::Git,
                 workspace_dir: "repo".to_string(),
-                remote_url: "https://example.com/repo.git".to_string(),
-                remote_branch: "main".to_string(),
-                base_sha: "abc123".to_string(),
-                local_branch: "pi/session/test/repo".to_string(),
+                remote_url: Some("https://example.com/repo.git".to_string()),
+                remote_branch: Some("main".to_string()),
+                source_path: None,
+                base_sha: Some("abc123".to_string()),
+                local_branch: Some("pi/session/test/repo".to_string()),
             }],
             tools: tools
                 .into_iter()
@@ -372,7 +394,7 @@ mod tests {
             &ctx(vec!["Bash"], Vec::new()),
         );
         assert!(rendered.contains("cwd=/tmp/project"));
-        assert!(rendered.contains("base commit: abc123"));
+        assert!(rendered.contains("starting branch: main"));
         assert!(rendered.contains("Parameters:"));
     }
 

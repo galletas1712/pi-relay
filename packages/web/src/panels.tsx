@@ -25,7 +25,13 @@ import { truncate } from "./text.ts";
 import type { Notice, Project, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
 
 function projectWorkspaceSummary(project: Project): string {
-	return project.workspaces.map((workspace) => `${workspace.workspace_dir}: ${workspace.remote_url}#${workspace.remote_branch}`).join("\n");
+	return project.workspaces
+		.map((workspace) =>
+			(workspace.kind ?? "git") === "local"
+				? `${workspace.workspace_dir}: local ${workspace.source_path ?? ""}`
+				: `${workspace.workspace_dir}: git ${workspace.remote_url ?? ""}#${workspace.remote_branch ?? ""}`,
+		)
+		.join("\n");
 }
 
 export function SidebarHeader({

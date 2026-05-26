@@ -163,20 +163,100 @@ pub struct SessionConfig {
     pub metadata: Value,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceKind {
+    #[default]
+    Git,
+    Local,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProjectWorkspace {
+    #[serde(default)]
+    pub kind: WorkspaceKind,
     pub workspace_dir: String,
-    pub remote_url: String,
-    pub remote_branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+}
+
+impl ProjectWorkspace {
+    pub fn git(
+        workspace_dir: impl Into<String>,
+        remote_url: impl Into<String>,
+        remote_branch: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: WorkspaceKind::Git,
+            workspace_dir: workspace_dir.into(),
+            remote_url: Some(remote_url.into()),
+            remote_branch: Some(remote_branch.into()),
+            source_path: None,
+        }
+    }
+
+    pub fn local(workspace_dir: impl Into<String>, source_path: impl Into<String>) -> Self {
+        Self {
+            kind: WorkspaceKind::Local,
+            workspace_dir: workspace_dir.into(),
+            remote_url: None,
+            remote_branch: None,
+            source_path: Some(source_path.into()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionWorkspace {
+    #[serde(default)]
+    pub kind: WorkspaceKind,
     pub workspace_dir: String,
-    pub remote_url: String,
-    pub remote_branch: String,
-    pub base_sha: String,
-    pub local_branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_branch: Option<String>,
+}
+
+impl SessionWorkspace {
+    pub fn git(
+        workspace_dir: impl Into<String>,
+        remote_url: impl Into<String>,
+        remote_branch: impl Into<String>,
+        base_sha: impl Into<String>,
+        local_branch: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind: WorkspaceKind::Git,
+            workspace_dir: workspace_dir.into(),
+            remote_url: Some(remote_url.into()),
+            remote_branch: Some(remote_branch.into()),
+            source_path: None,
+            base_sha: Some(base_sha.into()),
+            local_branch: Some(local_branch.into()),
+        }
+    }
+
+    pub fn local(workspace_dir: impl Into<String>, source_path: impl Into<String>) -> Self {
+        Self {
+            kind: WorkspaceKind::Local,
+            workspace_dir: workspace_dir.into(),
+            remote_url: None,
+            remote_branch: None,
+            source_path: Some(source_path.into()),
+            base_sha: None,
+            local_branch: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

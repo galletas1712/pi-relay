@@ -27,6 +27,15 @@
 	--font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
 }
 
+.project-dialog {
+	width: min(760px, calc(100vw - 48px));
+}
+
+.project-dialog form {
+	min-height: 0;
+	overflow: auto;
+}
+
 .primary-button:disabled {
 	cursor: not-allowed;
 	opacity: 0.55;
@@ -1789,6 +1798,7 @@ pre {
 .rename-dialog {
 	display: flex;
 	width: min(440px, calc(100vw - 48px));
+	max-height: min(760px, calc(100vh - 48px));
 	flex-direction: column;
 	overflow: hidden;
 	border: 1px solid var(--border);
@@ -1890,9 +1900,82 @@ pre {
 	padding: 0 10px;
 }
 
-.rename-field input:focus {
+.rename-field input:focus,
+.workspace-card input:focus,
+.workspace-card select:focus {
 	border-color: var(--ring);
 	box-shadow: 0 0 0 3px color-mix(in oklch, var(--ring) 35%, transparent);
+}
+
+.workspace-editor {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	padding: 14px 16px;
+}
+
+.workspace-editor-head {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	gap: 10px;
+}
+
+.workspace-editor-head > span,
+.workspace-card label span {
+	color: var(--muted-foreground);
+	font-size: 13px;
+}
+
+.workspace-editor-list {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.workspace-card {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--background);
+	padding: 10px;
+}
+
+.workspace-row {
+	display: grid;
+	grid-template-columns: 130px minmax(0, 1fr) auto;
+	gap: 10px;
+	align-items: end;
+}
+
+.workspace-row.git-fields {
+	grid-template-columns: minmax(0, 1fr) 150px;
+}
+
+.workspace-card label,
+.workspace-full-field {
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.workspace-card input,
+.workspace-card select {
+	min-width: 0;
+	height: 34px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--card);
+	color: var(--foreground);
+	outline: 0;
+	padding: 0 9px;
+}
+
+.workspace-remove {
+	height: 34px;
 }
 
 .delete-dialog-body {
@@ -2988,6 +3071,15 @@ pre {
 	.history-title-field input,
 	.rename-field input {
 		height: 38px;
+	}
+
+	.workspace-row,
+	.workspace-row.git-fields {
+		grid-template-columns: 1fr;
+	}
+
+	.workspace-remove {
+		width: 100%;
 	}
 
 	.history-options {

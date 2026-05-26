@@ -32,7 +32,7 @@ use agent_session::{AgentSession, SessionInput};
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
     EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputStatus,
-    SessionConfig,
+    SessionConfig, WorkspaceKind,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -746,11 +746,9 @@ async fn validate_project_workspaces(
         ));
     }
     let mut seen_dirs = BTreeSet::new();
-    let mut normalized = Vec::new();
+    let mut checked_workspaces = Vec::new();
     for workspace in workspaces {
         let workspace_dir = workspace.workspace_dir.trim();
-        let remote_url = workspace.remote_url.trim();
-        let remote_branch = workspace.remote_branch.trim();
         validate_workspace_dir(workspace_dir)
             .map_err(|error| RpcError::new("invalid_workspace", error.to_string()))?;
         if !seen_dirs.insert(workspace_dir.to_string()) {
@@ -759,16 +757,45 @@ async fn validate_project_workspaces(
                 format!("duplicate workspace_dir: {workspace_dir}"),
             ));
         }
-        validate_remote_branch(remote_url, remote_branch)
-            .await
-            .map_err(|error| RpcError::new("invalid_workspace", error.to_string()))?;
-        normalized.push(ProjectWorkspace {
-            workspace_dir: workspace_dir.to_string(),
-            remote_url: remote_url.to_string(),
-            remote_branch: remote_branch.to_string(),
-        });
+        match workspace.kind {
+            WorkspaceKind::Git => {
+                let remote_url = workspace.remote_url.as_deref().unwrap_or("").trim();
+                let remote_branch = workspace.remote_branch.as_deref().unwrap_or("").trim();
+                validate_remote_branch(remote_url, remote_branch)
+                    .await
+                    .map_err(|error| RpcError::new("invalid_workspace", error.to_string()))?;
+                checked_workspaces.push(ProjectWorkspace::git(
+                    workspace_dir,
+                    remote_url,
+                    remote_branch,
+                ));
+            }
+            WorkspaceKind::Local => {
+                let source_path = workspace.source_path.as_deref().unwrap_or("").trim();
+                if source_path.is_empty() {
+                    return Err(RpcError::new(
+                        "invalid_workspace",
+                        "local workspace source_path is required",
+                    ));
+                }
+                let source_path = PathBuf::from(source_path);
+                if !source_path.is_dir() {
+                    return Err(RpcError::new(
+                        "invalid_workspace",
+                        format!(
+                            "local workspace source_path is not a directory: {}",
+                            source_path.display()
+                        ),
+                    ));
+                }
+                checked_workspaces.push(ProjectWorkspace::local(
+                    workspace_dir,
+                    source_path.to_string_lossy().into_owned(),
+                ));
+            }
+        }
     }
-    Ok(normalized)
+    Ok(checked_workspaces)
 }
 
 fn home_dir_for_ephemeral_session() -> std::result::Result<PathBuf, RpcError> {
