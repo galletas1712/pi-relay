@@ -7,12 +7,13 @@ use agent_vocab::{
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use crate::sse::read_json_sse_text;
 use crate::{
-    sse::{read_json_sse_response, SseControl, SseEvent},
+    http::send_provider_generation_request,
+    sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
     ProviderError, ProviderResult, ProviderTokenCountRequest, ProviderTokenCountResponse,
     ProviderToolProfile, ProviderUsage,
@@ -27,7 +28,6 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const CLAUDE_CODE_VERSION: &str = "2.1.75";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75 (external, cli)";
 const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
-const ANTHROPIC_MESSAGES_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 
 // Anthropic's documented per-breakpoint backward lookback when matching a new
 // request against existing cache entries. We use this to decide when the tail
@@ -44,6 +44,40 @@ pub struct AnthropicProvider {
     client: reqwest::Client,
     api_key: String,
     base_url: String,
+}
+
+fn anthropic_error_message(
+    error_type: Option<&str>,
+    message: Option<&str>,
+    event: &Value,
+) -> String {
+    let message = message
+        .map(str::to_string)
+        .unwrap_or_else(|| event.to_string());
+    if let Some(error_type) = error_type {
+        if !message.contains(error_type) {
+            return format!("{error_type}: {message}");
+        }
+    }
+    message
+}
+
+fn anthropic_stream_provider_error(error_type: Option<&str>, message: String) -> ProviderError {
+    match error_type {
+        Some("rate_limit_error") => ProviderError::Status {
+            status: 429,
+            message,
+        },
+        Some("api_error") => ProviderError::Status {
+            status: 500,
+            message,
+        },
+        Some("overloaded_error") => ProviderError::Status {
+            status: 529,
+            message,
+        },
+        Some(_) | None => ProviderError::Provider(format!("Anthropic error: {message}")),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,21 +174,22 @@ impl ModelProvider for AnthropicProvider {
         let beta_header = anthropic_beta_header(&request.model);
         let body = messages_body(request)?;
 
-        let response = self
-            .client
-            .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
-            .header("accept", "text/event-stream")
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", beta_header)
-            .header("anthropic-dangerous-direct-browser-access", "true")
-            .header("User-Agent", CLAUDE_CODE_USER_AGENT)
-            .header("x-app", "cli")
-            .header("X-Claude-Code-Session-Id", session_id)
-            .header("x-client-request-id", client_request_id())
-            .json(&body)
-            .send()
-            .await?;
+        let response = send_provider_generation_request(
+            self.client
+                .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
+                .header("accept", "text/event-stream")
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", beta_header)
+                .header("anthropic-dangerous-direct-browser-access", "true")
+                .header("User-Agent", CLAUDE_CODE_USER_AGENT)
+                .header("x-app", "cli")
+                .header("X-Claude-Code-Session-Id", session_id)
+                .header("x-client-request-id", client_request_id())
+                .json(&body),
+            "Anthropic /messages",
+        )
+        .await?;
         parse_anthropic_stream(response).await
     }
 
@@ -788,12 +823,9 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
 
 async fn parse_anthropic_stream(response: reqwest::Response) -> ProviderResult<ModelResponse> {
     let mut state = AnthropicStreamState::default();
-    read_json_sse_response(
+    read_provider_json_sse_response(
         response,
-        Duration::from_secs(ANTHROPIC_MESSAGES_STREAM_IDLE_TIMEOUT_SECS),
-        format!(
-            "Anthropic response stream was idle for {ANTHROPIC_MESSAGES_STREAM_IDLE_TIMEOUT_SECS} seconds"
-        ),
+        "Anthropic response stream",
         response_error_message,
         |event| state.process_sse_event(event),
     )
@@ -884,15 +916,16 @@ impl AnthropicStreamState {
             }
             Some("message_stop") => Ok(SseControl::Stop),
             Some("error") => {
-                let message = event
-                    .pointer("/error/message")
-                    .or_else(|| event.get("message"))
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| event.to_string());
-                Err(ProviderError::Provider(format!(
-                    "Anthropic error: {message}"
-                )))
+                let error_type = event.pointer("/error/type").and_then(Value::as_str);
+                let message = anthropic_error_message(
+                    error_type,
+                    event
+                        .pointer("/error/message")
+                        .or_else(|| event.get("message"))
+                        .and_then(Value::as_str),
+                    event,
+                );
+                Err(anthropic_stream_provider_error(error_type, message))
             }
             Some("ping") | None => Ok(SseControl::Continue),
             Some(_) => Ok(SseControl::Continue),
@@ -1624,6 +1657,26 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
         assert_eq!(response.stop_reason, ModelStopReason::MaxOutputTokens);
         assert_eq!(usage.input_tokens, Some(8));
         assert_eq!(usage.output_tokens, Some(64));
+    }
+
+    #[test]
+    fn anthropic_sse_maps_overloaded_error_to_retryable_status() {
+        let sse = r#"
+event: error
+data: {"type":"error","error":{"type":"overloaded_error","message":"server overloaded"}}
+"#;
+
+        let error = parse_anthropic_sse(sse).expect_err("sse should fail");
+
+        assert!(error.is_retryable_transient());
+        match &error {
+            ProviderError::Status { status, message } => {
+                assert_eq!(*status, 529);
+                assert!(message.contains("overloaded_error"));
+                assert!(message.contains("server overloaded"));
+            }
+            _ => panic!("expected retryable status error, got {error:?}"),
+        }
     }
 
     #[test]

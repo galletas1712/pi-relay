@@ -11,6 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub mod anthropic;
+mod http;
 pub mod openai;
 mod sse;
 mod token_estimator;
@@ -282,6 +283,10 @@ pub struct ProviderUsage {
 pub enum ProviderError {
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("provider request timed out: {0}")]
+    Timeout(String),
+    #[error("transient provider error: {0}")]
+    Transient(String),
     #[error("provider returned an error: {0}")]
     Provider(String),
     #[error("provider returned HTTP {status}: {message}")]
@@ -295,7 +300,10 @@ impl ProviderError {
         match self {
             ProviderError::Status { status, .. } => Some(*status),
             ProviderError::Http(error) => error.status().map(|status| status.as_u16()),
-            _ => None,
+            ProviderError::Timeout(_)
+            | ProviderError::Transient(_)
+            | ProviderError::Provider(_)
+            | ProviderError::Json(_) => None,
         }
     }
 
@@ -312,6 +320,7 @@ impl ProviderError {
         }
 
         match self {
+            ProviderError::Timeout(_) | ProviderError::Transient(_) => true,
             ProviderError::Http(error) => {
                 error.is_timeout()
                     || error.is_connect()
@@ -352,6 +361,8 @@ impl ProviderError {
                 }
                 (!parts.is_empty()).then(|| parts.join("; "))
             }
+            ProviderError::Timeout(message) => Some(format!("timeout={message}")),
+            ProviderError::Transient(message) => Some(format!("transient={message}")),
             ProviderError::Status { status, .. } => Some(format!("status={status}")),
             ProviderError::Provider(_) | ProviderError::Json(_) => None,
         }
@@ -363,10 +374,11 @@ impl ProviderError {
         // example, returns schema-validation 400s for unsupported server tools.
         let status = self.status_code();
         let message = match self {
-            ProviderError::Status { message, .. } | ProviderError::Provider(message) => {
-                message.clone()
-            }
+            ProviderError::Status { message, .. }
+            | ProviderError::Transient(message)
+            | ProviderError::Provider(message) => message.clone(),
             ProviderError::Http(error) => error.to_string(),
+            ProviderError::Timeout(_) => return false,
             ProviderError::Json(_) => return false,
         };
         let lower = message.to_ascii_lowercase();
@@ -389,7 +401,7 @@ impl ProviderError {
 }
 
 fn is_retryable_transient_status(status: u16) -> bool {
-    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+    matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 fn error_source_chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
@@ -447,7 +459,7 @@ mod provider_error_tests {
 
     #[test]
     fn retryable_transient_classifier_matches_retryable_statuses_only() {
-        for status in [408, 429, 500, 502, 503, 504] {
+        for status in [408, 409, 429, 500, 502, 503, 504, 529] {
             assert!(
                 ProviderError::Status {
                     status,
@@ -458,7 +470,7 @@ mod provider_error_tests {
             );
         }
 
-        for status in [400, 401, 403, 404, 409, 413, 422] {
+        for status in [400, 401, 403, 404, 413, 422] {
             assert!(
                 !ProviderError::Status {
                     status,
@@ -477,6 +489,34 @@ mod provider_error_tests {
             message: "request entity too large".to_string(),
         }
         .is_retryable_transient());
+    }
+
+    #[test]
+    fn timeout_errors_are_retryable_transients() {
+        let error = ProviderError::Timeout("response headers timed out".to_string());
+
+        assert!(error.is_retryable_transient());
+        assert!(!error.is_context_overflow());
+        assert_eq!(
+            error.retry_diagnostic(),
+            Some("timeout=response headers timed out".to_string())
+        );
+    }
+
+    #[test]
+    fn transient_provider_errors_are_retryable_unless_context_overflow() {
+        let error = ProviderError::Transient("server disconnected".to_string());
+
+        assert!(error.is_retryable_transient());
+        assert_eq!(
+            error.retry_diagnostic(),
+            Some("transient=server disconnected".to_string())
+        );
+
+        let error = ProviderError::Transient("context_length_exceeded".to_string());
+
+        assert!(error.is_context_overflow());
+        assert!(!error.is_retryable_transient());
     }
 
     #[test]
