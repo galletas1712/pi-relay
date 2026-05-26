@@ -1,6 +1,7 @@
 use agent_provider::{ModelRequest, ModelResponse, ProviderToolProfile};
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
+use agent_vocab::TurnId;
 use anyhow::Result;
 use serde_json::Value;
 
@@ -16,6 +17,7 @@ pub(crate) async fn run_model(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
+    turn_id: TurnId,
     model_context: ModelContext,
 ) -> Result<ModelResponse> {
     let prompt = assemble_agent_prompt(state, config).await?;
@@ -37,6 +39,7 @@ pub(crate) async fn run_model(
             .and_then(Value::as_str)
             .map(str::to_string),
         session_id: Some(session_id.to_string()),
+        turn_id: Some(turn_id),
     };
 
     let credentials = Credentials::load();

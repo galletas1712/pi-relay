@@ -3,6 +3,7 @@
 use agent_tools::{ProviderTool, ToolRegistry};
 use agent_vocab::{
     AssistantMessage, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, TranscriptItem,
+    TurnId,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -42,6 +43,12 @@ pub struct ModelRequest {
     /// under OpenAI's ~15 RPM per-shard ceiling) and as the value of the
     /// `session_id` / `thread_id` / `x-client-request-id` headers.
     pub session_id: Option<String>,
+    /// Turn identifier for the user turn that owns this model request.
+    ///
+    /// Codex treats `x-codex-turn-state` as turn-scoped sticky routing state:
+    /// any value returned by an upstream request should be replayed by later
+    /// requests for the same turn, but must not leak into future turns.
+    pub turn_id: Option<TurnId>,
 }
 
 #[derive(Debug, Clone)]

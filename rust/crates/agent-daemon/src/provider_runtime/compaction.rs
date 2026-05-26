@@ -409,6 +409,7 @@ fn local_summary_request(
         // Local summary compaction uses an isolated compaction session id and
         // prompt-cache key. Remote OpenAI compaction intentionally does not.
         session_id: Some(compaction_session_id.to_string()),
+        turn_id: None,
     })
 }
 

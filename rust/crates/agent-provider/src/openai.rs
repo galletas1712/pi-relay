@@ -2,7 +2,7 @@ use agent_tools::{tool_display, ProviderTool, ToolDisplayInput};
 use agent_vocab::{
     AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
     ProviderReplayItem, ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem,
-    UserMessage,
+    TurnId, UserMessage,
 };
 use async_trait::async_trait;
 use reqwest::{
@@ -14,7 +14,7 @@ use std::{
     io::Cursor,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, OnceLock,
+        Arc, Mutex, OnceLock,
     },
     time::Duration,
 };
@@ -58,7 +58,7 @@ const CODEX_ORIGINATOR: &str = "codex_cli_rs";
 const CODEX_RESIDENCY_US: &str = "us";
 const CODEX_REQUEST_COMPRESSION_LEVEL: i32 = 3;
 const CODEX_COMPACT_REQUEST_TIMEOUT_SECS: u64 = 20 * 60;
-const CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
+const CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 
 #[derive(Debug, Clone)]
 pub struct OpenAiProvider {
@@ -78,6 +78,13 @@ pub struct OpenAiProvider {
 pub struct OpenAiCodexSessionState {
     session_id: String,
     window_generation: AtomicU64,
+    turn_state: Mutex<Option<CodexTurnState>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CodexTurnState {
+    turn_id: TurnId,
+    value: String,
 }
 
 impl OpenAiCodexSessionState {
@@ -85,6 +92,7 @@ impl OpenAiCodexSessionState {
         Self {
             session_id: session_id.into(),
             window_generation: AtomicU64::new(0),
+            turn_state: Mutex::new(None),
         }
     }
 
@@ -117,6 +125,29 @@ impl OpenAiCodexSessionState {
 
     pub fn window_id(&self) -> String {
         format!("{}:{}", self.session_id, self.window_generation())
+    }
+
+    pub fn turn_state_for_request(&self, turn_id: Option<TurnId>) -> Option<String> {
+        let turn_id = turn_id?;
+        let guard = self
+            .turn_state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        guard
+            .as_ref()
+            .filter(|state| state.turn_id == turn_id)
+            .map(|state| state.value.clone())
+    }
+
+    pub fn record_turn_state(&self, turn_id: Option<TurnId>, value: String) {
+        let Some(turn_id) = turn_id else {
+            return;
+        };
+        let mut guard = self
+            .turn_state
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        *guard = Some(CodexTurnState { turn_id, value });
     }
 }
 
@@ -363,6 +394,7 @@ impl OpenAiProvider {
         request: reqwest::RequestBuilder,
         session_id: &str,
         window_id: &str,
+        turn_state: Option<&str>,
     ) -> reqwest::RequestBuilder {
         let mut request = request
             // Identity (default_headers in Codex CLI).
@@ -391,6 +423,9 @@ impl OpenAiProvider {
         }
         if let Some(account_id) = &self.account_id {
             request = request.header(HEADER_CHATGPT_ACCOUNT, account_id);
+        }
+        if let Some(turn_state) = turn_state {
+            request = request.header(HEADER_CODEX_TURN_STATE, turn_state);
         }
         request
     }
@@ -462,6 +497,12 @@ impl OpenAiProvider {
             self.session_state.as_deref(),
             &request.transcript,
         );
+        let turn_id = request.turn_id;
+        let codex_turn_state = self
+            .session_state
+            .as_deref()
+            .filter(|state| state.session_id() == session_id)
+            .and_then(|state| state.turn_state_for_request(turn_id));
         let body = responses_body(request, &session_id)?;
 
         let response = zstd_json_request(
@@ -471,6 +512,7 @@ impl OpenAiProvider {
                     .header(ACCEPT, "text/event-stream"),
                 &session_id,
                 &window_id,
+                codex_turn_state.as_deref(),
             ),
             &body,
         )?
@@ -478,6 +520,14 @@ impl OpenAiProvider {
         .await?;
         let response_headers = OpenAiResponseHeaders::from_headers(response.headers());
         let mut parsed = parse_responses_stream(response, ProviderKind::OpenAi).await?;
+        if let (Some(turn_state), Some(session_state)) = (
+            response_headers.codex_turn_state.clone(),
+            self.session_state
+                .as_deref()
+                .filter(|state| state.session_id() == session_id),
+        ) {
+            session_state.record_turn_state(turn_id, turn_state);
+        }
         response_headers.attach_to_usage(&mut parsed.usage);
         Ok(parsed)
     }
@@ -504,6 +554,7 @@ impl OpenAiProvider {
                     .header(ACCEPT, "application/json"),
                 &session_id,
                 &window_id,
+                None,
             )
             .timeout(Duration::from_secs(CODEX_COMPACT_REQUEST_TIMEOUT_SECS))
             .json(&body)
@@ -1195,6 +1246,7 @@ mod tests {
                     .post("https://chatgpt.com/backend-api/codex/responses"),
                 "session-uuid-abcd",
                 "session-uuid-abcd:0",
+                Some("sticky-turn-state"),
             )
             .build()
             .expect("request builds");
@@ -1250,6 +1302,10 @@ mod tests {
             header(HEADER_CLIENT_REQUEST_ID).as_deref(),
             Some("session-uuid-abcd")
         );
+        assert_eq!(
+            header(HEADER_CODEX_TURN_STATE).as_deref(),
+            Some("sticky-turn-state")
+        );
     }
 
     #[test]
@@ -1263,6 +1319,7 @@ mod tests {
                     .post("https://chatgpt.com/backend-api/codex/responses"),
                 "session-xyz",
                 "session-xyz:0",
+                None,
             )
             .build()
             .expect("request builds");
@@ -1437,6 +1494,136 @@ mod tests {
     }
 
     #[test]
+    fn codex_turn_state_is_replayed_only_for_same_turn() {
+        let state = OpenAiCodexSessionState::new("session-1");
+
+        assert_eq!(state.turn_state_for_request(Some(TurnId(7))), None);
+        state.record_turn_state(Some(TurnId(7)), "sticky-state".to_string());
+
+        assert_eq!(
+            state.turn_state_for_request(Some(TurnId(7))).as_deref(),
+            Some("sticky-state")
+        );
+        assert_eq!(state.turn_state_for_request(Some(TurnId(8))), None);
+        assert_eq!(state.turn_state_for_request(None), None);
+    }
+
+    #[tokio::test]
+    async fn codex_complete_replays_turn_state_on_followup_request_only_same_turn() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}", listener.local_addr().expect("local addr"));
+        let captured_turn_states = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let server_turn_states = captured_turn_states.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.expect("request accepted");
+                let mut buffer = Vec::new();
+                let mut chunk = [0; 1024];
+                let (header_end, content_length) = loop {
+                    let read = stream.read(&mut chunk).await.expect("request reads");
+                    assert!(read > 0, "request closed before headers");
+                    buffer.extend_from_slice(&chunk[..read]);
+                    let Some(header_end) =
+                        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find_map(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    break (header_end, content_length);
+                };
+                let body_end = header_end + 4 + content_length;
+                while buffer.len() < body_end {
+                    let read = stream.read(&mut chunk).await.expect("request body reads");
+                    assert!(read > 0, "request closed before body");
+                    buffer.extend_from_slice(&chunk[..read]);
+                }
+
+                let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                let turn_state = headers
+                    .lines()
+                    .filter_map(|line| line.split_once(':'))
+                    .find_map(|(name, value)| {
+                        name.eq_ignore_ascii_case(HEADER_CODEX_TURN_STATE)
+                            .then(|| value.trim().to_string())
+                    });
+                server_turn_states.lock().await.push(turn_state);
+
+                let sse = r#"data: {"type":"response.completed","response":{"id":"resp_1"}}
+
+"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     content-type: text/event-stream\r\n\
+                     x-codex-turn-state: sticky-state\r\n\
+                     content-length: {}\r\n\
+                     connection: close\r\n\
+                     \r\n\
+                     {sse}",
+                    sse.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("response writes");
+            }
+        });
+
+        let session_state = Arc::new(OpenAiCodexSessionState::new("session-1"));
+        let provider = OpenAiProvider {
+            client: reqwest::Client::new(),
+            session_state: Some(session_state),
+            access_token: "token".to_string(),
+            account_id: None,
+            installation_id: None,
+            base_url,
+        };
+        let make_request = |turn_id| ModelRequest {
+            model: "gpt-5.5".to_string(),
+            prompt: PromptSections::default(),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::OpenAiCoding,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+            session_id: Some("session-1".to_string()),
+            turn_id: Some(turn_id),
+        };
+
+        provider
+            .complete(make_request(TurnId(1)))
+            .await
+            .expect("first request completes");
+        provider
+            .complete(make_request(TurnId(1)))
+            .await
+            .expect("same-turn request completes");
+        provider
+            .complete(make_request(TurnId(2)))
+            .await
+            .expect("next-turn request completes");
+        server.await.expect("server finishes");
+
+        assert_eq!(
+            *captured_turn_states.lock().await,
+            vec![None, Some("sticky-state".to_string()), None]
+        );
+    }
+
+    #[test]
     fn compact_parser_requires_compaction_item_with_type_diagnostics() {
         let error = parse_compact_response(
             r#"{"output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]},{"type":"reasoning"}]}"#,
@@ -1475,6 +1662,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: None,
                 session_id: None,
+                turn_id: None,
             },
             "test-session",
         )
@@ -1511,6 +1699,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::High,
                 prompt_cache_key: Some("pi-relay-test".to_string()),
                 session_id: None,
+                turn_id: None,
             },
             "test-session",
         )
@@ -1555,6 +1744,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: None,
                 session_id: None,
+                turn_id: None,
             },
             "test-session",
         )
@@ -1573,6 +1763,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::High,
                 prompt_cache_key: None,
                 session_id: None,
+                turn_id: None,
             },
             "test-session",
         )
@@ -1602,6 +1793,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: Some("explicit-cohort".to_string()),
                 session_id: None,
+                turn_id: None,
             },
             "session-not-used",
         )
@@ -1626,6 +1818,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: None,
                 session_id: Some("daemon-session-id".to_string()),
+                turn_id: None,
             },
             "daemon-session-id",
         )
@@ -1650,6 +1843,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: Some("cache-key".to_string()),
                 session_id: None,
+                turn_id: None,
             },
             "test-session",
         )
@@ -1687,6 +1881,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: None,
                 session_id: None,
+                turn_id: None,
             },
             "test-session",
         )
@@ -1709,6 +1904,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::XHigh,
                 prompt_cache_key: None,
                 session_id: None,
+                turn_id: None,
             },
             "test-session",
         )

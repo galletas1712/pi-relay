@@ -1168,6 +1168,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1228,6 +1229,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1333,6 +1335,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1395,6 +1398,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1438,6 +1442,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1650,6 +1655,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1684,6 +1690,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1726,6 +1733,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1778,6 +1786,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: None,
                 session_id: None,
+                turn_id: None,
             })
             .expect("body renders")
         };
@@ -1808,6 +1817,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: None,
                 session_id: None,
+                turn_id: None,
             })
             .expect("body renders")
         };
