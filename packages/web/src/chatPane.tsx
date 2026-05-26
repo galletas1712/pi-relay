@@ -71,6 +71,7 @@ export const ChatPane = memo(function ChatPane({
 				pendingActions={snapshot?.pending_actions ?? []}
 				activeLeafId={snapshot?.active_leaf_id ?? null}
 				isRunning={snapshot?.activity === "running"}
+				serverTimeMs={snapshot?.server_time_ms ?? null}
 				hasSession={!!selectedId}
 				sessionId={selectedId}
 				entriesSessionId={snapshot?.session_id ?? null}

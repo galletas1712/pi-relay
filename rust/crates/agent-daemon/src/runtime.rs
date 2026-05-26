@@ -1086,6 +1086,7 @@ mod tests {
             compaction_context: model_context,
             tokens_before: Some(250_000),
             last_turn_id: TurnId(1),
+            turn_started_at_ms: Some(1_700_000_000_000),
             trigger: CompactionTrigger::Auto {
                 reason: "provider context overflow before model completion".to_string(),
             },

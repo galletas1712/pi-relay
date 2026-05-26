@@ -37,6 +37,8 @@ pub struct CompactionSummary {
     pub summary: String,
     pub tokens_before: Option<usize>,
     pub last_turn_id: TurnId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_started_at_ms: Option<u64>,
 }
 
 impl CompactionSummary {
@@ -53,7 +55,13 @@ impl CompactionSummary {
             summary: summary.into(),
             tokens_before,
             last_turn_id,
+            turn_started_at_ms: None,
         }
+    }
+
+    pub fn with_turn_started_at_ms(mut self, turn_started_at_ms: Option<u64>) -> Self {
+        self.turn_started_at_ms = turn_started_at_ms;
+        self
     }
 }
 
