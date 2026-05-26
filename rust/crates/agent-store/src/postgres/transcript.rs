@@ -11,8 +11,9 @@ use sqlx::{Postgres, Row, Transaction};
 use crate::{ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree};
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
+use super::queue::bump_revisions_tx;
 use super::rows::row_to_stored_entry;
-use super::sql::action_is_unfinished;
+use super::sql::{action_is_unfinished, lock_session_tx};
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
@@ -285,6 +286,7 @@ impl PostgresAgentStore {
         leaf_id: Option<&str>,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         if let Some(leaf_id) = leaf_id {
             let belongs_to_session: bool = sqlx::query_scalar(
                 "select exists(select 1 from transcript_entries where session_id=$1 and id=$2::text)",
@@ -302,6 +304,7 @@ impl PostgresAgentStore {
             .bind(leaf_id)
             .execute(&mut *tx)
             .await?;
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_tx(
             &mut tx,
             session_id,
@@ -320,6 +323,7 @@ impl PostgresAgentStore {
         active_leaf_id: Option<&str>,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let mut frames = Vec::new();
         for entry in entries {
             insert_stored_entry_tx(&mut tx, session_id, entry).await?;
@@ -347,6 +351,7 @@ impl PostgresAgentStore {
             .bind(active_leaf_id)
             .execute(&mut *tx)
             .await?;
+        bump_revisions_tx(&mut tx, session_id, false, true).await?;
         frames.push(
             insert_event_tx(
                 &mut tx,

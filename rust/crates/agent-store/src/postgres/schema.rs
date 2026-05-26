@@ -37,7 +37,10 @@ create table if not exists sessions (
     active_leaf_id text null,
     system_prompt text not null,
     provider_config jsonb not null,
-    metadata jsonb not null default '{}'::jsonb
+    metadata jsonb not null default '{}'::jsonb,
+    session_revision bigint not null default 0,
+    queue_revision bigint not null default 0,
+    transcript_revision bigint not null default 0
 );
 
 alter table sessions add column if not exists system_prompt text not null default '';
@@ -74,6 +77,8 @@ create table if not exists queued_inputs (
     origin jsonb null,
     status text not null,
     created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    follow_up_position integer null,
     client_input_id text null
 );
 

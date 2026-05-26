@@ -60,6 +60,9 @@ pub(crate) enum RpcMethod {
     EventsUnsubscribe,
     InputFollowUp,
     InputPromoteQueued,
+    InputUpdateQueued,
+    InputCancelQueued,
+    InputReorderQueuedFollowUps,
     InputInterrupt,
     HistoryTree,
     HistoryContext,
@@ -90,6 +93,9 @@ impl RpcMethod {
             "events.unsubscribe" => Some(Self::EventsUnsubscribe),
             "input.follow_up" => Some(Self::InputFollowUp),
             "input.promote_queued" => Some(Self::InputPromoteQueued),
+            "input.update_queued" => Some(Self::InputUpdateQueued),
+            "input.cancel_queued" => Some(Self::InputCancelQueued),
+            "input.reorder_queued_follow_ups" => Some(Self::InputReorderQueuedFollowUps),
             "input.interrupt" => Some(Self::InputInterrupt),
             "history.tree" => Some(Self::HistoryTree),
             "history.context" => Some(Self::HistoryContext),
@@ -138,6 +144,18 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("input.follow_up"),
             Some(RpcMethod::InputFollowUp)
+        );
+        assert_eq!(
+            RpcMethod::parse("input.update_queued"),
+            Some(RpcMethod::InputUpdateQueued)
+        );
+        assert_eq!(
+            RpcMethod::parse("input.cancel_queued"),
+            Some(RpcMethod::InputCancelQueued)
+        );
+        assert_eq!(
+            RpcMethod::parse("input.reorder_queued_follow_ups"),
+            Some(RpcMethod::InputReorderQueuedFollowUps)
         );
         assert_eq!(
             RpcMethod::parse("session.sync_active_branch"),

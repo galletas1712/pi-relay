@@ -1,5 +1,33 @@
 # Rust Rewrite Worklog
 
+## 2026-05-26
+
+### Session Sync Redesign And Queued Follow-Up Mutations
+
+- Added per-session revision counters and canonical queue projections so
+  frontend/daemon/Postgres views converge by replacing stale state instead of
+  applying inferred queue patches.
+- Serialized short session-owned Postgres mutations with a row lock on the
+  target `sessions` row only. Provider/tool/compaction I/O remains outside DB
+  locks.
+- Reworked new queued-input consumption to peek rows and fence the final
+  transcript commit by row version plus canonical-next validation, avoiding new
+  `queued -> consuming` leases while preserving legacy consuming-row recovery.
+- Added Rust daemon/store RPC support for queued follow-up edit, cancel, and
+  full-list reorder. Steering messages stay at the top, keep steer/promote
+  order, and are not editable/reorderable through these follow-up RPCs.
+- Added standalone manual migration script
+  `rust/scripts/migrate-session-sync-v1.sql`; no old-session migration is wired
+  into daemon startup.
+- Captured the implementation plans in
+  `rust/docs/session-sync-redesign-plan.md` and
+  `rust/docs/queued-message-mutations-plan.md`.
+
+Verification:
+
+- `cargo check --manifest-path rust/Cargo.toml`
+- `cargo test --manifest-path rust/Cargo.toml`
+
 ## 2026-05-15
 
 ### Project-Scoped Sessions

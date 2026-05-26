@@ -17,8 +17,9 @@ use super::action_records::{model_action_context_leaf_id, model_action_payload};
 use super::events::{
     insert_event_tx, insert_event_with_activity_tx, insert_transcript_item_events_tx,
 };
+use super::queue::bump_revisions_tx;
 use super::rows::row_to_stored_entry;
-use super::sql::action_is_unfinished;
+use super::sql::{action_is_unfinished, lock_session_tx};
 use super::transcript::{insert_stored_entry_tx, model_context_from_entries};
 use super::PostgresAgentStore;
 
@@ -38,6 +39,7 @@ impl PostgresAgentStore {
         auto_limit_tokens: Option<usize>,
     ) -> Result<CreateCompactionResult> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let row = sqlx::query(
             r#"
             select action_id, turn_id, payload
@@ -204,6 +206,7 @@ impl PostgresAgentStore {
             )
             .await?,
         ];
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
         tx.commit().await?;
 
         Ok(CreateCompactionResult {
@@ -231,8 +234,9 @@ impl PostgresAgentStore {
         trigger: CompactionTrigger,
     ) -> Result<CreateCompactionResult> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let active_leaf_id: Option<String> =
-            sqlx::query_scalar("select active_leaf_id from sessions where id=$1 for update")
+            sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
                 .bind(session_id)
                 .fetch_optional(&mut *tx)
                 .await?
@@ -330,6 +334,7 @@ impl PostgresAgentStore {
             )
             .await?,
         ];
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
         tx.commit().await?;
 
         Ok(CreateCompactionResult {
@@ -357,6 +362,7 @@ impl PostgresAgentStore {
         completion: CompactionCompletion,
     ) -> Result<CompleteCompactionResult> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, &job.source_session_id).await?;
         let unfinished_actions = action_is_unfinished(None);
         let action_query = format!(
             r#"
@@ -386,7 +392,7 @@ impl PostgresAgentStore {
         }
 
         let active_leaf_id: Option<String> =
-            sqlx::query_scalar("select active_leaf_id from sessions where id=$1 for update")
+            sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
                 .bind(&job.source_session_id)
                 .fetch_one(&mut *tx)
                 .await?;
@@ -618,6 +624,7 @@ impl PostgresAgentStore {
             )
             .await?,
         );
+        bump_revisions_tx(&mut tx, &job.source_session_id, false, true).await?;
         tx.commit().await?;
         Ok(CompleteCompactionResult {
             new_root_id: Some(new_root_id),
@@ -633,6 +640,7 @@ impl PostgresAgentStore {
         error: String,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, &job.source_session_id).await?;
         let events = self
             .finish_compaction_error_tx(&mut tx, job, ActionStatus::Error, error)
             .await?;
@@ -679,6 +687,7 @@ impl PostgresAgentStore {
         if updated != 1 {
             return Ok(Vec::new());
         }
+        bump_revisions_tx(tx, &job.source_session_id, false, false).await?;
         let mut payload = json!({
             "action_row_id": job.action_row_id,
             "error": error,

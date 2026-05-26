@@ -11,9 +11,10 @@ use crate::{
 };
 
 use super::action_records::{action_event_matches_row, action_payload, ActionKey};
-use super::events::{insert_event_with_activity_tx, insert_session_event_tx};
+use super::events::{insert_event_tx, insert_session_event_tx};
+use super::queue::{bump_revisions_tx, queue_event_payload, queue_state_tx};
 use super::rows::row_text;
-use super::sql::action_is_unfinished;
+use super::sql::{action_is_unfinished, lock_session_tx, QUEUED_INPUT_DISPATCH_ORDER};
 use super::transcript::insert_entry_tx;
 use super::PostgresAgentStore;
 
@@ -44,6 +45,45 @@ pub(super) async fn persist_outputs_tx(
         consumed_input,
         accepted_input,
     } = batch;
+    let had_action_update = action_update.is_some();
+    let had_accepted_input = accepted_input.is_some();
+    let had_actions = !actions.is_empty();
+    let had_session_events = !session_events.is_empty();
+    let transcript_changed = !entries.is_empty();
+    let consumed_input_event = consumed_input.as_ref().map(|input| {
+        json!({
+            "input_id": input.id,
+            "priority": input.priority,
+            "client_input_id": input.client_input_id,
+        })
+    });
+
+    lock_session_tx(tx, session_id).await?;
+    let session_row = sqlx::query(
+        r#"
+            select active_leaf_id,
+                exists(select 1 from transcript_entries where session_id=$1) as has_transcript_entries
+            from sessions
+            where id=$1
+            "#,
+    )
+    .bind(session_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    let current_active_leaf_id = session_row.get::<Option<String>, _>("active_leaf_id");
+    let has_transcript_entries = session_row.get::<bool, _>("has_transcript_entries");
+    let active_leaf_changed = current_active_leaf_id.as_deref() != active_leaf_id;
+    if let Some(first_entry) = entries.first() {
+        if has_transcript_entries
+            && current_active_leaf_id.as_deref() != first_entry.parent_id.as_deref()
+        {
+            return Err(anyhow!(
+                "session active leaf changed while applying outputs: expected {:?}, found {:?}",
+                first_entry.parent_id,
+                current_active_leaf_id
+            ));
+        }
+    }
 
     for entry in entries {
         insert_entry_tx(tx, session_id, entry)
@@ -59,44 +99,50 @@ pub(super) async fn persist_outputs_tx(
 
     let mut frames = Vec::new();
     if let Some(input) = consumed_input {
-        let updated = sqlx::query(
+        let consume_query = format!(
             r#"
                 update queued_inputs
                 set status='consumed',
-                    origin=coalesce(origin, '{}'::jsonb)
+                    follow_up_position=null,
+                    updated_at=now(),
+                    origin=coalesce(origin, '{{}}'::jsonb)
                         || jsonb_build_object('consumed_at', now()::text)
                 where id=$1
                     and session_id=$2::text
-                    and status='consuming'
-                    and origin->>'claim_id'=$3
+                    and (
+                        (
+                            status='queued'
+                            and xmin::text=$4::text
+                            and id=(
+                                select id
+                                from queued_inputs
+                                where session_id=$2::text and status='queued'
+                                order by {QUEUED_INPUT_DISPATCH_ORDER}
+                                limit 1
+                            )
+                        )
+                        or (
+                            status='consuming'
+                            and origin->>'claim_id'=$3
+                        )
+                    )
                 "#,
-        )
-        .bind(&input.id)
-        .bind(session_id)
-        .bind(&input.claim_id)
-        .execute(&mut **tx)
-        .await
-        .context("mark queued input consumed")?
-        .rows_affected();
+        );
+        let updated = sqlx::query(&consume_query)
+            .bind(&input.id)
+            .bind(session_id)
+            .bind(&input.claim_id)
+            .bind(&input.row_version)
+            .execute(&mut **tx)
+            .await
+            .context("mark queued input consumed")?
+            .rows_affected();
         if updated != 1 {
             return Err(anyhow!("queued input was already consumed: {}", input.id));
         }
-        frames.push(
-            insert_event_with_activity_tx(
-                tx,
-                session_id,
-                EventType::InputConsumed,
-                json!({
-                    "input_id": input.id,
-                    "priority": input.priority,
-                    "client_input_id": input.client_input_id,
-                }),
-            )
-            .await
-            .context("insert input.consumed event")?,
-        );
     }
 
+    let mut accepted_input_event = None;
     if let Some(input) = accepted_input {
         let mut input_id = None;
         if let Some(client_input_id) = input.client_input_id.as_deref() {
@@ -124,21 +170,12 @@ pub(super) async fn persist_outputs_tx(
             input_id = Some(row.get::<String, _>("id"));
         }
 
-        frames.push(
-            insert_event_with_activity_tx(
-                tx,
-                session_id,
-                EventType::InputAccepted,
-                json!({
-                    "input_id": input_id,
-                    "priority": input.priority,
-                    "client_input_id": input.client_input_id,
-                    "content": input.content,
-                }),
-            )
-            .await
-            .context("insert input.accepted event")?,
-        );
+        accepted_input_event = Some(json!({
+            "input_id": input_id,
+            "priority": input.priority,
+            "client_input_id": input.client_input_id,
+            "content": input.content,
+        }));
     }
 
     if let Some(mut update) = action_update {
@@ -210,6 +247,44 @@ pub(super) async fn persist_outputs_tx(
             )
         })
         .collect::<HashMap<_, _>>();
+    let queue_changed = consumed_input_event.is_some();
+    let session_changed = queue_changed
+        || transcript_changed
+        || active_leaf_changed
+        || had_accepted_input
+        || had_action_update
+        || had_actions
+        || had_session_events;
+    if session_changed {
+        bump_revisions_tx(tx, session_id, queue_changed, transcript_changed).await?;
+    }
+    if consumed_input_event.is_some() || accepted_input_event.is_some() {
+        let queue = queue_state_tx(tx, session_id).await?;
+        if let Some(payload) = consumed_input_event {
+            frames.push(
+                insert_event_tx(
+                    tx,
+                    session_id,
+                    EventType::InputConsumed,
+                    queue_event_payload(&queue, payload),
+                )
+                .await
+                .context("insert input.consumed event")?,
+            );
+        }
+        if let Some(payload) = accepted_input_event {
+            frames.push(
+                insert_event_tx(
+                    tx,
+                    session_id,
+                    EventType::InputAccepted,
+                    queue_event_payload(&queue, payload),
+                )
+                .await
+                .context("insert input.accepted event")?,
+            );
+        }
+    }
     for event in session_events {
         frames.extend(
             insert_session_event_tx(tx, session_id, event, &entries_by_id, &action_rows)

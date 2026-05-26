@@ -63,6 +63,19 @@ Closed persistence vocabularies such as provider kind, input priority, queued
 input status, action kind/status, session activity, and event type are Rust
 enums that serialize to the string values shown below.
 
+Session-owned mutations take a row lock on the target `sessions` row before
+validating or writing related transcript/action/queue state:
+
+```sql
+select id from sessions where id = $1 for update;
+```
+
+This serializes one session at a time; it is not a table-wide or database-wide
+lock, and provider/tool work never runs while the lock is held. Fresh databases
+get the revision/order columns from the schema below. Existing databases must be
+upgraded with `rust/scripts/migrate-session-sync-v1.sql`; the daemon does not
+run that migration automatically.
+
 ### `sessions`
 
 ```text
@@ -73,8 +86,12 @@ workspaces jsonb not null default '[]'::jsonb
 created_at timestamptz not null default now()
 updated_at timestamptz not null default now()
 active_leaf_id text null
+system_prompt text not null
 provider_config jsonb not null
 metadata jsonb not null default '{}'::jsonb
+session_revision bigint not null default 0
+queue_revision bigint not null default 0
+transcript_revision bigint not null default 0
 ```
 
 ### `projects`
@@ -183,6 +200,8 @@ content jsonb not null
 origin jsonb null
 status text not null            -- queued | consuming | consumed | cancelled
 created_at timestamptz not null default now()
+updated_at timestamptz not null default now()
+follow_up_position integer null
 client_input_id text null
 ```
 
@@ -194,14 +213,20 @@ response does not append the user message twice. Busy-session rows stay
 `queued` while model/tool/compaction work is unfinished, so a daemon crash
 cannot lose accepted input that has not yet appeared in the transcript.
 
-Before a queued input is materialized, the daemon claims it by moving it to
-`consuming` and recording a claim id in `origin`. The user-facing edit path is
-`input.interrupt` followed by picker-driven switch; queued rows can be
-promoted to steer priority but are not edited or cancelled through websocket
-RPC. The daemon marks the row `consumed` in the same transaction that appends
-the corresponding transcript/action events, and validates the claim id before
-doing so. On daemon restart, abandoned `consuming` rows are reset to `queued`
-before recovery continues.
+New queue consumption does not claim rows by moving them to `consuming`.
+Instead, the daemon peeks the next `queued` row and later marks that same row
+`consumed` in the transcript/action/event transaction. The commit validates both
+the row version and that the row is still the canonical next queued input, so an
+edit/cancel/reorder or a new steer above it causes the stale daemon cursor to
+fail and reload from Postgres. The legacy `consuming` status remains only for
+rows produced by older daemons; on restart/touch, abandoned `consuming` rows are
+reset to `queued`.
+
+Follow-up order is dense and explicit. Steering rows always sort above
+follow-ups and are ordered by steering/promote time. Queued follow-ups sort by
+`follow_up_position`, then creation time and id. The frontend reorders by
+sending the complete ordered follow-up id list; the backend rewrites dense
+positions.
 
 ### `actions`
 
@@ -214,7 +239,7 @@ turn_id bigint null
 action_id bigint not null
 attempt_id text not null
 kind text not null              -- model | tool | compaction
-status text not null            -- running | completed | error | interrupted | stale
+status text not null            -- pending | blocked | running | completed | error | interrupted | stale
 payload jsonb not null
 result jsonb null
 created_at timestamptz not null default now()
@@ -446,6 +471,9 @@ Result shape:
   "metadata": {},
   "pending_actions": [],
   "queued_inputs": [],
+  "session_revision": 12,
+  "queue_revision": 5,
+  "transcript_revision": 7,
   "last_event_id": 42,
   "has_transcript_entries": true,
   "entries": []
@@ -453,8 +481,14 @@ Result shape:
 ```
 
 `queued_inputs` contains live queued or consuming user inputs with `input_id`,
-`priority`, `status`, `content`, `client_input_id`, `created_at`, and optional
-`promoted_at`. The web UI uses it for the composer-adjacent queue pane.
+`priority`, `status`, `content`, `client_input_id`, `created_at`, `updated_at`,
+optional `promoted_at`, and optional `follow_up_position`. The web UI uses it
+for the composer-adjacent queue pane. `session_revision`,
+`queue_revision`, and `transcript_revision` are monotonically increasing
+per-session counters for replacing stale cached views instead of inferring
+patches from partial events. `transcript_revision` changes when transcript rows
+change; active-leaf-only view changes use `session_revision` without changing
+the transcript data counter.
 `entries` is included only when `include_entries` is true. `entries_scope` may
 be `"active_branch"` or `"full_tree"` and defaults to `"full_tree"` for
 compatibility. The web UI can use the active-branch scope for normal display and
@@ -617,18 +651,51 @@ running or already queued, the daemon stores a durable queued row.
 }
 ```
 
-`expected_active_leaf_id` is optional. When present, the daemon rejects the
-input with `history_changed` if the active branch moved before the message was
-accepted or queued. The web UI uses this for restored composer drafts so a
-historical edit cannot silently send into a newer context. `client_input_id`
-is optional but strongly recommended for frontend sends; without it, retry
-idempotency is intentionally not provided.
+`expected_active_leaf_id` is optional. When present, the daemon rejects idle
+acceptance with `history_changed` if the active branch moved before the message
+was accepted. When the session is already busy, the message is a durable queued
+follow-up that will materialize only after earlier work commits from the
+then-active branch; queued rows can later be edited/cancelled/reordered before
+consumption. The web UI uses this fence for restored composer drafts so a
+historical edit cannot silently send into a newer idle context.
+`client_input_id` is optional but strongly recommended for frontend sends;
+without it, retry idempotency is intentionally not provided.
+
+Idle response:
+
+```json
+{ "accepted": true, "queued": false }
+```
+
+Busy response:
+
+```json
+{
+  "input_id": "input_...",
+  "accepted": true,
+  "queued": true,
+  "queue": {
+    "session_revision": 12,
+    "queue_revision": 5,
+    "transcript_revision": 7,
+    "activity": "running",
+    "queued_inputs": []
+  }
+}
+```
+
+Retries with the same `client_input_id` return `"replayed": true` and the same
+canonical queue object when the original ledger row is found.
+
+Queue snapshots in responses and events use the canonical ordering: queued
+steers first by steering/promote time, then queued follow-ups by dense
+`follow_up_position`.
 
 ### `input.promote_queued`
 
 Promotes a still-queued follow-up into the steer queue. Promotions are consumed
 in promotion order before remaining follow-ups. If a turn is between completed
-tool results and the next model request, the daemon claims the next queued steer
+tool results and the next model request, the daemon peeks the next queued steer
 and appends it as a same-turn user message before sending that model request.
 Follow-ups never use that mid-turn slot. Steers queued while compaction is
 running wait for the compaction action and then materialize as the next turn
@@ -645,14 +712,142 @@ Response:
   "input_id": "input_...",
   "priority": "steer",
   "status": "queued",
-  "promoted": true
+  "promoted": true,
+  "queue": {
+    "session_revision": 13,
+    "queue_revision": 6,
+    "transcript_revision": 7,
+    "activity": "running",
+    "queued_inputs": []
+  }
 }
 ```
 
-If the row was already claimed or consumed, the call succeeds with
-`"promoted": false` and the current row status. This makes the browser's stale
-queued-row race non-fatal. A missing input id still fails with
-`input_not_found`.
+If the row was already consumed, cancelled, legacy-consuming, or otherwise not a
+queued follow-up, the call succeeds with `"promoted": false` and the current row
+status. This makes the browser's stale queued-row race non-fatal. A missing
+input id still fails with `input_not_found`.
+
+### `input.update_queued`
+
+Edits the content of a still-queued follow-up. Steering messages are not
+editable through this RPC because steering order and content are already part of
+the high-priority control lane.
+
+```json
+{
+  "session_id": "s1",
+  "input_id": "input_...",
+  "expected_queue_revision": 5,
+  "content": [
+    { "type": "text", "text": "Actually fix the other test" }
+  ]
+}
+```
+
+`expected_queue_revision` is optional but recommended. When supplied, the store
+checks it under the per-session row lock before mutating the row. A stale value
+returns the canonical current queue with `"updated": false` and
+`"reason": "queue_changed"`.
+
+Response:
+
+```json
+{
+  "input_id": "input_...",
+  "updated": true,
+  "reason": null,
+  "priority": "follow_up",
+  "status": "queued",
+  "queue": {
+    "session_revision": 14,
+    "queue_revision": 7,
+    "transcript_revision": 7,
+    "activity": "running",
+    "queued_inputs": []
+  }
+}
+```
+
+If the row is a steer, consumed, consuming, or cancelled, the RPC returns
+`"updated": false`, `"reason": "not_editable"`, the row's current priority and
+status, and the canonical queue. Updating to identical content is a no-op: it
+returns `"updated": false`, `"reason": null`, and does not bump
+`queue_revision` or emit `input.updated`.
+
+### `input.cancel_queued`
+
+Deletes a still-queued follow-up from the visible queue by marking it
+`cancelled`. Cancelled rows remain in the ledger for idempotency/audit but are
+not returned by `session.get` queue projections.
+
+```json
+{
+  "session_id": "s1",
+  "input_id": "input_...",
+  "expected_queue_revision": 5
+}
+```
+
+Response:
+
+```json
+{
+  "input_id": "input_...",
+  "cancelled": true,
+  "reason": null,
+  "priority": "follow_up",
+  "status": "cancelled",
+  "queue": {
+    "session_revision": 15,
+    "queue_revision": 8,
+    "transcript_revision": 7,
+    "activity": "running",
+    "queued_inputs": []
+  }
+}
+```
+
+Stale revisions return `"reason": "queue_changed"` with the canonical queue.
+Steers and non-queued rows return `"reason": "not_editable"`.
+
+### `input.reorder_queued_follow_ups`
+
+Reorders queued follow-ups only. Steering rows are omitted from `input_ids`,
+remain at the top, cannot be reordered, and keep steering/promote order. The
+client sends the full desired follow-up id order; the backend rewrites dense
+`follow_up_position = 0..n-1` values.
+
+```json
+{
+  "session_id": "s1",
+  "expected_queue_revision": 5,
+  "input_ids": ["input_c", "input_a", "input_b"]
+}
+```
+
+Response:
+
+```json
+{
+  "reordered": true,
+  "reason": null,
+  "input_ids": ["input_c", "input_a", "input_b"],
+  "queue": {
+    "session_revision": 16,
+    "queue_revision": 9,
+    "transcript_revision": 7,
+    "activity": "running",
+    "queued_inputs": []
+  }
+}
+```
+
+The provided id set must exactly equal the current queued follow-up id set.
+Mismatch or stale `expected_queue_revision` returns `"reordered": false`,
+`"reason": "queue_changed"`, the current follow-up order in `input_ids`, and
+the canonical queue. Submitting the already-current order is a no-op and does
+not bump `queue_revision` or emit `input.reordered`.
 
 ### `input.interrupt`
 
@@ -809,6 +1004,9 @@ input.accepted
 input.queued
 input.consumed
 input.promoted
+input.updated
+input.cancelled
+input.reordered
 input.ignored
 transcript.appended
 turn.started
@@ -834,6 +1032,25 @@ session.idle
 
 No approval or awaiting-approval events are emitted.
 
+Queue-visible events produced by the redesigned paths (`input.accepted`,
+`input.queued`, `input.consumed`, `input.promoted`, `input.updated`,
+`input.cancelled`, and `input.reordered`) include the canonical post-transition
+queue projection:
+
+```json
+{
+  "session_revision": 13,
+  "queue_revision": 6,
+  "transcript_revision": 7,
+  "activity": "queued",
+  "queued_inputs": []
+}
+```
+
+Clients should replace cached queue state when an event carries a newer
+`queue_revision`. They should refetch rather than trying to infer ordering from
+partial event payloads.
+
 ## Manual Websocket Exercise Plan
 
 These checks should be run by sending websocket RPC frames exactly like a
@@ -843,7 +1060,8 @@ behavior should use real builtin tools.
 Useful SQL after each scenario:
 
 ```sql
-select active_leaf_id, provider_config, metadata
+select active_leaf_id, provider_config, metadata,
+       session_revision, queue_revision, transcript_revision
   from sessions where id = '<SESSION>';
 select key, value from daemon_config order by key;
 select sequence, id, parent_id, item
@@ -852,8 +1070,11 @@ select id, kind, status, attempt_id, payload, result
   from actions where session_id = '<SESSION>' order by created_at;
 select id, type, payload
   from events where session_id = '<SESSION>' order by id;
-select priority, status, client_input_id, content
-  from queued_inputs where session_id = '<SESSION>' order by created_at;
+select id, priority, status, client_input_id, content, created_at, updated_at,
+       follow_up_position, origin
+  from queued_inputs where session_id = '<SESSION>'
+  order by case priority when 'steer' then 0 else 1 end,
+           follow_up_position nulls last, created_at, id;
 ```
 
 ### 1. Draft Start, Basic Turn, And Replay
@@ -909,16 +1130,36 @@ stored transcript.
 Verify only one normal row and one normal `input.queued` event exist, no queued
 input is marked `consumed` while a model action is running, the promoted steer
 is consumed before the unpromoted follow-up at the next eligible boundary, and
-each queued input is claimed as `consuming` before becoming transcript. When
-the eligible boundary is a tool-to-model continuation, verify the promoted steer
-appears after the tool results and before the next model action without a
-`turn_finished` between them.
-`input.promote_queued` must promote before claim and return `"promoted": false`
-with the current row status once the row is `consuming` or `consumed`.
+new queued-input consumption keeps rows `queued` until the same transaction that
+appends transcript state marks them `consumed`. When the eligible boundary is a
+tool-to-model continuation, verify the promoted steer appears after the tool
+results and before the next model action without a `turn_finished` between
+them. `input.promote_queued` must promote before consumption and return
+`"promoted": false` with the current row status once the row is no longer a
+queued follow-up.
 
 Also verify an idle `input.follow_up` retried with the same `client_input_id`
 returns `"replayed": true`, leaves exactly one user-message transcript entry,
 and records a single consumed input ledger row.
+
+### 4a. Queued Follow-Up Edit, Cancel, And Reorder
+
+1. Start a turn and leave its model action running.
+2. Queue three follow-ups.
+3. Call `input.reorder_queued_follow_ups` with the full follow-up id list in a
+   new order.
+4. Call `input.update_queued` on one follow-up with the returned
+   `queue_revision`.
+5. Call `input.cancel_queued` on another follow-up.
+6. Queue or promote a steer and then try to update/cancel/reorder it through
+   the follow-up mutation RPCs.
+7. Repeat one mutation with a stale `expected_queue_revision`.
+
+Verify the queue pane order matches the canonical `session.get` order after
+every event, remaining follow-ups have dense `follow_up_position` values,
+steers stay at the top and are not editable/reorderable, stale revisions return
+`reason: "queue_changed"` with the current canonical queue, and no mutation is
+lost across daemon reconnect/restart.
 
 ### 5. Interrupt And Stale Completion
 

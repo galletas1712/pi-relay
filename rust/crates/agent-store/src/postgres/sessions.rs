@@ -11,7 +11,8 @@ use agent_vocab::{ProviderConfig, UserMessage};
 
 use super::events::insert_event_tx;
 use super::outputs::persist_outputs_tx;
-use super::sql::{action_is_unfinished, queued_input_is_active};
+use super::queue::bump_revisions_tx;
+use super::sql::{action_is_unfinished, lock_session_tx, queued_input_is_active};
 use super::PostgresAgentStore;
 
 fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -76,6 +77,7 @@ impl PostgresAgentStore {
         metadata: &Value,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let result = sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
             .bind(session_id)
             .bind(metadata)
@@ -84,6 +86,7 @@ impl PostgresAgentStore {
         if result.rows_affected() == 0 {
             return Err(anyhow!("session not found: {session_id}"));
         }
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_tx(
             &mut tx,
             session_id,
@@ -102,9 +105,10 @@ impl PostgresAgentStore {
         source_leaf_id: &str,
         error: &str,
     ) -> Result<()> {
-        let current = self.load_session_config(session_id).await?;
-        let max_failures = current
-            .metadata
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
+        let mut metadata = session_metadata_tx(&mut tx, session_id).await?;
+        let max_failures = metadata
             .pointer("/compaction/config/max_consecutive_failures")
             .and_then(Value::as_u64)
             .or_else(|| {
@@ -116,7 +120,6 @@ impl PostgresAgentStore {
             .map(|value| value as usize)
             .unwrap_or(3)
             .max(1);
-        let mut metadata = current.metadata;
         let state = ensure_compaction_auto_state_object(&mut metadata);
         let failures = state
             .get("consecutive_failures")
@@ -133,14 +136,17 @@ impl PostgresAgentStore {
         sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
             .bind(session_id)
             .bind(metadata)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn reset_auto_compaction_failures(&self, session_id: &str) -> Result<()> {
-        let current = self.load_session_config(session_id).await?;
-        let mut metadata = current.metadata;
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
+        let mut metadata = session_metadata_tx(&mut tx, session_id).await?;
         let state = ensure_compaction_auto_state_object(&mut metadata);
         state.insert("consecutive_failures".to_string(), json!(0));
         state.insert("suppressed".to_string(), json!(false));
@@ -149,8 +155,10 @@ impl PostgresAgentStore {
         sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
             .bind(session_id)
             .bind(metadata)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -160,8 +168,9 @@ impl PostgresAgentStore {
         new_root_id: Option<&str>,
         _manual: bool,
     ) -> Result<()> {
-        let current = self.load_session_config(session_id).await?;
-        let mut metadata = current.metadata;
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
+        let mut metadata = session_metadata_tx(&mut tx, session_id).await?;
         let state = ensure_compaction_auto_state_object(&mut metadata);
         state.insert("consecutive_failures".to_string(), json!(0));
         state.insert("suppressed".to_string(), json!(false));
@@ -171,8 +180,10 @@ impl PostgresAgentStore {
         sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
             .bind(session_id)
             .bind(metadata)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -248,6 +259,7 @@ impl PostgresAgentStore {
 
     pub async fn rename_session(&self, session_id: &str, title: &str) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let row = sqlx::query(
             r#"
                 update sessions
@@ -266,7 +278,8 @@ impl PostgresAgentStore {
         };
         let provider: ProviderConfig = serde_json::from_value(row.get("provider_config"))?;
         let metadata: Value = row.get("metadata");
-        let activity = self.activity(session_id).await?;
+        let activity = activity_tx(&mut tx, session_id).await?;
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_tx(
             &mut tx,
             session_id,
@@ -297,6 +310,7 @@ impl PostgresAgentStore {
         config: &SessionConfig,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let row = sqlx::query(
             "update sessions set provider_config=$2, metadata=$3, updated_at=now() where id=$1 returning metadata",
         )
@@ -309,7 +323,8 @@ impl PostgresAgentStore {
             return Err(anyhow!("session not found: {session_id}"));
         };
         let metadata: Value = row.get("metadata");
-        let activity = self.activity(session_id).await?;
+        let activity = activity_tx(&mut tx, session_id).await?;
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_tx(
             &mut tx,
             session_id,
@@ -449,5 +464,46 @@ impl PostgresAgentStore {
         } else {
             Ok(SessionActivity::Idle)
         }
+    }
+}
+
+async fn session_metadata_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> Result<Value> {
+    sqlx::query_scalar("select metadata from sessions where id=$1")
+        .bind(session_id)
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))
+}
+
+async fn activity_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> Result<SessionActivity> {
+    let unfinished_actions = action_is_unfinished(None);
+    let actions_query = format!(
+        "select exists(select 1 from actions where session_id=$1 and {unfinished_actions})"
+    );
+    let running: bool = sqlx::query_scalar(&actions_query)
+        .bind(session_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if running {
+        return Ok(SessionActivity::Running);
+    }
+    let active_queue = queued_input_is_active(None);
+    let queued_query = format!(
+        "select exists(select 1 from queued_inputs where session_id=$1 and {active_queue})"
+    );
+    let queued: bool = sqlx::query_scalar(&queued_query)
+        .bind(session_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    if queued {
+        Ok(SessionActivity::Queued)
+    } else {
+        Ok(SessionActivity::Idle)
     }
 }
