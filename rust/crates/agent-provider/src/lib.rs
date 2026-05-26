@@ -11,6 +11,7 @@ use thiserror::Error;
 
 pub mod anthropic;
 pub mod openai;
+mod sse;
 mod token_estimator;
 mod transcript;
 

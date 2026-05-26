@@ -20,7 +20,10 @@ use std::{
 };
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::sse::read_json_sse_text;
 use crate::{
+    sse::{read_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
     ProviderCompactionRequest, ProviderCompactionResponse, ProviderError, ProviderResult,
     ProviderToolProfile, ProviderUsage,
@@ -892,57 +895,27 @@ The conversation history before this point was compacted into this summary:
 }
 
 async fn parse_responses_stream(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     provider: ProviderKind,
 ) -> ProviderResult<ModelResponse> {
-    let status = response.status();
-    if !status.is_success() {
-        let bytes = response.bytes().await?;
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        return Err(ProviderError::Status {
-            status: status.as_u16(),
-            message: response_error_message(&text),
-        });
-    }
-
     let mut state = ResponsesStreamState::new(provider);
-    let mut buffer = Vec::new();
-    loop {
-        let chunk = match tokio::time::timeout(
-            Duration::from_secs(CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS),
-            response.chunk(),
-        )
-        .await
-        {
-            Ok(chunk) => chunk?,
-            Err(_) => {
-                return Err(ProviderError::Provider(format!(
-                    "OpenAI response stream was idle for {CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS} seconds"
-                )));
-            }
-        };
-        let Some(chunk) = chunk else {
-            break;
-        };
-        buffer.extend_from_slice(&chunk);
-        if process_complete_sse_frames(&mut buffer, &mut state)? {
-            return Ok(state.finish());
-        }
-    }
-    if process_final_sse_frame(&buffer, &mut state)? {
-        return Ok(state.finish());
-    }
+    read_json_sse_response(
+        response,
+        Duration::from_secs(CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS),
+        format!(
+            "OpenAI response stream was idle for {CODEX_RESPONSES_STREAM_IDLE_TIMEOUT_SECS} seconds"
+        ),
+        response_error_message,
+        |event| state.process_sse_event(event),
+    )
+    .await?;
     Ok(state.finish())
 }
 
 #[cfg(test)]
 fn parse_responses_sse(text: &str, provider: ProviderKind) -> ProviderResult<ModelResponse> {
     let mut state = ResponsesStreamState::new(provider);
-    let mut buffer = text.as_bytes().to_vec();
-    if process_complete_sse_frames(&mut buffer, &mut state)? {
-        return Ok(state.finish());
-    }
-    process_final_sse_frame(&buffer, &mut state)?;
+    read_json_sse_text(text, |event| state.process_sse_event(event))?;
     Ok(state.finish())
 }
 
@@ -974,7 +947,14 @@ impl ResponsesStreamState {
         }
     }
 
-    fn process_event(&mut self, event: &Value) -> ProviderResult<bool> {
+    fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
+        match event {
+            SseEvent::Json(event) => self.process_event(&event),
+            SseEvent::Done => Ok(SseControl::Stop),
+        }
+    }
+
+    fn process_event(&mut self, event: &Value) -> ProviderResult<SseControl> {
         match event.get("type").and_then(Value::as_str) {
             Some("response.output_item.done") => {
                 if let Some(item) = event.get("item") {
@@ -985,7 +965,7 @@ impl ResponsesStreamState {
                         self.provider,
                     )?;
                 }
-                Ok(false)
+                Ok(SseControl::Continue)
             }
             Some("response.failed") => {
                 let message = event
@@ -1001,7 +981,7 @@ impl ResponsesStreamState {
                 if message == Some("max_output_tokens") {
                     self.stop_reason = ModelStopReason::MaxOutputTokens;
                     self.usage = event.pointer("/response/usage").and_then(openai_usage);
-                    return Ok(true);
+                    return Ok(SseControl::Stop);
                 }
                 let message = message
                     .map(|reason| format!("response incomplete: {reason}"))
@@ -1010,7 +990,7 @@ impl ResponsesStreamState {
             }
             Some("response.completed" | "response.done") => {
                 self.usage = event.pointer("/response/usage").and_then(openai_usage);
-                Ok(true)
+                Ok(SseControl::Stop)
             }
             Some("error") => {
                 let message = event
@@ -1021,78 +1001,8 @@ impl ResponsesStreamState {
                     .unwrap_or_else(|| event.to_string());
                 Err(ProviderError::Provider(format!("Codex error: {message}")))
             }
-            _ => Ok(false),
+            _ => Ok(SseControl::Continue),
         }
-    }
-}
-
-fn process_complete_sse_frames(
-    buffer: &mut Vec<u8>,
-    state: &mut ResponsesStreamState,
-) -> ProviderResult<bool> {
-    while let Some((frame_end, separator_len)) = sse_frame_boundary(buffer) {
-        let frame = buffer[..frame_end].to_vec();
-        buffer.drain(..frame_end + separator_len);
-        if process_sse_frame(&frame, state)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-fn process_final_sse_frame(frame: &[u8], state: &mut ResponsesStreamState) -> ProviderResult<bool> {
-    if frame.iter().all(u8::is_ascii_whitespace) {
-        return Ok(false);
-    }
-    process_sse_frame(frame, state)
-}
-
-fn process_sse_frame(frame: &[u8], state: &mut ResponsesStreamState) -> ProviderResult<bool> {
-    match sse_frame_data(frame) {
-        Some(SseFrame::Json(data)) => {
-            let Ok(event) = serde_json::from_str::<Value>(&data) else {
-                // Match the legacy TS parser, which skips malformed SSE data
-                // chunks rather than failing the whole stream.
-                return Ok(false);
-            };
-            state.process_event(&event)
-        }
-        Some(SseFrame::Done) => Ok(true),
-        None => Ok(false),
-    }
-}
-
-enum SseFrame {
-    Json(String),
-    Done,
-}
-
-fn sse_frame_data(frame: &[u8]) -> Option<SseFrame> {
-    let frame = String::from_utf8_lossy(frame);
-    let data = frame
-        .lines()
-        .filter_map(|line| line.strip_prefix("data:").map(str::trim))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let data = data.trim();
-    if data.is_empty() {
-        None
-    } else if data == "[DONE]" {
-        Some(SseFrame::Done)
-    } else {
-        Some(SseFrame::Json(data.to_string()))
-    }
-}
-
-fn sse_frame_boundary(buffer: &[u8]) -> Option<(usize, usize)> {
-    let lf = buffer.windows(2).position(|window| window == b"\n\n");
-    let crlf = buffer.windows(4).position(|window| window == b"\r\n\r\n");
-    match (lf, crlf) {
-        (Some(lf), Some(crlf)) if lf < crlf => Some((lf, 2)),
-        (Some(_), Some(crlf)) => Some((crlf, 4)),
-        (Some(lf), None) => Some((lf, 2)),
-        (None, Some(crlf)) => Some((crlf, 4)),
-        (None, None) => None,
     }
 }
 
