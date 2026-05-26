@@ -13,7 +13,7 @@ use agent_store::{
 };
 use agent_tools::ToolContext;
 use agent_vocab::{
-    ProviderReplayItem, ToolResultMessage, ToolResultStatus, TranscriptItem, UserMessage,
+    ProviderReplayItem, ToolResultMessage, ToolResultStatus, TranscriptItem, TurnId, UserMessage,
 };
 use anyhow::Context;
 use serde_json::{json, Value};
@@ -1346,7 +1346,8 @@ async fn run_model_turn(
     };
 
     let result =
-        run_model_for_action_with_retries(&state, &session_id, &dispatch, model_context).await?;
+        run_model_for_action_with_retries(&state, &session_id, &dispatch, turn_id, model_context)
+            .await?;
     let driver = SessionDriver::acquire(&state, &session_id).await;
     if !state
         .repo
@@ -1466,6 +1467,7 @@ async fn run_model_for_action_with_retries(
     state: &AppState,
     session_id: &str,
     dispatch: &DispatchAction,
+    turn_id: TurnId,
     model_context: ModelContext,
 ) -> std::result::Result<
     std::result::Result<agent_provider::ModelResponse, ModelProviderFailure>,
@@ -1484,7 +1486,14 @@ async fn run_model_for_action_with_retries(
                 "action attempt is no longer running",
             ));
         }
-        let result = run_model(state, &dispatch.config, session_id, model_context.clone()).await;
+        let result = run_model(
+            state,
+            &dispatch.config,
+            session_id,
+            turn_id,
+            model_context.clone(),
+        )
+        .await;
         match result {
             Ok(response) => return Ok(Ok(response)),
             Err(error) => {

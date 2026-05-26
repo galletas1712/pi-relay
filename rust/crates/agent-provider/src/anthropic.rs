@@ -7,9 +7,12 @@ use agent_vocab::{
 use async_trait::async_trait;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use crate::sse::read_json_sse_text;
 use crate::{
+    sse::{read_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
     ProviderError, ProviderResult, ProviderTokenCountRequest, ProviderTokenCountResponse,
     ProviderToolProfile, ProviderUsage,
@@ -24,6 +27,7 @@ const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05-14";
 const CLAUDE_CODE_VERSION: &str = "2.1.75";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75 (external, cli)";
 const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
+const ANTHROPIC_MESSAGES_STREAM_IDLE_TIMEOUT_SECS: u64 = 120;
 
 // Anthropic's documented per-breakpoint backward lookback when matching a new
 // request against existing cache entries. We use this to decide when the tail
@@ -139,7 +143,7 @@ impl ModelProvider for AnthropicProvider {
         let response = self
             .client
             .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
-            .header("accept", "application/json")
+            .header("accept", "text/event-stream")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("anthropic-beta", beta_header)
@@ -151,16 +155,7 @@ impl ModelProvider for AnthropicProvider {
             .json(&body)
             .send()
             .await?;
-        let (status, text) = response_text(response).await?;
-        ensure_success(status, &text)?;
-        let response: Value = serde_json::from_str(&text).map_err(|error| {
-            ProviderError::Provider(format!(
-                "failed to parse Anthropic response JSON: {error}; body: {}",
-                response_excerpt(&text)
-            ))
-        })?;
-
-        parse_anthropic_message(&response)
+        parse_anthropic_stream(response).await
     }
 
     async fn count_tokens(
@@ -284,6 +279,9 @@ fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Va
         // costs us a slot we use for the deep-history transcript marker.
         body["tools"] = Value::Array(tools);
         body["tool_choice"] = json!({ "type": "auto" });
+    }
+    if input.max_tokens.is_some() {
+        body["stream"] = json!(true);
     }
     Ok(body)
 }
@@ -734,6 +732,7 @@ fn anthropic_user_content(message: &UserMessage) -> Value {
     )
 }
 
+#[cfg(test)]
 fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
     let content = response
         .get("content")
@@ -787,6 +786,269 @@ fn parse_anthropic_message(response: &Value) -> ProviderResult<ModelResponse> {
     })
 }
 
+async fn parse_anthropic_stream(response: reqwest::Response) -> ProviderResult<ModelResponse> {
+    let mut state = AnthropicStreamState::default();
+    read_json_sse_response(
+        response,
+        Duration::from_secs(ANTHROPIC_MESSAGES_STREAM_IDLE_TIMEOUT_SECS),
+        format!(
+            "Anthropic response stream was idle for {ANTHROPIC_MESSAGES_STREAM_IDLE_TIMEOUT_SECS} seconds"
+        ),
+        response_error_message,
+        |event| state.process_sse_event(event),
+    )
+    .await?;
+    state.finish()
+}
+
+#[cfg(test)]
+fn parse_anthropic_sse(text: &str) -> ProviderResult<ModelResponse> {
+    let mut state = AnthropicStreamState::default();
+    read_json_sse_text(text, |event| state.process_sse_event(event))?;
+    state.finish()
+}
+
+struct AnthropicStreamState {
+    message: Value,
+    content_blocks: Vec<Option<Value>>,
+    provider_replay: Vec<ProviderReplayItem>,
+    items: Vec<AssistantItem>,
+    usage: Option<ProviderUsage>,
+    stop_reason: ModelStopReason,
+}
+
+impl Default for AnthropicStreamState {
+    fn default() -> Self {
+        Self {
+            message: Value::Null,
+            content_blocks: Vec::new(),
+            provider_replay: Vec::new(),
+            items: Vec::new(),
+            usage: None,
+            stop_reason: ModelStopReason::Complete,
+        }
+    }
+}
+
+impl AnthropicStreamState {
+    fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
+        match event {
+            SseEvent::Json(event) => self.process_event(&event),
+            SseEvent::Done => Ok(SseControl::Stop),
+        }
+    }
+
+    fn process_event(&mut self, event: &Value) -> ProviderResult<SseControl> {
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_start") => {
+                self.message = event.get("message").cloned().unwrap_or_else(|| json!({}));
+                self.usage = self.message.get("usage").and_then(anthropic_usage);
+                Ok(SseControl::Continue)
+            }
+            Some("content_block_start") => {
+                if let (Some(index), Some(content_block)) = (
+                    event.get("index").and_then(Value::as_u64),
+                    event.get("content_block"),
+                ) {
+                    self.set_content_block(
+                        index as usize,
+                        normalize_stream_content_start(content_block),
+                    );
+                }
+                Ok(SseControl::Continue)
+            }
+            Some("content_block_delta") => {
+                let Some(index) = event.get("index").and_then(Value::as_u64) else {
+                    return Ok(SseControl::Continue);
+                };
+                if let Some(delta) = event.get("delta") {
+                    self.apply_content_delta(index as usize, delta);
+                }
+                Ok(SseControl::Continue)
+            }
+            Some("content_block_stop") => {
+                if let Some(index) = event.get("index").and_then(Value::as_u64) {
+                    self.finish_content_block(index as usize)?;
+                }
+                Ok(SseControl::Continue)
+            }
+            Some("message_delta") => {
+                if let Some(usage) = event.get("usage").and_then(anthropic_usage) {
+                    merge_anthropic_usage(&mut self.usage, usage);
+                }
+                if event.pointer("/delta/stop_reason").and_then(Value::as_str) == Some("max_tokens")
+                {
+                    self.stop_reason = ModelStopReason::MaxOutputTokens;
+                }
+                Ok(SseControl::Continue)
+            }
+            Some("message_stop") => Ok(SseControl::Stop),
+            Some("error") => {
+                let message = event
+                    .pointer("/error/message")
+                    .or_else(|| event.get("message"))
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| event.to_string());
+                Err(ProviderError::Provider(format!(
+                    "Anthropic error: {message}"
+                )))
+            }
+            Some("ping") | None => Ok(SseControl::Continue),
+            Some(_) => Ok(SseControl::Continue),
+        }
+    }
+
+    fn set_content_block(&mut self, index: usize, block: Value) {
+        if self.content_blocks.len() <= index {
+            self.content_blocks.resize_with(index + 1, || None);
+        }
+        self.content_blocks[index] = Some(block);
+    }
+
+    fn apply_content_delta(&mut self, index: usize, delta: &Value) {
+        let Some(Some(block)) = self.content_blocks.get_mut(index) else {
+            return;
+        };
+        match delta.get("type").and_then(Value::as_str) {
+            Some("input_json_delta") => {
+                append_json_string_field(block, "input", delta.get("partial_json"));
+            }
+            Some("text_delta") => {
+                append_json_string_field(block, "text", delta.get("text"));
+            }
+            Some("thinking_delta") => {
+                append_json_string_field(block, "thinking", delta.get("thinking"));
+            }
+            Some("signature_delta") => {
+                if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                    block["signature"] = Value::String(signature.to_string());
+                }
+            }
+            Some("citations_delta") | None => {}
+            Some(_) => {}
+        }
+    }
+
+    fn finish_content_block(&mut self, index: usize) -> ProviderResult<()> {
+        let Some(block) = self
+            .content_blocks
+            .get_mut(index)
+            .and_then(Option::take)
+            .map(finalize_stream_content_block)
+        else {
+            return Ok(());
+        };
+        push_anthropic_content_block(&block, &mut self.items, &mut self.provider_replay)
+    }
+
+    fn finish(mut self) -> ProviderResult<ModelResponse> {
+        for block in std::mem::take(&mut self.content_blocks)
+            .into_iter()
+            .flatten()
+            .map(finalize_stream_content_block)
+        {
+            push_anthropic_content_block(&block, &mut self.items, &mut self.provider_replay)?;
+        }
+        Ok(ModelResponse {
+            assistant: AssistantMessage { items: self.items },
+            provider_replay: self.provider_replay,
+            usage: self.usage,
+            stop_reason: self.stop_reason,
+        })
+    }
+}
+
+fn normalize_stream_content_start(block: &Value) -> Value {
+    let mut block = block.clone();
+    match block.get("type").and_then(Value::as_str) {
+        Some("tool_use") | Some("server_tool_use") => {
+            block["input"] = Value::String(String::new());
+        }
+        Some("text") => {
+            block["text"] = Value::String(String::new());
+        }
+        Some("thinking") => {
+            block["thinking"] = Value::String(String::new());
+            block["signature"] = Value::String(String::new());
+        }
+        _ => {}
+    }
+    block
+}
+
+fn finalize_stream_content_block(mut block: Value) -> Value {
+    if let Some("tool_use" | "server_tool_use") = block.get("type").and_then(Value::as_str) {
+        if let Some(input) = block.get("input").and_then(Value::as_str) {
+            block["input"] = parse_streamed_json_object(input);
+        }
+    }
+    block
+}
+
+fn parse_streamed_json_object(input: &str) -> Value {
+    if input.is_empty() {
+        return json!({});
+    }
+    serde_json::from_str(input).unwrap_or_else(|_| json!({}))
+}
+
+fn append_json_string_field(block: &mut Value, field: &str, delta: Option<&Value>) {
+    let Some(delta) = delta.and_then(Value::as_str) else {
+        return;
+    };
+    match block.get_mut(field) {
+        Some(Value::String(value)) => value.push_str(delta),
+        _ => block[field] = Value::String(delta.to_string()),
+    }
+}
+
+fn push_anthropic_content_block(
+    block: &Value,
+    items: &mut Vec<AssistantItem>,
+    provider_replay: &mut Vec<ProviderReplayItem>,
+) -> ProviderResult<()> {
+    let Some(block_type) = block.get("type").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    let display = anthropic_provider_replay_display(block);
+    provider_replay.push(ProviderReplayItem::new_with_display(
+        ProviderKind::Claude,
+        block,
+        display,
+    )?);
+
+    match block_type {
+        "text" => {
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                push_text_item(items, text);
+            }
+        }
+        "thinking" | "redacted_thinking" => {}
+        "tool_use" => {
+            let id = block
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| ProviderError::Provider("Claude tool_use missing id".to_string()))?;
+            let name = block.get("name").and_then(Value::as_str).ok_or_else(|| {
+                ProviderError::Provider("Claude tool_use missing name".to_string())
+            })?;
+            let name = canonical_anthropic_tool_name(name);
+            let input = block.get("input").cloned().ok_or_else(|| {
+                ProviderError::Provider("Claude tool_use missing input".to_string())
+            })?;
+            items.push(AssistantItem::ToolCall(ToolCall {
+                id: ToolCallId::new(id),
+                tool_name: name.to_string(),
+                args_json: serde_json::to_string(&input)?,
+            }));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn anthropic_stop_reason(response: &Value) -> ModelStopReason {
     match response.get("stop_reason").and_then(Value::as_str) {
         Some("max_tokens") => ModelStopReason::MaxOutputTokens,
@@ -851,6 +1113,22 @@ fn anthropic_usage(value: &Value) -> Option<ProviderUsage> {
     })
 }
 
+fn merge_anthropic_usage(current: &mut Option<ProviderUsage>, update: ProviderUsage) {
+    let current = current.get_or_insert_with(ProviderUsage::default);
+    if update.input_tokens.unwrap_or_default() > 0 {
+        current.input_tokens = update.input_tokens;
+    }
+    if update.output_tokens.is_some() {
+        current.output_tokens = update.output_tokens;
+    }
+    if update.cache_read_input_tokens.unwrap_or_default() > 0 {
+        current.cache_read_input_tokens = update.cache_read_input_tokens;
+    }
+    if update.cache_creation_input_tokens.unwrap_or_default() > 0 {
+        current.cache_creation_input_tokens = update.cache_creation_input_tokens;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,6 +1168,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -912,6 +1191,7 @@ mod tests {
         assert!(body.get("thinking").is_none());
         assert!(body.get("output_config").is_none());
         assert_eq!(body["max_tokens"], 2048);
+        assert_eq!(body["stream"], true);
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tools"][0]["name"], "read");
         // Tools must NOT carry a cache_control breakpoint: the stable system
@@ -949,12 +1229,14 @@ mod tests {
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
         assert_eq!(body["thinking"]["type"], "adaptive");
         assert_eq!(body["output_config"]["effort"], "xhigh");
         assert_eq!(body["max_tokens"], 2048);
+        assert_eq!(body["stream"], true);
     }
 
     #[test]
@@ -1002,6 +1284,7 @@ mod tests {
         assert_eq!(body["tool_choice"]["type"], "auto");
         assert_eq!(body["tools"][0]["name"], "read");
         assert!(body.get("max_tokens").is_none());
+        assert!(body.get("stream").is_none());
         assert!(body["messages"][0]["content"][0]
             .get("cache_control")
             .is_none());
@@ -1024,6 +1307,7 @@ mod tests {
         let body = count_tokens_body(request).expect("count body renders");
 
         assert!(body.get("max_tokens").is_none());
+        assert!(body.get("stream").is_none());
     }
 
     #[test]
@@ -1051,6 +1335,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1113,6 +1398,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1156,6 +1442,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::XHigh,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1254,6 +1541,92 @@ mod tests {
     }
 
     #[test]
+    fn anthropic_sse_accumulates_text_tool_calls_usage_and_stops_at_message_stop() {
+        let sse = r#"
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-7","content":[],"stop_reason":null,"usage":{"input_tokens":100,"output_tokens":1,"cache_read_input_tokens":75,"cache_creation_input_tokens":25}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hel"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"lo"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"str_replace_based_edit_tool","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":":\"README.md\"}"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":1}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":20}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"text","text":"ignored"}}
+"#;
+
+        let response = parse_anthropic_sse(sse).expect("sse parses");
+        let calls = response.assistant.tool_calls().collect::<Vec<_>>();
+
+        assert_eq!(response.assistant.text(), "hello");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].tool_name, "Edit");
+        assert_eq!(
+            calls[0].args_value().unwrap(),
+            json!({ "path": "README.md" })
+        );
+        assert_eq!(response.provider_replay.len(), 2);
+        let usage = response.usage.expect("usage should be parsed");
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(usage.cache_read_input_tokens, Some(75));
+        assert_eq!(usage.cache_creation_input_tokens, Some(25));
+        assert_eq!(response.stop_reason, ModelStopReason::Complete);
+    }
+
+    #[test]
+    fn anthropic_sse_maps_max_tokens_stop_reason_and_done_sentinel() {
+        let sse = r#"
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-7","content":[],"stop_reason":null,"usage":{"input_tokens":8,"output_tokens":1}}}
+
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}
+
+data: {"type":"content_block_stop","index":0}
+
+data: {"type":"message_delta","delta":{"stop_reason":"max_tokens","stop_sequence":null},"usage":{"output_tokens":64}}
+
+data: [DONE]
+
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":"ignored"}}
+"#;
+
+        let response = parse_anthropic_sse(sse).expect("sse parses");
+        let usage = response.usage.expect("usage should be parsed");
+
+        assert_eq!(response.assistant.text(), "partial");
+        assert_eq!(response.stop_reason, ModelStopReason::MaxOutputTokens);
+        assert_eq!(usage.input_tokens, Some(8));
+        assert_eq!(usage.output_tokens, Some(64));
+    }
+
+    #[test]
     fn anthropic_serializer_prefers_replay_blocks() {
         let raw = json!({ "type": "thinking", "thinking": "private", "signature": "sig" });
         let messages = transcript_to_messages(
@@ -1282,6 +1655,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1316,6 +1690,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1358,6 +1733,7 @@ mod tests {
             reasoning_effort: ReasoningEffort::Medium,
             prompt_cache_key: None,
             session_id: None,
+            turn_id: None,
         })
         .expect("body renders");
 
@@ -1410,6 +1786,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: None,
                 session_id: None,
+                turn_id: None,
             })
             .expect("body renders")
         };
@@ -1440,6 +1817,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: None,
                 session_id: None,
+                turn_id: None,
             })
             .expect("body renders")
         };

@@ -212,6 +212,7 @@ async fn run_provider_web_sidecar(
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: Some(sidecar_session_id.clone()),
         session_id: Some(sidecar_session_id.clone()),
+        turn_id: None,
     };
 
     let credentials = Credentials::load();
