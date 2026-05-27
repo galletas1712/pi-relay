@@ -916,20 +916,22 @@ pre {
 
 .assistant-block {
 	position: relative;
+	display: flex;
+	align-items: flex-end;
+	gap: 8px;
 	overflow-wrap: anywhere;
 	font-size: 15px;
 	line-height: 1.58;
 }
 
-.assistant-block.has-copy {
-	padding-bottom: 28px;
+.assistant-content {
+	min-width: 0;
+	flex: 1 1 auto;
 }
 
 .assistant-copy-button {
-	position: absolute;
-	right: 0;
-	bottom: 0;
 	display: inline-flex;
+	flex: 0 0 auto;
 	align-items: center;
 	justify-content: center;
 	width: 26px;
@@ -1368,23 +1370,42 @@ pre {
 }
 
 .tool-run-head-main {
+	display: flex;
 	min-width: 0;
 	flex: 1 1 auto;
+	flex-wrap: wrap;
+	align-items: center;
+	column-gap: 8px;
+	row-gap: 5px;
+}
+
+.tool-run-title {
+	min-width: 0;
+	flex: 0 1 auto;
+	max-width: 100%;
 }
 
 .tool-run-title,
 .tool-title {
 	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: var(--font-sans);
+	font-weight: 500;
+}
+
+.tool-title {
 	flex: 1 1 auto;
-	overflow-wrap: anywhere;
-	font-weight: 600;
 }
 
 .tool-run-summary {
 	display: flex;
+	flex: 0 0 auto;
 	flex-wrap: wrap;
 	gap: 6px;
-	margin-top: 5px;
+	width: max-content;
+	max-width: 100%;
 	font-family: var(--font-sans);
 	font-weight: 400;
 }
@@ -1472,6 +1493,16 @@ pre {
 	border-top: 1px solid color-mix(in oklch, var(--border) 72%, transparent);
 }
 
+.tool-run-show-link + .tool-run-items {
+	border-top: 1px solid color-mix(in oklch, var(--border) 72%, transparent);
+}
+
+.tool-run-items.scrollable {
+	max-height: 352px;
+	overflow-y: auto;
+	overscroll-behavior: contain;
+}
+
 .tool-run-item + .tool-run-item {
 	border-top: 1px solid color-mix(in oklch, var(--border) 72%, transparent);
 }
@@ -1509,8 +1540,11 @@ pre {
 
 .tool-run-item-title {
 	min-width: 0;
-	overflow-wrap: anywhere;
-	font-weight: 600;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: var(--font-sans);
+	font-weight: 500;
 }
 
 .tool-run-item-status {
@@ -1525,6 +1559,10 @@ pre {
 
 .tool-card.stand-alone {
 	margin: 0;
+}
+
+.tool-card.single-tool {
+	margin: 8px 0;
 }
 
 .tool-card.stand-alone .tool-run-item-toggle {
@@ -1593,12 +1631,14 @@ pre {
 
 .edit-preview-file {
 	color: var(--foreground);
-	font-weight: 600;
+	font-family: var(--font-sans);
+	font-weight: 500;
 	overflow-wrap: anywhere;
 }
 
 .edit-count {
-	font-weight: 600;
+	font-family: var(--font-sans);
+	font-weight: 500;
 }
 
 .edit-count.add {

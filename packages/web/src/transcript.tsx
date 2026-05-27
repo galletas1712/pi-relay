@@ -966,7 +966,8 @@ function inputSummaryFromInput(toolName: string, input: Record<string, unknown> 
 function AssistantCopyButton({ text }: { text: string }) {
 	const [copied, setCopied] = useState(false);
 	const copy = () => {
-		void navigator.clipboard?.writeText(text)
+		void navigator.clipboard
+			?.writeText(text)
 			.then(() => {
 				setCopied(true);
 				window.setTimeout(() => setCopied(false), 1200);
@@ -1034,8 +1035,10 @@ const AssistantTextBlock = memo(function AssistantTextBlock({ node }: { node: Ex
 	return (
 		<div className="message-row assistant-row">
 			<div className={`assistant-block phase-${node.phase} ${node.copyText ? "has-copy" : ""}`}>
-				{node.text ? <MarkdownText text={node.text} /> : null}
-				{node.citations.length ? <CitationList citations={node.citations} /> : null}
+				<div className="assistant-content">
+					{node.text ? <MarkdownText text={node.text} /> : null}
+					{node.citations.length ? <CitationList citations={node.citations} /> : null}
+				</div>
 				{node.copyText ? <AssistantCopyButton text={node.copyText} /> : null}
 			</div>
 		</div>
@@ -1044,11 +1047,11 @@ const AssistantTextBlock = memo(function AssistantTextBlock({ node }: { node: Ex
 
 const ToolRunGroup = memo(function ToolRunGroup({ node }: { node: Extract<TranscriptDisplayNode, { type: "tool_group" }> }) {
 	// Three-mode card: "collapsed" hides every item, "recent" shows just the
-	// last N items with a link to expand, "all" shows every item with a link
-	// to shrink back. The default tracks `isLive` (working → recent, done →
-	// collapsed); once the user touches anything we stash an override so
-	// later state churn (tool statuses changing, new items streaming in)
-	// doesn't blow away their selection — that was the existing bug.
+	// last N items with a link to expand, "all" shows every item in a capped
+	// scrolling list with a link to shrink back. The default tracks `isLive`
+	// (working → recent, done → collapsed); once the user touches anything we
+	// stash an override so later state churn (tool statuses changing, new items
+	// streaming in) doesn't blow away their selection — that was the existing bug.
 	const computedDefault = defaultToolGroupMode(node);
 	const [override, setOverride] = useState<ToolGroupMode | null>(null);
 	const mode: ToolGroupMode = override ?? computedDefault;
@@ -1059,6 +1062,7 @@ const ToolRunGroup = memo(function ToolRunGroup({ node }: { node: Extract<Transc
 	const hiddenCount = Math.max(0, totalItems - recentItems.length);
 	const isOpen = mode !== "collapsed";
 	const visibleItems = mode === "all" ? node.items : recentItems;
+	const scrollItems = mode === "all" && totalItems > 10;
 
 	const handleHeadToggle = useCallback(() => {
 		setOverride(isOpen ? "collapsed" : "recent");
@@ -1067,6 +1071,17 @@ const ToolRunGroup = memo(function ToolRunGroup({ node }: { node: Extract<Transc
 	const handleShowRecent = useCallback(() => setOverride("recent"), []);
 
 	const icon = status === "running" ? <Loader2 className="spin" size={14} /> : <Check size={14} />;
+	const onlyItem = totalItems === 1 ? node.items[0] : null;
+
+	if (onlyItem) {
+		return (
+			<div className="message-row assistant-row">
+				<div className={`tool-card stand-alone single-tool ${onlyItem.statusKind}`}>
+					<ToolRunDetailItem item={onlyItem} />
+				</div>
+			</div>
+		);
+	}
 
 	return (
 		<div className="message-row assistant-row">
@@ -1101,9 +1116,11 @@ const ToolRunGroup = memo(function ToolRunGroup({ node }: { node: Extract<Transc
 								</span>
 							</button>
 						) : null}
-						{visibleItems.map((item) => (
-							<ToolRunDetailItem item={item} key={item.key} />
-						))}
+						<div className={`tool-run-items ${scrollItems ? "scrollable" : ""}`}>
+							{visibleItems.map((item) => (
+								<ToolRunDetailItem item={item} key={item.key} />
+							))}
+						</div>
 					</div>
 				) : null}
 			</div>

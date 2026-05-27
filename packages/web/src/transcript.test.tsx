@@ -195,6 +195,33 @@ describe("ToolOutput", () => {
 	});
 });
 
+describe("MessageList tool use cards", () => {
+	it("renders a single tool directly instead of a grouped Used 1 tool header", () => {
+		const bashTool = { type: "tool_call" as const, id: "call_1", tool_name: "Bash", args_json: "{\"command\":\"ls\"}" };
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[
+					turnStartedEntry("start", 1, 1),
+					userEntryWithParent("user", "start", "inspect"),
+					assistantToolEntry("assistant", "user", [bashTool]),
+					toolResultEntry("result", "assistant", "call_1", "Bash", "ok"),
+					turnFinishedEntry("finish", "result", 1, "Graceful")
+				]}
+				activeLeafId="finish"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain("single-tool");
+		expect(html).toContain("Bash: ls");
+		expect(html).not.toContain("Used 1 tool");
+	});
+});
+
 describe("MessageList Working indicator", () => {
 	it("uses the persisted turn_started timestamp for the running turn", () => {
 		expect(runningTurnStartMs([turnStartedEntry("entry_turn", 1, 1234)])).toBe(1234);
@@ -351,6 +378,33 @@ function assistantEntry(id: string, parentId: string | null, text: string): Tran
 		parent_id: parentId,
 		timestamp_ms: 0,
 		item: { type: "assistant_message", items: [{ type: "text", text }] },
+		provider_replay: []
+	};
+}
+
+function assistantToolEntry(id: string, parentId: string | null, items: AssistantItem[]): TranscriptEntry {
+	return {
+		id,
+		parent_id: parentId,
+		timestamp_ms: 0,
+		item: { type: "assistant_message", items },
+		provider_replay: []
+	};
+}
+
+function toolResultEntry(
+	id: string,
+	parentId: string | null,
+	toolCallId: string,
+	toolName: string,
+	output: string,
+	status: "Success" | "Error" | "Interrupted" | "Crashed" = "Success",
+): TranscriptEntry {
+	return {
+		id,
+		parent_id: parentId,
+		timestamp_ms: 0,
+		item: { type: "tool_result", tool_call_id: toolCallId, tool_name: toolName, output, status },
 		provider_replay: []
 	};
 }
