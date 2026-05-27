@@ -12,7 +12,7 @@ use crate::registry::AgentTool;
 
 /// Single shell tool, registered as `Bash` for both providers.
 ///
-/// Each call runs in a fresh `sh -lc` subprocess rooted at the session
+/// Each call runs in a fresh `bash -lc` subprocess rooted at the session
 /// current working directory. There is no persistent shell state across calls and no
 /// per-call working-directory override — the model is told to chain with
 /// `&&` (or call `cd` inside the command) when it needs to scope work to a
@@ -53,7 +53,7 @@ impl AgentTool for BashTool {
                             { "type": "string" },
                             { "type": "array", "items": { "type": "string" } }
                         ],
-                        "description": "Shell command to execute. Either a single string (run via `sh -lc`) or an argv array (executed directly)."
+                        "description": "Shell command to execute. Either a single string (run via `bash -lc`) or an argv array (executed directly)."
                     },
                     "timeout_ms": {
                         "type": "integer",
@@ -87,7 +87,7 @@ async fn run_bash(
         .unwrap_or(ctx.timeout);
     let mut command = match args.command {
         ShellCommand::Text(command) => {
-            let mut process = tokio::process::Command::new("sh");
+            let mut process = tokio::process::Command::new("bash");
             process.arg("-lc").arg(command);
             process
         }
@@ -119,4 +119,81 @@ async fn run_bash(
         ToolResultMessage::error(call.id.clone(), &call.tool_name, text)
     };
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use agent_vocab::{ToolCallId, ToolResultMessage};
+    use serde_json::json;
+
+    use super::*;
+
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+    fn workspace() -> PathBuf {
+        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("pi-relay-bash-{}-{id}", std::process::id()));
+        fs::create_dir_all(&path).expect("create temp workspace");
+        path
+    }
+
+    fn text_call(command: &str) -> ToolCall {
+        ToolCall {
+            id: ToolCallId("call_bash".to_string()),
+            tool_name: "Bash".to_string(),
+            args_json: json!({ "command": command }).to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn text_commands_run_with_bash_semantics() {
+        let root = workspace();
+        let ctx = ToolContext::new(&root);
+
+        let result = BashTool
+            .execute(
+                &text_call(r#"[[ -n "${BASH_VERSION:-}" ]] && printf 'bash\n'"#),
+                &ctx,
+            )
+            .await
+            .expect("bash execution succeeds");
+
+        assert_eq!(
+            result,
+            ToolResultMessage::success(
+                ToolCallId("call_bash".to_string()),
+                "Bash",
+                "exit: exit status: 0\nstdout:\nbash\n\nstderr:\n",
+            )
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn text_commands_do_not_enable_strict_mode() {
+        let root = workspace();
+        let ctx = ToolContext::new(&root);
+
+        let result = BashTool
+            .execute(
+                &text_call("printf 'before\\n'; false; printf 'after\\n'"),
+                &ctx,
+            )
+            .await
+            .expect("bash execution succeeds");
+
+        assert_eq!(
+            result,
+            ToolResultMessage::success(
+                ToolCallId("call_bash".to_string()),
+                "Bash",
+                "exit: exit status: 0\nstdout:\nbefore\nafter\n\nstderr:\n",
+            )
+        );
+        fs::remove_dir_all(root).ok();
+    }
 }

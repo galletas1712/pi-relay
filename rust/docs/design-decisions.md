@@ -358,7 +358,7 @@ Coding tools split into two posture buckets:
 - **Uniform custom function tools** for `bash` and `grep`. Both providers see
   the same JSON-schema function tool, generated from a single builtin
   definition in `agent-tools`. The pi-relay runtime is stateless per call
-  (fresh `sh -lc` per `bash` invocation, fresh `rg` per `grep` invocation),
+  (fresh `bash -lc` per `bash` invocation, fresh `rg` per `grep` invocation),
   so the model-facing contract should match what the runtime can actually
   honor. Using Anthropic's native `bash_20250124` would have advertised a
   persistent shell session with a `restart` op that the runtime does not
