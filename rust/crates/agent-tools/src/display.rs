@@ -226,7 +226,7 @@ mod tests {
             tool_display(
                 "Bash",
                 ToolDisplayInput::LocalTool,
-                Some(&json!({ "command": ["pwd"] })),
+                Some(&json!({ "command": "pwd" })),
             ),
             Some(ReplayDisplay {
                 kind: ReplayDisplayKind::LocalTool,
