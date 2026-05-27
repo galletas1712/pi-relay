@@ -22,18 +22,11 @@ pub struct BashTool;
 
 #[derive(Debug, Deserialize)]
 struct BashArgs {
-    command: ShellCommand,
+    command: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
     max_output_tokens: Option<usize>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ShellCommand {
-    Text(String),
-    Argv(Vec<String>),
 }
 
 #[async_trait]
@@ -49,11 +42,8 @@ impl AgentTool for BashTool {
                 "type": "object",
                 "properties": {
                     "command": {
-                        "oneOf": [
-                            { "type": "string" },
-                            { "type": "array", "items": { "type": "string" } }
-                        ],
-                        "description": "Shell command to execute. Either a single string (run via `bash -lc`) or an argv array (executed directly)."
+                        "type": "string",
+                        "description": "Shell command to execute via `bash -lc`."
                     },
                     "timeout_ms": {
                         "type": "integer",
@@ -85,23 +75,8 @@ async fn run_bash(
         .timeout_ms
         .map(Duration::from_millis)
         .unwrap_or(ctx.timeout);
-    let mut command = match args.command {
-        ShellCommand::Text(command) => {
-            let mut process = tokio::process::Command::new("bash");
-            process.arg("-lc").arg(command);
-            process
-        }
-        ShellCommand::Argv(argv) => {
-            let Some((program, argv)) = argv.split_first() else {
-                return Err(ToolError::InvalidInput(
-                    "bash command argv cannot be empty".to_string(),
-                ));
-            };
-            let mut process = tokio::process::Command::new(program);
-            process.args(argv);
-            process
-        }
-    };
+    let mut command = tokio::process::Command::new("bash");
+    command.arg("-lc").arg(args.command);
     command.current_dir(&ctx.cwd);
     let output = tokio::time::timeout(timeout, command.output())
         .await
@@ -147,6 +122,19 @@ mod tests {
             tool_name: "Bash".to_string(),
             args_json: json!({ "command": command }).to_string(),
         }
+    }
+
+    #[test]
+    fn definition_advertises_string_command_only() {
+        let definition = BashTool.definition();
+
+        assert_eq!(
+            definition.input_schema["properties"]["command"]["type"],
+            "string"
+        );
+        assert!(definition.input_schema["properties"]["command"]
+            .get("oneOf")
+            .is_none());
     }
 
     #[tokio::test]

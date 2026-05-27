@@ -2040,7 +2040,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
     fn responses_sse_parses_custom_and_function_calls() {
         let sse = r#"data: {"type":"response.output_item.done","item":{"type":"custom_tool_call","call_id":"call_patch","name":"apply_patch","input":"*** Begin Patch\n*** End Patch\n"}}
 
-data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_bash","name":"Bash","arguments":"{\"command\":[\"pwd\"],\"timeout_ms\":120000}","status":"completed"}}
+data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_bash","name":"Bash","arguments":"{\"command\":\"pwd\",\"timeout_ms\":120000}","status":"completed"}}
 
 data: {"type":"response.completed","response":{"id":"resp_1"}}
 "#;
@@ -2055,7 +2055,7 @@ data: {"type":"response.completed","response":{"id":"resp_1"}}
             "*** Begin Patch\n*** End Patch\n"
         );
         assert_eq!(calls[1].tool_name, "Bash");
-        assert_eq!(calls[1].args_value().unwrap()["command"], json!(["pwd"]));
+        assert_eq!(calls[1].args_value().unwrap()["command"], "pwd");
         assert_eq!(calls[1].args_value().unwrap()["timeout_ms"], 120000);
     }
 
