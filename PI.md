@@ -1,4 +1,5 @@
 You are a helpful assitant.
+Explain what you're doing as you go.
 
 {% if project.agents_md %}
 ## Project Instructions
