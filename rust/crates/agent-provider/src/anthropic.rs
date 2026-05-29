@@ -92,8 +92,10 @@ fn anthropic_capabilities(model: &str) -> AnthropicModelCapabilities {
     let model = model.to_ascii_lowercase();
     let is_claude_4 = model.contains("claude-")
         && (model.contains("opus-4") || model.contains("sonnet-4") || model.contains("haiku-4"));
-    let is_adaptive =
-        model.contains("opus-4-6") || model.contains("sonnet-4-6") || model.contains("opus-4-7");
+    let is_adaptive = model.contains("opus-4-6")
+        || model.contains("sonnet-4-6")
+        || model.contains("opus-4-7")
+        || model.contains("opus-4-8");
     AnthropicModelCapabilities {
         adaptive_thinking: is_adaptive,
         context_management: is_claude_4,
@@ -333,12 +335,13 @@ fn anthropic_reasoning_effort(
     model: &str,
     effort: ReasoningEffort,
 ) -> ProviderResult<&'static str> {
+    let model = model.to_ascii_lowercase();
     match effort {
         ReasoningEffort::Low
         | ReasoningEffort::Medium
         | ReasoningEffort::High
         | ReasoningEffort::Max => Ok(effort.as_str()),
-        ReasoningEffort::XHigh if model.to_ascii_lowercase().contains("opus-4-7") => {
+        ReasoningEffort::XHigh if model.contains("opus-4-7") || model.contains("opus-4-8") => {
             Ok(effort.as_str())
         }
         ReasoningEffort::XHigh => Ok("high"),
@@ -1244,7 +1247,7 @@ mod tests {
     #[test]
     fn messages_body_enables_adaptive_thinking_for_adaptive_models() {
         let body = messages_body(ModelRequest {
-            model: "claude-opus-4-7".to_string(),
+            model: "claude-opus-4-8".to_string(),
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::CustomDefinitions,
@@ -1279,7 +1282,7 @@ mod tests {
         assert!(legacy.contains(CONTEXT_MANAGEMENT_BETA));
         assert!(!legacy.contains(EFFORT_BETA));
 
-        let adaptive = anthropic_beta_header("claude-opus-4-7");
+        let adaptive = anthropic_beta_header("claude-opus-4-8");
         assert!(!adaptive.contains(INTERLEAVED_THINKING_BETA));
         assert!(adaptive.contains(CONTEXT_MANAGEMENT_BETA));
         assert!(adaptive.contains(EFFORT_BETA));

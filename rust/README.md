@@ -78,7 +78,7 @@ Session provider config supports `reasoning_effort`, an optional explicit
 `max_tokens` cap, and `prompt_cache: { "key": "..." }`. OpenAI accepts
 `none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; Claude accepts `low`,
 `medium`, `high`, `xhigh`, and `max`. The daemon does not add a default OpenAI output
-cap. Claude Opus 4.7 uses adaptive thinking with `output_config.effort` and a
+cap. Claude Opus 4.8 uses adaptive thinking with `output_config.effort` and a
 64k default `max_tokens` value because the Messages API requires that field.
 The model system prompt is rendered from the repo-level `PI.md` template. Project-specific instructions enter through `AGENTS.md` files in the session's workspace checkouts, which `PI.md` composes explicitly. The daemon does not inject date, time, or cwd unless the template asks for it.
 

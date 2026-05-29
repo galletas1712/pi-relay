@@ -127,7 +127,7 @@ set an OpenAI output cap.
 
 `reasoning_effort` defaults to `xhigh`. OpenAI currently accepts `none`,
 `minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay. Claude accepts
-`low`, `medium`, `high`, `xhigh`, and `max`; Claude Opus 4.7 requests are sent
+`low`, `medium`, `high`, `xhigh`, and `max`; Claude Opus 4.8 requests are sent
 with adaptive thinking and `output_config.effort`.
 
 ### `daemon_config`
