@@ -183,6 +183,28 @@ describe("MessageList markdown code rendering", () => {
 		expect(html).not.toContain("code-language-label");
 		expect(html).toContain("hljs-keyword");
 	});
+
+	it("renders ```mermaid fences with the diagram placeholder instead of a raw code block", () => {
+		const diagram = "flowchart LR\n  A --> B";
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[assistantEntry("assistant", null, "Here is a diagram:\n\n```mermaid\n" + diagram + "\n```")]}
+				activeLeafId="assistant"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		// SSR renders before the client effect runs, so we expect the source
+		// fallback (not the syntax-highlighted .hljs version) wrapped in a
+		// `.mermaid-source` <pre>, and no <code class="hljs ..."> wrapper.
+		expect(html).toContain("mermaid-source");
+		expect(html).toContain("flowchart LR");
+		expect(html).not.toContain("hljs language-mermaid");
+	});
 });
 
 describe("ToolOutput", () => {

@@ -1145,6 +1145,30 @@ pre {
 	margin: 1em 0;
 }
 
+.assistant-markdown .mermaid-diagram {
+	display: block;
+	margin: 0.5em 0;
+	padding: 12px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--card);
+	overflow-x: auto;
+	text-align: center;
+}
+
+.assistant-markdown .mermaid-diagram svg {
+	max-width: 100%;
+	height: auto;
+}
+
+.assistant-markdown .mermaid-source {
+	position: relative;
+}
+
+.assistant-markdown .mermaid-source-error {
+	border-color: color-mix(in oklch, var(--destructive) 50%, var(--border));
+}
+
 .citation-list {
 	display: flex;
 	flex-wrap: wrap;

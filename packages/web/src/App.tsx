@@ -27,6 +27,7 @@ import { queryKeys } from "./queryKeys.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
+import { markdownComponents } from "./transcript.tsx";
 import {
 	applyActiveBranchSync,
 	mergeSnapshotIntoSessionList,
@@ -1770,13 +1771,7 @@ const MarkdownView = memo(function MarkdownView({ text }: { text: string }) {
 			<ReactMarkdown
 				rehypePlugins={[rehypeRaw]}
 				remarkPlugins={[remarkGfm]}
-				components={{
-					a: ({ href, children, ...props }) => (
-						<a href={href} target="_blank" rel="noreferrer" {...props}>
-							{children}
-						</a>
-					)
-				}}
+				components={markdownComponents}
 			>
 				{text}
 			</ReactMarkdown>
