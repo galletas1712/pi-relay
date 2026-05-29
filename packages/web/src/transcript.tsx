@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type UIEvent } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type UIEvent } from "react";
 import { AlertTriangle, Check, ChevronDown, Copy, Loader2, RotateCcw, Terminal } from "lucide-react";
 import rehypeRaw from "rehype-raw";
 import rehypeHighlight from "rehype-highlight";
@@ -6,6 +6,7 @@ import ReactMarkdown from "react-markdown";
 import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { branchEntriesFor } from "./historyTargets.ts";
+import { MermaidBlock } from "./mermaidBlock.tsx";
 import { citationsFromReplay, hostedToolsFromReplay, localToolCallIdFromReplay, parsedProviderReplay, replayContainsAssistantText } from "./providerReplay.ts";
 import type { HostedToolView, SourceCitation } from "./providerReplay.ts";
 import type { PendingTranscriptInput } from "./pendingInputs.ts";
@@ -981,13 +982,59 @@ function AssistantCopyButton({ text }: { text: string }) {
 	);
 }
 
-const markdownComponents: Components = {
+const MERMAID_LANGUAGE_CLASS = "language-mermaid";
+
+function isMermaidLanguageClass(className: unknown): boolean {
+	if (typeof className !== "string") return false;
+	return className.split(/\s+/).includes(MERMAID_LANGUAGE_CLASS);
+}
+
+function preWrapsMermaid(node: unknown): boolean {
+	if (!node || typeof node !== "object") return false;
+	const children = (node as { children?: Array<{ tagName?: string; properties?: { className?: unknown } }> }).children;
+	if (!Array.isArray(children) || children.length === 0) return false;
+	const first = children[0];
+	if (first?.tagName !== "code") return false;
+	const className = first.properties?.className;
+	if (Array.isArray(className)) {
+		return className.some((entry) => entry === MERMAID_LANGUAGE_CLASS);
+	}
+	return isMermaidLanguageClass(className);
+}
+
+function codeChildrenToString(children: ReactNode): string {
+	if (typeof children === "string") return children;
+	if (Array.isArray(children)) return children.map(codeChildrenToString).join("");
+	if (children && typeof children === "object" && "props" in children) {
+		const inner = (children as { props?: { children?: ReactNode } }).props?.children;
+		return codeChildrenToString(inner);
+	}
+	return "";
+}
+
+export const markdownComponents: Components = {
 	a: ({ href, children, ...props }) => (
 		<a href={href} target="_blank" rel="noreferrer" {...props}>
 			{children}
 		</a>
 	),
+	code: ({ node: _node, className, children, ...props }) => {
+		if (isMermaidLanguageClass(className)) {
+			const source = codeChildrenToString(children).replace(/\n$/, "");
+			return <MermaidBlock code={source} />;
+		}
+		return (
+			<code className={className} {...props}>
+				{children}
+			</code>
+		);
+	},
 	pre: ({ node, children, ...props }) => {
+		if (preWrapsMermaid(node)) {
+			// The child <code> override already returns a MermaidBlock; render
+			// it directly so the SVG isn't trapped inside a <pre>.
+			return <>{children}</>;
+		}
 		return (
 			<pre {...props}>
 				{children}
