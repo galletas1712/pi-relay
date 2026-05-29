@@ -11,6 +11,7 @@ pub(crate) fn context_window(provider: ProviderKind, model: &str) -> Option<usiz
             _ => None,
         },
         ProviderKind::Claude => match model {
+            "claude-opus-4-8" => Some(1_000_000),
             "claude-opus-4-7" => Some(1_000_000),
             "claude-sonnet-4-5" => Some(200_000),
             _ => None,
@@ -41,7 +42,7 @@ mod tests {
     #[test]
     fn known_claude_models_have_defaults() {
         assert_eq!(
-            context_window(ProviderKind::Claude, "claude-opus-4-7"),
+            context_window(ProviderKind::Claude, "claude-opus-4-8"),
             Some(1_000_000)
         );
         assert_eq!(

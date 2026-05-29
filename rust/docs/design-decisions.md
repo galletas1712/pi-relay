@@ -337,7 +337,7 @@ prefix-adjacent prompt for little value.
 
 The daemon also no longer imposes a default OpenAI/Codex output-token cap.
 `provider.max_tokens` remains an optional explicit cap if a particular session
-needs one. Claude Opus 4.7 uses adaptive thinking with `output_config.effort`;
+needs one. Claude Opus 4.8 uses adaptive thinking with `output_config.effort`;
 the provider sends a 64k `max_tokens` fallback because the Messages API requires
 that field and Anthropic recommends a large cap for `xhigh`/`max`.
 
