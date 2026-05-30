@@ -387,3 +387,13 @@ first and display a picker loading state while that capability is fetched.
   It keeps React state and the synchronous async-flow ref in one place
   (`replace`/`reset`/`update`) so App no longer hand-mirrors
   `setSelectedCache(...)` with `selectedCacheRef.current = ...` at each callsite.
+- Post-merge UX pitfall: the first selected-cache wiring still treated every
+  known event as a selected-session refresh hint. Busy turns emit many
+  action/model/tool/transcript side-channel events, so the header could flicker
+  between `refreshing` and settled even though the normalized cache had enough
+  data to stay current. The frontend now keeps `session.get(active_branch)` as
+  the fallback only for selected-session events whose canonical projection is
+  not otherwise available (`session.idle`, recovery/config/history/compaction
+  transitions, plus unknown events). Queue projections, append events, and
+  activity hints are merged locally, and overlapping selected refreshes are
+  coalesced per session.

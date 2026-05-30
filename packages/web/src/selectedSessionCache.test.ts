@@ -7,6 +7,7 @@ import {
 	applyTranscriptAppendedEvent,
 	applyTreeIndex,
 	emptySelectedSessionCache,
+	mergeSessionActivityEvent,
 	selectedEntries,
 	treeNodesInOrder,
 } from "./selectedSessionCache.ts";
@@ -49,6 +50,17 @@ describe("selected session cache", () => {
 		expect(newer.snapshot?.queued_inputs.map((input) => input.input_id)).toEqual(["input_1"]);
 		expect(stale.snapshot?.queue_revision).toBe(3);
 		expect(stale.snapshot?.queued_inputs.map((input) => input.input_id)).toEqual(["input_1"]);
+	});
+
+	it("merges activity hints from thin events without a full selected-session refresh", () => {
+		const first = entry("entry_1", null, "first", 1);
+		const cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([first], { lastEventId: 4 }));
+
+		const next = mergeSessionActivityEvent(cache, sessionId, 7, "running");
+
+		expect(next.snapshot?.activity).toBe("running");
+		expect(next.snapshot?.last_event_id).toBe(7);
+		expect(selectedEntries(next).map((candidate) => candidate.id)).toEqual(["entry_1"]);
 	});
 
 	it("accumulates contiguous tree-index pages for the same revision", () => {

@@ -157,6 +157,24 @@ export function applyEventHighWater(cache: SelectedSessionCache, sessionId: stri
 	};
 }
 
+export function mergeSessionActivityEvent(
+	cache: SelectedSessionCache,
+	sessionId: string,
+	eventId: number,
+	activity: SessionSnapshot["activity"],
+): SelectedSessionCache {
+	if (cache.sessionId !== sessionId || !cache.snapshot) return cache;
+	return {
+		...cache,
+		snapshot: {
+			...cache.snapshot,
+			activity,
+			last_event_id: Math.max(cache.snapshot.last_event_id, eventId),
+			entries: cache.snapshot.entries ?? selectedEntries(cache),
+		},
+	};
+}
+
 export function applySwitchResultToCache(
 	cache: SelectedSessionCache,
 	result: {

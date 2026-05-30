@@ -43,6 +43,7 @@ import {
 	applyTranscriptAppendedEvent,
 	applyTreeIndex,
 	emptySelectedSessionCache,
+	mergeSessionActivityEvent,
 	queueProjectionFromEvent,
 	selectedEntries,
 	treeNodesInOrder,
@@ -271,6 +272,7 @@ export function App() {
 	const subscribedEventSessionIds = useRef(new Set<string>());
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
 	const selectedLoadVersion = useRef(0);
+	const selectedRefreshInFlight = useRef(new Map<string, Promise<{ snapshot: SessionSnapshot; entries: TranscriptEntry[] } | null>>());
 
 	const pushNotice = useCallback((tone: Notice["tone"], text: string) => {
 		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_NOTICES + 1)), { id: randomId("notice"), tone, text }]);
@@ -515,6 +517,8 @@ export function App() {
 	const refreshSelectedSessionState = useCallback(
 		async (sessionId: string) => {
 			if (sessionId !== selectedRef.current) return null;
+			const inFlight = selectedRefreshInFlight.current.get(sessionId);
+			if (inFlight) return inFlight;
 			const currentSnapshot = selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current.snapshot : null;
 			setSelectedFetchState({
 				sessionId,
@@ -522,7 +526,7 @@ export function App() {
 				refreshing: !!currentSnapshot,
 				error: null,
 			});
-			try {
+			const request = (async () => {
 				const result = await getFreshSession(sessionId);
 				if (selectedRef.current === sessionId) {
 					setSelectedFetchState({
@@ -533,7 +537,7 @@ export function App() {
 					});
 				}
 				return result;
-			} catch (error) {
+			})().catch((error) => {
 				if (selectedRef.current === sessionId) {
 					setSelectedFetchState({
 						sessionId,
@@ -543,7 +547,13 @@ export function App() {
 					});
 				}
 				throw error;
-			}
+			}).finally(() => {
+				if (selectedRefreshInFlight.current.get(sessionId) === request) {
+					selectedRefreshInFlight.current.delete(sessionId);
+				}
+			});
+			selectedRefreshInFlight.current.set(sessionId, request);
+			return request;
 		},
 		[getFreshSession],
 	);
@@ -694,13 +704,17 @@ export function App() {
 							current.filter((input) => input.sessionId !== event.session_id || !pendingInputIsReflected(input, applied.cache.snapshot!)),
 						);
 					}
-					shouldSyncSelected = applied.result === "applied" ? false : shouldSyncSelected;
+					shouldSyncSelected = applied.result === "refresh";
 				} else if (isTranscriptSideChannelEvent(event)) {
 					const entryId = eventEntryId(event);
 					if (entryId && selectedCacheRef.current.entriesById.has(entryId)) {
 						replaceSelectedCache(applyEventHighWater(selectedCacheRef.current, event.session_id, event.event_id));
-						shouldSyncSelected = false;
 					}
+					shouldSyncSelected = false;
+				}
+				const activity = activityFromEvent(event);
+				if (activity) {
+					replaceSelectedCache(mergeSessionActivityEvent(selectedCacheRef.current, event.session_id, event.event_id, activity));
 				}
 			}
 			if (shouldSyncSelected) scheduleActiveBranchSync(event.session_id);

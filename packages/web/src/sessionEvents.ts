@@ -35,9 +35,28 @@ const SESSION_LIST_REFRESH_EVENTS = new Set([
 	"turn.finished",
 ]);
 
+const SELECTED_SESSION_REFRESH_EVENTS = new Set([
+	"session.configured",
+	"session.recovered",
+	"session.idle",
+	"session.work_cancelled",
+	"history.switched",
+	"history.compacted",
+	"compaction.requested",
+	"compaction.completed",
+	"compaction.error",
+]);
+
+const KNOWN_SESSION_EVENTS = new Set([
+	...SESSION_LIST_REFRESH_EVENTS,
+	"transcript.appended",
+	"turn.started",
+	"assistant.message",
+]);
+
 export function refreshPlanForEvent(event: Pick<EventFrame, "event">): SessionEventRefreshPlan {
 	return {
-		syncSelected: true,
+		syncSelected: SELECTED_SESSION_REFRESH_EVENTS.has(event.event) || !KNOWN_SESSION_EVENTS.has(event.event),
 		refreshList: SESSION_LIST_REFRESH_EVENTS.has(event.event),
 	};
 }
