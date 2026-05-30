@@ -397,11 +397,3 @@ first and display a picker loading state while that capability is fetched.
   transitions, plus unknown events). Queue projections, append events, and
   activity hints are merged locally, and overlapping selected refreshes are
   coalesced per session.
-- Mobile/browser suspend pitfall: a disconnected tab can miss the very first
-  append events for a brand-new session. Before the full `transcript.index` has
-  ever been loaded, append events form the only compact topology cache; the
-  reducer now accepts contiguous append nodes from sequence 1 onward instead of
-  waiting for a later explicit index fetch. Accepted optimistic transcript
-  bubbles also expire after a short grace period if canonical state still has
-  not matched them, so a missed follow-up append cannot leave a duplicate
-  `syncing...` shadow bubble until page reload.

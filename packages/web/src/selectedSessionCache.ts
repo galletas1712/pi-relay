@@ -1,12 +1,10 @@
 import { branchEntriesFor } from "./historyTargets.ts";
-import { contentBlocksToText } from "./text.ts";
 import type {
 	EventFrame,
 	QueueProjection,
 	QueuedInput,
 	SessionSnapshot,
 	TranscriptEntry,
-	TranscriptItem,
 	TranscriptTreeIndex,
 	TranscriptTreeNode,
 } from "./types.ts";
@@ -73,29 +71,13 @@ export function applySelectedSnapshot(cache: SelectedSessionCache, snapshot: Ses
 		base.treeTranscriptRevision !== null &&
 		snapshotTranscriptRevision !== null &&
 		base.treeTranscriptRevision !== snapshotTranscriptRevision;
-	const treeBase = treeRevisionChanged ? emptySelectedSessionCache(snapshot.session_id) : base;
-	const treeNodesById = new Map(treeBase.treeNodesById);
-	for (const entry of entries) {
-		const node = treeNodeFromEntry(entry);
-		if (node) treeNodesById.set(node.id, node);
-	}
-	const treeOrder = Array.from(treeNodesById.values())
-		.sort((left, right) => left.sequence - right.sequence)
-		.map((node) => node.id);
-	const treeChildrenByParentId = buildTreeChildren(treeOrder, treeNodesById);
-	const treeMaxSequence = Math.max(treeBase.treeMaxSequence, ...Array.from(treeNodesById.values(), (node) => node.sequence), 0);
 	return {
 		...base,
 		sessionId: snapshot.session_id,
 		snapshot: { ...snapshot, entries },
 		activeBranchEntryIds: entries.map((entry) => entry.id),
 		entriesById,
-		treeNodesById,
-		treeChildrenByParentId,
-		treeOrder,
-		treeTranscriptRevision: snapshotTranscriptRevision ?? treeBase.treeTranscriptRevision,
-		treeLoadedPrefixSequence: contiguousTreePrefix(treeNodesById),
-		treeMaxSequence,
+		treeTranscriptRevision: treeRevisionChanged ? snapshotTranscriptRevision : base.treeTranscriptRevision,
 		treeComplete: treeRevisionChanged ? false : base.treeComplete,
 		loading: false,
 		refreshing: false,
@@ -328,56 +310,14 @@ function buildTreeChildren(order: string[], byId: Map<string, TranscriptTreeNode
 	return children;
 }
 
-function contiguousTreePrefix(byId: Map<string, TranscriptTreeNode>): number {
-	const sequences = new Set(Array.from(byId.values(), (node) => node.sequence));
-	let prefix = 0;
-	while (sequences.has(prefix + 1)) prefix += 1;
-	return prefix;
-}
-
-function treeNodeFromEntry(entry: TranscriptEntry): TranscriptTreeNode | null {
-	const sequence = numberValue(entry.sequence);
-	if (sequence === null) return null;
-	return {
-		id: entry.id,
-		parent_id: entry.parent_id,
-		timestamp_ms: entry.timestamp_ms,
-		sequence,
-		item_type: entry.item.type,
-		turn_id: turnIdFromItem(entry.item),
-		outcome: entry.item.type === "turn_finished" ? entry.item.outcome : null,
-		can_switch_to: entry.item.type === "turn_finished" || entry.item.type === "compaction_summary",
-		edit_target_leaf_id: null,
-		display_hint: displayHintFromItem(entry.item),
-	};
-}
-
-function turnIdFromItem(item: TranscriptItem): number | null {
-	if (item.type === "turn_started" || item.type === "tool_call_started" || item.type === "turn_finished") return item.turn_id;
-	if (item.type === "compaction_summary") return item.last_turn_id;
-	return null;
-}
-
-function displayHintFromItem(item: TranscriptItem): string | null {
-	if (item.type === "turn_started") return `start turn ${item.turn_id}`;
-	if (item.type === "user_message") return contentBlocksToText(item.content);
-	if (item.type === "assistant_message") {
-		return item.items.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
-	}
-	if (item.type === "tool_call_started") return `tool call: ${item.tool_call.tool_name}`;
-	if (item.type === "tool_result") return `${item.tool_name}: ${item.output}`;
-	if (item.type === "turn_finished") return `${item.outcome} turn boundary for turn ${item.turn_id}`;
-	if (item.type === "compaction_summary") return item.summary;
-	return null;
-}
-
 function applyTreeNodeFromEvent(cache: SelectedSessionCache, event: EventFrame): Partial<SelectedSessionCache> {
 	const node = transcriptTreeNodeFromUnknown(event.data.tree_node);
 	if (!node) return {};
 	const revision = numberValue(event.data.transcript_revision) ?? cache.treeTranscriptRevision;
-	const updatesLoadedPrefix = node.sequence <= cache.treeLoadedPrefixSequence;
-	const extendsLoadedPrefix = node.sequence === cache.treeLoadedPrefixSequence + 1;
-	const canMergeNode = updatesLoadedPrefix || extendsLoadedPrefix;
+	const canMergeNode =
+		cache.treeTranscriptRevision === null ||
+		cache.treeComplete ||
+		node.sequence <= cache.treeLoadedPrefixSequence;
 	if (!canMergeNode) {
 		return {
 			treeTranscriptRevision: revision,
@@ -395,7 +335,7 @@ function applyTreeNodeFromEvent(cache: SelectedSessionCache, event: EventFrame):
 		treeChildrenByParentId: buildTreeChildren(treeOrder, treeNodesById),
 		treeOrder,
 		treeTranscriptRevision: revision,
-		treeLoadedPrefixSequence: extendsLoadedPrefix
+		treeLoadedPrefixSequence: cache.treeComplete
 			? Math.max(cache.treeLoadedPrefixSequence, node.sequence)
 			: cache.treeLoadedPrefixSequence,
 		treeMaxSequence: Math.max(cache.treeMaxSequence, node.sequence),

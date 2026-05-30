@@ -42,21 +42,15 @@ export function queuedInputFromPending(input: PendingInput): QueuePaneInput {
 	};
 }
 
-export function pendingInputIsReflected(input: PendingInput, snapshot: SessionSnapshot, nowMs = Date.now()): boolean {
+export function pendingInputIsReflected(input: PendingInput, snapshot: SessionSnapshot): boolean {
 	if (snapshot.queued_inputs.some((queued) => queuedInputMatchesPending(queued, input))) return true;
 	const fingerprint = contentFingerprint(input.content);
-	const entries = snapshot.entries ?? [];
-	if (
-		entries.some(
-			(entry) =>
-				entry.item.type === "user_message" &&
-				entry.timestamp_ms >= input.submittedAt - 10_000 &&
-				contentFingerprint(entry.item.content) === fingerprint,
-		)
-	) {
-		return true;
-	}
-	return input.status === "accepted" && nowMs - input.submittedAt > 10_000;
+	return (snapshot.entries ?? []).some(
+		(entry) =>
+			entry.item.type === "user_message" &&
+			entry.timestamp_ms >= input.submittedAt - 10_000 &&
+			contentFingerprint(entry.item.content) === fingerprint,
+	);
 }
 
 export function pendingInputMatchesEvent(input: PendingInput, event: EventFrame): boolean {
