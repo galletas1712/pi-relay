@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type RefObject, type SetStateAction } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { Menu, PanelRightOpen, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
@@ -48,6 +48,7 @@ import {
 	treeNodesInOrder,
 	type SelectedSessionCache,
 } from "./selectedSessionCache.ts";
+import { useSelectedSessionStore } from "./selectedSessionStore.ts";
 import {
 	DEFAULT_PROVIDER,
 	MODEL_OPTIONS,
@@ -247,7 +248,13 @@ export function App() {
 	const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
 	const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
 	const [promptDialog, setPromptDialog] = useState<PromptDialogState | null>(null);
-	const [selectedCache, setSelectedCache] = useState<SelectedSessionCache>(() => emptySelectedSessionCache(initialUiSelection.sessionId));
+	const {
+		cache: selectedCache,
+		cacheRef: selectedCacheRef,
+		replace: replaceSelectedCache,
+		reset: resetSelectedCache,
+		update: updateSelectedCache,
+	} = useSelectedSessionStore(initialUiSelection.sessionId);
 	const [selectedFetchState, setSelectedFetchState] = useState<{ sessionId: string | null; loading: boolean; refreshing: boolean; error: string | null }>({
 		sessionId: initialUiSelection.sessionId,
 		loading: !!initialUiSelection.sessionId,
@@ -263,7 +270,6 @@ export function App() {
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
-	const selectedCacheRef = useRef<SelectedSessionCache>(selectedCache);
 	const selectedLoadVersion = useRef(0);
 
 	const pushNotice = useCallback((tone: Notice["tone"], text: string) => {
@@ -273,10 +279,6 @@ export function App() {
 	useEffect(() => {
 		if (selectedRef.current !== selectedId) selectedRef.current = selectedId;
 	}, [selectedId]);
-
-	useEffect(() => {
-		selectedCacheRef.current = selectedCache;
-	}, [selectedCache]);
 
 	useEffect(() => {
 		if (selectedProjectRef.current !== selectedProjectId) selectedProjectRef.current = selectedProjectId;
@@ -389,8 +391,7 @@ export function App() {
 		selectedRef.current = sessionId;
 		setSelectedId(sessionId);
 		selectedLoadVersion.current += 1;
-		setSelectedCache(emptySelectedSessionCache(sessionId));
-		selectedCacheRef.current = emptySelectedSessionCache(sessionId);
+		resetSelectedCache(sessionId);
 		setSelectedFetchState({
 			sessionId,
 			loading: !!sessionId,
@@ -398,7 +399,7 @@ export function App() {
 			error: null,
 		});
 		rememberSelectedSession(selectedProjectRef.current, sessionId);
-	}, []);
+	}, [resetSelectedCache]);
 
 	const selectProjectSession = useCallback((projectId: string | null, sessionId: string | null) => {
 		selectedProjectRef.current = projectId;
@@ -406,8 +407,7 @@ export function App() {
 		setSelectedProjectId(projectId);
 		setSelectedId(sessionId);
 		selectedLoadVersion.current += 1;
-		setSelectedCache(emptySelectedSessionCache(sessionId));
-		selectedCacheRef.current = emptySelectedSessionCache(sessionId);
+		resetSelectedCache(sessionId);
 		setSelectedFetchState({
 			sessionId,
 			loading: !!sessionId,
@@ -415,7 +415,7 @@ export function App() {
 			error: null,
 		});
 		rememberUiSelection(projectId, sessionId);
-	}, []);
+	}, [resetSelectedCache]);
 
 	const invalidateSessionList = useCallback(
 		(projectId = selectedProjectRef.current) => {
@@ -466,11 +466,9 @@ export function App() {
 			const observedEventId = lastEventIds.current.get(snapshot.session_id) ?? 0;
 			lastEventIds.current.set(snapshot.session_id, Math.max(observedEventId, snapshot.last_event_id));
 			if (snapshot.session_id === selectedRef.current) {
-				setSelectedCache((current) => {
-					const next = applySelectedSnapshot(current.sessionId === snapshot.session_id ? current : emptySelectedSessionCache(snapshot.session_id), snapshot);
-					selectedCacheRef.current = next;
-					return next;
-				});
+				updateSelectedCache((current) =>
+					applySelectedSnapshot(current.sessionId === snapshot.session_id ? current : emptySelectedSessionCache(snapshot.session_id), snapshot),
+				);
 			}
 			queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(snapshot.project_id), (current) =>
 				mergeSnapshotIntoSessionList(current, snapshot),
@@ -502,18 +500,16 @@ export function App() {
 			patcher: (snapshot: SessionSnapshot) => SessionSnapshot,
 		) => {
 			if (sessionId !== selectedRef.current) return;
-			setSelectedCache((current) => {
+			updateSelectedCache((current) => {
 				if (current.sessionId !== sessionId || !current.snapshot) return current;
 				const nextSnapshot = patcher({
 					...current.snapshot,
 					entries: selectedEntries(current),
 				});
-				const next = applySelectedSnapshot(current, nextSnapshot);
-				selectedCacheRef.current = next;
-				return next;
+				return applySelectedSnapshot(current, nextSnapshot);
 			});
 		},
-		[],
+		[updateSelectedCache],
 	);
 
 	const refreshSelectedSessionState = useCallback(
@@ -586,8 +582,7 @@ export function App() {
 	useEffect(() => {
 		if (connection !== "open") return;
 		if (!selectedId) {
-			setSelectedCache(emptySelectedSessionCache(null));
-			selectedCacheRef.current = emptySelectedSessionCache(null);
+			resetSelectedCache(null);
 			setSelectedFetchState({ sessionId: null, loading: false, refreshing: false, error: null });
 			return;
 		}
@@ -619,7 +614,7 @@ export function App() {
 				});
 				pushNotice("error", errorMessage(error));
 			});
-	}, [connection, getFreshSession, pushNotice, selectedId]);
+	}, [connection, getFreshSession, pushNotice, resetSelectedCache, selectedId]);
 
 	const reconcilePendingInputEvent = useCallback((event: EventFrame) => {
 		if (event.event !== "input.queued" && event.event !== "input.accepted" && event.event !== "input.consumed" && event.event !== "input.promoted") return;
@@ -677,13 +672,13 @@ export function App() {
 			if (event.session_id === selectedRef.current) {
 				const queue = queueProjectionFromEvent(event);
 				if (queue) {
-					const next = applyEventHighWater(
-						applyQueueProjection(selectedCacheRef.current, event.session_id, queue),
-						event.session_id,
-						event.event_id,
+					const next = replaceSelectedCache(
+						applyEventHighWater(
+							applyQueueProjection(selectedCacheRef.current, event.session_id, queue),
+							event.session_id,
+							event.event_id,
+						),
 					);
-					selectedCacheRef.current = next;
-					setSelectedCache(next);
 					if (next.snapshot) {
 						setPendingInputs((current) =>
 							current.filter((input) => input.sessionId !== event.session_id || !pendingInputIsReflected(input, next.snapshot!)),
@@ -693,8 +688,7 @@ export function App() {
 				}
 				if (event.event === "transcript.appended") {
 					const applied = applyTranscriptAppendedEvent(selectedCacheRef.current, event);
-					selectedCacheRef.current = applied.cache;
-					setSelectedCache(applied.cache);
+					replaceSelectedCache(applied.cache);
 					if (applied.cache.snapshot) {
 						setPendingInputs((current) =>
 							current.filter((input) => input.sessionId !== event.session_id || !pendingInputIsReflected(input, applied.cache.snapshot!)),
@@ -704,9 +698,7 @@ export function App() {
 				} else if (isTranscriptSideChannelEvent(event)) {
 					const entryId = eventEntryId(event);
 					if (entryId && selectedCacheRef.current.entriesById.has(entryId)) {
-						const next = applyEventHighWater(selectedCacheRef.current, event.session_id, event.event_id);
-						selectedCacheRef.current = next;
-						setSelectedCache(next);
+						replaceSelectedCache(applyEventHighWater(selectedCacheRef.current, event.session_id, event.event_id));
 						shouldSyncSelected = false;
 					}
 				}
@@ -733,6 +725,7 @@ export function App() {
 		[
 			pushNotice,
 			reconcilePendingInputEvent,
+			replaceSelectedCache,
 			scheduleActiveBranchSync,
 			scheduleSessionListRefresh,
 		],
@@ -854,9 +847,9 @@ export function App() {
 					selectedCacheRef.current.treeTranscriptRevision !== null &&
 					selectedCacheRef.current.treeTranscriptRevision !== index.transcript_revision
 				) {
-					setSelectedCache((current) => {
+					updateSelectedCache((current) => {
 						if (current.sessionId !== sessionId) return current;
-						const next = {
+						return {
 							...current,
 							treeNodesById: new Map<string, TranscriptTreeNode>(),
 							treeChildrenByParentId: new Map<string | null, string[]>(),
@@ -865,22 +858,16 @@ export function App() {
 							treeMaxSequence: 0,
 							treeComplete: false,
 						};
-						selectedCacheRef.current = next;
-						return next;
 					});
 					nodes = [];
 					afterSequence = 0;
 					continue;
 				}
-				let nextCache: SelectedSessionCache | null = null;
-				setSelectedCache((current) => {
+				const nextCache = updateSelectedCache((current) => {
 					const base = current.sessionId === sessionId ? current : emptySelectedSessionCache(sessionId);
-					const next = applyTreeIndex(base, index);
-					selectedCacheRef.current = next;
-					nextCache = next;
-					return next;
+					return applyTreeIndex(base, index);
 				});
-				if (nextCache) nodes = treeNodesInOrder(nextCache);
+				nodes = treeNodesInOrder(nextCache);
 				afterSequence = Math.max(afterSequence, ...index.nodes.map((node) => node.sequence), index.after_sequence);
 				complete = index.complete || index.nodes.length === 0;
 			}
@@ -1166,11 +1153,7 @@ export function App() {
 					),
 				);
 				if (result.queue) {
-					setSelectedCache((current) => {
-						const next = applyQueueProjection(current, sessionId, result.queue!);
-						selectedCacheRef.current = next;
-						return next;
-					});
+					updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue!));
 				}
 				if (result.queued) {
 					setPendingInputs((current) =>
@@ -1206,6 +1189,7 @@ export function App() {
 			requireSelected,
 			selectedSession,
 			syncActiveBranchNow,
+			updateSelectedCache,
 		],
 	);
 
@@ -1252,7 +1236,7 @@ export function App() {
 			if (loadedSnapshot.activity !== "idle") {
 				throw new Error("stop the active turn before switching history");
 			}
-			const restoreText = await restoreTextForTarget(api, sessionId, target, selectedCacheRef, setSelectedCache);
+			const restoreText = await restoreTextForTarget(api, sessionId, target, selectedCacheRef, updateSelectedCache);
 			const result = await api.switchHistory({
 				sessionId,
 				leafId: target.actionLeafId,
@@ -1260,11 +1244,7 @@ export function App() {
 				returnActiveBranch: true,
 			});
 			if (restoreText !== null) composerHandleRef.current?.setValue(restoreText);
-			setSelectedCache((current) => {
-				const next = applySwitchResultToCache(current.sessionId === sessionId ? current : selectedCacheRef.current, result);
-				selectedCacheRef.current = next;
-				return next;
-			});
+			updateSelectedCache((current) => applySwitchResultToCache(current.sessionId === sessionId ? current : selectedCacheRef.current, result));
 			if (result.last_event_id !== undefined) lastEventIds.current.set(sessionId, result.last_event_id);
 			invalidateSessionList();
 			pushNotice("success", restoreText !== null ? "message restored for editing" : "switched to selected history point");
@@ -1275,6 +1255,7 @@ export function App() {
 			loadedSnapshot,
 			pushNotice,
 			requireSelected,
+			updateSelectedCache,
 		],
 	);
 
@@ -1299,18 +1280,14 @@ export function App() {
 			const sessionId = requireSelected();
 			const result = await api.promoteQueuedInput(sessionId, inputId);
 			if (result.queue) {
-				setSelectedCache((current) => {
-					const next = applyQueueProjection(current, sessionId, result.queue!);
-					selectedCacheRef.current = next;
-					return next;
-				});
+				updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue!));
 			}
 			await queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectRef.current) });
 			if (!result.promoted && result.status !== "queued") {
 				pushNotice("info", "message is already being processed");
 			}
 		},
-		[api, pushNotice, queryClient, requireSelected],
+		[api, pushNotice, queryClient, requireSelected, updateSelectedCache],
 	);
 
 	const updateQueuedInput = useCallback(
@@ -1318,16 +1295,12 @@ export function App() {
 			const sessionId = requireSelected();
 			const queueRevision = selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current.snapshot?.queue_revision : undefined;
 			const result = await api.updateQueuedInput(sessionId, inputId, textContent(text), queueRevision);
-			setSelectedCache((current) => {
-				const next = applyQueueProjection(current, sessionId, result.queue);
-				selectedCacheRef.current = next;
-				return next;
-			});
+			updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue));
 			if (!result.updated && result.reason === "queue_changed") pushNotice("info", "queue changed; refreshed");
 			if (!result.updated && result.reason === "not_editable") pushNotice("info", "message is no longer editable");
 			invalidateSessionList();
 		},
-		[api, invalidateSessionList, pushNotice, requireSelected],
+		[api, invalidateSessionList, pushNotice, requireSelected, updateSelectedCache],
 	);
 
 	const cancelQueuedInput = useCallback(
@@ -1335,16 +1308,12 @@ export function App() {
 			const sessionId = requireSelected();
 			const queueRevision = selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current.snapshot?.queue_revision : undefined;
 			const result = await api.cancelQueuedInput(sessionId, inputId, queueRevision);
-			setSelectedCache((current) => {
-				const next = applyQueueProjection(current, sessionId, result.queue);
-				selectedCacheRef.current = next;
-				return next;
-			});
+			updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue));
 			if (!result.cancelled && result.reason === "queue_changed") pushNotice("info", "queue changed; refreshed");
 			if (!result.cancelled && result.reason === "not_editable") pushNotice("info", "message is no longer cancellable");
 			invalidateSessionList();
 		},
-		[api, invalidateSessionList, pushNotice, requireSelected],
+		[api, invalidateSessionList, pushNotice, requireSelected, updateSelectedCache],
 	);
 
 	const reorderQueuedInput = useCallback(
@@ -1360,15 +1329,11 @@ export function App() {
 			[nextOrder[currentIndex], nextOrder[targetIndex]] = [nextOrder[targetIndex], nextOrder[currentIndex]];
 			const queueRevision = cache.sessionId === sessionId ? cache.snapshot?.queue_revision : undefined;
 			const result = await api.reorderQueuedFollowUps(sessionId, nextOrder, queueRevision);
-			setSelectedCache((current) => {
-				const next = applyQueueProjection(current, sessionId, result.queue);
-				selectedCacheRef.current = next;
-				return next;
-			});
+			updateSelectedCache((current) => applyQueueProjection(current, sessionId, result.queue));
 			if (!result.reordered && result.reason === "queue_changed") pushNotice("info", "queue changed; refreshed");
 			invalidateSessionList();
 		},
-		[api, invalidateSessionList, loadedSnapshot?.queued_inputs, pushNotice, requireSelected],
+		[api, invalidateSessionList, loadedSnapshot?.queued_inputs, pushNotice, requireSelected, updateSelectedCache],
 	);
 
 	const stopActiveTurn = useCallback(async () => {
@@ -1994,18 +1959,14 @@ async function restoreTextForTarget(
 	sessionId: string,
 	target: HistoryTargetOption,
 	selectedCacheRef: RefObject<SelectedSessionCache>,
-	setSelectedCache: Dispatch<SetStateAction<SelectedSessionCache>>,
+	updateSelectedCache: (updater: (current: SelectedSessionCache) => SelectedSessionCache) => SelectedSessionCache,
 ): Promise<string | null> {
 	if (target.restoreText !== undefined) return target.restoreText;
 	if (!target.restoreEntryId) return null;
 	const cached = selectedCacheRef.current.entriesById.get(target.restoreEntryId);
 	if (cached?.item.type === "user_message") return contentBlocksToText(cached.item.content);
 	const result = await api.getTranscriptEntries(sessionId, [target.restoreEntryId]);
-	setSelectedCache((current) => {
-		const next = applyEntryBodies(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.entries);
-		selectedCacheRef.current = next;
-		return next;
-	});
+	updateSelectedCache((current) => applyEntryBodies(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.entries));
 	const entry = result.entries.find((candidate) => candidate.id === target.restoreEntryId);
 	if (entry?.item.type === "user_message") return contentBlocksToText(entry.item.content);
 	return null;

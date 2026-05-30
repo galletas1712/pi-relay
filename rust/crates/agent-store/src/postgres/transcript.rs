@@ -806,3 +806,353 @@ pub(super) fn model_context_from_entries(entries: Vec<StoredTranscriptEntry>) ->
             .collect(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use agent_session::{SessionEvent, TranscriptStorageNode};
+    use agent_vocab::{
+        CompactionSummary, ProviderConfig, ProviderKind, ReasoningEffort, TranscriptItem, TurnId,
+        TurnOutcome, UserMessage,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::{OutputBatch, SessionConfig};
+
+    use super::*;
+
+    static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(30_000);
+
+    struct TestDb {
+        store: PostgresAgentStore,
+        admin_url: String,
+        name: String,
+    }
+
+    impl TestDb {
+        async fn cleanup(self) {
+            self.store.close().await;
+            if let Ok(admin) = sqlx::PgPool::connect(&self.admin_url).await {
+                let _ = sqlx::query(&format!(r#"drop database if exists "{}""#, self.name))
+                    .execute(&admin)
+                    .await;
+                admin.close().await;
+            }
+        }
+    }
+
+    async fn test_store() -> Option<TestDb> {
+        let admin_url = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok()?;
+        let name = format!(
+            "pi_relay_transcript_test_{}_{}",
+            std::process::id(),
+            TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let admin = sqlx::PgPool::connect(&admin_url)
+            .await
+            .expect("connect to PI_RELAY_TEST_DATABASE_URL");
+        sqlx::query(&format!(r#"create database "{name}""#))
+            .execute(&admin)
+            .await
+            .expect("create isolated test database");
+        admin.close().await;
+        let database_url = database_url_with_name(&admin_url, &name);
+        let store = PostgresAgentStore::connect(&database_url)
+            .await
+            .expect("connect isolated test database");
+        store
+            .migrate()
+            .await
+            .expect("migrate isolated test database");
+        Some(TestDb {
+            store,
+            admin_url,
+            name,
+        })
+    }
+
+    fn database_url_with_name(base: &str, name: &str) -> String {
+        let (prefix, query) = base
+            .split_once('?')
+            .map(|(prefix, query)| (prefix, format!("?{query}")))
+            .unwrap_or((base, String::new()));
+        let Some((root, _)) = prefix.rsplit_once('/') else {
+            return format!("{base}_{name}");
+        };
+        format!("{root}/{name}{query}")
+    }
+
+    fn session_config(project_id: Uuid) -> SessionConfig {
+        SessionConfig {
+            project_id: Some(project_id),
+            outer_cwd: "/tmp".to_string(),
+            workspaces: Vec::new(),
+            system_prompt: "test prompt".to_string(),
+            provider: ProviderConfig {
+                kind: ProviderKind::OpenAi,
+                model: "test-model".to_string(),
+                reasoning_effort: ReasoningEffort::Medium,
+                max_tokens: None,
+                prompt_cache: None,
+            },
+            metadata: json!({}),
+        }
+    }
+
+    async fn create_session(store: &PostgresAgentStore, session_id: &str) {
+        let project_id = Uuid::new_v4();
+        store
+            .create_project(project_id, "transcript test", &[], json!({}))
+            .await
+            .expect("project creates");
+        store
+            .create_session(session_id, &session_config(project_id))
+            .await
+            .expect("session creates");
+    }
+
+    fn entry(id: &str, parent_id: Option<&str>, item: TranscriptItem) -> TranscriptStorageNode {
+        TranscriptStorageNode {
+            id: id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            timestamp_ms: 1,
+            item,
+            provider_replay: Vec::new(),
+        }
+    }
+
+    fn turn_started(id: &str, parent_id: Option<&str>, turn_id: u64) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::TurnStarted {
+                turn_id: TurnId(turn_id),
+            },
+        )
+    }
+
+    fn user_message(id: &str, parent_id: Option<&str>, text: &str) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::UserMessage(UserMessage::text(text)),
+        )
+    }
+
+    fn turn_finished(id: &str, parent_id: Option<&str>, turn_id: u64) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(turn_id),
+                outcome: TurnOutcome::Graceful,
+            },
+        )
+    }
+
+    fn compaction_summary(id: &str, parent_id: Option<&str>, session_id: &str) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::CompactionSummary(CompactionSummary::new(
+                session_id,
+                "source_leaf",
+                "summary",
+                None,
+                TurnId(0),
+            )),
+        )
+    }
+
+    fn appended_event(entry: &TranscriptStorageNode) -> SessionEvent {
+        SessionEvent::TranscriptItemAppended {
+            entry_id: entry.id.clone(),
+            item: entry.item.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_tree_index_paginates_and_entries_include_sequence() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "transcript-index-page";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            turn_started("entry_start", None, 1),
+            user_message("entry_user", Some("entry_start"), "hello"),
+            turn_finished("entry_finish", Some("entry_user"), 1),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+
+        let first_page = store
+            .transcript_tree_index(session_id, Some(0), Some(2))
+            .await
+            .expect("first page loads");
+        assert_eq!(first_page.nodes.len(), 2);
+        assert_eq!(first_page.after_sequence, 0);
+        assert_eq!(first_page.max_sequence, 3);
+        assert!(!first_page.complete);
+        assert_eq!(first_page.nodes[0].id, "entry_start");
+        assert_eq!(first_page.nodes[0].sequence, 1);
+        assert_eq!(first_page.nodes[0].item_type, "turn_started");
+
+        let second_page = store
+            .transcript_tree_index(
+                session_id,
+                Some(first_page.nodes.last().expect("node").sequence),
+                Some(2),
+            )
+            .await
+            .expect("second page loads");
+        assert_eq!(second_page.nodes.len(), 1);
+        assert!(second_page.complete);
+        assert_eq!(second_page.nodes[0].id, "entry_finish");
+        assert!(second_page.nodes[0].can_switch_to);
+
+        let sparse_entries = store
+            .transcript_entries_by_id(
+                session_id,
+                &["entry_finish".to_string(), "entry_start".to_string()],
+            )
+            .await
+            .expect("entries by id load");
+        assert_eq!(
+            sparse_entries
+                .entries
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.sequence))
+                .collect::<Vec<_>>(),
+            vec![("entry_start", 1), ("entry_finish", 3)]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn switch_active_leaf_returns_revisions_and_active_branch() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "switch-active-branch";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            compaction_summary("entry_root", None, session_id),
+            turn_started("entry_a_start", Some("entry_root"), 1),
+            user_message("entry_a_user", Some("entry_a_start"), "branch a"),
+            turn_finished("entry_a_finish", Some("entry_a_user"), 1),
+            turn_started("entry_b_start", Some("entry_root"), 2),
+            user_message("entry_b_user", Some("entry_b_start"), "branch b"),
+            turn_finished("entry_b_finish", Some("entry_b_user"), 2),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_b_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+        let before = store
+            .session_snapshot(session_id)
+            .await
+            .expect("snapshot loads");
+
+        let result = store
+            .switch_active_leaf(session_id, Some("entry_a_finish"), true)
+            .await
+            .expect("switch succeeds");
+
+        assert_eq!(result.session_id, session_id);
+        assert_eq!(result.active_leaf_id.as_deref(), Some("entry_a_finish"));
+        assert_eq!(result.activity, SessionActivity::Idle);
+        assert!(result.session_revision > before.session_revision);
+        assert_eq!(result.queue_revision, before.queue_revision);
+        assert_eq!(result.transcript_revision, before.transcript_revision);
+        assert!(result.last_event_id > before.last_event_id);
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].event, EventType::HistorySwitched);
+        assert_eq!(
+            result
+                .active_branch_entries
+                .expect("active branch returned")
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "entry_root",
+                "entry_a_start",
+                "entry_a_user",
+                "entry_a_finish",
+            ]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn transcript_appended_event_uses_bumped_revision_and_sequence() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "transcript-event-revision";
+        create_session(store, session_id).await;
+
+        let first = user_message("entry_user", None, "hello");
+        let events = vec![appended_event(&first)];
+        let (frames, _) = store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(std::slice::from_ref(&first), Some("entry_user"), &events, &[]),
+            )
+            .await
+            .expect("transcript persists");
+        let snapshot = store
+            .session_snapshot(session_id)
+            .await
+            .expect("snapshot loads");
+        let frame = frames
+            .iter()
+            .find(|frame| frame.event == EventType::TranscriptAppended)
+            .expect("transcript appended event");
+
+        assert_eq!(snapshot.transcript_revision, 1);
+        assert_eq!(
+            frame.data["transcript_revision"].as_i64(),
+            Some(snapshot.transcript_revision)
+        );
+        assert_eq!(
+            frame.data["session_revision"].as_i64(),
+            Some(snapshot.session_revision)
+        );
+        assert_eq!(
+            frame.data["entry"]["sequence"].as_i64(),
+            Some(1)
+        );
+        assert_eq!(
+            frame.data["tree_node"]["sequence"].as_i64(),
+            Some(1)
+        );
+        assert_eq!(
+            frame.data["active_leaf_id"].as_str(),
+            Some("entry_user")
+        );
+
+        db.cleanup().await;
+    }
+}

@@ -369,3 +369,20 @@ first and display a picker loading state while that capability is fetched.
 - Queue edit/delete/reorder controls were added for queued follow-ups only.
   Steering rows remain immutable in the pane: they stay above follow-ups and
   expose only the disabled/non-editable state.
+- Review hardening found an implicit reducer/caller coupling: a changed-revision
+  delta `transcript.index` page could truncate the local compact tree if some
+  future caller skipped the paging-loop restart guard. The reducer now refuses
+  non-zero `after_sequence` pages unless they match the loaded
+  `transcript_revision` and are contiguous with loaded sequence state; callers
+  must restart from `after_sequence=0`.
+- Added focused selected-session reducer tests for normalization, queue
+  revision replacement, tree-index paging/restart behavior, append events, and
+  switch-result application.
+- Added agent-store Postgres tests for compact index pagination/sparse entry
+  sequence exposure, switch responses with revisions and active branch bodies,
+  and the bump-before-emit invariant for `transcript.appended`
+  `transcript_revision`/`sequence` payloads.
+- Extracted a very small `useSelectedSessionStore` host for the selected cache.
+  It keeps React state and the synchronous async-flow ref in one place
+  (`replace`/`reset`/`update`) so App no longer hand-mirrors
+  `setSelectedCache(...)` with `selectedCacheRef.current = ...` at each callsite.

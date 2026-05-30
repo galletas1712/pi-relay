@@ -92,9 +92,15 @@ export function applyEntryBodies(cache: SelectedSessionCache, sessionId: string,
 
 export function applyTreeIndex(cache: SelectedSessionCache, index: TranscriptTreeIndex): SelectedSessionCache {
 	if (cache.sessionId !== index.session_id) return cache;
-	const revisionChanged = cache.treeTranscriptRevision !== null && cache.treeTranscriptRevision !== index.transcript_revision;
-	const treeNodesById = revisionChanged ? new Map<string, TranscriptTreeNode>() : new Map(cache.treeNodesById);
-	for (const node of index.nodes) treeNodesById.set(node.id, node);
+	const loadedMaxSequence = Math.max(0, ...Array.from(cache.treeNodesById.values(), (node) => node.sequence));
+	const pageMatchesRevision = cache.treeTranscriptRevision === index.transcript_revision;
+	const pageIsContiguous = index.after_sequence <= loadedMaxSequence;
+	const canApplyPage = index.after_sequence === 0 || (pageMatchesRevision && pageIsContiguous);
+	const shouldReset = index.after_sequence === 0 || !pageMatchesRevision || !pageIsContiguous;
+	const treeNodesById = shouldReset ? new Map<string, TranscriptTreeNode>() : new Map(cache.treeNodesById);
+	if (canApplyPage) {
+		for (const node of index.nodes) treeNodesById.set(node.id, node);
+	}
 	const treeOrder = Array.from(treeNodesById.values())
 		.sort((left, right) => left.sequence - right.sequence)
 		.map((node) => node.id);
@@ -115,8 +121,8 @@ export function applyTreeIndex(cache: SelectedSessionCache, index: TranscriptTre
 		treeChildrenByParentId,
 		treeOrder,
 		treeTranscriptRevision: index.transcript_revision,
-		treeMaxSequence: index.max_sequence,
-		treeComplete: index.complete,
+		treeMaxSequence: canApplyPage ? index.max_sequence : 0,
+		treeComplete: canApplyPage ? index.complete : false,
 	};
 }
 
