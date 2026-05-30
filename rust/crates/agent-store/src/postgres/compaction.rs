@@ -571,6 +571,7 @@ impl PostgresAgentStore {
             ));
         }
 
+        bump_revisions_tx(&mut tx, &job.source_session_id, false, true).await?;
         let mut events = Vec::new();
         for entry in &installed_entries {
             events.extend(
@@ -624,7 +625,6 @@ impl PostgresAgentStore {
             )
             .await?,
         );
-        bump_revisions_tx(&mut tx, &job.source_session_id, false, true).await?;
         tx.commit().await?;
         Ok(CompleteCompactionResult {
             new_root_id: Some(new_root_id),

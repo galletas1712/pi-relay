@@ -1,9 +1,9 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use agent_session::StoredTranscriptEntry;
 use agent_store::{
     ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionSnapshot,
-    SessionSummary,
+    SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryRecord,
+    TranscriptTreeIndex,
 };
 use agent_vocab::TranscriptItem;
 use serde_json::{json, Value};
@@ -37,7 +37,7 @@ pub(crate) fn session_summary(summary: SessionSummary) -> Value {
 
 pub(crate) fn session_snapshot(
     snapshot: SessionSnapshot,
-    entries: Option<Vec<StoredTranscriptEntry>>,
+    entries: Option<Vec<TranscriptEntryRecord>>,
 ) -> Value {
     let pending_actions = snapshot
         .pending_actions
@@ -132,7 +132,42 @@ pub(crate) fn active_branch_sync(sync: ActiveBranchSync, overview: SessionSnapsh
     })
 }
 
-fn redact_entries(entries: Vec<StoredTranscriptEntry>) -> Vec<StoredTranscriptEntry> {
+pub(crate) fn transcript_tree_index(index: TranscriptTreeIndex) -> Value {
+    json!({
+        "session_id": index.session_id,
+        "active_leaf_id": index.active_leaf_id,
+        "session_revision": index.session_revision,
+        "transcript_revision": index.transcript_revision,
+        "after_sequence": index.after_sequence,
+        "max_sequence": index.max_sequence,
+        "complete": index.complete,
+        "nodes": index.nodes,
+    })
+}
+
+pub(crate) fn transcript_entries(result: TranscriptEntriesResult) -> Value {
+    json!({
+        "session_id": result.session_id,
+        "session_revision": result.session_revision,
+        "transcript_revision": result.transcript_revision,
+        "entries": redact_entries(result.entries),
+    })
+}
+
+pub(crate) fn switch_active_leaf(result: SwitchActiveLeafResult) -> Value {
+    json!({
+        "session_id": result.session_id,
+        "active_leaf_id": result.active_leaf_id,
+        "activity": result.activity,
+        "session_revision": result.session_revision,
+        "queue_revision": result.queue_revision,
+        "transcript_revision": result.transcript_revision,
+        "last_event_id": result.last_event_id,
+        "active_branch_entries": result.active_branch_entries.map(redact_entries),
+    })
+}
+
+fn redact_entries(entries: Vec<TranscriptEntryRecord>) -> Vec<TranscriptEntryRecord> {
     entries
         .into_iter()
         .map(|mut entry| {

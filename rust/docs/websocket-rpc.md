@@ -303,7 +303,8 @@ notification feed. With a concrete `after_event_id`, it returns missed rows in
 the RPC response and then streams live event frames on the same websocket while
 those rows are still in the reconnect buffer. With `after_event_id = null` or
 omitted, it starts at the current event head and returns no historical events;
-clients should load durable state through `session.get`/`history.tree` instead.
+clients should load durable state through `session.get` and, when they need
+compact full-tree topology, `transcript.index` instead.
 When a session reaches idle, the daemon publishes `session.idle` to live
 subscribers and then clears that session's event rows. Idle-only mutations such
 as configuration changes and same-session history switching also clear their
@@ -494,7 +495,78 @@ be `"active_branch"` or `"full_tree"` and defaults to `"full_tree"` for
 compatibility. The web UI can use the active-branch scope for normal display and
 reserve the full tree for switch/history UI. `has_transcript_entries`
 allows provider/model lock checks even when the active branch is empty after a
-root switch.
+root switch. Transcript entries returned by websocket RPCs include the Postgres
+`sequence` column, which is an append/order cursor but not itself a freshness
+token. Use `transcript_revision` to decide whether cached transcript data is
+fresh.
+
+## Transcript RPC
+
+### `transcript.index`
+
+Returns compact transcript topology without full message bodies or
+`provider_replay`. This is the normal history-picker endpoint.
+
+```json
+{ "session_id": "s1", "after_sequence": 0, "limit": 1000 }
+```
+
+Result shape:
+
+```json
+{
+  "session_id": "s1",
+  "active_leaf_id": "entry_9",
+  "session_revision": 12,
+  "transcript_revision": 7,
+  "after_sequence": 0,
+  "max_sequence": 42,
+  "complete": true,
+  "nodes": [
+    {
+      "id": "entry_1",
+      "parent_id": null,
+      "timestamp_ms": 123,
+      "sequence": 1,
+      "item_type": "user_message",
+      "turn_id": null,
+      "outcome": null,
+      "can_switch_to": false,
+      "edit_target_leaf_id": null,
+      "display_hint": "hello"
+    }
+  ]
+}
+```
+
+`transcript_revision` is the freshness token. `sequence` is only the pagination
+cursor for fetching more rows in the same transcript revision. `display_hint` is
+best-effort UI copy; clients must not treat it as authoritative transcript
+content. `can_switch_to` is daemon-computed boundary truth for direct switch
+targets. Editing a historical user message still switches to the previous turn
+boundary, which clients can derive from compact topology and the daemon validates
+again in `history.switch`.
+
+### `transcript.entries`
+
+Fetches sparse full transcript bodies by explicit entry IDs. This is for cases
+where the UI has compact topology but needs one or a few bodies, such as
+restoring a historical user message into the composer.
+
+```json
+{ "session_id": "s1", "entry_ids": ["entry_1", "entry_7"] }
+```
+
+Result shape:
+
+```json
+{
+  "session_id": "s1",
+  "session_revision": 12,
+  "transcript_revision": 7,
+  "entries": []
+}
+```
 
 ## Project RPC
 
@@ -894,7 +966,12 @@ both for "switch to the boundary before editing this user message" and for
 never creates a session and never deletes abandoned branches.
 
 ```json
-{ "session_id": "s1", "leaf_id": "entry_4", "expected_active_leaf_id": "entry_9" }
+{
+  "session_id": "s1",
+  "leaf_id": "entry_4",
+  "expected_active_leaf_id": "entry_9",
+  "return_active_branch": true
+}
 ```
 
 Root switch:
@@ -906,6 +983,10 @@ Root switch:
 Running sessions fail with `session_busy`; non-boundaries fail with
 `not_turn_boundary`. If `expected_active_leaf_id` is supplied and the session
 has moved since the picker was opened, switch fails with `history_changed`.
+When `return_active_branch` is true, the response includes the new
+`session_revision`, `queue_revision`, `transcript_revision`, `last_event_id`,
+and `active_branch_entries` so the frontend can render the switched branch
+without a follow-up `session.get` in the hot path.
 
 ### `turn.resume`
 
@@ -1050,6 +1131,26 @@ queue projection:
 Clients should replace cached queue state when an event carries a newer
 `queue_revision`. They should refetch rather than trying to infer ordering from
 partial event payloads.
+
+`transcript.appended` carries the appended entry body when available, plus its
+compact `tree_node`, `active_leaf_id`, and revision counters:
+
+```json
+{
+  "entry_id": "entry_10",
+  "entry": { "id": "entry_10", "sequence": 10, "parent_id": "entry_9" },
+  "tree_node": { "id": "entry_10", "sequence": 10, "item_type": "assistant_message" },
+  "active_leaf_id": "entry_10",
+  "session_revision": 14,
+  "queue_revision": 6,
+  "transcript_revision": 8
+}
+```
+
+`history.switched` similarly carries `active_leaf_id`, `activity`, and the
+revision counters. Events are freshness hints, not a generic patch protocol; if
+a client cannot apply an event safely, it should fetch the canonical projection
+it needs.
 
 ## Manual Websocket Exercise Plan
 

@@ -4,7 +4,7 @@ use agent_session::StoredTranscriptEntry;
 use anyhow::Result;
 use sqlx::{postgres::PgRow, Row};
 
-use crate::{EventFrame, EventType};
+use crate::{EventFrame, EventType, TranscriptEntryRecord};
 
 pub(super) fn row_to_event(row: PgRow) -> Result<EventFrame> {
     Ok(EventFrame {
@@ -34,6 +34,17 @@ pub(super) fn row_to_stored_entry(row: &PgRow) -> Result<StoredTranscriptEntry> 
         id: row.get("id"),
         parent_id: row.get("parent_id"),
         timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
+        item: serde_json::from_value(row.get("item"))?,
+        provider_replay: serde_json::from_value(row.get("provider_replay"))?,
+    })
+}
+
+pub(super) fn row_to_transcript_entry(row: &PgRow) -> Result<TranscriptEntryRecord> {
+    Ok(TranscriptEntryRecord {
+        id: row.get("id"),
+        parent_id: row.get("parent_id"),
+        timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
+        sequence: row.get("sequence"),
         item: serde_json::from_value(row.get("item"))?,
         provider_replay: serde_json::from_value(row.get("provider_replay"))?,
     })

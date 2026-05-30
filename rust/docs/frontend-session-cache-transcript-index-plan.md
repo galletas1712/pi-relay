@@ -335,3 +335,17 @@ first and display a picker loading state while that capability is fetched.
   prompt updates, Rust Claude model update, Mermaid rendering, and Claude Opus
   4.8 picker support. None changes this architecture; the web files do have
   recent markdown/rendering changes, so frontend edits must preserve those.
+- Backend implementation used an RPC/store-specific `TranscriptEntryRecord`
+  instead of adding `sequence` to `agent-session::StoredTranscriptEntry`. This
+  kept the session-core storage vocabulary stable and avoided touching all
+  stored-session tests/constructors. RPC-facing entry records serialize with the
+  same fields plus `sequence`.
+- `transcript.index.edit_target_leaf_id` is currently nullable rather than an
+  incorrect parent shortcut. The frontend can derive the previous boundary from
+  compact topology for user-message editing, and `history.switch` still validates
+  the final target server-side. This preserves correctness without making the
+  compact index do an ancestor walk per row.
+- Transcript append events now query the just-inserted row inside the same
+  transaction to include `sequence` and `tree_node`. Revision counters are read
+  after the commit path bumps them. Compaction/recovery paths were adjusted so
+  transcript events are emitted after transcript revisions are bumped.
