@@ -13,9 +13,9 @@ export const MODEL_OPTIONS: ModelOption[] = [
 		provider: { kind: "openai", model: "gpt-5.5", reasoning_effort: "xhigh" }
 	},
 	{
-		id: "claude:claude-opus-4-7",
-		label: "Claude Opus 4.7",
-		provider: { kind: "claude", model: "claude-opus-4-7", reasoning_effort: "xhigh" }
+		id: "claude:claude-opus-4-8",
+		label: "Claude Opus 4.8",
+		provider: { kind: "claude", model: "claude-opus-4-8", reasoning_effort: "xhigh" }
 	}
 ];
 
