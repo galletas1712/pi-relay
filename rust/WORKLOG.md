@@ -16,9 +16,8 @@
 - Added Rust daemon/store RPC support for queued follow-up edit, cancel, and
   full-list reorder. Steering messages stay at the top, keep steer/promote
   order, and are not editable/reorderable through these follow-up RPCs.
-- Added standalone manual migration script
-  `rust/scripts/migrate-session-sync-v1.sql`; no old-session migration is wired
-  into daemon startup.
+- Applied the one existing Postgres database migration manually before
+  merge; no old-session migration is wired into daemon startup.
 - Captured the implementation plans in
   `rust/docs/session-sync-redesign-plan.md` and
   `rust/docs/queued-message-mutations-plan.md`.

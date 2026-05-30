@@ -72,9 +72,9 @@ select id from sessions where id = $1 for update;
 
 This serializes one session at a time; it is not a table-wide or database-wide
 lock, and provider/tool work never runs while the lock is held. Fresh databases
-get the revision/order columns from the schema below. Existing databases must be
-upgraded with `rust/scripts/migrate-session-sync-v1.sql`; the daemon does not
-run that migration automatically.
+get the revision/order columns from the schema below. The current development
+database has already been upgraded manually; the daemon does not run old-session
+migrations automatically.
 
 ### `sessions`
 

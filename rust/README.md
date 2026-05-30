@@ -105,7 +105,6 @@ reorder RPCs; steering messages stay at the top and are not reorderable.
 Crashed or interrupted terminal model turns can be retried/continued directly
 from the transcript row.
 
-Existing Postgres databases need the one-shot
-`rust/scripts/migrate-session-sync-v1.sql` before running code that expects the
-new session revision and queue ordering columns. This migration is intentionally
-not run automatically by the daemon.
+The current development Postgres database has already been upgraded for the
+session revision and queue ordering columns; fresh databases get them from the
+schema. The daemon does not run old-session migrations automatically.

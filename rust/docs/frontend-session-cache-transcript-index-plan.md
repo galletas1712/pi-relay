@@ -38,8 +38,8 @@ intentionally does not add generic event patches.
 - No IndexedDB or persistent browser transcript cache in this stack.
 - No monolithic GraphQL-like `session.sync { want, known }` RPC.
 - No generic server-built `SessionPatch` in every event.
-- No daemon startup migration for old sessions. The prior PR's standalone SQL
-  migration remains the only old-session migration path.
+- No daemon startup migration for old sessions; the one existing database was
+  upgraded manually before merge.
 - No removal of backcompat/debug endpoints such as `history.tree` or
   `session.get(include_entries=true, entries_scope="full_tree")`.
 
