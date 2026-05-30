@@ -1,7 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_session::StoredTranscriptEntry;
-use agent_store::{ActiveBranchSync, HistoryTree, Project, SessionSnapshot, SessionSummary};
+use agent_store::{
+    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionSnapshot,
+    SessionSummary,
+};
 use agent_vocab::TranscriptItem;
 use serde_json::{json, Value};
 
@@ -51,17 +54,7 @@ pub(crate) fn session_snapshot(
     let queued_inputs = snapshot
         .queued_inputs
         .into_iter()
-        .map(|input| {
-            json!({
-                "input_id": input.input_id,
-                "priority": input.priority,
-                "status": input.status,
-                "content": input.content.content,
-                "client_input_id": input.client_input_id,
-                "created_at": input.created_at,
-                "promoted_at": input.promoted_at,
-            })
-        })
+        .map(queued_input)
         .collect::<Vec<_>>();
 
     let mut value = json!({
@@ -75,6 +68,9 @@ pub(crate) fn session_snapshot(
         "metadata": snapshot.metadata,
         "pending_actions": pending_actions,
         "queued_inputs": queued_inputs,
+        "session_revision": snapshot.session_revision,
+        "queue_revision": snapshot.queue_revision,
+        "transcript_revision": snapshot.transcript_revision,
         "last_event_id": snapshot.last_event_id,
         "has_transcript_entries": snapshot.has_transcript_entries,
         "server_time_ms": now_ms(),
@@ -83,6 +79,34 @@ pub(crate) fn session_snapshot(
         value["entries"] = json!(redact_entries(entries));
     }
     value
+}
+
+pub(crate) fn queue_state(queue: QueueState) -> Value {
+    json!({
+        "session_revision": queue.session_revision,
+        "queue_revision": queue.queue_revision,
+        "transcript_revision": queue.transcript_revision,
+        "activity": queue.activity,
+        "queued_inputs": queue
+            .queued_inputs
+            .into_iter()
+            .map(queued_input)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn queued_input(input: QueuedInputRecord) -> Value {
+    json!({
+        "input_id": input.input_id,
+        "priority": input.priority,
+        "status": input.status,
+        "content": input.content.content,
+        "client_input_id": input.client_input_id,
+        "created_at": input.created_at,
+        "updated_at": input.updated_at,
+        "promoted_at": input.promoted_at,
+        "follow_up_position": input.follow_up_position,
+    })
 }
 
 pub(crate) fn history_tree(tree: HistoryTree) -> Value {

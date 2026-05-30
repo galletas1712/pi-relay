@@ -130,6 +130,9 @@ text_enum! {
         SessionWorkCancelled => "session.work_cancelled",
         InputQueued => "input.queued",
         InputPromoted => "input.promoted",
+        InputUpdated => "input.updated",
+        InputCancelled => "input.cancelled",
+        InputReordered => "input.reordered",
         InputConsumed => "input.consumed",
         InputAccepted => "input.accepted",
         InputIgnored => "input.ignored",
@@ -302,6 +305,7 @@ pub struct PendingDispatchAction {
 pub struct EnqueueUserInputResult {
     pub input_id: String,
     pub event: Option<EventFrame>,
+    pub queue: Option<QueueState>,
 }
 
 pub struct PromoteQueuedInputResult {
@@ -310,6 +314,38 @@ pub struct PromoteQueuedInputResult {
     pub status: QueuedInputStatus,
     pub promoted: bool,
     pub event: Option<EventFrame>,
+    pub queue: QueueState,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateQueuedInputResult {
+    pub input_id: String,
+    pub updated: bool,
+    pub reason: Option<String>,
+    pub priority: InputPriority,
+    pub status: QueuedInputStatus,
+    pub event: Option<EventFrame>,
+    pub queue: QueueState,
+}
+
+#[derive(Debug, Clone)]
+pub struct CancelQueuedInputResult {
+    pub input_id: String,
+    pub cancelled: bool,
+    pub reason: Option<String>,
+    pub priority: InputPriority,
+    pub status: QueuedInputStatus,
+    pub event: Option<EventFrame>,
+    pub queue: QueueState,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReorderQueuedFollowUpsResult {
+    pub reordered: bool,
+    pub reason: Option<String>,
+    pub input_ids: Vec<String>,
+    pub event: Option<EventFrame>,
+    pub queue: QueueState,
 }
 
 #[derive(Debug, Clone)]
@@ -437,7 +473,18 @@ pub struct QueuedInputRecord {
     pub content: UserMessage,
     pub client_input_id: Option<String>,
     pub created_at: String,
+    pub updated_at: String,
     pub promoted_at: Option<String>,
+    pub follow_up_position: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct QueueState {
+    pub session_revision: i64,
+    pub queue_revision: i64,
+    pub transcript_revision: i64,
+    pub activity: SessionActivity,
+    pub queued_inputs: Vec<QueuedInputRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -452,6 +499,9 @@ pub struct SessionSnapshot {
     pub metadata: Value,
     pub pending_actions: Vec<PendingActionRecord>,
     pub queued_inputs: Vec<QueuedInputRecord>,
+    pub session_revision: i64,
+    pub queue_revision: i64,
+    pub transcript_revision: i64,
     pub last_event_id: i64,
     pub has_transcript_entries: bool,
 }
@@ -517,6 +567,7 @@ pub struct QueuedInput {
     pub content: UserMessage,
     pub client_input_id: Option<String>,
     pub claim_id: String,
+    pub row_version: String,
 }
 
 #[derive(Debug, Clone)]

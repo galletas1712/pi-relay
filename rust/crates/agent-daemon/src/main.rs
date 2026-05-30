@@ -262,6 +262,11 @@ async fn dispatch_request(
         RpcMethod::EventsUnsubscribe => events_unsubscribe(subscriptions, event_high_water, params),
         RpcMethod::InputFollowUp => input_user(state, params, InputPriority::FollowUp).await,
         RpcMethod::InputPromoteQueued => input_promote_queued(state, params).await,
+        RpcMethod::InputUpdateQueued => input_update_queued(state, params).await,
+        RpcMethod::InputCancelQueued => input_cancel_queued(state, params).await,
+        RpcMethod::InputReorderQueuedFollowUps => {
+            input_reorder_queued_follow_ups(state, params).await
+        }
         RpcMethod::InputInterrupt => input_interrupt(state, params).await,
         RpcMethod::HistoryTree => history_tree(state, params).await,
         RpcMethod::HistoryContext => history_context(state, params).await,
@@ -905,6 +910,7 @@ async fn input_user(
         Queued {
             input_id: String,
             event: Option<EventFrame>,
+            queue: Option<Value>,
             should_drive: bool,
         },
     }
@@ -917,6 +923,12 @@ async fn input_user(
                 .await
                 .map_err(anyhow::Error::from)?
             {
+                let queue = state
+                    .repo
+                    .queue_state(&session_id)
+                    .await
+                    .map(rpc_views::queue_state)
+                    .map_err(anyhow::Error::from)?;
                 return Ok(json!({
                     "input_id": record.input_id,
                     "accepted": record.status == QueuedInputStatus::Consumed,
@@ -925,6 +937,7 @@ async fn input_user(
                         QueuedInputStatus::Queued | QueuedInputStatus::Consuming
                     ),
                     "replayed": true,
+                    "queue": queue,
                 }));
             }
         }
@@ -947,6 +960,7 @@ async fn input_user(
             InputOutcome::Queued {
                 input_id: queued.input_id,
                 event: queued.event,
+                queue: queued.queue.map(rpc_views::queue_state),
                 should_drive: !has_running,
             }
         } else {
@@ -988,6 +1002,7 @@ async fn input_user(
         InputOutcome::Queued {
             input_id,
             event,
+            queue,
             should_drive,
         } => {
             if let Some(event) = event {
@@ -996,7 +1011,7 @@ async fn input_user(
             if should_drive {
                 driver.drive_until_blocked().await?;
             }
-            Ok(json!({ "input_id": input_id, "accepted": true, "queued": true }))
+            Ok(json!({ "input_id": input_id, "accepted": true, "queued": true, "queue": queue }))
         }
     }
 }
@@ -1022,6 +1037,104 @@ async fn input_promote_queued(
         "priority": result.priority,
         "status": result.status,
         "promoted": result.promoted,
+        "queue": rpc_views::queue_state(result.queue),
+    }))
+}
+
+async fn input_update_queued(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let input_id = required_string(&params, "input_id")?;
+    let expected_queue_revision = params
+        .get("expected_queue_revision")
+        .and_then(Value::as_i64);
+    let content_value = params
+        .get("content")
+        .cloned()
+        .ok_or_else(|| RpcError::new("invalid_params", "content is required"))?;
+    let content = parse_user_message(content_value)?;
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.recover_if_needed().await?;
+    let result = state
+        .repo
+        .update_queued_input(&session_id, &input_id, &content, expected_queue_revision)
+        .await
+        .map_err(map_queued_mutation_error)?;
+    if let Some(event) = result.event {
+        publish_events(state, vec![event]);
+    }
+    Ok(json!({
+        "input_id": result.input_id,
+        "updated": result.updated,
+        "reason": result.reason,
+        "priority": result.priority,
+        "status": result.status,
+        "queue": rpc_views::queue_state(result.queue),
+    }))
+}
+
+async fn input_cancel_queued(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let input_id = required_string(&params, "input_id")?;
+    let expected_queue_revision = params
+        .get("expected_queue_revision")
+        .and_then(Value::as_i64);
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.recover_if_needed().await?;
+    let result = state
+        .repo
+        .cancel_queued_input(&session_id, &input_id, expected_queue_revision)
+        .await
+        .map_err(map_queued_mutation_error)?;
+    if let Some(event) = result.event {
+        publish_events(state, vec![event]);
+    }
+    Ok(json!({
+        "input_id": result.input_id,
+        "cancelled": result.cancelled,
+        "reason": result.reason,
+        "priority": result.priority,
+        "status": result.status,
+        "queue": rpc_views::queue_state(result.queue),
+    }))
+}
+
+async fn input_reorder_queued_follow_ups(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let expected_queue_revision = params
+        .get("expected_queue_revision")
+        .and_then(Value::as_i64);
+    let input_ids = params
+        .get("input_ids")
+        .cloned()
+        .ok_or_else(|| RpcError::new("invalid_params", "input_ids is required"))
+        .and_then(|value| {
+            serde_json::from_value::<Vec<String>>(value)
+                .map_err(|error| RpcError::new("invalid_params", error.to_string()))
+        })?;
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.recover_if_needed().await?;
+    let result = state
+        .repo
+        .reorder_queued_follow_ups(&session_id, &input_ids, expected_queue_revision)
+        .await
+        .map_err(map_queued_mutation_error)?;
+    if let Some(event) = result.event {
+        publish_events(state, vec![event]);
+    }
+    Ok(json!({
+        "reordered": result.reordered,
+        "reason": result.reason,
+        "input_ids": result.input_ids,
+        "queue": rpc_views::queue_state(result.queue),
     }))
 }
 

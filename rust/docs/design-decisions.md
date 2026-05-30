@@ -73,8 +73,10 @@ applies to later provider requests, not one already in flight.
 Normal composer text is always `input.follow_up`, even while the agent is
 running. Queued follow-ups appear in a small pane above the composer. Each
 queued follow-up has a row-level steer control; pressing it promotes that row
-to the steer queue, ordered by promotion time. Active turns are interrupted with
-a stop button beside the composer, not with a slash command.
+to the steer queue, ordered by promotion time. The Rust backend supports
+follow-up edit, cancel, and reorder mutations, but this PR intentionally does
+not change the TypeScript frontend. Active turns are interrupted with a stop
+button beside the composer, not with a slash command.
 
 Slash autocomplete is intentionally shallow: it only appears while typing the
 command name. Enter on a partial command accepts the highlighted completion and
@@ -209,21 +211,33 @@ immediately.
 When a model/tool/compaction action is unfinished, composer sends remain
 `queued_inputs.status='queued'` follow-ups by default. Promoting a row changes
 its priority to `steer` and records `origin.promoted_at`; the queue consumes
-steers first in promotion order, then remaining follow-ups in creation order.
+steers first in promotion order, then remaining follow-ups by dense
+`follow_up_position` order. Follow-up reorder sends the complete id order rather
+than sparse/gapped order numbers; the store rewrites positions to `0..n-1`.
 If an active turn has just finished a tool batch and is about to request the
-model again, the daemon claims one queued steer before continuing and appends it
+model again, the daemon peeks one queued steer before continuing and appends it
 as a same-turn `user_message` after the tool results. Follow-ups are not
 eligible for that mid-turn slot. During compaction there is no same-turn slot,
 so queued steers wait behind the compaction action and become the next turn from
 the compacted root. Switch remains idle-only.
-Before the daemon materializes a queued row, it claims the row as `consuming`.
-The websocket surface only exposes queued promotion; editing historical input
-uses interrupt plus switch picker semantics. The daemon only marks a claimed
-input `consumed` in the transaction that also appends the corresponding
-transcript and action events.
+
+The Rust websocket surface exposes queued follow-up edit, cancel, and reorder
+mutations. These mutations only apply to `priority='follow_up'` and
+`status='queued'`. Steering rows are top-of-queue control messages: they cannot
+be edited, cancelled, or reordered by the follow-up mutation RPCs and remain
+ordered by steering/promote time. Editing historical input still uses interrupt
+plus switch picker semantics.
+
+Before the daemon materializes a queued row, it peeks the next row without
+moving it to `consuming`. The transcript commit marks that row `consumed` and
+validates both the row version and that it is still the canonical next queued
+input. If a queued mutation or new steer wins the race, the commit fails and
+the daemon reloads from Postgres. The legacy `consuming` vocabulary remains
+only for old rows and reset-on-touch recovery.
 
 That choice prevents a daemon-death gap where accepted user input has been moved
-into an in-memory mailbox but has not yet appeared in transcript history.
+into an in-memory mailbox but has not yet appeared in transcript history, while
+also allowing queued follow-up edits/cancels/reorders to win races cleanly.
 
 ### Input Idempotency Is Event-Idempotent Too
 

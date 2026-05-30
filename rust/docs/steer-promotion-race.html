@@ -311,10 +311,10 @@
       <h1>Steer promotion race: why the old error happened and what changed</h1>
       <p class="lede">
         The bug was not that steering was impossible. The bug was that the browser could show a stale queued
-        follow-up row for a moment after the daemon had already claimed that row. Clicking steer during that
+        follow-up row for a moment after the daemon had already materialized that row. Clicking steer during that
         window hit a backend error path meant for real invalid input. The fix has two layers: the backend now
-        treats "already claimed" as a normal no-op, and the UI applies queue events immediately so stale rows
-        disappear faster.
+        treats "no longer editable" as a normal no-op with a canonical queue snapshot, and the UI can replace
+        queue state from events immediately so stale rows disappear faster.
       </p>
     </header>
 
@@ -365,7 +365,7 @@
           <div class="connector"></div>
           <div class="step">
             <div class="actor">Runtime</div>
-            <div class="event warn-box"><strong>Claims row first</strong><small>The durable state is already <code>consuming</code> or <code>consumed</code>.</small></div>
+            <div class="event warn-box"><strong>Consumes row first</strong><small>The durable state is already <code>consumed</code> (or <code>consuming</code> for a legacy row).</small></div>
           </div>
           <div class="connector"></div>
           <div class="step">
@@ -380,7 +380,7 @@
           <div class="connector"></div>
           <div class="step">
             <div class="actor">Daemon</div>
-            <div class="event good-box"><strong>Returns ok response</strong><small><code>{ promoted: false, status: "consumed" }</code> or <code>{ promoted: false, status: "consuming" }</code>.</small></div>
+            <div class="event good-box"><strong>Returns ok response</strong><small><code>{ promoted: false, status: "consumed", queue: ... }</code> or the current legacy status.</small></div>
           </div>
           <div class="connector"></div>
           <div class="step">
@@ -402,7 +402,7 @@
         <div class="connector"></div>
         <div class="step">
           <div class="actor">User</div>
-          <div class="event"><strong>Clicks steer before daemon claims it</strong><small>The row is still editable.</small></div>
+          <div class="event"><strong>Clicks steer before daemon consumes it</strong><small>The row is still editable.</small></div>
         </div>
         <div class="connector"></div>
         <div class="step">
@@ -426,8 +426,8 @@
 
     <section class="card wide">
       <span class="tag">Queue row state machine</span>
-      <h2>The important boundary is the claim</h2>
-      <p>Promotion is only a mutation while the row is in <code>queued</code>. After claim, the transcript path owns it.</p>
+      <h2>The important boundary is the transcript commit</h2>
+      <p>Promotion is only a mutation while the row is in <code>queued</code>. New consumption keeps the row queued until the transcript transaction marks it consumed.</p>
 
       <div class="states">
         <div class="state">
@@ -436,7 +436,7 @@
         </div>
         <div class="state">
           <b>consuming</b>
-          <span>Claimed by runtime with a claim id. No longer editable.</span>
+          <span>Legacy claimed row from older daemons. No longer editable.</span>
         </div>
         <div class="state">
           <b>consumed</b>
@@ -465,7 +465,7 @@
             <td>Refresh queue, row appears as steer</td>
           </tr>
           <tr>
-            <td>Row is <code>consuming</code> or <code>consumed</code></td>
+            <td>Row is <code>consumed</code> or legacy <code>consuming</code></td>
             <td>Select row status, no event</td>
             <td><code>ok: true</code>, <code>promoted: false</code>, current status</td>
             <td>Refresh queue, show info notice</td>
@@ -525,7 +525,7 @@
           <tr>
             <td><code>rust/docs/websocket-rpc.md</code></td>
             <td>Contract documentation</td>
-            <td>Documented the new no-op response for claimed or consumed rows.</td>
+            <td>Documented the new no-op response for no-longer-editable rows.</td>
           </tr>
         </tbody>
       </table>

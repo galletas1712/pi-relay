@@ -97,6 +97,8 @@ Implemented user-facing behavior:
 - Steer/follow-up sends with idempotent `client_input_id` for both idle
   accepted input and busy queued input.
 - Queued follow-up promotion to steer priority, consumed in promotion order.
+- Queued follow-up edit, cancel, and full-list reorder RPCs in the Rust
+  daemon/store. Steering messages stay above follow-ups and are not reorderable.
 - Mid-turn steer insertion after completed tool results and before the next
   model request; follow-ups remain next-turn work, and compaction remains an
   action barrier.
@@ -217,14 +219,19 @@ Postgres is the only source of truth. The daemon may hold an in-memory
 transitions are written transactionally before follow-on work is dispatched.
 If that transactional write fails after the live session has advanced, the
 daemon evicts the live session so the next interaction reloads from Postgres.
+Short state transitions take a row lock on the target `sessions` row first,
+serializing that one session without locking unrelated sessions or holding locks
+across provider/tool I/O.
 Idle user inputs are materialized directly into transcript/action/event state.
 Busy user inputs are kept in Postgres until the session reaches a boundary.
-When the daemon is ready to consume one, it first claims the row as
-`consuming`; the final `consuming -> consumed` transition happens in the same
-transaction as the transcript/action/events that materialized it. Abandoned
-claims are reset to `queued` on first touch after daemon restart. That avoids a
-consumed-but-not-transcripted mailbox gap during daemon death while still
-letting queued edits fail cleanly once consumption has begun.
+When the daemon is ready to consume one, it peeks the next queued row and later
+marks that same row `consumed` in the transcript/action/event transaction. That
+commit fences the peek with the row version and re-checks that the row is still
+the canonical next queued input, so concurrent edit/cancel/reorder or a new
+steer above it forces the stale in-memory cursor to reload from Postgres.
+Legacy `consuming` rows from older daemons are reset to `queued` on first touch
+after daemon restart. This avoids a consumed-but-not-transcripted mailbox gap
+during daemon death while keeping queued follow-up mutations safe.
 
 Unfinished actions are execution leases owned by the daemon process. Startup
 marks leftover unfinished action rows stale before accepting websocket clients.
@@ -247,6 +254,9 @@ The Postgres data model is documented in
 - Daemon death during outstanding model/tool work is repaired on next touch with stale
   actions plus a crashed turn tail.
 - Late completions from stale attempts cannot mutate history.
+- Queue-visible transitions increment revision counters and emit canonical
+  queue projections so frontend/daemon/Postgres views converge by replacement,
+  not inferred patches.
 
 ## Providers
 

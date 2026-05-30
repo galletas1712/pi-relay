@@ -9,20 +9,34 @@ use crate::{
 
 use super::action_records::model_action_context_leaf_id;
 use super::events::insert_event_with_activity_tx;
+use super::queue::bump_revisions_tx;
 use super::rows::row_text;
-use super::sql::action_is_unfinished;
+use super::sql::{action_is_unfinished, lock_session_tx};
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
     pub async fn mark_all_unfinished_actions_stale(&self) -> Result<u64> {
         let unfinished_actions = action_is_unfinished(None);
         let query = format!(
-            "update actions set status='stale', updated_at=now() where {unfinished_actions}",
+            r#"
+            with updated_actions as (
+                update actions
+                set status='stale', updated_at=now()
+                where {unfinished_actions}
+                returning session_id
+            ),
+            updated_sessions as (
+                update sessions
+                set session_revision=session_revision + 1,
+                    updated_at=now()
+                where id in (select distinct session_id from updated_actions)
+                returning id
+            )
+            select count(*)::bigint from updated_actions
+            "#,
         );
-        Ok(sqlx::query(&query)
-            .execute(&self.pool)
-            .await?
-            .rows_affected())
+        let updated: i64 = sqlx::query_scalar(&query).fetch_one(&self.pool).await?;
+        Ok(updated as u64)
     }
 
     pub async fn has_unfinished_actions(&self, session_id: &str) -> Result<bool> {
@@ -133,6 +147,7 @@ impl PostgresAgentStore {
         event_type: EventType,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let query = "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and status='pending'";
         let updated = sqlx::query(&query)
             .bind(session_id)
@@ -145,6 +160,7 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok(Vec::new());
         }
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_with_activity_tx(
             &mut tx,
             session_id,
@@ -157,15 +173,22 @@ impl PostgresAgentStore {
     }
 
     pub async fn mark_action_stale(&self, session_id: &str, action_row_id: &str) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let unfinished_actions = action_is_unfinished(None);
         let query = format!(
             "update actions set status='stale', updated_at=now() where session_id=$1 and id=$2::text and {unfinished_actions}",
         );
-        sqlx::query(&query)
+        let updated = sqlx::query(&query)
             .bind(session_id)
             .bind(action_row_id)
-            .execute(&self.pool)
-            .await?;
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if updated > 0 {
+            bump_revisions_tx(&mut tx, session_id, false, false).await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -227,15 +250,21 @@ impl PostgresAgentStore {
         action_row_id: &str,
         attempt_id: &str,
     ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let updated = sqlx::query(
             "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and kind='model' and status='pending'",
         )
         .bind(session_id)
         .bind(action_row_id)
         .bind(attempt_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
+        if updated == 1 {
+            bump_revisions_tx(&mut tx, session_id, false, false).await?;
+        }
+        tx.commit().await?;
         Ok(updated == 1)
     }
 
@@ -247,6 +276,7 @@ impl PostgresAgentStore {
         error: &str,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let updated = sqlx::query(
             r#"
             update actions
@@ -272,6 +302,7 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok(Vec::new());
         }
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_with_activity_tx(
             &mut tx,
             session_id,
@@ -292,6 +323,7 @@ impl PostgresAgentStore {
         reason: &str,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
         let unfinished_actions = action_is_unfinished(None);
         let query = format!(
             r#"
@@ -313,6 +345,7 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok(Vec::new());
         }
+        bump_revisions_tx(&mut tx, session_id, false, false).await?;
         let event = insert_event_with_activity_tx(
             &mut tx,
             session_id,

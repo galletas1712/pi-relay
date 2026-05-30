@@ -100,5 +100,12 @@ Slash commands expose operations that do not already have dedicated controls:
 `/switch`, `/compact`, `/system`, and `/export`. Active turns use the
 stop button; new, rename, archive, and unarchive use sidebar controls; queued
 follow-ups can be promoted to steer from the queue pane above the composer.
+The Rust daemon/store also supports queued follow-up edit, cancel, and full-list
+reorder RPCs; steering messages stay at the top and are not reorderable.
 Crashed or interrupted terminal model turns can be retried/continued directly
 from the transcript row.
+
+Existing Postgres databases need the one-shot
+`rust/scripts/migrate-session-sync-v1.sql` before running code that expects the
+new session revision and queue ordering columns. This migration is intentionally
+not run automatically by the daemon.

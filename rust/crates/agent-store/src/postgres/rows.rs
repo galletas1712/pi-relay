@@ -1,9 +1,7 @@
 use std::str::FromStr;
 
 use agent_session::StoredTranscriptEntry;
-use agent_vocab::UserMessage;
 use anyhow::Result;
-use serde_json::Value;
 use sqlx::{postgres::PgRow, Row};
 
 use crate::{EventFrame, EventType};
@@ -39,11 +37,4 @@ pub(super) fn row_to_stored_entry(row: &PgRow) -> Result<StoredTranscriptEntry> 
         item: serde_json::from_value(row.get("item"))?,
         provider_replay: serde_json::from_value(row.get("provider_replay"))?,
     })
-}
-
-pub(super) fn queued_input_record_content(value: Value) -> Result<UserMessage> {
-    if value.get("content").is_none() {
-        return Ok(UserMessage::from_parts(Vec::new()));
-    }
-    Ok(serde_json::from_value(value)?)
 }

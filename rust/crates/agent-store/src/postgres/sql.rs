@@ -6,9 +6,15 @@ pub(super) const QUEUED_INPUT_DISPATCH_ORDER: &str = r#"
     case
         when priority='steer'
         then coalesce((origin->>'promoted_at')::timestamptz, created_at)
-        else created_at
+        else null
     end,
-    created_at
+    case
+        when priority='follow_up'
+        then follow_up_position
+        else null
+    end nulls last,
+    created_at,
+    id
 "#;
 
 pub(super) fn action_is_unfinished(alias: Option<&str>) -> String {
@@ -33,4 +39,18 @@ fn qualified_status_column(alias: Option<&str>) -> String {
     alias
         .map(|alias| format!("{alias}.status"))
         .unwrap_or_else(|| "status".to_string())
+}
+
+pub(super) async fn lock_session_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let locked = sqlx::query("select id from sessions where id=$1 for update")
+        .bind(session_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    if locked.is_none() {
+        anyhow::bail!("session not found: {session_id}");
+    }
+    Ok(())
 }
