@@ -18,6 +18,7 @@ export interface SelectedSessionCache {
 	treeChildrenByParentId: Map<string | null, string[]>;
 	treeOrder: string[];
 	treeTranscriptRevision: number | null;
+	treeLoadedPrefixSequence: number;
 	treeMaxSequence: number;
 	treeComplete: boolean;
 	loading: boolean;
@@ -35,6 +36,7 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		treeChildrenByParentId: new Map(),
 		treeOrder: [],
 		treeTranscriptRevision: null,
+		treeLoadedPrefixSequence: 0,
 		treeMaxSequence: 0,
 		treeComplete: false,
 		loading: false,
@@ -92,11 +94,10 @@ export function applyEntryBodies(cache: SelectedSessionCache, sessionId: string,
 
 export function applyTreeIndex(cache: SelectedSessionCache, index: TranscriptTreeIndex): SelectedSessionCache {
 	if (cache.sessionId !== index.session_id) return cache;
-	const loadedMaxSequence = Math.max(0, ...Array.from(cache.treeNodesById.values(), (node) => node.sequence));
 	const pageMatchesRevision = cache.treeTranscriptRevision === index.transcript_revision;
-	const pageIsContiguous = index.after_sequence <= loadedMaxSequence;
-	const canApplyPage = index.after_sequence === 0 || (pageMatchesRevision && pageIsContiguous);
-	const shouldReset = index.after_sequence === 0 || !pageMatchesRevision || !pageIsContiguous;
+	const pageStartsAtLoadedPrefix = index.after_sequence === cache.treeLoadedPrefixSequence;
+	const canApplyPage = index.after_sequence === 0 || (pageMatchesRevision && pageStartsAtLoadedPrefix);
+	const shouldReset = index.after_sequence === 0 || !pageMatchesRevision || !pageStartsAtLoadedPrefix;
 	const treeNodesById = shouldReset ? new Map<string, TranscriptTreeNode>() : new Map(cache.treeNodesById);
 	if (canApplyPage) {
 		for (const node of index.nodes) treeNodesById.set(node.id, node);
@@ -121,6 +122,7 @@ export function applyTreeIndex(cache: SelectedSessionCache, index: TranscriptTre
 		treeChildrenByParentId,
 		treeOrder,
 		treeTranscriptRevision: index.transcript_revision,
+		treeLoadedPrefixSequence: canApplyPage ? (index.nodes.at(-1)?.sequence ?? index.after_sequence) : 0,
 		treeMaxSequence: canApplyPage ? index.max_sequence : 0,
 		treeComplete: canApplyPage ? index.complete : false,
 	};
@@ -294,6 +296,17 @@ function applyTreeNodeFromEvent(cache: SelectedSessionCache, event: EventFrame):
 	const node = transcriptTreeNodeFromUnknown(event.data.tree_node);
 	if (!node) return {};
 	const revision = numberValue(event.data.transcript_revision) ?? cache.treeTranscriptRevision;
+	const canMergeNode =
+		cache.treeTranscriptRevision === null ||
+		cache.treeComplete ||
+		node.sequence <= cache.treeLoadedPrefixSequence;
+	if (!canMergeNode) {
+		return {
+			treeTranscriptRevision: revision,
+			treeMaxSequence: Math.max(cache.treeMaxSequence, node.sequence),
+			treeComplete: false,
+		};
+	}
 	const treeNodesById = new Map(cache.treeNodesById);
 	treeNodesById.set(node.id, node);
 	const treeOrder = Array.from(treeNodesById.values())
@@ -304,8 +317,11 @@ function applyTreeNodeFromEvent(cache: SelectedSessionCache, event: EventFrame):
 		treeChildrenByParentId: buildTreeChildren(treeOrder, treeNodesById),
 		treeOrder,
 		treeTranscriptRevision: revision,
+		treeLoadedPrefixSequence: cache.treeComplete
+			? Math.max(cache.treeLoadedPrefixSequence, node.sequence)
+			: cache.treeLoadedPrefixSequence,
 		treeMaxSequence: Math.max(cache.treeMaxSequence, node.sequence),
-		treeComplete: cache.treeComplete && node.sequence <= cache.treeMaxSequence,
+		treeComplete: cache.treeComplete,
 	};
 }
 

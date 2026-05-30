@@ -855,6 +855,7 @@ export function App() {
 							treeChildrenByParentId: new Map<string | null, string[]>(),
 							treeOrder: [],
 							treeTranscriptRevision: index.transcript_revision,
+							treeLoadedPrefixSequence: 0,
 							treeMaxSequence: 0,
 							treeComplete: false,
 						};

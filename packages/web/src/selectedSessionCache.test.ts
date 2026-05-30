@@ -74,6 +74,7 @@ describe("selected session cache", () => {
 
 		expect(treeNodesInOrder(cache).map((node) => node.id)).toEqual(["entry_1", "entry_2", "entry_3"]);
 		expect(cache.treeTranscriptRevision).toBe(7);
+		expect(cache.treeLoadedPrefixSequence).toBe(3);
 		expect(cache.treeMaxSequence).toBe(3);
 		expect(cache.treeComplete).toBe(true);
 	});
@@ -101,7 +102,34 @@ describe("selected session cache", () => {
 
 		expect(treeNodesInOrder(cache)).toEqual([]);
 		expect(cache.treeTranscriptRevision).toBe(2);
+		expect(cache.treeLoadedPrefixSequence).toBe(0);
 		expect(cache.treeMaxSequence).toBe(0);
+		expect(cache.treeComplete).toBe(false);
+	});
+
+	it("rejects overlapping delta tree pages because duplicate IDs can hide missing sequence gaps", () => {
+		let cache = applyTreeIndex(
+			emptySelectedSessionCache(sessionId),
+			treeIndex([treeNode("entry_1", null, 1), treeNode("entry_2", "entry_1", 2)], {
+				afterSequence: 0,
+				complete: false,
+				maxSequence: 4,
+				transcriptRevision: 1,
+			}),
+		);
+
+		cache = applyTreeIndex(
+			cache,
+			treeIndex([treeNode("entry_2", "entry_1", 2), treeNode("entry_4", "entry_2", 4)], {
+				afterSequence: 1,
+				complete: true,
+				maxSequence: 4,
+				transcriptRevision: 1,
+			}),
+		);
+
+		expect(treeNodesInOrder(cache)).toEqual([]);
+		expect(cache.treeLoadedPrefixSequence).toBe(0);
 		expect(cache.treeComplete).toBe(false);
 	});
 
