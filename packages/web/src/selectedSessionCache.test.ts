@@ -184,6 +184,19 @@ describe("selected session cache", () => {
 		expect(applied.cache.treeNodesById.get("entry_2")?.sequence).toBe(2);
 	});
 
+	it("builds a compact tree from append events before the tree index has been loaded", () => {
+		const first = entry("entry_1", null, "first", 1);
+		const second = entry("entry_2", "entry_1", "second", 2);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([], { transcriptRevision: 0 }));
+
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(first, 5, 1)).cache;
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(second, 6, 2)).cache;
+
+		expect(treeNodesInOrder(cache).map((node) => node.id)).toEqual(["entry_1", "entry_2"]);
+		expect(cache.treeLoadedPrefixSequence).toBe(2);
+		expect(cache.treeComplete).toBe(false);
+	});
+
 	it("requests a refresh when transcript append events move to another branch", () => {
 		const first = entry("entry_1", null, "first", 1);
 		const branched = entry("entry_3", "entry_other", "branched", 3);
