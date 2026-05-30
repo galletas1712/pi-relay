@@ -50,16 +50,33 @@ export function selectedEntries(cache: SelectedSessionCache): TranscriptEntry[] 
 	});
 }
 
+export function treeNodesInOrder(cache: SelectedSessionCache): TranscriptTreeNode[] {
+	return cache.treeOrder.flatMap((id) => {
+		const node = cache.treeNodesById.get(id);
+		return node ? [node] : [];
+	});
+}
+
 export function applySelectedSnapshot(cache: SelectedSessionCache, snapshot: SessionSnapshot): SelectedSessionCache {
 	const entries = snapshot.entries ?? [];
-	const entriesById = new Map(cache.sessionId === snapshot.session_id ? cache.entriesById : []);
+	const sameSession = cache.sessionId === snapshot.session_id;
+	const base = sameSession ? cache : emptySelectedSessionCache(snapshot.session_id);
+	const entriesById = new Map(base.entriesById);
 	for (const entry of entries) entriesById.set(entry.id, entry);
+	const snapshotTranscriptRevision = snapshot.transcript_revision ?? null;
+	const treeRevisionChanged =
+		sameSession &&
+		base.treeTranscriptRevision !== null &&
+		snapshotTranscriptRevision !== null &&
+		base.treeTranscriptRevision !== snapshotTranscriptRevision;
 	return {
-		...(cache.sessionId === snapshot.session_id ? cache : emptySelectedSessionCache(snapshot.session_id)),
+		...base,
 		sessionId: snapshot.session_id,
 		snapshot: { ...snapshot, entries },
 		activeBranchEntryIds: entries.map((entry) => entry.id),
 		entriesById,
+		treeTranscriptRevision: treeRevisionChanged ? snapshotTranscriptRevision : base.treeTranscriptRevision,
+		treeComplete: treeRevisionChanged ? false : base.treeComplete,
 		loading: false,
 		refreshing: false,
 		error: null,
@@ -88,6 +105,7 @@ export function applyTreeIndex(cache: SelectedSessionCache, index: TranscriptTre
 				active_leaf_id: index.active_leaf_id,
 				session_revision: Math.max(cache.snapshot.session_revision ?? 0, index.session_revision),
 				transcript_revision: Math.max(cache.snapshot.transcript_revision ?? 0, index.transcript_revision),
+				entries: cache.snapshot.entries ?? selectedEntries(cache),
 			}
 		: cache.snapshot;
 	return {
@@ -114,6 +132,19 @@ export function applyQueueProjection(cache: SelectedSessionCache, sessionId: str
 			session_revision: queue.session_revision,
 			queue_revision: queue.queue_revision,
 			transcript_revision: queue.transcript_revision,
+			entries: cache.snapshot.entries ?? selectedEntries(cache),
+		},
+	};
+}
+
+export function applyEventHighWater(cache: SelectedSessionCache, sessionId: string, eventId: number): SelectedSessionCache {
+	if (cache.sessionId !== sessionId || !cache.snapshot || cache.snapshot.last_event_id >= eventId) return cache;
+	return {
+		...cache,
+		snapshot: {
+			...cache.snapshot,
+			last_event_id: eventId,
+			entries: cache.snapshot.entries ?? selectedEntries(cache),
 		},
 	};
 }
@@ -167,14 +198,23 @@ export function applyTranscriptAppendedEvent(cache: SelectedSessionCache, event:
 	const activeLeafId = stringOrNull(event.data.active_leaf_id);
 	if (!entry) return { cache, result: "refresh" };
 	const currentLeafId = cache.activeBranchEntryIds.at(-1) ?? null;
-	const extendsBranch = entry.parent_id === currentLeafId || cache.activeBranchEntryIds.includes(entry.parent_id ?? "");
+	const appendsToActiveBranch = entry.parent_id === currentLeafId || (currentLeafId === null && entry.parent_id === null);
 	const entriesById = new Map(cache.entriesById);
 	entriesById.set(entry.id, entry);
 	let activeBranchEntryIds = cache.activeBranchEntryIds;
-	if (entry.parent_id === currentLeafId || (currentLeafId === null && entry.parent_id === null)) {
+	if (appendsToActiveBranch) {
 		activeBranchEntryIds = [...activeBranchEntryIds, entry.id];
 	} else if (activeLeafId && activeLeafId === entry.id) {
-		return { cache: { ...cache, entriesById }, result: "refresh" };
+		const snapshot: SessionSnapshot = {
+			...cache.snapshot,
+			active_leaf_id: activeLeafId,
+			session_revision: sessionRevision ?? cache.snapshot.session_revision ?? 0,
+			queue_revision: queueRevision ?? cache.snapshot.queue_revision ?? 0,
+			transcript_revision: transcriptRevision ?? cache.snapshot.transcript_revision ?? 0,
+			last_event_id: Math.max(cache.snapshot.last_event_id, event.event_id),
+			entries: cache.snapshot.entries ?? selectedEntries(cache),
+		};
+		return { cache: { ...cache, snapshot, entriesById, ...applyTreeNodeFromEvent(cache, event) }, result: "refresh" };
 	}
 	const snapshot: SessionSnapshot = {
 		...cache.snapshot,
@@ -192,7 +232,7 @@ export function applyTranscriptAppendedEvent(cache: SelectedSessionCache, event:
 		entriesById,
 		...applyTreeNodeFromEvent(cache, event),
 	};
-	return { cache: nextCache, result: extendsBranch ? "applied" : "refresh" };
+	return { cache: nextCache, result: appendsToActiveBranch ? "applied" : "refresh" };
 }
 
 export function branchFromTree(cache: SelectedSessionCache, leafId: string | null): TranscriptTreeNode[] {

@@ -353,3 +353,19 @@ first and display a picker loading state while that capability is fetched.
   selected-session cache helpers, and a compact history picker component. App
   wiring and queue mutation controls remain separate commits so each step stays
   reviewable.
+- App wiring now removes the selected-session `useQuery` cache authority. The
+  app keeps projects/session lists/tools/system prompt in TanStack Query, but
+  selected-session rendering, queue state, active branch bodies, compact
+  topology, and sparse fetched bodies live in `SelectedSessionCache`.
+- `/export` intentionally fetches only `session.get(active_branch)` now. The UI
+  exports "the current branch", so full-tree bodies were unnecessary hot-path
+  data and were another selected-session cache authority.
+- The selected cache opportunistically absorbs canonical queue projections from
+  queue mutation responses/events and absorbs `transcript.appended` entries when
+  they append to the displayed branch. Side-channel transcript events
+  (`turn.started`, `turn.finished`, `assistant.message`) advance the event
+  high-water locally when their `entry_id` is already known, avoiding redundant
+  selected refreshes after the matching `transcript.appended`.
+- Queue edit/delete/reorder controls were added for queued follow-ups only.
+  Steering rows remain immutable in the pane: they stay above follow-ups and
+  expose only the disabled/non-editable state.
