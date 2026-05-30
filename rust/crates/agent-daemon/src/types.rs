@@ -64,6 +64,8 @@ pub(crate) enum RpcMethod {
     InputCancelQueued,
     InputReorderQueuedFollowUps,
     InputInterrupt,
+    TranscriptIndex,
+    TranscriptEntries,
     HistoryTree,
     HistoryContext,
     HistorySwitch,
@@ -97,6 +99,8 @@ impl RpcMethod {
             "input.cancel_queued" => Some(Self::InputCancelQueued),
             "input.reorder_queued_follow_ups" => Some(Self::InputReorderQueuedFollowUps),
             "input.interrupt" => Some(Self::InputInterrupt),
+            "transcript.index" => Some(Self::TranscriptIndex),
+            "transcript.entries" => Some(Self::TranscriptEntries),
             "history.tree" => Some(Self::HistoryTree),
             "history.context" => Some(Self::HistoryContext),
             "history.switch" => Some(Self::HistorySwitch),
@@ -160,6 +164,14 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("session.sync_active_branch"),
             Some(RpcMethod::SessionSyncActiveBranch)
+        );
+        assert_eq!(
+            RpcMethod::parse("transcript.index"),
+            Some(RpcMethod::TranscriptIndex)
+        );
+        assert_eq!(
+            RpcMethod::parse("transcript.entries"),
+            Some(RpcMethod::TranscriptEntries)
         );
         assert_eq!(RpcMethod::parse("turn.resume"), Some(RpcMethod::TurnResume));
         assert_eq!(

@@ -10,6 +10,9 @@ use crate::{EventFrame, EventType, SessionActivity};
 
 use super::action_records::{action_payload, ActionKey};
 use super::rows::row_to_event;
+use super::transcript::{
+    session_state_for_event_tx, transcript_entry_record_tx, tree_node_from_entry,
+};
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
@@ -219,21 +222,44 @@ pub(super) async fn insert_transcript_item_events_tx(
     entry_id: &str,
     item: &TranscriptItem,
 ) -> Result<Vec<EventFrame>> {
-    let entry_payload = entry.map(|entry| {
-        json!({
+    let state = session_state_for_event_tx(tx, session_id).await?;
+    let record = transcript_entry_record_tx(tx, session_id, entry_id).await?;
+    let entry_payload = if let Some(entry) = record.as_ref() {
+        Some(json!({
             "id": entry.id,
             "parent_id": entry.parent_id,
             "timestamp_ms": entry.timestamp_ms,
+            "sequence": entry.sequence,
             "item": entry.item,
             "provider_replay": entry.provider_replay,
+        }))
+    } else {
+        entry.map(|entry| {
+            json!({
+                "id": entry.id,
+                "parent_id": entry.parent_id,
+                "timestamp_ms": entry.timestamp_ms,
+                "item": entry.item,
+                "provider_replay": entry.provider_replay,
+            })
         })
-    });
+    };
+    let tree_node = record.as_ref().map(tree_node_from_entry);
     let mut frames = vec![
         insert_event_with_activity_tx(
             tx,
             session_id,
             EventType::TranscriptAppended,
-            json!({ "entry_id": entry_id, "item": item, "entry": entry_payload }),
+            json!({
+                "entry_id": entry_id,
+                "item": item,
+                "entry": entry_payload,
+                "tree_node": tree_node,
+                "active_leaf_id": state.active_leaf_id,
+                "session_revision": state.session_revision,
+                "queue_revision": state.queue_revision,
+                "transcript_revision": state.transcript_revision,
+            }),
         )
         .await?,
     ];

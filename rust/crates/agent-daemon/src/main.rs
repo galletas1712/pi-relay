@@ -32,7 +32,7 @@ use agent_session::{AgentSession, SessionInput};
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
     EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputStatus,
-    SessionConfig, WorkspaceKind,
+    SessionConfig, TranscriptEntryScope, WorkspaceKind,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -268,6 +268,8 @@ async fn dispatch_request(
             input_reorder_queued_follow_ups(state, params).await
         }
         RpcMethod::InputInterrupt => input_interrupt(state, params).await,
+        RpcMethod::TranscriptIndex => transcript_index(state, params).await,
+        RpcMethod::TranscriptEntries => transcript_entries(state, params).await,
         RpcMethod::HistoryTree => history_tree(state, params).await,
         RpcMethod::HistoryContext => history_context(state, params).await,
         RpcMethod::HistorySwitch => history_switch(state, params).await,
@@ -479,20 +481,18 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
         .await
         .map_err(anyhow::Error::from)?;
     let entries = if include_entries {
-        let tree = if entries_scope == "active_branch" {
-            state
-                .repo
-                .active_branch(&session_id)
-                .await
-                .map_err(anyhow::Error::from)?
+        let scope = if entries_scope == "active_branch" {
+            TranscriptEntryScope::ActiveBranch
         } else {
+            TranscriptEntryScope::FullTree
+        };
+        Some(
             state
                 .repo
-                .history_tree(&session_id)
+                .transcript_entries_for_scope(&session_id, scope)
                 .await
-                .map_err(anyhow::Error::from)?
-        };
-        Some(tree.entries)
+                .map_err(anyhow::Error::from)?,
+        )
     } else {
         None
     };
@@ -1177,6 +1177,43 @@ async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result
     Ok(json!({ "interrupted": true, "aborted_task_kinds": aborted_tasks }))
 }
 
+async fn transcript_index(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let after_sequence = params.get("after_sequence").and_then(Value::as_i64);
+    let limit = params.get("limit").and_then(Value::as_i64);
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.recover_if_needed().await?;
+    let index = state
+        .repo
+        .transcript_tree_index(&session_id, after_sequence, limit)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(rpc_views::transcript_tree_index(index))
+}
+
+async fn transcript_entries(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let entry_ids = params
+        .get("entry_ids")
+        .cloned()
+        .ok_or_else(|| RpcError::new("invalid_params", "entry_ids is required"))
+        .and_then(|value| {
+            serde_json::from_value::<Vec<String>>(value)
+                .map_err(|error| RpcError::new("invalid_params", error.to_string()))
+        })?;
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.recover_if_needed().await?;
+    let result = state
+        .repo
+        .transcript_entries_by_id(&session_id, &entry_ids)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(rpc_views::transcript_entries(result))
+}
+
 async fn history_tree(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let started_at = Instant::now();
@@ -1245,19 +1282,18 @@ async fn history_switch(state: &AppState, params: Value) -> std::result::Result<
             "history.switch requires a turn boundary",
         ));
     }
-    let events = state
+    let return_active_branch = params
+        .get("return_active_branch")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let result = state
         .repo
-        .set_active_leaf(&session_id, leaf_id)
+        .switch_active_leaf(&session_id, leaf_id, return_active_branch)
         .await
         .map_err(anyhow::Error::from)?;
-    let activity = state
-        .repo
-        .activity(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
-    publish_events(state, events);
+    publish_events(state, result.events.clone());
     clear_event_buffer_if_idle(state, &session_id).await?;
-    Ok(json!({ "session_id": session_id, "active_leaf_id": leaf_id, "activity": activity }))
+    Ok(rpc_views::switch_active_leaf(result))
 }
 
 async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

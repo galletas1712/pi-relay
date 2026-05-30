@@ -452,7 +452,8 @@ pre {
 .icon-button,
 .send-button,
 .stop-button,
-.queue-steer-button {
+.queue-steer-button,
+.queue-icon-button {
 	display: inline-flex;
 	align-items: center;
 	justify-content: center;
@@ -498,7 +499,8 @@ pre {
 .icon-button:hover,
 .send-button:hover,
 .stop-button:hover,
-.queue-steer-button:not(:disabled):hover {
+.queue-steer-button:not(:disabled):hover,
+.queue-icon-button:not(:disabled):hover {
 	border-color: var(--border);
 	background: var(--accent);
 	color: var(--accent-foreground);
@@ -2384,7 +2386,7 @@ pre {
 	bottom: calc(100% + 8px);
 	left: 0;
 	z-index: 18;
-	max-height: 230px;
+	max-height: min(360px, 46dvh);
 	overflow: hidden;
 	border: 1px solid var(--border);
 	border-radius: var(--radius);
@@ -2418,13 +2420,13 @@ pre {
 }
 
 .queue-list {
-	max-height: 188px;
+	max-height: calc(min(360px, 46dvh) - 42px);
 	overflow: auto;
 }
 
 .queue-row {
 	display: grid;
-	grid-template-columns: minmax(0, 1fr) auto;
+	grid-template-columns: minmax(0, 1fr) auto auto;
 	align-items: center;
 	gap: 9px;
 	border-bottom: 1px solid var(--border);
@@ -2446,6 +2448,37 @@ pre {
 	font-size: 14px;
 }
 
+.queue-edit {
+	min-height: 58px;
+	width: 100%;
+	resize: vertical;
+	border: 1px solid var(--border);
+	border-radius: calc(var(--radius) - 3px);
+	background: var(--background);
+	color: var(--foreground);
+	padding: 7px 8px;
+	font: inherit;
+	line-height: 1.35;
+}
+
+.queue-actions {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.queue-icon-button {
+	width: 28px;
+	height: 28px;
+	border-color: var(--border);
+	background: var(--background);
+	color: var(--muted-foreground);
+}
+
+.queue-icon-button.destructive:not(:disabled) {
+	color: var(--destructive);
+}
+
 .queue-steer-button {
 	height: 28px;
 	border-color: var(--border);
@@ -2456,7 +2489,8 @@ pre {
 	font-size: 12px;
 }
 
-.queue-steer-button:disabled {
+.queue-steer-button:disabled,
+.queue-icon-button:disabled {
 	cursor: default;
 	opacity: 0.45;
 }
@@ -3086,14 +3120,20 @@ pre {
 		gap: 7px;
 	}
 
-	.queue-preview {
+	.queue-preview,
+	.queue-edit {
 		grid-column: 1;
 		grid-row: 1;
 	}
 
-	.queue-steer-button {
+	.queue-actions {
 		grid-column: 2;
 		grid-row: 1;
+	}
+
+	.queue-steer-button {
+		grid-column: 1 / -1;
+		justify-self: end;
 	}
 
 	.slash-row {

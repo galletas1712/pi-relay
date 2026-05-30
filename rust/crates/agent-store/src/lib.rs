@@ -5,11 +5,10 @@ mod postgres;
 use std::fmt;
 use std::str::FromStr;
 
-use agent_session::{
-    ModelContext, SessionAction, SessionEvent, StoredTranscriptEntry, TranscriptStorageNode,
-};
+use agent_session::{ModelContext, SessionAction, SessionEvent, TranscriptStorageNode};
 use agent_vocab::{
-    ActionId, ProviderConfig, ProviderKind, ProviderReplayItem, TurnId, UserMessage,
+    ActionId, ProviderConfig, ProviderKind, ProviderReplayItem, TranscriptItem, TurnId,
+    TurnOutcome, UserMessage,
 };
 pub use postgres::PostgresAgentStore;
 use serde::de::Error as _;
@@ -506,11 +505,61 @@ pub struct SessionSnapshot {
     pub has_transcript_entries: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptEntryScope {
+    FullTree,
+    ActiveBranch,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptEntryRecord {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub timestamp_ms: u64,
+    pub sequence: i64,
+    pub item: TranscriptItem,
+    pub provider_replay: Vec<ProviderReplayItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TranscriptTreeNodeRecord {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub timestamp_ms: u64,
+    pub sequence: i64,
+    pub item_type: String,
+    pub turn_id: Option<TurnId>,
+    pub outcome: Option<TurnOutcome>,
+    pub can_switch_to: bool,
+    pub edit_target_leaf_id: Option<String>,
+    pub display_hint: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptTreeIndex {
+    pub session_id: String,
+    pub active_leaf_id: Option<String>,
+    pub session_revision: i64,
+    pub transcript_revision: i64,
+    pub after_sequence: i64,
+    pub max_sequence: i64,
+    pub complete: bool,
+    pub nodes: Vec<TranscriptTreeNodeRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptEntriesResult {
+    pub session_id: String,
+    pub session_revision: i64,
+    pub transcript_revision: i64,
+    pub entries: Vec<TranscriptEntryRecord>,
+}
+
 #[derive(Debug, Clone)]
 pub struct HistoryTree {
     pub session_id: String,
     pub active_leaf_id: Option<String>,
-    pub entries: Vec<StoredTranscriptEntry>,
+    pub entries: Vec<TranscriptEntryRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -519,7 +568,20 @@ pub struct ActiveBranchSync {
     pub base_leaf_id: Option<String>,
     pub active_leaf_id: Option<String>,
     pub status: ActiveBranchSyncStatus,
-    pub entries: Vec<StoredTranscriptEntry>,
+    pub entries: Vec<TranscriptEntryRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SwitchActiveLeafResult {
+    pub session_id: String,
+    pub active_leaf_id: Option<String>,
+    pub activity: SessionActivity,
+    pub session_revision: i64,
+    pub queue_revision: i64,
+    pub transcript_revision: i64,
+    pub last_event_id: i64,
+    pub active_branch_entries: Option<Vec<TranscriptEntryRecord>>,
+    pub events: Vec<EventFrame>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

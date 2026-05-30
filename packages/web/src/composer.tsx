@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
-import { Loader2, MoveUp, Send, Square } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, Edit3, Loader2, MoveUp, Send, Square, Trash2, X } from "lucide-react";
 import { COMMANDS, filterCommands, matchSlashPrefix, type SlashCommandInfo } from "./slash.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
 import type { QueuePaneInput } from "./pendingInputs.ts";
@@ -34,7 +34,10 @@ export const Composer = memo(function Composer({
 	queuedInputs,
 	onSubmit,
 	onStop,
-	onPromoteQueued
+	onPromoteQueued,
+	onUpdateQueued,
+	onCancelQueued,
+	onMoveQueued,
 }: {
 	selectedId: string | null;
 	composerHandleRef: RefObject<ComposerHandle | null>;
@@ -45,6 +48,9 @@ export const Composer = memo(function Composer({
 	onSubmit: (text: string) => Promise<boolean> | boolean;
 	onStop: () => void;
 	onPromoteQueued: (inputId: string) => void;
+	onUpdateQueued: (inputId: string, text: string) => void;
+	onCancelQueued: (inputId: string) => void;
+	onMoveQueued: (inputId: string, direction: "up" | "down") => void;
 }) {
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
 	const selectedIdRef = useRef<string | null>(selectedId);
@@ -206,6 +212,9 @@ export const Composer = memo(function Composer({
 				inputs={queuedInputs}
 				visible={queuedInputs.length > 0 && !slashState.visible}
 				onPromote={onPromoteQueued}
+				onUpdate={onUpdateQueued}
+				onCancel={onCancelQueued}
+				onMove={onMoveQueued}
 			/>
 			<textarea
 				ref={textAreaRef}
@@ -245,12 +254,33 @@ export const Composer = memo(function Composer({
 export function QueuedInputPane({
 	inputs,
 	visible,
-	onPromote
+	onPromote,
+	onUpdate,
+	onCancel,
+	onMove,
 }: {
 	inputs: QueuePaneInput[];
 	visible: boolean;
 	onPromote: (inputId: string) => void;
+	onUpdate: (inputId: string, text: string) => void;
+	onCancel: (inputId: string) => void;
+	onMove: (inputId: string, direction: "up" | "down") => void;
 }) {
+	const [editingId, setEditingId] = useState<string | null>(null);
+	const [editingText, setEditingText] = useState("");
+	const followUpIds = useMemo(
+		() =>
+			inputs
+				.filter((input) => !input.pending && input.priority === "follow_up" && input.status === "queued")
+				.map((input) => input.input_id),
+		[inputs],
+	);
+	useEffect(() => {
+		if (editingId && !inputs.some((input) => input.input_id === editingId)) {
+			setEditingId(null);
+			setEditingText("");
+		}
+	}, [editingId, inputs]);
 	if (!visible) return null;
 	return (
 		<div className="queue-pane">
@@ -261,9 +291,100 @@ export function QueuedInputPane({
 			<div className="queue-list">
 				{inputs.map((input) => {
 					const canPromote = !input.pending && input.priority === "follow_up" && input.status === "queued";
+					const canMutate = canPromote;
+					const followUpIndex = followUpIds.indexOf(input.input_id);
+					const isEditing = editingId === input.input_id;
+					const preview = contentBlocksToText(input.content);
 					return (
 						<div className={`queue-row ${input.pending ? "pending" : ""}`} key={input.input_id}>
-							<span className="queue-preview">{truncate(firstLine(contentBlocksToText(input.content)) || "(empty)", 96)}</span>
+							{isEditing ? (
+								<textarea
+									className="queue-edit"
+									value={editingText}
+									onChange={(event) => setEditingText(event.target.value)}
+									rows={Math.min(4, Math.max(2, editingText.split("\n").length))}
+									autoFocus
+								/>
+							) : (
+								<span className="queue-preview">{truncate(firstLine(preview) || "(empty)", 96)}</span>
+							)}
+							{isEditing ? (
+								<div className="queue-actions">
+									<button
+										className="queue-icon-button"
+										type="button"
+										onClick={() => {
+											const nextText = editingText.trim();
+											if (!nextText) return;
+											onUpdate(input.input_id, nextText);
+											setEditingId(null);
+										}}
+										disabled={!editingText.trim()}
+										title="save queued message"
+										aria-label="save queued message"
+									>
+										<Check size={13} />
+									</button>
+									<button
+										className="queue-icon-button"
+										type="button"
+										onClick={() => {
+											setEditingId(null);
+											setEditingText("");
+										}}
+										title="cancel edit"
+										aria-label="cancel edit"
+									>
+										<X size={13} />
+									</button>
+								</div>
+							) : (
+								<div className="queue-actions">
+									<button
+										className="queue-icon-button"
+										type="button"
+										onClick={() => onMove(input.input_id, "up")}
+										disabled={!canMutate || followUpIndex <= 0}
+										title="move queued follow-up up"
+										aria-label="move queued follow-up up"
+									>
+										<ArrowUp size={13} />
+									</button>
+									<button
+										className="queue-icon-button"
+										type="button"
+										onClick={() => onMove(input.input_id, "down")}
+										disabled={!canMutate || followUpIndex < 0 || followUpIndex >= followUpIds.length - 1}
+										title="move queued follow-up down"
+										aria-label="move queued follow-up down"
+									>
+										<ArrowDown size={13} />
+									</button>
+									<button
+										className="queue-icon-button"
+										type="button"
+										onClick={() => {
+											setEditingId(input.input_id);
+											setEditingText(preview);
+										}}
+										disabled={!canMutate}
+										title={canMutate ? "edit queued follow-up" : "steering messages cannot be edited"}
+										aria-label="edit queued follow-up"
+									>
+										<Edit3 size={13} />
+									</button>
+									<button
+										className="queue-icon-button destructive"
+										type="button"
+										onClick={() => onCancel(input.input_id)}
+										disabled={!canMutate}
+										title={canMutate ? "delete queued follow-up" : "steering messages cannot be deleted here"}
+										aria-label="delete queued follow-up"
+									>
+										<Trash2 size={13} />
+									</button>
+								</div>
+							)}
 							<button
 								className="queue-steer-button"
 								type="button"

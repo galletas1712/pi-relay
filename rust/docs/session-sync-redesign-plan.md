@@ -12,8 +12,7 @@
   transcript marks it `consumed`.
 - Preserve action attempt fencing for long-running model/tool/compaction work.
 - Keep old-session migration outside the daemon runtime. Fresh schema gets the
-  new columns; existing databases are upgraded with the standalone script in
-  this PR.
+  new columns; the one existing database was upgraded manually before merge.
 
 ## Non-goals
 
@@ -33,8 +32,6 @@ Fresh databases add these columns:
 - `queued_inputs.updated_at timestamptz not null default now()`
 - action lease columns are left for a later worker-pool PR; the existing
   `attempt_id` fencing remains the completion guard.
-
-Existing databases are migrated by `rust/scripts/migrate-session-sync-v1.sql`.
 
 ## Locking strategy
 

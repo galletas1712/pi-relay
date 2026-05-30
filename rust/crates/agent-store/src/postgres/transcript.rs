@@ -3,18 +3,25 @@ use std::collections::BTreeMap;
 use agent_session::{
     ModelContext, ModelContextEntry, StoredSession, StoredTranscriptEntry, TranscriptStorageNode,
 };
-use agent_vocab::TranscriptItem;
+use agent_vocab::{AssistantItem, ContentBlock, TranscriptItem};
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Row, Transaction};
 
-use crate::{ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree};
+use crate::{
+    ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree, SessionActivity,
+    SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryRecord, TranscriptEntryScope,
+    TranscriptTreeIndex, TranscriptTreeNodeRecord,
+};
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
 use super::queue::bump_revisions_tx;
-use super::rows::row_to_stored_entry;
+use super::rows::{row_to_stored_entry, row_to_transcript_entry};
 use super::sql::{action_is_unfinished, lock_session_tx};
 use super::PostgresAgentStore;
+
+const DEFAULT_TRANSCRIPT_INDEX_LIMIT: i64 = 1000;
+const MAX_TRANSCRIPT_INDEX_LIMIT: i64 = 5000;
 
 impl PostgresAgentStore {
     pub async fn load_stored_session(&self, session_id: &str) -> Result<StoredSession> {
@@ -23,7 +30,7 @@ impl PostgresAgentStore {
             .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-        let entries = self.transcript_entries(session_id).await?;
+        let entries = self.stored_transcript_entries(session_id).await?;
         let mut metadata = BTreeMap::new();
         if let Value::Object(map) = session_row.get::<Value, _>("metadata") {
             for (key, value) in map {
@@ -66,10 +73,10 @@ impl PostgresAgentStore {
         };
         let entries = match base_leaf_id {
             Some(base_leaf_id) => {
-                self.active_branch_entries_after(session_id, base_leaf_id)
+                self.active_branch_entry_records_after(session_id, base_leaf_id)
                     .await?
             }
-            None => self.active_branch_entries(session_id).await?,
+            None => self.active_branch_entry_records(session_id).await?,
         };
         let status = match base_leaf_id {
             Some(_) if entries.is_empty() => ActiveBranchSyncStatus::BranchChanged,
@@ -114,15 +121,12 @@ impl PostgresAgentStore {
             return Ok(false);
         };
         let item: TranscriptItem = serde_json::from_value(item)?;
-        Ok(matches!(
-            item,
-            TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_)
-        ))
+        Ok(is_switch_boundary_item(&item))
     }
 
     pub async fn history_tree(&self, session_id: &str) -> Result<HistoryTree> {
         let active_leaf_id = self.active_leaf_id(session_id).await?;
-        let entries = self.transcript_entries(session_id).await?;
+        let entries = self.transcript_entry_records(session_id).await?;
         Ok(HistoryTree {
             session_id: session_id.to_string(),
             active_leaf_id,
@@ -133,13 +137,147 @@ impl PostgresAgentStore {
     pub async fn active_branch(&self, session_id: &str) -> Result<HistoryTree> {
         let active_leaf_id = self.active_leaf_id(session_id).await?;
         let entries = match active_leaf_id.as_deref() {
-            Some(_) => self.active_branch_entries(session_id).await?,
+            Some(_) => self.active_branch_entry_records(session_id).await?,
             None => Vec::new(),
         };
         Ok(HistoryTree {
             session_id: session_id.to_string(),
             active_leaf_id,
             entries,
+        })
+    }
+
+    pub async fn transcript_entries_for_scope(
+        &self,
+        session_id: &str,
+        scope: TranscriptEntryScope,
+    ) -> Result<Vec<TranscriptEntryRecord>> {
+        match scope {
+            TranscriptEntryScope::FullTree => self.transcript_entry_records(session_id).await,
+            TranscriptEntryScope::ActiveBranch => {
+                self.active_branch_entry_records(session_id).await
+            }
+        }
+    }
+
+    pub async fn transcript_entries_by_id(
+        &self,
+        session_id: &str,
+        entry_ids: &[String],
+    ) -> Result<TranscriptEntriesResult> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read read only")
+            .execute(&mut *tx)
+            .await?;
+        let session =
+            sqlx::query("select session_revision, transcript_revision from sessions where id=$1")
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let rows = if entry_ids.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query(
+                r#"
+                select id, parent_id, timestamp_ms, sequence, item, provider_replay
+                from transcript_entries
+                where session_id=$1 and id = any($2::text[])
+                order by sequence
+                "#,
+            )
+            .bind(session_id)
+            .bind(entry_ids)
+            .fetch_all(&mut *tx)
+            .await?
+        };
+        let entries = rows
+            .into_iter()
+            .map(|row| row_to_transcript_entry(&row))
+            .collect::<Result<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok(TranscriptEntriesResult {
+            session_id: session_id.to_string(),
+            session_revision: session.get("session_revision"),
+            transcript_revision: session.get("transcript_revision"),
+            entries,
+        })
+    }
+
+    pub async fn transcript_tree_index(
+        &self,
+        session_id: &str,
+        after_sequence: Option<i64>,
+        limit: Option<i64>,
+    ) -> Result<TranscriptTreeIndex> {
+        let after_sequence = after_sequence.unwrap_or_default().max(0);
+        let limit = limit
+            .unwrap_or(DEFAULT_TRANSCRIPT_INDEX_LIMIT)
+            .clamp(1, MAX_TRANSCRIPT_INDEX_LIMIT);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read read only")
+            .execute(&mut *tx)
+            .await?;
+        let session = sqlx::query(
+            r#"
+            select active_leaf_id, session_revision, transcript_revision
+            from sessions
+            where id=$1
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let max_sequence: i64 = sqlx::query_scalar(
+            "select coalesce(max(sequence),0)::bigint from transcript_entries where session_id=$1",
+        )
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        let rows = sqlx::query(
+            r#"
+            select id, parent_id, timestamp_ms, sequence, item
+            from transcript_entries
+            where session_id=$1 and sequence>$2
+            order by sequence
+            limit $3
+            "#,
+        )
+        .bind(session_id)
+        .bind(after_sequence)
+        .bind(limit)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut nodes = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.get::<String, _>("id");
+            let parent_id = row.get::<Option<String>, _>("parent_id");
+            let timestamp_ms = row.get::<i64, _>("timestamp_ms") as u64;
+            let sequence = row.get::<i64, _>("sequence");
+            let item: TranscriptItem = serde_json::from_value(row.get("item"))?;
+            nodes.push(tree_node_from_item(
+                id,
+                parent_id,
+                timestamp_ms,
+                sequence,
+                &item,
+            ));
+        }
+        let last_sequence = nodes
+            .last()
+            .map(|node| node.sequence)
+            .unwrap_or(after_sequence);
+        tx.commit().await?;
+        Ok(TranscriptTreeIndex {
+            session_id: session_id.to_string(),
+            active_leaf_id: session.get("active_leaf_id"),
+            session_revision: session.get("session_revision"),
+            transcript_revision: session.get("transcript_revision"),
+            after_sequence,
+            max_sequence,
+            complete: last_sequence >= max_sequence,
+            nodes,
         })
     }
 
@@ -163,7 +301,10 @@ impl PostgresAgentStore {
             .ok_or_else(|| anyhow!("session not found: {session_id}"))
     }
 
-    async fn transcript_entries(&self, session_id: &str) -> Result<Vec<StoredTranscriptEntry>> {
+    async fn stored_transcript_entries(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<StoredTranscriptEntry>> {
         let rows = sqlx::query(
             "select id, parent_id, timestamp_ms, item, provider_replay from transcript_entries where session_id=$1 order by sequence",
         )
@@ -175,11 +316,26 @@ impl PostgresAgentStore {
             .collect()
     }
 
-    async fn active_branch_entries_after(
+    async fn transcript_entry_records(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TranscriptEntryRecord>> {
+        let rows = sqlx::query(
+            "select id, parent_id, timestamp_ms, sequence, item, provider_replay from transcript_entries where session_id=$1 order by sequence",
+        )
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row_to_transcript_entry(&row))
+            .collect()
+    }
+
+    async fn active_branch_entry_records_after(
         &self,
         session_id: &str,
         base_leaf_id: &str,
-    ) -> Result<Vec<StoredTranscriptEntry>> {
+    ) -> Result<Vec<TranscriptEntryRecord>> {
         let rows = sqlx::query(
             r#"
             with recursive branch as (
@@ -200,7 +356,7 @@ impl PostgresAgentStore {
             base as (
                 select depth from branch where id = $2::text
             )
-            select branch.id, branch.parent_id, branch.timestamp_ms, branch.item, branch.provider_replay
+            select branch.id, branch.parent_id, branch.timestamp_ms, branch.sequence, branch.item, branch.provider_replay
             from branch, base
             where branch.depth < base.depth
             order by branch.depth desc
@@ -211,11 +367,14 @@ impl PostgresAgentStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|row| row_to_stored_entry(&row))
+            .map(|row| row_to_transcript_entry(&row))
             .collect()
     }
 
-    async fn active_branch_entries(&self, session_id: &str) -> Result<Vec<StoredTranscriptEntry>> {
+    async fn active_branch_entry_records(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<TranscriptEntryRecord>> {
         let rows = sqlx::query(
             r#"
             with recursive branch as (
@@ -232,7 +391,7 @@ impl PostgresAgentStore {
                   on parent.session_id = $1
                  and parent.id = child.parent_id
             )
-            select id, parent_id, timestamp_ms, item, provider_replay
+            select id, parent_id, timestamp_ms, sequence, item, provider_replay
             from branch
             order by sequence
             "#,
@@ -241,7 +400,7 @@ impl PostgresAgentStore {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|row| row_to_stored_entry(&row))
+            .map(|row| row_to_transcript_entry(&row))
             .collect()
     }
 
@@ -285,6 +444,16 @@ impl PostgresAgentStore {
         session_id: &str,
         leaf_id: Option<&str>,
     ) -> Result<Vec<EventFrame>> {
+        let result = self.switch_active_leaf(session_id, leaf_id, false).await?;
+        Ok(result.events)
+    }
+
+    pub async fn switch_active_leaf(
+        &self,
+        session_id: &str,
+        leaf_id: Option<&str>,
+        return_active_branch: bool,
+    ) -> Result<SwitchActiveLeafResult> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         if let Some(leaf_id) = leaf_id {
@@ -305,15 +474,38 @@ impl PostgresAgentStore {
             .execute(&mut *tx)
             .await?;
         bump_revisions_tx(&mut tx, session_id, false, false).await?;
+        let state = session_state_for_event_tx(&mut tx, session_id).await?;
         let event = insert_event_tx(
             &mut tx,
             session_id,
             EventType::HistorySwitched,
-            json!({ "active_leaf_id": leaf_id, "activity": "idle" }),
+            json!({
+                "active_leaf_id": leaf_id,
+                "activity": state.activity,
+                "session_revision": state.session_revision,
+                "queue_revision": state.queue_revision,
+                "transcript_revision": state.transcript_revision,
+            }),
         )
         .await?;
+        let last_event_id = event.event_id;
         tx.commit().await?;
-        Ok(vec![event])
+        let active_branch_entries = if return_active_branch {
+            Some(self.active_branch_entry_records(session_id).await?)
+        } else {
+            None
+        };
+        Ok(SwitchActiveLeafResult {
+            session_id: session_id.to_string(),
+            active_leaf_id: leaf_id.map(str::to_string),
+            activity: state.activity,
+            session_revision: state.session_revision,
+            queue_revision: state.queue_revision,
+            transcript_revision: state.transcript_revision,
+            last_event_id,
+            active_branch_entries,
+            events: vec![event],
+        })
     }
 
     pub async fn recover_session(
@@ -324,19 +516,8 @@ impl PostgresAgentStore {
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
-        let mut frames = Vec::new();
         for entry in entries {
             insert_stored_entry_tx(&mut tx, session_id, entry).await?;
-            frames.extend(
-                insert_transcript_item_events_tx(
-                    &mut tx,
-                    session_id,
-                    Some(entry),
-                    &entry.id,
-                    &entry.item,
-                )
-                .await?,
-            );
         }
         let unfinished_actions = action_is_unfinished(None);
         let query = format!(
@@ -352,18 +533,226 @@ impl PostgresAgentStore {
             .execute(&mut *tx)
             .await?;
         bump_revisions_tx(&mut tx, session_id, false, true).await?;
+        let state = session_state_for_event_tx(&mut tx, session_id).await?;
+        let mut frames = Vec::new();
+        for entry in entries {
+            frames.extend(
+                insert_transcript_item_events_tx(
+                    &mut tx,
+                    session_id,
+                    Some(entry),
+                    &entry.id,
+                    &entry.item,
+                )
+                .await?,
+            );
+        }
         frames.push(
             insert_event_tx(
                 &mut tx,
                 session_id,
                 EventType::SessionRecovered,
-                json!({ "active_leaf_id": active_leaf_id }),
+                json!({
+                    "active_leaf_id": active_leaf_id,
+                    "session_revision": state.session_revision,
+                    "queue_revision": state.queue_revision,
+                    "transcript_revision": state.transcript_revision,
+                    "activity": state.activity,
+                }),
             )
             .await?,
         );
         tx.commit().await?;
         Ok(frames)
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SessionEventState {
+    pub(crate) active_leaf_id: Option<String>,
+    pub(crate) session_revision: i64,
+    pub(crate) queue_revision: i64,
+    pub(crate) transcript_revision: i64,
+    pub(crate) activity: SessionActivity,
+}
+
+pub(crate) async fn session_state_for_event_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+) -> Result<SessionEventState> {
+    let row = sqlx::query(
+        r#"
+        select active_leaf_id, session_revision, queue_revision, transcript_revision,
+            exists(select 1 from actions where session_id=$1 and status in ('pending','blocked','running')) as has_running_work,
+            exists(select 1 from queued_inputs where session_id=$1 and status in ('queued','consuming')) as has_queued_input
+        from sessions
+        where id=$1
+        "#,
+    )
+    .bind(session_id)
+    .fetch_optional(&mut **tx)
+    .await?
+    .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+    let activity = if row.get::<bool, _>("has_running_work") {
+        SessionActivity::Running
+    } else if row.get::<bool, _>("has_queued_input") {
+        SessionActivity::Queued
+    } else {
+        SessionActivity::Idle
+    };
+    Ok(SessionEventState {
+        active_leaf_id: row.get("active_leaf_id"),
+        session_revision: row.get("session_revision"),
+        queue_revision: row.get("queue_revision"),
+        transcript_revision: row.get("transcript_revision"),
+        activity,
+    })
+}
+
+pub(crate) async fn transcript_entry_record_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    entry_id: &str,
+) -> Result<Option<TranscriptEntryRecord>> {
+    let row = sqlx::query(
+        r#"
+        select id, parent_id, timestamp_ms, sequence, item, provider_replay
+        from transcript_entries
+        where session_id=$1 and id=$2::text
+        "#,
+    )
+    .bind(session_id)
+    .bind(entry_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    row.map(|row| row_to_transcript_entry(&row)).transpose()
+}
+
+pub(crate) fn tree_node_from_entry(entry: &TranscriptEntryRecord) -> TranscriptTreeNodeRecord {
+    tree_node_from_item(
+        entry.id.clone(),
+        entry.parent_id.clone(),
+        entry.timestamp_ms,
+        entry.sequence,
+        &entry.item,
+    )
+}
+
+fn tree_node_from_item(
+    id: String,
+    parent_id: Option<String>,
+    timestamp_ms: u64,
+    sequence: i64,
+    item: &TranscriptItem,
+) -> TranscriptTreeNodeRecord {
+    let item_type = item_type(item).to_string();
+    let turn_id = item.turn_id();
+    let outcome = match item {
+        TranscriptItem::TurnFinished { outcome, .. } => Some(*outcome),
+        _ => None,
+    };
+    let can_switch_to = is_switch_boundary_item(item);
+    let edit_target_leaf_id = match item {
+        TranscriptItem::UserMessage(_) => previous_boundary_leaf_id_placeholder(&parent_id),
+        _ => None,
+    };
+    TranscriptTreeNodeRecord {
+        id,
+        parent_id,
+        timestamp_ms,
+        sequence,
+        item_type,
+        turn_id,
+        outcome,
+        can_switch_to,
+        edit_target_leaf_id,
+        display_hint: display_hint(item),
+    }
+}
+
+fn previous_boundary_leaf_id_placeholder(parent_id: &Option<String>) -> Option<String> {
+    // The daemon cannot infer the previous boundary without walking ancestors for
+    // every row in the compact index. Returning the parent is not correct, so keep
+    // this nullable and let the frontend derive the exact previous boundary from
+    // compact topology. The backend remains authoritative for switchable boundary
+    // rows via `can_switch_to` and history.switch validation.
+    let _ = parent_id;
+    None
+}
+
+fn item_type(item: &TranscriptItem) -> &'static str {
+    match item {
+        TranscriptItem::TurnStarted { .. } => "turn_started",
+        TranscriptItem::UserMessage(_) => "user_message",
+        TranscriptItem::AssistantMessage(_) => "assistant_message",
+        TranscriptItem::ToolCallStarted { .. } => "tool_call_started",
+        TranscriptItem::ToolResult(_) => "tool_result",
+        TranscriptItem::TurnFinished { .. } => "turn_finished",
+        TranscriptItem::CompactionSummary(_) => "compaction_summary",
+    }
+}
+
+fn is_switch_boundary_item(item: &TranscriptItem) -> bool {
+    matches!(
+        item,
+        TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_)
+    )
+}
+
+fn display_hint(item: &TranscriptItem) -> Option<String> {
+    let text = match item {
+        TranscriptItem::TurnStarted { turn_id } => format!("start turn {}", turn_id.0),
+        TranscriptItem::UserMessage(message) => content_blocks_text(&message.content),
+        TranscriptItem::AssistantMessage(message) => message
+            .items
+            .iter()
+            .map(|item| match item {
+                AssistantItem::Text(text) => text.clone(),
+                AssistantItem::ToolCall(call) => format!("tool call: {}", call.tool_name),
+            })
+            .collect::<Vec<_>>()
+            .join(""),
+        TranscriptItem::ToolCallStarted { tool_call, .. } => {
+            format!("tool call: {}", tool_call.tool_name)
+        }
+        TranscriptItem::ToolResult(result) => format!("{}: {}", result.tool_name, result.output),
+        TranscriptItem::TurnFinished { turn_id, outcome } => {
+            format!("{outcome:?} turn boundary for turn {}", turn_id.0)
+        }
+        TranscriptItem::CompactionSummary(summary) => summary.summary.clone(),
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(truncate_chars(trimmed, 160))
+    }
+}
+
+fn content_blocks_text(blocks: &[ContentBlock]) -> String {
+    blocks
+        .iter()
+        .map(|block| match block {
+            ContentBlock::Text { text } => text.clone(),
+            ContentBlock::Image { .. } => "[image]".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn truncate_chars(value: &str, max_chars: usize) -> String {
+    let mut chars = value.chars();
+    let mut truncated = String::new();
+    for _ in 0..max_chars {
+        let Some(ch) = chars.next() else {
+            return value.to_string();
+        };
+        truncated.push(ch);
+    }
+    if chars.next().is_some() {
+        truncated.push('…');
+    }
+    truncated
 }
 
 pub(super) async fn insert_entry_tx(
@@ -416,4 +805,354 @@ pub(super) fn model_context_from_entries(entries: Vec<StoredTranscriptEntry>) ->
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use agent_session::{SessionEvent, TranscriptStorageNode};
+    use agent_vocab::{
+        CompactionSummary, ProviderConfig, ProviderKind, ReasoningEffort, TranscriptItem, TurnId,
+        TurnOutcome, UserMessage,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use crate::{OutputBatch, SessionConfig};
+
+    use super::*;
+
+    static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(30_000);
+
+    struct TestDb {
+        store: PostgresAgentStore,
+        admin_url: String,
+        name: String,
+    }
+
+    impl TestDb {
+        async fn cleanup(self) {
+            self.store.close().await;
+            if let Ok(admin) = sqlx::PgPool::connect(&self.admin_url).await {
+                let _ = sqlx::query(&format!(r#"drop database if exists "{}""#, self.name))
+                    .execute(&admin)
+                    .await;
+                admin.close().await;
+            }
+        }
+    }
+
+    async fn test_store() -> Option<TestDb> {
+        let admin_url = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok()?;
+        let name = format!(
+            "pi_relay_transcript_test_{}_{}",
+            std::process::id(),
+            TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+        );
+        let admin = sqlx::PgPool::connect(&admin_url)
+            .await
+            .expect("connect to PI_RELAY_TEST_DATABASE_URL");
+        sqlx::query(&format!(r#"create database "{name}""#))
+            .execute(&admin)
+            .await
+            .expect("create isolated test database");
+        admin.close().await;
+        let database_url = database_url_with_name(&admin_url, &name);
+        let store = PostgresAgentStore::connect(&database_url)
+            .await
+            .expect("connect isolated test database");
+        store
+            .migrate()
+            .await
+            .expect("migrate isolated test database");
+        Some(TestDb {
+            store,
+            admin_url,
+            name,
+        })
+    }
+
+    fn database_url_with_name(base: &str, name: &str) -> String {
+        let (prefix, query) = base
+            .split_once('?')
+            .map(|(prefix, query)| (prefix, format!("?{query}")))
+            .unwrap_or((base, String::new()));
+        let Some((root, _)) = prefix.rsplit_once('/') else {
+            return format!("{base}_{name}");
+        };
+        format!("{root}/{name}{query}")
+    }
+
+    fn session_config(project_id: Uuid) -> SessionConfig {
+        SessionConfig {
+            project_id: Some(project_id),
+            outer_cwd: "/tmp".to_string(),
+            workspaces: Vec::new(),
+            system_prompt: "test prompt".to_string(),
+            provider: ProviderConfig {
+                kind: ProviderKind::OpenAi,
+                model: "test-model".to_string(),
+                reasoning_effort: ReasoningEffort::Medium,
+                max_tokens: None,
+                prompt_cache: None,
+            },
+            metadata: json!({}),
+        }
+    }
+
+    async fn create_session(store: &PostgresAgentStore, session_id: &str) {
+        let project_id = Uuid::new_v4();
+        store
+            .create_project(project_id, "transcript test", &[], json!({}))
+            .await
+            .expect("project creates");
+        store
+            .create_session(session_id, &session_config(project_id))
+            .await
+            .expect("session creates");
+    }
+
+    fn entry(id: &str, parent_id: Option<&str>, item: TranscriptItem) -> TranscriptStorageNode {
+        TranscriptStorageNode {
+            id: id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            timestamp_ms: 1,
+            item,
+            provider_replay: Vec::new(),
+        }
+    }
+
+    fn turn_started(id: &str, parent_id: Option<&str>, turn_id: u64) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::TurnStarted {
+                turn_id: TurnId(turn_id),
+            },
+        )
+    }
+
+    fn user_message(id: &str, parent_id: Option<&str>, text: &str) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::UserMessage(UserMessage::text(text)),
+        )
+    }
+
+    fn turn_finished(id: &str, parent_id: Option<&str>, turn_id: u64) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(turn_id),
+                outcome: TurnOutcome::Graceful,
+            },
+        )
+    }
+
+    fn compaction_summary(id: &str, parent_id: Option<&str>, session_id: &str) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::CompactionSummary(CompactionSummary::new(
+                session_id,
+                "source_leaf",
+                "summary",
+                None,
+                TurnId(0),
+            )),
+        )
+    }
+
+    fn appended_event(entry: &TranscriptStorageNode) -> SessionEvent {
+        SessionEvent::TranscriptItemAppended {
+            entry_id: entry.id.clone(),
+            item: entry.item.clone(),
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_tree_index_paginates_and_entries_include_sequence() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "transcript-index-page";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            turn_started("entry_start", None, 1),
+            user_message("entry_user", Some("entry_start"), "hello"),
+            turn_finished("entry_finish", Some("entry_user"), 1),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+
+        let first_page = store
+            .transcript_tree_index(session_id, Some(0), Some(2))
+            .await
+            .expect("first page loads");
+        assert_eq!(first_page.nodes.len(), 2);
+        assert_eq!(first_page.after_sequence, 0);
+        assert_eq!(first_page.max_sequence, 3);
+        assert!(!first_page.complete);
+        assert_eq!(first_page.nodes[0].id, "entry_start");
+        assert_eq!(first_page.nodes[0].sequence, 1);
+        assert_eq!(first_page.nodes[0].item_type, "turn_started");
+
+        let second_page = store
+            .transcript_tree_index(
+                session_id,
+                Some(first_page.nodes.last().expect("node").sequence),
+                Some(2),
+            )
+            .await
+            .expect("second page loads");
+        assert_eq!(second_page.nodes.len(), 1);
+        assert!(second_page.complete);
+        assert_eq!(second_page.nodes[0].id, "entry_finish");
+        assert!(second_page.nodes[0].can_switch_to);
+
+        let sparse_entries = store
+            .transcript_entries_by_id(
+                session_id,
+                &["entry_finish".to_string(), "entry_start".to_string()],
+            )
+            .await
+            .expect("entries by id load");
+        assert_eq!(
+            sparse_entries
+                .entries
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.sequence))
+                .collect::<Vec<_>>(),
+            vec![("entry_start", 1), ("entry_finish", 3)]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn switch_active_leaf_returns_revisions_and_active_branch() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "switch-active-branch";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            compaction_summary("entry_root", None, session_id),
+            turn_started("entry_a_start", Some("entry_root"), 1),
+            user_message("entry_a_user", Some("entry_a_start"), "branch a"),
+            turn_finished("entry_a_finish", Some("entry_a_user"), 1),
+            turn_started("entry_b_start", Some("entry_root"), 2),
+            user_message("entry_b_user", Some("entry_b_start"), "branch b"),
+            turn_finished("entry_b_finish", Some("entry_b_user"), 2),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_b_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+        let before = store
+            .session_snapshot(session_id)
+            .await
+            .expect("snapshot loads");
+
+        let result = store
+            .switch_active_leaf(session_id, Some("entry_a_finish"), true)
+            .await
+            .expect("switch succeeds");
+
+        assert_eq!(result.session_id, session_id);
+        assert_eq!(result.active_leaf_id.as_deref(), Some("entry_a_finish"));
+        assert_eq!(result.activity, SessionActivity::Idle);
+        assert!(result.session_revision > before.session_revision);
+        assert_eq!(result.queue_revision, before.queue_revision);
+        assert_eq!(result.transcript_revision, before.transcript_revision);
+        assert!(result.last_event_id > before.last_event_id);
+        assert_eq!(result.events.len(), 1);
+        assert_eq!(result.events[0].event, EventType::HistorySwitched);
+        assert_eq!(
+            result
+                .active_branch_entries
+                .expect("active branch returned")
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "entry_root",
+                "entry_a_start",
+                "entry_a_user",
+                "entry_a_finish",
+            ]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn transcript_appended_event_uses_bumped_revision_and_sequence() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "transcript-event-revision";
+        create_session(store, session_id).await;
+
+        let first = user_message("entry_user", None, "hello");
+        let events = vec![appended_event(&first)];
+        let (frames, _) = store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(std::slice::from_ref(&first), Some("entry_user"), &events, &[]),
+            )
+            .await
+            .expect("transcript persists");
+        let snapshot = store
+            .session_snapshot(session_id)
+            .await
+            .expect("snapshot loads");
+        let frame = frames
+            .iter()
+            .find(|frame| frame.event == EventType::TranscriptAppended)
+            .expect("transcript appended event");
+
+        assert_eq!(snapshot.transcript_revision, 1);
+        assert_eq!(
+            frame.data["transcript_revision"].as_i64(),
+            Some(snapshot.transcript_revision)
+        );
+        assert_eq!(
+            frame.data["session_revision"].as_i64(),
+            Some(snapshot.session_revision)
+        );
+        assert_eq!(
+            frame.data["entry"]["sequence"].as_i64(),
+            Some(1)
+        );
+        assert_eq!(
+            frame.data["tree_node"]["sequence"].as_i64(),
+            Some(1)
+        );
+        assert_eq!(
+            frame.data["active_leaf_id"].as_str(),
+            Some("entry_user")
+        );
+
+        db.cleanup().await;
+    }
 }
