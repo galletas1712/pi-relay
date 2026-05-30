@@ -56,7 +56,17 @@ export interface QueuedInput {
 	content: ContentBlock[];
 	client_input_id?: string | null;
 	created_at: string;
+	updated_at?: string;
 	promoted_at?: string | null;
+	follow_up_position?: number | null;
+}
+
+export interface QueueProjection {
+	session_revision: number;
+	queue_revision: number;
+	transcript_revision: number;
+	activity: Activity;
+	queued_inputs: QueuedInput[];
 }
 
 export interface SessionSnapshot {
@@ -70,6 +80,9 @@ export interface SessionSnapshot {
 	metadata: Record<string, unknown>;
 	pending_actions: PendingAction[];
 	queued_inputs: QueuedInput[];
+	session_revision?: number;
+	queue_revision?: number;
+	transcript_revision?: number;
 	last_event_id: number;
 	server_time_ms: number;
 	has_transcript_entries?: boolean;
@@ -173,12 +186,46 @@ export type TranscriptItem =
 			turn_started_at_ms?: number | null;
 	  };
 
+export type TranscriptItemType = TranscriptItem["type"];
+
 export interface TranscriptEntry {
 	id: string;
 	parent_id: string | null;
 	timestamp_ms: number;
+	sequence?: number;
 	item: TranscriptItem;
 	provider_replay?: ProviderReplayItem[];
+}
+
+export interface TranscriptTreeNode {
+	id: string;
+	parent_id: string | null;
+	timestamp_ms: number;
+	sequence: number;
+	item_type: TranscriptItemType;
+	turn_id?: number | null;
+	outcome?: TurnOutcome | null;
+	can_switch_to: boolean;
+	edit_target_leaf_id?: string | null;
+	display_hint?: string | null;
+}
+
+export interface TranscriptTreeIndex {
+	session_id: string;
+	active_leaf_id: string | null;
+	session_revision: number;
+	transcript_revision: number;
+	after_sequence: number;
+	max_sequence: number;
+	complete: boolean;
+	nodes: TranscriptTreeNode[];
+}
+
+export interface TranscriptEntriesResult {
+	session_id: string;
+	session_revision: number;
+	transcript_revision: number;
+	entries: TranscriptEntry[];
 }
 
 export interface HistoryTree {

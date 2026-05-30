@@ -9,10 +9,14 @@ import type {
 	InputPriority,
 	Project,
 	ProviderConfig,
+	QueueProjection,
 	QueuedInputStatus,
 	SessionSnapshot,
 	SessionSummary,
 	ToolListing,
+	TranscriptEntriesResult,
+	TranscriptEntry,
+	TranscriptTreeIndex,
 	TranscriptItem,
 	ProjectWorkspace,
 } from "./types.ts";
@@ -36,6 +40,8 @@ export interface AgentApi {
 	listTools(provider: string): Promise<ToolListing[]>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
 	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse>;
+	getTranscriptIndex(sessionId: string, options?: TranscriptIndexOptions): Promise<TranscriptTreeIndex>;
+	getTranscriptEntries(sessionId: string, entryIds: string[]): Promise<TranscriptEntriesResult>;
 	getHistoryTree(sessionId: string): Promise<HistoryTree>;
 	subscribeEvents(sessionId: string, afterEventId: number | null): Promise<EventFrame[]>;
 	unsubscribeEvents(sessionId: string): Promise<void>;
@@ -48,6 +54,9 @@ export interface AgentApi {
 	deleteSession(sessionId: string): Promise<DeleteSessionResult>;
 	configureSession(params: ConfigureSessionParams): Promise<ConfigureSessionResult>;
 	promoteQueuedInput(sessionId: string, inputId: string): Promise<PromoteQueuedResult>;
+	updateQueuedInput(sessionId: string, inputId: string, content: ContentBlock[], expectedQueueRevision?: number | null): Promise<UpdateQueuedResult>;
+	cancelQueuedInput(sessionId: string, inputId: string, expectedQueueRevision?: number | null): Promise<CancelQueuedResult>;
+	reorderQueuedFollowUps(sessionId: string, inputIds: string[], expectedQueueRevision?: number | null): Promise<ReorderQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
 }
@@ -72,6 +81,11 @@ export interface DeleteProjectResult {
 export interface GetSessionOptions {
 	includeEntries?: boolean;
 	entryScope?: EntryScope;
+}
+
+export interface TranscriptIndexOptions {
+	afterSequence?: number | null;
+	limit?: number | null;
 }
 
 export interface StartSessionParams {
@@ -102,6 +116,7 @@ export interface FollowUpResult {
 	accepted?: boolean;
 	queued?: boolean;
 	replayed?: boolean;
+	queue?: QueueProjection | null;
 }
 
 export interface InterruptResult {
@@ -125,6 +140,12 @@ export interface ResumeTurnResult {
 export interface SwitchHistoryResult {
 	session_id: string;
 	active_leaf_id: string | null;
+	activity?: Activity;
+	session_revision?: number;
+	queue_revision?: number;
+	transcript_revision?: number;
+	last_event_id?: number;
+	active_branch_entries?: TranscriptEntry[] | null;
 }
 
 export interface PromoteQueuedResult {
@@ -132,6 +153,32 @@ export interface PromoteQueuedResult {
 	priority: InputPriority;
 	status: QueuedInputStatus;
 	promoted: boolean;
+	queue?: QueueProjection;
+}
+
+export interface UpdateQueuedResult {
+	input_id: string;
+	updated: boolean;
+	reason?: string | null;
+	priority: InputPriority;
+	status: QueuedInputStatus;
+	queue: QueueProjection;
+}
+
+export interface CancelQueuedResult {
+	input_id: string;
+	cancelled: boolean;
+	reason?: string | null;
+	priority: InputPriority;
+	status: QueuedInputStatus;
+	queue: QueueProjection;
+}
+
+export interface ReorderQueuedResult {
+	reordered: boolean;
+	reason?: string | null;
+	input_ids: string[];
+	queue: QueueProjection;
 }
 
 export interface RenameSessionResult {
@@ -157,6 +204,7 @@ export interface SwitchHistoryParams {
 	sessionId: string;
 	leafId: string | null;
 	expectedActiveLeafId: string | null;
+	returnActiveBranch?: boolean;
 }
 
 export interface ConfigureSessionParams {
@@ -253,6 +301,21 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
+	getTranscriptIndex(sessionId: string, options: TranscriptIndexOptions = {}): Promise<TranscriptTreeIndex> {
+		return this.client.request<TranscriptTreeIndex>("transcript.index", {
+			session_id: sessionId,
+			after_sequence: options.afterSequence ?? undefined,
+			limit: options.limit ?? undefined
+		});
+	}
+
+	getTranscriptEntries(sessionId: string, entryIds: string[]): Promise<TranscriptEntriesResult> {
+		return this.client.request<TranscriptEntriesResult>("transcript.entries", {
+			session_id: sessionId,
+			entry_ids: entryIds
+		});
+	}
+
 	getHistoryTree(sessionId: string): Promise<HistoryTree> {
 		return this.client.request<HistoryTree>("history.tree", { session_id: sessionId });
 	}
@@ -306,7 +369,8 @@ class AgentApiClient implements AgentApi {
 		return this.client.request<SwitchHistoryResult>("history.switch", {
 			session_id: params.sessionId,
 			leaf_id: params.leafId,
-			expected_active_leaf_id: params.expectedActiveLeafId
+			expected_active_leaf_id: params.expectedActiveLeafId,
+			return_active_branch: params.returnActiveBranch || undefined
 		});
 	}
 
@@ -335,6 +399,31 @@ class AgentApiClient implements AgentApi {
 		return this.client.request<PromoteQueuedResult>("input.promote_queued", {
 			session_id: sessionId,
 			input_id: inputId
+		});
+	}
+
+	updateQueuedInput(sessionId: string, inputId: string, content: ContentBlock[], expectedQueueRevision?: number | null): Promise<UpdateQueuedResult> {
+		return this.client.request<UpdateQueuedResult>("input.update_queued", {
+			session_id: sessionId,
+			input_id: inputId,
+			expected_queue_revision: expectedQueueRevision ?? undefined,
+			content
+		});
+	}
+
+	cancelQueuedInput(sessionId: string, inputId: string, expectedQueueRevision?: number | null): Promise<CancelQueuedResult> {
+		return this.client.request<CancelQueuedResult>("input.cancel_queued", {
+			session_id: sessionId,
+			input_id: inputId,
+			expected_queue_revision: expectedQueueRevision ?? undefined
+		});
+	}
+
+	reorderQueuedFollowUps(sessionId: string, inputIds: string[], expectedQueueRevision?: number | null): Promise<ReorderQueuedResult> {
+		return this.client.request<ReorderQueuedResult>("input.reorder_queued_follow_ups", {
+			session_id: sessionId,
+			expected_queue_revision: expectedQueueRevision ?? undefined,
+			input_ids: inputIds
 		});
 	}
 

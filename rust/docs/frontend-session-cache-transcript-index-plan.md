@@ -349,3 +349,7 @@ first and display a picker loading state while that capability is fetched.
   transaction to include `sequence` and `tree_node`. Revision counters are read
   after the commit path bumps them. Compaction/recovery paths were adjusted so
   transcript events are emitted after transcript revisions are bumped.
+- The first frontend commit is an additive foundation: TypeScript API/types,
+  selected-session cache helpers, and a compact history picker component. App
+  wiring and queue mutation controls remain separate commits so each step stays
+  reviewable.

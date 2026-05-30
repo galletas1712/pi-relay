@@ -7,7 +7,7 @@ import {
 	modelStepTitle,
 	terminalModelStep
 } from "./turnView.ts";
-import type { TranscriptEntry, TurnOutcome } from "./types.ts";
+import type { TranscriptEntry, TranscriptTreeNode, TurnOutcome } from "./types.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
 
 export interface HistoryTargetOption {
@@ -15,6 +15,7 @@ export interface HistoryTargetOption {
 	actionLeafId: string | null;
 	expectedActiveLeafId?: string | null;
 	sourceEntryId?: string;
+	restoreEntryId?: string;
 	restoreText?: string;
 	turnLabel: string;
 	title: string;
@@ -43,6 +44,135 @@ export interface HistoryEntryDisplay {
 
 export function historySwitchOptions(entries: TranscriptEntry[], activeLeafId: string | null): HistoryTargetOption[] {
 	return measureHistoryDerivation("historySwitchOptions", entries, () => historyBranchPointOptions(entries, activeLeafId));
+}
+
+export function historySwitchOptionsFromNodes(nodes: TranscriptTreeNode[], activeLeafId: string | null): HistoryTargetOption[] {
+	return measureHistoryDerivation("historySwitchOptionsFromNodes", nodes, () => historyBranchPointOptionsFromNodes(nodes, activeLeafId));
+}
+
+export function nodeBranchIds(nodes: TranscriptTreeNode[], leafId: string | null): string[] {
+	if (!leafId) return [];
+	const byId = new Map(nodes.map((node) => [node.id, node]));
+	const branch: string[] = [];
+	const seen = new Set<string>();
+	let cursor: string | null = leafId;
+	while (cursor && !seen.has(cursor)) {
+		const node = byId.get(cursor);
+		if (!node) break;
+		branch.push(node.id);
+		seen.add(cursor);
+		cursor = node.parent_id;
+	}
+	return branch.reverse();
+}
+
+interface CompactEntryMeta {
+	turnId: number | null;
+	turnIdForChildren: number | null;
+	previousBoundaryId: string | null;
+}
+
+function historyBranchPointOptionsFromNodes(
+	nodes: TranscriptTreeNode[],
+	activeLeafId: string | null
+): HistoryTargetOption[] {
+	const byId = new Map(nodes.map((node) => [node.id, node]));
+	const metaById = compactMetaById(nodes, byId);
+	const options: HistoryTargetOption[] = [];
+	for (const node of nodes) {
+		const option = branchPointOptionForNode(byId, node, metaById.get(node.id), activeLeafId);
+		if (option) options.push(option);
+	}
+	return options.reverse();
+}
+
+function compactMetaById(nodes: TranscriptTreeNode[], byId: Map<string, TranscriptTreeNode>): Map<string, CompactEntryMeta> {
+	const metaById = new Map<string, CompactEntryMeta>();
+	for (const node of nodes) {
+		const parentId = node.parent_id && byId.has(node.parent_id) ? node.parent_id : null;
+		const parent = parentId ? byId.get(parentId) : null;
+		const parentMeta = parentId ? metaById.get(parentId) : null;
+		const previousBoundaryId = parent && isHistoryBoundaryNode(parent) ? parent.id : (parentMeta?.previousBoundaryId ?? null);
+		const turnId = turnIdForNode(node, parentMeta?.turnIdForChildren ?? null);
+		const turnIdForChildren = turnIdForChildNodes(node, turnId);
+		metaById.set(node.id, { turnId, turnIdForChildren, previousBoundaryId });
+	}
+	return metaById;
+}
+
+function isHistoryBoundaryNode(node: TranscriptTreeNode): boolean {
+	return node.item_type === "turn_finished" || node.item_type === "compaction_summary";
+}
+
+function turnIdForNode(node: TranscriptTreeNode, inheritedTurnId: number | null): number | null {
+	if (node.item_type === "turn_finished") return node.turn_id ?? inheritedTurnId;
+	if (node.item_type === "compaction_summary") return node.turn_id ?? inheritedTurnId;
+	if (node.item_type === "turn_started") return node.turn_id ?? inheritedTurnId;
+	return inheritedTurnId;
+}
+
+function turnIdForChildNodes(node: TranscriptTreeNode, currentTurnId: number | null): number | null {
+	if (node.item_type === "turn_finished") return null;
+	if (node.item_type === "compaction_summary") return node.turn_id ?? currentTurnId;
+	if (node.item_type === "turn_started") return node.turn_id ?? currentTurnId;
+	return currentTurnId;
+}
+
+function previousNodeBoundaryId(byId: Map<string, TranscriptTreeNode>, meta: CompactEntryMeta | undefined): string | null {
+	const boundaryId = meta?.previousBoundaryId ?? null;
+	if (!boundaryId || byId.has(boundaryId)) return boundaryId;
+	return null;
+}
+
+function branchPointOptionForNode(
+	byId: Map<string, TranscriptTreeNode>,
+	node: TranscriptTreeNode,
+	meta: CompactEntryMeta | undefined,
+	activeLeafId: string | null
+): HistoryTargetOption | null {
+	const time = formatTimestamp(node.timestamp_ms);
+	const currentTurnId = meta?.turnId ?? null;
+	const preview = truncate((node.display_hint ?? "").trim() || node.item_type.replaceAll("_", " "), 96);
+	if (node.item_type === "user_message") {
+		return {
+			id: node.id,
+			actionLeafId: previousNodeBoundaryId(byId, meta),
+			expectedActiveLeafId: activeLeafId,
+			sourceEntryId: node.id,
+			restoreEntryId: node.id,
+			turnLabel: currentTurnId ? `u${currentTurnId}` : "user",
+			title: "User message",
+			preview,
+			meta: `edit · ${time}`,
+			isActive: false
+		};
+	}
+	if (node.item_type === "turn_finished") {
+		return {
+			id: node.id,
+			actionLeafId: node.id,
+			expectedActiveLeafId: activeLeafId,
+			sourceEntryId: node.id,
+			turnLabel: node.turn_id ? `t${node.turn_id}` : "turn",
+			title: node.turn_id ? `End of turn ${node.turn_id}` : "End of turn",
+			preview,
+			meta: `switch · ${time}`,
+			isActive: activeLeafId === node.id,
+			outcome: node.outcome ?? undefined
+		};
+	}
+	if (node.item_type !== "compaction_summary") return null;
+	return {
+		id: node.id,
+		actionLeafId: node.id,
+		expectedActiveLeafId: activeLeafId,
+		sourceEntryId: node.id,
+		turnLabel: node.turn_id ? `c${node.turn_id}` : "comp",
+		title: "Compacted history",
+		preview,
+		meta: `switch · ${time}`,
+		isActive: activeLeafId === node.id
+	};
 }
 
 interface HistoryIndex {
@@ -249,6 +379,7 @@ function displayOptionForEntry(
 			id: entry.id,
 			actionLeafId: previousTurnBoundaryId(index, meta),
 			sourceEntryId: entry.id,
+			restoreEntryId: entry.id,
 			restoreText: text,
 			turnLabel: currentTurnId ? `u${currentTurnId}` : "user",
 			title: currentTurnId ? `User message in turn ${currentTurnId}` : "User message",
@@ -327,6 +458,7 @@ function branchPointOptionForEntry(
 			actionLeafId,
 			expectedActiveLeafId: activeLeafId,
 			sourceEntryId: entry.id,
+			restoreEntryId: entry.id,
 			restoreText: text,
 			turnLabel: currentTurnId ? `u${currentTurnId}` : "user",
 			title: "User message",
@@ -366,7 +498,7 @@ function branchPointOptionForEntry(
 	};
 }
 
-function measureHistoryDerivation<T>(label: string, entries: TranscriptEntry[], derive: () => T): T {
+function measureHistoryDerivation<T>(label: string, entries: { id: string }[], derive: () => T): T {
 	if (!perfEnabled()) return derive();
 	const startedAt = perfNow();
 	const result = derive();
