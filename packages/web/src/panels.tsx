@@ -8,8 +8,7 @@ import {
 	Search,
 	Settings,
 	Trash2,
-	X,
-	Loader2
+	X
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
 import { COMMANDS } from "./slash.ts";
@@ -465,7 +464,6 @@ export function LogHeader({
 	modelValue,
 	modelDisabled,
 	modelDisabledTitle,
-	snapshotRefreshing,
 	reasoningEfforts,
 	reasoningEffort,
 	onModelChange,
@@ -480,7 +478,6 @@ export function LogHeader({
 	modelValue: string;
 	modelDisabled: boolean;
 	modelDisabledTitle: string;
-	snapshotRefreshing?: boolean;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	onModelChange: (value: string) => void;
@@ -502,12 +499,6 @@ export function LogHeader({
 			) : (
 				<span className="log-session">No session selected</span>
 			)}
-			{snapshotRefreshing ? (
-				<span className="session-refresh-indicator" title="Refreshing session state">
-					<Loader2 className="spin" size={12} />
-					refreshing
-				</span>
-			) : null}
 			<div className="log-controls">
 				<label className="header-select">
 					<span>model</span>

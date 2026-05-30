@@ -1,6 +1,5 @@
 import { memo } from "react";
 import { LogHeader } from "./panels.tsx";
-import type { PendingTranscriptInput } from "./pendingInputs.ts";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { displayActivity, isArchivedSession, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
 import { MessageList } from "./transcript.tsx";
@@ -10,9 +9,7 @@ export interface ChatPaneProps {
 	session: SessionDisplayInfo | null;
 	snapshot: SessionSnapshot | null;
 	entries: TranscriptEntry[];
-	pendingTranscriptInputs: PendingTranscriptInput[];
 	transcriptLoading: boolean;
-	snapshotRefreshing: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
 	modelLocked: boolean;
@@ -32,9 +29,7 @@ export const ChatPane = memo(function ChatPane({
 	session,
 	snapshot,
 	entries,
-	pendingTranscriptInputs,
 	transcriptLoading,
-	snapshotRefreshing,
 	modelOptions,
 	modelValue,
 	modelLocked,
@@ -58,7 +53,6 @@ export const ChatPane = memo(function ChatPane({
 				modelValue={modelValue}
 				modelLocked={modelLocked}
 				modelControlsDisabled={modelControlsDisabled}
-				snapshotRefreshing={snapshotRefreshing}
 				reasoningEfforts={reasoningEfforts}
 				reasoningEffort={reasoningEffort}
 				rightOpen={rightOpen}
@@ -75,7 +69,6 @@ export const ChatPane = memo(function ChatPane({
 				hasSession={!!selectedId}
 				sessionId={selectedId}
 				entriesSessionId={snapshot?.session_id ?? null}
-				pendingInputs={pendingTranscriptInputs}
 				loadingSession={transcriptLoading}
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}
@@ -91,7 +84,6 @@ interface ChatHeaderProps {
 	modelValue: string;
 	modelLocked: boolean;
 	modelControlsDisabled: boolean;
-	snapshotRefreshing: boolean;
 	reasoningEfforts: ReasoningEffort[];
 	reasoningEffort: ReasoningEffort;
 	rightOpen: boolean;
@@ -107,7 +99,6 @@ const ChatHeader = memo(function ChatHeader({
 	modelValue,
 	modelLocked,
 	modelControlsDisabled,
-	snapshotRefreshing,
 	reasoningEfforts,
 	reasoningEffort,
 	rightOpen,
@@ -132,7 +123,6 @@ const ChatHeader = memo(function ChatHeader({
 			modelValue={modelValue}
 			modelDisabled={modelDisabled}
 			modelDisabledTitle={modelLocked ? "model is locked after the first transcript entry" : "model"}
-			snapshotRefreshing={snapshotRefreshing}
 			reasoningEfforts={displayedEfforts}
 			reasoningEffort={reasoningEffort}
 			rightOpen={rightOpen}

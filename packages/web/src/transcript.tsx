@@ -9,7 +9,6 @@ import { branchEntriesFor } from "./historyTargets.ts";
 import { MermaidBlock } from "./mermaidBlock.tsx";
 import { citationsFromReplay, hostedToolsFromReplay, localToolCallIdFromReplay, parsedProviderReplay, replayContainsAssistantText } from "./providerReplay.ts";
 import type { HostedToolView, SourceCitation } from "./providerReplay.ts";
-import type { PendingTranscriptInput } from "./pendingInputs.ts";
 import { contentBlocksToText, firstLine } from "./text.ts";
 import { assistantMessageText, buildTurnViews } from "./turnView.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
@@ -168,7 +167,6 @@ export const MessageList = memo(function MessageList({
 	hasSession,
 	sessionId,
 	entriesSessionId,
-	pendingInputs = [],
 	loadingSession = false,
 	onResumeTurn,
 	resumingTurnId
@@ -181,7 +179,6 @@ export const MessageList = memo(function MessageList({
 	hasSession: boolean;
 	sessionId?: string | null;
 	entriesSessionId?: string | null;
-	pendingInputs?: PendingTranscriptInput[];
 	loadingSession?: boolean;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
@@ -268,7 +265,7 @@ export const MessageList = memo(function MessageList({
 		activeScrollSessionCanSaveRef.current = true;
 		if (!shouldStickToBottomRef.current) return;
 		scrollToBottom();
-	}, [entriesBelongToSelectedSession, isRunning, pendingInputs, scrollSessionKey, scrollToBottom, visibleEntries]);
+	}, [entriesBelongToSelectedSession, isRunning, scrollSessionKey, scrollToBottom, visibleEntries]);
 
 	useLayoutEffect(() => {
 		if (!hasSession || typeof ResizeObserver === "undefined") return;
@@ -386,9 +383,6 @@ export const MessageList = memo(function MessageList({
 						onToggleCompaction={toggleCompaction}
 					/>
 				))}
-				{pendingInputs.map((input) => (
-					<PendingUserBubble input={input} key={input.id} />
-				))}
 				{isRunning && workingClock != null ? (
 					<WorkingIndicator clock={workingClock} />
 				) : null}
@@ -434,24 +428,6 @@ export function runningTurnClockAnchor(
 		serverAnchorMs: serverTimeMs,
 		clientAnchorMs: performance.now(),
 	};
-}
-
-const PendingUserBubble = memo(function PendingUserBubble({ input }: { input: PendingTranscriptInput }) {
-	return (
-		<div className={`message-row user-row pending-user-row ${input.status === "failed" ? "failed" : ""}`}>
-			<div className="user-bubble pending-user-bubble">
-				{contentBlocksToText(input.content)}
-				<span className="pending-user-status">{pendingUserStatusLabel(input)}</span>
-			</div>
-		</div>
-	);
-});
-
-function pendingUserStatusLabel(input: PendingTranscriptInput): string {
-	if (input.status === "failed") return input.error ?? "failed to send";
-	if (input.status === "queued") return "queued";
-	if (input.status === "accepted") return "syncing...";
-	return "sending...";
 }
 
 const WorkingIndicator = memo(function WorkingIndicator({ clock }: { clock: WorkingClockAnchor }) {

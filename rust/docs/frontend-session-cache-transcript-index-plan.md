@@ -246,9 +246,6 @@ interface SelectedSessionCache {
   treeTranscriptRevision: number | null;
   treeMaxSequence: number;
   treeComplete: boolean;
-  loading: boolean;
-  refreshing: boolean;
-  error: string | null;
 }
 ```
 
@@ -397,3 +394,22 @@ first and display a picker loading state while that capability is fetched.
   transitions, plus unknown events). Queue projections, append events, and
   activity hints are merged locally, and overlapping selected refreshes are
   coalesced per session.
+- Post-merge suspended-tab pitfall: `last_event_id` is only a replay cursor for
+  retained websocket event rows. The daemon may clear those rows when a session
+  becomes idle, so a later `session.get` can report a smaller `last_event_id`
+  than a tab observed before sleeping. The frontend must not interpret that as
+  stale canonical state. Selected freshness is driven by revisions plus explicit
+  reconciliation: after the page returns to the foreground
+  (`visibilitychange`/`focus`/bfcache `pageshow`) the
+  app invalidates the session list and fetches the selected active branch once,
+  throttled to avoid duplicate browser lifecycle events.
+- Compact topology from events is deliberately conservative. If the compact
+  tree is already complete, a backend-computed `tree_node` from
+  `transcript.appended` may extend it. If the tree is incomplete or stale, the
+  frontend leaves recovery to `transcript.index`; this keeps `/switch` correct
+  without deriving Rust display/turn-boundary logic in TypeScript.
+- The web UI no longer renders local transcript-pending bubbles (`SENDING...`
+  or `SYNCING...`). The composer button spinner is the only local indication
+  that a submit RPC is in flight. Transcript rows and queued-input rows render
+  only from canonical daemon events/RPC projections, which avoids duplicate
+  shadow messages after reconnect/foreground reconciliation.

@@ -21,9 +21,6 @@ export interface SelectedSessionCache {
 	treeLoadedPrefixSequence: number;
 	treeMaxSequence: number;
 	treeComplete: boolean;
-	loading: boolean;
-	refreshing: boolean;
-	error: string | null;
 }
 
 export function emptySelectedSessionCache(sessionId: string | null = null): SelectedSessionCache {
@@ -39,9 +36,6 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		treeLoadedPrefixSequence: 0,
 		treeMaxSequence: 0,
 		treeComplete: false,
-		loading: false,
-		refreshing: false,
-		error: null,
 	};
 }
 
@@ -63,8 +57,8 @@ export function applySelectedSnapshot(cache: SelectedSessionCache, snapshot: Ses
 	const entries = snapshot.entries ?? [];
 	const sameSession = cache.sessionId === snapshot.session_id;
 	const base = sameSession ? cache : emptySelectedSessionCache(snapshot.session_id);
-	const entriesById = new Map(base.entriesById);
-	for (const entry of entries) entriesById.set(entry.id, entry);
+	const entriesById = mergeEntryBodies(base.entriesById, entries);
+	const activeBranchEntryIds = entryIds(entries);
 	const snapshotTranscriptRevision = snapshot.transcript_revision ?? null;
 	const treeRevisionChanged =
 		sameSession &&
@@ -75,20 +69,17 @@ export function applySelectedSnapshot(cache: SelectedSessionCache, snapshot: Ses
 		...base,
 		sessionId: snapshot.session_id,
 		snapshot: { ...snapshot, entries },
-		activeBranchEntryIds: entries.map((entry) => entry.id),
+		activeBranchEntryIds: sameStringArray(base.activeBranchEntryIds, activeBranchEntryIds) ? base.activeBranchEntryIds : activeBranchEntryIds,
 		entriesById,
 		treeTranscriptRevision: treeRevisionChanged ? snapshotTranscriptRevision : base.treeTranscriptRevision,
 		treeComplete: treeRevisionChanged ? false : base.treeComplete,
-		loading: false,
-		refreshing: false,
-		error: null,
 	};
 }
 
 export function applyEntryBodies(cache: SelectedSessionCache, sessionId: string, entries: TranscriptEntry[]): SelectedSessionCache {
 	if (cache.sessionId !== sessionId) return cache;
-	const entriesById = new Map(cache.entriesById);
-	for (const entry of entries) entriesById.set(entry.id, entry);
+	const entriesById = mergeEntryBodies(cache.entriesById, entries);
+	if (entriesById === cache.entriesById) return cache;
 	return { ...cache, entriesById };
 }
 
@@ -190,10 +181,9 @@ export function applySwitchResultToCache(
 ): SelectedSessionCache {
 	if (cache.sessionId !== result.session_id || !cache.snapshot) return cache;
 	const entries = result.active_branch_entries ?? null;
-	const entriesById = new Map(cache.entriesById);
-	if (entries) {
-		for (const entry of entries) entriesById.set(entry.id, entry);
-	}
+	const entriesById = entries ? mergeEntryBodies(cache.entriesById, entries) : cache.entriesById;
+	const activeBranchEntryIds = entries ? entryIds(entries) : cache.activeBranchEntryIds;
+	const selectedEntryBodies = entries ? selectedEntriesFromIds(activeBranchEntryIds, entriesById) : cache.snapshot.entries ?? [];
 	return {
 		...cache,
 		snapshot: {
@@ -204,12 +194,10 @@ export function applySwitchResultToCache(
 			queue_revision: result.queue_revision ?? cache.snapshot.queue_revision,
 			transcript_revision: result.transcript_revision ?? cache.snapshot.transcript_revision,
 			last_event_id: result.last_event_id ?? cache.snapshot.last_event_id,
-			entries: entries ?? cache.snapshot.entries ?? [],
+			entries: selectedEntryBodies,
 		},
-		activeBranchEntryIds: entries ? entries.map((entry) => entry.id) : cache.activeBranchEntryIds,
+		activeBranchEntryIds: sameStringArray(cache.activeBranchEntryIds, activeBranchEntryIds) ? cache.activeBranchEntryIds : activeBranchEntryIds,
 		entriesById,
-		refreshing: false,
-		loading: false,
 	};
 }
 
@@ -310,15 +298,58 @@ function buildTreeChildren(order: string[], byId: Map<string, TranscriptTreeNode
 	return children;
 }
 
+function mergeEntryBodies(current: Map<string, TranscriptEntry>, entries: TranscriptEntry[]): Map<string, TranscriptEntry> {
+	let next = current;
+	for (const entry of entries) {
+		const existing = current.get(entry.id);
+		const merged = reusableEntry(existing, entry);
+		if (existing === merged) continue;
+		if (next === current) next = new Map(current);
+		next.set(entry.id, merged);
+	}
+	return next;
+}
+
+function reusableEntry(existing: TranscriptEntry | undefined, incoming: TranscriptEntry): TranscriptEntry {
+	if (!existing) return incoming;
+	// Transcript rows are append-only and immutable. Reusing existing entry
+	// objects when the durable identity matches keeps React transcript rows and
+	// scroll bookkeeping stable across canonical `session.get` refreshes.
+	if (
+		existing.id === incoming.id &&
+		existing.parent_id === incoming.parent_id &&
+		existing.timestamp_ms === incoming.timestamp_ms &&
+		existing.sequence === incoming.sequence
+	) {
+		return existing;
+	}
+	return incoming;
+}
+
+function entryIds(entries: TranscriptEntry[]): string[] {
+	return entries.map((entry) => entry.id);
+}
+
+function selectedEntriesFromIds(ids: string[], entriesById: Map<string, TranscriptEntry>): TranscriptEntry[] {
+	return ids.flatMap((id) => {
+		const entry = entriesById.get(id);
+		return entry ? [entry] : [];
+	});
+}
+
+function sameStringArray(left: string[], right: string[]): boolean {
+	if (left.length !== right.length) return false;
+	for (let index = 0; index < left.length; index += 1) {
+		if (left[index] !== right[index]) return false;
+	}
+	return true;
+}
+
 function applyTreeNodeFromEvent(cache: SelectedSessionCache, event: EventFrame): Partial<SelectedSessionCache> {
 	const node = transcriptTreeNodeFromUnknown(event.data.tree_node);
 	if (!node) return {};
 	const revision = numberValue(event.data.transcript_revision) ?? cache.treeTranscriptRevision;
-	const canMergeNode =
-		cache.treeTranscriptRevision === null ||
-		cache.treeComplete ||
-		node.sequence <= cache.treeLoadedPrefixSequence;
-	if (!canMergeNode) {
+	if (!cache.treeComplete) {
 		return {
 			treeTranscriptRevision: revision,
 			treeMaxSequence: Math.max(cache.treeMaxSequence, node.sequence),
@@ -335,9 +366,7 @@ function applyTreeNodeFromEvent(cache: SelectedSessionCache, event: EventFrame):
 		treeChildrenByParentId: buildTreeChildren(treeOrder, treeNodesById),
 		treeOrder,
 		treeTranscriptRevision: revision,
-		treeLoadedPrefixSequence: cache.treeComplete
-			? Math.max(cache.treeLoadedPrefixSequence, node.sequence)
-			: cache.treeLoadedPrefixSequence,
+		treeLoadedPrefixSequence: Math.max(cache.treeLoadedPrefixSequence, node.sequence),
 		treeMaxSequence: Math.max(cache.treeMaxSequence, node.sequence),
 		treeComplete: cache.treeComplete,
 	};
