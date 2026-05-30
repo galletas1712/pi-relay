@@ -1057,10 +1057,22 @@ export function App() {
 				if (result.queued) {
 					invalidateSessionList();
 				} else {
-					try {
-						await syncActiveBranchNow(sessionId);
-					} catch (error) {
-						pushNotice("error", errorMessage(error));
+					if (result.active_branch) {
+						updateSelectedCache((current) =>
+							applySwitchResultToCache(
+								current.sessionId === sessionId ? current : selectedCacheRef.current,
+								result.active_branch!,
+							),
+						);
+						if (result.active_branch.last_event_id !== undefined) {
+							lastEventIds.current.set(sessionId, result.active_branch.last_event_id);
+						}
+					} else {
+						try {
+							await syncActiveBranchNow(sessionId);
+						} catch (error) {
+							pushNotice("error", errorMessage(error));
+						}
 					}
 				}
 			} catch (error) {

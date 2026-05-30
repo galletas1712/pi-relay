@@ -906,7 +906,10 @@ async fn input_user(
     let content = parse_user_message(content_value)?;
 
     enum InputOutcome {
-        Accepted(Vec<DispatchAction>),
+        Accepted {
+            dispatches: Vec<DispatchAction>,
+            active_branch: Value,
+        },
         Queued {
             input_id: String,
             event: Option<EventFrame>,
@@ -976,28 +979,43 @@ async fn input_user(
                     .enqueue_input(agent_input_from_queued_priority(priority, content.clone()))
                     .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
             }
-            InputOutcome::Accepted(
-                driver
-                    .persist_active_outputs(
-                        active,
-                        None,
-                        None,
-                        Some(AcceptedInput {
-                            priority,
-                            content: content.clone(),
-                            client_input_id: client_input_id.clone(),
-                        }),
-                        Vec::new(),
-                    )
-                    .await?,
-            )
+            let dispatches = driver
+                .persist_active_outputs(
+                    active,
+                    None,
+                    None,
+                    Some(AcceptedInput {
+                        priority,
+                        content: content.clone(),
+                        client_input_id: client_input_id.clone(),
+                    }),
+                    Vec::new(),
+                )
+                .await?;
+            let snapshot = state
+                .repo
+                .session_snapshot(&session_id)
+                .await
+                .map_err(anyhow::Error::from)?;
+            let entries = state
+                .repo
+                .transcript_entries_for_scope(&session_id, TranscriptEntryScope::ActiveBranch)
+                .await
+                .map_err(anyhow::Error::from)?;
+            InputOutcome::Accepted {
+                dispatches,
+                active_branch: rpc_views::active_branch_projection(snapshot, entries),
+            }
         }
     };
 
     match outcome {
-        InputOutcome::Accepted(dispatches) => {
+        InputOutcome::Accepted {
+            dispatches,
+            active_branch,
+        } => {
             driver.dispatch(dispatches).await?;
-            Ok(json!({ "accepted": true, "queued": false }))
+            Ok(json!({ "accepted": true, "queued": false, "active_branch": active_branch }))
         }
         InputOutcome::Queued {
             input_id,

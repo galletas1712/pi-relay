@@ -278,6 +278,9 @@ it), not separately from `session(active_branch)`, `session(full_tree)`, and
 - History picker open: one or more small `transcript.index` page RPCs. For common
   small sessions this is one RPC; for large sessions it streams pages of compact
   nodes. No provider replay/full message bodies are transferred for the picker.
+- Idle follow-up submit: one RPC (`input.follow_up`) returns the accepted
+  active-branch projection, so the frontend can render the canonical transcript
+  immediately without a follow-up `session.get(active_branch)` hot-path fetch.
 - Branch switch: one RPC (`history.switch(return_active_branch=true)`) and render
   from the returned branch. If restoring a historical user message, first fetch
   that one body via `transcript.entries` only if the body is missing locally.
@@ -413,3 +416,7 @@ first and display a picker loading state while that capability is fetched.
   that a submit RPC is in flight. Transcript rows and queued-input rows render
   only from canonical daemon events/RPC projections, which avoids duplicate
   shadow messages after reconnect/foreground reconciliation.
+- `input.follow_up` now returns a canonical `active_branch` projection when the
+  input is accepted directly into an idle transcript. Queued follow-ups still
+  return the canonical queue projection. This keeps submit behavior canonical
+  without paying an extra selected-session refresh in the idle hot path.
