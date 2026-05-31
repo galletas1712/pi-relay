@@ -500,6 +500,11 @@ root switch. Transcript entries returned by websocket RPCs include the Postgres
 token. Use `transcript_revision` to decide whether cached transcript data is
 fresh.
 
+Normal UI transcript body responses omit raw provider replay by returning
+`provider_replay: []`. Passing `"include_provider_replay": true` requests the
+full durable replay sidecar and should be reserved for debug/export paths that
+explicitly need provider-native data.
+
 For UI display, `"active_branch"` follows compaction provenance: a
 `compaction_summary` entry with `parent_id = null` is rendered after its
 `source_leaf_id` lineage when that source leaf is available. This does not change
@@ -556,13 +561,17 @@ again in `history.switch`.
 
 ### `transcript.entries`
 
-Fetches sparse full transcript bodies by explicit entry IDs. This is for cases
-where the UI has compact topology but needs one or a few bodies, such as
+Fetches sparse transcript bodies by explicit entry IDs. This is for cases where
+the UI has compact topology but needs one or a few bodies, such as
 restoring a historical user message into the composer.
 
 ```json
 { "session_id": "s1", "entry_ids": ["entry_1", "entry_7"] }
 ```
+
+By default this returns the UI projection with `provider_replay: []`. Add
+`"include_provider_replay": true` only when the caller intentionally needs raw
+provider replay.
 
 Result shape:
 
