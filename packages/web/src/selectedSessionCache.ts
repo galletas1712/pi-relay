@@ -52,7 +52,7 @@ export function applyTranscriptTurns(cache: SelectedSessionCache, result: Transc
 		const entryIds =
 			cache.turnDetailsById.get(card.id) ??
 			(card.start_entry_id ? cache.turnDetailsById.get(card.start_entry_id) : undefined);
-		if (entryIds) turnDetailsById.set(card.id, entryIds);
+		if (entryIds && turnDetailCoversCard(entryIds, card)) turnDetailsById.set(card.id, entryIds);
 	}
 	const activeBranchEntryIds = result.active_leaf_id ? [result.active_leaf_id] : [];
 	const snapshot = cache.snapshot
@@ -78,6 +78,10 @@ export function applyTranscriptTurns(cache: SelectedSessionCache, result: Transc
 		turnTranscriptRevision: result.transcript_revision,
 		turnActiveLeafId: result.active_leaf_id,
 	};
+}
+
+function turnDetailCoversCard(entryIds: string[], card: TurnCard): boolean {
+	return (entryIds.at(-1) ?? null) === card.active_leaf_id;
 }
 
 export function applyTurnDetail(cache: SelectedSessionCache, sessionId: string, turnId: string, entries: TranscriptEntry[]): SelectedSessionCache {

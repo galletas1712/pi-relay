@@ -344,6 +344,41 @@ describe("selected session cache", () => {
 		expect(cache.entriesById.get("entry_assistant_final")).toBe(finalAssistant);
 	});
 
+	it("drops stale expanded turn details when canonical turn cards advance", () => {
+		const user = entry("entry_user", "entry_start", "full user message text", 2);
+		const finalAssistant = assistantEntry("entry_assistant_final", "entry_result", "full final answer", 5);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([], { transcriptRevision: 1 }));
+		cache = {
+			...cache,
+			turnDetailsById: new Map([["entry_start", ["entry_start", "entry_user"]]]),
+		};
+
+		cache = applyTranscriptTurns(cache, {
+			session_id: sessionId,
+			active_leaf_id: "entry_finish",
+			session_revision: 3,
+			transcript_revision: 2,
+			cards: [
+				{
+					id: "entry_finish",
+					turn_id: 1,
+					status: "completed",
+					outcome: "Graceful",
+					start_entry_id: "entry_start",
+					boundary_entry_id: "entry_finish",
+					active_leaf_id: "entry_finish",
+					start_timestamp_ms: 1_700_000_000_001,
+					user_messages: [user],
+					assistant_message: finalAssistant,
+					summary: null,
+					can_resume: false,
+				},
+			],
+		});
+
+		expect(cache.turnDetailsById.has("entry_finish")).toBe(false);
+	});
+
 	it("starts a new current turn card when a turn_started entry follows a completed turn", () => {
 		const started = turnStartedEntry("entry_start_2", "entry_finish_1", 2, 6);
 		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([entry("entry_finish_1", null, "done", 5)], { transcriptRevision: 1 }));

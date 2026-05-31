@@ -1185,9 +1185,10 @@ fn turn_card_row(row: &sqlx::postgres::PgRow) -> Result<TurnCardRow> {
             item,
             provider_replay: Vec::new(),
         }),
-        ("user_message" | "assistant_message", None) => {
-            return Err(anyhow!("turn-card row missing body item for {item_type}"));
+        ("user_message", None) => {
+            return Err(anyhow!("turn-card row missing body item for user_message"));
         }
+        ("assistant_message", None) => None,
         _ => None,
     };
     Ok(TurnCardRow {
@@ -1999,10 +2000,6 @@ mod tests {
         let card = &turns.cards[0];
         assert_eq!(card.user_messages.len(), 1);
         assert_eq!(card.user_messages[0].id, "entry_user");
-        assert!(!card
-            .user_messages
-            .iter()
-            .any(|entry| entry.id == "entry_assistant_first"));
         match &card.user_messages[0].item {
             TranscriptItem::UserMessage(message) => {
                 assert_eq!(content_blocks_text(&message.content), long_user);

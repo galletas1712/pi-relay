@@ -179,6 +179,11 @@ Implementation status:
   expansion. Compaction cards also preserve `last_turn_id` and
   `turn_started_at_ms` so a mid-turn compaction keeps the current turn label and
   Working timer anchored to the original turn start.
+- Follow-up cache fix: when canonical `transcript.turns` advances a card,
+  previously expanded detail is preserved only if the cached detail still
+  reaches the card's latest active leaf. Otherwise the detail cache is dropped so
+  the next expansion refetches `transcript.turn_detail` instead of showing a
+  stale partial detail.
 - The selected-session hot path now uses metadata-only `session.get` followed by
   `transcript.turns`; it does not fetch full active-branch bodies on session
   select, foreground refresh, accepted follow-up reconciliation, or
