@@ -66,6 +66,16 @@ Verification:
 - `npm run test --workspace packages/web`
 - `npm run build --workspace packages/web`
 
+Implementation status:
+
+- Done in `fix/switch-restore-full-user-message`.
+- The restore helper now treats `restore_entry_id` as authoritative and always
+  loads the full user-message body from the selected-session body cache or from
+  `transcript.entries`. Display-only `restoreText` is used only for legacy
+  targets without an entry id.
+- Added a compact-node switch-target test proving the compact preview is
+  truncated and `restoreText` is absent.
+
 ### PR 2: UI transcript projection without raw provider replay
 
 Problem: normal UI transcript endpoints select and serialize
