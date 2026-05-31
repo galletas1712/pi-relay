@@ -580,6 +580,13 @@ function appendTurnCard(
 		turnCardsById.set(nextCard.id, nextCard);
 		return { turnCardsById, turnOrder: [...currentOrder, nextCard.id] };
 	}
+	if (previousCard.status === "compacted") {
+		const nextCard = updateTurnCard(initialTurnCardFromCompactionResume(previousCard, entry), entry);
+		const nextId = turnCardStableId(nextCard);
+		const turnCardsById = new Map(currentCards);
+		turnCardsById.set(nextId, { ...nextCard, id: nextId });
+		return { turnCardsById, turnOrder: [...currentOrder, nextId] };
+	}
 
 	const updatedCard = updateTurnCard(previousCard, entry);
 	const nextId = turnCardStableId(updatedCard);
@@ -613,6 +620,23 @@ function initialTurnCard(entry: TranscriptEntry): TurnCard {
 		boundary_entry_id: null,
 		active_leaf_id: entry.id,
 		start_timestamp_ms: entry.timestamp_ms,
+		user_messages: [],
+		assistant_message: null,
+		summary: null,
+		can_resume: false,
+	};
+}
+
+function initialTurnCardFromCompactionResume(compactionCard: TurnCard, entry: TranscriptEntry): TurnCard {
+	return {
+		id: entry.id,
+		turn_id: turnIdForItem(entry.item) ?? compactionCard.turn_id ?? null,
+		status: "open",
+		outcome: null,
+		start_entry_id: null,
+		boundary_entry_id: null,
+		active_leaf_id: entry.id,
+		start_timestamp_ms: compactionCard.start_timestamp_ms,
 		user_messages: [],
 		assistant_message: null,
 		summary: null,
@@ -673,7 +697,9 @@ function compactionTurnCard(entry: TranscriptEntry): TurnCard {
 		start_entry_id: entry.id,
 		boundary_entry_id: entry.id,
 		active_leaf_id: entry.id,
-		start_timestamp_ms: entry.timestamp_ms,
+		start_timestamp_ms: entry.item.type === "compaction_summary" && typeof entry.item.turn_started_at_ms === "number"
+			? entry.item.turn_started_at_ms
+			: entry.timestamp_ms,
 		user_messages: [],
 		assistant_message: null,
 		summary: summary || null,

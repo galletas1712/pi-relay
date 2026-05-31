@@ -173,6 +173,12 @@ Implementation status:
   user-message entries and the full final semantic assistant-message entry for
   every card. It no longer carries derived previews/counts; the collapsed chat
   view renders directly from those entries.
+- Follow-up performance/correctness fix: `transcript.turns` selects full
+  assistant-message JSON only for the terminal assistant message in each card,
+  not for intermediate assistant/tool-call steps that are hidden until
+  expansion. Compaction cards also preserve `last_turn_id` and
+  `turn_started_at_ms` so a mid-turn compaction keeps the current turn label and
+  Working timer anchored to the original turn start.
 - The selected-session hot path now uses metadata-only `session.get` followed by
   `transcript.turns`; it does not fetch full active-branch bodies on session
   select, foreground refresh, accepted follow-up reconciliation, or
@@ -189,10 +195,10 @@ Implementation status:
   recovery, and compaction paths.
 - Pitfall: this implementation still derives cards by walking the active branch
   in SQL. It deliberately avoids selecting raw provider replay and only selects
-  full `item` JSON for the user/assistant bodies that collapsed cards actually
-  render; boundary/tool rows are used as metadata only. If microbenchmarks after
-  this PR still show card derivation as too slow on very large sessions, promote
-  cards to a denormalized read model in PR 5.
+  full `item` JSON for the user bodies and terminal assistant bodies that
+  collapsed cards actually render; boundary/tool rows are used as metadata only.
+  If microbenchmarks after this PR still show card derivation as too slow on
+  very large sessions, promote cards to a denormalized read model in PR 5.
 
 ### Deferred: Newest-first `/switch` targets
 

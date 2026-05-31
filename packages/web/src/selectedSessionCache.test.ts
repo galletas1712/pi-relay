@@ -278,6 +278,37 @@ describe("selected session cache", () => {
 		expect(cache.turnDetailsById.has("entry_start")).toBe(false);
 	});
 
+	it("carries compaction turn metadata into a resumed current card", () => {
+		const source = turnStartedEntry("entry_source", null, 7, 0);
+		const compact = compactionEntry("entry_compact", "entry_source", 1, 7, 1_700_000_000_123);
+		const assistant = assistantEntry("entry_assistant", "entry_compact", "resumed answer", 2);
+		let cache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([source], { transcriptRevision: 0 }),
+		);
+		cache = {
+			...cache,
+			turnCardsById: new Map([["entry_source", turnCard("entry_source", 7)]]),
+			turnOrder: ["entry_source"],
+		};
+
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(compact, 4, 1)).cache;
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(assistant, 5, 2)).cache;
+
+		expect(cache.turnOrder).toEqual(["entry_source", "entry_compact", "entry_assistant"]);
+		const compactCard = cache.turnCardsById.get("entry_compact");
+		const resumedCard = cache.turnCardsById.get("entry_assistant");
+		expect(compactCard).toMatchObject({
+			turn_id: 7,
+			start_timestamp_ms: 1_700_000_000_123,
+		});
+		expect(resumedCard).toMatchObject({
+			turn_id: 7,
+			start_timestamp_ms: 1_700_000_000_123,
+			assistant_message: assistant,
+		});
+	});
+
 	it("merges full turn-card message bodies from transcript.turns", () => {
 		const user = entry("entry_user", "entry_start", "full user message text", 2);
 		const finalAssistant = assistantEntry("entry_assistant_final", "entry_result", "full final answer", 5);
@@ -563,6 +594,7 @@ function snapshot(
 		queueRevision?: number;
 		transcriptRevision?: number;
 		lastEventId?: number;
+		activeLeafId?: string | null;
 	} = {},
 ): SessionSnapshot {
 	return {
@@ -571,7 +603,7 @@ function snapshot(
 		outer_cwd: "/repo",
 		workspaces: [],
 		activity: "idle",
-		active_leaf_id: entries.at(-1)?.id ?? null,
+		active_leaf_id: "activeLeafId" in options ? options.activeLeafId ?? null : entries.at(-1)?.id ?? null,
 		provider,
 		metadata: {},
 		pending_actions: [],
@@ -604,7 +636,13 @@ function overview(
 	};
 }
 
-function compactionEntry(id: string, sourceLeafId: string, sequence: number): TranscriptEntry {
+function compactionEntry(
+	id: string,
+	sourceLeafId: string,
+	sequence: number,
+	lastTurnId = 1,
+	turnStartedAtMs?: number,
+): TranscriptEntry {
 	return {
 		id,
 		parent_id: null,
@@ -616,7 +654,8 @@ function compactionEntry(id: string, sourceLeafId: string, sequence: number): Tr
 			source_leaf_id: sourceLeafId,
 			summary: "summarized",
 			tokens_before: null,
-			last_turn_id: 1,
+			last_turn_id: lastTurnId,
+			turn_started_at_ms: turnStartedAtMs,
 		},
 	};
 }
