@@ -132,6 +132,22 @@ pub(crate) fn active_branch_sync(sync: ActiveBranchSync, overview: SessionSnapsh
     })
 }
 
+pub(crate) fn active_branch_projection(
+    snapshot: SessionSnapshot,
+    entries: Vec<TranscriptEntryRecord>,
+) -> Value {
+    json!({
+        "session_id": snapshot.session_id,
+        "active_leaf_id": snapshot.active_leaf_id,
+        "activity": snapshot.activity,
+        "session_revision": snapshot.session_revision,
+        "queue_revision": snapshot.queue_revision,
+        "transcript_revision": snapshot.transcript_revision,
+        "last_event_id": snapshot.last_event_id,
+        "active_branch_entries": redact_entries(entries),
+    })
+}
+
 pub(crate) fn transcript_tree_index(index: TranscriptTreeIndex) -> Value {
     json!({
         "session_id": index.session_id,

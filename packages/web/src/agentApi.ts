@@ -117,6 +117,7 @@ export interface FollowUpResult {
 	queued?: boolean;
 	replayed?: boolean;
 	queue?: QueueProjection | null;
+	active_branch?: SwitchHistoryResult | null;
 }
 
 export interface InterruptResult {

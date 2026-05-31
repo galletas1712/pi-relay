@@ -2,7 +2,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { ArrowDown, ArrowUp, Check, Edit3, Loader2, MoveUp, Send, Square, Trash2, X } from "lucide-react";
 import { COMMANDS, filterCommands, matchSlashPrefix, type SlashCommandInfo } from "./slash.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
-import type { QueuePaneInput } from "./pendingInputs.ts";
+import type { QueuedInput } from "./types.ts";
 
 const NEW_SESSION_DRAFT_ID = "__new_session__";
 const COMPOSER_DRAFTS_STORAGE_KEY = "piRelayComposerDrafts:v1";
@@ -44,7 +44,7 @@ export const Composer = memo(function Composer({
 	sending: boolean;
 	canStop: boolean;
 	stopping: boolean;
-	queuedInputs: QueuePaneInput[];
+	queuedInputs: QueuedInput[];
 	onSubmit: (text: string) => Promise<boolean> | boolean;
 	onStop: () => void;
 	onPromoteQueued: (inputId: string) => void;
@@ -259,7 +259,7 @@ export function QueuedInputPane({
 	onCancel,
 	onMove,
 }: {
-	inputs: QueuePaneInput[];
+	inputs: QueuedInput[];
 	visible: boolean;
 	onPromote: (inputId: string) => void;
 	onUpdate: (inputId: string, text: string) => void;
@@ -271,7 +271,7 @@ export function QueuedInputPane({
 	const followUpIds = useMemo(
 		() =>
 			inputs
-				.filter((input) => !input.pending && input.priority === "follow_up" && input.status === "queued")
+				.filter((input) => input.priority === "follow_up" && input.status === "queued")
 				.map((input) => input.input_id),
 		[inputs],
 	);
@@ -290,13 +290,13 @@ export function QueuedInputPane({
 			</div>
 			<div className="queue-list">
 				{inputs.map((input) => {
-					const canPromote = !input.pending && input.priority === "follow_up" && input.status === "queued";
+					const canPromote = input.priority === "follow_up" && input.status === "queued";
 					const canMutate = canPromote;
 					const followUpIndex = followUpIds.indexOf(input.input_id);
 					const isEditing = editingId === input.input_id;
 					const preview = contentBlocksToText(input.content);
 					return (
-						<div className={`queue-row ${input.pending ? "pending" : ""}`} key={input.input_id}>
+						<div className="queue-row" key={input.input_id}>
 							{isEditing ? (
 								<textarea
 									className="queue-edit"
@@ -393,7 +393,7 @@ export function QueuedInputPane({
 								title={canPromote ? "promote to steer" : "already steering"}
 							>
 								<MoveUp size={13} />
-								<span>{input.pending ? "sending" : input.priority === "steer" ? "steering" : "steer"}</span>
+								<span>{input.priority === "steer" ? "steering" : "steer"}</span>
 							</button>
 						</div>
 					);

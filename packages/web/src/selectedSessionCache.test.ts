@@ -181,19 +181,59 @@ describe("selected session cache", () => {
 		expect(applied.result).toBe("applied");
 		expect(applied.cache.snapshot?.active_leaf_id).toBe("entry_2");
 		expect(selectedEntries(applied.cache).map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
-		expect(applied.cache.treeNodesById.get("entry_2")?.sequence).toBe(2);
 	});
 
-	it("builds a compact tree from append events before the tree index has been loaded", () => {
+	it("leaves incomplete compact topology to transcript.index instead of merging append events", () => {
 		const first = entry("entry_1", null, "first", 1);
-		const second = entry("entry_2", "entry_1", "second", 2);
 		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([], { transcriptRevision: 0 }));
 
-		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(first, 5, 1)).cache;
-		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(second, 6, 2)).cache;
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(first, 4, 1)).cache;
+
+		expect(treeNodesInOrder(cache)).toEqual([]);
+		expect(cache.treeLoadedPrefixSequence).toBe(0);
+		expect(cache.treeMaxSequence).toBe(1);
+		expect(cache.treeComplete).toBe(false);
+	});
+
+	it("extends a complete compact tree from append events without assuming per-session contiguous sequences", () => {
+		let cache = applyTreeIndex(
+			emptySelectedSessionCache(sessionId),
+			treeIndex([treeNode("entry_1", null, 10)], {
+				afterSequence: 0,
+				complete: true,
+				maxSequence: 10,
+				transcriptRevision: 1,
+			}),
+		);
+		cache = applySelectedSnapshot(cache, snapshot([entry("entry_1", null, "first", 10)], { transcriptRevision: 1 }));
+		const second = entry("entry_2", "entry_1", "second", 42);
+
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(second, 5, 2)).cache;
 
 		expect(treeNodesInOrder(cache).map((node) => node.id)).toEqual(["entry_1", "entry_2"]);
-		expect(cache.treeLoadedPrefixSequence).toBe(2);
+		expect(cache.treeLoadedPrefixSequence).toBe(42);
+		expect(cache.treeMaxSequence).toBe(42);
+		expect(cache.treeComplete).toBe(true);
+	});
+
+	it("does not merge append events beyond a partial compact index", () => {
+		let cache = applyTreeIndex(
+			emptySelectedSessionCache(sessionId),
+			treeIndex([treeNode("entry_1", null, 10)], {
+				afterSequence: 0,
+				complete: false,
+				maxSequence: 20,
+				transcriptRevision: 1,
+			}),
+		);
+		cache = applySelectedSnapshot(cache, snapshot([entry("entry_1", null, "first", 10)], { transcriptRevision: 1 }));
+		const later = entry("entry_3", "entry_2", "later", 42);
+
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(later, 6, 2)).cache;
+
+		expect(treeNodesInOrder(cache).map((node) => node.id)).toEqual(["entry_1"]);
+		expect(cache.treeLoadedPrefixSequence).toBe(10);
+		expect(cache.treeMaxSequence).toBe(42);
 		expect(cache.treeComplete).toBe(false);
 	});
 

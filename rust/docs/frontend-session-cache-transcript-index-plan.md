@@ -246,9 +246,6 @@ interface SelectedSessionCache {
   treeTranscriptRevision: number | null;
   treeMaxSequence: number;
   treeComplete: boolean;
-  loading: boolean;
-  refreshing: boolean;
-  error: string | null;
 }
 ```
 
@@ -281,6 +278,9 @@ it), not separately from `session(active_branch)`, `session(full_tree)`, and
 - History picker open: one or more small `transcript.index` page RPCs. For common
   small sessions this is one RPC; for large sessions it streams pages of compact
   nodes. No provider replay/full message bodies are transferred for the picker.
+- Idle follow-up submit: one RPC (`input.follow_up`) returns the accepted
+  active-branch projection, so the frontend can render the canonical transcript
+  immediately without a follow-up `session.get(active_branch)` hot-path fetch.
 - Branch switch: one RPC (`history.switch(return_active_branch=true)`) and render
   from the returned branch. If restoring a historical user message, first fetch
   that one body via `transcript.entries` only if the body is missing locally.
@@ -397,11 +397,26 @@ first and display a picker loading state while that capability is fetched.
   transitions, plus unknown events). Queue projections, append events, and
   activity hints are merged locally, and overlapping selected refreshes are
   coalesced per session.
-- Mobile/browser suspend pitfall: a disconnected tab can miss the very first
-  append events for a brand-new session. Before the full `transcript.index` has
-  ever been loaded, append events form the only compact topology cache; the
-  reducer now accepts contiguous append nodes from sequence 1 onward instead of
-  waiting for a later explicit index fetch. Accepted optimistic transcript
-  bubbles also expire after a short grace period if canonical state still has
-  not matched them, so a missed follow-up append cannot leave a duplicate
-  `syncing...` shadow bubble until page reload.
+- Post-merge suspended-tab pitfall: `last_event_id` is only a replay cursor for
+  retained websocket event rows. The daemon may clear those rows when a session
+  becomes idle, so a later `session.get` can report a smaller `last_event_id`
+  than a tab observed before sleeping. The frontend must not interpret that as
+  stale canonical state. Selected freshness is driven by revisions plus explicit
+  reconciliation: after the page returns to the foreground
+  (`visibilitychange`/`focus`/bfcache `pageshow`) the
+  app invalidates the session list and fetches the selected active branch once,
+  throttled to avoid duplicate browser lifecycle events.
+- Compact topology from events is deliberately conservative. If the compact
+  tree is already complete, a backend-computed `tree_node` from
+  `transcript.appended` may extend it. If the tree is incomplete or stale, the
+  frontend leaves recovery to `transcript.index`; this keeps `/switch` correct
+  without deriving Rust display/turn-boundary logic in TypeScript.
+- The web UI no longer renders local transcript-pending bubbles (`SENDING...`
+  or `SYNCING...`). The composer button spinner is the only local indication
+  that a submit RPC is in flight. Transcript rows and queued-input rows render
+  only from canonical daemon events/RPC projections, which avoids duplicate
+  shadow messages after reconnect/foreground reconciliation.
+- `input.follow_up` now returns a canonical `active_branch` projection when the
+  input is accepted directly into an idle transcript. Queued follow-ups still
+  return the canonical queue projection. This keeps submit behavior canonical
+  without paying an extra selected-session refresh in the idle hot path.
