@@ -19,6 +19,7 @@ export interface SelectedSessionCache {
 	treeNodesById: Map<string, TranscriptTreeNode>;
 	treeChildrenByParentId: Map<string | null, string[]>;
 	treeOrder: string[];
+	treeActiveLeafId: string | null;
 	treeTranscriptRevision: number | null;
 	treeLoadedPrefixSequence: number;
 	treeMaxSequence: number;
@@ -34,6 +35,7 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		treeNodesById: new Map(),
 		treeChildrenByParentId: new Map(),
 		treeOrder: [],
+		treeActiveLeafId: null,
 		treeTranscriptRevision: null,
 		treeLoadedPrefixSequence: 0,
 		treeMaxSequence: 0,
@@ -73,6 +75,7 @@ export function applySelectedSnapshot(cache: SelectedSessionCache, snapshot: Ses
 		snapshot: { ...snapshot, entries },
 		activeBranchEntryIds: sameStringArray(base.activeBranchEntryIds, activeBranchEntryIds) ? base.activeBranchEntryIds : activeBranchEntryIds,
 		entriesById,
+		treeActiveLeafId: treeRevisionChanged ? snapshot.active_leaf_id : base.treeActiveLeafId ?? snapshot.active_leaf_id,
 		treeTranscriptRevision: treeRevisionChanged ? snapshotTranscriptRevision : base.treeTranscriptRevision,
 		treeComplete: treeRevisionChanged ? false : base.treeComplete,
 	};
@@ -129,6 +132,7 @@ export function applyActiveBranchSyncToCache(
 				? cache.activeBranchEntryIds
 				: activeBranchEntryIds,
 			entriesById,
+			treeActiveLeafId: sync.active_leaf_id,
 		},
 		result: "applied",
 	};
@@ -151,7 +155,6 @@ export function applyTreeIndex(cache: SelectedSessionCache, index: TranscriptTre
 	const snapshot = cache.snapshot
 		? {
 				...cache.snapshot,
-				active_leaf_id: index.active_leaf_id,
 				session_revision: Math.max(cache.snapshot.session_revision ?? 0, index.session_revision),
 				transcript_revision: Math.max(cache.snapshot.transcript_revision ?? 0, index.transcript_revision),
 				entries: cache.snapshot.entries ?? selectedEntries(cache),
@@ -163,6 +166,7 @@ export function applyTreeIndex(cache: SelectedSessionCache, index: TranscriptTre
 		treeNodesById,
 		treeChildrenByParentId,
 		treeOrder,
+		treeActiveLeafId: canApplyPage ? index.active_leaf_id : cache.treeActiveLeafId,
 		treeTranscriptRevision: index.transcript_revision,
 		treeLoadedPrefixSequence: canApplyPage ? (index.nodes.at(-1)?.sequence ?? index.after_sequence) : 0,
 		treeMaxSequence: canApplyPage ? index.max_sequence : 0,
@@ -250,6 +254,7 @@ export function applySwitchResultToCache(
 		},
 		activeBranchEntryIds: sameStringArray(cache.activeBranchEntryIds, activeBranchEntryIds) ? cache.activeBranchEntryIds : activeBranchEntryIds,
 		entriesById,
+		treeActiveLeafId: result.active_leaf_id,
 	};
 }
 
@@ -420,8 +425,10 @@ function applyTreeNodeFromEvent(cache: SelectedSessionCache, event: EventFrame):
 	const node = transcriptTreeNodeFromUnknown(event.data.tree_node);
 	if (!node) return {};
 	const revision = numberValue(event.data.transcript_revision) ?? cache.treeTranscriptRevision;
+	const activeLeafId = stringOrNull(event.data.active_leaf_id);
 	if (!cache.treeComplete) {
 		return {
+			treeActiveLeafId: activeLeafId ?? cache.treeActiveLeafId,
 			treeTranscriptRevision: revision,
 			treeMaxSequence: Math.max(cache.treeMaxSequence, node.sequence),
 			treeComplete: false,
@@ -436,6 +443,7 @@ function applyTreeNodeFromEvent(cache: SelectedSessionCache, event: EventFrame):
 		treeNodesById,
 		treeChildrenByParentId: buildTreeChildren(treeOrder, treeNodesById),
 		treeOrder,
+		treeActiveLeafId: activeLeafId ?? cache.treeActiveLeafId,
 		treeTranscriptRevision: revision,
 		treeLoadedPrefixSequence: Math.max(cache.treeLoadedPrefixSequence, node.sequence),
 		treeMaxSequence: Math.max(cache.treeMaxSequence, node.sequence),

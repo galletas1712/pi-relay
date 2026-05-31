@@ -86,6 +86,45 @@ async fn transcript_entry_records_by_id_tx(
         .collect()
 }
 
+async fn active_branch_entry_records_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+) -> Result<Vec<TranscriptEntryRecord>> {
+    let rows = sqlx::query(
+        r#"
+        with recursive branch as (
+            select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence
+            from transcript_entries t
+            join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
+            where t.session_id = $1
+
+            union all
+
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence
+            from transcript_entries parent
+            join branch child
+              on parent.session_id = $1
+             and parent.id = coalesce(
+                case
+                    when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
+                    else null
+                end,
+                child.parent_id
+             )
+        )
+        select id, parent_id, timestamp_ms, sequence, item, provider_replay
+        from branch
+        order by sequence
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| row_to_transcript_entry(&row))
+        .collect()
+}
+
 impl PostgresAgentStore {
     pub async fn load_stored_session(&self, session_id: &str) -> Result<StoredSession> {
         let session_row = sqlx::query("select active_leaf_id, metadata from sessions where id=$1")
@@ -164,20 +203,24 @@ impl PostgresAgentStore {
     }
 
     pub async fn active_leaf_is_turn_boundary(&self, session_id: &str) -> Result<bool> {
-        let active_leaf_id: Option<String> =
-            sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
-                .bind(session_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-        let Some(active_leaf_id) = active_leaf_id else {
+        let active_leaf_id = self.active_leaf_id(session_id).await?;
+        self.transcript_leaf_is_turn_boundary(session_id, active_leaf_id.as_deref())
+            .await
+    }
+
+    pub async fn transcript_leaf_is_turn_boundary(
+        &self,
+        session_id: &str,
+        leaf_id: Option<&str>,
+    ) -> Result<bool> {
+        let Some(leaf_id) = leaf_id else {
             return Ok(true);
         };
         let item: Option<Value> = sqlx::query_scalar(
             "select item from transcript_entries where session_id=$1 and id=$2::text",
         )
         .bind(session_id)
-        .bind(&active_leaf_id)
+        .bind(leaf_id)
         .fetch_optional(&self.pool)
         .await?;
         let Some(item) = item else {
@@ -356,7 +399,7 @@ impl PostgresAgentStore {
         Ok(model_context_from_entries(entries))
     }
 
-    async fn active_leaf_id(&self, session_id: &str) -> Result<Option<String>> {
+    pub async fn active_leaf_id(&self, session_id: &str) -> Result<Option<String>> {
         sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
             .bind(session_id)
             .fetch_optional(&self.pool)
@@ -445,8 +488,7 @@ impl PostgresAgentStore {
         session_id: &str,
     ) -> Result<Vec<TranscriptEntryRecord>> {
         let mut tx = self.pool.begin().await?;
-        let ids = active_branch_entry_ids_tx(&mut tx, session_id).await?;
-        let records = transcript_entry_records_by_id_tx(&mut tx, session_id, &ids).await?;
+        let records = active_branch_entry_records_tx(&mut tx, session_id).await?;
         tx.commit().await?;
         Ok(records)
     }

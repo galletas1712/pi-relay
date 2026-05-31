@@ -38,12 +38,12 @@ pub(crate) async fn ensure_expected_active_leaf(
     if params.get("expected_active_leaf_id").is_none() {
         return Ok(());
     }
-    let stored = state
+    let active_leaf_id = state
         .repo
-        .load_stored_session(session_id)
+        .active_leaf_id(session_id)
         .await
         .map_err(anyhow::Error::from)?;
-    ensure_expected_active_leaf_matches(&stored.active_leaf_id, params)
+    ensure_expected_active_leaf_matches(&active_leaf_id, params)
 }
 
 pub(crate) fn ensure_expected_active_leaf_matches(

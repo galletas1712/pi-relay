@@ -44,6 +44,8 @@ export const ChatPane = memo(function ChatPane({
 	onToggleRight,
 	onResumeTurn
 }: ChatPaneProps) {
+	const loadedLeafId = activeLeafIdFromEntries(entries);
+	const visibleActiveLeafId = loadedLeafId ?? snapshot?.active_leaf_id ?? null;
 	return (
 		<main className="log-pane" data-slot="agent-log">
 			<ChatHeader
@@ -63,7 +65,7 @@ export const ChatPane = memo(function ChatPane({
 			<MessageList
 				entries={entries}
 				pendingActions={snapshot?.pending_actions ?? []}
-				activeLeafId={snapshot?.active_leaf_id ?? null}
+				activeLeafId={visibleActiveLeafId}
 				isRunning={snapshot?.activity === "running"}
 				serverTimeMs={snapshot?.server_time_ms ?? null}
 				hasSession={!!selectedId}
@@ -76,6 +78,10 @@ export const ChatPane = memo(function ChatPane({
 		</main>
 	);
 });
+
+export function activeLeafIdFromEntries(entries: TranscriptEntry[]): string | null {
+	return entries.at(-1)?.id ?? null;
+}
 
 interface ChatHeaderProps {
 	session: SessionDisplayInfo | null;

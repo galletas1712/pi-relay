@@ -1,4 +1,4 @@
-import { useMemo, useState, type CSSProperties } from "react";
+import { useMemo, useState, type CSSProperties, type ReactNode } from "react";
 import { ChevronRight, Loader2, RotateCcw, X } from "lucide-react";
 import { displayParentIdForNode } from "./displayParent.ts";
 import {
@@ -18,6 +18,15 @@ interface VisibleHistoryNodeRow {
 	parentId: string | null;
 	isBranchRoot: boolean;
 	descendantCount: number;
+}
+
+interface HistoryPickerContentParams {
+	loading: boolean;
+	error: string | null;
+	renderedRows: VisibleHistoryNodeRow[];
+	hiddenBranchIds: Set<string>;
+	onSwitch: (target: HistoryTargetOption) => void;
+	onToggleBranch: (entryId: string) => void;
 }
 
 export function CompactHistoryPickerDialog({
@@ -108,64 +117,14 @@ export function CompactHistoryPickerDialog({
 				</div>
 
 				<div className="history-options tree" role="tree" aria-label="switch targets">
-					{loading ? (
-						<div className="history-loading">
-							<Loader2 className="spin" size={16} />
-							<span>Loading history index...</span>
-						</div>
-					) : error ? (
-						<div className="history-empty error">{error}</div>
-					) : (
-						renderedRows.map((row) => {
-							const display = row.option;
-							const isCollapsedBranch = hiddenBranchIds.has(row.node.id);
-							const canCollapse = row.isBranchRoot && !row.isOnActivePath;
-							const outcomeClass = nonGracefulOutcomeClass(display.outcome);
-							return (
-								<div
-									key={row.node.id}
-									className={`history-tree-item ${row.isOnActivePath ? "on-active-path" : ""} ${isCollapsedBranch ? "collapsed" : ""} ${outcomeClass}`}
-									style={{ "--tree-depth": row.depth } as CSSProperties}
-								>
-									{canCollapse ? (
-										<button
-											className="branch-toggle"
-											type="button"
-											onClick={() => toggleBranch(row.node.id)}
-											aria-label={isCollapsedBranch ? "expand branch" : "collapse branch"}
-											aria-expanded={!isCollapsedBranch}
-										>
-											<ChevronRight size={13} />
-										</button>
-									) : null}
-									<button
-										className="history-option tree-row"
-										type="button"
-										role="treeitem"
-										aria-selected={row.isActive}
-										onClick={() => onSwitch(row.option)}
-									>
-										<span className="tree-guides" aria-hidden="true" />
-										<span className={`history-option-icon ${row.parentId ? "" : "root"}`}>
-											{display.turnLabel}
-										</span>
-										<span className="history-option-main">
-											<span className="history-option-title">
-												{display.title}
-												{row.isActive ? <span className="history-badge">current</span> : null}
-												{isCollapsedBranch ? <span className="history-badge muted">{row.descendantCount} hidden</span> : null}
-												{display.outcome && display.outcome !== "Graceful" ? (
-													<span className="history-badge danger">{display.outcome.toLowerCase()}</span>
-												) : null}
-											</span>
-											<span className="history-option-preview">{display.preview}</span>
-										</span>
-										<span className="history-option-meta">{display.meta}</span>
-									</button>
-								</div>
-							);
-						})
-					)}
+					{historyPickerContent({
+						loading,
+						error,
+						renderedRows,
+						hiddenBranchIds,
+						onSwitch,
+						onToggleBranch: toggleBranch,
+					})}
 					{!loading && !error && targetCount === 0 ? (
 						<div className="history-empty">
 							No editable messages, completed turns, or compaction roots yet.
@@ -174,6 +133,84 @@ export function CompactHistoryPickerDialog({
 				</div>
 			</div>
 		</div>
+	);
+}
+
+function historyPickerContent({
+	loading,
+	error,
+	renderedRows,
+	hiddenBranchIds,
+	onSwitch,
+	onToggleBranch,
+}: HistoryPickerContentParams): ReactNode {
+	if (loading && renderedRows.length === 0) {
+		return (
+			<div className="history-loading">
+				<Loader2 className="spin" size={16} />
+				<span>Loading history index...</span>
+			</div>
+		);
+	}
+	if (error) return <div className="history-empty error">{error}</div>;
+	return (
+		<>
+			{renderedRows.map((row) => {
+				const display = row.option;
+				const isCollapsedBranch = hiddenBranchIds.has(row.node.id);
+				const canCollapse = row.isBranchRoot && !row.isOnActivePath;
+				const outcomeClass = nonGracefulOutcomeClass(display.outcome);
+				return (
+					<div
+						key={row.node.id}
+						className={`history-tree-item ${row.isOnActivePath ? "on-active-path" : ""} ${isCollapsedBranch ? "collapsed" : ""} ${outcomeClass}`}
+						style={{ "--tree-depth": row.depth } as CSSProperties}
+					>
+						{canCollapse ? (
+							<button
+								className="branch-toggle"
+								type="button"
+								onClick={() => onToggleBranch(row.node.id)}
+								aria-label={isCollapsedBranch ? "expand branch" : "collapse branch"}
+								aria-expanded={!isCollapsedBranch}
+							>
+								<ChevronRight size={13} />
+							</button>
+						) : null}
+						<button
+							className="history-option tree-row"
+							type="button"
+							role="treeitem"
+							aria-selected={row.isActive}
+							onClick={() => onSwitch(row.option)}
+						>
+							<span className="tree-guides" aria-hidden="true" />
+							<span className={`history-option-icon ${row.parentId ? "" : "root"}`}>
+								{display.turnLabel}
+							</span>
+							<span className="history-option-main">
+								<span className="history-option-title">
+									{display.title}
+									{row.isActive ? <span className="history-badge">current</span> : null}
+									{isCollapsedBranch ? <span className="history-badge muted">{row.descendantCount} hidden</span> : null}
+									{display.outcome && display.outcome !== "Graceful" ? (
+										<span className="history-badge danger">{display.outcome.toLowerCase()}</span>
+									) : null}
+								</span>
+								<span className="history-option-preview">{display.preview}</span>
+							</span>
+							<span className="history-option-meta">{display.meta}</span>
+						</button>
+					</div>
+				);
+			})}
+			{loading ? (
+				<div className="history-loading">
+					<Loader2 className="spin" size={16} />
+					<span>Loading more history...</span>
+				</div>
+			) : null}
+		</>
 	);
 }
 
