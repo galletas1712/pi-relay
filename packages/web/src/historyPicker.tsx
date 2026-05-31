@@ -1,5 +1,6 @@
 import { useMemo, useState, type CSSProperties } from "react";
 import { ChevronRight, Loader2, RotateCcw, X } from "lucide-react";
+import { displayParentIdForEntry } from "./displayParent.ts";
 import {
 	branchEntriesFor,
 	historySwitchOptions,
@@ -145,7 +146,7 @@ export function HistoryPickerDialog({
 										onClick={() => onSwitch(row.option)}
 									>
 										<span className="tree-guides" aria-hidden="true" />
-										<span className={`history-option-icon ${row.entry.parent_id ? "" : "root"}`}>
+										<span className={`history-option-icon ${row.parentId ? "" : "root"}`}>
 											{display.turnLabel}
 										</span>
 										<span className="history-option-main">
@@ -192,7 +193,7 @@ function historyPickerRows(
 	const nearestVisibleAncestor = (entry: TranscriptEntry): string | null => {
 		const cached = visibleAncestorCache.get(entry.id);
 		if (cached !== undefined) return cached;
-		const parentId = entry.parent_id && byId.has(entry.parent_id) ? entry.parent_id : null;
+		const parentId = displayParentIdForEntry(entry, byId);
 		let ancestor: string | null = null;
 		if (parentId) {
 			ancestor = visibleIds.has(parentId) ? parentId : nearestVisibleAncestor(byId.get(parentId)!);

@@ -200,6 +200,7 @@ export interface TranscriptEntry {
 export interface TranscriptTreeNode {
 	id: string;
 	parent_id: string | null;
+	source_leaf_id?: string | null;
 	timestamp_ms: number;
 	sequence: number;
 	item_type: TranscriptItemType;
