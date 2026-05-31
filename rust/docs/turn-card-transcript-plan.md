@@ -166,12 +166,17 @@ Implementation status:
 - Added selected-session turn-card cache projections (`turnCardsById`,
   `turnOrder`, `turnDetailsById`) alongside the existing body/topology caches.
 - The chat pane renders turn cards when available and lazily fetches detail when
-  the user clicks "Show details". No turn detail is fetched in the selected
-  session hot path.
+  the user clicks "Show details". Expanded details request provider replay
+  explicitly so replay-derived decorations remain available without putting raw
+  replay back on the selected-session hot path. No turn detail is fetched in
+  the selected session hot path.
 - The selected-session hot path now uses metadata-only `session.get` followed by
   `transcript.turns`; it does not fetch full active-branch bodies on session
   select, foreground refresh, accepted follow-up reconciliation, or
   `history.switch`.
+- Transcript append events incrementally update the current card summary and
+  any already-expanded turn detail. The canonical `transcript.turns` refresh is
+  still used when the cache cannot prove an event extends the selected branch.
 - Pitfall: this implementation still derives cards by walking the active branch
   in SQL and reading a small set of JSON fields from `item`. It deliberately
   avoids selecting raw provider replay and avoids deserializing full transcript

@@ -171,7 +171,7 @@ pub(crate) fn transcript_turn_detail(result: TranscriptTurnDetailResult) -> Valu
         "session_revision": result.session_revision,
         "transcript_revision": result.transcript_revision,
         "turn_id": result.turn_id,
-        "entries": result.entries,
+        "entries": redact_entries(result.entries),
     })
 }
 

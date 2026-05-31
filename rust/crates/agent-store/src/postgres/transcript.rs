@@ -212,18 +212,19 @@ async fn active_branch_entry_records_between_tx(
     body_mode: TranscriptEntryBodyMode,
 ) -> Result<Vec<TranscriptEntryRecord>> {
     let provider_replay_select = provider_replay_select(body_mode);
-    let branch_provider_replay_select = branch_provider_replay_select(body_mode);
+    let leaf_provider_replay_select = aliased_provider_replay_select("t", body_mode);
+    let parent_provider_replay_select = aliased_provider_replay_select("parent", body_mode);
     let query = format!(
         r#"
         with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, {branch_provider_replay_select}, t.sequence
+            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence
             from transcript_entries t
             join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
             where t.session_id = $1
 
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {branch_provider_replay_select}, parent.sequence
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
@@ -572,7 +573,10 @@ impl PostgresAgentStore {
             None => Vec::new(),
         };
         let cards = turn_cards_from_rows(&rows);
-        let Some(card) = cards.iter().find(|card| card.id == turn_id) else {
+        let Some(card) = cards
+            .iter()
+            .find(|card| card.id == turn_id || card.start_entry_id.as_deref() == Some(turn_id))
+        else {
             tx.commit().await?;
             return Err(anyhow!("turn not found: {turn_id}"));
         };
@@ -590,7 +594,7 @@ impl PostgresAgentStore {
             active_leaf_id,
             session_revision: session.get("session_revision"),
             transcript_revision: session.get("transcript_revision"),
-            turn_id: turn_id.to_string(),
+            turn_id: card.id.clone(),
             entries: detail_entries,
         })
     }

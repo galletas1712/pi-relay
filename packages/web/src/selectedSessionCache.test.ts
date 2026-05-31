@@ -19,6 +19,7 @@ import type {
 	QueueProjection,
 	SessionSnapshot,
 	TranscriptEntry,
+	TurnCard,
 	TranscriptTreeIndex,
 	TranscriptTreeNode,
 } from "./types.ts";
@@ -233,6 +234,80 @@ describe("selected session cache", () => {
 		const applied = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(second, 5, 2));
 
 		expect(applied.cache.turnDetailsById.get("turn_1")).toEqual(["entry_1", "entry_2"]);
+	});
+
+	it("updates the current turn card incrementally as transcript events append", () => {
+		const started = turnStartedEntry("entry_start", null, 1, 1);
+		const user = entry("entry_user", "entry_start", "hello there", 2);
+		const assistant = assistantEntry("entry_assistant", "entry_user", "answer text", 3, 1);
+		const toolResult = toolResultEntry("entry_result", "entry_assistant", 4);
+		const finished = turnFinishedEntry("entry_finish", "entry_result", 1, "Graceful", 5);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([started], { transcriptRevision: 1 }));
+		cache = {
+			...cache,
+			turnOrder: ["entry_start"],
+			turnCardsById: new Map([["entry_start", turnCard("entry_start", 1)]]),
+			turnDetailsById: new Map([["entry_start", ["entry_start"]]]),
+			turnTranscriptRevision: 1,
+			turnActiveLeafId: "entry_start",
+		};
+
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(user, 5, 2)).cache;
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(assistant, 6, 3)).cache;
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(toolResult, 7, 4)).cache;
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(finished, 8, 5)).cache;
+
+		expect(cache.turnOrder).toEqual(["entry_finish"]);
+		const card = cache.turnCardsById.get("entry_finish");
+		expect(card).toMatchObject({
+			id: "entry_finish",
+			status: "completed",
+			active_leaf_id: "entry_finish",
+			boundary_entry_id: "entry_finish",
+			user_preview: "hello there",
+			assistant_preview: "answer text",
+			tool_call_count: 1,
+			tool_result_count: 1,
+			entry_count: 5,
+		});
+		expect(cache.turnDetailsById.get("entry_finish")).toEqual([
+			"entry_start",
+			"entry_user",
+			"entry_assistant",
+			"entry_result",
+			"entry_finish",
+		]);
+		expect(cache.turnDetailsById.has("entry_start")).toBe(false);
+	});
+
+	it("starts a new current turn card when a turn_started entry follows a completed turn", () => {
+		const started = turnStartedEntry("entry_start_2", "entry_finish_1", 2, 6);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([entry("entry_finish_1", null, "done", 5)], { transcriptRevision: 1 }));
+		cache = {
+			...cache,
+			turnOrder: ["entry_finish_1"],
+			turnCardsById: new Map([[
+				"entry_finish_1",
+				{
+					...turnCard("entry_finish_1", 1),
+					status: "completed",
+					boundary_entry_id: "entry_finish_1",
+					active_leaf_id: "entry_finish_1",
+					entry_count: 4,
+				},
+			]]),
+		};
+
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(started, 9, 2)).cache;
+
+		expect(cache.turnOrder).toEqual(["entry_finish_1", "entry_start_2"]);
+		expect(cache.turnCardsById.get("entry_start_2")).toMatchObject({
+			id: "entry_start_2",
+			turn_id: 2,
+			start_entry_id: "entry_start_2",
+			active_leaf_id: "entry_start_2",
+			entry_count: 1,
+		});
 	});
 
 	it("leaves incomplete compact topology to transcript.index instead of merging append events", () => {
@@ -522,6 +597,95 @@ function entry(id: string, parentId: string | null, text: string, sequence: numb
 		sequence,
 		item: { type: "user_message", content: [{ type: "text", text }] },
 		provider_replay: [],
+	};
+}
+
+function turnStartedEntry(id: string, parentId: string | null, turnId: number, sequence: number): TranscriptEntry {
+	return {
+		id,
+		parent_id: parentId,
+		timestamp_ms: 1_700_000_000_000 + sequence,
+		sequence,
+		item: { type: "turn_started", turn_id: turnId },
+		provider_replay: [],
+	};
+}
+
+function assistantEntry(id: string, parentId: string | null, text: string, sequence: number, toolCallCount = 0): TranscriptEntry {
+	return {
+		id,
+		parent_id: parentId,
+		timestamp_ms: 1_700_000_000_000 + sequence,
+		sequence,
+		item: {
+			type: "assistant_message",
+			items: [
+				{ type: "text", text },
+				...Array.from({ length: toolCallCount }, (_, index) => ({
+					type: "tool_call" as const,
+					id: `tool_${index}`,
+					tool_name: `tool_${index}`,
+					args_json: "{}",
+				})),
+			],
+		},
+		provider_replay: [],
+	};
+}
+
+function toolResultEntry(id: string, parentId: string | null, sequence: number): TranscriptEntry {
+	return {
+		id,
+		parent_id: parentId,
+		timestamp_ms: 1_700_000_000_000 + sequence,
+		sequence,
+		item: {
+			type: "tool_result",
+			tool_call_id: "tool_0",
+			tool_name: "tool_0",
+			output: "ok",
+			status: "Success",
+		},
+		provider_replay: [],
+	};
+}
+
+function turnFinishedEntry(
+	id: string,
+	parentId: string | null,
+	turnId: number,
+	outcome: "Graceful" | "Interrupted" | "Crashed",
+	sequence: number,
+): TranscriptEntry {
+	return {
+		id,
+		parent_id: parentId,
+		timestamp_ms: 1_700_000_000_000 + sequence,
+		sequence,
+		item: { type: "turn_finished", turn_id: turnId, outcome },
+		provider_replay: [],
+	};
+}
+
+function turnCard(id: string, turnId: number): TurnCard {
+	return {
+		id,
+		turn_id: turnId,
+		status: "open",
+		outcome: null,
+		start_entry_id: id,
+		boundary_entry_id: null,
+		active_leaf_id: id,
+		start_sequence: 1,
+		end_sequence: 1,
+		start_timestamp_ms: 1_700_000_000_001,
+		timestamp_ms: 1_700_000_000_001,
+		user_preview: null,
+		assistant_preview: null,
+		tool_call_count: 0,
+		tool_result_count: 0,
+		entry_count: 1,
+		can_resume: false,
 	};
 }
 

@@ -608,19 +608,24 @@ export function App() {
 		async (turnId: string) => {
 			const sessionId = selectedRef.current;
 			if (!sessionId) throw new Error("select a session first");
-			setExpandedTurnIds((current) => new Set(current).add(turnId));
 			const cache = selectedCacheRef.current;
-			if (turnDetailEntries(cache, turnId)) return;
+			if (turnDetailEntries(cache, turnId)) {
+				setExpandedTurnIds((current) => new Set(current).add(turnId));
+				return;
+			}
 			setLoadingTurnId(turnId);
 			try {
-				const result = await api.getTranscriptTurnDetail(sessionId, turnId);
+				const result = await api.getTranscriptTurnDetail(sessionId, turnId, { includeProviderReplay: true });
 				if (selectedRef.current !== sessionId) return;
-				updateSelectedCache((current) => applyTurnDetail(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, turnId, result.entries));
+				updateSelectedCache((current) => applyTurnDetail(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.turn_id, result.entries));
+				setExpandedTurnIds((current) => new Set(current).add(result.turn_id));
+			} catch (error) {
+				if (selectedRef.current === sessionId) pushNotice("error", errorMessage(error));
 			} finally {
 				setLoadingTurnId((current) => (current === turnId ? null : current));
 			}
 		},
-		[api, updateSelectedCache],
+		[api, pushNotice, updateSelectedCache],
 	);
 
 	const reconcileAfterForeground = useCallback(
@@ -738,7 +743,6 @@ export function App() {
 					if (entryId && selectedCacheRef.current.entriesById.has(entryId)) {
 						replaceSelectedCache(applyEventHighWater(selectedCacheRef.current, event.session_id, event.event_id));
 					}
-					shouldSyncSelected = event.event === "turn.started" || event.event === "turn.finished";
 				}
 				const activity = activityFromEvent(event);
 				if (activity) {
