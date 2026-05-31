@@ -93,6 +93,28 @@ describe("selected session cache", () => {
 		expect(cache.treeComplete).toBe(true);
 	});
 
+	it("keeps compact tree metadata from changing the visible active branch", () => {
+		const visible = entry("entry_1", null, "visible", 1);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([visible], { transcriptRevision: 1 }));
+
+		cache = applyTreeIndex(
+			cache,
+			treeIndex([treeNode("entry_1", null, 1), treeNode("entry_2", "entry_1", 2)], {
+				afterSequence: 0,
+				complete: true,
+				maxSequence: 2,
+				transcriptRevision: 2,
+				sessionRevision: 2,
+				activeLeafId: "entry_2",
+			}),
+		);
+
+		expect(cache.snapshot?.active_leaf_id).toBe("entry_1");
+		expect(cache.treeActiveLeafId).toBe("entry_2");
+		expect(cache.snapshot?.transcript_revision).toBe(2);
+		expect(selectedEntries(cache).map((candidate) => candidate.id)).toEqual(["entry_1"]);
+	});
+
 	it("rejects changed-revision delta tree pages so callers must restart from the beginning", () => {
 		let cache = applyTreeIndex(
 			emptySelectedSessionCache(sessionId),

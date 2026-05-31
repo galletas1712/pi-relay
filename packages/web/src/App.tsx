@@ -79,6 +79,7 @@ const NOTICE_TTL_MS = 4000;
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
 const SELECTED_SESSION_REFRESH_DEBOUNCE_MS = 80;
 const FOREGROUND_RECONCILE_THROTTLE_MS = 2000;
+const TRANSCRIPT_INDEX_PAGE_SIZE = 5000;
 const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
 const MEDIUM_PANEL_QUERY = "(min-width: 900px)";
 const WIDE_PANEL_QUERY = "(min-width: 1280px)";
@@ -787,7 +788,14 @@ export function App() {
 	}, [loadedSnapshot, queryClient]);
 
 	const ensureTreeIndex = useCallback(
-		async (sessionId: string, forceRestart = false): Promise<TranscriptTreeNode[]> => {
+		async (
+			sessionId: string,
+			options: {
+				forceRestart?: boolean;
+				onPage?: (nodes: TranscriptTreeNode[], complete: boolean) => void;
+			} = {},
+		): Promise<TranscriptTreeNode[]> => {
+			const forceRestart = options.forceRestart ?? false;
 			const initialCache = selectedCacheRef.current.sessionId === sessionId ? selectedCacheRef.current : emptySelectedSessionCache(sessionId);
 			const snapshotRevision = initialCache.snapshot?.transcript_revision ?? null;
 			const initialNodes = treeNodesInOrder(initialCache);
@@ -804,13 +812,14 @@ export function App() {
 					: 0;
 			let complete = false;
 			let nodes = afterSequence > 0 ? initialNodes : [];
+			if (nodes.length > 0) options.onPage?.(nodes, false);
 			while (!complete && selectedRef.current === sessionId) {
 				const shouldLogPerf = perfEnabled();
 				const startedAt = perfNow();
 				if (shouldLogPerf) perfLog("transcript.index start", { sessionId, afterSequence });
 				const index = await api.getTranscriptIndex(sessionId, {
 					afterSequence,
-					limit: 1000,
+					limit: TRANSCRIPT_INDEX_PAGE_SIZE,
 				});
 				if (shouldLogPerf) {
 					perfLog("transcript.index end", {
@@ -829,6 +838,7 @@ export function App() {
 				nodes = treeNodesInOrder(nextCache);
 				afterSequence = nextCache.treeLoadedPrefixSequence;
 				complete = nextCache.treeComplete;
+				options.onPage?.(nodes, complete);
 			}
 			return nodes;
 		},
@@ -1189,6 +1199,9 @@ export function App() {
 				throw new Error("stop the active turn before switching history");
 			}
 			const targetBranchIds = branchFromTree(selectedCacheRef.current, target.actionLeafId).map((node) => node.id);
+			if (target.actionLeafId && !targetBranchIds.includes(target.actionLeafId)) {
+				throw new Error("history index is still loading; please wait for the switch list to finish");
+			}
 			const missingBodyIds = targetBranchIds.filter((id) => !selectedCacheRef.current.entriesById.has(id));
 			const restoreText = await restoreTextForTarget(api, sessionId, target, selectedCacheRef, updateSelectedCache);
 			let result;
@@ -1203,7 +1216,7 @@ export function App() {
 				});
 			} catch (error) {
 				if (isHistoryChangedError(error)) {
-					await ensureTreeIndex(sessionId, true);
+					await ensureTreeIndex(sessionId, { forceRestart: true });
 					throw new Error("history changed; refreshed the switch list, please choose again");
 				}
 				throw error;
@@ -1371,14 +1384,27 @@ export function App() {
 				loading: !treeComplete,
 				error: null,
 			});
-			void ensureTreeIndex(sessionId)
+			void ensureTreeIndex(sessionId, {
+				onPage: (nodes, complete) => {
+					setHistoryDialog((current) => {
+						if (!current || current.sessionId !== sessionId) return current;
+						return {
+							...current,
+							nodes,
+							activeLeafId: selectedCacheRef.current.treeActiveLeafId ?? loadedSnapshot.active_leaf_id,
+							loading: !complete,
+							error: null,
+						};
+					});
+				},
+			})
 				.then((nodes) => {
 					setHistoryDialog((current) => {
 						if (!current || current.sessionId !== sessionId) return current;
 						return {
 							...current,
 							nodes,
-							activeLeafId: selectedCacheRef.current.snapshot?.active_leaf_id ?? loadedSnapshot.active_leaf_id,
+							activeLeafId: selectedCacheRef.current.treeActiveLeafId ?? current.activeLeafId,
 							loading: false,
 							error: null,
 						};

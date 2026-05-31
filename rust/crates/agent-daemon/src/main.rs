@@ -459,6 +459,7 @@ async fn session_list(state: &AppState, params: Value) -> std::result::Result<Va
 
 async fn session_get(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
+    let started_at = Instant::now();
     let include_entries = params
         .get("include_entries")
         .and_then(Value::as_bool)
@@ -474,12 +475,15 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
         ));
     }
     let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
+    let recovered_ms = started_at.elapsed().as_millis();
     let snapshot = state
         .repo
         .session_snapshot(&session_id)
         .await
         .map_err(anyhow::Error::from)?;
+    let snapshot_ms = started_at.elapsed().as_millis();
     let entries = if include_entries {
         let scope = if entries_scope == "active_branch" {
             TranscriptEntryScope::ActiveBranch
@@ -496,7 +500,20 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
     } else {
         None
     };
-    Ok(rpc_views::session_snapshot(snapshot, entries))
+    let entries_ms = started_at.elapsed().as_millis();
+    let entry_count = entries.as_ref().map(Vec::len).unwrap_or_default();
+    let value = rpc_views::session_snapshot(snapshot, entries);
+    let total_ms = started_at.elapsed().as_millis();
+    if perf_logging_enabled() {
+        eprintln!(
+            "perf session.get session={session_id} include_entries={include_entries} scope={entries_scope} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} snapshot_ms={} entries_ms={} view_ms={} total_ms={total_ms}",
+            recovered_ms.saturating_sub(acquired_ms),
+            snapshot_ms.saturating_sub(recovered_ms),
+            entries_ms.saturating_sub(snapshot_ms),
+            total_ms.saturating_sub(entries_ms),
+        );
+    }
+    Ok(value)
 }
 
 async fn session_sync_active_branch(
@@ -505,19 +522,37 @@ async fn session_sync_active_branch(
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let base_leaf_id = params.get("base_leaf_id").and_then(Value::as_str);
+    let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
+    let recovered_ms = started_at.elapsed().as_millis();
     let sync = state
         .repo
         .sync_active_branch(&session_id, base_leaf_id)
         .await
         .map_err(anyhow::Error::from)?;
+    let sync_ms = started_at.elapsed().as_millis();
     let overview = state
         .repo
         .session_snapshot(&session_id)
         .await
         .map_err(anyhow::Error::from)?;
-    Ok(rpc_views::active_branch_sync(sync, overview))
+    let snapshot_ms = started_at.elapsed().as_millis();
+    let entry_count = sync.entries.len();
+    let status = sync.status;
+    let value = rpc_views::active_branch_sync(sync, overview);
+    let total_ms = started_at.elapsed().as_millis();
+    if perf_logging_enabled() {
+        eprintln!(
+            "perf session.sync_active_branch session={session_id} base_leaf_id={base_leaf_id:?} status={status} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} sync_ms={} snapshot_ms={} view_ms={} total_ms={total_ms}",
+            recovered_ms.saturating_sub(acquired_ms),
+            sync_ms.saturating_sub(recovered_ms),
+            snapshot_ms.saturating_sub(sync_ms),
+            total_ms.saturating_sub(snapshot_ms),
+        );
+    }
+    Ok(value)
 }
 
 async fn session_rename(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
@@ -893,8 +928,11 @@ async fn input_user(
     priority: InputPriority,
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
+    let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
+    let recovered_ms = started_at.elapsed().as_millis();
     let client_input_id = params
         .get("client_input_id")
         .and_then(Value::as_str)
@@ -936,6 +974,13 @@ async fn input_user(
                     .await
                     .map(rpc_views::queue_state)
                     .map_err(anyhow::Error::from)?;
+                if perf_logging_enabled() {
+                    let total_ms = started_at.elapsed().as_millis();
+                    eprintln!(
+                        "perf input.follow_up session={session_id} priority={priority} replay=true acquire_ms={acquired_ms} recover_ms={} total_ms={total_ms}",
+                        recovered_ms.saturating_sub(acquired_ms),
+                    );
+                }
                 return Ok(json!({
                     "input_id": record.input_id,
                     "accepted": record.status == QueuedInputStatus::Consumed,
@@ -1019,6 +1064,13 @@ async fn input_user(
             active_branch_sync,
         } => {
             driver.dispatch(dispatches).await?;
+            if perf_logging_enabled() {
+                let total_ms = started_at.elapsed().as_millis();
+                eprintln!(
+                    "perf input.follow_up session={session_id} priority={priority} queued=false acquire_ms={acquired_ms} recover_ms={} total_ms={total_ms}",
+                    recovered_ms.saturating_sub(acquired_ms),
+                );
+            }
             Ok(
                 json!({ "accepted": true, "queued": false, "active_branch_sync": active_branch_sync }),
             )
@@ -1034,6 +1086,13 @@ async fn input_user(
             }
             if should_drive {
                 driver.drive_until_blocked().await?;
+            }
+            if perf_logging_enabled() {
+                let total_ms = started_at.elapsed().as_millis();
+                eprintln!(
+                    "perf input.follow_up session={session_id} priority={priority} queued=true should_drive={should_drive} acquire_ms={acquired_ms} recover_ms={} total_ms={total_ms}",
+                    recovered_ms.saturating_sub(acquired_ms),
+                );
             }
             Ok(json!({ "input_id": input_id, "accepted": true, "queued": true, "queue": queue }))
         }
@@ -1205,14 +1264,30 @@ async fn transcript_index(state: &AppState, params: Value) -> std::result::Resul
     let session_id = required_string(&params, "session_id")?;
     let after_sequence = params.get("after_sequence").and_then(Value::as_i64);
     let limit = params.get("limit").and_then(Value::as_i64);
+    let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
+    let recovered_ms = started_at.elapsed().as_millis();
     let index = state
         .repo
         .transcript_tree_index(&session_id, after_sequence, limit)
         .await
         .map_err(anyhow::Error::from)?;
-    Ok(rpc_views::transcript_tree_index(index))
+    let load_ms = started_at.elapsed().as_millis();
+    let node_count = index.nodes.len();
+    let complete = index.complete;
+    let value = rpc_views::transcript_tree_index(index);
+    let total_ms = started_at.elapsed().as_millis();
+    if perf_logging_enabled() {
+        eprintln!(
+            "perf transcript.index session={session_id} after_sequence={after_sequence:?} limit={limit:?} nodes={node_count} complete={complete} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
+            recovered_ms.saturating_sub(acquired_ms),
+            load_ms.saturating_sub(recovered_ms),
+            total_ms.saturating_sub(load_ms),
+        );
+    }
+    Ok(value)
 }
 
 async fn transcript_entries(
@@ -1247,7 +1322,7 @@ async fn history_tree(state: &AppState, params: Value) -> std::result::Result<Va
     let entry_count = tree.entries.len();
     let value = rpc_views::history_tree(tree);
     let total_ms = started_at.elapsed().as_millis();
-    if std::env::var_os("PI_RELAY_PERF").is_some() {
+    if perf_logging_enabled() {
         eprintln!(
             "perf history.tree session={session_id} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
             recovered_ms.saturating_sub(acquired_ms),
@@ -1256,6 +1331,10 @@ async fn history_tree(state: &AppState, params: Value) -> std::result::Result<Va
         );
     }
     Ok(value)
+}
+
+fn perf_logging_enabled() -> bool {
+    std::env::var_os("PI_RELAY_PERF").is_some()
 }
 
 async fn history_context(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
@@ -1283,22 +1362,31 @@ async fn history_context(state: &AppState, params: Value) -> std::result::Result
 
 async fn history_switch(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
+    let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
     driver.ensure_idle_for_source_mutation().await?;
+    let idle_ms = started_at.elapsed().as_millis();
     let leaf_id = params.get("leaf_id").and_then(Value::as_str);
-    let stored = state
+    let active_leaf_id = state
         .repo
-        .load_stored_session(&session_id)
+        .active_leaf_id(&session_id)
         .await
         .map_err(anyhow::Error::from)?;
-    ensure_expected_active_leaf_matches(&stored.active_leaf_id, &params)?;
-    let store = transcript_store_from_stored(&stored)?;
-    if !store.is_turn_boundary_at(leaf_id) {
+    ensure_expected_active_leaf_matches(&active_leaf_id, &params)?;
+    let expected_ms = started_at.elapsed().as_millis();
+    if !state
+        .repo
+        .transcript_leaf_is_turn_boundary(&session_id, leaf_id)
+        .await
+        .map_err(anyhow::Error::from)?
+    {
         return Err(RpcError::new(
             "not_turn_boundary",
             "history.switch requires a turn boundary",
         ));
     }
+    let boundary_ms = started_at.elapsed().as_millis();
     let return_active_branch = params
         .get("return_active_branch")
         .and_then(Value::as_bool)
@@ -1320,9 +1408,34 @@ async fn history_switch(state: &AppState, params: Value) -> std::result::Result<
         )
         .await
         .map_err(history_switch_error_to_rpc)?;
+    let switch_ms = started_at.elapsed().as_millis();
+    let returned_body_count = result
+        .active_branch_entries
+        .as_ref()
+        .map(Vec::len)
+        .unwrap_or_default();
+    let returned_id_count = result
+        .active_branch_entry_ids
+        .as_ref()
+        .map(Vec::len)
+        .unwrap_or_default();
     publish_events(state, result.events.clone());
     clear_event_buffer_if_idle(state, &session_id).await?;
-    Ok(rpc_views::switch_active_leaf(result))
+    let publish_ms = started_at.elapsed().as_millis();
+    let value = rpc_views::switch_active_leaf(result);
+    let total_ms = started_at.elapsed().as_millis();
+    if perf_logging_enabled() {
+        eprintln!(
+            "perf history.switch session={session_id} leaf_id={leaf_id:?} return_active_branch={return_active_branch} branch_ids={returned_id_count} bodies={returned_body_count} acquire_ms={acquired_ms} idle_ms={} expected_ms={} boundary_ms={} switch_ms={} publish_ms={} view_ms={} total_ms={total_ms}",
+            idle_ms.saturating_sub(acquired_ms),
+            expected_ms.saturating_sub(idle_ms),
+            boundary_ms.saturating_sub(expected_ms),
+            switch_ms.saturating_sub(boundary_ms),
+            publish_ms.saturating_sub(switch_ms),
+            total_ms.saturating_sub(publish_ms),
+        );
+    }
+    Ok(value)
 }
 
 fn required_string_vec(params: &Value, key: &str) -> std::result::Result<Vec<String>, RpcError> {
