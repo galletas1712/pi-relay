@@ -229,6 +229,43 @@ export interface TranscriptEntriesResult {
 	entries: TranscriptEntry[];
 }
 
+export interface TurnCard {
+	id: string;
+	turn_id?: number | null;
+	status: "completed" | "running" | "open" | "compacted";
+	outcome?: TurnOutcome | null;
+	start_entry_id?: string | null;
+	boundary_entry_id?: string | null;
+	active_leaf_id: string;
+	start_sequence: number;
+	end_sequence: number;
+	timestamp_ms: number;
+	user_preview?: string | null;
+	assistant_preview?: string | null;
+	tool_call_count: number;
+	tool_result_count: number;
+	entry_count: number;
+	can_resume: boolean;
+}
+
+export interface TranscriptTurnsResult {
+	session_id: string;
+	active_leaf_id: string | null;
+	session_revision: number;
+	transcript_revision: number;
+	cards: TurnCard[];
+	current_turn_entries: TranscriptEntry[];
+}
+
+export interface TranscriptTurnDetailResult {
+	session_id: string;
+	active_leaf_id: string | null;
+	session_revision: number;
+	transcript_revision: number;
+	turn_id: string;
+	entries: TranscriptEntry[];
+}
+
 export interface HistoryTree {
 	session_id: string;
 	active_leaf_id: string | null;

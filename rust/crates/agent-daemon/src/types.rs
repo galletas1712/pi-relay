@@ -66,6 +66,8 @@ pub(crate) enum RpcMethod {
     InputInterrupt,
     TranscriptIndex,
     TranscriptEntries,
+    TranscriptTurns,
+    TranscriptTurnDetail,
     HistoryTree,
     HistoryContext,
     HistorySwitch,
@@ -101,6 +103,8 @@ impl RpcMethod {
             "input.interrupt" => Some(Self::InputInterrupt),
             "transcript.index" => Some(Self::TranscriptIndex),
             "transcript.entries" => Some(Self::TranscriptEntries),
+            "transcript.turns" => Some(Self::TranscriptTurns),
+            "transcript.turn_detail" => Some(Self::TranscriptTurnDetail),
             "history.tree" => Some(Self::HistoryTree),
             "history.context" => Some(Self::HistoryContext),
             "history.switch" => Some(Self::HistorySwitch),
@@ -172,6 +176,14 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("transcript.entries"),
             Some(RpcMethod::TranscriptEntries)
+        );
+        assert_eq!(
+            RpcMethod::parse("transcript.turns"),
+            Some(RpcMethod::TranscriptTurns)
+        );
+        assert_eq!(
+            RpcMethod::parse("transcript.turn_detail"),
+            Some(RpcMethod::TranscriptTurnDetail)
         );
         assert_eq!(RpcMethod::parse("turn.resume"), Some(RpcMethod::TurnResume));
         assert_eq!(

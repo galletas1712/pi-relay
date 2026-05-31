@@ -12,7 +12,7 @@ import type { HostedToolView, SourceCitation } from "./providerReplay.ts";
 import { contentBlocksToText, firstLine } from "./text.ts";
 import { assistantMessageText, buildTurnViews } from "./turnView.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
-import type { AssistantItem, NoticeTone, PendingAction, ReplayDisplay, TranscriptEntry, TranscriptItem } from "./types.ts";
+import type { AssistantItem, NoticeTone, PendingAction, ReplayDisplay, TranscriptEntry, TranscriptItem, TurnCard } from "./types.ts";
 
 type ToolResultItem = Extract<TranscriptItem, { type: "tool_result" }>;
 type AssistantMessageEntry = TranscriptEntry & { item: Extract<TranscriptItem, { type: "assistant_message" }> };
@@ -64,6 +64,13 @@ type TranscriptDisplayNode =
 	| { type: "tool_result"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "tool_result" }> } }
 	| { type: "compaction_summary"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "compaction_summary" }> } }
 	| { type: "compaction_in_progress"; key: string; trigger: "auto" | "manual"; reason: string | null };
+
+export interface TurnCardView {
+	card: TurnCard;
+	entries: TranscriptEntry[] | null;
+	expanded: boolean;
+	isCurrent: boolean;
+}
 
 type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
 const STICKY_BOTTOM_EPSILON_PX = 1;
@@ -169,7 +176,10 @@ export const MessageList = memo(function MessageList({
 	entriesSessionId,
 	loadingSession = false,
 	onResumeTurn,
-	resumingTurnId
+	resumingTurnId,
+	turnCards,
+	onExpandTurn,
+	loadingTurnId
 }: {
 	entries: TranscriptEntry[];
 	pendingActions?: PendingAction[];
@@ -182,6 +192,9 @@ export const MessageList = memo(function MessageList({
 	loadingSession?: boolean;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
+	turnCards?: TurnCardView[] | null;
+	onExpandTurn?: (turnId: string) => void;
+	loadingTurnId?: string | null;
 }) {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const contentRef = useRef<HTMLDivElement | null>(null);
@@ -342,6 +355,7 @@ export const MessageList = memo(function MessageList({
 		() => (isRunning ? runningTurnStartMs(visibleEntries) : null),
 		[isRunning, visibleEntries],
 	);
+	const shouldUseTurnCards = !!turnCards && turnCards.length > 0;
 
 	if (!hasSession) {
 		return (
@@ -368,21 +382,34 @@ export const MessageList = memo(function MessageList({
 	return (
 		<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 			<div className="message-scroll-content" ref={contentRef}>
-				{visibleDisplayNodes.map((node) => (
-					<TranscriptDisplayNodeView
-						node={node}
-						key={node.key}
-						toolIndex={toolIndex}
-						isActiveLeaf={nodeLeafId(node) === activeLeafId}
-						isRunning={isRunning}
-						onResumeTurn={onResumeTurn}
-						resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
-						resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
-						compactionHiddenCount={compactionHiddenCounts.get(node.key) ?? 0}
-						compactionExpanded={!collapsedCompactions.has(node.key)}
-						onToggleCompaction={toggleCompaction}
-					/>
-				))}
+				{shouldUseTurnCards
+					? turnCards!.map((turn) => (
+							<TurnCardRow
+								key={turn.card.id}
+								turn={turn}
+								activeLeafId={activeLeafId}
+								isRunning={isRunning}
+								onResumeTurn={onResumeTurn}
+								resumingTurnId={resumingTurnId}
+								onExpandTurn={onExpandTurn}
+								loadingTurnId={loadingTurnId}
+							/>
+						))
+					: visibleDisplayNodes.map((node) => (
+							<TranscriptDisplayNodeView
+								node={node}
+								key={node.key}
+								toolIndex={toolIndex}
+								isActiveLeaf={nodeLeafId(node) === activeLeafId}
+								isRunning={isRunning}
+								onResumeTurn={onResumeTurn}
+								resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
+								resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
+								compactionHiddenCount={compactionHiddenCounts.get(node.key) ?? 0}
+								compactionExpanded={!collapsedCompactions.has(node.key)}
+								onToggleCompaction={toggleCompaction}
+							/>
+						))}
 				{isRunning && workingStartMs != null && serverTimeMs != null ? (
 					<WorkingIndicator startMs={workingStartMs} serverTimeMs={serverTimeMs} />
 				) : null}
@@ -569,6 +596,103 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	}
 	return null;
 });
+
+const TurnCardRow = memo(function TurnCardRow({
+	turn,
+	activeLeafId,
+	isRunning,
+	onResumeTurn,
+	resumingTurnId,
+	onExpandTurn,
+	loadingTurnId
+}: {
+	turn: TurnCardView;
+	activeLeafId: string | null;
+	isRunning: boolean;
+	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
+	resumingTurnId?: string | null;
+	onExpandTurn?: (turnId: string) => void;
+	loadingTurnId?: string | null;
+}) {
+	if (turn.expanded && turn.entries) {
+		const toolIndex = indexToolEntries(turn.entries);
+		const turnViews = buildTurnViews(turn.entries);
+		const displayNodes = deriveTranscriptDisplayNodes(turn.entries, turnViews, toolIndex.results, []);
+		const resumeEntryIdByNode = new Map(displayNodes.map((node) => [node.key, nodeLeafId(node)]));
+		return (
+			<div className="turn-card expanded">
+				<TurnCardSummary turn={turn} onExpandTurn={onExpandTurn} loadingTurnId={loadingTurnId} />
+				<div className="turn-card-detail">
+					{displayNodes.map((node) => (
+						<TranscriptDisplayNodeView
+							key={node.key}
+							node={node}
+							toolIndex={toolIndex}
+							isActiveLeaf={nodeLeafId(node) === activeLeafId}
+							isRunning={isRunning}
+							onResumeTurn={onResumeTurn}
+							resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
+							resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
+							compactionHiddenCount={0}
+							compactionExpanded
+							onToggleCompaction={() => {}}
+						/>
+					))}
+				</div>
+			</div>
+		);
+	}
+	return <TurnCardSummary turn={turn} onExpandTurn={onExpandTurn} loadingTurnId={loadingTurnId} />;
+});
+
+const TurnCardSummary = memo(function TurnCardSummary({
+	turn,
+	onExpandTurn,
+	loadingTurnId
+}: {
+	turn: TurnCardView;
+	onExpandTurn?: (turnId: string) => void;
+	loadingTurnId?: string | null;
+}) {
+	const card = turn.card;
+	const title = turnCardTitle(card);
+	const meta = turnCardMeta(card);
+	const isLoading = loadingTurnId === card.id;
+	const canExpand = !turn.expanded && card.status !== "compacted" && !!onExpandTurn;
+	return (
+		<div className={`turn-card ${turn.isCurrent ? "current" : ""} ${card.status}`}>
+			<div className="turn-card-header">
+				<div>
+					<div className="turn-card-title">{title}</div>
+					<div className="turn-card-meta">{meta}</div>
+				</div>
+				{canExpand ? (
+					<button type="button" className="turn-card-expand" disabled={isLoading} onClick={() => onExpandTurn?.(card.id)}>
+						{isLoading ? "Loading…" : "Show details"}
+					</button>
+				) : null}
+			</div>
+			{card.user_preview ? <div className="turn-card-user">{card.user_preview}</div> : null}
+			{card.assistant_preview ? <div className="turn-card-assistant">{card.assistant_preview}</div> : null}
+		</div>
+	);
+});
+
+function turnCardTitle(card: TurnCard): string {
+	if (card.status === "compacted") return `Compacted history${card.turn_id ? ` through turn ${card.turn_id}` : ""}`;
+	const label = card.turn_id ? `Turn ${card.turn_id}` : "Turn";
+	if (card.outcome && card.outcome !== "Graceful") return `${label} · ${card.outcome.toLowerCase()}`;
+	if (card.status === "completed") return `${label} · completed`;
+	if (card.status === "running") return `${label} · running`;
+	return label;
+}
+
+function turnCardMeta(card: TurnCard): string {
+	const parts = [`${card.entry_count} entr${card.entry_count === 1 ? "y" : "ies"}`];
+	if (card.tool_call_count > 0) parts.push(`${card.tool_call_count} tool call${card.tool_call_count === 1 ? "" : "s"}`);
+	if (card.tool_result_count > 0) parts.push(`${card.tool_result_count} result${card.tool_result_count === 1 ? "" : "s"}`);
+	return parts.join(" · ");
+}
 
 const UserBubble = memo(function UserBubble({ item, entryId }: { item: Extract<TranscriptItem, { type: "user_message" }>; entryId: string }) {
 	return (

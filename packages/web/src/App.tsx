@@ -33,12 +33,16 @@ import {
 	applySwitchResultToCache,
 	applyTranscriptAppendedEvent,
 	applyTreeIndex,
+	applyTranscriptTurns,
+	applyTurnDetail,
 	branchFromTree,
 	emptySelectedSessionCache,
 	mergeSessionActivityEvent,
 	queueProjectionFromEvent,
 	selectedEntries,
 	treeNodesInOrder,
+	turnCardsInOrder,
+	turnDetailEntries,
 	type SelectedSessionCache,
 } from "./selectedSessionCache.ts";
 import { useSelectedSessionStore } from "./selectedSessionStore.ts";
@@ -320,6 +324,33 @@ export function App() {
 		() => (selectedCache.sessionId === selectedId ? selectedEntries(selectedCache) : []),
 		[selectedCache.activeBranchEntryIds, selectedCache.entriesById, selectedCache.sessionId, selectedId],
 	);
+	const [expandedTurnIds, setExpandedTurnIds] = useState<Set<string>>(() => new Set());
+	const [loadingTurnId, setLoadingTurnId] = useState<string | null>(null);
+	const turnCardViews = useMemo(() => {
+		if (selectedCache.sessionId !== selectedId) return null;
+		const cards = turnCardsInOrder(selectedCache);
+		if (cards.length === 0) return null;
+		const currentId = cards.at(-1)?.id ?? null;
+		return cards.map((card) => {
+			const isCurrent = card.id === currentId && loadedSnapshot?.activity === "running";
+			const expanded = isCurrent || expandedTurnIds.has(card.id);
+			return {
+				card,
+				entries: expanded ? turnDetailEntries(selectedCache, card.id) : null,
+				expanded,
+				isCurrent,
+			};
+		});
+	}, [
+		expandedTurnIds,
+		loadedSnapshot?.activity,
+		selectedCache.entriesById,
+		selectedCache.sessionId,
+		selectedCache.turnCardsById,
+		selectedCache.turnDetailsById,
+		selectedCache.turnOrder,
+		selectedId,
+	]);
 
 	const snapshotChatSession = useMemo(() => {
 		if (!selectedId || !loadedSnapshot) return null;
@@ -453,10 +484,21 @@ export function App() {
 		[queryClient],
 	);
 
+	const refreshTranscriptTurns = useCallback(
+		async (sessionId: string) => {
+			const result = await api.getTranscriptTurns(sessionId);
+			if (selectedRef.current !== sessionId) return null;
+			updateSelectedCache((current) => applyTranscriptTurns(current.sessionId === sessionId ? current : selectedCacheRef.current, result));
+			return result;
+		},
+		[api, updateSelectedCache],
+	);
+
 	const getFreshSession = useCallback(
 		async (sessionId: string) => {
 			const snapshot = await fetchSessionSnapshot(sessionId, true, "fetch");
 			commitSelectedSnapshot(snapshot);
+			void refreshTranscriptTurns(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
 			if (selectedRef.current === sessionId && snapshot.project_id !== selectedProjectRef.current) {
 				selectedProjectRef.current = snapshot.project_id;
 				setSelectedProjectId(snapshot.project_id);
@@ -464,7 +506,7 @@ export function App() {
 			}
 			return { snapshot, entries: snapshot.entries ?? [] };
 		},
-		[commitSelectedSnapshot, fetchSessionSnapshot],
+		[commitSelectedSnapshot, fetchSessionSnapshot, pushNotice, refreshTranscriptTurns],
 	);
 
 	const patchSelectedSnapshot = useCallback(
@@ -559,6 +601,24 @@ export function App() {
 			const result = await api.getTranscriptEntries(sessionId, missingIds);
 			if (selectedRef.current !== sessionId) return;
 			updateSelectedCache((current) => applyEntryBodies(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.entries));
+		},
+		[api, updateSelectedCache],
+	);
+
+	const expandTurn = useCallback(
+		async (turnId: string) => {
+			const sessionId = selectedRef.current;
+			if (!sessionId) throw new Error("select a session first");
+			setExpandedTurnIds((current) => new Set(current).add(turnId));
+			if (turnDetailEntries(selectedCacheRef.current, turnId)) return;
+			setLoadingTurnId(turnId);
+			try {
+				const result = await api.getTranscriptTurnDetail(sessionId, turnId);
+				if (selectedRef.current !== sessionId) return;
+				updateSelectedCache((current) => applyTurnDetail(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, turnId, result.entries));
+			} finally {
+				setLoadingTurnId((current) => (current === turnId ? null : current));
+			}
 		},
 		[api, updateSelectedCache],
 	);
@@ -672,6 +732,7 @@ export function App() {
 				if (event.event === "transcript.appended") {
 					const applied = applyTranscriptAppendedEvent(selectedCacheRef.current, event);
 					replaceSelectedCache(applied.cache);
+					void refreshTranscriptTurns(event.session_id).catch((error) => pushNotice("error", errorMessage(error)));
 					shouldSyncSelected = applied.result === "refresh";
 				} else if (isTranscriptSideChannelEvent(event)) {
 					const entryId = eventEntryId(event);
@@ -707,6 +768,7 @@ export function App() {
 		[
 			pushNotice,
 			replaceSelectedCache,
+			refreshTranscriptTurns,
 			scheduleActiveBranchSync,
 			scheduleSessionListRefresh,
 		],
@@ -1780,6 +1842,7 @@ export function App() {
 				session={selectedChatSession}
 				snapshot={loadedSnapshot}
 				entries={loadedEntries}
+				turnCards={turnCardViews}
 				transcriptLoading={transcriptLoading}
 				modelOptions={MODEL_OPTIONS}
 				modelValue={providerModelKey(activeProvider)}
@@ -1794,6 +1857,8 @@ export function App() {
 				onReasoningEffortChange={handleReasoningEffortChange}
 				onToggleRight={handleToggleRight}
 				onResumeTurn={handleResumeTurn}
+				onExpandTurn={expandTurn}
+				loadingTurnId={loadingTurnId}
 			/>
 
 			<footer className="chat-dock" data-slot="chat-box">

@@ -3,12 +3,14 @@ import { LogHeader } from "./panels.tsx";
 import type { ModelOption } from "./sessionDefaults.ts";
 import { displayActivity, isArchivedSession, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
 import { MessageList } from "./transcript.tsx";
+import type { TurnCardView } from "./transcript.tsx";
 import type { ReasoningEffort, SessionSnapshot, TranscriptEntry } from "./types.ts";
 
 export interface ChatPaneProps {
 	session: SessionDisplayInfo | null;
 	snapshot: SessionSnapshot | null;
 	entries: TranscriptEntry[];
+	turnCards?: TurnCardView[] | null;
 	transcriptLoading: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
@@ -23,12 +25,15 @@ export interface ChatPaneProps {
 	onReasoningEffortChange: (value: ReasoningEffort) => void;
 	onToggleRight: () => void;
 	onResumeTurn: (entryId: string) => void;
+	onExpandTurn?: (turnId: string) => void;
+	loadingTurnId?: string | null;
 }
 
 export const ChatPane = memo(function ChatPane({
 	session,
 	snapshot,
 	entries,
+	turnCards,
 	transcriptLoading,
 	modelOptions,
 	modelValue,
@@ -42,7 +47,9 @@ export const ChatPane = memo(function ChatPane({
 	onModelChange,
 	onReasoningEffortChange,
 	onToggleRight,
-	onResumeTurn
+	onResumeTurn,
+	onExpandTurn,
+	loadingTurnId
 }: ChatPaneProps) {
 	const loadedLeafId = activeLeafIdFromEntries(entries);
 	const visibleActiveLeafId = loadedLeafId ?? snapshot?.active_leaf_id ?? null;
@@ -64,6 +71,7 @@ export const ChatPane = memo(function ChatPane({
 			/>
 			<MessageList
 				entries={entries}
+				turnCards={turnCards}
 				pendingActions={snapshot?.pending_actions ?? []}
 				activeLeafId={visibleActiveLeafId}
 				isRunning={snapshot?.activity === "running"}
@@ -74,6 +82,8 @@ export const ChatPane = memo(function ChatPane({
 				loadingSession={transcriptLoading}
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}
+				onExpandTurn={onExpandTurn}
+				loadingTurnId={loadingTurnId}
 			/>
 		</main>
 	);

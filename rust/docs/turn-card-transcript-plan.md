@@ -157,6 +157,24 @@ Verification:
 - Current/running turn still streams smoothly.
 - Existing transcript tests plus new turn-card tests.
 
+Implementation status:
+
+- Done in `feature/turn-card-transcript-view`.
+- Added composable `transcript.turns` and `transcript.turn_detail` RPCs.
+  `transcript.turns` returns active-branch turn cards plus eager detail for the
+  current/open turn; `transcript.turn_detail` returns detail for exactly one
+  card.
+- Added selected-session turn-card cache projections (`turnCardsById`,
+  `turnOrder`, `turnDetailsById`) alongside the existing body/topology caches.
+- The chat pane renders turn cards when available, expands the current/running
+  turn eagerly, and lazily fetches older turn detail when the user clicks
+  "Show details".
+- Pitfall: this first implementation computes cards from UI-projected active
+  branch entries in Rust. That keeps the durable model simple and avoids a
+  migration, but it still reads the active-branch `item` column. If this remains
+  too slow on very large sessions, promote cards to a denormalized read model in
+  PR 5.
+
 ### PR 4: Newest-first `/switch` targets
 
 Problem: `/switch` currently pages compact topology from oldest to newest and

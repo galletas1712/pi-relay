@@ -12,6 +12,7 @@ use crate::{
     ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree, SessionActivity,
     SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryBodyMode,
     TranscriptEntryRecord, TranscriptEntryScope, TranscriptTreeIndex, TranscriptTreeNodeRecord,
+    TranscriptTurnDetailResult, TranscriptTurnsResult, TurnCardRecord, TurnCardStatus,
 };
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
@@ -400,6 +401,90 @@ impl PostgresAgentStore {
             max_sequence,
             complete: last_sequence >= max_sequence,
             nodes,
+        })
+    }
+
+    pub async fn transcript_turns(&self, session_id: &str) -> Result<TranscriptTurnsResult> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read read only")
+            .execute(&mut *tx)
+            .await?;
+        let session = sqlx::query(
+            r#"
+            select active_leaf_id, session_revision, transcript_revision
+            from sessions
+            where id=$1
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let active_leaf_id: Option<String> = session.get("active_leaf_id");
+        let entries = match active_leaf_id.as_deref() {
+            Some(_) => {
+                active_branch_entry_records_tx(&mut tx, session_id, TranscriptEntryBodyMode::Ui)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        tx.commit().await?;
+        let (cards, current_turn_entries) = turn_cards_from_entries(&entries);
+        Ok(TranscriptTurnsResult {
+            session_id: session_id.to_string(),
+            active_leaf_id,
+            session_revision: session.get("session_revision"),
+            transcript_revision: session.get("transcript_revision"),
+            cards,
+            current_turn_entries,
+        })
+    }
+
+    pub async fn transcript_turn_detail(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        body_mode: TranscriptEntryBodyMode,
+    ) -> Result<TranscriptTurnDetailResult> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read read only")
+            .execute(&mut *tx)
+            .await?;
+        let session = sqlx::query(
+            r#"
+            select active_leaf_id, session_revision, transcript_revision
+            from sessions
+            where id=$1
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let active_leaf_id: Option<String> = session.get("active_leaf_id");
+        let entries = match active_leaf_id.as_deref() {
+            Some(_) => {
+                active_branch_entry_records_tx(&mut tx, session_id, body_mode)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+        tx.commit().await?;
+        let (cards, _) = turn_cards_from_entries(&entries);
+        let Some(card) = cards.iter().find(|card| card.id == turn_id) else {
+            return Err(anyhow!("turn not found: {turn_id}"));
+        };
+        let detail_entries = entries
+            .into_iter()
+            .filter(|entry| entry.sequence >= card.start_sequence && entry.sequence <= card.end_sequence)
+            .collect::<Vec<_>>();
+        Ok(TranscriptTurnDetailResult {
+            session_id: session_id.to_string(),
+            active_leaf_id,
+            session_revision: session.get("session_revision"),
+            transcript_revision: session.get("transcript_revision"),
+            turn_id: turn_id.to_string(),
+            entries: detail_entries,
         })
     }
 
@@ -944,6 +1029,216 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
         truncated.push('…');
     }
     truncated
+}
+
+#[derive(Debug)]
+struct MutableTurnCard {
+    turn_id: Option<agent_vocab::TurnId>,
+    start_entry_id: Option<String>,
+    boundary_entry_id: Option<String>,
+    active_leaf_id: String,
+    start_sequence: i64,
+    end_sequence: i64,
+    timestamp_ms: u64,
+    user_preview: Option<String>,
+    assistant_preview: Option<String>,
+    tool_call_count: usize,
+    tool_result_count: usize,
+    entry_count: usize,
+    status: TurnCardStatus,
+    outcome: Option<agent_vocab::TurnOutcome>,
+}
+
+fn turn_cards_from_entries(
+    entries: &[TranscriptEntryRecord],
+) -> (Vec<TurnCardRecord>, Vec<TranscriptEntryRecord>) {
+    let mut cards = Vec::new();
+    let mut current: Option<MutableTurnCard> = None;
+
+    for entry in entries {
+        if matches!(entry.item, TranscriptItem::CompactionSummary(_)) {
+            close_open_turn(&mut cards, &mut current);
+            cards.push(compaction_turn_card(entry));
+            continue;
+        }
+        if let TranscriptItem::TurnStarted { turn_id } = entry.item {
+            close_open_turn(&mut cards, &mut current);
+            current = Some(MutableTurnCard {
+                turn_id: Some(turn_id),
+                start_entry_id: Some(entry.id.clone()),
+                boundary_entry_id: None,
+                active_leaf_id: entry.id.clone(),
+                start_sequence: entry.sequence,
+                end_sequence: entry.sequence,
+                timestamp_ms: entry.timestamp_ms,
+                user_preview: None,
+                assistant_preview: None,
+                tool_call_count: 0,
+                tool_result_count: 0,
+                entry_count: 0,
+                status: TurnCardStatus::Open,
+                outcome: None,
+            });
+        }
+
+        let turn = current.get_or_insert_with(|| MutableTurnCard {
+            turn_id: entry.item.turn_id(),
+            start_entry_id: None,
+            boundary_entry_id: None,
+            active_leaf_id: entry.id.clone(),
+            start_sequence: entry.sequence,
+            end_sequence: entry.sequence,
+            timestamp_ms: entry.timestamp_ms,
+            user_preview: None,
+            assistant_preview: None,
+            tool_call_count: 0,
+            tool_result_count: 0,
+            entry_count: 0,
+            status: TurnCardStatus::Open,
+            outcome: None,
+        });
+        append_entry_to_turn_card(turn, entry);
+        if matches!(entry.item, TranscriptItem::TurnFinished { .. }) {
+            close_open_turn(&mut cards, &mut current);
+        }
+    }
+    close_open_turn(&mut cards, &mut current);
+
+    let current_turn_entries = cards
+        .last()
+        .filter(|card| !matches!(card.status, TurnCardStatus::Completed | TurnCardStatus::Compacted))
+        .map(|card| entries_for_card(entries, card))
+        .unwrap_or_default();
+    (cards, current_turn_entries)
+}
+
+fn append_entry_to_turn_card(card: &mut MutableTurnCard, entry: &TranscriptEntryRecord) {
+    card.active_leaf_id = entry.id.clone();
+    card.end_sequence = entry.sequence;
+    card.timestamp_ms = entry.timestamp_ms;
+    card.entry_count += 1;
+    if card.turn_id.is_none() {
+        card.turn_id = entry.item.turn_id();
+    }
+    match &entry.item {
+        TranscriptItem::UserMessage(message) => {
+            card.user_preview =
+                append_preview(card.user_preview.take(), content_blocks_text(&message.content));
+        }
+        TranscriptItem::AssistantMessage(message) => {
+            let text = message.text();
+            if !text.trim().is_empty() {
+                card.assistant_preview = Some(truncate_chars(text.trim(), 240));
+            }
+            card.tool_call_count += message.tool_calls().count();
+        }
+        TranscriptItem::ToolCallStarted { .. } => {
+            card.tool_call_count += 1;
+        }
+        TranscriptItem::ToolResult(_) => {
+            card.tool_result_count += 1;
+        }
+        TranscriptItem::TurnFinished { turn_id, outcome } => {
+            card.turn_id = Some(*turn_id);
+            card.boundary_entry_id = Some(entry.id.clone());
+            card.status = TurnCardStatus::Completed;
+            card.outcome = Some(*outcome);
+        }
+        TranscriptItem::TurnStarted { turn_id } => {
+            card.turn_id = Some(*turn_id);
+            card.start_entry_id.get_or_insert_with(|| entry.id.clone());
+        }
+        TranscriptItem::CompactionSummary(_) => {}
+    }
+}
+
+fn close_open_turn(cards: &mut Vec<TurnCardRecord>, current: &mut Option<MutableTurnCard>) {
+    let Some(card) = current.take() else {
+        return;
+    };
+    cards.push(finalize_turn_card(card));
+}
+
+fn finalize_turn_card(card: MutableTurnCard) -> TurnCardRecord {
+    let id = card
+        .boundary_entry_id
+        .clone()
+        .or_else(|| card.start_entry_id.clone())
+        .unwrap_or_else(|| card.active_leaf_id.clone());
+    let can_resume = matches!(
+        card.outcome,
+        Some(agent_vocab::TurnOutcome::Interrupted | agent_vocab::TurnOutcome::Crashed)
+    );
+    TurnCardRecord {
+        id,
+        turn_id: card.turn_id,
+        status: card.status,
+        outcome: card.outcome,
+        start_entry_id: card.start_entry_id,
+        boundary_entry_id: card.boundary_entry_id,
+        active_leaf_id: card.active_leaf_id,
+        start_sequence: card.start_sequence,
+        end_sequence: card.end_sequence,
+        timestamp_ms: card.timestamp_ms,
+        user_preview: card.user_preview,
+        assistant_preview: card.assistant_preview,
+        tool_call_count: card.tool_call_count,
+        tool_result_count: card.tool_result_count,
+        entry_count: card.entry_count,
+        can_resume,
+    }
+}
+
+fn compaction_turn_card(entry: &TranscriptEntryRecord) -> TurnCardRecord {
+    let (turn_id, summary) = match &entry.item {
+        TranscriptItem::CompactionSummary(summary) => (Some(summary.last_turn_id), summary.summary.clone()),
+        _ => (entry.item.turn_id(), String::new()),
+    };
+    TurnCardRecord {
+        id: entry.id.clone(),
+        turn_id,
+        status: TurnCardStatus::Compacted,
+        outcome: None,
+        start_entry_id: Some(entry.id.clone()),
+        boundary_entry_id: Some(entry.id.clone()),
+        active_leaf_id: entry.id.clone(),
+        start_sequence: entry.sequence,
+        end_sequence: entry.sequence,
+        timestamp_ms: entry.timestamp_ms,
+        user_preview: None,
+        assistant_preview: if summary.trim().is_empty() {
+            None
+        } else {
+            Some(truncate_chars(summary.trim(), 240))
+        },
+        tool_call_count: 0,
+        tool_result_count: 0,
+        entry_count: 1,
+        can_resume: false,
+    }
+}
+
+fn append_preview(current: Option<String>, next: String) -> Option<String> {
+    let next = next.trim();
+    if next.is_empty() {
+        return current;
+    }
+    let merged = match current {
+        Some(current) if !current.trim().is_empty() => format!("{}\n{}", current.trim(), next),
+        _ => next.to_string(),
+    };
+    Some(truncate_chars(merged.trim(), 240))
+}
+
+fn entries_for_card(
+    entries: &[TranscriptEntryRecord],
+    card: &TurnCardRecord,
+) -> Vec<TranscriptEntryRecord> {
+    entries
+        .iter()
+        .filter(|entry| entry.sequence >= card.start_sequence && entry.sequence <= card.end_sequence)
+        .cloned()
+        .collect()
 }
 
 pub(super) async fn insert_entry_tx(

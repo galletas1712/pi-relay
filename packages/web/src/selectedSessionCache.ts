@@ -9,6 +9,8 @@ import type {
 	TranscriptEntry,
 	TranscriptTreeIndex,
 	TranscriptTreeNode,
+	TranscriptTurnsResult,
+	TurnCard,
 } from "./types.ts";
 
 export interface SelectedSessionCache {
@@ -24,6 +26,69 @@ export interface SelectedSessionCache {
 	treeLoadedPrefixSequence: number;
 	treeMaxSequence: number;
 	treeComplete: boolean;
+	turnCardsById: Map<string, TurnCard>;
+	turnOrder: string[];
+	turnDetailsById: Map<string, string[]>;
+	turnTranscriptRevision: number | null;
+}
+
+export function applyTranscriptTurns(cache: SelectedSessionCache, result: TranscriptTurnsResult): SelectedSessionCache {
+	if (cache.sessionId !== result.session_id) return cache;
+	const entriesById = mergeEntryBodies(cache.entriesById, result.current_turn_entries);
+	const turnCardsById = new Map<string, TurnCard>();
+	for (const card of result.cards) turnCardsById.set(card.id, card);
+	const turnDetailsById = new Map<string, string[]>(cache.turnDetailsById);
+	const currentCard = result.cards.at(-1);
+	if (currentCard && result.current_turn_entries.length > 0) {
+		turnDetailsById.set(currentCard.id, result.current_turn_entries.map((entry) => entry.id));
+	}
+	const snapshot = cache.snapshot
+		? {
+				...cache.snapshot,
+				active_leaf_id: result.active_leaf_id,
+				session_revision: Math.max(cache.snapshot.session_revision ?? 0, result.session_revision),
+				transcript_revision: Math.max(cache.snapshot.transcript_revision ?? 0, result.transcript_revision),
+				entries: selectedEntriesFromIds(cache.activeBranchEntryIds, entriesById),
+			}
+		: cache.snapshot;
+	return {
+		...cache,
+		snapshot,
+		entriesById,
+		turnCardsById,
+		turnOrder: result.cards.map((card) => card.id),
+		turnDetailsById,
+		turnTranscriptRevision: result.transcript_revision,
+	};
+}
+
+export function applyTurnDetail(cache: SelectedSessionCache, sessionId: string, turnId: string, entries: TranscriptEntry[]): SelectedSessionCache {
+	if (cache.sessionId !== sessionId) return cache;
+	const entriesById = mergeEntryBodies(cache.entriesById, entries);
+	const turnDetailsById = new Map(cache.turnDetailsById);
+	turnDetailsById.set(turnId, entries.map((entry) => entry.id));
+	return {
+		...cache,
+		entriesById,
+		turnDetailsById,
+	};
+}
+
+export function turnCardsInOrder(cache: SelectedSessionCache): TurnCard[] {
+	return cache.turnOrder.flatMap((id) => {
+		const card = cache.turnCardsById.get(id);
+		return card ? [card] : [];
+	});
+}
+
+export function turnDetailEntries(cache: SelectedSessionCache, turnId: string): TranscriptEntry[] | null {
+	const ids = cache.turnDetailsById.get(turnId);
+	if (!ids) return null;
+	const entries = ids.flatMap((id) => {
+		const entry = cache.entriesById.get(id);
+		return entry ? [entry] : [];
+	});
+	return entries.length === ids.length ? entries : null;
 }
 
 export function emptySelectedSessionCache(sessionId: string | null = null): SelectedSessionCache {
@@ -40,6 +105,10 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		treeLoadedPrefixSequence: 0,
 		treeMaxSequence: 0,
 		treeComplete: false,
+		turnCardsById: new Map(),
+		turnOrder: [],
+		turnDetailsById: new Map(),
+		turnTranscriptRevision: null,
 	};
 }
 

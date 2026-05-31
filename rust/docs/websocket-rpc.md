@@ -584,6 +584,55 @@ Result shape:
 }
 ```
 
+### `transcript.turns`
+
+Returns active-branch turn cards for the selected-session transcript view plus
+eager detail for the current/open turn. This is the normal turn-card UI endpoint
+and omits raw provider replay.
+
+```json
+{ "session_id": "s1" }
+```
+
+Result shape:
+
+```json
+{
+  "session_id": "s1",
+  "active_leaf_id": "entry_42",
+  "session_revision": 12,
+  "transcript_revision": 7,
+  "cards": [],
+  "current_turn_entries": []
+}
+```
+
+### `transcript.turn_detail`
+
+Fetches the UI-projected entry bodies for one turn-card id, used when expanding
+an older collapsed turn.
+
+```json
+{ "session_id": "s1", "turn_id": "entry_42" }
+```
+
+By default this omits raw provider replay. Add
+`"include_provider_replay": true` only when the caller intentionally needs raw
+provider replay.
+
+Result shape:
+
+```json
+{
+  "session_id": "s1",
+  "active_leaf_id": "entry_42",
+  "session_revision": 12,
+  "transcript_revision": 7,
+  "turn_id": "entry_42",
+  "entries": []
+}
+```
+
 ## Project RPC
 
 ### `project.list`

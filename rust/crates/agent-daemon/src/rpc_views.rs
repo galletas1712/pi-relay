@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agent_store::{
     ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionSnapshot,
     SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryRecord,
-    TranscriptTreeIndex,
+    TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult,
 };
 use agent_vocab::TranscriptItem;
 use serde_json::{json, Value};
@@ -151,6 +151,28 @@ pub(crate) fn transcript_entries(result: TranscriptEntriesResult) -> Value {
         "session_revision": result.session_revision,
         "transcript_revision": result.transcript_revision,
         "entries": redact_entries(result.entries),
+    })
+}
+
+pub(crate) fn transcript_turns(result: TranscriptTurnsResult) -> Value {
+    json!({
+        "session_id": result.session_id,
+        "active_leaf_id": result.active_leaf_id,
+        "session_revision": result.session_revision,
+        "transcript_revision": result.transcript_revision,
+        "cards": result.cards,
+        "current_turn_entries": result.current_turn_entries,
+    })
+}
+
+pub(crate) fn transcript_turn_detail(result: TranscriptTurnDetailResult) -> Value {
+    json!({
+        "session_id": result.session_id,
+        "active_leaf_id": result.active_leaf_id,
+        "session_revision": result.session_revision,
+        "transcript_revision": result.transcript_revision,
+        "turn_id": result.turn_id,
+        "entries": result.entries,
     })
 }
 

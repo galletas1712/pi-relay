@@ -270,6 +270,8 @@ async fn dispatch_request(
         RpcMethod::InputInterrupt => input_interrupt(state, params).await,
         RpcMethod::TranscriptIndex => transcript_index(state, params).await,
         RpcMethod::TranscriptEntries => transcript_entries(state, params).await,
+        RpcMethod::TranscriptTurns => transcript_turns(state, params).await,
+        RpcMethod::TranscriptTurnDetail => transcript_turn_detail(state, params).await,
         RpcMethod::HistoryTree => history_tree(state, params).await,
         RpcMethod::HistoryContext => history_context(state, params).await,
         RpcMethod::HistorySwitch => history_switch(state, params).await,
@@ -1313,6 +1315,54 @@ async fn transcript_entries(
         .await
         .map_err(anyhow::Error::from)?;
     Ok(rpc_views::transcript_entries(result))
+}
+
+async fn transcript_turns(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let started_at = Instant::now();
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
+    driver.recover_if_needed().await?;
+    let recovered_ms = started_at.elapsed().as_millis();
+    let result = state
+        .repo
+        .transcript_turns(&session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let loaded_ms = started_at.elapsed().as_millis();
+    let card_count = result.cards.len();
+    let detail_count = result.current_turn_entries.len();
+    let value = rpc_views::transcript_turns(result);
+    let total_ms = started_at.elapsed().as_millis();
+    if perf_logging_enabled() {
+        eprintln!(
+            "perf transcript.turns session={session_id} cards={card_count} current_entries={detail_count} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
+            recovered_ms.saturating_sub(acquired_ms),
+            loaded_ms.saturating_sub(recovered_ms),
+            total_ms.saturating_sub(loaded_ms),
+        );
+    }
+    Ok(value)
+}
+
+async fn transcript_turn_detail(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let turn_id = required_string(&params, "turn_id")?;
+    let body_mode = transcript_body_mode_from_params(&params);
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.recover_if_needed().await?;
+    let result = state
+        .repo
+        .transcript_turn_detail(&session_id, &turn_id, body_mode)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(rpc_views::transcript_turn_detail(result))
 }
 
 async fn history_tree(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

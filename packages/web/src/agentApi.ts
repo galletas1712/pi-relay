@@ -18,6 +18,8 @@ import type {
 	TranscriptEntry,
 	TranscriptTreeIndex,
 	TranscriptItem,
+	TranscriptTurnDetailResult,
+	TranscriptTurnsResult,
 	ProjectWorkspace,
 } from "./types.ts";
 import type { EntryScope } from "./queryKeys.ts";
@@ -42,6 +44,8 @@ export interface AgentApi {
 	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse>;
 	getTranscriptIndex(sessionId: string, options?: TranscriptIndexOptions): Promise<TranscriptTreeIndex>;
 	getTranscriptEntries(sessionId: string, entryIds: string[]): Promise<TranscriptEntriesResult>;
+	getTranscriptTurns(sessionId: string): Promise<TranscriptTurnsResult>;
+	getTranscriptTurnDetail(sessionId: string, turnId: string): Promise<TranscriptTurnDetailResult>;
 	getHistoryTree(sessionId: string): Promise<HistoryTree>;
 	subscribeEvents(sessionId: string, afterEventId: number | null): Promise<EventFrame[]>;
 	unsubscribeEvents(sessionId: string): Promise<void>;
@@ -320,6 +324,19 @@ class AgentApiClient implements AgentApi {
 		return this.client.request<TranscriptEntriesResult>("transcript.entries", {
 			session_id: sessionId,
 			entry_ids: entryIds
+		});
+	}
+
+	getTranscriptTurns(sessionId: string): Promise<TranscriptTurnsResult> {
+		return this.client.request<TranscriptTurnsResult>("transcript.turns", {
+			session_id: sessionId
+		});
+	}
+
+	getTranscriptTurnDetail(sessionId: string, turnId: string): Promise<TranscriptTurnDetailResult> {
+		return this.client.request<TranscriptTurnDetailResult>("transcript.turn_detail", {
+			session_id: sessionId,
+			turn_id: turnId
 		});
 	}
 
