@@ -45,7 +45,9 @@ export function applyTranscriptTurns(
 	const mode = options.mode ?? "replace";
 	if (
 		mode === "prepend" &&
-		(cache.turnTranscriptRevision !== result.transcript_revision || cache.turnActiveLeafId !== result.active_leaf_id)
+		(cache.turnTranscriptRevision !== result.transcript_revision ||
+			cache.turnActiveLeafId !== result.active_leaf_id ||
+			cache.turnBeforeEntryId !== (result.before_entry_id ?? null))
 	) {
 		return cache;
 	}
@@ -109,6 +111,7 @@ function turnDetailCoversCard(entryIds: string[], card: TurnCard): boolean {
 
 export function applyTurnDetail(cache: SelectedSessionCache, sessionId: string, turnId: string, entries: TranscriptEntry[]): SelectedSessionCache {
 	if (cache.sessionId !== sessionId) return cache;
+	if (!cache.turnCardsById.has(turnId)) return cache;
 	const entriesById = mergeEntryBodies(cache.entriesById, entries);
 	const turnDetailsById = new Map(cache.turnDetailsById);
 	turnDetailsById.set(turnId, entries.map((entry) => entry.id));

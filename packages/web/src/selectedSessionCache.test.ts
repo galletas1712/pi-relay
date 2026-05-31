@@ -452,6 +452,37 @@ describe("selected session cache", () => {
 		expect(cache.turnCardsById.get("entry_finish_old")?.user_messages[0].id).toBe("entry_user_old");
 	});
 
+	it("ignores stale older transcript.turns pages when the cursor no longer matches", () => {
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([], { transcriptRevision: 1 }));
+		cache = {
+			...cache,
+			turnTranscriptRevision: 2,
+			turnActiveLeafId: "entry_finish_new",
+			turnBeforeEntryId: "entry_expected_cursor",
+			turnHasMoreBefore: true,
+			turnOrder: ["entry_finish_new"],
+			turnCardsById: new Map([["entry_finish_new", turnCard("entry_finish_new", 2)]]),
+		};
+
+		const next = applyTranscriptTurns(
+			cache,
+			{
+				session_id: sessionId,
+				active_leaf_id: "entry_finish_new",
+				session_revision: 3,
+				transcript_revision: 2,
+				before_entry_id: "entry_stale_cursor",
+				next_before_entry_id: null,
+				has_more_before: false,
+				limit: 1,
+				cards: [turnCard("entry_finish_old", 1)],
+			},
+			{ mode: "prepend" },
+		);
+
+		expect(next).toBe(cache);
+	});
+
 	it("starts a new current turn card when a turn_started entry follows a completed turn", () => {
 		const started = turnStartedEntry("entry_start_2", "entry_finish_1", 2, 6);
 		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([entry("entry_finish_1", null, "done", 5)], { transcriptRevision: 1 }));
