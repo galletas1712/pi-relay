@@ -39,6 +39,19 @@ describe("selected session cache", () => {
 		expect(cache.entriesById.get("entry_2")).toBe(child);
 	});
 
+	it("keeps cached active branch bodies when a metadata-only snapshot has the same active leaf", () => {
+		const root = entry("entry_1", null, "first", 1);
+		const child = entry("entry_2", "entry_1", "second", 2);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([root, child], { transcriptRevision: 4 }));
+
+		cache = applySelectedSnapshot(cache, overview([root, child], { sessionRevision: 5, transcriptRevision: 4 }));
+
+		expect(cache.activeBranchEntryIds).toEqual(["entry_1", "entry_2"]);
+		expect(selectedEntries(cache)).toEqual([root, child]);
+		expect(cache.snapshot?.entries).toEqual([root, child]);
+		expect(cache.snapshot?.session_revision).toBe(5);
+	});
+
 	it("replaces queue projections and ignores stale ones", () => {
 		const cache = applySelectedSnapshot(
 			emptySelectedSessionCache(sessionId),
@@ -205,6 +218,21 @@ describe("selected session cache", () => {
 		expect(applied.result).toBe("applied");
 		expect(applied.cache.snapshot?.active_leaf_id).toBe("entry_2");
 		expect(selectedEntries(applied.cache).map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
+	});
+
+	it("extends an expanded turn detail when transcript events append to that turn", () => {
+		const first = entry("entry_1", null, "first", 1);
+		const second = entry("entry_2", "entry_1", "second", 2);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([first], { transcriptRevision: 1 }));
+		cache = {
+			...cache,
+			turnOrder: ["turn_1"],
+			turnDetailsById: new Map([["turn_1", ["entry_1"]]]),
+		};
+
+		const applied = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(second, 5, 2));
+
+		expect(applied.cache.turnDetailsById.get("turn_1")).toEqual(["entry_1", "entry_2"]);
 	});
 
 	it("leaves incomplete compact topology to transcript.index instead of merging append events", () => {

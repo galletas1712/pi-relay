@@ -337,6 +337,50 @@ describe("MessageList Working indicator", () => {
 		expect(html).toContain("Working…");
 	});
 
+	it("uses the current turn card start timestamp without loading turn detail", () => {
+		const now = Date.now();
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "open",
+							outcome: null,
+							start_entry_id: "start",
+							boundary_entry_id: null,
+							active_leaf_id: "start",
+							start_sequence: 1,
+							end_sequence: 1,
+							start_timestamp_ms: now - 5_000,
+							timestamp_ms: now - 5_000,
+							user_preview: "do it",
+							assistant_preview: null,
+							tool_call_count: 0,
+							tool_result_count: 0,
+							entry_count: 1,
+							can_resume: false,
+						},
+						entries: null,
+						expanded: false,
+						isCurrent: true,
+					},
+				]}
+				activeLeafId="start"
+				isRunning
+				serverTimeMs={now}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain("Working…");
+		expect(html).toContain("do it");
+	});
+
 	it("omits the Working… row when the session is idle", () => {
 		const html = renderToStaticMarkup(
 			<MessageList

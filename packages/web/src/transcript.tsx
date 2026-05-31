@@ -352,8 +352,8 @@ export const MessageList = memo(function MessageList({
 	// synthesize a local start time; a running turn without this anchor is a
 	// protocol/storage bug, not something the UI can make correct.
 	const workingStartMs = useMemo(
-		() => (isRunning ? runningTurnStartMs(visibleEntries) : null),
-		[isRunning, visibleEntries],
+		() => (isRunning ? turnCards?.find((turn) => turn.isCurrent)?.card.start_timestamp_ms ?? runningTurnStartMs(visibleEntries) : null),
+		[isRunning, turnCards, visibleEntries],
 	);
 	const shouldUseTurnCards = !!turnCards && turnCards.length > 0;
 
@@ -621,7 +621,15 @@ const TurnCardRow = memo(function TurnCardRow({
 		const resumeEntryIdByNode = new Map(displayNodes.map((node) => [node.key, nodeLeafId(node)]));
 		return (
 			<div className="turn-card expanded">
-				<TurnCardSummary turn={turn} onExpandTurn={onExpandTurn} loadingTurnId={loadingTurnId} />
+				<TurnCardSummary
+					turn={turn}
+					activeLeafId={activeLeafId}
+					isRunning={isRunning}
+					onResumeTurn={onResumeTurn}
+					resumingTurnId={resumingTurnId}
+					onExpandTurn={onExpandTurn}
+					loadingTurnId={loadingTurnId}
+				/>
 				<div className="turn-card-detail">
 					{displayNodes.map((node) => (
 						<TranscriptDisplayNodeView
@@ -642,15 +650,33 @@ const TurnCardRow = memo(function TurnCardRow({
 			</div>
 		);
 	}
-	return <TurnCardSummary turn={turn} onExpandTurn={onExpandTurn} loadingTurnId={loadingTurnId} />;
+	return (
+		<TurnCardSummary
+			turn={turn}
+			activeLeafId={activeLeafId}
+			isRunning={isRunning}
+			onResumeTurn={onResumeTurn}
+			resumingTurnId={resumingTurnId}
+			onExpandTurn={onExpandTurn}
+			loadingTurnId={loadingTurnId}
+		/>
+	);
 });
 
 const TurnCardSummary = memo(function TurnCardSummary({
 	turn,
+	activeLeafId,
+	isRunning,
+	onResumeTurn,
+	resumingTurnId,
 	onExpandTurn,
 	loadingTurnId
 }: {
 	turn: TurnCardView;
+	activeLeafId: string | null;
+	isRunning: boolean;
+	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
+	resumingTurnId?: string | null;
 	onExpandTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
 }) {
@@ -659,6 +685,8 @@ const TurnCardSummary = memo(function TurnCardSummary({
 	const meta = turnCardMeta(card);
 	const isLoading = loadingTurnId === card.id;
 	const canExpand = !turn.expanded && card.status !== "compacted" && !!onExpandTurn;
+	const canResume = card.can_resume && card.active_leaf_id === activeLeafId && !isRunning && !!onResumeTurn;
+	const resumableOutcome = card.outcome === "Interrupted" || card.outcome === "Crashed" ? card.outcome : null;
 	return (
 		<div className={`turn-card ${turn.isCurrent ? "current" : ""} ${card.status}`}>
 			<div className="turn-card-header">
@@ -666,11 +694,23 @@ const TurnCardSummary = memo(function TurnCardSummary({
 					<div className="turn-card-title">{title}</div>
 					<div className="turn-card-meta">{meta}</div>
 				</div>
-				{canExpand ? (
-					<button type="button" className="turn-card-expand" disabled={isLoading} onClick={() => onExpandTurn?.(card.id)}>
-						{isLoading ? "Loading…" : "Show details"}
-					</button>
-				) : null}
+				<div className="turn-card-actions">
+					{canResume && !turn.isCurrent && resumableOutcome ? (
+						<button
+							type="button"
+							className="turn-card-expand"
+							disabled={resumingTurnId === card.active_leaf_id}
+							onClick={() => onResumeTurn?.(card.active_leaf_id, resumableOutcome)}
+						>
+							{resumingTurnId === card.active_leaf_id ? "Starting…" : resumableOutcome === "Interrupted" ? "Continue" : "Retry"}
+						</button>
+					) : null}
+					{canExpand ? (
+						<button type="button" className="turn-card-expand" disabled={isLoading} onClick={() => onExpandTurn?.(card.id)}>
+							{isLoading ? "Loading…" : "Show details"}
+						</button>
+					) : null}
+				</div>
 			</div>
 			{card.user_preview ? <div className="turn-card-user">{card.user_preview}</div> : null}
 			{card.assistant_preview ? <div className="turn-card-assistant">{card.assistant_preview}</div> : null}

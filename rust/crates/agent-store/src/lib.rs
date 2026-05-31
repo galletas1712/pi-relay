@@ -576,6 +576,7 @@ pub struct TurnCardRecord {
     pub active_leaf_id: String,
     pub start_sequence: i64,
     pub end_sequence: i64,
+    pub start_timestamp_ms: u64,
     pub timestamp_ms: u64,
     pub user_preview: Option<String>,
     pub assistant_preview: Option<String>,
@@ -592,7 +593,6 @@ pub struct TranscriptTurnsResult {
     pub session_revision: i64,
     pub transcript_revision: i64,
     pub cards: Vec<TurnCardRecord>,
-    pub current_turn_entries: Vec<TranscriptEntryRecord>,
 }
 
 #[derive(Debug, Clone)]

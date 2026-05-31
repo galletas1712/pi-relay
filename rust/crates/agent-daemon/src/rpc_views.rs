@@ -161,7 +161,6 @@ pub(crate) fn transcript_turns(result: TranscriptTurnsResult) -> Value {
         "session_revision": result.session_revision,
         "transcript_revision": result.transcript_revision,
         "cards": result.cards,
-        "current_turn_entries": result.current_turn_entries,
     })
 }
 

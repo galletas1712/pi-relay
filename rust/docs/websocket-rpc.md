@@ -586,9 +586,10 @@ Result shape:
 
 ### `transcript.turns`
 
-Returns active-branch turn cards for the selected-session transcript view plus
-eager detail for the current/open turn. This is the normal turn-card UI endpoint
-and omits raw provider replay.
+Returns active-branch turn cards for the selected-session transcript view. This
+is the normal hot-path UI endpoint and returns summaries only; detail/tool-call
+entries are fetched with `transcript.turn_detail` when a card is expanded. It
+omits raw provider replay.
 
 ```json
 { "session_id": "s1" }
@@ -602,15 +603,14 @@ Result shape:
   "active_leaf_id": "entry_42",
   "session_revision": 12,
   "transcript_revision": 7,
-  "cards": [],
-  "current_turn_entries": []
+  "cards": []
 }
 ```
 
 ### `transcript.turn_detail`
 
 Fetches the UI-projected entry bodies for one turn-card id, used when expanding
-an older collapsed turn.
+a collapsed turn.
 
 ```json
 { "session_id": "s1", "turn_id": "entry_42" }

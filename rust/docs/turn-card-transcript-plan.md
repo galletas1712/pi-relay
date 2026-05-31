@@ -23,8 +23,9 @@ current/running turn and lazily when the user expands an older turn.
    case.
 3. Do not send raw `provider_replay` to normal UI transcript responses.
 4. Show historical completed turns as collapsed cards by default.
-5. Load full turn details lazily when a user expands a turn.
-6. Keep the current/running turn detailed and live by default.
+5. Load full turn details lazily only when a user expands a turn.
+6. Keep the current/running turn represented by a live-updating summary card by
+   default; tool calls and intermediate entries still load only on expansion.
 7. Make `/switch` populate from newest switch/edit targets without loading the
    full compact topology.
 8. Preserve exact user-message restoration: picking a user message in `/switch`
@@ -127,25 +128,24 @@ Backend APIs:
 
 - `transcript.turns`
   - active branch only;
-  - returns newest/tail turn cards or a bounded page;
+  - returns turn cards only, no entry bodies;
   - contains compact summaries: user preview, final assistant preview, counts,
-    timestamps, status, boundary ids, edit targets;
+    timestamps, status, boundary ids, resume ids;
   - excludes raw provider replay.
 - `transcript.turn_detail`
   - returns full UI-projected entries for one turn/card;
   - excludes raw provider replay by default;
-  - current/running turn detail can be loaded eagerly.
+  - used only when the user expands a card.
 
 Frontend:
 
 - Add normalized selected-session turn cache:
   - `turnCardsById` / ordered turn ids;
   - `turnDetailsByTurnId`;
-  - current turn detail eager;
-  - historical turn details lazy on expand.
-- Render collapsed historical turn cards by default.
-- Render expanded/current turns with the existing detailed transcript row
-  components where possible.
+  - all details lazy on expand.
+- Render collapsed turn cards by default, including the current/running turn.
+- Render expanded turns with the existing detailed transcript row components
+  where possible.
 - Keep old entry-level selected cache temporarily as compatibility for export
   and while migrating operations.
 
@@ -161,21 +161,25 @@ Implementation status:
 
 - Done in `feature/turn-card-transcript-view`.
 - Added composable `transcript.turns` and `transcript.turn_detail` RPCs.
-  `transcript.turns` returns active-branch turn cards plus eager detail for the
-  current/open turn; `transcript.turn_detail` returns detail for exactly one
-  card.
+  `transcript.turns` returns active-branch turn cards only;
+  `transcript.turn_detail` returns detail for exactly one card.
 - Added selected-session turn-card cache projections (`turnCardsById`,
   `turnOrder`, `turnDetailsById`) alongside the existing body/topology caches.
-- The chat pane renders turn cards when available, expands the current/running
-  turn eagerly, and lazily fetches older turn detail when the user clicks
-  "Show details".
-- Pitfall: this first implementation computes cards from UI-projected active
-  branch entries in Rust. That keeps the durable model simple and avoids a
-  migration, but it still reads the active-branch `item` column. If this remains
-  too slow on very large sessions, promote cards to a denormalized read model in
-  PR 5.
+- The chat pane renders turn cards when available and lazily fetches detail when
+  the user clicks "Show details". No turn detail is fetched in the selected
+  session hot path.
+- The selected-session hot path now uses metadata-only `session.get` followed by
+  `transcript.turns`; it does not fetch full active-branch bodies on session
+  select, foreground refresh, accepted follow-up reconciliation, or
+  `history.switch`.
+- Pitfall: this implementation still derives cards by walking the active branch
+  in SQL and reading a small set of JSON fields from `item`. It deliberately
+  avoids selecting raw provider replay and avoids deserializing full transcript
+  entries for `transcript.turns`. If microbenchmarks after this PR still show
+  card derivation as too slow on very large sessions, promote cards to a
+  denormalized read model in PR 5.
 
-### PR 4: Newest-first `/switch` targets
+### Deferred: Newest-first `/switch` targets
 
 Problem: `/switch` currently pages compact topology from oldest to newest and
 then derives targets client-side. Recent useful rows can arrive late.
@@ -204,9 +208,9 @@ Verification:
 - Selecting a user edit restores the full user text.
 - Selecting turn/compaction targets still switches safely.
 
-### PR 5: Bulk transport / denormalized read model only if needed
+### Deferred: Bulk transport / denormalized read model only if needed
 
-After PRs 2-4, normal UX should no longer fetch huge payloads. If remaining
+After the turn-card hot path, normal UX should no longer fetch huge payloads. If remaining
 benchmarks still show head-of-line blocking or compact-index cost:
 
 - Move bulk transcript/detail/export fetches to HTTP with compression or a
@@ -234,7 +238,8 @@ benchmarks still show head-of-line blocking or compact-index cost:
 - The turn-card projection can initially be computed from the active branch in
   Rust. If benchmarks show it is too slow, promote it to a denormalized read
   model later.
-- For current/running turn detail, use the active branch suffix from the most
-  recent open turn/compaction boundary so live updates remain smooth.
+- Current/running turns stay collapsed by default; the card carries
+  `start_timestamp_ms` so the "Working…" timer remains anchored without loading
+  detail.
 - `/switch` target previews are display-only. Never use them as composer restore
   content.

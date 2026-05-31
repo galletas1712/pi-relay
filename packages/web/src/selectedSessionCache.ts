@@ -30,35 +30,41 @@ export interface SelectedSessionCache {
 	turnOrder: string[];
 	turnDetailsById: Map<string, string[]>;
 	turnTranscriptRevision: number | null;
+	turnActiveLeafId: string | null;
 }
 
 export function applyTranscriptTurns(cache: SelectedSessionCache, result: TranscriptTurnsResult): SelectedSessionCache {
 	if (cache.sessionId !== result.session_id) return cache;
-	const entriesById = mergeEntryBodies(cache.entriesById, result.current_turn_entries);
+	const entriesById = cache.entriesById;
 	const turnCardsById = new Map<string, TurnCard>();
 	for (const card of result.cards) turnCardsById.set(card.id, card);
-	const turnDetailsById = new Map<string, string[]>(cache.turnDetailsById);
-	const currentCard = result.cards.at(-1);
-	if (currentCard && result.current_turn_entries.length > 0) {
-		turnDetailsById.set(currentCard.id, result.current_turn_entries.map((entry) => entry.id));
+	const turnDetailsById = new Map<string, string[]>();
+	for (const [turnId, entryIds] of cache.turnDetailsById) {
+		if (turnCardsById.has(turnId)) turnDetailsById.set(turnId, entryIds);
 	}
+	const activeBranchEntryIds = result.active_leaf_id ? [result.active_leaf_id] : [];
 	const snapshot = cache.snapshot
 		? {
 				...cache.snapshot,
 				active_leaf_id: result.active_leaf_id,
+				has_transcript_entries: result.cards.length > 0,
 				session_revision: Math.max(cache.snapshot.session_revision ?? 0, result.session_revision),
 				transcript_revision: Math.max(cache.snapshot.transcript_revision ?? 0, result.transcript_revision),
-				entries: selectedEntriesFromIds(cache.activeBranchEntryIds, entriesById),
+				entries: selectedEntriesFromIds(activeBranchEntryIds, entriesById),
 			}
 		: cache.snapshot;
 	return {
 		...cache,
 		snapshot,
+		activeBranchEntryIds: sameStringArray(cache.activeBranchEntryIds, activeBranchEntryIds)
+			? cache.activeBranchEntryIds
+			: activeBranchEntryIds,
 		entriesById,
 		turnCardsById,
 		turnOrder: result.cards.map((card) => card.id),
 		turnDetailsById,
 		turnTranscriptRevision: result.transcript_revision,
+		turnActiveLeafId: result.active_leaf_id,
 	};
 }
 
@@ -109,6 +115,7 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		turnOrder: [],
 		turnDetailsById: new Map(),
 		turnTranscriptRevision: null,
+		turnActiveLeafId: null,
 	};
 }
 
@@ -127,11 +134,15 @@ export function treeNodesInOrder(cache: SelectedSessionCache): TranscriptTreeNod
 }
 
 export function applySelectedSnapshot(cache: SelectedSessionCache, snapshot: SessionSnapshot): SelectedSessionCache {
-	const entries = snapshot.entries ?? [];
 	const sameSession = cache.sessionId === snapshot.session_id;
 	const base = sameSession ? cache : emptySelectedSessionCache(snapshot.session_id);
-	const entriesById = mergeEntryBodies(base.entriesById, entries);
-	const activeBranchEntryIds = entryIds(entries);
+	const hasEntryBodies = Array.isArray(snapshot.entries);
+	const incomingEntries = snapshot.entries ?? [];
+	const entriesById = hasEntryBodies ? mergeEntryBodies(base.entriesById, incomingEntries) : base.entriesById;
+	const activeBranchEntryIds = hasEntryBodies
+		? entryIds(incomingEntries)
+		: activeBranchIdsForSnapshot(base.activeBranchEntryIds, snapshot.active_leaf_id ?? null);
+	const snapshotEntries = hasEntryBodies ? incomingEntries : selectedEntriesFromIds(activeBranchEntryIds, entriesById);
 	const snapshotTranscriptRevision = snapshot.transcript_revision ?? null;
 	const treeRevisionChanged =
 		sameSession &&
@@ -141,7 +152,7 @@ export function applySelectedSnapshot(cache: SelectedSessionCache, snapshot: Ses
 	return {
 		...base,
 		sessionId: snapshot.session_id,
-		snapshot: { ...snapshot, entries },
+		snapshot: { ...snapshot, entries: snapshotEntries },
 		activeBranchEntryIds: sameStringArray(base.activeBranchEntryIds, activeBranchEntryIds) ? base.activeBranchEntryIds : activeBranchEntryIds,
 		entriesById,
 		treeActiveLeafId: treeRevisionChanged ? snapshot.active_leaf_id : base.treeActiveLeafId ?? snapshot.active_leaf_id,
@@ -367,11 +378,15 @@ export function applyTranscriptAppendedEvent(cache: SelectedSessionCache, event:
 		last_event_id: Math.max(cache.snapshot.last_event_id, event.event_id),
 		entries: activeBranchEntryIds.map((id) => entriesById.get(id)).filter((candidate): candidate is TranscriptEntry => !!candidate),
 	};
+	const turnDetailsById = appendsToActiveBranch
+		? appendLoadedTurnDetail(cache.turnDetailsById, cache.turnOrder.at(-1) ?? null, currentLeafId, entry.id)
+		: cache.turnDetailsById;
 	const nextCache = {
 		...cache,
 		snapshot,
 		activeBranchEntryIds,
 		entriesById,
+		turnDetailsById,
 		...applyTreeNodeFromEvent(cache, event),
 	};
 	return { cache: nextCache, result: appendsToActiveBranch ? "applied" : "refresh" };
@@ -458,6 +473,11 @@ function entryIds(entries: TranscriptEntry[]): string[] {
 	return entries.map((entry) => entry.id);
 }
 
+function activeBranchIdsForSnapshot(currentIds: string[], activeLeafId: string | null): string[] {
+	if (!activeLeafId) return [];
+	return currentIds.at(-1) === activeLeafId ? currentIds : [activeLeafId];
+}
+
 function appendActiveBranchEntries(
 	currentIds: string[],
 	entriesById: Map<string, TranscriptEntry>,
@@ -480,6 +500,20 @@ function selectedEntriesFromIds(ids: string[], entriesById: Map<string, Transcri
 		const entry = entriesById.get(id);
 		return entry ? [entry] : [];
 	});
+}
+
+function appendLoadedTurnDetail(
+	current: Map<string, string[]>,
+	turnId: string | null,
+	currentLeafId: string | null,
+	entryId: string,
+): Map<string, string[]> {
+	if (!turnId) return current;
+	const ids = current.get(turnId);
+	if (!ids || ids.includes(entryId) || (ids.at(-1) ?? null) !== currentLeafId) return current;
+	const next = new Map(current);
+	next.set(turnId, [...ids, entryId]);
+	return next;
 }
 
 function sameStringArray(left: string[], right: string[]): boolean {

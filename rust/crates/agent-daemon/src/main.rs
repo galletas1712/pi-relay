@@ -1317,10 +1317,7 @@ async fn transcript_entries(
     Ok(rpc_views::transcript_entries(result))
 }
 
-async fn transcript_turns(
-    state: &AppState,
-    params: Value,
-) -> std::result::Result<Value, RpcError> {
+async fn transcript_turns(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
@@ -1334,12 +1331,11 @@ async fn transcript_turns(
         .map_err(anyhow::Error::from)?;
     let loaded_ms = started_at.elapsed().as_millis();
     let card_count = result.cards.len();
-    let detail_count = result.current_turn_entries.len();
     let value = rpc_views::transcript_turns(result);
     let total_ms = started_at.elapsed().as_millis();
     if perf_logging_enabled() {
         eprintln!(
-            "perf transcript.turns session={session_id} cards={card_count} current_entries={detail_count} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
+            "perf transcript.turns session={session_id} cards={card_count} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
             recovered_ms.saturating_sub(acquired_ms),
             loaded_ms.saturating_sub(recovered_ms),
             total_ms.saturating_sub(loaded_ms),

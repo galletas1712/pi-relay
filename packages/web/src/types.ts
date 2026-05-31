@@ -239,6 +239,7 @@ export interface TurnCard {
 	active_leaf_id: string;
 	start_sequence: number;
 	end_sequence: number;
+	start_timestamp_ms: number;
 	timestamp_ms: number;
 	user_preview?: string | null;
 	assistant_preview?: string | null;
@@ -254,7 +255,6 @@ export interface TranscriptTurnsResult {
 	session_revision: number;
 	transcript_revision: number;
 	cards: TurnCard[];
-	current_turn_entries: TranscriptEntry[];
 }
 
 export interface TranscriptTurnDetailResult {

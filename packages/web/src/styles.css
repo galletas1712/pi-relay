@@ -856,6 +856,13 @@ pre {
 	color: var(--muted-foreground);
 }
 
+.turn-card-actions {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: flex-end;
+	gap: 8px;
+}
+
 .turn-card-user,
 .turn-card-assistant {
 	margin-top: 10px;

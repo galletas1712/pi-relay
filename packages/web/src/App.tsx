@@ -25,7 +25,6 @@ import {
 	patchSessionListProvider,
 } from "./sessionQueryCache.ts";
 import {
-	applyActiveBranchSyncToCache,
 	applyEntryBodies,
 	applyEventHighWater,
 	applyQueueProjection,
@@ -333,7 +332,7 @@ export function App() {
 		const currentId = cards.at(-1)?.id ?? null;
 		return cards.map((card) => {
 			const isCurrent = card.id === currentId && loadedSnapshot?.activity === "running";
-			const expanded = isCurrent || expandedTurnIds.has(card.id);
+			const expanded = expandedTurnIds.has(card.id);
 			return {
 				card,
 				entries: expanded ? turnDetailEntries(selectedCache, card.id) : null,
@@ -496,17 +495,21 @@ export function App() {
 
 	const getFreshSession = useCallback(
 		async (sessionId: string) => {
-			const snapshot = await fetchSessionSnapshot(sessionId, true, "fetch");
+			const snapshot = await fetchSessionSnapshot(sessionId, false, "fetch");
 			commitSelectedSnapshot(snapshot);
-			void refreshTranscriptTurns(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
+			await refreshTranscriptTurns(sessionId);
 			if (selectedRef.current === sessionId && snapshot.project_id !== selectedProjectRef.current) {
 				selectedProjectRef.current = snapshot.project_id;
 				setSelectedProjectId(snapshot.project_id);
 				rememberUiSelection(snapshot.project_id, sessionId);
 			}
-			return { snapshot, entries: snapshot.entries ?? [] };
+			const cache = selectedCacheRef.current;
+			return {
+				snapshot: cache.sessionId === sessionId && cache.snapshot ? cache.snapshot : snapshot,
+				entries: cache.sessionId === sessionId ? selectedEntries(cache) : [],
+			};
 		},
-		[commitSelectedSnapshot, fetchSessionSnapshot, pushNotice, refreshTranscriptTurns],
+		[commitSelectedSnapshot, fetchSessionSnapshot, refreshTranscriptTurns],
 	);
 
 	const patchSelectedSnapshot = useCallback(
@@ -542,20 +545,27 @@ export function App() {
 				if (!currentSnapshot) {
 					result = await getFreshSession(sessionId);
 				} else {
-					const baseLeafId = selectedCacheRef.current.sessionId === sessionId ? (selectedCacheRef.current.activeBranchEntryIds.at(-1) ?? null) : null;
-					const sync = await api.syncActiveBranch(sessionId, baseLeafId);
+					const snapshot = await fetchSessionSnapshot(sessionId, false, "refresh");
 					if (selectedRef.current !== sessionId) return null;
-					let applied = false;
-					const nextCache = updateSelectedCache((current) => {
-						const syncResult = applyActiveBranchSyncToCache(current.sessionId === sessionId ? current : selectedCacheRef.current, sync);
-						applied = syncResult.result === "applied";
-						return syncResult.cache;
-					});
-					if (applied && nextCache.snapshot) {
-						result = { snapshot: nextCache.snapshot, entries: selectedEntries(nextCache) };
-					} else {
-						result = await getFreshSession(sessionId);
+					commitSelectedSnapshot(snapshot);
+					if (selectedRef.current === sessionId && snapshot.project_id !== selectedProjectRef.current) {
+						selectedProjectRef.current = snapshot.project_id;
+						setSelectedProjectId(snapshot.project_id);
+						rememberUiSelection(snapshot.project_id, sessionId);
 					}
+					const cacheAfterSnapshot = selectedCacheRef.current;
+					const needsTurns =
+						cacheAfterSnapshot.sessionId !== sessionId ||
+						cacheAfterSnapshot.turnTranscriptRevision !== (snapshot.transcript_revision ?? null) ||
+						cacheAfterSnapshot.turnActiveLeafId !== (snapshot.active_leaf_id ?? null) ||
+						(snapshot.has_transcript_entries && cacheAfterSnapshot.turnOrder.length === 0);
+					if (needsTurns) await refreshTranscriptTurns(sessionId);
+					if (selectedRef.current !== sessionId) return null;
+					const cache = selectedCacheRef.current;
+					result = {
+						snapshot: cache.sessionId === sessionId && cache.snapshot ? cache.snapshot : snapshot,
+						entries: cache.sessionId === sessionId ? selectedEntries(cache) : [],
+					};
 				}
 				if (selectedRef.current === sessionId) {
 					setSelectedFetchState({
@@ -580,7 +590,7 @@ export function App() {
 			selectedRefreshInFlight.current.set(sessionId, request);
 			return request;
 		},
-		[api, getFreshSession, updateSelectedCache],
+		[commitSelectedSnapshot, fetchSessionSnapshot, getFreshSession, refreshTranscriptTurns],
 	);
 
 	const syncActiveBranchNow = useCallback(
@@ -594,23 +604,13 @@ export function App() {
 		[refreshSelectedSessionState],
 	);
 
-	const fetchMissingEntryBodies = useCallback(
-		async (sessionId: string, entryIds: string[]) => {
-			const missingIds = entryIds.filter((id) => !selectedCacheRef.current.entriesById.has(id));
-			if (missingIds.length === 0) return;
-			const result = await api.getTranscriptEntries(sessionId, missingIds);
-			if (selectedRef.current !== sessionId) return;
-			updateSelectedCache((current) => applyEntryBodies(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.entries));
-		},
-		[api, updateSelectedCache],
-	);
-
 	const expandTurn = useCallback(
 		async (turnId: string) => {
 			const sessionId = selectedRef.current;
 			if (!sessionId) throw new Error("select a session first");
 			setExpandedTurnIds((current) => new Set(current).add(turnId));
-			if (turnDetailEntries(selectedCacheRef.current, turnId)) return;
+			const cache = selectedCacheRef.current;
+			if (turnDetailEntries(cache, turnId)) return;
 			setLoadingTurnId(turnId);
 			try {
 				const result = await api.getTranscriptTurnDetail(sessionId, turnId);
@@ -732,14 +732,13 @@ export function App() {
 				if (event.event === "transcript.appended") {
 					const applied = applyTranscriptAppendedEvent(selectedCacheRef.current, event);
 					replaceSelectedCache(applied.cache);
-					void refreshTranscriptTurns(event.session_id).catch((error) => pushNotice("error", errorMessage(error)));
 					shouldSyncSelected = applied.result === "refresh";
 				} else if (isTranscriptSideChannelEvent(event)) {
 					const entryId = eventEntryId(event);
 					if (entryId && selectedCacheRef.current.entriesById.has(entryId)) {
 						replaceSelectedCache(applyEventHighWater(selectedCacheRef.current, event.session_id, event.event_id));
 					}
-					shouldSyncSelected = false;
+					shouldSyncSelected = event.event === "turn.started" || event.event === "turn.finished";
 				}
 				const activity = activityFromEvent(event);
 				if (activity) {
@@ -768,7 +767,6 @@ export function App() {
 		[
 			pushNotice,
 			replaceSelectedCache,
-			refreshTranscriptTurns,
 			scheduleActiveBranchSync,
 			scheduleSessionListRefresh,
 		],
@@ -1155,7 +1153,7 @@ export function App() {
 					sessionId,
 					clientInputId,
 					expectedActiveLeafId: loadedSnapshot?.activity === "idle" ? (loadedSnapshot.active_leaf_id ?? null) : undefined,
-					baseLeafId: selectedCacheRef.current.sessionId === sessionId ? (selectedCacheRef.current.activeBranchEntryIds.at(-1) ?? null) : null,
+					baseLeafId: selectedBaseLeafId(selectedCacheRef.current, sessionId, loadedSnapshot?.active_leaf_id ?? null),
 					content,
 				});
 				if (result.queue) {
@@ -1165,21 +1163,12 @@ export function App() {
 					invalidateSessionList();
 				} else {
 					if (result.active_branch_sync) {
-						let applied = false;
-						updateSelectedCache((current) => {
-							const syncResult = applyActiveBranchSyncToCache(current.sessionId === sessionId ? current : selectedCacheRef.current, result.active_branch_sync!);
-							applied = syncResult.result === "applied";
-							return syncResult.cache;
-						});
-						const overview = result.active_branch_sync.overview;
+						const overview = {
+							...result.active_branch_sync.overview,
+							active_leaf_id: result.active_branch_sync.active_leaf_id,
+						};
+						commitSelectedSnapshot(overview);
 						lastEventIds.current.set(sessionId, Math.max(lastEventIds.current.get(sessionId) ?? 0, overview.last_event_id));
-						if (!applied) {
-							try {
-								await syncActiveBranchNow(sessionId);
-							} catch (error) {
-								pushNotice("error", errorMessage(error));
-							}
-						}
 					} else if (result.active_branch) {
 						updateSelectedCache((current) =>
 							applySwitchResultToCache(
@@ -1198,6 +1187,7 @@ export function App() {
 						}
 					}
 				}
+				void refreshTranscriptTurns(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
 			} catch (error) {
 				composerHandleRef.current?.restoreSubmittedDraft(sessionId, text);
 				throw error;
@@ -1205,14 +1195,15 @@ export function App() {
 		},
 		[
 			api,
+			commitSelectedSnapshot,
 			invalidateSessionList,
 			loadedSnapshot,
 			patchSelectedSnapshot,
 			pushNotice,
+			refreshTranscriptTurns,
 			refreshSelected,
 			requireSelected,
 			selectedSession,
-			syncActiveBranchNow,
 			updateSelectedCache,
 		],
 	);
@@ -1264,7 +1255,6 @@ export function App() {
 			if (target.actionLeafId && !targetBranchIds.includes(target.actionLeafId)) {
 				throw new Error("history index is still loading; please wait for the switch list to finish");
 			}
-			const missingBodyIds = targetBranchIds.filter((id) => !selectedCacheRef.current.entriesById.has(id));
 			const restoreText = await restoreTextForTarget(api, sessionId, target, selectedCacheRef, updateSelectedCache);
 			let result;
 			try {
@@ -1274,7 +1264,7 @@ export function App() {
 					expectedActiveLeafId: target.expectedActiveLeafId ?? loadedSnapshot.active_leaf_id ?? null,
 					expectedTranscriptRevision: selectedCacheRef.current.treeTranscriptRevision ?? loadedSnapshot.transcript_revision ?? null,
 					activeBranchEntryIds: targetBranchIds,
-					missingBodyIds,
+					missingBodyIds: [],
 				});
 			} catch (error) {
 				if (isHistoryChangedError(error)) {
@@ -1285,9 +1275,7 @@ export function App() {
 			}
 			if (restoreText !== null) composerHandleRef.current?.setValue(restoreText);
 			updateSelectedCache((current) => applySwitchResultToCache(current.sessionId === sessionId ? current : selectedCacheRef.current, result));
-			if (result.active_branch_entry_ids) {
-				await fetchMissingEntryBodies(sessionId, result.active_branch_entry_ids);
-			}
+			await refreshTranscriptTurns(sessionId);
 			if (result.last_event_id !== undefined) lastEventIds.current.set(sessionId, result.last_event_id);
 			invalidateSessionList();
 			pushNotice("success", restoreText !== null ? "message restored for editing" : "switched to selected history point");
@@ -1295,10 +1283,10 @@ export function App() {
 		[
 			api,
 			ensureTreeIndex,
-			fetchMissingEntryBodies,
 			invalidateSessionList,
 			loadedSnapshot,
 			pushNotice,
+			refreshTranscriptTurns,
 			requireSelected,
 			updateSelectedCache,
 		],
@@ -2009,6 +1997,11 @@ function isTranscriptSideChannelEvent(event: EventFrame): boolean {
 function eventEntryId(event: EventFrame): string | null {
 	const entryId = event.data.entry_id;
 	return typeof entryId === "string" ? entryId : null;
+}
+
+function selectedBaseLeafId(cache: SelectedSessionCache, sessionId: string, fallback: string | null): string | null {
+	if (cache.sessionId !== sessionId) return fallback;
+	return cache.activeBranchEntryIds.at(-1) ?? cache.snapshot?.active_leaf_id ?? fallback;
 }
 
 async function restoreTextForTarget(
