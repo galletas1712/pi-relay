@@ -615,7 +615,7 @@ export function App() {
 			}
 			setLoadingTurnId(turnId);
 			try {
-				const result = await api.getTranscriptTurnDetail(sessionId, turnId, { includeProviderReplay: true });
+				const result = await api.getTranscriptTurnDetail(sessionId, turnId);
 				if (selectedRef.current !== sessionId) return;
 				updateSelectedCache((current) => applyTurnDetail(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.turn_id, result.entries));
 				setExpandedTurnIds((current) => new Set(current).add(result.turn_id));

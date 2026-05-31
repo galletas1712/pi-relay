@@ -144,18 +144,6 @@ export type AssistantItem =
 			args_json: string;
 	  };
 
-export interface ProviderReplayItem {
-	provider: "openai" | "claude";
-	raw_json: string;
-	display?: ReplayDisplay | null;
-}
-
-export interface ReplayDisplay {
-	kind: "local_tool" | "hosted_tool";
-	pretty_name: string;
-	input_summary?: string | null;
-}
-
 export interface ToolCall {
 	id: string;
 	tool_name: string;
@@ -194,7 +182,6 @@ export interface TranscriptEntry {
 	timestamp_ms: number;
 	sequence?: number;
 	item: TranscriptItem;
-	provider_replay?: ProviderReplayItem[];
 }
 
 export interface TranscriptTreeNode {
@@ -232,20 +219,15 @@ export interface TranscriptEntriesResult {
 export interface TurnCard {
 	id: string;
 	turn_id?: number | null;
-	status: "completed" | "running" | "open" | "compacted";
+	status: "completed" | "open" | "compacted";
 	outcome?: TurnOutcome | null;
 	start_entry_id?: string | null;
 	boundary_entry_id?: string | null;
 	active_leaf_id: string;
-	start_sequence: number;
-	end_sequence: number;
 	start_timestamp_ms: number;
-	timestamp_ms: number;
-	user_preview?: string | null;
-	assistant_preview?: string | null;
-	tool_call_count: number;
-	tool_result_count: number;
-	entry_count: number;
+	user_messages: TranscriptEntry[];
+	assistant_message?: TranscriptEntry | null;
+	summary?: string | null;
 	can_resume: boolean;
 }
 

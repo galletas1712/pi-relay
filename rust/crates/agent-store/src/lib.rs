@@ -521,16 +521,6 @@ pub enum TranscriptEntryBodyMode {
     Full,
 }
 
-impl TranscriptEntryBodyMode {
-    pub fn from_include_provider_replay(include: bool) -> Self {
-        if include {
-            Self::Full
-        } else {
-            Self::Ui
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptEntryRecord {
     pub id: String,
@@ -538,6 +528,7 @@ pub struct TranscriptEntryRecord {
     pub timestamp_ms: u64,
     pub sequence: i64,
     pub item: TranscriptItem,
+    #[serde(skip_serializing)]
     pub provider_replay: Vec<ProviderReplayItem>,
 }
 
@@ -560,7 +551,6 @@ pub struct TranscriptTreeNodeRecord {
 #[serde(rename_all = "snake_case")]
 pub enum TurnCardStatus {
     Completed,
-    Running,
     Open,
     Compacted,
 }
@@ -578,11 +568,9 @@ pub struct TurnCardRecord {
     pub end_sequence: i64,
     pub start_timestamp_ms: u64,
     pub timestamp_ms: u64,
-    pub user_preview: Option<String>,
-    pub assistant_preview: Option<String>,
-    pub tool_call_count: usize,
-    pub tool_result_count: usize,
-    pub entry_count: usize,
+    pub user_messages: Vec<TranscriptEntryRecord>,
+    pub assistant_message: Option<TranscriptEntryRecord>,
+    pub summary: Option<String>,
     pub can_resume: bool,
 }
 

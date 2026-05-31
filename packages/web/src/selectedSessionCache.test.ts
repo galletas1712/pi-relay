@@ -7,6 +7,7 @@ import {
 	applySwitchResultToCache,
 	applyTranscriptAppendedEvent,
 	applyTreeIndex,
+	applyTranscriptTurns,
 	branchFromTree,
 	emptySelectedSessionCache,
 	mergeSessionActivityEvent,
@@ -264,12 +265,9 @@ describe("selected session cache", () => {
 			status: "completed",
 			active_leaf_id: "entry_finish",
 			boundary_entry_id: "entry_finish",
-			user_preview: "hello there",
-			assistant_preview: "answer text",
-			tool_call_count: 1,
-			tool_result_count: 1,
-			entry_count: 5,
 		});
+		expect(card?.user_messages.map((entry) => entry.id)).toEqual(["entry_user"]);
+		expect(card?.assistant_message?.id).toBe("entry_assistant");
 		expect(cache.turnDetailsById.get("entry_finish")).toEqual([
 			"entry_start",
 			"entry_user",
@@ -278,6 +276,41 @@ describe("selected session cache", () => {
 			"entry_finish",
 		]);
 		expect(cache.turnDetailsById.has("entry_start")).toBe(false);
+	});
+
+	it("merges full turn-card message bodies from transcript.turns", () => {
+		const user = entry("entry_user", "entry_start", "full user message text", 2);
+		const finalAssistant = assistantEntry("entry_assistant_final", "entry_result", "full final answer", 5);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([], { transcriptRevision: 1 }));
+
+		cache = applyTranscriptTurns(cache, {
+			session_id: sessionId,
+			active_leaf_id: "entry_finish",
+			session_revision: 3,
+			transcript_revision: 2,
+			cards: [
+				{
+					id: "entry_finish",
+					turn_id: 1,
+					status: "completed",
+					outcome: "Graceful",
+					start_entry_id: "entry_start",
+					boundary_entry_id: "entry_finish",
+					active_leaf_id: "entry_finish",
+					start_timestamp_ms: 1_700_000_000_001,
+					user_messages: [user],
+					assistant_message: finalAssistant,
+					summary: null,
+					can_resume: false,
+				},
+			],
+		});
+
+		const card = cache.turnCardsById.get("entry_finish");
+		expect(card?.user_messages[0]).toBe(cache.entriesById.get("entry_user"));
+		expect(card?.assistant_message).toBe(cache.entriesById.get("entry_assistant_final"));
+		expect(cache.entriesById.get("entry_user")).toBe(user);
+		expect(cache.entriesById.get("entry_assistant_final")).toBe(finalAssistant);
 	});
 
 	it("starts a new current turn card when a turn_started entry follows a completed turn", () => {
@@ -293,7 +326,6 @@ describe("selected session cache", () => {
 					status: "completed",
 					boundary_entry_id: "entry_finish_1",
 					active_leaf_id: "entry_finish_1",
-					entry_count: 4,
 				},
 			]]),
 		};
@@ -306,7 +338,8 @@ describe("selected session cache", () => {
 			turn_id: 2,
 			start_entry_id: "entry_start_2",
 			active_leaf_id: "entry_start_2",
-			entry_count: 1,
+			user_messages: [],
+			assistant_message: null,
 		});
 	});
 
@@ -585,7 +618,6 @@ function compactionEntry(id: string, sourceLeafId: string, sequence: number): Tr
 			tokens_before: null,
 			last_turn_id: 1,
 		},
-		provider_replay: [],
 	};
 }
 
@@ -596,7 +628,6 @@ function entry(id: string, parentId: string | null, text: string, sequence: numb
 		timestamp_ms: 1_700_000_000_000 + sequence,
 		sequence,
 		item: { type: "user_message", content: [{ type: "text", text }] },
-		provider_replay: [],
 	};
 }
 
@@ -607,7 +638,6 @@ function turnStartedEntry(id: string, parentId: string | null, turnId: number, s
 		timestamp_ms: 1_700_000_000_000 + sequence,
 		sequence,
 		item: { type: "turn_started", turn_id: turnId },
-		provider_replay: [],
 	};
 }
 
@@ -629,7 +659,6 @@ function assistantEntry(id: string, parentId: string | null, text: string, seque
 				})),
 			],
 		},
-		provider_replay: [],
 	};
 }
 
@@ -646,7 +675,6 @@ function toolResultEntry(id: string, parentId: string | null, sequence: number):
 			output: "ok",
 			status: "Success",
 		},
-		provider_replay: [],
 	};
 }
 
@@ -663,7 +691,6 @@ function turnFinishedEntry(
 		timestamp_ms: 1_700_000_000_000 + sequence,
 		sequence,
 		item: { type: "turn_finished", turn_id: turnId, outcome },
-		provider_replay: [],
 	};
 }
 
@@ -676,15 +703,10 @@ function turnCard(id: string, turnId: number): TurnCard {
 		start_entry_id: id,
 		boundary_entry_id: null,
 		active_leaf_id: id,
-		start_sequence: 1,
-		end_sequence: 1,
 		start_timestamp_ms: 1_700_000_000_001,
-		timestamp_ms: 1_700_000_000_001,
-		user_preview: null,
-		assistant_preview: null,
-		tool_call_count: 0,
-		tool_result_count: 0,
-		entry_count: 1,
+		user_messages: [],
+		assistant_message: null,
+		summary: null,
 		can_resume: false,
 	};
 }

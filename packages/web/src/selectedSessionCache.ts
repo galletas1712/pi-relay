@@ -1,6 +1,5 @@
 import { branchEntriesFor } from "./historyTargets.ts";
 import { displayParentIdForEntry, displayParentIdForNode } from "./displayParent.ts";
-import { contentBlocksToText, firstLine, truncate } from "./text.ts";
 import type {
 	EventFrame,
 	QueueProjection,
@@ -37,9 +36,17 @@ export interface SelectedSessionCache {
 
 export function applyTranscriptTurns(cache: SelectedSessionCache, result: TranscriptTurnsResult): SelectedSessionCache {
 	if (cache.sessionId !== result.session_id) return cache;
-	const entriesById = cache.entriesById;
+	let entriesById = cache.entriesById;
 	const turnCardsById = new Map<string, TurnCard>();
-	for (const card of result.cards) turnCardsById.set(card.id, card);
+	for (const card of result.cards) {
+		const cardEntries = [...card.user_messages, ...(card.assistant_message ? [card.assistant_message] : [])];
+		entriesById = mergeEntryBodies(entriesById, cardEntries);
+		turnCardsById.set(card.id, {
+			...card,
+			user_messages: card.user_messages.map((entry) => entriesById.get(entry.id) ?? entry),
+			assistant_message: card.assistant_message ? entriesById.get(card.assistant_message.id) ?? card.assistant_message : card.assistant_message,
+		});
+	}
 	const turnDetailsById = new Map<string, string[]>();
 	for (const card of result.cards) {
 		const entryIds =
@@ -566,7 +573,7 @@ function appendTurnCard(
 		return { turnCardsById, turnOrder: [...currentOrder, nextCard.id] };
 	}
 
-	const startsNewTurn = entry.item.type === "turn_started" && previousCard.entry_count > 0;
+	const startsNewTurn = entry.item.type === "turn_started" && previousCard.start_entry_id !== entry.id;
 	if (startsNewTurn) {
 		const nextCard = updateTurnCard(initialTurnCard(entry), entry);
 		const turnCardsById = new Map(currentCards);
@@ -596,7 +603,6 @@ function createTurnCardFromEntry(entry: TranscriptEntry): { turnCardsById: Map<s
 }
 
 function initialTurnCard(entry: TranscriptEntry): TurnCard {
-	const sequence = entry.sequence ?? 0;
 	const turnId = turnIdForItem(entry.item);
 	return {
 		id: entry.id,
@@ -606,28 +612,19 @@ function initialTurnCard(entry: TranscriptEntry): TurnCard {
 		start_entry_id: entry.item.type === "turn_started" ? entry.id : null,
 		boundary_entry_id: null,
 		active_leaf_id: entry.id,
-		start_sequence: sequence,
-		end_sequence: sequence,
 		start_timestamp_ms: entry.timestamp_ms,
-		timestamp_ms: entry.timestamp_ms,
-		user_preview: null,
-		assistant_preview: null,
-		tool_call_count: 0,
-		tool_result_count: 0,
-		entry_count: 0,
+		user_messages: [],
+		assistant_message: null,
+		summary: null,
 		can_resume: false,
 	};
 }
 
 function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
 	const item = entry.item;
-	const sequence = entry.sequence ?? card.end_sequence;
 	let next: TurnCard = {
 		...card,
 		active_leaf_id: entry.id,
-		end_sequence: sequence,
-		timestamp_ms: entry.timestamp_ms,
-		entry_count: card.entry_count + 1,
 		turn_id: card.turn_id ?? turnIdForItem(item),
 	};
 
@@ -640,28 +637,17 @@ function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
 	} else if (item.type === "user_message") {
 		next = {
 			...next,
-			user_preview: appendPreview(next.user_preview ?? null, contentBlocksToText(item.content)),
+			user_messages: appendUniqueEntry(next.user_messages, entry),
 		};
 	} else if (item.type === "assistant_message") {
-		const assistantText = item.items
-			.map((assistantItem) => (assistantItem.type === "text" ? assistantItem.text : ""))
-			.join("")
-			.trim();
 		next = {
 			...next,
-			assistant_preview: assistantText ? truncate(firstLine(assistantText) || assistantText, 240) : next.assistant_preview,
-			tool_call_count: next.tool_call_count + item.items.filter((assistantItem) => assistantItem.type === "tool_call").length,
+			assistant_message: entry,
 		};
 	} else if (item.type === "tool_call_started") {
 		next = {
 			...next,
 			turn_id: item.turn_id,
-			tool_call_count: next.tool_call_count + 1,
-		};
-	} else if (item.type === "tool_result") {
-		next = {
-			...next,
-			tool_result_count: next.tool_result_count + 1,
 		};
 	} else if (item.type === "turn_finished") {
 		next = {
@@ -677,7 +663,6 @@ function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
 }
 
 function compactionTurnCard(entry: TranscriptEntry): TurnCard {
-	const sequence = entry.sequence ?? 0;
 	const summary = entry.item.type === "compaction_summary" ? entry.item.summary.trim() : "";
 	const turnId = entry.item.type === "compaction_summary" ? entry.item.last_turn_id : null;
 	return {
@@ -688,15 +673,10 @@ function compactionTurnCard(entry: TranscriptEntry): TurnCard {
 		start_entry_id: entry.id,
 		boundary_entry_id: entry.id,
 		active_leaf_id: entry.id,
-		start_sequence: sequence,
-		end_sequence: sequence,
 		start_timestamp_ms: entry.timestamp_ms,
-		timestamp_ms: entry.timestamp_ms,
-		user_preview: null,
-		assistant_preview: summary ? truncate(firstLine(summary) || summary, 240) : null,
-		tool_call_count: 0,
-		tool_result_count: 0,
-		entry_count: 1,
+		user_messages: [],
+		assistant_message: null,
+		summary: summary || null,
 		can_resume: false,
 	};
 }
@@ -705,11 +685,12 @@ function turnCardStableId(card: TurnCard): string {
 	return card.boundary_entry_id ?? card.start_entry_id ?? card.active_leaf_id;
 }
 
-function appendPreview(current: string | null, next: string): string | null {
-	const trimmed = next.trim();
-	if (!trimmed) return current;
-	const merged = current?.trim() ? `${current.trim()}\n${trimmed}` : trimmed;
-	return truncate(merged, 240);
+function appendUniqueEntry(entries: TranscriptEntry[], entry: TranscriptEntry): TranscriptEntry[] {
+	const index = entries.findIndex((candidate) => candidate.id === entry.id);
+	if (index === -1) return [...entries, entry];
+	const next = [...entries];
+	next[index] = entry;
+	return next;
 }
 
 function turnIdForItem(item: TranscriptItem): number | null {

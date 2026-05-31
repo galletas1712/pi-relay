@@ -45,7 +45,7 @@ export interface AgentApi {
 	getTranscriptIndex(sessionId: string, options?: TranscriptIndexOptions): Promise<TranscriptTreeIndex>;
 	getTranscriptEntries(sessionId: string, entryIds: string[]): Promise<TranscriptEntriesResult>;
 	getTranscriptTurns(sessionId: string): Promise<TranscriptTurnsResult>;
-	getTranscriptTurnDetail(sessionId: string, turnId: string, options?: TranscriptBodyOptions): Promise<TranscriptTurnDetailResult>;
+	getTranscriptTurnDetail(sessionId: string, turnId: string): Promise<TranscriptTurnDetailResult>;
 	getHistoryTree(sessionId: string): Promise<HistoryTree>;
 	subscribeEvents(sessionId: string, afterEventId: number | null): Promise<EventFrame[]>;
 	unsubscribeEvents(sessionId: string): Promise<void>;
@@ -90,10 +90,6 @@ export interface GetSessionOptions {
 export interface TranscriptIndexOptions {
 	afterSequence?: number | null;
 	limit?: number | null;
-}
-
-export interface TranscriptBodyOptions {
-	includeProviderReplay?: boolean;
 }
 
 export interface StartSessionParams {
@@ -337,11 +333,10 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	getTranscriptTurnDetail(sessionId: string, turnId: string, options: TranscriptBodyOptions = {}): Promise<TranscriptTurnDetailResult> {
+	getTranscriptTurnDetail(sessionId: string, turnId: string): Promise<TranscriptTurnDetailResult> {
 		return this.client.request<TranscriptTurnDetailResult>("transcript.turn_detail", {
 			session_id: sessionId,
-			turn_id: turnId,
-			include_provider_replay: options.includeProviderReplay || undefined
+			turn_id: turnId
 		});
 	}
 

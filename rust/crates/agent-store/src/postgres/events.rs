@@ -232,7 +232,6 @@ pub(super) async fn insert_transcript_item_events_tx(
             "timestamp_ms": entry.timestamp_ms,
             "sequence": entry.sequence,
             "item": entry.item,
-            "provider_replay": entry.provider_replay,
         }))
     } else {
         entry.map(|entry| {
@@ -241,7 +240,6 @@ pub(super) async fn insert_transcript_item_events_tx(
                 "parent_id": entry.parent_id,
                 "timestamp_ms": entry.timestamp_ms,
                 "item": entry.item,
-                "provider_replay": entry.provider_replay,
             })
         })
     };

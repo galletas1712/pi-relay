@@ -178,21 +178,15 @@ async fn active_branch_turn_card_rows_tx(
                parent_id,
                timestamp_ms,
                sequence,
+               case
+                 when item->>'type' in ('user_message', 'assistant_message') then item
+                 else null
+               end as body_item,
                item->>'type' as item_type,
                item->'turn_id' as turn_id,
                item->'outcome' as outcome,
-               left(item #>> '{content,0,text}', 240) as first_user_text,
-               left(item #>> '{items,0,text}', 240) as first_assistant_text,
-               (
-                 select count(*)
-                 from jsonb_array_elements(coalesce(item->'items', '[]'::jsonb)) assistant_item
-                 where (assistant_item->>'type' = 'tool_call' or assistant_item ? 'tool_call')
-               ) as assistant_tool_call_count,
-               left(item->>'tool_name', 120) as tool_result_name,
-               left(item->>'output', 240) as tool_result_output,
-               left(item #>> '{tool_call,tool_name}', 120) as started_tool_name,
                item #>> '{last_turn_id}' as compaction_last_turn_id,
-               left(item->>'summary', 240) as compaction_summary
+               item->>'summary' as compaction_summary
         from branch
         where item->>'type' in ('turn_started', 'user_message', 'assistant_message', 'tool_call_started', 'tool_result', 'turn_finished', 'compaction_summary')
         order by sequence
@@ -378,7 +372,7 @@ impl PostgresAgentStore {
         let active_leaf_id = self.active_leaf_id(session_id).await?;
         let entries = match active_leaf_id.as_deref() {
             Some(_) => {
-                self.active_branch_entry_records(session_id, TranscriptEntryBodyMode::Full)
+                self.active_branch_entry_records(session_id, TranscriptEntryBodyMode::Ui)
                     .await?
             }
             None => Vec::new(),
@@ -1137,41 +1131,39 @@ fn turn_card_row(row: &sqlx::postgres::PgRow) -> Result<TurnCardRow> {
     let outcome = row
         .get::<Option<Value>, _>("outcome")
         .and_then(|value| value.as_str().and_then(parse_turn_outcome));
-    let text_preview = turn_card_text_preview(row, &item_type);
+    let summary = if item_type == "compaction_summary" {
+        row.get::<Option<String>, _>("compaction_summary")
+    } else {
+        None
+    };
+    let body_item = row
+        .get::<Option<Value>, _>("body_item")
+        .map(serde_json::from_value)
+        .transpose()?;
+    let entry = match (item_type.as_str(), body_item) {
+        ("user_message" | "assistant_message", Some(item)) => Some(TranscriptEntryRecord {
+            id: row.get("id"),
+            parent_id: row.get("parent_id"),
+            timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
+            sequence: row.get("sequence"),
+            item,
+            provider_replay: Vec::new(),
+        }),
+        ("user_message" | "assistant_message", None) => {
+            return Err(anyhow!("turn-card row missing body item for {item_type}"));
+        }
+        _ => None,
+    };
     Ok(TurnCardRow {
         id: row.get("id"),
         timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
         sequence: row.get("sequence"),
+        entry,
         item_type,
         turn_id,
         outcome,
-        text_preview,
-        assistant_tool_call_count: row
-            .get::<Option<i64>, _>("assistant_tool_call_count")
-            .unwrap_or(0) as usize,
+        summary,
     })
-}
-
-fn turn_card_text_preview(row: &sqlx::postgres::PgRow, item_type: &str) -> Option<String> {
-    match item_type {
-        "user_message" => row.get::<Option<String>, _>("first_user_text"),
-        "assistant_message" => row.get::<Option<String>, _>("first_assistant_text"),
-        "tool_call_started" => row
-            .get::<Option<String>, _>("started_tool_name")
-            .map(|name| format!("tool call: {name}")),
-        "tool_result" => {
-            let tool_name = row.get::<Option<String>, _>("tool_result_name");
-            let output = row.get::<Option<String>, _>("tool_result_output");
-            match (tool_name, output) {
-                (Some(name), Some(output)) => Some(format!("{name}: {output}")),
-                (Some(name), None) => Some(name),
-                (None, Some(output)) => Some(output),
-                (None, None) => None,
-            }
-        }
-        "compaction_summary" => row.get::<Option<String>, _>("compaction_summary"),
-        _ => None,
-    }
 }
 
 fn parse_turn_outcome(value: &str) -> Option<agent_vocab::TurnOutcome> {
@@ -1203,11 +1195,17 @@ struct TurnCardRow {
     id: String,
     timestamp_ms: u64,
     sequence: i64,
+    entry: Option<TranscriptEntryRecord>,
     item_type: String,
     turn_id: Option<agent_vocab::TurnId>,
     outcome: Option<agent_vocab::TurnOutcome>,
-    text_preview: Option<String>,
-    assistant_tool_call_count: usize,
+    summary: Option<String>,
+}
+
+impl TurnCardRow {
+    fn entry_record(&self) -> Option<TranscriptEntryRecord> {
+        self.entry.clone()
+    }
 }
 
 #[derive(Debug)]
@@ -1220,11 +1218,9 @@ struct MutableTurnCard {
     end_sequence: i64,
     start_timestamp_ms: u64,
     timestamp_ms: u64,
-    user_preview: Option<String>,
-    assistant_preview: Option<String>,
-    tool_call_count: usize,
-    tool_result_count: usize,
-    entry_count: usize,
+    user_messages: Vec<TranscriptEntryRecord>,
+    assistant_message: Option<TranscriptEntryRecord>,
+    summary: Option<String>,
     status: TurnCardStatus,
     outcome: Option<agent_vocab::TurnOutcome>,
 }
@@ -1250,11 +1246,9 @@ fn turn_cards_from_rows(rows: &[TurnCardRow]) -> Vec<TurnCardRecord> {
                 end_sequence: row.sequence,
                 start_timestamp_ms: row.timestamp_ms,
                 timestamp_ms: row.timestamp_ms,
-                user_preview: None,
-                assistant_preview: None,
-                tool_call_count: 0,
-                tool_result_count: 0,
-                entry_count: 0,
+                user_messages: Vec::new(),
+                assistant_message: None,
+                summary: None,
                 status: TurnCardStatus::Open,
                 outcome: None,
             });
@@ -1269,11 +1263,9 @@ fn turn_cards_from_rows(rows: &[TurnCardRow]) -> Vec<TurnCardRecord> {
             end_sequence: row.sequence,
             start_timestamp_ms: row.timestamp_ms,
             timestamp_ms: row.timestamp_ms,
-            user_preview: None,
-            assistant_preview: None,
-            tool_call_count: 0,
-            tool_result_count: 0,
-            entry_count: 0,
+            user_messages: Vec::new(),
+            assistant_message: None,
+            summary: None,
             status: TurnCardStatus::Open,
             outcome: None,
         });
@@ -1291,32 +1283,19 @@ fn append_entry_to_turn_card(card: &mut MutableTurnCard, row: &TurnCardRow) {
     card.active_leaf_id = row.id.clone();
     card.end_sequence = row.sequence;
     card.timestamp_ms = row.timestamp_ms;
-    card.entry_count += 1;
     if card.turn_id.is_none() {
         card.turn_id = row.turn_id;
     }
     match row.item_type.as_str() {
         "user_message" => {
-            if let Some(text) = &row.text_preview {
-                card.user_preview = append_preview(card.user_preview.take(), text.clone());
+            if let Some(entry) = row.entry_record() {
+                card.user_messages.push(entry);
             }
         }
         "assistant_message" => {
-            if let Some(text) = row
-                .text_preview
-                .as_deref()
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-            {
-                card.assistant_preview = Some(truncate_chars(text.trim(), 240));
+            if let Some(entry) = row.entry_record() {
+                card.assistant_message = Some(entry);
             }
-            card.tool_call_count += row.assistant_tool_call_count;
-        }
-        "tool_call_started" => {
-            card.tool_call_count += 1;
-        }
-        "tool_result" => {
-            card.tool_result_count += 1;
         }
         "turn_finished" => {
             if let Some(turn_id) = row.turn_id {
@@ -1365,17 +1344,15 @@ fn finalize_turn_card(card: MutableTurnCard) -> TurnCardRecord {
         end_sequence: card.end_sequence,
         start_timestamp_ms: card.start_timestamp_ms,
         timestamp_ms: card.timestamp_ms,
-        user_preview: card.user_preview,
-        assistant_preview: card.assistant_preview,
-        tool_call_count: card.tool_call_count,
-        tool_result_count: card.tool_result_count,
-        entry_count: card.entry_count,
+        user_messages: card.user_messages,
+        assistant_message: card.assistant_message,
+        summary: card.summary,
         can_resume,
     }
 }
 
 fn compaction_turn_card(row: &TurnCardRow) -> TurnCardRecord {
-    let summary = row.text_preview.clone().unwrap_or_default();
+    let summary = row.summary.as_ref().map(|value| value.trim().to_string());
     TurnCardRecord {
         id: row.id.clone(),
         turn_id: row.turn_id,
@@ -1388,29 +1365,11 @@ fn compaction_turn_card(row: &TurnCardRow) -> TurnCardRecord {
         end_sequence: row.sequence,
         start_timestamp_ms: row.timestamp_ms,
         timestamp_ms: row.timestamp_ms,
-        user_preview: None,
-        assistant_preview: if summary.trim().is_empty() {
-            None
-        } else {
-            Some(truncate_chars(summary.trim(), 240))
-        },
-        tool_call_count: 0,
-        tool_result_count: 0,
-        entry_count: 1,
+        user_messages: Vec::new(),
+        assistant_message: None,
+        summary: summary.filter(|value| !value.is_empty()),
         can_resume: false,
     }
-}
-
-fn append_preview(current: Option<String>, next: String) -> Option<String> {
-    let next = next.trim();
-    if next.is_empty() {
-        return current;
-    }
-    let merged = match current {
-        Some(current) if !current.trim().is_empty() => format!("{}\n{}", current.trim(), next),
-        _ => next.to_string(),
-    };
-    Some(truncate_chars(merged.trim(), 240))
 }
 
 pub(super) async fn insert_entry_tx(
@@ -1472,7 +1431,8 @@ mod tests {
     use agent_session::{SessionEvent, TranscriptStorageNode};
     use agent_vocab::{
         AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
-        ProviderReplayItem, ReasoningEffort, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+        ProviderReplayItem, ReasoningEffort, ToolCallId, ToolResultMessage, TranscriptItem,
+        TurnId, TurnOutcome, UserMessage,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -1645,6 +1605,32 @@ mod tests {
                 "summary",
                 None,
                 TurnId(0),
+            )),
+        )
+    }
+
+    fn assistant_message(
+        id: &str,
+        parent_id: Option<&str>,
+        text: &str,
+    ) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text(text.to_string())],
+            }),
+        )
+    }
+
+    fn tool_result(id: &str, parent_id: Option<&str>) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::ToolResult(ToolResultMessage::success(
+                ToolCallId::from("tool_1"),
+                "Bash",
+                "ok",
             )),
         )
     }
@@ -1895,6 +1881,68 @@ mod tests {
         assert!(ui_assistant.provider_replay.is_empty());
         assert_eq!(full_assistant.provider_replay.len(), 1);
         assert_eq!(synced_assistant.provider_replay.len(), 1);
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn transcript_turns_returns_full_user_and_final_assistant_entries() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "turn-card-full-messages";
+        create_session(store, session_id).await;
+
+        let long_user = "u".repeat(500);
+        let long_first_assistant = "first assistant".repeat(40);
+        let long_final_assistant = "final assistant answer ".repeat(40);
+        let entries = vec![
+            turn_started("entry_start", None, 1),
+            user_message("entry_user", Some("entry_start"), &long_user),
+            assistant_message("entry_assistant_first", Some("entry_user"), &long_first_assistant),
+            tool_result("entry_tool_result", Some("entry_assistant_first")),
+            assistant_message(
+                "entry_assistant_final",
+                Some("entry_tool_result"),
+                &long_final_assistant,
+            ),
+            turn_finished("entry_finish", Some("entry_assistant_final"), 1),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+
+        let turns = store
+            .transcript_turns(session_id)
+            .await
+            .expect("turn cards load");
+        assert_eq!(turns.cards.len(), 1);
+        let card = &turns.cards[0];
+        assert_eq!(card.user_messages.len(), 1);
+        assert_eq!(card.user_messages[0].id, "entry_user");
+        match &card.user_messages[0].item {
+            TranscriptItem::UserMessage(message) => {
+                assert_eq!(content_blocks_text(&message.content), long_user);
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+        let assistant = card
+            .assistant_message
+            .as_ref()
+            .expect("final assistant included");
+        assert_eq!(assistant.id, "entry_assistant_final");
+        match &assistant.item {
+            TranscriptItem::AssistantMessage(message) => {
+                assert_eq!(message.items, vec![AssistantItem::Text(long_final_assistant)]);
+            }
+            other => panic!("expected assistant message, got {other:?}"),
+        }
 
         db.cleanup().await;
     }

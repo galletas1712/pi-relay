@@ -21,7 +21,7 @@ current/running turn and lazily when the user expands an older turn.
    source of truth and `sessions.active_leaf_id` remains the current branch.
 2. Make selected-session load independent of full transcript size in the normal
    case.
-3. Do not send raw `provider_replay` to normal UI transcript responses.
+3. Do not expose raw `provider_replay` on any UI/RPC transcript response.
 4. Show historical completed turns as collapsed cards by default.
 5. Load full turn details lazily only when a user expands a turn.
 6. Keep the current/running turn represented by a live-updating summary card by
@@ -69,19 +69,6 @@ Verification:
 
 Implementation status:
 
-- Done in `perf/ui-transcript-no-provider-replay`.
-- Store/UI RPC transcript body reads now take a `TranscriptEntryBodyMode`.
-  Normal UI paths (`session.get`, `session.sync_active_branch`,
-  `transcript.entries`, `history.switch` returned bodies, and
-  `transcript.appended` event bodies) use `Ui`, which selects
-  `'[]'::jsonb as provider_replay` instead of reading/sending raw replay.
-- Full replay remains available behind the explicit `include_provider_replay`
-  RPC flag and internal model/history-context paths still read durable replay.
-- Added a Postgres store test proving the UI projection omits replay while the
-  full projection preserves it.
-
-Implementation status:
-
 - Done in `fix/switch-restore-full-user-message`.
 - The restore helper now treats `restore_entry_id` as authoritative and always
   loads the full user-message body from the selected-session body cache or from
@@ -106,10 +93,8 @@ Implementation:
   bodies without `provider_replay` for UI paths.
 - Keep existing full entry records for model continuation/export/debug paths.
 - Default frontend transcript body fetches to the UI projection.
-- Add an explicit `include_provider_replay` option only where raw replay is
-  intentionally needed.
-- Preserve any small display metadata that the UI actually needs, either from
-  existing visible `item` data or a small replay display projection if required.
+- Do not add a UI/RPC raw-replay escape hatch. Raw provider replay stays
+  server-side; the UI renders only semantic `TranscriptItem`s.
 
 Verification:
 
@@ -118,6 +103,20 @@ Verification:
 - `cargo check -p agent-daemon --manifest-path rust/Cargo.toml`
 - `npm run test --workspace packages/web`
 - `npm run build --workspace packages/web`
+
+Implementation status:
+
+- Done in `perf/ui-transcript-no-provider-replay`.
+- Store/UI RPC transcript body reads now take a `TranscriptEntryBodyMode`.
+  Normal UI paths (`session.get`, `session.sync_active_branch`,
+  `transcript.entries`, `history.switch` returned bodies, and
+  `transcript.appended` event bodies) use `Ui`, which avoids reading/sending
+  raw replay.
+- Follow-up simplification: the explicit raw-replay RPC flag was removed. Full
+  durable replay remains internal to model continuation/debug store reads, but
+  the frontend wire type no longer contains a `provider_replay` field at all.
+- Added a Postgres store test proving the UI projection omits replay while the
+  full projection preserves it.
 
 ### PR 3: Turn-card selected-session view
 
@@ -128,13 +127,15 @@ Backend APIs:
 
 - `transcript.turns`
   - active branch only;
-  - returns turn cards only, no entry bodies;
-  - contains compact summaries: user preview, final assistant preview, counts,
-    timestamps, status, boundary ids, resume ids;
-  - excludes raw provider replay.
+  - returns collapsed turn cards with the full user message entries in that
+    turn and the full final assistant message entry for that turn;
+  - omits intermediate tool calls/results until expansion;
+  - contains only the card metadata the UI needs: status, boundary ids, resume
+    flag, start timestamp, optional compaction summary;
+  - excludes raw provider replay from the wire entirely.
 - `transcript.turn_detail`
   - returns full UI-projected entries for one turn/card;
-  - excludes raw provider replay by default;
+  - excludes raw provider replay from the wire entirely;
   - used only when the user expands a card.
 
 Frontend:
@@ -166,10 +167,12 @@ Implementation status:
 - Added selected-session turn-card cache projections (`turnCardsById`,
   `turnOrder`, `turnDetailsById`) alongside the existing body/topology caches.
 - The chat pane renders turn cards when available and lazily fetches detail when
-  the user clicks "Show details". Expanded details request provider replay
-  explicitly so replay-derived decorations remain available without putting raw
-  replay back on the selected-session hot path. No turn detail is fetched in
-  the selected session hot path.
+  the user clicks "Show details". No turn detail is fetched in the selected
+  session hot path.
+- Follow-up simplification: `transcript.turns` now carries full semantic
+  user-message entries and the full final semantic assistant-message entry for
+  every card. It no longer carries derived previews/counts; the collapsed chat
+  view renders directly from those entries.
 - The selected-session hot path now uses metadata-only `session.get` followed by
   `transcript.turns`; it does not fetch full active-branch bodies on session
   select, foreground refresh, accepted follow-up reconciliation, or
@@ -178,11 +181,11 @@ Implementation status:
   any already-expanded turn detail. The canonical `transcript.turns` refresh is
   still used when the cache cannot prove an event extends the selected branch.
 - Pitfall: this implementation still derives cards by walking the active branch
-  in SQL and reading a small set of JSON fields from `item`. It deliberately
-  avoids selecting raw provider replay and avoids deserializing full transcript
-  entries for `transcript.turns`. If microbenchmarks after this PR still show
-  card derivation as too slow on very large sessions, promote cards to a
-  denormalized read model in PR 5.
+  in SQL. It deliberately avoids selecting raw provider replay and only selects
+  full `item` JSON for the user/assistant bodies that collapsed cards actually
+  render; boundary/tool rows are used as metadata only. If microbenchmarks after
+  this PR still show card derivation as too slow on very large sessions, promote
+  cards to a denormalized read model in PR 5.
 
 ### Deferred: Newest-first `/switch` targets
 
@@ -227,7 +230,7 @@ benchmarks still show head-of-line blocking or compact-index cost:
 ## Design invariants
 
 - Raw provider replay is needed for provider continuation, not normal transcript
-  display.
+  display. UI/RPC transcript payloads do not include it.
 - The backend remains authoritative for switchability and active branch state.
 - Frontend caches are projections and can be discarded/refetched by revision.
 - Revision fences remain the consistency mechanism for mutations.

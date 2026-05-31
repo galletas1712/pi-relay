@@ -15,7 +15,6 @@ function entry(id: string, parentId: string | null): TranscriptEntry {
 		timestamp_ms: 1,
 		sequence: 1,
 		item: { type: "user_message", content: [{ type: "text", text: id }] },
-		provider_replay: [],
 	};
 }
 

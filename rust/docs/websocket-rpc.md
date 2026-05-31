@@ -500,10 +500,10 @@ root switch. Transcript entries returned by websocket RPCs include the Postgres
 token. Use `transcript_revision` to decide whether cached transcript data is
 fresh.
 
-Normal UI transcript body responses omit raw provider replay by returning
-`provider_replay: []`. Passing `"include_provider_replay": true` requests the
-full durable replay sidecar and should be reserved for debug/export paths that
-explicitly need provider-native data.
+UI transcript body responses do not include the raw `provider_replay` sidecar.
+Replay remains stored durably for model continuation, but websocket RPCs expose
+only semantic transcript entries: `id`, `parent_id`, `timestamp_ms`, `sequence`,
+and `item`.
 
 For UI display, `"active_branch"` follows compaction provenance: a
 `compaction_summary` entry with `parent_id = null` is rendered after its
@@ -569,10 +569,6 @@ restoring a historical user message into the composer.
 { "session_id": "s1", "entry_ids": ["entry_1", "entry_7"] }
 ```
 
-By default this returns the UI projection with `provider_replay: []`. Add
-`"include_provider_replay": true` only when the caller intentionally needs raw
-provider replay.
-
 Result shape:
 
 ```json
@@ -587,9 +583,10 @@ Result shape:
 ### `transcript.turns`
 
 Returns active-branch turn cards for the selected-session transcript view. This
-is the normal hot-path UI endpoint and returns summaries only; detail/tool-call
-entries are fetched with `transcript.turn_detail` when a card is expanded. It
-omits raw provider replay.
+is the normal hot-path UI endpoint. Each card carries full semantic user-message
+entries for that turn and the full final semantic assistant-message entry for
+that turn; intermediate tool calls/results are fetched with
+`transcript.turn_detail` when a card is expanded. It omits raw provider replay.
 
 ```json
 { "session_id": "s1" }
@@ -615,10 +612,6 @@ a collapsed turn.
 ```json
 { "session_id": "s1", "turn_id": "entry_42" }
 ```
-
-By default this omits raw provider replay. Add
-`"include_provider_replay": true` only when the caller intentionally needs raw
-provider replay.
 
 Result shape:
 
