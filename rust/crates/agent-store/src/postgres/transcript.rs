@@ -256,7 +256,7 @@ impl PostgresAgentStore {
     pub async fn history_tree(&self, session_id: &str) -> Result<HistoryTree> {
         let active_leaf_id = self.active_leaf_id(session_id).await?;
         let entries = self
-            .transcript_entry_records(session_id, TranscriptEntryBodyMode::Full)
+            .transcript_entry_records(session_id, TranscriptEntryBodyMode::Ui)
             .await?;
         Ok(HistoryTree {
             session_id: session_id.to_string(),
