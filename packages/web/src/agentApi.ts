@@ -108,6 +108,7 @@ export interface QueueFollowUpParams {
 	sessionId: string;
 	clientInputId: string;
 	expectedActiveLeafId?: string | null;
+	baseLeafId?: string | null;
 	content: ContentBlock[];
 }
 
@@ -118,6 +119,7 @@ export interface FollowUpResult {
 	replayed?: boolean;
 	queue?: QueueProjection | null;
 	active_branch?: SwitchHistoryResult | null;
+	active_branch_sync?: ActiveBranchSyncResponse | null;
 }
 
 export interface InterruptResult {
@@ -146,6 +148,7 @@ export interface SwitchHistoryResult {
 	queue_revision?: number;
 	transcript_revision?: number;
 	last_event_id?: number;
+	active_branch_entry_ids?: string[] | null;
 	active_branch_entries?: TranscriptEntry[] | null;
 }
 
@@ -206,6 +209,9 @@ export interface SwitchHistoryParams {
 	leafId: string | null;
 	expectedActiveLeafId: string | null;
 	returnActiveBranch?: boolean;
+	expectedTranscriptRevision?: number | null;
+	activeBranchEntryIds?: string[];
+	missingBodyIds?: string[];
 }
 
 export interface ConfigureSessionParams {
@@ -350,6 +356,7 @@ class AgentApiClient implements AgentApi {
 			session_id: params.sessionId,
 			client_input_id: params.clientInputId,
 			expected_active_leaf_id: params.expectedActiveLeafId,
+			base_leaf_id: params.baseLeafId,
 			content: params.content
 		});
 	}
@@ -371,7 +378,10 @@ class AgentApiClient implements AgentApi {
 			session_id: params.sessionId,
 			leaf_id: params.leafId,
 			expected_active_leaf_id: params.expectedActiveLeafId,
-			return_active_branch: params.returnActiveBranch || undefined
+			return_active_branch: params.returnActiveBranch || undefined,
+			expected_transcript_revision: params.expectedTranscriptRevision ?? undefined,
+			active_branch_entry_ids: params.activeBranchEntryIds,
+			missing_body_ids: params.missingBodyIds
 		});
 	}
 

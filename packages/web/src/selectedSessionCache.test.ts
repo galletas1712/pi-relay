@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+	applyActiveBranchSyncToCache,
 	applyEntryBodies,
 	applyQueueProjection,
 	applySelectedSnapshot,
@@ -317,6 +318,84 @@ describe("selected session cache", () => {
 		expect(selectedEntries(cache).map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
 		expect(cache.entriesById.get("entry_sparse")).toBe(sparse);
 	});
+
+	it("applies active-branch suffix sync without replacing existing bodies", () => {
+		const original = entry("entry_1", null, "first", 1);
+		const appended = entry("entry_2", "entry_1", "second", 2);
+		const cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([original], { transcriptRevision: 1 }));
+
+		const applied = applyActiveBranchSyncToCache(cache, {
+			session_id: sessionId,
+			base_leaf_id: "entry_1",
+			active_leaf_id: "entry_2",
+			status: "extended",
+			entries: [appended],
+			overview: overview([], { sessionRevision: 2, transcriptRevision: 2, lastEventId: 9, activeLeafId: "entry_2" }),
+		});
+
+		expect(applied.result).toBe("applied");
+		expect(selectedEntries(applied.cache).map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
+		expect(applied.cache.entriesById.get("entry_1")).toBe(original);
+		expect(applied.cache.snapshot?.last_event_id).toBe(9);
+	});
+
+	it("requests reload when active-branch sync suffix does not extend the cached leaf", () => {
+		const original = entry("entry_1", null, "first", 1);
+		const branched = entry("entry_3", "entry_other", "branched", 3);
+		const cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([original], { transcriptRevision: 1 }));
+
+		const applied = applyActiveBranchSyncToCache(cache, {
+			session_id: sessionId,
+			base_leaf_id: "entry_1",
+			active_leaf_id: "entry_3",
+			status: "extended",
+			entries: [branched],
+			overview: overview([], { activeLeafId: "entry_3" }),
+		});
+
+		expect(applied.result).toBe("reload");
+		expect(selectedEntries(applied.cache).map((candidate) => candidate.id)).toEqual(["entry_1"]);
+	});
+
+	it("installs sparse switch branch ids while preserving cached bodies", () => {
+		const original = entry("entry_1", null, "first", 1);
+		const switched = entry("entry_2", "entry_1", "switched", 2);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([original], { transcriptRevision: 1 }));
+		cache = applyEntryBodies(cache, sessionId, [switched]);
+
+		cache = applySwitchResultToCache(cache, {
+			session_id: sessionId,
+			active_leaf_id: "entry_2",
+			activity: "idle",
+			session_revision: 3,
+			queue_revision: 1,
+			transcript_revision: 1,
+			last_event_id: 8,
+			active_branch_entry_ids: ["entry_1", "entry_2"],
+			active_branch_entries: [],
+		});
+
+		expect(cache.activeBranchEntryIds).toEqual(["entry_1", "entry_2"]);
+		expect(selectedEntries(cache).map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
+		expect(cache.snapshot?.entries?.map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
+	});
+
+	it("hydrates selected snapshot entries when sparse bodies arrive after branch ids", () => {
+		const original = entry("entry_1", null, "first", 1);
+		const switched = entry("entry_2", "entry_1", "switched", 2);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([original], { transcriptRevision: 1 }));
+		cache = applySwitchResultToCache(cache, {
+			session_id: sessionId,
+			active_leaf_id: "entry_2",
+			active_branch_entry_ids: ["entry_1", "entry_2"],
+			active_branch_entries: [],
+		});
+
+		cache = applyEntryBodies(cache, sessionId, [switched]);
+
+		expect(selectedEntries(cache).map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
+		expect(cache.snapshot?.entries?.map((candidate) => candidate.id)).toEqual(["entry_1", "entry_2"]);
+	});
 });
 
 function snapshot(
@@ -346,6 +425,24 @@ function snapshot(
 		server_time_ms: 1_700_000_000_000,
 		has_transcript_entries: entries.length > 0,
 		entries,
+	};
+}
+
+function overview(
+	entries: TranscriptEntry[],
+	options: {
+		sessionRevision?: number;
+		queueRevision?: number;
+		transcriptRevision?: number;
+		lastEventId?: number;
+		activeLeafId?: string | null;
+	} = {},
+): Omit<SessionSnapshot, "entries"> {
+	const value = snapshot(entries, options);
+	const { entries: _entries, ...rest } = value;
+	return {
+		...rest,
+		active_leaf_id: options.activeLeafId ?? value.active_leaf_id,
 	};
 }
 

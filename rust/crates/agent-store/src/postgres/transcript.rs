@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use agent_session::{
     ModelContext, ModelContextEntry, StoredSession, StoredTranscriptEntry, TranscriptStorageNode,
@@ -22,6 +22,69 @@ use super::PostgresAgentStore;
 
 const DEFAULT_TRANSCRIPT_INDEX_LIMIT: i64 = 1000;
 const MAX_TRANSCRIPT_INDEX_LIMIT: i64 = 5000;
+
+async fn active_branch_entry_ids_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        r#"
+        with recursive branch as (
+            select t.id, t.parent_id, t.item, t.sequence
+            from transcript_entries t
+            join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
+            where t.session_id = $1
+
+            union all
+
+            select parent.id, parent.parent_id, parent.item, parent.sequence
+            from transcript_entries parent
+            join branch child
+              on parent.session_id = $1
+             and parent.id = coalesce(
+                case
+                    when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
+                    else null
+                end,
+                child.parent_id
+             )
+        )
+        select id from branch order by sequence
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|row| row.get::<String, _>("id"))
+        .collect())
+}
+
+async fn transcript_entry_records_by_id_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    entry_ids: &[String],
+) -> Result<Vec<TranscriptEntryRecord>> {
+    if entry_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        select id, parent_id, timestamp_ms, sequence, item, provider_replay
+        from transcript_entries
+        where session_id=$1 and id = any($2::text[])
+        order by sequence
+        "#,
+    )
+    .bind(session_id)
+    .bind(entry_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter()
+        .map(|row| row_to_transcript_entry(&row))
+        .collect()
+}
 
 impl PostgresAgentStore {
     pub async fn load_stored_session(&self, session_id: &str) -> Result<StoredSession> {
@@ -381,39 +444,11 @@ impl PostgresAgentStore {
         &self,
         session_id: &str,
     ) -> Result<Vec<TranscriptEntryRecord>> {
-        let rows = sqlx::query(
-            r#"
-            with recursive branch as (
-                select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence
-                from transcript_entries t
-                join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
-                where t.session_id = $1
-
-                union all
-
-                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence
-                from transcript_entries parent
-                join branch child
-                  on parent.session_id = $1
-                 and parent.id = coalesce(
-                    case
-                        when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
-                        else null
-                    end,
-                    child.parent_id
-                 )
-            )
-            select id, parent_id, timestamp_ms, sequence, item, provider_replay
-            from branch
-            order by sequence
-            "#,
-        )
-        .bind(session_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| row_to_transcript_entry(&row))
-            .collect()
+        let mut tx = self.pool.begin().await?;
+        let ids = active_branch_entry_ids_tx(&mut tx, session_id).await?;
+        let records = transcript_entry_records_by_id_tx(&mut tx, session_id, &ids).await?;
+        tx.commit().await?;
+        Ok(records)
     }
 
     pub(crate) async fn branch_entries_to_leaf(
@@ -456,7 +491,9 @@ impl PostgresAgentStore {
         session_id: &str,
         leaf_id: Option<&str>,
     ) -> Result<Vec<EventFrame>> {
-        let result = self.switch_active_leaf(session_id, leaf_id, false).await?;
+        let result = self
+            .switch_active_leaf(session_id, leaf_id, false, None, None, None)
+            .await?;
         Ok(result.events)
     }
 
@@ -465,9 +502,27 @@ impl PostgresAgentStore {
         session_id: &str,
         leaf_id: Option<&str>,
         return_active_branch: bool,
+        expected_transcript_revision: Option<i64>,
+        expected_active_branch_entry_ids: Option<&[String]>,
+        missing_body_ids: Option<&[String]>,
     ) -> Result<SwitchActiveLeafResult> {
+        let expected_active_branch_entry_ids =
+            expected_active_branch_entry_ids.filter(|ids| !ids.is_empty());
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
+        let current_transcript_revision: i64 =
+            sqlx::query_scalar("select transcript_revision from sessions where id=$1")
+                .bind(session_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        if let Some(expected) = expected_transcript_revision {
+            if current_transcript_revision != expected {
+                return Err(anyhow!(
+                    "history_changed: transcript revision changed before history.switch was applied"
+                ));
+            }
+        }
         if let Some(leaf_id) = leaf_id {
             let belongs_to_session: bool = sqlx::query_scalar(
                 "select exists(select 1 from transcript_entries where session_id=$1 and id=$2::text)",
@@ -501,12 +556,54 @@ impl PostgresAgentStore {
         )
         .await?;
         let last_event_id = event.event_id;
-        tx.commit().await?;
-        let active_branch_entries = if return_active_branch {
-            Some(self.active_branch_entry_records(session_id).await?)
+        let expected_ids = expected_active_branch_entry_ids.map(|ids| ids.to_vec());
+        let active_branch_entry_ids =
+            if return_active_branch || expected_ids.is_some() || missing_body_ids.is_some() {
+                Some(active_branch_entry_ids_tx(&mut tx, session_id).await?)
+            } else {
+                None
+            };
+        if let (Some(expected_ids), Some(active_branch_entry_ids)) =
+            (expected_ids.as_deref(), active_branch_entry_ids.as_deref())
+        {
+            if expected_ids != active_branch_entry_ids {
+                return Err(anyhow!(
+                    "history_changed: target branch changed before history.switch was applied"
+                ));
+            }
+        }
+        let active_branch_entries = if let (Some(missing_ids), Some(active_branch_entry_ids)) =
+            (missing_body_ids, active_branch_entry_ids.as_deref())
+        {
+            let branch_ids = active_branch_entry_ids
+                .iter()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let requested_branch_ids = missing_ids
+                .iter()
+                .filter(|entry_id| branch_ids.contains(entry_id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+            Some(
+                transcript_entry_records_by_id_tx(&mut tx, session_id, &requested_branch_ids)
+                    .await?,
+            )
+        } else if return_active_branch {
+            Some(
+                transcript_entry_records_by_id_tx(
+                    &mut tx,
+                    session_id,
+                    active_branch_entry_ids.as_deref().unwrap_or(&[]),
+                )
+                .await?,
+            )
         } else {
             None
         };
+        tx.commit().await?;
+        let should_return_branch_ids =
+            expected_active_branch_entry_ids.is_some() || missing_body_ids.is_some();
+        let active_branch_entry_ids = active_branch_entry_ids.filter(|_| should_return_branch_ids);
         Ok(SwitchActiveLeafResult {
             session_id: session_id.to_string(),
             active_leaf_id: leaf_id.map(str::to_string),
@@ -515,6 +612,7 @@ impl PostgresAgentStore {
             queue_revision: state.queue_revision,
             transcript_revision: state.transcript_revision,
             last_event_id,
+            active_branch_entry_ids,
             active_branch_entries,
             events: vec![event],
         })
@@ -1063,6 +1161,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switch_active_leaf_can_return_branch_ids_and_sparse_bodies() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "switch-sparse-branch";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            turn_started("entry_start", None, 1),
+            user_message("entry_user", Some("entry_start"), "hello"),
+            turn_finished("entry_finish", Some("entry_user"), 1),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+        let before = store
+            .session_snapshot(session_id)
+            .await
+            .expect("snapshot loads");
+        let expected_ids = entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<Vec<_>>();
+        let missing_ids = vec!["entry_user".to_string(), "not-on-branch".to_string()];
+
+        let result = store
+            .switch_active_leaf(
+                session_id,
+                Some("entry_finish"),
+                false,
+                Some(before.transcript_revision),
+                Some(&expected_ids),
+                Some(&missing_ids),
+            )
+            .await
+            .expect("switch succeeds");
+
+        assert_eq!(
+            result.active_branch_entry_ids.as_deref(),
+            Some(expected_ids.as_slice())
+        );
+        assert_eq!(
+            result
+                .active_branch_entries
+                .expect("sparse entries returned")
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["entry_user"]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn switch_active_leaf_returns_revisions_and_active_branch() {
         let Some(db) = test_store().await else {
             eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -1097,7 +1256,7 @@ mod tests {
             .expect("snapshot loads");
 
         let result = store
-            .switch_active_leaf(session_id, Some("entry_a_finish"), true)
+            .switch_active_leaf(session_id, Some("entry_a_finish"), true, None, None, None)
             .await
             .expect("switch succeeds");
 

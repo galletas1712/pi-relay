@@ -4,6 +4,7 @@ import type {
 	EventFrame,
 	QueueProjection,
 	QueuedInput,
+	ActiveBranchSyncResponse,
 	SessionSnapshot,
 	TranscriptEntry,
 	TranscriptTreeIndex,
@@ -81,7 +82,56 @@ export function applyEntryBodies(cache: SelectedSessionCache, sessionId: string,
 	if (cache.sessionId !== sessionId) return cache;
 	const entriesById = mergeEntryBodies(cache.entriesById, entries);
 	if (entriesById === cache.entriesById) return cache;
-	return { ...cache, entriesById };
+	return {
+		...cache,
+		entriesById,
+		snapshot: cache.snapshot
+			? {
+					...cache.snapshot,
+					entries: selectedEntriesFromIds(cache.activeBranchEntryIds, entriesById),
+				}
+			: cache.snapshot,
+	};
+}
+
+export type ActiveBranchSyncApplyResult = "applied" | "reload" | "ignored";
+
+export function applyActiveBranchSyncToCache(
+	cache: SelectedSessionCache,
+	sync: ActiveBranchSyncResponse,
+): { cache: SelectedSessionCache; result: ActiveBranchSyncApplyResult } {
+	if (cache.sessionId !== sync.session_id || !cache.snapshot) return { cache, result: "ignored" };
+	if (sync.status === "branch_changed") return { cache, result: "reload" };
+
+	const overview = sync.overview;
+	let entriesById = cache.entriesById;
+	let activeBranchEntryIds = cache.activeBranchEntryIds;
+	if (sync.status === "extended") {
+		entriesById = mergeEntryBodies(entriesById, sync.entries);
+		const appendedEntryIds = appendActiveBranchEntries(cache.activeBranchEntryIds, entriesById, sync.entries);
+		if (!appendedEntryIds) return { cache, result: "reload" };
+		activeBranchEntryIds = appendedEntryIds;
+	}
+	if ((activeBranchEntryIds.at(-1) ?? null) !== sync.active_leaf_id) return { cache, result: "reload" };
+
+	const selectedEntryBodies = selectedEntriesFromIds(activeBranchEntryIds, entriesById);
+	if (selectedEntryBodies.length !== activeBranchEntryIds.length) return { cache, result: "reload" };
+	return {
+		cache: {
+			...cache,
+			snapshot: {
+				...cache.snapshot,
+				...overview,
+				active_leaf_id: sync.active_leaf_id,
+				entries: selectedEntryBodies,
+			},
+			activeBranchEntryIds: sameStringArray(cache.activeBranchEntryIds, activeBranchEntryIds)
+				? cache.activeBranchEntryIds
+				: activeBranchEntryIds,
+			entriesById,
+		},
+		result: "applied",
+	};
 }
 
 export function applyTreeIndex(cache: SelectedSessionCache, index: TranscriptTreeIndex): SelectedSessionCache {
@@ -177,14 +227,15 @@ export function applySwitchResultToCache(
 		queue_revision?: number;
 		transcript_revision?: number;
 		last_event_id?: number;
+		active_branch_entry_ids?: string[] | null;
 		active_branch_entries?: TranscriptEntry[] | null;
 	},
 ): SelectedSessionCache {
 	if (cache.sessionId !== result.session_id || !cache.snapshot) return cache;
 	const entries = result.active_branch_entries ?? null;
 	const entriesById = entries ? mergeEntryBodies(cache.entriesById, entries) : cache.entriesById;
-	const activeBranchEntryIds = entries ? entryIds(entries) : cache.activeBranchEntryIds;
-	const selectedEntryBodies = entries ? selectedEntriesFromIds(activeBranchEntryIds, entriesById) : cache.snapshot.entries ?? [];
+	const activeBranchEntryIds = result.active_branch_entry_ids ?? (entries ? entryIds(entries) : cache.activeBranchEntryIds);
+	const selectedEntryBodies = selectedEntriesFromIds(activeBranchEntryIds, entriesById);
 	return {
 		...cache,
 		snapshot: {
@@ -331,6 +382,23 @@ function reusableEntry(existing: TranscriptEntry | undefined, incoming: Transcri
 
 function entryIds(entries: TranscriptEntry[]): string[] {
 	return entries.map((entry) => entry.id);
+}
+
+function appendActiveBranchEntries(
+	currentIds: string[],
+	entriesById: Map<string, TranscriptEntry>,
+	entries: TranscriptEntry[],
+): string[] | null {
+	if (entries.length === 0) return currentIds;
+	let nextIds = currentIds;
+	for (const entry of entries) {
+		if (nextIds.includes(entry.id)) continue;
+		const currentLeafId = nextIds.at(-1) ?? null;
+		if (displayParentIdForEntry(entry, entriesById) !== currentLeafId) return null;
+		if (nextIds === currentIds) nextIds = [...currentIds];
+		nextIds.push(entry.id);
+	}
+	return nextIds;
 }
 
 function selectedEntriesFromIds(ids: string[], entriesById: Map<string, TranscriptEntry>): TranscriptEntry[] {
