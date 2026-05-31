@@ -75,6 +75,10 @@ Implementation status:
   targets without an entry id.
 - Added a compact-node switch-target test proving the compact preview is
   truncated and `restoreText` is absent.
+- Follow-up clarification: `/switch` must not show a partial target list while
+  the compact index is still paging. The compact dialog now shows only the
+  loading state until `treeComplete` is true, unless a complete fresh tree is
+  already cached.
 
 ### PR 2: UI transcript projection without raw provider replay
 

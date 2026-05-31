@@ -1379,7 +1379,7 @@ export function App() {
 			const treeComplete = cache.sessionId === sessionId && treeRevisionMatches && cache.treeComplete;
 			setHistoryDialog({
 				sessionId,
-				nodes: cachedNodes,
+				nodes: treeComplete ? cachedNodes : [],
 				activeLeafId: loadedSnapshot.active_leaf_id,
 				loading: !treeComplete,
 				error: null,
@@ -1390,7 +1390,7 @@ export function App() {
 						if (!current || current.sessionId !== sessionId) return current;
 						return {
 							...current,
-							nodes,
+							nodes: complete ? nodes : [],
 							activeLeafId: selectedCacheRef.current.treeActiveLeafId ?? loadedSnapshot.active_leaf_id,
 							loading: !complete,
 							error: null,

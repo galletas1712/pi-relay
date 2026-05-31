@@ -144,7 +144,7 @@ function historyPickerContent({
 	onSwitch,
 	onToggleBranch,
 }: HistoryPickerContentParams): ReactNode {
-	if (loading && renderedRows.length === 0) {
+	if (loading) {
 		return (
 			<div className="history-loading">
 				<Loader2 className="spin" size={16} />
