@@ -1,17 +1,19 @@
 use std::collections::HashMap;
 
-use agent_session::{SessionAction, SessionActionKind, SessionEvent, StoredTranscriptEntry};
+use agent_session::{SessionAction, SessionActionKind, SessionEvent};
 use agent_vocab::TranscriptItem;
 use anyhow::Result;
 use serde_json::{json, Value};
 use sqlx::{Executor, Postgres, Transaction};
 
-use crate::{EventFrame, EventType, SessionActivity, TranscriptEntryBodyMode};
+use crate::{
+    EventFrame, EventType, SessionActivity, TranscriptEntryBodyMode, TranscriptEntryRecord,
+};
 
 use super::action_records::{action_payload, ActionKey};
 use super::rows::row_to_event;
 use super::transcript::{
-    session_state_for_event_tx, transcript_entry_record_tx, tree_node_from_entry,
+    session_state_for_event_tx, transcript_entry_record_tx, tree_node_from_entry, SessionEventState,
 };
 use super::PostgresAgentStore;
 
@@ -129,7 +131,8 @@ pub(super) async fn insert_session_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     event: &SessionEvent,
-    entries_by_id: &HashMap<&str, StoredTranscriptEntry>,
+    state: Option<&SessionEventState>,
+    entries_by_id: &HashMap<String, TranscriptEntryRecord>,
     action_rows: &HashMap<ActionKey, String>,
 ) -> Result<Vec<EventFrame>> {
     match event {
@@ -137,6 +140,7 @@ pub(super) async fn insert_session_event_tx(
             insert_transcript_item_events_tx(
                 tx,
                 session_id,
+                state,
                 entries_by_id.get(entry_id.as_str()),
                 entry_id,
                 item,
@@ -218,13 +222,27 @@ pub(super) async fn insert_session_event_tx(
 pub(super) async fn insert_transcript_item_events_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
-    entry: Option<&StoredTranscriptEntry>,
+    state: Option<&SessionEventState>,
+    entry: Option<&TranscriptEntryRecord>,
     entry_id: &str,
     item: &TranscriptItem,
 ) -> Result<Vec<EventFrame>> {
-    let state = session_state_for_event_tx(tx, session_id).await?;
-    let record =
-        transcript_entry_record_tx(tx, session_id, entry_id, TranscriptEntryBodyMode::Ui).await?;
+    let fallback_state;
+    let state = if let Some(state) = state {
+        state
+    } else {
+        fallback_state = session_state_for_event_tx(tx, session_id).await?;
+        &fallback_state
+    };
+    let fallback_record;
+    let record = if let Some(entry) = entry {
+        Some(entry)
+    } else {
+        fallback_record =
+            transcript_entry_record_tx(tx, session_id, entry_id, TranscriptEntryBodyMode::Ui)
+                .await?;
+        fallback_record.as_ref()
+    };
     let entry_payload = if let Some(entry) = record.as_ref() {
         Some(json!({
             "id": entry.id,
@@ -234,16 +252,9 @@ pub(super) async fn insert_transcript_item_events_tx(
             "item": entry.item,
         }))
     } else {
-        entry.map(|entry| {
-            json!({
-                "id": entry.id,
-                "parent_id": entry.parent_id,
-                "timestamp_ms": entry.timestamp_ms,
-                "item": entry.item,
-            })
-        })
+        None
     };
-    let tree_node = record.as_ref().map(tree_node_from_entry);
+    let tree_node = record.map(tree_node_from_entry);
     let mut frames = vec![
         insert_event_with_activity_tx(
             tx,

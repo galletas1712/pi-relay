@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use agent_session::{SessionAction, SessionEvent, StoredTranscriptEntry};
+use agent_session::{SessionAction, SessionEvent};
 use anyhow::{anyhow, Context, Result};
 use serde_json::json;
 use sqlx::{Postgres, Row, Transaction};
@@ -15,7 +15,7 @@ use super::events::{insert_event_tx, insert_session_event_tx};
 use super::queue::{bump_revisions_tx, queue_event_payload, queue_state_tx};
 use super::rows::row_text;
 use super::sql::{action_is_unfinished, lock_session_tx, QUEUED_INPUT_DISPATCH_ORDER};
-use super::transcript::insert_entry_tx;
+use super::transcript::{insert_entry_tx, session_state_for_event_tx};
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
@@ -85,10 +85,14 @@ pub(super) async fn persist_outputs_tx(
         }
     }
 
+    let mut entry_records_by_id = HashMap::new();
     for entry in entries {
-        insert_entry_tx(tx, session_id, entry)
+        if let Some(record) = insert_entry_tx(tx, session_id, entry)
             .await
-            .with_context(|| format!("insert transcript entry {}", entry.id))?;
+            .with_context(|| format!("insert transcript entry {}", entry.id))?
+        {
+            entry_records_by_id.insert(record.id.clone(), record);
+        }
     }
     sqlx::query("update sessions set active_leaf_id=$2::text, updated_at=now() where id=$1")
         .bind(session_id)
@@ -232,21 +236,6 @@ pub(super) async fn persist_outputs_tx(
         });
     }
 
-    let entries_by_id = entries
-        .iter()
-        .map(|entry| {
-            (
-                entry.id.as_str(),
-                StoredTranscriptEntry {
-                    id: entry.id.clone(),
-                    parent_id: entry.parent_id.clone(),
-                    timestamp_ms: entry.timestamp_ms,
-                    item: entry.item.clone(),
-                    provider_replay: entry.provider_replay.clone(),
-                },
-            )
-        })
-        .collect::<HashMap<_, _>>();
     let queue_changed = consumed_input_event.is_some();
     let session_changed = queue_changed
         || transcript_changed
@@ -285,9 +274,29 @@ pub(super) async fn persist_outputs_tx(
             );
         }
     }
+    // This is the daemon progress hot path: after persisting output entries, do
+    // not re-query each just-inserted transcript row while emitting websocket
+    // events. Use the INSERT ... RETURNING records collected above, and read the
+    // revision/head state once after the revision bump. The event helper keeps a
+    // fallback lookup for rare idempotent-conflict or recovery/compaction paths.
+    let has_transcript_events = session_events.iter().any(|event| {
+        matches!(event, SessionEvent::TranscriptItemAppended { .. })
+    });
+    let event_state = if has_transcript_events {
+        Some(session_state_for_event_tx(tx, session_id).await?)
+    } else {
+        None
+    };
     for event in session_events {
         frames.extend(
-            insert_session_event_tx(tx, session_id, event, &entries_by_id, &action_rows)
+            insert_session_event_tx(
+                tx,
+                session_id,
+                event,
+                event_state.as_ref(),
+                &entry_records_by_id,
+                &action_rows,
+            )
                 .await
                 .with_context(|| format!("insert session event {event:?}"))?,
         );

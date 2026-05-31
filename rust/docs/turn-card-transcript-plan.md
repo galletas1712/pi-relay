@@ -180,6 +180,13 @@ Implementation status:
 - Transcript append events incrementally update the current card summary and
   any already-expanded turn detail. The canonical `transcript.turns` refresh is
   still used when the cache cannot prove an event extends the selected branch.
+- Hot-path pitfall fixed during review: daemon progress should not block on
+  extra per-entry transcript reads between model/tool/model work. The output
+  persistence path now reuses the `insert into transcript_entries ... returning`
+  record for websocket append payloads and reads revision/head state once after
+  the revision bump, rather than querying each just-inserted row again while
+  emitting events. The fallback lookup remains only for rare duplicate-entry,
+  recovery, and compaction paths.
 - Pitfall: this implementation still derives cards by walking the active branch
   in SQL. It deliberately avoids selecting raw provider replay and only selects
   full `item` JSON for the user/assistant bodies that collapsed cards actually

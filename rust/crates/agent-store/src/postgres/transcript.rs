@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use agent_session::{
     ModelContext, ModelContextEntry, StoredSession, StoredTranscriptEntry, TranscriptStorageNode,
@@ -889,8 +889,11 @@ impl PostgresAgentStore {
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
+        let mut inserted_records = HashMap::new();
         for entry in entries {
-            insert_stored_entry_tx(&mut tx, session_id, entry).await?;
+            if let Some(record) = insert_stored_entry_tx(&mut tx, session_id, entry).await? {
+                inserted_records.insert(record.id.clone(), record);
+            }
         }
         let unfinished_actions = action_is_unfinished(None);
         let query = format!(
@@ -913,7 +916,8 @@ impl PostgresAgentStore {
                 insert_transcript_item_events_tx(
                     &mut tx,
                     session_id,
-                    Some(entry),
+                    Some(&state),
+                    inserted_records.get(entry.id.as_str()),
                     &entry.id,
                     &entry.item,
                 )
@@ -1376,7 +1380,7 @@ pub(super) async fn insert_entry_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     entry: &TranscriptStorageNode,
-) -> Result<()> {
+) -> Result<Option<TranscriptEntryRecord>> {
     let stored = StoredTranscriptEntry {
         id: entry.id.clone(),
         parent_id: entry.parent_id.clone(),
@@ -1391,13 +1395,14 @@ pub(super) async fn insert_stored_entry_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     entry: &StoredTranscriptEntry,
-) -> Result<()> {
+) -> Result<Option<TranscriptEntryRecord>> {
     let turn_id = entry.item.turn_id().map(|turn_id| turn_id.0 as i64);
-    sqlx::query(
+    let row = sqlx::query(
         r#"
         insert into transcript_entries (session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id)
         values ($1::text, $2::text, $3::text, $4, $5, $6, $7::bigint)
         on conflict (session_id, id) do nothing
+        returning id, parent_id, timestamp_ms, sequence, item
         "#,
     )
     .bind(session_id)
@@ -1407,9 +1412,19 @@ pub(super) async fn insert_stored_entry_tx(
     .bind(serde_json::to_value(&entry.item)?)
     .bind(serde_json::to_value(&entry.provider_replay)?)
     .bind(turn_id)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    Ok(())
+    row.map(|row| {
+        Ok(TranscriptEntryRecord {
+            id: row.get("id"),
+            parent_id: row.get("parent_id"),
+            timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
+            sequence: row.get("sequence"),
+            item: serde_json::from_value(row.get("item"))?,
+            provider_replay: Vec::new(),
+        })
+    })
+    .transpose()
 }
 
 pub(super) fn model_context_from_entries(entries: Vec<StoredTranscriptEntry>) -> ModelContext {
