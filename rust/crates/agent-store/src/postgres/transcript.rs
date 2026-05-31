@@ -30,10 +30,10 @@ fn provider_replay_select(body_mode: TranscriptEntryBodyMode) -> &'static str {
     }
 }
 
-fn branch_provider_replay_select(body_mode: TranscriptEntryBodyMode) -> &'static str {
+fn aliased_provider_replay_select(alias: &str, body_mode: TranscriptEntryBodyMode) -> String {
     match body_mode {
-        TranscriptEntryBodyMode::Full => "t.provider_replay",
-        TranscriptEntryBodyMode::Ui => "'[]'::jsonb as provider_replay",
+        TranscriptEntryBodyMode::Full => format!("{alias}.provider_replay"),
+        TranscriptEntryBodyMode::Ui => "'[]'::jsonb as provider_replay".to_string(),
     }
 }
 
@@ -109,18 +109,19 @@ async fn active_branch_entry_records_tx(
     body_mode: TranscriptEntryBodyMode,
 ) -> Result<Vec<TranscriptEntryRecord>> {
     let provider_replay_select = provider_replay_select(body_mode);
-    let branch_provider_replay_select = branch_provider_replay_select(body_mode);
+    let leaf_provider_replay_select = aliased_provider_replay_select("t", body_mode);
+    let parent_provider_replay_select = aliased_provider_replay_select("parent", body_mode);
     let query = format!(
         r#"
         with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, {branch_provider_replay_select}, t.sequence
+            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence
             from transcript_entries t
             join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
             where t.session_id = $1
 
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {branch_provider_replay_select}, parent.sequence
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
@@ -462,18 +463,19 @@ impl PostgresAgentStore {
         body_mode: TranscriptEntryBodyMode,
     ) -> Result<Vec<TranscriptEntryRecord>> {
         let provider_replay_select = provider_replay_select(body_mode);
-        let branch_provider_replay_select = branch_provider_replay_select(body_mode);
+        let leaf_provider_replay_select = aliased_provider_replay_select("t", body_mode);
+        let parent_provider_replay_select = aliased_provider_replay_select("parent", body_mode);
         let query = format!(
             r#"
             with recursive branch as (
-                select t.id, t.parent_id, t.timestamp_ms, t.item, {branch_provider_replay_select}, t.sequence, 0 as depth
+                select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence, 0 as depth
                 from transcript_entries t
                 join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
                 where t.session_id = $1
 
                 union all
 
-                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {branch_provider_replay_select}, parent.sequence, child.depth + 1
+                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence, child.depth + 1
                 from transcript_entries parent
                 join branch child
                   on parent.session_id = $1
@@ -1357,6 +1359,75 @@ mod tests {
 
         assert!(ui_entries.entries[0].provider_replay.is_empty());
         assert_eq!(full_entries.entries[0].provider_replay.len(), 1);
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn active_branch_full_projection_preserves_provider_replay() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "active-branch-full-projection";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            turn_started("entry_start", None, 1),
+            assistant_message_with_replay("entry_assistant", Some("entry_start"), "hello"),
+            turn_finished("entry_finish", Some("entry_assistant"), 1),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+
+        let ui_entries = store
+            .transcript_entries_for_scope(
+                session_id,
+                TranscriptEntryScope::ActiveBranch,
+                TranscriptEntryBodyMode::Ui,
+            )
+            .await
+            .expect("ui active branch loads");
+        let full_entries = store
+            .transcript_entries_for_scope(
+                session_id,
+                TranscriptEntryScope::ActiveBranch,
+                TranscriptEntryBodyMode::Full,
+            )
+            .await
+            .expect("full active branch loads");
+        let synced_entries = store
+            .sync_active_branch(
+                session_id,
+                Some("entry_start"),
+                TranscriptEntryBodyMode::Full,
+            )
+            .await
+            .expect("full active branch suffix syncs")
+            .entries;
+
+        let ui_assistant = ui_entries
+            .iter()
+            .find(|entry| entry.id == "entry_assistant")
+            .expect("ui assistant entry");
+        let full_assistant = full_entries
+            .iter()
+            .find(|entry| entry.id == "entry_assistant")
+            .expect("full assistant entry");
+        let synced_assistant = synced_entries
+            .iter()
+            .find(|entry| entry.id == "entry_assistant")
+            .expect("synced assistant entry");
+
+        assert!(ui_assistant.provider_replay.is_empty());
+        assert_eq!(full_assistant.provider_replay.len(), 1);
+        assert_eq!(synced_assistant.provider_replay.len(), 1);
 
         db.cleanup().await;
     }
