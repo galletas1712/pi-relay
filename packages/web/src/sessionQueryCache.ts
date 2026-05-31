@@ -1,5 +1,6 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { queryKeys, type EntryScope } from "./queryKeys.ts";
+import { displayParentIdForEntry } from "./displayParent.ts";
 import type { ActiveBranchSyncResponse, EventFrame, SessionSnapshot, SessionSummary } from "./types.ts";
 
 export function patchSessionList(
@@ -109,7 +110,7 @@ export function applyActiveBranchSync(snapshot: SessionSnapshot | undefined, syn
 		for (const entry of sync.entries) {
 			if (nextEntries.some((candidate) => candidate.id === entry.id)) continue;
 			const currentLeafId = nextEntries.at(-1)?.id ?? null;
-			if (entry.parent_id !== currentLeafId) return "reload";
+			if (displayParentIdForEntry(entry) !== currentLeafId) return "reload";
 			nextEntries.push(entry);
 		}
 	}

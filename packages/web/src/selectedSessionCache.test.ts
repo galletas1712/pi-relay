@@ -6,6 +6,7 @@ import {
 	applySwitchResultToCache,
 	applyTranscriptAppendedEvent,
 	applyTreeIndex,
+	branchFromTree,
 	emptySelectedSessionCache,
 	mergeSessionActivityEvent,
 	selectedEntries,
@@ -237,6 +238,50 @@ describe("selected session cache", () => {
 		expect(cache.treeComplete).toBe(false);
 	});
 
+	it("appends compaction roots that continue from the current branch", () => {
+		const first = entry("entry_1", null, "first", 1);
+		const compact = compactionEntry("compact_1", "entry_1", 2);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([first], { transcriptRevision: 1 }));
+		cache = applyTreeIndex(
+			cache,
+			treeIndex([treeNode("entry_1", null, 1)], {
+				afterSequence: 0,
+				complete: true,
+				maxSequence: 1,
+				transcriptRevision: 1,
+				activeLeafId: "entry_1",
+			}),
+		);
+
+		const applied = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(compact, 5, 2));
+
+		expect(applied.result).toBe("applied");
+		expect(selectedEntries(applied.cache).map((candidate) => candidate.id)).toEqual(["entry_1", "compact_1"]);
+		expect(applied.cache.treeNodesById.get("compact_1")?.source_leaf_id).toBe("entry_1");
+	});
+
+	it("walks tree branches through compaction source leaves", () => {
+		let cache = applyTreeIndex(
+			emptySelectedSessionCache(sessionId),
+			treeIndex(
+				[
+					treeNode("entry_1", null, 1),
+					treeNode("compact_1", null, 2, "compaction_summary", "entry_1"),
+					treeNode("entry_2", "compact_1", 3),
+				],
+				{
+					afterSequence: 0,
+					complete: true,
+					maxSequence: 3,
+					transcriptRevision: 1,
+					activeLeafId: "entry_2",
+				},
+			),
+		);
+
+		expect(branchFromTree(cache, "entry_2").map((node) => node.id)).toEqual(["entry_1", "compact_1", "entry_2"]);
+	});
+
 	it("requests a refresh when transcript append events move to another branch", () => {
 		const first = entry("entry_1", null, "first", 1);
 		const branched = entry("entry_3", "entry_other", "branched", 3);
@@ -304,6 +349,24 @@ function snapshot(
 	};
 }
 
+function compactionEntry(id: string, sourceLeafId: string, sequence: number): TranscriptEntry {
+	return {
+		id,
+		parent_id: null,
+		timestamp_ms: 1_700_000_000_000 + sequence,
+		sequence,
+		item: {
+			type: "compaction_summary",
+			source_session_id: sessionId,
+			source_leaf_id: sourceLeafId,
+			summary: "summarized",
+			tokens_before: null,
+			last_turn_id: 1,
+		},
+		provider_replay: [],
+	};
+}
+
 function entry(id: string, parentId: string | null, text: string, sequence: number): TranscriptEntry {
 	return {
 		id,
@@ -320,10 +383,12 @@ function treeNode(
 	parentId: string | null,
 	sequence: number,
 	itemType: TranscriptTreeNode["item_type"] = "user_message",
+	sourceLeafId: string | null = null,
 ): TranscriptTreeNode {
 	return {
 		id,
 		parent_id: parentId,
+		source_leaf_id: sourceLeafId,
 		timestamp_ms: 1_700_000_000_000 + sequence,
 		sequence,
 		item_type: itemType,
@@ -377,6 +442,7 @@ function queueProjection(queueRevision: number, activity: QueueProjection["activ
 }
 
 function transcriptAppendedEvent(entryRecord: TranscriptEntry, eventId: number, transcriptRevision: number): EventFrame {
+	const sourceLeafId = entryRecord.item.type === "compaction_summary" ? entryRecord.item.source_leaf_id : null;
 	return {
 		event_id: eventId,
 		event: "transcript.appended",
@@ -384,7 +450,7 @@ function transcriptAppendedEvent(entryRecord: TranscriptEntry, eventId: number, 
 		data: {
 			entry_id: entryRecord.id,
 			entry: entryRecord,
-			tree_node: treeNode(entryRecord.id, entryRecord.parent_id, entryRecord.sequence ?? 0, entryRecord.item.type),
+			tree_node: treeNode(entryRecord.id, entryRecord.parent_id, entryRecord.sequence ?? 0, entryRecord.item.type, sourceLeafId),
 			active_leaf_id: entryRecord.id,
 			session_revision: transcriptRevision,
 			queue_revision: 1,

@@ -500,6 +500,12 @@ root switch. Transcript entries returned by websocket RPCs include the Postgres
 token. Use `transcript_revision` to decide whether cached transcript data is
 fresh.
 
+For UI display, `"active_branch"` follows compaction provenance: a
+`compaction_summary` entry with `parent_id = null` is rendered after its
+`source_leaf_id` lineage when that source leaf is available. This does not change
+the persisted transcript topology or model-visible ancestry; model context and
+`history.context` continue to follow stored `parent_id` links only.
+
 ## Transcript RPC
 
 ### `transcript.index`
@@ -526,6 +532,7 @@ Result shape:
     {
       "id": "entry_1",
       "parent_id": null,
+      "source_leaf_id": null,
       "timestamp_ms": 123,
       "sequence": 1,
       "item_type": "user_message",

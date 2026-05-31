@@ -1,4 +1,5 @@
 import { branchEntriesFor } from "./historyTargets.ts";
+import { displayParentIdForEntry, displayParentIdForNode } from "./displayParent.ts";
 import type {
 	EventFrame,
 	QueueProjection,
@@ -212,7 +213,9 @@ export function applyTranscriptAppendedEvent(cache: SelectedSessionCache, event:
 	const activeLeafId = stringOrNull(event.data.active_leaf_id);
 	if (!entry) return { cache, result: "refresh" };
 	const currentLeafId = cache.activeBranchEntryIds.at(-1) ?? null;
-	const appendsToActiveBranch = entry.parent_id === currentLeafId || (currentLeafId === null && entry.parent_id === null);
+	const entryDisplayParentId = displayParentIdForEntry(entry);
+	const appendsToActiveBranch =
+		entryDisplayParentId === currentLeafId || (currentLeafId === null && entryDisplayParentId === null);
 	const entriesById = new Map(cache.entriesById);
 	entriesById.set(entry.id, entry);
 	let activeBranchEntryIds = cache.activeBranchEntryIds;
@@ -259,7 +262,7 @@ export function branchFromTree(cache: SelectedSessionCache, leafId: string | nul
 		if (!node) break;
 		result.push(node);
 		seen.add(cursor);
-		cursor = node.parent_id;
+		cursor = displayParentIdForNode(node, cache.treeNodesById);
 	}
 	return result.reverse();
 }
@@ -290,7 +293,7 @@ function buildTreeChildren(order: string[], byId: Map<string, TranscriptTreeNode
 	for (const id of order) {
 		const node = byId.get(id);
 		if (!node) continue;
-		const parentId = node.parent_id && byId.has(node.parent_id) ? node.parent_id : null;
+		const parentId = displayParentIdForNode(node, byId);
 		const siblings = children.get(parentId) ?? [];
 		siblings.push(id);
 		children.set(parentId, siblings);

@@ -350,7 +350,13 @@ impl PostgresAgentStore {
                 from transcript_entries parent
                 join branch child
                   on parent.session_id = $1
-                 and parent.id = child.parent_id
+                 and parent.id = coalesce(
+                    case
+                        when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
+                        else null
+                    end,
+                    child.parent_id
+                 )
                 where child.id <> $2::text
             ),
             base as (
@@ -389,7 +395,13 @@ impl PostgresAgentStore {
                 from transcript_entries parent
                 join branch child
                   on parent.session_id = $1
-                 and parent.id = child.parent_id
+                 and parent.id = coalesce(
+                    case
+                        when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
+                        else null
+                    end,
+                    child.parent_id
+                 )
             )
             select id, parent_id, timestamp_ms, sequence, item, provider_replay
             from branch
@@ -651,6 +663,10 @@ fn tree_node_from_item(
         TranscriptItem::TurnFinished { outcome, .. } => Some(*outcome),
         _ => None,
     };
+    let source_leaf_id = match item {
+        TranscriptItem::CompactionSummary(summary) => Some(summary.source_leaf_id.clone()),
+        _ => None,
+    };
     let can_switch_to = is_switch_boundary_item(item);
     let edit_target_leaf_id = match item {
         TranscriptItem::UserMessage(_) => previous_boundary_leaf_id_placeholder(&parent_id),
@@ -659,6 +675,7 @@ fn tree_node_from_item(
     TranscriptTreeNodeRecord {
         id,
         parent_id,
+        source_leaf_id,
         timestamp_ms,
         sequence,
         item_type,
@@ -952,13 +969,18 @@ mod tests {
         )
     }
 
-    fn compaction_summary(id: &str, parent_id: Option<&str>, session_id: &str) -> TranscriptStorageNode {
+    fn compaction_summary(
+        id: &str,
+        parent_id: Option<&str>,
+        session_id: &str,
+        source_leaf_id: &str,
+    ) -> TranscriptStorageNode {
         entry(
             id,
             parent_id,
             TranscriptItem::CompactionSummary(CompactionSummary::new(
                 session_id,
-                "source_leaf",
+                source_leaf_id,
                 "summary",
                 None,
                 TurnId(0),
@@ -1051,7 +1073,10 @@ mod tests {
         create_session(store, session_id).await;
 
         let entries = vec![
-            compaction_summary("entry_root", None, session_id),
+            turn_started("entry_source_start", None, 1),
+            user_message("entry_source_user", Some("entry_source_start"), "source"),
+            turn_finished("entry_source_finish", Some("entry_source_user"), 1),
+            compaction_summary("entry_root", None, session_id, "entry_source_finish"),
             turn_started("entry_a_start", Some("entry_root"), 1),
             user_message("entry_a_user", Some("entry_a_start"), "branch a"),
             turn_finished("entry_a_finish", Some("entry_a_user"), 1),
@@ -1093,6 +1118,9 @@ mod tests {
                 .map(|entry| entry.id.as_str())
                 .collect::<Vec<_>>(),
             vec![
+                "entry_source_start",
+                "entry_source_user",
+                "entry_source_finish",
                 "entry_root",
                 "entry_a_start",
                 "entry_a_user",
@@ -1118,7 +1146,12 @@ mod tests {
         let (frames, _) = store
             .persist_outputs(
                 session_id,
-                OutputBatch::new(std::slice::from_ref(&first), Some("entry_user"), &events, &[]),
+                OutputBatch::new(
+                    std::slice::from_ref(&first),
+                    Some("entry_user"),
+                    &events,
+                    &[],
+                ),
             )
             .await
             .expect("transcript persists");
@@ -1140,18 +1173,9 @@ mod tests {
             frame.data["session_revision"].as_i64(),
             Some(snapshot.session_revision)
         );
-        assert_eq!(
-            frame.data["entry"]["sequence"].as_i64(),
-            Some(1)
-        );
-        assert_eq!(
-            frame.data["tree_node"]["sequence"].as_i64(),
-            Some(1)
-        );
-        assert_eq!(
-            frame.data["active_leaf_id"].as_str(),
-            Some("entry_user")
-        );
+        assert_eq!(frame.data["entry"]["sequence"].as_i64(), Some(1));
+        assert_eq!(frame.data["tree_node"]["sequence"].as_i64(), Some(1));
+        assert_eq!(frame.data["active_leaf_id"].as_str(), Some("entry_user"));
 
         db.cleanup().await;
     }

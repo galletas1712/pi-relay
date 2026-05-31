@@ -7,6 +7,7 @@ import {
 	modelStepTitle,
 	terminalModelStep
 } from "./turnView.ts";
+import { displayParentIdForEntry, displayParentIdForNode } from "./displayParent.ts";
 import type { TranscriptEntry, TranscriptTreeNode, TurnOutcome } from "./types.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
 
@@ -61,7 +62,7 @@ export function nodeBranchIds(nodes: TranscriptTreeNode[], leafId: string | null
 		if (!node) break;
 		branch.push(node.id);
 		seen.add(cursor);
-		cursor = node.parent_id;
+		cursor = displayParentIdForNode(node, byId);
 	}
 	return branch.reverse();
 }
@@ -89,7 +90,7 @@ function historyBranchPointOptionsFromNodes(
 function compactMetaById(nodes: TranscriptTreeNode[], byId: Map<string, TranscriptTreeNode>): Map<string, CompactEntryMeta> {
 	const metaById = new Map<string, CompactEntryMeta>();
 	for (const node of nodes) {
-		const parentId = node.parent_id && byId.has(node.parent_id) ? node.parent_id : null;
+		const parentId = displayParentIdForNode(node, byId);
 		const parent = parentId ? byId.get(parentId) : null;
 		const parentMeta = parentId ? metaById.get(parentId) : null;
 		const previousBoundaryId = parent && isHistoryBoundaryNode(parent) ? parent.id : (parentMeta?.previousBoundaryId ?? null);
@@ -295,7 +296,7 @@ function createHistoryIndex(entries: TranscriptEntry[]): HistoryIndex {
 	const children = new Map<string | null, TranscriptEntry[]>();
 	const metaById = new Map<string, EntryMeta>();
 	for (const entry of entries) {
-		const parentId = entry.parent_id && byId.has(entry.parent_id) ? entry.parent_id : null;
+		const parentId = displayParentIdForEntry(entry, byId);
 		const siblings = children.get(parentId) ?? [];
 		siblings.push(entry);
 		children.set(parentId, siblings);
@@ -319,7 +320,7 @@ function createHistoryIndex(entries: TranscriptEntry[]): HistoryIndex {
 			if (!entry) break;
 			branch.push(entry);
 			seen.add(cursor);
-			cursor = entry.parent_id;
+			cursor = displayParentIdForEntry(entry, byId);
 		}
 		branch.reverse();
 		branchCache.set(leafId, branch);

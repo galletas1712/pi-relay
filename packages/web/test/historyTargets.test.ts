@@ -3,9 +3,10 @@ import {
 	branchEntriesFor,
 	historyEntryDisplay,
 	historySwitchOptions,
+	nodeBranchIds,
 	historyTreeRows
 } from "../src/historyTargets.ts";
-import type { TranscriptEntry } from "../src/types.ts";
+import type { TranscriptEntry, TranscriptTreeNode } from "../src/types.ts";
 
 const baseTime = Date.UTC(2026, 0, 1, 12, 0, 0);
 
@@ -79,6 +80,70 @@ describe("branchEntriesFor", () => {
 			"finish1",
 			"sibling"
 		]);
+	});
+
+	it("uses compaction source leaves as display parents", () => {
+		expect(branchEntriesFor(compactedFixtureEntries(), "compact1").map((item) => item.id)).toEqual([
+			"start1",
+			"user1",
+			"assistant1",
+			"finish1",
+			"start2",
+			"user2",
+			"assistant2",
+			"finish2",
+			"compact1"
+		]);
+		expect(branchEntriesFor(compactedFixtureEntries(), "finish3").map((item) => item.id)).toEqual([
+			"start1",
+			"user1",
+			"assistant1",
+			"finish1",
+			"start2",
+			"user2",
+			"assistant2",
+			"finish2",
+			"compact1",
+			"start3",
+			"user3",
+			"finish3"
+		]);
+	});
+
+});
+
+function node(
+	id: string,
+	parent_id: string | null,
+	sequence: number,
+	item_type: TranscriptTreeNode["item_type"],
+	source_leaf_id: string | null = null
+): TranscriptTreeNode {
+	return {
+		id,
+		parent_id,
+		source_leaf_id,
+		timestamp_ms: baseTime + sequence,
+		sequence,
+		item_type,
+		turn_id: item_type === "turn_finished" || item_type === "compaction_summary" ? sequence : null,
+		outcome: item_type === "turn_finished" ? "Graceful" : null,
+		can_switch_to: item_type === "turn_finished" || item_type === "compaction_summary",
+		edit_target_leaf_id: null,
+		display_hint: id
+	};
+}
+
+describe("nodeBranchIds", () => {
+	it("uses compact tree-node source leaves as display parents", () => {
+		const nodes: TranscriptTreeNode[] = [
+			node("start1", null, 1, "turn_started"),
+			node("finish1", "start1", 2, "turn_finished"),
+			node("compact1", null, 3, "compaction_summary", "finish1"),
+			node("finish2", "compact1", 4, "turn_finished")
+		];
+
+		expect(nodeBranchIds(nodes, "finish2")).toEqual(["start1", "finish1", "compact1", "finish2"]);
 	});
 });
 
@@ -160,6 +225,26 @@ describe("historyTreeRows", () => {
 			["user2", 0, true],
 			["assistant2", 0, true],
 			["finish2", 0, true],
+			["sibling", 1, false]
+		]);
+	});
+
+	it("renders compaction roots as continuations of their source branch", () => {
+		const rows = historyTreeRows(compactedFixtureEntries(), "finish3");
+
+		expect(rows.map((row) => [row.entry.id, row.depth, row.isOnActivePath])).toEqual([
+			["start1", 0, true],
+			["user1", 0, true],
+			["assistant1", 0, true],
+			["finish1", 0, true],
+			["start2", 0, true],
+			["user2", 0, true],
+			["assistant2", 0, true],
+			["finish2", 0, true],
+			["compact1", 0, true],
+			["start3", 0, true],
+			["user3", 0, true],
+			["finish3", 0, true],
 			["sibling", 1, false]
 		]);
 	});

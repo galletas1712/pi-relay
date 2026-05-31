@@ -81,6 +81,32 @@ describe("assistantRenderParts", () => {
 	});
 });
 
+describe("MessageList compaction display", () => {
+	it("keeps pre-compaction entries visible by default", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[
+					turnStartedEntry("start", 1, 1),
+					userEntryWithParent("user", "start", "before compaction"),
+					turnFinishedEntry("finish", "user", 1, "Graceful"),
+					compactionSummaryEntry("compact", null, 1, 2, null, "finish"),
+				]}
+				activeLeafId="compact"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain("before compaction");
+		expect(html).toContain("Context compacted through turn 1");
+		expect(html).toContain("Hide prior");
+		expect(html).not.toContain("prior entries hidden");
+	});
+});
+
 function toolCall(id: string, toolName: string): AssistantItem {
 	return { type: "tool_call", id, tool_name: toolName, args_json: "{}" };
 }
@@ -457,6 +483,7 @@ function compactionSummaryEntry(
 	lastTurnId: number,
 	timestampMs: number,
 	turnStartedAtMs?: number | null,
+	sourceLeafId = "source_leaf",
 ): TranscriptEntry {
 	return {
 		id,
@@ -465,7 +492,7 @@ function compactionSummaryEntry(
 		item: {
 			type: "compaction_summary",
 			source_session_id: "session_a",
-			source_leaf_id: "source_leaf",
+			source_leaf_id: sourceLeafId,
 			summary: "summary",
 			tokens_before: null,
 			last_turn_id: lastTurnId,

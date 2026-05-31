@@ -289,9 +289,9 @@ export const MessageList = memo(function MessageList({
 		for (const node of displayNodes) ids.set(node.key, nodeLeafId(node));
 		return ids;
 	}, [displayNodes]);
-	// Each compaction collapses the display nodes between itself and the
-	// previous compaction (or session start). The count is precomputed so the
-	// marker's "show N hidden" label stays accurate as turns stream in.
+	// Each compaction can hide the display nodes between itself and the previous
+	// compaction (or session start). The count is precomputed so the marker's
+	// "show N hidden" label stays accurate as turns stream in.
 	const compactionHiddenCounts = useMemo(() => {
 		const counts = new Map<string, number>();
 		let segmentStart = 0;
@@ -302,12 +302,12 @@ export const MessageList = memo(function MessageList({
 		});
 		return counts;
 	}, [displayNodes]);
-	const [expandedCompactions, setExpandedCompactions] = useState<ReadonlySet<string>>(() => new Set());
+	const [collapsedCompactions, setCollapsedCompactions] = useState<ReadonlySet<string>>(() => new Set());
 	useEffect(() => {
-		setExpandedCompactions(new Set());
+		setCollapsedCompactions(new Set());
 	}, [sessionId]);
 	const toggleCompaction = useCallback((key: string) => {
-		setExpandedCompactions((prev) => {
+		setCollapsedCompactions((prev) => {
 			const next = new Set(prev);
 			if (next.has(key)) next.delete(key);
 			else next.add(key);
@@ -320,7 +320,7 @@ export const MessageList = memo(function MessageList({
 		let segmentStart = 0;
 		displayNodes.forEach((node, index) => {
 			if (node.type !== "compaction_summary") return;
-			if (expandedCompactions.has(node.key)) {
+			if (!collapsedCompactions.has(node.key)) {
 				for (let j = segmentStart; j < index; j++) result.push(displayNodes[j]);
 			}
 			result.push(node);
@@ -328,7 +328,7 @@ export const MessageList = memo(function MessageList({
 		});
 		for (let j = segmentStart; j < displayNodes.length; j++) result.push(displayNodes[j]);
 		return result;
-	}, [compactionHiddenCounts, displayNodes, expandedCompactions]);
+	}, [collapsedCompactions, compactionHiddenCounts, displayNodes]);
 
 	// While a turn is running we show a single "Working…" row at the end of
 	// the transcript instead of a sticky pill, so the user can see how long
@@ -379,7 +379,7 @@ export const MessageList = memo(function MessageList({
 						resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
 						resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
 						compactionHiddenCount={compactionHiddenCounts.get(node.key) ?? 0}
-						compactionExpanded={expandedCompactions.has(node.key)}
+						compactionExpanded={!collapsedCompactions.has(node.key)}
 						onToggleCompaction={toggleCompaction}
 					/>
 				))}

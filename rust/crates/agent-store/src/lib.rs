@@ -525,6 +525,7 @@ pub struct TranscriptEntryRecord {
 pub struct TranscriptTreeNodeRecord {
     pub id: String,
     pub parent_id: Option<String>,
+    pub source_leaf_id: Option<String>,
     pub timestamp_ms: u64,
     pub sequence: i64,
     pub item_type: String,

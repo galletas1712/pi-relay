@@ -102,6 +102,18 @@ describe("session query cache helpers", () => {
 		expect(snapshot.last_event_id).toBe(2);
 	});
 
+	it("applies an active branch sync suffix when compaction continues from the cached leaf", () => {
+		const snapshot = snapshotFixture();
+		snapshot.active_leaf_id = "entry_1";
+		snapshot.entries = [entry("entry_1", null, "first")];
+		const compact = compactionEntry("compact_1", "entry_1");
+
+		expect(applyActiveBranchSync(snapshot, syncResponse("extended", [compact], "compact_1", 2))).toBe("applied");
+
+		expect(snapshot.active_leaf_id).toBe("compact_1");
+		expect(snapshot.entries?.map((candidate) => candidate.id)).toEqual(["entry_1", "compact_1"]);
+	});
+
 	it("asks for a reload when a sync suffix does not extend the cached leaf", () => {
 		const snapshot = snapshotFixture();
 		snapshot.active_leaf_id = "entry_other";
@@ -136,6 +148,22 @@ function seededClient(): QueryClient {
 	queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(projectId), [summary()]);
 	queryClient.setQueryData<SessionSnapshot>(queryKeys.session(sessionId, "active_branch"), snapshotFixture());
 	return queryClient;
+}
+
+function compactionEntry(id: string, sourceLeafId: string): TranscriptEntry {
+	return {
+		id,
+		parent_id: null,
+		timestamp_ms: 1_700_000_000_001,
+		item: {
+			type: "compaction_summary",
+			source_session_id: sessionId,
+			source_leaf_id: sourceLeafId,
+			summary: "summarized",
+			tokens_before: null,
+			last_turn_id: 1,
+		},
+	};
 }
 
 function summary(): SessionSummary {
