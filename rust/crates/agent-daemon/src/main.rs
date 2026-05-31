@@ -1314,6 +1314,8 @@ async fn transcript_entries(
 
 async fn transcript_turns(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
+    let before_entry_id = params.get("before_entry_id").and_then(Value::as_str);
+    let limit = params.get("limit").and_then(Value::as_i64);
     let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
     let acquired_ms = started_at.elapsed().as_millis();
@@ -1321,7 +1323,7 @@ async fn transcript_turns(state: &AppState, params: Value) -> std::result::Resul
     let recovered_ms = started_at.elapsed().as_millis();
     let result = state
         .repo
-        .transcript_turns(&session_id)
+        .transcript_turns(&session_id, before_entry_id, limit)
         .await
         .map_err(anyhow::Error::from)?;
     let loaded_ms = started_at.elapsed().as_millis();
@@ -1330,7 +1332,7 @@ async fn transcript_turns(state: &AppState, params: Value) -> std::result::Resul
     let total_ms = started_at.elapsed().as_millis();
     if perf_logging_enabled() {
         eprintln!(
-            "perf transcript.turns session={session_id} cards={card_count} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
+            "perf transcript.turns session={session_id} before_entry_id={before_entry_id:?} limit={limit:?} cards={card_count} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
             recovered_ms.saturating_sub(acquired_ms),
             loaded_ms.saturating_sub(recovered_ms),
             total_ms.saturating_sub(loaded_ms),
@@ -1344,12 +1346,22 @@ async fn transcript_turn_detail(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
-    let turn_id = required_string(&params, "turn_id")?;
+    let card_id = required_string(&params, "card_id")?;
+    let leaf_id = required_string(&params, "leaf_id")?;
+    let start_sequence = required_i64(&params, "start_sequence")?;
+    let end_sequence = required_i64(&params, "end_sequence")?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.recover_if_needed().await?;
     let result = state
         .repo
-        .transcript_turn_detail(&session_id, &turn_id, TranscriptEntryBodyMode::Ui)
+        .transcript_turn_detail(
+            &session_id,
+            &card_id,
+            &leaf_id,
+            start_sequence,
+            end_sequence,
+            TranscriptEntryBodyMode::Ui,
+        )
         .await
         .map_err(anyhow::Error::from)?;
     Ok(rpc_views::transcript_turn_detail(result))
@@ -1496,6 +1508,13 @@ fn required_string_vec(params: &Value, key: &str) -> std::result::Result<Vec<Str
             serde_json::from_value::<Vec<String>>(value)
                 .map_err(|error| RpcError::new("invalid_params", error.to_string()))
         })
+}
+
+fn required_i64(params: &Value, key: &str) -> std::result::Result<i64, RpcError> {
+    params
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::new("invalid_params", format!("{key} is required")))
 }
 
 fn optional_string_vec(

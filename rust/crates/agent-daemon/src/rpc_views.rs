@@ -159,6 +159,10 @@ pub(crate) fn transcript_turns(result: TranscriptTurnsResult) -> Value {
         "active_leaf_id": result.active_leaf_id,
         "session_revision": result.session_revision,
         "transcript_revision": result.transcript_revision,
+        "before_entry_id": result.before_entry_id,
+        "next_before_entry_id": result.next_before_entry_id,
+        "has_more_before": result.has_more_before,
+        "limit": result.limit,
         "cards": result.cards.into_iter().map(turn_card).collect::<Vec<_>>(),
     })
 }
@@ -169,7 +173,7 @@ pub(crate) fn transcript_turn_detail(result: TranscriptTurnDetailResult) -> Valu
         "active_leaf_id": result.active_leaf_id,
         "session_revision": result.session_revision,
         "transcript_revision": result.transcript_revision,
-        "turn_id": result.turn_id,
+        "card_id": result.card_id,
         "entries": transcript_entry_values(result.entries),
     })
 }
@@ -197,6 +201,8 @@ fn turn_card(card: TurnCardRecord) -> Value {
         "start_entry_id": card.start_entry_id,
         "boundary_entry_id": card.boundary_entry_id,
         "active_leaf_id": card.active_leaf_id,
+        "start_sequence": card.start_sequence,
+        "end_sequence": card.end_sequence,
         "start_timestamp_ms": card.start_timestamp_ms,
         "user_messages": transcript_entry_values(card.user_messages),
         "assistant_message": card.assistant_message.map(transcript_entry),

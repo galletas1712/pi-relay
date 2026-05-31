@@ -888,6 +888,12 @@ pre {
 	opacity: 0.65;
 }
 
+.turn-card-load-older {
+	display: flex;
+	justify-content: center;
+	margin: 2px 0 8px;
+}
+
 .tool-row {
 	display: grid;
 	grid-template-columns: 112px minmax(0, 1fr);

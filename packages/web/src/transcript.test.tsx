@@ -339,6 +339,8 @@ describe("MessageList Working indicator", () => {
 							start_entry_id: "start",
 							boundary_entry_id: null,
 							active_leaf_id: "start",
+							start_sequence: 1,
+							end_sequence: 1,
 							start_timestamp_ms: now - 5_000,
 							user_messages: [userEntryWithParent("user", "start", "do it")],
 							assistant_message: null,

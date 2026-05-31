@@ -27,6 +27,9 @@ export interface ChatPaneProps {
 	onResumeTurn: (entryId: string) => void;
 	onExpandTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
+	hasOlderTurns?: boolean;
+	loadingOlderTurns?: boolean;
+	onLoadOlderTurns?: () => void;
 }
 
 export const ChatPane = memo(function ChatPane({
@@ -49,7 +52,10 @@ export const ChatPane = memo(function ChatPane({
 	onToggleRight,
 	onResumeTurn,
 	onExpandTurn,
-	loadingTurnId
+	loadingTurnId,
+	hasOlderTurns,
+	loadingOlderTurns,
+	onLoadOlderTurns
 }: ChatPaneProps) {
 	const loadedLeafId = activeLeafIdFromEntries(entries);
 	const visibleActiveLeafId = loadedLeafId ?? snapshot?.active_leaf_id ?? null;
@@ -84,6 +90,9 @@ export const ChatPane = memo(function ChatPane({
 				resumingTurnId={resumingTurnId}
 				onExpandTurn={onExpandTurn}
 				loadingTurnId={loadingTurnId}
+				hasOlderTurns={hasOlderTurns}
+				loadingOlderTurns={loadingOlderTurns}
+				onLoadOlderTurns={onLoadOlderTurns}
 			/>
 		</main>
 	);

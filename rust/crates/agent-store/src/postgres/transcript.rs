@@ -23,6 +23,8 @@ use super::PostgresAgentStore;
 
 const DEFAULT_TRANSCRIPT_INDEX_LIMIT: i64 = 1000;
 const MAX_TRANSCRIPT_INDEX_LIMIT: i64 = 5000;
+const DEFAULT_TRANSCRIPT_TURN_LIMIT: i64 = 50;
+const MAX_TRANSCRIPT_TURN_LIMIT: i64 = 200;
 
 fn provider_replay_select(body_mode: TranscriptEntryBodyMode) -> &'static str {
     match body_mode {
@@ -151,18 +153,38 @@ async fn active_branch_entry_records_tx(
 async fn active_branch_turn_card_rows_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
+    before_entry_id: Option<&str>,
+    limit: i64,
 ) -> Result<Vec<TurnCardRow>> {
     let rows = sqlx::query(
         r#"
         with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, t.sequence
+            select t.id,
+                   t.parent_id,
+                   t.timestamp_ms,
+                   t.item,
+                   t.sequence,
+                   case
+                     when t.item->>'type' in ('turn_started', 'compaction_summary') then 1
+                     else 0
+                   end as boundary_count
             from transcript_entries t
-            join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
+            left join sessions s on s.id = t.session_id
             where t.session_id = $1
+              and t.id = coalesce($2::text, s.active_leaf_id)
 
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.sequence
+            select parent.id,
+                   parent.parent_id,
+                   parent.timestamp_ms,
+                   parent.item,
+                   parent.sequence,
+                   child.boundary_count
+                     + case
+                         when parent.item->>'type' in ('turn_started', 'compaction_summary') then 1
+                         else 0
+                       end as boundary_count
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
@@ -173,6 +195,7 @@ async fn active_branch_turn_card_rows_tx(
                 end,
                 child.parent_id
              )
+            where child.boundary_count < $3
         ),
         card_rows as (
             select id,
@@ -207,6 +230,7 @@ async fn active_branch_turn_card_rows_tx(
                card_rows.item->>'type' as item_type,
                card_rows.item->'turn_id' as turn_id,
                card_rows.item->'outcome' as outcome,
+               card_rows.item->>'source_leaf_id' as compaction_source_leaf_id,
                card_rows.item #>> '{last_turn_id}' as compaction_last_turn_id,
                card_rows.item #>> '{turn_started_at_ms}' as compaction_turn_started_at_ms,
                card_rows.item->>'summary' as compaction_summary
@@ -217,6 +241,8 @@ async fn active_branch_turn_card_rows_tx(
         "#
     )
     .bind(session_id)
+    .bind(before_entry_id)
+    .bind(limit)
     .fetch_all(&mut **tx)
     .await?;
     rows.into_iter().map(|row| turn_card_row(&row)).collect()
@@ -225,6 +251,7 @@ async fn active_branch_turn_card_rows_tx(
 async fn active_branch_entry_records_between_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
+    leaf_id: &str,
     start_sequence: i64,
     end_sequence: i64,
     body_mode: TranscriptEntryBodyMode,
@@ -234,34 +261,31 @@ async fn active_branch_entry_records_between_tx(
     let parent_provider_replay_select = aliased_provider_replay_select("parent", body_mode);
     let query = format!(
         r#"
-        with recursive branch as (
+        with recursive card_path as (
             select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence
             from transcript_entries t
-            join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
             where t.session_id = $1
+              and t.id = $2::text
+              and t.sequence = $4
 
             union all
 
             select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence
             from transcript_entries parent
-            join branch child
+            join card_path child
               on parent.session_id = $1
-             and parent.id = coalesce(
-                case
-                    when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
-                    else null
-                end,
-                child.parent_id
-             )
+             and parent.id = child.parent_id
+            where child.sequence > $3
         )
         select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}
-        from branch
-        where sequence between $2 and $3
+        from card_path
+        where sequence between $3 and $4
         order by sequence
         "#
     );
     let rows = sqlx::query(&query)
         .bind(session_id)
+        .bind(leaf_id)
         .bind(start_sequence)
         .bind(end_sequence)
         .fetch_all(&mut **tx)
@@ -532,7 +556,15 @@ impl PostgresAgentStore {
         })
     }
 
-    pub async fn transcript_turns(&self, session_id: &str) -> Result<TranscriptTurnsResult> {
+    pub async fn transcript_turns(
+        &self,
+        session_id: &str,
+        before_entry_id: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<TranscriptTurnsResult> {
+        let limit = limit
+            .unwrap_or(DEFAULT_TRANSCRIPT_TURN_LIMIT)
+            .clamp(1, MAX_TRANSCRIPT_TURN_LIMIT);
         let mut tx = self.pool.begin().await?;
         sqlx::query("set transaction isolation level repeatable read read only")
             .execute(&mut *tx)
@@ -549,10 +581,16 @@ impl PostgresAgentStore {
         .await?
         .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         let active_leaf_id: Option<String> = session.get("active_leaf_id");
-        let rows = match active_leaf_id.as_deref() {
-            Some(_) => active_branch_turn_card_rows_tx(&mut tx, session_id).await?,
-            None => Vec::new(),
+        let rows = if active_leaf_id.is_some() || before_entry_id.is_some() {
+            active_branch_turn_card_rows_tx(&mut tx, session_id, before_entry_id, limit).await?
+        } else {
+            Vec::new()
         };
+        let next_before_entry_id = rows
+            .first()
+            .and_then(TurnCardRow::display_parent_id)
+            .map(ToOwned::to_owned);
+        let has_more_before = next_before_entry_id.is_some();
         let cards = turn_cards_from_rows(&rows);
         tx.commit().await?;
         Ok(TranscriptTurnsResult {
@@ -560,6 +598,10 @@ impl PostgresAgentStore {
             active_leaf_id,
             session_revision: session.get("session_revision"),
             transcript_revision: session.get("transcript_revision"),
+            before_entry_id: before_entry_id.map(ToOwned::to_owned),
+            next_before_entry_id,
+            has_more_before,
+            limit,
             cards,
         })
     }
@@ -567,9 +609,17 @@ impl PostgresAgentStore {
     pub async fn transcript_turn_detail(
         &self,
         session_id: &str,
-        turn_id: &str,
+        card_id: &str,
+        leaf_id: &str,
+        start_sequence: i64,
+        end_sequence: i64,
         body_mode: TranscriptEntryBodyMode,
     ) -> Result<TranscriptTurnDetailResult> {
+        if start_sequence > end_sequence {
+            return Err(anyhow!(
+                "invalid turn-card sequence range: {start_sequence}..{end_sequence}"
+            ));
+        }
         let mut tx = self.pool.begin().await?;
         sqlx::query("set transaction isolation level repeatable read read only")
             .execute(&mut *tx)
@@ -586,33 +636,30 @@ impl PostgresAgentStore {
         .await?
         .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
         let active_leaf_id: Option<String> = session.get("active_leaf_id");
-        let rows = match active_leaf_id.as_deref() {
-            Some(_) => active_branch_turn_card_rows_tx(&mut tx, session_id).await?,
-            None => Vec::new(),
-        };
-        let cards = turn_cards_from_rows(&rows);
-        let Some(card) = cards
-            .iter()
-            .find(|card| card.id == turn_id || card.start_entry_id.as_deref() == Some(turn_id))
-        else {
-            tx.commit().await?;
-            return Err(anyhow!("turn not found: {turn_id}"));
-        };
         let detail_entries = active_branch_entry_records_between_tx(
             &mut tx,
             session_id,
-            card.start_sequence,
-            card.end_sequence,
+            leaf_id,
+            start_sequence,
+            end_sequence,
             body_mode,
         )
         .await?;
+        if detail_entries.is_empty()
+            || detail_entries.first().map(|entry| entry.sequence) != Some(start_sequence)
+            || detail_entries.last().map(|entry| entry.sequence) != Some(end_sequence)
+            || !detail_entries.iter().any(|entry| entry.id == card_id)
+        {
+            tx.commit().await?;
+            return Err(anyhow!("turn card detail not found: {card_id}"));
+        }
         tx.commit().await?;
         Ok(TranscriptTurnDetailResult {
             session_id: session_id.to_string(),
             active_leaf_id,
             session_revision: session.get("session_revision"),
             transcript_revision: session.get("transcript_revision"),
-            turn_id: card.id.clone(),
+            card_id: card_id.to_string(),
             entries: detail_entries,
         })
     }
@@ -1193,6 +1240,8 @@ fn turn_card_row(row: &sqlx::postgres::PgRow) -> Result<TurnCardRow> {
     };
     Ok(TurnCardRow {
         id: row.get("id"),
+        parent_id: row.get("parent_id"),
+        compaction_source_leaf_id: row.get("compaction_source_leaf_id"),
         timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
         sequence: row.get("sequence"),
         entry,
@@ -1238,6 +1287,8 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 #[derive(Debug)]
 struct TurnCardRow {
     id: String,
+    parent_id: Option<String>,
+    compaction_source_leaf_id: Option<String>,
     timestamp_ms: u64,
     sequence: i64,
     entry: Option<TranscriptEntryRecord>,
@@ -1251,6 +1302,14 @@ struct TurnCardRow {
 impl TurnCardRow {
     fn entry_record(&self) -> Option<TranscriptEntryRecord> {
         self.entry.clone()
+    }
+
+    fn display_parent_id(&self) -> Option<&str> {
+        if self.item_type == "compaction_summary" {
+            self.compaction_source_leaf_id.as_deref()
+        } else {
+            self.parent_id.as_deref()
+        }
     }
 }
 
@@ -1505,8 +1564,8 @@ mod tests {
     use agent_session::{SessionEvent, TranscriptStorageNode};
     use agent_vocab::{
         AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
-        ProviderReplayItem, ReasoningEffort, ToolCallId, ToolResultMessage, TranscriptItem,
-        TurnId, TurnOutcome, UserMessage,
+        ProviderReplayItem, ReasoningEffort, ToolCallId, ToolResultMessage, TranscriptItem, TurnId,
+        TurnOutcome, UserMessage,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -1683,11 +1742,7 @@ mod tests {
         )
     }
 
-    fn assistant_message(
-        id: &str,
-        parent_id: Option<&str>,
-        text: &str,
-    ) -> TranscriptStorageNode {
+    fn assistant_message(id: &str, parent_id: Option<&str>, text: &str) -> TranscriptStorageNode {
         entry(
             id,
             parent_id,
@@ -1975,7 +2030,11 @@ mod tests {
         let entries = vec![
             turn_started("entry_start", None, 1),
             user_message("entry_user", Some("entry_start"), &long_user),
-            assistant_message("entry_assistant_first", Some("entry_user"), &long_first_assistant),
+            assistant_message(
+                "entry_assistant_first",
+                Some("entry_user"),
+                &long_first_assistant,
+            ),
             tool_result("entry_tool_result", Some("entry_assistant_first")),
             assistant_message(
                 "entry_assistant_final",
@@ -1993,7 +2052,7 @@ mod tests {
             .expect("transcript persists");
 
         let turns = store
-            .transcript_turns(session_id)
+            .transcript_turns(session_id, None, None)
             .await
             .expect("turn cards load");
         assert_eq!(turns.cards.len(), 1);
@@ -2013,7 +2072,10 @@ mod tests {
         assert_eq!(assistant.id, "entry_assistant_final");
         match &assistant.item {
             TranscriptItem::AssistantMessage(message) => {
-                assert_eq!(message.items, vec![AssistantItem::Text(long_final_assistant)]);
+                assert_eq!(
+                    message.items,
+                    vec![AssistantItem::Text(long_final_assistant)]
+                );
             }
             other => panic!("expected assistant message, got {other:?}"),
         }
@@ -2053,7 +2115,7 @@ mod tests {
             .expect("transcript persists");
 
         let turns = store
-            .transcript_turns(session_id)
+            .transcript_turns(session_id, None, None)
             .await
             .expect("turn cards load");
         assert_eq!(turns.cards.len(), 2);
@@ -2064,8 +2126,87 @@ mod tests {
         assert_eq!(resumed_card.turn_id, Some(TurnId(7)));
         assert_eq!(resumed_card.start_timestamp_ms, turn_started_at_ms);
         assert_eq!(
-            resumed_card.assistant_message.as_ref().map(|entry| entry.id.as_str()),
+            resumed_card
+                .assistant_message
+                .as_ref()
+                .map(|entry| entry.id.as_str()),
             Some(final_assistant.id.as_str())
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn transcript_turns_pages_from_tail_and_detail_uses_card_bounds() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "turn-card-tail-pages";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            turn_started("entry_1_start", None, 1),
+            user_message("entry_1_user", Some("entry_1_start"), "one"),
+            turn_finished("entry_1_finish", Some("entry_1_user"), 1),
+            turn_started("entry_2_start", Some("entry_1_finish"), 2),
+            user_message("entry_2_user", Some("entry_2_start"), "two"),
+            turn_finished("entry_2_finish", Some("entry_2_user"), 2),
+            turn_started("entry_3_start", Some("entry_2_finish"), 3),
+            user_message("entry_3_user", Some("entry_3_start"), "three"),
+            turn_finished("entry_3_finish", Some("entry_3_user"), 3),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_3_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+
+        let latest = store
+            .transcript_turns(session_id, None, Some(1))
+            .await
+            .expect("latest turn page loads");
+        assert_eq!(latest.cards.len(), 1);
+        assert_eq!(latest.cards[0].id, "entry_3_finish");
+        assert_eq!(
+            latest.next_before_entry_id.as_deref(),
+            Some("entry_2_finish")
+        );
+        assert!(latest.has_more_before);
+
+        let previous = store
+            .transcript_turns(session_id, latest.next_before_entry_id.as_deref(), Some(1))
+            .await
+            .expect("previous turn page loads");
+        assert_eq!(previous.cards.len(), 1);
+        assert_eq!(previous.cards[0].id, "entry_2_finish");
+        assert_eq!(
+            previous.next_before_entry_id.as_deref(),
+            Some("entry_1_finish")
+        );
+
+        let card = &latest.cards[0];
+        let detail = store
+            .transcript_turn_detail(
+                session_id,
+                &card.id,
+                &card.active_leaf_id,
+                card.start_sequence,
+                card.end_sequence,
+                TranscriptEntryBodyMode::Ui,
+            )
+            .await
+            .expect("card detail loads from targeted bounds");
+        assert_eq!(
+            detail
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["entry_3_start", "entry_3_user", "entry_3_finish"]
         );
 
         db.cleanup().await;

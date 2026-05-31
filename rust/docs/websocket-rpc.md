@@ -582,15 +582,20 @@ Result shape:
 
 ### `transcript.turns`
 
-Returns active-branch turn cards for the selected-session transcript view. This
-is the normal hot-path UI endpoint. Each card carries full semantic user-message
-entries for that turn and the full final semantic assistant-message entry for
-that turn; intermediate tool calls/results are fetched with
-`transcript.turn_detail` when a card is expanded. It omits raw provider replay.
+Returns a newest/tail page of active-branch turn cards for the selected-session
+transcript view. This is the normal hot-path UI endpoint. Each card carries full
+semantic user-message entries for that turn and the full final semantic
+assistant-message entry for that turn; intermediate tool calls/results are
+fetched with `transcript.turn_detail` when a card is expanded. It omits raw
+provider replay.
 
 ```json
-{ "session_id": "s1" }
+{ "session_id": "s1", "limit": 50, "before_entry_id": "entry_17" }
 ```
+
+`before_entry_id` is optional. Omit it to fetch the newest/tail page ending at
+the active leaf. To fetch older cards, pass the `next_before_entry_id` returned
+by the previous page. The server clamps `limit` to a small maximum.
 
 Result shape:
 
@@ -600,17 +605,29 @@ Result shape:
   "active_leaf_id": "entry_42",
   "session_revision": 12,
   "transcript_revision": 7,
+  "before_entry_id": null,
+  "next_before_entry_id": "entry_17",
+  "has_more_before": true,
+  "limit": 50,
   "cards": []
 }
 ```
 
 ### `transcript.turn_detail`
 
-Fetches the UI-projected entry bodies for one turn-card id, used when expanding
-a collapsed turn.
+Fetches the UI-projected entry bodies for one turn card, used when expanding a
+collapsed turn. The request uses the `card_id`, `active_leaf_id`,
+`start_sequence`, and `end_sequence` returned by `transcript.turns`, so the
+daemon can fetch only the requested card path instead of recomputing all cards.
 
 ```json
-{ "session_id": "s1", "turn_id": "entry_42" }
+{
+  "session_id": "s1",
+  "card_id": "entry_42",
+  "leaf_id": "entry_42",
+  "start_sequence": 37,
+  "end_sequence": 42
+}
 ```
 
 Result shape:
@@ -621,7 +638,7 @@ Result shape:
   "active_leaf_id": "entry_42",
   "session_revision": 12,
   "transcript_revision": 7,
-  "turn_id": "entry_42",
+  "card_id": "entry_42",
   "entries": []
 }
 ```

@@ -163,7 +163,10 @@ export const MessageList = memo(function MessageList({
 	resumingTurnId,
 	turnCards,
 	onExpandTurn,
-	loadingTurnId
+	loadingTurnId,
+	hasOlderTurns,
+	loadingOlderTurns,
+	onLoadOlderTurns
 }: {
 	entries: TranscriptEntry[];
 	pendingActions?: PendingAction[];
@@ -179,6 +182,9 @@ export const MessageList = memo(function MessageList({
 	turnCards?: TurnCardView[] | null;
 	onExpandTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
+	hasOlderTurns?: boolean;
+	loadingOlderTurns?: boolean;
+	onLoadOlderTurns?: () => void;
 }) {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const contentRef = useRef<HTMLDivElement | null>(null);
@@ -367,18 +373,29 @@ export const MessageList = memo(function MessageList({
 		<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 			<div className="message-scroll-content" ref={contentRef}>
 				{shouldUseTurnCards
-					? turnCards!.map((turn) => (
-							<TurnCardRow
-								key={turn.card.id}
-								turn={turn}
-								activeLeafId={activeLeafId}
-								isRunning={isRunning}
-								onResumeTurn={onResumeTurn}
-								resumingTurnId={resumingTurnId}
-								onExpandTurn={onExpandTurn}
-								loadingTurnId={loadingTurnId}
-							/>
-						))
+					? (
+							<>
+								{hasOlderTurns ? (
+									<div className="turn-card-load-older">
+										<button type="button" className="turn-card-expand" disabled={loadingOlderTurns} onClick={onLoadOlderTurns}>
+											{loadingOlderTurns ? "Loading older…" : "Load older turns"}
+										</button>
+									</div>
+								) : null}
+								{turnCards!.map((turn) => (
+									<TurnCardRow
+										key={turn.card.id}
+										turn={turn}
+										activeLeafId={activeLeafId}
+										isRunning={isRunning}
+										onResumeTurn={onResumeTurn}
+										resumingTurnId={resumingTurnId}
+										onExpandTurn={onExpandTurn}
+										loadingTurnId={loadingTurnId}
+									/>
+								))}
+							</>
+						)
 					: visibleDisplayNodes.map((node) => (
 							<TranscriptDisplayNodeView
 								node={node}

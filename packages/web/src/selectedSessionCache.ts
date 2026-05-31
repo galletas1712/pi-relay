@@ -32,23 +32,44 @@ export interface SelectedSessionCache {
 	turnDetailsById: Map<string, string[]>;
 	turnTranscriptRevision: number | null;
 	turnActiveLeafId: string | null;
+	turnHasMoreBefore: boolean;
+	turnBeforeEntryId: string | null;
 }
 
-export function applyTranscriptTurns(cache: SelectedSessionCache, result: TranscriptTurnsResult): SelectedSessionCache {
+export function applyTranscriptTurns(
+	cache: SelectedSessionCache,
+	result: TranscriptTurnsResult,
+	options: { mode?: "replace" | "prepend" } = {},
+): SelectedSessionCache {
 	if (cache.sessionId !== result.session_id) return cache;
+	const mode = options.mode ?? "replace";
+	if (
+		mode === "prepend" &&
+		(cache.turnTranscriptRevision !== result.transcript_revision || cache.turnActiveLeafId !== result.active_leaf_id)
+	) {
+		return cache;
+	}
 	let entriesById = cache.entriesById;
-	const turnCardsById = new Map<string, TurnCard>();
+	const incomingCardsById = new Map<string, TurnCard>();
 	for (const card of result.cards) {
 		const cardEntries = [...card.user_messages, ...(card.assistant_message ? [card.assistant_message] : [])];
 		entriesById = mergeEntryBodies(entriesById, cardEntries);
-		turnCardsById.set(card.id, {
+		incomingCardsById.set(card.id, {
 			...card,
 			user_messages: card.user_messages.map((entry) => entriesById.get(entry.id) ?? entry),
 			assistant_message: card.assistant_message ? entriesById.get(card.assistant_message.id) ?? card.assistant_message : card.assistant_message,
 		});
 	}
+	const orderedIds = mode === "prepend"
+		? uniqueStringArray([...result.cards.map((card) => card.id), ...cache.turnOrder])
+		: result.cards.map((card) => card.id);
+	const turnCardsById = mode === "prepend"
+		? new Map([...cache.turnCardsById, ...incomingCardsById])
+		: incomingCardsById;
 	const turnDetailsById = new Map<string, string[]>();
-	for (const card of result.cards) {
+	for (const cardId of orderedIds) {
+		const card = turnCardsById.get(cardId);
+		if (!card) continue;
 		const entryIds =
 			cache.turnDetailsById.get(card.id) ??
 			(card.start_entry_id ? cache.turnDetailsById.get(card.start_entry_id) : undefined);
@@ -73,10 +94,12 @@ export function applyTranscriptTurns(cache: SelectedSessionCache, result: Transc
 			: activeBranchEntryIds,
 		entriesById,
 		turnCardsById,
-		turnOrder: result.cards.map((card) => card.id),
+		turnOrder: orderedIds,
 		turnDetailsById,
 		turnTranscriptRevision: result.transcript_revision,
 		turnActiveLeafId: result.active_leaf_id,
+		turnHasMoreBefore: result.has_more_before,
+		turnBeforeEntryId: result.next_before_entry_id ?? null,
 	};
 }
 
@@ -132,6 +155,8 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		turnDetailsById: new Map(),
 		turnTranscriptRevision: null,
 		turnActiveLeafId: null,
+		turnHasMoreBefore: false,
+		turnBeforeEntryId: null,
 	};
 }
 
@@ -623,6 +648,8 @@ function initialTurnCard(entry: TranscriptEntry): TurnCard {
 		start_entry_id: entry.item.type === "turn_started" ? entry.id : null,
 		boundary_entry_id: null,
 		active_leaf_id: entry.id,
+		start_sequence: entry.sequence ?? 0,
+		end_sequence: entry.sequence ?? 0,
 		start_timestamp_ms: entry.timestamp_ms,
 		user_messages: [],
 		assistant_message: null,
@@ -640,6 +667,8 @@ function initialTurnCardFromCompactionResume(compactionCard: TurnCard, entry: Tr
 		start_entry_id: null,
 		boundary_entry_id: null,
 		active_leaf_id: entry.id,
+		start_sequence: entry.sequence ?? 0,
+		end_sequence: entry.sequence ?? 0,
 		start_timestamp_ms: compactionCard.start_timestamp_ms,
 		user_messages: [],
 		assistant_message: null,
@@ -653,6 +682,7 @@ function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
 	let next: TurnCard = {
 		...card,
 		active_leaf_id: entry.id,
+		end_sequence: entry.sequence ?? card.end_sequence,
 		turn_id: card.turn_id ?? turnIdForItem(item),
 	};
 
@@ -661,6 +691,7 @@ function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
 			...next,
 			turn_id: item.turn_id,
 			start_entry_id: next.start_entry_id ?? entry.id,
+			start_sequence: next.start_entry_id ? next.start_sequence : entry.sequence ?? next.start_sequence,
 		};
 	} else if (item.type === "user_message") {
 		next = {
@@ -701,6 +732,8 @@ function compactionTurnCard(entry: TranscriptEntry): TurnCard {
 		start_entry_id: entry.id,
 		boundary_entry_id: entry.id,
 		active_leaf_id: entry.id,
+		start_sequence: entry.sequence ?? 0,
+		end_sequence: entry.sequence ?? 0,
 		start_timestamp_ms: entry.item.type === "compaction_summary" && typeof entry.item.turn_started_at_ms === "number"
 			? entry.item.turn_started_at_ms
 			: entry.timestamp_ms,
@@ -739,6 +772,17 @@ function sameStringArray(left: string[], right: string[]): boolean {
 		if (left[index] !== right[index]) return false;
 	}
 	return true;
+}
+
+function uniqueStringArray(values: string[]): string[] {
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const value of values) {
+		if (seen.has(value)) continue;
+		seen.add(value);
+		result.push(value);
+	}
+	return result;
 }
 
 function applyTreeNodeFromEvent(cache: SelectedSessionCache, event: EventFrame): Partial<SelectedSessionCache> {

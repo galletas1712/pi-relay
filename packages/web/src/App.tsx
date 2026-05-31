@@ -83,6 +83,7 @@ const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
 const SELECTED_SESSION_REFRESH_DEBOUNCE_MS = 80;
 const FOREGROUND_RECONCILE_THROTTLE_MS = 2000;
 const TRANSCRIPT_INDEX_PAGE_SIZE = 5000;
+const TRANSCRIPT_TURN_PAGE_SIZE = 50;
 const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
 const MEDIUM_PANEL_QUERY = "(min-width: 900px)";
 const WIDE_PANEL_QUERY = "(min-width: 1280px)";
@@ -325,6 +326,7 @@ export function App() {
 	);
 	const [expandedTurnIds, setExpandedTurnIds] = useState<Set<string>>(() => new Set());
 	const [loadingTurnId, setLoadingTurnId] = useState<string | null>(null);
+	const [loadingOlderTurns, setLoadingOlderTurns] = useState(false);
 	const turnCardViews = useMemo(() => {
 		if (selectedCache.sessionId !== selectedId) return null;
 		const cards = turnCardsInOrder(selectedCache);
@@ -485,12 +487,38 @@ export function App() {
 
 	const refreshTranscriptTurns = useCallback(
 		async (sessionId: string) => {
-			const result = await api.getTranscriptTurns(sessionId);
+			const result = await api.getTranscriptTurns(sessionId, { limit: TRANSCRIPT_TURN_PAGE_SIZE });
 			if (selectedRef.current !== sessionId) return null;
 			updateSelectedCache((current) => applyTranscriptTurns(current.sessionId === sessionId ? current : selectedCacheRef.current, result));
 			return result;
 		},
 		[api, updateSelectedCache],
+	);
+
+	const loadOlderTranscriptTurns = useCallback(
+		async () => {
+			const sessionId = selectedRef.current;
+			if (!sessionId || loadingOlderTurns) return;
+			const cache = selectedCacheRef.current;
+			if (cache.sessionId !== sessionId || !cache.turnHasMoreBefore || !cache.turnBeforeEntryId) return;
+			const beforeEntryId = cache.turnBeforeEntryId;
+			setLoadingOlderTurns(true);
+			try {
+				const result = await api.getTranscriptTurns(sessionId, {
+					beforeEntryId,
+					limit: TRANSCRIPT_TURN_PAGE_SIZE,
+				});
+				if (selectedRef.current !== sessionId) return;
+				updateSelectedCache((current) =>
+					applyTranscriptTurns(current.sessionId === sessionId ? current : selectedCacheRef.current, result, { mode: "prepend" }),
+				);
+			} catch (error) {
+				if (selectedRef.current === sessionId) pushNotice("error", errorMessage(error));
+			} finally {
+				setLoadingOlderTurns(false);
+			}
+		},
+		[api, loadingOlderTurns, pushNotice, updateSelectedCache],
 	);
 
 	const getFreshSession = useCallback(
@@ -605,24 +633,31 @@ export function App() {
 	);
 
 	const expandTurn = useCallback(
-		async (turnId: string) => {
+		async (cardId: string) => {
 			const sessionId = selectedRef.current;
 			if (!sessionId) throw new Error("select a session first");
 			const cache = selectedCacheRef.current;
-			if (turnDetailEntries(cache, turnId)) {
-				setExpandedTurnIds((current) => new Set(current).add(turnId));
+			const card = cache.turnCardsById.get(cardId);
+			if (!card) throw new Error("turn card is not loaded");
+			if (turnDetailEntries(cache, cardId)) {
+				setExpandedTurnIds((current) => new Set(current).add(cardId));
 				return;
 			}
-			setLoadingTurnId(turnId);
+			setLoadingTurnId(cardId);
 			try {
-				const result = await api.getTranscriptTurnDetail(sessionId, turnId);
+				const result = await api.getTranscriptTurnDetail(sessionId, {
+					cardId: card.id,
+					leafId: card.active_leaf_id,
+					startSequence: card.start_sequence,
+					endSequence: card.end_sequence,
+				});
 				if (selectedRef.current !== sessionId) return;
-				updateSelectedCache((current) => applyTurnDetail(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.turn_id, result.entries));
-				setExpandedTurnIds((current) => new Set(current).add(result.turn_id));
+				updateSelectedCache((current) => applyTurnDetail(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.card_id, result.entries));
+				setExpandedTurnIds((current) => new Set(current).add(result.card_id));
 			} catch (error) {
 				if (selectedRef.current === sessionId) pushNotice("error", errorMessage(error));
 			} finally {
-				setLoadingTurnId((current) => (current === turnId ? null : current));
+				setLoadingTurnId((current) => (current === cardId ? null : current));
 			}
 		},
 		[api, pushNotice, updateSelectedCache],
@@ -1851,6 +1886,9 @@ export function App() {
 				onResumeTurn={handleResumeTurn}
 				onExpandTurn={expandTurn}
 				loadingTurnId={loadingTurnId}
+				hasOlderTurns={selectedCache.sessionId === selectedId && selectedCache.turnHasMoreBefore}
+				loadingOlderTurns={loadingOlderTurns}
+				onLoadOlderTurns={loadOlderTranscriptTurns}
 			/>
 
 			<footer className="chat-dock" data-slot="chat-box">

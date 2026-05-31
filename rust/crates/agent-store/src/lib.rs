@@ -580,6 +580,10 @@ pub struct TranscriptTurnsResult {
     pub active_leaf_id: Option<String>,
     pub session_revision: i64,
     pub transcript_revision: i64,
+    pub before_entry_id: Option<String>,
+    pub next_before_entry_id: Option<String>,
+    pub has_more_before: bool,
+    pub limit: i64,
     pub cards: Vec<TurnCardRecord>,
 }
 
@@ -589,7 +593,7 @@ pub struct TranscriptTurnDetailResult {
     pub active_leaf_id: Option<String>,
     pub session_revision: i64,
     pub transcript_revision: i64,
-    pub turn_id: String,
+    pub card_id: String,
     pub entries: Vec<TranscriptEntryRecord>,
 }
 

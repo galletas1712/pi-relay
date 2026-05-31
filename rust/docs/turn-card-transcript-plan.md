@@ -127,6 +127,8 @@ Backend APIs:
 
 - `transcript.turns`
   - active branch only;
+  - returns a bounded newest/tail page by default and older pages via
+    `before_entry_id`;
   - returns collapsed turn cards with the full user message entries in that
     turn and the full final assistant message entry for that turn;
   - omits intermediate tool calls/results until expansion;
@@ -135,6 +137,8 @@ Backend APIs:
   - excludes raw provider replay from the wire entirely.
 - `transcript.turn_detail`
   - returns full UI-projected entries for one turn/card;
+  - takes the card id, leaf id, and sequence bounds from `transcript.turns` so
+    the backend reads only that card path rather than materializing every card;
   - excludes raw provider replay from the wire entirely;
   - used only when the user expands a card.
 
@@ -152,7 +156,7 @@ Frontend:
 
 Verification:
 
-- Long-session selected load should fetch a small bounded turn-card payload,
+- Long-session selected load should fetch one bounded tail page of turn cards,
   not the whole active branch.
 - Expanding an old turn fetches only that turn detail.
 - Current/running turn still streams smoothly.
@@ -162,13 +166,17 @@ Implementation status:
 
 - Done in `feature/turn-card-transcript-view`.
 - Added composable `transcript.turns` and `transcript.turn_detail` RPCs.
-  `transcript.turns` returns active-branch turn cards only;
-  `transcript.turn_detail` returns detail for exactly one card.
+  `transcript.turns` returns bounded active-branch turn-card pages; the first
+  call fetches the newest/tail page and a `next_before_entry_id` cursor fetches
+  older pages on demand. `transcript.turn_detail` returns detail for exactly
+  one card by following that card's leaf/sequence bounds instead of recomputing
+  all turn cards.
 - Added selected-session turn-card cache projections (`turnCardsById`,
   `turnOrder`, `turnDetailsById`) alongside the existing body/topology caches.
 - The chat pane renders turn cards when available and lazily fetches detail when
-  the user clicks "Show details". No turn detail is fetched in the selected
-  session hot path.
+  the user clicks "Show details". Older historical cards are fetched only when
+  the user clicks "Load older turns". No turn detail or older page is fetched
+  in the selected-session hot path.
 - Follow-up simplification: `transcript.turns` now carries full semantic
   user-message entries and the full final semantic assistant-message entry for
   every card. It no longer carries derived previews/counts; the collapsed chat
@@ -198,12 +206,20 @@ Implementation status:
   the revision bump, rather than querying each just-inserted row again while
   emitting events. The fallback lookup remains only for rare duplicate-entry,
   recovery, and compaction paths.
-- Pitfall: this implementation still derives cards by walking the active branch
-  in SQL. It deliberately avoids selecting raw provider replay and only selects
-  full `item` JSON for the user bodies and terminal assistant bodies that
-  collapsed cards actually render; boundary/tool rows are used as metadata only.
-  If microbenchmarks after this PR still show card derivation as too slow on
-  very large sessions, promote cards to a denormalized read model in PR 5.
+- Follow-up performance fix: `transcript.turns` no longer walks the whole
+  active branch on selected-session load. The recursive query starts from the
+  active leaf (or a server-returned older-page cursor) and walks backward only
+  until it has the requested number of card starts. This keeps the hot-path
+  response bounded by the requested tail-page size plus the entries inside
+  those turns.
+- Follow-up performance fix: `transcript.turn_detail` no longer derives every
+  card before finding the requested one. The frontend sends the card id,
+  leaf id, and sequence bounds from the card page; the backend validates and
+  reads only that card's parent chain.
+- Remaining pitfall: bounded paging is still computed from append-only
+  `transcript_entries` at read time. If microbenchmarks still show card
+  derivation as too slow for a single very large turn, promote cards to a
+  denormalized read model in PR 5.
 
 ### Deferred: Newest-first `/switch` targets
 

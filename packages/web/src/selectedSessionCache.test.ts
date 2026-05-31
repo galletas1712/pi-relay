@@ -319,6 +319,10 @@ describe("selected session cache", () => {
 			active_leaf_id: "entry_finish",
 			session_revision: 3,
 			transcript_revision: 2,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
 			cards: [
 				{
 					id: "entry_finish",
@@ -328,6 +332,8 @@ describe("selected session cache", () => {
 					start_entry_id: "entry_start",
 					boundary_entry_id: "entry_finish",
 					active_leaf_id: "entry_finish",
+					start_sequence: 1,
+					end_sequence: 6,
 					start_timestamp_ms: 1_700_000_000_001,
 					user_messages: [user],
 					assistant_message: finalAssistant,
@@ -358,6 +364,10 @@ describe("selected session cache", () => {
 			active_leaf_id: "entry_finish",
 			session_revision: 3,
 			transcript_revision: 2,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
 			cards: [
 				{
 					id: "entry_finish",
@@ -367,6 +377,8 @@ describe("selected session cache", () => {
 					start_entry_id: "entry_start",
 					boundary_entry_id: "entry_finish",
 					active_leaf_id: "entry_finish",
+					start_sequence: 1,
+					end_sequence: 6,
 					start_timestamp_ms: 1_700_000_000_001,
 					user_messages: [user],
 					assistant_message: finalAssistant,
@@ -377,6 +389,67 @@ describe("selected session cache", () => {
 		});
 
 		expect(cache.turnDetailsById.has("entry_finish")).toBe(false);
+	});
+
+	it("prepends older transcript.turns pages without replacing the loaded tail page", () => {
+		const olderUser = entry("entry_user_old", "entry_start_old", "old user", 2);
+		const latestUser = entry("entry_user_new", "entry_start_new", "new user", 7);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([], { transcriptRevision: 1 }));
+		cache = applyTranscriptTurns(cache, {
+			session_id: sessionId,
+			active_leaf_id: "entry_finish_new",
+			session_revision: 3,
+			transcript_revision: 2,
+			before_entry_id: null,
+			next_before_entry_id: "entry_finish_old",
+			has_more_before: true,
+			limit: 1,
+			cards: [
+				{
+					...turnCard("entry_finish_new", 2),
+					status: "completed",
+					start_entry_id: "entry_start_new",
+					boundary_entry_id: "entry_finish_new",
+					active_leaf_id: "entry_finish_new",
+					start_sequence: 6,
+					end_sequence: 8,
+					user_messages: [latestUser],
+				},
+			],
+		});
+
+		cache = applyTranscriptTurns(
+			cache,
+			{
+				session_id: sessionId,
+				active_leaf_id: "entry_finish_new",
+				session_revision: 3,
+				transcript_revision: 2,
+				before_entry_id: "entry_finish_old",
+				next_before_entry_id: null,
+				has_more_before: false,
+				limit: 1,
+				cards: [
+					{
+						...turnCard("entry_finish_old", 1),
+						status: "completed",
+						start_entry_id: "entry_start_old",
+						boundary_entry_id: "entry_finish_old",
+						active_leaf_id: "entry_finish_old",
+						start_sequence: 1,
+						end_sequence: 3,
+						user_messages: [olderUser],
+					},
+				],
+			},
+			{ mode: "prepend" },
+		);
+
+		expect(cache.turnOrder).toEqual(["entry_finish_old", "entry_finish_new"]);
+		expect(cache.turnHasMoreBefore).toBe(false);
+		expect(cache.turnBeforeEntryId).toBeNull();
+		expect(cache.turnCardsById.get("entry_finish_new")?.user_messages[0].id).toBe("entry_user_new");
+		expect(cache.turnCardsById.get("entry_finish_old")?.user_messages[0].id).toBe("entry_user_old");
 	});
 
 	it("starts a new current turn card when a turn_started entry follows a completed turn", () => {
@@ -777,6 +850,8 @@ function turnCard(id: string, turnId: number): TurnCard {
 		start_entry_id: id,
 		boundary_entry_id: null,
 		active_leaf_id: id,
+		start_sequence: 1,
+		end_sequence: 1,
 		start_timestamp_ms: 1_700_000_000_001,
 		user_messages: [],
 		assistant_message: null,
