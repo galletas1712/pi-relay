@@ -12,6 +12,7 @@ import {
 	runningTurnClockAnchor,
 	runningTurnStartMs,
 	saveTranscriptScrollPositions,
+	stableWorkingElapsedMs,
 	TRANSCRIPT_SCROLL_STORAGE_KEY,
 	type TranscriptScrollStorage,
 	ToolOutput,
@@ -301,6 +302,22 @@ describe("MessageList Working indicator", () => {
 
 	it("does not synthesize a local clock when the server time is missing", () => {
 		expect(runningTurnClockAnchor([turnStartedEntry("entry_turn", 1, 1_000)], null)).toBeNull();
+	});
+
+	it("keeps a stable working clock anchor across transcript updates", () => {
+		const nowSpy = vi.spyOn(performance, "now");
+		try {
+			nowSpy.mockReturnValue(1_000);
+			const initial = stableWorkingElapsedMs(null, 1_000, 10_000);
+			nowSpy.mockReturnValue(2_000);
+			const updated = stableWorkingElapsedMs(initial.clock, 1_000, 10_000);
+
+			expect(initial.elapsedMs).toBe(9_000);
+			expect(updated.elapsedMs).toBe(10_000);
+			expect(updated.clock).toBe(initial.clock);
+		} finally {
+			nowSpy.mockRestore();
+		}
 	});
 
 	it("renders a Working… row at the transcript tail when the session is running", () => {

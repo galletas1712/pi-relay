@@ -338,10 +338,10 @@ export const MessageList = memo(function MessageList({
 	// compaction replaced the raw open-turn suffix. We deliberately do not
 	// synthesize a local start time; a running turn without this anchor is a
 	// protocol/storage bug, not something the UI can make correct.
-	const workingClock = useMemo(() => {
-		if (!isRunning) return null;
-		return runningTurnClockAnchor(visibleEntries, serverTimeMs);
-	}, [isRunning, serverTimeMs, visibleEntries]);
+	const workingStartMs = useMemo(
+		() => (isRunning ? runningTurnStartMs(visibleEntries) : null),
+		[isRunning, visibleEntries],
+	);
 
 	if (!hasSession) {
 		return (
@@ -383,8 +383,8 @@ export const MessageList = memo(function MessageList({
 						onToggleCompaction={toggleCompaction}
 					/>
 				))}
-				{isRunning && workingClock != null ? (
-					<WorkingIndicator clock={workingClock} />
+				{isRunning && workingStartMs != null && serverTimeMs != null ? (
+					<WorkingIndicator startMs={workingStartMs} serverTimeMs={serverTimeMs} />
 				) : null}
 			</div>
 		</div>
@@ -393,6 +393,21 @@ export const MessageList = memo(function MessageList({
 
 function workingElapsedMs(clock: WorkingClockAnchor): number {
 	return Math.max(0, clock.serverAnchorMs + (performance.now() - clock.clientAnchorMs) - clock.startMs);
+}
+
+export function stableWorkingElapsedMs(
+	previous: WorkingClockAnchor | null,
+	startMs: number,
+	serverTimeMs: number,
+): { clock: WorkingClockAnchor; elapsedMs: number } {
+	const clock = previous?.startMs === startMs
+		? previous
+		: {
+				startMs,
+				serverAnchorMs: serverTimeMs,
+				clientAnchorMs: performance.now(),
+			};
+	return { clock, elapsedMs: workingElapsedMs(clock) };
 }
 
 export interface WorkingClockAnchor {
@@ -430,15 +445,23 @@ export function runningTurnClockAnchor(
 	};
 }
 
-const WorkingIndicator = memo(function WorkingIndicator({ clock }: { clock: WorkingClockAnchor }) {
-	const [elapsedMs, setElapsedMs] = useState(() => workingElapsedMs(clock));
+const WorkingIndicator = memo(function WorkingIndicator({ startMs, serverTimeMs }: { startMs: number; serverTimeMs: number }) {
+	const anchorRef = useRef<WorkingClockAnchor | null>(null);
+	const [elapsedMs, setElapsedMs] = useState(() => {
+		const stable = stableWorkingElapsedMs(anchorRef.current, startMs, serverTimeMs);
+		anchorRef.current = stable.clock;
+		return stable.elapsedMs;
+	});
 	useEffect(() => {
-		setElapsedMs(workingElapsedMs(clock));
+		const stable = stableWorkingElapsedMs(anchorRef.current, startMs, serverTimeMs);
+		anchorRef.current = stable.clock;
+		const clock = anchorRef.current!;
+		setElapsedMs(stable.elapsedMs);
 		const interval = window.setInterval(() => {
 			setElapsedMs(workingElapsedMs(clock));
 		}, 1000);
 		return () => window.clearInterval(interval);
-	}, [clock]);
+	}, [startMs]);
 	return (
 		<SystemMessage
 			tone="info"

@@ -899,6 +899,10 @@ async fn input_user(
         .get("client_input_id")
         .and_then(Value::as_str)
         .map(str::to_string);
+    let base_leaf_id = params
+        .get("base_leaf_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
     let content_value = params
         .get("content")
         .cloned()
@@ -908,7 +912,7 @@ async fn input_user(
     enum InputOutcome {
         Accepted {
             dispatches: Vec<DispatchAction>,
-            active_branch: Value,
+            active_branch_sync: Value,
         },
         Queued {
             input_id: String,
@@ -992,19 +996,19 @@ async fn input_user(
                     Vec::new(),
                 )
                 .await?;
+            let sync = state
+                .repo
+                .sync_active_branch(&session_id, base_leaf_id.as_deref())
+                .await
+                .map_err(anyhow::Error::from)?;
             let snapshot = state
                 .repo
                 .session_snapshot(&session_id)
                 .await
                 .map_err(anyhow::Error::from)?;
-            let entries = state
-                .repo
-                .transcript_entries_for_scope(&session_id, TranscriptEntryScope::ActiveBranch)
-                .await
-                .map_err(anyhow::Error::from)?;
             InputOutcome::Accepted {
                 dispatches,
-                active_branch: rpc_views::active_branch_projection(snapshot, entries),
+                active_branch_sync: rpc_views::active_branch_sync(sync, snapshot),
             }
         }
     };
@@ -1012,10 +1016,12 @@ async fn input_user(
     match outcome {
         InputOutcome::Accepted {
             dispatches,
-            active_branch,
+            active_branch_sync,
         } => {
             driver.dispatch(dispatches).await?;
-            Ok(json!({ "accepted": true, "queued": false, "active_branch": active_branch }))
+            Ok(
+                json!({ "accepted": true, "queued": false, "active_branch_sync": active_branch_sync }),
+            )
         }
         InputOutcome::Queued {
             input_id,
@@ -1214,14 +1220,7 @@ async fn transcript_entries(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
-    let entry_ids = params
-        .get("entry_ids")
-        .cloned()
-        .ok_or_else(|| RpcError::new("invalid_params", "entry_ids is required"))
-        .and_then(|value| {
-            serde_json::from_value::<Vec<String>>(value)
-                .map_err(|error| RpcError::new("invalid_params", error.to_string()))
-        })?;
+    let entry_ids = required_string_vec(&params, "entry_ids")?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.recover_if_needed().await?;
     let result = state
@@ -1304,14 +1303,59 @@ async fn history_switch(state: &AppState, params: Value) -> std::result::Result<
         .get("return_active_branch")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let expected_transcript_revision = params
+        .get("expected_transcript_revision")
+        .and_then(Value::as_i64);
+    let active_branch_entry_ids = optional_string_vec(&params, "active_branch_entry_ids")?;
+    let missing_body_ids = optional_string_vec(&params, "missing_body_ids")?;
     let result = state
         .repo
-        .switch_active_leaf(&session_id, leaf_id, return_active_branch)
+        .switch_active_leaf(
+            &session_id,
+            leaf_id,
+            return_active_branch,
+            expected_transcript_revision,
+            active_branch_entry_ids.as_deref(),
+            missing_body_ids.as_deref(),
+        )
         .await
-        .map_err(anyhow::Error::from)?;
+        .map_err(history_switch_error_to_rpc)?;
     publish_events(state, result.events.clone());
     clear_event_buffer_if_idle(state, &session_id).await?;
     Ok(rpc_views::switch_active_leaf(result))
+}
+
+fn required_string_vec(params: &Value, key: &str) -> std::result::Result<Vec<String>, RpcError> {
+    params
+        .get(key)
+        .cloned()
+        .ok_or_else(|| RpcError::new("invalid_params", format!("{key} is required")))
+        .and_then(|value| {
+            serde_json::from_value::<Vec<String>>(value)
+                .map_err(|error| RpcError::new("invalid_params", error.to_string()))
+        })
+}
+
+fn optional_string_vec(
+    params: &Value,
+    key: &str,
+) -> std::result::Result<Option<Vec<String>>, RpcError> {
+    params
+        .get(key)
+        .cloned()
+        .map(|value| {
+            serde_json::from_value::<Vec<String>>(value)
+                .map_err(|error| RpcError::new("invalid_params", error.to_string()))
+        })
+        .transpose()
+}
+
+fn history_switch_error_to_rpc(error: anyhow::Error) -> RpcError {
+    let message = error.to_string();
+    if message.starts_with("history_changed:") {
+        return RpcError::new("history_changed", message);
+    }
+    error.into()
 }
 
 async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

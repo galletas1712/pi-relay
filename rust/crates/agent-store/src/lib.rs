@@ -581,6 +581,7 @@ pub struct SwitchActiveLeafResult {
     pub queue_revision: i64,
     pub transcript_revision: i64,
     pub last_event_id: i64,
+    pub active_branch_entry_ids: Option<Vec<String>>,
     pub active_branch_entries: Option<Vec<TranscriptEntryRecord>>,
     pub events: Vec<EventFrame>,
 }
