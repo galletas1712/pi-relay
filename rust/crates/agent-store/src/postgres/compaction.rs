@@ -458,7 +458,7 @@ impl PostgresAgentStore {
             ),
             provider_replay: completion.provider_replay.clone(),
         };
-        insert_stored_entry_tx(&mut tx, &job.source_session_id, &root_entry).await?;
+        let _ = insert_stored_entry_tx(&mut tx, &job.source_session_id, &root_entry).await?;
 
         let mut installed_entries = vec![root_entry.clone()];
         let mut parent_id = new_root_id.clone();
@@ -466,7 +466,7 @@ impl PostgresAgentStore {
             suffix.parent_id = Some(parent_id.clone());
             parent_id = suffix.id.clone();
             let stored = StoredTranscriptEntry::from(suffix);
-            insert_stored_entry_tx(&mut tx, &job.source_session_id, &stored).await?;
+            let _ = insert_stored_entry_tx(&mut tx, &job.source_session_id, &stored).await?;
             installed_entries.push(stored);
         }
         let installed_active_leaf_id = parent_id;
@@ -578,7 +578,8 @@ impl PostgresAgentStore {
                 insert_transcript_item_events_tx(
                     &mut tx,
                     &job.source_session_id,
-                    Some(entry),
+                    None,
+                    None,
                     &entry.id,
                     &entry.item,
                 )

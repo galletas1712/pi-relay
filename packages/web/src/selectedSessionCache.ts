@@ -7,8 +7,11 @@ import type {
 	ActiveBranchSyncResponse,
 	SessionSnapshot,
 	TranscriptEntry,
+	TranscriptItem,
 	TranscriptTreeIndex,
 	TranscriptTreeNode,
+	TranscriptTurnsResult,
+	TurnCard,
 } from "./types.ts";
 
 export interface SelectedSessionCache {
@@ -24,6 +27,133 @@ export interface SelectedSessionCache {
 	treeLoadedPrefixSequence: number;
 	treeMaxSequence: number;
 	treeComplete: boolean;
+	turnCardsById: Map<string, TurnCard>;
+	turnOrder: string[];
+	turnDetailsById: Map<string, string[]>;
+	turnTranscriptRevision: number | null;
+	turnActiveLeafId: string | null;
+	turnHasMoreBefore: boolean;
+	turnBeforeEntryId: string | null;
+}
+
+export function applyTranscriptTurns(
+	cache: SelectedSessionCache,
+	result: TranscriptTurnsResult,
+	options: { mode?: "replace" | "prepend" } = {},
+): SelectedSessionCache {
+	if (cache.sessionId !== result.session_id) return cache;
+	const mode = options.mode ?? "replace";
+	if (
+		mode === "prepend" &&
+		(cache.turnTranscriptRevision !== result.transcript_revision ||
+			cache.turnActiveLeafId !== result.active_leaf_id ||
+			cache.turnBeforeEntryId !== (result.before_entry_id ?? null))
+	) {
+		return cache;
+	}
+	if (mode === "replace" && isStaleTranscriptTurnsResult(cache, result)) return cache;
+	let entriesById = cache.entriesById;
+	const incomingCardsById = new Map<string, TurnCard>();
+	for (const card of result.cards) {
+		const cardEntries = [...card.user_messages, ...(card.assistant_message ? [card.assistant_message] : [])];
+		entriesById = mergeEntryBodies(entriesById, cardEntries);
+		incomingCardsById.set(card.id, {
+			...card,
+			user_messages: card.user_messages.map((entry) => entriesById.get(entry.id) ?? entry),
+			assistant_message: card.assistant_message ? entriesById.get(card.assistant_message.id) ?? card.assistant_message : card.assistant_message,
+		});
+	}
+	const orderedIds = mode === "prepend"
+		? uniqueStringArray([...result.cards.map((card) => card.id), ...cache.turnOrder])
+		: result.cards.map((card) => card.id);
+	const turnCardsById = mode === "prepend"
+		? new Map([...cache.turnCardsById, ...incomingCardsById])
+		: incomingCardsById;
+	const turnDetailsById = new Map<string, string[]>();
+	for (const cardId of orderedIds) {
+		const card = turnCardsById.get(cardId);
+		if (!card) continue;
+		const entryIds =
+			cache.turnDetailsById.get(card.id) ??
+			(card.start_entry_id ? cache.turnDetailsById.get(card.start_entry_id) : undefined);
+		if (entryIds && turnDetailCoversCard(entryIds, card)) turnDetailsById.set(card.id, entryIds);
+	}
+	const activeBranchEntryIds = result.active_leaf_id ? [result.active_leaf_id] : [];
+	const snapshot = cache.snapshot
+		? {
+				...cache.snapshot,
+				active_leaf_id: result.active_leaf_id,
+				has_transcript_entries: result.cards.length > 0,
+				session_revision: Math.max(cache.snapshot.session_revision ?? 0, result.session_revision),
+				transcript_revision: Math.max(cache.snapshot.transcript_revision ?? 0, result.transcript_revision),
+				entries: selectedEntriesFromIds(activeBranchEntryIds, entriesById),
+			}
+		: cache.snapshot;
+	return {
+		...cache,
+		snapshot,
+		activeBranchEntryIds: sameStringArray(cache.activeBranchEntryIds, activeBranchEntryIds)
+			? cache.activeBranchEntryIds
+			: activeBranchEntryIds,
+		entriesById,
+		turnCardsById,
+		turnOrder: orderedIds,
+		turnDetailsById,
+		turnTranscriptRevision: result.transcript_revision,
+		turnActiveLeafId: result.active_leaf_id,
+		turnHasMoreBefore: result.has_more_before,
+		turnBeforeEntryId: result.next_before_entry_id ?? null,
+	};
+}
+
+function turnDetailCoversCard(entryIds: string[], card: TurnCard): boolean {
+	return (entryIds.at(-1) ?? null) === card.active_leaf_id;
+}
+
+function isStaleTranscriptTurnsResult(cache: SelectedSessionCache, result: TranscriptTurnsResult): boolean {
+	const snapshotRevision = cache.snapshot?.transcript_revision ?? null;
+	const knownRevision = Math.max(cache.turnTranscriptRevision ?? -1, snapshotRevision ?? -1);
+	if (knownRevision >= 0 && result.transcript_revision < knownRevision) return true;
+	const knownActiveLeafId = cache.snapshot?.active_leaf_id ?? cache.turnActiveLeafId;
+	if (
+		result.transcript_revision === knownRevision &&
+		knownActiveLeafId !== undefined &&
+		knownActiveLeafId !== result.active_leaf_id
+	) {
+		return true;
+	}
+	return false;
+}
+
+export function applyTurnDetail(cache: SelectedSessionCache, sessionId: string, turnId: string, entries: TranscriptEntry[]): SelectedSessionCache {
+	if (cache.sessionId !== sessionId) return cache;
+	const card = cache.turnCardsById.get(turnId);
+	if (!card || entries.at(-1)?.id !== card.active_leaf_id) return cache;
+	const entriesById = mergeEntryBodies(cache.entriesById, entries);
+	const turnDetailsById = new Map(cache.turnDetailsById);
+	turnDetailsById.set(turnId, entries.map((entry) => entry.id));
+	return {
+		...cache,
+		entriesById,
+		turnDetailsById,
+	};
+}
+
+export function turnCardsInOrder(cache: SelectedSessionCache): TurnCard[] {
+	return cache.turnOrder.flatMap((id) => {
+		const card = cache.turnCardsById.get(id);
+		return card ? [card] : [];
+	});
+}
+
+export function turnDetailEntries(cache: SelectedSessionCache, turnId: string): TranscriptEntry[] | null {
+	const ids = cache.turnDetailsById.get(turnId);
+	if (!ids) return null;
+	const entries = ids.flatMap((id) => {
+		const entry = cache.entriesById.get(id);
+		return entry ? [entry] : [];
+	});
+	return entries.length === ids.length ? entries : null;
 }
 
 export function emptySelectedSessionCache(sessionId: string | null = null): SelectedSessionCache {
@@ -40,6 +170,13 @@ export function emptySelectedSessionCache(sessionId: string | null = null): Sele
 		treeLoadedPrefixSequence: 0,
 		treeMaxSequence: 0,
 		treeComplete: false,
+		turnCardsById: new Map(),
+		turnOrder: [],
+		turnDetailsById: new Map(),
+		turnTranscriptRevision: null,
+		turnActiveLeafId: null,
+		turnHasMoreBefore: false,
+		turnBeforeEntryId: null,
 	};
 }
 
@@ -58,11 +195,15 @@ export function treeNodesInOrder(cache: SelectedSessionCache): TranscriptTreeNod
 }
 
 export function applySelectedSnapshot(cache: SelectedSessionCache, snapshot: SessionSnapshot): SelectedSessionCache {
-	const entries = snapshot.entries ?? [];
 	const sameSession = cache.sessionId === snapshot.session_id;
 	const base = sameSession ? cache : emptySelectedSessionCache(snapshot.session_id);
-	const entriesById = mergeEntryBodies(base.entriesById, entries);
-	const activeBranchEntryIds = entryIds(entries);
+	const hasEntryBodies = Array.isArray(snapshot.entries);
+	const incomingEntries = snapshot.entries ?? [];
+	const entriesById = hasEntryBodies ? mergeEntryBodies(base.entriesById, incomingEntries) : base.entriesById;
+	const activeBranchEntryIds = hasEntryBodies
+		? entryIds(incomingEntries)
+		: activeBranchIdsForSnapshot(base.activeBranchEntryIds, snapshot.active_leaf_id ?? null);
+	const snapshotEntries = hasEntryBodies ? incomingEntries : selectedEntriesFromIds(activeBranchEntryIds, entriesById);
 	const snapshotTranscriptRevision = snapshot.transcript_revision ?? null;
 	const treeRevisionChanged =
 		sameSession &&
@@ -72,7 +213,7 @@ export function applySelectedSnapshot(cache: SelectedSessionCache, snapshot: Ses
 	return {
 		...base,
 		sessionId: snapshot.session_id,
-		snapshot: { ...snapshot, entries },
+		snapshot: { ...snapshot, entries: snapshotEntries },
 		activeBranchEntryIds: sameStringArray(base.activeBranchEntryIds, activeBranchEntryIds) ? base.activeBranchEntryIds : activeBranchEntryIds,
 		entriesById,
 		treeActiveLeafId: treeRevisionChanged ? snapshot.active_leaf_id : base.treeActiveLeafId ?? snapshot.active_leaf_id,
@@ -298,11 +439,33 @@ export function applyTranscriptAppendedEvent(cache: SelectedSessionCache, event:
 		last_event_id: Math.max(cache.snapshot.last_event_id, event.event_id),
 		entries: activeBranchEntryIds.map((id) => entriesById.get(id)).filter((candidate): candidate is TranscriptEntry => !!candidate),
 	};
+	const previousTurnId = cache.turnOrder.at(-1) ?? null;
+	const turnCards = appendsToActiveBranch
+		? appendTurnCard(cache.turnCardsById, cache.turnOrder, entry)
+		: {
+				turnCardsById: cache.turnCardsById,
+				turnOrder: cache.turnOrder,
+			};
+	const nextTurnId = turnCards.turnOrder.at(-1) ?? null;
+	const previousCardStillExists = previousTurnId ? turnCards.turnCardsById.has(previousTurnId) : false;
+	const appendedNewCard = !!previousTurnId && previousTurnId !== nextTurnId && previousCardStillExists;
+	const previousCardWasReplaced = !!previousTurnId && previousTurnId !== nextTurnId && !previousCardStillExists;
+	let turnDetailsById = appendsToActiveBranch && !appendedNewCard
+		? appendLoadedTurnDetail(cache.turnDetailsById, previousTurnId, currentLeafId, entry.id)
+		: cache.turnDetailsById;
+	if (previousCardWasReplaced) {
+		turnDetailsById = migrateCurrentTurnDetailId(turnDetailsById, previousTurnId, nextTurnId);
+	}
 	const nextCache = {
 		...cache,
 		snapshot,
 		activeBranchEntryIds,
 		entriesById,
+		turnDetailsById,
+		turnCardsById: turnCards.turnCardsById,
+		turnOrder: turnCards.turnOrder,
+		turnTranscriptRevision: transcriptRevision ?? cache.turnTranscriptRevision,
+		turnActiveLeafId: activeLeafId ?? cache.turnActiveLeafId,
 		...applyTreeNodeFromEvent(cache, event),
 	};
 	return { cache: nextCache, result: appendsToActiveBranch ? "applied" : "refresh" };
@@ -389,6 +552,11 @@ function entryIds(entries: TranscriptEntry[]): string[] {
 	return entries.map((entry) => entry.id);
 }
 
+function activeBranchIdsForSnapshot(currentIds: string[], activeLeafId: string | null): string[] {
+	if (!activeLeafId) return [];
+	return currentIds.at(-1) === activeLeafId ? currentIds : [activeLeafId];
+}
+
 function appendActiveBranchEntries(
 	currentIds: string[],
 	entriesById: Map<string, TranscriptEntry>,
@@ -413,12 +581,235 @@ function selectedEntriesFromIds(ids: string[], entriesById: Map<string, Transcri
 	});
 }
 
+function appendLoadedTurnDetail(
+	current: Map<string, string[]>,
+	turnId: string | null,
+	currentLeafId: string | null,
+	entryId: string,
+): Map<string, string[]> {
+	if (!turnId) return current;
+	const ids = current.get(turnId);
+	if (!ids || ids.includes(entryId) || (ids.at(-1) ?? null) !== currentLeafId) return current;
+	const next = new Map(current);
+	next.set(turnId, [...ids, entryId]);
+	return next;
+}
+
+function migrateCurrentTurnDetailId(
+	current: Map<string, string[]>,
+	previousTurnId: string | null,
+	nextTurnId: string | null,
+): Map<string, string[]> {
+	if (!previousTurnId || !nextTurnId || previousTurnId === nextTurnId) return current;
+	const ids = current.get(previousTurnId);
+	if (!ids || current.has(nextTurnId)) return current;
+	const next = new Map(current);
+	next.delete(previousTurnId);
+	next.set(nextTurnId, ids);
+	return next;
+}
+
+function appendTurnCard(
+	currentCards: Map<string, TurnCard>,
+	currentOrder: string[],
+	entry: TranscriptEntry,
+): { turnCardsById: Map<string, TurnCard>; turnOrder: string[] } {
+	if (currentOrder.length === 0) {
+		return createTurnCardFromEntry(entry);
+	}
+
+	const previousCardId = currentOrder.at(-1);
+	const previousCard = previousCardId ? currentCards.get(previousCardId) : undefined;
+	if (!previousCard) return { turnCardsById: currentCards, turnOrder: currentOrder };
+
+	if (entry.item.type === "compaction_summary") {
+		const nextCard = compactionTurnCard(entry);
+		const turnCardsById = new Map(currentCards);
+		turnCardsById.set(nextCard.id, nextCard);
+		return { turnCardsById, turnOrder: [...currentOrder, nextCard.id] };
+	}
+
+	const startsNewTurn = entry.item.type === "turn_started" && previousCard.start_entry_id !== entry.id;
+	if (startsNewTurn) {
+		const nextCard = updateTurnCard(initialTurnCard(entry), entry);
+		const turnCardsById = new Map(currentCards);
+		turnCardsById.set(nextCard.id, nextCard);
+		return { turnCardsById, turnOrder: [...currentOrder, nextCard.id] };
+	}
+	if (previousCard.status === "compacted") {
+		const nextCard = updateTurnCard(initialTurnCardFromCompactionResume(previousCard, entry), entry);
+		const nextId = turnCardStableId(nextCard);
+		const turnCardsById = new Map(currentCards);
+		turnCardsById.set(nextId, { ...nextCard, id: nextId });
+		return { turnCardsById, turnOrder: [...currentOrder, nextId] };
+	}
+
+	const updatedCard = updateTurnCard(previousCard, entry);
+	const nextId = turnCardStableId(updatedCard);
+	const turnCardsById = new Map(currentCards);
+	turnCardsById.delete(previousCard.id);
+	turnCardsById.set(nextId, { ...updatedCard, id: nextId });
+	const turnOrder = sameLastId(currentOrder, previousCard.id)
+		? [...currentOrder.slice(0, -1), nextId]
+		: currentOrder.map((id) => (id === previousCard.id ? nextId : id));
+	return { turnCardsById, turnOrder };
+}
+
+function createTurnCardFromEntry(entry: TranscriptEntry): { turnCardsById: Map<string, TurnCard>; turnOrder: string[] } {
+	const card = entry.item.type === "compaction_summary" ? compactionTurnCard(entry) : updateTurnCard(initialTurnCard(entry), entry);
+	const stableId = turnCardStableId(card);
+	const normalizedCard = { ...card, id: stableId };
+	return {
+		turnCardsById: new Map([[normalizedCard.id, normalizedCard]]),
+		turnOrder: [normalizedCard.id],
+	};
+}
+
+function initialTurnCard(entry: TranscriptEntry): TurnCard {
+	const turnId = turnIdForItem(entry.item);
+	return {
+		id: entry.id,
+		turn_id: turnId,
+		status: "open",
+		outcome: null,
+		start_entry_id: entry.item.type === "turn_started" ? entry.id : null,
+		boundary_entry_id: null,
+		active_leaf_id: entry.id,
+		start_sequence: entry.sequence ?? 0,
+		end_sequence: entry.sequence ?? 0,
+		start_timestamp_ms: entry.timestamp_ms,
+		user_messages: [],
+		assistant_message: null,
+		summary: null,
+		can_resume: false,
+	};
+}
+
+function initialTurnCardFromCompactionResume(compactionCard: TurnCard, entry: TranscriptEntry): TurnCard {
+	return {
+		id: entry.id,
+		turn_id: turnIdForItem(entry.item) ?? compactionCard.turn_id ?? null,
+		status: "open",
+		outcome: null,
+		start_entry_id: null,
+		boundary_entry_id: null,
+		active_leaf_id: entry.id,
+		start_sequence: entry.sequence ?? 0,
+		end_sequence: entry.sequence ?? 0,
+		start_timestamp_ms: compactionCard.start_timestamp_ms,
+		user_messages: [],
+		assistant_message: null,
+		summary: null,
+		can_resume: false,
+	};
+}
+
+function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
+	const item = entry.item;
+	let next: TurnCard = {
+		...card,
+		active_leaf_id: entry.id,
+		end_sequence: entry.sequence ?? card.end_sequence,
+		turn_id: card.turn_id ?? turnIdForItem(item),
+	};
+
+	if (item.type === "turn_started") {
+		next = {
+			...next,
+			turn_id: item.turn_id,
+			start_entry_id: next.start_entry_id ?? entry.id,
+			start_sequence: next.start_entry_id ? next.start_sequence : entry.sequence ?? next.start_sequence,
+		};
+	} else if (item.type === "user_message") {
+		next = {
+			...next,
+			user_messages: appendUniqueEntry(next.user_messages, entry),
+		};
+	} else if (item.type === "assistant_message") {
+		next = {
+			...next,
+			assistant_message: entry,
+		};
+	} else if (item.type === "tool_call_started") {
+		next = {
+			...next,
+			turn_id: item.turn_id,
+		};
+	} else if (item.type === "turn_finished") {
+		next = {
+			...next,
+			turn_id: item.turn_id,
+			status: "completed",
+			outcome: item.outcome,
+			boundary_entry_id: entry.id,
+			can_resume: item.outcome === "Interrupted" || item.outcome === "Crashed",
+		};
+	}
+	return next;
+}
+
+function compactionTurnCard(entry: TranscriptEntry): TurnCard {
+	const summary = entry.item.type === "compaction_summary" ? entry.item.summary.trim() : "";
+	const turnId = entry.item.type === "compaction_summary" ? entry.item.last_turn_id : null;
+	return {
+		id: entry.id,
+		turn_id: turnId,
+		status: "compacted",
+		outcome: null,
+		start_entry_id: entry.id,
+		boundary_entry_id: entry.id,
+		active_leaf_id: entry.id,
+		start_sequence: entry.sequence ?? 0,
+		end_sequence: entry.sequence ?? 0,
+		start_timestamp_ms: entry.item.type === "compaction_summary" && typeof entry.item.turn_started_at_ms === "number"
+			? entry.item.turn_started_at_ms
+			: entry.timestamp_ms,
+		user_messages: [],
+		assistant_message: null,
+		summary: summary || null,
+		can_resume: false,
+	};
+}
+
+function turnCardStableId(card: TurnCard): string {
+	return card.boundary_entry_id ?? card.start_entry_id ?? card.active_leaf_id;
+}
+
+function appendUniqueEntry(entries: TranscriptEntry[], entry: TranscriptEntry): TranscriptEntry[] {
+	const index = entries.findIndex((candidate) => candidate.id === entry.id);
+	if (index === -1) return [...entries, entry];
+	const next = [...entries];
+	next[index] = entry;
+	return next;
+}
+
+function turnIdForItem(item: TranscriptItem): number | null {
+	if (item.type === "turn_started" || item.type === "turn_finished" || item.type === "tool_call_started") return item.turn_id;
+	if (item.type === "compaction_summary") return item.last_turn_id;
+	return null;
+}
+
+function sameLastId(ids: string[], expectedLastId: string): boolean {
+	return ids.at(-1) === expectedLastId;
+}
+
 function sameStringArray(left: string[], right: string[]): boolean {
 	if (left.length !== right.length) return false;
 	for (let index = 0; index < left.length; index += 1) {
 		if (left[index] !== right[index]) return false;
 	}
 	return true;
+}
+
+function uniqueStringArray(values: string[]): string[] {
+	const seen = new Set<string>();
+	const result: string[] = [];
+	for (const value of values) {
+		if (seen.has(value)) continue;
+		seen.add(value);
+		result.push(value);
+	}
+	return result;
 }
 
 function applyTreeNodeFromEvent(cache: SelectedSessionCache, event: EventFrame): Partial<SelectedSessionCache> {

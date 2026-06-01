@@ -500,10 +500,10 @@ root switch. Transcript entries returned by websocket RPCs include the Postgres
 token. Use `transcript_revision` to decide whether cached transcript data is
 fresh.
 
-Normal UI transcript body responses omit raw provider replay by returning
-`provider_replay: []`. Passing `"include_provider_replay": true` requests the
-full durable replay sidecar and should be reserved for debug/export paths that
-explicitly need provider-native data.
+UI transcript body responses do not include the raw `provider_replay` sidecar.
+Replay remains stored durably for model continuation, but websocket RPCs expose
+only semantic transcript entries: `id`, `parent_id`, `timestamp_ms`, `sequence`,
+and `item`.
 
 For UI display, `"active_branch"` follows compaction provenance: a
 `compaction_summary` entry with `parent_id = null` is rendered after its
@@ -569,10 +569,6 @@ restoring a historical user message into the composer.
 { "session_id": "s1", "entry_ids": ["entry_1", "entry_7"] }
 ```
 
-By default this returns the UI projection with `provider_replay: []`. Add
-`"include_provider_replay": true` only when the caller intentionally needs raw
-provider replay.
-
 Result shape:
 
 ```json
@@ -580,6 +576,69 @@ Result shape:
   "session_id": "s1",
   "session_revision": 12,
   "transcript_revision": 7,
+  "entries": []
+}
+```
+
+### `transcript.turns`
+
+Returns a newest/tail page of active-branch turn cards for the selected-session
+transcript view. This is the normal hot-path UI endpoint. Each card carries full
+semantic user-message entries for that turn and the full final semantic
+assistant-message entry for that turn; intermediate tool calls/results are
+fetched with `transcript.turn_detail` when a card is expanded. It omits raw
+provider replay.
+
+```json
+{ "session_id": "s1", "limit": 50, "before_entry_id": "entry_17" }
+```
+
+`before_entry_id` is optional. Omit it to fetch the newest/tail page ending at
+the active leaf. To fetch older cards, pass the `next_before_entry_id` returned
+by the previous page. The server clamps `limit` to a small maximum.
+
+Result shape:
+
+```json
+{
+  "session_id": "s1",
+  "active_leaf_id": "entry_42",
+  "session_revision": 12,
+  "transcript_revision": 7,
+  "before_entry_id": null,
+  "next_before_entry_id": "entry_17",
+  "has_more_before": true,
+  "limit": 50,
+  "cards": []
+}
+```
+
+### `transcript.turn_detail`
+
+Fetches the UI-projected entry bodies for one turn card, used when expanding a
+collapsed turn. The request uses the `card_id`, `active_leaf_id`,
+`start_sequence`, and `end_sequence` returned by `transcript.turns`, so the
+daemon can fetch only the requested card path instead of recomputing all cards.
+
+```json
+{
+  "session_id": "s1",
+  "card_id": "entry_42",
+  "leaf_id": "entry_42",
+  "start_sequence": 37,
+  "end_sequence": 42
+}
+```
+
+Result shape:
+
+```json
+{
+  "session_id": "s1",
+  "active_leaf_id": "entry_42",
+  "session_revision": 12,
+  "transcript_revision": 7,
+  "card_id": "entry_42",
   "entries": []
 }
 ```

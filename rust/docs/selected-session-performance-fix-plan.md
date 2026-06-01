@@ -1,5 +1,16 @@
 # Selected Session Performance and Smoothness Fix Plan
 
+## Status after the turn-card hot path
+
+This plan captured the first repair pass after the selected-session cache
+regression. The long-term hot path is now described in
+`turn-card-transcript-plan.md`: selected-session refreshes use metadata-only
+`session.get` plus `transcript.turns`, and entry bodies are fetched with
+`transcript.turn_detail` only when a user expands a turn. The
+`session.sync_active_branch` and sparse-body switch protocol remain available
+for compatibility and targeted detail/body fetches, but normal selected-session
+loads no longer fetch the full active branch.
+
 ## Problem statement
 
 After the selected-session cache landed, a few hot paths still behave like they are uncached:

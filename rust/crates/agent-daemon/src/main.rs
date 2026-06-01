@@ -270,6 +270,8 @@ async fn dispatch_request(
         RpcMethod::InputInterrupt => input_interrupt(state, params).await,
         RpcMethod::TranscriptIndex => transcript_index(state, params).await,
         RpcMethod::TranscriptEntries => transcript_entries(state, params).await,
+        RpcMethod::TranscriptTurns => transcript_turns(state, params).await,
+        RpcMethod::TranscriptTurnDetail => transcript_turn_detail(state, params).await,
         RpcMethod::HistoryTree => history_tree(state, params).await,
         RpcMethod::HistoryContext => history_context(state, params).await,
         RpcMethod::HistorySwitch => history_switch(state, params).await,
@@ -464,7 +466,6 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
         .get("include_entries")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let body_mode = transcript_body_mode_from_params(&params);
     let entries_scope = params
         .get("entries_scope")
         .and_then(Value::as_str)
@@ -494,7 +495,7 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
         Some(
             state
                 .repo
-                .transcript_entries_for_scope(&session_id, scope, body_mode)
+                .transcript_entries_for_scope(&session_id, scope, TranscriptEntryBodyMode::Ui)
                 .await
                 .map_err(anyhow::Error::from)?,
         )
@@ -507,8 +508,7 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
     let total_ms = started_at.elapsed().as_millis();
     if perf_logging_enabled() {
         eprintln!(
-            "perf session.get session={session_id} include_entries={include_entries} scope={entries_scope} provider_replay={} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} snapshot_ms={} entries_ms={} view_ms={} total_ms={total_ms}",
-            matches!(body_mode, TranscriptEntryBodyMode::Full),
+            "perf session.get session={session_id} include_entries={include_entries} scope={entries_scope} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} snapshot_ms={} entries_ms={} view_ms={} total_ms={total_ms}",
             recovered_ms.saturating_sub(acquired_ms),
             snapshot_ms.saturating_sub(recovered_ms),
             entries_ms.saturating_sub(snapshot_ms),
@@ -524,7 +524,6 @@ async fn session_sync_active_branch(
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let base_leaf_id = params.get("base_leaf_id").and_then(Value::as_str);
-    let body_mode = transcript_body_mode_from_params(&params);
     let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
     let acquired_ms = started_at.elapsed().as_millis();
@@ -532,7 +531,7 @@ async fn session_sync_active_branch(
     let recovered_ms = started_at.elapsed().as_millis();
     let sync = state
         .repo
-        .sync_active_branch(&session_id, base_leaf_id, body_mode)
+        .sync_active_branch(&session_id, base_leaf_id, TranscriptEntryBodyMode::Ui)
         .await
         .map_err(anyhow::Error::from)?;
     let sync_ms = started_at.elapsed().as_millis();
@@ -548,8 +547,7 @@ async fn session_sync_active_branch(
     let total_ms = started_at.elapsed().as_millis();
     if perf_logging_enabled() {
         eprintln!(
-            "perf session.sync_active_branch session={session_id} base_leaf_id={base_leaf_id:?} provider_replay={} status={status} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} sync_ms={} snapshot_ms={} view_ms={} total_ms={total_ms}",
-            matches!(body_mode, TranscriptEntryBodyMode::Full),
+            "perf session.sync_active_branch session={session_id} base_leaf_id={base_leaf_id:?} status={status} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} sync_ms={} snapshot_ms={} view_ms={} total_ms={total_ms}",
             recovered_ms.saturating_sub(acquired_ms),
             sync_ms.saturating_sub(recovered_ms),
             snapshot_ms.saturating_sub(sync_ms),
@@ -1304,15 +1302,69 @@ async fn transcript_entries(
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let entry_ids = required_string_vec(&params, "entry_ids")?;
-    let body_mode = transcript_body_mode_from_params(&params);
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.recover_if_needed().await?;
     let result = state
         .repo
-        .transcript_entries_by_id(&session_id, &entry_ids, body_mode)
+        .transcript_entries_by_id(&session_id, &entry_ids, TranscriptEntryBodyMode::Ui)
         .await
         .map_err(anyhow::Error::from)?;
     Ok(rpc_views::transcript_entries(result))
+}
+
+async fn transcript_turns(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let before_entry_id = params.get("before_entry_id").and_then(Value::as_str);
+    let limit = params.get("limit").and_then(Value::as_i64);
+    let started_at = Instant::now();
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
+    driver.recover_if_needed().await?;
+    let recovered_ms = started_at.elapsed().as_millis();
+    let result = state
+        .repo
+        .transcript_turns(&session_id, before_entry_id, limit)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let loaded_ms = started_at.elapsed().as_millis();
+    let card_count = result.cards.len();
+    let value = rpc_views::transcript_turns(result);
+    let total_ms = started_at.elapsed().as_millis();
+    if perf_logging_enabled() {
+        eprintln!(
+            "perf transcript.turns session={session_id} before_entry_id={before_entry_id:?} limit={limit:?} cards={card_count} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
+            recovered_ms.saturating_sub(acquired_ms),
+            loaded_ms.saturating_sub(recovered_ms),
+            total_ms.saturating_sub(loaded_ms),
+        );
+    }
+    Ok(value)
+}
+
+async fn transcript_turn_detail(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let session_id = required_string(&params, "session_id")?;
+    let card_id = required_string(&params, "card_id")?;
+    let leaf_id = required_string(&params, "leaf_id")?;
+    let start_sequence = required_i64(&params, "start_sequence")?;
+    let end_sequence = required_i64(&params, "end_sequence")?;
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    driver.recover_if_needed().await?;
+    let result = state
+        .repo
+        .transcript_turn_detail(
+            &session_id,
+            &card_id,
+            &leaf_id,
+            start_sequence,
+            end_sequence,
+            TranscriptEntryBodyMode::Ui,
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(rpc_views::transcript_turn_detail(result))
 }
 
 async fn history_tree(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
@@ -1458,6 +1510,13 @@ fn required_string_vec(params: &Value, key: &str) -> std::result::Result<Vec<Str
         })
 }
 
+fn required_i64(params: &Value, key: &str) -> std::result::Result<i64, RpcError> {
+    params
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| RpcError::new("invalid_params", format!("{key} is required")))
+}
+
 fn optional_string_vec(
     params: &Value,
     key: &str,
@@ -1470,15 +1529,6 @@ fn optional_string_vec(
                 .map_err(|error| RpcError::new("invalid_params", error.to_string()))
         })
         .transpose()
-}
-
-fn transcript_body_mode_from_params(params: &Value) -> TranscriptEntryBodyMode {
-    TranscriptEntryBodyMode::from_include_provider_replay(
-        params
-            .get("include_provider_replay")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
-    )
 }
 
 fn history_switch_error_to_rpc(error: anyhow::Error) -> RpcError {

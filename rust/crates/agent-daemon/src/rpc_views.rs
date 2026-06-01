@@ -3,9 +3,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use agent_store::{
     ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionSnapshot,
     SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryRecord,
-    TranscriptTreeIndex,
+    TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult, TurnCardRecord,
 };
-use agent_vocab::TranscriptItem;
 use serde_json::{json, Value};
 
 pub(crate) fn project(project: Project) -> Value {
@@ -76,7 +75,7 @@ pub(crate) fn session_snapshot(
         "server_time_ms": now_ms(),
     });
     if let Some(entries) = entries {
-        value["entries"] = json!(redact_entries(entries));
+        value["entries"] = json!(transcript_entry_values(entries));
     }
     value
 }
@@ -113,7 +112,7 @@ pub(crate) fn history_tree(tree: HistoryTree) -> Value {
     json!({
         "session_id": tree.session_id,
         "active_leaf_id": tree.active_leaf_id,
-        "entries": redact_entries(tree.entries),
+        "entries": transcript_entry_values(tree.entries),
     })
 }
 
@@ -127,7 +126,7 @@ pub(crate) fn active_branch_sync(sync: ActiveBranchSync, overview: SessionSnapsh
         "base_leaf_id": base_leaf_id,
         "active_leaf_id": active_leaf_id,
         "status": status,
-        "entries": redact_entries(entries),
+        "entries": transcript_entry_values(entries),
         "overview": session_snapshot(overview, None),
     })
 }
@@ -150,7 +149,32 @@ pub(crate) fn transcript_entries(result: TranscriptEntriesResult) -> Value {
         "session_id": result.session_id,
         "session_revision": result.session_revision,
         "transcript_revision": result.transcript_revision,
-        "entries": redact_entries(result.entries),
+        "entries": transcript_entry_values(result.entries),
+    })
+}
+
+pub(crate) fn transcript_turns(result: TranscriptTurnsResult) -> Value {
+    json!({
+        "session_id": result.session_id,
+        "active_leaf_id": result.active_leaf_id,
+        "session_revision": result.session_revision,
+        "transcript_revision": result.transcript_revision,
+        "before_entry_id": result.before_entry_id,
+        "next_before_entry_id": result.next_before_entry_id,
+        "has_more_before": result.has_more_before,
+        "limit": result.limit,
+        "cards": result.cards.into_iter().map(turn_card).collect::<Vec<_>>(),
+    })
+}
+
+pub(crate) fn transcript_turn_detail(result: TranscriptTurnDetailResult) -> Value {
+    json!({
+        "session_id": result.session_id,
+        "active_leaf_id": result.active_leaf_id,
+        "session_revision": result.session_revision,
+        "transcript_revision": result.transcript_revision,
+        "card_id": result.card_id,
+        "entries": transcript_entry_values(result.entries),
     })
 }
 
@@ -164,20 +188,41 @@ pub(crate) fn switch_active_leaf(result: SwitchActiveLeafResult) -> Value {
         "transcript_revision": result.transcript_revision,
         "last_event_id": result.last_event_id,
         "active_branch_entry_ids": result.active_branch_entry_ids,
-        "active_branch_entries": result.active_branch_entries.map(redact_entries),
+        "active_branch_entries": result.active_branch_entries.map(transcript_entry_values),
     })
 }
 
-fn redact_entries(entries: Vec<TranscriptEntryRecord>) -> Vec<TranscriptEntryRecord> {
-    entries
-        .into_iter()
-        .map(|mut entry| {
-            if matches!(entry.item, TranscriptItem::CompactionSummary(_)) {
-                entry.provider_replay.clear();
-            }
-            entry
-        })
-        .collect()
+fn turn_card(card: TurnCardRecord) -> Value {
+    json!({
+        "id": card.id,
+        "turn_id": card.turn_id,
+        "status": card.status,
+        "outcome": card.outcome,
+        "start_entry_id": card.start_entry_id,
+        "boundary_entry_id": card.boundary_entry_id,
+        "active_leaf_id": card.active_leaf_id,
+        "start_sequence": card.start_sequence,
+        "end_sequence": card.end_sequence,
+        "start_timestamp_ms": card.start_timestamp_ms,
+        "user_messages": transcript_entry_values(card.user_messages),
+        "assistant_message": card.assistant_message.map(transcript_entry),
+        "summary": card.summary,
+        "can_resume": card.can_resume,
+    })
+}
+
+fn transcript_entry_values(entries: Vec<TranscriptEntryRecord>) -> Vec<Value> {
+    entries.into_iter().map(transcript_entry).collect()
+}
+
+fn transcript_entry(entry: TranscriptEntryRecord) -> Value {
+    json!({
+        "id": entry.id,
+        "parent_id": entry.parent_id,
+        "timestamp_ms": entry.timestamp_ms,
+        "sequence": entry.sequence,
+        "item": entry.item,
+    })
 }
 
 fn now_ms() -> u64 {

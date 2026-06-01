@@ -7,12 +7,10 @@ import type { Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { branchEntriesFor } from "./historyTargets.ts";
 import { MermaidBlock } from "./mermaidBlock.tsx";
-import { citationsFromReplay, hostedToolsFromReplay, localToolCallIdFromReplay, parsedProviderReplay, replayContainsAssistantText } from "./providerReplay.ts";
-import type { HostedToolView, SourceCitation } from "./providerReplay.ts";
 import { contentBlocksToText, firstLine } from "./text.ts";
 import { assistantMessageText, buildTurnViews } from "./turnView.ts";
 import type { ModelStepView, TurnView } from "./turnView.ts";
-import type { AssistantItem, NoticeTone, PendingAction, ReplayDisplay, TranscriptEntry, TranscriptItem } from "./types.ts";
+import type { AssistantItem, NoticeTone, PendingAction, TranscriptEntry, TranscriptItem, TurnCard } from "./types.ts";
 
 type ToolResultItem = Extract<TranscriptItem, { type: "tool_result" }>;
 type AssistantMessageEntry = TranscriptEntry & { item: Extract<TranscriptItem, { type: "assistant_message" }> };
@@ -30,22 +28,9 @@ type ToolRunItem =
 			statusKind: ToolRunStatusKind;
 			statusLabel: string;
 			argsJson?: string;
-			display?: ReplayDisplay | null;
 			result?: ToolResultItem;
 			input: Record<string, unknown> | null;
 			editPreview: EditToolPreview | null;
-	  }
-	| {
-			source: "hosted";
-			key: string;
-			entryId: string;
-			id: string;
-			rawName: string;
-			prettyName: string;
-			title: string;
-			statusKind: ToolRunStatusKind;
-			statusLabel: string;
-			tool: HostedToolView;
 	  };
 
 type TranscriptDisplayNode =
@@ -57,13 +42,19 @@ type TranscriptDisplayNode =
 			text: string;
 			copyText: string;
 			phase: ModelStepView["phase"];
-			citations: SourceCitation[];
 	  }
 	| { type: "tool_group"; key: string; id: string; items: ToolRunItem[]; turnId: number | null; turnOpen: boolean; isLive: boolean }
 	| { type: "turn_finished"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "turn_finished" }> } }
 	| { type: "tool_result"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "tool_result" }> } }
 	| { type: "compaction_summary"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "compaction_summary" }> } }
 	| { type: "compaction_in_progress"; key: string; trigger: "auto" | "manual"; reason: string | null };
+
+export interface TurnCardView {
+	card: TurnCard;
+	entries: TranscriptEntry[] | null;
+	expanded: boolean;
+	isCurrent: boolean;
+}
 
 type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
 const STICKY_BOTTOM_EPSILON_PX = 1;
@@ -169,7 +160,13 @@ export const MessageList = memo(function MessageList({
 	entriesSessionId,
 	loadingSession = false,
 	onResumeTurn,
-	resumingTurnId
+	resumingTurnId,
+	turnCards,
+	onExpandTurn,
+	loadingTurnId,
+	hasOlderTurns,
+	loadingOlderTurns,
+	onLoadOlderTurns
 }: {
 	entries: TranscriptEntry[];
 	pendingActions?: PendingAction[];
@@ -182,6 +179,12 @@ export const MessageList = memo(function MessageList({
 	loadingSession?: boolean;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
+	turnCards?: TurnCardView[] | null;
+	onExpandTurn?: (turnId: string) => void;
+	loadingTurnId?: string | null;
+	hasOlderTurns?: boolean;
+	loadingOlderTurns?: boolean;
+	onLoadOlderTurns?: () => void;
 }) {
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	const contentRef = useRef<HTMLDivElement | null>(null);
@@ -339,9 +342,10 @@ export const MessageList = memo(function MessageList({
 	// synthesize a local start time; a running turn without this anchor is a
 	// protocol/storage bug, not something the UI can make correct.
 	const workingStartMs = useMemo(
-		() => (isRunning ? runningTurnStartMs(visibleEntries) : null),
-		[isRunning, visibleEntries],
+		() => (isRunning ? turnCards?.find((turn) => turn.isCurrent)?.card.start_timestamp_ms ?? runningTurnStartMs(visibleEntries) : null),
+		[isRunning, turnCards, visibleEntries],
 	);
+	const shouldUseTurnCards = !!turnCards && turnCards.length > 0;
 
 	if (!hasSession) {
 		return (
@@ -368,21 +372,45 @@ export const MessageList = memo(function MessageList({
 	return (
 		<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 			<div className="message-scroll-content" ref={contentRef}>
-				{visibleDisplayNodes.map((node) => (
-					<TranscriptDisplayNodeView
-						node={node}
-						key={node.key}
-						toolIndex={toolIndex}
-						isActiveLeaf={nodeLeafId(node) === activeLeafId}
-						isRunning={isRunning}
-						onResumeTurn={onResumeTurn}
-						resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
-						resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
-						compactionHiddenCount={compactionHiddenCounts.get(node.key) ?? 0}
-						compactionExpanded={!collapsedCompactions.has(node.key)}
-						onToggleCompaction={toggleCompaction}
-					/>
-				))}
+				{shouldUseTurnCards
+					? (
+							<>
+								{hasOlderTurns ? (
+									<div className="turn-card-load-older">
+										<button type="button" className="turn-card-expand" disabled={loadingOlderTurns} onClick={onLoadOlderTurns}>
+											{loadingOlderTurns ? "Loading older…" : "Load older turns"}
+										</button>
+									</div>
+								) : null}
+								{turnCards!.map((turn) => (
+									<TurnCardRow
+										key={turn.card.id}
+										turn={turn}
+										activeLeafId={activeLeafId}
+										isRunning={isRunning}
+										onResumeTurn={onResumeTurn}
+										resumingTurnId={resumingTurnId}
+										onExpandTurn={onExpandTurn}
+										loadingTurnId={loadingTurnId}
+									/>
+								))}
+							</>
+						)
+					: visibleDisplayNodes.map((node) => (
+							<TranscriptDisplayNodeView
+								node={node}
+								key={node.key}
+								toolIndex={toolIndex}
+								isActiveLeaf={nodeLeafId(node) === activeLeafId}
+								isRunning={isRunning}
+								onResumeTurn={onResumeTurn}
+								resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
+								resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
+								compactionHiddenCount={compactionHiddenCounts.get(node.key) ?? 0}
+								compactionExpanded={!collapsedCompactions.has(node.key)}
+								onToggleCompaction={toggleCompaction}
+							/>
+						))}
 				{isRunning && workingStartMs != null && serverTimeMs != null ? (
 					<WorkingIndicator startMs={workingStartMs} serverTimeMs={serverTimeMs} />
 				) : null}
@@ -570,6 +598,157 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	return null;
 });
 
+const TurnCardRow = memo(function TurnCardRow({
+	turn,
+	activeLeafId,
+	isRunning,
+	onResumeTurn,
+	resumingTurnId,
+	onExpandTurn,
+	loadingTurnId
+}: {
+	turn: TurnCardView;
+	activeLeafId: string | null;
+	isRunning: boolean;
+	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
+	resumingTurnId?: string | null;
+	onExpandTurn?: (turnId: string) => void;
+	loadingTurnId?: string | null;
+}) {
+	if (turn.expanded && turn.entries) {
+		const toolIndex = indexToolEntries(turn.entries);
+		const turnViews = buildTurnViews(turn.entries);
+		const displayNodes = deriveTranscriptDisplayNodes(turn.entries, turnViews, toolIndex.results, []);
+		const resumeEntryIdByNode = new Map(displayNodes.map((node) => [node.key, nodeLeafId(node)]));
+		return (
+			<div className="turn-card expanded">
+				<TurnCardSummary
+					turn={turn}
+					activeLeafId={activeLeafId}
+					isRunning={isRunning}
+					onResumeTurn={onResumeTurn}
+					resumingTurnId={resumingTurnId}
+					onExpandTurn={onExpandTurn}
+					loadingTurnId={loadingTurnId}
+				/>
+				<div className="turn-card-detail">
+					{displayNodes.map((node) => (
+						<TranscriptDisplayNodeView
+							key={node.key}
+							node={node}
+							toolIndex={toolIndex}
+							isActiveLeaf={nodeLeafId(node) === activeLeafId}
+							isRunning={isRunning}
+							onResumeTurn={onResumeTurn}
+							resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
+							resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
+							compactionHiddenCount={0}
+							compactionExpanded
+							onToggleCompaction={() => {}}
+						/>
+					))}
+				</div>
+			</div>
+		);
+	}
+	return (
+		<TurnCardSummary
+			turn={turn}
+			activeLeafId={activeLeafId}
+			isRunning={isRunning}
+			onResumeTurn={onResumeTurn}
+			resumingTurnId={resumingTurnId}
+			onExpandTurn={onExpandTurn}
+			loadingTurnId={loadingTurnId}
+		/>
+	);
+});
+
+const TurnCardSummary = memo(function TurnCardSummary({
+	turn,
+	activeLeafId,
+	isRunning,
+	onResumeTurn,
+	resumingTurnId,
+	onExpandTurn,
+	loadingTurnId
+}: {
+	turn: TurnCardView;
+	activeLeafId: string | null;
+	isRunning: boolean;
+	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
+	resumingTurnId?: string | null;
+	onExpandTurn?: (turnId: string) => void;
+	loadingTurnId?: string | null;
+}) {
+	const card = turn.card;
+	const title = turnCardTitle(card);
+	const meta = turnCardMeta(card);
+	const isLoading = loadingTurnId === card.id;
+	const canExpand = (!turn.expanded || !turn.entries) && card.status !== "compacted" && !!onExpandTurn;
+	const canResume = card.can_resume && card.active_leaf_id === activeLeafId && !isRunning && !!onResumeTurn;
+	const resumableOutcome = card.outcome === "Interrupted" || card.outcome === "Crashed" ? card.outcome : null;
+	return (
+		<div className={`turn-card ${turn.isCurrent ? "current" : ""} ${card.status}`}>
+			<div className="turn-card-header">
+				<div>
+					<div className="turn-card-title">{title}</div>
+					{meta ? <div className="turn-card-meta">{meta}</div> : null}
+				</div>
+				<div className="turn-card-actions">
+					{canResume && !turn.isCurrent && resumableOutcome ? (
+						<button
+							type="button"
+							className="turn-card-expand"
+							disabled={resumingTurnId === card.active_leaf_id}
+							onClick={() => onResumeTurn?.(card.active_leaf_id, resumableOutcome)}
+						>
+							{resumingTurnId === card.active_leaf_id ? "Starting…" : resumableOutcome === "Interrupted" ? "Continue" : "Retry"}
+						</button>
+					) : null}
+					{canExpand ? (
+						<button type="button" className="turn-card-expand" disabled={isLoading} onClick={() => onExpandTurn?.(card.id)}>
+							{isLoading ? "Loading…" : "Show details"}
+						</button>
+					) : null}
+				</div>
+			</div>
+			{card.status === "compacted" && card.summary ? <div className="turn-card-assistant">{card.summary}</div> : null}
+			{card.user_messages.map((entry) =>
+				entry.item.type === "user_message" ? <UserBubble key={entry.id} entryId={entry.id} item={entry.item} /> : null,
+			)}
+			{card.assistant_message?.item.type === "assistant_message" ? (
+				<AssistantTextBlock
+					node={{
+						type: "assistant_text",
+						key: `${card.assistant_message.id}-turn-card`,
+						entry: card.assistant_message as AssistantMessageEntry,
+						text: assistantMessageText(card.assistant_message.item),
+						copyText: assistantMessageText(card.assistant_message.item),
+						phase: card.status === "completed" && card.outcome === "Graceful" ? "final_answer" : turn.isCurrent ? "running" : "unknown",
+					}}
+				/>
+			) : null}
+		</div>
+	);
+});
+
+function turnCardTitle(card: TurnCard): string {
+	if (card.status === "compacted") return `Compacted history${card.turn_id ? ` through turn ${card.turn_id}` : ""}`;
+	const label = card.turn_id ? `Turn ${card.turn_id}` : "Turn";
+	if (card.outcome && card.outcome !== "Graceful") return `${label} · ${card.outcome.toLowerCase()}`;
+	if (card.status === "completed") return `${label} · completed`;
+	return label;
+}
+
+function turnCardMeta(card: TurnCard): string {
+	const parts = [];
+	if (card.status === "open") parts.push("in progress");
+	if (card.user_messages.length > 1) parts.push(`${card.user_messages.length} user messages`);
+	if (!card.assistant_message && card.status !== "compacted") parts.push("waiting for assistant");
+	return parts.join(" · ");
+}
+
 const UserBubble = memo(function UserBubble({ item, entryId }: { item: Extract<TranscriptItem, { type: "user_message" }>; entryId: string }) {
 	return (
 		<div className="message-row user-row">
@@ -581,73 +760,10 @@ const UserBubble = memo(function UserBubble({ item, entryId }: { item: Extract<T
 
 export type AssistantRenderPart =
 	| { type: "text"; key: string; item: Extract<AssistantItem, { type: "text" }> }
-	| { type: "tool_call"; key: string; item: Extract<AssistantItem, { type: "tool_call" }>; display?: ReplayDisplay | null }
-	| { type: "hosted_tool"; key: string; tool: ReturnType<typeof hostedToolsFromReplay>[number] };
+	| { type: "tool_call"; key: string; item: Extract<AssistantItem, { type: "tool_call" }> };
 
-export function assistantRenderParts(items: AssistantItem[], providerReplay: TranscriptEntry["provider_replay"] | undefined): AssistantRenderPart[] {
-	items = coalesceAdjacentTextItems(items);
-	const parsedReplay = parsedProviderReplay(providerReplay);
-	const hostedTools = hostedToolsFromReplay(providerReplay);
-	if (parsedReplay.length === 0) {
-		return items.map((item, index) => itemRenderPart(item, `item-${index}`));
-	}
-
-	const parts: AssistantRenderPart[] = [];
-	const localToolById = new Map<string, Extract<AssistantItem, { type: "tool_call" }>>();
-	for (const item of items) {
-		if (item.type === "tool_call") localToolById.set(item.id, item);
-	}
-	const localDisplayById = new Map<string, ReplayDisplay | null | undefined>();
-	for (const replayItem of parsedReplay) {
-		const toolId = localToolCallIdFromReplay(replayItem.raw);
-		if (toolId) localDisplayById.set(toolId, replayItem.display);
-	}
-	const hostedById = new Map(hostedTools.map((tool) => [tool.id, tool]));
-	const renderedTextIndexes = new Set<number>();
-	const renderedToolIds = new Set<string>();
-	const renderedHostedIds = new Set<string>();
-
-	const renderText = () => {
-		items.forEach((item, index) => {
-			if (item.type === "text" && !renderedTextIndexes.has(index)) {
-				renderedTextIndexes.add(index);
-				parts.push({ type: "text", key: `text-${index}`, item });
-			}
-		});
-	};
-
-	for (const replayItem of parsedReplay) {
-		const hosted = replayItem.raw.id ? hostedById.get(replayItem.raw.id) : undefined;
-		if (hosted && !renderedHostedIds.has(hosted.id)) {
-			renderedHostedIds.add(hosted.id);
-			parts.push({ type: "hosted_tool", key: `hosted-${hosted.id}`, tool: hosted });
-			continue;
-		}
-		const toolId = localToolCallIdFromReplay(replayItem.raw);
-		if (toolId) {
-			const tool = localToolById.get(toolId);
-			if (tool && !renderedToolIds.has(tool.id)) {
-				renderedToolIds.add(tool.id);
-				parts.push({ type: "tool_call", key: `tool-${tool.id}`, item: tool, display: localDisplayById.get(tool.id) });
-			}
-			continue;
-		}
-		if (replayContainsAssistantText(replayItem.raw)) {
-			renderText();
-		}
-	}
-
-	items.forEach((item, index) => {
-		if (item.type === "text") {
-			if (!renderedTextIndexes.has(index)) parts.push({ type: "text", key: `text-${index}`, item });
-			return;
-		}
-		if (!renderedToolIds.has(item.id)) parts.push({ type: "tool_call", key: `tool-${item.id}`, item, display: localDisplayById.get(item.id) });
-	});
-	for (const tool of hostedTools) {
-		if (!renderedHostedIds.has(tool.id)) parts.push({ type: "hosted_tool", key: `hosted-${tool.id}`, tool });
-	}
-	return parts;
+export function assistantRenderParts(items: AssistantItem[]): AssistantRenderPart[] {
+	return coalesceAdjacentTextItems(items).map((item, index) => itemRenderPart(item, `item-${index}`));
 }
 
 function itemRenderPart(item: AssistantItem, key: string): AssistantRenderPart {
@@ -743,34 +859,22 @@ class TranscriptDisplayBuilder {
 	}
 
 	private appendAssistantMessage(entry: AssistantMessageEntry) {
-		const parts = assistantRenderParts(entry.item.items, entry.provider_replay);
-		const citations = citationsFromReplay(entry.provider_replay);
-		let citationsRendered = false;
+		const parts = assistantRenderParts(entry.item.items);
 		for (const part of parts) {
 			if (part.type === "text") {
 				if (!part.item.text) continue;
 				this.flushGroup();
-				this.nodes.push(this.assistantTextNode(entry, part.key, part.item.text, citationsRendered ? [] : citations));
-				citationsRendered = true;
+				this.nodes.push(this.assistantTextNode(entry, part.key, part.item.text));
 				continue;
 			}
-			if (part.type === "tool_call") {
-				this.appendToolItem(entry, localToolRunItem(entry.id, part, this.toolResults.get(part.item.id)));
-				continue;
-			}
-			this.appendToolItem(entry, hostedToolRunItem(entry.id, part));
-		}
-		if (citations.length && !citationsRendered) {
-			this.flushGroup();
-			this.nodes.push(this.assistantTextNode(entry, "citations", "", citations));
+			this.appendToolItem(entry, localToolRunItem(entry.id, part, this.toolResults.get(part.item.id)));
 		}
 	}
 
 	private assistantTextNode(
 		entry: AssistantMessageEntry,
 		key: string,
-		text: string,
-		citations: SourceCitation[]
+		text: string
 	): Extract<TranscriptDisplayNode, { type: "assistant_text" }> {
 		const step = this.turnByEntryId.get(entry.id)?.modelSteps.find((candidate) => candidate.entry.id === entry.id);
 		return {
@@ -780,7 +884,6 @@ class TranscriptDisplayBuilder {
 			text,
 			copyText: assistantMessageText(entry.item),
 			phase: step?.phase ?? "unknown",
-			citations
 		};
 	}
 
@@ -891,7 +994,7 @@ function localToolRunItem(
 	const input = parseToolInput(part.item.args_json);
 	const statusKind = !result ? "running" : result.status === "Success" ? "success" : "error";
 	const editPreview = editToolPreview(part.item.tool_name, input, result);
-	const prettyName = part.display?.pretty_name ?? prettyToolName(part.item.tool_name);
+	const prettyName = prettyToolName(part.item.tool_name);
 	return {
 		source: "local",
 		key: `local-${entryId}-${part.item.id}`,
@@ -899,30 +1002,13 @@ function localToolRunItem(
 		id: part.item.id,
 		rawName: part.item.tool_name,
 		prettyName: editPreview ? "Edit" : prettyName,
-		title: editPreview?.header ?? formatDisplayHeader(prettyName, part.display?.input_summary ?? inputSummaryFromInput(part.item.tool_name, input)),
+		title: editPreview?.header ?? formatDisplayHeader(prettyName, inputSummaryFromInput(part.item.tool_name, input)),
 		statusKind,
 		statusLabel: result ? result.status.toLowerCase() : "running",
 		argsJson: part.item.args_json,
-		display: part.display,
 		result,
 		input,
 		editPreview
-	};
-}
-
-function hostedToolRunItem(entryId: string, part: Extract<AssistantRenderPart, { type: "hosted_tool" }>): ToolRunItem {
-	const statusKind = part.tool.status === "completed" ? "success" : part.tool.status === "error" ? "error" : "running";
-	return {
-		source: "hosted",
-		key: `hosted-${entryId}-${part.tool.id}`,
-		entryId,
-		id: part.tool.id,
-		rawName: part.tool.name,
-		prettyName: part.tool.prettyName,
-		title: formatDisplayHeader(part.tool.prettyName, part.tool.inputSummary),
-		statusKind,
-		statusLabel: part.tool.status,
-		tool: part.tool
 	};
 }
 
@@ -1056,34 +1142,12 @@ const MarkdownText = memo(function MarkdownText({ text }: { text: string }) {
 	);
 });
 
-function CitationList({ citations }: { citations: ReturnType<typeof citationsFromReplay> }) {
-	return (
-		<div className="citation-list" aria-label="Sources">
-			<span className="citation-label">Sources</span>
-			{citations.map((citation, index) => (
-				<a
-					className="citation-chip"
-					href={citation.url}
-					key={citation.id}
-					target="_blank"
-					rel="noreferrer"
-					title={citation.citedText ?? citation.title}
-				>
-					<span className="citation-index">{index + 1}</span>
-					<span className="citation-title">{citation.title}</span>
-				</a>
-			))}
-		</div>
-	);
-}
-
 const AssistantTextBlock = memo(function AssistantTextBlock({ node }: { node: Extract<TranscriptDisplayNode, { type: "assistant_text" }> }) {
 	return (
 		<div className="message-row assistant-row">
 			<div className={`assistant-block phase-${node.phase} ${node.copyText ? "has-copy" : ""}`}>
 				<div className="assistant-content">
 					{node.text ? <MarkdownText text={node.text} /> : null}
-					{node.citations.length ? <CitationList citations={node.citations} /> : null}
 				</div>
 				{node.copyText ? <AssistantCopyButton text={node.copyText} /> : null}
 			</div>
@@ -1176,7 +1240,7 @@ const ToolRunGroup = memo(function ToolRunGroup({ node }: { node: Extract<Transc
 
 const ToolRunDetailItem = memo(function ToolRunDetailItem({ item, defaultExpanded = false }: { item: ToolRunItem; defaultExpanded?: boolean }) {
 	const [expanded, setExpanded] = useState(defaultExpanded);
-	const isExpandable = item.source === "local" ? !!item.editPreview || !!item.input || !!item.result : !!item.tool.input || !!item.tool.output;
+	const isExpandable = !!item.editPreview || !!item.input || !!item.result;
 	const rowStyle = isExpandable ? undefined : { gridTemplateColumns: "24px minmax(0, 1fr) auto" };
 	const icon =
 		item.statusKind === "error" ? (
@@ -1205,14 +1269,14 @@ const ToolRunDetailItem = memo(function ToolRunDetailItem({ item, defaultExpande
 			</button>
 			{expanded && isExpandable ? (
 				<div className="tool-run-item-body">
-					{item.source === "local" ? <LocalToolRunBody item={item} /> : <HostedToolRunBody item={item} />}
+					<LocalToolRunBody item={item} />
 				</div>
 			) : null}
 		</div>
 	);
 });
 
-function LocalToolRunBody({ item }: { item: Extract<ToolRunItem, { source: "local" }> }) {
+function LocalToolRunBody({ item }: { item: ToolRunItem }) {
 	const result = item.result;
 	const showResultOutput = result && (!item.editPreview?.hideSuccessOutput || result.status !== "Success");
 	return (
@@ -1234,29 +1298,6 @@ function LocalToolRunBody({ item }: { item: Extract<ToolRunItem, { source: "loca
 				<div className="tool-pending">waiting for tool result</div>
 			) : null}
 			{item.editPreview ? null : <div className="tool-call-id">id {item.id}</div>}
-		</>
-	);
-}
-
-function HostedToolRunBody({ item }: { item: Extract<ToolRunItem, { source: "hosted" }> }) {
-	const failed = item.tool.status === "error";
-	return (
-		<>
-			{item.tool.input ? (
-				<div className="tool-section">
-					<div className="tool-section-label">input</div>
-					<pre>{JSON.stringify(item.tool.input, null, 2)}</pre>
-				</div>
-			) : null}
-			{item.tool.output ? (
-				<div className="tool-section">
-					<div className="tool-section-label">output</div>
-					<pre className={failed ? "tool-output-error" : ""}>{item.tool.output}</pre>
-				</div>
-			) : null}
-			<div className="tool-call-id">
-				{item.tool.provider} hosted tool {item.tool.id}
-			</div>
 		</>
 	);
 }
@@ -1295,7 +1336,7 @@ function groupSummaryPills(items: ToolRunItem[]): string[] {
 		.map(([name, count]) => `${count} ${name}`);
 }
 
-function isEditToolRunItem(item: ToolRunItem): item is Extract<ToolRunItem, { source: "local" }> & { editPreview: EditToolPreview } {
+function isEditToolRunItem(item: ToolRunItem): item is ToolRunItem & { editPreview: EditToolPreview } {
 	return item.source === "local" && !!item.editPreview;
 }
 

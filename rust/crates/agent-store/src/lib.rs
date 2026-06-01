@@ -521,16 +521,6 @@ pub enum TranscriptEntryBodyMode {
     Full,
 }
 
-impl TranscriptEntryBodyMode {
-    pub fn from_include_provider_replay(include: bool) -> Self {
-        if include {
-            Self::Full
-        } else {
-            Self::Ui
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptEntryRecord {
     pub id: String,
@@ -538,6 +528,7 @@ pub struct TranscriptEntryRecord {
     pub timestamp_ms: u64,
     pub sequence: i64,
     pub item: TranscriptItem,
+    #[serde(skip_serializing)]
     pub provider_replay: Vec<ProviderReplayItem>,
 }
 
@@ -554,6 +545,56 @@ pub struct TranscriptTreeNodeRecord {
     pub can_switch_to: bool,
     pub edit_target_leaf_id: Option<String>,
     pub display_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnCardStatus {
+    Completed,
+    Open,
+    Compacted,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TurnCardRecord {
+    pub id: String,
+    pub turn_id: Option<TurnId>,
+    pub status: TurnCardStatus,
+    pub outcome: Option<TurnOutcome>,
+    pub start_entry_id: Option<String>,
+    pub boundary_entry_id: Option<String>,
+    pub active_leaf_id: String,
+    pub start_sequence: i64,
+    pub end_sequence: i64,
+    pub start_timestamp_ms: u64,
+    pub timestamp_ms: u64,
+    pub user_messages: Vec<TranscriptEntryRecord>,
+    pub assistant_message: Option<TranscriptEntryRecord>,
+    pub summary: Option<String>,
+    pub can_resume: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptTurnsResult {
+    pub session_id: String,
+    pub active_leaf_id: Option<String>,
+    pub session_revision: i64,
+    pub transcript_revision: i64,
+    pub before_entry_id: Option<String>,
+    pub next_before_entry_id: Option<String>,
+    pub has_more_before: bool,
+    pub limit: i64,
+    pub cards: Vec<TurnCardRecord>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptTurnDetailResult {
+    pub session_id: String,
+    pub active_leaf_id: Option<String>,
+    pub session_revision: i64,
+    pub transcript_revision: i64,
+    pub card_id: String,
+    pub entries: Vec<TranscriptEntryRecord>,
 }
 
 #[derive(Debug, Clone)]

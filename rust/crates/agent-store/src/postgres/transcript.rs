@@ -1,9 +1,9 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use agent_session::{
     ModelContext, ModelContextEntry, StoredSession, StoredTranscriptEntry, TranscriptStorageNode,
 };
-use agent_vocab::{AssistantItem, ContentBlock, TranscriptItem};
+use agent_vocab::TranscriptItem;
 use anyhow::{anyhow, Result};
 use serde_json::{json, Value};
 use sqlx::{Postgres, Row, Transaction};
@@ -12,6 +12,7 @@ use crate::{
     ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree, SessionActivity,
     SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryBodyMode,
     TranscriptEntryRecord, TranscriptEntryScope, TranscriptTreeIndex, TranscriptTreeNodeRecord,
+    TranscriptTurnDetailResult, TranscriptTurnsResult, TurnCardRecord, TurnCardStatus,
 };
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
@@ -22,6 +23,8 @@ use super::PostgresAgentStore;
 
 const DEFAULT_TRANSCRIPT_INDEX_LIMIT: i64 = 1000;
 const MAX_TRANSCRIPT_INDEX_LIMIT: i64 = 5000;
+const DEFAULT_TRANSCRIPT_TURN_LIMIT: i64 = 50;
+const MAX_TRANSCRIPT_TURN_LIMIT: i64 = 200;
 
 fn provider_replay_select(body_mode: TranscriptEntryBodyMode) -> &'static str {
     match body_mode {
@@ -147,6 +150,151 @@ async fn active_branch_entry_records_tx(
         .collect()
 }
 
+async fn active_branch_turn_card_rows_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    before_entry_id: Option<&str>,
+    limit: i64,
+) -> Result<Vec<TurnCardRow>> {
+    let rows = sqlx::query(
+        r#"
+        with recursive branch as (
+            select t.id,
+                   t.parent_id,
+                   t.timestamp_ms,
+                   t.item,
+                   t.sequence,
+                   case
+                     when t.item->>'type' in ('turn_started', 'compaction_summary') then 1
+                     else 0
+                   end as boundary_count
+            from transcript_entries t
+            left join sessions s on s.id = t.session_id
+            where t.session_id = $1
+              and t.id = coalesce($2::text, s.active_leaf_id)
+
+            union all
+
+            select parent.id,
+                   parent.parent_id,
+                   parent.timestamp_ms,
+                   parent.item,
+                   parent.sequence,
+                   child.boundary_count
+                     + case
+                         when parent.item->>'type' in ('turn_started', 'compaction_summary') then 1
+                         else 0
+                       end as boundary_count
+            from transcript_entries parent
+            join branch child
+              on parent.session_id = $1
+             and parent.id = coalesce(
+                case
+                    when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
+                    else null
+                end,
+                child.parent_id
+             )
+            where child.boundary_count < $3
+        ),
+        card_rows as (
+            select id,
+                   parent_id,
+                   timestamp_ms,
+                   item,
+                   sequence,
+                   sum(
+                     case
+                       when item->>'type' in ('turn_started', 'compaction_summary') then 1
+                       else 0
+                     end
+                   ) over (order by sequence rows between unbounded preceding and current row) as card_ordinal
+            from branch
+            where item->>'type' in ('turn_started', 'user_message', 'assistant_message', 'tool_call_started', 'tool_result', 'turn_finished', 'compaction_summary')
+        ),
+        terminal_assistant as (
+            select card_ordinal, max(sequence) as sequence
+            from card_rows
+            where item->>'type' = 'assistant_message'
+            group by card_ordinal
+        )
+        select card_rows.id,
+               card_rows.parent_id,
+               card_rows.timestamp_ms,
+               card_rows.sequence,
+               case
+                 when card_rows.item->>'type' = 'user_message'
+                      or terminal_assistant.sequence = card_rows.sequence then card_rows.item
+                 else null
+               end as body_item,
+               card_rows.item->>'type' as item_type,
+               card_rows.item->'turn_id' as turn_id,
+               card_rows.item->'outcome' as outcome,
+               card_rows.item->>'source_leaf_id' as compaction_source_leaf_id,
+               card_rows.item #>> '{last_turn_id}' as compaction_last_turn_id,
+               card_rows.item #>> '{turn_started_at_ms}' as compaction_turn_started_at_ms,
+               card_rows.item->>'summary' as compaction_summary
+        from card_rows
+        left join terminal_assistant
+          on terminal_assistant.card_ordinal = card_rows.card_ordinal
+        order by card_rows.sequence
+        "#
+    )
+    .bind(session_id)
+    .bind(before_entry_id)
+    .bind(limit)
+    .fetch_all(&mut **tx)
+    .await?;
+    rows.into_iter().map(|row| turn_card_row(&row)).collect()
+}
+
+async fn active_branch_entry_records_between_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    leaf_id: &str,
+    start_sequence: i64,
+    end_sequence: i64,
+    body_mode: TranscriptEntryBodyMode,
+) -> Result<Vec<TranscriptEntryRecord>> {
+    let provider_replay_select = provider_replay_select(body_mode);
+    let leaf_provider_replay_select = aliased_provider_replay_select("t", body_mode);
+    let parent_provider_replay_select = aliased_provider_replay_select("parent", body_mode);
+    let query = format!(
+        r#"
+        with recursive card_path as (
+            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence
+            from transcript_entries t
+            where t.session_id = $1
+              and t.id = $2::text
+              and t.sequence = $4
+
+            union all
+
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence
+            from transcript_entries parent
+            join card_path child
+              on parent.session_id = $1
+             and parent.id = child.parent_id
+            where child.sequence > $3
+        )
+        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}
+        from card_path
+        where sequence between $3 and $4
+        order by sequence
+        "#
+    );
+    let rows = sqlx::query(&query)
+        .bind(session_id)
+        .bind(leaf_id)
+        .bind(start_sequence)
+        .bind(end_sequence)
+        .fetch_all(&mut **tx)
+        .await?;
+    rows.into_iter()
+        .map(|row| row_to_transcript_entry(&row))
+        .collect()
+}
+
 impl PostgresAgentStore {
     pub async fn load_stored_session(&self, session_id: &str) -> Result<StoredSession> {
         let session_row = sqlx::query("select active_leaf_id, metadata from sessions where id=$1")
@@ -201,7 +349,10 @@ impl PostgresAgentStore {
                 self.active_branch_entry_records_after(session_id, base_leaf_id, body_mode)
                     .await?
             }
-            None => self.active_branch_entry_records(session_id, body_mode).await?,
+            None => {
+                self.active_branch_entry_records(session_id, body_mode)
+                    .await?
+            }
         };
         let status = match base_leaf_id {
             Some(_) if entries.is_empty() => ActiveBranchSyncStatus::BranchChanged,
@@ -268,9 +419,10 @@ impl PostgresAgentStore {
     pub async fn active_branch(&self, session_id: &str) -> Result<HistoryTree> {
         let active_leaf_id = self.active_leaf_id(session_id).await?;
         let entries = match active_leaf_id.as_deref() {
-            Some(_) => self
-                .active_branch_entry_records(session_id, TranscriptEntryBodyMode::Full)
-                .await?,
+            Some(_) => {
+                self.active_branch_entry_records(session_id, TranscriptEntryBodyMode::Ui)
+                    .await?
+            }
             None => Vec::new(),
         };
         Ok(HistoryTree {
@@ -291,7 +443,8 @@ impl PostgresAgentStore {
                 self.transcript_entry_records(session_id, body_mode).await
             }
             TranscriptEntryScope::ActiveBranch => {
-                self.active_branch_entry_records(session_id, body_mode).await
+                self.active_branch_entry_records(session_id, body_mode)
+                    .await
             }
         }
     }
@@ -400,6 +553,114 @@ impl PostgresAgentStore {
             max_sequence,
             complete: last_sequence >= max_sequence,
             nodes,
+        })
+    }
+
+    pub async fn transcript_turns(
+        &self,
+        session_id: &str,
+        before_entry_id: Option<&str>,
+        limit: Option<i64>,
+    ) -> Result<TranscriptTurnsResult> {
+        let limit = limit
+            .unwrap_or(DEFAULT_TRANSCRIPT_TURN_LIMIT)
+            .clamp(1, MAX_TRANSCRIPT_TURN_LIMIT);
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read read only")
+            .execute(&mut *tx)
+            .await?;
+        let session = sqlx::query(
+            r#"
+            select active_leaf_id, session_revision, transcript_revision
+            from sessions
+            where id=$1
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let active_leaf_id: Option<String> = session.get("active_leaf_id");
+        let rows = if active_leaf_id.is_some() || before_entry_id.is_some() {
+            active_branch_turn_card_rows_tx(&mut tx, session_id, before_entry_id, limit).await?
+        } else {
+            Vec::new()
+        };
+        let next_before_entry_id = rows
+            .first()
+            .and_then(TurnCardRow::display_parent_id)
+            .map(ToOwned::to_owned);
+        let has_more_before = next_before_entry_id.is_some();
+        let cards = turn_cards_from_rows(&rows);
+        tx.commit().await?;
+        Ok(TranscriptTurnsResult {
+            session_id: session_id.to_string(),
+            active_leaf_id,
+            session_revision: session.get("session_revision"),
+            transcript_revision: session.get("transcript_revision"),
+            before_entry_id: before_entry_id.map(ToOwned::to_owned),
+            next_before_entry_id,
+            has_more_before,
+            limit,
+            cards,
+        })
+    }
+
+    pub async fn transcript_turn_detail(
+        &self,
+        session_id: &str,
+        card_id: &str,
+        leaf_id: &str,
+        start_sequence: i64,
+        end_sequence: i64,
+        body_mode: TranscriptEntryBodyMode,
+    ) -> Result<TranscriptTurnDetailResult> {
+        if start_sequence > end_sequence {
+            return Err(anyhow!(
+                "invalid turn-card sequence range: {start_sequence}..{end_sequence}"
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("set transaction isolation level repeatable read read only")
+            .execute(&mut *tx)
+            .await?;
+        let session = sqlx::query(
+            r#"
+            select active_leaf_id, session_revision, transcript_revision
+            from sessions
+            where id=$1
+            "#,
+        )
+        .bind(session_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let active_leaf_id: Option<String> = session.get("active_leaf_id");
+        let detail_entries = active_branch_entry_records_between_tx(
+            &mut tx,
+            session_id,
+            leaf_id,
+            start_sequence,
+            end_sequence,
+            body_mode,
+        )
+        .await?;
+        if detail_entries.is_empty()
+            || detail_entries.first().map(|entry| entry.sequence) != Some(start_sequence)
+            || detail_entries.last().map(|entry| entry.sequence) != Some(end_sequence)
+            || !detail_entries.iter().any(|entry| entry.id == card_id)
+        {
+            tx.commit().await?;
+            return Err(anyhow!("turn card detail not found: {card_id}"));
+        }
+        tx.commit().await?;
+        Ok(TranscriptTurnDetailResult {
+            session_id: session_id.to_string(),
+            active_leaf_id,
+            session_revision: session.get("session_revision"),
+            transcript_revision: session.get("transcript_revision"),
+            card_id: card_id.to_string(),
+            entries: detail_entries,
         })
     }
 
@@ -699,8 +960,11 @@ impl PostgresAgentStore {
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
+        let mut inserted_records = HashMap::new();
         for entry in entries {
-            insert_stored_entry_tx(&mut tx, session_id, entry).await?;
+            if let Some(record) = insert_stored_entry_tx(&mut tx, session_id, entry).await? {
+                inserted_records.insert(record.id.clone(), record);
+            }
         }
         let unfinished_actions = action_is_unfinished(None);
         let query = format!(
@@ -723,7 +987,8 @@ impl PostgresAgentStore {
                 insert_transcript_item_events_tx(
                     &mut tx,
                     session_id,
-                    Some(entry),
+                    Some(&state),
+                    inserted_records.get(entry.id.as_str()),
                     &entry.id,
                     &entry.item,
                 )
@@ -898,8 +1163,10 @@ fn display_hint(item: &TranscriptItem) -> Option<String> {
             .items
             .iter()
             .map(|item| match item {
-                AssistantItem::Text(text) => text.clone(),
-                AssistantItem::ToolCall(call) => format!("tool call: {}", call.tool_name),
+                agent_vocab::AssistantItem::Text(text) => text.clone(),
+                agent_vocab::AssistantItem::ToolCall(call) => {
+                    format!("tool call: {}", call.tool_name)
+                }
             })
             .collect::<Vec<_>>()
             .join(""),
@@ -920,15 +1187,86 @@ fn display_hint(item: &TranscriptItem) -> Option<String> {
     }
 }
 
-fn content_blocks_text(blocks: &[ContentBlock]) -> String {
+fn content_blocks_text(blocks: &[agent_vocab::ContentBlock]) -> String {
     blocks
         .iter()
         .map(|block| match block {
-            ContentBlock::Text { text } => text.clone(),
-            ContentBlock::Image { .. } => "[image]".to_string(),
+            agent_vocab::ContentBlock::Text { text } => text.clone(),
+            agent_vocab::ContentBlock::Image { .. } => "[image]".to_string(),
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn turn_card_row(row: &sqlx::postgres::PgRow) -> Result<TurnCardRow> {
+    let item_type: String = row.get("item_type");
+    let mut turn_id = row
+        .get::<Option<Value>, _>("turn_id")
+        .and_then(|value| value.as_u64().map(agent_vocab::TurnId));
+    let compaction_last_turn_id = row
+        .get::<Option<String>, _>("compaction_last_turn_id")
+        .as_deref()
+        .and_then(parse_u64)
+        .map(agent_vocab::TurnId);
+    if item_type == "compaction_summary" {
+        turn_id = compaction_last_turn_id;
+    }
+    let outcome = row
+        .get::<Option<Value>, _>("outcome")
+        .and_then(|value| value.as_str().and_then(parse_turn_outcome));
+    let summary = if item_type == "compaction_summary" {
+        row.get::<Option<String>, _>("compaction_summary")
+    } else {
+        None
+    };
+    let body_item = row
+        .get::<Option<Value>, _>("body_item")
+        .map(serde_json::from_value)
+        .transpose()?;
+    let entry = match (item_type.as_str(), body_item) {
+        ("user_message" | "assistant_message", Some(item)) => Some(TranscriptEntryRecord {
+            id: row.get("id"),
+            parent_id: row.get("parent_id"),
+            timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
+            sequence: row.get("sequence"),
+            item,
+            provider_replay: Vec::new(),
+        }),
+        ("user_message", None) => {
+            return Err(anyhow!("turn-card row missing body item for user_message"));
+        }
+        ("assistant_message", None) => None,
+        _ => None,
+    };
+    Ok(TurnCardRow {
+        id: row.get("id"),
+        parent_id: row.get("parent_id"),
+        compaction_source_leaf_id: row.get("compaction_source_leaf_id"),
+        timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
+        sequence: row.get("sequence"),
+        entry,
+        item_type,
+        turn_id,
+        compaction_turn_started_at_ms: row
+            .get::<Option<String>, _>("compaction_turn_started_at_ms")
+            .as_deref()
+            .and_then(parse_u64),
+        outcome,
+        summary,
+    })
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok()
+}
+
+fn parse_turn_outcome(value: &str) -> Option<agent_vocab::TurnOutcome> {
+    match value {
+        "Graceful" => Some(agent_vocab::TurnOutcome::Graceful),
+        "Interrupted" => Some(agent_vocab::TurnOutcome::Interrupted),
+        "Crashed" => Some(agent_vocab::TurnOutcome::Crashed),
+        _ => None,
+    }
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -946,11 +1284,221 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     truncated
 }
 
+#[derive(Debug)]
+struct TurnCardRow {
+    id: String,
+    parent_id: Option<String>,
+    compaction_source_leaf_id: Option<String>,
+    timestamp_ms: u64,
+    sequence: i64,
+    entry: Option<TranscriptEntryRecord>,
+    item_type: String,
+    turn_id: Option<agent_vocab::TurnId>,
+    compaction_turn_started_at_ms: Option<u64>,
+    outcome: Option<agent_vocab::TurnOutcome>,
+    summary: Option<String>,
+}
+
+impl TurnCardRow {
+    fn entry_record(&self) -> Option<TranscriptEntryRecord> {
+        self.entry.clone()
+    }
+
+    fn display_parent_id(&self) -> Option<&str> {
+        if self.item_type == "compaction_summary" {
+            self.compaction_source_leaf_id.as_deref()
+        } else {
+            self.parent_id.as_deref()
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MutableTurnCard {
+    turn_id: Option<agent_vocab::TurnId>,
+    start_entry_id: Option<String>,
+    boundary_entry_id: Option<String>,
+    active_leaf_id: String,
+    start_sequence: i64,
+    end_sequence: i64,
+    start_timestamp_ms: u64,
+    timestamp_ms: u64,
+    user_messages: Vec<TranscriptEntryRecord>,
+    assistant_message: Option<TranscriptEntryRecord>,
+    summary: Option<String>,
+    status: TurnCardStatus,
+    outcome: Option<agent_vocab::TurnOutcome>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CompactionResumeAnchor {
+    turn_id: Option<agent_vocab::TurnId>,
+    start_timestamp_ms: Option<u64>,
+}
+
+fn turn_cards_from_rows(rows: &[TurnCardRow]) -> Vec<TurnCardRecord> {
+    let mut cards = Vec::new();
+    let mut current: Option<MutableTurnCard> = None;
+    let mut compaction_resume_anchor: Option<CompactionResumeAnchor> = None;
+
+    for row in rows {
+        if row.item_type == "compaction_summary" {
+            close_open_turn(&mut cards, &mut current);
+            cards.push(compaction_turn_card(row));
+            compaction_resume_anchor = Some(CompactionResumeAnchor {
+                turn_id: row.turn_id,
+                start_timestamp_ms: row.compaction_turn_started_at_ms,
+            });
+            continue;
+        }
+        if row.item_type == "turn_started" {
+            close_open_turn(&mut cards, &mut current);
+            compaction_resume_anchor = None;
+            current = Some(MutableTurnCard {
+                turn_id: row.turn_id,
+                start_entry_id: Some(row.id.clone()),
+                boundary_entry_id: None,
+                active_leaf_id: row.id.clone(),
+                start_sequence: row.sequence,
+                end_sequence: row.sequence,
+                start_timestamp_ms: row.timestamp_ms,
+                timestamp_ms: row.timestamp_ms,
+                user_messages: Vec::new(),
+                assistant_message: None,
+                summary: None,
+                status: TurnCardStatus::Open,
+                outcome: None,
+            });
+        }
+
+        let anchor = compaction_resume_anchor;
+        let turn = current.get_or_insert_with(|| MutableTurnCard {
+            turn_id: row.turn_id.or(anchor.and_then(|anchor| anchor.turn_id)),
+            start_entry_id: None,
+            boundary_entry_id: None,
+            active_leaf_id: row.id.clone(),
+            start_sequence: row.sequence,
+            end_sequence: row.sequence,
+            start_timestamp_ms: anchor
+                .and_then(|anchor| anchor.start_timestamp_ms)
+                .unwrap_or(row.timestamp_ms),
+            timestamp_ms: row.timestamp_ms,
+            user_messages: Vec::new(),
+            assistant_message: None,
+            summary: None,
+            status: TurnCardStatus::Open,
+            outcome: None,
+        });
+        append_entry_to_turn_card(turn, row);
+        if row.item_type == "turn_finished" {
+            close_open_turn(&mut cards, &mut current);
+        }
+    }
+    close_open_turn(&mut cards, &mut current);
+
+    cards
+}
+
+fn append_entry_to_turn_card(card: &mut MutableTurnCard, row: &TurnCardRow) {
+    card.active_leaf_id = row.id.clone();
+    card.end_sequence = row.sequence;
+    card.timestamp_ms = row.timestamp_ms;
+    if card.turn_id.is_none() {
+        card.turn_id = row.turn_id;
+    }
+    match row.item_type.as_str() {
+        "user_message" => {
+            if let Some(entry) = row.entry_record() {
+                card.user_messages.push(entry);
+            }
+        }
+        "assistant_message" => {
+            if let Some(entry) = row.entry_record() {
+                card.assistant_message = Some(entry);
+            }
+        }
+        "turn_finished" => {
+            if let Some(turn_id) = row.turn_id {
+                card.turn_id = Some(turn_id);
+            }
+            card.boundary_entry_id = Some(row.id.clone());
+            card.status = TurnCardStatus::Completed;
+            card.outcome = row.outcome;
+        }
+        "turn_started" => {
+            if let Some(turn_id) = row.turn_id {
+                card.turn_id = Some(turn_id);
+            }
+            card.start_entry_id.get_or_insert_with(|| row.id.clone());
+        }
+        _ => {}
+    }
+}
+
+fn close_open_turn(cards: &mut Vec<TurnCardRecord>, current: &mut Option<MutableTurnCard>) {
+    let Some(card) = current.take() else {
+        return;
+    };
+    cards.push(finalize_turn_card(card));
+}
+
+fn finalize_turn_card(card: MutableTurnCard) -> TurnCardRecord {
+    let id = card
+        .boundary_entry_id
+        .clone()
+        .or_else(|| card.start_entry_id.clone())
+        .unwrap_or_else(|| card.active_leaf_id.clone());
+    let can_resume = matches!(
+        card.outcome,
+        Some(agent_vocab::TurnOutcome::Interrupted | agent_vocab::TurnOutcome::Crashed)
+    );
+    TurnCardRecord {
+        id,
+        turn_id: card.turn_id,
+        status: card.status,
+        outcome: card.outcome,
+        start_entry_id: card.start_entry_id,
+        boundary_entry_id: card.boundary_entry_id,
+        active_leaf_id: card.active_leaf_id,
+        start_sequence: card.start_sequence,
+        end_sequence: card.end_sequence,
+        start_timestamp_ms: card.start_timestamp_ms,
+        timestamp_ms: card.timestamp_ms,
+        user_messages: card.user_messages,
+        assistant_message: card.assistant_message,
+        summary: card.summary,
+        can_resume,
+    }
+}
+
+fn compaction_turn_card(row: &TurnCardRow) -> TurnCardRecord {
+    let summary = row.summary.as_ref().map(|value| value.trim().to_string());
+    TurnCardRecord {
+        id: row.id.clone(),
+        turn_id: row.turn_id,
+        status: TurnCardStatus::Compacted,
+        outcome: None,
+        start_entry_id: Some(row.id.clone()),
+        boundary_entry_id: Some(row.id.clone()),
+        active_leaf_id: row.id.clone(),
+        start_sequence: row.sequence,
+        end_sequence: row.sequence,
+        start_timestamp_ms: row
+            .compaction_turn_started_at_ms
+            .unwrap_or(row.timestamp_ms),
+        timestamp_ms: row.timestamp_ms,
+        user_messages: Vec::new(),
+        assistant_message: None,
+        summary: summary.filter(|value| !value.is_empty()),
+        can_resume: false,
+    }
+}
+
 pub(super) async fn insert_entry_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     entry: &TranscriptStorageNode,
-) -> Result<()> {
+) -> Result<Option<TranscriptEntryRecord>> {
     let stored = StoredTranscriptEntry {
         id: entry.id.clone(),
         parent_id: entry.parent_id.clone(),
@@ -965,13 +1513,14 @@ pub(super) async fn insert_stored_entry_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     entry: &StoredTranscriptEntry,
-) -> Result<()> {
+) -> Result<Option<TranscriptEntryRecord>> {
     let turn_id = entry.item.turn_id().map(|turn_id| turn_id.0 as i64);
-    sqlx::query(
+    let row = sqlx::query(
         r#"
         insert into transcript_entries (session_id, id, parent_id, timestamp_ms, item, provider_replay, turn_id)
         values ($1::text, $2::text, $3::text, $4, $5, $6, $7::bigint)
         on conflict (session_id, id) do nothing
+        returning id, parent_id, timestamp_ms, sequence, item
         "#,
     )
     .bind(session_id)
@@ -981,9 +1530,19 @@ pub(super) async fn insert_stored_entry_tx(
     .bind(serde_json::to_value(&entry.item)?)
     .bind(serde_json::to_value(&entry.provider_replay)?)
     .bind(turn_id)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    Ok(())
+    row.map(|row| {
+        Ok(TranscriptEntryRecord {
+            id: row.get("id"),
+            parent_id: row.get("parent_id"),
+            timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
+            sequence: row.get("sequence"),
+            item: serde_json::from_value(row.get("item"))?,
+            provider_replay: Vec::new(),
+        })
+    })
+    .transpose()
 }
 
 pub(super) fn model_context_from_entries(entries: Vec<StoredTranscriptEntry>) -> ModelContext {
@@ -1005,7 +1564,8 @@ mod tests {
     use agent_session::{SessionEvent, TranscriptStorageNode};
     use agent_vocab::{
         AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
-        ProviderReplayItem, ReasoningEffort, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+        ProviderReplayItem, ReasoningEffort, ToolCallId, ToolResultMessage, TranscriptItem, TurnId,
+        TurnOutcome, UserMessage,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -1178,6 +1738,28 @@ mod tests {
                 "summary",
                 None,
                 TurnId(0),
+            )),
+        )
+    }
+
+    fn assistant_message(id: &str, parent_id: Option<&str>, text: &str) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text(text.to_string())],
+            }),
+        )
+    }
+
+    fn tool_result(id: &str, parent_id: Option<&str>) -> TranscriptStorageNode {
+        entry(
+            id,
+            parent_id,
+            TranscriptItem::ToolResult(ToolResultMessage::success(
+                ToolCallId::from("tool_1"),
+                "Bash",
+                "ok",
             )),
         )
     }
@@ -1428,6 +2010,204 @@ mod tests {
         assert!(ui_assistant.provider_replay.is_empty());
         assert_eq!(full_assistant.provider_replay.len(), 1);
         assert_eq!(synced_assistant.provider_replay.len(), 1);
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn transcript_turns_returns_full_user_and_final_assistant_entries() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "turn-card-full-messages";
+        create_session(store, session_id).await;
+
+        let long_user = "u".repeat(500);
+        let long_first_assistant = "first assistant".repeat(40);
+        let long_final_assistant = "final assistant answer ".repeat(40);
+        let entries = vec![
+            turn_started("entry_start", None, 1),
+            user_message("entry_user", Some("entry_start"), &long_user),
+            assistant_message(
+                "entry_assistant_first",
+                Some("entry_user"),
+                &long_first_assistant,
+            ),
+            tool_result("entry_tool_result", Some("entry_assistant_first")),
+            assistant_message(
+                "entry_assistant_final",
+                Some("entry_tool_result"),
+                &long_final_assistant,
+            ),
+            turn_finished("entry_finish", Some("entry_assistant_final"), 1),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+
+        let turns = store
+            .transcript_turns(session_id, None, None)
+            .await
+            .expect("turn cards load");
+        assert_eq!(turns.cards.len(), 1);
+        let card = &turns.cards[0];
+        assert_eq!(card.user_messages.len(), 1);
+        assert_eq!(card.user_messages[0].id, "entry_user");
+        match &card.user_messages[0].item {
+            TranscriptItem::UserMessage(message) => {
+                assert_eq!(content_blocks_text(&message.content), long_user);
+            }
+            other => panic!("expected user message, got {other:?}"),
+        }
+        let assistant = card
+            .assistant_message
+            .as_ref()
+            .expect("final assistant included");
+        assert_eq!(assistant.id, "entry_assistant_final");
+        match &assistant.item {
+            TranscriptItem::AssistantMessage(message) => {
+                assert_eq!(
+                    message.items,
+                    vec![AssistantItem::Text(long_final_assistant)]
+                );
+            }
+            other => panic!("expected assistant message, got {other:?}"),
+        }
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn transcript_turns_preserves_compaction_resume_metadata() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "turn-card-compaction-metadata";
+        create_session(store, session_id).await;
+
+        let turn_started_at_ms = 1_700_000_123_456;
+        let mut compacted = compaction_summary("entry_compact", None, session_id, "entry_source");
+        compacted.timestamp_ms = turn_started_at_ms + 5_000;
+        if let TranscriptItem::CompactionSummary(summary) = &mut compacted.item {
+            summary.last_turn_id = TurnId(7);
+            summary.turn_started_at_ms = Some(turn_started_at_ms);
+        }
+        let final_assistant = assistant_message("entry_assistant", Some("entry_compact"), "done");
+        let entries = vec![
+            compacted,
+            final_assistant.clone(),
+            turn_finished("entry_finish", Some("entry_assistant"), 7),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+
+        let turns = store
+            .transcript_turns(session_id, None, None)
+            .await
+            .expect("turn cards load");
+        assert_eq!(turns.cards.len(), 2);
+        let compact_card = &turns.cards[0];
+        assert_eq!(compact_card.turn_id, Some(TurnId(7)));
+        assert_eq!(compact_card.start_timestamp_ms, turn_started_at_ms);
+        let resumed_card = &turns.cards[1];
+        assert_eq!(resumed_card.turn_id, Some(TurnId(7)));
+        assert_eq!(resumed_card.start_timestamp_ms, turn_started_at_ms);
+        assert_eq!(
+            resumed_card
+                .assistant_message
+                .as_ref()
+                .map(|entry| entry.id.as_str()),
+            Some(final_assistant.id.as_str())
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn transcript_turns_pages_from_tail_and_detail_uses_card_bounds() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "turn-card-tail-pages";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            turn_started("entry_1_start", None, 1),
+            user_message("entry_1_user", Some("entry_1_start"), "one"),
+            turn_finished("entry_1_finish", Some("entry_1_user"), 1),
+            turn_started("entry_2_start", Some("entry_1_finish"), 2),
+            user_message("entry_2_user", Some("entry_2_start"), "two"),
+            turn_finished("entry_2_finish", Some("entry_2_user"), 2),
+            turn_started("entry_3_start", Some("entry_2_finish"), 3),
+            user_message("entry_3_user", Some("entry_3_start"), "three"),
+            turn_finished("entry_3_finish", Some("entry_3_user"), 3),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_3_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+
+        let latest = store
+            .transcript_turns(session_id, None, Some(1))
+            .await
+            .expect("latest turn page loads");
+        assert_eq!(latest.cards.len(), 1);
+        assert_eq!(latest.cards[0].id, "entry_3_finish");
+        assert_eq!(
+            latest.next_before_entry_id.as_deref(),
+            Some("entry_2_finish")
+        );
+        assert!(latest.has_more_before);
+
+        let previous = store
+            .transcript_turns(session_id, latest.next_before_entry_id.as_deref(), Some(1))
+            .await
+            .expect("previous turn page loads");
+        assert_eq!(previous.cards.len(), 1);
+        assert_eq!(previous.cards[0].id, "entry_2_finish");
+        assert_eq!(
+            previous.next_before_entry_id.as_deref(),
+            Some("entry_1_finish")
+        );
+
+        let card = &latest.cards[0];
+        let detail = store
+            .transcript_turn_detail(
+                session_id,
+                &card.id,
+                &card.active_leaf_id,
+                card.start_sequence,
+                card.end_sequence,
+                TranscriptEntryBodyMode::Ui,
+            )
+            .await
+            .expect("card detail loads from targeted bounds");
+        assert_eq!(
+            detail
+                .entries
+                .iter()
+                .map(|entry| entry.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["entry_3_start", "entry_3_user", "entry_3_finish"]
+        );
 
         db.cleanup().await;
     }

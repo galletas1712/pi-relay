@@ -17,29 +17,24 @@ import {
 	type TranscriptScrollStorage,
 	ToolOutput,
 } from "./transcript.tsx";
-import type { AssistantItem, ProviderReplayItem, TranscriptEntry } from "./types.ts";
+import type { AssistantItem, TranscriptEntry } from "./types.ts";
 
 describe("assistantRenderParts", () => {
-	it("uses local replay display metadata even when no hosted tools are present", () => {
-		const parts = assistantRenderParts(
-			[toolCall("call_1", "Edit")],
-			[
-				replay(
-					"claude",
-					{ type: "tool_use", id: "call_1", name: "Edit" },
-					{ kind: "local_tool", pretty_name: "Edit", input_summary: "view tmp/file.txt" }
-				)
-			]
-		);
+	it("keeps assistant text and tool-call parts in transcript order", () => {
+		const parts = assistantRenderParts([
+			{ type: "text", text: "hello" },
+			toolCall("call_1", "Edit"),
+		]);
 
 		expect(parts).toMatchObject([
 			{
+				type: "text",
+				item: { type: "text", text: "hello" },
+			},
+			{
 				type: "tool_call",
-				display: {
-					pretty_name: "Edit",
-					input_summary: "view tmp/file.txt"
-				}
-			}
+				item: { type: "tool_call", id: "call_1", tool_name: "Edit" },
+			},
 		]);
 	});
 
@@ -110,14 +105,6 @@ describe("MessageList compaction display", () => {
 
 function toolCall(id: string, toolName: string): AssistantItem {
 	return { type: "tool_call", id, tool_name: toolName, args_json: "{}" };
-}
-
-function replay(provider: ProviderReplayItem["provider"], raw: unknown, display: NonNullable<ProviderReplayItem["display"]>): ProviderReplayItem {
-	return {
-		provider,
-		raw_json: JSON.stringify(raw),
-		display
-	};
 }
 
 describe("isScrolledAtBottom", () => {
@@ -337,6 +324,87 @@ describe("MessageList Working indicator", () => {
 		expect(html).toContain("Working…");
 	});
 
+	it("uses the current turn card start timestamp without loading turn detail", () => {
+		const now = Date.now();
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "open",
+							outcome: null,
+							start_entry_id: "start",
+							boundary_entry_id: null,
+							active_leaf_id: "start",
+							start_sequence: 1,
+							end_sequence: 1,
+							start_timestamp_ms: now - 5_000,
+							user_messages: [userEntryWithParent("user", "start", "do it")],
+							assistant_message: null,
+							summary: null,
+							can_resume: false,
+						},
+						entries: null,
+						expanded: false,
+						isCurrent: true,
+					},
+				]}
+				activeLeafId="start"
+				isRunning
+				serverTimeMs={now}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain("Working…");
+		expect(html).toContain("do it");
+	});
+
+	it("offers to refetch turn details when a card is expanded but detail is missing", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "open",
+							outcome: null,
+							start_entry_id: "start",
+							boundary_entry_id: null,
+							active_leaf_id: "start",
+							start_sequence: 1,
+							end_sequence: 1,
+							start_timestamp_ms: Date.now(),
+							user_messages: [userEntryWithParent("user", "start", "do it")],
+							assistant_message: null,
+							summary: null,
+							can_resume: false,
+						},
+						entries: null,
+						expanded: true,
+						isCurrent: false,
+					},
+				]}
+				activeLeafId="start"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+			/>
+		);
+
+		expect(html).toContain("Show details");
+	});
+
 	it("omits the Working… row when the session is idle", () => {
 		const html = renderToStaticMarkup(
 			<MessageList
@@ -410,7 +478,6 @@ function userEntry(id: string, text: string): TranscriptEntry {
 		parent_id: null,
 		timestamp_ms: 0,
 		item: { type: "user_message", content: [{ type: "text", text }] },
-		provider_replay: []
 	};
 }
 
@@ -433,7 +500,6 @@ function userEntryWithParent(id: string, parentId: string | null, text: string):
 		parent_id: parentId,
 		timestamp_ms: 0,
 		item: { type: "user_message", content: [{ type: "text", text }] },
-		provider_replay: []
 	};
 }
 
@@ -443,7 +509,6 @@ function assistantEntry(id: string, parentId: string | null, text: string): Tran
 		parent_id: parentId,
 		timestamp_ms: 0,
 		item: { type: "assistant_message", items: [{ type: "text", text }] },
-		provider_replay: []
 	};
 }
 
@@ -453,7 +518,6 @@ function assistantToolEntry(id: string, parentId: string | null, items: Assistan
 		parent_id: parentId,
 		timestamp_ms: 0,
 		item: { type: "assistant_message", items },
-		provider_replay: []
 	};
 }
 
@@ -470,7 +534,6 @@ function toolResultEntry(
 		parent_id: parentId,
 		timestamp_ms: 0,
 		item: { type: "tool_result", tool_call_id: toolCallId, tool_name: toolName, output, status },
-		provider_replay: []
 	};
 }
 
@@ -480,7 +543,6 @@ function turnFinishedEntry(id: string, parentId: string | null, turnId: number, 
 		parent_id: parentId,
 		timestamp_ms: 0,
 		item: { type: "turn_finished", turn_id: turnId, outcome },
-		provider_replay: []
 	};
 }
 
@@ -490,7 +552,6 @@ function turnStartedEntry(id: string, turnId: number, timestampMs: number): Tran
 		parent_id: null,
 		timestamp_ms: timestampMs,
 		item: { type: "turn_started", turn_id: turnId },
-		provider_replay: []
 	};
 }
 
@@ -515,7 +576,6 @@ function compactionSummaryEntry(
 			last_turn_id: lastTurnId,
 			turn_started_at_ms: turnStartedAtMs,
 		},
-		provider_replay: []
 	};
 }
 

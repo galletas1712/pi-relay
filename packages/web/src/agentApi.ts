@@ -18,6 +18,8 @@ import type {
 	TranscriptEntry,
 	TranscriptTreeIndex,
 	TranscriptItem,
+	TranscriptTurnDetailResult,
+	TranscriptTurnsResult,
 	ProjectWorkspace,
 } from "./types.ts";
 import type { EntryScope } from "./queryKeys.ts";
@@ -42,6 +44,8 @@ export interface AgentApi {
 	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse>;
 	getTranscriptIndex(sessionId: string, options?: TranscriptIndexOptions): Promise<TranscriptTreeIndex>;
 	getTranscriptEntries(sessionId: string, entryIds: string[]): Promise<TranscriptEntriesResult>;
+	getTranscriptTurns(sessionId: string, options?: TranscriptTurnsOptions): Promise<TranscriptTurnsResult>;
+	getTranscriptTurnDetail(sessionId: string, request: TranscriptTurnDetailRequest): Promise<TranscriptTurnDetailResult>;
 	getHistoryTree(sessionId: string): Promise<HistoryTree>;
 	subscribeEvents(sessionId: string, afterEventId: number | null): Promise<EventFrame[]>;
 	unsubscribeEvents(sessionId: string): Promise<void>;
@@ -86,6 +90,18 @@ export interface GetSessionOptions {
 export interface TranscriptIndexOptions {
 	afterSequence?: number | null;
 	limit?: number | null;
+}
+
+export interface TranscriptTurnsOptions {
+	beforeEntryId?: string | null;
+	limit?: number | null;
+}
+
+export interface TranscriptTurnDetailRequest {
+	cardId: string;
+	leafId: string;
+	startSequence: number;
+	endSequence: number;
 }
 
 export interface StartSessionParams {
@@ -320,6 +336,24 @@ class AgentApiClient implements AgentApi {
 		return this.client.request<TranscriptEntriesResult>("transcript.entries", {
 			session_id: sessionId,
 			entry_ids: entryIds
+		});
+	}
+
+	getTranscriptTurns(sessionId: string, options: TranscriptTurnsOptions = {}): Promise<TranscriptTurnsResult> {
+		return this.client.request<TranscriptTurnsResult>("transcript.turns", {
+			session_id: sessionId,
+			before_entry_id: options.beforeEntryId ?? undefined,
+			limit: options.limit ?? undefined
+		});
+	}
+
+	getTranscriptTurnDetail(sessionId: string, request: TranscriptTurnDetailRequest): Promise<TranscriptTurnDetailResult> {
+		return this.client.request<TranscriptTurnDetailResult>("transcript.turn_detail", {
+			session_id: sessionId,
+			card_id: request.cardId,
+			leaf_id: request.leafId,
+			start_sequence: request.startSequence,
+			end_sequence: request.endSequence
 		});
 	}
 
