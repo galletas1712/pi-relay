@@ -10,8 +10,8 @@ use sqlx::{Postgres, Row, Transaction};
 
 use crate::{
     ActiveBranchSync, ActiveBranchSyncStatus, EventFrame, EventType, HistoryTree, SessionActivity,
-    SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryRecord, TranscriptEntryScope,
-    TranscriptTreeIndex, TranscriptTreeNodeRecord,
+    SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryBodyMode,
+    TranscriptEntryRecord, TranscriptEntryScope, TranscriptTreeIndex, TranscriptTreeNodeRecord,
 };
 
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
@@ -22,6 +22,20 @@ use super::PostgresAgentStore;
 
 const DEFAULT_TRANSCRIPT_INDEX_LIMIT: i64 = 1000;
 const MAX_TRANSCRIPT_INDEX_LIMIT: i64 = 5000;
+
+fn provider_replay_select(body_mode: TranscriptEntryBodyMode) -> &'static str {
+    match body_mode {
+        TranscriptEntryBodyMode::Full => "provider_replay",
+        TranscriptEntryBodyMode::Ui => "'[]'::jsonb as provider_replay",
+    }
+}
+
+fn aliased_provider_replay_select(alias: &str, body_mode: TranscriptEntryBodyMode) -> String {
+    match body_mode {
+        TranscriptEntryBodyMode::Full => format!("{alias}.provider_replay"),
+        TranscriptEntryBodyMode::Ui => "'[]'::jsonb as provider_replay".to_string(),
+    }
+}
 
 async fn active_branch_entry_ids_tx(
     tx: &mut Transaction<'_, Postgres>,
@@ -65,22 +79,25 @@ async fn transcript_entry_records_by_id_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     entry_ids: &[String],
+    body_mode: TranscriptEntryBodyMode,
 ) -> Result<Vec<TranscriptEntryRecord>> {
     if entry_ids.is_empty() {
         return Ok(Vec::new());
     }
-    let rows = sqlx::query(
+    let provider_replay_select = provider_replay_select(body_mode);
+    let query = format!(
         r#"
-        select id, parent_id, timestamp_ms, sequence, item, provider_replay
+        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}
         from transcript_entries
         where session_id=$1 and id = any($2::text[])
         order by sequence
-        "#,
-    )
-    .bind(session_id)
-    .bind(entry_ids)
-    .fetch_all(&mut **tx)
-    .await?;
+        "#
+    );
+    let rows = sqlx::query(&query)
+        .bind(session_id)
+        .bind(entry_ids)
+        .fetch_all(&mut **tx)
+        .await?;
     rows.into_iter()
         .map(|row| row_to_transcript_entry(&row))
         .collect()
@@ -89,18 +106,22 @@ async fn transcript_entry_records_by_id_tx(
 async fn active_branch_entry_records_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
+    body_mode: TranscriptEntryBodyMode,
 ) -> Result<Vec<TranscriptEntryRecord>> {
-    let rows = sqlx::query(
+    let provider_replay_select = provider_replay_select(body_mode);
+    let leaf_provider_replay_select = aliased_provider_replay_select("t", body_mode);
+    let parent_provider_replay_select = aliased_provider_replay_select("parent", body_mode);
+    let query = format!(
         r#"
         with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence
+            select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence
             from transcript_entries t
             join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
             where t.session_id = $1
 
             union all
 
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence
             from transcript_entries parent
             join branch child
               on parent.session_id = $1
@@ -112,14 +133,15 @@ async fn active_branch_entry_records_tx(
                 child.parent_id
              )
         )
-        select id, parent_id, timestamp_ms, sequence, item, provider_replay
+        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}
         from branch
         order by sequence
-        "#,
-    )
-    .bind(session_id)
-    .fetch_all(&mut **tx)
-    .await?;
+        "#
+    );
+    let rows = sqlx::query(&query)
+        .bind(session_id)
+        .fetch_all(&mut **tx)
+        .await?;
     rows.into_iter()
         .map(|row| row_to_transcript_entry(&row))
         .collect()
@@ -153,6 +175,7 @@ impl PostgresAgentStore {
         &self,
         session_id: &str,
         base_leaf_id: Option<&str>,
+        body_mode: TranscriptEntryBodyMode,
     ) -> Result<ActiveBranchSync> {
         let active_leaf_id = self.active_leaf_id(session_id).await?;
         if active_leaf_id.as_deref() == base_leaf_id {
@@ -175,10 +198,10 @@ impl PostgresAgentStore {
         };
         let entries = match base_leaf_id {
             Some(base_leaf_id) => {
-                self.active_branch_entry_records_after(session_id, base_leaf_id)
+                self.active_branch_entry_records_after(session_id, base_leaf_id, body_mode)
                     .await?
             }
-            None => self.active_branch_entry_records(session_id).await?,
+            None => self.active_branch_entry_records(session_id, body_mode).await?,
         };
         let status = match base_leaf_id {
             Some(_) if entries.is_empty() => ActiveBranchSyncStatus::BranchChanged,
@@ -232,7 +255,9 @@ impl PostgresAgentStore {
 
     pub async fn history_tree(&self, session_id: &str) -> Result<HistoryTree> {
         let active_leaf_id = self.active_leaf_id(session_id).await?;
-        let entries = self.transcript_entry_records(session_id).await?;
+        let entries = self
+            .transcript_entry_records(session_id, TranscriptEntryBodyMode::Ui)
+            .await?;
         Ok(HistoryTree {
             session_id: session_id.to_string(),
             active_leaf_id,
@@ -243,7 +268,9 @@ impl PostgresAgentStore {
     pub async fn active_branch(&self, session_id: &str) -> Result<HistoryTree> {
         let active_leaf_id = self.active_leaf_id(session_id).await?;
         let entries = match active_leaf_id.as_deref() {
-            Some(_) => self.active_branch_entry_records(session_id).await?,
+            Some(_) => self
+                .active_branch_entry_records(session_id, TranscriptEntryBodyMode::Full)
+                .await?,
             None => Vec::new(),
         };
         Ok(HistoryTree {
@@ -257,11 +284,14 @@ impl PostgresAgentStore {
         &self,
         session_id: &str,
         scope: TranscriptEntryScope,
+        body_mode: TranscriptEntryBodyMode,
     ) -> Result<Vec<TranscriptEntryRecord>> {
         match scope {
-            TranscriptEntryScope::FullTree => self.transcript_entry_records(session_id).await,
+            TranscriptEntryScope::FullTree => {
+                self.transcript_entry_records(session_id, body_mode).await
+            }
             TranscriptEntryScope::ActiveBranch => {
-                self.active_branch_entry_records(session_id).await
+                self.active_branch_entry_records(session_id, body_mode).await
             }
         }
     }
@@ -270,6 +300,7 @@ impl PostgresAgentStore {
         &self,
         session_id: &str,
         entry_ids: &[String],
+        body_mode: TranscriptEntryBodyMode,
     ) -> Result<TranscriptEntriesResult> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("set transaction isolation level repeatable read read only")
@@ -281,26 +312,11 @@ impl PostgresAgentStore {
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
-        let rows = if entry_ids.is_empty() {
+        let entries = if entry_ids.is_empty() {
             Vec::new()
         } else {
-            sqlx::query(
-                r#"
-                select id, parent_id, timestamp_ms, sequence, item, provider_replay
-                from transcript_entries
-                where session_id=$1 and id = any($2::text[])
-                order by sequence
-                "#,
-            )
-            .bind(session_id)
-            .bind(entry_ids)
-            .fetch_all(&mut *tx)
-            .await?
+            transcript_entry_records_by_id_tx(&mut tx, session_id, entry_ids, body_mode).await?
         };
-        let entries = rows
-            .into_iter()
-            .map(|row| row_to_transcript_entry(&row))
-            .collect::<Result<Vec<_>>>()?;
         tx.commit().await?;
         Ok(TranscriptEntriesResult {
             session_id: session_id.to_string(),
@@ -425,13 +441,16 @@ impl PostgresAgentStore {
     async fn transcript_entry_records(
         &self,
         session_id: &str,
+        body_mode: TranscriptEntryBodyMode,
     ) -> Result<Vec<TranscriptEntryRecord>> {
-        let rows = sqlx::query(
-            "select id, parent_id, timestamp_ms, sequence, item, provider_replay from transcript_entries where session_id=$1 order by sequence",
-        )
-        .bind(session_id)
-        .fetch_all(&self.pool)
-        .await?;
+        let provider_replay_select = provider_replay_select(body_mode);
+        let query = format!(
+            "select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select} from transcript_entries where session_id=$1 order by sequence",
+        );
+        let rows = sqlx::query(&query)
+            .bind(session_id)
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter()
             .map(|row| row_to_transcript_entry(&row))
             .collect()
@@ -441,18 +460,22 @@ impl PostgresAgentStore {
         &self,
         session_id: &str,
         base_leaf_id: &str,
+        body_mode: TranscriptEntryBodyMode,
     ) -> Result<Vec<TranscriptEntryRecord>> {
-        let rows = sqlx::query(
+        let provider_replay_select = provider_replay_select(body_mode);
+        let leaf_provider_replay_select = aliased_provider_replay_select("t", body_mode);
+        let parent_provider_replay_select = aliased_provider_replay_select("parent", body_mode);
+        let query = format!(
             r#"
             with recursive branch as (
-                select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence, 0 as depth
+                select t.id, t.parent_id, t.timestamp_ms, t.item, {leaf_provider_replay_select}, t.sequence, 0 as depth
                 from transcript_entries t
                 join sessions s on s.id = t.session_id and s.active_leaf_id = t.id
                 where t.session_id = $1
 
                 union all
 
-                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence, child.depth + 1
+                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, {parent_provider_replay_select}, parent.sequence, child.depth + 1
                 from transcript_entries parent
                 join branch child
                   on parent.session_id = $1
@@ -468,16 +491,17 @@ impl PostgresAgentStore {
             base as (
                 select depth from branch where id = $2::text
             )
-            select branch.id, branch.parent_id, branch.timestamp_ms, branch.sequence, branch.item, branch.provider_replay
+            select branch.id, branch.parent_id, branch.timestamp_ms, branch.sequence, branch.item, {provider_replay_select}
             from branch, base
             where branch.depth < base.depth
             order by branch.depth desc
-            "#,
-        )
-        .bind(session_id)
-        .bind(base_leaf_id)
-        .fetch_all(&self.pool)
-        .await?;
+            "#
+        );
+        let rows = sqlx::query(&query)
+            .bind(session_id)
+            .bind(base_leaf_id)
+            .fetch_all(&self.pool)
+            .await?;
         rows.into_iter()
             .map(|row| row_to_transcript_entry(&row))
             .collect()
@@ -486,9 +510,10 @@ impl PostgresAgentStore {
     async fn active_branch_entry_records(
         &self,
         session_id: &str,
+        body_mode: TranscriptEntryBodyMode,
     ) -> Result<Vec<TranscriptEntryRecord>> {
         let mut tx = self.pool.begin().await?;
-        let records = active_branch_entry_records_tx(&mut tx, session_id).await?;
+        let records = active_branch_entry_records_tx(&mut tx, session_id, body_mode).await?;
         tx.commit().await?;
         Ok(records)
     }
@@ -627,8 +652,13 @@ impl PostgresAgentStore {
                 .cloned()
                 .collect::<Vec<_>>();
             Some(
-                transcript_entry_records_by_id_tx(&mut tx, session_id, &requested_branch_ids)
-                    .await?,
+                transcript_entry_records_by_id_tx(
+                    &mut tx,
+                    session_id,
+                    &requested_branch_ids,
+                    TranscriptEntryBodyMode::Ui,
+                )
+                .await?,
             )
         } else if return_active_branch {
             Some(
@@ -636,6 +666,7 @@ impl PostgresAgentStore {
                     &mut tx,
                     session_id,
                     active_branch_entry_ids.as_deref().unwrap_or(&[]),
+                    TranscriptEntryBodyMode::Ui,
                 )
                 .await?,
             )
@@ -765,18 +796,21 @@ pub(crate) async fn transcript_entry_record_tx(
     tx: &mut Transaction<'_, Postgres>,
     session_id: &str,
     entry_id: &str,
+    body_mode: TranscriptEntryBodyMode,
 ) -> Result<Option<TranscriptEntryRecord>> {
-    let row = sqlx::query(
+    let provider_replay_select = provider_replay_select(body_mode);
+    let query = format!(
         r#"
-        select id, parent_id, timestamp_ms, sequence, item, provider_replay
+        select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}
         from transcript_entries
         where session_id=$1 and id=$2::text
-        "#,
-    )
-    .bind(session_id)
-    .bind(entry_id)
-    .fetch_optional(&mut **tx)
-    .await?;
+        "#
+    );
+    let row = sqlx::query(&query)
+        .bind(session_id)
+        .bind(entry_id)
+        .fetch_optional(&mut **tx)
+        .await?;
     row.map(|row| row_to_transcript_entry(&row)).transpose()
 }
 
@@ -970,8 +1004,8 @@ mod tests {
 
     use agent_session::{SessionEvent, TranscriptStorageNode};
     use agent_vocab::{
-        CompactionSummary, ProviderConfig, ProviderKind, ReasoningEffort, TranscriptItem, TurnId,
-        TurnOutcome, UserMessage,
+        AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
+        ProviderReplayItem, ReasoningEffort, TranscriptItem, TurnId, TurnOutcome, UserMessage,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -1098,6 +1132,26 @@ mod tests {
         )
     }
 
+    fn assistant_message_with_replay(
+        id: &str,
+        parent_id: Option<&str>,
+        text: &str,
+    ) -> TranscriptStorageNode {
+        TranscriptStorageNode {
+            id: id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            timestamp_ms: 1,
+            item: TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text(text.to_string())],
+            }),
+            provider_replay: vec![ProviderReplayItem::new(
+                ProviderKind::OpenAi,
+                &json!({ "type": "message", "large": "raw" }),
+            )
+            .expect("provider replay serializes")],
+        }
+    }
+
     fn turn_finished(id: &str, parent_id: Option<&str>, turn_id: u64) -> TranscriptStorageNode {
         entry(
             id,
@@ -1187,6 +1241,7 @@ mod tests {
             .transcript_entries_by_id(
                 session_id,
                 &["entry_finish".to_string(), "entry_start".to_string()],
+                TranscriptEntryBodyMode::Ui,
             )
             .await
             .expect("entries by id load");
@@ -1259,6 +1314,120 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["entry_user"]
         );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn ui_transcript_projection_omits_provider_replay() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "ui-transcript-projection";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            turn_started("entry_start", None, 1),
+            assistant_message_with_replay("entry_assistant", Some("entry_start"), "hello"),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_assistant"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+
+        let ui_entries = store
+            .transcript_entries_by_id(
+                session_id,
+                &["entry_assistant".to_string()],
+                TranscriptEntryBodyMode::Ui,
+            )
+            .await
+            .expect("ui entries load");
+        let full_entries = store
+            .transcript_entries_by_id(
+                session_id,
+                &["entry_assistant".to_string()],
+                TranscriptEntryBodyMode::Full,
+            )
+            .await
+            .expect("full entries load");
+
+        assert!(ui_entries.entries[0].provider_replay.is_empty());
+        assert_eq!(full_entries.entries[0].provider_replay.len(), 1);
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn active_branch_full_projection_preserves_provider_replay() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "active-branch-full-projection";
+        create_session(store, session_id).await;
+
+        let entries = vec![
+            turn_started("entry_start", None, 1),
+            assistant_message_with_replay("entry_assistant", Some("entry_start"), "hello"),
+            turn_finished("entry_finish", Some("entry_assistant"), 1),
+        ];
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(&entries, Some("entry_finish"), &[], &[]),
+            )
+            .await
+            .expect("transcript persists");
+
+        let ui_entries = store
+            .transcript_entries_for_scope(
+                session_id,
+                TranscriptEntryScope::ActiveBranch,
+                TranscriptEntryBodyMode::Ui,
+            )
+            .await
+            .expect("ui active branch loads");
+        let full_entries = store
+            .transcript_entries_for_scope(
+                session_id,
+                TranscriptEntryScope::ActiveBranch,
+                TranscriptEntryBodyMode::Full,
+            )
+            .await
+            .expect("full active branch loads");
+        let synced_entries = store
+            .sync_active_branch(
+                session_id,
+                Some("entry_start"),
+                TranscriptEntryBodyMode::Full,
+            )
+            .await
+            .expect("full active branch suffix syncs")
+            .entries;
+
+        let ui_assistant = ui_entries
+            .iter()
+            .find(|entry| entry.id == "entry_assistant")
+            .expect("ui assistant entry");
+        let full_assistant = full_entries
+            .iter()
+            .find(|entry| entry.id == "entry_assistant")
+            .expect("full assistant entry");
+        let synced_assistant = synced_entries
+            .iter()
+            .find(|entry| entry.id == "entry_assistant")
+            .expect("synced assistant entry");
+
+        assert!(ui_assistant.provider_replay.is_empty());
+        assert_eq!(full_assistant.provider_replay.len(), 1);
+        assert_eq!(synced_assistant.provider_replay.len(), 1);
 
         db.cleanup().await;
     }

@@ -511,6 +511,26 @@ pub enum TranscriptEntryScope {
     ActiveBranch,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptEntryBodyMode {
+    /// Normal UI projection: visible transcript item only, no raw provider
+    /// replay sidecar.
+    Ui,
+    /// Full durable transcript entry including provider replay, for model
+    /// continuation/debug paths that explicitly need it.
+    Full,
+}
+
+impl TranscriptEntryBodyMode {
+    pub fn from_include_provider_replay(include: bool) -> Self {
+        if include {
+            Self::Full
+        } else {
+            Self::Ui
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TranscriptEntryRecord {
     pub id: String,

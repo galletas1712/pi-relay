@@ -32,7 +32,7 @@ use agent_session::{AgentSession, SessionInput};
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
     EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputStatus,
-    SessionConfig, TranscriptEntryScope, WorkspaceKind,
+    SessionConfig, TranscriptEntryBodyMode, TranscriptEntryScope, WorkspaceKind,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -464,6 +464,7 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
         .get("include_entries")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let body_mode = transcript_body_mode_from_params(&params);
     let entries_scope = params
         .get("entries_scope")
         .and_then(Value::as_str)
@@ -493,7 +494,7 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
         Some(
             state
                 .repo
-                .transcript_entries_for_scope(&session_id, scope)
+                .transcript_entries_for_scope(&session_id, scope, body_mode)
                 .await
                 .map_err(anyhow::Error::from)?,
         )
@@ -506,7 +507,8 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
     let total_ms = started_at.elapsed().as_millis();
     if perf_logging_enabled() {
         eprintln!(
-            "perf session.get session={session_id} include_entries={include_entries} scope={entries_scope} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} snapshot_ms={} entries_ms={} view_ms={} total_ms={total_ms}",
+            "perf session.get session={session_id} include_entries={include_entries} scope={entries_scope} provider_replay={} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} snapshot_ms={} entries_ms={} view_ms={} total_ms={total_ms}",
+            matches!(body_mode, TranscriptEntryBodyMode::Full),
             recovered_ms.saturating_sub(acquired_ms),
             snapshot_ms.saturating_sub(recovered_ms),
             entries_ms.saturating_sub(snapshot_ms),
@@ -522,6 +524,7 @@ async fn session_sync_active_branch(
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let base_leaf_id = params.get("base_leaf_id").and_then(Value::as_str);
+    let body_mode = transcript_body_mode_from_params(&params);
     let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
     let acquired_ms = started_at.elapsed().as_millis();
@@ -529,7 +532,7 @@ async fn session_sync_active_branch(
     let recovered_ms = started_at.elapsed().as_millis();
     let sync = state
         .repo
-        .sync_active_branch(&session_id, base_leaf_id)
+        .sync_active_branch(&session_id, base_leaf_id, body_mode)
         .await
         .map_err(anyhow::Error::from)?;
     let sync_ms = started_at.elapsed().as_millis();
@@ -545,7 +548,8 @@ async fn session_sync_active_branch(
     let total_ms = started_at.elapsed().as_millis();
     if perf_logging_enabled() {
         eprintln!(
-            "perf session.sync_active_branch session={session_id} base_leaf_id={base_leaf_id:?} status={status} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} sync_ms={} snapshot_ms={} view_ms={} total_ms={total_ms}",
+            "perf session.sync_active_branch session={session_id} base_leaf_id={base_leaf_id:?} provider_replay={} status={status} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} sync_ms={} snapshot_ms={} view_ms={} total_ms={total_ms}",
+            matches!(body_mode, TranscriptEntryBodyMode::Full),
             recovered_ms.saturating_sub(acquired_ms),
             sync_ms.saturating_sub(recovered_ms),
             snapshot_ms.saturating_sub(sync_ms),
@@ -1043,7 +1047,11 @@ async fn input_user(
                 .await?;
             let sync = state
                 .repo
-                .sync_active_branch(&session_id, base_leaf_id.as_deref())
+                .sync_active_branch(
+                    &session_id,
+                    base_leaf_id.as_deref(),
+                    TranscriptEntryBodyMode::Ui,
+                )
                 .await
                 .map_err(anyhow::Error::from)?;
             let snapshot = state
@@ -1296,11 +1304,12 @@ async fn transcript_entries(
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let entry_ids = required_string_vec(&params, "entry_ids")?;
+    let body_mode = transcript_body_mode_from_params(&params);
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.recover_if_needed().await?;
     let result = state
         .repo
-        .transcript_entries_by_id(&session_id, &entry_ids)
+        .transcript_entries_by_id(&session_id, &entry_ids, body_mode)
         .await
         .map_err(anyhow::Error::from)?;
     Ok(rpc_views::transcript_entries(result))
@@ -1461,6 +1470,15 @@ fn optional_string_vec(
                 .map_err(|error| RpcError::new("invalid_params", error.to_string()))
         })
         .transpose()
+}
+
+fn transcript_body_mode_from_params(params: &Value) -> TranscriptEntryBodyMode {
+    TranscriptEntryBodyMode::from_include_provider_replay(
+        params
+            .get("include_provider_replay")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
 }
 
 fn history_switch_error_to_rpc(error: anyhow::Error) -> RpcError {

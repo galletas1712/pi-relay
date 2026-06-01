@@ -68,6 +68,19 @@ Verification:
 
 Implementation status:
 
+- Done in `perf/ui-transcript-no-provider-replay`.
+- Store/UI RPC transcript body reads now take a `TranscriptEntryBodyMode`.
+  Normal UI paths (`session.get`, `session.sync_active_branch`,
+  `transcript.entries`, `history.switch` returned bodies, and
+  `transcript.appended` event bodies) use `Ui`, which selects
+  `'[]'::jsonb as provider_replay` instead of reading/sending raw replay.
+- Full replay remains available behind the explicit `include_provider_replay`
+  RPC flag and internal model/history-context paths still read durable replay.
+- Added a Postgres store test proving the UI projection omits replay while the
+  full projection preserves it.
+
+Implementation status:
+
 - Done in `fix/switch-restore-full-user-message`.
 - The restore helper now treats `restore_entry_id` as authoritative and always
   loads the full user-message body from the selected-session body cache or from

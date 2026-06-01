@@ -6,7 +6,7 @@ use anyhow::Result;
 use serde_json::{json, Value};
 use sqlx::{Executor, Postgres, Transaction};
 
-use crate::{EventFrame, EventType, SessionActivity};
+use crate::{EventFrame, EventType, SessionActivity, TranscriptEntryBodyMode};
 
 use super::action_records::{action_payload, ActionKey};
 use super::rows::row_to_event;
@@ -223,7 +223,8 @@ pub(super) async fn insert_transcript_item_events_tx(
     item: &TranscriptItem,
 ) -> Result<Vec<EventFrame>> {
     let state = session_state_for_event_tx(tx, session_id).await?;
-    let record = transcript_entry_record_tx(tx, session_id, entry_id).await?;
+    let record =
+        transcript_entry_record_tx(tx, session_id, entry_id, TranscriptEntryBodyMode::Ui).await?;
     let entry_payload = if let Some(entry) = record.as_ref() {
         Some(json!({
             "id": entry.id,
