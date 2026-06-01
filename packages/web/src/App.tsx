@@ -1379,7 +1379,7 @@ export function App() {
 			const treeComplete = cache.sessionId === sessionId && treeRevisionMatches && cache.treeComplete;
 			setHistoryDialog({
 				sessionId,
-				nodes: cachedNodes,
+				nodes: treeComplete ? cachedNodes : [],
 				activeLeafId: loadedSnapshot.active_leaf_id,
 				loading: !treeComplete,
 				error: null,
@@ -1390,7 +1390,7 @@ export function App() {
 						if (!current || current.sessionId !== sessionId) return current;
 						return {
 							...current,
-							nodes,
+							nodes: complete ? nodes : [],
 							activeLeafId: selectedCacheRef.current.treeActiveLeafId ?? loadedSnapshot.active_leaf_id,
 							loading: !complete,
 							error: null,
@@ -1953,15 +1953,14 @@ async function restoreTextForTarget(
 	selectedCacheRef: RefObject<SelectedSessionCache>,
 	updateSelectedCache: (updater: (current: SelectedSessionCache) => SelectedSessionCache) => SelectedSessionCache,
 ): Promise<string | null> {
-	if (target.restoreText !== undefined) return target.restoreText;
-	if (!target.restoreEntryId) return null;
+	if (!target.restoreEntryId) return target.restoreText ?? null;
 	const cached = selectedCacheRef.current.entriesById.get(target.restoreEntryId);
 	if (cached?.item.type === "user_message") return contentBlocksToText(cached.item.content);
 	const result = await api.getTranscriptEntries(sessionId, [target.restoreEntryId]);
 	updateSelectedCache((current) => applyEntryBodies(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.entries));
 	const entry = result.entries.find((candidate) => candidate.id === target.restoreEntryId);
 	if (entry?.item.type === "user_message") return contentBlocksToText(entry.item.content);
-	return null;
+	throw new Error("could not load the full user message for editing");
 }
 
 function SystemPromptDialog({

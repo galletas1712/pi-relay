@@ -3,6 +3,7 @@ import {
 	branchEntriesFor,
 	historyEntryDisplay,
 	historySwitchOptions,
+	historySwitchOptionsFromNodes,
 	nodeBranchIds,
 	historyTreeRows
 } from "../src/historyTargets.ts";
@@ -209,6 +210,30 @@ describe("historySwitchOptions", () => {
 			outcome: "Crashed",
 			isActive: true
 		});
+	});
+});
+
+describe("historySwitchOptionsFromNodes", () => {
+	it("uses compact user-message text only as a display preview, never restore text", () => {
+		const fullText = "x".repeat(180);
+		const nodes: TranscriptTreeNode[] = [
+			node("start1", null, 1, "turn_started"),
+			node("user1", "start1", 2, "user_message"),
+			node("finish1", "user1", 3, "turn_finished")
+		];
+		nodes[1] = { ...nodes[1], display_hint: fullText };
+
+		const options = historySwitchOptionsFromNodes(nodes, "finish1");
+		const userOption = options.find((option) => option.id === "user1");
+
+		expect(userOption).toMatchObject({
+			id: "user1",
+			restoreEntryId: "user1",
+			title: "User message"
+		});
+		expect(userOption?.preview).toHaveLength(96);
+		expect(userOption?.preview).not.toBe(fullText);
+		expect(userOption?.restoreText).toBeUndefined();
 	});
 });
 
