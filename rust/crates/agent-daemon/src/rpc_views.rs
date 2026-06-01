@@ -204,6 +204,7 @@ fn turn_card(card: TurnCardRecord) -> Value {
         "start_sequence": card.start_sequence,
         "end_sequence": card.end_sequence,
         "start_timestamp_ms": card.start_timestamp_ms,
+        "timestamp_ms": card.timestamp_ms,
         "user_messages": transcript_entry_values(card.user_messages),
         "assistant_message": card.assistant_message.map(transcript_entry),
         "summary": card.summary,

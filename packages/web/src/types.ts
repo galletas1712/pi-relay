@@ -227,6 +227,7 @@ export interface TurnCard {
 	start_sequence: number;
 	end_sequence: number;
 	start_timestamp_ms: number;
+	timestamp_ms: number;
 	user_messages: TranscriptEntry[];
 	assistant_message?: TranscriptEntry | null;
 	summary?: string | null;

@@ -1,3 +1,4 @@
+import { displayParentIdForEntry } from "../displayParent.ts";
 import type { TranscriptEntry, TranscriptItem, TranscriptTurnsResult, TurnCard } from "../types.ts";
 import { mergeEntryBodies, selectedEntriesFromIds, sameStringArray, uniqueStringArray } from "./entries.ts";
 import type { SelectedSessionCache } from "./types.ts";
@@ -91,18 +92,53 @@ function isStaleTranscriptTurnsResult(cache: SelectedSessionCache, result: Trans
 	return false;
 }
 
-export function applyTurnDetail(cache: SelectedSessionCache, sessionId: string, turnId: string, entries: TranscriptEntry[]): SelectedSessionCache {
-	if (cache.sessionId !== sessionId) return cache;
+export interface ApplyTurnDetailResult {
+	cache: SelectedSessionCache;
+	applied: boolean;
+}
+
+export function applyTurnDetail(cache: SelectedSessionCache, sessionId: string, turnId: string, entries: TranscriptEntry[]): ApplyTurnDetailResult {
+	if (cache.sessionId !== sessionId) return { cache, applied: false };
 	const card = cache.turnCardsById.get(turnId);
-	if (!card || entries.at(-1)?.id !== card.active_leaf_id) return cache;
+	const lastEntryId = entries.at(-1)?.id ?? null;
+	if (!card || !lastEntryId) return { cache, applied: false };
+	const acceptsPartialOpenTurn = card.status === "open";
+	if (lastEntryId !== card.active_leaf_id && !acceptsPartialOpenTurn) return { cache, applied: false };
 	const entriesById = mergeEntryBodies(cache.entriesById, entries);
 	const turnDetailsById = new Map(cache.turnDetailsById);
-	turnDetailsById.set(turnId, entries.map((entry) => entry.id));
+	turnDetailsById.set(turnId, extendTurnDetailEntryIds(entries.map((entry) => entry.id), card, entriesById));
 	return {
-		...cache,
-		entriesById,
-		turnDetailsById,
+		cache: {
+			...cache,
+			entriesById,
+			turnDetailsById,
+		},
+		applied: true,
 	};
+}
+
+function extendTurnDetailEntryIds(entryIds: string[], card: TurnCard, entriesById: Map<string, TranscriptEntry>): string[] {
+	const ids = [...entryIds];
+	const seenIds = new Set(ids);
+	let currentLeafId = ids.at(-1) ?? null;
+	while (currentLeafId && currentLeafId !== card.active_leaf_id) {
+		const child = findOnlyDisplayChild(currentLeafId, entriesById);
+		if (!child || seenIds.has(child.id)) break;
+		ids.push(child.id);
+		seenIds.add(child.id);
+		currentLeafId = child.id;
+	}
+	return ids;
+}
+
+function findOnlyDisplayChild(parentId: string, entriesById: Map<string, TranscriptEntry>): TranscriptEntry | null {
+	let child: TranscriptEntry | null = null;
+	for (const entry of entriesById.values()) {
+		if (displayParentIdForEntry(entry) !== parentId) continue;
+		if (child) return null;
+		child = entry;
+	}
+	return child;
 }
 
 export function turnCardsInOrder(cache: SelectedSessionCache): TurnCard[] {
@@ -228,6 +264,7 @@ function initialTurnCard(entry: TranscriptEntry): TurnCard {
 		start_sequence: entry.sequence ?? 0,
 		end_sequence: entry.sequence ?? 0,
 		start_timestamp_ms: entry.timestamp_ms,
+		timestamp_ms: entry.timestamp_ms,
 		user_messages: [],
 		assistant_message: null,
 		summary: null,
@@ -247,6 +284,7 @@ function initialTurnCardFromCompactionResume(compactionCard: TurnCard, entry: Tr
 		start_sequence: entry.sequence ?? 0,
 		end_sequence: entry.sequence ?? 0,
 		start_timestamp_ms: compactionCard.start_timestamp_ms,
+		timestamp_ms: entry.timestamp_ms,
 		user_messages: [],
 		assistant_message: null,
 		summary: null,
@@ -260,6 +298,7 @@ function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
 		...card,
 		active_leaf_id: entry.id,
 		end_sequence: entry.sequence ?? card.end_sequence,
+		timestamp_ms: entry.timestamp_ms,
 		turn_id: card.turn_id ?? turnIdForItem(item),
 	};
 

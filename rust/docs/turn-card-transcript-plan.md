@@ -280,8 +280,9 @@ benchmarks still show head-of-line blocking or compact-index cost:
 - The turn-card projection can initially be computed from the active branch in
   Rust. If benchmarks show it is too slow, promote it to a denormalized read
   model later.
-- Current/running turns stay collapsed by default; the card carries
-  `start_timestamp_ms` so the "Working…" timer remains anchored without loading
-  detail.
+- Current/running turns are expanded by default and load detail automatically;
+  completed turns collapse by default. Cards carry `start_timestamp_ms` and
+  `timestamp_ms` so the UI can show live "Working…" and completed
+  "Worked for …" durations.
 - `/switch` target previews are display-only. Never use them as composer restore
   content.

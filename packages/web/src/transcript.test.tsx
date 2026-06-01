@@ -18,7 +18,7 @@ import {
 	type TranscriptScrollStorage,
 	ToolOutput,
 } from "./transcript.tsx";
-import type { AssistantItem, TranscriptEntry, TurnCard } from "./types.ts";
+import type { AssistantItem, PendingAction, TranscriptEntry, TurnCard } from "./types.ts";
 
 describe("assistantRenderParts", () => {
 	it("keeps assistant text and tool-call parts in transcript order", () => {
@@ -315,6 +315,210 @@ describe("MessageList tool use cards", () => {
 		expect(html).toContain("Bash: ls");
 		expect(html).not.toContain("Used 1 tool");
 	});
+
+	it("shows loaded details for the current running turn by default", () => {
+		const bashTool = { type: "tool_call" as const, id: "call_1", tool_name: "Bash", args_json: "{\"command\":\"date\"}" };
+		const start = turnStartedEntry("start", 1, 1);
+		const user = userEntryWithParent("user", "start", "inspect");
+		const assistant = assistantToolEntry("assistant", "user", [bashTool]);
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "open",
+							outcome: null,
+							start_entry_id: "start",
+							boundary_entry_id: null,
+							active_leaf_id: "assistant",
+							start_sequence: 1,
+							end_sequence: 3,
+							start_timestamp_ms: 1,
+							timestamp_ms: 3,
+							user_messages: [user],
+							assistant_message: assistant,
+							summary: null,
+							can_resume: false,
+						},
+						entries: [start, user, assistant],
+						expanded: true,
+						isCurrent: true,
+					},
+				]}
+				activeLeafId="assistant"
+				isRunning
+				serverTimeMs={3}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
+			/>
+		);
+
+		expect(html).toContain("Bash: date");
+		expect(html).toContain("expanded");
+	});
+
+	it("keeps completed turn card details collapsed by default", () => {
+		const bashTool = { type: "tool_call" as const, id: "call_1", tool_name: "Bash", args_json: "{\"command\":\"date\"}" };
+		const start = turnStartedEntry("start", 1, 1);
+		const user = userEntryWithParent("user", "start", "inspect");
+		const assistant = assistantToolEntry("assistant", "user", [bashTool]);
+		const finish = turnFinishedEntry("finish", "assistant", 1, "Graceful", 6_001);
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "completed",
+							outcome: "Graceful",
+							start_entry_id: "start",
+							boundary_entry_id: "finish",
+							active_leaf_id: "finish",
+							start_sequence: 1,
+							end_sequence: 4,
+							start_timestamp_ms: 1,
+							timestamp_ms: 6_001,
+							user_messages: [user],
+							assistant_message: assistant,
+							summary: null,
+							can_resume: false,
+						},
+						entries: [start, user, assistant, finish],
+						expanded: false,
+						isCurrent: false,
+					},
+				]}
+				activeLeafId="finish"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
+			/>
+		);
+
+		expect(html).not.toContain("Bash: date");
+		expect(html).toContain("Show details");
+		expect(html).toContain("Worked for 6s");
+	});
+
+	it("keeps the latest tool-only assistant message visible in expanded turn details", () => {
+		const bashTool = { type: "tool_call" as const, id: "call_1", tool_name: "Bash", args_json: "{\"command\":\"echo hi\"}" };
+		const start = turnStartedEntry("start", 1, 1);
+		const user = userEntryWithParent("user", "start", "inspect");
+		const assistant = assistantToolEntry("assistant", "user", [bashTool]);
+		const result = toolResultEntry("result", "assistant", "call_1", "Bash", "ok");
+		const finish = turnFinishedEntry("finish", "result", 1, "Graceful");
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "completed",
+							outcome: "Graceful",
+							start_entry_id: "start",
+							boundary_entry_id: "finish",
+							active_leaf_id: "finish",
+							start_sequence: 1,
+							end_sequence: 5,
+							start_timestamp_ms: 1,
+							timestamp_ms: 6_001,
+							user_messages: [user],
+							assistant_message: assistant,
+							summary: null,
+							can_resume: false,
+						},
+						entries: [start, user, assistant, result, finish],
+						expanded: true,
+						isCurrent: false,
+					},
+				]}
+				activeLeafId="finish"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
+			/>
+		);
+
+		expect(html).toContain("Bash: echo hi");
+		expect(html).toContain("single-tool");
+		expect(html).toContain("Worked for 6s");
+	});
+
+	it("renders pending tools in expanded current turn details", () => {
+		const pendingActions: PendingAction[] = [
+			{
+				action_row_id: "action_1",
+				kind: "tool",
+				status: "running",
+				payload: {
+					id: "call_pending",
+					tool_name: "Bash",
+					args_json: "{\"command\":\"npm test\"}",
+				},
+			},
+		];
+		const start = turnStartedEntry("start", 1, 1);
+		const user = userEntryWithParent("user", "start", "test it");
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				pendingActions={pendingActions}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "open",
+							outcome: null,
+							start_entry_id: "start",
+							boundary_entry_id: null,
+							active_leaf_id: "user",
+							start_sequence: 1,
+							end_sequence: 2,
+							start_timestamp_ms: 1,
+							timestamp_ms: 1,
+							user_messages: [user],
+							assistant_message: null,
+							summary: null,
+							can_resume: false,
+						},
+						entries: [start, user],
+						expanded: true,
+						isCurrent: true,
+					},
+				]}
+				activeLeafId="user"
+				isRunning
+				serverTimeMs={1}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
+			/>
+		);
+
+		expect(html).toContain("Bash: npm test");
+		expect(html).toContain("running");
+	});
 });
 
 describe("MessageList Working indicator", () => {
@@ -401,6 +605,7 @@ describe("MessageList Working indicator", () => {
 							start_sequence: 1,
 							end_sequence: 1,
 							start_timestamp_ms: now - 5_000,
+							timestamp_ms: now - 5_000,
 							user_messages: [userEntryWithParent("user", "start", "do it")],
 							assistant_message: null,
 							summary: null,
@@ -441,6 +646,7 @@ describe("MessageList Working indicator", () => {
 							start_sequence: 1,
 							end_sequence: 1,
 							start_timestamp_ms: Date.now(),
+							timestamp_ms: Date.now(),
 							user_messages: [userEntryWithParent("user", "start", "do it")],
 							assistant_message: null,
 							summary: null,
@@ -552,6 +758,7 @@ function turnCard(id: string, turnId: number, userText: string): TurnCard {
 		start_sequence: turnId,
 		end_sequence: turnId,
 		start_timestamp_ms: 0,
+		timestamp_ms: 0,
 		user_messages: [userEntryWithParent(`user_${turnId}`, `start_${turnId}`, userText)],
 		assistant_message: assistantEntry(`assistant_${turnId}`, `user_${turnId}`, `answer ${turnId}`),
 		summary: null,
@@ -615,11 +822,17 @@ function toolResultEntry(
 	};
 }
 
-function turnFinishedEntry(id: string, parentId: string | null, turnId: number, outcome: "Graceful" | "Interrupted" | "Crashed"): TranscriptEntry {
+function turnFinishedEntry(
+	id: string,
+	parentId: string | null,
+	turnId: number,
+	outcome: "Graceful" | "Interrupted" | "Crashed",
+	timestampMs = 0
+): TranscriptEntry {
 	return {
 		id,
 		parent_id: parentId,
-		timestamp_ms: 0,
+		timestamp_ms: timestampMs,
 		item: { type: "turn_finished", turn_id: turnId, outcome },
 	};
 }

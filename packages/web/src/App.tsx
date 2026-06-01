@@ -269,6 +269,7 @@ export function App() {
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
 	const selectedLoadVersion = useRef(0);
 	const selectedRefreshInFlight = useRef(new Map<string, Promise<{ snapshot: SessionSnapshot; entries: TranscriptEntry[] } | null>>());
+	const autoLoadedTurnDetailRef = useRef<string | null>(null);
 	const lastForegroundReconcileAt = useRef(Date.now());
 
 	const pushNotice = useCallback((tone: Notice["tone"], text: string) => {
@@ -326,15 +327,19 @@ export function App() {
 	);
 	const [expandedTurnIds, setExpandedTurnIds] = useState<Set<string>>(() => new Set());
 	const [loadingTurnId, setLoadingTurnId] = useState<string | null>(null);
+	const [autoLoadingTurnId, setAutoLoadingTurnId] = useState<string | null>(null);
 	const [loadingOlderTurns, setLoadingOlderTurns] = useState(false);
+	const orderedTurnCards = useMemo(
+		() => (selectedCache.sessionId === selectedId ? turnCardsInOrder(selectedCache) : []),
+		[selectedCache.sessionId, selectedCache.turnCardsById, selectedCache.turnOrder, selectedId],
+	);
+	const latestTurnCard = orderedTurnCards.at(-1) ?? null;
+	const runningTurnCardId = loadedSnapshot?.activity === "running" && latestTurnCard?.status === "open" ? latestTurnCard.id : null;
 	const turnCardViews = useMemo(() => {
-		if (selectedCache.sessionId !== selectedId) return null;
-		const cards = turnCardsInOrder(selectedCache);
-		if (cards.length === 0) return null;
-		const currentId = cards.at(-1)?.id ?? null;
-		return cards.map((card) => {
-			const isCurrent = card.id === currentId && loadedSnapshot?.activity === "running";
-			const expanded = expandedTurnIds.has(card.id);
+		if (orderedTurnCards.length === 0) return null;
+		return orderedTurnCards.map((card) => {
+			const isCurrent = card.id === runningTurnCardId;
+			const expanded = expandedTurnIds.has(card.id) || isCurrent;
 			return {
 				card,
 				entries: expanded ? turnDetailEntries(selectedCache, card.id) : null,
@@ -344,13 +349,10 @@ export function App() {
 		});
 	}, [
 		expandedTurnIds,
-		loadedSnapshot?.activity,
+		orderedTurnCards,
+		runningTurnCardId,
 		selectedCache.entriesById,
-		selectedCache.sessionId,
-		selectedCache.turnCardsById,
 		selectedCache.turnDetailsById,
-		selectedCache.turnOrder,
-		selectedId,
 	]);
 
 	const snapshotChatSession = useMemo(() => {
@@ -632,18 +634,19 @@ export function App() {
 		[refreshSelectedSessionState],
 	);
 
-	const expandTurn = useCallback(
-		async (cardId: string) => {
+	const loadTurnDetail = useCallback(
+		async (cardId: string, options: { mode: "manual" | "auto" }) => {
 			const sessionId = selectedRef.current;
 			if (!sessionId) throw new Error("select a session first");
 			const cache = selectedCacheRef.current;
 			const card = cache.turnCardsById.get(cardId);
 			if (!card) throw new Error("turn card is not loaded");
 			if (turnDetailEntries(cache, cardId)) {
-				setExpandedTurnIds((current) => new Set(current).add(cardId));
+				if (options.mode === "manual") setExpandedTurnIds((current) => new Set(current).add(cardId));
 				return;
 			}
-			setLoadingTurnId(cardId);
+			if (options.mode === "manual") setLoadingTurnId(cardId);
+			else setAutoLoadingTurnId(cardId);
 			try {
 				const result = await api.getTranscriptTurnDetail(sessionId, {
 					cardId: card.id,
@@ -652,15 +655,27 @@ export function App() {
 					endSequence: card.end_sequence,
 				});
 				if (selectedRef.current !== sessionId) return;
-				updateSelectedCache((current) => applyTurnDetail(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.card_id, result.entries));
-				setExpandedTurnIds((current) => new Set(current).add(result.card_id));
+				let applied = false;
+				updateSelectedCache((current) => {
+					const detail = applyTurnDetail(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.card_id, result.entries);
+					applied = detail.applied;
+					return detail.cache;
+				});
+				if (applied && options.mode === "manual") setExpandedTurnIds((current) => new Set(current).add(result.card_id));
 			} catch (error) {
 				if (selectedRef.current === sessionId) pushNotice("error", errorMessage(error));
 			} finally {
-				setLoadingTurnId((current) => (current === cardId ? null : current));
+				if (options.mode === "manual") setLoadingTurnId((current) => (current === cardId ? null : current));
+				else setAutoLoadingTurnId((current) => (current === cardId ? null : current));
 			}
 		},
 		[api, pushNotice, updateSelectedCache],
+	);
+	const expandTurn = useCallback(
+		(cardId: string) => {
+			void loadTurnDetail(cardId, { mode: "manual" });
+		},
+		[loadTurnDetail],
 	);
 	const collapseTurn = useCallback((cardId: string) => {
 		setExpandedTurnIds((current) => {
@@ -670,6 +685,21 @@ export function App() {
 			return next;
 		});
 	}, []);
+
+	useEffect(() => {
+		if (!runningTurnCardId || autoLoadingTurnId === runningTurnCardId) return;
+		const cache = selectedCacheRef.current;
+		const card = cache.turnCardsById.get(runningTurnCardId);
+		const autoLoadKey = card ? `${runningTurnCardId}:${card.active_leaf_id}` : runningTurnCardId;
+		if (autoLoadedTurnDetailRef.current === autoLoadKey) return;
+		if (turnDetailEntries(cache, runningTurnCardId)) return;
+		autoLoadedTurnDetailRef.current = autoLoadKey;
+		void loadTurnDetail(runningTurnCardId, { mode: "auto" });
+	}, [autoLoadingTurnId, loadTurnDetail, runningTurnCardId, selectedCache.turnCardsById, selectedCache.turnDetailsById]);
+
+	useEffect(() => {
+		autoLoadedTurnDetailRef.current = null;
+	}, [selectedId]);
 
 	const reconcileAfterForeground = useCallback(
 		() => {
@@ -1894,7 +1924,7 @@ export function App() {
 				onResumeTurn={handleResumeTurn}
 				onExpandTurn={expandTurn}
 				onCollapseTurn={collapseTurn}
-				loadingTurnId={loadingTurnId}
+				loadingTurnId={loadingTurnId ?? autoLoadingTurnId}
 				hasOlderTurns={selectedCache.sessionId === selectedId && selectedCache.turnHasMoreBefore}
 				loadingOlderTurns={loadingOlderTurns}
 				onLoadOlderTurns={loadOlderTranscriptTurns}
