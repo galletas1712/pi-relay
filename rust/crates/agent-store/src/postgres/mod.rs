@@ -12,6 +12,7 @@ mod snapshots;
 mod sql;
 mod token_usage;
 mod transcript;
+mod turn_cards;
 
 use anyhow::Result;
 use sqlx::postgres::PgPoolOptions;
