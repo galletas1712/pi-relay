@@ -662,6 +662,14 @@ export function App() {
 		},
 		[api, pushNotice, updateSelectedCache],
 	);
+	const collapseTurn = useCallback((cardId: string) => {
+		setExpandedTurnIds((current) => {
+			if (!current.has(cardId)) return current;
+			const next = new Set(current);
+			next.delete(cardId);
+			return next;
+		});
+	}, []);
 
 	const reconcileAfterForeground = useCallback(
 		() => {
@@ -1885,6 +1893,7 @@ export function App() {
 				onToggleRight={handleToggleRight}
 				onResumeTurn={handleResumeTurn}
 				onExpandTurn={expandTurn}
+				onCollapseTurn={collapseTurn}
 				loadingTurnId={loadingTurnId}
 				hasOlderTurns={selectedCache.sessionId === selectedId && selectedCache.turnHasMoreBefore}
 				loadingOlderTurns={loadingOlderTurns}

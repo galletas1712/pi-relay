@@ -26,6 +26,7 @@ export interface ChatPaneProps {
 	onToggleRight: () => void;
 	onResumeTurn: (entryId: string) => void;
 	onExpandTurn?: (turnId: string) => void;
+	onCollapseTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
 	hasOlderTurns?: boolean;
 	loadingOlderTurns?: boolean;
@@ -52,6 +53,7 @@ export const ChatPane = memo(function ChatPane({
 	onToggleRight,
 	onResumeTurn,
 	onExpandTurn,
+	onCollapseTurn,
 	loadingTurnId,
 	hasOlderTurns,
 	loadingOlderTurns,
@@ -89,6 +91,7 @@ export const ChatPane = memo(function ChatPane({
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}
 				onExpandTurn={onExpandTurn}
+				onCollapseTurn={onCollapseTurn}
 				loadingTurnId={loadingTurnId}
 				hasOlderTurns={hasOlderTurns}
 				loadingOlderTurns={loadingOlderTurns}

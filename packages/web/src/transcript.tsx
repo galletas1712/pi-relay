@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type UIEvent } from "react";
-import { AlertTriangle, Check, ChevronDown, Copy, Loader2, RotateCcw, Terminal } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, ChevronUp, Copy, Loader2, RotateCcw, Terminal } from "lucide-react";
 import rehypeRaw from "rehype-raw";
 import rehypeHighlight from "rehype-highlight";
 import ReactMarkdown from "react-markdown";
@@ -57,7 +57,10 @@ export interface TurnCardView {
 }
 
 type ScrollMetrics = Pick<HTMLDivElement, "clientHeight" | "scrollHeight" | "scrollTop">;
+type TurnJumpDirection = "previous" | "next";
+type TurnJumpTarget = { id: string; nodeKey?: string };
 const STICKY_BOTTOM_EPSILON_PX = 1;
+const TURN_JUMP_EPSILON_PX = 2;
 const ACTIVE_SESSION_SCROLL_KEY = "__active_session__";
 const TRANSCRIPT_SCROLL_STORAGE_KEY = "piRelayTranscriptScroll:v1";
 const RECENT_TOOL_ROW_COUNT = 3;
@@ -65,6 +68,12 @@ const RECENT_TOOL_ROW_COUNT = 3;
 export interface ScrollPositionSnapshot {
 	scrollTop: number;
 	sticky: boolean;
+}
+
+export interface TurnJumpTargetPosition {
+	id: string;
+	top: number;
+	bottom: number;
 }
 
 export type TranscriptScrollStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">;
@@ -91,6 +100,36 @@ export function restoreScrollPosition(node: ScrollMetrics, position: ScrollPosit
 		node.scrollTop = position.scrollTop;
 	}
 	return isScrolledAtBottom(node);
+}
+
+export function adjacentTurnJumpTargetId(
+	targets: readonly TurnJumpTargetPosition[],
+	scrollTop: number,
+	direction: TurnJumpDirection,
+	viewportHeight = 0
+): string | null {
+	const orderedTargets = [...targets].sort((left, right) => left.top - right.top);
+	if (direction === "previous") {
+		let currentIndex = -1;
+		for (const [index, target] of orderedTargets.entries()) {
+			if (target.top > scrollTop + TURN_JUMP_EPSILON_PX) break;
+			currentIndex = index;
+		}
+		if (currentIndex === -1) return null;
+		const currentTarget = orderedTargets[currentIndex];
+		if (!turnJumpTargetIsFullyVisible(currentTarget, scrollTop, viewportHeight) && currentTarget.top < scrollTop - TURN_JUMP_EPSILON_PX) {
+			return currentTarget.id;
+		}
+		return orderedTargets[currentIndex - 1]?.id ?? null;
+	}
+	for (const target of orderedTargets) {
+		if (target.top > scrollTop + TURN_JUMP_EPSILON_PX) return target.id;
+	}
+	return null;
+}
+
+function turnJumpTargetIsFullyVisible(target: TurnJumpTargetPosition, scrollTop: number, viewportHeight: number): boolean {
+	return target.top >= scrollTop - TURN_JUMP_EPSILON_PX && target.bottom <= scrollTop + viewportHeight + TURN_JUMP_EPSILON_PX;
 }
 
 export function loadTranscriptScrollPositions(storage = browserStorage()): Map<string, ScrollPositionSnapshot> {
@@ -163,6 +202,7 @@ export const MessageList = memo(function MessageList({
 	resumingTurnId,
 	turnCards,
 	onExpandTurn,
+	onCollapseTurn,
 	loadingTurnId,
 	hasOlderTurns,
 	loadingOlderTurns,
@@ -181,6 +221,7 @@ export const MessageList = memo(function MessageList({
 	resumingTurnId?: string | null;
 	turnCards?: TurnCardView[] | null;
 	onExpandTurn?: (turnId: string) => void;
+	onCollapseTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
 	hasOlderTurns?: boolean;
 	loadingOlderTurns?: boolean;
@@ -212,6 +253,45 @@ export const MessageList = memo(function MessageList({
 			saveTranscriptScrollPositions(scrollPositionsRef.current);
 		}
 	}, []);
+
+	const collectTurnJumpTargetPositions = useCallback((): TurnJumpTargetPosition[] => {
+		const scroller = scrollRef.current;
+		if (!scroller) return [];
+		const scrollerRect = scroller.getBoundingClientRect();
+		return Array.from(scroller.querySelectorAll<HTMLElement>("[data-turn-jump-target-id]"))
+			.flatMap((target) => {
+				const id = target.dataset.turnJumpTargetId;
+				if (!id) return [];
+				const targetRect = target.getBoundingClientRect();
+				const top = scroller.scrollTop + targetRect.top - scrollerRect.top;
+				const bottom = scroller.scrollTop + targetRect.bottom - scrollerRect.top;
+				return Number.isFinite(top) && Number.isFinite(bottom) ? [{ id, top, bottom }] : [];
+			})
+			.sort((left, right) => left.top - right.top);
+	}, []);
+
+	const scrollToTurnJumpTarget = useCallback((targetId: string) => {
+		const scroller = scrollRef.current;
+		if (!scroller) return;
+		const target = turnJumpTargetNode(scroller, targetId);
+		if (!target) return;
+		const scrollerRect = scroller.getBoundingClientRect();
+		const targetRect = target.getBoundingClientRect();
+		scroller.scrollTop = Math.max(0, scroller.scrollTop + targetRect.top - scrollerRect.top);
+		shouldStickToBottomRef.current = false;
+		const key = activeScrollSessionKeyRef.current;
+		if (key && activeScrollSessionCanSaveRef.current) {
+			scrollPositionsRef.current.set(key, { scrollTop: scroller.scrollTop, sticky: false });
+			saveTranscriptScrollPositions(scrollPositionsRef.current);
+		}
+	}, []);
+
+	const jumpToAdjacentTurn = useCallback((direction: TurnJumpDirection) => {
+		const scroller = scrollRef.current;
+		if (!scroller) return;
+		const targetId = adjacentTurnJumpTargetId(collectTurnJumpTargetPositions(), scroller.scrollTop, direction, scroller.clientHeight);
+		if (targetId) scrollToTurnJumpTarget(targetId);
+	}, [collectTurnJumpTargetPositions, scrollToTurnJumpTarget]);
 
 	const handleScroll = useCallback((event: UIEvent<HTMLDivElement>) => {
 		if (pendingScrollRestoreRef.current?.key === activeScrollSessionKeyRef.current) return;
@@ -346,13 +426,28 @@ export const MessageList = memo(function MessageList({
 		[isRunning, turnCards, visibleEntries],
 	);
 	const shouldUseTurnCards = !!turnCards && turnCards.length > 0;
+	const fallbackTurnJumpTargets = useMemo(
+		() => buildFallbackTurnJumpTargets(turnViews, visibleDisplayNodes),
+		[turnViews, visibleDisplayNodes],
+	);
+	const turnJumpTargets = useMemo<TurnJumpTarget[]>(
+		() => shouldUseTurnCards ? turnCards!.map((turn) => ({ id: turn.card.id })) : fallbackTurnJumpTargets,
+		[fallbackTurnJumpTargets, shouldUseTurnCards, turnCards],
+	);
+	const fallbackTargetIdByNodeKey = useMemo(
+		() => new Map(fallbackTurnJumpTargets.flatMap((target) => target.nodeKey ? [[target.nodeKey, target.id]] : [])),
+		[fallbackTurnJumpTargets],
+	);
+	const showTurnJumpControls = turnJumpTargets.length > 1;
 
 	if (!hasSession) {
 		return (
-			<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
-				<div className="empty-state">
-					<Terminal size={34} />
-					<span>Select or create a session</span>
+			<div className="message-list-shell">
+				<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
+					<div className="empty-state">
+						<Terminal size={34} />
+						<span>Select or create a session</span>
+					</div>
 				</div>
 			</div>
 		);
@@ -360,61 +455,125 @@ export const MessageList = memo(function MessageList({
 
 	if (loadingSession || !entriesBelongToSelectedSession) {
 		return (
-			<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
-				<div className="empty-state">
-					<Loader2 className="spin" size={28} />
-					<span>Loading session...</span>
+			<div className="message-list-shell">
+				<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
+					<div className="empty-state">
+						<Loader2 className="spin" size={28} />
+						<span>Loading session...</span>
+					</div>
 				</div>
 			</div>
 		);
 	}
 
 	return (
-		<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
-			<div className="message-scroll-content" ref={contentRef}>
-				{shouldUseTurnCards
-					? (
-							<>
-								{hasOlderTurns ? (
-									<div className="turn-card-load-older">
-										<button type="button" className="turn-card-expand" disabled={loadingOlderTurns} onClick={onLoadOlderTurns}>
-											{loadingOlderTurns ? "Loading older…" : "Load older turns"}
-										</button>
-									</div>
-								) : null}
-								{turnCards!.map((turn) => (
-									<TurnCardRow
-										key={turn.card.id}
-										turn={turn}
-										activeLeafId={activeLeafId}
+		<div className={`message-list-shell ${showTurnJumpControls ? "with-turn-jump-controls" : ""}`}>
+			<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
+				<div className="message-scroll-content" ref={contentRef}>
+					{shouldUseTurnCards
+						? (
+								<>
+									{hasOlderTurns ? (
+										<div className="turn-card-load-older">
+											<button type="button" className="turn-card-expand" disabled={loadingOlderTurns} onClick={onLoadOlderTurns}>
+												{loadingOlderTurns ? "Loading older…" : "Load older turns"}
+											</button>
+										</div>
+									) : null}
+									{turnCards!.map((turn) => (
+										<TurnCardRow
+											key={turn.card.id}
+											turn={turn}
+											activeLeafId={activeLeafId}
+											isRunning={isRunning}
+											onResumeTurn={onResumeTurn}
+											resumingTurnId={resumingTurnId}
+											onExpandTurn={onExpandTurn}
+											onCollapseTurn={onCollapseTurn}
+											loadingTurnId={loadingTurnId}
+											turnJumpTargetId={turn.card.id}
+										/>
+									))}
+								</>
+							)
+						: visibleDisplayNodes.map((node) => {
+								const targetId = fallbackTargetIdByNodeKey.get(node.key);
+								const view = (
+									<TranscriptDisplayNodeView
+										key={node.key}
+										node={node}
+										toolIndex={toolIndex}
+										isActiveLeaf={nodeLeafId(node) === activeLeafId}
 										isRunning={isRunning}
 										onResumeTurn={onResumeTurn}
-										resumingTurnId={resumingTurnId}
-										onExpandTurn={onExpandTurn}
-										loadingTurnId={loadingTurnId}
+										resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
+										resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
+										compactionHiddenCount={compactionHiddenCounts.get(node.key) ?? 0}
+										compactionExpanded={!collapsedCompactions.has(node.key)}
+										onToggleCompaction={toggleCompaction}
 									/>
-								))}
-							</>
-						)
-					: visibleDisplayNodes.map((node) => (
-							<TranscriptDisplayNodeView
-								node={node}
-								key={node.key}
-								toolIndex={toolIndex}
-								isActiveLeaf={nodeLeafId(node) === activeLeafId}
-								isRunning={isRunning}
-								onResumeTurn={onResumeTurn}
-								resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
-								resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
-								compactionHiddenCount={compactionHiddenCounts.get(node.key) ?? 0}
-								compactionExpanded={!collapsedCompactions.has(node.key)}
-								onToggleCompaction={toggleCompaction}
-							/>
-						))}
-				{isRunning && workingStartMs != null && serverTimeMs != null ? (
-					<WorkingIndicator startMs={workingStartMs} serverTimeMs={serverTimeMs} />
-				) : null}
+								);
+								return targetId ? (
+									<div key={node.key} className="turn-jump-target" data-turn-jump-target-id={targetId}>
+										{view}
+									</div>
+								) : (
+									view
+								);
+							})}
+					{isRunning && workingStartMs != null && serverTimeMs != null ? (
+						<WorkingIndicator startMs={workingStartMs} serverTimeMs={serverTimeMs} />
+					) : null}
+				</div>
 			</div>
+			<TurnJumpControls visible={showTurnJumpControls} onJump={jumpToAdjacentTurn} />
+		</div>
+	);
+});
+
+function buildFallbackTurnJumpTargets(turns: TurnView[], displayNodes: TranscriptDisplayNode[]): TurnJumpTarget[] {
+	const targets: TurnJumpTarget[] = [];
+	for (const [index, turn] of turns.entries()) {
+		const entryIds = new Set(turn.entries.map((entry) => entry.id));
+		const displayNode = displayNodes.find((node) => entryIds.has(nodeLeafId(node)));
+		if (displayNode) targets.push({ id: `turn-${index}-${displayNode.key}`, nodeKey: displayNode.key });
+	}
+	return targets;
+}
+
+function turnJumpTargetNode(scroller: HTMLDivElement, targetId: string): HTMLElement | null {
+	return Array.from(scroller.querySelectorAll<HTMLElement>("[data-turn-jump-target-id]"))
+		.find((target) => target.dataset.turnJumpTargetId === targetId) ?? null;
+}
+
+const TurnJumpControls = memo(function TurnJumpControls({
+	visible,
+	onJump,
+}: {
+	visible: boolean;
+	onJump: (direction: TurnJumpDirection) => void;
+}) {
+	if (!visible) return null;
+	return (
+		<div className="turn-jump-controls" aria-label="Turn navigation">
+			<button
+				type="button"
+				className="turn-jump-button"
+				aria-label="Jump to previous turn"
+				title="Previous turn"
+				onClick={() => onJump("previous")}
+			>
+				<ChevronUp size={18} />
+			</button>
+			<button
+				type="button"
+				className="turn-jump-button"
+				aria-label="Jump to next turn"
+				title="Next turn"
+				onClick={() => onJump("next")}
+			>
+				<ChevronDown size={18} />
+			</button>
 		</div>
 	);
 });
@@ -605,7 +764,9 @@ const TurnCardRow = memo(function TurnCardRow({
 	onResumeTurn,
 	resumingTurnId,
 	onExpandTurn,
-	loadingTurnId
+	onCollapseTurn,
+	loadingTurnId,
+	turnJumpTargetId
 }: {
 	turn: TurnCardView;
 	activeLeafId: string | null;
@@ -613,89 +774,68 @@ const TurnCardRow = memo(function TurnCardRow({
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
 	onExpandTurn?: (turnId: string) => void;
+	onCollapseTurn?: (turnId: string) => void;
 	loadingTurnId?: string | null;
+	turnJumpTargetId?: string;
 }) {
+	const card = turn.card;
+	const isLoading = loadingTurnId === card.id;
+	const isExpanded = turn.expanded && !!turn.entries;
+	const canToggleDetails = card.status !== "compacted" && (!!onExpandTurn || !!onCollapseTurn);
+	const canResume = card.can_resume && card.active_leaf_id === activeLeafId && !isRunning && !!onResumeTurn;
+	const resumableOutcome = card.outcome === "Interrupted" || card.outcome === "Crashed" ? card.outcome : null;
+	const firstUserMessageId = card.user_messages.at(0)?.id ?? null;
+	const rootTurnJumpTargetId = firstUserMessageId ? undefined : turnJumpTargetId;
+	const detailLabel = isExpanded ? "Hide details" : isLoading ? "Loading…" : "Show details";
+	const onToggleDetails = () => {
+		if (isExpanded) onCollapseTurn?.(card.id);
+		else onExpandTurn?.(card.id);
+	};
+	let detailRows: ReactNode = null;
 	if (turn.expanded && turn.entries) {
 		const toolIndex = indexToolEntries(turn.entries);
 		const turnViews = buildTurnViews(turn.entries);
-		const displayNodes = deriveTranscriptDisplayNodes(turn.entries, turnViews, toolIndex.results, []);
+		const displayNodes = turnDetailDisplayNodesBeforeLatestAssistant(deriveTranscriptDisplayNodes(turn.entries, turnViews, toolIndex.results, []), turn.card);
 		const resumeEntryIdByNode = new Map(displayNodes.map((node) => [node.key, nodeLeafId(node)]));
-		return (
-			<div className="turn-card expanded">
-				<TurnCardSummary
-					turn={turn}
-					activeLeafId={activeLeafId}
-					isRunning={isRunning}
-					onResumeTurn={onResumeTurn}
-					resumingTurnId={resumingTurnId}
-					onExpandTurn={onExpandTurn}
-					loadingTurnId={loadingTurnId}
-				/>
-				<div className="turn-card-detail">
-					{displayNodes.map((node) => (
-						<TranscriptDisplayNodeView
-							key={node.key}
-							node={node}
-							toolIndex={toolIndex}
-							isActiveLeaf={nodeLeafId(node) === activeLeafId}
-							isRunning={isRunning}
-							onResumeTurn={onResumeTurn}
-							resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
-							resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
-							compactionHiddenCount={0}
-							compactionExpanded
-							onToggleCompaction={() => {}}
-						/>
-					))}
-				</div>
-			</div>
-		);
+		detailRows = displayNodes.map((node) => (
+			<TranscriptDisplayNodeView
+				key={node.key}
+				node={node}
+				toolIndex={toolIndex}
+				isActiveLeaf={nodeLeafId(node) === activeLeafId}
+				isRunning={isRunning}
+				onResumeTurn={onResumeTurn}
+				resumeEntryId={resumeEntryIdByNode.get(node.key) ?? nodeLeafId(node)}
+				resuming={resumeEntryIdByNode.get(node.key) === resumingTurnId}
+				compactionHiddenCount={0}
+				compactionExpanded
+				onToggleCompaction={() => {}}
+			/>
+		));
 	}
 	return (
-		<TurnCardSummary
-			turn={turn}
-			activeLeafId={activeLeafId}
-			isRunning={isRunning}
-			onResumeTurn={onResumeTurn}
-			resumingTurnId={resumingTurnId}
-			onExpandTurn={onExpandTurn}
-			loadingTurnId={loadingTurnId}
-		/>
-	);
-});
-
-const TurnCardSummary = memo(function TurnCardSummary({
-	turn,
-	activeLeafId,
-	isRunning,
-	onResumeTurn,
-	resumingTurnId,
-	onExpandTurn,
-	loadingTurnId
-}: {
-	turn: TurnCardView;
-	activeLeafId: string | null;
-	isRunning: boolean;
-	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
-	resumingTurnId?: string | null;
-	onExpandTurn?: (turnId: string) => void;
-	loadingTurnId?: string | null;
-}) {
-	const card = turn.card;
-	const title = turnCardTitle(card);
-	const meta = turnCardMeta(card);
-	const isLoading = loadingTurnId === card.id;
-	const canExpand = (!turn.expanded || !turn.entries) && card.status !== "compacted" && !!onExpandTurn;
-	const canResume = card.can_resume && card.active_leaf_id === activeLeafId && !isRunning && !!onResumeTurn;
-	const resumableOutcome = card.outcome === "Interrupted" || card.outcome === "Crashed" ? card.outcome : null;
-	return (
-		<div className={`turn-card ${turn.isCurrent ? "current" : ""} ${card.status}`}>
-			<div className="turn-card-header">
-				<div>
-					<div className="turn-card-title">{title}</div>
-					{meta ? <div className="turn-card-meta">{meta}</div> : null}
-				</div>
-				<div className="turn-card-actions">
+		<div
+			className={["turn-summary", turn.isCurrent ? "current" : null, card.status, isExpanded ? "expanded" : null].filter(Boolean).join(" ")}
+			data-turn-jump-target-id={rootTurnJumpTargetId}
+		>
+			{card.user_messages.map((entry) =>
+				entry.item.type === "user_message" ? (
+					<UserBubble
+						key={entry.id}
+						entryId={entry.id}
+						item={entry.item}
+						turnJumpTargetId={entry.id === firstUserMessageId ? turnJumpTargetId : undefined}
+					/>
+				) : null,
+			)}
+			{detailRows}
+			{canToggleDetails || canResume ? (
+				<div className="turn-detail-toggle-row">
+					{canToggleDetails ? (
+						<button type="button" className="turn-card-expand" disabled={isLoading && !isExpanded} onClick={onToggleDetails}>
+							{detailLabel}
+						</button>
+					) : null}
 					{canResume && !turn.isCurrent && resumableOutcome ? (
 						<button
 							type="button"
@@ -706,52 +846,56 @@ const TurnCardSummary = memo(function TurnCardSummary({
 							{resumingTurnId === card.active_leaf_id ? "Starting…" : resumableOutcome === "Interrupted" ? "Continue" : "Retry"}
 						</button>
 					) : null}
-					{canExpand ? (
-						<button type="button" className="turn-card-expand" disabled={isLoading} onClick={() => onExpandTurn?.(card.id)}>
-							{isLoading ? "Loading…" : "Show details"}
-						</button>
-					) : null}
 				</div>
-			</div>
-			{card.status === "compacted" && card.summary ? <div className="turn-card-assistant">{card.summary}</div> : null}
-			{card.user_messages.map((entry) =>
-				entry.item.type === "user_message" ? <UserBubble key={entry.id} entryId={entry.id} item={entry.item} /> : null,
-			)}
-			{card.assistant_message?.item.type === "assistant_message" ? (
-				<AssistantTextBlock
-					node={{
-						type: "assistant_text",
-						key: `${card.assistant_message.id}-turn-card`,
-						entry: card.assistant_message as AssistantMessageEntry,
-						text: assistantMessageText(card.assistant_message.item),
-						copyText: assistantMessageText(card.assistant_message.item),
-						phase: card.status === "completed" && card.outcome === "Graceful" ? "final_answer" : turn.isCurrent ? "running" : "unknown",
-					}}
-				/>
 			) : null}
+			<TurnSummaryAssistant turn={turn} />
 		</div>
 	);
 });
 
-function turnCardTitle(card: TurnCard): string {
-	if (card.status === "compacted") return `Compacted history${card.turn_id ? ` through turn ${card.turn_id}` : ""}`;
-	const label = card.turn_id ? `Turn ${card.turn_id}` : "Turn";
-	if (card.outcome && card.outcome !== "Graceful") return `${label} · ${card.outcome.toLowerCase()}`;
-	if (card.status === "completed") return `${label} · completed`;
-	return label;
+function turnDetailDisplayNodesBeforeLatestAssistant(displayNodes: TranscriptDisplayNode[], card: TurnCard): TranscriptDisplayNode[] {
+	const assistantId = card.assistant_message?.id ?? null;
+	if (!assistantId) return displayNodes;
+	return displayNodes.filter((node) => {
+		if (node.type === "assistant_text" && node.entry.id === assistantId) return false;
+		if (node.type === "tool_group" && node.items.some((item) => item.entryId === assistantId)) return false;
+		if (node.type === "user" && card.user_messages.some((entry) => entry.id === node.entry.id)) return false;
+		if (node.type === "turn_finished") return false;
+		return true;
+	});
 }
 
-function turnCardMeta(card: TurnCard): string {
-	const parts = [];
-	if (card.status === "open") parts.push("in progress");
-	if (card.user_messages.length > 1) parts.push(`${card.user_messages.length} user messages`);
-	if (!card.assistant_message && card.status !== "compacted") parts.push("waiting for assistant");
-	return parts.join(" · ");
-}
-
-const UserBubble = memo(function UserBubble({ item, entryId }: { item: Extract<TranscriptItem, { type: "user_message" }>; entryId: string }) {
+const TurnSummaryAssistant = memo(function TurnSummaryAssistant({ turn }: { turn: TurnCardView }) {
+	const card = turn.card;
+	if (card.status === "compacted" && card.summary) {
+		return <div className="turn-card-assistant">{card.summary}</div>;
+	}
+	if (card.assistant_message?.item.type !== "assistant_message") return null;
 	return (
-		<div className="message-row user-row">
+		<AssistantTextBlock
+			node={{
+				type: "assistant_text",
+				key: `${card.assistant_message.id}-turn-card`,
+				entry: card.assistant_message as AssistantMessageEntry,
+				text: assistantMessageText(card.assistant_message.item),
+				copyText: assistantMessageText(card.assistant_message.item),
+				phase: card.status === "completed" && card.outcome === "Graceful" ? "final_answer" : turn.isCurrent ? "running" : "unknown",
+			}}
+		/>
+	);
+});
+
+const UserBubble = memo(function UserBubble({
+	item,
+	entryId,
+	turnJumpTargetId
+}: {
+	item: Extract<TranscriptItem, { type: "user_message" }>;
+	entryId: string;
+	turnJumpTargetId?: string;
+}) {
+	return (
+		<div className="message-row user-row" data-turn-jump-target-id={turnJumpTargetId}>
 			<EntryId entryId={entryId} />
 			<div className="user-bubble">{contentBlocksToText(item.content)}</div>
 		</div>
