@@ -43,7 +43,7 @@ async fn active_branch_turn_card_rows_tx(
                    t.item,
                    t.sequence,
                    case
-                     when t.item->>'type' in ('turn_started', 'compaction_summary') then 1
+                     when t.item->>'type' = 'turn_started' then 1
                      else 0
                    end as boundary_count
             from transcript_entries t
@@ -60,7 +60,7 @@ async fn active_branch_turn_card_rows_tx(
                    parent.sequence,
                    child.boundary_count
                      + case
-                         when parent.item->>'type' in ('turn_started', 'compaction_summary') then 1
+                         when parent.item->>'type' = 'turn_started' then 1
                          else 0
                        end as boundary_count
             from transcript_entries parent
@@ -83,7 +83,7 @@ async fn active_branch_turn_card_rows_tx(
                    sequence,
                    sum(
                      case
-                       when item->>'type' in ('turn_started', 'compaction_summary') then 1
+                       when item->>'type' = 'turn_started' then 1
                        else 0
                      end
                    ) over (order by sequence rows between unbounded preceding and current row) as card_ordinal
@@ -110,8 +110,7 @@ async fn active_branch_turn_card_rows_tx(
                card_rows.item->'outcome' as outcome,
                card_rows.item->>'source_leaf_id' as compaction_source_leaf_id,
                card_rows.item #>> '{last_turn_id}' as compaction_last_turn_id,
-               card_rows.item #>> '{turn_started_at_ms}' as compaction_turn_started_at_ms,
-               card_rows.item->>'summary' as compaction_summary
+               card_rows.item #>> '{turn_started_at_ms}' as compaction_turn_started_at_ms
         from card_rows
         left join terminal_assistant
           on terminal_assistant.card_ordinal = card_rows.card_ordinal
@@ -142,11 +141,6 @@ fn turn_card_row(row: &sqlx::postgres::PgRow) -> Result<TurnCardRow> {
     let outcome = row
         .get::<Option<Value>, _>("outcome")
         .and_then(|value| value.as_str().and_then(parse_turn_outcome));
-    let summary = if item_type == "compaction_summary" {
-        row.get::<Option<String>, _>("compaction_summary")
-    } else {
-        None
-    };
     let body_item = row
         .get::<Option<Value>, _>("body_item")
         .map(serde_json::from_value)
@@ -180,7 +174,6 @@ fn turn_card_row(row: &sqlx::postgres::PgRow) -> Result<TurnCardRow> {
             .as_deref()
             .and_then(parse_u64),
         outcome,
-        summary,
     })
 }
 
@@ -209,7 +202,6 @@ struct TurnCardRow {
     turn_id: Option<agent_vocab::TurnId>,
     compaction_turn_started_at_ms: Option<u64>,
     outcome: Option<agent_vocab::TurnOutcome>,
-    summary: Option<String>,
 }
 
 impl TurnCardRow {
@@ -247,6 +239,7 @@ struct MutableTurnCard {
 struct CompactionResumeAnchor {
     turn_id: Option<agent_vocab::TurnId>,
     start_timestamp_ms: Option<u64>,
+    start_sequence: Option<i64>,
 }
 
 fn turn_cards_from_rows(rows: &[TurnCardRow]) -> Vec<TurnCardRecord> {
@@ -256,12 +249,16 @@ fn turn_cards_from_rows(rows: &[TurnCardRow]) -> Vec<TurnCardRecord> {
 
     for row in rows {
         if row.item_type == "compaction_summary" {
-            close_open_turn(&mut cards, &mut current);
-            cards.push(compaction_turn_card(row));
             compaction_resume_anchor = Some(CompactionResumeAnchor {
                 turn_id: row.turn_id,
                 start_timestamp_ms: row.compaction_turn_started_at_ms,
+                start_sequence: row.compaction_turn_started_at_ms.map(|_| row.sequence),
             });
+            if row.compaction_turn_started_at_ms.is_none() {
+                close_open_turn(&mut cards, &mut current);
+            } else if let Some(turn) = current.as_mut() {
+                append_entry_to_turn_card(turn, row);
+            }
             continue;
         }
         if row.item_type == "turn_started" {
@@ -285,12 +282,15 @@ fn turn_cards_from_rows(rows: &[TurnCardRow]) -> Vec<TurnCardRecord> {
         }
 
         let anchor = compaction_resume_anchor;
+        let start_sequence = anchor
+            .and_then(|anchor| anchor.start_sequence)
+            .unwrap_or(row.sequence);
         let turn = current.get_or_insert_with(|| MutableTurnCard {
             turn_id: row.turn_id.or(anchor.and_then(|anchor| anchor.turn_id)),
             start_entry_id: None,
             boundary_entry_id: None,
             active_leaf_id: row.id.clone(),
-            start_sequence: row.sequence,
+            start_sequence,
             end_sequence: row.sequence,
             start_timestamp_ms: anchor
                 .and_then(|anchor| anchor.start_timestamp_ms)
@@ -344,6 +344,14 @@ fn append_entry_to_turn_card(card: &mut MutableTurnCard, row: &TurnCardRow) {
             }
             card.start_entry_id.get_or_insert_with(|| row.id.clone());
         }
+        "compaction_summary" => {
+            if let Some(turn_id) = row.turn_id {
+                card.turn_id = Some(turn_id);
+            }
+            if let Some(start_timestamp_ms) = row.compaction_turn_started_at_ms {
+                card.start_timestamp_ms = start_timestamp_ms;
+            }
+        }
         _ => {}
     }
 }
@@ -381,28 +389,5 @@ fn finalize_turn_card(card: MutableTurnCard) -> TurnCardRecord {
         assistant_message: card.assistant_message,
         summary: card.summary,
         can_resume,
-    }
-}
-
-fn compaction_turn_card(row: &TurnCardRow) -> TurnCardRecord {
-    let summary = row.summary.as_ref().map(|value| value.trim().to_string());
-    TurnCardRecord {
-        id: row.id.clone(),
-        turn_id: row.turn_id,
-        status: TurnCardStatus::Compacted,
-        outcome: None,
-        start_entry_id: Some(row.id.clone()),
-        boundary_entry_id: Some(row.id.clone()),
-        active_leaf_id: row.id.clone(),
-        start_sequence: row.sequence,
-        end_sequence: row.sequence,
-        start_timestamp_ms: row
-            .compaction_turn_started_at_ms
-            .unwrap_or(row.timestamp_ms),
-        timestamp_ms: row.timestamp_ms,
-        user_messages: Vec::new(),
-        assistant_message: None,
-        summary: summary.filter(|value| !value.is_empty()),
-        can_resume: false,
     }
 }

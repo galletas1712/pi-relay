@@ -177,7 +177,13 @@ async fn active_branch_entry_records_between_tx(
             from transcript_entries parent
             join card_path child
               on parent.session_id = $1
-             and parent.id = child.parent_id
+             and parent.id = coalesce(
+                case
+                    when child.item->>'type' = 'compaction_summary' then child.item->>'source_leaf_id'
+                    else null
+                end,
+                child.parent_id
+             )
             where child.sequence > $3
         )
         select id, parent_id, timestamp_ms, sequence, item, {provider_replay_select}
@@ -1738,13 +1744,11 @@ mod tests {
             .transcript_turns(session_id, None, None)
             .await
             .expect("turn cards load");
-        assert_eq!(turns.cards.len(), 2);
-        let compact_card = &turns.cards[0];
-        assert_eq!(compact_card.turn_id, Some(TurnId(7)));
-        assert_eq!(compact_card.start_timestamp_ms, turn_started_at_ms);
-        let resumed_card = &turns.cards[1];
+        assert_eq!(turns.cards.len(), 1);
+        let resumed_card = &turns.cards[0];
         assert_eq!(resumed_card.turn_id, Some(TurnId(7)));
         assert_eq!(resumed_card.start_timestamp_ms, turn_started_at_ms);
+        assert_eq!(resumed_card.start_sequence, 1);
         assert_eq!(
             resumed_card
                 .assistant_message
