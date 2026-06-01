@@ -441,16 +441,23 @@ export function applyTranscriptAppendedEvent(cache: SelectedSessionCache, event:
 		last_event_id: Math.max(cache.snapshot.last_event_id, event.event_id),
 		entries: activeBranchEntryIds.map((id) => entriesById.get(id)).filter((candidate): candidate is TranscriptEntry => !!candidate),
 	};
-	let turnDetailsById = appendsToActiveBranch
-		? appendLoadedTurnDetail(cache.turnDetailsById, cache.turnOrder.at(-1) ?? null, currentLeafId, entry.id)
-		: cache.turnDetailsById;
+	const previousTurnId = cache.turnOrder.at(-1) ?? null;
 	const turnCards = appendsToActiveBranch
 		? appendTurnCard(cache.turnCardsById, cache.turnOrder, entry)
 		: {
 				turnCardsById: cache.turnCardsById,
 				turnOrder: cache.turnOrder,
 			};
-	turnDetailsById = migrateCurrentTurnDetailId(turnDetailsById, cache.turnOrder.at(-1) ?? null, turnCards.turnOrder.at(-1) ?? null);
+	const nextTurnId = turnCards.turnOrder.at(-1) ?? null;
+	const previousCardStillExists = previousTurnId ? turnCards.turnCardsById.has(previousTurnId) : false;
+	const appendedNewCard = !!previousTurnId && previousTurnId !== nextTurnId && previousCardStillExists;
+	const previousCardWasReplaced = !!previousTurnId && previousTurnId !== nextTurnId && !previousCardStillExists;
+	let turnDetailsById = appendsToActiveBranch && !appendedNewCard
+		? appendLoadedTurnDetail(cache.turnDetailsById, previousTurnId, currentLeafId, entry.id)
+		: cache.turnDetailsById;
+	if (previousCardWasReplaced) {
+		turnDetailsById = migrateCurrentTurnDetailId(turnDetailsById, previousTurnId, nextTurnId);
+	}
 	const nextCache = {
 		...cache,
 		snapshot,

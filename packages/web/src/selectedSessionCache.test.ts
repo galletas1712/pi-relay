@@ -279,6 +279,32 @@ describe("selected session cache", () => {
 		expect(cache.turnDetailsById.has("entry_start")).toBe(false);
 	});
 
+	it("keeps completed turn detail attached when a new turn card is appended", () => {
+		const started = turnStartedEntry("entry_start_2", "entry_finish_1", 2, 6);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([entry("entry_finish_1", null, "done", 5)], { transcriptRevision: 1 }));
+		cache = {
+			...cache,
+			activeBranchEntryIds: ["entry_finish_1"],
+			turnOrder: ["entry_finish_1"],
+			turnCardsById: new Map([[
+				"entry_finish_1",
+				{
+					...turnCard("entry_finish_1", 1),
+					status: "completed",
+					boundary_entry_id: "entry_finish_1",
+					active_leaf_id: "entry_finish_1",
+				},
+			]]),
+			turnDetailsById: new Map([["entry_finish_1", ["entry_start_1", "entry_user_1", "entry_finish_1"]]]),
+		};
+
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(started, 9, 2)).cache;
+
+		expect(cache.turnOrder).toEqual(["entry_finish_1", "entry_start_2"]);
+		expect(cache.turnDetailsById.get("entry_finish_1")).toEqual(["entry_start_1", "entry_user_1", "entry_finish_1"]);
+		expect(cache.turnDetailsById.has("entry_start_2")).toBe(false);
+	});
+
 	it("carries compaction turn metadata into a resumed current card", () => {
 		const source = turnStartedEntry("entry_source", null, 7, 0);
 		const compact = compactionEntry("entry_compact", "entry_source", 1, 7, 1_700_000_000_123);
