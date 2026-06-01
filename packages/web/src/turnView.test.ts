@@ -43,6 +43,42 @@ describe("buildTurnViews", () => {
 		expect(turn.modelSteps[0].phase).toBe("final_answer");
 	});
 
+	it("keeps mid-turn compaction inside the containing turn", () => {
+		const entries = [
+			entry("start", { type: "turn_started", turn_id: 7 }),
+			entry("user", { type: "user_message", content: [{ type: "text", text: "first" }] }),
+			entry("assistant-before-compact", { type: "assistant_message", items: [text("I will keep going.")] }),
+			entry("compact", {
+				type: "compaction_summary",
+				source_session_id: "session",
+				source_leaf_id: "assistant-before-compact",
+				summary: "summary",
+				tokens_before: 123,
+				last_turn_id: 7,
+				turn_started_at_ms: 1_700_000_000_000
+			}),
+			entry("assistant-final", { type: "assistant_message", items: [text("Done.")] }),
+			entry("finish", { type: "turn_finished", turn_id: 7, outcome: "Graceful" })
+		];
+
+		const turns = buildTurnViews(entries);
+
+		expect(turns).toHaveLength(1);
+		const [turn] = turns;
+		expect(turn.turnId).toBe(7);
+		expect(turn.entries.map((candidate) => candidate.id)).toEqual([
+			"start",
+			"user",
+			"assistant-before-compact",
+			"assistant-final",
+			"finish"
+		]);
+		expect(turn.modelSteps.map((step) => [step.entry.id, step.phase])).toEqual([
+			["assistant-before-compact", "unknown"],
+			["assistant-final", "final_answer"]
+		]);
+	});
+
 	it("marks terminal assistant text in crashed turns as aborted", () => {
 		const entries = [
 			entry("start", { type: "turn_started", turn_id: 3 }),

@@ -322,7 +322,8 @@ export function applyTranscriptAppendedEvent(cache: SelectedSessionCache, event:
 	const previousCardStillExists = previousTurnId ? turnCards.turnCardsById.has(previousTurnId) : false;
 	const appendedNewCard = !!previousTurnId && previousTurnId !== nextTurnId && previousCardStillExists;
 	const previousCardWasReplaced = !!previousTurnId && previousTurnId !== nextTurnId && !previousCardStillExists;
-	let turnDetailsById = appendsToActiveBranch && !appendedNewCard
+	const previousCardWasOpen = previousTurnId ? cache.turnCardsById.get(previousTurnId)?.status === "open" : false;
+	let turnDetailsById = appendsToActiveBranch && !appendedNewCard && (entry.item.type !== "compaction_summary" || previousCardWasOpen)
 		? appendLoadedTurnDetail(cache.turnDetailsById, previousTurnId, currentLeafId, entry.id)
 		: cache.turnDetailsById;
 	if (previousCardWasReplaced) {

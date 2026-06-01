@@ -305,7 +305,7 @@ describe("selected session cache", () => {
 		expect(cache.turnDetailsById.has("entry_start_2")).toBe(false);
 	});
 
-	it("carries compaction turn metadata into a resumed current card", () => {
+	it("carries compaction turn metadata into the current card without adding a compaction card", () => {
 		const source = turnStartedEntry("entry_source", null, 7, 0);
 		const compact = compactionEntry("entry_compact", "entry_source", 1, 7, 1_700_000_000_123);
 		const assistant = assistantEntry("entry_assistant", "entry_compact", "resumed answer", 2);
@@ -320,15 +320,13 @@ describe("selected session cache", () => {
 		};
 
 		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(compact, 4, 1)).cache;
+		expect(cache.turnOrder).toEqual(["entry_source"]);
+		expect(cache.turnCardsById.has("entry_compact")).toBe(false);
 		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(assistant, 5, 2)).cache;
 
-		expect(cache.turnOrder).toEqual(["entry_source", "entry_compact", "entry_assistant"]);
-		const compactCard = cache.turnCardsById.get("entry_compact");
-		const resumedCard = cache.turnCardsById.get("entry_assistant");
-		expect(compactCard).toMatchObject({
-			turn_id: 7,
-			start_timestamp_ms: 1_700_000_000_123,
-		});
+		expect(cache.turnOrder).toEqual(["entry_source"]);
+		expect(cache.turnCardsById.has("entry_compact")).toBe(false);
+		const resumedCard = cache.turnCardsById.get("entry_source");
 		expect(resumedCard).toMatchObject({
 			turn_id: 7,
 			start_timestamp_ms: 1_700_000_000_123,

@@ -88,7 +88,7 @@ export function buildTurnViews(entries: TranscriptEntry[]): TurnView[] {
 			continue;
 		}
 		if (item.type === "compaction_summary") {
-			closeCurrent();
+			if (typeof item.turn_started_at_ms !== "number") closeCurrent();
 			continue;
 		}
 
