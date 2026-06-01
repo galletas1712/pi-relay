@@ -609,7 +609,25 @@ Result shape:
   "next_before_entry_id": "entry_17",
   "has_more_before": true,
   "limit": 50,
-  "cards": []
+  "cards": [
+    {
+      "id": "entry_42",
+      "turn_id": 7,
+      "status": "completed",
+      "outcome": "Graceful",
+      "start_entry_id": "entry_37",
+      "boundary_entry_id": "entry_42",
+      "active_leaf_id": "entry_42",
+      "start_sequence": 37,
+      "end_sequence": 42,
+      "start_timestamp_ms": 1700000000000,
+      "timestamp_ms": 1700000006000,
+      "user_messages": [],
+      "assistant_message": null,
+      "summary": null,
+      "can_resume": false
+    }
+  ]
 }
 ```
 

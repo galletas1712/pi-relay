@@ -484,6 +484,7 @@ export const MessageList = memo(function MessageList({
 										<TurnCardRow
 											key={turn.card.id}
 											turn={turn}
+											pendingActions={turn.isCurrent ? pendingActions : []}
 											activeLeafId={activeLeafId}
 											isRunning={isRunning}
 											onResumeTurn={onResumeTurn}
@@ -759,6 +760,7 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 
 const TurnCardRow = memo(function TurnCardRow({
 	turn,
+	pendingActions,
 	activeLeafId,
 	isRunning,
 	onResumeTurn,
@@ -769,6 +771,7 @@ const TurnCardRow = memo(function TurnCardRow({
 	turnJumpTargetId
 }: {
 	turn: TurnCardView;
+	pendingActions?: PendingAction[];
 	activeLeafId: string | null;
 	isRunning: boolean;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
@@ -781,7 +784,7 @@ const TurnCardRow = memo(function TurnCardRow({
 	const card = turn.card;
 	const isLoading = loadingTurnId === card.id;
 	const isExpanded = turn.expanded && !!turn.entries;
-	const canToggleDetails = card.status !== "compacted" && (!!onExpandTurn || !!onCollapseTurn);
+	const canToggleDetails = card.status !== "compacted" && (!!onExpandTurn || !!onCollapseTurn) && !(turn.isCurrent && isExpanded);
 	const canResume = card.can_resume && card.active_leaf_id === activeLeafId && !isRunning && !!onResumeTurn;
 	const resumableOutcome = card.outcome === "Interrupted" || card.outcome === "Crashed" ? card.outcome : null;
 	const firstUserMessageId = card.user_messages.at(0)?.id ?? null;
@@ -795,7 +798,7 @@ const TurnCardRow = memo(function TurnCardRow({
 	if (turn.expanded && turn.entries) {
 		const toolIndex = indexToolEntries(turn.entries);
 		const turnViews = buildTurnViews(turn.entries);
-		const displayNodes = turnDetailDisplayNodesBeforeLatestAssistant(deriveTranscriptDisplayNodes(turn.entries, turnViews, toolIndex.results, []), turn.card);
+		const displayNodes = turnDetailDisplayNodesBeforeLatestAssistant(deriveTranscriptDisplayNodes(turn.entries, turnViews, toolIndex.results, pendingActions), turn.card);
 		const resumeEntryIdByNode = new Map(displayNodes.map((node) => [node.key, nodeLeafId(node)]));
 		detailRows = displayNodes.map((node) => (
 			<TranscriptDisplayNodeView
@@ -849,17 +852,17 @@ const TurnCardRow = memo(function TurnCardRow({
 				</div>
 			) : null}
 			<TurnSummaryAssistant turn={turn} />
+			<TurnDuration card={card} />
 		</div>
 	);
 });
 
 function turnDetailDisplayNodesBeforeLatestAssistant(displayNodes: TranscriptDisplayNode[], card: TurnCard): TranscriptDisplayNode[] {
 	const assistantId = card.assistant_message?.id ?? null;
-	if (!assistantId) return displayNodes;
+	const userMessageIds = new Set(card.user_messages.map((entry) => entry.id));
 	return displayNodes.filter((node) => {
-		if (node.type === "assistant_text" && node.entry.id === assistantId) return false;
-		if (node.type === "tool_group" && node.items.some((item) => item.entryId === assistantId)) return false;
-		if (node.type === "user" && card.user_messages.some((entry) => entry.id === node.entry.id)) return false;
+		if (assistantId && node.type === "assistant_text" && node.entry.id === assistantId) return false;
+		if (node.type === "user" && userMessageIds.has(node.entry.id)) return false;
 		if (node.type === "turn_finished") return false;
 		return true;
 	});
@@ -884,6 +887,11 @@ const TurnSummaryAssistant = memo(function TurnSummaryAssistant({ turn }: { turn
 		/>
 	);
 });
+
+function TurnDuration({ card }: { card: TurnCard }) {
+	if (card.status !== "completed" || card.timestamp_ms <= card.start_timestamp_ms) return null;
+	return <SystemMessage tone="info" text={`Worked for ${formatElapsed(card.timestamp_ms - card.start_timestamp_ms)}`} />;
+}
 
 const UserBubble = memo(function UserBubble({
 	item,

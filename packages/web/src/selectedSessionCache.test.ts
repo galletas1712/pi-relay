@@ -360,6 +360,7 @@ describe("selected session cache", () => {
 					start_sequence: 1,
 					end_sequence: 6,
 					start_timestamp_ms: 1_700_000_000_001,
+					timestamp_ms: 1_700_000_000_006,
 					user_messages: [user],
 					assistant_message: finalAssistant,
 					summary: null,
@@ -405,6 +406,7 @@ describe("selected session cache", () => {
 					start_sequence: 1,
 					end_sequence: 6,
 					start_timestamp_ms: 1_700_000_000_001,
+					timestamp_ms: 1_700_000_000_006,
 					user_messages: [user],
 					assistant_message: finalAssistant,
 					summary: null,
@@ -416,12 +418,51 @@ describe("selected session cache", () => {
 		expect(cache.turnDetailsById.has("entry_finish")).toBe(false);
 	});
 
-	it("ignores stale turn detail responses that do not reach the current card leaf", () => {
+	it("ignores stale completed turn detail responses that do not reach the current card leaf", () => {
 		const started = turnStartedEntry("entry_start", null, 1, 1);
 		const user = entry("entry_user", "entry_start", "full user message text", 2);
 		const firstAssistant = assistantEntry("entry_assistant_1", "entry_user", "partial", 3);
 		const currentAssistant = assistantEntry("entry_assistant_2", "entry_assistant_1", "newer", 4);
 		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([], { transcriptRevision: 1 }));
+		cache = {
+			...cache,
+			turnOrder: ["entry_start"],
+			turnCardsById: new Map([[
+				"entry_start",
+				{
+					...turnCard("entry_start", 1),
+					status: "completed",
+					outcome: "Graceful",
+					boundary_entry_id: "entry_assistant_2",
+					active_leaf_id: "entry_assistant_2",
+					start_sequence: 1,
+					end_sequence: 4,
+				},
+			]]),
+		};
+
+		const stale = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant]);
+		const fresh = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant, currentAssistant]);
+
+		expect(stale).toEqual({ cache, applied: false });
+		expect(fresh.applied).toBe(true);
+		expect(fresh.cache.turnDetailsById.get("entry_start")).toEqual([
+			"entry_start",
+			"entry_user",
+			"entry_assistant_1",
+			"entry_assistant_2",
+		]);
+	});
+
+	it("accepts open turn detail responses that race with active leaf changes", () => {
+		const started = turnStartedEntry("entry_start", null, 1, 1);
+		const user = entry("entry_user", "entry_start", "full user message text", 2);
+		const firstAssistant = assistantEntry("entry_assistant_1", "entry_user", "partial", 3);
+		const currentAssistant = assistantEntry("entry_assistant_2", "entry_assistant_1", "newer", 4);
+		let cache = applySelectedSnapshot(
+			emptySelectedSessionCache(sessionId),
+			snapshot([started, user, firstAssistant, currentAssistant], { transcriptRevision: 4 }),
+		);
 		cache = {
 			...cache,
 			turnOrder: ["entry_start"],
@@ -436,11 +477,10 @@ describe("selected session cache", () => {
 			]]),
 		};
 
-		const stale = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant]);
-		const fresh = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant, currentAssistant]);
+		const detail = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant]);
 
-		expect(stale).toBe(cache);
-		expect(fresh.turnDetailsById.get("entry_start")).toEqual([
+		expect(detail.applied).toBe(true);
+		expect(detail.cache.turnDetailsById.get("entry_start")).toEqual([
 			"entry_start",
 			"entry_user",
 			"entry_assistant_1",
@@ -626,6 +666,26 @@ describe("selected session cache", () => {
 			active_leaf_id: "entry_start_2",
 			user_messages: [],
 			assistant_message: null,
+		});
+	});
+
+	it("updates incremental turn card end timestamps from appended entries", () => {
+		const started = turnStartedEntry("entry_start", null, 1, 1);
+		const user = entry("entry_user", "entry_start", "hello", 2);
+		const finished = turnFinishedEntry("entry_finish", "entry_user", 1, "Graceful", 3);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([started], { transcriptRevision: 1 }));
+		cache = {
+			...cache,
+			turnOrder: ["entry_start"],
+			turnCardsById: new Map([["entry_start", turnCard("entry_start", 1)]]),
+		};
+
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(user, 4, 2)).cache;
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(finished, 5, 3)).cache;
+
+		expect(cache.turnCardsById.get("entry_finish")).toMatchObject({
+			start_timestamp_ms: 1_700_000_000_001,
+			timestamp_ms: 1_700_000_000_003,
 		});
 	});
 
@@ -1000,6 +1060,7 @@ function turnCard(id: string, turnId: number): TurnCard {
 		start_sequence: 1,
 		end_sequence: 1,
 		start_timestamp_ms: 1_700_000_000_001,
+		timestamp_ms: 1_700_000_000_001,
 		user_messages: [],
 		assistant_message: null,
 		summary: null,
