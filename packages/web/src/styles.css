@@ -775,16 +775,66 @@ pre {
 	opacity: 0.6;
 }
 
-.message-scroll {
+.message-list-shell {
 	position: relative;
 	flex: 1;
 	min-height: 0;
+}
+
+.message-scroll {
+	height: 100%;
 	overflow: auto;
 	padding: 18px 0 24px;
 }
 
+.message-list-shell.with-turn-jump-controls .message-scroll {
+	padding-bottom: 96px;
+}
+
 .message-scroll-content {
 	position: relative;
+}
+
+.turn-jump-target {
+	display: block;
+}
+
+.turn-jump-controls {
+	position: absolute;
+	right: max(16px, env(safe-area-inset-right, 0px));
+	bottom: 16px;
+	z-index: 12;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: 6px;
+	pointer-events: none;
+}
+
+.turn-jump-button {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	width: 34px;
+	height: 34px;
+	border: 1px solid color-mix(in oklch, var(--border) 82%, transparent);
+	border-radius: 999px;
+	background: color-mix(in oklch, var(--card) 94%, transparent);
+	color: var(--foreground);
+	box-shadow: 0 8px 24px color-mix(in oklch, var(--foreground) 14%, transparent);
+	cursor: pointer;
+	pointer-events: auto;
+}
+
+.turn-jump-button:hover,
+.turn-jump-button:focus-visible {
+	border-color: color-mix(in oklch, var(--primary) 45%, var(--border));
+	color: var(--primary);
+}
+
+.turn-jump-button:focus-visible {
+	outline: 2px solid color-mix(in oklch, var(--ring) 65%, transparent);
+	outline-offset: 2px;
 }
 
 .empty-state {
@@ -814,62 +864,26 @@ pre {
 	display: block;
 }
 
-.turn-card {
+.turn-summary.current .assistant-block {
+	border-color: color-mix(in oklch, var(--primary) 36%, var(--border));
+}
+
+.turn-detail-toggle-row {
 	width: min(100%, 900px);
-	margin: 10px auto;
-	padding: 12px 24px;
-	border: 1px solid var(--border);
-	border-radius: calc(var(--radius) + 2px);
-	background: color-mix(in oklch, var(--card) 92%, transparent);
-}
-
-.turn-card.current {
-	border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
-}
-
-.turn-card.expanded {
-	padding: 0;
-	border: 0;
-	background: transparent;
-}
-
-.turn-card-detail {
-	margin-top: 6px;
-}
-
-.turn-card-header {
-	display: flex;
-	align-items: flex-start;
-	justify-content: space-between;
-	gap: 12px;
-}
-
-.turn-card-title {
-	font-weight: 600;
-	font-size: 13px;
-}
-
-.turn-card-meta {
-	margin-top: 2px;
-	font-family: var(--font-mono);
-	font-size: 11.5px;
-	color: var(--muted-foreground);
-}
-
-.turn-card-actions {
+	margin: 4px auto;
+	padding: 0 24px;
 	display: flex;
 	flex-wrap: wrap;
-	justify-content: flex-end;
+	justify-content: flex-start;
 	gap: 8px;
 }
 
 .turn-card-assistant {
-	margin-top: 10px;
+	width: min(100%, 900px);
+	margin: 8px auto;
+	padding: 0 24px;
 	white-space: pre-wrap;
 	line-height: 1.45;
-}
-
-.turn-card-assistant {
 	color: var(--muted-foreground);
 }
 

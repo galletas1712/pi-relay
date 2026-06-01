@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import {
+	adjacentTurnJumpTargetId,
 	assistantRenderParts,
 	captureScrollPosition,
 	editToolPreview,
@@ -17,7 +18,7 @@ import {
 	type TranscriptScrollStorage,
 	ToolOutput,
 } from "./transcript.tsx";
-import type { AssistantItem, TranscriptEntry } from "./types.ts";
+import type { AssistantItem, TranscriptEntry, TurnCard } from "./types.ts";
 
 describe("assistantRenderParts", () => {
 	it("keeps assistant text and tool-call parts in transcript order", () => {
@@ -93,6 +94,8 @@ describe("MessageList compaction display", () => {
 				hasSession
 				sessionId="session_a"
 				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
 			/>
 		);
 
@@ -157,6 +160,62 @@ describe("scroll position snapshots", () => {
 		saveTranscriptScrollPositions(new Map(), storage);
 
 		expect(storage.getItem(TRANSCRIPT_SCROLL_STORAGE_KEY)).toBeNull();
+	});
+});
+
+describe("turn jump navigation", () => {
+	const targets = [
+		{ id: "turn_1", top: 0, bottom: 80 },
+		{ id: "turn_2", top: 320, bottom: 400 },
+		{ id: "turn_3", top: 980, bottom: 1060 },
+	];
+
+	it("jumps to the nearest previous turn beginning before the current scroll position", () => {
+		expect(adjacentTurnJumpTargetId(targets, 700, "previous")).toBe("turn_2");
+	});
+
+	it("jumps to the current turn user message when it is clipped above the viewport", () => {
+		expect(adjacentTurnJumpTargetId(targets, 350, "previous", 400)).toBe("turn_2");
+	});
+
+	it("jumps to the previous turn user message when the current user message is fully visible", () => {
+		expect(adjacentTurnJumpTargetId(targets, 320, "previous", 400)).toBe("turn_1");
+	});
+
+	it("jumps past the current turn when already at its beginning", () => {
+		expect(adjacentTurnJumpTargetId(targets, 320, "previous")).toBe("turn_1");
+	});
+
+	it("jumps to the next turn beginning after the current scroll position", () => {
+		expect(adjacentTurnJumpTargetId(targets, 321, "next")).toBe("turn_3");
+	});
+
+	it("renders pinned controls and DOM anchors when there are multiple turns", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{ card: turnCard("turn_1", 1, "first"), entries: null, expanded: false, isCurrent: false },
+					{ card: turnCard("turn_2", 2, "second"), entries: [userEntryWithParent("user_2", "start_2", "second")], expanded: true, isCurrent: false },
+				]}
+				activeLeafId="finish_2"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
+			/>
+		);
+
+		expect(html).toContain("turn-jump-controls");
+		expect(html).toContain("aria-label=\"Jump to previous turn\"");
+		expect(html).toContain("aria-label=\"Jump to next turn\"");
+		expect(html).toContain("data-turn-jump-target-id=\"turn_1\"");
+		expect(html).toContain("data-turn-jump-target-id=\"turn_2\"");
+		expect(html).toContain("turn-summary completed expanded");
+		expect(html).toContain("Hide details");
 	});
 });
 
@@ -478,6 +537,25 @@ function userEntry(id: string, text: string): TranscriptEntry {
 		parent_id: null,
 		timestamp_ms: 0,
 		item: { type: "user_message", content: [{ type: "text", text }] },
+	};
+}
+
+function turnCard(id: string, turnId: number, userText: string): TurnCard {
+	return {
+		id,
+		turn_id: turnId,
+		status: "completed",
+		outcome: "Graceful",
+		start_entry_id: `start_${turnId}`,
+		boundary_entry_id: `finish_${turnId}`,
+		active_leaf_id: `finish_${turnId}`,
+		start_sequence: turnId,
+		end_sequence: turnId,
+		start_timestamp_ms: 0,
+		user_messages: [userEntryWithParent(`user_${turnId}`, `start_${turnId}`, userText)],
+		assistant_message: assistantEntry(`assistant_${turnId}`, `user_${turnId}`, `answer ${turnId}`),
+		summary: null,
+		can_resume: false,
 	};
 }
 
