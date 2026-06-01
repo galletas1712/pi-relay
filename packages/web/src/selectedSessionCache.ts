@@ -114,8 +114,6 @@ function isStaleTranscriptTurnsResult(cache: SelectedSessionCache, result: Trans
 	const snapshotRevision = cache.snapshot?.transcript_revision ?? null;
 	const knownRevision = Math.max(cache.turnTranscriptRevision ?? -1, snapshotRevision ?? -1);
 	if (knownRevision >= 0 && result.transcript_revision < knownRevision) return true;
-	const snapshotSessionRevision = cache.snapshot?.session_revision ?? null;
-	if (snapshotSessionRevision !== null && result.session_revision < snapshotSessionRevision) return true;
 	const knownActiveLeafId = cache.snapshot?.active_leaf_id ?? cache.turnActiveLeafId;
 	if (
 		result.transcript_revision === knownRevision &&

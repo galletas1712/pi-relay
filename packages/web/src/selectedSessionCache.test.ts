@@ -572,6 +572,35 @@ describe("selected session cache", () => {
 		expect(stale.snapshot?.active_leaf_id).toBe("entry_user_new");
 	});
 
+	it("accepts transcript.turns pages with older session metadata when transcript state still matches", () => {
+		const started = turnStartedEntry("entry_start", null, 1, 1);
+		const user = entry("entry_user", "entry_start", "hello", 2);
+		const card = {
+			...turnCard("entry_user", 1),
+			start_entry_id: "entry_start",
+			active_leaf_id: "entry_user",
+			end_sequence: 2,
+			user_messages: [user],
+		};
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([started, user], { transcriptRevision: 4, sessionRevision: 8 }));
+
+		cache = applyTranscriptTurns(cache, {
+			session_id: sessionId,
+			active_leaf_id: "entry_user",
+			session_revision: 7,
+			transcript_revision: 4,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
+			cards: [card],
+		});
+
+		expect(cache.turnOrder).toEqual(["entry_user"]);
+		expect(cache.turnCardsById.get("entry_user")?.user_messages).toEqual([user]);
+		expect(cache.snapshot?.session_revision).toBe(8);
+	});
+
 	it("starts a new current turn card when a turn_started entry follows a completed turn", () => {
 		const started = turnStartedEntry("entry_start_2", "entry_finish_1", 2, 6);
 		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([entry("entry_finish_1", null, "done", 5)], { transcriptRevision: 1 }));
