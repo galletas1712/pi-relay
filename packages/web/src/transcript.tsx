@@ -685,7 +685,7 @@ const TurnCardSummary = memo(function TurnCardSummary({
 	const title = turnCardTitle(card);
 	const meta = turnCardMeta(card);
 	const isLoading = loadingTurnId === card.id;
-	const canExpand = !turn.expanded && card.status !== "compacted" && !!onExpandTurn;
+	const canExpand = (!turn.expanded || !turn.entries) && card.status !== "compacted" && !!onExpandTurn;
 	const canResume = card.can_resume && card.active_leaf_id === activeLeafId && !isRunning && !!onResumeTurn;
 	const resumableOutcome = card.outcome === "Interrupted" || card.outcome === "Crashed" ? card.outcome : null;
 	return (

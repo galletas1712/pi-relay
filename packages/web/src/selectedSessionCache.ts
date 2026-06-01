@@ -51,6 +51,7 @@ export function applyTranscriptTurns(
 	) {
 		return cache;
 	}
+	if (mode === "replace" && isStaleTranscriptTurnsResult(cache, result)) return cache;
 	let entriesById = cache.entriesById;
 	const incomingCardsById = new Map<string, TurnCard>();
 	for (const card of result.cards) {
@@ -109,9 +110,27 @@ function turnDetailCoversCard(entryIds: string[], card: TurnCard): boolean {
 	return (entryIds.at(-1) ?? null) === card.active_leaf_id;
 }
 
+function isStaleTranscriptTurnsResult(cache: SelectedSessionCache, result: TranscriptTurnsResult): boolean {
+	const snapshotRevision = cache.snapshot?.transcript_revision ?? null;
+	const knownRevision = Math.max(cache.turnTranscriptRevision ?? -1, snapshotRevision ?? -1);
+	if (knownRevision >= 0 && result.transcript_revision < knownRevision) return true;
+	const snapshotSessionRevision = cache.snapshot?.session_revision ?? null;
+	if (snapshotSessionRevision !== null && result.session_revision < snapshotSessionRevision) return true;
+	const knownActiveLeafId = cache.snapshot?.active_leaf_id ?? cache.turnActiveLeafId;
+	if (
+		result.transcript_revision === knownRevision &&
+		knownActiveLeafId !== undefined &&
+		knownActiveLeafId !== result.active_leaf_id
+	) {
+		return true;
+	}
+	return false;
+}
+
 export function applyTurnDetail(cache: SelectedSessionCache, sessionId: string, turnId: string, entries: TranscriptEntry[]): SelectedSessionCache {
 	if (cache.sessionId !== sessionId) return cache;
-	if (!cache.turnCardsById.has(turnId)) return cache;
+	const card = cache.turnCardsById.get(turnId);
+	if (!card || entries.at(-1)?.id !== card.active_leaf_id) return cache;
 	const entriesById = mergeEntryBodies(cache.entriesById, entries);
 	const turnDetailsById = new Map(cache.turnDetailsById);
 	turnDetailsById.set(turnId, entries.map((entry) => entry.id));

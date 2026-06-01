@@ -8,6 +8,7 @@ import {
 	applyTranscriptAppendedEvent,
 	applyTreeIndex,
 	applyTranscriptTurns,
+	applyTurnDetail,
 	branchFromTree,
 	emptySelectedSessionCache,
 	mergeSessionActivityEvent,
@@ -391,6 +392,38 @@ describe("selected session cache", () => {
 		expect(cache.turnDetailsById.has("entry_finish")).toBe(false);
 	});
 
+	it("ignores stale turn detail responses that do not reach the current card leaf", () => {
+		const started = turnStartedEntry("entry_start", null, 1, 1);
+		const user = entry("entry_user", "entry_start", "full user message text", 2);
+		const firstAssistant = assistantEntry("entry_assistant_1", "entry_user", "partial", 3);
+		const currentAssistant = assistantEntry("entry_assistant_2", "entry_assistant_1", "newer", 4);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([], { transcriptRevision: 1 }));
+		cache = {
+			...cache,
+			turnOrder: ["entry_start"],
+			turnCardsById: new Map([[
+				"entry_start",
+				{
+					...turnCard("entry_start", 1),
+					active_leaf_id: "entry_assistant_2",
+					start_sequence: 1,
+					end_sequence: 4,
+				},
+			]]),
+		};
+
+		const stale = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant]);
+		const fresh = applyTurnDetail(cache, sessionId, "entry_start", [started, user, firstAssistant, currentAssistant]);
+
+		expect(stale).toBe(cache);
+		expect(fresh.turnDetailsById.get("entry_start")).toEqual([
+			"entry_start",
+			"entry_user",
+			"entry_assistant_1",
+			"entry_assistant_2",
+		]);
+	});
+
 	it("prepends older transcript.turns pages without replacing the loaded tail page", () => {
 		const olderUser = entry("entry_user_old", "entry_start_old", "old user", 2);
 		const latestUser = entry("entry_user_new", "entry_start_new", "new user", 7);
@@ -481,6 +514,36 @@ describe("selected session cache", () => {
 		);
 
 		expect(next).toBe(cache);
+	});
+
+	it("ignores stale replacement transcript.turns pages after append events advance the cache", () => {
+		const started = turnStartedEntry("entry_start", null, 1, 1);
+		const appended = entry("entry_user_new", "entry_start", "new message", 2);
+		let cache = applySelectedSnapshot(emptySelectedSessionCache(sessionId), snapshot([started], { transcriptRevision: 1, sessionRevision: 1 }));
+		cache = {
+			...cache,
+			turnTranscriptRevision: 1,
+			turnActiveLeafId: "entry_start",
+			turnOrder: ["entry_start"],
+			turnCardsById: new Map([["entry_start", turnCard("entry_start", 1)]]),
+		};
+		cache = applyTranscriptAppendedEvent(cache, transcriptAppendedEvent(appended, 5, 2)).cache;
+
+		const stale = applyTranscriptTurns(cache, {
+			session_id: sessionId,
+			active_leaf_id: "entry_start",
+			session_revision: 1,
+			transcript_revision: 1,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
+			cards: [turnCard("entry_start", 1)],
+		});
+
+		expect(stale).toBe(cache);
+		expect(stale.turnActiveLeafId).toBe("entry_user_new");
+		expect(stale.snapshot?.active_leaf_id).toBe("entry_user_new");
 	});
 
 	it("starts a new current turn card when a turn_started entry follows a completed turn", () => {

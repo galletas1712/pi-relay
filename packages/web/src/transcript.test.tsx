@@ -365,6 +365,46 @@ describe("MessageList Working indicator", () => {
 		expect(html).toContain("do it");
 	});
 
+	it("offers to refetch turn details when a card is expanded but detail is missing", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "open",
+							outcome: null,
+							start_entry_id: "start",
+							boundary_entry_id: null,
+							active_leaf_id: "start",
+							start_sequence: 1,
+							end_sequence: 1,
+							start_timestamp_ms: Date.now(),
+							user_messages: [userEntryWithParent("user", "start", "do it")],
+							assistant_message: null,
+							summary: null,
+							can_resume: false,
+						},
+						entries: null,
+						expanded: true,
+						isCurrent: false,
+					},
+				]}
+				activeLeafId="start"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+			/>
+		);
+
+		expect(html).toContain("Show details");
+	});
+
 	it("omits the Working… row when the session is idle", () => {
 		const html = renderToStaticMarkup(
 			<MessageList
