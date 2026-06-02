@@ -588,7 +588,7 @@ export function stableWorkingElapsedMs(
 	startMs: number,
 	serverTimeMs: number,
 ): { clock: WorkingClockAnchor; elapsedMs: number } {
-	const clock = previous?.startMs === startMs
+	const clock = previous?.startMs === startMs && previous.serverAnchorMs >= serverTimeMs
 		? previous
 		: {
 				startMs,
@@ -649,7 +649,7 @@ const WorkingIndicator = memo(function WorkingIndicator({ startMs, serverTimeMs 
 			setElapsedMs(workingElapsedMs(clock));
 		}, 1000);
 		return () => window.clearInterval(interval);
-	}, [startMs]);
+	}, [serverTimeMs, startMs]);
 	return (
 		<SystemMessage
 			tone="info"

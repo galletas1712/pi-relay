@@ -550,6 +550,25 @@ describe("MessageList Working indicator", () => {
 		}
 	});
 
+	it("refreshes the working clock anchor when a newer server timestamp arrives", () => {
+		const nowSpy = vi.spyOn(performance, "now");
+		try {
+			nowSpy.mockReturnValue(1_000);
+			const cached = stableWorkingElapsedMs(null, 1_000, 10_000);
+			nowSpy.mockReturnValue(2_000);
+			const refreshed = stableWorkingElapsedMs(cached.clock, 1_000, 20_000);
+
+			expect(refreshed.elapsedMs).toBe(19_000);
+			expect(refreshed.clock).toEqual({
+				startMs: 1_000,
+				serverAnchorMs: 20_000,
+				clientAnchorMs: 2_000,
+			});
+		} finally {
+			nowSpy.mockRestore();
+		}
+	});
+
 	it("does not synthesize a local clock when the server time is missing", () => {
 		expect(runningTurnClockAnchor([turnStartedEntry("entry_turn", 1, 1_000)], null)).toBeNull();
 	});
