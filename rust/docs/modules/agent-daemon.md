@@ -20,25 +20,37 @@
 The daemon is split by responsibility, not by RPC method family (see [Daemon Modules Have Narrow Jobs](../design-decisions.md#daemon-modules-have-narrow-jobs)). Handlers stay protocol glue: validate params, call the repo/runtime, shape JSON.
 
 ```
-main.rs            websocket accept + JSON-RPC routing + every RPC handler
+main.rs            websocket accept + JSON-RPC routing + most RPC handlers
+session_start.rs   explicit session-start pipeline: workspace materialization,
+                   prompt render, atomic session/output persist, initial dispatch
 config.rs          --database-url / --bind, DATABASE_URL / PI_AGENTD_BIND
 types.rs           RpcRequest/Response/Error, RpcMethod parse table, DispatchAction, RuntimeSession
 state.rs           AppState: repo handle, active sessions, driver locks, task registry,
                    event broadcaster, tool registry, provider connections, workspaces
 codec.rs           JSON <-> vocab parsing + transcript-store reconstruction helpers
 auth.rs            credential loading (Codex/Anthropic) + Codex 401 token refresh
-runtime.rs         SessionDriver, recovery, queue consumption, dispatch, event publishing
+runtime/           SessionDriver facade plus concrete lifecycle phases:
+                   events, outputs, task registry, dispatch, model, tool, compaction
+workspaces/        workspace base refresh, local/git source handling, sanitization,
+                   and session instantiation (btrfs/reflink/copy fallback)
 rpc_views.rs       response shaping (snapshots, queue state, transcript views, server_time_ms)
 model_metadata.rs  per-model context windows + 85% auto-compaction default limit
 provider_runtime/  provider selection, model/web-tool execution, compaction, token accounting
 ```
+
+`runtime/` keeps ordering-sensitive behavior in named phases instead of a generic
+hook/event bus: queued inputs are persisted before dispatch, model dispatch is
+gated before a provider task is spawned, and compaction resumes through the same
+driver loop after its durable store update. The narrow extension precedent
+remains `ToolRegistry`/`ToolExtension`, where the variation point is real and
+does not own session durability.
 
 `provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (remote/local compaction), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization).
 
 ## Key types
 
 - `AppState` (state.rs): cloneable handle shared by every connection and background task. Holds `Arc<PostgresAgentStore>`, `active: HashMap<session_id, Arc<Mutex<RuntimeSession>>>` (loaded live sessions), `session_driver_locks`, a `tasks` registry of running dispatch/compaction handles, a `broadcast::Sender<EventFrame>`, the `ToolRegistry`, the `ProviderConnectionRegistry`, the `WorkspaceManager`, and the `prompt_root` (nearest ancestor containing `PI.md`).
-- `SessionDriver` (runtime.rs): an RAII handle holding an owned guard on a per-session lock. All session-mutating handlers acquire one so work on a single session is strictly serialized while different sessions run concurrently.
+- `SessionDriver` (runtime/mod.rs): an RAII handle holding an owned guard on a per-session lock. All session-mutating handlers acquire one so work on a single session is strictly serialized while different sessions run concurrently.
 - `RuntimeSession` (types.rs): an in-memory `AgentSession` plus its `SessionConfig`. Lives in `active` only while the session is doing work.
 - `RpcMethod` (types.rs): the parse table mapping wire method strings to handlers. Unknown methods return `unknown_method`.
 - `DispatchAction` (types.rs): a persisted action (`row_id`, `attempt_id`, `SessionAction`) paired with the `SessionConfig` to execute it under.
