@@ -353,7 +353,7 @@ async fn session_start(state: &AppState, params: Value) -> std::result::Result<V
             .map_err(anyhow::Error::from)?;
         state
             .workspaces
-            .materialize_session(&session_id, &project.workspaces)
+            .materialize_session(project_id, &session_id, &project.workspaces)
             .await
             .map_err(anyhow::Error::from)?
     } else {
@@ -750,6 +750,13 @@ async fn project_update(state: &AppState, params: Value) -> std::result::Result<
         .update_project(project_id, name, &workspaces)
         .await
         .map_err(anyhow::Error::from)?;
+    if let Err(error) = state
+        .workspaces
+        .reconcile_project_bases(project_id, &project.workspaces)
+        .await
+    {
+        eprintln!("failed to reconcile workspace bases for project {project_id}: {error:#}");
+    }
     Ok(rpc_views::project(project))
 }
 
@@ -765,6 +772,9 @@ async fn project_delete(state: &AppState, params: Value) -> std::result::Result<
             "project_not_empty",
             "project was not found or still has sessions",
         ));
+    }
+    if let Err(error) = state.workspaces.remove_project_bases(project_id).await {
+        eprintln!("failed to remove workspace bases for project {project_id}: {error:#}");
     }
     Ok(json!({ "project_id": project_id, "deleted": true }))
 }

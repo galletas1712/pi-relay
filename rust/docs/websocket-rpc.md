@@ -110,8 +110,14 @@ Projects define workspace sources. Git workspaces use
 workspaces use `{ kind: "local", workspace_dir, source_path }`. Legacy Git
 records without `kind` are treated as `kind: "git"`. When a project session
 starts, the daemon creates private workspace directories under the session
-`outer_cwd`: Git workspaces are fetched from their configured remote branch and
-local folder workspaces are copied from their configured source path.
+`outer_cwd`. For each project workspace, the daemon also maintains a managed
+per-project workspace base under its state directory. At session start, Git
+bases are destructively refreshed to the configured remote branch head with
+`git fetch`/`reset --hard`/`clean -ffdx`; local folder bases are destructively
+refreshed from `source_path` with `rsync --delete`. Session workspaces are then
+instantiated from those bases, preferring Btrfs subvolume snapshots on
+Btrfs-backed state storage and falling back to reflink/copy behavior when CoW is
+not available.
 Ephemeral host sessions have `project_id: null`, no project workspaces, and use
 `$HOME` as `outer_cwd`. Model prompt context and local tools use the session's
 stored `outer_cwd`.
@@ -704,6 +710,9 @@ Each `workspace_dir` must be a direct child name and must not start with `.`.
 For Git workspaces, `remote_url` must be reachable by `git ls-remote`, and
 `remote_branch` must name an existing branch on that remote. For local folder
 workspaces, `source_path` must be an existing directory on the daemon host.
+Changing a workspace's name, kind, Git remote/branch, or local source path
+causes the managed workspace base for that slot to be discarded and recreated
+for future sessions.
 Updating a project does not change existing sessions in that project.
 
 ```json
