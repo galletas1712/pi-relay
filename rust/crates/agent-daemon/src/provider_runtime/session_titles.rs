@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use agent_provider::{ModelRequest, ModelTranscriptEntry, PromptSections, ProviderToolProfile};
+use agent_provider::{ModelTranscriptEntry, PromptSections, ProviderToolProfile};
 use agent_store::SessionConfig;
 use agent_tools::ProviderTool;
 use agent_vocab::{
@@ -11,14 +10,12 @@ use agent_vocab::{
 use serde::Serialize;
 use serde_json::{json, Value};
 
-use crate::auth::Credentials;
 use crate::runtime::{
     clear_event_buffer_if_idle, publish_events, replace_active_session_config, SessionDriver,
 };
 use crate::state::AppState;
 
-use super::auth_retry::complete_with_auth_retry;
-use super::provider::provider_for_config;
+use super::{run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 
 const TITLE_TOOL_NAME: &str = "rename_session";
 const TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 160;
@@ -173,29 +170,15 @@ async fn generate_session_title(
     config: &SessionConfig,
     request: &PendingTitleRefresh,
 ) -> anyhow::Result<Option<String>> {
-    let sidecar_session_id = title_sidecar_session_id(session_id);
     let title_context = SessionTitlePromptContext {
         current_title: request.title_at_submit.as_deref().unwrap_or_default(),
         user_message: render_user_message_for_title(&request.message),
     };
-    let provider =
-        match provider_for_config(state, config, &Credentials::load(), &sidecar_session_id).await {
-            Ok(provider) => provider,
-            Err(error) => {
-                state
-                    .provider_connections
-                    .remove_session(&sidecar_session_id)
-                    .await;
-                return Err(error);
-            }
-        };
-    let response = complete_with_auth_retry(
+    let response = run_model_sidecar(
         state,
         config,
-        &sidecar_session_id,
-        provider,
-        ModelRequest {
-            model: config.provider.model.clone(),
+        ModelSidecarRequest {
+            sidecar_session_id: title_sidecar_session_id(session_id),
             prompt: PromptSections::stable(TITLE_GENERATION_SYSTEM_PROMPT),
             transcript: vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
                 UserMessage::text(serde_json::to_string(&title_context)?),
@@ -204,17 +187,9 @@ async fn generate_session_title(
             tools: vec![title_tool(config.provider.kind)],
             max_tokens: Some(TITLE_GENERATION_MAX_OUTPUT_TOKENS),
             reasoning_effort: title_reasoning_effort(config.provider.kind),
-            prompt_cache_key: Some(sidecar_session_id.clone()),
-            session_id: Some(sidecar_session_id.clone()),
-            turn_id: None,
         },
     )
-    .await;
-    state
-        .provider_connections
-        .remove_session(&sidecar_session_id)
-        .await;
-    let response = response?;
+    .await?;
 
     Ok(title_from_response(&response.assistant.items))
 }
@@ -335,15 +310,7 @@ fn session_title_disabled(config: &SessionConfig) -> bool {
 }
 
 fn title_sidecar_session_id(session_id: &str) -> String {
-    let clean = session_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-        .take(32)
-        .collect::<String>();
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    session_id.hash(&mut hasher);
-    let hash = hasher.finish();
-    format!("title-{clean}-{hash:016x}")
+    sidecar_session_id("title", session_id, &[])
 }
 
 fn looks_like_secret(value: &str) -> bool {

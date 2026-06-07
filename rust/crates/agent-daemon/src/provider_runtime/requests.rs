@@ -42,6 +42,15 @@ pub(crate) async fn run_model(
         turn_id: Some(turn_id),
     };
 
+    complete_model_request(state, config, session_id, request).await
+}
+
+pub(super) async fn complete_model_request(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+    request: ModelRequest,
+) -> Result<ModelResponse> {
     let credentials = Credentials::load();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
     Ok(complete_with_auth_retry(state, config, session_id, provider, request).await?)
