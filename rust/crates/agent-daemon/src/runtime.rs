@@ -24,11 +24,18 @@ use crate::codec::transcript_store_from_stored;
 use crate::provider_runtime::{
     auto_limit_tokens, compaction_auto_state, compaction_config, is_web_tool_name,
     load_skill_result, model_input_tokens_for_gate, run_compaction, run_model, run_web_tool,
+    schedule_session_title_refresh,
 };
 use crate::state::{AppState, RunningTask};
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
 const MODEL_PROVIDER_MAX_ATTEMPTS: usize = 3;
+
+struct ConsumedInputDispatch {
+    dispatches: Vec<DispatchAction>,
+    title_config: SessionConfig,
+    title_content: UserMessage,
+}
 
 pub(crate) async fn ensure_expected_active_leaf(
     state: &AppState,
@@ -265,10 +272,16 @@ impl SessionDriver {
         loop {
             let active = self.active_session().await;
             let Some(active) = active else { break };
-            if let Some(dispatched) = self.consume_ready_steer(active.clone()).await? {
-                let has_dispatched_work = !dispatched.is_empty();
-                dispatched_all.extend(dispatched.clone());
-                self.dispatch(dispatched).await?;
+            if let Some(consumed) = self.consume_ready_steer(active.clone()).await? {
+                let has_dispatched_work = !consumed.dispatches.is_empty();
+                dispatched_all.extend(consumed.dispatches.clone());
+                self.dispatch(consumed.dispatches).await?;
+                schedule_session_title_refresh(
+                    &self.state,
+                    self.session_id.clone(),
+                    &consumed.title_config,
+                    &consumed.title_content,
+                );
                 if has_dispatched_work {
                     break;
                 }
@@ -311,6 +324,7 @@ impl SessionDriver {
                 .await
                 .map_err(anyhow::Error::from)?;
             if let Some(queued) = maybe_input {
+                let title_content = queued.content.clone();
                 let agent_input =
                     agent_input_from_queued_priority(queued.priority, queued.content.clone());
                 let active = self.active_session().await;
@@ -327,12 +341,19 @@ impl SessionDriver {
                             .map_err(anyhow::Error::from)?;
                         return Err(RpcError::new("invalid_input", error.to_string()));
                     }
+                    let title_config = active.lock().await.config.clone();
                     let dispatched = self
                         .persist_active_outputs(active, None, Some(queued), None, Vec::new())
                         .await?;
                     let has_dispatched_work = !dispatched.is_empty();
                     dispatched_all.extend(dispatched.clone());
                     self.dispatch(dispatched).await?;
+                    schedule_session_title_refresh(
+                        &self.state,
+                        self.session_id.clone(),
+                        &title_config,
+                        &title_content,
+                    );
                     if has_dispatched_work {
                         break;
                     }
@@ -362,7 +383,7 @@ impl SessionDriver {
     async fn consume_ready_steer(
         &self,
         active: Arc<Mutex<RuntimeSession>>,
-    ) -> std::result::Result<Option<Vec<DispatchAction>>, RpcError> {
+    ) -> std::result::Result<Option<ConsumedInputDispatch>, RpcError> {
         let is_ready_to_continue = {
             let runtime = active.lock().await;
             runtime.session.is_ready_to_continue()
@@ -381,6 +402,7 @@ impl SessionDriver {
             return Ok(None);
         };
 
+        let title_content = queued.content.clone();
         let agent_input = agent_input_from_queued_priority(queued.priority, queued.content.clone());
         let enqueue_result = {
             let mut runtime = active.lock().await;
@@ -395,9 +417,15 @@ impl SessionDriver {
             return Err(RpcError::new("invalid_input", error.to_string()));
         }
 
-        self.persist_active_outputs(active, None, Some(queued), None, Vec::new())
-            .await
-            .map(Some)
+        let title_config = active.lock().await.config.clone();
+        let dispatches = self
+            .persist_active_outputs(active, None, Some(queued), None, Vec::new())
+            .await?;
+        Ok(Some(ConsumedInputDispatch {
+            dispatches,
+            title_config,
+            title_content,
+        }))
     }
 
     pub(crate) async fn apply_agent_input(
@@ -1805,6 +1833,17 @@ fn session_uses_harness(config: &SessionConfig) -> bool {
 pub(crate) fn publish_events(state: &AppState, events: Vec<EventFrame>) {
     for event in events {
         let _ = state.events.send(event);
+    }
+}
+
+pub(crate) async fn replace_active_session_config(
+    state: &AppState,
+    session_id: &str,
+    config: SessionConfig,
+) {
+    let active = state.active.lock().await.get(session_id).cloned();
+    if let Some(active) = active {
+        active.lock().await.config = config;
     }
 }
 
