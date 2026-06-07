@@ -1,6 +1,5 @@
 use super::*;
-use agent_vocab::{AssistantItem, ToolCall, ToolCallId};
-use serde_json::json;
+use agent_vocab::AssistantItem;
 
 #[test]
 fn sanitize_title_trims_quotes_and_punctuation() {
@@ -8,6 +7,13 @@ fn sanitize_title_trims_quotes_and_punctuation() {
         sanitize_title("  \"Production deploy notes.\"  "),
         Some("Production deploy notes".to_string())
     );
+}
+
+#[test]
+fn title_from_response_ignores_null_title() {
+    let items = vec![AssistantItem::Text("{\"title\":null}".to_string())];
+
+    assert_eq!(title_from_response(&items), None);
 }
 
 #[test]
@@ -21,15 +27,10 @@ fn sanitize_title_rejects_secret_like_titles() {
 }
 
 #[test]
-fn title_from_response_uses_rename_tool_call() {
-    let items = vec![
-        AssistantItem::Text("ignored".to_string()),
-        AssistantItem::ToolCall(ToolCall {
-            id: ToolCallId::new("call_1"),
-            tool_name: TITLE_TOOL_NAME.to_string(),
-            args_json: json!({ "title": "Debug flaky tests" }).to_string(),
-        }),
-    ];
+fn title_from_response_uses_json_text() {
+    let items = vec![AssistantItem::Text(
+        "{\"title\":\"Debug flaky tests\"}".to_string(),
+    )];
 
     assert_eq!(
         title_from_response(&items),

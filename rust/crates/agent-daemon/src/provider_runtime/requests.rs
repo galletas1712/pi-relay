@@ -13,6 +13,17 @@ use super::prompt::assemble_agent_prompt;
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
 
+pub(crate) fn model_prompt_cache_key(config: &SessionConfig, session_id: &str) -> String {
+    config
+        .provider
+        .prompt_cache
+        .as_ref()
+        .and_then(|value| value.get("key"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| session_id.to_string())
+}
+
 pub(crate) async fn run_model(
     state: &AppState,
     config: &SessionConfig,
@@ -31,13 +42,7 @@ pub(crate) async fn run_model(
             .provider_tools_for_provider(config.provider.kind),
         max_tokens: config.provider.max_tokens,
         reasoning_effort: config.provider.reasoning_effort,
-        prompt_cache_key: config
-            .provider
-            .prompt_cache
-            .as_ref()
-            .and_then(|value| value.get("key"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        prompt_cache_key: Some(model_prompt_cache_key(config, session_id)),
         session_id: Some(session_id.to_string()),
         turn_id: Some(turn_id),
     };

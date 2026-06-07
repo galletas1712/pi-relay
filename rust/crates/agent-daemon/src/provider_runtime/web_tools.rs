@@ -190,6 +190,7 @@ async fn run_provider_web_sidecar(
 ) -> ToolResultMessage {
     let sidecar_session_id = web_sidecar_session_id(session_id, call.id.as_str());
     let request = ModelSidecarRequest {
+        prompt_cache_key: sidecar_session_id.clone(),
         sidecar_session_id,
         prompt: PromptSections::stable(
             "You are a web-tool executor for pi-relay. Use the provided web tool to satisfy the requested tool call. Return a concise tool result for the caller and include source URLs whenever available. Do not ask follow-up questions.",

@@ -17,7 +17,7 @@ pub(crate) use compaction::{
 pub(crate) use connections::ProviderConnectionRegistry;
 pub(crate) use context_accounting::model_input_tokens_for_gate;
 pub(crate) use prompt::{current_pi_template, render_pi_prompt};
-pub(crate) use requests::run_model;
+pub(crate) use requests::{model_prompt_cache_key, run_model};
 pub(crate) use session_titles::{schedule_session_title_refresh, SessionTitleScheduler};
 pub(crate) use sidecar::{run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 pub(crate) use skills::{load_skill_result, skill_identifier};

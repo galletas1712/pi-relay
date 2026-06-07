@@ -22,6 +22,7 @@ const SIDECAR_ID_OWNER_CHARS: usize = 24;
 /// should cause a separate durable mutation.
 pub(crate) struct ModelSidecarRequest {
     pub(crate) sidecar_session_id: String,
+    pub(crate) prompt_cache_key: String,
     pub(crate) prompt: PromptSections,
     pub(crate) transcript: Vec<ModelTranscriptEntry>,
     pub(crate) tool_profile: ProviderToolProfile,
@@ -45,7 +46,7 @@ pub(crate) async fn run_model_sidecar(
             tools: request.tools,
             max_tokens: request.max_tokens,
             reasoning_effort: request.reasoning_effort,
-            prompt_cache_key: Some(sidecar_session_id.clone()),
+            prompt_cache_key: Some(request.prompt_cache_key),
             session_id: Some(sidecar_session_id.clone()),
             turn_id: None,
         };

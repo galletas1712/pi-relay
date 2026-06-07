@@ -3,21 +3,19 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_provider::{ModelTranscriptEntry, PromptSections, ProviderToolProfile};
 use agent_store::SessionConfig;
-use agent_tools::ProviderTool;
 use agent_vocab::{
     AssistantItem, ContentBlock, ProviderKind, ReasoningEffort, TranscriptItem, UserMessage,
 };
 use serde::Serialize;
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::runtime::{
     clear_event_buffer_if_idle, publish_events, replace_active_session_config, SessionDriver,
 };
 use crate::state::AppState;
 
-use super::{run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
+use super::{model_prompt_cache_key, run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 
-const TITLE_TOOL_NAME: &str = "rename_session";
 const TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 160;
 const TITLE_INPUT_CHAR_LIMIT: usize = 8_000;
 const TITLE_MAX_CHARS: usize = 64;
@@ -178,13 +176,19 @@ async fn generate_session_title(
         state,
         config,
         ModelSidecarRequest {
+            prompt_cache_key: model_prompt_cache_key(config, session_id),
             sidecar_session_id: title_sidecar_session_id(session_id),
-            prompt: PromptSections::stable(TITLE_GENERATION_SYSTEM_PROMPT),
+            prompt: PromptSections::new(
+                Some(config.system_prompt.clone()),
+                Some(TITLE_GENERATION_SYSTEM_PROMPT.to_string()),
+            ),
             transcript: vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
                 UserMessage::text(serde_json::to_string(&title_context)?),
             ))],
-            tool_profile: ProviderToolProfile::CustomDefinitions,
-            tools: vec![title_tool(config.provider.kind)],
+            tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
+            tools: state
+                .tools
+                .provider_tools_for_provider(config.provider.kind),
             max_tokens: Some(TITLE_GENERATION_MAX_OUTPUT_TOKENS),
             reasoning_effort: title_reasoning_effort(config.provider.kind),
         },
@@ -200,36 +204,20 @@ struct SessionTitlePromptContext<'a> {
     user_message: String,
 }
 
-const TITLE_GENERATION_SYSTEM_PROMPT: &str = r#"You generate short UI titles for pi-relay chat sessions.
+const TITLE_GENERATION_SYSTEM_PROMPT: &str = r#"Above is the normal pi-relay system prompt for this session. For this sidecar request only, ignore any instruction to solve the user's coding task.
 
-You are given JSON containing the current session title and the user message for this turn. Use the rename_session tool to rename the session that encapsulates the conversation so far, or if the session name is already appropriate, do nothing.
+You generate short UI titles for pi-relay chat sessions. You are given JSON containing the current session title and the user message for this turn. Decide whether to rename the session that encapsulates the conversation so far.
 
 Rules:
-- Only call rename_session when the new title is clearly better than the current title.
+- Do not call any tools.
+- Return exactly one JSON object and no other text.
+- Use {"title":"..."} only when the new title is clearly better than the current title.
+- Use {"title":null} if the session name is already appropriate or no safe title is warranted.
 - Prefer 3-8 words and at most 64 characters.
 - Use the user's language when practical.
 - Do not include quotation marks, trailing punctuation, or generic prefixes such as "Chat about".
 - The title must not contain secrets, access tokens, API keys, or credentials.
-- If the message is mostly a secret/credential, an empty/unclear fragment, or an interruption/control request, do nothing."#;
-
-fn title_tool(provider: ProviderKind) -> ProviderTool {
-    ProviderTool::function_json_named(
-        provider,
-        TITLE_TOOL_NAME,
-        "Rename the session if a better short title is warranted.",
-        json!({
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-                "title": {
-                    "type": "string",
-                    "description": "The new short session title."
-                }
-            },
-            "required": ["title"]
-        }),
-    )
-}
+- If the message is mostly a secret/credential, an empty/unclear fragment, or an interruption/control request, use {"title":null}."#;
 
 fn title_reasoning_effort(provider: ProviderKind) -> ReasoningEffort {
     match provider {
@@ -240,13 +228,10 @@ fn title_reasoning_effort(provider: ProviderKind) -> ReasoningEffort {
 
 fn title_from_response(items: &[AssistantItem]) -> Option<String> {
     items.iter().find_map(|item| {
-        let AssistantItem::ToolCall(call) = item else {
+        let AssistantItem::Text(text) = item else {
             return None;
         };
-        if call.tool_name != TITLE_TOOL_NAME {
-            return None;
-        }
-        let args = call.args_value().ok()?;
+        let args: Value = serde_json::from_str(text.trim()).ok()?;
         let raw_title = args.get("title").and_then(Value::as_str)?;
         sanitize_title(raw_title)
     })
