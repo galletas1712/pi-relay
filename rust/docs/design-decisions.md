@@ -127,9 +127,11 @@ to accidentally couple to everything else now live elsewhere:
 
 - credential loading and Codex refresh in `auth.rs`
 - JSON-to-vocabulary parsing and transcript recovery helpers in `codec.rs`
-- provider selection and request execution in `provider_runtime.rs`
+- provider selection and request execution in `provider_runtime/`
 - live session lifecycle, `SessionDriver` serialization, queued-input
-  materialization, dispatch, and event publication in `runtime.rs`
+  materialization, dispatch, and event publication in `runtime/`
+- session creation/materialization ordering in `session_start.rs`
+- workspace base refresh and session instantiation in `workspaces/`
 - process-local daemon state in `state.rs`
 - all Postgres SQL and transaction boundaries in
   `agent-store::PostgresAgentStore`
