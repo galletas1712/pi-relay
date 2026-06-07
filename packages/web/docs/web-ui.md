@@ -1,0 +1,239 @@
+# Web UI
+
+The React/Vite client in `packages/web`. It talks to the `pi-agentd` daemon over a single websocket
+([websocket-rpc](../../../rust/docs/websocket-rpc.md)) and renders a session's transcript turn-by-turn.
+See the [Rust Agent Stack](../../../rust/docs/architecture.md) overview and [design decisions](../../../rust/docs/design-decisions.md)
+for the runtime it drives, and [agent-daemon](../../../rust/docs/modules/agent-daemon.md) for the RPC server.
+
+The UI is operational, not marketing-shaped: a dense three-pane layout, compact rows, small controls,
+and transcript-first interaction.
+
+```
++----------------+----------------------------------+--------------+
+| Sidebar        | Chat pane                        | Inspector    |
+| projects +     | header (model/effort/title)      | global cfg   |
+| session list   | transcript (turn cards)          | session head |
+| activity counts| ----------------------------------| pending      |
+|                | composer + queue pane + slash    | actions/tools|
++----------------+----------------------------------+--------------+
+```
+
+Panels collapse responsively: `wide` shows all three, `medium` drops the sidebar to an overlay,
+`compact` overlays both side panels. The mobile top bar exposes drawer toggles and a connection pill.
+
+## Responsibilities
+
+- Own the websocket connection, reconnection, and event fan-out (`rpc.ts`), with a typed RPC facade (`agentApi.ts`).
+- Keep project and session-list server state in TanStack Query.
+- Keep the *selected* session's head, queue, active branch, compact transcript tree, and turn cards/details in a
+  separate normalized per-session cache.
+- Render the active branch as collapsible turn cards, fetching full entry detail lazily.
+- Compose and submit input, manage the queued-follow-up pane, and expose slash commands.
+
+## Data layer
+
+Two distinct stores, split by access pattern.
+
+```
+TanStack Query                          SelectedSessionCache (per sessionId)
+------------------------------          ------------------------------------
+projects        queryKeys.projects      snapshot (head/revisions/queue/metadata)
+session lists   queryKeys.sessions(pid) activeBranchEntryIds + entriesById
+tools           queryKeys.tools(kind)   tree* (compact topology for /switch)
+system prompt   queryKeys.systemPrompt  turnCardsById/turnOrder/turnDetailsById
+```
+
+### TanStack Query owns server lists
+
+Projects, per-project session summaries, the provider tool list, and the system prompt are server lists owned by
+TanStack Query (keys in `queryKeys.ts`). They are refreshed by invalidation, not bespoke caching. Session-list
+refreshes after events are debounced/coalesced.
+
+Metadata-only operations patch the cached list in place instead of triggering a transcript reload. `sessionQueryCache.ts`
+provides `patchSessionList*` helpers; rename, archive/unarchive, and provider change call the RPC, then patch the
+cached `SessionSummary` (and the selected snapshot) directly. The list query is still invalidated afterward as a
+reconciliation fallback, but the visible row updates immediately. Activity transitions from events also patch the
+list row before the debounced invalidation fires.
+
+### SelectedSessionCache owns the selected session
+
+`useSelectedSessionStore` (`selectedSessionStore.ts`) holds an in-memory `Map<sessionId, SelectedSessionCache>` plus a
+current pointer. `replace`/`reset`/`update` keep React state and a synchronous `cacheRef` in lockstep so async flows
+read the latest cache without waiting for a render. `reset(sessionId)` re-points at a cached entry if one exists,
+otherwise an empty cache; it does not evict other sessions. Switching away and back to a session reuses its cached
+tree/bodies/cards, so revisits feel instant. `drop(sessionId)` evicts a deleted session.
+
+The cache (`selectedSessionCache/types.ts`) is normalized:
+
+- `snapshot` — head: revisions, queue, activity, metadata, `last_event_id`, `server_time_ms`.
+- `activeBranchEntryIds` + `entriesById` — render order plus a body map. Reducers preserve object identity for
+  unchanged entries (`mergeEntryBodies`) so transcript rows and scroll position stay stable across refreshes.
+- `tree*` — compact transcript topology (`TranscriptTreeNode`) for the `/switch` picker, paged by `sequence` and
+  fenced by `transcript_revision`.
+- `turnCardsById` / `turnOrder` / `turnDetailsById` — turn cards in order and lazily-loaded per-turn detail entry id lists.
+
+Reducers live in `selectedSessionCache.ts` and `selectedSessionCache/{entries,turns}.ts`. They are pure functions over
+the cache; every reducer no-ops if `cache.sessionId` does not match the incoming `session_id`, so late responses for a
+deselected session are ignored.
+
+### Revisions drive convergence
+
+The daemon stamps `session_revision`, `queue_revision`, and `transcript_revision` on snapshots, queue projections, and
+events. These are the freshness tokens; the cache uses them to decide whether to apply an incremental update or refetch:
+
+- Queue projections replace queue state only when their `queue_revision` is newer.
+- A changed `transcript_revision` on a snapshot/turns page invalidates the cached tree/turn state for that session.
+- Compact-index pages are accepted only when they match the loaded `transcript_revision` and start exactly at the
+  loaded prefix sequence; otherwise the reducer restarts from `after_sequence = 0`.
+- `last_event_id` is treated as a transient replay cursor only, never as a durable freshness signal — the daemon may
+  clear old event rows after a session goes idle, so a fresh `session.get` can legitimately report a smaller cursor.
+
+### Modular RPCs and hot paths
+
+Selected-session loads avoid full active-branch bodies. The hot path is metadata `session.get` (no entries) plus a
+bounded `transcript.turns` tail page.
+
+| Flow | RPC(s) | Notes |
+| --- | --- | --- |
+| Cold open / refresh | `session.get` (no entries) + `transcript.turns` | one bounded tail page of cards |
+| Load older turns | `transcript.turns` with `before_entry_id` | prepend-paged on demand |
+| Expand a turn | `transcript.turn_detail` | one card's entries, by card id + leaf/sequence bounds |
+| Foreground/focus reconcile | `session.sync_active_branch` | suffix-only sync from the cached base leaf |
+| `/switch` picker | `transcript.index` pages | compact topology only |
+| Switch target | `history.switch` | revision-fenced; returns branch ids + sparse missing bodies |
+| Restore user message | `transcript.entries` | full body for the picked message, only if missing locally |
+
+`session.sync_active_branch` returns `unchanged` / `extended` / `branch_changed`. The cache merges overview metadata on
+`unchanged`, appends the suffix on `extended`, and falls back to a full `session.get` on `branch_changed` (or when the
+returned suffix does not extend the cached leaf).
+
+Provider replay is never on the wire: UI transcript projections omit `provider_replay` entirely, and the frontend
+`TranscriptEntry` type has no such field. The UI renders only semantic `TranscriptItem`s.
+
+## Turn-oriented transcript
+
+The chat pane renders the active branch as turn cards (`transcript.tsx` / `selectedSessionCache/turns.ts`), not a flat
+entry stream.
+
+- Historical completed turns collapse to a summary card: the turn's user messages plus the final assistant message and
+  a "Worked for …" duration. Intermediate tool calls/results are omitted until expanded.
+- "Show details" fetches `transcript.turn_detail` for that card and renders the full detailed rows; "Hide details"
+  collapses again. "Load older turns" pages older cards.
+- The current/running turn auto-expands and auto-loads its detail so progress streams live. A single "Working… {elapsed}"
+  row trails the transcript. Its clock anchors only to durable server data — the active branch's `turn_started` entry,
+  or a mid-turn `compaction_summary` that remembers the original turn start — and the anchor is rebuilt only when
+  `startMs` changes, so streaming entries do not reset the elapsed timer.
+- Transcript-append events incrementally update the current card and any already-expanded detail (`appendTurnCard`,
+  `appendLoadedTurnDetail`); a canonical `transcript.turns` refresh runs when the cache cannot prove an event extends
+  the selected branch. When a card's stable id changes, expanded detail migrates with it (`migrateCurrentTurnDetailId`).
+- Compaction renders as a typed summary row, not a transcript replacement. The marker can hide/show the prior entries
+  in its segment.
+- Crashed or interrupted terminal turns expose a Continue/Retry action inline that calls `turn.resume`.
+- Turn-start, graceful turn-finish, and tool-call-start bookkeeping entries are not rendered as messages.
+- Turn-jump controls page between turn anchors; scroll position is sticky-to-bottom and persisted per session in
+  `localStorage`.
+
+### Tool calls render as collapsible groups
+
+Consecutive assistant tool activity is grouped into a `ToolRunGroup`. Each group is a three-mode card:
+
+- `collapsed` — hides every item (default for a finished group).
+- `recent` — shows the last 3 items with a link to expand (default while the group is live/running).
+- `all` — shows every item in a capped scrolling list with a link to shrink back.
+
+The default tracks liveness (working → `recent`, done → `collapsed`); once the user toggles a group, an override is
+stashed so later status churn or streaming items do not blow away their selection. A single tool renders as a stand-alone
+row. Tool results fold into their matching call row rather than appearing as separate raw events. Edit-shaped calls
+render an "Edit …" header with a diff-style preview. Display names map the builtin tools (`Edit`, `Bash`, `Grep`,
+`Web search`, `Web fetch`); see [agent-tools](../../../rust/docs/modules/agent-tools.md).
+
+## Events and reconciliation
+
+`rpc.ts` parses each frame as either an RPC response (`ok` field present) or an event, then fans events out to handlers.
+`sessionEvents.ts` classifies each event into a refresh plan:
+
+- `refreshList` — debounced session-list invalidation (most lifecycle/queue/turn events).
+- `syncSelected` — schedule a selected-session reconciliation, but only for events whose canonical projection is not
+  otherwise mergeable (idle, recovery, config, history, compaction transitions, and any unknown event).
+
+For the selected session the handler applies as much as it can locally before falling back: queue projections
+(`applyQueueProjection`), `transcript.appended` entries (`applyTranscriptAppendedEvent`), and activity hints all merge
+into the cache; side-channel events (`turn.started`, `turn.finished`, `assistant.message`) only advance the event
+high-water when their entry is already known. Overlapping selected refreshes are coalesced per session. Returning to the
+foreground (`visibilitychange` / `focus` / bfcache `pageshow`) invalidates the session list and runs one throttled
+active-branch sync.
+
+The app subscribes to events for every visible session via `events.subscribe`, replaying missed events from the stored
+`last_event_id`, and unsubscribes from sessions that leave the list.
+
+## Composer, queue, and slash commands
+
+The composer (`composer.tsx`) always sends ordinary text as `input.follow_up`, even while the agent is running. Cmd/Ctrl+Enter
+sends; Enter inserts a newline. There is no local "message queued" or pending-bubble shadow row — transcript rows render
+only from canonical daemon projections; the send button spinner is the only local in-flight indication.
+
+Submit routing (`submitComposer`): a leading `/` runs a slash command; otherwise, if a session is selected the text is
+queued via `queueUserInput`, and if none is selected `startNewSession` calls `session.start` and selects the new durable
+session. Selection is immediate imperative state (`selectedRef`) so the next keystroke targets the just-created session,
+not the one selected a render earlier.
+
+### Queue pane
+
+When follow-ups are queued, a pane above the composer (`QueuedInputPane`) lists them with row-level controls:
+
+- promote a follow-up to steer (`input.promote_queued`),
+- edit a queued follow-up's text (`input.update_queued`),
+- cancel it (`input.cancel_queued`),
+- reorder follow-ups up/down (`input.reorder_queued_follow_ups`, sending the full ordered follow-up id list).
+
+Each mutation passes the cached `queue_revision` as an optimistic fence and replaces queue state from the returned
+canonical `queue` projection. Steering rows are immutable: they stay above follow-ups and expose only disabled controls.
+Queue events apply immediately so a stale row that the daemon already consumed disappears fast; a "no longer editable"
+promote/edit is a benign no-op, not an error.
+
+### Per-session composer drafts
+
+Composer text is persisted per session in `localStorage` under `piRelayComposerDrafts:v1`, keyed by `session_id`
+(new-session text uses a fixed key). Switching sessions swaps the visible draft; a failed send restores the typed text.
+There are no browser-local *session* drafts — only Postgres-backed sessions appear in the sidebar, and starting a new
+chat is purely composer state. UI selection (`piRelayUiResume:v1`) and transcript scroll position are the other
+`localStorage`-backed UI state.
+
+### Slash commands
+
+Slash commands (`slash.ts`) are thin wrappers over RPCs that lack a dedicated control. Autocomplete is shallow: it shows
+only while typing the command name; Enter on a partial accepts the highlighted completion and adds a trailing space,
+Enter on an exact command submits.
+
+| Command | Action |
+| --- | --- |
+| `/switch` | Opens the same-session history picker (idle only). User-message targets restore the full original message into the composer; turn/compaction targets just become the active leaf. |
+| `/compact` | Requests context compaction (`compaction.request`). |
+| `/system` | Shows the selected session's rendered `PI.md` prompt and source template (`system.prompt`). Requires a durable session. |
+| `/export` | Exports the current branch's assistant/user messages, fetching active-branch bodies for the export view. |
+
+Switch never accepts raw transcript ids; the picker is the only path. The picker shows a loading state until the compact
+tree is complete (or a fresh complete tree is cached), and `history.switch` revalidates the expected leaf and
+transcript revision server-side, refreshing the picker if history changed underneath.
+
+## Model and reasoning controls
+
+The chat header exposes a model picker and a provider-specific reasoning-effort picker (`sessionDefaults.ts`). Two
+providers are offered: OpenAI (`gpt-5.5`) and Claude (`claude-opus-4-8`). The provider/model is locked once the session
+has any transcript history, because both providers carry provider-shaped replay state across turns. Reasoning effort is a
+per-request knob and can change during or between turns (applying to subsequently created requests). Effort options
+differ by provider: OpenAI offers `none…xhigh`; Claude offers `low…max`. Changing model/effort calls `session.configure`
+and patches the cached list/snapshot.
+
+## Notes
+
+- Every cache reducer is keyed by `session_id` and no-ops on mismatch; stale async responses for a deselected session are
+  safely ignored.
+- Compact topology from events is conservative: an event `tree_node` extends the tree only when it is already complete;
+  otherwise topology recovery is left to `transcript.index` so `/switch` stays correct without re-deriving Rust
+  turn-boundary logic in TypeScript.
+- The selected cache is tab-lifetime only; there is no IndexedDB or persistent transcript cache.
+- `/switch` previews and compact `display_hint` text may be truncated; mutation/restore content always comes from full
+  entry bodies, never the preview.
+- Thinking blocks never reach the UI — they are discarded at the provider parse layer, so `AssistantItem` is only
+  `text` or `tool_call`. See [agent-provider](../../../rust/docs/modules/agent-provider.md).

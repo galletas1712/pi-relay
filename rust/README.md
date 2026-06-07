@@ -1,51 +1,47 @@
 # Rust Agent Stack
 
-Personal-use Rust rewrite of the core pi-style agent runtime. The design keeps
-the good local semantics around resume, switch, and compaction while
-removing the hierarchical subagent machinery from the TypeScript fork.
+Personal-use Rust rewrite of the core pi-style agent runtime. It keeps the good
+local semantics around resume, switch, and compaction while removing the
+hierarchical subagent machinery from the TypeScript fork.
 
-See [`docs/architecture.md`](docs/architecture.md) for the detailed design.
-See [`docs/websocket-rpc.md`](docs/websocket-rpc.md) for the implemented
-Postgres-first websocket RPC contract and manual exercise plan.
-See [`docs/design-decisions.md`](docs/design-decisions.md) for the visible UI
-choices and invisible runtime/storage decisions.
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) - overview and crate map.
+- [`docs/design-decisions.md`](docs/design-decisions.md) - the visible and
+  invisible engineering choices and why they were made.
+- [`docs/websocket-rpc.md`](docs/websocket-rpc.md) - the frontend websocket RPC
+  contract and manual exercise plan.
+- [`docs/modules/`](docs/modules) - one reference per crate (linked below).
+- [`docs/plans/`](docs/plans) - in-flight future work only.
+- [`../packages/web/docs/web-ui.md`](../packages/web/docs/web-ui.md) - the React
+  web client.
 
 ## Crate Layout
 
-| Crate | What it owns |
-| --- | --- |
-| `agent-vocab` | Shared serializable ids, message blocks, images, assistant items, tool calls/results, and transcript items. |
-| `agent-core` | Pure deterministic FSM for one agent turn loop. No I/O. |
-| `agent-session` | Durable transcript forest, model context materialization, resume, compaction, and storage snapshots. |
-| `agent-store` | Postgres-only session/event/action/input persistence for the daemon. |
-| `agent-provider` | `ModelProvider` plus OpenAI and Anthropic adapters. |
-| `agent-tools` | `AgentTool`, `ToolRegistry`, and builtin `read`/`write`/`edit`/`bash` tools. |
-| `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch. |
+| Crate | What it owns | Doc |
+| --- | --- | --- |
+| `agent-vocab` | Shared serializable ids, message blocks, images, assistant items, tool calls/results, transcript items, provider config. | [docs/modules/agent-vocab.md](docs/modules/agent-vocab.md) |
+| `agent-core` | Pure deterministic FSM for one agent turn loop. No I/O. | [docs/modules/agent-core.md](docs/modules/agent-core.md) |
+| `agent-session` | Durable transcript forest, model-context materialization, resume, switch, compaction. | [docs/modules/agent-session.md](docs/modules/agent-session.md) |
+| `agent-store` | Postgres-only session/transcript/queue/action/event persistence and recovery. | [docs/modules/agent-store.md](docs/modules/agent-store.md) |
+| `agent-provider` | `ModelProvider` plus OpenAI/Codex and Anthropic adapters. | [docs/modules/agent-provider.md](docs/modules/agent-provider.md) |
+| `agent-tools` | `AgentTool`, `ToolRegistry`, and builtin `edit`/`bash`/`grep`/`web_search`/`web_fetch`/`load_skill` tools. | [docs/modules/agent-tools.md](docs/modules/agent-tools.md) |
+| `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch. | [docs/modules/agent-daemon.md](docs/modules/agent-daemon.md) |
+| `agent-prompt` | Renders the repo-level `PI.md` system prompt. | [docs/modules/agent-prompt.md](docs/modules/agent-prompt.md) |
 
-## Running
+## Build And Test
 
 ```sh
 cargo check --manifest-path rust/Cargo.toml --all
-cargo test --manifest-path rust/Cargo.toml -p agent-core
-cargo fmt --manifest-path rust/Cargo.toml --all --check
+cargo test  --manifest-path rust/Cargo.toml --all
+cargo fmt   --manifest-path rust/Cargo.toml --all --check
 ```
 
-Full workspace test linking currently depends on the local macOS toolchain
-finding the Apple SDK and `libiconv`. On this machine the passing full command
-is:
+## Run The Daemon
+
+Start Postgres (any Postgres 16 works):
 
 ```sh
-SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
-RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/clang' \
-cargo test --manifest-path rust/Cargo.toml --all
-```
-
-## Websocket Daemon
-
-Start Postgres, for example with OrbStack/Docker:
-
-```sh
-DOCKER_HOST=unix:///Users/schwinns/.orbstack/run/docker.sock \
 docker run -d --name pi-relay-pg \
   -e POSTGRES_PASSWORD=postgres \
   -e POSTGRES_USER=postgres \
@@ -53,58 +49,40 @@ docker run -d --name pi-relay-pg \
   -p 55432:5432 postgres:16-alpine
 ```
 
-Run the daemon:
+Run `pi-agentd` (the websocket endpoint is `ws://127.0.0.1:8787`):
 
 ```sh
-SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk \
-RUSTFLAGS='-C linker=/Library/Developer/CommandLineTools/usr/bin/clang' \
 cargo run --manifest-path rust/Cargo.toml -p agent-daemon -- \
   --database-url postgres://postgres:postgres@127.0.0.1:55432/pi_relay \
   --bind 127.0.0.1:8787
 ```
 
-The websocket endpoint is `ws://127.0.0.1:8787`.
+`--database-url`/`DATABASE_URL` is required; `--bind`/`PI_AGENTD_BIND` defaults
+to `127.0.0.1:8787`. The daemon creates its schema on startup but does not run
+old-session migrations automatically.
 
-Provider credential loading:
-
-- `provider.kind = "codex"` uses `CODEX_ACCESS_TOKEN` or
-  `~/.codex/auth.json`, including `tokens.account_id` when present.
-- `provider.kind = "openai"` uses the same ChatGPT/Codex subscription auth
-  path. pi-relay does not support plain OpenAI API-key auth for OpenAI models.
-- `provider.kind = "anthropic"` or `"claude"` uses `ANTHROPIC_API_KEY` or
-  Claude Code's `primaryApiKey` from `~/.claude/config.json` / `~/.claude.json`.
-
-Session provider config supports `reasoning_effort`, an optional explicit
-`max_tokens` cap, and `prompt_cache: { "key": "..." }`. OpenAI accepts
-`none`, `minimal`, `low`, `medium`, `high`, and `xhigh`; Claude accepts `low`,
-`medium`, `high`, `xhigh`, and `max`. The daemon does not add a default OpenAI output
-cap. Claude Opus 4.8 uses adaptive thinking with `output_config.effort` and a
-64k default `max_tokens` value because the Messages API requires that field.
-The model system prompt is rendered from the repo-level `PI.md` template. Project-specific instructions enter through `AGENTS.md` files in the session's workspace checkouts, which `PI.md` composes explicitly. The daemon does not inject date, time, or cwd unless the template asks for it.
-
-## Web UI
+## Run The Web UI
 
 ```sh
 npm run dev:web
 ```
 
-The web UI runs at `http://127.0.0.1:8788` and connects to
-`ws://127.0.0.1:8787` by default. Override the daemon URL with
-`VITE_PI_AGENT_WS`.
+The web UI serves at `http://127.0.0.1:8788` and connects to
+`ws://127.0.0.1:8787` by default; override with `VITE_PI_AGENT_WS`. See
+[`../packages/web/docs/web-ui.md`](../packages/web/docs/web-ui.md) for the client
+design.
 
-The composer sends regular text as `input.follow_up`. The top bar exposes the
-model picker and provider-specific reasoning effort picker. The model is locked
-once the session has transcript history; reasoning effort can still be changed
-during or between turns and applies to subsequently created provider requests.
-Slash commands expose operations that do not already have dedicated controls:
-`/switch`, `/compact`, `/system`, and `/export`. Active turns use the
-stop button; new, rename, archive, and unarchive use sidebar controls; queued
-follow-ups can be promoted to steer from the queue pane above the composer.
-The Rust daemon/store also supports queued follow-up edit, cancel, and full-list
-reorder RPCs; steering messages stay at the top and are not reorderable.
-Crashed or interrupted terminal model turns can be retried/continued directly
-from the transcript row.
+## Provider Credentials
 
-The current development Postgres database has already been upgraded for the
-session revision and queue ordering columns; fresh databases get them from the
-schema. The daemon does not run old-session migrations automatically.
+Credentials are loaded at model-call time, not stored on the session:
+
+- `provider.kind = "openai"` uses the ChatGPT/Codex subscription transport
+  (`CODEX_ACCESS_TOKEN` or `~/.codex/auth.json`, including `tokens.account_id`).
+  pi-relay does not support plain OpenAI API-key auth for OpenAI models.
+- `provider.kind = "anthropic"` / `"claude"` uses `ANTHROPIC_API_KEY` or Claude
+  Code's `primaryApiKey` from `~/.claude/config.json` / `~/.claude.json`.
+
+Provider/model tuning (`reasoning_effort`, optional `max_tokens`,
+`prompt_cache.key`) and the exact accepted values are documented in
+[`docs/websocket-rpc.md`](docs/websocket-rpc.md) and
+[`docs/modules/agent-provider.md`](docs/modules/agent-provider.md).

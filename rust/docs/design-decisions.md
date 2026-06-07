@@ -30,25 +30,22 @@ The design keeps the app operational instead of marketing-like: compact rows,
 small controls, stable panes, low-decoration styling, and transcript-first
 interaction.
 
-### Draft Sessions Are Browser State
+### Composer Drafts Are Browser State
 
-Clicking New session creates a browser-local draft session, not a Postgres row.
-The draft row stores a stable future `session_id`, title, provider, composer
-text, and timestamps in `localStorage`; this is enough for a brand-new unsent
-draft to survive refresh without polluting durable agent state.
+There is no browser-local draft *session*. Clicking New session is composer
+state: the selected session is cleared, and the first non-command send calls
+`session.start`, which creates the durable row and materializes the first user
+input in one step (see "The Web UI Does Not Own Session Drafts" below).
 
-Sending the first normal message from that draft calls `session.start`, which
-creates the durable session and immediately materializes the first user input.
-After the backend accepts it, the UI removes the local draft and selects the
-durable session. Empty web-created durable rows are also hidden defensively in
-`session.list` unless they have transcript, queued input, or actions.
-`metadata.hidden = true` is a separate list-filtering convention
-for local verification cleanup; it is not a lifecycle state and does not delete
-or mutate transcript history.
+Per-session composer *text* is web-owned `localStorage` state, keyed by session
+(with a `__new_session__` key for the unsent new chat). It also holds restored
+historical user messages after a switch. Composer text is deliberately never
+stored in `sessions.metadata` or transcript rows.
 
-Composer drafts for existing sessions are also web-owned `localStorage` state.
-They are used for restored historical user messages after switch, and are
-deliberately not stored in `sessions.metadata` or transcript rows.
+Empty web-created durable rows are hidden defensively in `session.list` unless
+they have transcript, queued input, or actions. `metadata.hidden = true` is a
+separate list-filtering convention for local verification cleanup; it is not a
+lifecycle state and does not delete or mutate transcript history.
 
 ### Slash Commands Are Thin RPC Calls
 
@@ -73,10 +70,11 @@ applies to later provider requests, not one already in flight.
 Normal composer text is always `input.follow_up`, even while the agent is
 running. Queued follow-ups appear in a small pane above the composer. Each
 queued follow-up has a row-level steer control; pressing it promotes that row
-to the steer queue, ordered by promotion time. The Rust backend supports
-follow-up edit, cancel, and reorder mutations, but this PR intentionally does
-not change the TypeScript frontend. Active turns are interrupted with a stop
-button beside the composer, not with a slash command.
+to the steer queue, ordered by promotion time. Each queued follow-up can also be
+edited, cancelled, and reordered from the queue pane; the web UI wires
+`input.update_queued`, `input.cancel_queued`, and `input.reorder_queued_follow_ups`.
+Steers stay pinned on top and are not reorderable. Active turns are interrupted
+with a stop button beside the composer, not with a slash command.
 
 Slash autocomplete is intentionally shallow: it only appears while typing the
 command name. Enter on a partial command accepts the highlighted completion and
@@ -250,9 +248,11 @@ The web composer keeps the same generated `client_input_id` while a send is
 unconfirmed, so a lost websocket response can be retried without duplicating the
 user message.
 
-For brand-new draft starts, the browser stores a stable future `session_id` on
-the draft. Retrying `session.start` with that id returns the existing durable
-session instead of creating another one.
+For a brand-new chat, the browser generates the `session_id` and sends it with
+`session.start`. `session.start` is idempotent on that id: if the session
+already exists it returns `{ replayed: true }` instead of creating a second
+session, and the stable `client_input_id` keeps the first message from being
+duplicated.
 
 ### Switch And History Targets
 
@@ -359,8 +359,9 @@ that field and Anthropic recommends a large cap for `xhigh`/`max`.
 
 Tool definitions and execution live outside `agent-core`. The core only models
 tool requests and tool results. The daemon's builtin registry currently owns the
-actual `read`, `write`, `edit`, and `bash` behavior and always executes allowed
-tool calls.
+actual `edit`, `bash`, `grep`, `web_search`, `web_fetch`, and `load_skill`
+behavior and always executes allowed tool calls. (`web_search` is registered but
+has no configured backend yet, so it returns an error result.)
 
 This keeps core portable and makes future tool customization a daemon/runtime
 choice.
