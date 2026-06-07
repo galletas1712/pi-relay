@@ -64,6 +64,28 @@ export function patchSessionListActivity(
 	}));
 }
 
+export function patchSessionListEventSummary(
+	queryClient: QueryClient,
+	projectId: string | null,
+	event: EventFrame,
+	activity: SessionSummary["activity"] | null,
+) {
+	const metadata = recordValue(event.data.metadata);
+	const provider = providerValue(event.data.provider);
+	const activeLeafId = activeLeafIdValue(event.data);
+	if (!metadata && !provider && !activity && activeLeafId === undefined) return;
+
+	patchSessionList(queryClient, projectId, event.session_id, (session) => ({
+		...session,
+		metadata: metadata ?? session.metadata,
+		provider: provider ?? session.provider,
+		activity: activity ?? session.activity,
+		active_leaf_id: activeLeafId === undefined ? session.active_leaf_id : activeLeafId,
+		has_transcript_entries:
+			activeLeafId === undefined ? session.has_transcript_entries : activeLeafId !== null || session.has_transcript_entries,
+	}));
+}
+
 export function patchSessionSnapshot(
 	queryClient: QueryClient,
 	sessionId: string,
@@ -97,6 +119,28 @@ export function mergeSnapshotIntoSessionList(
 		};
 	});
 	return found ? nextSessions : sessions;
+}
+
+function recordValue(value: unknown): Record<string, unknown> | null {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+}
+
+function providerValue(value: unknown): SessionSummary["provider"] | null {
+	const candidate = recordValue(value);
+	if (!candidate) return null;
+	if ((candidate.kind !== "openai" && candidate.kind !== "claude") || typeof candidate.model !== "string") return null;
+	return {
+		...candidate,
+		kind: candidate.kind,
+		model: candidate.model,
+	} as SessionSummary["provider"];
+}
+
+function activeLeafIdValue(data: Record<string, unknown>): string | null | undefined {
+	if (!Object.prototype.hasOwnProperty.call(data, "active_leaf_id")) return undefined;
+	const value = data.active_leaf_id;
+	if (value === null || typeof value === "string") return value;
+	return undefined;
 }
 
 export type ActiveBranchSyncApplyResult = "applied" | "reload";
