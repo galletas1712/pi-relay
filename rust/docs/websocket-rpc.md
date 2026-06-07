@@ -11,11 +11,15 @@ sending the same websocket frames a frontend would send.
 ## Core Decisions
 
 1. Sessions are durable rows, not opened processes.
-   There is no user-facing `open`, `close`, `resume`, or `delete` RPC. A
-   frontend starts a new chat with `session.start` when the first message is
-   sent, subscribes with `events.subscribe`, and gets the current state with
-   `session.get`. Empty durable sessions are not part of the websocket
-   contract; browser-local drafts become durable only through `session.start`.
+   There is no user-facing `open` or `close` RPC, and no session-level `resume`
+   (idle sessions resume implicitly - see below). A frontend starts a new chat
+   with `session.start` when the first message is sent, subscribes with
+   `events.subscribe`, and gets the current state with `session.get`.
+   `session.delete` exists and removes an idle session with its transcript,
+   queue, action, and event rows. `turn.resume` is a turn-level operation
+   (re-run an interrupted/crashed terminal turn), not a session lifecycle
+   command. Empty durable sessions are not part of the websocket contract; a
+   new chat becomes durable only through `session.start`.
 
 2. Idle sessions resume implicitly.
    When a daemon starts or a browser reconnects, the active leaf, transcript
@@ -133,22 +137,24 @@ stored `outer_cwd`.
 }
 ```
 
-Supported provider kinds are:
+Supported provider kinds are exactly two (`ProviderKind = OpenAi | Claude`):
 
-- `codex`: OpenAI Responses API through the ChatGPT/Codex backend. Uses
-  `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json`, plus `ChatGPT-Account-ID` when
-  available, and sends the Codex residency routing header required by
-  workspace-backed ChatGPT accounts. This is the path tested with real
-  credentials.
-- `openai`: alias for the same ChatGPT/Codex subscription transport. pi-relay
+- `openai`: OpenAI Responses API. It always routes through the ChatGPT/Codex
+  subscription transport - it reads `CODEX_ACCESS_TOKEN` or `~/.codex/auth.json`,
+  adds `ChatGPT-Account-ID` when available, and sends the Codex residency
+  routing header required by workspace-backed ChatGPT accounts. pi-relay
   intentionally does not support plain OpenAI API-key auth for OpenAI models.
+  This is the path tested with real credentials.
 - `anthropic` or `claude`: Anthropic Messages API through `ANTHROPIC_API_KEY`.
+
+`codex` is **not** a provider kind; it is the auth transport used by the
+`openai` kind. A request with `"kind": "codex"` is rejected at decode time.
 
 `prompt_cache.key` maps to `ModelRequest::prompt_cache_key` and is sent on the
 OpenAI request path. `max_tokens` is optional; when omitted the daemon does not
 set an OpenAI output cap.
 
-`reasoning_effort` defaults to `xhigh`. OpenAI currently accepts `none`,
+`reasoning_effort` defaults to `medium`. OpenAI currently accepts `none`,
 `minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay. Claude accepts
 `low`, `medium`, `high`, `xhigh`, and `max`; Claude Opus 4.8 requests are sent
 with adaptive thinking and `output_config.effort`.
@@ -395,7 +401,7 @@ the normal frontend path for a brand-new draft.
   "session_id": "optional-stable-id",
   "project_id": "f2b0e23c-1fd7-4977-9d60-f6842e25d15b",
   "provider": {
-    "kind": "codex",
+    "kind": "openai",
     "model": "gpt-5.5",
     "prompt_cache": { "key": "pi-relay-local" }
   },
@@ -474,7 +480,7 @@ Result shape:
   ],
   "activity": "idle",
   "active_leaf_id": "entry_9",
-  "provider": { "kind": "codex", "model": "gpt-5.5" },
+  "provider": { "kind": "openai", "model": "gpt-5.5" },
   "metadata": {},
   "pending_actions": [],
   "queued_inputs": [],
@@ -482,6 +488,7 @@ Result shape:
   "queue_revision": 5,
   "transcript_revision": 7,
   "last_event_id": 42,
+  "server_time_ms": 1717800000000,
   "has_transcript_entries": true,
   "entries": []
 }
@@ -501,7 +508,9 @@ be `"active_branch"` or `"full_tree"` and defaults to `"full_tree"` for
 compatibility. The web UI can use the active-branch scope for normal display and
 reserve the full tree for switch/history UI. `has_transcript_entries`
 allows provider/model lock checks even when the active branch is empty after a
-root switch. Transcript entries returned by websocket RPCs include the Postgres
+root switch. `server_time_ms` is the daemon's wall-clock (ms) at response time,
+used by the UI to anchor live timers against server time rather than client
+clocks. Transcript entries returned by websocket RPCs include the Postgres
 `sequence` column, which is an append/order cursor but not itself a freshness
 token. Use `transcript_revision` to decide whether cached transcript data is
 fresh.
@@ -730,6 +739,13 @@ Updating a project does not change existing sessions in that project.
 }
 ```
 
+### `project.delete`
+
+Deletes an **empty** project. Params: `project_id`. Fails with
+`project_not_empty` if the project is missing or still has any session; on
+success it removes the project's managed workspace bases and returns
+`{ "project_id", "deleted": true }`.
+
 ### `session.rename`
 
 Updates the UI-facing session title stored in metadata. The title is required
@@ -765,6 +781,28 @@ knobs such as `reasoning_effort` during or between turns. Runtime changes apply
 to subsequently created provider requests, not to an already in-flight request.
 Responses and `session.configured` events include `provider`, `metadata`, and
 `activity` so clients can patch cached summaries and selected snapshots.
+
+### `session.sync_active_branch`
+
+Cheap incremental reconciliation of the selected session's active branch.
+Params: `session_id` and an optional `base_leaf_id` (the leaf the client already
+has). The daemon recovers the session if needed, then returns only the delta
+against `base_leaf_id` with a `status` of `unchanged`, `extended` (a suffix of
+new entries appended past the client's leaf), or `branch_changed` (the active
+branch diverged, so the client replaces its body cache). The response carries
+the UI-projected entries (no raw `provider_replay`) plus the session overview
+(`active_leaf_id`, revisions, `server_time_ms`). This is the normal selected-
+session refresh path; full `session.get(include_entries=true)` is reserved for
+cold loads and history UI.
+
+### `session.delete`
+
+Idle-only. Params: `session_id` (and optional `expected_active_leaf_id`).
+Acquires the session driver, requires idle (no unfinished action, no queued
+input), evicts any live session, removes the row, and cascades to its transcript
+entries, queued inputs, actions, and events; session workspace directories are
+cleaned up. Returns `{ "session_id", "deleted": true }`. A missing session is
+`session_not_found`.
 
 ## System Prompt RPC
 
@@ -1118,7 +1156,13 @@ tool-rerun semantics exist.
 
 ### `tools.list`
 
-Returns the builtin definitions: `read`, `write`, `edit`, and `bash`.
+Requires a `provider` parameter (`"openai"` or `"anthropic"`/`"claude"`) and
+returns the model-visible tool definitions for that provider, because the tool
+surface is provider-shaped (e.g. OpenAI `apply_patch` vs Anthropic
+`text_editor_20250728` for editing). The registered builtins are `edit`, `bash`,
+`grep`, `web_search`, `web_fetch`, and `load_skill` - there are no `read`/`write`
+tools. Each returned entry carries `name`, `description`, `input_schema`,
+`canonical_name`, `prompt_alias`, `execution`, and `kind: "local_tool"`.
 
 No other tool RPC exists. Tool requests are automatic. A tool-level failure,
 such as a missing file, missing edit target, malformed args, non-zero bash exit,
@@ -1416,10 +1460,10 @@ descendant rows are preserved, and non-boundary switch fails with
 
 Use `harness.model.complete` to request real tools:
 
-- `read` success and missing-file error.
-- `write` success.
-- `edit` success and missing-target error.
+- `edit` success and missing-target error (`apply_patch` for OpenAI,
+  `text_editor_20250728` for Anthropic).
 - `bash` success, non-zero exit, malformed args, and timeout.
+- `grep` success and no-match.
 - Multiple tool calls in one assistant response.
 
 Verify there is no approval event, tools emit `tool.requested`/`tool.started`,
@@ -1483,7 +1527,7 @@ With `~/.codex/auth.json` or `CODEX_ACCESS_TOKEN` available:
   "params": {
     "session_id": "manual_real_codex",
     "provider": {
-      "kind": "codex",
+      "kind": "openai",
       "model": "gpt-5.5",
       "prompt_cache": { "key": "pi-relay-real-smoke" }
     },
@@ -1540,9 +1584,10 @@ contains the original image block.
 ### 13. Real Anthropic Provider
 
 Run only when `ANTHROPIC_API_KEY` is present. Create a session with
-`provider.kind = "anthropic"` or `"claude"` and ask the model to use the `read`
-tool. Verify provider-requested tool calls, real tool results, a second model
-request containing those results, and a final assistant message.
+`provider.kind = "anthropic"` or `"claude"` and ask the model to use the `edit`
+tool (`text_editor_20250728`) or `bash`. Verify provider-requested tool calls,
+real tool results, a second model request containing those results, and a final
+assistant message.
 
 ## Documentation Sync Rule
 

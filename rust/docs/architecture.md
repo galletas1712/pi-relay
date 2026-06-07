@@ -1,10 +1,17 @@
 # Rust Agent Stack Architecture
 
 This is the Rust rewrite of the core pi-style runtime in this repo. It is not a
-literal port of the local TypeScript fork's hierarchical subagent work. The
-Rust stack keeps the semantics that are useful for personal agent work:
-branch-aware transcript history, switch, compaction, automatic local tools, and
-a Postgres-backed websocket control plane.
+literal port of the local TypeScript fork's hierarchical subagent work. The Rust
+stack keeps the semantics that are useful for personal agent work: branch-aware
+transcript history, switch, compaction, automatic local tools, and a
+Postgres-backed websocket control plane.
+
+This document is the overview and map. Each crate has its own reference under
+[`modules/`](modules/); the cross-cutting product/engineering rationale lives in
+[`design-decisions.md`](design-decisions.md); the frontend wire contract is in
+[`websocket-rpc.md`](websocket-rpc.md); the React client is documented in
+[`../../packages/web/docs/web-ui.md`](../../packages/web/docs/web-ui.md); and
+in-flight future work lives under [`plans/`](plans/).
 
 ## Goals
 
@@ -13,7 +20,7 @@ a Postgres-backed websocket control plane.
    compaction are core semantics.
 3. Make the frontend protocol durable and recoverable by treating Postgres as
    the websocket source of truth.
-4. Keep providers intentionally narrow: Codex/OpenAI and Anthropic/Claude only.
+4. Keep providers intentionally narrow: OpenAI/Codex and Anthropic/Claude only.
 5. Keep tools separate from the agent loop so tool sets can be customized
    without changing the FSM.
 6. Do not include subagent orchestration or generic injected-message routing.
@@ -21,74 +28,69 @@ a Postgres-backed websocket control plane.
 ## Crate Stack
 
 ```text
-agent-daemon
-  websocket RPC + provider/tool dispatch
-
-agent-session
-  AgentSession, TranscriptStore, ModelContext,
-  resume/switch, storage snapshots
-
-agent-core
-  deterministic FSM for one turn loop; no I/O
-
-agent-store
-  Postgres session/event/action/input persistence
-
-agent-provider
-  ModelProvider trait plus OpenAI/Codex and Anthropic adapters
-
-agent-tools
-  Tool trait, ToolRegistry, builtin read/write/edit/bash tools
-
-agent-vocab
-  shared ids, message blocks, tool calls/results, transcript items
+agent-daemon     websocket RPC + provider/tool dispatch, recovery, events
+   |
+   |  drives
+   v
+agent-session    transcript forest, model-context materialization,
+   |             resume / switch / compaction, replay sidecar lane
+   |
+   +-- agent-core      deterministic FSM for one turn loop; no I/O
+   +-- agent-store     Postgres persistence (the only durable backend)
+   +-- agent-provider  ModelProvider + OpenAI/Codex and Anthropic adapters
+   +-- agent-tools     AgentTool, ToolRegistry, builtin tools
+   +-- agent-prompt    renders the PI.md system prompt
+            |
+            v
+agent-vocab      shared ids, message blocks, tool calls/results,
+                 transcript items, provider config (no behavior, no I/O)
 ```
 
-`agent-vocab` stays low in the stack so providers, tools, storage, session code,
-the CLI, and the daemon can talk about messages without depending on the FSM.
+| Crate | What it owns | Reference |
+| --- | --- | --- |
+| `agent-vocab` | Serializable ids, message blocks, images, assistant items, tool calls/results, transcript items, and provider config. | [modules/agent-vocab.md](modules/agent-vocab.md) |
+| `agent-core` | Pure deterministic FSM for one agent turn loop. No I/O. | [modules/agent-core.md](modules/agent-core.md) |
+| `agent-session` | Durable transcript forest, model-context materialization, resume, switch, compaction, and the provider-replay lane. | [modules/agent-session.md](modules/agent-session.md) |
+| `agent-store` | Postgres-only session/transcript/queue/action/event persistence plus recovery and revision/queue projections. | [modules/agent-store.md](modules/agent-store.md) |
+| `agent-provider` | `ModelProvider` plus OpenAI/Codex (Responses) and Anthropic (Messages) adapters, prompt-cache shaping, and provider compaction. | [modules/agent-provider.md](modules/agent-provider.md) |
+| `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`grep`/`web_search`/`web_fetch`/`load_skill` tools. | [modules/agent-tools.md](modules/agent-tools.md) |
+| `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. | [modules/agent-daemon.md](modules/agent-daemon.md) |
+| `agent-prompt` | Renders the repo-level `PI.md` system prompt from session/workspace/tool/skill context. | [modules/agent-prompt.md](modules/agent-prompt.md) |
 
-## Agent Daemon Modules
+`agent-vocab` stays at the bottom of the graph so providers, tools, storage,
+session code, and the daemon can all talk about messages without depending on
+the FSM.
 
-`agent-daemon` is intentionally a thin control plane around the crates below it.
-Its module split is:
+## How A Turn Flows
 
-- `main.rs`: websocket accept loop, JSON-RPC routing, and RPC handlers. It is
-  allowed to translate protocol parameters into runtime calls, but it should not
-  own provider execution, storage SQL, auth refresh, or transcript parsing.
-- `config.rs`: command-line and environment parsing for daemon startup.
-- `types.rs`: daemon-local RPC envelopes, request parameter structs, runtime
-  handles, and websocket errors.
-- `state.rs`: process-local daemon state: repository handle, active session
-  projections, per-session driver locks, event broadcaster, tool registry, and
-  tool context.
-- `codec.rs`: translation between JSON-RPC payloads and core/session vocabulary,
-  plus transcript recovery helpers that operate on storage-neutral session
-  shapes.
-- `auth.rs`: OpenAI/Codex/Anthropic credential loading and Codex token refresh.
-- `provider_runtime.rs`: provider selection and model execution. It is the only
-  daemon module that knows how provider config maps to concrete provider
-  adapters.
-- `runtime.rs`: `SessionDriver`, live session loading, crash recovery,
-  queued-input consumption, action completion, model/tool dispatch, and event
-  publishing.
-- `agent-store::PostgresAgentStore`: concrete Postgres persistence. SQL,
-  transaction boundaries, row mapping, event replay, input ledger, action rows,
-  daemon config, and recovery persistence live in the storage crate rather than
-  inside the daemon.
+```text
+user input
+   |  (RPC)
+   v
+agent-daemon ---- persist accepted transition ----> agent-store (Postgres)
+   |
+   |  materialize ModelContext from the active leaf
+   v
+agent-session --> agent-core FSM --requests--> agent-provider (model call)
+   |                   |                            |
+   |                   |                       agent-tools (tool calls)
+   |                   v
+   |             transcript items + side effects
+   v
+agent-store (append, bump revisions, emit events) --> websocket subscribers
+```
 
-This split keeps the daemon as transport/runtime glue. Postgres is the only
-supported durable backend; there is no storage trait until a second real
-backend earns the abstraction. `agent-session` remains independent from
-websocket transport and SQL by owning only live session semantics plus storage
-snapshot shapes.
+Postgres is committed before follow-on provider/tool work is dispatched, so a
+crash leaves either a recoverable open tail or replayable events. Long provider,
+tool, and compaction I/O runs outside the per-session row lock and reconverges
+through the action `attempt_id` fence. The mechanics live in
+[agent-store](modules/agent-store.md) and [agent-daemon](modules/agent-daemon.md).
 
 ## Feature Audit
 
 Implemented user-facing behavior:
 
 - Structured text and image user input.
-- Redacted assistant thinking markers without storing thinking content.
-- String tool-call ids.
 - Automatic local tool execution with no approval interface.
 - Durable session rows in Postgres for websocket sessions.
 - Reconnect event replay with `events.subscribe(after_event_id)`; initial
@@ -96,244 +98,34 @@ Implemented user-facing behavior:
 - Derived session activity: `idle`, `queued`, `running`.
 - Steer/follow-up sends with idempotent `client_input_id` for both idle
   accepted input and busy queued input.
-- Queued follow-up promotion to steer priority, consumed in promotion order.
-- Queued follow-up edit, cancel, and full-list reorder RPCs in the Rust
-  daemon/store. Steering messages stay above follow-ups and are not reorderable.
+- Queued follow-up promotion to steer priority, plus follow-up edit, cancel, and
+  full-list reorder (steers stay pinned on top and are not reorderable). The web
+  UI wires all of these.
 - Mid-turn steer insertion after completed tool results and before the next
-  model request; follow-ups remain next-turn work, and compaction remains an
-  action barrier.
-- Turn-level interrupt.
-- Idle-only retry/continue for terminal model turns. This resumes from the
-  original model checkpoint and appends a sibling branch instead of duplicating
-  the user message.
-- Idle-only active-branch switch.
-- Idle-only compaction request with structural validation.
-- Daemon restart recovery for open transcript tails.
-- Stale action rejection through persisted `attempt_id`.
-- Repo-level `PI.md` prompt composition, with each workspace directory's
-  `AGENTS.md` included by the template.
-- Provider config with `max_tokens` and `prompt_cache.key`.
-- Real Codex provider path through `~/.codex/auth.json` or
-  `CODEX_ACCESS_TOKEN`.
-- OpenAI Responses provider through ChatGPT/Codex subscription auth and
-  Anthropic API-key provider adapter.
+  model request; follow-ups remain next-turn work.
+- Turn-level interrupt; idle-only retry/continue (`turn.resume`) for terminal
+  model turns; idle-only active-branch switch; idle-only `session.delete`.
+- Manual and automatic compaction; OpenAI uses provider-native compaction,
+  Anthropic uses a local text summary. Compaction is a typed transcript root,
+  not a session boundary.
+- Turn-oriented selected-session loading: collapsed turn cards plus lazy
+  per-turn detail, so normal loads do not scale with transcript size, and raw
+  `provider_replay` never reaches any UI/RPC response.
+- Daemon restart recovery for open transcript tails; stale action rejection via
+  persisted `attempt_id`.
+- Repo-level `PI.md` prompt composition, with each workspace's `AGENTS.md`
+  included by the template.
+- Real OpenAI/Codex (ChatGPT subscription transport) and Anthropic API-key
+  provider paths, with prompt-cache shaping on both.
 
 Not implemented by design:
 
 - Hierarchical subagent orchestration.
 - Approval UI or tool permission policy.
-- Explicit open/close/resume/delete session RPC.
+- Explicit `open`/`close` or session-level `resume` RPC.
 - General plugin/provider marketplace.
-- Non-Postgres storage backends. The old in-memory/JSONL store layer was
-  removed once the websocket path became Postgres-only.
-
-## Vocabulary
-
-`agent-vocab` owns serializable data shapes:
-
-- `TurnId` and `ActionId`: numeric local runtime ids.
-- `ToolCallId`: opaque provider/tool id string.
-- `UserMessage`: `Vec<ContentBlock>`.
-- `ContentBlock`: `Text` and `Image`.
-- `ImageContent`: `mime_type` plus `ImageSource`.
-- `ImageSource`: `Base64` or `Url`.
-- `AssistantMessage`: ordered `Vec<AssistantItem>`.
-- `AssistantItem`: `Text`, `ThinkingRedacted`, or `ToolCall`.
-- `ToolDefinition`, `ToolCall`, `ToolResultMessage`, `ToolResultStatus`.
-- `TranscriptItem`: `TurnStarted`, `UserMessage`, `AssistantMessage`,
-  `ToolCallStarted`, `ToolResult`, `TurnFinished`, and `CompactionSummary`.
-
-Thinking block content is intentionally discarded. Images are first-class input
-because the agent needs vision-capable provider requests.
-
-## Core FSM
-
-`agent-core` owns only deterministic turn transitions:
-
-- Inputs: user steer/follow-up, interrupt, model completion/failure, tool
-  completion.
-- Outputs: transcript items and requested side effects.
-- Requested side effects: model request, tool request, and turn cancellation.
-- No filesystem, network, async runtime, provider SDK, tool execution, durable
-  storage, or websocket concepts.
-
-The core does not model injected context, sources, agents, or routing metadata.
-
-## Session Semantics
-
-`agent-session` wraps the pure FSM with durable history semantics.
-
-`AgentSession` owns:
-
-- `AgentCoreLoop`.
-- `TranscriptStore`.
-- Private outstanding action tracking.
-- Optional context-token count.
-- Action and event outboxes.
-
-`TranscriptStore` is an append-only forest:
-
-```rust
-pub struct TranscriptStorageNode {
-    pub id: String,
-    pub parent_id: Option<String>,
-    pub timestamp_ms: u64,
-    pub item: TranscriptItem,
-}
-```
-
-The active session view is one root-to-leaf path. `ModelContext` is
-materialized from that path for provider requests and daemon-owned compaction
-jobs.
-
-Important operations:
-
-- Restore/resume: build an idle core from stored transcript history. Open tails
-  are recovered as crashed before the session is exposed as idle.
-- Switch: move the active leaf to a prior turn boundary without deleting rows.
-  This is transcript-only; workspace files are not checkpointed or restored.
-- Compaction: the daemon asks the provider to summarize the active
-  `ModelContext`; `agent-store` atomically appends a
-  `TranscriptItem::CompactionSummary` root and makes that root active. The old
-  branch remains available for same-session active-leaf switching and tree
-  inspection. Compaction is not a session boundary.
-
-The session primitive can invalidate active work during a local switch. The
-websocket contract is stricter: source-mutating history writes are idle-only so
-frontend lifecycle rules are easy to reason about and test.
-
-## Storage And Recovery
-
-There is one durable storage backend today:
-
-- `agent-store::PostgresAgentStore`: normalized Postgres persistence for
-  sessions, transcript entries, queued inputs, actions, events, and daemon
-  config.
-
-`agent-session` also owns `StoredSession` and `StoredTranscriptEntry` as
-storage snapshot shapes used to rehydrate the live session semantics. Those
-types are not a backend abstraction by themselves.
-
-Postgres is the only source of truth. The daemon may hold an in-memory
-`AgentSession` while a turn is running, but accepted
-transitions are written transactionally before follow-on work is dispatched.
-If that transactional write fails after the live session has advanced, the
-daemon evicts the live session so the next interaction reloads from Postgres.
-Short state transitions take a row lock on the target `sessions` row first,
-serializing that one session without locking unrelated sessions or holding locks
-across provider/tool I/O.
-Idle user inputs are materialized directly into transcript/action/event state.
-Busy user inputs are kept in Postgres until the session reaches a boundary.
-When the daemon is ready to consume one, it peeks the next queued row and later
-marks that same row `consumed` in the transcript/action/event transaction. That
-commit fences the peek with the row version and re-checks that the row is still
-the canonical next queued input, so concurrent edit/cancel/reorder or a new
-steer above it forces the stale in-memory cursor to reload from Postgres.
-Legacy `consuming` rows from older daemons are reset to `queued` on first touch
-after daemon restart. This avoids a consumed-but-not-transcripted mailbox gap
-during daemon death while keeping queued follow-up mutations safe.
-
-Unfinished actions are execution leases owned by the daemon process. Startup
-marks leftover unfinished action rows stale before accepting websocket clients.
-If a stale action left the active transcript in an open turn, first touch
-rehydrates the session and appends a crashed turn boundary. A clean boundary
-with an unfinished action is otherwise treated as legitimate live work, which is
-what lets queued follow-ups wait behind provider-backed compaction without
-triggering transcript repair.
-
-The Postgres data model is documented in
-[`websocket-rpc.md`](websocket-rpc.md). Its important recovery invariants are:
-
-- Open transcript tails are valid while unfinished actions explain them.
-- Interrupt commits the closed interrupted tail and action invalidation
-  together.
-- Session-wide cancellation is represented by `session.work_cancelled`; it does
-  not create a model/tool action row.
-- Daemon death before commit leaves the old open tail recoverable.
-- Daemon death after commit leaves replayable events.
-- Daemon death during outstanding model/tool work is repaired on next touch with stale
-  actions plus a crashed turn tail.
-- Late completions from stale attempts cannot mutate history.
-- Queue-visible transitions increment revision counters and emit canonical
-  queue projections so frontend/daemon/Postgres views converge by replacement,
-  not inferred patches.
-
-## Providers
-
-`agent-provider` defines:
-
-- `ModelRequest`.
-- `ModelResponse`.
-- `ModelProvider`.
-- `OpenAiProvider`.
-- `AnthropicProvider`.
-
-`ModelRequest` includes `model`, `PromptSections`, transcript items, tool
-definitions, optional explicit `max_tokens`, and optional `prompt_cache_key`.
-`PromptSections` separates a stable prefix from dynamic daemon context so the
-cacheable prefix is rendered before request-specific context and transcript
-history.
-
-Provider adapters:
-
-- OpenAI/Codex backend via streamed Responses API, bearer ChatGPT token,
-  optional `ChatGPT-Account-ID`, and the Codex residency routing header.
-- Anthropic Messages API via `ANTHROPIC_API_KEY`.
-
-Supported provider features:
-
-- Text input/output.
-- Image input via URL or base64 data URL.
-- Tool definitions and tool calls.
-- Tool result replay.
-- Redacted thinking markers.
-- Stable-prefix/dynamic-context prompt rendering.
-- Prompt cache key on OpenAI request paths.
-- Priority service tier, explicit parallel tool calls, and disabled output
-  storage on OpenAI/Codex Responses requests.
-- No daemon-enforced OpenAI/Codex output-token cap when `max_tokens` is omitted.
-
-Streaming is currently normalized inside the OpenAI/Codex provider by reading
-the SSE response and producing one `AssistantMessage`.
-
-## Tools
-
-`agent-tools` owns:
-
-- `AgentTool`.
-- `ToolRegistry`.
-- `ToolContext`.
-- Builtin `read`, `write`, `edit`, and `bash`.
-
-Tools are async and registry-driven. The agent loop requests a tool call; the
-daemon or CLI chooses the registry and feeds a `ToolResultMessage` back into
-the session.
-
-Current builtins:
-
-- `Grep`: search files under the session `outer_cwd`.
-- `Edit`/`apply_patch`: view or edit files under the session `outer_cwd`.
-- `Bash`: run a fresh command under the session `outer_cwd` with a 30-second
-  default timeout.
-
-Tools are intentionally unsandboxed personal-use primitives. Tool calls are
-always allowed, and there is no approval interface.
-
-## Daemon And RPC
-
-`agent-daemon` exposes `pi-agentd`, a websocket JSON-RPC-ish server backed by
-Postgres. It owns:
-
-- Schema migration for the normalized Postgres tables.
-- Websocket request routing.
-- Reconnect event replay.
-- Session recovery before first touch.
-- Provider credential loading.
-- Automatic tool dispatch.
-- Development harness methods for deterministic model/compaction edges.
-
-The implemented RPC contract is documented in
-[`websocket-rpc.md`](websocket-rpc.md).
+- Non-Postgres storage backends. The old in-memory/JSONL store layer was removed
+  once the websocket path became Postgres-only.
 
 ## Removed Pieces
 
@@ -341,31 +133,23 @@ The implemented RPC contract is documented in
 - `SessionRegistry`.
 - Async channel `AgentRunner`.
 - Hierarchical subagent-specific control surfaces and routing metadata.
+- The old in-memory/JSONL `agent-store` layer.
 
 Durable storage is the registry. Process-local state only exists to drive
 current work.
 
 ## Verification Status
 
-The current implementation has been checked with:
+The implementation is checked with full-workspace format/compile/unit tests,
+plus the manual websocket exercises in [websocket-rpc.md](websocket-rpc.md)
+against a real Postgres database (real Codex text and image-URL turns, daemon
+death/restart recovery with snapshot reload, and reconnect event replay).
+Anthropic real-provider websocket tests require a raw `ANTHROPIC_API_KEY`.
 
-- Full workspace formatting.
-- Full workspace compile.
-- Full workspace unit tests.
-- Manual websocket exercises against a real Postgres database.
-- Browser flow checks against the real websocket daemon.
-- Real Codex text and image-URL turns through the websocket daemon.
-- Daemon death/restart recovery with snapshot reload plus reconnect event
-  replay.
+## Where To Read Next
 
-Anthropic real-provider websocket tests require a raw `ANTHROPIC_API_KEY`; the
-local Claude Code credentials were not a raw Anthropic key.
-
-## Useful Next Steps
-
-- Add a small scripted websocket exercise runner for the manual scenarios.
-- Add SQLx offline/prepare metadata if we decide compile-checked queries are
-  worth the extra local setup. The runtime store already uses SQLx for pooling,
-  binding, transactions, and row decoding.
-- Add richer usage/cost accounting inside provider adapters without changing
-  `agent-core`.
+- Per-crate detail: [`modules/`](modules/).
+- Why the visible/invisible choices were made: [design-decisions.md](design-decisions.md).
+- The frontend wire contract and manual exercise plan: [websocket-rpc.md](websocket-rpc.md).
+- The React client: [`../../packages/web/docs/web-ui.md`](../../packages/web/docs/web-ui.md).
+- In-flight future work: [`plans/`](plans/).
