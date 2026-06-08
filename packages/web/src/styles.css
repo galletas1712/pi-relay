@@ -288,11 +288,10 @@ pre {
 }
 
 .inspector-head {
-	font-family: var(--font-mono);
+	font-family: var(--font-sans);
 	font-size: var(--text-xs);
-	font-weight: 500;
-	text-transform: uppercase;
-	letter-spacing: 0.04em;
+	font-weight: 600;
+	letter-spacing: 0;
 }
 
 .activity-counts {
@@ -378,9 +377,9 @@ pre {
 	justify-content: space-between;
 	gap: 8px;
 	padding: 0 4px 6px;
-	font-family: var(--font-mono);
+	font-family: var(--font-sans);
 	font-size: var(--text-2xs);
-	text-transform: uppercase;
+	font-weight: 600;
 	color: var(--muted-foreground);
 }
 
@@ -1618,21 +1617,24 @@ pre {
 .tool-call-id,
 .tool-pending {
 	padding: 8px 12px 0;
-	font-family: var(--font-mono);
 	font-size: var(--text-2xs);
-	text-transform: uppercase;
 	color: var(--muted-foreground);
+}
+
+.tool-section-label {
+	font-family: var(--font-sans);
+	font-weight: 600;
 }
 
 .tool-call-id {
 	border-top: 1px solid var(--border);
 	padding: 8px 12px;
-	text-transform: none;
+	font-family: var(--font-mono);
 }
 
 .tool-pending {
 	padding-bottom: 10px;
-	text-transform: none;
+	font-family: var(--font-sans);
 }
 
 .tool-run-group pre,
@@ -1847,9 +1849,9 @@ pre {
 }
 
 .history-title-field span {
-	font-family: var(--font-mono);
+	font-family: var(--font-sans);
 	font-size: var(--text-xs);
-	text-transform: uppercase;
+	font-weight: 600;
 	color: var(--muted-foreground);
 }
 
@@ -2520,10 +2522,10 @@ pre {
 	gap: 12px;
 	border-bottom: 1px solid var(--border);
 	padding: 8px 10px;
-	font-family: var(--font-mono);
+	font-family: var(--font-sans);
 	font-size: var(--text-xs);
+	font-weight: 600;
 	color: var(--muted-foreground);
-	text-transform: uppercase;
 }
 
 .queue-list {
@@ -2792,11 +2794,10 @@ pre {
 
 .inspect-section h2 {
 	margin: 0 0 9px;
-	font-family: var(--font-mono);
+	font-family: var(--font-sans);
 	font-size: var(--text-xs);
-	font-weight: 500;
-	text-transform: uppercase;
-	letter-spacing: 0.04em;
+	font-weight: 600;
+	letter-spacing: 0;
 	color: var(--muted-foreground);
 }
 
