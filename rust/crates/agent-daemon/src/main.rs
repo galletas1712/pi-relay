@@ -280,7 +280,10 @@ async fn dispatch_request(
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
+        RpcMethod::SubagentList => subagents::subagent_list(state, params).await,
         RpcMethod::SubagentSpawn => subagents::subagent_spawn(state, params).await,
+        RpcMethod::SubagentSend => subagents::subagent_send(state, params).await,
+        RpcMethod::SubagentTail => subagents::subagent_tail(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }

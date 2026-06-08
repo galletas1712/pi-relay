@@ -74,7 +74,10 @@ pub(crate) enum RpcMethod {
     TurnResume,
     ToolsList,
     CompactionRequest,
+    SubagentList,
     SubagentSpawn,
+    SubagentSend,
+    SubagentTail,
     HarnessModelComplete,
     HarnessModelFail,
 }
@@ -112,7 +115,10 @@ impl RpcMethod {
             "turn.resume" => Some(Self::TurnResume),
             "tools.list" => Some(Self::ToolsList),
             "compaction.request" => Some(Self::CompactionRequest),
+            "subagent.list" => Some(Self::SubagentList),
             "subagent.spawn" => Some(Self::SubagentSpawn),
+            "subagent.send" => Some(Self::SubagentSend),
+            "subagent.tail" => Some(Self::SubagentTail),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
             _ => None,
@@ -189,8 +195,20 @@ mod tests {
         );
         assert_eq!(RpcMethod::parse("turn.resume"), Some(RpcMethod::TurnResume));
         assert_eq!(
+            RpcMethod::parse("subagent.list"),
+            Some(RpcMethod::SubagentList)
+        );
+        assert_eq!(
             RpcMethod::parse("subagent.spawn"),
             Some(RpcMethod::SubagentSpawn)
+        );
+        assert_eq!(
+            RpcMethod::parse("subagent.send"),
+            Some(RpcMethod::SubagentSend)
+        );
+        assert_eq!(
+            RpcMethod::parse("subagent.tail"),
+            Some(RpcMethod::SubagentTail)
         );
         assert_eq!(
             RpcMethod::parse("history.switch"),

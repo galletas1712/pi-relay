@@ -10,12 +10,51 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::codec::from_params;
+use crate::codec::{from_params, parse_user_message};
 use crate::provider_runtime::{render_pi_prompt, resolve_skill_role};
-use crate::runtime::SessionDriver;
+use crate::rpc_views;
+use crate::runtime::{publish_events, SessionDriver};
 use crate::session_start::{start_prepared_session, PreparedSessionStart, StartedSession};
 use crate::state::AppState;
 use crate::types::RpcError;
+
+pub(crate) async fn subagent_list(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let params: SubagentListParams = from_params(params)?;
+    let parent_session_id = params.parent_session_id.trim().to_string();
+    if parent_session_id.is_empty() {
+        return Err(RpcError::new(
+            "invalid_params",
+            "parent_session_id cannot be empty",
+        ));
+    }
+    let relationships = state
+        .repo
+        .list_session_relationships_by_source(
+            &parent_session_id,
+            Some(SessionRelationshipKind::Subagent),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    let mut subagents = Vec::with_capacity(relationships.len());
+    for relationship in relationships {
+        let activity = state
+            .repo
+            .activity(&relationship.target_session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        subagents.push(json!({
+            "relationship": relationship_view(&relationship),
+            "activity": activity,
+        }));
+    }
+    Ok(json!({
+        "parent_session_id": parent_session_id,
+        "subagents": subagents,
+    }))
+}
 
 pub(crate) async fn subagent_spawn(
     state: &AppState,
@@ -30,6 +69,89 @@ pub(crate) async fn subagent_spawn(
         "activity": spawned.started.activity,
         "replayed": spawned.started.replayed,
     }))
+}
+
+pub(crate) async fn subagent_send(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let request = SubagentSendRequest::from_params(params)?;
+    let relationship =
+        require_subagent_relationship(state, &request.parent_session_id, &request.child_session_id)
+            .await?;
+    let child_driver = SessionDriver::acquire(state, &request.child_session_id).await;
+    child_driver.recover_if_needed().await?;
+    let has_running = state
+        .repo
+        .has_unfinished_actions(&request.child_session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let queued = state
+        .repo
+        .enqueue_user_input(
+            &request.child_session_id,
+            request.priority,
+            &request.content,
+            request.client_input_id.as_deref(),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    if let Some(event) = queued.event {
+        publish_events(state, vec![event]);
+    }
+    if !has_running {
+        child_driver.drive_until_blocked().await?;
+    }
+    let queue = state
+        .repo
+        .queue_state(&request.child_session_id)
+        .await
+        .map(rpc_views::queue_state)
+        .map_err(anyhow::Error::from)?;
+    Ok(json!({
+        "parent_session_id": request.parent_session_id,
+        "child_session_id": request.child_session_id,
+        "relationship": relationship_view(&relationship),
+        "input_id": queued.input_id,
+        "queued": true,
+        "queue": queue,
+    }))
+}
+
+pub(crate) async fn subagent_tail(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let params: SubagentTailParams = from_params(params)?;
+    let parent_session_id = params.parent_session_id.trim().to_string();
+    let child_session_id = params.child_session_id.trim().to_string();
+    if parent_session_id.is_empty() || child_session_id.is_empty() {
+        return Err(RpcError::new(
+            "invalid_params",
+            "parent_session_id and child_session_id cannot be empty",
+        ));
+    }
+    let relationship =
+        require_subagent_relationship(state, &parent_session_id, &child_session_id).await?;
+    let child_driver = SessionDriver::acquire(state, &child_session_id).await;
+    child_driver.recover_if_needed().await?;
+    let turns = state
+        .repo
+        .transcript_turns(&child_session_id, None, params.limit.map(i64::from))
+        .await
+        .map(rpc_views::transcript_turns)
+        .map_err(anyhow::Error::from)?;
+    Ok(json!({
+        "parent_session_id": parent_session_id,
+        "child_session_id": child_session_id,
+        "relationship": relationship_view(&relationship),
+        "transcript": turns,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct SubagentListParams {
+    parent_session_id: String,
 }
 
 #[derive(Debug)]
@@ -99,6 +221,52 @@ struct SubagentSpawnParams {
     metadata: Option<Value>,
     workflow_id: Option<String>,
     result_variable: Option<String>,
+}
+
+#[derive(Debug)]
+struct SubagentSendRequest {
+    parent_session_id: String,
+    child_session_id: String,
+    priority: InputPriority,
+    content: UserMessage,
+    client_input_id: Option<String>,
+}
+
+impl SubagentSendRequest {
+    fn from_params(params: Value) -> std::result::Result<Self, RpcError> {
+        let params: SubagentSendParams = from_params(params)?;
+        let parent_session_id = params.parent_session_id.trim().to_string();
+        let child_session_id = params.child_session_id.trim().to_string();
+        if parent_session_id.is_empty() || child_session_id.is_empty() {
+            return Err(RpcError::new(
+                "invalid_params",
+                "parent_session_id and child_session_id cannot be empty",
+            ));
+        }
+        Ok(Self {
+            parent_session_id,
+            child_session_id,
+            priority: params.priority.unwrap_or(InputPriority::FollowUp),
+            content: parse_user_message(params.content)?,
+            client_input_id: params.client_input_id,
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct SubagentSendParams {
+    parent_session_id: String,
+    child_session_id: String,
+    priority: Option<InputPriority>,
+    content: Value,
+    client_input_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubagentTailParams {
+    parent_session_id: String,
+    child_session_id: String,
+    limit: Option<u32>,
 }
 
 struct SpawnedSubagent {
@@ -241,6 +409,29 @@ async fn spawn_subagent(
     })
 }
 
+async fn require_subagent_relationship(
+    state: &AppState,
+    parent_session_id: &str,
+    child_session_id: &str,
+) -> std::result::Result<SessionRelationship, RpcError> {
+    let relationship = state
+        .repo
+        .session_relationship_for_target(child_session_id)
+        .await
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| RpcError::new("subagent_not_found", "subagent relationship not found"))?;
+    if relationship.source_session_id != parent_session_id
+        || relationship.kind != SessionRelationshipKind::Subagent
+        || relationship.control_mode != SessionRelationshipControlMode::ParentControlled
+    {
+        return Err(RpcError::new(
+            "subagent_not_found",
+            "subagent relationship not found",
+        ));
+    }
+    Ok(relationship)
+}
+
 fn subagent_metadata(metadata: Value, parent_session_id: &str, role_file_path: &PathBuf) -> Value {
     let mut metadata = match metadata {
         Value::Object(map) => Value::Object(map),
@@ -363,6 +554,20 @@ mod tests {
         }))
         .expect_err("empty task rejected");
         assert_eq!(error.code, "invalid_params");
+    }
+
+    #[test]
+    fn send_request_defaults_to_follow_up_priority() {
+        let request = SubagentSendRequest::from_params(json!({
+            "parent_session_id": " parent ",
+            "child_session_id": " child ",
+            "content": [{ "type": "text", "text": "Continue." }],
+        }))
+        .expect("request parses");
+        assert_eq!(request.parent_session_id, "parent");
+        assert_eq!(request.child_session_id, "child");
+        assert_eq!(request.priority, InputPriority::FollowUp);
+        assert_eq!(request.content, "Continue.");
     }
 
     #[test]
