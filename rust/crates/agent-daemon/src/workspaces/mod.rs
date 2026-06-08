@@ -23,13 +23,22 @@ use self::config::{
 };
 pub(crate) use self::git::validate_remote_branch;
 use self::git::{git_output, refresh_git_workspace_base, run_git};
-use self::instantiate::{create_workspace_dir, instantiate_workspace_from_base};
+use self::instantiate::{
+    create_workspace_dir, instantiate_workspace_from_base, materialize_tree_from_source_exact,
+};
 use self::local::refresh_local_workspace_base;
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceManager {
     state_root: PathBuf,
     workspace_base_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ForkedSessionWorkspaces {
+    pub(crate) outer_cwd: String,
+    pub(crate) baseline_cwd: String,
+    pub(crate) workspaces: Vec<SessionWorkspace>,
 }
 
 impl WorkspaceManager {
@@ -112,6 +121,89 @@ impl WorkspaceManager {
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn fork_session_from_parent(
+        &self,
+        parent_session_id: &str,
+        parent_outer_cwd: &str,
+        parent_workspaces: &[SessionWorkspace],
+        child_session_id: &str,
+    ) -> Result<ForkedSessionWorkspaces> {
+        if parent_session_id == child_session_id {
+            bail!("child session id must differ from parent session id");
+        }
+        self.ensure_session(parent_session_id, parent_outer_cwd, parent_workspaces)
+            .await?;
+
+        let child_root = self.session_root(child_session_id);
+        let parent_cwd = PathBuf::from(parent_outer_cwd);
+        if child_root.starts_with(&parent_cwd) {
+            bail!(
+                "child session root {} must not be inside parent cwd {}",
+                child_root.display(),
+                parent_cwd.display()
+            );
+        }
+        if child_root.exists() {
+            tokio::fs::remove_dir_all(&child_root)
+                .await
+                .with_context(|| {
+                    format!(
+                        "remove existing child session root {}",
+                        child_root.display()
+                    )
+                })?;
+        }
+        tokio::fs::create_dir_all(&child_root)
+            .await
+            .with_context(|| format!("create child session root {}", child_root.display()))?;
+
+        let child_cwd = child_root.join("cwd");
+        let baseline_cwd = child_root.join("baseline-cwd");
+        materialize_tree_from_source_exact(&parent_cwd, &child_cwd)
+            .await
+            .with_context(|| {
+                format!(
+                    "fork parent session cwd {} to child cwd {}",
+                    parent_cwd.display(),
+                    child_cwd.display()
+                )
+            })?;
+        materialize_tree_from_source_exact(&parent_cwd, &baseline_cwd)
+            .await
+            .with_context(|| {
+                format!(
+                    "fork parent session cwd {} to child baseline {}",
+                    parent_cwd.display(),
+                    baseline_cwd.display()
+                )
+            })?;
+
+        let mut child_workspaces = Vec::with_capacity(parent_workspaces.len());
+        for workspace in parent_workspaces {
+            validate_workspace_dir(&workspace.workspace_dir)?;
+            let child_workspace_root = child_cwd.join(&workspace.workspace_dir);
+            let mut child_workspace = workspace.clone();
+            if workspace.kind == WorkspaceKind::Git {
+                validate_git_workspace_isolated(&child_workspace_root).await?;
+                let local_branch = local_branch(child_session_id, &workspace.workspace_dir);
+                let head = git_output(&child_workspace_root, ["rev-parse", "HEAD"]).await?;
+                run_git(
+                    &child_workspace_root,
+                    ["switch", "-C", &local_branch, &head],
+                )
+                .await?;
+                child_workspace.local_branch = Some(local_branch);
+            }
+            child_workspaces.push(child_workspace);
+        }
+
+        Ok(ForkedSessionWorkspaces {
+            outer_cwd: child_cwd.to_string_lossy().into_owned(),
+            baseline_cwd: baseline_cwd.to_string_lossy().into_owned(),
+            workspaces: child_workspaces,
+        })
     }
 
     pub(crate) async fn remove_session_dir(&self, session_id: &str) -> Result<()> {
@@ -329,6 +421,49 @@ fn local_branch(session_id: &str, workspace_dir: &str) -> String {
         branch_component(session_id),
         branch_component(workspace_dir)
     )
+}
+
+async fn validate_git_workspace_isolated(workspace_root: &Path) -> Result<()> {
+    if !workspace_root.is_dir() {
+        bail!(
+            "child git workspace is missing: {}",
+            workspace_root.display()
+        );
+    }
+    let git_dir = git_output(workspace_root, ["rev-parse", "--git-dir"]).await?;
+    let common_dir = git_output(workspace_root, ["rev-parse", "--git-common-dir"]).await?;
+    let workspace_root = tokio::fs::canonicalize(workspace_root)
+        .await
+        .with_context(|| format!("canonicalize child workspace {}", workspace_root.display()))?;
+    let git_dir = canonicalize_git_path(&workspace_root, &git_dir).await?;
+    let common_dir = canonicalize_git_path(&workspace_root, &common_dir).await?;
+    if !git_dir.starts_with(&workspace_root) {
+        bail!(
+            "child git dir {} escapes workspace {}",
+            git_dir.display(),
+            workspace_root.display()
+        );
+    }
+    if !common_dir.starts_with(&workspace_root) {
+        bail!(
+            "child git common dir {} escapes workspace {}",
+            common_dir.display(),
+            workspace_root.display()
+        );
+    }
+    Ok(())
+}
+
+async fn canonicalize_git_path(workspace_root: &Path, git_path: &str) -> Result<PathBuf> {
+    let path = Path::new(git_path);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace_root.join(path)
+    };
+    tokio::fs::canonicalize(&path)
+        .await
+        .with_context(|| format!("canonicalize git path {}", path.display()))
 }
 
 #[cfg(test)]
