@@ -996,7 +996,6 @@ export function App() {
 			!!selectedId && (lastEventIds.current.has(selectedId) || loadedSnapshot?.session_id === selectedId);
 		const desiredSessionIds = new Set<string>();
 		for (const session of sessions) {
-			if (session.session_id === selectedId && !selectedHasEventCursor) continue;
 			desiredSessionIds.add(session.session_id);
 		}
 		if (selectedId && selectedHasEventCursor) desiredSessionIds.add(selectedId);

@@ -259,10 +259,59 @@ fn title_from_response(items: &[AssistantItem]) -> Option<String> {
         let AssistantItem::Text(text) = item else {
             return None;
         };
-        let args: Value = serde_json::from_str(text.trim()).ok()?;
+        let args = title_json_from_text(text)?;
         let raw_title = args.get("title").and_then(Value::as_str)?;
         sanitize_title(raw_title)
     })
+}
+
+fn title_json_from_text(text: &str) -> Option<Value> {
+    let text = text.trim();
+    serde_json::from_str(text)
+        .ok()
+        .or_else(|| serde_json::from_str(strip_json_code_fence(text)?).ok())
+        .or_else(|| parse_first_json_object(text))
+}
+
+fn strip_json_code_fence(text: &str) -> Option<&str> {
+    let text = text.strip_prefix("```")?;
+    let text = text
+        .strip_prefix("json")
+        .or_else(|| text.strip_prefix("JSON"))
+        .unwrap_or(text);
+    let text = text.strip_prefix('\n').unwrap_or(text);
+    text.strip_suffix("```").map(str::trim)
+}
+
+fn parse_first_json_object(text: &str) -> Option<Value> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, ch) in text[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth = depth.saturating_add(1),
+            '}' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return serde_json::from_str(&text[start..=start + offset]).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn sanitize_title(title: &str) -> Option<String> {
