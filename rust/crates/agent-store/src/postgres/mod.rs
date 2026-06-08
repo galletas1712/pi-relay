@@ -14,6 +14,7 @@ mod sql;
 mod token_usage;
 mod transcript;
 mod turn_cards;
+mod workflow_variables;
 
 use anyhow::Result;
 use sqlx::postgres::PgPoolOptions;

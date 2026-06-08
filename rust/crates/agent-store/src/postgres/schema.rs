@@ -19,6 +19,7 @@ use sqlx::PgPool;
 /// - `events`: ordered observable event stream for websocket replay.
 /// - `session_relationships`: provenance/control graph between normal session
 ///   rows for subagents and related top-level sessions.
+/// - `workflow_variables`: durable workflow/session-scoped context bus values.
 const SCHEMA_SQL: &str = r#"
 create table if not exists projects (
     id uuid primary key,
@@ -147,6 +148,21 @@ create index if not exists session_relationships_source_kind_idx
 
 create index if not exists session_relationships_root_idx
     on session_relationships(root_session_id, created_at, id);
+
+create table if not exists workflow_variables (
+    workflow_id text not null,
+    name text not null,
+    value_json jsonb null,
+    value_text text null,
+    producer_session_id text null references sessions(id) on delete set null,
+    producer_action_id text null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now(),
+    primary key (workflow_id, name)
+);
+
+create index if not exists workflow_variables_workflow_updated_idx
+    on workflow_variables(workflow_id, updated_at, name);
 "#;
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {
