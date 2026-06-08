@@ -25,6 +25,20 @@
 	--ring: hsl(234 86% 64% / 0.45);
 	--font-sans: "Geist Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 	--font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+
+	/*
+	 * Type scale — a single, proportional set of integer steps so UI text reads
+	 * consistently and renders crisply (we deliberately avoid half-pixel sizes,
+	 * which blur on most displays). Roughly a +1px ladder anchored on the 13px
+	 * body size that dominates the UI.
+	 */
+	--text-2xs: 11px; /* micro labels: ids, pills, section eyebrows */
+	--text-xs: 12px; /* captions & metadata: secondary list lines, mono cells */
+	--text-sm: 13px; /* default UI text: form fields, list/dialog body */
+	--text-md: 14px; /* emphasis: list-item titles, pane headers */
+	--text-lg: 15px; /* reading text: assistant transcript & markdown */
+	--text-xl: 16px; /* headings: dialog titles */
+	--text-input-mobile: 17px; /* mobile inputs (>=16px avoids iOS auto-zoom) */
 }
 
 .project-dialog {
@@ -94,7 +108,7 @@ body,
 }
 
 html {
-	font: 15px/1.45 var(--font-sans);
+	font: var(--text-lg)/1.45 var(--font-sans);
 	-webkit-font-smoothing: antialiased;
 	font-feature-settings: "cv11", "ss01";
 }
@@ -195,7 +209,7 @@ pre {
 	text-overflow: ellipsis;
 	white-space: nowrap;
 	color: var(--foreground);
-	font-size: 14px;
+	font-size: var(--text-md);
 	font-weight: 600;
 }
 
@@ -210,7 +224,7 @@ pre {
 
 .mobile-topbar-status .connection-pill,
 .mobile-topbar-status .session-state {
-	font-size: 11px;
+	font-size: var(--text-2xs);
 	line-height: 1.3;
 	padding: 1px 6px;
 }
@@ -268,14 +282,14 @@ pre {
 
 .log-header {
 	font-family: var(--font-sans);
-	font-size: 14px;
+	font-size: var(--text-md);
 	font-weight: 600;
 	letter-spacing: 0;
 }
 
 .inspector-head {
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	font-weight: 500;
 	text-transform: uppercase;
 	letter-spacing: 0.04em;
@@ -293,7 +307,7 @@ pre {
 	align-items: center;
 	gap: 5px;
 	font-family: var(--font-sans);
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	font-weight: 500;
 	letter-spacing: 0;
 	text-transform: lowercase;
@@ -330,7 +344,7 @@ pre {
 }
 
 .connection-pill {
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	font-weight: 500;
 }
 
@@ -365,7 +379,7 @@ pre {
 	gap: 8px;
 	padding: 0 4px 6px;
 	font-family: var(--font-mono);
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	text-transform: uppercase;
 	color: var(--muted-foreground);
 }
@@ -428,13 +442,13 @@ pre {
 }
 
 .project-title {
-	font-size: 13.5px;
+	font-size: var(--text-sm);
 	font-weight: 600;
 }
 
 .project-cwd {
-	font-family: var(--font-mono);
-	font-size: 11px;
+	font-family: var(--font-sans);
+	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 }
 
@@ -529,7 +543,7 @@ pre {
 	outline: 0;
 	background: transparent;
 	color: var(--foreground);
-	font-size: 13.5px;
+	font-size: var(--text-sm);
 }
 
 .search-clear-button {
@@ -611,7 +625,7 @@ pre {
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	font-size: 13.5px;
+	font-size: var(--text-sm);
 	font-weight: 500;
 }
 
@@ -624,7 +638,7 @@ pre {
 .session-sub,
 .session-leaf {
 	font-family: var(--font-mono);
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 }
 
 .session-row-action {
@@ -676,7 +690,7 @@ pre {
 
 .empty-list {
 	padding: 32px 8px;
-	font-size: 13px;
+	font-size: var(--text-sm);
 }
 
 .empty-list.compact {
@@ -699,7 +713,7 @@ pre {
 }
 
 .session-state {
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	font-weight: 500;
 }
 
@@ -892,7 +906,7 @@ pre {
 	border-radius: 999px;
 	background: var(--card);
 	padding: 4px 10px;
-	font-size: 12px;
+	font-size: var(--text-xs);
 	color: var(--foreground);
 	cursor: pointer;
 }
@@ -936,7 +950,7 @@ pre {
 	height: 22px;
 	padding: 0;
 	font-family: var(--font-mono);
-	font-size: 11px;
+	font-size: var(--text-2xs);
 	color: var(--muted-foreground);
 	cursor: pointer;
 	opacity: 0;
@@ -979,7 +993,7 @@ pre {
 	align-items: flex-end;
 	gap: 8px;
 	overflow-wrap: anywhere;
-	font-size: 15px;
+	font-size: var(--text-lg);
 	line-height: 1.58;
 }
 
@@ -1051,7 +1065,7 @@ pre {
 .assistant-markdown h5,
 .assistant-markdown h6 {
 	margin: 1em 0 0.45em;
-	font-size: 15px;
+	font-size: var(--text-lg);
 	line-height: 1.35;
 	font-weight: 600;
 }
@@ -1101,7 +1115,7 @@ pre {
 	background: transparent;
 	padding: 0;
 	color: inherit;
-	font-size: 13px;
+	font-size: var(--text-sm);
 	line-height: 1.55;
 }
 
@@ -1181,7 +1195,7 @@ pre {
 	max-width: 100%;
 	overflow: auto;
 	border-collapse: collapse;
-	font-size: 13.5px;
+	font-size: var(--text-sm);
 }
 
 .assistant-markdown th,
@@ -1235,7 +1249,7 @@ pre {
 	border-radius: var(--radius);
 	padding: 3px 7px;
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 }
 
@@ -1247,7 +1261,7 @@ pre {
 	margin: 6px auto;
 	padding: 0 24px;
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 	font-variant-numeric: tabular-nums;
 }
@@ -1270,7 +1284,7 @@ pre {
 	background: var(--card);
 	padding: 0 8px;
 	font-family: var(--font-mono);
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	color: inherit;
 	cursor: pointer;
 }
@@ -1305,7 +1319,7 @@ pre {
 	background: color-mix(in oklch, var(--card) 96%, transparent);
 	padding: 8px 10px;
 	box-shadow: 0 10px 32px color-mix(in oklch, var(--foreground) 14%, transparent);
-	font-size: 13px;
+	font-size: var(--text-sm);
 	color: var(--foreground);
 }
 
@@ -1372,7 +1386,7 @@ pre {
 	padding: 8px 10px;
 	text-align: left;
 	font-family: var(--font-mono);
-	font-size: 13px;
+	font-size: var(--text-sm);
 	color: var(--foreground);
 	cursor: pointer;
 }
@@ -1445,14 +1459,14 @@ pre {
 	border-radius: 999px;
 	background: color-mix(in oklch, var(--background) 62%, transparent);
 	padding: 2px 7px;
-	font-size: 12px;
+	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 }
 
 .tool-run-head-status,
 .tool-status {
 	flex: 0 0 auto;
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	color: var(--muted-foreground);
 }
 
@@ -1482,7 +1496,7 @@ pre {
 	align-items: center;
 	padding: 6px 10px;
 	font-family: var(--font-mono);
-	font-size: 12.5px;
+	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 }
 
@@ -1501,7 +1515,7 @@ pre {
 	padding: 6px 10px;
 	text-align: left;
 	font-family: var(--font-mono);
-	font-size: 12.5px;
+	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 	cursor: pointer;
 }
@@ -1545,7 +1559,7 @@ pre {
 	padding: 7px 10px;
 	text-align: left;
 	font-family: var(--font-mono);
-	font-size: 12.5px;
+	font-size: var(--text-xs);
 	color: var(--foreground);
 	cursor: pointer;
 }
@@ -1575,7 +1589,7 @@ pre {
 }
 
 .tool-run-item-status {
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	color: var(--muted-foreground);
 }
 
@@ -1605,7 +1619,7 @@ pre {
 .tool-pending {
 	padding: 8px 12px 0;
 	font-family: var(--font-mono);
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	text-transform: uppercase;
 	color: var(--muted-foreground);
 }
@@ -1631,7 +1645,7 @@ pre {
 	padding: 12px 18px;
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	line-height: 1.4;
 }
 
@@ -1652,7 +1666,7 @@ pre {
 	border-bottom: 1px solid var(--border);
 	padding: 8px 12px;
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 }
 
@@ -1681,7 +1695,7 @@ pre {
 	overflow-y: auto;
 	overflow-x: hidden;
 	font-family: var(--font-mono);
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	line-height: 1.4;
 }
 
@@ -1812,7 +1826,7 @@ pre {
 
 .history-dialog-copy h2 {
 	margin: 0;
-	font-size: 15.5px;
+	font-size: var(--text-xl);
 	font-weight: 600;
 	letter-spacing: 0;
 }
@@ -1820,7 +1834,7 @@ pre {
 .history-dialog-copy p {
 	margin: 2px 0 0;
 	color: var(--muted-foreground);
-	font-size: 13px;
+	font-size: var(--text-sm);
 }
 
 .history-title-field {
@@ -1834,7 +1848,7 @@ pre {
 
 .history-title-field span {
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	text-transform: uppercase;
 	color: var(--muted-foreground);
 }
@@ -1893,7 +1907,7 @@ pre {
 	background: var(--muted);
 	color: var(--muted-foreground);
 	padding: 6px 10px;
-	font-size: 13px;
+	font-size: var(--text-sm);
 }
 
 .system-prompt-tabs button.selected {
@@ -1915,7 +1929,7 @@ pre {
 	margin: 0;
 	white-space: pre-wrap;
 	overflow-wrap: anywhere;
-	font-size: 13px;
+	font-size: var(--text-sm);
 	line-height: 1.5;
 }
 
@@ -1939,7 +1953,7 @@ pre {
 
 .rename-dialog-copy h2 {
 	margin: 0;
-	font-size: 16.5px;
+	font-size: var(--text-xl);
 	font-weight: 600;
 	letter-spacing: 0;
 }
@@ -1953,7 +1967,7 @@ pre {
 
 .rename-field span {
 	color: var(--muted-foreground);
-	font-size: 13px;
+	font-size: var(--text-sm);
 }
 
 .rename-field input {
@@ -1991,7 +2005,7 @@ pre {
 .workspace-editor-head > span,
 .workspace-card label span {
 	color: var(--muted-foreground);
-	font-size: 13px;
+	font-size: var(--text-sm);
 }
 
 .workspace-editor-list {
@@ -2008,6 +2022,21 @@ pre {
 	border-radius: var(--radius);
 	background: var(--background);
 	padding: 10px;
+}
+
+/* Mirror the WorkspaceScopePicker popover: kind icon + sans label per workspace. */
+.workspace-card-head {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	color: var(--foreground);
+	font-family: var(--font-sans);
+	font-size: var(--text-sm);
+	font-weight: 500;
+}
+
+.workspace-card-head svg {
+	color: var(--muted-foreground);
 }
 
 .workspace-row {
@@ -2085,7 +2114,7 @@ pre {
 	background: var(--background);
 	color: var(--foreground);
 	padding: 0 12px;
-	font-size: 13px;
+	font-size: var(--text-sm);
 	cursor: pointer;
 }
 
@@ -2231,7 +2260,7 @@ pre {
 	border: 1px solid var(--border);
 	border-radius: 999px;
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 }
 
@@ -2251,7 +2280,7 @@ pre {
 	min-width: 0;
 	align-items: center;
 	gap: 7px;
-	font-size: 14px;
+	font-size: var(--text-md);
 	font-weight: 600;
 }
 
@@ -2270,12 +2299,12 @@ pre {
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	font-size: 13px;
+	font-size: var(--text-sm);
 }
 
 .history-option-meta {
 	font-family: var(--font-mono);
-	font-size: 11.5px;
+	font-size: var(--text-2xs);
 	white-space: nowrap;
 }
 
@@ -2284,7 +2313,7 @@ pre {
 	border-radius: 999px;
 	padding: 1px 6px;
 	font-family: var(--font-mono);
-	font-size: 11px;
+	font-size: var(--text-2xs);
 	font-weight: 400;
 	color: var(--muted-foreground);
 }
@@ -2315,7 +2344,7 @@ pre {
 	gap: 8px;
 	padding: 34px 12px;
 	color: var(--muted-foreground);
-	font-size: 13px;
+	font-size: var(--text-sm);
 	font-weight: 500;
 }
 
@@ -2331,7 +2360,7 @@ pre {
 	border: 0;
 	background: transparent;
 	color: var(--muted-foreground);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	padding: 2px 0;
 	cursor: pointer;
 }
@@ -2369,7 +2398,7 @@ pre {
 	gap: 6px;
 	min-width: 0;
 	color: var(--foreground);
-	font-size: 13px;
+	font-size: var(--text-sm);
 }
 
 .workspace-scope-name span {
@@ -2383,7 +2412,7 @@ pre {
 	border-radius: var(--radius);
 	background: var(--card);
 	color: var(--foreground);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	padding: 4px 8px;
 	outline: 0;
 }
@@ -2492,7 +2521,7 @@ pre {
 	border-bottom: 1px solid var(--border);
 	padding: 8px 10px;
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 	text-transform: uppercase;
 }
@@ -2519,7 +2548,7 @@ pre {
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
-	font-size: 14px;
+	font-size: var(--text-md);
 }
 
 .queue-edit {
@@ -2560,7 +2589,7 @@ pre {
 	color: var(--foreground);
 	padding: 0 8px;
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 }
 
 .queue-steer-button:disabled,
@@ -2609,7 +2638,7 @@ pre {
 .slash-name {
 	min-width: 0;
 	font-family: var(--font-mono);
-	font-size: 13px;
+	font-size: var(--text-sm);
 	color: var(--foreground);
 	overflow-wrap: anywhere;
 }
@@ -2617,13 +2646,13 @@ pre {
 .slash-name small {
 	margin-left: 6px;
 	color: var(--muted-foreground);
-	font-size: 12px;
+	font-size: var(--text-xs);
 }
 
 .slash-description {
 	min-width: 0;
 	color: var(--muted-foreground);
-	font-size: 13px;
+	font-size: var(--text-sm);
 	overflow-wrap: anywhere;
 }
 
@@ -2764,7 +2793,7 @@ pre {
 .inspect-section h2 {
 	margin: 0 0 9px;
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	font-weight: 500;
 	text-transform: uppercase;
 	letter-spacing: 0.04em;
@@ -2779,7 +2808,7 @@ pre {
 	justify-content: space-between;
 	gap: 12px;
 	min-height: 24px;
-	font-size: 13px;
+	font-size: var(--text-sm);
 }
 
 .kv span,
@@ -2796,7 +2825,7 @@ pre {
 	text-overflow: ellipsis;
 	white-space: nowrap;
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	font-weight: 500;
 }
 
@@ -2817,7 +2846,7 @@ pre {
 	border-radius: 999px;
 	padding: 3px 7px;
 	font-family: var(--font-mono);
-	font-size: 12px;
+	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 }
 
@@ -2896,7 +2925,7 @@ pre {
 
 .export-count {
 	color: var(--muted-foreground);
-	font-size: 13px;
+	font-size: var(--text-sm);
 }
 
 .export-toolbar-actions {
@@ -2916,7 +2945,7 @@ pre {
 	padding: 28px 12px;
 	text-align: center;
 	color: var(--muted-foreground);
-	font-size: 14px;
+	font-size: var(--text-md);
 }
 
 .export-option {
@@ -2945,7 +2974,7 @@ pre {
 }
 
 .export-option-title {
-	font-size: 13px;
+	font-size: var(--text-sm);
 	font-weight: 600;
 }
 
@@ -2960,7 +2989,7 @@ pre {
 
 .export-option-preview {
 	color: var(--muted-foreground);
-	font-size: 13px;
+	font-size: var(--text-sm);
 	overflow: hidden;
 	text-overflow: ellipsis;
 	white-space: nowrap;
@@ -3021,18 +3050,18 @@ pre {
 
 @media (max-width: 760px) {
 	html {
-		font-size: 15.5px;
+		font-size: var(--text-lg);
 	}
 
 	input,
 	textarea,
 	select {
-		font-size: 17.5px;
+		font-size: var(--text-input-mobile);
 	}
 
 	.search-box input,
 	.composer {
-		font-size: 17.5px;
+		font-size: var(--text-input-mobile);
 	}
 
 	.app-shell {
@@ -3075,7 +3104,7 @@ pre {
 		width: 100%;
 		max-width: none;
 		height: 34px;
-		font-size: 17.5px;
+		font-size: var(--text-input-mobile);
 	}
 
 	.message-scroll {
@@ -3098,7 +3127,7 @@ pre {
 	}
 
 	.assistant-block {
-		font-size: 15.5px;
+		font-size: var(--text-lg);
 		line-height: 1.56;
 	}
 
@@ -3234,7 +3263,7 @@ pre {
 	}
 
 	.history-dialog-copy p {
-		font-size: 12.5px;
+		font-size: var(--text-xs);
 	}
 
 	.history-title-field {
@@ -3292,7 +3321,7 @@ pre {
 	}
 
 	.history-option-meta {
-		font-size: 11px;
+		font-size: var(--text-2xs);
 	}
 
 	.history-actions,
@@ -3350,7 +3379,7 @@ pre {
 	}
 
 	.tool-run-pill {
-		font-size: 11.5px;
+		font-size: var(--text-2xs);
 		padding: 1px 6px;
 	}
 
