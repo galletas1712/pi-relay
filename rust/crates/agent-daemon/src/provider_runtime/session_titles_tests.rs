@@ -59,6 +59,13 @@ fn truncated_web_titles_are_treated_as_placeholders() {
         Some("right now session names in pi-relay are just a prefix of the ..."),
         &json!({ "created_by": "web" }),
     ));
+    assert_eq!(
+        title_prompt_for_current_title(
+            Some("right now session names in pi-relay are just a prefix of the ..."),
+            &json!({ "created_by": "web" }),
+        ),
+        TITLE_REPLACE_PLACEHOLDER_PROMPT
+    );
 }
 
 #[test]
@@ -79,6 +86,13 @@ fn explicit_or_finished_titles_are_not_truncated_placeholders() {
         Some("Manual looking title ..."),
         &json!({ "created_by": "web", "auto_title_disabled": true }),
     ));
+    assert_eq!(
+        title_prompt_for_current_title(
+            Some("Auto Session Titles"),
+            &json!({ "created_by": "web" })
+        ),
+        TITLE_REFRESH_PROMPT
+    );
 }
 
 #[test]
