@@ -34,6 +34,11 @@ fn ensure_compaction_auto_state_object(metadata: &mut Value) -> &mut Map<String,
     ensure_object(auto_state)
 }
 
+enum TitleUpdateKind {
+    Automatic,
+    Manual,
+}
+
 impl PostgresAgentStore {
     pub async fn create_session(
         &self,
@@ -258,21 +263,57 @@ impl PostgresAgentStore {
     }
 
     pub async fn rename_session(&self, session_id: &str, title: &str) -> Result<Vec<EventFrame>> {
+        self.update_session_title(session_id, title, TitleUpdateKind::Automatic)
+            .await
+    }
+
+    pub async fn rename_session_manually(
+        &self,
+        session_id: &str,
+        title: &str,
+    ) -> Result<Vec<EventFrame>> {
+        self.update_session_title(session_id, title, TitleUpdateKind::Manual)
+            .await
+    }
+
+    async fn update_session_title(
+        &self,
+        session_id: &str,
+        title: &str,
+        update_kind: TitleUpdateKind,
+    ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
-        let row = sqlx::query(
-            r#"
+        let query = match update_kind {
+            TitleUpdateKind::Automatic => {
+                r#"
                 update sessions
                 set metadata = jsonb_set(metadata, '{title}', to_jsonb($2::text), true),
                     updated_at = now()
                 where id = $1
                 returning provider_config, metadata
-            "#,
-        )
-        .bind(session_id)
-        .bind(title)
-        .fetch_optional(&mut *tx)
-        .await?;
+            "#
+            }
+            TitleUpdateKind::Manual => {
+                r#"
+                update sessions
+                set metadata = jsonb_set(
+                        jsonb_set(metadata, '{title}', to_jsonb($2::text), true),
+                        '{auto_title_disabled}',
+                        'true'::jsonb,
+                        true
+                    ),
+                    updated_at = now()
+                where id = $1
+                returning provider_config, metadata
+            "#
+            }
+        };
+        let row = sqlx::query(query)
+            .bind(session_id)
+            .bind(title)
+            .fetch_optional(&mut *tx)
+            .await?;
         let Some(row) = row else {
             return Err(anyhow!("session not found: {session_id}"));
         };

@@ -9,7 +9,7 @@ use agent_tools::ToolRegistry;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
-use crate::provider_runtime::ProviderConnectionRegistry;
+use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
 use crate::types::RuntimeSession;
 use crate::workspaces::WorkspaceManager;
 
@@ -29,6 +29,7 @@ pub(crate) struct AppState {
     pub(crate) events: broadcast::Sender<EventFrame>,
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) provider_connections: ProviderConnectionRegistry,
+    pub(crate) session_titles: SessionTitleScheduler,
     pub(crate) workspaces: WorkspaceManager,
     pub(crate) prompt_root: PathBuf,
 }

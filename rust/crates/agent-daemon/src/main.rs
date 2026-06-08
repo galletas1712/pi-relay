@@ -17,7 +17,9 @@ use crate::codec::{
     transcript_store_from_stored,
 };
 use crate::config::Config;
-use crate::provider_runtime::{current_pi_template, ProviderConnectionRegistry};
+use crate::provider_runtime::{
+    current_pi_template, ProviderConnectionRegistry, SessionTitleScheduler,
+};
 use crate::runtime::*;
 use crate::state::AppState;
 use crate::types::*;
@@ -68,6 +70,7 @@ async fn main() -> Result<()> {
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         provider_connections: ProviderConnectionRegistry::new(),
+        session_titles: SessionTitleScheduler::default(),
         workspaces,
         prompt_root,
     };
@@ -445,15 +448,21 @@ async fn session_rename(state: &AppState, params: Value) -> std::result::Result<
     let _driver = SessionDriver::acquire(state, &session_id).await;
     let events = state
         .repo
-        .rename_session(&session_id, &title)
+        .rename_session_manually(&session_id, &title)
         .await
         .map_err(anyhow::Error::from)?;
+    let config = state
+        .repo
+        .load_session_config(&session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    replace_active_session_config(state, &session_id, config.clone()).await;
     publish_events(state, events);
     clear_event_buffer_if_idle(state, &session_id).await?;
     Ok(json!({
         "session_id": session_id,
         "title": title,
-        "metadata": state.repo.load_session_config(&session_id).await.map_err(anyhow::Error::from)?.metadata,
+        "metadata": config.metadata,
         "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?
     }))
 }
@@ -510,10 +519,14 @@ async fn session_configure(
         .transpose()
         .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
         .unwrap_or_else(|| current.provider.clone());
-    let metadata = params
+    let mut metadata = params
         .get("metadata")
         .cloned()
         .unwrap_or_else(|| current.metadata.clone());
+    if metadata_title(&metadata) != metadata_title(&current.metadata) {
+        ensure_metadata_object(&mut metadata)
+            .insert("auto_title_disabled".to_string(), json!(true));
+    }
     let model_changed = provider_model_changed(&current.provider, &provider);
     let metadata_changed = metadata != current.metadata;
     if model_changed {
@@ -560,6 +573,23 @@ async fn session_configure(
 
 fn provider_model_changed(previous: &ProviderConfig, next: &ProviderConfig) -> bool {
     previous.kind != next.kind || previous.model != next.model
+}
+
+fn metadata_title(metadata: &Value) -> Option<&str> {
+    metadata
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+}
+
+fn ensure_metadata_object(metadata: &mut Value) -> &mut serde_json::Map<String, Value> {
+    if !metadata.is_object() {
+        *metadata = json!({});
+    }
+    metadata
+        .as_object_mut()
+        .expect("metadata was forced to object")
 }
 
 async fn project_list(state: &AppState) -> std::result::Result<Value, RpcError> {

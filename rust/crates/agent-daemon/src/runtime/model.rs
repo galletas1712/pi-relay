@@ -4,7 +4,7 @@ use agent_store::{ActionStatus, ActionUpdate};
 use agent_vocab::TurnId;
 use serde_json::{json, Value};
 
-use crate::provider_runtime::run_model;
+use crate::provider_runtime::{run_model, schedule_session_title_refresh_after_model};
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError};
 
@@ -36,6 +36,7 @@ pub(super) async fn run_model_turn(
         },
         ..dispatch
     };
+    let title_model_context = model_context.clone();
 
     let result =
         run_model_for_action_with_retries(&state, &session_id, &dispatch, turn_id, model_context)
@@ -86,7 +87,7 @@ pub(super) async fn run_model_turn(
             let provider_replay = response.provider_replay;
             match stop_reason {
                 agent_provider::ModelStopReason::Complete => {
-                    driver
+                    let dispatches = driver
                         .apply_session_input(
                             active,
                             SessionInput::ModelCompleted {
@@ -97,7 +98,14 @@ pub(super) async fn run_model_turn(
                             action_update,
                             provider_replay,
                         )
-                        .await?
+                        .await?;
+                    schedule_session_title_refresh_after_model(
+                        &state,
+                        session_id.clone(),
+                        &dispatch.config,
+                        &title_model_context,
+                    );
+                    dispatches
                 }
                 agent_provider::ModelStopReason::MaxOutputTokens => {
                     driver

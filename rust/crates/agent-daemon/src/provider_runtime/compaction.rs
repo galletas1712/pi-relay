@@ -393,6 +393,7 @@ fn local_summary_request(
     transcript.push(TranscriptItem::UserMessage(UserMessage::text(compaction_request)).into());
     Ok(ModelRequest {
         model: config.provider.model.clone(),
+        transcript_cache_prefix_len: None,
         prompt: PromptSections::stable(config.system_prompt.clone()),
         transcript,
         tool_profile: ProviderToolProfile::None,

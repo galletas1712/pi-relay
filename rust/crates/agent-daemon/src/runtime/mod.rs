@@ -33,6 +33,10 @@ pub(crate) use outputs::{
 };
 pub(crate) use tasks::{abort_session_tasks, take_tasks};
 
+struct ConsumedInputDispatch {
+    dispatches: Vec<DispatchAction>,
+}
+
 pub(crate) async fn ensure_expected_active_leaf(
     state: &AppState,
     session_id: &str,
@@ -268,10 +272,10 @@ impl SessionDriver {
         loop {
             let active = self.active_session().await;
             let Some(active) = active else { break };
-            if let Some(dispatched) = self.consume_ready_steer(active.clone()).await? {
-                let has_dispatched_work = !dispatched.is_empty();
-                dispatched_all.extend(dispatched.clone());
-                self.dispatch(dispatched).await?;
+            if let Some(consumed) = self.consume_ready_steer(active.clone()).await? {
+                let has_dispatched_work = !consumed.dispatches.is_empty();
+                dispatched_all.extend(consumed.dispatches.clone());
+                self.dispatch(consumed.dispatches).await?;
                 if has_dispatched_work {
                     break;
                 }
@@ -365,7 +369,7 @@ impl SessionDriver {
     async fn consume_ready_steer(
         &self,
         active: Arc<Mutex<RuntimeSession>>,
-    ) -> std::result::Result<Option<Vec<DispatchAction>>, RpcError> {
+    ) -> std::result::Result<Option<ConsumedInputDispatch>, RpcError> {
         let is_ready_to_continue = {
             let runtime = active.lock().await;
             runtime.session.is_ready_to_continue()
@@ -398,9 +402,10 @@ impl SessionDriver {
             return Err(RpcError::new("invalid_input", error.to_string()));
         }
 
-        self.persist_active_outputs(active, None, Some(queued), None, Vec::new())
-            .await
-            .map(Some)
+        let dispatches = self
+            .persist_active_outputs(active, None, Some(queued), None, Vec::new())
+            .await?;
+        Ok(Some(ConsumedInputDispatch { dispatches }))
     }
 
     pub(crate) async fn apply_agent_input(
@@ -601,6 +606,17 @@ impl SessionDriver {
         }
         dispatch_all(&self.state, &self.session_id, ready);
         Ok(())
+    }
+}
+
+pub(crate) async fn replace_active_session_config(
+    state: &AppState,
+    session_id: &str,
+    config: SessionConfig,
+) {
+    let active = state.active.lock().await.get(session_id).cloned();
+    if let Some(active) = active {
+        active.lock().await.config = config;
     }
 }
 

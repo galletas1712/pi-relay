@@ -9,14 +9,10 @@ use agent_vocab::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
-use crate::auth::Credentials;
 use crate::state::AppState;
 
-use super::auth_retry::complete_with_auth_retry;
-use super::provider::provider_for_config;
+use super::{run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 
 #[derive(Debug, Deserialize)]
 struct WebSearchArgs {
@@ -32,10 +28,7 @@ struct WebSearchArgs {
 }
 
 fn web_sidecar_session_id(session_id: &str, call_id: &str) -> String {
-    let mut hasher = DefaultHasher::new();
-    session_id.hash(&mut hasher);
-    call_id.hash(&mut hasher);
-    format!("web-{:016x}", hasher.finish())
+    sidecar_session_id("web", session_id, &[call_id])
 }
 
 #[derive(Debug, Deserialize)]
@@ -198,37 +191,29 @@ async fn run_provider_web_sidecar(
     max_output_tokens: Option<usize>,
 ) -> ToolResultMessage {
     let sidecar_session_id = web_sidecar_session_id(session_id, call.id.as_str());
-    let request = ModelRequest {
-        model: config.provider.model.clone(),
-        prompt: PromptSections::stable(
-            "You are a web-tool executor for pi-relay. Use the provided web tool to satisfy the requested tool call. Return a concise tool result for the caller and include source URLs whenever available. Do not ask follow-up questions.",
-        ),
-        transcript: vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
-            UserMessage::text(user_prompt),
-        ))],
-        tool_profile: ProviderToolProfile::CustomDefinitions,
-        tools: vec![tool],
-        max_tokens: Some(config.provider.max_tokens.unwrap_or(8_192).min(8_192)),
-        reasoning_effort: config.provider.reasoning_effort,
-        prompt_cache_key: Some(sidecar_session_id.clone()),
-        session_id: Some(sidecar_session_id.clone()),
-        turn_id: None,
+    let request = ModelSidecarRequest {
+        prompt_cache_key: sidecar_session_id.clone(),
+        sidecar_session_id,
+        request: ModelRequest {
+            model: config.provider.model.clone(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::stable(
+                "You are a web-tool executor for pi-relay. Use the provided web tool to satisfy the requested tool call. Return a concise tool result for the caller and include source URLs whenever available. Do not ask follow-up questions.",
+            ),
+            transcript: vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
+                UserMessage::text(user_prompt),
+            ))],
+            tool_profile: ProviderToolProfile::CustomDefinitions,
+            tools: vec![tool],
+            max_tokens: Some(config.provider.max_tokens.unwrap_or(8_192).min(8_192)),
+            reasoning_effort: config.provider.reasoning_effort,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        },
     };
 
-    let credentials = Credentials::load();
-    let provider = match provider_for_config(state, config, &credentials, &sidecar_session_id).await
-    {
-        Ok(provider) => provider,
-        Err(error) => {
-            return ToolResultMessage::error(
-                call.id.clone(),
-                &call.tool_name,
-                format!("web tool provider backend is not configured: {error}"),
-            )
-        }
-    };
-
-    match complete_with_auth_retry(state, config, &sidecar_session_id, provider, request).await {
+    match run_model_sidecar(state, config, request).await {
         Ok(response) => sidecar_response_to_tool_result(call, response, max_output_tokens),
         Err(error) => ToolResultMessage::error(
             call.id.clone(),
