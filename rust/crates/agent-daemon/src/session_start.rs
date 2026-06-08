@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_session::AgentSession;
-use agent_store::{InputPriority, SessionConfig};
-use agent_vocab::ProviderConfig;
+use agent_store::{InputPriority, SessionActivity, SessionConfig};
+use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -31,7 +31,6 @@ pub(crate) async fn session_start(
     let content = parse_user_message(params.content)?;
 
     let driver = SessionDriver::acquire(state, &session_id).await;
-
     if state
         .repo
         .session_exists(&session_id)
@@ -83,6 +82,97 @@ pub(crate) async fn session_start(
     };
     config.system_prompt = render_pi_prompt(state, &config).map_err(anyhow::Error::from)?;
 
+    let started = start_prepared_session_with_driver(
+        state,
+        &driver,
+        PreparedSessionStart {
+            session_id,
+            config,
+            priority,
+            content,
+            client_input_id: params.client_input_id,
+        },
+    )
+    .await?;
+    Ok(json!({
+        "session_id": started.session_id,
+        "project_id": started.project_id,
+        "activity": started.activity,
+        "replayed": started.replayed,
+    }))
+}
+
+pub(crate) struct PreparedSessionStart {
+    pub(crate) session_id: String,
+    pub(crate) config: SessionConfig,
+    pub(crate) priority: InputPriority,
+    pub(crate) content: UserMessage,
+    pub(crate) client_input_id: Option<String>,
+}
+
+pub(crate) struct StartedSession {
+    pub(crate) session_id: String,
+    pub(crate) project_id: Option<Uuid>,
+    pub(crate) activity: SessionActivity,
+    pub(crate) replayed: bool,
+}
+
+pub(crate) async fn start_prepared_session(
+    state: &AppState,
+    request: PreparedSessionStart,
+) -> std::result::Result<StartedSession, RpcError> {
+    let driver = SessionDriver::acquire(state, &request.session_id).await;
+    start_prepared_session_with_driver(state, &driver, request).await
+}
+
+async fn start_prepared_session_with_driver(
+    state: &AppState,
+    driver: &SessionDriver,
+    request: PreparedSessionStart,
+) -> std::result::Result<StartedSession, RpcError> {
+    let PreparedSessionStart {
+        session_id,
+        config,
+        priority,
+        content,
+        client_input_id,
+    } = request;
+    let project_id = config.project_id;
+
+    if state
+        .repo
+        .session_exists(&session_id)
+        .await
+        .map_err(anyhow::Error::from)?
+    {
+        let current = state
+            .repo
+            .load_session_config(&session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        state
+            .workspaces
+            .ensure_session(&session_id, &current.outer_cwd, &current.workspaces)
+            .await
+            .map_err(anyhow::Error::from)?;
+        return Ok(StartedSession {
+            session_id: session_id.clone(),
+            project_id: current.project_id,
+            activity: state
+                .repo
+                .activity(&session_id)
+                .await
+                .map_err(anyhow::Error::from)?,
+            replayed: true,
+        });
+    }
+
+    state
+        .workspaces
+        .ensure_session(&session_id, &config.outer_cwd, &config.workspaces)
+        .await
+        .map_err(anyhow::Error::from)?;
+
     let mut session = AgentSession::new();
     session
         .enqueue_input(agent_input_from_queued_priority(priority, content.clone()))
@@ -101,18 +191,22 @@ pub(crate) async fn session_start(
             &actions,
             priority,
             &content,
-            params.client_input_id.as_deref(),
+            client_input_id.as_deref(),
         )
         .await
         .map_err(anyhow::Error::from)?;
 
     if frames.is_empty() {
-        return Ok(json!({
-            "session_id": session_id,
-            "project_id": project_id,
-            "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?,
-            "replayed": true,
-        }));
+        return Ok(StartedSession {
+            session_id: session_id.clone(),
+            project_id,
+            activity: state
+                .repo
+                .activity(&session_id)
+                .await
+                .map_err(anyhow::Error::from)?,
+            replayed: true,
+        });
     }
     let dispatches = attach_dispatch_config(persisted_actions, &config);
 
@@ -124,12 +218,16 @@ pub(crate) async fn session_start(
     publish_events(state, frames);
     driver.dispatch(dispatches).await?;
 
-    Ok(json!({
-        "session_id": session_id,
-        "project_id": project_id,
-        "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?,
-        "replayed": false,
-    }))
+    Ok(StartedSession {
+        session_id: session_id.clone(),
+        project_id,
+        activity: state
+            .repo
+            .activity(&session_id)
+            .await
+            .map_err(anyhow::Error::from)?,
+        replayed: false,
+    })
 }
 
 #[derive(Debug, Deserialize)]

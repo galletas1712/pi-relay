@@ -1,8 +1,9 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
+use agent_prompt::Skill;
 use agent_store::SessionWorkspace;
 use agent_vocab::{ToolCall, ToolResultMessage};
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use super::prompt::{
@@ -93,6 +94,50 @@ pub(crate) fn skill_identifier(workspace: Option<&str>, name: &str) -> String {
     }
 }
 
+pub(crate) struct ResolvedSkillRole {
+    pub(crate) name: String,
+    pub(crate) workspace: Option<String>,
+    pub(crate) description: String,
+    pub(crate) file_path: PathBuf,
+    pub(crate) content: String,
+}
+
+pub(crate) fn resolve_skill_role(
+    outer_cwd: &Path,
+    workspaces: &[SessionWorkspace],
+    name: &str,
+    workspace: Option<&str>,
+) -> Result<ResolvedSkillRole> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("role name cannot be empty"));
+    }
+    let workspace = workspace.map(str::trim).filter(|value| !value.is_empty());
+    let skills = load_skills_for_session_workspaces(outer_cwd, workspaces);
+    let Some(skill) = skills
+        .into_iter()
+        .find(|skill| skill.name == name && skill.workspace.as_deref() == workspace)
+    else {
+        return Err(match workspace {
+            Some(workspace) => anyhow!("role skill not found: {workspace}/{name}"),
+            None => anyhow!("role skill not found: {name}"),
+        });
+    };
+    role_from_skill(skill)
+}
+
+fn role_from_skill(skill: Skill) -> Result<ResolvedSkillRole> {
+    let content = std::fs::read_to_string(&skill.file_path)
+        .with_context(|| format!("read role skill {}", skill.file_path.display()))?;
+    Ok(ResolvedSkillRole {
+        name: skill.name,
+        workspace: skill.workspace,
+        description: skill.description,
+        file_path: skill.file_path,
+        content: content.trim().to_string(),
+    })
+}
+
 fn xml_escape(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -140,6 +185,36 @@ mod tests {
         let second = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
         assert_eq!(second.status, agent_vocab::ToolResultStatus::Success);
         assert_eq!(second.output, "skill already loaded");
+
+        std::fs::remove_dir_all(outer_cwd).ok();
+    }
+
+    #[test]
+    fn resolves_skill_role_content_without_tool_xml() {
+        let outer_cwd = make_temp_dir("resolve-skill-role");
+        let workspace = outer_cwd.join("repo");
+        let skill_dir = workspace.join(".agents/skills/reviewer");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: reviewer\ndescription: Review code.\n---\n\nReview carefully.\n",
+        )
+        .expect("skill file");
+
+        let role = resolve_skill_role(
+            &outer_cwd,
+            &[SessionWorkspace::local("repo", "")],
+            "reviewer",
+            Some("repo"),
+        )
+        .expect("role resolves");
+        assert_eq!(role.name, "reviewer");
+        assert_eq!(role.workspace.as_deref(), Some("repo"));
+        assert_eq!(role.description, "Review code.");
+        assert_eq!(
+            role.content,
+            "---\nname: reviewer\ndescription: Review code.\n---\n\nReview carefully."
+        );
 
         std::fs::remove_dir_all(outer_cwd).ok();
     }

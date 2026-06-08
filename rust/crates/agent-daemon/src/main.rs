@@ -9,6 +9,7 @@ mod rpc_views;
 mod runtime;
 mod session_start;
 mod state;
+mod subagents;
 mod types;
 mod workspaces;
 
@@ -279,6 +280,7 @@ async fn dispatch_request(
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
+        RpcMethod::SubagentSpawn => subagents::subagent_spawn(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }
