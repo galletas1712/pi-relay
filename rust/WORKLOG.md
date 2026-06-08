@@ -1,5 +1,33 @@
 # Rust Rewrite Worklog
 
+## 2026-05-27
+
+### Per-Session Workspace Subset And Git Branch Override
+
+- Added an optional `workspaces` array to `session.start` so a project session can
+  materialize a subset of the project's workspaces (keeping unrelated workspace
+  dirs, their `AGENTS.md`, and skills out of the session `outer_cwd` and prompt)
+  and can override the git branch each selected workspace starts from.
+- Introduced `workspaces::selection` (`WorkspaceSelection` / `RequestedWorkspace` /
+  `SelectedWorkspace`) to validate the request against the project: rejects empty
+  selections, unknown dirs, duplicates, and branch overrides on local-folder
+  workspaces; preserves project-declared order. Extracted from `workspaces/mod.rs`
+  to keep that module focused (479 -> 376 LoC).
+- `WorkspaceManager::materialize_session` now reconciles managed bases against the
+  project's full set (so a subset never deletes skipped workspaces' bases) but only
+  instantiates the selected subset. Git branch overrides fetch the requested branch
+  into the session copy via `fetch_session_branch_head` after instantiation; the
+  shared per-project base stays on the project's configured branch.
+- Web: collapsible `WorkspaceScopePicker` above the composer for new project
+  sessions, defaulting to all-included/default-branch (sends no `workspaces`, so
+  daemon behavior is unchanged). Per-project choices persist in `localStorage`
+  (`workspaceScope.ts`); stale entries for removed workspaces are dropped on
+  re-derive.
+- Verified with `cargo test -p agent-daemon` (45 tests, including 3 selection unit
+  tests and a git branch-override materialization test) and the web suite via
+  vitest (125 tests, including 5 new `workspaceScope` tests). Updated
+  `docs/websocket-rpc.md` and `packages/web/docs/web-ui.md`.
+
 ## 2026-05-26
 
 ### Session Sync Redesign And Queued Follow-Up Mutations

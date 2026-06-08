@@ -177,6 +177,16 @@ queued via `queueUserInput`, and if none is selected `startNewSession` calls `se
 session. Selection is immediate imperative state (`selectedRef`) so the next keystroke targets the just-created session,
 not the one selected a render earlier.
 
+### Workspace scope picker
+
+When composing a new session inside a project (no session selected), a collapsible `WorkspaceScopePicker`
+(`workspaceScopePicker.tsx`) sits above the composer. It scopes the next session to a subset of the project's workspaces
+and lets git workspaces start from a non-default branch, then feeds `session.start`'s optional `workspaces` array via
+`startWorkspacesFromScope`. It defaults to every workspace included at its default branch (sending no `workspaces`, i.e.
+the daemon's existing behavior), so the type-and-send flow is unchanged. Per-project choices persist in `localStorage`
+under `piRelayWorkspaceScope:v1` (`workspaceScope.ts`); stored entries for workspaces a project no longer declares are
+dropped when the picker re-derives.
+
 ### Queue pane
 
 When follow-ups are queued, a pane above the composer (`QueuedInputPane`) lists them with row-level controls:

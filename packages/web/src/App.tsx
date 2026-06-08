@@ -71,6 +71,13 @@ import {
 	rememberUiSelection,
 	selectedSessionForProject,
 } from "./uiResume.ts";
+import {
+	rememberWorkspaceScope,
+	startWorkspacesFromScope,
+	workspaceScopeForProject,
+	type WorkspaceScopeEntry,
+} from "./workspaceScope.ts";
+import { WorkspaceScopePicker } from "./workspaceScopePicker.tsx";
 import type {
 	EventFrame,
 	Notice,
@@ -319,6 +326,25 @@ export function App() {
 		() => projects.find((project) => project.project_id === selectedProjectId) ?? null,
 		[projects, selectedProjectId],
 	);
+
+	// Editable workspace scope for the *next* new session in the selected project.
+	// Reset from persisted scope whenever the project (or its workspace set) changes;
+	// projectWorkspaceKey captures the workspace set so renames/edits re-derive scope
+	// while a plain projects refetch leaves in-progress edits untouched.
+	const [workspaceScope, setWorkspaceScope] = useState<WorkspaceScopeEntry[]>([]);
+	const workspaceScopeRef = useRef<WorkspaceScopeEntry[]>(workspaceScope);
+	workspaceScopeRef.current = workspaceScope;
+	const projectWorkspaces = selectedProject?.workspaces ?? null;
+	const projectWorkspacesRef = useRef(projectWorkspaces);
+	projectWorkspacesRef.current = projectWorkspaces;
+	const projectWorkspaceKey = projectWorkspaces?.map((workspace) => workspace.workspace_dir).join("\n") ?? "";
+	useEffect(() => {
+		setWorkspaceScope(workspaceScopeForProject(selectedProjectId, projectWorkspacesRef.current ?? []));
+	}, [selectedProjectId, projectWorkspaceKey]);
+	const handleWorkspaceScopeChange = useCallback((scope: WorkspaceScopeEntry[]) => {
+		setWorkspaceScope(scope);
+		rememberWorkspaceScope(selectedProjectRef.current, scope);
+	}, []);
 
 	const selectedSession = useMemo(
 		() => sessionItems.find((session) => session.session_id === selectedId) ?? null,
@@ -1316,6 +1342,7 @@ export function App() {
 				clientInputId: randomId("web_start"),
 				priority: "follow_up",
 				content: textContent(text),
+				workspaces: projectId ? startWorkspacesFromScope(workspaceScopeRef.current) : undefined,
 			});
 			await queryClient.invalidateQueries({
 				queryKey: queryKeys.sessions(projectId),
@@ -1938,6 +1965,9 @@ export function App() {
 			/>
 
 			<footer className="chat-dock" data-slot="chat-box">
+				{!selectedId && selectedProject && workspaceScope.length ? (
+					<WorkspaceScopePicker scope={workspaceScope} onChange={handleWorkspaceScopeChange} disabled={sending} />
+				) : null}
 				<Composer
 					selectedId={selectedId}
 					composerHandleRef={composerHandleRef}

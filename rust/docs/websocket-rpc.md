@@ -418,6 +418,31 @@ Omit `project_id` to start an ephemeral host session. Ephemeral sessions are not
 assigned to a project, have no project workspace records, and use `$HOME` as
 their `outer_cwd`.
 
+By default a project session materializes every workspace the project declares.
+Pass an optional `workspaces` array to scope the session to a subset, so unrelated
+workspace directories — along with their `AGENTS.md` files and skills — stay out of
+the session `outer_cwd` and the rendered prompt:
+
+```json
+{
+  "workspaces": [
+    { "workspace_dir": "repo-a" },
+    { "workspace_dir": "repo-b", "branch": "feature/login" }
+  ]
+}
+```
+
+Each entry names a `workspace_dir` declared by the project and may set an optional
+`branch` to populate that session's git workspace from a branch other than the
+project's configured `remote_branch`. The override only affects the session's own
+copy: the daemon fetches the branch into the session workspace after instantiating
+it from the managed base, leaving the shared per-project base on the project's
+configured branch. Branch overrides are only valid for git workspaces. The daemon
+rejects (`invalid_params`) a `workspaces` array that is empty, names a directory the
+project does not declare, repeats a workspace, or sets `branch` on a local-folder
+workspace. Selected workspaces are materialized in the project's declared order
+regardless of request order. The field is ignored for ephemeral sessions.
+
 The daemon writes `session.created`, `input.accepted`, transcript entries,
 actions, and events in the same session-start transition before dispatching
 provider/tool work. For project sessions it snapshots the project's current

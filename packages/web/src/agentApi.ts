@@ -104,6 +104,11 @@ export interface TranscriptTurnDetailRequest {
 	endSequence: number;
 }
 
+export interface StartSessionWorkspace {
+	workspaceDir: string;
+	branch?: string | null;
+}
+
 export interface StartSessionParams {
 	sessionId: string;
 	projectId?: string | null;
@@ -112,6 +117,8 @@ export interface StartSessionParams {
 	clientInputId: string;
 	priority: InputPriority;
 	content: ContentBlock[];
+	/** Subset of the project's workspaces to materialize, with optional per-session git branch overrides. Omit for all. */
+	workspaces?: StartSessionWorkspace[] | null;
 }
 
 export interface StartSessionResult {
@@ -381,7 +388,13 @@ class AgentApiClient implements AgentApi {
 			metadata: params.metadata,
 			client_input_id: params.clientInputId,
 			priority: params.priority,
-			content: params.content
+			content: params.content,
+			workspaces: params.workspaces?.length
+				? params.workspaces.map((workspace) => ({
+						workspace_dir: workspace.workspaceDir,
+						branch: workspace.branch?.trim() || undefined
+					}))
+				: undefined
 		});
 	}
 
