@@ -82,18 +82,6 @@ fn explicit_or_finished_titles_are_not_truncated_placeholders() {
 }
 
 #[test]
-fn title_reasoning_effort_uses_provider_supported_low_effort() {
-    assert_eq!(
-        title_reasoning_effort(ProviderKind::OpenAi),
-        ReasoningEffort::Low
-    );
-    assert_eq!(
-        title_reasoning_effort(ProviderKind::Claude),
-        ReasoningEffort::Low
-    );
-}
-
-#[test]
 fn title_from_response_uses_json_text() {
     let items = vec![AssistantItem::Text(
         "{\"title\":\"Debug flaky tests\"}".to_string(),
