@@ -242,6 +242,7 @@ fn messages_body(request: ModelRequest) -> ProviderResult<Value> {
         max_tokens: Some(request.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS)),
         reasoning_effort: Some(request.reasoning_effort),
         cache_transcript: true,
+        transcript_cache_prefix_len: request.transcript_cache_prefix_len,
     })
 }
 
@@ -262,6 +263,7 @@ fn count_tokens_body(request: ProviderTokenCountRequest) -> ProviderResult<Value
         max_tokens: None,
         reasoning_effort: Some(request.reasoning_effort),
         cache_transcript: false,
+        transcript_cache_prefix_len: None,
     })
 }
 
@@ -274,14 +276,12 @@ struct AnthropicRequestBodyInput {
     max_tokens: Option<u32>,
     reasoning_effort: Option<ReasoningEffort>,
     cache_transcript: bool,
+    transcript_cache_prefix_len: Option<usize>,
 }
 
 fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Value> {
     let capabilities = anthropic_capabilities(&input.model);
-    let mut messages = transcript_to_messages(&input.prompt, &input.transcript)?;
-    if input.cache_transcript {
-        add_transcript_cache_breakpoints(&mut messages);
-    }
+    let messages = transcript_to_messages_for_request(&input)?;
     let mut body = json!({
         "model": input.model,
         "messages": messages,
@@ -321,6 +321,26 @@ fn anthropic_request_body(input: AnthropicRequestBodyInput) -> ProviderResult<Va
         body["stream"] = json!(true);
     }
     Ok(body)
+}
+
+fn transcript_to_messages_for_request(
+    input: &AnthropicRequestBodyInput,
+) -> ProviderResult<Vec<Value>> {
+    if !input.cache_transcript {
+        return transcript_to_messages(&input.prompt, &input.transcript);
+    }
+    let Some(prefix_len) = input.transcript_cache_prefix_len else {
+        let mut messages = transcript_to_messages(&input.prompt, &input.transcript)?;
+        add_transcript_cache_breakpoints(&mut messages);
+        return Ok(messages);
+    };
+
+    let prefix_len = prefix_len.min(input.transcript.len());
+    let (prefix, suffix) = input.transcript.split_at(prefix_len);
+    let mut messages = transcript_to_messages(&input.prompt, prefix)?;
+    add_transcript_cache_breakpoints(&mut messages);
+    messages.extend(transcript_to_messages(&input.prompt, suffix)?);
+    Ok(messages)
 }
 
 fn client_request_id() -> String {
@@ -1187,6 +1207,7 @@ mod tests {
     fn messages_body_omits_adaptive_thinking_for_non_adaptive_models() {
         let body = messages_body(ModelRequest {
             model: "claude-sonnet-4-5".to_string(),
+            transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::CustomDefinitions,
@@ -1248,6 +1269,7 @@ mod tests {
     fn messages_body_enables_adaptive_thinking_for_adaptive_models() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-8".to_string(),
+            transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::CustomDefinitions,
@@ -1350,6 +1372,7 @@ mod tests {
     fn messages_body_sorts_tools_for_cache_stability() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
+            transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::CustomDefinitions,
@@ -1426,6 +1449,7 @@ mod tests {
     fn messages_body_renders_anthropic_native_coding_tools() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
+            transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::AnthropicCoding,
@@ -1464,6 +1488,7 @@ mod tests {
     fn messages_body_marks_latest_transcript_block_for_cache() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
+            transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![
                 TranscriptItem::UserMessage(UserMessage::text("first")).into(),
@@ -1493,6 +1518,37 @@ mod tests {
                 "type": "ephemeral",
             })
         );
+    }
+
+    #[test]
+    fn messages_body_keeps_sidecar_suffix_out_of_cache_prefix() {
+        let body = messages_body(ModelRequest {
+            model: "claude-opus-4-7".to_string(),
+            transcript_cache_prefix_len: Some(1),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![
+                TranscriptItem::UserMessage(UserMessage::text("normal user turn")).into(),
+                TranscriptItem::UserMessage(UserMessage::text("sidecar title prompt")).into(),
+            ],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::XHigh,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        })
+        .expect("body renders");
+
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({
+                "type": "ephemeral",
+            })
+        );
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
     }
 
     #[test]
@@ -1703,6 +1759,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
     fn stable_system_block_keeps_one_hour_ttl() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
+            transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::None,
@@ -1738,6 +1795,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         ];
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
+            transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript,
             tool_profile: ProviderToolProfile::None,
@@ -1781,6 +1839,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         }
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
+            transcript_cache_prefix_len: None,
             prompt: PromptSections::stable("stable rules"),
             transcript,
             tool_profile: ProviderToolProfile::None,
@@ -1834,6 +1893,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         let make_body = |first_user: &str| {
             messages_body(ModelRequest {
                 model: "claude-opus-4-7".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("a stable system prompt long enough to fingerprint"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text(first_user)).into()],
                 tool_profile: ProviderToolProfile::None,
@@ -1865,6 +1925,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         let make_body = |stable: &str| {
             messages_body(ModelRequest {
                 model: "claude-opus-4-7".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable(stable),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("anything")).into()],
                 tool_profile: ProviderToolProfile::None,

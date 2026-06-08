@@ -18,8 +18,7 @@ use crate::codec::{
 };
 use crate::config::Config;
 use crate::provider_runtime::{
-    current_pi_template, schedule_session_title_refresh, ProviderConnectionRegistry,
-    SessionTitleScheduler,
+    current_pi_template, ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::*;
 use crate::state::AppState;
@@ -856,8 +855,6 @@ async fn input_user(
         Accepted {
             dispatches: Vec<DispatchAction>,
             active_branch_sync: Value,
-            title_config: SessionConfig,
-            title_content: agent_vocab::UserMessage,
         },
         Queued {
             input_id: String,
@@ -935,7 +932,6 @@ async fn input_user(
                     .enqueue_input(agent_input_from_queued_priority(priority, content.clone()))
                     .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
             }
-            let title_config = active.lock().await.config.clone();
             let dispatches = driver
                 .persist_active_outputs(
                     active,
@@ -966,8 +962,6 @@ async fn input_user(
             InputOutcome::Accepted {
                 dispatches,
                 active_branch_sync: rpc_views::active_branch_sync(sync, snapshot),
-                title_config,
-                title_content: content,
             }
         }
     };
@@ -976,16 +970,8 @@ async fn input_user(
         InputOutcome::Accepted {
             dispatches,
             active_branch_sync,
-            title_config,
-            title_content,
         } => {
             driver.dispatch(dispatches).await?;
-            schedule_session_title_refresh(
-                state,
-                session_id.clone(),
-                &title_config,
-                &title_content,
-            );
             if perf_logging_enabled() {
                 let total_ms = started_at.elapsed().as_millis();
                 eprintln!(

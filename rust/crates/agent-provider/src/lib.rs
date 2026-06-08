@@ -28,6 +28,14 @@ pub use transcript::normalize_transcript_for_provider;
 pub struct ModelRequest {
     pub model: String,
     pub prompt: PromptSections,
+    /// If set, providers that support transcript cache markers should place
+    /// those markers only within the first `n` transcript entries.
+    ///
+    /// This is useful for non-persistent sidecar requests that append an
+    /// instruction after an otherwise normal model-turn transcript: the
+    /// provider-visible prefix stays identical to the regular request, and the
+    /// sidecar-only suffix does not become the cache breakpoint.
+    pub transcript_cache_prefix_len: Option<usize>,
     pub transcript: Vec<ModelTranscriptEntry>,
     pub tool_profile: ProviderToolProfile,
     pub tools: Vec<ProviderTool>,

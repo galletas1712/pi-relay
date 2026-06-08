@@ -1,5 +1,6 @@
 use super::*;
-use agent_vocab::AssistantItem;
+use agent_session::ModelContext;
+use agent_vocab::{AssistantItem, TranscriptItem, UserMessage};
 
 #[test]
 fn sanitize_title_trims_quotes_and_punctuation() {
@@ -7,6 +8,31 @@ fn sanitize_title_trims_quotes_and_punctuation() {
         sanitize_title("  \"Production deploy notes.\"  "),
         Some("Production deploy notes".to_string())
     );
+}
+
+#[test]
+fn title_trigger_message_uses_only_model_context_ending_in_user_message() {
+    let message = UserMessage::text("debug flaky tests");
+    let context = ModelContext::from_transcript_items(vec![
+        TranscriptItem::TurnStarted {
+            turn_id: agent_vocab::TurnId(1),
+        },
+        TranscriptItem::UserMessage(message.clone()),
+    ]);
+
+    assert_eq!(title_trigger_message(&context), Some(&message));
+
+    let context = ModelContext::from_transcript_items(vec![
+        TranscriptItem::TurnStarted {
+            turn_id: agent_vocab::TurnId(1),
+        },
+        TranscriptItem::UserMessage(message),
+        TranscriptItem::AssistantMessage(agent_vocab::AssistantMessage {
+            items: vec![AssistantItem::Text("done".to_string())],
+        }),
+    ]);
+
+    assert_eq!(title_trigger_message(&context), None);
 }
 
 #[test]

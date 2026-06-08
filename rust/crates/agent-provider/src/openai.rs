@@ -1644,6 +1644,7 @@ mod tests {
         };
         let make_request = |turn_id| ModelRequest {
             model: "gpt-5.5".to_string(),
+            transcript_cache_prefix_len: None,
             prompt: PromptSections::default(),
             transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
             tool_profile: ProviderToolProfile::OpenAiCoding,
@@ -1706,6 +1707,7 @@ mod tests {
         let body = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::default(),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tool_profile: ProviderToolProfile::None,
@@ -1729,6 +1731,7 @@ mod tests {
         let body = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::new(
                     Some("static system".to_string()),
                     Some("cwd: /tmp/project".to_string()),
@@ -1785,6 +1788,7 @@ mod tests {
         let first = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::new(
                     Some("stable rules".to_string()),
                     Some("cwd: /tmp/one".to_string()),
@@ -1804,6 +1808,7 @@ mod tests {
         let second = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::new(
                     Some("stable rules".to_string()),
                     Some("cwd: /tmp/two".to_string()),
@@ -1837,6 +1842,7 @@ mod tests {
         let body = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tool_profile: ProviderToolProfile::None,
@@ -1862,6 +1868,7 @@ mod tests {
         let body = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tool_profile: ProviderToolProfile::None,
@@ -1884,6 +1891,7 @@ mod tests {
         let body = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::new(
                     Some("stable agent rules".to_string()),
                     Some("workspace: /tmp/pi".to_string()),
@@ -1912,6 +1920,7 @@ mod tests {
         let body = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable agent rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tool_profile: ProviderToolProfile::CustomDefinitions,
@@ -1948,6 +1957,7 @@ mod tests {
         let body = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
+                transcript_cache_prefix_len: None,
                 prompt: PromptSections::stable("stable agent rules"),
                 transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
                 tool_profile: ProviderToolProfile::OpenAiCoding,

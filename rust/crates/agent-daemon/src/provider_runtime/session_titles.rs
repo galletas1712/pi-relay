@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
-use agent_provider::{ModelTranscriptEntry, PromptSections, ProviderToolProfile};
+use agent_provider::ModelTranscriptEntry;
+use agent_session::ModelContext;
 use agent_store::SessionConfig;
 use agent_vocab::{
     AssistantItem, ContentBlock, ProviderKind, ReasoningEffort, TranscriptItem, UserMessage,
@@ -14,7 +15,7 @@ use crate::runtime::{
 };
 use crate::state::AppState;
 
-use super::{model_prompt_cache_key, run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
+use super::{build_model_request, run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 
 const TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 160;
 const TITLE_INPUT_CHAR_LIMIT: usize = 8_000;
@@ -23,6 +24,13 @@ const TITLE_MAX_CHARS: usize = 64;
 #[derive(Clone, Default)]
 pub(crate) struct SessionTitleScheduler {
     pending: Arc<StdMutex<HashMap<String, PendingTitleRefresh>>>,
+}
+
+fn title_trigger_message(model_context: &ModelContext) -> Option<&UserMessage> {
+    let Some(TranscriptItem::UserMessage(message)) = model_context.transcript_items().last() else {
+        return None;
+    };
+    Some(message)
 }
 
 fn pending_generation_matches(state: &AppState, session_id: &str, generation: u64) -> bool {
@@ -39,23 +47,30 @@ fn pending_generation_matches(state: &AppState, session_id: &str, generation: u6
 struct PendingTitleRefresh {
     generation: u64,
     message: UserMessage,
+    config: SessionConfig,
+    model_context: ModelContext,
     title_at_submit: Option<String>,
 }
 
-pub(crate) fn schedule_session_title_refresh(
+pub(crate) fn schedule_session_title_refresh_after_model(
     state: &AppState,
     session_id: impl Into<String>,
     config: &SessionConfig,
-    message: &UserMessage,
+    model_context: &ModelContext,
 ) {
     if session_title_disabled(config) {
         return;
     }
+    let Some(message) = title_trigger_message(model_context) else {
+        return;
+    };
     let title_at_submit = metadata_title(&config.metadata);
 
     let state = state.clone();
     let session_id = session_id.into();
+    let config = config.clone();
     let message = message.clone();
+    let model_context = model_context.clone();
     let should_spawn = {
         let mut pending = state
             .session_titles
@@ -71,6 +86,8 @@ pub(crate) fn schedule_session_title_refresh(
             PendingTitleRefresh {
                 generation,
                 message,
+                config,
+                model_context,
                 title_at_submit,
             },
         );
@@ -132,7 +149,7 @@ async fn refresh_session_title(
         return Ok(());
     }
 
-    let Some(title) = generate_session_title(state, session_id, &current_config, &request).await?
+    let Some(title) = generate_session_title(state, session_id, &request.config, &request).await?
     else {
         return Ok(());
     };
@@ -172,25 +189,36 @@ async fn generate_session_title(
         current_title: request.title_at_submit.as_deref().unwrap_or_default(),
         user_message: render_user_message_for_title(&request.message),
     };
+    let mut model_request = build_model_request(
+        state,
+        config,
+        session_id,
+        None,
+        request.model_context.clone(),
+    )
+    .await?;
+    let cache_prefix_len = model_request.transcript.len();
+    model_request.transcript_cache_prefix_len = Some(cache_prefix_len);
+    model_request.max_tokens = Some(TITLE_GENERATION_MAX_OUTPUT_TOKENS);
+    model_request.reasoning_effort = title_reasoning_effort(config.provider.kind);
+    model_request
+        .transcript
+        .push(ModelTranscriptEntry::from(TranscriptItem::UserMessage(
+            UserMessage::text(format!(
+                "{TITLE_GENERATION_PROMPT}\n\n{}",
+                serde_json::to_string(&title_context)?
+            )),
+        )));
     let response = run_model_sidecar(
         state,
         config,
         ModelSidecarRequest {
-            prompt_cache_key: model_prompt_cache_key(config, session_id),
+            prompt_cache_key: model_request
+                .prompt_cache_key
+                .clone()
+                .unwrap_or_else(|| session_id.to_string()),
             sidecar_session_id: title_sidecar_session_id(session_id),
-            prompt: PromptSections::new(
-                Some(config.system_prompt.clone()),
-                Some(TITLE_GENERATION_SYSTEM_PROMPT.to_string()),
-            ),
-            transcript: vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
-                UserMessage::text(serde_json::to_string(&title_context)?),
-            ))],
-            tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-            tools: state
-                .tools
-                .provider_tools_for_provider(config.provider.kind),
-            max_tokens: Some(TITLE_GENERATION_MAX_OUTPUT_TOKENS),
-            reasoning_effort: title_reasoning_effort(config.provider.kind),
+            request: model_request,
         },
     )
     .await?;
@@ -204,9 +232,9 @@ struct SessionTitlePromptContext<'a> {
     user_message: String,
 }
 
-const TITLE_GENERATION_SYSTEM_PROMPT: &str = r#"Above is the normal pi-relay system prompt for this session. For this sidecar request only, ignore any instruction to solve the user's coding task.
+const TITLE_GENERATION_PROMPT: &str = r#"Above is the conversation prefix for the normal model request for this turn. For this sidecar request only, ignore any instruction to solve the user's coding task.
 
-You generate short UI titles for pi-relay chat sessions. You are given JSON containing the current session title and the user message for this turn. Decide whether to rename the session that encapsulates the conversation so far.
+Generate a short UI title for the pi-relay chat session. You are given JSON containing the current session title and the user message for this turn. Decide whether to rename the session that encapsulates the conversation so far.
 
 Rules:
 - Do not call any tools.

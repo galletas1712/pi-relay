@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::codec::{from_params, parse_user_message};
-use crate::provider_runtime::{render_pi_prompt, schedule_session_title_refresh};
+use crate::provider_runtime::render_pi_prompt;
 use crate::runtime::{
     agent_input_from_queued_priority, attach_dispatch_config, collect_runtime_outputs,
     publish_events, SessionDriver,
@@ -123,7 +123,6 @@ pub(crate) async fn session_start(
         .insert(session_id.clone(), Arc::new(Mutex::new(runtime)));
     publish_events(state, frames);
     driver.dispatch(dispatches).await?;
-    schedule_session_title_refresh(state, session_id.clone(), &config, &content);
 
     Ok(json!({
         "session_id": session_id,

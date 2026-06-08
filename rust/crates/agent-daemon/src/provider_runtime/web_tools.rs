@@ -1,4 +1,6 @@
-use agent_provider::{ModelResponse, ModelTranscriptEntry, PromptSections, ProviderToolProfile};
+use agent_provider::{
+    ModelRequest, ModelResponse, ModelTranscriptEntry, PromptSections, ProviderToolProfile,
+};
 use agent_store::SessionConfig;
 use agent_tools::{limit_tool_output_with_max_tokens, ProviderTool, ToolContext, ToolExecution};
 use agent_vocab::{
@@ -192,16 +194,23 @@ async fn run_provider_web_sidecar(
     let request = ModelSidecarRequest {
         prompt_cache_key: sidecar_session_id.clone(),
         sidecar_session_id,
-        prompt: PromptSections::stable(
-            "You are a web-tool executor for pi-relay. Use the provided web tool to satisfy the requested tool call. Return a concise tool result for the caller and include source URLs whenever available. Do not ask follow-up questions.",
-        ),
-        transcript: vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
-            UserMessage::text(user_prompt),
-        ))],
-        tool_profile: ProviderToolProfile::CustomDefinitions,
-        tools: vec![tool],
-        max_tokens: Some(config.provider.max_tokens.unwrap_or(8_192).min(8_192)),
-        reasoning_effort: config.provider.reasoning_effort,
+        request: ModelRequest {
+            model: config.provider.model.clone(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::stable(
+                "You are a web-tool executor for pi-relay. Use the provided web tool to satisfy the requested tool call. Return a concise tool result for the caller and include source URLs whenever available. Do not ask follow-up questions.",
+            ),
+            transcript: vec![ModelTranscriptEntry::from(TranscriptItem::UserMessage(
+                UserMessage::text(user_prompt),
+            ))],
+            tool_profile: ProviderToolProfile::CustomDefinitions,
+            tools: vec![tool],
+            max_tokens: Some(config.provider.max_tokens.unwrap_or(8_192).min(8_192)),
+            reasoning_effort: config.provider.reasoning_effort,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        },
     };
 
     match run_model_sidecar(state, config, request).await {

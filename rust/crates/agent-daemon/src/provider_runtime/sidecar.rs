@@ -1,9 +1,5 @@
-use agent_provider::{
-    ModelRequest, ModelResponse, ModelTranscriptEntry, PromptSections, ProviderToolProfile,
-};
+use agent_provider::{ModelRequest, ModelResponse};
 use agent_store::SessionConfig;
-use agent_tools::ProviderTool;
-use agent_vocab::ReasoningEffort;
 use anyhow::Result;
 
 use crate::state::AppState;
@@ -23,12 +19,7 @@ const SIDECAR_ID_OWNER_CHARS: usize = 24;
 pub(crate) struct ModelSidecarRequest {
     pub(crate) sidecar_session_id: String,
     pub(crate) prompt_cache_key: String,
-    pub(crate) prompt: PromptSections,
-    pub(crate) transcript: Vec<ModelTranscriptEntry>,
-    pub(crate) tool_profile: ProviderToolProfile,
-    pub(crate) tools: Vec<ProviderTool>,
-    pub(crate) max_tokens: Option<u32>,
-    pub(crate) reasoning_effort: ReasoningEffort,
+    pub(crate) request: ModelRequest,
 }
 
 pub(crate) async fn run_model_sidecar(
@@ -37,19 +28,12 @@ pub(crate) async fn run_model_sidecar(
     request: ModelSidecarRequest,
 ) -> Result<ModelResponse> {
     let sidecar_session_id = request.sidecar_session_id;
+    let prompt_cache_key = request.prompt_cache_key;
+    let mut model_request = request.request;
     let result = async {
-        let model_request = ModelRequest {
-            model: config.provider.model.clone(),
-            prompt: request.prompt,
-            transcript: request.transcript,
-            tool_profile: request.tool_profile,
-            tools: request.tools,
-            max_tokens: request.max_tokens,
-            reasoning_effort: request.reasoning_effort,
-            prompt_cache_key: Some(request.prompt_cache_key),
-            session_id: Some(sidecar_session_id.clone()),
-            turn_id: None,
-        };
+        model_request.prompt_cache_key = Some(prompt_cache_key);
+        model_request.session_id = Some(sidecar_session_id.clone());
+        model_request.turn_id = None;
         complete_model_request(state, config, &sidecar_session_id, model_request).await
     }
     .await;

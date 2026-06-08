@@ -14,13 +14,12 @@ use agent_session::{AgentSession, SessionAction, SessionInput};
 use agent_store::{
     AcceptedInput, ActionUpdate, EventType, OutputBatch, QueuedInput, SessionConfig,
 };
-use agent_vocab::{ProviderReplayItem, UserMessage};
+use agent_vocab::ProviderReplayItem;
 use anyhow::Context;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::codec::transcript_store_from_stored;
-use crate::provider_runtime::schedule_session_title_refresh;
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
@@ -36,8 +35,6 @@ pub(crate) use tasks::{abort_session_tasks, take_tasks};
 
 struct ConsumedInputDispatch {
     dispatches: Vec<DispatchAction>,
-    title_config: SessionConfig,
-    title_content: UserMessage,
 }
 
 pub(crate) async fn ensure_expected_active_leaf(
@@ -279,12 +276,6 @@ impl SessionDriver {
                 let has_dispatched_work = !consumed.dispatches.is_empty();
                 dispatched_all.extend(consumed.dispatches.clone());
                 self.dispatch(consumed.dispatches).await?;
-                schedule_session_title_refresh(
-                    &self.state,
-                    self.session_id.clone(),
-                    &consumed.title_config,
-                    &consumed.title_content,
-                );
                 if has_dispatched_work {
                     break;
                 }
@@ -327,7 +318,6 @@ impl SessionDriver {
                 .await
                 .map_err(anyhow::Error::from)?;
             if let Some(queued) = maybe_input {
-                let title_content = queued.content.clone();
                 let agent_input =
                     agent_input_from_queued_priority(queued.priority, queued.content.clone());
                 let active = self.active_session().await;
@@ -344,19 +334,12 @@ impl SessionDriver {
                             .map_err(anyhow::Error::from)?;
                         return Err(RpcError::new("invalid_input", error.to_string()));
                     }
-                    let title_config = active.lock().await.config.clone();
                     let dispatched = self
                         .persist_active_outputs(active, None, Some(queued), None, Vec::new())
                         .await?;
                     let has_dispatched_work = !dispatched.is_empty();
                     dispatched_all.extend(dispatched.clone());
                     self.dispatch(dispatched).await?;
-                    schedule_session_title_refresh(
-                        &self.state,
-                        self.session_id.clone(),
-                        &title_config,
-                        &title_content,
-                    );
                     if has_dispatched_work {
                         break;
                     }
@@ -405,7 +388,6 @@ impl SessionDriver {
             return Ok(None);
         };
 
-        let title_content = queued.content.clone();
         let agent_input = agent_input_from_queued_priority(queued.priority, queued.content.clone());
         let enqueue_result = {
             let mut runtime = active.lock().await;
@@ -420,15 +402,10 @@ impl SessionDriver {
             return Err(RpcError::new("invalid_input", error.to_string()));
         }
 
-        let title_config = active.lock().await.config.clone();
         let dispatches = self
             .persist_active_outputs(active, None, Some(queued), None, Vec::new())
             .await?;
-        Ok(Some(ConsumedInputDispatch {
-            dispatches,
-            title_config,
-            title_content,
-        }))
+        Ok(Some(ConsumedInputDispatch { dispatches }))
     }
 
     pub(crate) async fn apply_agent_input(
