@@ -13,6 +13,34 @@ export function isArchivedSession(session: SessionDisplayInfo): boolean {
 	return session.metadata?.archived === true;
 }
 
+export function sortSessionsByLastUserMessage(sessions: SessionListItem[]): SessionListItem[] {
+	return [...sessions].sort(compareSessionsByLastUserMessage);
+}
+
+function compareSessionsByLastUserMessage(left: SessionListItem, right: SessionListItem): number {
+	const archivedDifference = Number(isArchivedSession(left)) - Number(isArchivedSession(right));
+	if (archivedDifference !== 0) return archivedDifference;
+
+	const leftTimestamp = sortableLastUserMessageTimestamp(left);
+	const rightTimestamp = sortableLastUserMessageTimestamp(right);
+	if (leftTimestamp !== rightTimestamp) return rightTimestamp - leftTimestamp;
+
+	const leftCreatedAt = Date.parse(left.created_at);
+	const rightCreatedAt = Date.parse(right.created_at);
+	if (Number.isFinite(leftCreatedAt) && Number.isFinite(rightCreatedAt) && leftCreatedAt !== rightCreatedAt) {
+		return rightCreatedAt - leftCreatedAt;
+	}
+
+	if (left.session_id < right.session_id) return 1;
+	if (left.session_id > right.session_id) return -1;
+	return 0;
+}
+
+function sortableLastUserMessageTimestamp(session: SessionListItem): number {
+	const timestamp = session.last_user_message_timestamp_ms;
+	return typeof timestamp === "number" && Number.isFinite(timestamp) ? timestamp : -Infinity;
+}
+
 export function sessionDisplayActivity(session: SessionDisplayInfo): SessionDisplayActivity {
 	return displayActivity(session.activity);
 }

@@ -359,6 +359,7 @@ pub struct SessionSummary {
     pub metadata: Value,
     pub created_at: String,
     pub updated_at: String,
+    pub last_user_message_timestamp_ms: Option<i64>,
     pub has_transcript_entries: bool,
 }
 
@@ -502,6 +503,7 @@ pub struct SessionSnapshot {
     pub queue_revision: i64,
     pub transcript_revision: i64,
     pub last_event_id: i64,
+    pub last_user_message_timestamp_ms: Option<i64>,
     pub has_transcript_entries: bool,
 }
 

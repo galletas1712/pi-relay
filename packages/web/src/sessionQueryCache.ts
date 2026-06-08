@@ -1,6 +1,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { queryKeys, type EntryScope } from "./queryKeys.ts";
 import { displayParentIdForEntry } from "./displayParent.ts";
+import { sortSessionsByLastUserMessage } from "./sessionList.ts";
 import type { ActiveBranchSyncResponse, EventFrame, SessionSnapshot, SessionSummary } from "./types.ts";
 
 export function patchSessionList(
@@ -17,7 +18,7 @@ export function patchSessionList(
 			changed = true;
 			return patcher(session);
 		});
-		return changed ? next : current;
+		return changed ? sortSessionsByLastUserMessage(next) : current;
 	});
 }
 
@@ -73,7 +74,8 @@ export function patchSessionListEventSummary(
 	const metadata = recordValue(event.data.metadata);
 	const provider = providerValue(event.data.provider);
 	const activeLeafId = activeLeafIdValue(event.data);
-	if (!metadata && !provider && !activity && activeLeafId === undefined) return;
+	const lastUserMessageTimestampMs = lastUserMessageTimestampFromEvent(event);
+	if (!metadata && !provider && !activity && activeLeafId === undefined && lastUserMessageTimestampMs === undefined) return;
 
 	patchSessionList(queryClient, projectId, event.session_id, (session) => ({
 		...session,
@@ -81,6 +83,10 @@ export function patchSessionListEventSummary(
 		provider: provider ?? session.provider,
 		activity: activity ?? session.activity,
 		active_leaf_id: activeLeafId === undefined ? session.active_leaf_id : activeLeafId,
+		last_user_message_timestamp_ms:
+			lastUserMessageTimestampMs === undefined
+				? session.last_user_message_timestamp_ms
+				: Math.max(session.last_user_message_timestamp_ms ?? Number.NEGATIVE_INFINITY, lastUserMessageTimestampMs),
 		has_transcript_entries:
 			activeLeafId === undefined ? session.has_transcript_entries : activeLeafId !== null || session.has_transcript_entries,
 	}));
@@ -108,17 +114,21 @@ export function mergeSnapshotIntoSessionList(
 		if (session.session_id !== snapshot.session_id) return session;
 		found = true;
 		return {
-				...session,
-				project_id: snapshot.project_id,
-				outer_cwd: snapshot.outer_cwd,
-				workspaces: snapshot.workspaces,
-				activity: snapshot.activity,
+			...session,
+			project_id: snapshot.project_id,
+			outer_cwd: snapshot.outer_cwd,
+			workspaces: snapshot.workspaces,
+			activity: snapshot.activity,
 			active_leaf_id: snapshot.active_leaf_id,
 			provider: snapshot.provider,
 			metadata: snapshot.metadata,
+			last_user_message_timestamp_ms:
+				snapshot.last_user_message_timestamp_ms === undefined
+					? session.last_user_message_timestamp_ms
+					: snapshot.last_user_message_timestamp_ms,
 		};
 	});
-	return found ? nextSessions : sessions;
+	return found ? sortSessionsByLastUserMessage(nextSessions) : sessions;
 }
 
 function recordValue(value: unknown): Record<string, unknown> | null {
@@ -141,6 +151,15 @@ function activeLeafIdValue(data: Record<string, unknown>): string | null | undef
 	const value = data.active_leaf_id;
 	if (value === null || typeof value === "string") return value;
 	return undefined;
+}
+
+function lastUserMessageTimestampFromEvent(event: EventFrame): number | undefined {
+	if (event.event !== "transcript.appended") return undefined;
+	const entry = recordValue(event.data.entry);
+	const item = entry ? recordValue(entry.item) : null;
+	const timestamp = entry?.timestamp_ms;
+	if (item?.type !== "user_message" || typeof timestamp !== "number" || !Number.isFinite(timestamp)) return undefined;
+	return timestamp;
 }
 
 export type ActiveBranchSyncApplyResult = "applied" | "reload";

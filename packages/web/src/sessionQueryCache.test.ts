@@ -87,6 +87,7 @@ describe("session query cache helpers", () => {
 			eventFrame("transcript.appended", {
 				active_leaf_id: "entry_2",
 				activity: "running",
+				entry: entry("entry_2", null, "hello", 1_700_000_000_123),
 			}),
 			"running",
 		);
@@ -94,8 +95,38 @@ describe("session query cache helpers", () => {
 		expect(queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(projectId))?.[0]).toMatchObject({
 			active_leaf_id: "entry_2",
 			activity: "running",
+			last_user_message_timestamp_ms: 1_700_000_000_123,
 			has_transcript_entries: true,
 		});
+	});
+
+	it("re-sorts session list patches by latest user message timestamp", () => {
+		const queryClient = new QueryClient();
+		queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(projectId), [
+			summary({
+				sessionId: "session_old",
+				lastUserMessageTimestampMs: 1_700_000_000_000,
+			}),
+			summary({
+				sessionId,
+				lastUserMessageTimestampMs: 1_699_999_999_999,
+			}),
+		]);
+
+		patchSessionListEventSummary(
+			queryClient,
+			projectId,
+			eventFrame("transcript.appended", {
+				active_leaf_id: "entry_new",
+				entry: entry("entry_new", null, "new", 1_700_000_000_500),
+			}),
+			"running",
+		);
+
+		expect(queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(projectId))?.map((session) => session.session_id)).toEqual([
+			sessionId,
+			"session_old",
+		]);
 	});
 
 	it("patches null active leaf ids from history events in the session list", () => {
@@ -149,11 +180,17 @@ describe("session query cache helpers", () => {
 
 	it("merges authoritative selected snapshots into the session list", () => {
 		const sessions = [summary()];
-		const snapshot = { ...snapshotFixture(), activity: "running" as const, metadata: { title: "Snapshot" } };
+		const snapshot = {
+			...snapshotFixture(),
+			activity: "running" as const,
+			metadata: { title: "Snapshot" },
+			last_user_message_timestamp_ms: 1_700_000_000_999,
+		};
 
 		expect(mergeSnapshotIntoSessionList(sessions, snapshot)?.[0]).toMatchObject({
 			activity: "running",
 			metadata: { title: "Snapshot" },
+			last_user_message_timestamp_ms: 1_700_000_000_999,
 		});
 	});
 
@@ -243,37 +280,43 @@ function compactionEntry(id: string, sourceLeafId: string): TranscriptEntry {
 	};
 }
 
-function summary(): SessionSummary {
+function summary(
+	options: {
+		sessionId?: string;
+		lastUserMessageTimestampMs?: number | null;
+	} = {},
+): SessionSummary {
 	return {
-			session_id: sessionId,
-			project_id: projectId,
-			outer_cwd: "/repo",
-			workspaces: [],
+		session_id: options.sessionId ?? sessionId,
+		project_id: projectId,
+		outer_cwd: "/repo",
+		workspaces: [],
 		activity: "idle",
 		active_leaf_id: null,
 		provider,
 		metadata: { title: "Old", archived: true },
 		created_at: "2026-01-01T00:00:00Z",
 		updated_at: "2026-01-01T00:00:00Z",
+		last_user_message_timestamp_ms: options.lastUserMessageTimestampMs ?? null,
 		has_transcript_entries: false,
 	};
 }
 
-function entry(id: string, parentId: string | null, text: string): TranscriptEntry {
+function entry(id: string, parentId: string | null, text: string, timestampMs = 1_700_000_000_000): TranscriptEntry {
 	return {
 		id,
 		parent_id: parentId,
-		timestamp_ms: 1_700_000_000_000,
+		timestamp_ms: timestampMs,
 		item: { type: "user_message", content: [{ type: "text", text }] },
 	};
 }
 
 function snapshotFixture(): SessionSnapshot {
 	return {
-			session_id: sessionId,
-			project_id: projectId,
-			outer_cwd: "/repo",
-			workspaces: [],
+		session_id: sessionId,
+		project_id: projectId,
+		outer_cwd: "/repo",
+		workspaces: [],
 		activity: "idle",
 		active_leaf_id: null,
 		provider,
@@ -291,6 +334,7 @@ function snapshotFixture(): SessionSnapshot {
 		],
 		last_event_id: 1,
 		server_time_ms: 1_700_000_000_000,
+		last_user_message_timestamp_ms: null,
 		entries: [],
 	};
 }

@@ -20,7 +20,12 @@ impl PostgresAgentStore {
             .execute(&mut *tx)
             .await?;
         let session = sqlx::query(
-            "select id, project_id, outer_cwd, workspaces, active_leaf_id, provider_config, metadata from sessions where id=$1",
+            r#"
+            select id, project_id, outer_cwd, workspaces, active_leaf_id,
+                provider_config, metadata, last_user_message_timestamp_ms
+            from sessions
+            where id=$1
+            "#,
         )
         .bind(session_id)
         .fetch_one(&mut *tx)
@@ -87,6 +92,7 @@ impl PostgresAgentStore {
             queue_revision: queue.queue_revision,
             transcript_revision: queue.transcript_revision,
             last_event_id,
+            last_user_message_timestamp_ms: session.get("last_user_message_timestamp_ms"),
             has_transcript_entries,
         })
     }

@@ -55,7 +55,15 @@ import {
 	textContent,
 	withReasoningEffort,
 } from "./sessionDefaults.ts";
-import { projectTitle, sessionTitle, isArchivedSession, displayActivity, tallyActivities, type SessionListItem } from "./sessionList.ts";
+import {
+	projectTitle,
+	sessionTitle,
+	isArchivedSession,
+	displayActivity,
+	sortSessionsByLastUserMessage,
+	tallyActivities,
+	type SessionListItem,
+} from "./sessionList.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
 import {
 	loadUiSelection,
@@ -306,7 +314,7 @@ export function App() {
 	});
 	const sessions = sessionsQuery.data ?? [];
 
-	const sessionItems: SessionListItem[] = sessions;
+	const sessionItems = useMemo(() => sortSessionsByLastUserMessage(sessions), [sessions]);
 	const selectedProject = useMemo(
 		() => projects.find((project) => project.project_id === selectedProjectId) ?? null,
 		[projects, selectedProjectId],
