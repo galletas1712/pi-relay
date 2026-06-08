@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
-import { Menu, PanelRightOpen, X } from "lucide-react";
+import { Folder, FolderGit2, Menu, PanelRightOpen, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
@@ -2372,6 +2372,10 @@ function ProjectDialog({
 							{state.workspaces.map((workspace, index) => {
 								return (
 									<div className="workspace-card" key={index}>
+										<div className="workspace-card-head">
+											{workspace.kind === "git" ? <FolderGit2 size={14} /> : <Folder size={14} />}
+											<span>{workspace.kind === "git" ? "Git repo" : "Local folder"}</span>
+										</div>
 										<div className="workspace-row">
 											<label>
 												<span>Type</span>
