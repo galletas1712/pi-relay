@@ -462,6 +462,61 @@ describe("MessageList tool use cards", () => {
 		expect(html).toContain("Worked for 6s");
 	});
 
+	it("interleaves steer messages in expanded turn details", () => {
+		const start = turnStartedEntry("start", 1, 1);
+		const user = userEntryWithParent("user", "start", "start work");
+		const assistantProgress = assistantEntry("assistant_progress", "user", "I will inspect first.");
+		const steer = userEntryWithParent("steer", "assistant_progress", "actually check tests too");
+		const assistantFinal = assistantEntry("assistant_final", "steer", "Done.");
+		const finish = turnFinishedEntry("finish", "assistant_final", 1, "Graceful");
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "completed",
+							outcome: "Graceful",
+							start_entry_id: "start",
+							boundary_entry_id: "finish",
+							active_leaf_id: "finish",
+							start_sequence: 1,
+							end_sequence: 6,
+							start_timestamp_ms: 1,
+							timestamp_ms: 6_001,
+							user_messages: [user, steer],
+							assistant_message: assistantFinal,
+							summary: null,
+							can_resume: false,
+						},
+						entries: [start, user, assistantProgress, steer, assistantFinal, finish],
+						expanded: true,
+						isCurrent: false,
+					},
+				]}
+				activeLeafId="finish"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
+			/>
+		);
+
+		const firstUserIndex = html.indexOf("start work");
+		const progressIndex = html.indexOf("I will inspect first.");
+		const steerIndex = html.indexOf("actually check tests too");
+		const finalIndex = html.indexOf("Done.");
+		expect([firstUserIndex, progressIndex, steerIndex, finalIndex].every((index) => index !== -1)).toBe(true);
+		expect(firstUserIndex).toBeLessThan(progressIndex);
+		expect(progressIndex).toBeLessThan(steerIndex);
+		expect(steerIndex).toBeLessThan(finalIndex);
+	});
+
 	it("renders pending tools in expanded current turn details", () => {
 		const pendingActions: PendingAction[] = [
 			{
