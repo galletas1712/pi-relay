@@ -76,23 +76,41 @@ pub(crate) async fn subagent_send(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let request = SubagentSendRequest::from_params(params)?;
+    send_to_subagent(
+        state,
+        &request.parent_session_id,
+        &request.child_session_id,
+        request.priority,
+        request.content,
+        request.client_input_id,
+    )
+    .await
+}
+
+pub(crate) async fn send_to_subagent(
+    state: &AppState,
+    parent_session_id: &str,
+    child_session_id: &str,
+    priority: InputPriority,
+    content: UserMessage,
+    client_input_id: Option<String>,
+) -> std::result::Result<Value, RpcError> {
     let relationship =
-        require_subagent_relationship(state, &request.parent_session_id, &request.child_session_id)
-            .await?;
-    let child_driver = SessionDriver::acquire(state, &request.child_session_id).await;
+        require_subagent_relationship(state, parent_session_id, child_session_id).await?;
+    let child_driver = SessionDriver::acquire(state, child_session_id).await;
     child_driver.recover_if_needed().await?;
     let has_running = state
         .repo
-        .has_unfinished_actions(&request.child_session_id)
+        .has_unfinished_actions(child_session_id)
         .await
         .map_err(anyhow::Error::from)?;
     let queued = state
         .repo
         .enqueue_user_input(
-            &request.child_session_id,
-            request.priority,
-            &request.content,
-            request.client_input_id.as_deref(),
+            child_session_id,
+            priority,
+            &content,
+            client_input_id.as_deref(),
         )
         .await
         .map_err(anyhow::Error::from)?;
@@ -104,13 +122,13 @@ pub(crate) async fn subagent_send(
     }
     let queue = state
         .repo
-        .queue_state(&request.child_session_id)
+        .queue_state(child_session_id)
         .await
         .map(rpc_views::queue_state)
         .map_err(anyhow::Error::from)?;
     Ok(json!({
-        "parent_session_id": request.parent_session_id,
-        "child_session_id": request.child_session_id,
+        "parent_session_id": parent_session_id,
+        "child_session_id": child_session_id,
         "relationship": relationship_view(&relationship),
         "input_id": queued.input_id,
         "queued": true,

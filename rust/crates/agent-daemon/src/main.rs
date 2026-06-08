@@ -11,6 +11,7 @@ mod session_start;
 mod state;
 mod subagents;
 mod types;
+mod workflows;
 mod workspaces;
 
 use crate::codec::{
@@ -284,6 +285,10 @@ async fn dispatch_request(
         RpcMethod::SubagentSpawn => subagents::subagent_spawn(state, params).await,
         RpcMethod::SubagentSend => subagents::subagent_send(state, params).await,
         RpcMethod::SubagentTail => subagents::subagent_tail(state, params).await,
+        RpcMethod::WorkflowVarsList => workflows::workflow_vars_list(state, params).await,
+        RpcMethod::WorkflowVarRead => workflows::workflow_var_read(state, params).await,
+        RpcMethod::WorkflowVarWrite => workflows::workflow_var_write(state, params).await,
+        RpcMethod::WorkflowContextSend => workflows::workflow_context_send(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }

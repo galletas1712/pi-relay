@@ -78,6 +78,10 @@ pub(crate) enum RpcMethod {
     SubagentSpawn,
     SubagentSend,
     SubagentTail,
+    WorkflowVarsList,
+    WorkflowVarRead,
+    WorkflowVarWrite,
+    WorkflowContextSend,
     HarnessModelComplete,
     HarnessModelFail,
 }
@@ -119,6 +123,10 @@ impl RpcMethod {
             "subagent.spawn" => Some(Self::SubagentSpawn),
             "subagent.send" => Some(Self::SubagentSend),
             "subagent.tail" => Some(Self::SubagentTail),
+            "workflow.vars_list" => Some(Self::WorkflowVarsList),
+            "workflow.var_read" => Some(Self::WorkflowVarRead),
+            "workflow.var_write" => Some(Self::WorkflowVarWrite),
+            "workflow.context_send" => Some(Self::WorkflowContextSend),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
             _ => None,
@@ -209,6 +217,22 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("subagent.tail"),
             Some(RpcMethod::SubagentTail)
+        );
+        assert_eq!(
+            RpcMethod::parse("workflow.vars_list"),
+            Some(RpcMethod::WorkflowVarsList)
+        );
+        assert_eq!(
+            RpcMethod::parse("workflow.var_read"),
+            Some(RpcMethod::WorkflowVarRead)
+        );
+        assert_eq!(
+            RpcMethod::parse("workflow.var_write"),
+            Some(RpcMethod::WorkflowVarWrite)
+        );
+        assert_eq!(
+            RpcMethod::parse("workflow.context_send"),
+            Some(RpcMethod::WorkflowContextSend)
         );
         assert_eq!(
             RpcMethod::parse("history.switch"),
