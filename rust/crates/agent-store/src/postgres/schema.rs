@@ -38,6 +38,7 @@ create table if not exists sessions (
     system_prompt text not null,
     provider_config jsonb not null,
     metadata jsonb not null default '{}'::jsonb,
+    last_user_message_timestamp_ms bigint null,
     session_revision bigint not null default 0,
     queue_revision bigint not null default 0,
     transcript_revision bigint not null default 0

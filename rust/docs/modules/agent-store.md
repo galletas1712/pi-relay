@@ -285,8 +285,9 @@ context size without re-counting the whole branch.
 - Thinking blocks are not stored here; they are discarded at the provider parse
   layer, so `AssistantItem` persisted in `item` is only `Text` / `ToolCall`.
 - `list_sessions` hides `metadata.hidden='true'` sessions, sorts archived last,
-  and suppresses empty web-created sessions (no transcript, no live queue, no
-  actions) so abandoned drafts do not clutter the list.
+  orders each group by latest user-message transcript timestamp, and suppresses
+  empty web-created sessions (no transcript, no live queue, no actions) so
+  abandoned drafts do not clutter the list.
 - `delete_session` cascades to transcript entries, queued inputs, actions, and
   events via `on delete cascade`.
 - Sessions snapshot project workspace source metadata at creation; project

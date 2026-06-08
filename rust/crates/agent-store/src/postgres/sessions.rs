@@ -400,6 +400,7 @@ impl PostgresAgentStore {
                     s.metadata,
                     s.created_at::text as created_at,
                     s.updated_at::text as updated_at,
+                    s.last_user_message_timestamp_ms,
                     exists(select 1 from actions a where a.session_id=s.id and {running_actions}) as has_running_work,
                     exists(select 1 from queued_inputs q where q.session_id=s.id and {active_queue}) as has_queued_input,
                     exists(select 1 from transcript_entries t where t.session_id=s.id) as has_transcript_entries
@@ -417,6 +418,7 @@ impl PostgresAgentStore {
                     )
                 order by
                     case when s.metadata->>'archived' = 'true' then 1 else 0 end asc,
+                    last_user_message_timestamp_ms desc nulls last,
                     s.created_at desc,
                     s.id desc
                 limit $1
@@ -452,6 +454,7 @@ impl PostgresAgentStore {
                     metadata: row.get("metadata"),
                     created_at: row.get("created_at"),
                     updated_at: row.get("updated_at"),
+                    last_user_message_timestamp_ms: row.get("last_user_message_timestamp_ms"),
                     has_transcript_entries: row.get("has_transcript_entries"),
                 })
             })
@@ -507,6 +510,10 @@ impl PostgresAgentStore {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sessions_tests.rs"]
+mod tests;
 
 async fn session_metadata_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,

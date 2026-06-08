@@ -30,6 +30,7 @@ pub(crate) fn session_summary(summary: SessionSummary) -> Value {
         "metadata": summary.metadata,
         "created_at": summary.created_at,
         "updated_at": summary.updated_at,
+        "last_user_message_timestamp_ms": summary.last_user_message_timestamp_ms,
         "has_transcript_entries": summary.has_transcript_entries,
     })
 }
@@ -71,6 +72,7 @@ pub(crate) fn session_snapshot(
         "queue_revision": snapshot.queue_revision,
         "transcript_revision": snapshot.transcript_revision,
         "last_event_id": snapshot.last_event_id,
+        "last_user_message_timestamp_ms": snapshot.last_user_message_timestamp_ms,
         "has_transcript_entries": snapshot.has_transcript_entries,
         "server_time_ms": now_ms(),
     });

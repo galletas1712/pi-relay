@@ -39,6 +39,7 @@ export interface SessionSummary {
 	metadata: Record<string, unknown>;
 	created_at: string;
 	updated_at: string;
+	last_user_message_timestamp_ms?: number | null;
 	has_transcript_entries?: boolean;
 }
 
@@ -85,6 +86,7 @@ export interface SessionSnapshot {
 	transcript_revision?: number;
 	last_event_id: number;
 	server_time_ms: number;
+	last_user_message_timestamp_ms?: number | null;
 	has_transcript_entries?: boolean;
 	entries?: TranscriptEntry[];
 }

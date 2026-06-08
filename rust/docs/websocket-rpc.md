@@ -430,7 +430,7 @@ For web drafts, the frontend should always provide both the stable draft-owned
 
 ### `session.list`
 
-Lists durable sessions, newest first.
+Lists durable sessions by last user-message timestamp, latest first.
 
 ```json
 { "limit": 50 }
@@ -440,12 +440,14 @@ Pass a `project_id` to list that project's sessions. Omit `project_id` to list
 ephemeral host sessions.
 
 Each row includes `session_id`, nullable `project_id`, `outer_cwd`, `workspaces`,
-`activity`, `active_leaf_id`, `provider`, `metadata`, `updated_at`, and
-`has_transcript_entries`. Defensive listing hides accidental empty web-created
-rows that have no transcript, queued input, or actions. Rows
-with `metadata.hidden = true` are also omitted from the list; this is used for
-local verification cleanup, not as a core lifecycle state. Browser-local drafts
-are not returned by this RPC.
+`activity`, `active_leaf_id`, `provider`, `metadata`, `updated_at`,
+`last_user_message_timestamp_ms`, and `has_transcript_entries`. Archived rows
+remain at the end of the list. Sessions without user messages sort after
+sessions that have user messages, then by creation time. Defensive listing hides
+accidental empty web-created rows that have no transcript, queued input, or
+actions. Rows with `metadata.hidden = true` are also omitted from the list; this
+is used for local verification cleanup, not as a core lifecycle state.
+Browser-local drafts are not returned by this RPC.
 
 ### `session.get`
 
@@ -488,6 +490,7 @@ Result shape:
   "queue_revision": 5,
   "transcript_revision": 7,
   "last_event_id": 42,
+  "last_user_message_timestamp_ms": 1717799900000,
   "server_time_ms": 1717800000000,
   "has_transcript_entries": true,
   "entries": []

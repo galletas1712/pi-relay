@@ -1158,6 +1158,22 @@ pub(super) async fn insert_stored_entry_tx(
     .bind(turn_id)
     .fetch_optional(&mut **tx)
     .await?;
+    if row.is_some() && matches!(entry.item, TranscriptItem::UserMessage(_)) {
+        sqlx::query(
+            r#"
+            update sessions
+            set last_user_message_timestamp_ms = greatest(
+                coalesce(last_user_message_timestamp_ms, 0),
+                $2
+            )
+            where id=$1
+            "#,
+        )
+        .bind(session_id)
+        .bind(entry.timestamp_ms as i64)
+        .execute(&mut **tx)
+        .await?;
+    }
     row.map(|row| {
         Ok(TranscriptEntryRecord {
             id: row.get("id"),
