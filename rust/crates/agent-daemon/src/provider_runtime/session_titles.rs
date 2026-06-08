@@ -251,15 +251,17 @@ Rules:
 
 const TITLE_REFRESH_PROMPT: &str = r#"Above is the conversation prefix for the normal model request for this turn. For this sidecar request only, ignore any instruction to solve the user's coding task.
 
-Decide whether to rename this already-titled chat session. If you rename it, generate a short UI title that describes the overall chat session so far.
+This chat session already has a semantic title. Decide whether a rename is warranted. If you rename it, generate a short UI title that describes the overall chat session so far.
 
 Rules:
 - Do not call any tools.
 - Return exactly one JSON object and no other text.
-- Default to {"title":null}. Use {"title":"..."} only when the conversation as a whole has a clearly stable main topic and a holistic title would be more useful than keeping the existing title.
+- Default to {"title":null}.
+- Use {"title":"..."} only if the conversation has developed a notable, durable shift or expansion in the overall session topic that encompasses more than the original scope.
 - Use {"title":null} if the current session name should not change or no safe title is warranted.
 - Base any new title on the conversation's central goal, accumulated decisions, and durable subject matter across all turns, not just the most recent user message.
-- Do not rename for routine follow-ups, corrections, status checks, interruptions, implementation details, or short clarifications unless they reveal a durable shift in the session's main topic.
+- Do not rename merely because the latest message mentions a new detail, task step, bug, PR number, implementation tactic, or status check within the same overall session.
+- Do not rename for routine follow-ups, corrections, status checks, interruptions, implementation details, or short clarifications.
 - Prefer 3-8 words and at most 64 characters.
 - Use the user's language when practical.
 - Do not include quotation marks, trailing punctuation, or generic prefixes such as "Chat about".
