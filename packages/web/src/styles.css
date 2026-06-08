@@ -2397,6 +2397,12 @@ pre {
 }
 
 .chat-dock {
+	grid-column: 1;
+	grid-row: 3;
+	border-top: 1px solid var(--border);
+	background: var(--card);
+	padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+}
 
 .composer-wrap {
 	position: relative;
