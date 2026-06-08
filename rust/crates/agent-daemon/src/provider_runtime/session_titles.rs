@@ -1,12 +1,11 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use agent_provider::ModelTranscriptEntry;
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
-use agent_vocab::{
-    AssistantItem, ContentBlock, ProviderKind, ReasoningEffort, TranscriptItem, UserMessage,
-};
+use agent_vocab::{AssistantItem, ContentBlock, ReasoningEffort, TranscriptItem, UserMessage};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -20,6 +19,7 @@ use super::{build_model_request, run_model_sidecar, sidecar_session_id, ModelSid
 const TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 160;
 const TITLE_INPUT_CHAR_LIMIT: usize = 8_000;
 const TITLE_MAX_CHARS: usize = 64;
+const TITLE_SIDECAR_TIMEOUT_SECS: u64 = 45;
 
 #[derive(Clone, Default)]
 pub(crate) struct SessionTitleScheduler {
@@ -204,7 +204,7 @@ async fn generate_session_title(
     let cache_prefix_len = model_request.transcript.len();
     model_request.transcript_cache_prefix_len = Some(cache_prefix_len);
     model_request.max_tokens = Some(TITLE_GENERATION_MAX_OUTPUT_TOKENS);
-    model_request.reasoning_effort = title_reasoning_effort(config.provider.kind);
+    model_request.reasoning_effort = ReasoningEffort::Low;
     model_request
         .transcript
         .push(ModelTranscriptEntry::from(TranscriptItem::UserMessage(
@@ -213,19 +213,33 @@ async fn generate_session_title(
                 serde_json::to_string(&title_context)?
             )),
         )));
-    let response = run_model_sidecar(
-        state,
-        config,
-        ModelSidecarRequest {
-            prompt_cache_key: model_request
-                .prompt_cache_key
-                .clone()
-                .unwrap_or_else(|| session_id.to_string()),
-            sidecar_session_id: title_sidecar_session_id(session_id),
-            request: model_request,
-        },
+    let sidecar_session_id = title_sidecar_session_id(session_id);
+    let response = match tokio::time::timeout(
+        Duration::from_secs(TITLE_SIDECAR_TIMEOUT_SECS),
+        run_model_sidecar(
+            state,
+            config,
+            ModelSidecarRequest {
+                prompt_cache_key: model_request
+                    .prompt_cache_key
+                    .clone()
+                    .unwrap_or_else(|| session_id.to_string()),
+                sidecar_session_id: sidecar_session_id.clone(),
+                request: model_request,
+            },
+        ),
     )
-    .await?;
+    .await
+    {
+        Ok(response) => response?,
+        Err(_) => {
+            state
+                .provider_connections
+                .remove_session(&sidecar_session_id)
+                .await;
+            anyhow::bail!("title sidecar timed out after {TITLE_SIDECAR_TIMEOUT_SECS} seconds");
+        }
+    };
 
     Ok(title_from_response(&response.assistant.items))
 }
@@ -252,13 +266,6 @@ Rules:
 - Do not include quotation marks, trailing punctuation, or generic prefixes such as "Chat about".
 - The title must not contain secrets, access tokens, API keys, or credentials.
 - If the message is mostly a secret/credential, an empty/unclear fragment, or an interruption/control request, use {"title":null}."#;
-
-fn title_reasoning_effort(provider: ProviderKind) -> ReasoningEffort {
-    match provider {
-        ProviderKind::OpenAi => ReasoningEffort::Low,
-        ProviderKind::Claude => ReasoningEffort::Low,
-    }
-}
 
 fn title_from_response(items: &[AssistantItem]) -> Option<String> {
     items.iter().find_map(|item| {

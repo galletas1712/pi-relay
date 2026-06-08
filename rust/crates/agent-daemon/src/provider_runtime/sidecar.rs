@@ -28,9 +28,15 @@ pub(crate) async fn run_model_sidecar(
     request: ModelSidecarRequest,
 ) -> Result<ModelResponse> {
     let sidecar_session_id = request.sidecar_session_id;
-    let prompt_cache_key = request.prompt_cache_key;
-    let model_request =
-        prepare_sidecar_model_request(request.request, &sidecar_session_id, prompt_cache_key);
+    let mut model_request = request.request;
+    model_request.prompt_cache_key = Some(request.prompt_cache_key);
+    // Preserve an owner session id when the caller built the sidecar from a
+    // normal model request; providers use that id as part of cache routing. If
+    // there is no owner session, isolate the request under the sidecar id.
+    model_request
+        .session_id
+        .get_or_insert_with(|| sidecar_session_id.clone());
+    model_request.turn_id = None;
     let result =
         async { complete_model_request(state, config, &sidecar_session_id, model_request).await }
             .await;
@@ -39,19 +45,6 @@ pub(crate) async fn run_model_sidecar(
         .remove_session(&sidecar_session_id)
         .await;
     result
-}
-
-fn prepare_sidecar_model_request(
-    mut request: ModelRequest,
-    sidecar_session_id: &str,
-    prompt_cache_key: String,
-) -> ModelRequest {
-    request.prompt_cache_key = Some(prompt_cache_key);
-    request
-        .session_id
-        .get_or_insert_with(|| sidecar_session_id.to_string());
-    request.turn_id = None;
-    request
 }
 
 pub(crate) fn sidecar_session_id(prefix: &str, owner_session_id: &str, parts: &[&str]) -> String {
