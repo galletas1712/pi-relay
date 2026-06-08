@@ -20,7 +20,7 @@ import { refreshPlanForEvent } from "./sessionEvents.ts";
 import { markdownComponents } from "./transcript.tsx";
 import {
 	mergeSnapshotIntoSessionList,
-	patchSessionListActivity,
+	patchSessionListEventSummary,
 	patchSessionListMetadata,
 	patchSessionListProvider,
 } from "./sessionQueryCache.ts";
@@ -823,9 +823,9 @@ export function App() {
 				}
 			}
 			if (shouldSyncSelected) scheduleActiveBranchSync(event.session_id);
+			const activity = activityFromEvent(event);
+			patchSessionListEventSummary(queryClient, selectedProjectRef.current, event, activity);
 			if (refreshPlan.refreshList) {
-				const activity = activityFromEvent(event);
-				if (activity) patchSessionListActivity(queryClient, selectedProjectRef.current, event.session_id, activity);
 				scheduleSessionListRefresh();
 			}
 

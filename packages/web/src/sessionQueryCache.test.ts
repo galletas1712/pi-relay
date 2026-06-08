@@ -5,11 +5,12 @@ import {
 	applyActiveBranchSync,
 	mergeSnapshotIntoSessionList,
 	patchSessionListActivity,
+	patchSessionListEventSummary,
 	patchSessionListMetadata,
 	patchSessionListProvider,
 	patchSessionSnapshot,
 } from "./sessionQueryCache.ts";
-import type { ActiveBranchSyncResponse, ProviderConfig, SessionSnapshot, SessionSummary, TranscriptEntry } from "./types.ts";
+import type { ActiveBranchSyncResponse, EventFrame, ProviderConfig, SessionSnapshot, SessionSummary, TranscriptEntry } from "./types.ts";
 
 const projectId = "project_1";
 const sessionId = "session_1";
@@ -53,6 +54,73 @@ describe("session query cache helpers", () => {
 		expect(queryClient.getQueryData<SessionSnapshot>(queryKeys.session(sessionId, "active_branch"))).toMatchObject({
 			provider,
 			activity: "idle",
+		});
+	});
+
+	it("patches session list metadata, provider, and activity from configured events", () => {
+		const queryClient = seededClient();
+
+		patchSessionListEventSummary(
+			queryClient,
+			projectId,
+			eventFrame("session.configured", {
+				metadata: { title: "Generated title" },
+				provider: nextProvider,
+				activity: "running",
+			}),
+			"running",
+		);
+
+		expect(queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(projectId))?.[0]).toMatchObject({
+			metadata: { title: "Generated title" },
+			provider: nextProvider,
+			activity: "running",
+		});
+	});
+
+	it("patches active leaf ids from transcript events in the session list", () => {
+		const queryClient = seededClient();
+
+		patchSessionListEventSummary(
+			queryClient,
+			projectId,
+			eventFrame("transcript.appended", {
+				active_leaf_id: "entry_2",
+				activity: "running",
+			}),
+			"running",
+		);
+
+		expect(queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(projectId))?.[0]).toMatchObject({
+			active_leaf_id: "entry_2",
+			activity: "running",
+			has_transcript_entries: true,
+		});
+	});
+
+	it("patches null active leaf ids from history events in the session list", () => {
+		const queryClient = seededClient();
+		patchSessionListEventSummary(
+			queryClient,
+			projectId,
+			eventFrame("transcript.appended", { active_leaf_id: "entry_2" }),
+			null,
+		);
+
+		patchSessionListEventSummary(
+			queryClient,
+			projectId,
+			eventFrame("history.switched", {
+				active_leaf_id: null,
+				activity: "idle",
+			}),
+			"idle",
+		);
+
+		expect(queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(projectId))?.[0]).toMatchObject({
+			active_leaf_id: null,
+			activity: "idle",
+			has_transcript_entries: true,
 		});
 	});
 
@@ -148,6 +216,15 @@ function seededClient(): QueryClient {
 	queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(projectId), [summary()]);
 	queryClient.setQueryData<SessionSnapshot>(queryKeys.session(sessionId, "active_branch"), snapshotFixture());
 	return queryClient;
+}
+
+function eventFrame(event: string, data: Record<string, unknown>): EventFrame {
+	return {
+		event_id: 2,
+		event,
+		session_id: sessionId,
+		data,
+	};
 }
 
 function compactionEntry(id: string, sourceLeafId: string): TranscriptEntry {
