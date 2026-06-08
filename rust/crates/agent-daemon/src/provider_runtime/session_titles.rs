@@ -49,7 +49,7 @@ struct PendingTitleRefresh {
     title_at_submit: Option<String>,
 }
 
-pub(crate) fn schedule_session_title_refresh_after_model(
+pub(crate) fn schedule_session_title_refresh_for_model_turn(
     state: &AppState,
     session_id: impl Into<String>,
     config: &SessionConfig,

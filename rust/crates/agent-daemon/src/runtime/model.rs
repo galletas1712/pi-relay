@@ -4,7 +4,7 @@ use agent_store::{ActionStatus, ActionUpdate};
 use agent_vocab::TurnId;
 use serde_json::{json, Value};
 
-use crate::provider_runtime::{run_model, schedule_session_title_refresh_after_model};
+use crate::provider_runtime::{run_model, schedule_session_title_refresh_for_model_turn};
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError};
 
@@ -36,7 +36,15 @@ pub(super) async fn run_model_turn(
         },
         ..dispatch
     };
-    let title_model_context = model_context.clone();
+    // Title generation is a sidecar fork at the same transcript checkpoint as
+    // the model turn: immediately after the user message, before assistant
+    // output is persisted.
+    schedule_session_title_refresh_for_model_turn(
+        &state,
+        session_id.clone(),
+        &dispatch.config,
+        &model_context,
+    );
 
     let result =
         run_model_for_action_with_retries(&state, &session_id, &dispatch, turn_id, model_context)
@@ -99,12 +107,6 @@ pub(super) async fn run_model_turn(
                             provider_replay,
                         )
                         .await?;
-                    schedule_session_title_refresh_after_model(
-                        &state,
-                        session_id.clone(),
-                        &dispatch.config,
-                        &title_model_context,
-                    );
                     dispatches
                 }
                 agent_provider::ModelStopReason::MaxOutputTokens => {
