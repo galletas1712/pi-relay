@@ -65,6 +65,40 @@ fn title_from_response_uses_json_text() {
 }
 
 #[test]
+fn title_from_response_uses_fenced_json_text() {
+    let items = vec![AssistantItem::Text(
+        "```json\n{\"title\":\"Debug flaky tests\"}\n```".to_string(),
+    )];
+
+    assert_eq!(
+        title_from_response(&items),
+        Some("Debug flaky tests".to_string())
+    );
+}
+
+#[test]
+fn title_from_response_uses_json_object_embedded_in_text() {
+    let items = vec![AssistantItem::Text(
+        "Here is the title:\n{\"title\":\"Debug flaky tests\"}\nThanks".to_string(),
+    )];
+
+    assert_eq!(
+        title_from_response(&items),
+        Some("Debug flaky tests".to_string())
+    );
+}
+
+#[test]
+fn title_from_response_ignores_embedded_object_without_title() {
+    let items = vec![AssistantItem::Text(
+        "Here is the title:\n{\"other\":\"Debug flaky tests\"}\n{\"title\":\"Ignored\"}"
+            .to_string(),
+    )];
+
+    assert_eq!(title_from_response(&items), None);
+}
+
+#[test]
 fn title_sidecar_session_id_is_short_and_distinct_from_main_session() {
     let id = title_sidecar_session_id("session_00000000-0000-0000-0000-000000000000");
 
