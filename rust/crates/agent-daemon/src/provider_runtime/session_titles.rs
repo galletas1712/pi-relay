@@ -5,8 +5,7 @@ use std::time::Duration;
 use agent_provider::ModelTranscriptEntry;
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
-use agent_vocab::{AssistantItem, ContentBlock, ReasoningEffort, TranscriptItem, UserMessage};
-use serde::Serialize;
+use agent_vocab::{AssistantItem, ReasoningEffort, TranscriptItem, UserMessage};
 use serde_json::Value;
 
 use crate::runtime::{
@@ -17,7 +16,6 @@ use crate::state::AppState;
 use super::{build_model_request, run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 
 const TITLE_GENERATION_MAX_OUTPUT_TOKENS: u32 = 160;
-const TITLE_INPUT_CHAR_LIMIT: usize = 8_000;
 const TITLE_MAX_CHARS: usize = 64;
 const TITLE_SIDECAR_TIMEOUT_SECS: u64 = 45;
 
@@ -46,7 +44,6 @@ fn pending_generation_matches(state: &AppState, session_id: &str, generation: u6
 #[derive(Debug, Clone)]
 struct PendingTitleRefresh {
     generation: u64,
-    message: UserMessage,
     config: SessionConfig,
     model_context: ModelContext,
     title_at_submit: Option<String>,
@@ -61,15 +58,14 @@ pub(crate) fn schedule_session_title_refresh_after_model(
     if session_title_disabled(config) {
         return;
     }
-    let Some(message) = title_trigger_message(model_context) else {
+    if title_trigger_message(model_context).is_none() {
         return;
-    };
+    }
     let title_at_submit = metadata_title(&config.metadata);
 
     let state = state.clone();
     let session_id = session_id.into();
     let config = config.clone();
-    let message = message.clone();
     let model_context = model_context.clone();
     let should_spawn = {
         let mut pending = state
@@ -85,7 +81,6 @@ pub(crate) fn schedule_session_title_refresh_after_model(
             session_id.clone(),
             PendingTitleRefresh {
                 generation,
-                message,
                 config,
                 model_context,
                 title_at_submit,
@@ -185,14 +180,10 @@ async fn generate_session_title(
     config: &SessionConfig,
     request: &PendingTitleRefresh,
 ) -> anyhow::Result<Option<String>> {
-    let title_context = SessionTitlePromptContext {
-        current_title: request.title_at_submit.as_deref().unwrap_or_default(),
-        current_title_is_truncated_placeholder: current_title_is_truncated_placeholder(
-            request.title_at_submit.as_deref(),
-            &request.config.metadata,
-        ),
-        user_message: render_user_message_for_title(&request.message),
-    };
+    let title_prompt = title_prompt_for_current_title(
+        request.title_at_submit.as_deref(),
+        &request.config.metadata,
+    );
     let mut model_request = build_model_request(
         state,
         config,
@@ -208,10 +199,7 @@ async fn generate_session_title(
     model_request
         .transcript
         .push(ModelTranscriptEntry::from(TranscriptItem::UserMessage(
-            UserMessage::text(format!(
-                "{TITLE_GENERATION_PROMPT}\n\n{}",
-                serde_json::to_string(&title_context)?
-            )),
+            UserMessage::text(title_prompt),
         )));
     let sidecar_session_id = title_sidecar_session_id(session_id);
     let response = match tokio::time::timeout(
@@ -244,28 +232,47 @@ async fn generate_session_title(
     Ok(title_from_response(&response.assistant.items))
 }
 
-#[derive(Serialize)]
-struct SessionTitlePromptContext<'a> {
-    current_title: &'a str,
-    current_title_is_truncated_placeholder: bool,
-    user_message: String,
-}
+const TITLE_REPLACE_PLACEHOLDER_PROMPT: &str = r#"Above is the conversation prefix for the normal model request for this turn. For this sidecar request only, ignore any instruction to solve the user's coding task.
 
-const TITLE_GENERATION_PROMPT: &str = r#"Above is the conversation prefix for the normal model request for this turn. For this sidecar request only, ignore any instruction to solve the user's coding task.
-
-Generate a short UI title for the pi-relay chat session. You are given JSON containing the current session title and the user message for this turn. Decide whether to rename the session that encapsulates the conversation so far.
+Generate a short UI title that describes the overall chat session so far.
 
 Rules:
 - Do not call any tools.
 - Return exactly one JSON object and no other text.
-- Use {"title":"..."} only when the new title is clearly better than the current title.
-- If current_title_is_truncated_placeholder is true, treat the current title as a fallback placeholder from the first user message rather than a user-chosen title; prefer replacing it with a concise semantic title unless no safe title is warranted.
-- Use {"title":null} if the session name is already appropriate or no safe title is warranted.
+- Use {"title":"..."} with a concise semantic title.
+- Use {"title":null} only if no safe title is warranted.
+- Base the title on the conversation's central goal, accumulated decisions, and durable subject matter across all turns, not just the most recent user message.
+- If the latest user message is a follow-up, correction, status check, interruption, or implementation detail, treat it as context for the broader session rather than the title's topic.
 - Prefer 3-8 words and at most 64 characters.
 - Use the user's language when practical.
 - Do not include quotation marks, trailing punctuation, or generic prefixes such as "Chat about".
 - The title must not contain secrets, access tokens, API keys, or credentials.
 - If the message is mostly a secret/credential, an empty/unclear fragment, or an interruption/control request, use {"title":null}."#;
+
+const TITLE_REFRESH_PROMPT: &str = r#"Above is the conversation prefix for the normal model request for this turn. For this sidecar request only, ignore any instruction to solve the user's coding task.
+
+Decide whether to rename this already-titled chat session. If you rename it, generate a short UI title that describes the overall chat session so far.
+
+Rules:
+- Do not call any tools.
+- Return exactly one JSON object and no other text.
+- Default to {"title":null}. Use {"title":"..."} only when the conversation as a whole has a clearly stable main topic and a holistic title would be more useful than keeping the existing title.
+- Use {"title":null} if the current session name should not change or no safe title is warranted.
+- Base any new title on the conversation's central goal, accumulated decisions, and durable subject matter across all turns, not just the most recent user message.
+- Do not rename for routine follow-ups, corrections, status checks, interruptions, implementation details, or short clarifications unless they reveal a durable shift in the session's main topic.
+- Prefer 3-8 words and at most 64 characters.
+- Use the user's language when practical.
+- Do not include quotation marks, trailing punctuation, or generic prefixes such as "Chat about".
+- The title must not contain secrets, access tokens, API keys, or credentials.
+- If the message is mostly a secret/credential, an empty/unclear fragment, or an interruption/control request, use {"title":null}."#;
+
+fn title_prompt_for_current_title(current_title: Option<&str>, metadata: &Value) -> &'static str {
+    if current_title_is_truncated_placeholder(current_title, metadata) {
+        TITLE_REPLACE_PLACEHOLDER_PROMPT
+    } else {
+        TITLE_REFRESH_PROMPT
+    }
+}
 
 fn title_from_response(items: &[AssistantItem]) -> Option<String> {
     items.iter().find_map(|item| {
@@ -345,17 +352,6 @@ fn sanitize_title(title: &str) -> Option<String> {
         title = title.trim_end().to_string();
     }
     (!title.is_empty()).then_some(title)
-}
-
-fn render_user_message_for_title(message: &UserMessage) -> String {
-    let mut rendered = Vec::new();
-    for block in &message.content {
-        match block {
-            ContentBlock::Text { text } => rendered.push(text.clone()),
-            ContentBlock::Image { .. } => rendered.push("[image]".to_string()),
-        }
-    }
-    truncate_chars(&rendered.join("\n"), TITLE_INPUT_CHAR_LIMIT)
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
