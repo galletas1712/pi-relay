@@ -1,6 +1,7 @@
 use super::*;
 use agent_session::ModelContext;
 use agent_vocab::{AssistantItem, TranscriptItem, UserMessage};
+use serde_json::json;
 
 #[test]
 fn sanitize_title_trims_quotes_and_punctuation() {
@@ -49,6 +50,46 @@ fn sanitize_title_rejects_secret_like_titles() {
     assert_eq!(
         sanitize_title("API key rotation"),
         Some("API key rotation".to_string())
+    );
+}
+
+#[test]
+fn truncated_web_titles_are_treated_as_placeholders() {
+    assert!(current_title_is_truncated_placeholder(
+        Some("right now session names in pi-relay are just a prefix of the ..."),
+        &json!({ "created_by": "web" }),
+    ));
+}
+
+#[test]
+fn explicit_or_finished_titles_are_not_truncated_placeholders() {
+    assert!(!current_title_is_truncated_placeholder(
+        Some("Auto Session Titles"),
+        &json!({ "created_by": "web" }),
+    ));
+    assert!(!current_title_is_truncated_placeholder(
+        Some("Long title from another client ..."),
+        &json!({ "created_by": "api" }),
+    ));
+    assert!(!current_title_is_truncated_placeholder(
+        Some("Unknown client title ..."),
+        &json!({}),
+    ));
+    assert!(!current_title_is_truncated_placeholder(
+        Some("Manual looking title ..."),
+        &json!({ "created_by": "web", "auto_title_disabled": true }),
+    ));
+}
+
+#[test]
+fn title_reasoning_effort_uses_provider_supported_low_effort() {
+    assert_eq!(
+        title_reasoning_effort(ProviderKind::OpenAi),
+        ReasoningEffort::Low
+    );
+    assert_eq!(
+        title_reasoning_effort(ProviderKind::Claude),
+        ReasoningEffort::Low
     );
 }
 
