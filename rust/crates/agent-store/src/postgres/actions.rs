@@ -50,6 +50,22 @@ impl PostgresAgentStore {
             .await?)
     }
 
+    pub async fn has_unfinished_actions_except(
+        &self,
+        session_id: &str,
+        excluded_action_row_id: &str,
+    ) -> Result<bool> {
+        let unfinished_actions = action_is_unfinished(None);
+        let query = format!(
+            "select exists(select 1 from actions where session_id=$1 and id<>$2::text and {unfinished_actions})"
+        );
+        Ok(sqlx::query_scalar(&query)
+            .bind(session_id)
+            .bind(excluded_action_row_id)
+            .fetch_one(&self.pool)
+            .await?)
+    }
+
     pub async fn load_action(&self, session_id: &str, action_row_id: &str) -> Result<StoredAction> {
         let row = sqlx::query(
             "select kind, action_id, turn_id, attempt_id from actions where session_id=$1 and id=$2::text and status='running'",

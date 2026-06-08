@@ -1,5 +1,5 @@
 use super::*;
-use agent_store::ProjectWorkspace;
+use agent_store::{ProjectWorkspace, SessionRelationshipFilesystemMode};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
@@ -147,6 +147,12 @@ async fn fork_session_from_parent_copies_current_state_without_refreshing_base()
     let baseline_repo = Path::new(&fork.baseline_cwd).join("repo");
 
     assert_eq!(fork.workspaces.len(), 1);
+    assert!(matches!(
+        fork.filesystem_mode,
+        SessionRelationshipFilesystemMode::BtrfsSnapshot
+            | SessionRelationshipFilesystemMode::ReflinkCopy
+            | SessionRelationshipFilesystemMode::PlainCopy
+    ));
     assert_eq!(
         fork.workspaces[0].local_branch.as_deref(),
         Some("pi/session/child-session/repo")

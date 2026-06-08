@@ -150,6 +150,7 @@ create index if not exists session_relationships_root_idx
     on session_relationships(root_session_id, created_at, id);
 
 create table if not exists workflow_variables (
+    owner_session_id text not null,
     workflow_id text not null,
     name text not null,
     value_json jsonb null,
@@ -158,11 +159,27 @@ create table if not exists workflow_variables (
     producer_action_id text null,
     created_at timestamptz not null default now(),
     updated_at timestamptz not null default now(),
-    primary key (workflow_id, name)
+    primary key (owner_session_id, workflow_id, name)
 );
+
+alter table workflow_variables add column if not exists owner_session_id text;
+
+update workflow_variables
+set owner_session_id=coalesce(producer_session_id, 'legacy')
+where owner_session_id is null;
+
+alter table workflow_variables alter column owner_session_id set not null;
+
+alter table workflow_variables drop constraint if exists workflow_variables_pkey;
+
+alter table workflow_variables
+    add primary key (owner_session_id, workflow_id, name);
 
 create index if not exists workflow_variables_workflow_updated_idx
     on workflow_variables(workflow_id, updated_at, name);
+
+create index if not exists workflow_variables_owner_workflow_updated_idx
+    on workflow_variables(owner_session_id, workflow_id, updated_at, name);
 "#;
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {

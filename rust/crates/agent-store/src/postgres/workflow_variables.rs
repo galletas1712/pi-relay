@@ -14,6 +14,7 @@ impl PostgresAgentStore {
         let row = sqlx::query(
             r#"
             insert into workflow_variables (
+                owner_session_id,
                 workflow_id,
                 name,
                 value_json,
@@ -21,8 +22,8 @@ impl PostgresAgentStore {
                 producer_session_id,
                 producer_action_id
             )
-            values ($1, $2, $3, $4, $5, $6)
-            on conflict (workflow_id, name)
+            values ($1, $2, $3, $4, $5, $6, $7)
+            on conflict (owner_session_id, workflow_id, name)
             do update set
                 value_json=excluded.value_json,
                 value_text=excluded.value_text,
@@ -30,6 +31,7 @@ impl PostgresAgentStore {
                 producer_action_id=excluded.producer_action_id,
                 updated_at=now()
             returning
+                owner_session_id,
                 workflow_id,
                 name,
                 value_json,
@@ -40,6 +42,7 @@ impl PostgresAgentStore {
                 updated_at::text as updated_at
             "#,
         )
+        .bind(&variable.owner_session_id)
         .bind(&variable.workflow_id)
         .bind(&variable.name)
         .bind(&variable.value_json)
@@ -53,12 +56,14 @@ impl PostgresAgentStore {
 
     pub async fn workflow_variable(
         &self,
+        owner_session_id: &str,
         workflow_id: &str,
         name: &str,
     ) -> Result<Option<WorkflowVariable>> {
         let row = sqlx::query(
             r#"
             select
+                owner_session_id,
                 workflow_id,
                 name,
                 value_json,
@@ -68,9 +73,10 @@ impl PostgresAgentStore {
                 created_at::text as created_at,
                 updated_at::text as updated_at
             from workflow_variables
-            where workflow_id=$1 and name=$2
+            where owner_session_id=$1 and workflow_id=$2 and name=$3
             "#,
         )
+        .bind(owner_session_id)
         .bind(workflow_id)
         .bind(name)
         .fetch_optional(&self.pool)
@@ -80,11 +86,14 @@ impl PostgresAgentStore {
 
     pub async fn list_workflow_variables(
         &self,
+        owner_session_id: &str,
         workflow_id: &str,
+        limit: i64,
     ) -> Result<Vec<WorkflowVariable>> {
         let rows = sqlx::query(
             r#"
             select
+                owner_session_id,
                 workflow_id,
                 name,
                 value_json,
@@ -94,11 +103,14 @@ impl PostgresAgentStore {
                 created_at::text as created_at,
                 updated_at::text as updated_at
             from workflow_variables
-            where workflow_id=$1
+            where owner_session_id=$1 and workflow_id=$2
             order by name
+            limit $3
             "#,
         )
+        .bind(owner_session_id)
         .bind(workflow_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(workflow_variable_from_row).collect()
@@ -107,6 +119,7 @@ impl PostgresAgentStore {
 
 fn workflow_variable_from_row(row: sqlx::postgres::PgRow) -> Result<WorkflowVariable> {
     Ok(WorkflowVariable {
+        owner_session_id: row.get("owner_session_id"),
         workflow_id: row.get("workflow_id"),
         name: row.get("name"),
         value_json: row.get::<Option<Value>, _>("value_json"),
@@ -230,6 +243,7 @@ mod tests {
 
         let first = store
             .write_workflow_variable(&WorkflowVariableWrite {
+                owner_session_id: "producer".to_string(),
                 workflow_id: "workflow_1".to_string(),
                 name: "review".to_string(),
                 value_json: Some(json!({ "issues": [] })),
@@ -239,11 +253,12 @@ mod tests {
             })
             .await
             .expect("variable writes");
+        assert_eq!(first.owner_session_id, "producer");
         assert_eq!(first.workflow_id, "workflow_1");
         assert_eq!(first.name, "review");
 
         let listed = store
-            .list_workflow_variables("workflow_1")
+            .list_workflow_variables("producer", "workflow_1", 100)
             .await
             .expect("variables list");
         assert_eq!(listed.len(), 1);
@@ -251,6 +266,7 @@ mod tests {
 
         let updated = store
             .write_workflow_variable(&WorkflowVariableWrite {
+                owner_session_id: "producer".to_string(),
                 workflow_id: "workflow_1".to_string(),
                 name: "review".to_string(),
                 value_json: Some(json!({ "issues": ["one"] })),
@@ -264,7 +280,7 @@ mod tests {
         assert_eq!(updated.producer_action_id.as_deref(), Some("action_2"));
 
         let read = store
-            .workflow_variable("workflow_1", "review")
+            .workflow_variable("producer", "workflow_1", "review")
             .await
             .expect("variable reads")
             .expect("variable exists");

@@ -54,14 +54,24 @@ pub(super) async fn materialize_tree_from_source(source: &Path, target: &Path) -
     copy_dir_all(source, target, SymlinkMode::Sanitize).await
 }
 
-pub(super) async fn materialize_tree_from_source_exact(source: &Path, target: &Path) -> Result<()> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum MaterializeTreeMode {
+    BtrfsSnapshot,
+    ReflinkCopy,
+    PlainCopy,
+}
+
+pub(super) async fn materialize_tree_from_source_exact(
+    source: &Path,
+    target: &Path,
+) -> Result<MaterializeTreeMode> {
     if try_btrfs_subvolume_snapshot(source, target).await? {
-        return Ok(());
+        return Ok(MaterializeTreeMode::BtrfsSnapshot);
     }
 
     if try_btrfs_subvolume_create(target).await? {
         match reflink_dir_all(source, target, SymlinkMode::Preserve).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(MaterializeTreeMode::ReflinkCopy),
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(target).await;
                 eprintln!(
@@ -73,7 +83,8 @@ pub(super) async fn materialize_tree_from_source_exact(source: &Path, target: &P
         }
     }
 
-    copy_dir_all(source, target, SymlinkMode::Preserve).await
+    copy_dir_all(source, target, SymlinkMode::Preserve).await?;
+    Ok(MaterializeTreeMode::PlainCopy)
 }
 
 async fn try_btrfs_subvolume_snapshot(source: &Path, target: &Path) -> Result<bool> {

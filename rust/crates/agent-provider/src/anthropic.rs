@@ -1409,8 +1409,16 @@ mod tests {
                 "Grep",
                 "LoadSkill",
                 "str_replace_based_edit_tool",
+                "SubagentList",
+                "SubagentSend",
+                "SubagentSpawn",
+                "SubagentTail",
                 "web_fetch",
-                "web_search"
+                "web_search",
+                "WorkflowContextSend",
+                "WorkflowVarRead",
+                "WorkflowVarsList",
+                "WorkflowVarWrite"
             ]
         );
         for tool in tools {
@@ -1446,13 +1454,29 @@ mod tests {
         assert!(body["tools"][2].get("type").is_none());
         assert_eq!(body["tools"][3]["type"], "text_editor_20250728");
         assert_eq!(body["tools"][3]["name"], "str_replace_based_edit_tool");
-        assert_eq!(body["tools"][4]["name"], "web_fetch");
+        assert_eq!(body["tools"][4]["name"], "SubagentList");
         assert!(body["tools"][4].get("type").is_none());
-        assert_eq!(body["tools"][5]["name"], "web_search");
+        assert_eq!(body["tools"][5]["name"], "SubagentSend");
         assert!(body["tools"][5].get("type").is_none());
+        assert_eq!(body["tools"][6]["name"], "SubagentSpawn");
+        assert!(body["tools"][6].get("type").is_none());
+        assert_eq!(body["tools"][7]["name"], "SubagentTail");
+        assert!(body["tools"][7].get("type").is_none());
+        assert_eq!(body["tools"][8]["name"], "web_fetch");
+        assert!(body["tools"][8].get("type").is_none());
+        assert_eq!(body["tools"][9]["name"], "web_search");
+        assert!(body["tools"][9].get("type").is_none());
+        assert_eq!(body["tools"][10]["name"], "WorkflowContextSend");
+        assert!(body["tools"][10].get("type").is_none());
+        assert_eq!(body["tools"][11]["name"], "WorkflowVarRead");
+        assert!(body["tools"][11].get("type").is_none());
+        assert_eq!(body["tools"][12]["name"], "WorkflowVarsList");
+        assert!(body["tools"][12].get("type").is_none());
+        assert_eq!(body["tools"][13]["name"], "WorkflowVarWrite");
+        assert!(body["tools"][13].get("type").is_none());
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
-        for index in 0..6 {
+        for index in 0..14 {
             assert!(
                 body["tools"][index].get("cache_control").is_none(),
                 "tool {index} should not carry cache_control"

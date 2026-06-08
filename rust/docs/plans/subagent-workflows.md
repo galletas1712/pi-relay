@@ -415,6 +415,7 @@ Add durable variables scoped to a workflow or parent session:
 
 ```text
 workflow_variables
+  owner_session_id
   workflow_id
   name
   value_json
@@ -424,6 +425,12 @@ workflow_variables
   created_at
   updated_at
 ```
+
+`owner_session_id` is the durable scope boundary. For a top-level session it is
+the current session id; for a subagent it is the relationship root session id.
+RPCs/tools should derive this owner from the caller/session graph instead of
+trusting caller-provided owner ids. This prevents two unrelated sessions from
+accidentally or intentionally colliding on a guessed `workflow_id`.
 
 Variables should support both text and JSON. JSON is necessary for structured
 agent results; text is useful for transcript excerpts, diffs, and f-string-like
@@ -441,17 +448,20 @@ WorkflowContextSend
 Example:
 
 ```text
-WorkflowVarsList()
-WorkflowVarRead(name="reviewer_findings")
+WorkflowVarsList(workflow_id="review-workflow")
+WorkflowVarRead(workflow_id="review-workflow", name="reviewer_findings")
 WorkflowContextSend(
-  target_agent="implementer",
+  workflow_id="review-workflow",
+  child_session_id="session_...",
   template="Reviewer found:\n{reviewer_findings}\nPlease address these."
 )
 ```
 
-`WorkflowContextSend` renders a bounded template using workflow variables, then
-appends the rendered message to a subagent or related session. This is simpler
-than asking the parent model to manually paste content between tool calls.
+`WorkflowVarsList` should be bounded and return names/metadata by default;
+`WorkflowVarRead` returns full values. `WorkflowContextSend` renders a bounded
+template by loading only variables referenced as `{variable_name}`, then appends
+the rendered message to a subagent or related session. This is simpler than
+asking the parent model to manually paste content between tool calls.
 
 #### 8.2 Agent result capture
 
@@ -694,7 +704,12 @@ No new work needed here except reusing the primitives for parent-to-child forks.
 - Add `SubagentManager::spawn`.
 - Add `RelatedSessionManager::spawn` for same-project top-level handoff
   sessions.
+- Persist the child session and relationship before dispatching the child's
+  first model turn so the child can immediately resolve parent/root workflow
+  scope.
 - Drive the child through existing `SessionDriver`.
+- On spawn failure after child session creation, remove active runtime state,
+  durable child rows, provider connections, and the child workspace directory.
 - Add harness/fake-provider integration tests so this works without real model
   calls.
 
@@ -703,6 +718,11 @@ No new work needed here except reusing the primitives for parent-to-child forks.
 - Implement `send`, `tail`, `transcript`, `wait`, `interrupt`, and `stop`.
 - Reuse existing input and interrupt paths where possible.
 - Add parent/child status projection.
+- Keep relationship status fresh from session activity when listing/observing
+  children.
+- When deleting a parent session, recursively delete or explicitly promote its
+  hidden parent-controlled child sessions so hidden orphan sessions are not left
+  behind.
 - Add limits: max depth, max children per parent, max concurrently running
   children.
 - Add events for parent observability, for example:
@@ -722,6 +742,10 @@ No new work needed here except reusing the primitives for parent-to-child forks.
 - Add bounded template rendering for context forwarding:
   `{variable_name}` interpolation, max rendered size, and clear errors for
   missing variables.
+- Key variables by `(owner_session_id, workflow_id, name)` and derive
+  `owner_session_id` from the session/relationship graph.
+- Override producer metadata from daemon-owned tool execution instead of
+  trusting model-supplied `producer_session_id` or `producer_action_id`.
 - Ensure workflow operations have the parent session id and can call
   `SubagentManager` / `RelatedSessionManager`.
 

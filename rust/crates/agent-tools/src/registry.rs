@@ -304,6 +304,14 @@ pub(crate) fn sort_tools_by_name(tools: &mut [ProviderTool]) {
 pub fn builtin_tool_definition(name: &str) -> Option<ToolDefinition> {
     match name {
         "LoadSkill" => Some(load_skill_definition()),
+        "SubagentSpawn" => Some(subagent_spawn_definition()),
+        "SubagentList" => Some(subagent_list_definition()),
+        "SubagentSend" => Some(subagent_send_definition()),
+        "SubagentTail" => Some(subagent_tail_definition()),
+        "WorkflowVarsList" => Some(workflow_vars_list_definition()),
+        "WorkflowVarRead" => Some(workflow_var_read_definition()),
+        "WorkflowVarWrite" => Some(workflow_var_write_definition()),
+        "WorkflowContextSend" => Some(workflow_context_send_definition()),
         "Edit" | "apply_patch" => Some(ApplyPatchTool.definition()),
         "Bash" => Some(BashTool.definition()),
         "Grep" => Some(GrepTool.definition()),
@@ -335,6 +343,149 @@ fn load_skill_definition() -> ToolDefinition {
     )
 }
 
+fn subagent_spawn_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "SubagentSpawn",
+        "Spawn a hidden parent-controlled subagent from the current session cwd. The child gets a CoW/copy of the parent's current filesystem state and a role loaded from SKILL.md.",
+        json!({
+            "type": "object",
+            "properties": {
+                "role": { "type": "string", "description": "Role skill name to load into the child." },
+                "role_workspace": { "type": "string", "description": "Optional workspace for the role skill." },
+                "task": { "type": "string", "description": "Task prompt for the child subagent." },
+                "display_name": { "type": "string", "description": "Optional human-readable label." },
+                "workflow_id": { "type": "string", "description": "Optional workflow id for grouping variables/results." },
+                "result_variable": { "type": "string", "description": "Optional workflow variable the child should write when done." }
+            },
+            "required": ["role", "task"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn subagent_list_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "SubagentList",
+        "List subagents spawned by the current parent session, including their relationship metadata and live activity.",
+        json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn subagent_send_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "SubagentSend",
+        "Append a follow-up or steering message to one of this session's child subagents.",
+        json!({
+            "type": "object",
+            "properties": {
+                "child_session_id": { "type": "string", "description": "Child subagent session id." },
+                "message": { "type": "string", "description": "Text message to append to the child." },
+                "priority": {
+                    "type": "string",
+                    "enum": ["follow_up", "steer"],
+                    "description": "Optional input priority. Defaults to follow_up."
+                },
+                "client_input_id": { "type": "string", "description": "Optional idempotency key." }
+            },
+            "required": ["child_session_id", "message"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn subagent_tail_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "SubagentTail",
+        "Read the latest active-branch transcript turns for one of this session's child subagents.",
+        json!({
+            "type": "object",
+            "properties": {
+                "child_session_id": { "type": "string", "description": "Child subagent session id." },
+                "limit": { "type": "integer", "description": "Maximum number of turn cards to return." }
+            },
+            "required": ["child_session_id"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn workflow_vars_list_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "WorkflowVarsList",
+        "List durable workflow variables for a workflow id in the current session workflow scope.",
+        json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": { "type": "string", "description": "Workflow id." },
+                "limit": { "type": "integer", "description": "Optional maximum number of variables to return. Defaults to 100 and is capped." }
+            },
+            "required": ["workflow_id"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn workflow_var_read_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "WorkflowVarRead",
+        "Read one durable workflow variable by workflow id and name in the current session workflow scope.",
+        json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": { "type": "string", "description": "Workflow id." },
+                "name": { "type": "string", "description": "Variable name." }
+            },
+            "required": ["workflow_id", "name"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn workflow_var_write_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "WorkflowVarWrite",
+        "Write or replace a durable workflow variable. Use this to return structured subagent results or save intermediate context for later workflow steps.",
+        json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": { "type": "string", "description": "Workflow id." },
+                "name": { "type": "string", "description": "Variable name." },
+                "value_json": { "description": "Optional structured JSON value." },
+                "value_text": { "type": "string", "description": "Optional text value." }
+            },
+            "required": ["workflow_id", "name"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn workflow_context_send_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "WorkflowContextSend",
+        "Render a template with workflow variables and send the rendered text to a child subagent. Variables are referenced as {name}.",
+        json!({
+            "type": "object",
+            "properties": {
+                "workflow_id": { "type": "string", "description": "Workflow id." },
+                "child_session_id": { "type": "string", "description": "Child subagent session id." },
+                "template": { "type": "string", "description": "Template text containing {variable_name} placeholders." },
+                "priority": {
+                    "type": "string",
+                    "enum": ["follow_up", "steer"],
+                    "description": "Optional input priority. Defaults to follow_up."
+                },
+                "client_input_id": { "type": "string", "description": "Optional idempotency key." }
+            },
+            "required": ["workflow_id", "child_session_id", "template"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 pub struct FirstPartyToolExtension;
 
 impl ToolExtension for FirstPartyToolExtension {
@@ -344,6 +495,7 @@ impl ToolExtension for FirstPartyToolExtension {
 
     fn register(&self, registry: &mut ToolRegistry) {
         register_load_skill(registry);
+        register_subagent_and_workflow_tools(registry);
         register_edit(registry);
         register_bash(registry);
         register_grep(registry);
@@ -354,9 +506,18 @@ impl ToolExtension for FirstPartyToolExtension {
 
 fn register_load_skill(registry: &mut ToolRegistry) {
     let definition = load_skill_definition();
+    register_daemon_owned_json_tool(registry, definition, "skill_loader");
+}
+
+fn register_daemon_owned_json_tool(
+    registry: &mut ToolRegistry,
+    definition: ToolDefinition,
+    prompt_alias: &str,
+) {
+    let canonical_name = definition.name.clone();
     registry.register_tool(
-        ToolDescriptor::new("LoadSkill")
-            .prompt_alias("skill_loader")
+        ToolDescriptor::new(canonical_name)
+            .prompt_alias(prompt_alias)
             .provider(
                 ProviderKind::OpenAi,
                 ProviderTool::openai_function(&definition),
@@ -366,6 +527,17 @@ fn register_load_skill(registry: &mut ToolRegistry) {
                 ProviderTool::anthropic_client(&definition),
             ),
     );
+}
+
+fn register_subagent_and_workflow_tools(registry: &mut ToolRegistry) {
+    register_daemon_owned_json_tool(registry, subagent_spawn_definition(), "subagents");
+    register_daemon_owned_json_tool(registry, subagent_list_definition(), "subagents");
+    register_daemon_owned_json_tool(registry, subagent_send_definition(), "subagents");
+    register_daemon_owned_json_tool(registry, subagent_tail_definition(), "subagents");
+    register_daemon_owned_json_tool(registry, workflow_vars_list_definition(), "workflow");
+    register_daemon_owned_json_tool(registry, workflow_var_read_definition(), "workflow");
+    register_daemon_owned_json_tool(registry, workflow_var_write_definition(), "workflow");
+    register_daemon_owned_json_tool(registry, workflow_context_send_definition(), "workflow");
 }
 
 fn register_edit(registry: &mut ToolRegistry) {
@@ -528,11 +700,41 @@ mod tests {
 
         assert_eq!(
             openai,
-            ["Edit", "Bash", "Grep", "LoadSkill", "WebFetch", "WebSearch"]
+            [
+                "Edit",
+                "Bash",
+                "Grep",
+                "LoadSkill",
+                "SubagentList",
+                "SubagentSend",
+                "SubagentSpawn",
+                "SubagentTail",
+                "WebFetch",
+                "WebSearch",
+                "WorkflowContextSend",
+                "WorkflowVarRead",
+                "WorkflowVarsList",
+                "WorkflowVarWrite"
+            ]
         );
         assert_eq!(
             claude,
-            ["Bash", "Grep", "LoadSkill", "Edit", "WebFetch", "WebSearch"]
+            [
+                "Bash",
+                "Grep",
+                "LoadSkill",
+                "Edit",
+                "SubagentList",
+                "SubagentSend",
+                "SubagentSpawn",
+                "SubagentTail",
+                "WebFetch",
+                "WebSearch",
+                "WorkflowContextSend",
+                "WorkflowVarRead",
+                "WorkflowVarsList",
+                "WorkflowVarWrite"
+            ]
         );
     }
 
@@ -557,8 +759,16 @@ mod tests {
                 "Bash",
                 "Grep",
                 "LoadSkill",
+                "SubagentList",
+                "SubagentSend",
+                "SubagentSpawn",
+                "SubagentTail",
                 "web_fetch",
-                "web_search"
+                "web_search",
+                "WorkflowContextSend",
+                "WorkflowVarRead",
+                "WorkflowVarsList",
+                "WorkflowVarWrite"
             ]
         );
         assert_eq!(
@@ -568,8 +778,16 @@ mod tests {
                 "Grep",
                 "LoadSkill",
                 "str_replace_based_edit_tool",
+                "SubagentList",
+                "SubagentSend",
+                "SubagentSpawn",
+                "SubagentTail",
                 "web_fetch",
-                "web_search"
+                "web_search",
+                "WorkflowContextSend",
+                "WorkflowVarRead",
+                "WorkflowVarsList",
+                "WorkflowVarWrite"
             ]
         );
     }

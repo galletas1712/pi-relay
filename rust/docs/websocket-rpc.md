@@ -801,8 +801,9 @@ Idle-only. Params: `session_id` (and optional `expected_active_leaf_id`).
 Acquires the session driver, requires idle (no unfinished action, no queued
 input), evicts any live session, removes the row, and cascades to its transcript
 entries, queued inputs, actions, and events; session workspace directories are
-cleaned up. Returns `{ "session_id", "deleted": true }`. A missing session is
-`session_not_found`.
+cleaned up. Hidden parent-controlled subagents are deleted recursively and must
+also be idle. Returns `{ "session_id", "deleted": true,
+"deleted_child_session_ids": [...] }`. A missing session is `session_not_found`.
 
 ## System Prompt RPC
 

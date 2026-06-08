@@ -16,7 +16,7 @@ use crate::runtime::{
     publish_events, SessionDriver,
 };
 use crate::state::AppState;
-use crate::types::{RpcError, RuntimeSession};
+use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
 pub(crate) async fn session_start(
     state: &AppState,
@@ -91,6 +91,7 @@ pub(crate) async fn session_start(
             priority,
             content,
             client_input_id: params.client_input_id,
+            dispatch_mode: PreparedSessionDispatchMode::Auto,
         },
     )
     .await?;
@@ -108,6 +109,12 @@ pub(crate) struct PreparedSessionStart {
     pub(crate) priority: InputPriority,
     pub(crate) content: UserMessage,
     pub(crate) client_input_id: Option<String>,
+    pub(crate) dispatch_mode: PreparedSessionDispatchMode,
+}
+
+pub(crate) enum PreparedSessionDispatchMode {
+    Auto,
+    Deferred,
 }
 
 pub(crate) struct StartedSession {
@@ -115,6 +122,7 @@ pub(crate) struct StartedSession {
     pub(crate) project_id: Option<Uuid>,
     pub(crate) activity: SessionActivity,
     pub(crate) replayed: bool,
+    pub(crate) dispatches: Vec<DispatchAction>,
 }
 
 pub(crate) async fn start_prepared_session(
@@ -136,6 +144,7 @@ async fn start_prepared_session_with_driver(
         priority,
         content,
         client_input_id,
+        dispatch_mode,
     } = request;
     let project_id = config.project_id;
 
@@ -164,6 +173,7 @@ async fn start_prepared_session_with_driver(
                 .await
                 .map_err(anyhow::Error::from)?,
             replayed: true,
+            dispatches: Vec::new(),
         });
     }
 
@@ -206,6 +216,7 @@ async fn start_prepared_session_with_driver(
                 .await
                 .map_err(anyhow::Error::from)?,
             replayed: true,
+            dispatches: Vec::new(),
         });
     }
     let dispatches = attach_dispatch_config(persisted_actions, &config);
@@ -216,7 +227,10 @@ async fn start_prepared_session_with_driver(
         .await
         .insert(session_id.clone(), Arc::new(Mutex::new(runtime)));
     publish_events(state, frames);
-    driver.dispatch(dispatches).await?;
+    match dispatch_mode {
+        PreparedSessionDispatchMode::Auto => driver.dispatch(dispatches.clone()).await?,
+        PreparedSessionDispatchMode::Deferred => {}
+    }
 
     Ok(StartedSession {
         session_id: session_id.clone(),
@@ -227,6 +241,7 @@ async fn start_prepared_session_with_driver(
             .await
             .map_err(anyhow::Error::from)?,
         replayed: false,
+        dispatches,
     })
 }
 

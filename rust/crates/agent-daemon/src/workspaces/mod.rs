@@ -10,7 +10,9 @@ use std::{
     sync::Arc,
 };
 
-use agent_store::{ProjectWorkspace, SessionWorkspace, WorkspaceKind};
+use agent_store::{
+    ProjectWorkspace, SessionRelationshipFilesystemMode, SessionWorkspace, WorkspaceKind,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -25,6 +27,7 @@ pub(crate) use self::git::validate_remote_branch;
 use self::git::{git_output, refresh_git_workspace_base, run_git};
 use self::instantiate::{
     create_workspace_dir, instantiate_workspace_from_base, materialize_tree_from_source_exact,
+    MaterializeTreeMode,
 };
 use self::local::refresh_local_workspace_base;
 
@@ -34,11 +37,20 @@ pub(crate) struct WorkspaceManager {
     workspace_base_lock: Arc<Mutex<()>>,
 }
 
+fn relationship_filesystem_mode(mode: MaterializeTreeMode) -> SessionRelationshipFilesystemMode {
+    match mode {
+        MaterializeTreeMode::BtrfsSnapshot => SessionRelationshipFilesystemMode::BtrfsSnapshot,
+        MaterializeTreeMode::ReflinkCopy => SessionRelationshipFilesystemMode::ReflinkCopy,
+        MaterializeTreeMode::PlainCopy => SessionRelationshipFilesystemMode::PlainCopy,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ForkedSessionWorkspaces {
     pub(crate) outer_cwd: String,
     pub(crate) baseline_cwd: String,
     pub(crate) workspaces: Vec<SessionWorkspace>,
+    pub(crate) filesystem_mode: SessionRelationshipFilesystemMode,
 }
 
 impl WorkspaceManager {
@@ -161,7 +173,7 @@ impl WorkspaceManager {
 
         let child_cwd = child_root.join("cwd");
         let baseline_cwd = child_root.join("baseline-cwd");
-        materialize_tree_from_source_exact(&parent_cwd, &child_cwd)
+        let child_mode = materialize_tree_from_source_exact(&parent_cwd, &child_cwd)
             .await
             .with_context(|| {
                 format!(
@@ -170,7 +182,7 @@ impl WorkspaceManager {
                     child_cwd.display()
                 )
             })?;
-        materialize_tree_from_source_exact(&parent_cwd, &baseline_cwd)
+        let _baseline_mode = materialize_tree_from_source_exact(&parent_cwd, &baseline_cwd)
             .await
             .with_context(|| {
                 format!(
@@ -203,6 +215,7 @@ impl WorkspaceManager {
             outer_cwd: child_cwd.to_string_lossy().into_owned(),
             baseline_cwd: baseline_cwd.to_string_lossy().into_owned(),
             workspaces: child_workspaces,
+            filesystem_mode: relationship_filesystem_mode(child_mode),
         })
     }
 

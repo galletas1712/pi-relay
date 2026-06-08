@@ -1971,9 +1971,25 @@ mod tests {
         assert_eq!(body["tools"][3]["type"], "function");
         assert_eq!(body["tools"][3]["name"], "LoadSkill");
         assert_eq!(body["tools"][4]["type"], "function");
-        assert_eq!(body["tools"][4]["name"], "web_fetch");
+        assert_eq!(body["tools"][4]["name"], "SubagentList");
         assert_eq!(body["tools"][5]["type"], "function");
-        assert_eq!(body["tools"][5]["name"], "web_search");
+        assert_eq!(body["tools"][5]["name"], "SubagentSend");
+        assert_eq!(body["tools"][6]["type"], "function");
+        assert_eq!(body["tools"][6]["name"], "SubagentSpawn");
+        assert_eq!(body["tools"][7]["type"], "function");
+        assert_eq!(body["tools"][7]["name"], "SubagentTail");
+        assert_eq!(body["tools"][8]["type"], "function");
+        assert_eq!(body["tools"][8]["name"], "web_fetch");
+        assert_eq!(body["tools"][9]["type"], "function");
+        assert_eq!(body["tools"][9]["name"], "web_search");
+        assert_eq!(body["tools"][10]["type"], "function");
+        assert_eq!(body["tools"][10]["name"], "WorkflowContextSend");
+        assert_eq!(body["tools"][11]["type"], "function");
+        assert_eq!(body["tools"][11]["name"], "WorkflowVarRead");
+        assert_eq!(body["tools"][12]["type"], "function");
+        assert_eq!(body["tools"][12]["name"], "WorkflowVarsList");
+        assert_eq!(body["tools"][13]["type"], "function");
+        assert_eq!(body["tools"][13]["name"], "WorkflowVarWrite");
     }
 
     #[test]

@@ -9,7 +9,15 @@ use serde_json::json;
 
 use crate::provider_runtime::{is_web_tool_name, load_skill_result, run_web_tool};
 use crate::state::AppState;
+use crate::subagents::{
+    subagent_list_for_parent, subagent_send_for_parent, subagent_spawn_for_parent,
+    subagent_tail_for_parent,
+};
 use crate::types::{DispatchAction, RpcError};
+use crate::workflows::{
+    workflow_context_send_tool, workflow_var_read_tool, workflow_var_write_tool,
+    workflow_vars_list_tool,
+};
 
 use super::{agent_input_from_queued_priority, publish_events, SessionDriver};
 
@@ -41,6 +49,7 @@ pub(super) async fn run_tool_turn(
         return Ok(());
     }
     publish_events(&state, events);
+    let tool_action_row_id = dispatch.row_id.clone();
     state
         .workspaces
         .ensure_session(
@@ -61,6 +70,8 @@ pub(super) async fn run_tool_turn(
             &loaded_skills,
             &tool_call,
         )
+    } else if is_daemon_workflow_tool_name(&tool_call.tool_name) {
+        run_daemon_workflow_tool(&state, &session_id, &tool_action_row_id, &tool_call).await
     } else if is_web_tool_name(&tool_call.tool_name) {
         run_web_tool(
             &state,
@@ -196,6 +207,59 @@ fn loaded_skill_identifier(output: &str) -> Option<String> {
         workspace.as_deref(),
         &name,
     ))
+}
+
+fn is_daemon_workflow_tool_name(name: &str) -> bool {
+    matches!(
+        name,
+        "SubagentSpawn"
+            | "SubagentList"
+            | "SubagentSend"
+            | "SubagentTail"
+            | "WorkflowVarsList"
+            | "WorkflowVarRead"
+            | "WorkflowVarWrite"
+            | "WorkflowContextSend"
+    )
+}
+
+async fn run_daemon_workflow_tool(
+    state: &AppState,
+    session_id: &str,
+    action_row_id: &str,
+    call: &agent_vocab::ToolCall,
+) -> ToolResultMessage {
+    let args = match call.args_value() {
+        Ok(args) => args,
+        Err(error) => {
+            return ToolResultMessage::error(
+                call.id.clone(),
+                &call.tool_name,
+                format!("workflow tool arguments were invalid JSON: {error}"),
+            )
+        }
+    };
+    let result = match call.tool_name.as_str() {
+        "SubagentSpawn" => {
+            subagent_spawn_for_parent(state, session_id, args, Some(action_row_id)).await
+        }
+        "SubagentList" => subagent_list_for_parent(state, session_id).await,
+        "SubagentSend" => subagent_send_for_parent(state, session_id, args).await,
+        "SubagentTail" => subagent_tail_for_parent(state, session_id, args).await,
+        "WorkflowVarsList" => workflow_vars_list_tool(state, session_id, args).await,
+        "WorkflowVarRead" => workflow_var_read_tool(state, session_id, args).await,
+        "WorkflowVarWrite" => workflow_var_write_tool(state, session_id, action_row_id, args).await,
+        "WorkflowContextSend" => workflow_context_send_tool(state, session_id, args).await,
+        _ => Err(RpcError::new("unknown_tool", "unknown workflow tool")),
+    };
+    match result {
+        Ok(value) => ToolResultMessage::success(
+            call.id.clone(),
+            &call.tool_name,
+            serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string()),
+        ),
+        Err(error) => ToolResultMessage::error(call.id.clone(), &call.tool_name, error.message),
+    }
 }
 
 fn xml_unescape(input: &str) -> String {

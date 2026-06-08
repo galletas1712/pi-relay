@@ -243,6 +243,7 @@ pub struct SessionRelationshipPatch {
 
 #[derive(Debug, Clone)]
 pub struct WorkflowVariableWrite {
+    pub owner_session_id: String,
     pub workflow_id: String,
     pub name: String,
     pub value_json: Option<Value>,
@@ -253,6 +254,7 @@ pub struct WorkflowVariableWrite {
 
 #[derive(Debug, Clone)]
 pub struct WorkflowVariable {
+    pub owner_session_id: String,
     pub workflow_id: String,
     pub name: String,
     pub value_json: Option<Value>,
