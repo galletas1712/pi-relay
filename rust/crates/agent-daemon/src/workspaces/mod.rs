@@ -3,6 +3,7 @@ mod git;
 mod instantiate;
 mod local;
 mod sanitize;
+mod selection;
 
 use std::{
     collections::BTreeSet,
@@ -22,9 +23,11 @@ use self::config::{
     WORKSPACE_BASE_DIR, WORKSPACE_BASE_METADATA,
 };
 pub(crate) use self::git::validate_remote_branch;
-use self::git::{git_output, refresh_git_workspace_base, run_git};
+use self::git::{fetch_session_branch_head, git_output, refresh_git_workspace_base, run_git};
 use self::instantiate::{create_workspace_dir, instantiate_workspace_from_base};
 use self::local::refresh_local_workspace_base;
+use self::selection::SelectedWorkspace;
+pub(crate) use self::selection::{RequestedWorkspace, WorkspaceSelection};
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceManager {
@@ -54,11 +57,21 @@ impl WorkspaceManager {
         }
     }
 
+    /// Materialize a new session's workspaces under a private `outer_cwd`.
+    ///
+    /// `project_workspaces` is the project's full declared set and is used to
+    /// reconcile the managed per-project workspace bases (so a session scoped to a
+    /// subset never destroys the bases of workspaces it skipped).
+    /// `selected_workspaces` is the subset to actually instantiate into the session,
+    /// each paired with an optional git branch override; the workspaces must be a
+    /// subset of `project_workspaces` (callers resolve this via
+    /// [`WorkspaceSelection::resolve`]).
     pub(crate) async fn materialize_session(
         &self,
         project_id: Uuid,
         session_id: &str,
         project_workspaces: &[ProjectWorkspace],
+        selected_workspaces: &[SelectedWorkspace],
     ) -> Result<(String, Vec<SessionWorkspace>)> {
         let root = self.session_root(session_id);
         if root.exists() {
@@ -69,11 +82,17 @@ impl WorkspaceManager {
         let _workspace_base_guard = self.workspace_base_lock.lock().await;
         self.remove_stale_workspace_bases(project_id, project_workspaces)
             .await?;
-        let mut workspaces = Vec::with_capacity(project_workspaces.len());
-        for workspace in project_workspaces {
+        let mut workspaces = Vec::with_capacity(selected_workspaces.len());
+        for selected in selected_workspaces {
             workspaces.push(
-                self.materialize_workspace(project_id, session_id, &cwd, workspace)
-                    .await?,
+                self.materialize_workspace(
+                    project_id,
+                    session_id,
+                    &cwd,
+                    &selected.workspace,
+                    selected.branch_override.as_deref(),
+                )
+                .await?,
             );
         }
         Ok((cwd.to_string_lossy().into_owned(), workspaces))
@@ -256,11 +275,18 @@ impl WorkspaceManager {
         session_id: &str,
         cwd: &Path,
         workspace: &ProjectWorkspace,
+        branch_override: Option<&str>,
     ) -> Result<SessionWorkspace> {
         match workspace.kind {
             WorkspaceKind::Git => {
-                self.materialize_git_workspace(project_id, session_id, cwd, workspace)
-                    .await
+                self.materialize_git_workspace(
+                    project_id,
+                    session_id,
+                    cwd,
+                    workspace,
+                    branch_override,
+                )
+                .await
             }
             WorkspaceKind::Local => {
                 self.materialize_local_workspace(project_id, cwd, workspace)
@@ -275,10 +301,12 @@ impl WorkspaceManager {
         session_id: &str,
         cwd: &Path,
         workspace: &ProjectWorkspace,
+        branch_override: Option<&str>,
     ) -> Result<SessionWorkspace> {
         let base = self.refresh_workspace_base(project_id, workspace).await?;
         let remote_url = required_git_field(base.config.remote_url.as_deref(), "remote_url")?;
-        let branch = required_git_field(base.config.remote_branch.as_deref(), "remote_branch")?;
+        let default_branch =
+            required_git_field(base.config.remote_branch.as_deref(), "remote_branch")?;
         let workspace_dir = base.config.workspace_dir.as_str();
         let target = cwd.join(workspace_dir);
         if target.exists() {
@@ -287,13 +315,25 @@ impl WorkspaceManager {
         let local_branch = local_branch(session_id, workspace_dir);
 
         instantiate_workspace_from_base(&base.path, &target).await?;
-        let base_sha = git_output(&target, ["rev-parse", "HEAD"]).await?;
+        // The session copy inherits the base's branch by default; an override fetches
+        // the requested branch into this session's copy only, leaving the shared base
+        // on the project's configured branch.
+        let (session_branch, base_sha) = match branch_override {
+            Some(branch) if branch != default_branch => {
+                let sha = fetch_session_branch_head(&target, branch).await?;
+                (branch, sha)
+            }
+            _ => (
+                default_branch,
+                git_output(&target, ["rev-parse", "HEAD"]).await?,
+            ),
+        };
         run_git(&target, ["switch", "-C", &local_branch, &base_sha]).await?;
 
         Ok(SessionWorkspace::git(
             workspace_dir,
             remote_url,
-            branch,
+            session_branch,
             base_sha,
             local_branch,
         ))

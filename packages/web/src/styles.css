@@ -2319,13 +2319,84 @@ pre {
 	font-weight: 500;
 }
 
-.chat-dock {
-	grid-column: 1;
-	grid-row: 3;
-	border-top: 1px solid var(--border);
-	background: var(--card);
-	padding: 10px 14px calc(10px + env(safe-area-inset-bottom, 0px));
+.workspace-scope {
+	max-width: 920px;
+	margin: 0 auto 8px;
 }
+
+.workspace-scope-toggle {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	border: 0;
+	background: transparent;
+	color: var(--muted-foreground);
+	font-size: 12px;
+	padding: 2px 0;
+	cursor: pointer;
+}
+
+.workspace-scope-toggle:hover {
+	color: var(--foreground);
+}
+
+.workspace-scope-count {
+	color: var(--muted-foreground);
+	font-variant-numeric: tabular-nums;
+}
+
+.workspace-scope-list {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	margin-top: 6px;
+	padding: 8px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--background);
+}
+
+.workspace-scope-item {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 200px);
+	align-items: center;
+	gap: 8px;
+}
+
+.workspace-scope-name {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	min-width: 0;
+	color: var(--foreground);
+	font-size: 13px;
+}
+
+.workspace-scope-name span {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.workspace-scope-branch {
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--card);
+	color: var(--foreground);
+	font-size: 12px;
+	padding: 4px 8px;
+	outline: 0;
+}
+
+.workspace-scope-branch:focus {
+	border-color: var(--ring);
+}
+
+.workspace-scope-branch:disabled {
+	opacity: 0.5;
+}
+
+.chat-dock {
 
 .composer-wrap {
 	position: relative;

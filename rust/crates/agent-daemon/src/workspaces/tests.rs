@@ -3,6 +3,14 @@ use agent_store::ProjectWorkspace;
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+/// Select every project workspace at its default branch, matching the common
+/// "no subset, no branch override" case used by most materialization tests.
+fn select_all(project_workspaces: &[ProjectWorkspace]) -> Vec<SelectedWorkspace> {
+    WorkspaceSelection::All
+        .resolve(project_workspaces)
+        .expect("select all workspaces")
+}
+
 #[tokio::test]
 async fn materialize_session_workspaces_from_local_remote() {
     let temp = TempDir::new("workspace-manager");
@@ -42,7 +50,12 @@ async fn materialize_session_workspaces_from_local_remote() {
     )];
 
     let (cwd, workspaces) = manager
-        .materialize_session(project_id, "session-1", &project_workspaces)
+        .materialize_session(
+            project_id,
+            "session-1",
+            &project_workspaces,
+            &select_all(&project_workspaces),
+        )
         .await
         .expect("materialize session");
     assert_eq!(workspaces.len(), 1);
@@ -72,13 +85,98 @@ async fn materialize_session_workspaces_from_local_remote() {
     git(&seed, ["push", "origin", "main"]);
 
     let (cwd, _) = manager
-        .materialize_session(project_id, "session-2", &project_workspaces)
+        .materialize_session(
+            project_id,
+            "session-2",
+            &project_workspaces,
+            &select_all(&project_workspaces),
+        )
         .await
         .expect("materialize second session");
     assert_eq!(
         std::fs::read_to_string(Path::new(&cwd).join("repo/README.md"))
             .expect("updated workspace file"),
         "updated\n"
+    );
+}
+
+#[tokio::test]
+async fn materialize_session_git_workspace_honors_branch_override() {
+    let temp = TempDir::new("workspace-manager-branch-override");
+    let remote = temp.path().join("remote.git");
+    let seed = temp.path().join("seed");
+    std::fs::create_dir_all(&seed).expect("seed dir");
+
+    git(
+        temp.path(),
+        ["init", "--bare", remote.to_str().expect("remote path")],
+    );
+    git(&seed, ["init"]);
+    git(&seed, ["config", "user.email", "pi-relay@example.test"]);
+    git(&seed, ["config", "user.name", "pi relay"]);
+    git(&seed, ["config", "commit.gpgsign", "false"]);
+    std::fs::write(seed.join("README.md"), "main\n").expect("seed file");
+    git(&seed, ["add", "README.md"]);
+    git(&seed, ["commit", "-m", "initial"]);
+    git(&seed, ["branch", "-M", "main"]);
+    git(
+        &seed,
+        [
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().expect("remote path"),
+        ],
+    );
+    git(&seed, ["push", "origin", "main"]);
+
+    // A separate feature branch with distinct content the session should populate.
+    git(&seed, ["switch", "-c", "feature"]);
+    std::fs::write(seed.join("README.md"), "feature\n").expect("feature seed file");
+    git(&seed, ["add", "README.md"]);
+    git(&seed, ["commit", "-m", "feature work"]);
+    git(&seed, ["push", "origin", "feature"]);
+
+    let manager = WorkspaceManager::new(temp.path().join("state"));
+    let project_id = Uuid::new_v4();
+    let project_workspaces = vec![ProjectWorkspace::git(
+        "repo",
+        remote.to_string_lossy(),
+        "main",
+    )];
+    let selection = WorkspaceSelection::Subset(vec![RequestedWorkspace {
+        workspace_dir: "repo".to_string(),
+        branch: Some("feature".to_string()),
+    }]);
+    let selected = selection
+        .resolve(&project_workspaces)
+        .expect("resolve branch override");
+
+    let (cwd, workspaces) = manager
+        .materialize_session(
+            project_id,
+            "session-feature",
+            &project_workspaces,
+            &selected,
+        )
+        .await
+        .expect("materialize session with branch override");
+
+    assert_eq!(workspaces.len(), 1);
+    assert_eq!(workspaces[0].remote_branch.as_deref(), Some("feature"));
+    assert_eq!(
+        std::fs::read_to_string(Path::new(&cwd).join("repo/README.md"))
+            .expect("override workspace file"),
+        "feature\n"
+    );
+
+    // The shared project base stays on the project's configured branch (main).
+    let base = manager
+        .workspace_base_slot(project_id, "repo")
+        .join(WORKSPACE_BASE_DIR);
+    assert_eq!(
+        git_stdout(&base, ["rev-parse", "refs/remotes/origin/main"]),
+        git_stdout(&base, ["rev-parse", "HEAD"]),
     );
 }
 
@@ -100,7 +198,12 @@ async fn materialize_session_workspaces_from_local_folder() {
     )];
 
     let (cwd, workspaces) = manager
-        .materialize_session(project_id, "session-local", &project_workspaces)
+        .materialize_session(
+            project_id,
+            "session-local",
+            &project_workspaces,
+            &select_all(&project_workspaces),
+        )
         .await
         .expect("materialize local session");
     let target = Path::new(&cwd).join("local-repo");
@@ -128,7 +231,12 @@ async fn materialize_session_workspaces_from_local_folder() {
     std::fs::write(source.join("new.txt"), "new\n").expect("new source file");
 
     let (cwd, _) = manager
-        .materialize_session(project_id, "session-local-2", &project_workspaces)
+        .materialize_session(
+            project_id,
+            "session-local-2",
+            &project_workspaces,
+            &select_all(&project_workspaces),
+        )
         .await
         .expect("materialize refreshed local session");
     let refreshed = Path::new(&cwd).join("local-repo");
@@ -164,7 +272,12 @@ async fn materialize_session_snapshots_managed_btrfs_base_when_available() {
     )];
 
     let (cwd, _) = manager
-        .materialize_session(project_id, "session-btrfs", &project_workspaces)
+        .materialize_session(
+            project_id,
+            "session-btrfs",
+            &project_workspaces,
+            &select_all(&project_workspaces),
+        )
         .await
         .expect("materialize btrfs session");
     let target = Path::new(&cwd).join("local-repo");
@@ -201,7 +314,12 @@ async fn workspace_base_config_changes_recreate_base() {
         source_a.to_string_lossy(),
     )];
     manager
-        .materialize_session(project_id, "session-a", &workspace_a)
+        .materialize_session(
+            project_id,
+            "session-a",
+            &workspace_a,
+            &select_all(&workspace_a),
+        )
         .await
         .expect("materialize source a");
 
@@ -210,7 +328,12 @@ async fn workspace_base_config_changes_recreate_base() {
         source_b.to_string_lossy(),
     )];
     let (cwd, _) = manager
-        .materialize_session(project_id, "session-b", &workspace_b)
+        .materialize_session(
+            project_id,
+            "session-b",
+            &workspace_b,
+            &select_all(&workspace_b),
+        )
         .await
         .expect("materialize source b");
     let target = Path::new(&cwd).join("local-repo");
@@ -235,7 +358,12 @@ async fn workspace_name_change_removes_old_base() {
         source.to_string_lossy(),
     )];
     manager
-        .materialize_session(project_id, "session-old", &old_workspace)
+        .materialize_session(
+            project_id,
+            "session-old",
+            &old_workspace,
+            &select_all(&old_workspace),
+        )
         .await
         .expect("materialize old workspace");
     assert!(manager.workspace_base_slot(project_id, "old-name").exists());
@@ -245,7 +373,12 @@ async fn workspace_name_change_removes_old_base() {
         source.to_string_lossy(),
     )];
     manager
-        .materialize_session(project_id, "session-new", &new_workspace)
+        .materialize_session(
+            project_id,
+            "session-new",
+            &new_workspace,
+            &select_all(&new_workspace),
+        )
         .await
         .expect("materialize renamed workspace");
     assert!(!manager.workspace_base_slot(project_id, "old-name").exists());

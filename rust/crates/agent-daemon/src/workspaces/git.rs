@@ -31,6 +31,43 @@ pub(super) async fn refresh_git_workspace_base(
     Ok(())
 }
 
+/// Fetch a per-session branch override into an already-instantiated git workspace
+/// and return its commit sha.
+///
+/// The session workspace inherits `origin` from the managed project base, so this
+/// only needs to fetch the override branch (the project base itself stays on the
+/// project's configured branch and is shared across sessions). Errors when the
+/// branch name is invalid or absent on the remote; these are client-input errors.
+pub(super) async fn fetch_session_branch_head(workspace: &Path, branch: &str) -> Result<String> {
+    let branch = branch.trim();
+    if branch.is_empty() {
+        bail!("session branch override is required");
+    }
+    let branch_check = git_command()
+        .args(["check-ref-format", "--branch", branch])
+        .output()
+        .await
+        .context("validate session branch override name")?;
+    if !branch_check.status.success() {
+        bail!("session branch override is not a valid git branch name: {branch}");
+    }
+    let branch_refspec = format!("+refs/heads/{branch}:refs/remotes/origin/{branch}");
+    let fetch = git_command()
+        .args(["fetch", "--prune", "origin", &branch_refspec])
+        .current_dir(workspace)
+        .output()
+        .await
+        .with_context(|| format!("fetch session branch {branch} in {}", workspace.display()))?;
+    if !fetch.status.success() {
+        bail!(
+            "session branch override not found on remote: {branch}: {}",
+            String::from_utf8_lossy(&fetch.stderr).trim()
+        );
+    }
+    let origin_ref = format!("refs/remotes/origin/{branch}");
+    git_output(workspace, ["rev-parse", &origin_ref]).await
+}
+
 pub(crate) async fn validate_remote_branch(remote_url: &str, remote_branch: &str) -> Result<()> {
     let remote_url = remote_url.trim();
     let remote_branch = remote_branch.trim();

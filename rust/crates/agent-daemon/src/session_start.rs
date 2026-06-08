@@ -17,6 +17,7 @@ use crate::runtime::{
 };
 use crate::state::AppState;
 use crate::types::{RpcError, RuntimeSession};
+use crate::workspaces::{RequestedWorkspace, WorkspaceSelection};
 
 pub(crate) async fn session_start(
     state: &AppState,
@@ -62,9 +63,17 @@ pub(crate) async fn session_start(
             .get_project(project_id)
             .await
             .map_err(anyhow::Error::from)?;
+        let selection = WorkspaceSelection::from_requested(
+            params
+                .workspaces
+                .map(|workspaces| workspaces.into_iter().map(Into::into).collect()),
+        );
+        let selected = selection
+            .resolve(&project.workspaces)
+            .map_err(|error| RpcError::new("invalid_params", error.to_string()))?;
         state
             .workspaces
-            .materialize_session(project_id, &session_id, &project.workspaces)
+            .materialize_session(project_id, &session_id, &project.workspaces, &selected)
             .await
             .map_err(anyhow::Error::from)?
     } else {
@@ -141,6 +150,30 @@ struct StartSessionParams {
     client_input_id: Option<String>,
     priority: Option<InputPriority>,
     content: Value,
+    /// Optional subset of the project's workspaces to materialize for this session,
+    /// each with an optional per-session git branch override. Omit to materialize
+    /// every project workspace at its default branch. Ignored for ephemeral sessions.
+    workspaces: Option<Vec<StartSessionWorkspace>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StartSessionWorkspace {
+    workspace_dir: String,
+    #[serde(default)]
+    branch: Option<String>,
+}
+
+impl From<StartSessionWorkspace> for RequestedWorkspace {
+    fn from(value: StartSessionWorkspace) -> Self {
+        let branch = value
+            .branch
+            .map(|branch| branch.trim().to_string())
+            .filter(|branch| !branch.is_empty());
+        Self {
+            workspace_dir: value.workspace_dir,
+            branch,
+        }
+    }
 }
 
 fn home_dir_for_ephemeral_session() -> std::result::Result<PathBuf, RpcError> {
