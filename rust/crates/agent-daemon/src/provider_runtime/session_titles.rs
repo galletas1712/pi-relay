@@ -187,6 +187,10 @@ async fn generate_session_title(
 ) -> anyhow::Result<Option<String>> {
     let title_context = SessionTitlePromptContext {
         current_title: request.title_at_submit.as_deref().unwrap_or_default(),
+        current_title_is_truncated_placeholder: current_title_is_truncated_placeholder(
+            request.title_at_submit.as_deref(),
+            &request.config.metadata,
+        ),
         user_message: render_user_message_for_title(&request.message),
     };
     let mut model_request = build_model_request(
@@ -229,6 +233,7 @@ async fn generate_session_title(
 #[derive(Serialize)]
 struct SessionTitlePromptContext<'a> {
     current_title: &'a str,
+    current_title_is_truncated_placeholder: bool,
     user_message: String,
 }
 
@@ -240,6 +245,7 @@ Rules:
 - Do not call any tools.
 - Return exactly one JSON object and no other text.
 - Use {"title":"..."} only when the new title is clearly better than the current title.
+- If current_title_is_truncated_placeholder is true, treat the current title as a fallback placeholder from the first user message rather than a user-chosen title; prefer replacing it with a concise semantic title unless no safe title is warranted.
 - Use {"title":null} if the session name is already appropriate or no safe title is warranted.
 - Prefer 3-8 words and at most 64 characters.
 - Use the user's language when practical.
@@ -249,7 +255,7 @@ Rules:
 
 fn title_reasoning_effort(provider: ProviderKind) -> ReasoningEffort {
     match provider {
-        ProviderKind::OpenAi => ReasoningEffort::Minimal,
+        ProviderKind::OpenAi => ReasoningEffort::Low,
         ProviderKind::Claude => ReasoningEffort::Low,
     }
 }
@@ -347,6 +353,24 @@ fn render_user_message_for_title(message: &UserMessage) -> String {
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+fn current_title_is_truncated_placeholder(current_title: Option<&str>, metadata: &Value) -> bool {
+    if metadata.get("created_by").and_then(Value::as_str) != Some("web")
+        || metadata
+            .get("auto_title_disabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    let Some(current_title) = current_title
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return false;
+    };
+    current_title.ends_with("...")
 }
 
 fn metadata_title(metadata: &Value) -> Option<String> {
