@@ -172,6 +172,30 @@ pub struct SessionRelationship {
 }
 
 #[derive(Debug, Clone)]
+pub struct WorkflowVariableWrite {
+    pub owner_session_id: String,
+    pub workflow_id: String,
+    pub name: String,
+    pub value_json: Option<Value>,
+    pub value_text: Option<String>,
+    pub producer_session_id: Option<String>,
+    pub producer_action_id: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowVariable {
+    pub owner_session_id: String,
+    pub workflow_id: String,
+    pub name: String,
+    pub value_json: Option<Value>,
+    pub value_text: Option<String>,
+    pub producer_session_id: Option<String>,
+    pub producer_action_id: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub project_id: Option<Uuid>,
     pub outer_cwd: String,

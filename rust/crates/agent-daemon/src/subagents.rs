@@ -262,6 +262,8 @@ struct SubagentSpawnRequest {
     display_name: Option<String>,
     provider: Option<ProviderConfig>,
     metadata: Value,
+    workflow_id: Option<String>,
+    result_variable: Option<String>,
 }
 
 impl SubagentSpawnRequest {
@@ -305,6 +307,20 @@ impl SubagentSpawnRequest {
             .child_session_id
             .map(|session_id| session_id.trim().to_string())
             .filter(|session_id| !session_id.is_empty());
+        let workflow_id = params
+            .workflow_id
+            .map(|workflow_id| workflow_id.trim().to_string())
+            .filter(|workflow_id| !workflow_id.is_empty());
+        let result_variable = params
+            .result_variable
+            .map(|result_variable| result_variable.trim().to_string())
+            .filter(|result_variable| !result_variable.is_empty());
+        if result_variable.is_some() && workflow_id.is_none() {
+            return Err(RpcError::new(
+                "invalid_params",
+                "workflow_id is required when result_variable is set",
+            ));
+        }
         Ok(Self {
             parent_session_id,
             child_session_id,
@@ -315,6 +331,8 @@ impl SubagentSpawnRequest {
             display_name: params.display_name,
             provider: params.provider,
             metadata: params.metadata.unwrap_or_else(|| json!({})),
+            workflow_id,
+            result_variable,
         })
     }
 }
@@ -330,6 +348,8 @@ struct SubagentSpawnParams {
     display_name: Option<String>,
     provider: Option<ProviderConfig>,
     metadata: Option<Value>,
+    workflow_id: Option<String>,
+    result_variable: Option<String>,
 }
 
 #[derive(Debug)]
@@ -480,6 +500,8 @@ async fn spawn_subagent(
         role.workspace.as_deref(),
         request.display_name.as_deref(),
         &request.task,
+        request.workflow_id.as_deref(),
+        request.result_variable.as_deref(),
         &role.file_path,
         &parent_config.metadata,
     );
@@ -509,6 +531,8 @@ async fn spawn_subagent(
         &request.parent_session_id,
         &task,
         request.initial_context.as_deref(),
+        request.workflow_id.as_deref(),
+        request.result_variable.as_deref(),
     );
     let started = start_prepared_session(
         state,
@@ -625,6 +649,8 @@ fn subagent_metadata(
     role_workspace: Option<&str>,
     display_name: Option<&str>,
     task: &str,
+    workflow_id: Option<&str>,
+    result_variable: Option<&str>,
     role_file_path: &PathBuf,
     parent_metadata: &Value,
 ) -> Value {
@@ -654,6 +680,12 @@ fn subagent_metadata(
         map.insert("display_name".to_string(), json!(display_name));
     }
     map.insert("task".to_string(), json!(task));
+    if let Some(workflow_id) = workflow_id {
+        map.insert("workflow_id".to_string(), json!(workflow_id));
+    }
+    if let Some(result_variable) = result_variable {
+        map.insert("result_variable".to_string(), json!(result_variable));
+    }
     map.insert("role_file_path".to_string(), json!(role_file_path));
     metadata
 }
@@ -662,11 +694,26 @@ fn child_initial_task_message(
     parent_session_id: &str,
     task: &str,
     initial_context: Option<&str>,
+    workflow_id: Option<&str>,
+    result_variable: Option<&str>,
 ) -> String {
     let mut message = format!("Subagent task from parent session `{parent_session_id}`:\n\n{task}");
     if let Some(initial_context) = initial_context {
         message.push_str("\n\n# Initial context\n\n");
         message.push_str(initial_context);
+    }
+    if workflow_id.is_some() || result_variable.is_some() {
+        message.push_str("\n\n# Workflow reporting\n\n");
+        if let Some(workflow_id) = workflow_id {
+            message.push_str(&format!("- workflow_id: `{workflow_id}`\n"));
+        }
+        if let Some(result_variable) = result_variable {
+            message.push_str(&format!("- result_variable: `{result_variable}`\n"));
+        }
+        message.push_str(
+            "\nWhen you have a useful final or intermediate result, call `WorkWrite` \
+with this workflow id and set `var` to the result variable so the parent workflow can read it.",
+        );
     }
     message
 }
@@ -718,6 +765,8 @@ mod tests {
             "role_workspace": " repo ",
             "task": " Review this ",
             "initial_context": " Context ",
+            "workflow_id": " workflow ",
+            "result_variable": " result ",
         }))
         .expect("request parses");
         assert_eq!(request.parent_session_id, "parent");
@@ -725,6 +774,8 @@ mod tests {
         assert_eq!(request.role_workspace.as_deref(), Some("repo"));
         assert_eq!(request.task, "Review this");
         assert_eq!(request.initial_context.as_deref(), Some("Context"));
+        assert_eq!(request.workflow_id.as_deref(), Some("workflow"));
+        assert_eq!(request.result_variable.as_deref(), Some("result"));
 
         let error = SubagentSpawnRequest::from_params(json!({
             "parent_session_id": "parent",
@@ -732,6 +783,18 @@ mod tests {
             "task": "  ",
         }))
         .expect_err("empty task rejected");
+        assert_eq!(error.code, "invalid_params");
+    }
+
+    #[test]
+    fn spawn_request_requires_workflow_for_result_variable() {
+        let error = SubagentSpawnRequest::from_params(json!({
+            "parent_session_id": "parent",
+            "role": "reviewer",
+            "task": "Review this",
+            "result_variable": "result",
+        }))
+        .expect_err("workflow is required");
         assert_eq!(error.code, "invalid_params");
     }
 
@@ -758,6 +821,8 @@ mod tests {
             Some("repo"),
             Some("Review"),
             "Review this",
+            Some("workflow"),
+            Some("result"),
             &PathBuf::from("/tmp/reviewer/SKILL.md"),
             &json!({ "harness": true }),
         );
@@ -773,6 +838,8 @@ mod tests {
                 "role_workspace": "repo",
                 "display_name": "Review",
                 "task": "Review this",
+                "workflow_id": "workflow",
+                "result_variable": "result",
                 "role_file_path": "/tmp/reviewer/SKILL.md",
             })
         );

@@ -14,6 +14,14 @@ use crate::subagents::{
     subagent_tail_for_parent,
 };
 use crate::types::{DispatchAction, RpcError};
+use crate::workflow_tools::{
+    work_await_for_session, work_read_for_session, work_send_for_session, work_spawn_for_source,
+    work_write_for_session,
+};
+use crate::workflows::{
+    workflow_await_tool, workflow_context_send_tool, workflow_var_read_tool,
+    workflow_var_write_tool, workflow_vars_list_tool,
+};
 
 use super::{agent_input_from_queued_priority, publish_events, SessionDriver};
 
@@ -66,8 +74,8 @@ pub(super) async fn run_tool_turn(
             &loaded_skills,
             &tool_call,
         )
-    } else if is_subagent_tool_name(&tool_call.tool_name) {
-        run_subagent_tool(&state, &session_id, &tool_action_row_id, &tool_call).await
+    } else if is_daemon_workflow_tool_name(&tool_call.tool_name) {
+        run_daemon_workflow_tool(&state, &session_id, &tool_action_row_id, &tool_call).await
     } else if is_web_tool_name(&tool_call.tool_name) {
         run_web_tool(
             &state,
@@ -205,14 +213,27 @@ fn loaded_skill_identifier(output: &str) -> Option<String> {
     ))
 }
 
-fn is_subagent_tool_name(name: &str) -> bool {
+fn is_daemon_workflow_tool_name(name: &str) -> bool {
     matches!(
         name,
-        "SubagentSpawn" | "SubagentList" | "SubagentSend" | "SubagentTail"
+        "SubagentSpawn"
+            | "SubagentList"
+            | "SubagentSend"
+            | "SubagentTail"
+            | "WorkflowVarsList"
+            | "WorkflowVarRead"
+            | "WorkflowVarWrite"
+            | "WorkflowAwait"
+            | "WorkflowContextSend"
+            | "WorkSpawn"
+            | "WorkAwait"
+            | "WorkRead"
+            | "WorkSend"
+            | "WorkWrite"
     )
 }
 
-async fn run_subagent_tool(
+async fn run_daemon_workflow_tool(
     state: &AppState,
     session_id: &str,
     action_row_id: &str,
@@ -224,7 +245,7 @@ async fn run_subagent_tool(
             return ToolResultMessage::error(
                 call.id.clone(),
                 &call.tool_name,
-                format!("subagent tool arguments were invalid JSON: {error}"),
+                format!("workflow tool arguments were invalid JSON: {error}"),
             )
         }
     };
@@ -235,7 +256,17 @@ async fn run_subagent_tool(
         "SubagentList" => subagent_list_for_parent(state, session_id).await,
         "SubagentSend" => subagent_send_for_parent(state, session_id, args).await,
         "SubagentTail" => subagent_tail_for_parent(state, session_id, args).await,
-        _ => Err(RpcError::new("unknown_tool", "unknown subagent tool")),
+        "WorkflowVarsList" => workflow_vars_list_tool(state, session_id, args).await,
+        "WorkflowVarRead" => workflow_var_read_tool(state, session_id, args).await,
+        "WorkflowVarWrite" => workflow_var_write_tool(state, session_id, action_row_id, args).await,
+        "WorkflowAwait" => workflow_await_tool(state, session_id, args).await,
+        "WorkflowContextSend" => workflow_context_send_tool(state, session_id, args).await,
+        "WorkSpawn" => work_spawn_for_source(state, session_id, args, Some(action_row_id)).await,
+        "WorkAwait" => work_await_for_session(state, session_id, args).await,
+        "WorkRead" => work_read_for_session(state, session_id, args).await,
+        "WorkSend" => work_send_for_session(state, session_id, args).await,
+        "WorkWrite" => work_write_for_session(state, session_id, Some(action_row_id), args).await,
+        _ => Err(RpcError::new("unknown_tool", "unknown workflow tool")),
     };
     match result {
         Ok(value) => ToolResultMessage::success(

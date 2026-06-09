@@ -11,6 +11,8 @@ mod session_start;
 mod state;
 mod subagents;
 mod types;
+mod workflow_tools;
+mod workflows;
 mod workspaces;
 
 use crate::codec::{
@@ -99,6 +101,13 @@ async fn main() -> Result<()> {
     drain_dispatch_tasks(&state).await;
     state.repo.close().await;
     Ok(())
+}
+
+fn without_source_session_id(mut params: Value) -> Value {
+    if let Value::Object(map) = &mut params {
+        map.remove("source_session_id");
+    }
+    params
 }
 
 fn find_prompt_root(start: PathBuf) -> Result<PathBuf> {
@@ -287,6 +296,58 @@ async fn dispatch_request(
         RpcMethod::SubagentSpawn => subagents::subagent_spawn(state, params).await,
         RpcMethod::SubagentSend => subagents::subagent_send(state, params).await,
         RpcMethod::SubagentTail => subagents::subagent_tail(state, params).await,
+        RpcMethod::WorkflowVarsList => workflows::workflow_vars_list(state, params).await,
+        RpcMethod::WorkflowVarRead => workflows::workflow_var_read(state, params).await,
+        RpcMethod::WorkflowVarWrite => workflows::workflow_var_write(state, params).await,
+        RpcMethod::WorkflowAwait => workflows::workflow_await(state, params).await,
+        RpcMethod::WorkflowContextSend => workflows::workflow_context_send(state, params).await,
+        RpcMethod::WorkSpawn => {
+            let session_id = required_string(&params, "source_session_id")?;
+            workflow_tools::work_spawn_for_source(
+                state,
+                &session_id,
+                without_source_session_id(params),
+                None,
+            )
+            .await
+        }
+        RpcMethod::WorkAwait => {
+            let session_id = required_string(&params, "source_session_id")?;
+            workflow_tools::work_await_for_session(
+                state,
+                &session_id,
+                without_source_session_id(params),
+            )
+            .await
+        }
+        RpcMethod::WorkRead => {
+            let session_id = required_string(&params, "source_session_id")?;
+            workflow_tools::work_read_for_session(
+                state,
+                &session_id,
+                without_source_session_id(params),
+            )
+            .await
+        }
+        RpcMethod::WorkSend => {
+            let session_id = required_string(&params, "source_session_id")?;
+            workflow_tools::work_send_for_session(
+                state,
+                &session_id,
+                without_source_session_id(params),
+            )
+            .await
+        }
+        RpcMethod::WorkWrite => {
+            let session_id = required_string(&params, "source_session_id")?;
+            workflow_tools::work_write_for_session(
+                state,
+                &session_id,
+                None,
+                without_source_session_id(params),
+            )
+            .await
+        }
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }

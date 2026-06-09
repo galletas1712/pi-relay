@@ -1433,7 +1433,12 @@ mod tests {
                 "LoadSkill",
                 "str_replace_based_edit_tool",
                 "web_fetch",
-                "web_search"
+                "web_search",
+                "WorkAwait",
+                "WorkRead",
+                "WorkSend",
+                "WorkSpawn",
+                "WorkWrite"
             ]
         );
         for tool in tools {
@@ -1462,21 +1467,42 @@ mod tests {
         })
         .expect("body renders");
 
-        assert_eq!(body["tools"][0]["name"], "Bash");
-        assert!(body["tools"][0].get("type").is_none());
-        assert_eq!(body["tools"][1]["name"], "Grep");
-        assert!(body["tools"][1].get("type").is_none());
-        assert_eq!(body["tools"][2]["name"], "LoadSkill");
-        assert!(body["tools"][2].get("type").is_none());
+        let names = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "Bash",
+                "Grep",
+                "LoadSkill",
+                "str_replace_based_edit_tool",
+                "web_fetch",
+                "web_search",
+                "WorkAwait",
+                "WorkRead",
+                "WorkSend",
+                "WorkSpawn",
+                "WorkWrite",
+            ]
+        );
         assert_eq!(body["tools"][3]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][3]["name"], "str_replace_based_edit_tool");
-        assert_eq!(body["tools"][4]["name"], "web_fetch");
-        assert!(body["tools"][4].get("type").is_none());
-        assert_eq!(body["tools"][5]["name"], "web_search");
-        assert!(body["tools"][5].get("type").is_none());
+        for (idx, tool) in body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .enumerate()
+        {
+            if idx != 3 {
+                assert!(tool.get("type").is_none());
+            }
+        }
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
-        for index in 0..6 {
+        for index in 0..17 {
             assert!(
                 body["tools"][index].get("cache_control").is_none(),
                 "tool {index} should not carry cache_control"

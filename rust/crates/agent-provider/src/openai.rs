@@ -1972,18 +1972,37 @@ mod tests {
         )
         .expect("responses body renders");
 
+        let names = body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .map(|tool| tool["name"].as_str().expect("tool name"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                "apply_patch",
+                "Bash",
+                "Grep",
+                "LoadSkill",
+                "web_fetch",
+                "web_search",
+                "WorkAwait",
+                "WorkRead",
+                "WorkSend",
+                "WorkSpawn",
+                "WorkWrite",
+            ]
+        );
         assert_eq!(body["tools"][0]["type"], "custom");
-        assert_eq!(body["tools"][0]["name"], "apply_patch");
-        assert_eq!(body["tools"][1]["type"], "function");
-        assert_eq!(body["tools"][1]["name"], "Bash");
-        assert_eq!(body["tools"][2]["type"], "function");
-        assert_eq!(body["tools"][2]["name"], "Grep");
-        assert_eq!(body["tools"][3]["type"], "function");
-        assert_eq!(body["tools"][3]["name"], "LoadSkill");
-        assert_eq!(body["tools"][4]["type"], "function");
-        assert_eq!(body["tools"][4]["name"], "web_fetch");
-        assert_eq!(body["tools"][5]["type"], "function");
-        assert_eq!(body["tools"][5]["name"], "web_search");
+        for tool in body["tools"]
+            .as_array()
+            .expect("tools array")
+            .iter()
+            .skip(1)
+        {
+            assert_eq!(tool["type"], "function");
+        }
     }
 
     #[test]
