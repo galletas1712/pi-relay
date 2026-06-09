@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod adjacent_sessions;
 mod auth;
 mod codec;
 mod config;
@@ -284,6 +285,12 @@ async fn dispatch_request(
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
+        RpcMethod::AdjacentSessionList => {
+            adjacent_sessions::adjacent_session_list(state, params).await
+        }
+        RpcMethod::AdjacentSessionSpawn => {
+            adjacent_sessions::adjacent_session_spawn(state, params).await
+        }
         RpcMethod::SubagentList => subagents::subagent_list(state, params).await,
         RpcMethod::SubagentSpawn => subagents::subagent_spawn(state, params).await,
         RpcMethod::SubagentSend => subagents::subagent_send(state, params).await,

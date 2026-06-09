@@ -74,6 +74,8 @@ pub(crate) enum RpcMethod {
     TurnResume,
     ToolsList,
     CompactionRequest,
+    AdjacentSessionList,
+    AdjacentSessionSpawn,
     SubagentList,
     SubagentSpawn,
     SubagentSend,
@@ -115,6 +117,8 @@ impl RpcMethod {
             "turn.resume" => Some(Self::TurnResume),
             "tools.list" => Some(Self::ToolsList),
             "compaction.request" => Some(Self::CompactionRequest),
+            "adjacent_session.list" => Some(Self::AdjacentSessionList),
+            "adjacent_session.spawn" => Some(Self::AdjacentSessionSpawn),
             "subagent.list" => Some(Self::SubagentList),
             "subagent.spawn" => Some(Self::SubagentSpawn),
             "subagent.send" => Some(Self::SubagentSend),
@@ -194,6 +198,14 @@ mod tests {
             Some(RpcMethod::TranscriptTurnDetail)
         );
         assert_eq!(RpcMethod::parse("turn.resume"), Some(RpcMethod::TurnResume));
+        assert_eq!(
+            RpcMethod::parse("adjacent_session.list"),
+            Some(RpcMethod::AdjacentSessionList)
+        );
+        assert_eq!(
+            RpcMethod::parse("adjacent_session.spawn"),
+            Some(RpcMethod::AdjacentSessionSpawn)
+        );
         assert_eq!(
             RpcMethod::parse("subagent.list"),
             Some(RpcMethod::SubagentList)
