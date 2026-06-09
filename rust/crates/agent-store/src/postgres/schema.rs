@@ -38,6 +38,7 @@ create table if not exists sessions (
     system_prompt text not null,
     provider_config jsonb not null,
     metadata jsonb not null default '{}'::jsonb,
+    parent_session_id text null references sessions(id) on delete set null,
     last_user_message_timestamp_ms bigint null,
     session_revision bigint not null default 0,
     queue_revision bigint not null default 0,
@@ -46,8 +47,14 @@ create table if not exists sessions (
 
 alter table sessions add column if not exists system_prompt text not null default '';
 
+alter table sessions add column if not exists parent_session_id text null references sessions(id) on delete set null;
+
 create index if not exists sessions_project_created_idx
     on sessions(project_id, created_at desc, id desc);
+
+create index if not exists sessions_parent_created_idx
+    on sessions(parent_session_id, created_at, id)
+    where parent_session_id is not null;
 
 create table if not exists daemon_config (
     key text primary key,
