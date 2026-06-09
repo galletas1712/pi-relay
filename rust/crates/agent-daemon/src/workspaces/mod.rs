@@ -37,13 +37,6 @@ pub(crate) struct WorkspaceManager {
     workspace_base_lock: Arc<Mutex<()>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ForkedSessionWorkspaces {
-    pub(crate) outer_cwd: String,
-    pub(crate) baseline_cwd: String,
-    pub(crate) workspaces: Vec<SessionWorkspace>,
-}
-
 impl WorkspaceManager {
     pub(crate) fn from_default_state_dir() -> Result<Self> {
         let state_home = match std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty())
@@ -148,7 +141,7 @@ impl WorkspaceManager {
         parent_outer_cwd: &str,
         parent_workspaces: &[SessionWorkspace],
         child_session_id: &str,
-    ) -> Result<ForkedSessionWorkspaces> {
+    ) -> Result<(String, Vec<SessionWorkspace>)> {
         if parent_session_id == child_session_id {
             bail!("child session id must differ from parent session id");
         }
@@ -179,7 +172,6 @@ impl WorkspaceManager {
             .with_context(|| format!("create child session root {}", child_root.display()))?;
 
         let child_cwd = child_root.join("cwd");
-        let baseline_cwd = child_root.join("baseline-cwd");
         materialize_tree_from_source_exact(&parent_cwd, &child_cwd)
             .await
             .with_context(|| {
@@ -187,15 +179,6 @@ impl WorkspaceManager {
                     "fork parent session cwd {} to child cwd {}",
                     parent_cwd.display(),
                     child_cwd.display()
-                )
-            })?;
-        materialize_tree_from_source_exact(&parent_cwd, &baseline_cwd)
-            .await
-            .with_context(|| {
-                format!(
-                    "fork parent session cwd {} to child baseline {}",
-                    parent_cwd.display(),
-                    baseline_cwd.display()
                 )
             })?;
 
@@ -218,11 +201,7 @@ impl WorkspaceManager {
             child_workspaces.push(child_workspace);
         }
 
-        Ok(ForkedSessionWorkspaces {
-            outer_cwd: child_cwd.to_string_lossy().into_owned(),
-            baseline_cwd: baseline_cwd.to_string_lossy().into_owned(),
-            workspaces: child_workspaces,
-        })
+        Ok((child_cwd.to_string_lossy().into_owned(), child_workspaces))
     }
 
     pub(crate) async fn remove_session_dir(&self, session_id: &str) -> Result<()> {

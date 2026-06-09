@@ -23,44 +23,23 @@ pub(super) async fn instantiate_workspace_from_base(base: &Path, target: &Path) 
 }
 
 pub(super) async fn materialize_tree_from_source(source: &Path, target: &Path) -> Result<()> {
-    if try_btrfs_subvolume_snapshot(source, target).await? {
-        match sanitize_copied_tree(target).await {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                let _ = tokio::fs::remove_dir_all(target).await;
-                eprintln!(
-                    "failed to sanitize btrfs snapshot {} from {}; falling back to copy: {error:#}",
-                    target.display(),
-                    source.display()
-                );
-            }
-        }
-    }
-
-    if try_btrfs_subvolume_create(target).await? {
-        match reflink_dir_all(source, target, SymlinkMode::Sanitize).await {
-            Ok(()) => return Ok(()),
-            Err(error) => {
-                let _ = tokio::fs::remove_dir_all(target).await;
-                eprintln!(
-                    "failed to populate btrfs workspace subvolume {} from {}; falling back to copy: {error:#}",
-                    target.display(),
-                    source.display()
-                );
-            }
-        }
-    }
-
-    copy_dir_all(source, target, SymlinkMode::Sanitize).await
+    materialize_tree_from_source_with_mode(source, target, SymlinkMode::Sanitize).await
 }
 
 pub(super) async fn materialize_tree_from_source_exact(source: &Path, target: &Path) -> Result<()> {
-    if try_btrfs_subvolume_snapshot(source, target).await? {
+    materialize_tree_from_source_with_mode(source, target, SymlinkMode::Preserve).await
+}
+
+async fn materialize_tree_from_source_with_mode(
+    source: &Path,
+    target: &Path,
+    symlink_mode: SymlinkMode,
+) -> Result<()> {
+    if try_snapshot_tree(source, target, symlink_mode).await? {
         return Ok(());
     }
-
     if try_btrfs_subvolume_create(target).await? {
-        match reflink_dir_all(source, target, SymlinkMode::Preserve).await {
+        match reflink_dir_all(source, target, symlink_mode).await {
             Ok(()) => return Ok(()),
             Err(error) => {
                 let _ = tokio::fs::remove_dir_all(target).await;
@@ -73,7 +52,32 @@ pub(super) async fn materialize_tree_from_source_exact(source: &Path, target: &P
         }
     }
 
-    copy_dir_all(source, target, SymlinkMode::Preserve).await
+    copy_dir_all(source, target, symlink_mode).await
+}
+
+async fn try_snapshot_tree(
+    source: &Path,
+    target: &Path,
+    symlink_mode: SymlinkMode,
+) -> Result<bool> {
+    if !try_btrfs_subvolume_snapshot(source, target).await? {
+        return Ok(false);
+    }
+    if matches!(symlink_mode, SymlinkMode::Preserve) {
+        return Ok(true);
+    }
+    match sanitize_copied_tree(target).await {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            let _ = tokio::fs::remove_dir_all(target).await;
+            eprintln!(
+                "failed to sanitize btrfs snapshot {} from {}; falling back to copy: {error:#}",
+                target.display(),
+                source.display()
+            );
+            Ok(false)
+        }
+    }
 }
 
 async fn try_btrfs_subvolume_snapshot(source: &Path, target: &Path) -> Result<bool> {

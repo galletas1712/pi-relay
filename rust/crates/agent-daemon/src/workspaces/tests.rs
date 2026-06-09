@@ -237,7 +237,7 @@ async fn fork_session_from_parent_copies_current_state_without_refreshing_base()
     git(&seed, ["commit", "-m", "remote update"]);
     git(&seed, ["push", "origin", "main"]);
 
-    let fork = manager
+    let (child_cwd, child_workspaces) = manager
         .fork_session_from_parent(
             "parent-session",
             &parent_cwd,
@@ -246,12 +246,11 @@ async fn fork_session_from_parent_copies_current_state_without_refreshing_base()
         )
         .await
         .expect("fork child session");
-    let child_repo = Path::new(&fork.outer_cwd).join("repo");
-    let baseline_repo = Path::new(&fork.baseline_cwd).join("repo");
+    let child_repo = Path::new(&child_cwd).join("repo");
 
-    assert_eq!(fork.workspaces.len(), 1);
+    assert_eq!(child_workspaces.len(), 1);
     assert_eq!(
-        fork.workspaces[0].local_branch.as_deref(),
+        child_workspaces[0].local_branch.as_deref(),
         Some("pi/session/child-session/repo")
     );
     assert_eq!(
@@ -271,20 +270,7 @@ async fn fork_session_from_parent_copies_current_state_without_refreshing_base()
         "untracked parent\n"
     );
     assert_eq!(
-        std::fs::read_to_string(baseline_repo.join("README.md")).expect("baseline dirty file"),
-        "dirty parent\n"
-    );
-    assert_eq!(
-        std::fs::read_to_string(baseline_repo.join("UNTRACKED.txt"))
-            .expect("baseline untracked file"),
-        "untracked parent\n"
-    );
-    assert_eq!(
         std::fs::read_link(child_repo.join("external-link")).expect("child symlink"),
-        PathBuf::from("/etc/passwd")
-    );
-    assert_eq!(
-        std::fs::read_link(baseline_repo.join("external-link")).expect("baseline symlink"),
         PathBuf::from("/etc/passwd")
     );
     assert_git_paths_inside(&child_repo);
