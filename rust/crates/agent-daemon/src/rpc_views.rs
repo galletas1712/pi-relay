@@ -1,9 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_store::{
-    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionSnapshot,
-    SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryRecord,
-    TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult, TurnCardRecord,
+    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionRelationship,
+    SessionSnapshot, SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult,
+    TranscriptEntryRecord, TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult,
+    TurnCardRecord,
 };
 use serde_json::{json, Value};
 
@@ -93,6 +94,31 @@ pub(crate) fn queue_state(queue: QueueState) -> Value {
             .into_iter()
             .map(queued_input)
             .collect::<Vec<_>>(),
+    })
+}
+
+pub(crate) fn session_relationship(relationship: &SessionRelationship) -> Value {
+    json!({
+        "relationship_id": relationship.relationship_id,
+        "source_session_id": relationship.source_session_id,
+        "target_session_id": relationship.target_session_id,
+        "root_session_id": relationship.root_session_id,
+        "kind": relationship.kind,
+        "control_mode": relationship.control_mode,
+        "visibility": relationship.visibility,
+        "role_name": relationship.role_name,
+        "role_workspace": relationship.role_workspace,
+        "display_name": relationship.display_name,
+        "task": relationship.task,
+        "spawned_from_leaf_id": relationship.spawned_from_leaf_id,
+        "spawned_from_action_row_id": relationship.spawned_from_action_row_id,
+        "workflow_id": relationship.workflow_id,
+        "result_variable": relationship.result_variable,
+        "status": relationship.status,
+        "filesystem_mode": relationship.filesystem_mode,
+        "metadata": relationship.metadata,
+        "created_at": relationship.created_at,
+        "updated_at": relationship.updated_at,
     })
 }
 
