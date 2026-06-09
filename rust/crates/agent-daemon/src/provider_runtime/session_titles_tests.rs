@@ -1,7 +1,6 @@
 use super::*;
 use agent_session::ModelContext;
-use agent_vocab::{AssistantItem, TranscriptItem, UserMessage};
-use serde_json::json;
+use agent_vocab::{AssistantItem, TranscriptItem, TurnId, UserMessage};
 
 #[test]
 fn sanitize_title_trims_quotes_and_punctuation() {
@@ -12,28 +11,30 @@ fn sanitize_title_trims_quotes_and_punctuation() {
 }
 
 #[test]
-fn title_trigger_message_uses_only_model_context_ending_in_user_message() {
-    let message = UserMessage::text("debug flaky tests");
+fn title_prompt_requires_context_ending_in_user_message() {
     let context = ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted {
-            turn_id: agent_vocab::TurnId(1),
+            turn_id: TurnId::first(),
         },
-        TranscriptItem::UserMessage(message.clone()),
+        TranscriptItem::UserMessage(UserMessage::text("debug flaky tests")),
     ]);
 
-    assert_eq!(title_trigger_message(&context), Some(&message));
+    assert_eq!(
+        title_prompt_for_model_turn(TurnId::first(), &context),
+        Some(TITLE_INITIAL_PROMPT)
+    );
 
     let context = ModelContext::from_transcript_items(vec![
         TranscriptItem::TurnStarted {
-            turn_id: agent_vocab::TurnId(1),
+            turn_id: TurnId::first(),
         },
-        TranscriptItem::UserMessage(message),
+        TranscriptItem::UserMessage(UserMessage::text("debug flaky tests")),
         TranscriptItem::AssistantMessage(agent_vocab::AssistantMessage {
             items: vec![AssistantItem::Text("done".to_string())],
         }),
     ]);
 
-    assert_eq!(title_trigger_message(&context), None);
+    assert_eq!(title_prompt_for_model_turn(TurnId::first(), &context), None);
 }
 
 #[test]
@@ -54,44 +55,63 @@ fn sanitize_title_rejects_secret_like_titles() {
 }
 
 #[test]
-fn truncated_web_titles_are_treated_as_placeholders() {
-    assert!(current_title_is_truncated_placeholder(
-        Some("right now session names in pi-relay are just a prefix of the ..."),
-        &json!({ "created_by": "web" }),
-    ));
+fn first_user_message_turn_uses_replacement_prompt() {
+    let context = ModelContext::from_transcript_items(vec![
+        TranscriptItem::TurnStarted {
+            turn_id: TurnId::first(),
+        },
+        TranscriptItem::UserMessage(UserMessage::text(
+            "https://github.com/deepseek-ai/DeepEP\n\nDeepEPV2 uses NCCL GIN.",
+        )),
+    ]);
+
     assert_eq!(
-        title_prompt_for_current_title(
-            Some("right now session names in pi-relay are just a prefix of the ..."),
-            &json!({ "created_by": "web" }),
-        ),
-        TITLE_REPLACE_PLACEHOLDER_PROMPT
+        title_prompt_for_model_turn(TurnId::first(), &context),
+        Some(TITLE_INITIAL_PROMPT)
     );
 }
 
 #[test]
-fn explicit_or_finished_titles_are_not_truncated_placeholders() {
-    assert!(!current_title_is_truncated_placeholder(
-        Some("Auto Session Titles"),
-        &json!({ "created_by": "web" }),
-    ));
-    assert!(!current_title_is_truncated_placeholder(
-        Some("Long title from another client ..."),
-        &json!({ "created_by": "api" }),
-    ));
-    assert!(!current_title_is_truncated_placeholder(
-        Some("Unknown client title ..."),
-        &json!({}),
-    ));
-    assert!(!current_title_is_truncated_placeholder(
-        Some("Manual looking title ..."),
-        &json!({ "created_by": "web", "auto_title_disabled": true }),
-    ));
+fn later_user_message_turn_uses_refresh_prompt() {
+    let context = ModelContext::from_transcript_items(vec![
+        TranscriptItem::TurnStarted {
+            turn_id: TurnId::first(),
+        },
+        TranscriptItem::UserMessage(UserMessage::text("https://github.com/deepseek-ai/DeepEP")),
+        TranscriptItem::AssistantMessage(agent_vocab::AssistantMessage {
+            items: vec![AssistantItem::Text("done".to_string())],
+        }),
+        TranscriptItem::TurnFinished {
+            turn_id: TurnId::first(),
+            outcome: agent_vocab::TurnOutcome::Graceful,
+        },
+        TranscriptItem::TurnStarted { turn_id: TurnId(2) },
+        TranscriptItem::UserMessage(UserMessage::text("follow-up")),
+    ]);
+
     assert_eq!(
-        title_prompt_for_current_title(
-            Some("Auto Session Titles"),
-            &json!({ "created_by": "web" })
-        ),
-        TITLE_REFRESH_PROMPT
+        title_prompt_for_model_turn(TurnId(2), &context),
+        Some(TITLE_REFRESH_PROMPT)
+    );
+}
+
+#[test]
+fn compacted_later_user_message_turn_uses_refresh_prompt() {
+    let context = ModelContext::from_transcript_items(vec![
+        TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+            "session",
+            "entry",
+            "Earlier session summary",
+            None,
+            TurnId(8),
+        )),
+        TranscriptItem::TurnStarted { turn_id: TurnId(9) },
+        TranscriptItem::UserMessage(UserMessage::text("follow-up after compaction")),
+    ]);
+
+    assert_eq!(
+        title_prompt_for_model_turn(TurnId(9), &context),
+        Some(TITLE_REFRESH_PROMPT)
     );
 }
 

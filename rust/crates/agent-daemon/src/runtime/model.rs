@@ -43,6 +43,7 @@ pub(super) async fn run_model_turn(
         &state,
         session_id.clone(),
         &dispatch.config,
+        turn_id,
         &model_context,
     );
 
