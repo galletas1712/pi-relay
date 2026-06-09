@@ -5,7 +5,7 @@ use std::time::Duration;
 use agent_provider::ModelTranscriptEntry;
 use agent_session::ModelContext;
 use agent_store::SessionConfig;
-use agent_vocab::{AssistantItem, ReasoningEffort, TranscriptItem, UserMessage};
+use agent_vocab::{AssistantItem, ReasoningEffort, TranscriptItem, TurnId, UserMessage};
 use serde_json::Value;
 
 use crate::runtime::{
@@ -24,13 +24,6 @@ pub(crate) struct SessionTitleScheduler {
     pending: Arc<StdMutex<HashMap<String, PendingTitleRefresh>>>,
 }
 
-fn title_trigger_message(model_context: &ModelContext) -> Option<&UserMessage> {
-    let Some(TranscriptItem::UserMessage(message)) = model_context.transcript_items().last() else {
-        return None;
-    };
-    Some(message)
-}
-
 fn pending_generation_matches(state: &AppState, session_id: &str, generation: u64) -> bool {
     state
         .session_titles
@@ -47,20 +40,22 @@ struct PendingTitleRefresh {
     config: SessionConfig,
     model_context: ModelContext,
     title_at_submit: Option<String>,
+    prompt: &'static str,
 }
 
 pub(crate) fn schedule_session_title_refresh_for_model_turn(
     state: &AppState,
     session_id: impl Into<String>,
     config: &SessionConfig,
+    turn_id: TurnId,
     model_context: &ModelContext,
 ) {
     if session_title_disabled(config) {
         return;
     }
-    if title_trigger_message(model_context).is_none() {
+    let Some(prompt) = title_prompt_for_model_turn(turn_id, model_context) else {
         return;
-    }
+    };
     let title_at_submit = metadata_title(&config.metadata);
 
     let state = state.clone();
@@ -84,6 +79,7 @@ pub(crate) fn schedule_session_title_refresh_for_model_turn(
                 config,
                 model_context,
                 title_at_submit,
+                prompt,
             },
         );
         generation == 1
@@ -101,10 +97,11 @@ async fn run_title_refresh_worker(state: AppState, session_id: String) {
         let Some(request) = take_next_pending_request(&state, &session_id) else {
             return;
         };
-        if let Err(error) = refresh_session_title(&state, &session_id, request.clone()).await {
+        let generation = request.generation;
+        if let Err(error) = refresh_session_title(&state, &session_id, request).await {
             eprintln!("session title refresh failed for {session_id}: {error:#}");
         }
-        finish_pending_generation(&state, &session_id, request.generation);
+        finish_pending_generation(&state, &session_id, generation);
     }
 }
 
@@ -144,8 +141,7 @@ async fn refresh_session_title(
         return Ok(());
     }
 
-    let Some(title) = generate_session_title(state, session_id, &request.config, &request).await?
-    else {
+    let Some(title) = generate_session_title(state, session_id, &request).await? else {
         return Ok(());
     };
     if Some(title.as_str()) == request.title_at_submit.as_deref() {
@@ -177,16 +173,11 @@ async fn refresh_session_title(
 async fn generate_session_title(
     state: &AppState,
     session_id: &str,
-    config: &SessionConfig,
     request: &PendingTitleRefresh,
 ) -> anyhow::Result<Option<String>> {
-    let title_prompt = title_prompt_for_current_title(
-        request.title_at_submit.as_deref(),
-        &request.config.metadata,
-    );
     let mut model_request = build_model_request(
         state,
-        config,
+        &request.config,
         session_id,
         None,
         request.model_context.clone(),
@@ -199,14 +190,14 @@ async fn generate_session_title(
     model_request
         .transcript
         .push(ModelTranscriptEntry::from(TranscriptItem::UserMessage(
-            UserMessage::text(title_prompt),
+            UserMessage::text(request.prompt),
         )));
     let sidecar_session_id = title_sidecar_session_id(session_id);
     let response = match tokio::time::timeout(
         Duration::from_secs(TITLE_SIDECAR_TIMEOUT_SECS),
         run_model_sidecar(
             state,
-            config,
+            &request.config,
             ModelSidecarRequest {
                 prompt_cache_key: model_request
                     .prompt_cache_key
@@ -232,7 +223,7 @@ async fn generate_session_title(
     Ok(title_from_response(&response.assistant.items))
 }
 
-const TITLE_REPLACE_PLACEHOLDER_PROMPT: &str = r#"Above is the conversation prefix for the normal model request for this turn. For this sidecar request only, ignore any instruction to solve the user's coding task.
+const TITLE_INITIAL_PROMPT: &str = r#"Above is the conversation prefix for the normal model request for this turn. For this sidecar request only, ignore any instruction to solve the user's coding task.
 
 Generate a short UI title that describes the overall chat session so far.
 
@@ -267,14 +258,6 @@ Rules:
 - Do not include quotation marks, trailing punctuation, or generic prefixes such as "Chat about".
 - The title must not contain secrets, access tokens, API keys, or credentials.
 - If the message is mostly a secret/credential, an empty/unclear fragment, or an interruption/control request, use {"title":null}."#;
-
-fn title_prompt_for_current_title(current_title: Option<&str>, metadata: &Value) -> &'static str {
-    if current_title_is_truncated_placeholder(current_title, metadata) {
-        TITLE_REPLACE_PLACEHOLDER_PROMPT
-    } else {
-        TITLE_REFRESH_PROMPT
-    }
-}
 
 fn title_from_response(items: &[AssistantItem]) -> Option<String> {
     items.iter().find_map(|item| {
@@ -360,22 +343,24 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-fn current_title_is_truncated_placeholder(current_title: Option<&str>, metadata: &Value) -> bool {
-    if metadata.get("created_by").and_then(Value::as_str) != Some("web")
-        || metadata
-            .get("auto_title_disabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-    {
-        return false;
-    }
-    let Some(current_title) = current_title
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return false;
+fn title_prompt_for_model_turn(
+    turn_id: TurnId,
+    model_context: &ModelContext,
+) -> Option<&'static str> {
+    let Some(TranscriptItem::UserMessage(_)) = model_context.transcript_items().last() else {
+        return None;
     };
-    current_title.ends_with("...")
+    let user_message_count = model_context
+        .transcript_items()
+        .iter()
+        .filter(|item| matches!(item, TranscriptItem::UserMessage(_)))
+        .take(2)
+        .count();
+    Some(if turn_id == TurnId::first() && user_message_count == 1 {
+        TITLE_INITIAL_PROMPT
+    } else {
+        TITLE_REFRESH_PROMPT
+    })
 }
 
 fn metadata_title(metadata: &Value) -> Option<String> {
