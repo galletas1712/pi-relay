@@ -1,9 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_store::{
-    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionSnapshot,
-    SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryRecord,
-    TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult, TurnCardRecord,
+    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionRelationship,
+    SessionSnapshot, SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult,
+    TranscriptEntryRecord, TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult,
+    TurnCardRecord,
 };
 use serde_json::{json, Value};
 
@@ -93,6 +94,16 @@ pub(crate) fn queue_state(queue: QueueState) -> Value {
             .into_iter()
             .map(queued_input)
             .collect::<Vec<_>>(),
+    })
+}
+
+pub(crate) fn session_relationship(relationship: &SessionRelationship) -> Value {
+    json!({
+        "relationship_id": relationship.relationship_id,
+        "parent_session_id": relationship.parent_session_id,
+        "child_session_id": relationship.child_session_id,
+        "created_at": relationship.created_at,
+        "updated_at": relationship.updated_at,
     })
 }
 

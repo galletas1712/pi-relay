@@ -279,9 +279,9 @@ pub(super) async fn persist_outputs_tx(
     // events. Use the INSERT ... RETURNING records collected above, and read the
     // revision/head state once after the revision bump. The event helper keeps a
     // fallback lookup for rare idempotent-conflict or recovery/compaction paths.
-    let has_transcript_events = session_events.iter().any(|event| {
-        matches!(event, SessionEvent::TranscriptItemAppended { .. })
-    });
+    let has_transcript_events = session_events
+        .iter()
+        .any(|event| matches!(event, SessionEvent::TranscriptItemAppended { .. }));
     let event_state = if has_transcript_events {
         Some(session_state_for_event_tx(tx, session_id).await?)
     } else {
@@ -297,8 +297,8 @@ pub(super) async fn persist_outputs_tx(
                 &entry_records_by_id,
                 &action_rows,
             )
-                .await
-                .with_context(|| format!("insert session event {event:?}"))?,
+            .await
+            .with_context(|| format!("insert session event {event:?}"))?,
         );
     }
     Ok((frames, dispatch))

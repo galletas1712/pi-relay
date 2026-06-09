@@ -9,6 +9,7 @@ mod rpc_views;
 mod runtime;
 mod session_start;
 mod state;
+mod subagents;
 mod types;
 mod workspaces;
 
@@ -282,6 +283,10 @@ async fn dispatch_request(
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
+        RpcMethod::SubagentList => subagents::subagent_list(state, params).await,
+        RpcMethod::SubagentSpawn => subagents::subagent_spawn(state, params).await,
+        RpcMethod::SubagentSend => subagents::subagent_send(state, params).await,
+        RpcMethod::SubagentTail => subagents::subagent_tail(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }
@@ -478,27 +483,71 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
         return Err(RpcError::new("session_not_found", "session not found"));
     }
 
-    let driver = SessionDriver::acquire(state, &session_id).await;
-    driver.ensure_idle_for_source_mutation().await?;
-    state.active.lock().await.remove(&session_id);
+    let (child_session_ids, _drivers) =
+        lock_hidden_subagent_delete_tree(state, &session_id).await?;
 
-    let deleted = state
-        .repo
-        .delete_session(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
-    if !deleted {
-        return Err(RpcError::new("session_not_found", "session not found"));
+    let mut delete_order = child_session_ids.clone();
+    delete_order.reverse();
+    delete_order.push(session_id.clone());
+    for candidate_session_id in &delete_order {
+        state.active.lock().await.remove(candidate_session_id);
+        let deleted = state
+            .repo
+            .delete_session(candidate_session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if !deleted && candidate_session_id == &session_id {
+            return Err(RpcError::new("session_not_found", "session not found"));
+        }
+        if let Err(error) = state
+            .workspaces
+            .remove_session_dir(candidate_session_id)
+            .await
+        {
+            eprintln!(
+                "failed to remove session workspace state for {candidate_session_id}: {error:#}"
+            );
+        }
+        state
+            .provider_connections
+            .remove_session(candidate_session_id)
+            .await;
     }
-    if let Err(error) = state.workspaces.remove_session_dir(&session_id).await {
-        eprintln!("failed to remove session workspace state for {session_id}: {error:#}");
-    }
-    state.provider_connections.remove_session(&session_id).await;
 
     Ok(json!({
         "session_id": session_id,
         "deleted": true,
+        "deleted_child_session_ids": child_session_ids,
     }))
+}
+
+async fn lock_hidden_subagent_delete_tree(
+    state: &AppState,
+    session_id: &str,
+) -> std::result::Result<(Vec<String>, Vec<SessionDriver>), RpcError> {
+    let mut seen = BTreeSet::new();
+    seen.insert(session_id.to_string());
+    let mut stack = vec![session_id.to_string()];
+    let mut child_session_ids = Vec::new();
+    let mut drivers = Vec::new();
+    while let Some(parent_session_id) = stack.pop() {
+        let driver = SessionDriver::acquire(state, &parent_session_id).await;
+        driver.ensure_idle_for_source_mutation().await?;
+        let relationships = state
+            .repo
+            .list_child_session_relationships(&parent_session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        for relationship in relationships {
+            if !seen.insert(relationship.child_session_id.clone()) {
+                continue;
+            }
+            stack.push(relationship.child_session_id.clone());
+            child_session_ids.push(relationship.child_session_id);
+        }
+        drivers.push(driver);
+    }
+    Ok((child_session_ids, drivers))
 }
 
 async fn session_configure(
@@ -1563,7 +1612,7 @@ async fn harness_model_complete(
     )?;
     let action = state
         .repo
-        .load_action(&session_id, &action_row_id)
+        .load_harness_model_action(&session_id, &action_row_id)
         .await
         .map_err(|error| RpcError::new("stale_action", error.to_string()))?;
     if action.kind != ActionKind::Model {
@@ -1572,6 +1621,11 @@ async fn harness_model_complete(
             "action is not a model action",
         ));
     }
+    state
+        .repo
+        .claim_pending_model_action(&session_id, &action_row_id, &action.attempt_id)
+        .await
+        .map_err(anyhow::Error::from)?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     let active = driver
         .require_active_session("stale_action", "session is not active")
@@ -1611,9 +1665,14 @@ async fn harness_model_fail(
         .to_string();
     let action = state
         .repo
-        .load_action(&session_id, &action_row_id)
+        .load_harness_model_action(&session_id, &action_row_id)
         .await
         .map_err(|error| RpcError::new("stale_action", error.to_string()))?;
+    state
+        .repo
+        .claim_pending_model_action(&session_id, &action_row_id, &action.attempt_id)
+        .await
+        .map_err(anyhow::Error::from)?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     let active = driver
         .require_active_session("stale_action", "session is not active")
