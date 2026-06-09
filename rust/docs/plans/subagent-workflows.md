@@ -42,22 +42,19 @@ normal session, not spawned by another agent.
 
 ## Storage model
 
-`session_relationships` is intentionally minimal:
+Subagent ownership uses the existing session parent pointer:
 
 ```text
-session_relationships
+sessions
   id                  primary key
   parent_session_id   references sessions(id)
-  child_session_id    references sessions(id), unique
-  created_at
-  updated_at
 ```
 
-This answers the only relationship question the daemon needs for v1: "who owns
-this child session?" Rich status, control, visibility, filesystem mode, and role
-metadata live outside the relationship row. Child session metadata can record
-role/task/workflow hints for UI and debugging, but authorization and cleanup use
-only the parent pointer.
+This answers the only ownership question the daemon needs for v1: "who owns this
+child session?" Rich status, control, visibility, filesystem mode, and role
+metadata are not modeled as first-class relationship records. Child session
+metadata can record role/task/workflow hints for UI and debugging, but
+authorization and cleanup use only `sessions.parent_session_id`.
 
 ## Runtime model
 
@@ -69,12 +66,12 @@ only the parent pointer.
 - resolves the requested role from built-ins (`worker`, `reviewer`, `tester`) or
   a project/user `SKILL.md`;
 - forks the child workspace from the parent's current cwd;
-- creates the child session with hidden subagent metadata;
-- inserts the parent relationship before dispatching child work;
+- creates the child session with hidden subagent metadata and a durable
+  `parent_session_id`;
 - dispatches the child's initial turn.
 
-If relationship insertion or initial dispatch fails, the daemon cleans up the
-child session/workspace so hidden orphans are not left behind.
+If initial dispatch fails, the daemon cleans up the child session/workspace so
+hidden orphans are not left behind.
 
 ### Steering and reading
 
@@ -107,7 +104,7 @@ The system prompt should stay concise and token-efficient:
 - child filesystem edits are isolated and never merged automatically.
 
 Avoid presenting many overlapping choices. In particular, do not expose adjacent
-sessions, separate relationship kinds, or multiple spawn modes to the model.
+sessions or multiple spawn modes to the model.
 
 ## UI model
 
@@ -120,7 +117,7 @@ transcript preview/steering UI can be reused for subagents:
 - steering uses `WorkSend`.
 
 Later UI work can enrich child labels from session metadata, but it should not
-require a richer relationship schema.
+require a separate relationship schema.
 
 ## Editable workflow scripts
 

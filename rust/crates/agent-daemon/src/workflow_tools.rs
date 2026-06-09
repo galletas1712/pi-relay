@@ -265,14 +265,14 @@ async fn read_session_overview(
         .session_snapshot(&target_session_id)
         .await
         .map_err(anyhow::Error::from)?;
-    let relationship = state
+    let parent_link = state
         .repo
-        .session_relationship_for_child(&target_session_id)
+        .session_parent_link_for_child(&target_session_id)
         .await
         .map_err(anyhow::Error::from)?;
     Ok(json!({
         "session": rpc_views::session_snapshot(snapshot, None),
-        "relationship": relationship.as_ref().map(rpc_views::session_relationship),
+        "parent_link": parent_link.as_ref().map(rpc_views::session_parent_link),
         "access": "read_only",
     }))
 }
@@ -360,13 +360,13 @@ async fn ensure_read_allowed(
         .load_session_config(target_session_id)
         .await
         .map_err(anyhow::Error::from)?;
-    let target_relationship = state
+    let target_parent_link = state
         .repo
-        .session_relationship_for_child(target_session_id)
+        .session_parent_link_for_child(target_session_id)
         .await
         .map_err(anyhow::Error::from)?;
-    if let Some(relationship) = &target_relationship {
-        if relationship.parent_session_id == requester_session_id {
+    if let Some(parent_link) = &target_parent_link {
+        if parent_link.parent_session_id == requester_session_id {
             return Ok(());
         }
         return Err(RpcError::new(

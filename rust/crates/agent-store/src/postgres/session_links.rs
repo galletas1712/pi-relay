@@ -1,108 +1,98 @@
 use anyhow::{anyhow, Result};
 use sqlx::Row;
 
-use crate::{CreateSessionRelationship, SessionRelationship};
+use crate::SessionParentLink;
 
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
-    pub async fn create_session_relationship(
+    pub async fn set_session_parent(
         &self,
-        relationship: &CreateSessionRelationship,
-    ) -> Result<SessionRelationship> {
+        child_session_id: &str,
+        parent_session_id: &str,
+    ) -> Result<SessionParentLink> {
+        if child_session_id == parent_session_id {
+            return Err(anyhow!(
+                "child session id must differ from parent session id"
+            ));
+        }
         let row = sqlx::query(
             r#"
-            insert into session_relationships (
-                id,
-                parent_session_id,
-                child_session_id
-            )
-            values ($1, $2, $3)
+            update sessions
+            set parent_session_id=$2::text,
+                updated_at=now()
+            where id=$1::text
             returning
-                id,
                 parent_session_id,
-                child_session_id,
+                id as child_session_id,
                 created_at::text as created_at,
                 updated_at::text as updated_at
             "#,
         )
-        .bind(&relationship.relationship_id)
-        .bind(&relationship.parent_session_id)
-        .bind(&relationship.child_session_id)
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(relationship_from_row(row))
+        .bind(child_session_id)
+        .bind(parent_session_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or_else(|| anyhow!("session not found: {child_session_id}"))?;
+        Ok(parent_link_from_row(row))
     }
 
-    pub async fn session_relationship(&self, relationship_id: &str) -> Result<SessionRelationship> {
-        let row = sqlx::query(RELATIONSHIP_SELECT)
-            .bind(relationship_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| anyhow!("session relationship not found: {relationship_id}"))?;
-        Ok(relationship_from_row(row))
-    }
-
-    pub async fn session_relationship_for_child(
+    pub async fn session_parent_link_for_child(
         &self,
         child_session_id: &str,
-    ) -> Result<Option<SessionRelationship>> {
+    ) -> Result<Option<SessionParentLink>> {
         let row = sqlx::query(
             r#"
             select
-                id,
                 parent_session_id,
-                child_session_id,
+                id as child_session_id,
                 created_at::text as created_at,
                 updated_at::text as updated_at
-            from session_relationships
-            where child_session_id=$1
+            from sessions
+            where id=$1::text
+                and parent_session_id is not null
             "#,
         )
         .bind(child_session_id)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(relationship_from_row))
+        Ok(row.map(parent_link_from_row))
     }
 
-    pub async fn list_child_session_relationships(
+    pub async fn session_parent_id(&self, child_session_id: &str) -> Result<Option<String>> {
+        let row = sqlx::query("select parent_session_id from sessions where id=$1::text")
+            .bind(child_session_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow!("session not found: {child_session_id}"))?;
+        Ok(row.get("parent_session_id"))
+    }
+
+    pub async fn list_child_session_parent_links(
         &self,
         parent_session_id: &str,
-    ) -> Result<Vec<SessionRelationship>> {
+    ) -> Result<Vec<SessionParentLink>> {
         let rows = sqlx::query(
             r#"
             select
-                id,
                 parent_session_id,
-                child_session_id,
+                id as child_session_id,
                 created_at::text as created_at,
                 updated_at::text as updated_at
-            from session_relationships
-            where parent_session_id=$1
+            from sessions
+            where parent_session_id=$1::text
             order by created_at, id
             "#,
         )
         .bind(parent_session_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(relationship_from_row).collect())
+        Ok(rows.into_iter().map(parent_link_from_row).collect())
     }
 }
 
-const RELATIONSHIP_SELECT: &str = r#"
-    select
-        id,
-        parent_session_id,
-        child_session_id,
-        created_at::text as created_at,
-        updated_at::text as updated_at
-    from session_relationships
-    where id=$1
-"#;
-
-fn relationship_from_row(row: sqlx::postgres::PgRow) -> SessionRelationship {
-    SessionRelationship {
-        relationship_id: row.get("id"),
+fn parent_link_from_row(row: sqlx::postgres::PgRow) -> SessionParentLink {
+    SessionParentLink {
         parent_session_id: row.get("parent_session_id"),
         child_session_id: row.get("child_session_id"),
         created_at: row.get("created_at"),
@@ -118,7 +108,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::{CreateSessionRelationship, SessionConfig};
+    use crate::SessionConfig;
 
     use super::*;
 
@@ -145,7 +135,7 @@ mod tests {
     async fn test_store() -> Option<TestDb> {
         let admin_url = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok()?;
         let name = format!(
-            "pi_relay_relationship_test_{}_{}",
+            "pi_relay_parent_link_test_{}_{}",
             std::process::id(),
             TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -201,7 +191,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_relationships_can_be_created_and_listed() {
+    async fn parent_links_can_be_set_and_listed() {
         let Some(db) = test_store().await else { return };
         let project_id = Uuid::new_v4();
         let parent_session_id = "parent-session";
@@ -241,29 +231,31 @@ mod tests {
 
         let created = db
             .store
-            .create_session_relationship(&CreateSessionRelationship {
-                relationship_id: "rel-parent-child".to_string(),
-                parent_session_id: parent_session_id.to_string(),
-                child_session_id: child_session_id.to_string(),
-            })
+            .set_session_parent(child_session_id, parent_session_id)
             .await
-            .expect("create relationship");
+            .expect("set parent link");
         assert_eq!(created.parent_session_id, parent_session_id);
         assert_eq!(created.child_session_id, child_session_id);
 
         let children = db
             .store
-            .list_child_session_relationships(parent_session_id)
+            .list_child_session_parent_links(parent_session_id)
             .await
             .expect("list children");
         assert_eq!(children, vec![created.clone()]);
         let by_child = db
             .store
-            .session_relationship_for_child(child_session_id)
+            .session_parent_link_for_child(child_session_id)
             .await
-            .expect("relationship by child")
+            .expect("link by child")
             .expect("child has parent");
         assert_eq!(by_child, created);
+        let parent_id = db
+            .store
+            .session_parent_id(child_session_id)
+            .await
+            .expect("parent id loads");
+        assert_eq!(parent_id.as_deref(), Some(parent_session_id));
 
         db.cleanup().await;
     }

@@ -17,8 +17,6 @@ use sqlx::PgPool;
 ///   Idempotency is keyed by `(session_id, client_input_id)`.
 /// - `actions`: durable model/tool/compaction/cancel work records.
 /// - `events`: ordered observable event stream for websocket replay.
-/// - `session_relationships`: one parent pointer per child session, used for
-///   subagent ownership and cleanup.
 /// - `workflow_variables`: durable workflow/session-scoped context bus values.
 const SCHEMA_SQL: &str = r#"
 create table if not exists projects (
@@ -41,6 +39,7 @@ create table if not exists sessions (
     system_prompt text not null,
     provider_config jsonb not null,
     metadata jsonb not null default '{}'::jsonb,
+    parent_session_id text null references sessions(id) on delete set null,
     last_user_message_timestamp_ms bigint null,
     session_revision bigint not null default 0,
     queue_revision bigint not null default 0,
@@ -49,8 +48,27 @@ create table if not exists sessions (
 
 alter table sessions add column if not exists system_prompt text not null default '';
 
+alter table sessions add column if not exists parent_session_id text null references sessions(id) on delete set null;
+
+do $$
+begin
+    if to_regclass('public.session_relationships') is not null then
+        update sessions s
+        set parent_session_id = r.parent_session_id
+        from session_relationships r
+        where s.id = r.child_session_id
+          and s.parent_session_id is null;
+
+        drop table session_relationships;
+    end if;
+end $$;
+
 create index if not exists sessions_project_created_idx
     on sessions(project_id, created_at desc, id desc);
+
+create index if not exists sessions_parent_created_idx
+    on sessions(parent_session_id, created_at, id)
+    where parent_session_id is not null;
 
 create table if not exists daemon_config (
     key text primary key,
@@ -116,20 +134,6 @@ create table if not exists events (
 );
 
 create index if not exists events_session_id_idx on events(session_id, id);
-
-create table if not exists session_relationships (
-    id text primary key,
-    parent_session_id text not null references sessions(id) on delete cascade,
-    child_session_id text not null references sessions(id) on delete cascade,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-);
-
-create unique index if not exists session_relationships_child_idx
-    on session_relationships(child_session_id);
-
-create index if not exists session_relationships_parent_idx
-    on session_relationships(parent_session_id, created_at, id);
 
 create table if not exists workflow_variables (
     owner_session_id text not null references sessions(id) on delete cascade,

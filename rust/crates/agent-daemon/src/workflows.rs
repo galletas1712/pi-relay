@@ -477,19 +477,19 @@ async fn workflow_owner_session_id(
     let mut owner_session_id = session_id.to_string();
     let mut seen = BTreeSet::new();
     while seen.insert(owner_session_id.clone()) {
-        let Some(relationship) = state
+        let Some(parent_session_id) = state
             .repo
-            .session_relationship_for_child(&owner_session_id)
+            .session_parent_id(&owner_session_id)
             .await
             .map_err(anyhow::Error::from)?
         else {
             return Ok(owner_session_id);
         };
-        owner_session_id = relationship.parent_session_id;
+        owner_session_id = parent_session_id;
     }
     Err(RpcError::new(
-        "invalid_relationship_graph",
-        "cycle in session parent relationships",
+        "invalid_parent_graph",
+        "cycle in session parent links",
     ))
 }
 
@@ -520,9 +520,9 @@ async fn workflow_await_snapshot(
             .activity(session_id)
             .await
             .map_err(anyhow::Error::from)?;
-        let relationship = state
+        let parent_link = state
             .repo
-            .session_relationship_for_child(session_id)
+            .session_parent_link_for_child(session_id)
             .await
             .map_err(anyhow::Error::from)?;
         if request.session_condition == WorkflowAwaitSessionCondition::Idle
@@ -533,7 +533,7 @@ async fn workflow_await_snapshot(
         sessions.push(json!({
             "session_id": session_id,
             "activity": activity,
-            "relationship": relationship.as_ref().map(rpc_views::session_relationship),
+            "parent_link": parent_link.as_ref().map(rpc_views::session_parent_link),
         }));
     }
 

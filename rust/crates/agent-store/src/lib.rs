@@ -156,15 +156,7 @@ text_enum! {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CreateSessionRelationship {
-    pub relationship_id: String,
-    pub parent_session_id: String,
-    pub child_session_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionRelationship {
-    pub relationship_id: String,
+pub struct SessionParentLink {
     pub parent_session_id: String,
     pub child_session_id: String,
     pub created_at: String,

@@ -594,17 +594,17 @@ async fn lock_hidden_subagent_delete_tree(
     while let Some(parent_session_id) = stack.pop() {
         let driver = SessionDriver::acquire(state, &parent_session_id).await;
         driver.ensure_idle_for_source_mutation().await?;
-        let relationships = state
+        let child_links = state
             .repo
-            .list_child_session_relationships(&parent_session_id)
+            .list_child_session_parent_links(&parent_session_id)
             .await
             .map_err(anyhow::Error::from)?;
-        for relationship in relationships {
-            if !seen.insert(relationship.child_session_id.clone()) {
+        for child_link in child_links {
+            if !seen.insert(child_link.child_session_id.clone()) {
                 continue;
             }
-            stack.push(relationship.child_session_id.clone());
-            child_session_ids.push(relationship.child_session_id);
+            stack.push(child_link.child_session_id.clone());
+            child_session_ids.push(child_link.child_session_id);
         }
         drivers.push(driver);
     }

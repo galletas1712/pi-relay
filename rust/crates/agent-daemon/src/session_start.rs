@@ -100,6 +100,7 @@ pub(crate) async fn session_start(
             priority,
             content,
             client_input_id: params.client_input_id,
+            parent_session_id: None,
             dispatch_mode: PreparedSessionDispatchMode::Auto,
         },
     )
@@ -118,6 +119,7 @@ pub(crate) struct PreparedSessionStart {
     pub(crate) priority: InputPriority,
     pub(crate) content: UserMessage,
     pub(crate) client_input_id: Option<String>,
+    pub(crate) parent_session_id: Option<String>,
     pub(crate) dispatch_mode: PreparedSessionDispatchMode,
 }
 
@@ -153,6 +155,7 @@ async fn start_prepared_session_with_driver(
         priority,
         content,
         client_input_id,
+        parent_session_id,
         dispatch_mode,
     } = request;
     let project_id = config.project_id;
@@ -201,7 +204,7 @@ async fn start_prepared_session_with_driver(
     let config = runtime.config.clone();
     let (frames, persisted_actions) = state
         .repo
-        .start_session_outputs(
+        .start_session_outputs_with_parent(
             &session_id,
             &config,
             &entries,
@@ -211,6 +214,7 @@ async fn start_prepared_session_with_driver(
             priority,
             &content,
             client_input_id.as_deref(),
+            parent_session_id.as_deref(),
         )
         .await
         .map_err(anyhow::Error::from)?;

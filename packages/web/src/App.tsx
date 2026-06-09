@@ -2213,7 +2213,7 @@ function agentIsInspectable(
 ): boolean {
 	if (!root) return false;
 	if (sessionId === root.session_id) return true;
-	return (workSessions?.subagents ?? []).some((item) => item.relationship.child_session_id === sessionId);
+	return (workSessions?.subagents ?? []).some((item) => item.parent_link.child_session_id === sessionId);
 }
 
 async function restoreTextForTarget(

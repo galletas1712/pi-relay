@@ -1,7 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_store::{
-    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionRelationship,
+    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionParentLink,
     SessionSnapshot, SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult,
     TranscriptEntryRecord, TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult,
     TurnCardRecord,
@@ -97,13 +97,12 @@ pub(crate) fn queue_state(queue: QueueState) -> Value {
     })
 }
 
-pub(crate) fn session_relationship(relationship: &SessionRelationship) -> Value {
+pub(crate) fn session_parent_link(link: &SessionParentLink) -> Value {
     json!({
-        "relationship_id": relationship.relationship_id,
-        "parent_session_id": relationship.parent_session_id,
-        "child_session_id": relationship.child_session_id,
-        "created_at": relationship.created_at,
-        "updated_at": relationship.updated_at,
+        "parent_session_id": link.parent_session_id,
+        "child_session_id": link.child_session_id,
+        "created_at": link.created_at,
+        "updated_at": link.updated_at,
     })
 }
 

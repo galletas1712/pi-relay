@@ -478,7 +478,7 @@ fn subagent_spawn_definition() -> ToolDefinition {
 fn subagent_list_definition() -> ToolDefinition {
     ToolDefinition::new(
         "SubagentList",
-        "List subagents spawned by the current parent session, including their relationship metadata and live activity.",
+        "List subagents spawned by the current parent session, including their parent-link metadata and live activity.",
         json!({
             "type": "object",
             "properties": {},

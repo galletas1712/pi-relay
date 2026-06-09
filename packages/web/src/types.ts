@@ -15,8 +15,7 @@ export interface ProviderConfig {
 	prompt_cache?: Record<string, unknown>;
 }
 
-export interface SessionRelationship {
-	relationship_id: string;
+export interface SessionParentLink {
 	parent_session_id: string;
 	child_session_id: string;
 	created_at: string;
@@ -24,7 +23,7 @@ export interface SessionRelationship {
 }
 
 export interface RelatedSessionItem {
-	relationship: SessionRelationship;
+	parent_link: SessionParentLink;
 	activity: Activity;
 }
 

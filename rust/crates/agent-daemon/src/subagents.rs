@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agent_store::{CreateSessionRelationship, InputPriority, SessionConfig, SessionRelationship};
+use agent_store::{InputPriority, SessionConfig, SessionParentLink};
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -30,20 +30,20 @@ pub(crate) async fn subagent_list(
             "parent_session_id cannot be empty",
         ));
     }
-    let relationships = state
+    let parent_links = state
         .repo
-        .list_child_session_relationships(&parent_session_id)
+        .list_child_session_parent_links(&parent_session_id)
         .await
         .map_err(anyhow::Error::from)?;
-    let mut subagents = Vec::with_capacity(relationships.len());
-    for relationship in relationships {
+    let mut subagents = Vec::with_capacity(parent_links.len());
+    for parent_link in parent_links {
         let activity = state
             .repo
-            .activity(&relationship.child_session_id)
+            .activity(&parent_link.child_session_id)
             .await
             .map_err(anyhow::Error::from)?;
         subagents.push(json!({
-            "relationship": rpc_views::session_relationship(&relationship),
+            "parent_link": rpc_views::session_parent_link(&parent_link),
             "activity": activity,
         }));
     }
@@ -73,7 +73,7 @@ pub(crate) async fn subagent_spawn_for_parent(
     Ok(json!({
         "parent_session_id": spawned.parent_session_id,
         "child_session_id": spawned.started.session_id,
-        "relationship": rpc_views::session_relationship(&spawned.relationship),
+        "parent_link": rpc_views::session_parent_link(&spawned.parent_link),
         "activity": spawned.started.activity,
         "replayed": spawned.started.replayed,
     }))
@@ -144,7 +144,7 @@ pub(crate) async fn subagent_spawn(
     Ok(json!({
         "parent_session_id": spawned.parent_session_id,
         "child_session_id": spawned.started.session_id,
-        "relationship": rpc_views::session_relationship(&spawned.relationship),
+        "parent_link": rpc_views::session_parent_link(&spawned.parent_link),
         "activity": spawned.started.activity,
         "replayed": spawned.started.replayed,
     }))
@@ -174,8 +174,8 @@ pub(crate) async fn send_to_subagent(
     content: UserMessage,
     client_input_id: Option<String>,
 ) -> std::result::Result<Value, RpcError> {
-    let relationship =
-        require_subagent_relationship(state, parent_session_id, child_session_id).await?;
+    let parent_link =
+        require_subagent_parent_link(state, parent_session_id, child_session_id).await?;
     let child_driver = SessionDriver::acquire(state, child_session_id).await;
     child_driver.recover_if_needed().await?;
     let has_running = state
@@ -208,7 +208,7 @@ pub(crate) async fn send_to_subagent(
     Ok(json!({
         "parent_session_id": parent_session_id,
         "child_session_id": child_session_id,
-        "relationship": rpc_views::session_relationship(&relationship),
+        "parent_link": rpc_views::session_parent_link(&parent_link),
         "input_id": queued.input_id,
         "queued": true,
         "queue": queue,
@@ -228,8 +228,8 @@ pub(crate) async fn subagent_tail(
             "parent_session_id and child_session_id cannot be empty",
         ));
     }
-    let relationship =
-        require_subagent_relationship(state, &parent_session_id, &child_session_id).await?;
+    let parent_link =
+        require_subagent_parent_link(state, &parent_session_id, &child_session_id).await?;
     let child_driver = SessionDriver::acquire(state, &child_session_id).await;
     child_driver.recover_if_needed().await?;
     let turns = state
@@ -241,7 +241,7 @@ pub(crate) async fn subagent_tail(
     Ok(json!({
         "parent_session_id": parent_session_id,
         "child_session_id": child_session_id,
-        "relationship": rpc_views::session_relationship(&relationship),
+        "parent_link": rpc_views::session_parent_link(&parent_link),
         "transcript": turns,
     }))
 }
@@ -401,7 +401,7 @@ struct SubagentTailParams {
 struct SpawnedSubagent {
     parent_session_id: String,
     started: StartedSession,
-    relationship: SessionRelationship,
+    parent_link: SessionParentLink,
 }
 
 async fn spawn_subagent(
@@ -430,8 +430,8 @@ async fn spawn_subagent(
         None => None,
     };
     if let Some(child_session_id) = existing_child_session_id {
-        let relationship =
-            require_subagent_relationship(state, &request.parent_session_id, child_session_id)
+        let parent_link =
+            require_subagent_parent_link(state, &request.parent_session_id, child_session_id)
                 .await?;
         let activity = state
             .repo
@@ -447,7 +447,7 @@ async fn spawn_subagent(
                 replayed: true,
                 dispatches: Vec::new(),
             },
-            relationship,
+            parent_link,
         });
     }
 
@@ -525,7 +525,6 @@ async fn spawn_subagent(
         },
     )?;
 
-    let relationship_id = format!("relationship_{}", Uuid::new_v4());
     let task = request.task;
     let initial_task = child_initial_task_message(
         &request.parent_session_id,
@@ -542,25 +541,22 @@ async fn spawn_subagent(
             priority: InputPriority::FollowUp,
             content: UserMessage::text(initial_task),
             client_input_id: None,
+            parent_session_id: Some(request.parent_session_id.clone()),
             dispatch_mode: PreparedSessionDispatchMode::Deferred,
         },
     )
     .await?;
-    let relationship = match state
+    let parent_link = state
         .repo
-        .create_session_relationship(&CreateSessionRelationship {
-            relationship_id,
-            parent_session_id: request.parent_session_id.clone(),
-            child_session_id: child_session_id.clone(),
-        })
+        .session_parent_link_for_child(&child_session_id)
         .await
-    {
-        Ok(relationship) => relationship,
-        Err(error) => {
-            cleanup_failed_spawn(state, &child_session_id, "relationship insert failure").await;
-            return Err(anyhow::Error::from(error).into());
-        }
-    };
+        .map_err(anyhow::Error::from)?
+        .ok_or_else(|| {
+            RpcError::new(
+                "parent_link_missing",
+                "child session was created without a parent link",
+            )
+        })?;
 
     let child_driver = SessionDriver::acquire(state, &started.session_id).await;
     if let Err(error) = child_driver.dispatch(started.dispatches.clone()).await {
@@ -571,7 +567,7 @@ async fn spawn_subagent(
     Ok(SpawnedSubagent {
         parent_session_id: request.parent_session_id,
         started,
-        relationship,
+        parent_link,
     })
 }
 
@@ -604,24 +600,24 @@ async fn ensure_parent_ready_for_subagent_spawn(
     parent_driver.ensure_idle_for_source_mutation().await
 }
 
-async fn require_subagent_relationship(
+async fn require_subagent_parent_link(
     state: &AppState,
     parent_session_id: &str,
     child_session_id: &str,
-) -> std::result::Result<SessionRelationship, RpcError> {
-    let relationship = state
+) -> std::result::Result<SessionParentLink, RpcError> {
+    let parent_link = state
         .repo
-        .session_relationship_for_child(child_session_id)
+        .session_parent_link_for_child(child_session_id)
         .await
         .map_err(anyhow::Error::from)?
-        .ok_or_else(|| RpcError::new("subagent_not_found", "subagent relationship not found"))?;
-    if relationship.parent_session_id != parent_session_id {
+        .ok_or_else(|| RpcError::new("subagent_not_found", "subagent parent link not found"))?;
+    if parent_link.parent_session_id != parent_session_id {
         return Err(RpcError::new(
             "subagent_not_found",
-            "subagent relationship not found",
+            "subagent parent link not found",
         ));
     }
-    Ok(relationship)
+    Ok(parent_link)
 }
 
 async fn cleanup_failed_spawn(state: &AppState, child_session_id: &str, reason: &str) {

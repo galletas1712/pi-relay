@@ -26,7 +26,7 @@ import type {
 	Notice,
 	Project,
 	ReasoningEffort,
-	SessionRelationship,
+	SessionParentLink,
 	SessionSnapshot,
 	ToolListing,
 	TranscriptTurnsResult,
@@ -95,12 +95,12 @@ function AgentTreeSection({
 					/>
 					{subagents.map((item) => (
 						<AgentTreeButton
-							key={item.relationship.relationship_id}
-							selected={selectedAgentSessionId === item.relationship.child_session_id}
-							title={relationshipTitle(item.relationship)}
-							subtitle={relationshipSubtitle(item.relationship)}
+							key={item.parent_link.child_session_id}
+							selected={selectedAgentSessionId === item.parent_link.child_session_id}
+							title={parentLinkTitle(item.parent_link)}
+							subtitle={parentLinkSubtitle(item.parent_link)}
 							activity={item.activity}
-							onClick={() => onSelectAgent?.(item.relationship.child_session_id)}
+							onClick={() => onSelectAgent?.(item.parent_link.child_session_id)}
 						/>
 					))}
 				</div>
@@ -141,7 +141,7 @@ function AgentTreeButton({
 
 function AgentTranscriptPreview({
 	sessionId,
-	relationship,
+	parentLink,
 	preview,
 	loading,
 	error,
@@ -149,7 +149,7 @@ function AgentTranscriptPreview({
 	onSteerSubagent
 }: {
 	sessionId: string | null;
-	relationship: SessionRelationship | null;
+	parentLink: SessionParentLink | null;
 	preview: TranscriptTurnsResult | null;
 	loading: boolean;
 	error: string | null;
@@ -158,7 +158,7 @@ function AgentTranscriptPreview({
 }) {
 	const cards = preview?.cards ?? [];
 	const [draft, setDraft] = useState("");
-	const canSteer = relationship !== null;
+	const canSteer = parentLink !== null;
 	return (
 		<section className="inspect-section">
 			<h2>Transcript preview</h2>
@@ -211,18 +211,18 @@ function AgentTranscriptPreview({
 	);
 }
 
-function selectedRelationshipForSession(workSessions: WorkSessionsResult | null, sessionId: string): SessionRelationship | null {
+function selectedParentLinkForSession(workSessions: WorkSessionsResult | null, sessionId: string): SessionParentLink | null {
 	return (workSessions?.subagents ?? [])
-		.map((item) => item.relationship)
-		.find((relationship) => relationship.child_session_id === sessionId) ?? null;
+		.map((item) => item.parent_link)
+		.find((parentLink) => parentLink.child_session_id === sessionId) ?? null;
 }
 
-function relationshipTitle(relationship: SessionRelationship): string {
-	return relationship.child_session_id.slice(0, 13);
+function parentLinkTitle(parentLink: SessionParentLink): string {
+	return parentLink.child_session_id.slice(0, 13);
 }
 
-function relationshipSubtitle(relationship: SessionRelationship): string {
-	return `subagent · parent ${relationship.parent_session_id.slice(0, 13)}`;
+function parentLinkSubtitle(parentLink: SessionParentLink): string {
+	return `subagent · parent ${parentLink.parent_session_id.slice(0, 13)}`;
 }
 
 function turnUserPreview(messages: TranscriptTurnsResult["cards"][number]["user_messages"]): string {
@@ -770,8 +770,8 @@ export function Inspector({
 	onSelectAgent?: (sessionId: string) => void;
 	onClose?: () => void;
 }) {
-	const selectedRelationship = selectedAgentSessionId
-		? selectedRelationshipForSession(workSessions ?? null, selectedAgentSessionId)
+	const selectedParentLink = selectedAgentSessionId
+		? selectedParentLinkForSession(workSessions ?? null, selectedAgentSessionId)
 		: null;
 	return (
 		<div className="inspector-inner">
@@ -832,7 +832,7 @@ export function Inspector({
 			/>
 			<AgentTranscriptPreview
 				sessionId={selectedAgentSessionId ?? snapshot?.session_id ?? null}
-				relationship={selectedRelationship}
+				parentLink={selectedParentLink}
 				preview={transcriptPreview ?? null}
 				loading={transcriptPreviewLoading ?? false}
 				error={transcriptPreviewError ?? null}
