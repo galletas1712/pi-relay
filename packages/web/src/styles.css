@@ -2387,7 +2387,7 @@ pre {
 	border: 0;
 	background: transparent;
 	color: var(--muted-foreground);
-	font-size: var(--text-xs);
+	font-size: var(--text-sm);
 	padding: 2px 0;
 	cursor: pointer;
 }
@@ -2439,7 +2439,7 @@ pre {
 	border-radius: var(--radius);
 	background: var(--card);
 	color: var(--foreground);
-	font-size: var(--text-xs);
+	font-size: var(--text-sm);
 	padding: 4px 8px;
 	outline: 0;
 }
