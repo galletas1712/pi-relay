@@ -184,10 +184,20 @@ fn add_skills_from_agents_dir(dir: &Path, workspace: Option<&str>, skills: &mut 
 
 fn load_skill_file(path: &Path, workspace: Option<&str>) -> Option<Skill> {
     let raw = std::fs::read_to_string(path).ok()?;
-    let (frontmatter, _body) = split_frontmatter(&raw);
+    let (frontmatter, body) = split_frontmatter(&raw);
     let frontmatter = parse_simple_frontmatter(frontmatter.unwrap_or_default());
-    let name = frontmatter.get("name").cloned()?.trim().to_string();
-    let description = frontmatter.get("description")?.trim().to_string();
+    let name = match frontmatter.get("name").cloned() {
+        Some(name) => name,
+        None => skill_name_from_path(path)?,
+    }
+    .trim()
+    .to_string();
+    let description = match frontmatter.get("description").cloned() {
+        Some(description) => description,
+        None => skill_description_from_body(body).unwrap_or_else(|| format!("Skill role `{name}`")),
+    }
+    .trim()
+    .to_string();
     if name.is_empty() || description.is_empty() {
         return None;
     }
@@ -196,6 +206,36 @@ fn load_skill_file(path: &Path, workspace: Option<&str>) -> Option<Skill> {
         None => Skill::global(name, description, path),
     };
     Some(skill)
+}
+
+fn skill_name_from_path(path: &Path) -> Option<String> {
+    Some(
+        path.parent()?
+            .file_name()?
+            .to_string_lossy()
+            .trim()
+            .to_string(),
+    )
+}
+
+fn skill_description_from_body(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let description = line
+            .split_once(':')
+            .filter(|(key, value)| {
+                key.trim().eq_ignore_ascii_case("description") && !value.trim().is_empty()
+            })
+            .map(|(_, value)| value.trim().to_string());
+        if let Some(description) = description {
+            return Some(description);
+        }
+        return Some(line.to_string());
+    }
+    None
 }
 
 fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
@@ -329,6 +369,29 @@ mod tests {
             .iter()
             .any(|skill| skill.workspace.as_deref() == Some("repo") && skill.name == "nested"));
         assert!(!skills.iter().any(|skill| skill.name == "root-file"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn frontmatterless_skill_uses_directory_name_and_description_line() {
+        let root = make_temp_dir("skills-frontmatterless");
+        let outer = root.join("outer");
+        let workspace = outer.join("repo");
+        let skill_path = workspace.join(".agents/skills/planner/SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().expect("skill parent")).expect("skill dir");
+        std::fs::write(
+            &skill_path,
+            "# planner\n\nDescription: Plan workflow steps.\n\nProduce a plan.\n",
+        )
+        .expect("write skill");
+
+        let skills = load_skills_for_workspace_roots_with_home(&outer, &["repo".to_string()], None);
+        let skill = skills
+            .iter()
+            .find(|skill| skill.workspace.as_deref() == Some("repo") && skill.name == "planner")
+            .expect("frontmatterless skill discovered");
+        assert_eq!(skill.description, "Plan workflow steps.");
 
         std::fs::remove_dir_all(root).ok();
     }
