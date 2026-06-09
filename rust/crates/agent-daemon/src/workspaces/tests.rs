@@ -181,6 +181,102 @@ async fn materialize_session_git_workspace_honors_branch_override() {
 }
 
 #[tokio::test]
+async fn fork_session_from_parent_copies_current_state_without_refreshing_base() {
+    let temp = TempDir::new("workspace-manager-fork");
+    let remote = temp.path().join("remote.git");
+    let seed = temp.path().join("seed");
+    std::fs::create_dir_all(&seed).expect("seed dir");
+
+    git(
+        temp.path(),
+        ["init", "--bare", remote.to_str().expect("remote path")],
+    );
+    git(&seed, ["init"]);
+    git(&seed, ["config", "user.email", "pi-relay@example.test"]);
+    git(&seed, ["config", "user.name", "pi relay"]);
+    git(&seed, ["config", "commit.gpgsign", "false"]);
+    std::fs::write(seed.join("README.md"), "hello\n").expect("seed file");
+    git(&seed, ["add", "README.md"]);
+    git(&seed, ["commit", "-m", "initial"]);
+    git(&seed, ["branch", "-M", "main"]);
+    git(
+        &seed,
+        [
+            "remote",
+            "add",
+            "origin",
+            remote.to_str().expect("remote path"),
+        ],
+    );
+    git(&seed, ["push", "origin", "main"]);
+
+    let manager = WorkspaceManager::new(temp.path().join("state"));
+    let project_id = Uuid::new_v4();
+    let project_workspaces = vec![ProjectWorkspace::git(
+        "repo",
+        remote.to_string_lossy(),
+        "main",
+    )];
+    let (parent_cwd, parent_workspaces) = manager
+        .materialize_session(
+            project_id,
+            "parent-session",
+            &project_workspaces,
+            &select_all(&project_workspaces),
+        )
+        .await
+        .expect("materialize parent session");
+    let parent_repo = Path::new(&parent_cwd).join("repo");
+    std::fs::write(parent_repo.join("README.md"), "dirty parent\n").expect("dirty parent file");
+    std::fs::write(parent_repo.join("UNTRACKED.txt"), "untracked parent\n")
+        .expect("untracked parent file");
+    make_symlink(Path::new("/etc/passwd"), &parent_repo.join("external-link"));
+
+    std::fs::write(seed.join("README.md"), "remote update\n").expect("remote update");
+    git(&seed, ["add", "README.md"]);
+    git(&seed, ["commit", "-m", "remote update"]);
+    git(&seed, ["push", "origin", "main"]);
+
+    let (child_cwd, child_workspaces) = manager
+        .fork_session_from_parent(
+            "parent-session",
+            &parent_cwd,
+            &parent_workspaces,
+            "child-session",
+        )
+        .await
+        .expect("fork child session");
+    let child_repo = Path::new(&child_cwd).join("repo");
+
+    assert_eq!(child_workspaces.len(), 1);
+    assert_eq!(
+        child_workspaces[0].local_branch.as_deref(),
+        Some("pi/session/child-session/repo")
+    );
+    assert_eq!(
+        git_stdout(&child_repo, ["branch", "--show-current"]),
+        "pi/session/child-session/repo"
+    );
+    assert_eq!(
+        git_stdout(&parent_repo, ["branch", "--show-current"]),
+        "pi/session/parent-session/repo"
+    );
+    assert_eq!(
+        std::fs::read_to_string(child_repo.join("README.md")).expect("child dirty file"),
+        "dirty parent\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(child_repo.join("UNTRACKED.txt")).expect("child untracked file"),
+        "untracked parent\n"
+    );
+    assert_eq!(
+        std::fs::read_link(child_repo.join("external-link")).expect("child symlink"),
+        PathBuf::from("/etc/passwd")
+    );
+    assert_git_paths_inside(&child_repo);
+}
+
+#[tokio::test]
 async fn materialize_session_workspaces_from_local_folder() {
     let temp = TempDir::new("workspace-manager-local");
     let source = temp.path().join("source");
@@ -459,6 +555,29 @@ fn git_stdout<const N: usize>(cwd: &Path, args: [&str; N]) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn assert_git_paths_inside(workspace: &Path) {
+    let root = workspace.canonicalize().expect("canonical workspace");
+    for args in [
+        ["rev-parse", "--git-dir"],
+        ["rev-parse", "--git-common-dir"],
+    ] {
+        let output = git_stdout(workspace, args);
+        let path = Path::new(&output);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            root.join(path)
+        };
+        let path = path.canonicalize().expect("canonical git path");
+        assert!(
+            path.starts_with(&root),
+            "git path {} should be inside {}",
+            path.display(),
+            root.display()
+        );
+    }
 }
 
 struct TempDir {
