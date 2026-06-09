@@ -1,15 +1,14 @@
 use std::path::PathBuf;
 
-use agent_store::{InputPriority, SessionConfig, SessionParentLink};
+use agent_store::{InputPriority, SessionConfig};
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::codec::{from_params, parse_user_message};
+use crate::codec::from_params;
 use crate::provider_runtime::{render_pi_prompt, resolve_skill_role};
-use crate::rpc_views;
-use crate::runtime::{publish_events, SessionDriver};
+use crate::runtime::SessionDriver;
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart, StartedSession,
 };
@@ -30,20 +29,20 @@ pub(crate) async fn subagent_list(
             "parent_session_id cannot be empty",
         ));
     }
-    let parent_links = state
+    let child_session_ids = state
         .repo
-        .list_child_session_parent_links(&parent_session_id)
+        .list_child_session_ids(&parent_session_id)
         .await
         .map_err(anyhow::Error::from)?;
-    let mut subagents = Vec::with_capacity(parent_links.len());
-    for parent_link in parent_links {
+    let mut subagents = Vec::with_capacity(child_session_ids.len());
+    for child_session_id in child_session_ids {
         let activity = state
             .repo
-            .activity(&parent_link.child_session_id)
+            .activity(&child_session_id)
             .await
             .map_err(anyhow::Error::from)?;
         subagents.push(json!({
-            "parent_link": rpc_views::session_parent_link(&parent_link),
+            "child_session_id": child_session_id,
             "activity": activity,
         }));
     }
@@ -51,88 +50,6 @@ pub(crate) async fn subagent_list(
         "parent_session_id": parent_session_id,
         "subagents": subagents,
     }))
-}
-
-pub(crate) async fn subagent_list_for_parent(
-    state: &AppState,
-    parent_session_id: &str,
-) -> std::result::Result<Value, RpcError> {
-    subagent_list(state, json!({ "parent_session_id": parent_session_id })).await
-}
-
-pub(crate) async fn subagent_spawn_for_parent(
-    state: &AppState,
-    parent_session_id: &str,
-    args: Value,
-    excluded_parent_action_row_id: Option<&str>,
-) -> std::result::Result<Value, RpcError> {
-    let mut params = object_args(args)?;
-    params.insert("parent_session_id".to_string(), json!(parent_session_id));
-    let request = SubagentSpawnRequest::from_params(Value::Object(params))?;
-    let spawned = spawn_subagent(state, request, excluded_parent_action_row_id).await?;
-    Ok(json!({
-        "parent_session_id": spawned.parent_session_id,
-        "child_session_id": spawned.started.session_id,
-        "parent_link": rpc_views::session_parent_link(&spawned.parent_link),
-        "activity": spawned.started.activity,
-        "replayed": spawned.started.replayed,
-    }))
-}
-
-pub(crate) async fn subagent_send_for_parent(
-    state: &AppState,
-    parent_session_id: &str,
-    args: Value,
-) -> std::result::Result<Value, RpcError> {
-    let args = object_args(args)?;
-    let child_session_id = args
-        .get("child_session_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RpcError::new("invalid_params", "child_session_id is required"))?;
-    let message = args
-        .get("message")
-        .and_then(Value::as_str)
-        .ok_or_else(|| RpcError::new("invalid_params", "message is required"))?;
-    let priority = args
-        .get("priority")
-        .cloned()
-        .map(serde_json::from_value)
-        .transpose()
-        .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
-        .unwrap_or(InputPriority::FollowUp);
-    let client_input_id = args
-        .get("client_input_id")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    send_to_subagent(
-        state,
-        parent_session_id,
-        child_session_id,
-        priority,
-        UserMessage::text(message.to_string()),
-        client_input_id,
-    )
-    .await
-}
-
-pub(crate) async fn subagent_tail_for_parent(
-    state: &AppState,
-    parent_session_id: &str,
-    args: Value,
-) -> std::result::Result<Value, RpcError> {
-    let mut params = object_args(args)?;
-    params.insert("parent_session_id".to_string(), json!(parent_session_id));
-    subagent_tail(state, Value::Object(params)).await
-}
-
-fn object_args(value: Value) -> std::result::Result<serde_json::Map<String, Value>, RpcError> {
-    match value {
-        Value::Object(map) => Ok(map),
-        _ => Err(RpcError::new(
-            "invalid_params",
-            "tool arguments must be a JSON object",
-        )),
-    }
 }
 
 pub(crate) async fn subagent_spawn(
@@ -144,105 +61,8 @@ pub(crate) async fn subagent_spawn(
     Ok(json!({
         "parent_session_id": spawned.parent_session_id,
         "child_session_id": spawned.started.session_id,
-        "parent_link": rpc_views::session_parent_link(&spawned.parent_link),
         "activity": spawned.started.activity,
         "replayed": spawned.started.replayed,
-    }))
-}
-
-pub(crate) async fn subagent_send(
-    state: &AppState,
-    params: Value,
-) -> std::result::Result<Value, RpcError> {
-    let request = SubagentSendRequest::from_params(params)?;
-    send_to_subagent(
-        state,
-        &request.parent_session_id,
-        &request.child_session_id,
-        request.priority,
-        request.content,
-        request.client_input_id,
-    )
-    .await
-}
-
-pub(crate) async fn send_to_subagent(
-    state: &AppState,
-    parent_session_id: &str,
-    child_session_id: &str,
-    priority: InputPriority,
-    content: UserMessage,
-    client_input_id: Option<String>,
-) -> std::result::Result<Value, RpcError> {
-    let parent_link =
-        require_subagent_parent_link(state, parent_session_id, child_session_id).await?;
-    let child_driver = SessionDriver::acquire(state, child_session_id).await;
-    child_driver.recover_if_needed().await?;
-    let has_running = state
-        .repo
-        .has_unfinished_actions(child_session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let queued = state
-        .repo
-        .enqueue_user_input(
-            child_session_id,
-            priority,
-            &content,
-            client_input_id.as_deref(),
-        )
-        .await
-        .map_err(anyhow::Error::from)?;
-    if let Some(event) = queued.event {
-        publish_events(state, vec![event]);
-    }
-    if !has_running {
-        child_driver.drive_until_blocked().await?;
-    }
-    let queue = state
-        .repo
-        .queue_state(child_session_id)
-        .await
-        .map(rpc_views::queue_state)
-        .map_err(anyhow::Error::from)?;
-    Ok(json!({
-        "parent_session_id": parent_session_id,
-        "child_session_id": child_session_id,
-        "parent_link": rpc_views::session_parent_link(&parent_link),
-        "input_id": queued.input_id,
-        "queued": true,
-        "queue": queue,
-    }))
-}
-
-pub(crate) async fn subagent_tail(
-    state: &AppState,
-    params: Value,
-) -> std::result::Result<Value, RpcError> {
-    let params: SubagentTailParams = from_params(params)?;
-    let parent_session_id = params.parent_session_id.trim().to_string();
-    let child_session_id = params.child_session_id.trim().to_string();
-    if parent_session_id.is_empty() || child_session_id.is_empty() {
-        return Err(RpcError::new(
-            "invalid_params",
-            "parent_session_id and child_session_id cannot be empty",
-        ));
-    }
-    let parent_link =
-        require_subagent_parent_link(state, &parent_session_id, &child_session_id).await?;
-    let child_driver = SessionDriver::acquire(state, &child_session_id).await;
-    child_driver.recover_if_needed().await?;
-    let turns = state
-        .repo
-        .transcript_turns(&child_session_id, None, params.limit.map(i64::from))
-        .await
-        .map(rpc_views::transcript_turns)
-        .map_err(anyhow::Error::from)?;
-    Ok(json!({
-        "parent_session_id": parent_session_id,
-        "child_session_id": child_session_id,
-        "parent_link": rpc_views::session_parent_link(&parent_link),
-        "transcript": turns,
     }))
 }
 
@@ -262,8 +82,6 @@ struct SubagentSpawnRequest {
     display_name: Option<String>,
     provider: Option<ProviderConfig>,
     metadata: Value,
-    workflow_id: Option<String>,
-    result_variable: Option<String>,
 }
 
 impl SubagentSpawnRequest {
@@ -307,20 +125,6 @@ impl SubagentSpawnRequest {
             .child_session_id
             .map(|session_id| session_id.trim().to_string())
             .filter(|session_id| !session_id.is_empty());
-        let workflow_id = params
-            .workflow_id
-            .map(|workflow_id| workflow_id.trim().to_string())
-            .filter(|workflow_id| !workflow_id.is_empty());
-        let result_variable = params
-            .result_variable
-            .map(|result_variable| result_variable.trim().to_string())
-            .filter(|result_variable| !result_variable.is_empty());
-        if result_variable.is_some() && workflow_id.is_none() {
-            return Err(RpcError::new(
-                "invalid_params",
-                "workflow_id is required when result_variable is set",
-            ));
-        }
         Ok(Self {
             parent_session_id,
             child_session_id,
@@ -331,8 +135,6 @@ impl SubagentSpawnRequest {
             display_name: params.display_name,
             provider: params.provider,
             metadata: params.metadata.unwrap_or_else(|| json!({})),
-            workflow_id,
-            result_variable,
         })
     }
 }
@@ -348,60 +150,11 @@ struct SubagentSpawnParams {
     display_name: Option<String>,
     provider: Option<ProviderConfig>,
     metadata: Option<Value>,
-    workflow_id: Option<String>,
-    result_variable: Option<String>,
-}
-
-#[derive(Debug)]
-struct SubagentSendRequest {
-    parent_session_id: String,
-    child_session_id: String,
-    priority: InputPriority,
-    content: UserMessage,
-    client_input_id: Option<String>,
-}
-
-impl SubagentSendRequest {
-    fn from_params(params: Value) -> std::result::Result<Self, RpcError> {
-        let params: SubagentSendParams = from_params(params)?;
-        let parent_session_id = params.parent_session_id.trim().to_string();
-        let child_session_id = params.child_session_id.trim().to_string();
-        if parent_session_id.is_empty() || child_session_id.is_empty() {
-            return Err(RpcError::new(
-                "invalid_params",
-                "parent_session_id and child_session_id cannot be empty",
-            ));
-        }
-        Ok(Self {
-            parent_session_id,
-            child_session_id,
-            priority: params.priority.unwrap_or(InputPriority::FollowUp),
-            content: parse_user_message(params.content)?,
-            client_input_id: params.client_input_id,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct SubagentSendParams {
-    parent_session_id: String,
-    child_session_id: String,
-    priority: Option<InputPriority>,
-    content: Value,
-    client_input_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SubagentTailParams {
-    parent_session_id: String,
-    child_session_id: String,
-    limit: Option<u32>,
 }
 
 struct SpawnedSubagent {
     parent_session_id: String,
     started: StartedSession,
-    parent_link: SessionParentLink,
 }
 
 async fn spawn_subagent(
@@ -430,9 +183,7 @@ async fn spawn_subagent(
         None => None,
     };
     if let Some(child_session_id) = existing_child_session_id {
-        let parent_link =
-            require_subagent_parent_link(state, &request.parent_session_id, child_session_id)
-                .await?;
+        require_known_subagent(state, &request.parent_session_id, child_session_id).await?;
         let activity = state
             .repo
             .activity(child_session_id)
@@ -447,7 +198,6 @@ async fn spawn_subagent(
                 replayed: true,
                 dispatches: Vec::new(),
             },
-            parent_link,
         });
     }
 
@@ -495,13 +245,10 @@ async fn spawn_subagent(
 
     let child_metadata = subagent_metadata(
         request.metadata,
-        &request.parent_session_id,
         &role.name,
         role.workspace.as_deref(),
         request.display_name.as_deref(),
         &request.task,
-        request.workflow_id.as_deref(),
-        request.result_variable.as_deref(),
         &role.file_path,
         &parent_config.metadata,
     );
@@ -530,8 +277,6 @@ async fn spawn_subagent(
         &request.parent_session_id,
         &task,
         request.initial_context.as_deref(),
-        request.workflow_id.as_deref(),
-        request.result_variable.as_deref(),
     );
     let started = start_prepared_session(
         state,
@@ -546,17 +291,7 @@ async fn spawn_subagent(
         },
     )
     .await?;
-    let parent_link = state
-        .repo
-        .session_parent_link_for_child(&child_session_id)
-        .await
-        .map_err(anyhow::Error::from)?
-        .ok_or_else(|| {
-            RpcError::new(
-                "parent_link_missing",
-                "child session was created without a parent link",
-            )
-        })?;
+    require_known_subagent(state, &request.parent_session_id, &child_session_id).await?;
 
     let child_driver = SessionDriver::acquire(state, &started.session_id).await;
     if let Err(error) = child_driver.dispatch(started.dispatches.clone()).await {
@@ -567,7 +302,6 @@ async fn spawn_subagent(
     Ok(SpawnedSubagent {
         parent_session_id: request.parent_session_id,
         started,
-        parent_link,
     })
 }
 
@@ -600,24 +334,24 @@ async fn ensure_parent_ready_for_subagent_spawn(
     parent_driver.ensure_idle_for_source_mutation().await
 }
 
-async fn require_subagent_parent_link(
+pub(crate) async fn require_known_subagent(
     state: &AppState,
     parent_session_id: &str,
     child_session_id: &str,
-) -> std::result::Result<SessionParentLink, RpcError> {
-    let parent_link = state
+) -> std::result::Result<(), RpcError> {
+    let actual_parent_session_id = state
         .repo
-        .session_parent_link_for_child(child_session_id)
+        .session_parent_id(child_session_id)
         .await
         .map_err(anyhow::Error::from)?
-        .ok_or_else(|| RpcError::new("subagent_not_found", "subagent parent link not found"))?;
-    if parent_link.parent_session_id != parent_session_id {
+        .ok_or_else(|| RpcError::new("subagent_not_found", "subagent is not in scope"))?;
+    if actual_parent_session_id != parent_session_id {
         return Err(RpcError::new(
             "subagent_not_found",
-            "subagent parent link not found",
+            "subagent is not in scope",
         ));
     }
-    Ok(parent_link)
+    Ok(())
 }
 
 async fn cleanup_failed_spawn(state: &AppState, child_session_id: &str, reason: &str) {
@@ -640,13 +374,10 @@ async fn cleanup_failed_spawn(state: &AppState, child_session_id: &str, reason: 
 
 fn subagent_metadata(
     metadata: Value,
-    parent_session_id: &str,
     role_name: &str,
     role_workspace: Option<&str>,
     display_name: Option<&str>,
     task: &str,
-    workflow_id: Option<&str>,
-    result_variable: Option<&str>,
     role_file_path: &PathBuf,
     parent_metadata: &Value,
 ) -> Value {
@@ -667,7 +398,6 @@ fn subagent_metadata(
     }
     map.insert("hidden".to_string(), json!(true));
     map.insert("subagent".to_string(), json!(true));
-    map.insert("parent_session_id".to_string(), json!(parent_session_id));
     map.insert("role_name".to_string(), json!(role_name));
     if let Some(role_workspace) = role_workspace {
         map.insert("role_workspace".to_string(), json!(role_workspace));
@@ -676,12 +406,6 @@ fn subagent_metadata(
         map.insert("display_name".to_string(), json!(display_name));
     }
     map.insert("task".to_string(), json!(task));
-    if let Some(workflow_id) = workflow_id {
-        map.insert("workflow_id".to_string(), json!(workflow_id));
-    }
-    if let Some(result_variable) = result_variable {
-        map.insert("result_variable".to_string(), json!(result_variable));
-    }
     map.insert("role_file_path".to_string(), json!(role_file_path));
     metadata
 }
@@ -690,26 +414,11 @@ fn child_initial_task_message(
     parent_session_id: &str,
     task: &str,
     initial_context: Option<&str>,
-    workflow_id: Option<&str>,
-    result_variable: Option<&str>,
 ) -> String {
     let mut message = format!("Subagent task from parent session `{parent_session_id}`:\n\n{task}");
     if let Some(initial_context) = initial_context {
         message.push_str("\n\n# Initial context\n\n");
         message.push_str(initial_context);
-    }
-    if workflow_id.is_some() || result_variable.is_some() {
-        message.push_str("\n\n# Workflow reporting\n\n");
-        if let Some(workflow_id) = workflow_id {
-            message.push_str(&format!("- workflow_id: `{workflow_id}`\n"));
-        }
-        if let Some(result_variable) = result_variable {
-            message.push_str(&format!("- result_variable: `{result_variable}`\n"));
-        }
-        message.push_str(
-            "\nWhen you have a useful final or intermediate result, call `WorkWrite` \
-with this workflow id and set `var` to the result variable so the parent workflow can read it.",
-        );
     }
     message
 }
@@ -761,8 +470,6 @@ mod tests {
             "role_workspace": " repo ",
             "task": " Review this ",
             "initial_context": " Context ",
-            "workflow_id": " workflow ",
-            "result_variable": " result ",
         }))
         .expect("request parses");
         assert_eq!(request.parent_session_id, "parent");
@@ -770,8 +477,6 @@ mod tests {
         assert_eq!(request.role_workspace.as_deref(), Some("repo"));
         assert_eq!(request.task, "Review this");
         assert_eq!(request.initial_context.as_deref(), Some("Context"));
-        assert_eq!(request.workflow_id.as_deref(), Some("workflow"));
-        assert_eq!(request.result_variable.as_deref(), Some("result"));
 
         let error = SubagentSpawnRequest::from_params(json!({
             "parent_session_id": "parent",
@@ -783,42 +488,13 @@ mod tests {
     }
 
     #[test]
-    fn spawn_request_requires_workflow_for_result_variable() {
-        let error = SubagentSpawnRequest::from_params(json!({
-            "parent_session_id": "parent",
-            "role": "reviewer",
-            "task": "Review this",
-            "result_variable": "result",
-        }))
-        .expect_err("workflow is required");
-        assert_eq!(error.code, "invalid_params");
-    }
-
-    #[test]
-    fn send_request_defaults_to_follow_up_priority() {
-        let request = SubagentSendRequest::from_params(json!({
-            "parent_session_id": " parent ",
-            "child_session_id": " child ",
-            "content": [{ "type": "text", "text": "Continue." }],
-        }))
-        .expect("request parses");
-        assert_eq!(request.parent_session_id, "parent");
-        assert_eq!(request.child_session_id, "child");
-        assert_eq!(request.priority, InputPriority::FollowUp);
-        assert_eq!(request.content, "Continue.");
-    }
-
-    #[test]
-    fn subagent_metadata_marks_session_hidden_and_parented() {
+    fn subagent_metadata_marks_session_hidden() {
         let metadata = subagent_metadata(
             json!({ "custom": true }),
-            "parent",
             "reviewer",
             Some("repo"),
             Some("Review"),
             "Review this",
-            Some("workflow"),
-            Some("result"),
             &PathBuf::from("/tmp/reviewer/SKILL.md"),
             &json!({ "harness": true }),
         );
@@ -829,13 +505,10 @@ mod tests {
                 "harness": true,
                 "hidden": true,
                 "subagent": true,
-                "parent_session_id": "parent",
                 "role_name": "reviewer",
                 "role_workspace": "repo",
                 "display_name": "Review",
                 "task": "Review this",
-                "workflow_id": "workflow",
-                "result_variable": "result",
                 "role_file_path": "/tmp/reviewer/SKILL.md",
             })
         );

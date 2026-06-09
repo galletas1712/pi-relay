@@ -1,8 +1,6 @@
 use anyhow::{anyhow, Result};
 use sqlx::Row;
 
-use crate::SessionParentLink;
-
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
@@ -10,53 +8,28 @@ impl PostgresAgentStore {
         &self,
         child_session_id: &str,
         parent_session_id: &str,
-    ) -> Result<SessionParentLink> {
+    ) -> Result<()> {
         if child_session_id == parent_session_id {
             return Err(anyhow!(
                 "child session id must differ from parent session id"
             ));
         }
-        let row = sqlx::query(
+        let updated = sqlx::query(
             r#"
             update sessions
             set parent_session_id=$2::text,
                 updated_at=now()
             where id=$1::text
-            returning
-                parent_session_id,
-                id as child_session_id,
-                created_at::text as created_at,
-                updated_at::text as updated_at
             "#,
         )
         .bind(child_session_id)
         .bind(parent_session_id)
-        .fetch_optional(&self.pool)
-        .await?
-        .ok_or_else(|| anyhow!("session not found: {child_session_id}"))?;
-        Ok(parent_link_from_row(row))
-    }
-
-    pub async fn session_parent_link_for_child(
-        &self,
-        child_session_id: &str,
-    ) -> Result<Option<SessionParentLink>> {
-        let row = sqlx::query(
-            r#"
-            select
-                parent_session_id,
-                id as child_session_id,
-                created_at::text as created_at,
-                updated_at::text as updated_at
-            from sessions
-            where id=$1::text
-                and parent_session_id is not null
-            "#,
-        )
-        .bind(child_session_id)
-        .fetch_optional(&self.pool)
+        .execute(&self.pool)
         .await?;
-        Ok(row.map(parent_link_from_row))
+        if updated.rows_affected() == 0 {
+            return Err(anyhow!("session not found: {child_session_id}"));
+        }
+        Ok(())
     }
 
     pub async fn session_parent_id(&self, child_session_id: &str) -> Result<Option<String>> {
@@ -68,17 +41,10 @@ impl PostgresAgentStore {
         Ok(row.get("parent_session_id"))
     }
 
-    pub async fn list_child_session_parent_links(
-        &self,
-        parent_session_id: &str,
-    ) -> Result<Vec<SessionParentLink>> {
+    pub async fn list_child_session_ids(&self, parent_session_id: &str) -> Result<Vec<String>> {
         let rows = sqlx::query(
             r#"
-            select
-                parent_session_id,
-                id as child_session_id,
-                created_at::text as created_at,
-                updated_at::text as updated_at
+            select id as child_session_id
             from sessions
             where parent_session_id=$1::text
             order by created_at, id
@@ -87,16 +53,10 @@ impl PostgresAgentStore {
         .bind(parent_session_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(parent_link_from_row).collect())
-    }
-}
-
-fn parent_link_from_row(row: sqlx::postgres::PgRow) -> SessionParentLink {
-    SessionParentLink {
-        parent_session_id: row.get("parent_session_id"),
-        child_session_id: row.get("child_session_id"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
+        Ok(rows
+            .into_iter()
+            .map(|row| row.get("child_session_id"))
+            .collect())
     }
 }
 
@@ -135,7 +95,7 @@ mod tests {
     async fn test_store() -> Option<TestDb> {
         let admin_url = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok()?;
         let name = format!(
-            "pi_relay_parent_link_test_{}_{}",
+            "pi_relay_session_parent_test_{}_{}",
             std::process::id(),
             TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
         );
@@ -191,7 +151,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parent_links_can_be_set_and_listed() {
+    async fn parent_session_ids_can_be_set_and_listed() {
         let Some(db) = test_store().await else { return };
         let project_id = Uuid::new_v4();
         let parent_session_id = "parent-session";
@@ -229,27 +189,17 @@ mod tests {
             .await
             .expect("create child session");
 
-        let created = db
-            .store
+        db.store
             .set_session_parent(child_session_id, parent_session_id)
             .await
-            .expect("set parent link");
-        assert_eq!(created.parent_session_id, parent_session_id);
-        assert_eq!(created.child_session_id, child_session_id);
+            .expect("set parent session id");
 
         let children = db
             .store
-            .list_child_session_parent_links(parent_session_id)
+            .list_child_session_ids(parent_session_id)
             .await
             .expect("list children");
-        assert_eq!(children, vec![created.clone()]);
-        let by_child = db
-            .store
-            .session_parent_link_for_child(child_session_id)
-            .await
-            .expect("link by child")
-            .expect("child has parent");
-        assert_eq!(by_child, created);
+        assert_eq!(children, vec![child_session_id.to_string()]);
         let parent_id = db
             .store
             .session_parent_id(child_session_id)

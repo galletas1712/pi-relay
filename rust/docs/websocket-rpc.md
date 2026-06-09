@@ -93,6 +93,7 @@ active_leaf_id text null
 system_prompt text not null
 provider_config jsonb not null
 metadata jsonb not null default '{}'::jsonb
+parent_session_id text null references sessions(id) on delete set null
 session_revision bigint not null default 0
 queue_revision bigint not null default 0
 transcript_revision bigint not null default 0
@@ -886,13 +887,17 @@ running or already queued, the daemon stores a durable queued row.
   "session_id": "s1",
   "client_input_id": "ci-1",
   "expected_active_leaf_id": "entry_9",
+  "priority": "follow_up",
   "content": [
     { "type": "text", "text": "Fix this test" }
   ]
 }
 ```
 
-`expected_active_leaf_id` is optional. When present, the daemon rejects idle
+`priority` is optional and defaults to `follow_up`; clients can set `steer` for
+high-priority steering input against any regular session id, including a
+subagent session selected from the UI. `expected_active_leaf_id` is optional.
+When present, the daemon rejects idle
 acceptance with `history_changed` if the active branch moved before the message
 was accepted. When the session is already busy, the message is a durable queued
 follow-up that will materialize only after earlier work commits from the
@@ -1180,6 +1185,74 @@ turns fail with `not_resumable`, non-terminal targets fail with
 `not_terminal_turn`, active/queued sessions fail with `session_busy`, and turns
 whose terminal work was tool execution fail with `not_resumable` until explicit
 tool-rerun semantics exist.
+
+## Subagent RPC
+
+Subagents are regular durable sessions whose `sessions.parent_session_id` points
+at the session that spawned them. These RPCs are websocket/backend primitives for
+UI and future orchestration runtimes; they are not exposed as provider-visible
+model tools.
+
+Once a client knows a child `session_id`, it should use ordinary session RPCs:
+`transcript.*`/`session.get` to inspect, `input.follow_up` to send follow-ups or
+`priority: "steer"` messages, and `input.interrupt` to stop active work.
+
+### `subagent.list`
+
+Lists direct child subagents for a parent session.
+
+Request:
+
+```json
+{ "parent_session_id": "session_parent" }
+```
+
+Response:
+
+```json
+{
+  "parent_session_id": "session_parent",
+  "subagents": [
+    { "child_session_id": "session_child", "activity": "running" }
+  ]
+}
+```
+
+### `subagent.spawn`
+
+Backend/internal spawn primitive. Creates a child project session, resolves the
+requested role, forks the child's workspace from the parent's current workspace,
+stores `parent_session_id`, schedules the child's initial turn, and returns the
+child session id. It does not wait for the child to finish; blocking "call"
+semantics belong in the future Python REPL helper layer.
+
+This RPC is intentionally not a model-facing orchestration API. Its current
+schema includes backend-oriented fields such as deterministic child ids, display
+metadata, provider override, and arbitrary metadata; a future Python REPL
+orchestration surface should wrap it with smaller helpers such as
+`subagents.call(...)` and `subagents.call_bulk(...)`.
+
+Request:
+
+```json
+{
+  "parent_session_id": "session_parent",
+  "role": "reviewer",
+  "task": "Review the current patch and report blocking issues.",
+  "initial_context": "Optional bounded context for the child."
+}
+```
+
+Response:
+
+```json
+{
+  "parent_session_id": "session_parent",
+  "child_session_id": "session_child",
+  "activity": "running",
+  "replayed": false
+}
+```
 
 ## Tools
 

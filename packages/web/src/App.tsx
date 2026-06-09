@@ -90,7 +90,7 @@ import type {
 	TranscriptEntry,
 	TranscriptTreeNode,
 	ProjectWorkspace,
-	WorkSessionsResult,
+	SubagentListResult,
 } from "./types.ts";
 
 const MAX_NOTICES = 24;
@@ -428,16 +428,16 @@ export function App() {
 		enabled: connection === "open",
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
-	const workSessionsQuery = useQuery({
-		queryKey: queryKeys.workSessions(loadedSnapshot?.session_id ?? null),
+	const subagentsQuery = useQuery({
+		queryKey: queryKeys.subagents(loadedSnapshot?.session_id ?? null),
 		queryFn: () => {
 			if (!loadedSnapshot) throw new Error("select a session first");
-			return api.listWorkSessions(loadedSnapshot.session_id);
+			return api.listSubagents(loadedSnapshot.session_id);
 		},
 		enabled: connection === "open" && !!loadedSnapshot,
 	});
 	const effectiveInspectedAgentSessionId =
-		inspectedAgentSessionId && agentIsInspectable(loadedSnapshot, workSessionsQuery.data ?? null, inspectedAgentSessionId)
+		inspectedAgentSessionId && agentIsInspectable(loadedSnapshot, subagentsQuery.data ?? null, inspectedAgentSessionId)
 			? inspectedAgentSessionId
 			: loadedSnapshot?.session_id ?? null;
 	const inspectedTranscriptQuery = useQuery({
@@ -893,7 +893,7 @@ export function App() {
 					(event.session_id === loadedSnapshot.session_id || event.session_id === effectiveInspectedAgentSessionId)
 				) {
 					void queryClient.invalidateQueries({
-						queryKey: queryKeys.workSessions(loadedSnapshot.session_id),
+						queryKey: queryKeys.subagents(loadedSnapshot.session_id),
 					});
 					void queryClient.invalidateQueries({
 						queryKey: queryKeys.agentTranscriptPreview(loadedSnapshot.session_id, effectiveInspectedAgentSessionId),
@@ -1884,15 +1884,15 @@ export function App() {
 			if (!parentSessionId || !childSessionId || childSessionId === parentSessionId) return;
 			setSteeringSubagent(true);
 			void api
-				.steerSubagent({
-					parentSessionId,
-					childSessionId,
-					message,
+				.queueFollowUp({
+					sessionId: childSessionId,
+					clientInputId: randomId("web_subagent_input"),
 					priority: "steer",
+					content: textContent(message),
 				})
 				.then(() =>
 					Promise.all([
-						queryClient.invalidateQueries({ queryKey: queryKeys.workSessions(parentSessionId) }),
+						queryClient.invalidateQueries({ queryKey: queryKeys.subagents(parentSessionId) }),
 						queryClient.invalidateQueries({
 							queryKey: queryKeys.agentTranscriptPreview(parentSessionId, childSessionId),
 						}),
@@ -2058,9 +2058,9 @@ export function App() {
 				<Inspector
 					snapshot={loadedSnapshot}
 					tools={tools}
-					workSessions={workSessionsQuery.data ?? null}
-					workSessionsLoading={workSessionsQuery.isLoading}
-					workSessionsError={workSessionsQuery.error ? errorMessage(workSessionsQuery.error) : null}
+					subagentsResult={subagentsQuery.data ?? null}
+					subagentsLoading={subagentsQuery.isLoading}
+					subagentsError={subagentsQuery.error ? errorMessage(subagentsQuery.error) : null}
 					selectedAgentSessionId={effectiveInspectedAgentSessionId}
 					transcriptPreview={inspectedTranscriptQuery.data ?? null}
 					transcriptPreviewLoading={inspectedTranscriptQuery.isLoading}
@@ -2208,12 +2208,12 @@ function selectedBaseLeafId(cache: SelectedSessionCache, sessionId: string, fall
 
 function agentIsInspectable(
 	root: SessionSnapshot | null,
-	workSessions: WorkSessionsResult | null,
+	subagentsResult: SubagentListResult | null,
 	sessionId: string,
 ): boolean {
 	if (!root) return false;
 	if (sessionId === root.session_id) return true;
-	return (workSessions?.subagents ?? []).some((item) => item.parent_link.child_session_id === sessionId);
+	return (subagentsResult?.subagents ?? []).some((item) => item.child_session_id === sessionId);
 }
 
 async function restoreTextForTarget(

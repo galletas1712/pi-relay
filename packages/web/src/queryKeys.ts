@@ -6,7 +6,7 @@ export const queryKeys = {
 	projects: ["projects"] as const,
 	tools: (provider: string) => ["tools", provider] as const,
 	sessions: (projectId: string | null) => ["sessions", projectId] as const,
-	workSessions: (sessionId: string | null) => ["work-sessions", sessionId] as const,
+	subagents: (sessionId: string | null) => ["subagents", sessionId] as const,
 	agentTranscriptPreview: (rootSessionId: string | null, sessionId: string | null) =>
 		["agent-transcript-preview", rootSessionId, sessionId] as const,
 	session: (sessionId: string, scope: EntryScope = "full_tree") => ["session", sessionId, scope] as const,

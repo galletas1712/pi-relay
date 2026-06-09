@@ -76,18 +76,6 @@ pub(crate) enum RpcMethod {
     CompactionRequest,
     SubagentList,
     SubagentSpawn,
-    SubagentSend,
-    SubagentTail,
-    WorkflowVarsList,
-    WorkflowVarRead,
-    WorkflowVarWrite,
-    WorkflowAwait,
-    WorkflowContextSend,
-    WorkSpawn,
-    WorkAwait,
-    WorkRead,
-    WorkSend,
-    WorkWrite,
     HarnessModelComplete,
     HarnessModelFail,
 }
@@ -127,18 +115,6 @@ impl RpcMethod {
             "compaction.request" => Some(Self::CompactionRequest),
             "subagent.list" => Some(Self::SubagentList),
             "subagent.spawn" => Some(Self::SubagentSpawn),
-            "subagent.send" => Some(Self::SubagentSend),
-            "subagent.tail" => Some(Self::SubagentTail),
-            "workflow.vars_list" => Some(Self::WorkflowVarsList),
-            "workflow.var_read" => Some(Self::WorkflowVarRead),
-            "workflow.var_write" => Some(Self::WorkflowVarWrite),
-            "workflow.await" => Some(Self::WorkflowAwait),
-            "workflow.context_send" => Some(Self::WorkflowContextSend),
-            "work.spawn" => Some(Self::WorkSpawn),
-            "work.await" => Some(Self::WorkAwait),
-            "work.read" => Some(Self::WorkRead),
-            "work.send" => Some(Self::WorkSend),
-            "work.write" => Some(Self::WorkWrite),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
             _ => None,
@@ -222,39 +198,6 @@ mod tests {
             RpcMethod::parse("subagent.spawn"),
             Some(RpcMethod::SubagentSpawn)
         );
-        assert_eq!(
-            RpcMethod::parse("subagent.send"),
-            Some(RpcMethod::SubagentSend)
-        );
-        assert_eq!(
-            RpcMethod::parse("subagent.tail"),
-            Some(RpcMethod::SubagentTail)
-        );
-        assert_eq!(
-            RpcMethod::parse("workflow.vars_list"),
-            Some(RpcMethod::WorkflowVarsList)
-        );
-        assert_eq!(
-            RpcMethod::parse("workflow.var_read"),
-            Some(RpcMethod::WorkflowVarRead)
-        );
-        assert_eq!(
-            RpcMethod::parse("workflow.var_write"),
-            Some(RpcMethod::WorkflowVarWrite)
-        );
-        assert_eq!(
-            RpcMethod::parse("workflow.await"),
-            Some(RpcMethod::WorkflowAwait)
-        );
-        assert_eq!(
-            RpcMethod::parse("workflow.context_send"),
-            Some(RpcMethod::WorkflowContextSend)
-        );
-        assert_eq!(RpcMethod::parse("work.spawn"), Some(RpcMethod::WorkSpawn));
-        assert_eq!(RpcMethod::parse("work.await"), Some(RpcMethod::WorkAwait));
-        assert_eq!(RpcMethod::parse("work.read"), Some(RpcMethod::WorkRead));
-        assert_eq!(RpcMethod::parse("work.send"), Some(RpcMethod::WorkSend));
-        assert_eq!(RpcMethod::parse("work.write"), Some(RpcMethod::WorkWrite));
         assert_eq!(
             RpcMethod::parse("history.switch"),
             Some(RpcMethod::HistorySwitch)

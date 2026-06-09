@@ -1986,12 +1986,7 @@ mod tests {
                 "Grep",
                 "LoadSkill",
                 "web_fetch",
-                "web_search",
-                "WorkAwait",
-                "WorkRead",
-                "WorkSend",
-                "WorkSpawn",
-                "WorkWrite",
+                "web_search"
             ]
         );
         assert_eq!(body["tools"][0]["type"], "custom");

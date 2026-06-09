@@ -21,7 +21,7 @@ import type {
 	TranscriptTurnDetailResult,
 	TranscriptTurnsResult,
 	ProjectWorkspace,
-	WorkSessionsResult,
+	SubagentListResult,
 } from "./types.ts";
 import type { EntryScope } from "./queryKeys.ts";
 
@@ -47,8 +47,7 @@ export interface AgentApi {
 	getTranscriptEntries(sessionId: string, entryIds: string[]): Promise<TranscriptEntriesResult>;
 	getTranscriptTurns(sessionId: string, options?: TranscriptTurnsOptions): Promise<TranscriptTurnsResult>;
 	getTranscriptTurnDetail(sessionId: string, request: TranscriptTurnDetailRequest): Promise<TranscriptTurnDetailResult>;
-	listWorkSessions(sessionId: string): Promise<WorkSessionsResult>;
-	steerSubagent(params: SteerSubagentParams): Promise<SteerSubagentResult>;
+	listSubagents(sessionId: string): Promise<SubagentListResult>;
 	getHistoryTree(sessionId: string): Promise<HistoryTree>;
 	subscribeEvents(sessionId: string, afterEventId: number | null): Promise<EventFrame[]>;
 	unsubscribeEvents(sessionId: string): Promise<void>;
@@ -66,15 +65,6 @@ export interface AgentApi {
 	reorderQueuedFollowUps(sessionId: string, inputIds: string[], expectedQueueRevision?: number | null): Promise<ReorderQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
-}
-
-export interface SteerSubagentResult {
-	parent_session_id: string;
-	child_session_id: string;
-	input_id?: string;
-	queued?: boolean;
-	replayed?: boolean;
-	queue?: QueueProjection | null;
 }
 
 export interface CreateProjectParams {
@@ -121,13 +111,6 @@ export interface StartSessionWorkspace {
 	branch?: string | null;
 }
 
-export interface SteerSubagentParams {
-	parentSessionId: string;
-	childSessionId: string;
-	message: string;
-	priority?: InputPriority;
-}
-
 export interface StartSessionParams {
 	sessionId: string;
 	projectId?: string | null;
@@ -151,6 +134,7 @@ export interface QueueFollowUpParams {
 	clientInputId: string;
 	expectedActiveLeafId?: string | null;
 	baseLeafId?: string | null;
+	priority?: InputPriority;
 	content: ContentBlock[];
 }
 
@@ -383,20 +367,9 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	listWorkSessions(sessionId: string): Promise<WorkSessionsResult> {
-		return this.client.request<WorkSessionsResult>("work.read", {
-			source_session_id: sessionId,
-			view: "sessions",
-			scope: "mine"
-		});
-	}
-
-	steerSubagent(params: SteerSubagentParams): Promise<SteerSubagentResult> {
-		return this.client.request<SteerSubagentResult>("work.send", {
-			source_session_id: params.parentSessionId,
-			to: params.childSessionId,
-			message: params.message,
-			priority: params.priority ?? "steer"
+	listSubagents(sessionId: string): Promise<SubagentListResult> {
+		return this.client.request<SubagentListResult>("subagent.list", {
+			parent_session_id: sessionId
 		});
 	}
 
@@ -440,6 +413,7 @@ class AgentApiClient implements AgentApi {
 			client_input_id: params.clientInputId,
 			expected_active_leaf_id: params.expectedActiveLeafId,
 			base_leaf_id: params.baseLeafId,
+			priority: params.priority ?? undefined,
 			content: params.content
 		});
 	}

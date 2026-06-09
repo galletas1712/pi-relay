@@ -15,22 +15,14 @@ export interface ProviderConfig {
 	prompt_cache?: Record<string, unknown>;
 }
 
-export interface SessionParentLink {
-	parent_session_id: string;
+export interface SubagentSessionItem {
 	child_session_id: string;
-	created_at: string;
-	updated_at: string;
-}
-
-export interface RelatedSessionItem {
-	parent_link: SessionParentLink;
 	activity: Activity;
 }
 
-export interface WorkSessionsResult {
-	session_id: string;
-	scope: "mine";
-	subagents: RelatedSessionItem[];
+export interface SubagentListResult {
+	parent_session_id: string;
+	subagents: SubagentSessionItem[];
 }
 
 export interface ProjectWorkspace {

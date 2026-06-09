@@ -26,11 +26,10 @@ import type {
 	Notice,
 	Project,
 	ReasoningEffort,
-	SessionParentLink,
 	SessionSnapshot,
 	ToolListing,
 	TranscriptTurnsResult,
-	WorkSessionsResult
+	SubagentListResult
 } from "./types.ts";
 
 function projectWorkspaceSummary(project: Project): string {
@@ -67,20 +66,20 @@ export function SidebarHeader({
 
 function AgentTreeSection({
 	snapshot,
-	workSessions,
+	subagentsResult,
 	loading,
 	error,
 	selectedAgentSessionId,
 	onSelectAgent
 }: {
 	snapshot: SessionSnapshot | null;
-	workSessions: WorkSessionsResult | null;
+	subagentsResult: SubagentListResult | null;
 	loading: boolean;
 	error: string | null;
 	selectedAgentSessionId: string | null;
 	onSelectAgent?: (sessionId: string) => void;
 }) {
-	const subagents = workSessions?.subagents ?? [];
+	const subagents = subagentsResult?.subagents ?? [];
 	return (
 		<section className="inspect-section">
 			<h2>Agents</h2>
@@ -95,12 +94,12 @@ function AgentTreeSection({
 					/>
 					{subagents.map((item) => (
 						<AgentTreeButton
-							key={item.parent_link.child_session_id}
-							selected={selectedAgentSessionId === item.parent_link.child_session_id}
-							title={parentLinkTitle(item.parent_link)}
-							subtitle={parentLinkSubtitle(item.parent_link)}
+							key={item.child_session_id}
+							selected={selectedAgentSessionId === item.child_session_id}
+							title={subagentTitle(item.child_session_id)}
+							subtitle="subagent"
 							activity={item.activity}
-							onClick={() => onSelectAgent?.(item.parent_link.child_session_id)}
+							onClick={() => onSelectAgent?.(item.child_session_id)}
 						/>
 					))}
 				</div>
@@ -141,7 +140,7 @@ function AgentTreeButton({
 
 function AgentTranscriptPreview({
 	sessionId,
-	parentLink,
+	canSteer,
 	preview,
 	loading,
 	error,
@@ -149,7 +148,7 @@ function AgentTranscriptPreview({
 	onSteerSubagent
 }: {
 	sessionId: string | null;
-	parentLink: SessionParentLink | null;
+	canSteer: boolean;
 	preview: TranscriptTurnsResult | null;
 	loading: boolean;
 	error: string | null;
@@ -158,7 +157,6 @@ function AgentTranscriptPreview({
 }) {
 	const cards = preview?.cards ?? [];
 	const [draft, setDraft] = useState("");
-	const canSteer = parentLink !== null;
 	return (
 		<section className="inspect-section">
 			<h2>Transcript preview</h2>
@@ -205,24 +203,18 @@ function AgentTranscriptPreview({
 					</button>
 				</form>
 			) : sessionId ? (
-				<p className="muted">Only subagents can be steered here.</p>
+				<p className="muted">Select a listed subagent to steer it from here.</p>
 			) : null}
 		</section>
 	);
 }
 
-function selectedParentLinkForSession(workSessions: WorkSessionsResult | null, sessionId: string): SessionParentLink | null {
-	return (workSessions?.subagents ?? [])
-		.map((item) => item.parent_link)
-		.find((parentLink) => parentLink.child_session_id === sessionId) ?? null;
+function isSubagentSession(subagentsResult: SubagentListResult | null, sessionId: string): boolean {
+	return (subagentsResult?.subagents ?? []).some((item) => item.child_session_id === sessionId);
 }
 
-function parentLinkTitle(parentLink: SessionParentLink): string {
-	return parentLink.child_session_id.slice(0, 13);
-}
-
-function parentLinkSubtitle(parentLink: SessionParentLink): string {
-	return `subagent · parent ${parentLink.parent_session_id.slice(0, 13)}`;
+function subagentTitle(sessionId: string): string {
+	return sessionId.slice(0, 13);
 }
 
 function turnUserPreview(messages: TranscriptTurnsResult["cards"][number]["user_messages"]): string {
@@ -744,9 +736,9 @@ export function NoticeStack({ notices, rightOpen }: { notices: Notice[]; rightOp
 export function Inspector({
 	snapshot,
 	tools,
-	workSessions,
-	workSessionsLoading,
-	workSessionsError,
+	subagentsResult,
+	subagentsLoading,
+	subagentsError,
 	selectedAgentSessionId,
 	transcriptPreview,
 	transcriptPreviewLoading,
@@ -758,9 +750,9 @@ export function Inspector({
 }: {
 	snapshot: SessionSnapshot | null;
 	tools: ToolListing[];
-	workSessions?: WorkSessionsResult | null;
-	workSessionsLoading?: boolean;
-	workSessionsError?: string | null;
+	subagentsResult?: SubagentListResult | null;
+	subagentsLoading?: boolean;
+	subagentsError?: string | null;
 	selectedAgentSessionId?: string | null;
 	transcriptPreview?: TranscriptTurnsResult | null;
 	transcriptPreviewLoading?: boolean;
@@ -770,9 +762,9 @@ export function Inspector({
 	onSelectAgent?: (sessionId: string) => void;
 	onClose?: () => void;
 }) {
-	const selectedParentLink = selectedAgentSessionId
-		? selectedParentLinkForSession(workSessions ?? null, selectedAgentSessionId)
-		: null;
+	const selectedCanSteer = selectedAgentSessionId
+		? isSubagentSession(subagentsResult ?? null, selectedAgentSessionId)
+		: false;
 	return (
 		<div className="inspector-inner">
 			<div className="inspector-head">
@@ -824,15 +816,15 @@ export function Inspector({
 			</section>
 			<AgentTreeSection
 				snapshot={snapshot}
-				workSessions={workSessions ?? null}
-				loading={workSessionsLoading ?? false}
-				error={workSessionsError ?? null}
+				subagentsResult={subagentsResult ?? null}
+				loading={subagentsLoading ?? false}
+				error={subagentsError ?? null}
 				selectedAgentSessionId={selectedAgentSessionId ?? snapshot?.session_id ?? null}
 				onSelectAgent={onSelectAgent}
 			/>
 			<AgentTranscriptPreview
 				sessionId={selectedAgentSessionId ?? snapshot?.session_id ?? null}
-				parentLink={selectedParentLink}
+				canSteer={selectedCanSteer}
 				preview={transcriptPreview ?? null}
 				loading={transcriptPreviewLoading ?? false}
 				error={transcriptPreviewError ?? null}

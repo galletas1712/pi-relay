@@ -17,7 +17,6 @@ use sqlx::PgPool;
 ///   Idempotency is keyed by `(session_id, client_input_id)`.
 /// - `actions`: durable model/tool/compaction/cancel work records.
 /// - `events`: ordered observable event stream for websocket replay.
-/// - `workflow_variables`: durable workflow/session-scoped context bus values.
 const SCHEMA_SQL: &str = r#"
 create table if not exists projects (
     id uuid primary key,
@@ -49,19 +48,6 @@ create table if not exists sessions (
 alter table sessions add column if not exists system_prompt text not null default '';
 
 alter table sessions add column if not exists parent_session_id text null references sessions(id) on delete set null;
-
-do $$
-begin
-    if to_regclass('public.session_relationships') is not null then
-        update sessions s
-        set parent_session_id = r.parent_session_id
-        from session_relationships r
-        where s.id = r.child_session_id
-          and s.parent_session_id is null;
-
-        drop table session_relationships;
-    end if;
-end $$;
 
 create index if not exists sessions_project_created_idx
     on sessions(project_id, created_at desc, id desc);
@@ -134,59 +120,6 @@ create table if not exists events (
 );
 
 create index if not exists events_session_id_idx on events(session_id, id);
-
-create table if not exists workflow_variables (
-    owner_session_id text not null references sessions(id) on delete cascade,
-    workflow_id text not null,
-    name text not null,
-    value_json jsonb null,
-    value_text text null,
-    producer_session_id text null references sessions(id) on delete set null,
-    producer_action_id text null,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now(),
-    primary key (owner_session_id, workflow_id, name)
-);
-
-alter table workflow_variables add column if not exists owner_session_id text;
-
-update workflow_variables
-set owner_session_id=coalesce(producer_session_id, 'legacy')
-where owner_session_id is null;
-
-delete from workflow_variables
-where not exists (
-    select 1 from sessions where sessions.id=workflow_variables.owner_session_id
-);
-
-alter table workflow_variables alter column owner_session_id set not null;
-
-alter table workflow_variables drop constraint if exists workflow_variables_pkey;
-
-alter table workflow_variables
-    add primary key (owner_session_id, workflow_id, name);
-
-do $$
-begin
-    if not exists (
-        select 1
-        from pg_constraint
-        where conname='workflow_variables_owner_session_id_fkey'
-          and conrelid='workflow_variables'::regclass
-    ) then
-        alter table workflow_variables
-            add constraint workflow_variables_owner_session_id_fkey
-            foreign key (owner_session_id)
-            references sessions(id)
-            on delete cascade;
-    end if;
-end $$;
-
-create index if not exists workflow_variables_workflow_updated_idx
-    on workflow_variables(workflow_id, updated_at, name);
-
-create index if not exists workflow_variables_owner_workflow_updated_idx
-    on workflow_variables(owner_session_id, workflow_id, updated_at, name);
 "#;
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {

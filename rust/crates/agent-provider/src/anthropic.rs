@@ -1433,12 +1433,7 @@ mod tests {
                 "LoadSkill",
                 "str_replace_based_edit_tool",
                 "web_fetch",
-                "web_search",
-                "WorkAwait",
-                "WorkRead",
-                "WorkSend",
-                "WorkSpawn",
-                "WorkWrite"
+                "web_search"
             ]
         );
         for tool in tools {
@@ -1482,11 +1477,6 @@ mod tests {
                 "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search",
-                "WorkAwait",
-                "WorkRead",
-                "WorkSend",
-                "WorkSpawn",
-                "WorkWrite",
             ]
         );
         assert_eq!(body["tools"][3]["type"], "text_editor_20250728");

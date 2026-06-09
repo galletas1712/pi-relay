@@ -11,8 +11,6 @@ mod session_start;
 mod state;
 mod subagents;
 mod types;
-mod workflow_tools;
-mod workflows;
 mod workspaces;
 
 use crate::codec::{
@@ -101,13 +99,6 @@ async fn main() -> Result<()> {
     drain_dispatch_tasks(&state).await;
     state.repo.close().await;
     Ok(())
-}
-
-fn without_source_session_id(mut params: Value) -> Value {
-    if let Value::Object(map) = &mut params {
-        map.remove("source_session_id");
-    }
-    params
 }
 
 fn find_prompt_root(start: PathBuf) -> Result<PathBuf> {
@@ -274,7 +265,7 @@ async fn dispatch_request(
             events_subscribe(state, subscriptions, event_high_water, params).await
         }
         RpcMethod::EventsUnsubscribe => events_unsubscribe(subscriptions, event_high_water, params),
-        RpcMethod::InputFollowUp => input_user(state, params, InputPriority::FollowUp).await,
+        RpcMethod::InputFollowUp => input_user(state, params).await,
         RpcMethod::InputPromoteQueued => input_promote_queued(state, params).await,
         RpcMethod::InputUpdateQueued => input_update_queued(state, params).await,
         RpcMethod::InputCancelQueued => input_cancel_queued(state, params).await,
@@ -294,60 +285,6 @@ async fn dispatch_request(
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
         RpcMethod::SubagentList => subagents::subagent_list(state, params).await,
         RpcMethod::SubagentSpawn => subagents::subagent_spawn(state, params).await,
-        RpcMethod::SubagentSend => subagents::subagent_send(state, params).await,
-        RpcMethod::SubagentTail => subagents::subagent_tail(state, params).await,
-        RpcMethod::WorkflowVarsList => workflows::workflow_vars_list(state, params).await,
-        RpcMethod::WorkflowVarRead => workflows::workflow_var_read(state, params).await,
-        RpcMethod::WorkflowVarWrite => workflows::workflow_var_write(state, params).await,
-        RpcMethod::WorkflowAwait => workflows::workflow_await(state, params).await,
-        RpcMethod::WorkflowContextSend => workflows::workflow_context_send(state, params).await,
-        RpcMethod::WorkSpawn => {
-            let session_id = required_string(&params, "source_session_id")?;
-            workflow_tools::work_spawn_for_source(
-                state,
-                &session_id,
-                without_source_session_id(params),
-                None,
-            )
-            .await
-        }
-        RpcMethod::WorkAwait => {
-            let session_id = required_string(&params, "source_session_id")?;
-            workflow_tools::work_await_for_session(
-                state,
-                &session_id,
-                without_source_session_id(params),
-            )
-            .await
-        }
-        RpcMethod::WorkRead => {
-            let session_id = required_string(&params, "source_session_id")?;
-            workflow_tools::work_read_for_session(
-                state,
-                &session_id,
-                without_source_session_id(params),
-            )
-            .await
-        }
-        RpcMethod::WorkSend => {
-            let session_id = required_string(&params, "source_session_id")?;
-            workflow_tools::work_send_for_session(
-                state,
-                &session_id,
-                without_source_session_id(params),
-            )
-            .await
-        }
-        RpcMethod::WorkWrite => {
-            let session_id = required_string(&params, "source_session_id")?;
-            workflow_tools::work_write_for_session(
-                state,
-                &session_id,
-                None,
-                without_source_session_id(params),
-            )
-            .await
-        }
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }
@@ -594,17 +531,17 @@ async fn lock_hidden_subagent_delete_tree(
     while let Some(parent_session_id) = stack.pop() {
         let driver = SessionDriver::acquire(state, &parent_session_id).await;
         driver.ensure_idle_for_source_mutation().await?;
-        let child_links = state
+        let child_session_ids_for_parent = state
             .repo
-            .list_child_session_parent_links(&parent_session_id)
+            .list_child_session_ids(&parent_session_id)
             .await
             .map_err(anyhow::Error::from)?;
-        for child_link in child_links {
-            if !seen.insert(child_link.child_session_id.clone()) {
+        for child_session_id in child_session_ids_for_parent {
+            if !seen.insert(child_session_id.clone()) {
                 continue;
             }
-            stack.push(child_link.child_session_id.clone());
-            child_session_ids.push(child_link.child_session_id);
+            stack.push(child_session_id.clone());
+            child_session_ids.push(child_session_id);
         }
         drivers.push(driver);
     }
@@ -936,17 +873,15 @@ fn events_unsubscribe(
     Ok(json!({ "session_id": session_id }))
 }
 
-async fn input_user(
-    state: &AppState,
-    params: Value,
-    priority: InputPriority,
-) -> std::result::Result<Value, RpcError> {
+async fn input_user(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
-    let started_at = Instant::now();
-    let driver = SessionDriver::acquire(state, &session_id).await;
-    let acquired_ms = started_at.elapsed().as_millis();
-    driver.recover_if_needed().await?;
-    let recovered_ms = started_at.elapsed().as_millis();
+    let priority = params
+        .get("priority")
+        .cloned()
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
+        .unwrap_or(InputPriority::FollowUp);
     let client_input_id = params
         .get("client_input_id")
         .and_then(Value::as_str)
@@ -960,7 +895,41 @@ async fn input_user(
         .cloned()
         .ok_or_else(|| RpcError::new("invalid_params", "content is required"))?;
     let content = parse_user_message(content_value)?;
+    enqueue_session_input(
+        state,
+        SessionInputRequest {
+            session_id,
+            priority,
+            content,
+            client_input_id,
+            base_leaf_id,
+            expected_active_leaf_id: params.get("expected_active_leaf_id").cloned(),
+        },
+    )
+    .await
+}
 
+pub(crate) struct SessionInputRequest {
+    pub(crate) session_id: String,
+    pub(crate) priority: InputPriority,
+    pub(crate) content: agent_vocab::UserMessage,
+    pub(crate) client_input_id: Option<String>,
+    pub(crate) base_leaf_id: Option<String>,
+    pub(crate) expected_active_leaf_id: Option<Value>,
+}
+
+pub(crate) async fn enqueue_session_input(
+    state: &AppState,
+    request: SessionInputRequest,
+) -> std::result::Result<Value, RpcError> {
+    let SessionInputRequest {
+        session_id,
+        priority,
+        content,
+        client_input_id,
+        base_leaf_id,
+        expected_active_leaf_id,
+    } = request;
     enum InputOutcome {
         Accepted {
             dispatches: Vec<DispatchAction>,
@@ -974,6 +943,15 @@ async fn input_user(
         },
     }
 
+    let started_at = Instant::now();
+    let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
+    driver.recover_if_needed().await?;
+    let recovered_ms = started_at.elapsed().as_millis();
+    let mut expected_params = json!({});
+    if let Some(expected_active_leaf_id) = expected_active_leaf_id {
+        expected_params["expected_active_leaf_id"] = expected_active_leaf_id;
+    }
     let outcome = {
         if let Some(client_input_id) = client_input_id.as_deref() {
             if let Some(record) = state
@@ -1030,7 +1008,7 @@ async fn input_user(
                 should_drive: !has_running,
             }
         } else {
-            ensure_expected_active_leaf(state, &session_id, &params).await?;
+            ensure_expected_active_leaf(state, &session_id, &expected_params).await?;
             driver.ensure_active_loaded().await?;
             let active = driver
                 .require_active_session("session_not_found", "session not found")
@@ -1241,17 +1219,24 @@ async fn input_reorder_queued_follow_ups(
 
 async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
-    let driver = SessionDriver::acquire(state, &session_id).await;
+    interrupt_session(state, &session_id).await
+}
+
+pub(crate) async fn interrupt_session(
+    state: &AppState,
+    session_id: &str,
+) -> std::result::Result<Value, RpcError> {
+    let driver = SessionDriver::acquire(state, session_id).await;
     driver.recover_if_needed().await?;
     let active = driver.active_session().await;
     let Some(active) = active else {
         let events = state
             .repo
-            .cancel_unfinished_session_work(&session_id, "session interrupted")
+            .cancel_unfinished_session_work(session_id, "session interrupted")
             .await
             .map_err(anyhow::Error::from)?;
         if !events.is_empty() {
-            let aborted_tasks = abort_session_tasks(state, &session_id);
+            let aborted_tasks = abort_session_tasks(state, session_id);
             publish_events(state, events);
             driver.drive_until_blocked().await?;
             return Ok(json!({ "interrupted": true, "aborted_task_kinds": aborted_tasks }));
@@ -1266,10 +1251,10 @@ async fn input_interrupt(state: &AppState, params: Value) -> std::result::Result
             .await
             .map_err(anyhow::Error::from)?;
         publish_events(state, vec![event]);
-        clear_event_buffer_if_idle(state, &session_id).await?;
+        clear_event_buffer_if_idle(state, session_id).await?;
         return Ok(json!({ "ignored": true }));
     };
-    let aborted_tasks = abort_session_tasks(state, &session_id);
+    let aborted_tasks = abort_session_tasks(state, session_id);
     let dispatches = driver
         .apply_agent_input(active, AgentInput::Interrupt, None)
         .await?;
