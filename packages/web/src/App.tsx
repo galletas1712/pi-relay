@@ -90,6 +90,7 @@ import type {
 	TranscriptEntry,
 	TranscriptTreeNode,
 	ProjectWorkspace,
+	WorkSessionsResult,
 } from "./types.ts";
 
 const MAX_NOTICES = 24;
@@ -261,6 +262,8 @@ export function App() {
 	const [deleteDialog, setDeleteDialog] = useState<DeleteDialogState | null>(null);
 	const [projectDialog, setProjectDialog] = useState<ProjectDialogState | null>(null);
 	const [promptDialog, setPromptDialog] = useState<PromptDialogState | null>(null);
+	const [inspectedAgentSessionId, setInspectedAgentSessionId] = useState<string | null>(initialUiSelection.sessionId);
+	const [steeringSubagent, setSteeringSubagent] = useState(false);
 	const {
 		cache: selectedCache,
 		cacheRef: selectedCacheRef,
@@ -293,6 +296,10 @@ export function App() {
 
 	useEffect(() => {
 		if (selectedRef.current !== selectedId) selectedRef.current = selectedId;
+	}, [selectedId]);
+
+	useEffect(() => {
+		setInspectedAgentSessionId(selectedId);
 	}, [selectedId]);
 
 	useEffect(() => {
@@ -421,6 +428,26 @@ export function App() {
 		enabled: connection === "open",
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
+	const workSessionsQuery = useQuery({
+		queryKey: queryKeys.workSessions(loadedSnapshot?.session_id ?? null),
+		queryFn: () => {
+			if (!loadedSnapshot) throw new Error("select a session first");
+			return api.listWorkSessions(loadedSnapshot.session_id);
+		},
+		enabled: connection === "open" && !!loadedSnapshot,
+	});
+	const effectiveInspectedAgentSessionId =
+		inspectedAgentSessionId && agentIsInspectable(loadedSnapshot, workSessionsQuery.data ?? null, inspectedAgentSessionId)
+			? inspectedAgentSessionId
+			: loadedSnapshot?.session_id ?? null;
+	const inspectedTranscriptQuery = useQuery({
+		queryKey: queryKeys.agentTranscriptPreview(loadedSnapshot?.session_id ?? null, effectiveInspectedAgentSessionId),
+		queryFn: () => {
+			if (!effectiveInspectedAgentSessionId) throw new Error("select an agent first");
+			return api.getTranscriptTurns(effectiveInspectedAgentSessionId, { limit: 6 });
+		},
+		enabled: connection === "open" && !!effectiveInspectedAgentSessionId,
+	});
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
 	const hasTranscriptEntries =
 		loadedSnapshot?.has_transcript_entries ??
@@ -861,6 +888,17 @@ export function App() {
 			patchSessionListEventSummary(queryClient, selectedProjectRef.current, event, activity);
 			if (refreshPlan.refreshList) {
 				scheduleSessionListRefresh();
+				if (
+					loadedSnapshot?.session_id &&
+					(event.session_id === loadedSnapshot.session_id || event.session_id === effectiveInspectedAgentSessionId)
+				) {
+					void queryClient.invalidateQueries({
+						queryKey: queryKeys.workSessions(loadedSnapshot.session_id),
+					});
+					void queryClient.invalidateQueries({
+						queryKey: queryKeys.agentTranscriptPreview(loadedSnapshot.session_id, effectiveInspectedAgentSessionId),
+					});
+				}
 			}
 
 			if (event.session_id === selectedRef.current) {
@@ -876,7 +914,10 @@ export function App() {
 			}
 		},
 		[
+			effectiveInspectedAgentSessionId,
+			loadedSnapshot?.session_id,
 			pushNotice,
+			queryClient,
 			replaceSelectedCache,
 			scheduleActiveBranchSync,
 			scheduleSessionListRefresh,
@@ -1025,6 +1066,7 @@ export function App() {
 			desiredSessionIds.add(session.session_id);
 		}
 		if (selectedId && selectedHasEventCursor) desiredSessionIds.add(selectedId);
+		if (effectiveInspectedAgentSessionId) desiredSessionIds.add(effectiveInspectedAgentSessionId);
 		for (const sessionId of Array.from(subscribedEventSessionIds.current)) {
 			if (desiredSessionIds.has(sessionId)) continue;
 			subscribedEventSessionIds.current.delete(sessionId);
@@ -1055,6 +1097,7 @@ export function App() {
 		handleSessionEvent,
 		loadedSnapshot?.last_event_id,
 		loadedSnapshot?.session_id,
+		effectiveInspectedAgentSessionId,
 		pushNotice,
 		selectedId,
 		sessions,
@@ -1834,6 +1877,33 @@ export function App() {
 		},
 		[pushNotice, reorderQueuedInput],
 	);
+	const handleSteerSubagent = useCallback(
+		(message: string) => {
+			const parentSessionId = loadedSnapshot?.session_id;
+			const childSessionId = effectiveInspectedAgentSessionId;
+			if (!parentSessionId || !childSessionId || childSessionId === parentSessionId) return;
+			setSteeringSubagent(true);
+			void api
+				.steerSubagent({
+					parentSessionId,
+					childSessionId,
+					message,
+					priority: "steer",
+				})
+				.then(() =>
+					Promise.all([
+						queryClient.invalidateQueries({ queryKey: queryKeys.workSessions(parentSessionId) }),
+						queryClient.invalidateQueries({
+							queryKey: queryKeys.agentTranscriptPreview(parentSessionId, childSessionId),
+						}),
+					]),
+				)
+				.then(() => pushNotice("success", "sent steer to subagent"))
+				.catch((error) => pushNotice("error", errorMessage(error)))
+				.finally(() => setSteeringSubagent(false));
+		},
+		[api, effectiveInspectedAgentSessionId, loadedSnapshot?.session_id, pushNotice, queryClient],
+	);
 	const mobileTitle = selectedSession
 		? sessionTitle(selectedSession)
 		: selectedProject
@@ -1985,7 +2055,21 @@ export function App() {
 			</footer>
 
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
-				<Inspector snapshot={loadedSnapshot} tools={tools} onClose={() => setRightOpen(false)} />
+				<Inspector
+					snapshot={loadedSnapshot}
+					tools={tools}
+					workSessions={workSessionsQuery.data ?? null}
+					workSessionsLoading={workSessionsQuery.isLoading}
+					workSessionsError={workSessionsQuery.error ? errorMessage(workSessionsQuery.error) : null}
+					selectedAgentSessionId={effectiveInspectedAgentSessionId}
+					transcriptPreview={inspectedTranscriptQuery.data ?? null}
+					transcriptPreviewLoading={inspectedTranscriptQuery.isLoading}
+					transcriptPreviewError={inspectedTranscriptQuery.error ? errorMessage(inspectedTranscriptQuery.error) : null}
+					subagentSteering={steeringSubagent}
+					onSteerSubagent={handleSteerSubagent}
+					onSelectAgent={setInspectedAgentSessionId}
+					onClose={() => setRightOpen(false)}
+				/>
 			</aside>
 
 			{renameSessionId ? (
@@ -2120,6 +2204,16 @@ function eventEntryId(event: EventFrame): string | null {
 function selectedBaseLeafId(cache: SelectedSessionCache, sessionId: string, fallback: string | null): string | null {
 	if (cache.sessionId !== sessionId) return fallback;
 	return cache.activeBranchEntryIds.at(-1) ?? cache.snapshot?.active_leaf_id ?? fallback;
+}
+
+function agentIsInspectable(
+	root: SessionSnapshot | null,
+	workSessions: WorkSessionsResult | null,
+	sessionId: string,
+): boolean {
+	if (!root) return false;
+	if (sessionId === root.session_id) return true;
+	return (workSessions?.subagents ?? []).some((item) => item.relationship.child_session_id === sessionId);
 }
 
 async function restoreTextForTarget(

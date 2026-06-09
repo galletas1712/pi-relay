@@ -21,6 +21,7 @@ import type {
 	TranscriptTurnDetailResult,
 	TranscriptTurnsResult,
 	ProjectWorkspace,
+	WorkSessionsResult,
 } from "./types.ts";
 import type { EntryScope } from "./queryKeys.ts";
 
@@ -46,6 +47,8 @@ export interface AgentApi {
 	getTranscriptEntries(sessionId: string, entryIds: string[]): Promise<TranscriptEntriesResult>;
 	getTranscriptTurns(sessionId: string, options?: TranscriptTurnsOptions): Promise<TranscriptTurnsResult>;
 	getTranscriptTurnDetail(sessionId: string, request: TranscriptTurnDetailRequest): Promise<TranscriptTurnDetailResult>;
+	listWorkSessions(sessionId: string): Promise<WorkSessionsResult>;
+	steerSubagent(params: SteerSubagentParams): Promise<SteerSubagentResult>;
 	getHistoryTree(sessionId: string): Promise<HistoryTree>;
 	subscribeEvents(sessionId: string, afterEventId: number | null): Promise<EventFrame[]>;
 	unsubscribeEvents(sessionId: string): Promise<void>;
@@ -63,6 +66,15 @@ export interface AgentApi {
 	reorderQueuedFollowUps(sessionId: string, inputIds: string[], expectedQueueRevision?: number | null): Promise<ReorderQueuedResult>;
 	requestCompaction(sessionId: string): Promise<{ action_row_id: string | null }>;
 	getHistoryContext(sessionId: string, leafId?: string): Promise<TranscriptItem[]>;
+}
+
+export interface SteerSubagentResult {
+	parent_session_id: string;
+	child_session_id: string;
+	input_id?: string;
+	queued?: boolean;
+	replayed?: boolean;
+	queue?: QueueProjection | null;
 }
 
 export interface CreateProjectParams {
@@ -107,6 +119,13 @@ export interface TranscriptTurnDetailRequest {
 export interface StartSessionWorkspace {
 	workspaceDir: string;
 	branch?: string | null;
+}
+
+export interface SteerSubagentParams {
+	parentSessionId: string;
+	childSessionId: string;
+	message: string;
+	priority?: InputPriority;
 }
 
 export interface StartSessionParams {
@@ -361,6 +380,23 @@ class AgentApiClient implements AgentApi {
 			leaf_id: request.leafId,
 			start_sequence: request.startSequence,
 			end_sequence: request.endSequence
+		});
+	}
+
+	listWorkSessions(sessionId: string): Promise<WorkSessionsResult> {
+		return this.client.request<WorkSessionsResult>("work.read", {
+			source_session_id: sessionId,
+			view: "sessions",
+			scope: "mine"
+		});
+	}
+
+	steerSubagent(params: SteerSubagentParams): Promise<SteerSubagentResult> {
+		return this.client.request<SteerSubagentResult>("work.send", {
+			source_session_id: params.parentSessionId,
+			to: params.childSessionId,
+			message: params.message,
+			priority: params.priority ?? "steer"
 		});
 	}
 

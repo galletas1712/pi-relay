@@ -15,6 +15,25 @@ export interface ProviderConfig {
 	prompt_cache?: Record<string, unknown>;
 }
 
+export interface SessionRelationship {
+	relationship_id: string;
+	parent_session_id: string;
+	child_session_id: string;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface RelatedSessionItem {
+	relationship: SessionRelationship;
+	activity: Activity;
+}
+
+export interface WorkSessionsResult {
+	session_id: string;
+	scope: "mine";
+	subagents: RelatedSessionItem[];
+}
+
 export interface ProjectWorkspace {
 	kind?: "git" | "local";
 	workspace_dir: string;

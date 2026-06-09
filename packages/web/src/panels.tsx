@@ -13,6 +13,7 @@ import {
 import { memo, useEffect, useRef, useState } from "react";
 import { COMMANDS } from "./slash.ts";
 import {
+	displayActivity,
 	isArchivedSession,
 	projectTitle,
 	sessionDisplayActivity,
@@ -20,8 +21,17 @@ import {
 	type SessionDisplayActivity,
 	type SessionListItem
 } from "./sessionList.ts";
-import { truncate } from "./text.ts";
-import type { Notice, Project, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
+import { contentBlocksToText, firstLine, truncate } from "./text.ts";
+import type {
+	Notice,
+	Project,
+	ReasoningEffort,
+	SessionRelationship,
+	SessionSnapshot,
+	ToolListing,
+	TranscriptTurnsResult,
+	WorkSessionsResult
+} from "./types.ts";
 
 function projectWorkspaceSummary(project: Project): string {
 	return project.workspaces
@@ -53,6 +63,183 @@ export function SidebarHeader({
 			</div>
 		</div>
 	);
+}
+
+function AgentTreeSection({
+	snapshot,
+	workSessions,
+	loading,
+	error,
+	selectedAgentSessionId,
+	onSelectAgent
+}: {
+	snapshot: SessionSnapshot | null;
+	workSessions: WorkSessionsResult | null;
+	loading: boolean;
+	error: string | null;
+	selectedAgentSessionId: string | null;
+	onSelectAgent?: (sessionId: string) => void;
+}) {
+	const subagents = workSessions?.subagents ?? [];
+	return (
+		<section className="inspect-section">
+			<h2>Agents</h2>
+			{snapshot ? (
+				<div className="agent-tree">
+					<AgentTreeButton
+						selected={selectedAgentSessionId === snapshot.session_id}
+						title={sessionTitle(snapshot)}
+						subtitle="root session"
+						activity={snapshot.activity}
+						onClick={() => onSelectAgent?.(snapshot.session_id)}
+					/>
+					{subagents.map((item) => (
+						<AgentTreeButton
+							key={item.relationship.relationship_id}
+							selected={selectedAgentSessionId === item.relationship.child_session_id}
+							title={relationshipTitle(item.relationship)}
+							subtitle={relationshipSubtitle(item.relationship)}
+							activity={item.activity}
+							onClick={() => onSelectAgent?.(item.relationship.child_session_id)}
+						/>
+					))}
+				</div>
+			) : (
+				<p className="muted">No session selected.</p>
+			)}
+			{loading ? <p className="muted">Loading agents…</p> : null}
+			{error ? <p className="error-text">{error}</p> : null}
+			{snapshot && !loading && !error && subagents.length === 0 ? <p className="muted">No subagents yet.</p> : null}
+		</section>
+	);
+}
+
+function AgentTreeButton({
+	selected,
+	title,
+	subtitle,
+	activity,
+	onClick
+}: {
+	selected: boolean;
+	title: string;
+	subtitle: string;
+	activity: SessionSnapshot["activity"];
+	onClick: () => void;
+}) {
+	return (
+		<button className={`agent-tree-row ${selected ? "selected" : ""}`} type="button" onClick={onClick}>
+			<span className={`status-rail ${displayActivity(activity)}`} />
+			<span className="agent-tree-main">
+				<span className="agent-tree-title">{title}</span>
+				<span className="agent-tree-sub">{subtitle}</span>
+			</span>
+			<span className={`agent-tree-activity ${displayActivity(activity)}`}>{displayActivity(activity)}</span>
+		</button>
+	);
+}
+
+function AgentTranscriptPreview({
+	sessionId,
+	relationship,
+	preview,
+	loading,
+	error,
+	steering,
+	onSteerSubagent
+}: {
+	sessionId: string | null;
+	relationship: SessionRelationship | null;
+	preview: TranscriptTurnsResult | null;
+	loading: boolean;
+	error: string | null;
+	steering: boolean;
+	onSteerSubagent?: (message: string) => void;
+}) {
+	const cards = preview?.cards ?? [];
+	const [draft, setDraft] = useState("");
+	const canSteer = relationship !== null;
+	return (
+		<section className="inspect-section">
+			<h2>Transcript preview</h2>
+			{!sessionId ? <p className="muted">No agent selected.</p> : null}
+			{loading ? <p className="muted">Loading transcript…</p> : null}
+			{error ? <p className="error-text">{error}</p> : null}
+			{sessionId && !loading && !error && cards.length === 0 ? (
+				<p className="muted">No transcript turns yet.</p>
+			) : null}
+			{cards.length > 0 ? (
+				<div className="agent-preview-list">
+					{cards.slice(-6).map((card) => (
+						<div className="agent-preview-card" key={card.id}>
+							<div className="agent-preview-meta">
+								<span>{card.turn_id ? `turn ${card.turn_id}` : "turn"}</span>
+								<span>{card.status === "completed" ? card.outcome ?? "done" : card.status}</span>
+							</div>
+							<p>{turnUserPreview(card.user_messages)}</p>
+							<p className="muted">{turnAssistantPreview(card.assistant_message)}</p>
+						</div>
+					))}
+				</div>
+			) : null}
+			{canSteer ? (
+				<form
+					className="subagent-steer-form"
+					onSubmit={(event) => {
+						event.preventDefault();
+						const message = draft.trim();
+						if (!message || steering) return;
+						onSteerSubagent?.(message);
+						setDraft("");
+					}}
+				>
+					<textarea
+						value={draft}
+						onChange={(event) => setDraft(event.target.value)}
+						placeholder="Steer this subagent…"
+						rows={3}
+						disabled={steering}
+					/>
+					<button className="secondary-button" type="submit" disabled={steering || !draft.trim()}>
+						{steering ? "Sending…" : "Send steer"}
+					</button>
+				</form>
+			) : sessionId ? (
+				<p className="muted">Only subagents can be steered here.</p>
+			) : null}
+		</section>
+	);
+}
+
+function selectedRelationshipForSession(workSessions: WorkSessionsResult | null, sessionId: string): SessionRelationship | null {
+	return (workSessions?.subagents ?? [])
+		.map((item) => item.relationship)
+		.find((relationship) => relationship.child_session_id === sessionId) ?? null;
+}
+
+function relationshipTitle(relationship: SessionRelationship): string {
+	return relationship.child_session_id.slice(0, 13);
+}
+
+function relationshipSubtitle(relationship: SessionRelationship): string {
+	return `subagent · parent ${relationship.parent_session_id.slice(0, 13)}`;
+}
+
+function turnUserPreview(messages: TranscriptTurnsResult["cards"][number]["user_messages"]): string {
+	const text = messages
+		.map((entry) => (entry.item.type === "user_message" ? contentBlocksToText(entry.item.content) : ""))
+		.join(" ")
+		.trim();
+	return truncate(firstLine(text) || "No user message.", 160);
+}
+
+function turnAssistantPreview(message: TranscriptTurnsResult["cards"][number]["assistant_message"]): string {
+	if (!message || message.item.type !== "assistant_message") return "No assistant response yet.";
+	const text = message.item.items
+		.map((item) => (item.type === "text" ? item.text : `Tool call: ${item.tool_name}`))
+		.join(" ")
+		.trim();
+	return truncate(firstLine(text) || "Assistant response.", 180);
 }
 
 export interface SidebarProps {
@@ -557,12 +744,35 @@ export function NoticeStack({ notices, rightOpen }: { notices: Notice[]; rightOp
 export function Inspector({
 	snapshot,
 	tools,
+	workSessions,
+	workSessionsLoading,
+	workSessionsError,
+	selectedAgentSessionId,
+	transcriptPreview,
+	transcriptPreviewLoading,
+	transcriptPreviewError,
+	subagentSteering,
+	onSteerSubagent,
+	onSelectAgent,
 	onClose
 }: {
 	snapshot: SessionSnapshot | null;
 	tools: ToolListing[];
+	workSessions?: WorkSessionsResult | null;
+	workSessionsLoading?: boolean;
+	workSessionsError?: string | null;
+	selectedAgentSessionId?: string | null;
+	transcriptPreview?: TranscriptTurnsResult | null;
+	transcriptPreviewLoading?: boolean;
+	transcriptPreviewError?: string | null;
+	subagentSteering?: boolean;
+	onSteerSubagent?: (message: string) => void;
+	onSelectAgent?: (sessionId: string) => void;
 	onClose?: () => void;
 }) {
+	const selectedRelationship = selectedAgentSessionId
+		? selectedRelationshipForSession(workSessions ?? null, selectedAgentSessionId)
+		: null;
 	return (
 		<div className="inspector-inner">
 			<div className="inspector-head">
@@ -612,6 +822,23 @@ export function Inspector({
 					<p className="muted">No active work.</p>
 				)}
 			</section>
+			<AgentTreeSection
+				snapshot={snapshot}
+				workSessions={workSessions ?? null}
+				loading={workSessionsLoading ?? false}
+				error={workSessionsError ?? null}
+				selectedAgentSessionId={selectedAgentSessionId ?? snapshot?.session_id ?? null}
+				onSelectAgent={onSelectAgent}
+			/>
+			<AgentTranscriptPreview
+				sessionId={selectedAgentSessionId ?? snapshot?.session_id ?? null}
+				relationship={selectedRelationship}
+				preview={transcriptPreview ?? null}
+				loading={transcriptPreviewLoading ?? false}
+				error={transcriptPreviewError ?? null}
+				steering={subagentSteering ?? false}
+				onSteerSubagent={onSteerSubagent}
+			/>
 			<section className="inspect-section">
 				<h2>Tools</h2>
 				<div className="tool-list">

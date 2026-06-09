@@ -2858,6 +2858,104 @@ pre {
 	gap: 4px;
 }
 
+.agent-tree,
+.agent-preview-list {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.agent-tree-row {
+	display: flex;
+	width: 100%;
+	align-items: stretch;
+	gap: 8px;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: transparent;
+	padding: 7px 8px;
+	text-align: left;
+	cursor: pointer;
+}
+
+.agent-tree-row:hover,
+.agent-tree-row.selected {
+	background: color-mix(in oklch, var(--muted) 58%, transparent);
+}
+
+.agent-tree-main {
+	display: flex;
+	min-width: 0;
+	flex: 1;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.agent-tree-title,
+.agent-tree-sub,
+.agent-tree-activity,
+.agent-preview-meta {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.agent-tree-title {
+	font-size: 13px;
+	font-weight: 500;
+}
+
+.agent-tree-sub,
+.agent-tree-activity {
+	color: var(--muted-foreground);
+	font-family: var(--font-mono);
+	font-size: 11px;
+}
+
+.agent-preview-card {
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	padding: 8px;
+}
+
+.agent-preview-card p {
+	margin: 4px 0 0;
+	font-size: 12.5px;
+	overflow-wrap: anywhere;
+}
+
+.agent-preview-meta {
+	display: flex;
+	justify-content: space-between;
+	gap: 8px;
+	color: var(--muted-foreground);
+	font-family: var(--font-mono);
+	font-size: 11px;
+}
+
+.subagent-steer-form {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	margin-top: 8px;
+}
+
+.subagent-steer-form textarea {
+	width: 100%;
+	resize: vertical;
+	border: 1px solid var(--border);
+	border-radius: var(--radius);
+	background: var(--background);
+	color: var(--foreground);
+	padding: 8px;
+	font-size: 13px;
+}
+
+.subagent-steer-form button {
+	align-self: flex-end;
+}
+
 .tool-list {
 	display: flex;
 	flex-wrap: wrap;
