@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
-import { ArrowDown, ArrowUp, Check, Edit3, Loader2, MoveUp, Send, Square, Trash2, X } from "lucide-react";
+import { ArrowDown, ArrowUp, Check, Edit3, Loader2, Send, ShipWheel, Square, Trash2, X } from "lucide-react";
 import { COMMANDS, filterCommands, matchSlashPrefix, type SlashCommandInfo } from "./slash.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
 import type { QueuedInput } from "./types.ts";
@@ -391,9 +391,9 @@ export function QueuedInputPane({
 								onClick={() => onPromote(input.input_id)}
 								disabled={!canPromote}
 								title={canPromote ? "promote to steer" : "already steering"}
+								aria-label={canPromote ? "promote to steer" : "already steering"}
 							>
-								<MoveUp size={13} />
-								<span>{input.priority === "steer" ? "steering" : "steer"}</span>
+								<ShipWheel size={15} />
 							</button>
 						</div>
 					);
