@@ -153,6 +153,90 @@ text_enum! {
         TurnFinished => "turn.finished",
         AssistantMessage => "assistant.message",
     }
+
+    pub enum SessionRelationshipKind {
+        Subagent => "subagent",
+        Related => "related",
+        RelatedFork => "related_fork",
+    }
+
+    pub enum SessionRelationshipControlMode {
+        ParentControlled => "parent_controlled",
+        NoControl => "none",
+    }
+
+    pub enum SessionRelationshipVisibility {
+        Hidden => "hidden",
+        Nested => "nested",
+        TopLevel => "top_level",
+    }
+
+    pub enum SessionRelationshipStatus {
+        Running => "running",
+        Idle => "idle",
+        Stopped => "stopped",
+        Completed => "completed",
+        Error => "error",
+    }
+
+    pub enum SessionRelationshipFilesystemMode {
+        BtrfsSnapshot => "btrfs_snapshot",
+        ReflinkCopy => "reflink_copy",
+        PlainCopy => "plain_copy",
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateSessionRelationship {
+    pub relationship_id: String,
+    pub source_session_id: String,
+    pub target_session_id: String,
+    pub root_session_id: String,
+    pub kind: SessionRelationshipKind,
+    pub control_mode: SessionRelationshipControlMode,
+    pub visibility: SessionRelationshipVisibility,
+    pub role_name: Option<String>,
+    pub role_workspace: Option<String>,
+    pub display_name: Option<String>,
+    pub task: String,
+    pub spawned_from_leaf_id: Option<String>,
+    pub spawned_from_action_row_id: Option<String>,
+    pub workflow_id: Option<String>,
+    pub result_variable: Option<String>,
+    pub status: SessionRelationshipStatus,
+    pub filesystem_mode: Option<SessionRelationshipFilesystemMode>,
+    pub metadata: Value,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRelationship {
+    pub relationship_id: String,
+    pub source_session_id: String,
+    pub target_session_id: String,
+    pub root_session_id: String,
+    pub kind: SessionRelationshipKind,
+    pub control_mode: SessionRelationshipControlMode,
+    pub visibility: SessionRelationshipVisibility,
+    pub role_name: Option<String>,
+    pub role_workspace: Option<String>,
+    pub display_name: Option<String>,
+    pub task: String,
+    pub spawned_from_leaf_id: Option<String>,
+    pub spawned_from_action_row_id: Option<String>,
+    pub workflow_id: Option<String>,
+    pub result_variable: Option<String>,
+    pub status: SessionRelationshipStatus,
+    pub filesystem_mode: Option<SessionRelationshipFilesystemMode>,
+    pub metadata: Value,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SessionRelationshipPatch {
+    pub status: Option<SessionRelationshipStatus>,
+    pub display_name: Option<Option<String>>,
+    pub metadata: Option<Value>,
 }
 
 #[derive(Debug, Clone)]

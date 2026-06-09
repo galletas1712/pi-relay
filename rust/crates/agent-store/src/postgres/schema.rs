@@ -17,6 +17,8 @@ use sqlx::PgPool;
 ///   Idempotency is keyed by `(session_id, client_input_id)`.
 /// - `actions`: durable model/tool/compaction/cancel work records.
 /// - `events`: ordered observable event stream for websocket replay.
+/// - `session_relationships`: provenance/control graph between normal session
+///   rows for subagents and related top-level sessions.
 const SCHEMA_SQL: &str = r#"
 create table if not exists projects (
     id uuid primary key,
@@ -113,6 +115,38 @@ create table if not exists events (
 );
 
 create index if not exists events_session_id_idx on events(session_id, id);
+
+create table if not exists session_relationships (
+    id text primary key,
+    source_session_id text not null references sessions(id) on delete cascade,
+    target_session_id text not null references sessions(id) on delete cascade,
+    root_session_id text not null references sessions(id) on delete cascade,
+    kind text not null,
+    control_mode text not null,
+    visibility text not null,
+    role_name text null,
+    role_workspace text null,
+    display_name text null,
+    task text not null,
+    spawned_from_leaf_id text null,
+    spawned_from_action_row_id text null,
+    workflow_id text null,
+    result_variable text null,
+    status text not null,
+    filesystem_mode text null,
+    metadata jsonb not null default '{}'::jsonb,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create unique index if not exists session_relationships_target_idx
+    on session_relationships(target_session_id);
+
+create index if not exists session_relationships_source_kind_idx
+    on session_relationships(source_session_id, kind, created_at, id);
+
+create index if not exists session_relationships_root_idx
+    on session_relationships(root_session_id, created_at, id);
 "#;
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {
