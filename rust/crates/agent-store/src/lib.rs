@@ -155,6 +155,22 @@ text_enum! {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateSessionRelationship {
+    pub relationship_id: String,
+    pub parent_session_id: String,
+    pub child_session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRelationship {
+    pub relationship_id: String,
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
     pub project_id: Option<Uuid>,

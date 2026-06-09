@@ -17,6 +17,8 @@ use sqlx::PgPool;
 ///   Idempotency is keyed by `(session_id, client_input_id)`.
 /// - `actions`: durable model/tool/compaction/cancel work records.
 /// - `events`: ordered observable event stream for websocket replay.
+/// - `session_relationships`: one parent pointer per child session, used for
+///   subagent ownership and cleanup.
 const SCHEMA_SQL: &str = r#"
 create table if not exists projects (
     id uuid primary key,
@@ -113,6 +115,20 @@ create table if not exists events (
 );
 
 create index if not exists events_session_id_idx on events(session_id, id);
+
+create table if not exists session_relationships (
+    id text primary key,
+    parent_session_id text not null references sessions(id) on delete cascade,
+    child_session_id text not null references sessions(id) on delete cascade,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create unique index if not exists session_relationships_child_idx
+    on session_relationships(child_session_id);
+
+create index if not exists session_relationships_parent_idx
+    on session_relationships(parent_session_id, created_at, id);
 "#;
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {

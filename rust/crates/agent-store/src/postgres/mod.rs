@@ -5,6 +5,7 @@ mod events;
 mod outputs;
 mod projects;
 mod queue;
+mod relationships;
 mod rows;
 mod schema;
 mod sessions;
