@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use agent_store::SessionActivity;
-use agent_vocab::{TranscriptItem, UserMessage};
+use agent_vocab::{TranscriptItem, TurnOutcome, UserMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -457,6 +457,32 @@ async fn call_result(
         .transcript_turns(&spawned.child_session_id, None, Some(20))
         .await
         .map_err(anyhow::Error::from)?;
+    if let Some(card) = turns.cards.iter().rev().find(|card| {
+        matches!(
+            card.outcome,
+            Some(TurnOutcome::Crashed | TurnOutcome::Interrupted)
+        )
+    }) {
+        let code = match card.outcome {
+            Some(TurnOutcome::Interrupted) => "subagent_interrupted",
+            _ => "subagent_crashed",
+        };
+        let label = match card.outcome {
+            Some(TurnOutcome::Interrupted) => "was interrupted",
+            _ => "crashed",
+        };
+        return Err(RpcError::new(
+            code,
+            format!(
+                "subagent {} {} in turn {}",
+                spawned.child_session_id,
+                label,
+                card.turn_id
+                    .map(|turn_id| turn_id.0.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+        ));
+    }
     let text = latest_assistant_text(&turns.cards);
     let activity = state
         .repo

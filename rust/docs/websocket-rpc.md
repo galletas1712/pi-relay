@@ -1236,6 +1236,20 @@ subagents[result.session_id].interrupt()
 
 `subagents.call(...)` and `subagents.call_bulk(...)` are blocking Python helper
 semantics layered over the non-blocking `subagent.spawn` backend primitive.
+`call_bulk` issues the spawn requests back-to-back, then waits for all children
+to become idle before returning.
+
+`role` can be a built-in role (`worker`, `reviewer`, `tester`) or the name of an
+available skill. A unique workspace-scoped skill can be addressed by name alone;
+if multiple workspace skills share a role name, pass `role_workspace` to
+disambiguate. `fork_context=False` sends only the delegated task plus the normal
+session prompt, workspace/project context, and role instructions. `fork_context=True`
+also appends a bounded textual snapshot of the parent session's active branch to
+the child initial message.
+
+If a child turn crashes or is interrupted while a blocking helper is waiting, the
+helper raises an exception in the Python cell and the `repl.exec` response has
+`result.ok: false`.
 
 ## Tools
 
