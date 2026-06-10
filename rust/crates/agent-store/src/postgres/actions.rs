@@ -67,6 +67,27 @@ impl PostgresAgentStore {
         })
     }
 
+    pub async fn load_harness_model_action(
+        &self,
+        session_id: &str,
+        action_row_id: &str,
+    ) -> Result<StoredAction> {
+        let row = sqlx::query(
+            "select kind, action_id, turn_id, attempt_id from actions where session_id=$1 and id=$2::text and kind='model' and status in ('pending','running')",
+        )
+            .bind(session_id)
+            .bind(action_row_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| anyhow!("model action not found or not active: {action_row_id}"))?;
+        Ok(StoredAction {
+            kind: row_text::<ActionKind>(&row, "kind")?,
+            action_id: row.get("action_id"),
+            turn_id: row.get("turn_id"),
+            attempt_id: row.get("attempt_id"),
+        })
+    }
+
     pub async fn find_resumable_model_action(
         &self,
         session_id: &str,

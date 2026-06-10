@@ -7,6 +7,7 @@ mod projects;
 mod queue;
 mod rows;
 mod schema;
+mod session_links;
 mod sessions;
 mod snapshots;
 mod sql;
