@@ -13,6 +13,7 @@ import type {
 	QueuedInputStatus,
 	SessionSnapshot,
 	SessionSummary,
+	SubagentListResult,
 	ToolListing,
 	TranscriptEntriesResult,
 	TranscriptEntry,
@@ -38,6 +39,7 @@ export interface AgentApi {
 	updateProject(params: UpdateProjectParams): Promise<Project>;
 	deleteProject(projectId: string): Promise<DeleteProjectResult>;
 	listSessions(limit?: number, projectId?: string | null): Promise<SessionSummary[]>;
+	listSubagents(parentSessionId: string): Promise<SubagentListResult>;
 	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse>;
 	listTools(provider: string): Promise<ToolListing[]>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
@@ -303,6 +305,12 @@ class AgentApiClient implements AgentApi {
 			project_id: projectId || undefined
 		});
 		return result.sessions;
+	}
+
+	listSubagents(parentSessionId: string): Promise<SubagentListResult> {
+		return this.client.request<SubagentListResult>("subagent.list", {
+			parent_session_id: parentSessionId
+		});
 	}
 
 	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse> {

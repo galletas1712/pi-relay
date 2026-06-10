@@ -1,6 +1,7 @@
 import {
 	Archive,
 	ArchiveRestore,
+	Bot,
 	Edit3,
 	Folder,
 	PanelRightOpen,
@@ -17,11 +18,12 @@ import {
 	projectTitle,
 	sessionDisplayActivity,
 	sessionTitle,
+	displayActivity,
 	type SessionDisplayActivity,
 	type SessionListItem
 } from "./sessionList.ts";
 import { truncate } from "./text.ts";
-import type { Notice, Project, ReasoningEffort, SessionSnapshot, ToolListing } from "./types.ts";
+import type { Notice, Project, ReasoningEffort, SessionSnapshot, SessionSummary, SubagentListResult, ToolListing } from "./types.ts";
 
 function projectWorkspaceSummary(project: Project): string {
 	return project.workspaces
@@ -53,6 +55,69 @@ export function SidebarHeader({
 			</div>
 		</div>
 	);
+}
+
+function SubagentsSection({
+	parentSessionId,
+	subagents,
+	summaries,
+	loading,
+	error,
+	onSelectSession,
+}: {
+	parentSessionId: string | null;
+	subagents: SubagentListResult | null;
+	summaries: SessionSummary[];
+	loading: boolean;
+	error: string | null;
+	onSelectSession?: (sessionId: string) => void;
+}) {
+	const summaryById = new Map(summaries.map((summary) => [summary.session_id, summary]));
+	const children = subagents?.subagents ?? [];
+	return (
+		<section className="inspect-section">
+			<h2>Subagents</h2>
+			{!parentSessionId ? <p className="muted">No session selected.</p> : null}
+			{loading ? <p className="muted">Loading subagents…</p> : null}
+			{error ? <p className="error-text">{error}</p> : null}
+			{parentSessionId && !loading && !error && children.length === 0 ? <p className="muted">No direct subagents yet.</p> : null}
+			{children.length > 0 ? (
+				<div className="subagent-list" role="list">
+					{children.map((child) => {
+						const summary = summaryById.get(child.child_session_id);
+						const activity = child.activity;
+						const roleName = roleLabel(summary);
+						return (
+							<button
+								className="subagent-row"
+								type="button"
+								key={child.child_session_id}
+								onClick={() => onSelectSession?.(child.child_session_id)}
+								title={`open ${child.child_session_id}`}
+							>
+								<span className={`status-rail ${displayActivity(activity)}`} />
+								<span className="subagent-main">
+									<span className="subagent-title">
+										<Bot size={13} />
+										{summary ? sessionTitle(summary) : child.child_session_id.slice(0, 13)}
+									</span>
+									<span className="subagent-sub">
+										{roleName ? `${roleName} · ` : ""}{summary?.provider.model ?? "session"} · {child.child_session_id.slice(0, 13)}
+									</span>
+								</span>
+								<span className={`subagent-activity ${displayActivity(activity)}`}>{displayActivity(activity)}</span>
+							</button>
+						);
+					})}
+				</div>
+			) : null}
+		</section>
+	);
+}
+
+function roleLabel(session: SessionSummary | undefined): string | null {
+	const role = session?.metadata?.role_name;
+	return typeof role === "string" && role.trim() ? role : null;
 }
 
 export interface SidebarProps {
@@ -556,11 +621,21 @@ export function NoticeStack({ notices, rightOpen }: { notices: Notice[]; rightOp
 
 export function Inspector({
 	snapshot,
+	subagents,
+	subagentSummaries,
+	subagentsLoading,
+	subagentsError,
 	tools,
+	onSelectSession,
 	onClose
 }: {
 	snapshot: SessionSnapshot | null;
+	subagents: SubagentListResult | null;
+	subagentSummaries: SessionSummary[];
+	subagentsLoading: boolean;
+	subagentsError: string | null;
 	tools: ToolListing[];
+	onSelectSession?: (sessionId: string) => void;
 	onClose?: () => void;
 }) {
 	return (
@@ -585,6 +660,21 @@ export function Inspector({
 							<strong>{snapshot.metadata.archived === true ? "yes" : "no"}</strong>
 						</div>
 						<div className="kv">
+							<span>parent</span>
+							{snapshot.parent_session_id ? (
+								<button
+									className="link-button"
+									type="button"
+									onClick={() => onSelectSession?.(snapshot.parent_session_id!)}
+									title={`open parent ${snapshot.parent_session_id}`}
+								>
+									{snapshot.parent_session_id.slice(0, 13)}
+								</button>
+							) : (
+								<strong>none</strong>
+							)}
+						</div>
+						<div className="kv">
 							<span>leaf</span>
 							<strong>{snapshot.active_leaf_id?.slice(0, 12) ?? "root"}</strong>
 						</div>
@@ -597,6 +687,14 @@ export function Inspector({
 					<p className="muted">No session selected.</p>
 				)}
 			</section>
+			<SubagentsSection
+				parentSessionId={snapshot?.session_id ?? null}
+				subagents={subagents}
+				summaries={subagentSummaries}
+				loading={subagentsLoading}
+				error={subagentsError}
+				onSelectSession={onSelectSession}
+			/>
 			<section className="inspect-section">
 				<h2>Pending</h2>
 				{snapshot?.pending_actions.length ? (

@@ -31,6 +31,7 @@ export interface SessionWorkspace extends ProjectWorkspace {
 export interface SessionSummary {
 	session_id: string;
 	project_id: string | null;
+	parent_session_id?: string | null;
 	outer_cwd: string;
 	workspaces: SessionWorkspace[];
 	activity: Activity;
@@ -73,6 +74,7 @@ export interface QueueProjection {
 export interface SessionSnapshot {
 	session_id: string;
 	project_id: string | null;
+	parent_session_id?: string | null;
 	outer_cwd: string;
 	workspaces: SessionWorkspace[];
 	activity: Activity;
@@ -110,6 +112,16 @@ export interface EventFrame {
 	event: string;
 	session_id: string;
 	data: Record<string, unknown>;
+}
+
+export interface SubagentListItem {
+	child_session_id: string;
+	activity: Activity;
+}
+
+export interface SubagentListResult {
+	parent_session_id: string;
+	subagents: SubagentListItem[];
 }
 
 export type SessionOverview = Omit<SessionSnapshot, "entries">;

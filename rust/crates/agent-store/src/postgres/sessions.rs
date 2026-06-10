@@ -428,6 +428,7 @@ impl PostgresAgentStore {
                 select
                     s.id,
                     s.project_id,
+                    s.parent_session_id,
                     s.outer_cwd,
                     s.workspaces,
                     s.active_leaf_id,
@@ -479,6 +480,7 @@ impl PostgresAgentStore {
                 Ok(SessionSummary {
                     session_id: id,
                     project_id: row.get("project_id"),
+                    parent_session_id: row.get("parent_session_id"),
                     outer_cwd: row.get("outer_cwd"),
                     workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
                         row.get::<Value, _>("workspaces"),

@@ -406,13 +406,13 @@ export function App() {
 		if (!selectedId) return null;
 		return {
 			session_id: selectedId,
-			project_id: selectedSession?.project_id ?? selectedProjectId,
+			project_id: selectedSession?.project_id ?? loadedSnapshot?.project_id ?? selectedProjectId,
 			activity: selectedSession?.activity ?? "idle",
 			active_leaf_id: selectedSession?.active_leaf_id ?? null,
 			provider: selectedSession?.provider ?? newSessionProvider,
 			metadata: selectedSession?.metadata ?? {},
 		};
-	}, [newSessionProvider, selectedId, selectedProjectId, selectedSession]);
+	}, [loadedSnapshot?.project_id, newSessionProvider, selectedId, selectedProjectId, selectedSession]);
 	const selectedChatSession = snapshotChatSession ?? selectedListChatSession;
 
 	const activeProvider = loadedSnapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
@@ -423,6 +423,25 @@ export function App() {
 		enabled: connection === "open",
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
+	const subagentsQuery = useQuery({
+		queryKey: queryKeys.subagents(loadedSnapshot?.session_id ?? null),
+		queryFn: () => {
+			if (!loadedSnapshot) throw new Error("select a session first");
+			return api.listSubagents(loadedSnapshot.session_id);
+		},
+		enabled: connection === "open" && !!loadedSnapshot,
+		refetchInterval: loadedSnapshot?.activity === "running" ? 2_000 : false,
+	});
+	const subagentIds = useMemo(
+		() => subagentsQuery.data?.subagents.map((subagent) => subagent.child_session_id) ?? [],
+		[subagentsQuery.data],
+	);
+	const subagentSummariesQuery = useQuery({
+		queryKey: queryKeys.subagentSummaries(loadedSnapshot?.session_id ?? null, subagentIds),
+		queryFn: async () => Promise.all(subagentIds.map(async (sessionId) => snapshotToSummary(await api.getSession(sessionId)))),
+		enabled: connection === "open" && subagentIds.length > 0,
+	});
+	const subagentSummaries = subagentSummariesQuery.data ?? [];
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
 	const hasTranscriptEntries =
 		loadedSnapshot?.has_transcript_entries ??
@@ -863,6 +882,9 @@ export function App() {
 			patchSessionListEventSummary(queryClient, selectedProjectRef.current, event, activity);
 			if (refreshPlan.refreshList) {
 				scheduleSessionListRefresh();
+				if (loadedSnapshot?.session_id) {
+					void queryClient.invalidateQueries({ queryKey: queryKeys.subagents(loadedSnapshot.session_id) });
+				}
 			}
 
 			if (event.session_id === selectedRef.current) {
@@ -879,9 +901,11 @@ export function App() {
 		},
 		[
 			pushNotice,
+			queryClient,
 			replaceSelectedCache,
 			scheduleActiveBranchSync,
 			scheduleSessionListRefresh,
+			loadedSnapshot?.session_id,
 		],
 	);
 
@@ -1026,6 +1050,9 @@ export function App() {
 		for (const session of sessions) {
 			desiredSessionIds.add(session.session_id);
 		}
+		for (const subagentId of subagentIds) {
+			desiredSessionIds.add(subagentId);
+		}
 		if (selectedId && selectedHasEventCursor) desiredSessionIds.add(selectedId);
 		for (const sessionId of Array.from(subscribedEventSessionIds.current)) {
 			if (desiredSessionIds.has(sessionId)) continue;
@@ -1060,6 +1087,7 @@ export function App() {
 		pushNotice,
 		selectedId,
 		sessions,
+		subagentIds,
 	]);
 
 	const configureProvider = useCallback(
@@ -1851,16 +1879,16 @@ export function App() {
 		},
 		[pushNotice, reorderQueuedInput],
 	);
-	const mobileTitle = selectedSession
-		? sessionTitle(selectedSession)
+	const mobileTitle = selectedChatSession
+		? sessionTitle(selectedChatSession)
 		: selectedProject
 			? projectTitle(selectedProject)
 			: "pi relay";
-	const mobileActivity = selectedSession
-		? displayActivity(loadedSnapshot?.activity ?? selectedSession.activity)
+	const mobileActivity = selectedChatSession
+		? displayActivity(loadedSnapshot?.activity ?? selectedChatSession.activity)
 		: null;
-	const mobileArchived = selectedSession ? isArchivedSession(selectedSession) : false;
-	const mobileSessionStatus = selectedSession ? (mobileArchived ? "archived" : mobileActivity) : null;
+	const mobileArchived = selectedChatSession ? isArchivedSession(selectedChatSession) : false;
+	const mobileSessionStatus = selectedChatSession ? (mobileArchived ? "archived" : mobileActivity) : null;
 	const sidebarIsOverlay = panelMode !== "wide";
 	const inspectorIsOverlay = panelMode === "compact";
 	const sidebarOverlayOpen = sidebarIsOverlay && sidebarOpen;
@@ -2001,7 +2029,19 @@ export function App() {
 			</footer>
 
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
-				<Inspector snapshot={loadedSnapshot} tools={tools} onClose={() => setRightOpen(false)} />
+				<Inspector
+					snapshot={loadedSnapshot}
+					subagents={subagentsQuery.data ?? null}
+					subagentSummaries={subagentSummaries}
+					subagentsLoading={subagentsQuery.isLoading || subagentSummariesQuery.isLoading}
+					subagentsError={errorMessageOrNull(subagentsQuery.error ?? subagentSummariesQuery.error)}
+					tools={tools}
+					onSelectSession={(sessionId) => {
+						selectSession(sessionId);
+						if (inspectorIsOverlay) setRightOpen(false);
+					}}
+					onClose={() => setRightOpen(false)}
+				/>
 			</aside>
 
 			{renameSessionId ? (
@@ -2067,6 +2107,28 @@ export function App() {
 
 function titleFromText(text: string): string {
 	return truncate(firstLine(text).trim() || "New session", 64);
+}
+
+function snapshotToSummary(snapshot: SessionSnapshot): SessionSummary {
+	return {
+		session_id: snapshot.session_id,
+		project_id: snapshot.project_id,
+		parent_session_id: snapshot.parent_session_id,
+		outer_cwd: snapshot.outer_cwd,
+		workspaces: snapshot.workspaces,
+		activity: snapshot.activity,
+		active_leaf_id: snapshot.active_leaf_id,
+		provider: snapshot.provider,
+		metadata: snapshot.metadata,
+		created_at: "",
+		updated_at: "",
+		last_user_message_timestamp_ms: snapshot.last_user_message_timestamp_ms,
+		has_transcript_entries: snapshot.has_transcript_entries,
+	};
+}
+
+function errorMessageOrNull(error: unknown): string | null {
+	return error === null || error === undefined ? null : errorMessage(error);
 }
 
 function errorMessage(error: unknown): string {
