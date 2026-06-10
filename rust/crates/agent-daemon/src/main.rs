@@ -5,6 +5,7 @@ mod codec;
 mod config;
 mod model_metadata;
 mod provider_runtime;
+mod repl;
 mod rpc_views;
 mod runtime;
 mod session_start;
@@ -72,6 +73,7 @@ async fn main() -> Result<()> {
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
+        repls: repl::ReplRegistry::default(),
         workspaces,
         prompt_root,
     };
@@ -97,6 +99,7 @@ async fn main() -> Result<()> {
     }
 
     drain_dispatch_tasks(&state).await;
+    state.repls.kill_all().await;
     state.repo.close().await;
     Ok(())
 }
@@ -283,6 +286,7 @@ async fn dispatch_request(
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
+        RpcMethod::ReplExec => repl::repl_exec(state, params).await,
         RpcMethod::SubagentList => subagents::subagent_list(state, params).await,
         RpcMethod::SubagentSpawn => subagents::subagent_spawn(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,

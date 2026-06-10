@@ -1180,6 +1180,63 @@ turns fail with `not_resumable`, non-terminal targets fail with
 whose terminal work was tool execution fail with `not_resumable` until explicit
 tool-rerun semantics exist.
 
+## REPL RPC
+
+### `repl.exec`
+
+Executes a Python code cell in a stateful per-session REPL process. The REPL is
+an orchestration environment, not a provider-visible tool schema. Python
+globals persist between calls for the same `session_id`; stdout/stderr are
+captured and returned with the last expression's `repr`.
+
+Request:
+
+```json
+{
+  "session_id": "session_parent",
+  "code": "review = subagents.call(role='reviewer', message='Review this patch')\nreview",
+  "timeout_ms": 600000
+}
+```
+
+Response:
+
+```json
+{
+  "type": "exec_result",
+  "id": 1,
+  "ok": true,
+  "stdout": "",
+  "stderr": "",
+  "result_repr": "SubagentResult(session_id='session_child', role='reviewer', text='...')",
+  "result_json": {
+    "session_id": "session_child",
+    "role": "reviewer",
+    "text": "...",
+    "activity": "idle",
+    "transcript": {}
+  },
+  "error": null
+}
+```
+
+The REPL preimports `subagents`:
+
+```python
+result = subagents.call(role="reviewer", message="Review this", fork_context=False)
+results = subagents.call_bulk([
+    {"role": "worker", "message": "Try approach A", "fork_context": True},
+    {"role": "worker", "message": "Try approach B", "fork_context": True},
+])
+children = subagents.list()
+turns = subagents[result.session_id].transcript
+subagents[result.session_id].steer("Change direction")
+subagents[result.session_id].interrupt()
+```
+
+`subagents.call(...)` and `subagents.call_bulk(...)` are blocking Python helper
+semantics layered over the non-blocking `subagent.spawn` backend primitive.
+
 ## Tools
 
 ### `tools.list`
