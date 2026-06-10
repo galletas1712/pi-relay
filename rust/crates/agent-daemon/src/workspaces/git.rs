@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
@@ -141,6 +142,137 @@ pub(super) async fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> R
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+pub(super) async fn git_output_dynamic(cwd: &Path, args: Vec<String>) -> Result<String> {
+    let output = git_command()
+        .args(&args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .with_context(|| format!("run git in {}", cwd.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub(super) async fn snapshot_worktree_commit(cwd: &Path, message: &str) -> Result<String> {
+    let temp_index = temp_index_path();
+    tokio::fs::copy(cwd.join(".git/index"), &temp_index)
+        .await
+        .with_context(|| format!("copy git index for {}", cwd.display()))?;
+    let result = snapshot_worktree_commit_with_index(cwd, &temp_index, message).await;
+    let _ = tokio::fs::remove_file(&temp_index).await;
+    result
+}
+
+async fn snapshot_worktree_commit_with_index(
+    cwd: &Path,
+    index: &Path,
+    message: &str,
+) -> Result<String> {
+    let head = git_output(cwd, ["rev-parse", "HEAD"]).await?;
+    git_output_dynamic_with_index(
+        cwd,
+        index,
+        vec![
+            "add".to_string(),
+            "-A".to_string(),
+            "--".to_string(),
+            ".".to_string(),
+        ],
+    )
+    .await?;
+    let tree = git_output_dynamic_with_index(cwd, index, vec!["write-tree".to_string()]).await?;
+    git_output_dynamic_with_index(
+        cwd,
+        index,
+        vec![
+            "commit-tree".to_string(),
+            tree,
+            "-p".to_string(),
+            head,
+            "-m".to_string(),
+            message.to_string(),
+        ],
+    )
+    .await
+}
+
+async fn git_output_dynamic_with_index(
+    cwd: &Path,
+    index: &Path,
+    args: Vec<String>,
+) -> Result<String> {
+    let output = git_command()
+        .env("GIT_INDEX_FILE", index)
+        .args(&args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .with_context(|| format!("run git in {}", cwd.display()))?;
+    if !output.status.success() {
+        bail!(
+            "git failed in {}: {}",
+            cwd.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn temp_index_path() -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!("pi-relay-git-index-{}-{nanos}", std::process::id()))
+}
+
+pub(super) async fn fetch_local_commit_ref(
+    cwd: &Path,
+    source_repo: &Path,
+    commit: &str,
+    target_ref: &str,
+) -> Result<()> {
+    let export_ref = format!(
+        "refs/pi-relay/exports/{}",
+        target_ref
+            .strip_prefix("refs/pi-relay/sources/")
+            .unwrap_or("source")
+    );
+    git_output_dynamic(
+        source_repo,
+        vec![
+            "update-ref".to_string(),
+            export_ref.clone(),
+            commit.to_string(),
+        ],
+    )
+    .await?;
+    let refspec = format!("{export_ref}:{target_ref}");
+    let fetch_result = git_output_dynamic(
+        cwd,
+        vec![
+            "fetch".to_string(),
+            "--no-tags".to_string(),
+            source_repo.to_string_lossy().into_owned(),
+            refspec,
+        ],
+    )
+    .await
+    .map(|_| ());
+    let _ = git_output_dynamic(
+        source_repo,
+        vec!["update-ref".to_string(), "-d".to_string(), export_ref],
+    )
+    .await;
+    fetch_result
+}
+
 async fn git_remote_exists(cwd: &Path, name: &str) -> Result<bool> {
     let output = git_command()
         .args(["remote", "get-url", name])
@@ -153,6 +285,11 @@ async fn git_remote_exists(cwd: &Path, name: &str) -> Result<bool> {
 
 fn git_command() -> Command {
     let mut command = Command::new("git");
-    command.env("GIT_TERMINAL_PROMPT", "0");
+    command
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_AUTHOR_NAME", "pi-relay")
+        .env("GIT_AUTHOR_EMAIL", "pi-relay@example.invalid")
+        .env("GIT_COMMITTER_NAME", "pi-relay")
+        .env("GIT_COMMITTER_EMAIL", "pi-relay@example.invalid");
     command
 }

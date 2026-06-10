@@ -79,6 +79,7 @@ struct SubagentSpawnRequest {
     role_workspace: Option<String>,
     task: String,
     initial_context: Option<String>,
+    sources: Vec<String>,
     display_name: Option<String>,
     provider: Option<ProviderConfig>,
     metadata: Value,
@@ -125,6 +126,16 @@ impl SubagentSpawnRequest {
             .child_session_id
             .map(|session_id| session_id.trim().to_string())
             .filter(|session_id| !session_id.is_empty());
+        let mut sources = Vec::new();
+        for source in params.sources.unwrap_or_default() {
+            let Some(source_session_id) = source_session_id(source) else {
+                return Err(RpcError::new(
+                    "invalid_params",
+                    "each source must be a session id string or an object containing session_id or child_session_id",
+                ));
+            };
+            sources.push(source_session_id);
+        }
         Ok(Self {
             parent_session_id,
             child_session_id,
@@ -132,6 +143,7 @@ impl SubagentSpawnRequest {
             role_workspace,
             task,
             initial_context,
+            sources,
             display_name: params.display_name,
             provider: params.provider,
             metadata: params.metadata.unwrap_or_else(|| json!({})),
@@ -147,6 +159,7 @@ struct SubagentSpawnParams {
     role_workspace: Option<String>,
     task: String,
     initial_context: Option<String>,
+    sources: Option<Vec<Value>>,
     display_name: Option<String>,
     provider: Option<ProviderConfig>,
     metadata: Option<Value>,
@@ -225,6 +238,10 @@ async fn spawn_subagent(
         request.role_workspace.as_deref(),
     )
     .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
+    let source_configs = load_source_configs(state, &request.parent_session_id, &request.sources)
+        .await?
+        .into_iter()
+        .collect::<Vec<_>>();
     let (outer_cwd, workspaces) = state
         .workspaces
         .fork_session_from_parent(
@@ -264,12 +281,24 @@ async fn spawn_subagent(
             parent_session_id: &request.parent_session_id,
         },
     )?;
+    let source_refs = match state
+        .workspaces
+        .import_source_refs(&outer_cwd, &child_config.workspaces, &source_configs)
+        .await
+    {
+        Ok(source_refs) => source_refs,
+        Err(error) => {
+            let _ = state.workspaces.remove_session_dir(&child_session_id).await;
+            return Err(anyhow::Error::from(error).into());
+        }
+    };
 
     let task = request.task;
     let initial_task = child_initial_task_message(
         &request.parent_session_id,
         &task,
         request.initial_context.as_deref(),
+        &source_refs,
     );
     let started = start_prepared_session(
         state,
@@ -296,6 +325,43 @@ async fn spawn_subagent(
         parent_session_id: request.parent_session_id,
         started,
     })
+}
+
+fn source_session_id(value: Value) -> Option<String> {
+    match value {
+        Value::String(session_id) => {
+            let session_id = session_id.trim();
+            (!session_id.is_empty()).then(|| session_id.to_string())
+        }
+        Value::Object(map) => map
+            .get("session_id")
+            .or_else(|| map.get("child_session_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|session_id| !session_id.is_empty())
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+async fn load_source_configs(
+    state: &AppState,
+    parent_session_id: &str,
+    source_session_ids: &[String],
+) -> std::result::Result<Vec<(String, SessionConfig)>, RpcError> {
+    let mut sources = Vec::with_capacity(source_session_ids.len());
+    for source_session_id in source_session_ids {
+        require_known_subagent(state, parent_session_id, source_session_id).await?;
+        let source_driver = SessionDriver::acquire(state, source_session_id).await;
+        source_driver.ensure_idle_for_source_mutation().await?;
+        let config = state
+            .repo
+            .load_session_config(source_session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        sources.push((source_session_id.clone(), config));
+    }
+    Ok(sources)
 }
 
 pub(crate) async fn require_known_subagent(
@@ -386,6 +452,7 @@ fn child_initial_task_message(
     parent_session_id: &str,
     task: &str,
     initial_context: Option<&str>,
+    source_refs: &[crate::workspaces::SourceRefSpec],
 ) -> String {
     let mut message = format!(
         "# Delegated task\n\nParent session: `{parent_session_id}`\n\n{task}\n\n# Parent active context\n\n"
@@ -401,6 +468,27 @@ of the parent's active branch at delegation time.\n\n",
             "No parent transcript/context snapshot was included for this call (`fork_context=False`). \
 Use the delegated task, role instructions, workspace/project context, and any files/tools you inspect.",
         );
+    }
+    if !source_refs.is_empty() {
+        message.push_str("\n\n# Source child sessions\n\n");
+        message.push_str(
+            "The following child session outputs are available as local git refs in your workspace. \
+Inspect or merge them with git commands as needed; do not assume they are already applied.\n",
+        );
+        let mut current_source = "";
+        for source_ref in source_refs {
+            if current_source != source_ref.source_id {
+                current_source = &source_ref.source_id;
+                message.push_str(&format!(
+                    "\n## {}\n\n- Session: `{}`\n- Git refs:\n",
+                    source_ref.source_id, source_ref.session_id
+                ));
+            }
+            message.push_str(&format!(
+                "  - workspace `{}`: `{}`\n",
+                source_ref.workspace_dir, source_ref.git_ref
+            ));
+        }
     }
     message
 }
@@ -461,6 +549,19 @@ mod tests {
         assert_eq!(request.task, "Review this");
         assert_eq!(request.initial_context.as_deref(), Some("Context"));
 
+        let request = SubagentSpawnRequest::from_params(json!({
+            "parent_session_id": "parent",
+            "role": "merger",
+            "task": "Merge this",
+            "sources": [
+                " child-a ",
+                { "session_id": " child-b " },
+                { "child_session_id": " child-c " }
+            ]
+        }))
+        .expect("request parses sources");
+        assert_eq!(request.sources, ["child-a", "child-b", "child-c"]);
+
         let error = SubagentSpawnRequest::from_params(json!({
             "parent_session_id": "parent",
             "role": "reviewer",
@@ -500,7 +601,7 @@ mod tests {
 
     #[test]
     fn child_initial_task_message_marks_absent_parent_context() {
-        let message = child_initial_task_message("parent", "Inspect the repo.", None);
+        let message = child_initial_task_message("parent", "Inspect the repo.", None, &[]);
 
         assert!(message.contains("# Delegated task"));
         assert!(message.contains("Parent session: `parent`"));
@@ -516,11 +617,32 @@ mod tests {
             "parent",
             "Continue the investigation.",
             Some("Parent session `parent` active context:\n\nAssistant:\nprior answer"),
+            &[],
         );
 
         assert!(message.contains("# Delegated task"));
         assert!(message.contains("The parent requested `fork_context=True`"));
         assert!(message.contains("Parent session `parent` active context:"));
         assert!(message.contains("prior answer"));
+    }
+
+    #[test]
+    fn child_initial_task_message_lists_source_refs_without_diff_payload() {
+        let refs = vec![crate::workspaces::SourceRefSpec {
+            source_id: "source-1-implementer-abc123".to_string(),
+            session_id: "session_abc123".to_string(),
+            workspace_dir: "repo".to_string(),
+            git_ref: "refs/pi-relay/sources/source-1-implementer-abc123".to_string(),
+            commit: "deadbeef".to_string(),
+        }];
+        let message = child_initial_task_message("parent", "Merge this.", None, &refs);
+
+        assert!(message.contains("# Source child sessions"));
+        assert!(message.contains("## source-1-implementer-abc123"));
+        assert!(message.contains("- Session: `session_abc123`"));
+        assert!(message
+            .contains("- workspace `repo`: `refs/pi-relay/sources/source-1-implementer-abc123`"));
+        assert!(!message.contains("deadbeef"));
+        assert!(!message.contains("```diff"));
     }
 }

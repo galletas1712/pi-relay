@@ -1228,6 +1228,11 @@ results = subagents.call_bulk([
     {"role": "worker", "message": "Try approach A", "fork_context": True},
     {"role": "worker", "message": "Try approach B", "fork_context": True},
 ])
+merge = subagents.call(
+    role="merger",
+    message="Merge the useful parts of the worker proposals.",
+    sources=results,
+)
 children = subagents.list()
 turns = subagents[result.session_id].transcript
 subagents[result.session_id].steer("Change direction")
@@ -1238,6 +1243,15 @@ subagents[result.session_id].interrupt()
 semantics layered over the non-blocking `subagent.spawn` backend primitive.
 `call_bulk` issues the spawn requests back-to-back, then waits for all children
 to become idle before returning.
+
+`sources=[...]` may be passed to `subagents.call(...)` with known child
+`SubagentResult`s, `SubagentHandle`s, dicts containing `session_id`, or session-id
+strings. The daemon validates each source is a child of the current parent and
+prepares compact source metadata for the spawned child. For git workspaces, each
+source child's final worktree is made available in the new child's corresponding
+workspace as a local ref such as
+`refs/pi-relay/sources/source-1-implementer-a1b2c3d4`; local-folder workspaces
+are not merged or serialized.
 
 `role` can be a built-in role (`worker`, `reviewer`, `tester`) or the name of an
 available skill. A unique workspace-scoped skill can be addressed by name alone;
