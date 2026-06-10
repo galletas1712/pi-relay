@@ -232,6 +232,7 @@ async fn spawn_subagent(
     }
 
     let role = resolve_skill_role(
+        &state.prompt_root,
         &PathBuf::from(&parent_config.outer_cwd),
         &parent_config.workspaces,
         &request.role,

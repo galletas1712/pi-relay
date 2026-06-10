@@ -6,6 +6,7 @@ use agent_prompt::{
 };
 use agent_store::{SessionConfig, SessionWorkspace, WorkspaceKind};
 use agent_vocab::ProviderKind;
+use anyhow::{anyhow, Context};
 
 use crate::state::AppState;
 
@@ -84,6 +85,13 @@ fn load_prompt_skills(config: &SessionConfig) -> Vec<Skill> {
     load_skills_for_session_workspaces(&PathBuf::from(&config.outer_cwd), &config.workspaces)
 }
 
+#[derive(Debug)]
+pub(super) struct ParsedSkillFile {
+    pub(super) name: String,
+    pub(super) description: String,
+    pub(super) body: String,
+}
+
 #[cfg(test)]
 #[allow(dead_code)]
 pub(super) fn load_skills_for_workspace_roots(
@@ -102,6 +110,12 @@ pub(super) fn load_skills_for_session_workspaces(
     workspaces: &[SessionWorkspace],
 ) -> Vec<Skill> {
     load_skills_for_session_workspaces_with_home(outer_cwd, workspaces, home_dir().as_deref())
+}
+
+pub(super) fn load_global_skills_from_dir(dir: &Path) -> Vec<Skill> {
+    let mut skills = Vec::new();
+    add_skills_from_agents_dir(dir, None, &mut skills);
+    skills
 }
 
 #[cfg(test)]
@@ -183,19 +197,39 @@ fn add_skills_from_agents_dir(dir: &Path, workspace: Option<&str>, skills: &mut 
 }
 
 fn load_skill_file(path: &Path, workspace: Option<&str>) -> Option<Skill> {
-    let raw = std::fs::read_to_string(path).ok()?;
-    let (frontmatter, _body) = split_frontmatter(&raw);
-    let frontmatter = parse_simple_frontmatter(frontmatter.unwrap_or_default());
-    let name = frontmatter.get("name").cloned()?.trim().to_string();
-    let description = frontmatter.get("description")?.trim().to_string();
-    if name.is_empty() || description.is_empty() {
+    let parsed = load_parsed_skill_file(path).ok()?;
+    if parsed.name.is_empty() || parsed.description.is_empty() {
         return None;
     }
     let skill = match workspace {
-        Some(workspace) => Skill::workspace(workspace.to_string(), name, description, path),
-        None => Skill::global(name, description, path),
+        Some(workspace) => {
+            Skill::workspace(workspace.to_string(), parsed.name, parsed.description, path)
+        }
+        None => Skill::global(parsed.name, parsed.description, path),
     };
     Some(skill)
+}
+
+pub(super) fn load_parsed_skill_file(path: &Path) -> anyhow::Result<ParsedSkillFile> {
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("read skill {}", path.display()))?;
+    let (frontmatter, body) = split_frontmatter(&raw);
+    let frontmatter = parse_simple_frontmatter(frontmatter.unwrap_or_default());
+    let name = frontmatter
+        .get("name")
+        .ok_or_else(|| anyhow!("skill {} missing frontmatter name", path.display()))?
+        .trim()
+        .to_string();
+    let description = frontmatter
+        .get("description")
+        .ok_or_else(|| anyhow!("skill {} missing frontmatter description", path.display()))?
+        .trim()
+        .to_string();
+    Ok(ParsedSkillFile {
+        name,
+        description,
+        body: body.trim().to_string(),
+    })
 }
 
 fn split_frontmatter(raw: &str) -> (Option<&str>, &str) {
@@ -329,6 +363,35 @@ mod tests {
             .iter()
             .any(|skill| skill.workspace.as_deref() == Some("repo") && skill.name == "nested"));
         assert!(!skills.iter().any(|skill| skill.name == "root-file"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn subagent_role_defaults_are_not_prompt_skills() {
+        let root = make_temp_dir("subagent-roles-not-skills");
+        let outer = root.join("outer");
+        let workspace = outer.join("repo");
+        write_skill(
+            &outer.join("subagent-roles/tester/SKILL.md"),
+            "tester",
+            "default subagent role",
+        );
+        write_skill(
+            &workspace.join("subagent-roles/reviewer/SKILL.md"),
+            "reviewer",
+            "workspace-local default-like role",
+        );
+        write_skill(
+            &workspace.join(".agents/skills/visible/SKILL.md"),
+            "visible",
+            "normal skill",
+        );
+
+        let skills = load_skills_for_workspace_roots_with_home(&outer, &["repo".to_string()], None);
+        assert!(skills.iter().any(|skill| skill.name == "visible"));
+        assert!(!skills.iter().any(|skill| skill.name == "tester"));
+        assert!(!skills.iter().any(|skill| skill.name == "reviewer"));
 
         std::fs::remove_dir_all(root).ok();
     }
