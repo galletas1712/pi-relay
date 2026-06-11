@@ -21,7 +21,7 @@ impl PostgresAgentStore {
             .await?;
         let session = sqlx::query(
             r#"
-            select id, project_id, outer_cwd, workspaces, active_leaf_id,
+            select id, project_id, parent_session_id, outer_cwd, workspaces, active_leaf_id,
                 provider_config, metadata, last_user_message_timestamp_ms
             from sessions
             where id=$1
@@ -68,6 +68,7 @@ impl PostgresAgentStore {
         Ok(SessionSnapshot {
             session_id: session.get("id"),
             project_id: session.get("project_id"),
+            parent_session_id: session.get("parent_session_id"),
             outer_cwd: session.get("outer_cwd"),
             workspaces: serde_json::from_value::<Vec<SessionWorkspace>>(
                 session.get::<Value, _>("workspaces"),

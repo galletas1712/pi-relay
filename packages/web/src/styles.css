@@ -2858,6 +2858,100 @@ pre {
 	gap: 4px;
 }
 
+.subagent-list {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+}
+
+.subagent-row {
+	display: flex;
+	width: 100%;
+	min-height: 44px;
+	align-items: center;
+	gap: 8px;
+	border: 1px solid transparent;
+	border-radius: var(--radius);
+	background: transparent;
+	padding: 6px 8px;
+	text-align: left;
+	cursor: pointer;
+}
+
+.subagent-row:hover,
+.subagent-row:focus-visible {
+	border-color: var(--border);
+	background: var(--accent);
+	outline: none;
+}
+
+.subagent-main {
+	display: flex;
+	min-width: 0;
+	flex: 1;
+	flex-direction: column;
+	gap: 2px;
+}
+
+.subagent-title {
+	display: flex;
+	min-width: 0;
+	align-items: center;
+	gap: 5px;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-size: var(--text-sm);
+	font-weight: 600;
+}
+
+.subagent-sub {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--muted-foreground);
+	font-size: var(--text-xs);
+}
+
+.subagent-activity {
+	flex: 0 0 auto;
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	padding: 2px 7px;
+	font-size: var(--text-2xs);
+	color: var(--muted-foreground);
+}
+
+.subagent-activity.running {
+	border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
+	color: var(--primary);
+}
+
+.subagent-activity.idle {
+	border-color: color-mix(in oklch, var(--success) 40%, var(--border));
+	color: var(--success);
+}
+
+.link-button {
+	min-width: 0;
+	border: 0;
+	background: transparent;
+	padding: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--primary);
+	font-size: var(--text-sm);
+	font-weight: 500;
+	cursor: pointer;
+}
+
+.link-button:hover,
+.link-button:focus-visible {
+	text-decoration: underline;
+	outline: none;
+}
+
 .tool-list {
 	display: flex;
 	flex-wrap: wrap;

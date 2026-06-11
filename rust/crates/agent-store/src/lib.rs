@@ -351,6 +351,7 @@ pub struct ReorderQueuedFollowUpsResult {
 pub struct SessionSummary {
     pub session_id: String,
     pub project_id: Option<Uuid>,
+    pub parent_session_id: Option<String>,
     pub outer_cwd: String,
     pub workspaces: Vec<SessionWorkspace>,
     pub activity: SessionActivity,
@@ -491,6 +492,7 @@ pub struct QueueState {
 pub struct SessionSnapshot {
     pub session_id: String,
     pub project_id: Option<Uuid>,
+    pub parent_session_id: Option<String>,
     pub outer_cwd: String,
     pub workspaces: Vec<SessionWorkspace>,
     pub activity: SessionActivity,

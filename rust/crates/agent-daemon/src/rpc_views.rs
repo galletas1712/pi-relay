@@ -22,6 +22,7 @@ pub(crate) fn session_summary(summary: SessionSummary) -> Value {
     json!({
         "session_id": summary.session_id,
         "project_id": summary.project_id,
+        "parent_session_id": summary.parent_session_id,
         "outer_cwd": summary.outer_cwd,
         "workspaces": summary.workspaces,
         "activity": summary.activity,
@@ -60,6 +61,7 @@ pub(crate) fn session_snapshot(
     let mut value = json!({
         "session_id": snapshot.session_id,
         "project_id": snapshot.project_id,
+        "parent_session_id": snapshot.parent_session_id,
         "outer_cwd": snapshot.outer_cwd,
         "workspaces": snapshot.workspaces,
         "activity": snapshot.activity,

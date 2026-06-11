@@ -206,6 +206,27 @@ mod tests {
             .await
             .expect("parent id loads");
         assert_eq!(parent_id.as_deref(), Some(parent_session_id));
+        let listed_child = db
+            .store
+            .list_sessions(Some(project_id), 10)
+            .await
+            .expect("list sessions includes parent id")
+            .into_iter()
+            .find(|session| session.session_id == child_session_id)
+            .expect("child session is listed");
+        assert_eq!(
+            listed_child.parent_session_id.as_deref(),
+            Some(parent_session_id)
+        );
+        let child_snapshot = db
+            .store
+            .session_snapshot(child_session_id)
+            .await
+            .expect("snapshot includes parent id");
+        assert_eq!(
+            child_snapshot.parent_session_id.as_deref(),
+            Some(parent_session_id)
+        );
 
         db.cleanup().await;
     }
