@@ -77,7 +77,11 @@ pub(super) async fn run_tool_turn(
             .await
         {
             Ok(result) => result,
-            Err(_) => ToolResultMessage::crashed(tool_call.id.clone(), tool_call.tool_name.clone()),
+            Err(error) => ToolResultMessage::error(
+                tool_call.id.clone(),
+                tool_call.tool_name.clone(),
+                format!("tool execution failed: {error}"),
+            ),
         }
     };
     let status = if matches!(result.status, ToolResultStatus::Success) {

@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::context::ToolContext;
-use crate::error::{ToolError, ToolResult};
+use crate::error::ToolResult;
 use crate::output::limit_tool_output_with_max_tokens;
 use crate::registry::AgentTool;
 
@@ -78,9 +78,19 @@ async fn run_bash(
     let mut command = tokio::process::Command::new("bash");
     command.arg("-lc").arg(args.command);
     command.current_dir(&ctx.cwd);
-    let output = tokio::time::timeout(timeout, command.output())
-        .await
-        .map_err(|_| ToolError::Timeout)??;
+    // Keep timeouts as ordinary tool results so the transcript records a
+    // recoverable failure at the tool-call boundary instead of a generic crash.
+    command.kill_on_drop(true);
+    let output = match tokio::time::timeout(timeout, command.output()).await {
+        Ok(output) => output?,
+        Err(_) => {
+            return Ok(ToolResultMessage::error(
+                call.id.clone(),
+                &call.tool_name,
+                format!("command timed out after {} ms", timeout.as_millis()),
+            ));
+        }
+    };
     let text = format!(
         "exit: {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
@@ -102,7 +112,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use agent_vocab::{ToolCallId, ToolResultMessage};
+    use agent_vocab::{ToolCallId, ToolResultMessage, ToolResultStatus};
     use serde_json::json;
 
     use super::*;
@@ -182,6 +192,28 @@ mod tests {
                 "exit: exit status: 0\nstdout:\nbefore\nafter\n\nstderr:\n",
             )
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn timeouts_return_tool_error_results() {
+        let root = workspace();
+        let ctx = ToolContext::new(&root);
+        let call = ToolCall {
+            id: ToolCallId("call_bash".to_string()),
+            tool_name: "Bash".to_string(),
+            args_json: json!({ "command": "sleep 1", "timeout_ms": 10 }).to_string(),
+        };
+
+        let result = BashTool
+            .execute(&call, &ctx)
+            .await
+            .expect("timeout is represented as a tool result");
+
+        assert_eq!(result.status, ToolResultStatus::Error);
+        assert_eq!(result.tool_call_id, ToolCallId("call_bash".to_string()));
+        assert_eq!(result.tool_name, "Bash");
+        assert!(result.output.contains("command timed out after"));
         fs::remove_dir_all(root).ok();
     }
 }
