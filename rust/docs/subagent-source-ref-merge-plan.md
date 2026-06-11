@@ -22,10 +22,11 @@ inside the new child's fork as local git refs.
 ## Workflow
 
 ```python
-implementations = subagents.call_bulk([
+implementers = subagents.spawn_bulk([
     {"role": "implementer", "message": "Try approach A"},
     {"role": "implementer", "message": "Try approach B"},
 ])
+implementations = subagents.wait(implementers)
 
 merge = subagents.call(
     role="merger",
@@ -94,7 +95,7 @@ Refs are the minimum useful information for a merger:
 - Git remains the source of truth for ignore handling, renames, conflicts, and
   merge operations.
 - The merger can inspect only what it needs.
-- Multiple child proposals from `call_bulk` become multiple local refs.
+- Multiple child proposals from `spawn_bulk`/`wait` become multiple local refs.
 - The parent remains the authority: merged changes are still just another child
   proposal until explicitly accepted later.
 

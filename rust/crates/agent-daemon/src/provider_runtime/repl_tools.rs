@@ -43,11 +43,14 @@ pub(crate) async fn run_repl_tool(
         .execute(state, session_id, args.code, args.timeout_ms)
         .await
     {
-        Ok(result) => ToolResultMessage::success(
-            call.id.clone(),
-            &call.tool_name,
-            format_repl_tool_output(&result),
-        ),
+        Ok(result) => {
+            let output = format_repl_tool_output(&result);
+            if result.get("ok").and_then(Value::as_bool) == Some(false) {
+                ToolResultMessage::error(call.id.clone(), &call.tool_name, output)
+            } else {
+                ToolResultMessage::success(call.id.clone(), &call.tool_name, output)
+            }
+        }
         Err(error) => ToolResultMessage::error(
             call.id.clone(),
             &call.tool_name,
@@ -59,11 +62,9 @@ pub(crate) async fn run_repl_tool(
 fn format_repl_tool_output(result: &Value) -> String {
     let stdout = result.get("stdout").and_then(Value::as_str).unwrap_or("");
     let stderr = result.get("stderr").and_then(Value::as_str).unwrap_or("");
-    let result_repr = result
-        .get("result_repr")
-        .and_then(Value::as_str)
-        .unwrap_or("None");
+    let result_repr = result.get("result_repr").and_then(Value::as_str);
     let result_json = result.get("result_json").unwrap_or(&Value::Null);
+    let error = result.get("error").unwrap_or(&Value::Null);
 
     let mut sections = Vec::new();
     if !stdout.is_empty() {
@@ -72,13 +73,30 @@ fn format_repl_tool_output(result: &Value) -> String {
     if !stderr.is_empty() {
         sections.push(format!("stderr:\n{stderr}"));
     }
-    sections.push(format!("result_repr:\n{result_repr}"));
+    if !error.is_null() {
+        if let Some(message) = error.get("message").and_then(Value::as_str) {
+            sections.push(format!("error:\n{message}"));
+        }
+        if let Some(traceback) = error.get("traceback").and_then(Value::as_str) {
+            sections.push(format!("traceback:\n{traceback}"));
+        }
+        if !error.is_object() {
+            sections.push(format!("error_json:\n{}", render_json(error)));
+        }
+    }
+    if let Some(result_repr) = result_repr {
+        sections.push(format!("result_repr:\n{result_repr}"));
+    } else if error.is_null() {
+        sections.push("result_repr:\nNone".to_string());
+    }
     if !result_json.is_null() {
-        let rendered =
-            serde_json::to_string_pretty(result_json).unwrap_or_else(|_| result_json.to_string());
-        sections.push(format!("result_json:\n{rendered}"));
+        sections.push(format!("result_json:\n{}", render_json(result_json)));
     }
     sections.join("\n\n")
+}
+
+fn render_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 #[cfg(test)]
@@ -101,5 +119,24 @@ mod tests {
         assert!(output.contains("stdout:\nhello\n"));
         assert!(output.contains("result_repr:\nSubagentResult"));
         assert!(output.contains("\"session_id\": \"child\""));
+    }
+
+    #[test]
+    fn formats_repl_exception_with_traceback() {
+        let output = format_repl_tool_output(&json!({
+            "stdout": "before\n",
+            "stderr": "",
+            "result_repr": null,
+            "result_json": null,
+            "error": {
+                "message": "division by zero",
+                "traceback": "Traceback..."
+            }
+        }));
+
+        assert!(output.contains("stdout:\nbefore\n"));
+        assert!(output.contains("error:\ndivision by zero"));
+        assert!(output.contains("traceback:\nTraceback..."));
+        assert!(!output.contains("result_repr:\nNone"));
     }
 }

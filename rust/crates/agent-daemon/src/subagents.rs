@@ -57,13 +57,26 @@ pub(crate) async fn subagent_spawn(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let request = SubagentSpawnRequest::from_params(params)?;
-    let spawned = spawn_subagent(state, request).await?;
-    Ok(json!({
+    let spawned = spawn_subagent(state, request, ParentSpawnState::MustBeIdle).await?;
+    Ok(spawned_subagent_view(spawned))
+}
+
+pub(crate) async fn subagent_spawn_from_active_parent(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let request = SubagentSpawnRequest::from_params(params)?;
+    let spawned = spawn_subagent(state, request, ParentSpawnState::MayBeActive).await?;
+    Ok(spawned_subagent_view(spawned))
+}
+
+fn spawned_subagent_view(spawned: SpawnedSubagent) -> Value {
+    json!({
         "parent_session_id": spawned.parent_session_id,
         "child_session_id": spawned.started.session_id,
         "activity": spawned.started.activity,
         "replayed": spawned.started.replayed,
-    }))
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -170,9 +183,16 @@ struct SpawnedSubagent {
     started: StartedSession,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParentSpawnState {
+    MustBeIdle,
+    MayBeActive,
+}
+
 async fn spawn_subagent(
     state: &AppState,
     request: SubagentSpawnRequest,
+    parent_spawn_state: ParentSpawnState,
 ) -> std::result::Result<SpawnedSubagent, RpcError> {
     let parent_config = state
         .repo
@@ -214,7 +234,10 @@ async fn spawn_subagent(
     }
 
     let parent_driver = SessionDriver::acquire(state, &request.parent_session_id).await;
-    parent_driver.ensure_idle_for_source_mutation().await?;
+    match parent_spawn_state {
+        ParentSpawnState::MustBeIdle => parent_driver.ensure_idle_for_source_mutation().await?,
+        ParentSpawnState::MayBeActive => parent_driver.recover_if_needed().await?,
+    }
 
     let child_session_id = request
         .child_session_id

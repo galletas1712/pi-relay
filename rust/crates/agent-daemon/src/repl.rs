@@ -1,13 +1,11 @@
-use std::collections::HashMap;
-use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Instant;
-
 use agent_store::SessionActivity;
 use agent_vocab::{TranscriptItem, TurnOutcome, UserMessage};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashMap;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
@@ -17,12 +15,10 @@ use crate::codec::{from_params, required_string};
 use crate::rpc_views;
 use crate::runtime::SessionDriver;
 use crate::state::AppState;
-use crate::subagents::{require_known_subagent, subagent_list, subagent_spawn};
+use crate::subagents::{require_known_subagent, subagent_list, subagent_spawn_from_active_parent};
 use crate::types::RpcError;
 use crate::{enqueue_session_input, interrupt_session, SessionInputRequest};
 
-const DEFAULT_REPL_TIMEOUT_MS: u64 = 10 * 60 * 1000;
-const DEFAULT_SUBAGENT_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const SUBAGENT_POLL_INTERVAL_MS: u64 = 250;
 const PARENT_CONTEXT_MAX_CHARS: usize = 60 * 1024;
 
@@ -40,22 +36,28 @@ impl ReplRegistry {
         timeout_ms: Option<u64>,
     ) -> std::result::Result<Value, RpcError> {
         let repl = self.get_or_start(session_id).await?;
-        let timeout_ms = timeout_ms.unwrap_or(DEFAULT_REPL_TIMEOUT_MS);
         let run = repl.execute(state, code);
-        match timeout(Duration::from_millis(timeout_ms), run).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(error)) => {
+        let result = if let Some(timeout_ms) = timeout_ms {
+            match timeout(Duration::from_millis(timeout_ms), run).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.remove_and_kill(session_id).await;
+                    return Err(RpcError::new(
+                        "repl_timeout",
+                        format!("Python REPL execution exceeded {timeout_ms}ms"),
+                    ));
+                }
+            }
+        } else {
+            run.await
+        };
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) => {
                 if matches!(error.code.as_str(), "repl_exited" | "repl_protocol_error") {
                     self.remove_and_kill(session_id).await;
                 }
                 Err(error)
-            }
-            Err(_) => {
-                self.remove_and_kill(session_id).await;
-                Err(RpcError::new(
-                    "repl_timeout",
-                    format!("Python REPL execution exceeded {timeout_ms}ms"),
-                ))
             }
         }
     }
@@ -278,6 +280,9 @@ async fn handle_host_call(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     match method {
+        "subagents.spawn" => subagents_spawn_host(state, parent_session_id, params).await,
+        "subagents.spawn_bulk" => subagents_spawn_bulk_host(state, parent_session_id, params).await,
+        "subagents.wait" => subagents_wait_host(state, parent_session_id, params).await,
         "subagents.call" => subagents_call(state, parent_session_id, params).await,
         "subagents.call_bulk" => subagents_call_bulk(state, parent_session_id, params).await,
         "subagents.list" => subagents_list_host(state, parent_session_id, params).await,
@@ -300,7 +305,6 @@ struct SubagentCallParams {
     role_workspace: Option<String>,
     #[serde(default)]
     sources: Vec<Value>,
-    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -317,22 +321,31 @@ struct SubagentCallSpec {
 #[derive(Debug, Deserialize)]
 struct SubagentCallBulkParams {
     calls: Vec<SubagentCallSpec>,
-    timeout_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct SpawnedCall {
     child_session_id: String,
-    role: String,
+    role: Option<String>,
 }
 
-async fn subagents_call(
+#[derive(Debug, Deserialize)]
+struct SubagentWaitTarget {
+    session_id: String,
+    role: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SubagentWaitParams {
+    targets: Vec<SubagentWaitTarget>,
+}
+
+async fn subagents_spawn_host(
     state: &AppState,
     parent_session_id: &str,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let params: SubagentCallParams = from_params(params)?;
-    let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_SUBAGENT_TIMEOUT_MS);
     let spawned = spawn_call(
         state,
         parent_session_id,
@@ -345,7 +358,84 @@ async fn subagents_call(
         },
     )
     .await?;
-    wait_for_children_idle(state, &[spawned.child_session_id.clone()], timeout_ms).await?;
+    spawned_handle_value(state, spawned).await
+}
+
+async fn subagents_spawn_bulk_host(
+    state: &AppState,
+    parent_session_id: &str,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let params: SubagentCallBulkParams = from_params(params)?;
+    if params.calls.is_empty() {
+        return Err(RpcError::new("invalid_params", "calls cannot be empty"));
+    }
+    let mut handles = Vec::with_capacity(params.calls.len());
+    for call in params.calls {
+        let spawned = spawn_call(state, parent_session_id, call).await?;
+        handles.push(spawned_handle_value(state, spawned).await?);
+    }
+    Ok(json!(handles))
+}
+
+async fn subagents_wait_host(
+    state: &AppState,
+    parent_session_id: &str,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let params: SubagentWaitParams = from_params(params)?;
+    if params.targets.is_empty() {
+        return Err(RpcError::new("invalid_params", "targets cannot be empty"));
+    }
+    let mut targets = Vec::with_capacity(params.targets.len());
+    for target in params.targets {
+        let child_session_id = target.session_id.trim().to_string();
+        if child_session_id.is_empty() {
+            return Err(RpcError::new(
+                "invalid_params",
+                "session_id cannot be empty",
+            ));
+        }
+        require_known_subagent(state, parent_session_id, &child_session_id).await?;
+        targets.push(SpawnedCall {
+            child_session_id,
+            role: target
+                .role
+                .map(|role| role.trim().to_string())
+                .filter(|role| !role.is_empty()),
+        });
+    }
+    let child_session_ids = targets
+        .iter()
+        .map(|target| target.child_session_id.clone())
+        .collect::<Vec<_>>();
+    wait_for_children_idle(state, &child_session_ids).await?;
+    let mut results = Vec::with_capacity(targets.len());
+    for target in targets {
+        results.push(call_result(state, target).await?);
+    }
+    Ok(json!(results))
+}
+
+async fn subagents_call(
+    state: &AppState,
+    parent_session_id: &str,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let params: SubagentCallParams = from_params(params)?;
+    let spawned = spawn_call(
+        state,
+        parent_session_id,
+        SubagentCallSpec {
+            role: params.role,
+            message: params.message,
+            fork_context: params.fork_context,
+            role_workspace: params.role_workspace,
+            sources: params.sources,
+        },
+    )
+    .await?;
+    wait_for_children_idle(state, &[spawned.child_session_id.clone()]).await?;
     call_result(state, spawned).await
 }
 
@@ -358,7 +448,6 @@ async fn subagents_call_bulk(
     if params.calls.is_empty() {
         return Err(RpcError::new("invalid_params", "calls cannot be empty"));
     }
-    let timeout_ms = params.timeout_ms.unwrap_or(DEFAULT_SUBAGENT_TIMEOUT_MS);
     let mut spawned = Vec::with_capacity(params.calls.len());
     for call in params.calls {
         spawned.push(spawn_call(state, parent_session_id, call).await?);
@@ -367,7 +456,7 @@ async fn subagents_call_bulk(
         .iter()
         .map(|call| call.child_session_id.clone())
         .collect::<Vec<_>>();
-    wait_for_children_idle(state, &child_session_ids, timeout_ms).await?;
+    wait_for_children_idle(state, &child_session_ids).await?;
     let mut results = Vec::with_capacity(spawned.len());
     for call in spawned {
         results.push(call_result(state, call).await?);
@@ -411,7 +500,7 @@ async fn spawn_call(
     if let Some(initial_context) = initial_context {
         params["initial_context"] = json!(initial_context);
     }
-    let spawned = subagent_spawn(state, params).await?;
+    let spawned = subagent_spawn_from_active_parent(state, params).await?;
     let child_session_id = spawned
         .get("child_session_id")
         .and_then(Value::as_str)
@@ -419,17 +508,30 @@ async fn spawn_call(
         .to_string();
     Ok(SpawnedCall {
         child_session_id,
-        role,
+        role: Some(role),
     })
+}
+
+async fn spawned_handle_value(
+    state: &AppState,
+    spawned: SpawnedCall,
+) -> std::result::Result<Value, RpcError> {
+    let activity = state
+        .repo
+        .activity(&spawned.child_session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(json!({
+        "session_id": spawned.child_session_id,
+        "role": spawned.role,
+        "activity": activity,
+    }))
 }
 
 async fn wait_for_children_idle(
     state: &AppState,
     child_session_ids: &[String],
-    timeout_ms: u64,
 ) -> std::result::Result<(), RpcError> {
-    let started = Instant::now();
-    let timeout_duration = Duration::from_millis(timeout_ms);
     loop {
         let mut all_idle = true;
         for child_session_id in child_session_ids {
@@ -445,12 +547,6 @@ async fn wait_for_children_idle(
         }
         if all_idle {
             return Ok(());
-        }
-        if started.elapsed() >= timeout_duration {
-            return Err(RpcError::new(
-                "subagent_timeout",
-                format!("subagent call exceeded {timeout_ms}ms"),
-            ));
         }
         sleep(Duration::from_millis(SUBAGENT_POLL_INTERVAL_MS)).await;
     }
@@ -659,6 +755,7 @@ import io
 import json
 import sys
 import traceback
+import types
 
 _CONTROL_IN = sys.stdin
 _CONTROL_OUT = sys.stdout
@@ -732,8 +829,20 @@ class SubagentResult:
 
 
 class SubagentHandle:
-    def __init__(self, session_id):
+    def __init__(self, session_id, role=None, activity=None):
         self.session_id = session_id
+        self.role = role
+        self.activity = activity
+
+    def to_dict(self):
+        return {
+            "session_id": self.session_id,
+            "role": self.role,
+            "activity": self.activity,
+        }
+
+    def wait(self):
+        return subagents.wait(self)
 
     @property
     def transcript(self):
@@ -749,7 +858,7 @@ class SubagentHandle:
         return _host_call("subagents.interrupt", {"session_id": self.session_id})
 
     def __repr__(self):
-        return f"SubagentHandle({self.session_id!r})"
+        return f"SubagentHandle(session_id={self.session_id!r}, role={self.role!r}, activity={self.activity!r})"
 
 
 def _source_id(source):
@@ -760,34 +869,74 @@ def _source_id(source):
     return source
 
 
-class Subagents:
-    def call(self, role, message, fork_context=False, timeout=None, role_workspace=None, sources=None):
-        params = {
-            "role": role,
-            "message": message,
-            "fork_context": bool(fork_context),
-        }
-        if timeout is not None:
-            params["timeout_ms"] = int(float(timeout) * 1000)
-        if role_workspace is not None:
-            params["role_workspace"] = role_workspace
-        if sources is not None:
-            params["sources"] = [_source_id(source) for source in sources]
-        return SubagentResult(_host_call("subagents.call", params))
+def _wait_target(target):
+    if isinstance(target, SubagentResult) or isinstance(target, SubagentHandle):
+        return {"session_id": target.session_id, "role": getattr(target, "role", None)}
+    if isinstance(target, dict):
+        session_id = target.get("session_id") or target.get("child_session_id")
+        return {"session_id": session_id, "role": target.get("role")}
+    return {"session_id": target, "role": None}
 
-    def call_bulk(self, calls, timeout=None):
-        normalized = []
-        for call in calls:
-            item = dict(call)
-            if "timeout" in item and "timeout_ms" not in item:
-                item["timeout_ms"] = int(float(item.pop("timeout")) * 1000)
-            if "sources" in item and item["sources"] is not None:
-                item["sources"] = [_source_id(source) for source in item["sources"]]
-            normalized.append(item)
-        params = {"calls": normalized}
-        if timeout is not None:
-            params["timeout_ms"] = int(float(timeout) * 1000)
-        return [SubagentResult(item) for item in _host_call("subagents.call_bulk", params)]
+
+def _spawn_params(role, message, fork_context=False, role_workspace=None, sources=None):
+    params = {
+        "role": role,
+        "message": message,
+        "fork_context": bool(fork_context),
+    }
+    if role_workspace is not None:
+        params["role_workspace"] = role_workspace
+    if sources is not None:
+        params["sources"] = [_source_id(source) for source in sources]
+    return params
+
+
+def _normalize_call(call):
+    item = dict(call)
+    item.pop("timeout", None)
+    item.pop("timeout_ms", None)
+    if "sources" in item and item["sources"] is not None:
+        item["sources"] = [_source_id(source) for source in item["sources"]]
+    return item
+
+
+class Subagents:
+    def spawn(self, role, message, fork_context=False, role_workspace=None, sources=None):
+        data = _host_call(
+            "subagents.spawn",
+            _spawn_params(role, message, fork_context, role_workspace, sources),
+        )
+        return SubagentHandle(
+            data.get("session_id"),
+            role=data.get("role"),
+            activity=data.get("activity"),
+        )
+
+    def spawn_bulk(self, calls):
+        data = _host_call("subagents.spawn_bulk", {"calls": [_normalize_call(call) for call in calls]})
+        return [
+            SubagentHandle(
+                item.get("session_id"),
+                role=item.get("role"),
+                activity=item.get("activity"),
+            )
+            for item in data
+        ]
+
+    def wait(self, targets):
+        single = not isinstance(targets, (list, tuple))
+        target_list = [targets] if single else list(targets)
+        results = [SubagentResult(item) for item in _host_call(
+            "subagents.wait",
+            {"targets": [_wait_target(target) for target in target_list]},
+        )]
+        return results[0] if single else results
+
+    def call(self, role, message, fork_context=False, role_workspace=None, sources=None):
+        return self.spawn(role, message, fork_context, role_workspace, sources).wait()
+
+    def call_bulk(self, calls):
+        return self.wait(self.spawn_bulk(calls))
 
     def list(self, parent_session_id=None):
         return _host_call("subagents.list", {"parent_session_id": parent_session_id})
@@ -797,6 +946,24 @@ class Subagents:
 
 
 subagents = Subagents()
+
+
+class _SubagentsModule(types.ModuleType):
+    def __getitem__(self, session_id):
+        return subagents[session_id]
+
+
+_subagents_module = _SubagentsModule("subagents")
+_subagents_module.spawn = subagents.spawn
+_subagents_module.spawn_bulk = subagents.spawn_bulk
+_subagents_module.wait = subagents.wait
+_subagents_module.call = subagents.call
+_subagents_module.call_bulk = subagents.call_bulk
+_subagents_module.list = subagents.list
+_subagents_module.SubagentResult = SubagentResult
+_subagents_module.SubagentHandle = SubagentHandle
+_subagents_module.subagents = subagents
+sys.modules["subagents"] = _subagents_module
 
 
 def _exec_cell(code, globals_dict):
@@ -915,6 +1082,26 @@ mod tests {
         assert_eq!(second["id"], 2);
         assert_eq!(second["ok"], true);
         assert_eq!(second["result_json"], 42);
+
+        repl.write_control(json!({
+            "type": "exec",
+            "id": 3,
+            "code": "import subagents\nprint(hasattr(subagents, 'spawn'), hasattr(subagents, 'spawn_bulk'), hasattr(subagents, 'wait'), hasattr(subagents, 'call'))\nsubagents['child']",
+        }))
+        .await
+        .expect("write import exec");
+        let imported = repl.read_control().await.expect("read import result");
+        assert_eq!(imported["type"], "exec_result");
+        assert_eq!(imported["id"], 3);
+        assert_eq!(imported["ok"], true);
+        assert_eq!(imported["stdout"], "True True True True\n");
+        assert!(imported["result_repr"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("SubagentHandle"));
+        assert_eq!(imported["result_json"]["session_id"], "child");
+        assert!(imported["result_json"].get("role").is_some());
+        assert!(imported["result_json"].get("activity").is_some());
 
         repl.kill().await;
     }
