@@ -1194,8 +1194,7 @@ Request:
 ```json
 {
   "session_id": "session_parent",
-  "code": "review = subagents.call(role='reviewer', message='Review this patch')\nreview",
-  "timeout_ms": 600000
+  "code": "review = subagents.spawn(role='reviewer', message='Review this patch')\nsubagents.wait(review)"
 }
 ```
 
@@ -1220,31 +1219,40 @@ Response:
 }
 ```
 
-The REPL preimports `subagents`:
+The REPL exposes `subagents` directly; `import subagents` also works but is not required:
 
 ```python
-result = subagents.call(role="reviewer", message="Review this", fork_context=False)
-results = subagents.call_bulk([
+handle = subagents.spawn(role="reviewer", message="Review this", fork_context=False)
+workers = subagents.spawn_bulk([
     {"role": "worker", "message": "Try approach A", "fork_context": True},
     {"role": "worker", "message": "Try approach B", "fork_context": True},
 ])
+result = subagents.wait(handle)
+results = subagents.wait(workers)
 merge = subagents.call(
     role="merger",
     message="Merge the useful parts of the worker proposals.",
     sources=results,
 )
 children = subagents.list()
-turns = subagents[result.session_id].transcript
-subagents[result.session_id].steer("Change direction")
-subagents[result.session_id].interrupt()
+turns = subagents[handle.session_id].transcript
+handle.steer("Change direction")
+handle.interrupt()
 ```
 
-`subagents.call(...)` and `subagents.call_bulk(...)` are blocking Python helper
-semantics layered over the non-blocking `subagent.spawn` backend primitive.
-`call_bulk` issues the spawn requests back-to-back, then waits for all children
-to become idle before returning.
+`subagents.spawn(...)` and `subagents.spawn_bulk(...)` return `SubagentHandle`s
+immediately after creating child sessions. `subagents.wait(handle_or_handles)` is
+the explicit blocking operation: it waits until the selected child sessions are
+idle, then returns `SubagentResult` objects with final text/transcript snippets.
+`subagents.call(...)` and `subagents.call_bulk(...)` are convenience wrappers for
+spawn-then-wait and should only be used when the parent intentionally wants to
+block immediately. These helpers do not have subagent timeouts; children may run
+for a long time and should either complete normally or be interrupted explicitly.
+The provider-visible `PythonRepl` tool reports Python exceptions as tool errors
+with stdout/stderr and traceback, while the websocket `repl.exec` RPC returns the
+raw `ok: false` REPL payload.
 
-`sources=[...]` may be passed to `subagents.call(...)` with known child
+`sources=[...]` may be passed to `subagents.spawn(...)`/`subagents.call(...)` with known child
 `SubagentResult`s, `SubagentHandle`s, dicts containing `session_id`, or session-id
 strings. The daemon validates each source is a child of the current parent and
 prepares compact source metadata for the spawned child. For git workspaces, each

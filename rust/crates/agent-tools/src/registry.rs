@@ -339,7 +339,7 @@ fn load_skill_definition() -> ToolDefinition {
 fn python_repl_definition() -> ToolDefinition {
     ToolDefinition::new(
         "PythonRepl",
-        "Execute Python code in this session's stateful orchestration REPL. Use this for subagent delegation and for keeping orchestration state in Python variables. The REPL has `subagents` preimported.",
+        "Execute Python code in this session's stateful orchestration REPL. Use this for subagent delegation and for keeping orchestration state in Python variables. The REPL provides `subagents` as a global and as an importable module.",
         json!({
             "type": "object",
             "properties": {
@@ -349,7 +349,7 @@ fn python_repl_definition() -> ToolDefinition {
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Optional execution timeout in milliseconds."
+                    "description": "Optional execution timeout in milliseconds for short Python snippets. Omit this for subagent delegation because child sessions may run for a long time."
                 }
             },
             "required": ["code"],

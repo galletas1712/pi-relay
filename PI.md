@@ -41,8 +41,12 @@ You may use the following tools to help you accomplish your tasks:
 
 For complex work, use the `{{ tools.aliases.python_repl | default(value="PythonRepl") }}` tool as the subagent delegation and orchestration surface.
 
-- Use `subagents.call(role, message, fork_context=False, sources=None)` for one delegated task.
-- Use `subagents.call_bulk([...])` for independent work that should run in parallel.
+- Use `handle = subagents.spawn(role, message, fork_context=False, sources=None)` to start one child and keep control in the parent.
+- Use `handles = subagents.spawn_bulk([...])` to start independent children in parallel.
+- Use `result = subagents.wait(handle)` or `results = subagents.wait(handles)` only when you explicitly want to block until child sessions are idle.
+- `subagents.call(...)` and `subagents.call_bulk(...)` are convenience wrappers for spawn-then-wait.
+- The REPL exposes `subagents` directly; `import subagents` also works but is not required.
+- Do not set a timeout for subagent delegation; child sessions may run for a long time and should complete or be interrupted explicitly.
 - Prefer fresh, focused child context. Set `fork_context=True` only when the child needs the parent transcript/context.
 - Store subagent results in Python variables and pass only the minimum useful context forward.
 - REPL variables persist only while the daemon/REPL process is alive. Durable state lives in sessions, subagent transcripts, and workspaces; after a restart, reconstruct needed context with `subagents.list()` and subagent transcripts.
