@@ -7,7 +7,8 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 use super::prompt::{
-    load_skills_for_session_workspaces, load_skills_for_session_workspaces_with_home,
+    load_global_skills_from_dir, load_parsed_skill_file, load_skills_for_session_workspaces,
+    load_skills_for_session_workspaces_with_home,
 };
 
 pub(crate) fn load_skill_result(
@@ -104,6 +105,7 @@ pub(crate) struct ResolvedSkillRole {
 }
 
 pub(crate) fn resolve_skill_role(
+    prompt_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     name: &str,
@@ -131,7 +133,9 @@ pub(crate) fn resolve_skill_role(
         .collect::<Vec<_>>();
     match matches.len() {
         1 => role_from_skill(matches.remove(0)),
-        0 => builtin_role(name).ok_or_else(|| anyhow!("role skill not found: {name}")),
+        0 => packaged_role(prompt_root, name)
+            .ok_or_else(|| anyhow!("role skill not found: {name}"))
+            .and_then(role_from_skill),
         _ => {
             let mut scopes = matches
                 .iter()
@@ -146,53 +150,25 @@ pub(crate) fn resolve_skill_role(
     }
 }
 
-fn builtin_role(name: &str) -> Option<ResolvedSkillRole> {
-    let (description, content) = match name {
-        "worker" => (
-            "Perform delegated implementation, research, or artifact work.",
-            "You are a delegated worker subagent.\n\
-- Read the task and any parent-provided context carefully.\n\
-- Make the smallest coherent artifact or change for the delegated task.\n\
-- Do not claim verification or metric success unless you actually ran the validation.\n\
-- Report artifacts, commands run, assumptions, risks, blockers, and next actions clearly.",
-        ),
-        "reviewer" => (
-            "Review artifacts and handoffs against the objective.",
-            "You are a delegated reviewer subagent.\n\
-- Compare the implementation or proposal against the objective and parent-provided context.\n\
-- Identify blocking issues, non-blocking issues, missing evidence, and recommended next steps.\n\
-- Run lightweight static checks when appropriate and possible.\n\
-- Prefer structured output with `pass`, `blocking_issues`, `nonblocking_issues`, `commands`, `evidence`, and `recommended_next_step`.\n\
-- Do not substitute review/static success for requested runtime/test/metric success.",
-        ),
-        "tester" => (
-            "Run validation and report evidence.",
-            "You are a delegated tester subagent.\n\
-- Run or design the validation requested by the parent task.\n\
-- Capture exact commands, environment notes, results, metrics, artifacts, and failures.\n\
-- Return structured output with `pass`, `commands`, `metrics`, `evidence`, and `failures`.\n\
-- Do not claim success without evidence that matches the acceptance criteria.",
-        ),
-        _ => return None,
-    };
-    Some(ResolvedSkillRole {
-        name: name.to_string(),
-        workspace: None,
-        description: description.to_string(),
-        file_path: PathBuf::from(format!("<builtin:{name}>")),
-        content: content.to_string(),
-    })
+fn load_packaged_role_skills(prompt_root: &Path) -> Vec<Skill> {
+    load_global_skills_from_dir(&prompt_root.join("subagent-roles"))
+}
+
+fn packaged_role(prompt_root: &Path, name: &str) -> Option<Skill> {
+    load_packaged_role_skills(prompt_root)
+        .into_iter()
+        .find(|skill| skill.name == name)
 }
 
 fn role_from_skill(skill: Skill) -> Result<ResolvedSkillRole> {
-    let content = std::fs::read_to_string(&skill.file_path)
+    let parsed = load_parsed_skill_file(&skill.file_path)
         .with_context(|| format!("read role skill {}", skill.file_path.display()))?;
     Ok(ResolvedSkillRole {
         name: skill.name,
         workspace: skill.workspace,
         description: skill.description,
         file_path: skill.file_path,
-        content: content.trim().to_string(),
+        content: parsed.body,
     })
 }
 
@@ -261,6 +237,7 @@ mod tests {
 
         let role = resolve_skill_role(
             &outer_cwd,
+            &outer_cwd,
             &[SessionWorkspace::local("repo", "")],
             "reviewer",
             Some("repo"),
@@ -269,10 +246,7 @@ mod tests {
         assert_eq!(role.name, "reviewer");
         assert_eq!(role.workspace.as_deref(), Some("repo"));
         assert_eq!(role.description, "Review code.");
-        assert_eq!(
-            role.content,
-            "---\nname: reviewer\ndescription: Review code.\n---\n\nReview carefully."
-        );
+        assert_eq!(role.content, "Review carefully.");
 
         std::fs::remove_dir_all(outer_cwd).ok();
     }
@@ -290,6 +264,7 @@ mod tests {
         .expect("skill file");
 
         let role = resolve_skill_role(
+            &outer_cwd,
             &outer_cwd,
             &[SessionWorkspace::local("repo", "")],
             "context-inspector",
@@ -319,6 +294,7 @@ mod tests {
 
         let error = resolve_skill_role(
             &outer_cwd,
+            &outer_cwd,
             &[
                 SessionWorkspace::local("repo-a", ""),
                 SessionWorkspace::local("repo-b", ""),
@@ -333,9 +309,16 @@ mod tests {
     }
 
     #[test]
-    fn resolves_builtin_worker_role_when_skill_is_absent() {
-        let outer_cwd = make_temp_dir("resolve-builtin-role");
+    fn resolves_packaged_worker_role_when_skill_is_absent() {
+        let outer_cwd = make_temp_dir("resolve-packaged-role");
+        write_role(
+            &outer_cwd.join("subagent-roles/worker/SKILL.md"),
+            "worker",
+            "Perform delegated implementation, research, or artifact work.",
+            "You are a delegated worker subagent.\n\nReport clearly.",
+        );
         let role = resolve_skill_role(
+            &outer_cwd,
             &outer_cwd,
             &[SessionWorkspace::local("repo", "")],
             "worker",
@@ -348,8 +331,14 @@ mod tests {
             role.description,
             "Perform delegated implementation, research, or artifact work."
         );
-        assert!(role.content.contains("delegated worker subagent"));
-        assert_eq!(role.file_path, PathBuf::from("<builtin:worker>"));
+        assert_eq!(
+            role.content,
+            "You are a delegated worker subagent.\n\nReport clearly."
+        );
+        assert_eq!(
+            role.file_path,
+            outer_cwd.join("subagent-roles/worker/SKILL.md")
+        );
 
         std::fs::remove_dir_all(outer_cwd).ok();
     }
@@ -358,6 +347,7 @@ mod tests {
     fn workspace_role_still_requires_a_skill_file() {
         let outer_cwd = make_temp_dir("resolve-missing-workspace-role");
         let error = resolve_skill_role(
+            &outer_cwd,
             &outer_cwd,
             &[SessionWorkspace::local("repo", "")],
             "worker",
@@ -410,5 +400,15 @@ mod tests {
             std::env::temp_dir().join(format!("pi-relay-{prefix}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir
+    }
+
+    fn write_role(path: &Path, name: &str, description: &str, body: &str) {
+        let parent = path.parent().expect("role path parent");
+        std::fs::create_dir_all(parent).expect("role dir");
+        std::fs::write(
+            path,
+            format!("---\nname: {name}\ndescription: {description}\n---\n\n{body}\n"),
+        )
+        .expect("role file");
     }
 }

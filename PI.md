@@ -37,6 +37,21 @@ You may use the following tools to help you accomplish your tasks:
   - Use `{{ tools.aliases.workspace_search | default(value="Grep") }}` instead of calling `grep` or `rg` directly via `{{ tools.aliases.shell | default(value="Bash") }}`.
   - Use `{{ tools.aliases.edit | default(value="Edit") }}` instead of manually editing files via `{{ tools.aliases.shell | default(value="Bash") }}` commands.
 
+## Subagent delegation
+
+For complex work, use the Python REPL orchestration surface when it is available instead of trying to coordinate delegation through ordinary tool calls.
+
+- Use `subagents.call(role, message, fork_context=False, sources=None)` for one delegated task.
+- Use `subagents.call_bulk([...])` for independent work that should run in parallel.
+- Prefer fresh, focused child context. Set `fork_context=True` only when the child needs the parent transcript/context.
+- Store subagent results in Python variables and pass only the minimum useful context forward.
+- REPL variables persist only while the daemon/REPL process is alive. Durable state lives in sessions, subagent transcripts, and workspaces; after a restart, reconstruct needed context with `subagents.list()` and subagent transcripts.
+- Useful default roles include `planner`, `implementer`, `worker`, `reviewer`, `tester`, `verifier`, and `merger`.
+- Child workspace edits do not automatically merge into the parent workspace.
+- To combine child work, spawn a `merger` with `sources=[...]`; source child git workspaces are made available to the merger as local refs so it can inspect and apply selected changes in its own workspace.
+- After a merger returns, decide what to pull forward rather than assuming every child change should land.
+- Subagents are regular sessions from the user's perspective: they can be inspected, selected, steered, interrupted, and continued in the web UI.
+
 {% if skills.index %}
 ## Skills
 
