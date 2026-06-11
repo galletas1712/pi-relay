@@ -58,8 +58,8 @@ impl ModelContext {
         self
     }
 
-    pub(crate) fn recover_open_turn(mut self, closure: OpenTurnClosure) -> Self {
-        Self::recover_open_turn_items(&mut self.items, closure);
+    pub(crate) fn close_open_turn_to_boundary(mut self, closure: OpenTurnClosure) -> Self {
+        Self::close_open_turn_items_to_boundary(&mut self.items, closure);
         self.provider_replay.resize_with(self.items.len(), Vec::new);
         self
     }
@@ -160,28 +160,56 @@ impl ModelContext {
         });
     }
 
-    fn recover_open_turn_items(items: &mut Vec<TranscriptItem>, closure: OpenTurnClosure) {
+    fn close_open_turn_items_to_boundary(
+        items: &mut Vec<TranscriptItem>,
+        closure: OpenTurnClosure,
+    ) {
         let Some((turn_id, turn_start)) = Self::open_turn_start(items) else {
             return;
         };
+
         Self::complete_open_tool_calls(items, turn_start, turn_id, closure);
+        if !Self::is_turn_boundary_items(items) {
+            items.push(TranscriptItem::TurnFinished {
+                turn_id,
+                outcome: closure.turn_outcome(),
+            });
+        }
     }
 
     fn open_turn_start(items: &[TranscriptItem]) -> Option<(TurnId, usize)> {
-        items
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, item)| match item {
-                TranscriptItem::TurnStarted { turn_id } => Some(Some((*turn_id, index))),
-                TranscriptItem::TurnFinished { .. } => Some(None),
-                TranscriptItem::CompactionSummary(_)
-                | TranscriptItem::UserMessage(_)
+        let mut saw_open_tail = false;
+        for (index, item) in items.iter().enumerate().rev() {
+            match item {
+                TranscriptItem::TurnStarted { turn_id } => return Some((*turn_id, index)),
+                TranscriptItem::TurnFinished { .. } => return None,
+                TranscriptItem::CompactionSummary(summary) => {
+                    // Mid-turn compaction replaces the original `turn_started`
+                    // with a summary root. If assistant/tool rows were appended
+                    // after that root and the process died, crash recovery must
+                    // still be able to complete the open turn instead of leaving
+                    // the active leaf at a non-boundary tool item.
+                    return saw_open_tail.then_some((summary.last_turn_id, index));
+                }
+                TranscriptItem::UserMessage(_)
                 | TranscriptItem::AssistantMessage(_)
                 | TranscriptItem::ToolCallStarted { .. }
-                | TranscriptItem::ToolResult(_) => None,
-            })
-            .flatten()
+                | TranscriptItem::ToolResult(_) => saw_open_tail = true,
+            }
+        }
+        None
+    }
+
+    fn is_turn_boundary_items(items: &[TranscriptItem]) -> bool {
+        for item in items.iter().rev() {
+            match item {
+                TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_) => {
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+        true
     }
 
     fn complete_open_tool_calls(
@@ -438,6 +466,52 @@ mod tests {
             TranscriptItem::ToolResult(ToolResultMessage::crashed(second.id.clone(), "read"))
         );
         assert_eq!(transcript.open_turn_ready_to_continue(), Some(TurnId(7)));
+    }
+
+    #[test]
+    fn crashed_compacted_tail_patches_missing_tool_results_and_finishes_turn() {
+        let first = tool_call(1, "bash");
+        let second = tool_call(2, "read");
+
+        let transcript = ModelContext::from_transcript_items(vec![
+            TranscriptItem::CompactionSummary(CompactionSummary::new(
+                "session",
+                "source",
+                "summary",
+                None,
+                TurnId(58),
+            )),
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![
+                    AssistantItem::ToolCall(first.clone()),
+                    AssistantItem::ToolCall(second.clone()),
+                ],
+            }),
+            TranscriptItem::ToolCallStarted {
+                turn_id: TurnId(58),
+                tool_call: first.clone(),
+            },
+            TranscriptItem::ToolResult(tool_result(first.id.clone(), "bash")),
+        ])
+        .close_open_turn_to_boundary(OpenTurnClosure::Crashed);
+
+        assert!(transcript.transcript_items().iter().any(|item| matches!(
+            item,
+            TranscriptItem::ToolCallStarted { turn_id, tool_call }
+                if *turn_id == TurnId(58) && tool_call.id == second.id
+        )));
+        assert!(transcript.transcript_items().iter().any(|item| matches!(
+            item,
+            TranscriptItem::ToolResult(result)
+                if result.tool_call_id == second.id && result.status == ToolResultStatus::Crashed
+        )));
+        assert_eq!(
+            transcript.transcript_items().last(),
+            Some(&TranscriptItem::TurnFinished {
+                turn_id: TurnId(58),
+                outcome: TurnOutcome::Crashed,
+            })
+        );
     }
 
     #[test]

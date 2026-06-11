@@ -603,24 +603,17 @@ impl AgentSession {
         transcript_store: &mut TranscriptStore,
         closure: OpenTurnClosure,
     ) -> Result<(), HistoryOperationError> {
-        if transcript_store.is_turn_boundary()
-            || transcript_store
-                .model_context()
-                .open_turn_ready_to_continue()
-                .is_some()
-        {
+        if transcript_store.is_turn_boundary() {
             return Ok(());
         }
 
         let items = transcript_store.model_context().into_transcript_items();
         let original_len = items.len();
+        // Stored-session recovery is repairing abandoned durable state, not
+        // continuing live tool execution. Persist a real turn boundary so APIs
+        // that require boundary leaves never see a recovered tool_result leaf.
         let recovered_context =
-            ModelContext::from_transcript_items(items).recover_open_turn(closure);
-        let recovered_context = if recovered_context.open_turn_ready_to_continue().is_some() {
-            recovered_context
-        } else {
-            recovered_context.close_open_turn(closure)
-        };
+            ModelContext::from_transcript_items(items).close_open_turn_to_boundary(closure);
         let recovered = recovered_context.into_transcript_items();
         if recovered.len() == original_len {
             return Err(HistoryOperationError::Store(
@@ -629,12 +622,7 @@ impl AgentSession {
         }
 
         transcript_store.append_transcript_items(recovered.into_iter().skip(original_len));
-        if transcript_store.is_turn_boundary()
-            || transcript_store
-                .model_context()
-                .open_turn_ready_to_continue()
-                .is_some()
-        {
+        if transcript_store.is_turn_boundary() {
             Ok(())
         } else {
             Err(HistoryOperationError::Store(

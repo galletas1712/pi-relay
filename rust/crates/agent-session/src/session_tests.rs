@@ -291,7 +291,7 @@ fn from_model_context_closes_open_turn_as_crashed() {
 }
 
 #[test]
-fn from_transcript_store_repairs_open_tool_turn_and_continues() {
+fn from_transcript_store_repairs_open_tool_turn_to_boundary() {
     let tool_call = ToolCall {
         id: ToolCallId::from_u64(1),
         tool_name: "read".to_string(),
@@ -328,9 +328,74 @@ fn from_transcript_store_repairs_open_tool_turn_and_continues() {
                 tool_call.id,
                 tool_call.tool_name,
             )),
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(7),
+                outcome: TurnOutcome::Crashed,
+            },
         ]
     );
-    assert!(session.is_ready_to_continue());
+    assert!(session.transcript_store().is_turn_boundary());
+    assert!(!session.is_ready_to_continue());
+}
+
+#[test]
+fn stored_session_repairs_compacted_open_tool_turn_to_boundary() {
+    let first = ToolCall {
+        id: ToolCallId::from_u64(1),
+        tool_name: "bash".to_string(),
+        args_json: "{}".to_string(),
+    };
+    let second = ToolCall {
+        id: ToolCallId::from_u64(2),
+        tool_name: "bash".to_string(),
+        args_json: "{}".to_string(),
+    };
+    let store = TranscriptStore::from_model_context(&ModelContext::from_transcript_items(vec![
+        TranscriptItem::CompactionSummary(CompactionSummary::new(
+            "session",
+            "source",
+            "summary",
+            None,
+            TurnId(58),
+        )),
+        TranscriptItem::AssistantMessage(AssistantMessage {
+            items: vec![
+                AssistantItem::ToolCall(first.clone()),
+                AssistantItem::ToolCall(second.clone()),
+            ],
+        }),
+        TranscriptItem::ToolCallStarted {
+            turn_id: TurnId(58),
+            tool_call: first.clone(),
+        },
+        TranscriptItem::ToolResult(ToolResultMessage {
+            tool_call_id: first.id.clone(),
+            tool_name: first.tool_name.clone(),
+            output: "ok".to_string(),
+            status: ToolResultStatus::Success,
+        }),
+    ]));
+
+    let session = AgentSession::from_transcript_store(store)
+        .expect("compacted open turn should be repairable");
+
+    assert_eq!(
+        session.model_context().transcript_items().last(),
+        Some(&TranscriptItem::TurnFinished {
+            turn_id: TurnId(58),
+            outcome: TurnOutcome::Crashed,
+        })
+    );
+    assert!(session
+        .model_context()
+        .transcript_items()
+        .iter()
+        .any(|item| matches!(
+            item,
+            TranscriptItem::ToolResult(result)
+                if result.tool_call_id == second.id && result.status == ToolResultStatus::Crashed
+        )));
+    assert!(session.transcript_store().is_turn_boundary());
 }
 
 #[test]
