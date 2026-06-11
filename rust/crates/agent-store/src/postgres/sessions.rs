@@ -213,11 +213,44 @@ impl PostgresAgentStore {
         content: &UserMessage,
         client_input_id: Option<&str>,
     ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
+        self.start_session_outputs_with_parent(
+            session_id,
+            config,
+            entries,
+            active_leaf_id,
+            session_events,
+            actions,
+            priority,
+            content,
+            client_input_id,
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_session_outputs_with_parent(
+        &self,
+        session_id: &str,
+        config: &SessionConfig,
+        entries: &[TranscriptStorageNode],
+        active_leaf_id: Option<&str>,
+        session_events: &[SessionEvent],
+        actions: &[SessionAction],
+        priority: InputPriority,
+        content: &UserMessage,
+        client_input_id: Option<&str>,
+        parent_session_id: Option<&str>,
+    ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
+        if parent_session_id == Some(session_id) {
+            return Err(anyhow!(
+                "child session id must differ from parent session id"
+            ));
+        }
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
             r#"
-                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, system_prompt, provider_config, metadata)
-                values ($1, $2, $3, $4, $5::text, $6, $7, $8)
+                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, system_prompt, provider_config, metadata, parent_session_id)
+                values ($1, $2, $3, $4, $5::text, $6, $7, $8, $9::text)
                 on conflict (id) do nothing
                 returning id
                 "#,
@@ -230,6 +263,7 @@ impl PostgresAgentStore {
         .bind(&config.system_prompt)
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
+        .bind(parent_session_id)
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_none() {
@@ -245,6 +279,7 @@ impl PostgresAgentStore {
                 json!({
                     "session_id": session_id,
                     "project_id": config.project_id,
+                    "parent_session_id": parent_session_id,
                     "provider": config.provider,
                 }),
             )
