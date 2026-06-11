@@ -192,8 +192,20 @@ export class AgentRpcClient implements RpcClient {
 
 export function defaultWsUrl(): string {
 	const configured = import.meta.env.VITE_PI_AGENT_WS as string | undefined;
-	if (configured) return configured;
-	const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-	const port = window.location.port ? `:${window.location.port}` : "";
-	return `${proto}//${window.location.hostname}${port}/ws`;
+	return resolveWsUrl(configured, window.location);
+}
+
+export function resolveWsUrl(
+	configured: string | undefined,
+	location: Pick<Location, "hostname" | "port" | "protocol">,
+): string {
+	if (configured?.trim()) return configured;
+	if (isLoopbackHost(location.hostname)) return "ws://127.0.0.1:8787";
+	const proto = location.protocol === "https:" ? "wss:" : "ws:";
+	const port = location.port ? `:${location.port}` : "";
+	return `${proto}//${location.hostname}${port}/ws`;
+}
+
+function isLoopbackHost(hostname: string): boolean {
+	return hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" || hostname === "[::1]";
 }
