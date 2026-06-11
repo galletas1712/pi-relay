@@ -1180,6 +1180,77 @@ turns fail with `not_resumable`, non-terminal targets fail with
 whose terminal work was tool execution fail with `not_resumable` until explicit
 tool-rerun semantics exist.
 
+## REPL RPC
+
+### `repl.exec`
+
+Executes a Python code cell in a stateful per-session REPL process. The REPL is
+an orchestration environment, not a provider-visible tool schema. Python
+globals persist between calls for the same `session_id`; stdout/stderr are
+captured and returned with the last expression's `repr`.
+
+Request:
+
+```json
+{
+  "session_id": "session_parent",
+  "code": "review = subagents.call(role='reviewer', message='Review this patch')\nreview",
+  "timeout_ms": 600000
+}
+```
+
+Response:
+
+```json
+{
+  "type": "exec_result",
+  "id": 1,
+  "ok": true,
+  "stdout": "",
+  "stderr": "",
+  "result_repr": "SubagentResult(session_id='session_child', role='reviewer', text='...')",
+  "result_json": {
+    "session_id": "session_child",
+    "role": "reviewer",
+    "text": "...",
+    "activity": "idle",
+    "transcript": {}
+  },
+  "error": null
+}
+```
+
+The REPL preimports `subagents`:
+
+```python
+result = subagents.call(role="reviewer", message="Review this", fork_context=False)
+results = subagents.call_bulk([
+    {"role": "worker", "message": "Try approach A", "fork_context": True},
+    {"role": "worker", "message": "Try approach B", "fork_context": True},
+])
+children = subagents.list()
+turns = subagents[result.session_id].transcript
+subagents[result.session_id].steer("Change direction")
+subagents[result.session_id].interrupt()
+```
+
+`subagents.call(...)` and `subagents.call_bulk(...)` are blocking Python helper
+semantics layered over the non-blocking `subagent.spawn` backend primitive.
+`call_bulk` issues the spawn requests back-to-back, then waits for all children
+to become idle before returning.
+
+`role` can be a built-in role (`worker`, `reviewer`, `tester`) or the name of an
+available skill. A unique workspace-scoped skill can be addressed by name alone;
+if multiple workspace skills share a role name, pass `role_workspace` to
+disambiguate. `fork_context=False` sends only the delegated task plus the normal
+session prompt, workspace/project context, and role instructions. `fork_context=True`
+also appends a bounded textual snapshot of the parent session's active branch to
+the child initial message.
+
+If a child turn crashes or is interrupted while a blocking helper is waiting, the
+helper raises an exception in the Python cell and the `repl.exec` response has
+`result.ok: false`.
+
 ## Tools
 
 ### `tools.list`

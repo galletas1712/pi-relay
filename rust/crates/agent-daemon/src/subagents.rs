@@ -360,6 +360,14 @@ fn subagent_metadata(
         map.entry("harness".to_string())
             .or_insert_with(|| json!(true));
     }
+    if parent_metadata
+        .get("auto_title_disabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        map.entry("auto_title_disabled".to_string())
+            .or_insert_with(|| json!(true));
+    }
     map.insert("hidden".to_string(), json!(true));
     map.insert("subagent".to_string(), json!(true));
     map.insert("role_name".to_string(), json!(role_name));
@@ -379,10 +387,20 @@ fn child_initial_task_message(
     task: &str,
     initial_context: Option<&str>,
 ) -> String {
-    let mut message = format!("Subagent task from parent session `{parent_session_id}`:\n\n{task}");
+    let mut message = format!(
+        "# Delegated task\n\nParent session: `{parent_session_id}`\n\n{task}\n\n# Parent active context\n\n"
+    );
     if let Some(initial_context) = initial_context {
-        message.push_str("\n\n# Initial context\n\n");
-        message.push_str(initial_context);
+        message.push_str(
+            "The parent requested `fork_context=True`; the following is a bounded textual snapshot \
+of the parent's active branch at delegation time.\n\n",
+        );
+        message.push_str(initial_context.trim());
+    } else {
+        message.push_str(
+            "No parent transcript/context snapshot was included for this call (`fork_context=False`). \
+Use the delegated task, role instructions, workspace/project context, and any files/tools you inspect.",
+        );
     }
     message
 }
@@ -410,6 +428,7 @@ fn child_system_prompt(
 You are a child agent spawned by parent session `{}`.\n\
 The parent can inspect your transcript, send follow-up messages, interrupt you, and decide whether to merge your filesystem changes.\n\
 Keep your own context focused on the delegated task. Do not assume your changes are merged automatically.\n\
+Your role instructions are already included below; do not call `LoadSkill` for this same role unless you explicitly need to inspect another skill.\n\
 When you finish, report concise results and any follow-up work clearly.\n\n\
 # Subagent role\n\n\
 Role: `{}` ({workspace})\n\
@@ -460,13 +479,14 @@ mod tests {
             Some("Review"),
             "Review this",
             &PathBuf::from("/tmp/reviewer/SKILL.md"),
-            &json!({ "harness": true }),
+            &json!({ "harness": true, "auto_title_disabled": true }),
         );
         assert_eq!(
             metadata,
             json!({
                 "custom": true,
                 "harness": true,
+                "auto_title_disabled": true,
                 "hidden": true,
                 "subagent": true,
                 "role_name": "reviewer",
@@ -476,5 +496,31 @@ mod tests {
                 "role_file_path": "/tmp/reviewer/SKILL.md",
             })
         );
+    }
+
+    #[test]
+    fn child_initial_task_message_marks_absent_parent_context() {
+        let message = child_initial_task_message("parent", "Inspect the repo.", None);
+
+        assert!(message.contains("# Delegated task"));
+        assert!(message.contains("Parent session: `parent`"));
+        assert!(message.contains("Inspect the repo."));
+        assert!(message.contains(
+            "No parent transcript/context snapshot was included for this call (`fork_context=False`)."
+        ));
+    }
+
+    #[test]
+    fn child_initial_task_message_labels_forked_parent_context() {
+        let message = child_initial_task_message(
+            "parent",
+            "Continue the investigation.",
+            Some("Parent session `parent` active context:\n\nAssistant:\nprior answer"),
+        );
+
+        assert!(message.contains("# Delegated task"));
+        assert!(message.contains("The parent requested `fork_context=True`"));
+        assert!(message.contains("Parent session `parent` active context:"));
+        assert!(message.contains("prior answer"));
     }
 }

@@ -115,20 +115,35 @@ pub(crate) fn resolve_skill_role(
     }
     let workspace = workspace.map(str::trim).filter(|value| !value.is_empty());
     let skills = load_skills_for_session_workspaces(outer_cwd, workspaces);
-    let Some(skill) = skills
+    if let Some(workspace) = workspace {
+        let Some(skill) = skills
+            .into_iter()
+            .find(|skill| skill.name == name && skill.workspace.as_deref() == Some(workspace))
+        else {
+            return Err(anyhow!("role skill not found: {workspace}/{name}"));
+        };
+        return role_from_skill(skill);
+    }
+
+    let mut matches = skills
         .into_iter()
-        .find(|skill| skill.name == name && skill.workspace.as_deref() == workspace)
-    else {
-        match (workspace, builtin_role(name)) {
-            (None, Some(role)) => return Ok(role),
-            (Some(_), _) | (None, None) => {}
+        .filter(|skill| skill.name == name)
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => role_from_skill(matches.remove(0)),
+        0 => builtin_role(name).ok_or_else(|| anyhow!("role skill not found: {name}")),
+        _ => {
+            let mut scopes = matches
+                .iter()
+                .map(|skill| skill.workspace.as_deref().unwrap_or("global"))
+                .collect::<Vec<_>>();
+            scopes.sort_unstable();
+            Err(anyhow!(
+                "role skill is ambiguous: {name} exists in {}; pass role_workspace",
+                scopes.join(", ")
+            ))
         }
-        return Err(match workspace {
-            Some(workspace) => anyhow!("role skill not found: {workspace}/{name}"),
-            None => anyhow!("role skill not found: {name}"),
-        });
-    };
-    role_from_skill(skill)
+    }
 }
 
 fn builtin_role(name: &str) -> Option<ResolvedSkillRole> {
@@ -258,6 +273,61 @@ mod tests {
             role.content,
             "---\nname: reviewer\ndescription: Review code.\n---\n\nReview carefully."
         );
+
+        std::fs::remove_dir_all(outer_cwd).ok();
+    }
+
+    #[test]
+    fn resolves_unambiguous_workspace_role_without_workspace_arg() {
+        let outer_cwd = make_temp_dir("resolve-unambiguous-workspace-role");
+        let workspace = outer_cwd.join("repo");
+        let skill_dir = workspace.join(".agents/skills/context-inspector");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: context-inspector\ndescription: Inspect context.\n---\n\nInspect carefully.\n",
+        )
+        .expect("skill file");
+
+        let role = resolve_skill_role(
+            &outer_cwd,
+            &[SessionWorkspace::local("repo", "")],
+            "context-inspector",
+            None,
+        )
+        .expect("role resolves");
+        assert_eq!(role.name, "context-inspector");
+        assert_eq!(role.workspace.as_deref(), Some("repo"));
+
+        std::fs::remove_dir_all(outer_cwd).ok();
+    }
+
+    #[test]
+    fn ambiguous_workspace_role_requires_workspace_arg() {
+        let outer_cwd = make_temp_dir("resolve-ambiguous-workspace-role");
+        for workspace in ["repo-a", "repo-b"] {
+            let skill_dir = outer_cwd
+                .join(workspace)
+                .join(".agents/skills/context-inspector");
+            std::fs::create_dir_all(&skill_dir).expect("skill dir");
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: context-inspector\ndescription: Inspect context.\n---\n\nInspect carefully.\n",
+            )
+            .expect("skill file");
+        }
+
+        let error = resolve_skill_role(
+            &outer_cwd,
+            &[
+                SessionWorkspace::local("repo-a", ""),
+                SessionWorkspace::local("repo-b", ""),
+            ],
+            "context-inspector",
+            None,
+        )
+        .expect_err("ambiguous role rejected");
+        assert!(error.to_string().contains("pass role_workspace"));
 
         std::fs::remove_dir_all(outer_cwd).ok();
     }
