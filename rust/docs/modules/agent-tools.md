@@ -49,7 +49,7 @@ through it.
 
 ## Registered tools
 
-`with_builtin_tools()` registers six canonical tools through
+`with_builtin_tools()` registers seven canonical tools through
 `FirstPartyToolExtension`. Each is local-executed; the model-visible form
 differs only where provider semantics justify it.
 
@@ -61,6 +61,7 @@ differs only where provider semantics justify it.
 | `WebSearch`  | `web_search` (JSON function)              | `web_search` (JSON client tool)                 | `web_search`       | `WebSearchTool`                  |
 | `WebFetch`   | `web_fetch` (JSON function)               | `web_fetch` (JSON client tool)                  | `web_fetch`        | `WebFetchTool`                   |
 | `LoadSkill`  | `LoadSkill` (JSON function)               | `LoadSkill` (JSON client tool)                  | `skill_loader`     | runtime-handled (no registry executor) |
+| `PythonRepl` | `PythonRepl` (JSON function)              | `PythonRepl` (JSON client tool)                 | `python_repl`      | runtime-handled (no registry executor) |
 
 There are no `read`/`write` tools. File reads go through `Edit`'s `view`
 command (Anthropic) or through `Bash` (`cat`, `sed`, `rg`, …) on OpenAI.
@@ -140,6 +141,7 @@ it against the session's loaded-skill set and workspace skills.
 model emits tool call (provider wire name, e.g. "apply_patch")
   -> daemon: ToolContext::new(session outer_cwd)   [timeout 30s]
   -> LoadSkill?  -> runtime skill loader (no registry executor)
+  -> PythonRepl? -> runtime session REPL dispatch (no registry executor)
   -> web tool?   -> runtime web dispatch (WebSearch/WebFetch)
   -> else        -> registry.execute(provider, call, ctx)
                       canonical_tool_name_for_provider() maps wire name
