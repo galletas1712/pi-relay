@@ -100,6 +100,7 @@ const FOREGROUND_RECONCILE_THROTTLE_MS = 2000;
 const TRANSCRIPT_INDEX_PAGE_SIZE = 5000;
 const TRANSCRIPT_TURN_PAGE_SIZE = 50;
 const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
+const SIDEBAR_CLOSE_BEFORE_SELECT_MS = 200;
 const MEDIUM_PANEL_QUERY = "(min-width: 900px)";
 const WIDE_PANEL_QUERY = "(min-width: 1280px)";
 
@@ -282,6 +283,7 @@ export function App() {
 	const lastEventIds = useRef(new Map<string, number>());
 	const subscribedEventSessionIds = useRef(new Set<string>());
 	const panelModeRef = useRef<PanelMode>(panelModeForViewport());
+	const sidebarSelectTimer = useRef<number | null>(null);
 	const selectedLoadVersion = useRef(0);
 	const selectedRefreshInFlight = useRef(new Map<string, Promise<{ snapshot: SessionSnapshot; entries: TranscriptEntry[] } | null>>());
 	const autoLoadedTurnDetailRef = useRef<string | null>(null);
@@ -1774,6 +1776,18 @@ export function App() {
 	const closeSidebarIfOverlay = useCallback(() => {
 		if (panelModeRef.current !== "wide") setSidebarOpen(false);
 	}, []);
+	const handleSidebarSelectSession = useCallback((sessionId: string) => {
+		if (panelModeRef.current === "wide") {
+			selectSession(sessionId);
+			return;
+		}
+		setSidebarOpen(false);
+		if (sidebarSelectTimer.current !== null) window.clearTimeout(sidebarSelectTimer.current);
+		sidebarSelectTimer.current = window.setTimeout(() => {
+			sidebarSelectTimer.current = null;
+			selectSession(sessionId);
+		}, SIDEBAR_CLOSE_BEFORE_SELECT_MS);
+	}, [selectSession]);
 	useEffect(() => {
 		const onKeyDown = (event: KeyboardEvent) => {
 			if (event.key !== "Escape") return;
@@ -1782,6 +1796,9 @@ export function App() {
 		};
 		window.addEventListener("keydown", onKeyDown);
 		return () => window.removeEventListener("keydown", onKeyDown);
+	}, []);
+	useEffect(() => () => {
+		if (sidebarSelectTimer.current !== null) window.clearTimeout(sidebarSelectTimer.current);
 	}, []);
 	useEffect(() => {
 		if (typeof window.matchMedia !== "function") return;
@@ -1920,8 +1937,7 @@ export function App() {
 					closeSidebarIfOverlay();
 				}}
 				onSelectSession={(sessionId) => {
-					selectSession(sessionId);
-					closeSidebarIfOverlay();
+					handleSidebarSelectSession(sessionId);
 				}}
 				onRename={(session) => {
 					openRenameDialog(session);
