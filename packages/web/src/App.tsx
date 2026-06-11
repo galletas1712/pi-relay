@@ -288,6 +288,7 @@ export function App() {
 	const selectedRefreshInFlight = useRef(new Map<string, Promise<{ snapshot: SessionSnapshot; entries: TranscriptEntry[] } | null>>());
 	const autoLoadedTurnDetailRef = useRef<string | null>(null);
 	const lastForegroundReconcileAt = useRef(Date.now());
+	const handleSessionEventRef = useRef<(event: EventFrame) => void>(() => undefined);
 
 	const pushNotice = useCallback((tone: Notice["tone"], text: string) => {
 		setNotices((current) => [...current.slice(Math.max(0, current.length - MAX_NOTICES + 1)), { id: randomId("notice"), tone, text }]);
@@ -910,12 +911,14 @@ export function App() {
 	);
 
 	useEffect(() => {
+		handleSessionEventRef.current = handleSessionEvent;
+	}, [handleSessionEvent]);
+
+	useEffect(() => {
 		const offStatus = api.onStatus((status) => {
 			setConnection(status);
-			if (status !== "open") {
-				subscribedEventSessionIds.current.clear();
-				return;
-			}
+			subscribedEventSessionIds.current.clear();
+			if (status !== "open") return;
 			void Promise.all([
 				queryClient.invalidateQueries({ queryKey: queryKeys.projects }),
 				queryClient.invalidateQueries({ queryKey: queryKeys.systemPromptRoot }),
@@ -924,7 +927,7 @@ export function App() {
 				}),
 			]).catch((error) => pushNotice("error", errorMessage(error)));
 		});
-		const offEvent = api.onEvent(handleSessionEvent);
+		const offEvent = api.onEvent((event) => handleSessionEventRef.current(event));
 		void api.connect().catch((error) => pushNotice("error", errorMessage(error)));
 		return () => {
 			offStatus();
@@ -933,7 +936,7 @@ export function App() {
 			if (sessionListRefreshTimer.current !== null) window.clearTimeout(sessionListRefreshTimer.current);
 			api.close();
 		};
-	}, [api, handleSessionEvent, pushNotice, queryClient]);
+	}, [api, pushNotice, queryClient]);
 
 	useEffect(() => {
 		if (projectsQuery.error) pushNotice("error", errorMessage(projectsQuery.error));
