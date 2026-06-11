@@ -1184,10 +1184,10 @@ tool-rerun semantics exist.
 
 ### `repl.exec`
 
-Executes a Python code cell in a stateful per-session REPL process. The REPL is
-an orchestration environment, not a provider-visible tool schema. Python
-globals persist between calls for the same `session_id`; stdout/stderr are
-captured and returned with the last expression's `repr`.
+Executes a Python code cell in a stateful per-session REPL process. This is the
+websocket counterpart to the provider-visible `PythonRepl` tool. Python globals
+persist between calls for the same `session_id`; stdout/stderr are captured and
+returned with the last expression's `repr`.
 
 Request:
 
@@ -1273,9 +1273,10 @@ Requires a `provider` parameter (`"openai"` or `"anthropic"`/`"claude"`) and
 returns the model-visible tool definitions for that provider, because the tool
 surface is provider-shaped (e.g. OpenAI `apply_patch` vs Anthropic
 `text_editor_20250728` for editing). The registered builtins are `edit`, `bash`,
-`grep`, `web_search`, `web_fetch`, and `load_skill` - there are no `read`/`write`
-tools. Each returned entry carries `name`, `description`, `input_schema`,
-`canonical_name`, `prompt_alias`, `execution`, and `kind: "local_tool"`.
+`grep`, `web_search`, `web_fetch`, `load_skill`, and `python_repl` - there are
+no `read`/`write` tools. Each returned entry carries `name`, `description`,
+`input_schema`, `canonical_name`, `prompt_alias`, `execution`, and
+`kind: "local_tool"`.
 
 No other tool RPC exists. Tool requests are automatic. A tool-level failure,
 such as a missing file, missing edit target, malformed args, non-zero bash exit,

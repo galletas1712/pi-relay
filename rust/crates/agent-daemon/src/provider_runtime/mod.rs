@@ -4,6 +4,7 @@ mod connections;
 mod context_accounting;
 mod prompt;
 mod provider;
+mod repl_tools;
 mod requests;
 mod session_titles;
 mod sidecar;
@@ -17,6 +18,7 @@ pub(crate) use compaction::{
 pub(crate) use connections::ProviderConnectionRegistry;
 pub(crate) use context_accounting::model_input_tokens_for_gate;
 pub(crate) use prompt::{current_pi_template, render_pi_prompt};
+pub(crate) use repl_tools::{is_repl_tool_name, run_repl_tool};
 pub(crate) use requests::{build_model_request, run_model};
 pub(crate) use session_titles::{
     schedule_session_title_refresh_for_model_turn, SessionTitleScheduler,

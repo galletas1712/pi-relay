@@ -304,6 +304,7 @@ pub(crate) fn sort_tools_by_name(tools: &mut [ProviderTool]) {
 pub fn builtin_tool_definition(name: &str) -> Option<ToolDefinition> {
     match name {
         "LoadSkill" => Some(load_skill_definition()),
+        "PythonRepl" => Some(python_repl_definition()),
         "Edit" | "apply_patch" => Some(ApplyPatchTool.definition()),
         "Bash" => Some(BashTool.definition()),
         "Grep" => Some(GrepTool.definition()),
@@ -335,6 +336,28 @@ fn load_skill_definition() -> ToolDefinition {
     )
 }
 
+fn python_repl_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "PythonRepl",
+        "Execute Python code in this session's stateful orchestration REPL. Use this for subagent delegation and for keeping orchestration state in Python variables. The REPL has `subagents` preimported.",
+        json!({
+            "type": "object",
+            "properties": {
+                "code": {
+                    "type": "string",
+                    "description": "Python code to execute. The last expression's repr is returned, and stdout/stderr are captured."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Optional execution timeout in milliseconds."
+                }
+            },
+            "required": ["code"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 pub struct FirstPartyToolExtension;
 
 impl ToolExtension for FirstPartyToolExtension {
@@ -344,6 +367,7 @@ impl ToolExtension for FirstPartyToolExtension {
 
     fn register(&self, registry: &mut ToolRegistry) {
         register_load_skill(registry);
+        register_python_repl(registry);
         register_edit(registry);
         register_bash(registry);
         register_grep(registry);
@@ -357,6 +381,22 @@ fn register_load_skill(registry: &mut ToolRegistry) {
     registry.register_tool(
         ToolDescriptor::new("LoadSkill")
             .prompt_alias("skill_loader")
+            .provider(
+                ProviderKind::OpenAi,
+                ProviderTool::openai_function(&definition),
+            )
+            .provider(
+                ProviderKind::Claude,
+                ProviderTool::anthropic_client(&definition),
+            ),
+    );
+}
+
+fn register_python_repl(registry: &mut ToolRegistry) {
+    let definition = python_repl_definition();
+    registry.register_tool(
+        ToolDescriptor::new("PythonRepl")
+            .prompt_alias("python_repl")
             .provider(
                 ProviderKind::OpenAi,
                 ProviderTool::openai_function(&definition),
@@ -528,11 +568,27 @@ mod tests {
 
         assert_eq!(
             openai,
-            ["Edit", "Bash", "Grep", "LoadSkill", "WebFetch", "WebSearch"]
+            [
+                "Edit",
+                "Bash",
+                "Grep",
+                "LoadSkill",
+                "PythonRepl",
+                "WebFetch",
+                "WebSearch"
+            ]
         );
         assert_eq!(
             claude,
-            ["Bash", "Grep", "LoadSkill", "Edit", "WebFetch", "WebSearch"]
+            [
+                "Bash",
+                "Grep",
+                "LoadSkill",
+                "PythonRepl",
+                "Edit",
+                "WebFetch",
+                "WebSearch"
+            ]
         );
     }
 
@@ -557,6 +613,7 @@ mod tests {
                 "Bash",
                 "Grep",
                 "LoadSkill",
+                "PythonRepl",
                 "web_fetch",
                 "web_search"
             ]
@@ -567,6 +624,7 @@ mod tests {
                 "Bash",
                 "Grep",
                 "LoadSkill",
+                "PythonRepl",
                 "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search"
@@ -630,6 +688,30 @@ mod tests {
         assert_eq!(claude_fetch.execution, ToolExecution::LocalJson);
         assert_eq!(claude_fetch.input_schema["type"], "object");
         assert!(claude_fetch.input_schema["properties"].get("url").is_some());
+    }
+
+    #[test]
+    fn python_repl_is_a_builtin_local_json_tool_for_each_provider() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let openai_repl = registry
+            .provider_tools_for_provider(ProviderKind::OpenAi)
+            .into_iter()
+            .find(|tool| tool.canonical_name == "PythonRepl")
+            .expect("OpenAI PythonRepl tool");
+        let claude_repl = registry
+            .provider_tools_for_provider(ProviderKind::Claude)
+            .into_iter()
+            .find(|tool| tool.canonical_name == "PythonRepl")
+            .expect("Claude PythonRepl tool");
+
+        assert_eq!(openai_repl.name, "PythonRepl");
+        assert_eq!(openai_repl.prompt_alias.as_deref(), Some("python_repl"));
+        assert_eq!(openai_repl.execution, ToolExecution::LocalJson);
+        assert_eq!(openai_repl.input_schema["type"], "object");
+        assert!(openai_repl.input_schema["properties"].get("code").is_some());
+        assert_eq!(claude_repl.name, "PythonRepl");
+        assert_eq!(claude_repl.prompt_alias.as_deref(), Some("python_repl"));
+        assert_eq!(claude_repl.execution, ToolExecution::LocalJson);
     }
 
     #[test]

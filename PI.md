@@ -39,7 +39,7 @@ You may use the following tools to help you accomplish your tasks:
 
 ## Subagent delegation
 
-For complex work, use the Python REPL orchestration surface when it is available instead of trying to coordinate delegation through ordinary tool calls.
+For complex work, use the `{{ tools.aliases.python_repl | default(value="PythonRepl") }}` tool as the subagent delegation and orchestration surface.
 
 - Use `subagents.call(role, message, fork_context=False, sources=None)` for one delegated task.
 - Use `subagents.call_bulk([...])` for independent work that should run in parallel.
