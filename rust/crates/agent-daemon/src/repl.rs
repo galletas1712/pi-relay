@@ -298,6 +298,8 @@ struct SubagentCallParams {
     #[serde(default)]
     fork_context: bool,
     role_workspace: Option<String>,
+    #[serde(default)]
+    sources: Vec<Value>,
     timeout_ms: Option<u64>,
 }
 
@@ -308,6 +310,8 @@ struct SubagentCallSpec {
     #[serde(default)]
     fork_context: bool,
     role_workspace: Option<String>,
+    #[serde(default)]
+    sources: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -337,6 +341,7 @@ async fn subagents_call(
             message: params.message,
             fork_context: params.fork_context,
             role_workspace: params.role_workspace,
+            sources: params.sources,
         },
     )
     .await?;
@@ -393,6 +398,9 @@ async fn spawn_call(
         "role": role,
         "task": message,
     });
+    if !spec.sources.is_empty() {
+        params["sources"] = json!(spec.sources);
+    }
     if let Some(role_workspace) = spec
         .role_workspace
         .map(|workspace| workspace.trim().to_string())
@@ -744,8 +752,16 @@ class SubagentHandle:
         return f"SubagentHandle({self.session_id!r})"
 
 
+def _source_id(source):
+    if isinstance(source, SubagentResult) or isinstance(source, SubagentHandle):
+        return source.session_id
+    if isinstance(source, dict):
+        return source.get("session_id") or source.get("child_session_id")
+    return source
+
+
 class Subagents:
-    def call(self, role, message, fork_context=False, timeout=None, role_workspace=None):
+    def call(self, role, message, fork_context=False, timeout=None, role_workspace=None, sources=None):
         params = {
             "role": role,
             "message": message,
@@ -755,6 +771,8 @@ class Subagents:
             params["timeout_ms"] = int(float(timeout) * 1000)
         if role_workspace is not None:
             params["role_workspace"] = role_workspace
+        if sources is not None:
+            params["sources"] = [_source_id(source) for source in sources]
         return SubagentResult(_host_call("subagents.call", params))
 
     def call_bulk(self, calls, timeout=None):
@@ -763,6 +781,8 @@ class Subagents:
             item = dict(call)
             if "timeout" in item and "timeout_ms" not in item:
                 item["timeout_ms"] = int(float(item.pop("timeout")) * 1000)
+            if "sources" in item and item["sources"] is not None:
+                item["sources"] = [_source_id(source) for source in item["sources"]]
             normalized.append(item)
         params = {"calls": normalized}
         if timeout is not None:
