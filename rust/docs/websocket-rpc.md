@@ -1261,7 +1261,7 @@ workspace as a local ref such as
 `refs/pi-relay/sources/source-1-implementer-a1b2c3d4`; local-folder workspaces
 are not merged or serialized.
 
-`role` can be a built-in role (`worker`, `reviewer`, `tester`) or the name of an
+`role` can be a built-in role (`explore`, `worker`, `reviewer`, `tester`) or the name of an
 available skill. A unique workspace-scoped skill can be addressed by name alone;
 if multiple workspace skills share a role name, pass `role_workspace` to
 disambiguate. `fork_context=False` sends only the delegated task plus the normal
