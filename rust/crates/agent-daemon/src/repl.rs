@@ -939,7 +939,25 @@ class Subagents:
         return self.wait(self.spawn_bulk(calls))
 
     def list(self, parent_session_id=None):
-        return _host_call("subagents.list", {"parent_session_id": parent_session_id})
+        response = _host_call("subagents.list", {"parent_session_id": parent_session_id})
+        items = response.get("subagents") if isinstance(response, dict) else None
+        handles = []
+        for item in items or []:
+            handles.append(SubagentHandle(
+                item.get("child_session_id") or item.get("session_id"),
+                role=item.get("role") or item.get("role_name"),
+                activity=item.get("activity"),
+            ))
+        return handles
+
+    def steer(self, session_id, message):
+        return _host_call("subagents.steer", {
+            "session_id": _source_id(session_id),
+            "message": message,
+        })
+
+    def interrupt(self, session_id):
+        return _host_call("subagents.interrupt", {"session_id": _source_id(session_id)})
 
     def __getitem__(self, session_id):
         return SubagentHandle(session_id)
@@ -960,6 +978,8 @@ _subagents_module.wait = subagents.wait
 _subagents_module.call = subagents.call
 _subagents_module.call_bulk = subagents.call_bulk
 _subagents_module.list = subagents.list
+_subagents_module.steer = subagents.steer
+_subagents_module.interrupt = subagents.interrupt
 _subagents_module.SubagentResult = SubagentResult
 _subagents_module.SubagentHandle = SubagentHandle
 _subagents_module.subagents = subagents
@@ -1086,7 +1106,7 @@ mod tests {
         repl.write_control(json!({
             "type": "exec",
             "id": 3,
-            "code": "import subagents\nprint(hasattr(subagents, 'spawn'), hasattr(subagents, 'spawn_bulk'), hasattr(subagents, 'wait'), hasattr(subagents, 'call'))\nsubagents['child']",
+            "code": "import subagents\nprint(hasattr(subagents, 'spawn'), hasattr(subagents, 'spawn_bulk'), hasattr(subagents, 'wait'), hasattr(subagents, 'call'), hasattr(subagents, 'steer'), hasattr(subagents, 'interrupt'), hasattr(subagents, 'list'))\nsubagents['child']",
         }))
         .await
         .expect("write import exec");
@@ -1094,7 +1114,7 @@ mod tests {
         assert_eq!(imported["type"], "exec_result");
         assert_eq!(imported["id"], 3);
         assert_eq!(imported["ok"], true);
-        assert_eq!(imported["stdout"], "True True True True\n");
+        assert_eq!(imported["stdout"], "True True True True True True True\n");
         assert!(imported["result_repr"]
             .as_str()
             .unwrap_or_default()
