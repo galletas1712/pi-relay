@@ -596,6 +596,7 @@ pre {
 }
 
 .session-row {
+	--session-row-actions-width: 80px;
 	position: relative;
 	display: flex;
 	width: 100%;
@@ -608,6 +609,7 @@ pre {
 	padding: 6px 8px;
 	text-align: left;
 	cursor: pointer;
+	overflow: hidden;
 }
 
 .session-row:hover {
@@ -640,6 +642,12 @@ pre {
 	flex: 1;
 	flex-direction: column;
 	gap: 2px;
+	transition: padding-right 120ms ease;
+}
+
+.session-row:has(.session-row-actions:hover) .session-main,
+.session-row:has(.session-row-actions:focus-within) .session-main {
+	padding-right: var(--session-row-actions-width);
 }
 
 .session-title {
@@ -672,8 +680,39 @@ pre {
 	opacity: 0;
 }
 
+.session-row-actions {
+	position: absolute;
+	top: 50%;
+	right: 6px;
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	border-radius: 8px;
+	background: var(--sidebar);
+	opacity: 0;
+	pointer-events: none;
+	transform: translateY(-50%);
+	transition: opacity 120ms ease;
+}
+
+.session-row:hover .session-row-actions {
+	background: var(--sidebar-accent);
+}
+
+.session-row.selected .session-row-actions {
+	background: var(--accent);
+}
+
+.session-row:hover .session-row-actions,
+.session-row:focus-visible .session-row-actions,
+.session-row-actions:focus-within {
+	opacity: 1;
+	pointer-events: auto;
+}
+
 .session-row:hover .session-row-action,
 .session-row:focus-visible .session-row-action,
+.session-row-actions:focus-within .session-row-action,
 .session-row-action:focus-visible {
 	opacity: 1;
 }
@@ -3261,6 +3300,15 @@ pre {
 	.entry-id,
 	.session-row-action {
 		opacity: 1;
+	}
+
+	.session-row-actions {
+		opacity: 1;
+		pointer-events: auto;
+	}
+
+	.session-row .session-main {
+		padding-right: var(--session-row-actions-width);
 	}
 
 	.entry-id:not(.inline) {
