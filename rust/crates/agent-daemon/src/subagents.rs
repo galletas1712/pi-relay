@@ -41,9 +41,23 @@ pub(crate) async fn subagent_list(
             .activity(&child_session_id)
             .await
             .map_err(anyhow::Error::from)?;
+        // Best-effort: surface the child's role so list() handles carry it.
+        let role = state
+            .repo
+            .load_session_config(&child_session_id)
+            .await
+            .ok()
+            .and_then(|config| {
+                config
+                    .metadata
+                    .get("role_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            });
         subagents.push(json!({
             "child_session_id": child_session_id,
             "activity": activity,
+            "role": role,
         }));
     }
     Ok(json!({

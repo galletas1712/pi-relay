@@ -1238,6 +1238,8 @@ children = subagents.list()
 turns = subagents[handle.session_id].transcript
 handle.steer("Change direction")
 handle.interrupt()
+subagents.steer(handle, "Change direction")
+subagents.interrupt(handle.session_id)
 ```
 
 `subagents.spawn(...)` and `subagents.spawn_bulk(...)` return `SubagentHandle`s
@@ -1251,6 +1253,16 @@ for a long time and should either complete normally or be interrupted explicitly
 The provider-visible `PythonRepl` tool reports Python exceptions as tool errors
 with stdout/stderr and traceback, while the websocket `repl.exec` RPC returns the
 raw `ok: false` REPL payload.
+
+`subagents.list(parent_session_id=None)` returns a list of `SubagentHandle`
+objects (one per known child of the parent) carrying `session_id`, `role`
+(when available), and `activity`. The returned handles are immediately
+actionable: callers can `.steer(...)`, `.interrupt()`, `.wait()`, or read
+`.transcript` on them. `subagents.steer(session_id, message)` and
+`subagents.interrupt(session_id)` are top-level convenience methods that accept a
+session-id string, a `SubagentHandle`, a `SubagentResult`, or a dict containing
+`session_id`/`child_session_id`; they mirror the `handle.steer(message)` and
+`handle.interrupt()` instance methods.
 
 `sources=[...]` may be passed to `subagents.spawn(...)`/`subagents.call(...)` with known child
 `SubagentResult`s, `SubagentHandle`s, dicts containing `session_id`, or session-id
