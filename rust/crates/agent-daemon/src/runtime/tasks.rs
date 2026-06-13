@@ -27,6 +27,12 @@ pub(crate) fn take_tasks(state: &AppState) -> Vec<JoinHandle<()>> {
     tasks.drain().map(|(_, task)| task.handle).collect()
 }
 
+pub(crate) fn session_has_live_tasks(state: &AppState, session_id: &str) -> bool {
+    let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
+    tasks.retain(|_, task| !task.handle.is_finished());
+    tasks.values().any(|task| task.session_id == session_id)
+}
+
 pub(super) fn register_task(state: &AppState, task: RunningTask) {
     state
         .tasks

@@ -1,6 +1,6 @@
 use agent_store::SessionActivity;
 use agent_vocab::{TranscriptItem, TurnOutcome, UserMessage};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -13,7 +13,7 @@ use tokio::time::{sleep, timeout, Duration};
 
 use crate::codec::{from_params, required_string};
 use crate::rpc_views;
-use crate::runtime::SessionDriver;
+use crate::runtime::{session_has_live_tasks, SessionDriver};
 use crate::state::AppState;
 use crate::subagents::{require_known_subagent, subagent_list, subagent_spawn_from_active_parent};
 use crate::types::RpcError;
@@ -281,10 +281,8 @@ async fn handle_host_call(
 ) -> std::result::Result<Value, RpcError> {
     match method {
         "subagents.spawn" => subagents_spawn_host(state, parent_session_id, params).await,
-        "subagents.spawn_bulk" => subagents_spawn_bulk_host(state, parent_session_id, params).await,
         "subagents.wait" => subagents_wait_host(state, parent_session_id, params).await,
         "subagents.call" => subagents_call(state, parent_session_id, params).await,
-        "subagents.call_bulk" => subagents_call_bulk(state, parent_session_id, params).await,
         "subagents.list" => subagents_list_host(state, parent_session_id, params).await,
         "subagents.read" => subagents_read_host(state, parent_session_id, params).await,
         "subagents.steer" => subagents_steer_host(state, parent_session_id, params).await,
@@ -307,23 +305,16 @@ struct SubagentCallParams {
     sources: Vec<Value>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone)]
 struct SubagentCallSpec {
     role: String,
     message: String,
-    #[serde(default)]
     fork_context: bool,
     role_workspace: Option<String>,
-    #[serde(default)]
     sources: Vec<Value>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SubagentCallBulkParams {
-    calls: Vec<SubagentCallSpec>,
-}
-
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 struct SpawnedCall {
     child_session_id: String,
     role: Option<String>,
@@ -359,23 +350,6 @@ async fn subagents_spawn_host(
     )
     .await?;
     spawned_handle_value(state, spawned).await
-}
-
-async fn subagents_spawn_bulk_host(
-    state: &AppState,
-    parent_session_id: &str,
-    params: Value,
-) -> std::result::Result<Value, RpcError> {
-    let params: SubagentCallBulkParams = from_params(params)?;
-    if params.calls.is_empty() {
-        return Err(RpcError::new("invalid_params", "calls cannot be empty"));
-    }
-    let mut handles = Vec::with_capacity(params.calls.len());
-    for call in params.calls {
-        let spawned = spawn_call(state, parent_session_id, call).await?;
-        handles.push(spawned_handle_value(state, spawned).await?);
-    }
-    Ok(json!(handles))
 }
 
 async fn subagents_wait_host(
@@ -437,31 +411,6 @@ async fn subagents_call(
     .await?;
     wait_for_children_idle(state, &[spawned.child_session_id.clone()]).await?;
     call_result(state, spawned).await
-}
-
-async fn subagents_call_bulk(
-    state: &AppState,
-    parent_session_id: &str,
-    params: Value,
-) -> std::result::Result<Value, RpcError> {
-    let params: SubagentCallBulkParams = from_params(params)?;
-    if params.calls.is_empty() {
-        return Err(RpcError::new("invalid_params", "calls cannot be empty"));
-    }
-    let mut spawned = Vec::with_capacity(params.calls.len());
-    for call in params.calls {
-        spawned.push(spawn_call(state, parent_session_id, call).await?);
-    }
-    let child_session_ids = spawned
-        .iter()
-        .map(|call| call.child_session_id.clone())
-        .collect::<Vec<_>>();
-    wait_for_children_idle(state, &child_session_ids).await?;
-    let mut results = Vec::with_capacity(spawned.len());
-    for call in spawned {
-        results.push(call_result(state, call).await?);
-    }
-    Ok(json!(results))
 }
 
 async fn spawn_call(
@@ -535,11 +484,25 @@ async fn wait_for_children_idle(
     loop {
         let mut all_idle = true;
         for child_session_id in child_session_ids {
-            let activity = state
+            let driver = SessionDriver::acquire(state, child_session_id).await;
+            driver.recover_if_needed().await?;
+            let mut activity = state
                 .repo
                 .activity(child_session_id)
                 .await
                 .map_err(anyhow::Error::from)?;
+            if activity != SessionActivity::Idle && !session_has_live_tasks(state, child_session_id)
+            {
+                driver.drive_until_blocked().await?;
+                activity = state
+                    .repo
+                    .activity(child_session_id)
+                    .await
+                    .map_err(anyhow::Error::from)?;
+            }
+            if activity == SessionActivity::Idle {
+                driver.notify_subagent_parent_idle_if_needed().await;
+            }
             if activity != SessionActivity::Idle {
                 all_idle = false;
                 break;
@@ -561,31 +524,31 @@ async fn call_result(
         .transcript_turns(&spawned.child_session_id, None, Some(20))
         .await
         .map_err(anyhow::Error::from)?;
-    if let Some(card) = turns.cards.iter().rev().find(|card| {
-        matches!(
+    if let Some(card) = turns.cards.iter().rev().find(|card| card.outcome.is_some()) {
+        if matches!(
             card.outcome,
             Some(TurnOutcome::Crashed | TurnOutcome::Interrupted)
-        )
-    }) {
-        let code = match card.outcome {
-            Some(TurnOutcome::Interrupted) => "subagent_interrupted",
-            _ => "subagent_crashed",
-        };
-        let label = match card.outcome {
-            Some(TurnOutcome::Interrupted) => "was interrupted",
-            _ => "crashed",
-        };
-        return Err(RpcError::new(
-            code,
-            format!(
-                "subagent {} {} in turn {}",
-                spawned.child_session_id,
-                label,
-                card.turn_id
-                    .map(|turn_id| turn_id.0.to_string())
-                    .unwrap_or_else(|| "unknown".to_string())
-            ),
-        ));
+        ) {
+            let code = match card.outcome {
+                Some(TurnOutcome::Interrupted) => "subagent_interrupted",
+                _ => "subagent_crashed",
+            };
+            let label = match card.outcome {
+                Some(TurnOutcome::Interrupted) => "was interrupted",
+                _ => "crashed",
+            };
+            return Err(RpcError::new(
+                code,
+                format!(
+                    "subagent {} {} in latest terminal turn {}",
+                    spawned.child_session_id,
+                    label,
+                    card.turn_id
+                        .map(|turn_id| turn_id.0.to_string())
+                        .unwrap_or_else(|| "unknown".to_string())
+                ),
+            ));
+        }
     }
     let text = latest_assistant_text(&turns.cards);
     let activity = state
@@ -891,15 +854,6 @@ def _spawn_params(role, message, fork_context=False, role_workspace=None, source
     return params
 
 
-def _normalize_call(call):
-    item = dict(call)
-    item.pop("timeout", None)
-    item.pop("timeout_ms", None)
-    if "sources" in item and item["sources"] is not None:
-        item["sources"] = [_source_id(source) for source in item["sources"]]
-    return item
-
-
 class Subagents:
     def spawn(self, role, message, fork_context=False, role_workspace=None, sources=None):
         data = _host_call(
@@ -912,17 +866,6 @@ class Subagents:
             activity=data.get("activity"),
         )
 
-    def spawn_bulk(self, calls):
-        data = _host_call("subagents.spawn_bulk", {"calls": [_normalize_call(call) for call in calls]})
-        return [
-            SubagentHandle(
-                item.get("session_id"),
-                role=item.get("role"),
-                activity=item.get("activity"),
-            )
-            for item in data
-        ]
-
     def wait(self, targets):
         single = not isinstance(targets, (list, tuple))
         target_list = [targets] if single else list(targets)
@@ -934,9 +877,6 @@ class Subagents:
 
     def call(self, role, message, fork_context=False, role_workspace=None, sources=None):
         return self.spawn(role, message, fork_context, role_workspace, sources).wait()
-
-    def call_bulk(self, calls):
-        return self.wait(self.spawn_bulk(calls))
 
     def list(self, parent_session_id=None):
         response = _host_call("subagents.list", {"parent_session_id": parent_session_id})
@@ -973,10 +913,8 @@ class _SubagentsModule(types.ModuleType):
 
 _subagents_module = _SubagentsModule("subagents")
 _subagents_module.spawn = subagents.spawn
-_subagents_module.spawn_bulk = subagents.spawn_bulk
 _subagents_module.wait = subagents.wait
 _subagents_module.call = subagents.call
-_subagents_module.call_bulk = subagents.call_bulk
 _subagents_module.list = subagents.list
 _subagents_module.steer = subagents.steer
 _subagents_module.interrupt = subagents.interrupt
@@ -1106,7 +1044,7 @@ mod tests {
         repl.write_control(json!({
             "type": "exec",
             "id": 3,
-            "code": "import subagents\nprint(hasattr(subagents, 'spawn'), hasattr(subagents, 'spawn_bulk'), hasattr(subagents, 'wait'), hasattr(subagents, 'call'), hasattr(subagents, 'steer'), hasattr(subagents, 'interrupt'), hasattr(subagents, 'list'))\nsubagents['child']",
+            "code": "import subagents\nprint(hasattr(subagents, 'spawn'), hasattr(subagents, 'spawn_bulk'), hasattr(subagents, 'wait'), hasattr(subagents, 'call'), hasattr(subagents, 'call_bulk'), hasattr(subagents, 'steer'), hasattr(subagents, 'interrupt'), hasattr(subagents, 'list'))\nsubagents['child']",
         }))
         .await
         .expect("write import exec");
@@ -1114,7 +1052,10 @@ mod tests {
         assert_eq!(imported["type"], "exec_result");
         assert_eq!(imported["id"], 3);
         assert_eq!(imported["ok"], true);
-        assert_eq!(imported["stdout"], "True True True True True True True\n");
+        assert_eq!(
+            imported["stdout"],
+            "True False True True False True True True\n"
+        );
         assert!(imported["result_repr"]
             .as_str()
             .unwrap_or_default()

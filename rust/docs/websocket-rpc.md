@@ -324,6 +324,10 @@ session event buffers after live publication. Durable
 session state lives in `sessions`, `transcript_entries`, `queued_inputs`, and
 `actions`; old toast-worthy events such as `model.error` are not retained as
 history.
+Parent-scoped `subagent.*` lifecycle events are written to the parent session's
+stream, not the child stream. They remain replayable until the parent session's
+normal event-buffer cleanup so a parent can reconnect and observe child
+completion without polling.
 
 ## Transcript Validity
 
@@ -1223,10 +1227,10 @@ The REPL exposes `subagents` directly; `import subagents` also works but is not 
 
 ```python
 handle = subagents.spawn(role="reviewer", message="Review this", fork_context=False)
-workers = subagents.spawn_bulk([
-    {"role": "worker", "message": "Try approach A", "fork_context": True},
-    {"role": "worker", "message": "Try approach B", "fork_context": True},
-])
+workers = [
+    subagents.spawn(role="worker", message="Try approach A", fork_context=True),
+    subagents.spawn(role="worker", message="Try approach B", fork_context=True),
+]
 result = subagents.wait(handle)
 results = subagents.wait(workers)
 merge = subagents.call(
@@ -1242,14 +1246,25 @@ subagents.steer(handle, "Change direction")
 subagents.interrupt(handle.session_id)
 ```
 
-`subagents.spawn(...)` and `subagents.spawn_bulk(...)` return `SubagentHandle`s
-immediately after creating child sessions. `subagents.wait(handle_or_handles)` is
-the explicit blocking operation: it waits until the selected child sessions are
-idle, then returns `SubagentResult` objects with final text/transcript snippets.
-`subagents.call(...)` and `subagents.call_bulk(...)` are convenience wrappers for
-spawn-then-wait and should only be used when the parent intentionally wants to
-block immediately. These helpers do not have subagent timeouts; children may run
-for a long time and should either complete normally or be interrupted explicitly.
+`subagents.spawn(...)` returns a `SubagentHandle` immediately after creating a
+child session. Spawn multiple children with repeated `spawn(...)` calls and keep
+the handles in a list. `subagents.wait(handle_or_handles)` is the explicit
+blocking operation: it waits until the selected child sessions are idle, then
+returns `SubagentResult` objects with final text/transcript snippets.
+If the latest terminal child turn is interrupted or crashed, `wait(...)` and
+`call(...)` raise `subagent_interrupted` or `subagent_crashed` instead of
+silently treating that terminal state as a successful result.
+`subagents.call(...)` is a convenience wrapper for spawn-then-wait and should
+only be used when the parent intentionally wants to block immediately. This
+helper does not have a subagent timeout; children may run for a long time and
+should either complete normally or be interrupted explicitly.
+Callers should retain handles for every spawned child, later `wait(...)`,
+`list()`, or read transcripts, and reconcile, steer, or interrupt those children
+before reporting final work.
+Each child runs in its own distinct session cwd/workspace clone. Parent prompts
+should describe the task and relevant files, not ask the child to operate in the
+parent cwd; child file edits do not appear in the parent workspace until they
+are explicitly inspected and merged.
 The provider-visible `PythonRepl` tool reports Python exceptions as tool errors
 with stdout/stderr and traceback, while the websocket `repl.exec` RPC returns the
 raw `ok: false` REPL payload.
@@ -1272,6 +1287,14 @@ source child's final worktree is made available in the new child's corresponding
 workspace as a local ref such as
 `refs/pi-relay/sources/source-1-implementer-a1b2c3d4`; local-folder workspaces
 are not merged or serialized.
+
+When a subagent is spawned, re-driven after being idle, or goes idle, the daemon
+emits parent-scoped `subagent.spawned`, `subagent.running`, and `subagent.idle`
+events. Idle notifications are de-duplicated per completed terminal child state,
+not for the child session lifetime, so a reused/steered child emits another
+running/idle cycle for its next piece of work. Parent sessions can subscribe to
+their normal event stream instead of polling `subagents.list()` to discover child
+completion.
 
 `role` can be a built-in role (`explore`, `worker`, `reviewer`, `tester`) or the name of an
 available skill. A unique workspace-scoped skill can be addressed by name alone;
@@ -1389,6 +1412,9 @@ history.compacted
 session.work_cancelled
 session.recovered
 session.idle
+subagent.spawned
+subagent.running
+subagent.idle
 ```
 
 No approval or awaiting-approval events are emitted.

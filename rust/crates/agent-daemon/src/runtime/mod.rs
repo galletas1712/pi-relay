@@ -12,9 +12,10 @@ use std::sync::Arc;
 use agent_core::AgentInput;
 use agent_session::{AgentSession, SessionAction, SessionInput};
 use agent_store::{
-    AcceptedInput, ActionUpdate, EventType, OutputBatch, QueuedInput, SessionConfig,
+    AcceptedInput, ActionUpdate, EventFrame, EventType, OutputBatch, QueuedInput, SessionActivity,
+    SessionConfig,
 };
-use agent_vocab::ProviderReplayItem;
+use agent_vocab::{ProviderReplayItem, TranscriptItem, TurnOutcome};
 use anyhow::Context;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -31,7 +32,7 @@ use outputs::attach_provider_replay;
 pub(crate) use outputs::{
     agent_input_from_queued_priority, attach_dispatch_config, collect_runtime_outputs,
 };
-pub(crate) use tasks::{abort_session_tasks, take_tasks};
+pub(crate) use tasks::{abort_session_tasks, session_has_live_tasks, take_tasks};
 
 pub(crate) async fn ensure_expected_active_leaf(
     state: &AppState,
@@ -165,6 +166,7 @@ impl SessionDriver {
             .await
             .map_err(anyhow::Error::from)?
         {
+            self.reconcile_abandoned_boundary_session().await?;
             return Ok(());
         }
         let stored = self
@@ -175,6 +177,7 @@ impl SessionDriver {
             .map_err(anyhow::Error::from)?;
         let store = transcript_store_from_stored(&stored)?;
         if store.is_turn_boundary() {
+            self.reconcile_abandoned_boundary_session().await?;
             return Ok(());
         }
         let recovered = AgentSession::from_stored_session(stored.clone())
@@ -197,6 +200,18 @@ impl SessionDriver {
             )
             .await
             .map_err(anyhow::Error::from)?;
+        let mut events = events;
+        let activity = self
+            .state
+            .repo
+            .activity(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if !should_continue && activity == SessionActivity::Idle {
+            if let Some(event) = self.try_subagent_parent_idle_event().await {
+                events.push(event);
+            }
+        }
         publish_events(&self.state, events);
         clear_event_buffer_if_idle(&self.state, &self.session_id).await?;
         if should_continue {
@@ -355,11 +370,141 @@ impl SessionDriver {
                 .insert_event(&self.session_id, EventType::SessionIdle, json!({}))
                 .await
                 .map_err(anyhow::Error::from)?;
-            publish_events(&self.state, vec![event]);
+            let mut events = vec![event];
+            if let Some(event) = self.try_subagent_parent_idle_event().await {
+                events.push(event);
+            }
+            publish_events(&self.state, events);
             clear_event_buffer_if_idle(&self.state, &self.session_id).await?;
             break;
         }
         Ok(dispatched_all)
+    }
+
+    pub(crate) async fn notify_subagent_parent_idle_if_needed(&self) {
+        if let Some(event) = self.try_subagent_parent_idle_event().await {
+            publish_events(&self.state, vec![event]);
+        }
+    }
+
+    async fn reconcile_abandoned_boundary_session(&self) -> std::result::Result<(), RpcError> {
+        let activity = self
+            .state
+            .repo
+            .activity(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if activity == SessionActivity::Running
+            && !session_has_live_tasks(&self.state, &self.session_id)
+        {
+            self.state
+                .repo
+                .mark_unfinished_actions_stale(&self.session_id)
+                .await
+                .map_err(anyhow::Error::from)?;
+        }
+        let activity = self
+            .state
+            .repo
+            .activity(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if activity == SessionActivity::Idle {
+            self.notify_subagent_parent_idle_if_needed().await;
+        }
+        Ok(())
+    }
+
+    async fn try_subagent_parent_idle_event(&self) -> Option<EventFrame> {
+        match self.subagent_parent_idle_event().await {
+            Ok(event) => event,
+            Err(error) => {
+                eprintln!(
+                    "failed to publish parent subagent idle event child={}: {}: {}",
+                    self.session_id, error.code, error.message
+                );
+                None
+            }
+        }
+    }
+
+    async fn subagent_parent_idle_event(
+        &self,
+    ) -> std::result::Result<Option<EventFrame>, RpcError> {
+        let Some(parent_session_id) = self
+            .state
+            .repo
+            .session_parent_id(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?
+        else {
+            return Ok(None);
+        };
+        let config = self
+            .state
+            .repo
+            .load_session_config(&self.session_id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let turns = self
+            .state
+            .repo
+            .transcript_turns(&self.session_id, None, Some(20))
+            .await
+            .map_err(anyhow::Error::from)?;
+        let outcome = turns
+            .cards
+            .iter()
+            .rev()
+            .find_map(|card| card.outcome)
+            .unwrap_or(TurnOutcome::Graceful);
+        let notification_key = turns
+            .cards
+            .iter()
+            .rev()
+            .find(|card| card.outcome.is_some())
+            .map(|card| format!("active_leaf:{}", card.active_leaf_id))
+            .or_else(|| {
+                turns
+                    .active_leaf_id
+                    .as_ref()
+                    .map(|active_leaf_id| format!("active_leaf:{active_leaf_id}"))
+            })
+            .unwrap_or_else(|| "empty".to_string());
+        let text = turns
+            .cards
+            .iter()
+            .rev()
+            .filter_map(|card| card.assistant_message.as_ref())
+            .find_map(|entry| match &entry.item {
+                TranscriptItem::AssistantMessage(message) => Some(message.text()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        let summary_preview = if text.chars().count() > 500 {
+            format!("{}…", text.chars().take(500).collect::<String>())
+        } else {
+            text
+        };
+        let event = self
+            .state
+            .repo
+            .insert_subagent_idle_event_once(
+                &parent_session_id,
+                &self.session_id,
+                &notification_key,
+                json!({
+                    "child_session_id": self.session_id,
+                    "role": config.metadata.get("role_name").and_then(Value::as_str),
+                    "role_workspace": config.metadata.get("role_workspace").and_then(Value::as_str),
+                    "display_name": config.metadata.get("display_name").and_then(Value::as_str),
+                    "outcome": outcome,
+                    "summary_preview": summary_preview,
+                }),
+            )
+            .await
+            .map_err(anyhow::Error::from)?;
+        Ok(event)
     }
 
     async fn consume_ready_steer(

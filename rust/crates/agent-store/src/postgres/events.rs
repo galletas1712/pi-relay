@@ -4,7 +4,7 @@ use agent_session::{SessionAction, SessionActionKind, SessionEvent};
 use agent_vocab::TranscriptItem;
 use anyhow::Result;
 use serde_json::{json, Value};
-use sqlx::{Executor, Postgres, Transaction};
+use sqlx::{Executor, Postgres, Row, Transaction};
 
 use crate::{
     EventFrame, EventType, SessionActivity, TranscriptEntryBodyMode, TranscriptEntryRecord,
@@ -41,6 +41,61 @@ impl PostgresAgentStore {
         data: Value,
     ) -> Result<EventFrame> {
         insert_event_row(&self.pool, session_id, event, data).await
+    }
+
+    pub async fn insert_events(
+        &self,
+        session_id: &str,
+        events: Vec<(EventType, Value)>,
+    ) -> Result<Vec<EventFrame>> {
+        let mut tx = self.pool.begin().await?;
+        let mut frames = Vec::with_capacity(events.len());
+        for (event_type, payload) in events {
+            frames.push(insert_event_tx(&mut tx, session_id, event_type, payload).await?);
+        }
+        tx.commit().await?;
+        Ok(frames)
+    }
+
+    pub async fn insert_subagent_idle_event_once(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        notification_key: &str,
+        payload: Value,
+    ) -> Result<Option<EventFrame>> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("select metadata from sessions where id=$1 for update")
+            .bind(child_session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let mut metadata: Value = row.get("metadata");
+        if metadata
+            .get("subagent_parent_idle_notification_key")
+            .and_then(Value::as_str)
+            == Some(notification_key)
+        {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let event =
+            insert_event_tx(&mut tx, parent_session_id, EventType::SubagentIdle, payload).await?;
+        ensure_payload_object(&mut metadata).insert(
+            "subagent_parent_idle_notification_key".to_string(),
+            Value::String(notification_key.to_string()),
+        );
+        sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
+            .bind(child_session_id)
+            .bind(&metadata)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(Some(event))
     }
 
     pub async fn events_after(
