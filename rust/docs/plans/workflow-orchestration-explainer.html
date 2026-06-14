@@ -1,0 +1,1060 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>pi-relay workflow orchestration explainer</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f7f4ef;
+      --paper: #fffdf8;
+      --ink: #1f2933;
+      --muted: #667085;
+      --line: #d8d0c4;
+      --accent: #7c3aed;
+      --accent-2: #0f766e;
+      --accent-3: #c2410c;
+      --ok: #15803d;
+      --warn: #b45309;
+      --bad: #b91c1c;
+      --code-bg: #111827;
+      --code-fg: #e5e7eb;
+      --shadow: 0 20px 50px rgba(31, 41, 51, 0.10);
+      --radius: 18px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      background:
+        radial-gradient(circle at top left, rgba(124, 58, 237, 0.12), transparent 32rem),
+        radial-gradient(circle at 75% 10%, rgba(15, 118, 110, 0.10), transparent 28rem),
+        var(--bg);
+      color: var(--ink);
+      font-family: var(--sans);
+      line-height: 1.55;
+    }
+
+    a { color: var(--accent); }
+    code, pre { font-family: var(--mono); }
+    pre {
+      margin: 0;
+      padding: 1rem;
+      overflow: auto;
+      border-radius: 14px;
+      background: var(--code-bg);
+      color: var(--code-fg);
+      font-size: 0.88rem;
+      line-height: 1.45;
+    }
+
+    .page {
+      width: min(1180px, calc(100vw - 32px));
+      margin: 0 auto;
+      padding: 32px 0 80px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: minmax(0, 1.3fr) minmax(320px, 0.7fr);
+      gap: 28px;
+      align-items: stretch;
+      margin-bottom: 28px;
+    }
+
+    .card {
+      background: rgba(255, 253, 248, 0.92);
+      border: 1px solid rgba(216, 208, 196, 0.9);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+
+    .hero-main {
+      padding: clamp(28px, 4vw, 52px);
+    }
+
+    .eyebrow {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 18px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(124, 58, 237, 0.10);
+      color: #5b21b6;
+      font-size: 0.82rem;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3 { line-height: 1.12; }
+    h1 {
+      margin: 0 0 18px;
+      font-size: clamp(2.3rem, 5vw, 4.8rem);
+      letter-spacing: -0.06em;
+    }
+    h2 {
+      margin: 0 0 18px;
+      font-size: clamp(1.7rem, 3vw, 2.6rem);
+      letter-spacing: -0.04em;
+    }
+    h3 {
+      margin: 0 0 10px;
+      font-size: 1.2rem;
+      letter-spacing: -0.02em;
+    }
+    p { margin: 0 0 1rem; }
+    .lead {
+      color: #344054;
+      font-size: clamp(1.05rem, 2vw, 1.3rem);
+      max-width: 64ch;
+    }
+
+    .hero-side {
+      padding: 24px;
+      display: grid;
+      gap: 14px;
+      align-content: center;
+    }
+
+    .pill-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 16px;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 7px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: #344054;
+      font-size: 0.88rem;
+      font-weight: 650;
+    }
+
+    .toc {
+      display: grid;
+      gap: 8px;
+      padding: 18px;
+    }
+    .toc a {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 10px 12px;
+      border-radius: 12px;
+      color: var(--ink);
+      text-decoration: none;
+      background: rgba(255, 255, 255, 0.65);
+      border: 1px solid transparent;
+    }
+    .toc a:hover { border-color: var(--line); background: white; }
+    .toc span { color: var(--muted); font-family: var(--mono); font-size: 0.85rem; }
+
+    section {
+      margin-top: 28px;
+      padding: clamp(22px, 3vw, 34px);
+    }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      align-items: start;
+      margin-bottom: 22px;
+    }
+    .section-head p {
+      color: var(--muted);
+      max-width: 66ch;
+    }
+
+    .grid {
+      display: grid;
+      gap: 16px;
+    }
+    .grid.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .grid.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+    .mini-card {
+      padding: 18px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.78);
+    }
+    .mini-card p { color: var(--muted); margin-bottom: 0; }
+    .num {
+      display: inline-grid;
+      place-items: center;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: var(--ink);
+      color: white;
+      font-weight: 800;
+      font-size: 0.86rem;
+      margin-bottom: 10px;
+    }
+
+    .diagram {
+      width: 100%;
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fff;
+      margin: 18px 0;
+    }
+    svg {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+    .svg-label { font: 700 16px var(--sans); fill: #1f2933; }
+    .svg-small { font: 500 12px var(--sans); fill: #667085; }
+    .svg-code { font: 600 12px var(--mono); fill: #334155; }
+
+    .compare {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .old, .new {
+      padding: 20px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+    }
+    .old { background: #fff7ed; }
+    .new { background: #ecfdf5; }
+    .old h3 { color: var(--accent-3); }
+    .new h3 { color: var(--ok); }
+
+    .chat {
+      display: grid;
+      gap: 12px;
+      margin-top: 14px;
+    }
+    .bubble {
+      max-width: 84%;
+      padding: 13px 15px;
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    .bubble.user {
+      justify-self: start;
+      background: #eef2ff;
+      border-color: #c7d2fe;
+    }
+    .bubble.agent {
+      justify-self: end;
+      background: #ecfdf5;
+      border-color: #a7f3d0;
+    }
+    .bubble.tool {
+      justify-self: stretch;
+      max-width: 100%;
+      background: #111827;
+      color: #e5e7eb;
+      border-color: #111827;
+      font-family: var(--mono);
+      font-size: 0.86rem;
+      white-space: pre-wrap;
+    }
+    .bubble.workflow {
+      justify-self: stretch;
+      max-width: 100%;
+      background: #fff7ed;
+      border-color: #fed7aa;
+    }
+    .speaker {
+      display: block;
+      margin-bottom: 5px;
+      color: var(--muted);
+      font-size: 0.78rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .tool .speaker { color: #9ca3af; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      overflow: hidden;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: white;
+    }
+    th, td {
+      padding: 13px 14px;
+      vertical-align: top;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+    }
+    th {
+      background: #f1ece4;
+      font-size: 0.86rem;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+    tr:last-child td { border-bottom: 0; }
+
+    .run-board {
+      display: grid;
+      grid-template-columns: 0.9fr 1.25fr 1fr;
+      gap: 14px;
+      margin-top: 16px;
+    }
+    .lane {
+      min-height: 280px;
+      border: 1px dashed #c9c0b4;
+      border-radius: 16px;
+      padding: 14px;
+      background: rgba(255, 255, 255, 0.58);
+    }
+    .lane h3 {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    .count {
+      padding: 3px 8px;
+      border-radius: 999px;
+      background: #eee7dd;
+      color: var(--muted);
+      font-size: 0.78rem;
+    }
+    .task-card {
+      padding: 13px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: white;
+      margin-bottom: 10px;
+    }
+    .task-card strong { display: block; }
+    .status {
+      display: inline-flex;
+      margin-top: 8px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 0.78rem;
+      font-weight: 800;
+    }
+    .status.running { color: #075985; background: #e0f2fe; }
+    .status.done { color: #166534; background: #dcfce7; }
+    .status.blocked { color: #92400e; background: #fef3c7; }
+
+    details {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 14px 16px;
+      background: rgba(255, 255, 255, 0.76);
+    }
+    details + details { margin-top: 10px; }
+    summary {
+      cursor: pointer;
+      font-weight: 800;
+    }
+
+    .footer {
+      margin-top: 28px;
+      padding: 22px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    @media (max-width: 900px) {
+      .hero, .grid.two, .grid.three, .grid.four, .compare, .run-board {
+        grid-template-columns: 1fr;
+      }
+      .bubble { max-width: 100%; }
+      .section-head { display: block; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header class="hero">
+      <div class="hero-main card">
+        <div class="eyebrow">pi-relay design explainer</div>
+        <h1>Workflow orchestration without the orchestration tax</h1>
+        <p class="lead">
+          The new plan replaces ad hoc Python REPL subagent orchestration with
+          discoverable workflow plugins, scoped task agents, durable artifacts,
+          and a simple run board UX.
+        </p>
+        <div class="pill-list">
+          <span class="pill">4 primitives</span>
+          <span class="pill">workflow plugins</span>
+          <span class="pill">regular tool calls</span>
+          <span class="pill">scoped task agents</span>
+          <span class="pill">artifacts as handoffs</span>
+        </div>
+      </div>
+      <aside class="hero-side card">
+        <h2 style="font-size:1.35rem;margin-bottom:0;">Quick map</h2>
+        <nav class="toc" aria-label="Table of contents">
+          <a href="#what-changed">What changed <span>01</span></a>
+          <a href="#primitives">The four primitives <span>02</span></a>
+          <a href="#plugins">Workflow plugins <span>03</span></a>
+          <a href="#ux">Human UX <span>04</span></a>
+          <a href="#agent-ux">Agent UX <span>05</span></a>
+          <a href="#flows">Example flows <span>06</span></a>
+          <a href="#subagents">Subagents after workflows <span>07</span></a>
+        </nav>
+      </aside>
+    </header>
+
+    <section id="what-changed" class="card">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">01 · What changed</div>
+          <h2>From subagent scripts to workflow plugins</h2>
+        </div>
+        <p>
+          The old mental model asked a parent agent to write Python control flow
+          against subagents. The new model gives top-level agents normal tools to
+          discover and invoke workflow plugins.
+        </p>
+      </div>
+
+      <div class="compare">
+        <div class="old">
+          <h3>Old path: parent-agent orchestration</h3>
+          <ul>
+            <li>Parent model writes Python REPL orchestration.</li>
+            <li>Subagents are the primary abstraction.</li>
+            <li>Control flow lives in ephemeral Python state.</li>
+            <li>Handoffs are transcript snippets or manual summaries.</li>
+            <li>Human interruption makes parent control flow fragile.</li>
+          </ul>
+        </div>
+        <div class="new">
+          <h3>New path: workflow plugins</h3>
+          <ul>
+            <li>Top-level model calls <code>workflow.list</code> and <code>workflow.start</code>.</li>
+            <li>Run/Task/Artifact are the durable abstractions.</li>
+            <li>Control flow lives in plugin code and persisted state.</li>
+            <li>Artifacts are the default handoff mechanism.</li>
+            <li>Task agents are scoped, observable, and interruptible.</li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="diagram" aria-label="Old vs new architecture diagram">
+        <svg viewBox="0 0 1100 330" role="img">
+          <defs>
+            <marker id="arrow" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L8,3 z" fill="#64748b"></path>
+            </marker>
+          </defs>
+          <rect x="30" y="35" width="490" height="250" rx="18" fill="#fff7ed" stroke="#fed7aa"/>
+          <text x="55" y="70" class="svg-label" fill="#c2410c">Old: Python REPL as orchestrator</text>
+          <rect x="65" y="105" width="145" height="58" rx="12" fill="#fff" stroke="#d8d0c4"/>
+          <text x="92" y="137" class="svg-label">Parent agent</text>
+          <rect x="280" y="105" width="170" height="58" rx="12" fill="#111827"/>
+          <text x="305" y="137" class="svg-label" fill="#e5e7eb">Python REPL</text>
+          <rect x="95" y="205" width="105" height="48" rx="10" fill="#fff" stroke="#d8d0c4"/>
+          <text x="116" y="235" class="svg-small">child A</text>
+          <rect x="230" y="205" width="105" height="48" rx="10" fill="#fff" stroke="#d8d0c4"/>
+          <text x="251" y="235" class="svg-small">child B</text>
+          <rect x="365" y="205" width="105" height="48" rx="10" fill="#fff" stroke="#d8d0c4"/>
+          <text x="386" y="235" class="svg-small">child C</text>
+          <line x1="210" y1="134" x2="278" y2="134" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="365" y1="164" x2="150" y2="204" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="365" y1="164" x2="282" y2="204" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="365" y1="164" x2="417" y2="204" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+          <text x="72" y="275" class="svg-small">Control flow is model-written and fragile.</text>
+
+          <rect x="580" y="35" width="490" height="250" rx="18" fill="#ecfdf5" stroke="#a7f3d0"/>
+          <text x="605" y="70" class="svg-label" fill="#15803d">New: workflow plugin runtime</text>
+          <rect x="620" y="105" width="120" height="58" rx="12" fill="#fff" stroke="#d8d0c4"/>
+          <text x="642" y="137" class="svg-label">Agent</text>
+          <rect x="790" y="105" width="185" height="58" rx="12" fill="#fff" stroke="#d8d0c4"/>
+          <text x="818" y="130" class="svg-label">workflow.*</text>
+          <text x="824" y="148" class="svg-small">list · describe · start</text>
+          <rect x="715" y="205" width="125" height="48" rx="10" fill="#fff" stroke="#d8d0c4"/>
+          <text x="748" y="235" class="svg-small">Run</text>
+          <rect x="865" y="205" width="125" height="48" rx="10" fill="#fff" stroke="#d8d0c4"/>
+          <text x="895" y="235" class="svg-small">Tasks</text>
+          <rect x="1000" y="205" width="45" height="48" rx="10" fill="#fff" stroke="#d8d0c4"/>
+          <text x="1009" y="235" class="svg-small">Art</text>
+          <line x1="740" y1="134" x2="788" y2="134" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="882" y1="164" x2="780" y2="204" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="882" y1="164" x2="928" y2="204" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+          <line x1="990" y1="229" x2="998" y2="229" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+          <text x="622" y="275" class="svg-small">Control flow is plugin-owned and persisted.</text>
+        </svg>
+      </div>
+    </section>
+
+    <section id="primitives" class="card">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">02 · The model</div>
+          <h2>Four primitives carry the whole system</h2>
+        </div>
+        <p>
+          The plan intentionally avoids extra tables for proposals, budgets,
+          variables, and leases. If it can be a task result or an artifact, it is
+          not a new abstraction.
+        </p>
+      </div>
+
+      <div class="grid four">
+        <div class="mini-card">
+          <span class="num">1</span>
+          <h3>Run</h3>
+          <p>Overall goal, plugin kind, status, params, and small plugin-owned state.</p>
+        </div>
+        <div class="mini-card">
+          <span class="num">2</span>
+          <h3>Task</h3>
+          <p>One unit of work, usually a scoped child agent session with a role and prompt.</p>
+        </div>
+        <div class="mini-card">
+          <span class="num">3</span>
+          <h3>Artifact</h3>
+          <p>Handoffs, evidence, diffs, logs, source refs, snapshots, decisions, notes.</p>
+        </div>
+        <div class="mini-card">
+          <span class="num">4</span>
+          <h3>Workspace source</h3>
+          <p>How a task sees files: no workspace, read parent, fork parent, from task, or sources.</p>
+        </div>
+      </div>
+
+      <div class="diagram" aria-label="Run task artifact workspace diagram">
+        <svg viewBox="0 0 1100 320" role="img">
+          <defs>
+            <marker id="arrow2" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L8,3 z" fill="#64748b"></path>
+            </marker>
+          </defs>
+          <rect x="60" y="105" width="160" height="90" rx="16" fill="#eef2ff" stroke="#c7d2fe"/>
+          <text x="119" y="140" class="svg-label">Run</text>
+          <text x="88" y="164" class="svg-small">goal · params · state</text>
+
+          <rect x="330" y="60" width="160" height="75" rx="16" fill="#fff" stroke="#d8d0c4"/>
+          <text x="387" y="94" class="svg-label">Task</text>
+          <text x="362" y="116" class="svg-small">implementer</text>
+          <rect x="330" y="185" width="160" height="75" rx="16" fill="#fff" stroke="#d8d0c4"/>
+          <text x="387" y="219" class="svg-label">Task</text>
+          <text x="372" y="241" class="svg-small">reviewer</text>
+
+          <rect x="610" y="72" width="175" height="65" rx="16" fill="#ecfdf5" stroke="#a7f3d0"/>
+          <text x="665" y="103" class="svg-label">Artifact</text>
+          <text x="642" y="124" class="svg-small">handoff / diff</text>
+          <rect x="610" y="183" width="175" height="65" rx="16" fill="#ecfdf5" stroke="#a7f3d0"/>
+          <text x="665" y="214" class="svg-label">Artifact</text>
+          <text x="646" y="235" class="svg-small">verdict / notes</text>
+
+          <rect x="895" y="105" width="160" height="90" rx="16" fill="#fff7ed" stroke="#fed7aa"/>
+          <text x="923" y="140" class="svg-label">Workspace</text>
+          <text x="918" y="164" class="svg-small">fork · from_task</text>
+
+          <line x1="220" y1="150" x2="328" y2="98" stroke="#64748b" stroke-width="2" marker-end="url(#arrow2)"/>
+          <line x1="220" y1="150" x2="328" y2="222" stroke="#64748b" stroke-width="2" marker-end="url(#arrow2)"/>
+          <line x1="490" y1="98" x2="608" y2="104" stroke="#64748b" stroke-width="2" marker-end="url(#arrow2)"/>
+          <line x1="610" y1="216" x2="492" y2="222" stroke="#64748b" stroke-width="2" marker-end="url(#arrow2)"/>
+          <line x1="785" y1="104" x2="893" y2="132" stroke="#64748b" stroke-width="2" marker-end="url(#arrow2)"/>
+          <line x1="785" y1="216" x2="893" y2="168" stroke="#64748b" stroke-width="2" marker-end="url(#arrow2)"/>
+        </svg>
+      </div>
+    </section>
+
+    <section id="plugins" class="card">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">03 · Plugin registry</div>
+          <h2>Workflows are discoverable plugins</h2>
+        </div>
+        <p>
+          "Plugin" means the top-level agent can discover the workflow, read its
+          input schema, and start it through regular tool calls. It does not mean
+          we need a generic graph DSL in v1.
+        </p>
+      </div>
+
+      <div class="grid two">
+        <div>
+          <h3>Manifest</h3>
+          <pre>{
+  "id": "kubernetes_e2e",
+  "title": "Kubernetes e2e test",
+  "description": "Run adaptive tests against a cluster.",
+  "input_schema": {
+    "required": ["context", "namespace", "test_goal"]
+  },
+  "default_roles": ["kubernetes-tester"]
+}</pre>
+        </div>
+        <div>
+          <h3>Runtime contract</h3>
+          <pre>trait WorkflowPlugin {
+    fn manifest(&self) -> Manifest;
+    fn start(&self, params: Json) -> Advance;
+    fn advance(
+        &self,
+        run: Run,
+        tasks: Vec&lt;Task&gt;,
+        artifacts: Vec&lt;Artifact&gt;,
+    ) -> Advance;
+}</pre>
+        </div>
+      </div>
+
+      <div class="diagram" aria-label="Plugin discovery and start flow">
+        <svg viewBox="0 0 1100 280" role="img">
+          <defs>
+            <marker id="arrow3" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L8,3 z" fill="#64748b"></path>
+            </marker>
+          </defs>
+          <rect x="55" y="95" width="145" height="72" rx="16" fill="#eef2ff" stroke="#c7d2fe"/>
+          <text x="87" y="126" class="svg-label">Top agent</text>
+          <text x="82" y="148" class="svg-small">normal tool calls</text>
+          <rect x="285" y="55" width="185" height="60" rx="14" fill="#fff" stroke="#d8d0c4"/>
+          <text x="321" y="87" class="svg-code">workflow.list</text>
+          <rect x="285" y="145" width="185" height="60" rx="14" fill="#fff" stroke="#d8d0c4"/>
+          <text x="304" y="177" class="svg-code">workflow.describe</text>
+          <rect x="560" y="95" width="180" height="72" rx="16" fill="#fff" stroke="#d8d0c4"/>
+          <text x="594" y="126" class="svg-label">Registry</text>
+          <text x="590" y="148" class="svg-small">bundled plugins</text>
+          <rect x="835" y="95" width="190" height="72" rx="16" fill="#ecfdf5" stroke="#a7f3d0"/>
+          <text x="870" y="126" class="svg-code">workflow.start</text>
+          <text x="877" y="148" class="svg-small">creates a Run</text>
+          <line x1="200" y1="120" x2="283" y2="85" stroke="#64748b" stroke-width="2" marker-end="url(#arrow3)"/>
+          <line x1="200" y1="143" x2="283" y2="175" stroke="#64748b" stroke-width="2" marker-end="url(#arrow3)"/>
+          <line x1="470" y1="85" x2="558" y2="119" stroke="#64748b" stroke-width="2" marker-end="url(#arrow3)"/>
+          <line x1="470" y1="175" x2="558" y2="145" stroke="#64748b" stroke-width="2" marker-end="url(#arrow3)"/>
+          <line x1="740" y1="131" x2="833" y2="131" stroke="#64748b" stroke-width="2" marker-end="url(#arrow3)"/>
+        </svg>
+      </div>
+    </section>
+
+    <section id="ux" class="card">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">04 · Human UX</div>
+          <h2>The human sees a run board</h2>
+        </div>
+        <p>
+          The UI should be about what is happening and what needs attention, not
+          about graph topology. Most actions are verbs on task cards and human
+          requests.
+        </p>
+      </div>
+
+      <div class="run-board">
+        <div class="lane">
+          <h3>Run <span class="count">1</span></h3>
+          <div class="task-card">
+            <strong>Kubernetes e2e</strong>
+            <span>Goal: test the operator on <code>dynamo-nscale-dev</code>.</span>
+            <span class="status running">running</span>
+          </div>
+          <div class="task-card">
+            <strong>Current phase</strong>
+            <span>Diagnosing rollout and image version.</span>
+          </div>
+        </div>
+        <div class="lane">
+          <h3>Task cards <span class="count">3</span></h3>
+          <div class="task-card">
+            <strong>kubernetes-tester</strong>
+            <span>Collecting pod events and rollout status.</span>
+            <span class="status running">running</span>
+          </div>
+          <div class="task-card">
+            <strong>evidence artifact</strong>
+            <span>pod-describe, events, image digest.</span>
+            <span class="status done">written</span>
+          </div>
+          <div class="task-card">
+            <strong>human request</strong>
+            <span>Teleport auth renewal needed.</span>
+            <span class="status blocked">blocked</span>
+          </div>
+        </div>
+        <div class="lane">
+          <h3>Controls <span class="count">verbs</span></h3>
+          <div class="task-card">
+            <strong>Available actions</strong>
+            <span>Pause · cancel · retry task · steer child · answer human request</span>
+          </div>
+          <div class="task-card">
+            <strong>Latest decision</strong>
+            <span>Suggested next: rebuild image, then rerun rollout.</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="agent-ux" class="card">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">05 · Agent UX</div>
+          <h2>The agent receives a scoped task contract</h2>
+        </div>
+        <p>
+          Workflow task agents are not little orchestrators. They receive a role,
+          selected context, workspace instructions, allowed outputs, and a stop
+          condition.
+        </p>
+      </div>
+
+      <div class="grid two">
+        <div>
+          <h3>Example task prompt</h3>
+          <pre>You are task task_k8s_1 in run run_42.
+
+Role:
+  kubernetes-tester
+
+Run goal:
+  Run e2e tests for the operator.
+
+Task goal:
+  Deploy the test manifest, observe rollout,
+  collect evidence, classify the outcome.
+
+Context:
+  artifact_build_image_digest
+  artifact_test_manifest
+
+Workspace:
+  read_parent
+
+Allowed outputs:
+  complete with one of:
+    pass | product_failure |
+    environment_retry | human_needed
+
+Stopping condition:
+  Stop when tests pass, a code issue is found,
+  or human action is required.</pre>
+        </div>
+        <div>
+          <h3>Example task result</h3>
+          <pre>{
+  "status": "done",
+  "summary": "Rollout failed because the deployed image digest is stale.",
+  "artifact_id": "artifact_k8s_rollout_evidence",
+  "suggested_next": "rebuild_image"
+}</pre>
+          <p style="margin-top:14px;color:var(--muted);">
+            The workflow plugin reads <code>suggested_next</code> and decides
+            whether to create another Kubernetes tester task, ask for a rebuild,
+            or mark the run failed.
+          </p>
+        </div>
+      </div>
+
+      <div class="diagram" aria-label="Agent task lifecycle">
+        <svg viewBox="0 0 1100 250" role="img">
+          <defs>
+            <marker id="arrow4" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L8,3 z" fill="#64748b"></path>
+            </marker>
+          </defs>
+          <rect x="55" y="85" width="155" height="70" rx="16" fill="#eef2ff" stroke="#c7d2fe"/>
+          <text x="84" y="116" class="svg-label">Plugin</text>
+          <text x="78" y="138" class="svg-small">creates task</text>
+          <rect x="285" y="85" width="170" height="70" rx="16" fill="#fff" stroke="#d8d0c4"/>
+          <text x="315" y="116" class="svg-label">Task prompt</text>
+          <text x="314" y="138" class="svg-small">scoped context</text>
+          <rect x="535" y="85" width="170" height="70" rx="16" fill="#fff" stroke="#d8d0c4"/>
+          <text x="570" y="116" class="svg-label">Agent acts</text>
+          <text x="569" y="138" class="svg-small">normal tools</text>
+          <rect x="785" y="85" width="235" height="70" rx="16" fill="#ecfdf5" stroke="#a7f3d0"/>
+          <text x="824" y="116" class="svg-label">Artifact + result</text>
+          <text x="840" y="138" class="svg-small">summary · evidence · suggested_next</text>
+          <line x1="210" y1="120" x2="283" y2="120" stroke="#64748b" stroke-width="2" marker-end="url(#arrow4)"/>
+          <line x1="455" y1="120" x2="533" y2="120" stroke="#64748b" stroke-width="2" marker-end="url(#arrow4)"/>
+          <line x1="705" y1="120" x2="783" y2="120" stroke="#64748b" stroke-width="2" marker-end="url(#arrow4)"/>
+        </svg>
+      </div>
+    </section>
+
+    <section id="flows" class="card">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">06 · Examples</div>
+          <h2>What actual exchanges look like</h2>
+        </div>
+        <p>
+          These examples show the system from the perspective of a user, the
+          top-level agent, workflow tools, and task agents.
+        </p>
+      </div>
+
+      <details open>
+        <summary>Kubernetes e2e: user asks for adaptive cluster testing</summary>
+        <div class="chat">
+          <div class="bubble user">
+            <span class="speaker">User</span>
+            Run the operator e2e tests in <code>dynamo-nscale-dev</code>, namespace
+            <code>schwinns</code>. If it is an infra issue, adapt and retry. If it is a code
+            issue, stop with evidence.
+          </div>
+          <div class="bubble agent">
+            <span class="speaker">Top-level agent</span>
+            I’ll look for an appropriate workflow plugin and start it with the cluster
+            details.
+          </div>
+          <div class="bubble tool"><span class="speaker">Tool call</span>workflow.list()</div>
+          <div class="bubble workflow">
+            <span class="speaker">Tool result</span>
+            Available: <code>explore</code>, <code>implement_review_test</code>,
+            <code>kubernetes_e2e</code>, <code>parallel_race</code>.
+          </div>
+          <div class="bubble tool"><span class="speaker">Tool call</span>workflow.describe({ "id": "kubernetes_e2e" })</div>
+          <div class="bubble tool"><span class="speaker">Tool call</span>workflow.start({
+  "kind": "kubernetes_e2e",
+  "goal": "Run operator e2e tests",
+  "params": {
+    "context": "dynamo-nscale-dev",
+    "namespace": "schwinns",
+    "test_goal": "operator e2e",
+    "stop_when": "pass, code issue found, or human needed"
+  }
+})</div>
+          <div class="bubble workflow">
+            <span class="speaker">Workflow</span>
+            Created run <code>run_42</code>. Started task <code>task_k8s_1</code>
+            with role <code>kubernetes-tester</code>.
+          </div>
+          <div class="bubble workflow">
+            <span class="speaker">Task result</span>
+            <code>task_k8s_1</code> wrote evidence and completed:
+            <code>suggested_next = "rebuild_image"</code>. Summary: deployed digest
+            does not match current code.
+          </div>
+          <div class="bubble agent">
+            <span class="speaker">Top-level agent</span>
+            The run found a code/deployment issue, not a cluster scheduling issue. The
+            evidence artifact includes rollout status, pod events, and image digest.
+          </div>
+        </div>
+      </details>
+
+      <details>
+        <summary>Implement/review/test: reviewer loop before testing</summary>
+        <div class="chat">
+          <div class="bubble user">
+            <span class="speaker">User</span>
+            Implement this change, get a reviewer happy, then run tests. If tests fail,
+            go back through review before testing again.
+          </div>
+          <div class="bubble tool"><span class="speaker">Tool call</span>workflow.start({
+  "kind": "implement_review_test",
+  "goal": "Implement durable run/task/artifact tables",
+  "params": {
+    "acceptance": "tables, repo methods, basic tests",
+    "test": "cargo test -p agent-store",
+    "stop_when": "reviewer approves and tests pass"
+  }
+})</div>
+          <div class="bubble workflow">
+            <span class="speaker">Workflow</span>
+            Round 1: started <code>implementer</code>. Its handoff artifact becomes the
+            input to <code>reviewer</code>.
+          </div>
+          <div class="bubble workflow">
+            <span class="speaker">Reviewer task result</span>
+            Changes requested: migration is missing an index. Suggested next:
+            <code>implement_changes</code>.
+          </div>
+          <div class="bubble workflow">
+            <span class="speaker">Workflow</span>
+            Round 2: starts implementer from previous implementation artifact and
+            reviewer notes. No testing yet.
+          </div>
+          <div class="bubble workflow">
+            <span class="speaker">Reviewer task result</span>
+            Approved. Suggested next: <code>test</code>.
+          </div>
+          <div class="bubble workflow">
+            <span class="speaker">Tester task result</span>
+            Tests failed because repo method returns stale status. Suggested next:
+            <code>code_issue</code>.
+          </div>
+          <div class="bubble agent">
+            <span class="speaker">Top-level agent</span>
+            The workflow is returning to the implement/review loop with the test
+            evidence attached.
+          </div>
+        </div>
+      </details>
+
+      <details>
+        <summary>Explore: parallel RLM-style exploration</summary>
+        <div class="chat">
+          <div class="bubble user">
+            <span class="speaker">User</span>
+            Explore options for making workflow plugins load from workspaces. Give me
+            tradeoffs.
+          </div>
+          <div class="bubble tool"><span class="speaker">Tool call</span>workflow.start({
+  "kind": "explore",
+  "goal": "Explore workspace-loaded workflow plugins",
+  "params": {
+    "question": "What plugin formats and trust model should we use?",
+    "num_explorers": 4
+  }
+})</div>
+          <div class="bubble workflow">
+            <span class="speaker">Workflow</span>
+            Spawned 4 explorer tasks. Each receives a different angle: Rust ABI,
+            WASM, manifest-only plugins, and security/trust.
+          </div>
+          <div class="bubble workflow">
+            <span class="speaker">Reducer</span>
+            Synthesized explorer artifacts into one decision artifact with recommended
+            v1/v2 split.
+          </div>
+        </div>
+      </details>
+
+      <details>
+        <summary>Hill-climb: propose/evaluate candidates</summary>
+        <div class="chat">
+          <div class="bubble user">
+            <span class="speaker">User</span>
+            Find the simplest API shape for workflow plugin manifests. Iterate until
+            the evaluator thinks it is simple enough.
+          </div>
+          <div class="bubble workflow">
+            <span class="speaker">Workflow</span>
+            Iteration 1 proposer writes candidate manifest. Evaluator scores clarity
+            6/10 and asks to remove lifecycle hooks.
+          </div>
+          <div class="bubble workflow">
+            <span class="speaker">Workflow</span>
+            Iteration 2 proposer simplifies to <code>id/title/description/input_schema/default_roles</code>.
+            Evaluator scores 9/10. Best artifact updated.
+          </div>
+        </div>
+      </details>
+    </section>
+
+    <section id="subagents" class="card">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">07 · Subagents</div>
+          <h2>Subagents become execution modes, not the orchestrator</h2>
+        </div>
+        <p>
+          Workflows reduce the need for recursive subagent orchestration, but we
+          should not remove async/observable helper agents entirely.
+        </p>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Mode</th>
+            <th>Used for</th>
+            <th>Properties</th>
+            <th>Tools</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><strong>Workflow task agent</strong></td>
+            <td>Tasks created by workflow plugins.</td>
+            <td>Scoped, non-recursive, async, observable, interruptible, artifact-producing.</td>
+            <td><code>task.write_artifact</code>, <code>task.complete</code>, <code>task.fail</code></td>
+          </tr>
+          <tr>
+            <td><strong>Inline call</strong></td>
+            <td>Small read-only summarization/review/classification tasks.</td>
+            <td>One-shot optimization; no workspace write; no separate long-lived control flow.</td>
+            <td>Task result only, optionally artifact write.</td>
+          </tr>
+          <tr>
+            <td><strong>Direct delegation agent</strong></td>
+            <td>Ad hoc top-level splitting outside a formal workflow.</td>
+            <td>Async, inspectable, cancellable/steerable, optional isolated workspace.</td>
+            <td><code>agent.spawn</code>, <code>agent.status</code>, <code>agent.read</code>, <code>agent.cancel</code></td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="diagram" aria-label="Subagent mode split">
+        <svg viewBox="0 0 1100 280" role="img">
+          <defs>
+            <marker id="arrow5" markerWidth="10" markerHeight="10" refX="7" refY="3" orient="auto">
+              <path d="M0,0 L0,6 L8,3 z" fill="#64748b"></path>
+            </marker>
+          </defs>
+          <rect x="70" y="100" width="170" height="72" rx="16" fill="#eef2ff" stroke="#c7d2fe"/>
+          <text x="104" y="130" class="svg-label">Top agent</text>
+          <text x="98" y="151" class="svg-small">regular tools</text>
+          <rect x="350" y="45" width="220" height="68" rx="16" fill="#ecfdf5" stroke="#a7f3d0"/>
+          <text x="384" y="75" class="svg-label">Workflow plugin</text>
+          <text x="396" y="96" class="svg-small">creates scoped tasks</text>
+          <rect x="350" y="165" width="220" height="68" rx="16" fill="#fff" stroke="#d8d0c4"/>
+          <text x="379" y="195" class="svg-label">Direct delegation</text>
+          <text x="388" y="216" class="svg-small">agent.spawn/read/cancel</text>
+          <rect x="700" y="45" width="260" height="68" rx="16" fill="#fff" stroke="#d8d0c4"/>
+          <text x="744" y="75" class="svg-label">Workflow task agent</text>
+          <text x="743" y="96" class="svg-small">non-recursive · artifact output</text>
+          <rect x="700" y="165" width="260" height="68" rx="16" fill="#fff7ed" stroke="#fed7aa"/>
+          <text x="755" y="195" class="svg-label">Helper agent</text>
+          <text x="735" y="216" class="svg-small">ad hoc · async · inspectable</text>
+          <line x1="240" y1="124" x2="348" y2="78" stroke="#64748b" stroke-width="2" marker-end="url(#arrow5)"/>
+          <line x1="240" y1="150" x2="348" y2="199" stroke="#64748b" stroke-width="2" marker-end="url(#arrow5)"/>
+          <line x1="570" y1="79" x2="698" y2="79" stroke="#64748b" stroke-width="2" marker-end="url(#arrow5)"/>
+          <line x1="570" y1="199" x2="698" y2="199" stroke="#64748b" stroke-width="2" marker-end="url(#arrow5)"/>
+        </svg>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="section-head">
+        <div>
+          <div class="eyebrow">Design rules</div>
+          <h2>How to keep it small</h2>
+        </div>
+      </div>
+      <div class="grid two">
+        <div class="mini-card">
+          <h3>Prefer artifacts over abstractions</h3>
+          <p>If a concept can be a handoff, evidence file, source ref, snapshot, or decision artifact, do not add a table.</p>
+        </div>
+        <div class="mini-card">
+          <h3>Prefer plugin code over graph DSL</h3>
+          <p>If control flow can live in a workflow plugin's <code>advance</code> function, do not create a generic graph edge.</p>
+        </div>
+        <div class="mini-card">
+          <h3>Prefer scoped agents over recursive agents</h3>
+          <p>A workflow task agent should complete its task, write artifacts, and stop. The plugin creates more tasks if needed.</p>
+        </div>
+        <div class="mini-card">
+          <h3>Prefer normal tool calls</h3>
+          <p>Top-level agents discover and invoke workflows with <code>workflow.*</code>. Python REPL remains an escape hatch.</p>
+        </div>
+      </div>
+    </section>
+
+    <footer class="footer">
+      <p>
+        This explainer accompanies <code>rust/docs/plans/workflow-orchestration.md</code>.
+        It is intentionally static HTML so it can be opened directly from the repo.
+      </p>
+    </footer>
+  </main>
+</body>
+</html>
