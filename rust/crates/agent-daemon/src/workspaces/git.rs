@@ -1,3 +1,4 @@
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -108,8 +109,19 @@ pub(crate) async fn validate_remote_branch(remote_url: &str, remote_branch: &str
     Ok(())
 }
 
-pub(super) async fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<()> {
-    let output = git_command()
+/// Run `git` in `cwd` (optionally against an alternate index) and return trimmed
+/// stdout. The typed wrappers below choose the arg shape and whether stdout is
+/// used; this is the single place that spawns git and maps failure to an error.
+async fn git(
+    cwd: &Path,
+    index: Option<&Path>,
+    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
+) -> Result<String> {
+    let mut command = git_command();
+    if let Some(index) = index {
+        command.env("GIT_INDEX_FILE", index);
+    }
+    let output = command
         .args(args)
         .current_dir(cwd)
         .output()
@@ -122,41 +134,19 @@ pub(super) async fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Resu
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub(super) async fn run_git<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<()> {
+    git(cwd, None, args).await.map(|_| ())
 }
 
 pub(super) async fn git_output<const N: usize>(cwd: &Path, args: [&str; N]) -> Result<String> {
-    let output = git_command()
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .with_context(|| format!("run git in {}", cwd.display()))?;
-    if !output.status.success() {
-        bail!(
-            "git failed in {}: {}",
-            cwd.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    git(cwd, None, args).await
 }
 
-pub(super) async fn git_output_dynamic(cwd: &Path, args: Vec<String>) -> Result<String> {
-    let output = git_command()
-        .args(&args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .with_context(|| format!("run git in {}", cwd.display()))?;
-    if !output.status.success() {
-        bail!(
-            "git failed in {}: {}",
-            cwd.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+async fn git_output_dynamic(cwd: &Path, args: Vec<String>) -> Result<String> {
+    git(cwd, None, args).await
 }
 
 pub(super) async fn snapshot_worktree_commit(cwd: &Path, message: &str) -> Result<String> {
@@ -207,21 +197,7 @@ async fn git_output_dynamic_with_index(
     index: &Path,
     args: Vec<String>,
 ) -> Result<String> {
-    let output = git_command()
-        .env("GIT_INDEX_FILE", index)
-        .args(&args)
-        .current_dir(cwd)
-        .output()
-        .await
-        .with_context(|| format!("run git in {}", cwd.display()))?;
-    if !output.status.success() {
-        bail!(
-            "git failed in {}: {}",
-            cwd.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    git(cwd, Some(index), args).await
 }
 
 fn temp_index_path() -> PathBuf {
