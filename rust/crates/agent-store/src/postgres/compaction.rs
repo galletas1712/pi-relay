@@ -20,7 +20,9 @@ use super::events::{
 use super::queue::bump_revisions_tx;
 use super::rows::row_to_stored_entry;
 use super::sql::{action_is_unfinished, lock_session_tx};
-use super::transcript::{insert_stored_entry_tx, model_context_from_entries};
+use super::transcript::{
+    branch_entries_to_leaf, insert_stored_entry_tx, model_context_from_entries,
+};
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
@@ -70,7 +72,7 @@ impl PostgresAgentStore {
         let source_leaf_id = model_action_context_leaf_id(&payload)
             .ok_or_else(|| anyhow!("model action has no compaction source leaf"))?;
         let source_entries =
-            branch_entries_to_leaf_tx(&mut tx, session_id, &source_leaf_id).await?;
+            branch_entries_to_leaf(&mut *tx, session_id, &source_leaf_id).await?;
         if source_entries.is_empty() {
             return Err(anyhow!("transcript leaf not found: {source_leaf_id}"));
         }
@@ -789,41 +791,6 @@ pub(super) async fn latest_context_usage_tx(
             .and_then(Value::as_u64)
             .map(|value| value as usize)
     }))
-}
-
-async fn branch_entries_to_leaf_tx(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    session_id: &str,
-    leaf_id: &str,
-) -> Result<Vec<StoredTranscriptEntry>> {
-    let rows = sqlx::query(
-        r#"
-        with recursive branch as (
-            select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence
-            from transcript_entries t
-            where t.session_id = $1
-              and t.id = $2::text
-
-            union all
-
-            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence
-            from transcript_entries parent
-            join branch child
-              on parent.session_id = $1
-             and parent.id = child.parent_id
-        )
-        select id, parent_id, timestamp_ms, item, provider_replay
-        from branch
-        order by sequence
-        "#,
-    )
-    .bind(session_id)
-    .bind(leaf_id)
-    .fetch_all(&mut **tx)
-    .await?;
-    rows.into_iter()
-        .map(|row| row_to_stored_entry(&row))
-        .collect()
 }
 
 fn now_ms() -> u64 {

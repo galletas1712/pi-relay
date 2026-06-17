@@ -1,5 +1,17 @@
+use crate::SessionActivity;
+
 const UNFINISHED_ACTION_STATUSES: &str = "'pending','blocked','running'";
 const ACTIVE_QUEUED_INPUT_STATUSES: &str = "'queued','consuming'";
+
+pub(super) fn session_activity(running: bool, queued: bool) -> SessionActivity {
+    if running {
+        SessionActivity::Running
+    } else if queued {
+        SessionActivity::Queued
+    } else {
+        SessionActivity::Idle
+    }
+}
 
 pub(super) const QUEUED_INPUT_DISPATCH_ORDER: &str = r#"
     case priority when 'steer' then 0 else 1 end,

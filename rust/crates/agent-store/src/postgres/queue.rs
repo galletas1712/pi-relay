@@ -7,13 +7,14 @@ use uuid::Uuid;
 use crate::{
     CancelQueuedInputResult, EnqueueUserInputResult, EventType, InputPriority, InputRecord,
     PromoteQueuedInputResult, QueueMutationError, QueueState, QueuedInput, QueuedInputRecord,
-    QueuedInputStatus, ReorderQueuedFollowUpsResult, SessionActivity, UpdateQueuedInputResult,
+    QueuedInputStatus, ReorderQueuedFollowUpsResult, UpdateQueuedInputResult,
 };
 
 use super::events::insert_event_tx;
 use super::rows::row_text;
 use super::sql::{
-    lock_session_tx, queued_input_is_active, queued_input_is_editable, QUEUED_INPUT_DISPATCH_ORDER,
+    lock_session_tx, queued_input_is_active, queued_input_is_editable, session_activity,
+    QUEUED_INPUT_DISPATCH_ORDER,
 };
 use super::PostgresAgentStore;
 
@@ -702,13 +703,7 @@ pub(super) async fn queue_state_tx(
     .bind(session_id)
     .fetch_one(&mut **tx)
     .await?;
-    let activity = if unfinished_actions {
-        SessionActivity::Running
-    } else if !queued_rows.is_empty() {
-        SessionActivity::Queued
-    } else {
-        SessionActivity::Idle
-    };
+    let activity = session_activity(unfinished_actions, !queued_rows.is_empty());
     Ok(QueueState {
         session_revision: session.get("session_revision"),
         queue_revision: session.get("queue_revision"),
