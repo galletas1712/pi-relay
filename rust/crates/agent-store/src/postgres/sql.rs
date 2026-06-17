@@ -33,6 +33,13 @@ pub(super) fn action_is_unfinished(alias: Option<&str>) -> String {
     status_is_one_of(alias, UNFINISHED_ACTION_STATUSES)
 }
 
+/// The query that marks a single session's unfinished actions stale. Shared by
+/// per-session recovery (`recover_session`) and `mark_unfinished_actions_stale`.
+pub(super) fn stale_unfinished_actions_for_session() -> String {
+    let unfinished_actions = action_is_unfinished(None);
+    format!("update actions set status='stale', updated_at=now() where session_id=$1 and {unfinished_actions}")
+}
+
 pub(super) fn queued_input_is_active(alias: Option<&str>) -> String {
     status_is_one_of(alias, ACTIVE_QUEUED_INPUT_STATUSES)
 }

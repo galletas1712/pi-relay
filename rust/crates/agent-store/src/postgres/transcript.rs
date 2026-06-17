@@ -18,7 +18,7 @@ use crate::{
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
 use super::queue::bump_revisions_tx;
 use super::rows::{row_to_stored_entry, row_to_transcript_entry};
-use super::sql::{action_is_unfinished, lock_session_tx};
+use super::sql::{lock_session_tx, stale_unfinished_actions_for_session};
 use super::turn_cards::{active_branch_turn_card_page_tx, TurnCardPage};
 use super::PostgresAgentStore;
 
@@ -838,10 +838,7 @@ impl PostgresAgentStore {
                 inserted_records.insert(record.id.clone(), record);
             }
         }
-        let unfinished_actions = action_is_unfinished(None);
-        let query = format!(
-            "update actions set status='stale', updated_at=now() where session_id=$1 and {unfinished_actions}",
-        );
+        let query = stale_unfinished_actions_for_session();
         sqlx::query(&query)
             .bind(session_id)
             .execute(&mut *tx)
