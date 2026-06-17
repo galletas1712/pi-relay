@@ -15,4 +15,4 @@ pub use registry::{
     AgentTool, FirstPartyToolExtension, ProviderTool, ToolDescriptor, ToolExecution, ToolExtension,
     ToolRegistry,
 };
-pub use tools::APPLY_PATCH_LARK_GRAMMAR;
+pub use tools::{nonempty_domains, WebFetchArgs, WebSearchArgs, APPLY_PATCH_LARK_GRAMMAR};

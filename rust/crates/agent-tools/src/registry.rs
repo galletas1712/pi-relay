@@ -333,21 +333,32 @@ impl ToolExtension for FirstPartyToolExtension {
     }
 
     fn register(&self, registry: &mut ToolRegistry) {
-        register_load_skill(registry);
-        register_python_repl(registry);
+        register_runtime_tool(registry, "LoadSkill", "skill_loader", load_skill_definition());
+        register_runtime_tool(
+            registry,
+            "PythonRepl",
+            "python_repl",
+            python_repl_definition(),
+        );
         register_edit(registry);
-        register_bash(registry);
-        register_grep(registry);
-        register_web_search(registry);
-        register_web_fetch(registry);
+        register_uniform(registry, "Bash", "shell", BashTool);
+        register_uniform(registry, "Grep", "workspace_search", GrepTool);
+        register_uniform(registry, "WebSearch", "web_search", WebSearchTool);
+        register_uniform(registry, "WebFetch", "web_fetch", WebFetchTool);
     }
 }
 
-fn register_load_skill(registry: &mut ToolRegistry) {
-    let definition = load_skill_definition();
+/// Registers a tool the runtime intercepts before execution, so it is exposed
+/// to both providers as a plain function with no executor.
+fn register_runtime_tool(
+    registry: &mut ToolRegistry,
+    canonical_name: &str,
+    prompt_alias: &str,
+    definition: ToolDefinition,
+) {
     registry.register_tool(
-        ToolDescriptor::new("LoadSkill")
-            .prompt_alias("skill_loader")
+        ToolDescriptor::new(canonical_name)
+            .prompt_alias(prompt_alias)
             .provider(
                 ProviderKind::OpenAi,
                 ProviderTool::openai_function(&definition),
@@ -359,11 +370,18 @@ fn register_load_skill(registry: &mut ToolRegistry) {
     );
 }
 
-fn register_python_repl(registry: &mut ToolRegistry) {
-    let definition = python_repl_definition();
+/// Registers a tool the same way across every provider: a plain function
+/// declaration plus the same executor for each provider.
+fn register_uniform<T: AgentTool + Clone + 'static>(
+    registry: &mut ToolRegistry,
+    canonical_name: &str,
+    prompt_alias: &str,
+    tool: T,
+) {
+    let definition = tool.definition();
     registry.register_tool(
-        ToolDescriptor::new("PythonRepl")
-            .prompt_alias("python_repl")
+        ToolDescriptor::new(canonical_name)
+            .prompt_alias(prompt_alias)
             .provider(
                 ProviderKind::OpenAi,
                 ProviderTool::openai_function(&definition),
@@ -371,7 +389,9 @@ fn register_python_repl(registry: &mut ToolRegistry) {
             .provider(
                 ProviderKind::Claude,
                 ProviderTool::anthropic_client(&definition),
-            ),
+            )
+            .executor(ProviderKind::OpenAi, tool.clone())
+            .executor(ProviderKind::Claude, tool),
     );
 }
 
@@ -424,78 +444,6 @@ fn openai_apply_patch_tool() -> ProviderTool {
         }),
         ToolExecution::LocalFreeformText,
     )
-}
-
-fn register_bash(registry: &mut ToolRegistry) {
-    let definition = BashTool.definition();
-    registry.register_tool(
-        ToolDescriptor::new("Bash")
-            .prompt_alias("shell")
-            .provider(
-                ProviderKind::OpenAi,
-                ProviderTool::openai_function(&definition),
-            )
-            .provider(
-                ProviderKind::Claude,
-                ProviderTool::anthropic_client(&definition),
-            )
-            .executor(ProviderKind::OpenAi, BashTool)
-            .executor(ProviderKind::Claude, BashTool),
-    );
-}
-
-fn register_grep(registry: &mut ToolRegistry) {
-    let definition = GrepTool.definition();
-    registry.register_tool(
-        ToolDescriptor::new("Grep")
-            .prompt_alias("workspace_search")
-            .provider(
-                ProviderKind::OpenAi,
-                ProviderTool::openai_function(&definition),
-            )
-            .provider(
-                ProviderKind::Claude,
-                ProviderTool::anthropic_client(&definition),
-            )
-            .executor(ProviderKind::OpenAi, GrepTool)
-            .executor(ProviderKind::Claude, GrepTool),
-    );
-}
-
-fn register_web_search(registry: &mut ToolRegistry) {
-    let definition = WebSearchTool.definition();
-    registry.register_tool(
-        ToolDescriptor::new("WebSearch")
-            .prompt_alias("web_search")
-            .provider(
-                ProviderKind::OpenAi,
-                ProviderTool::openai_function(&definition),
-            )
-            .provider(
-                ProviderKind::Claude,
-                ProviderTool::anthropic_client(&definition),
-            )
-            .executor(ProviderKind::OpenAi, WebSearchTool)
-            .executor(ProviderKind::Claude, WebSearchTool),
-    );
-}
-
-fn register_web_fetch(registry: &mut ToolRegistry) {
-    let definition = WebFetchTool.definition();
-    registry.register_tool(
-        ToolDescriptor::new("WebFetch")
-            .prompt_alias("web_fetch")
-            .provider(
-                ProviderKind::OpenAi,
-                ProviderTool::openai_function(&definition),
-            )
-            .provider(
-                ProviderKind::Claude,
-                ProviderTool::anthropic_client(&definition),
-            )
-            .executor(ProviderKind::OpenAi, WebFetchTool)
-            .executor(ProviderKind::Claude, WebFetchTool),
-    );
 }
 
 #[cfg(test)]
