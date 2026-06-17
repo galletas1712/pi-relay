@@ -458,64 +458,66 @@ export function SessionRow({
 					{session.active_leaf_id ? session.active_leaf_id.slice(0, 6) : "root"}
 				</span>
 			</span>
-			<span
-				className="session-row-action"
-				role="button"
-				tabIndex={0}
-				title="rename session"
-				aria-label={`rename ${sessionTitle(session)}`}
-				onClick={(event) => {
-					event.stopPropagation();
-					onRename();
-				}}
-				onKeyDown={(event) => {
-					if (event.key !== "Enter" && event.key !== " ") return;
-					event.preventDefault();
-					event.stopPropagation();
-					onRename();
-				}}
-			>
-				<Edit3 size={13} />
-			</span>
-			<span
-				className={`session-row-action ${canArchive ? "" : "disabled"}`}
-				role="button"
-				tabIndex={canArchive ? 0 : -1}
-				title={canArchive ? (archived ? "unarchive session" : "archive session") : "only idle sessions can be archived"}
-				aria-label={`${archived ? "unarchive" : "archive"} ${sessionTitle(session)}`}
-				aria-disabled={!canArchive}
-				onClick={(event) => {
-					event.stopPropagation();
-					if (canArchive) onArchiveToggle();
-				}}
-				onKeyDown={(event) => {
-					if (!canArchive || (event.key !== "Enter" && event.key !== " ")) return;
-					event.preventDefault();
-					event.stopPropagation();
-					onArchiveToggle();
-				}}
-			>
-				<ArchiveIcon size={13} />
-			</span>
-			<span
-				className={`session-row-action danger ${canDelete ? "" : "disabled"}`}
-				role="button"
-				tabIndex={canDelete ? 0 : -1}
-				title={canDelete ? "delete session" : "only idle sessions can be deleted"}
-				aria-label={`delete ${sessionTitle(session)}`}
-				aria-disabled={!canDelete}
-				onClick={(event) => {
-					event.stopPropagation();
-					if (canDelete) onDelete();
-				}}
-				onKeyDown={(event) => {
-					if (!canDelete || (event.key !== "Enter" && event.key !== " ")) return;
-					event.preventDefault();
-					event.stopPropagation();
-					onDelete();
-				}}
-			>
-				<Trash2 size={13} />
+			<span className="session-row-actions" aria-label="session actions">
+				<span
+					className="session-row-action"
+					role="button"
+					tabIndex={0}
+					title="rename session"
+					aria-label={`rename ${sessionTitle(session)}`}
+					onClick={(event) => {
+						event.stopPropagation();
+						onRename();
+					}}
+					onKeyDown={(event) => {
+						if (event.key !== "Enter" && event.key !== " ") return;
+						event.preventDefault();
+						event.stopPropagation();
+						onRename();
+					}}
+				>
+					<Edit3 size={13} />
+				</span>
+				<span
+					className={`session-row-action ${canArchive ? "" : "disabled"}`}
+					role="button"
+					tabIndex={canArchive ? 0 : -1}
+					title={canArchive ? (archived ? "unarchive session" : "archive session") : "only idle sessions can be archived"}
+					aria-label={`${archived ? "unarchive" : "archive"} ${sessionTitle(session)}`}
+					aria-disabled={!canArchive}
+					onClick={(event) => {
+						event.stopPropagation();
+						if (canArchive) onArchiveToggle();
+					}}
+					onKeyDown={(event) => {
+						if (!canArchive || (event.key !== "Enter" && event.key !== " ")) return;
+						event.preventDefault();
+						event.stopPropagation();
+						onArchiveToggle();
+					}}
+				>
+					<ArchiveIcon size={13} />
+				</span>
+				<span
+					className={`session-row-action danger ${canDelete ? "" : "disabled"}`}
+					role="button"
+					tabIndex={canDelete ? 0 : -1}
+					title={canDelete ? "delete session" : "only idle sessions can be deleted"}
+					aria-label={`delete ${sessionTitle(session)}`}
+					aria-disabled={!canDelete}
+					onClick={(event) => {
+						event.stopPropagation();
+						if (canDelete) onDelete();
+					}}
+					onKeyDown={(event) => {
+						if (!canDelete || (event.key !== "Enter" && event.key !== " ")) return;
+						event.preventDefault();
+						event.stopPropagation();
+						onDelete();
+					}}
+				>
+					<Trash2 size={13} />
+				</span>
 			</span>
 		</button>
 	);
