@@ -142,6 +142,14 @@ pub struct ProviderConfig {
     pub prompt_cache: Option<Value>,
 }
 
+impl ProviderConfig {
+    /// The configured prompt-cache key, if any. Callers append their own scope
+    /// suffix (e.g. `:compaction`) where needed.
+    pub fn prompt_cache_key(&self) -> Option<&str> {
+        self.prompt_cache.as_ref()?.get("key")?.as_str()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderReplayItem {
     pub provider: ProviderKind,
