@@ -39,6 +39,25 @@ impl PostgresAgentStore {
         Ok(updated as u64)
     }
 
+    pub async fn mark_unfinished_actions_stale(&self, session_id: &str) -> Result<u64> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, session_id).await?;
+        let unfinished_actions = action_is_unfinished(None);
+        let query = format!(
+            "update actions set status='stale', updated_at=now() where session_id=$1 and {unfinished_actions}",
+        );
+        let updated = sqlx::query(&query)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if updated > 0 {
+            bump_revisions_tx(&mut tx, session_id, false, false).await?;
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
     pub async fn has_unfinished_actions(&self, session_id: &str) -> Result<bool> {
         let unfinished_actions = action_is_unfinished(None);
         let query = format!(

@@ -1981,9 +1981,11 @@ mod tests {
         assert_eq!(body["tools"][3]["type"], "function");
         assert_eq!(body["tools"][3]["name"], "LoadSkill");
         assert_eq!(body["tools"][4]["type"], "function");
-        assert_eq!(body["tools"][4]["name"], "web_fetch");
+        assert_eq!(body["tools"][4]["name"], "PythonRepl");
         assert_eq!(body["tools"][5]["type"], "function");
-        assert_eq!(body["tools"][5]["name"], "web_search");
+        assert_eq!(body["tools"][5]["name"], "web_fetch");
+        assert_eq!(body["tools"][6]["type"], "function");
+        assert_eq!(body["tools"][6]["name"], "web_search");
     }
 
     #[test]

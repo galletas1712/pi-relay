@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agent_store::{InputPriority, SessionConfig};
+use agent_store::{EventFrame, EventType, InputPriority, SessionConfig};
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::codec::from_params;
 use crate::provider_runtime::{render_pi_prompt, resolve_skill_role};
-use crate::runtime::SessionDriver;
+use crate::runtime::{publish_events, SessionDriver};
 use crate::session_start::{
     start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart, StartedSession,
 };
@@ -353,8 +353,37 @@ async fn spawn_subagent(
     .await?;
     require_known_subagent(state, &request.parent_session_id, &child_session_id).await?;
 
+    let parent_events = match subagent_parent_spawn_events(
+        state,
+        &request.parent_session_id,
+        &started.session_id,
+        &role.name,
+        role.workspace.as_deref(),
+        request.display_name.as_deref(),
+    )
+    .await
+    {
+        Ok(parent_events) => parent_events,
+        Err(error) => {
+            cleanup_failed_spawn(state, &started.session_id, "parent lifecycle event failure")
+                .await;
+            return Err(error);
+        }
+    };
+    publish_events(state, parent_events);
+
     let child_driver = SessionDriver::acquire(state, &started.session_id).await;
     if let Err(error) = child_driver.dispatch(started.dispatches.clone()).await {
+        publish_subagent_parent_dispatch_failed_event(
+            state,
+            &request.parent_session_id,
+            &started.session_id,
+            &role.name,
+            role.workspace.as_deref(),
+            request.display_name.as_deref(),
+            &error,
+        )
+        .await;
         cleanup_failed_spawn(state, &started.session_id, "initial dispatch failure").await;
         return Err(error);
     }
@@ -363,6 +392,132 @@ async fn spawn_subagent(
         parent_session_id: request.parent_session_id,
         started,
     })
+}
+
+async fn subagent_parent_spawn_events(
+    state: &AppState,
+    parent_session_id: &str,
+    child_session_id: &str,
+    role: &str,
+    role_workspace: Option<&str>,
+    display_name: Option<&str>,
+) -> std::result::Result<Vec<EventFrame>, RpcError> {
+    state
+        .repo
+        .insert_events(
+            parent_session_id,
+            vec![
+                (
+                    EventType::SubagentSpawned,
+                    json!({
+                        "child_session_id": child_session_id,
+                        "role": role,
+                        "role_workspace": role_workspace,
+                        "display_name": display_name,
+                    }),
+                ),
+                (
+                    EventType::SubagentRunning,
+                    json!({
+                        "child_session_id": child_session_id,
+                        "role": role,
+                        "role_workspace": role_workspace,
+                        "display_name": display_name,
+                    }),
+                ),
+            ],
+        )
+        .await
+        .map_err(anyhow::Error::from)
+        .map_err(RpcError::from)
+}
+
+pub(crate) async fn subagent_lifecycle_payload(
+    state: &AppState,
+    child_session_id: &str,
+) -> std::result::Result<Value, RpcError> {
+    let config = state
+        .repo
+        .load_session_config(child_session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(json!({
+        "child_session_id": child_session_id,
+        "role": config.metadata.get("role_name").and_then(Value::as_str),
+        "role_workspace": config.metadata.get("role_workspace").and_then(Value::as_str),
+        "display_name": config.metadata.get("display_name").and_then(Value::as_str),
+    }))
+}
+
+pub(crate) async fn publish_subagent_parent_running_if_child(
+    state: &AppState,
+    child_session_id: &str,
+) {
+    let parent_session_id = match state.repo.session_parent_id(child_session_id).await {
+        Ok(Some(parent_session_id)) => parent_session_id,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!(
+                "failed to load parent for subagent running event child={child_session_id}: {error:#}"
+            );
+            return;
+        }
+    };
+    let payload = match subagent_lifecycle_payload(state, child_session_id).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            eprintln!(
+                "failed to build subagent running event child={child_session_id}: {}: {}",
+                error.code, error.message
+            );
+            return;
+        }
+    };
+    match state
+        .repo
+        .insert_event(&parent_session_id, EventType::SubagentRunning, payload)
+        .await
+    {
+        Ok(event) => publish_events(state, vec![event]),
+        Err(error) => eprintln!(
+            "failed to publish parent subagent running event parent={parent_session_id} child={child_session_id}: {error:#}"
+        ),
+    }
+}
+
+async fn publish_subagent_parent_dispatch_failed_event(
+    state: &AppState,
+    parent_session_id: &str,
+    child_session_id: &str,
+    role: &str,
+    role_workspace: Option<&str>,
+    display_name: Option<&str>,
+    error: &RpcError,
+) {
+    let summary_preview = format!("initial dispatch failed: {}: {}", error.code, error.message);
+    match state
+        .repo
+        .insert_subagent_idle_event_once(
+            parent_session_id,
+            child_session_id,
+            "initial-dispatch-failed",
+            json!({
+                "child_session_id": child_session_id,
+                "role": role,
+                "role_workspace": role_workspace,
+                "display_name": display_name,
+                "outcome": "Crashed",
+                "summary_preview": summary_preview,
+            }),
+        )
+        .await
+    {
+        Ok(Some(event)) => publish_events(state, vec![event]),
+        Ok(None) => {}
+        Err(event_error) => eprintln!(
+            "failed to publish parent subagent dispatch-failed event parent={parent_session_id} child={child_session_id}: {event_error:#}"
+        ),
+    }
 }
 
 fn source_session_id(value: Value) -> Option<String> {

@@ -938,12 +938,14 @@ pub(crate) async fn enqueue_session_input(
         Accepted {
             dispatches: Vec<DispatchAction>,
             active_branch_sync: Value,
+            publish_subagent_running: bool,
         },
         Queued {
             input_id: String,
             event: Option<EventFrame>,
             queue: Option<Value>,
             should_drive: bool,
+            publish_subagent_running: bool,
         },
     }
 
@@ -1010,6 +1012,7 @@ pub(crate) async fn enqueue_session_input(
                 event: queued.event,
                 queue: queued.queue.map(rpc_views::queue_state),
                 should_drive: !has_running,
+                publish_subagent_running: !has_running,
             }
         } else {
             ensure_expected_active_leaf(state, &session_id, &expected_params).await?;
@@ -1054,6 +1057,7 @@ pub(crate) async fn enqueue_session_input(
             InputOutcome::Accepted {
                 dispatches,
                 active_branch_sync: rpc_views::active_branch_sync(sync, snapshot),
+                publish_subagent_running: true,
             }
         }
     };
@@ -1062,7 +1066,11 @@ pub(crate) async fn enqueue_session_input(
         InputOutcome::Accepted {
             dispatches,
             active_branch_sync,
+            publish_subagent_running,
         } => {
+            if publish_subagent_running {
+                subagents::publish_subagent_parent_running_if_child(state, &session_id).await;
+            }
             driver.dispatch(dispatches).await?;
             if perf_logging_enabled() {
                 let total_ms = started_at.elapsed().as_millis();
@@ -1080,11 +1088,15 @@ pub(crate) async fn enqueue_session_input(
             event,
             queue,
             should_drive,
+            publish_subagent_running,
         } => {
             if let Some(event) = event {
                 publish_events(state, vec![event]);
             }
             if should_drive {
+                if publish_subagent_running {
+                    subagents::publish_subagent_parent_running_if_child(state, &session_id).await;
+                }
                 driver.drive_until_blocked().await?;
             }
             if perf_logging_enabled() {

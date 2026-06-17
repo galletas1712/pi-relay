@@ -46,18 +46,21 @@ For complex work, use the `{{ tools.aliases.python_repl | default(value="PythonR
 **Prefer reusing an existing subagent over spawning a new one.** Before spawning, call `subagents.list()`; if an idle child with a fitting role/workspace already exists, re-engage it with `subagents["<session_id>"].steer("<next instructions>")` (this re-drives an idle child and preserves its forked workspace and accumulated context). Only spawn a fresh subagent when no existing child is a good fit or you need additional parallelism.
 
 - Use `handle = subagents.spawn(role, message, fork_context=False, sources=None)` to start one child and keep control in the parent.
-- Use `handles = subagents.spawn_bulk([...])` to start independent children in parallel.
+- Spawn multiple children with repeated `subagents.spawn(...)` calls and keep the returned handles in a list.
 - Use `result = subagents.wait(handle)` or `results = subagents.wait(handles)` only when you explicitly want to block until child sessions are idle.
-- `subagents.call(...)` and `subagents.call_bulk(...)` are convenience wrappers for spawn-then-wait.
+- `subagents.call(...)` is a convenience wrapper for spawn-then-wait.
 - The REPL exposes `subagents` directly; `import subagents` also works but is not required.
+- Do not abandon spawned children: keep handles, later `wait(...)`/`list()`/read transcripts, and reconcile or explicitly interrupt/steer them before reporting final work.
+- Use `handle.steer(...)`, `handle.interrupt()`, `subagents.steer(...)`, and `subagents.interrupt(...)` to redirect or stop children explicitly instead of waiting for a stuck or wrong turn.
 - Do not set a timeout for subagent delegation; child sessions may run for a long time and should complete or be interrupted explicitly.
+- Each subagent runs in its own distinct session cwd/workspace clone. Do not pass the parent cwd as the child's working directory, and do not expect child file edits to appear in the parent workspace unless you explicitly inspect and merge them.
 - Prefer fresh, focused child context. Set `fork_context=True` only when the child needs the parent transcript/context.
 - Store subagent results in Python variables and pass only the minimum useful context forward.
 - REPL variables persist only while the daemon/REPL process is alive. Durable state lives in sessions, subagent transcripts, and workspaces; after a restart, reconstruct needed context with `subagents.list()` and subagent transcripts.
 - Useful default roles include `explore` (read-only investigation), `planner`, `implementer`, `worker`, `reviewer`, `tester`, `verifier`, and `merger`.
 - Child workspace edits do not automatically merge into the parent workspace.
-- To combine child work, spawn a `merger` with `sources=[...]`; source child git workspaces are made available to the merger as local refs so it can inspect and apply selected changes in its own workspace.
-- After a merger returns, decide what to pull forward rather than assuming every child change should land.
+- The `merger` role plus `sources=[...]` exposes source child git workspaces as local refs in the merger child's workspace. This helps produce a merged proposal, but it still does not apply changes to the parent automatically.
+- After any child or merger returns, explicitly inspect/merge/pull the desired changes into the parent workspace rather than assuming child changes landed.
 - Subagents are regular sessions from the user's perspective: they can be inspected, selected, steered, interrupted, and continued in the web UI.
 
 {% if skills.index %}

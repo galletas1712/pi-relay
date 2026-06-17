@@ -204,17 +204,18 @@ fn workspaces_markdown(workspaces: &[PromptWorkspace]) -> String {
     }
     workspaces
         .iter()
-        .map(|workspace| {
-            match workspace.kind {
-                PromptWorkspaceKind::Git => format!(
-                    "- {dir}\n  - type: Git\n  - remote: {remote}\n  - starting branch: {branch}",
-                    dir = workspace.workspace_dir,
-                    remote = workspace.remote_url.as_deref().unwrap_or(""),
-                    branch = workspace.remote_branch.as_deref().unwrap_or(""),
-                ),
-                PromptWorkspaceKind::Local => {
-                    format!("- {dir}\n  - type: local folder copy", dir = workspace.workspace_dir)
-                }
+        .map(|workspace| match workspace.kind {
+            PromptWorkspaceKind::Git => format!(
+                "- {dir}\n  - type: Git\n  - remote: {remote}\n  - starting branch: {branch}",
+                dir = workspace.workspace_dir,
+                remote = workspace.remote_url.as_deref().unwrap_or(""),
+                branch = workspace.remote_branch.as_deref().unwrap_or(""),
+            ),
+            PromptWorkspaceKind::Local => {
+                format!(
+                    "- {dir}\n  - type: local folder copy",
+                    dir = workspace.workspace_dir
+                )
             }
         })
         .collect::<Vec<_>>()

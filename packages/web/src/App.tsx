@@ -893,6 +893,12 @@ export function App() {
 				if (event.event === "compaction.requested") pushNotice("info", compactionRequestedNotice(event.data));
 				if (event.event === "compaction.completed") pushNotice("success", compactionCompletedNotice(event.data));
 				if (event.event === "compaction.error") pushNotice("error", compactionErrorNotice(event.data));
+				if (event.event === "subagent.running") pushNotice("info", subagentRunningNotice(event.data));
+				if (event.event === "subagent.idle") {
+					const outcome = typeof event.data.outcome === "string" ? event.data.outcome : null;
+					const level = outcome === "Crashed" ? "error" : outcome === "Interrupted" ? "info" : "success";
+					pushNotice(level, subagentIdleNotice(event.data));
+				}
 				if (event.event === "turn.finished") {
 					const outcome = typeof event.data.outcome === "string" ? event.data.outcome : null;
 					if (outcome === "Interrupted") pushNotice("info", "turn interrupted");
@@ -2166,6 +2172,30 @@ function compactionErrorNotice(data: Record<string, unknown>): string {
 	const error = typeof data.error === "string" ? data.error : "compaction failed";
 	const label = data.trigger === "auto" ? "auto-compaction error" : "compaction error";
 	return `${label}: ${truncate(error, 420)}`;
+}
+
+function subagentLabel(data: Record<string, unknown>): string {
+	const label =
+		typeof data.display_name === "string" && data.display_name.trim()
+			? data.display_name.trim()
+			: typeof data.role === "string" && data.role.trim()
+				? data.role.trim()
+				: "subagent";
+	const child = typeof data.child_session_id === "string" ? data.child_session_id.slice(0, 13) : "";
+	return child ? `${label} ${child}` : label;
+}
+
+function subagentRunningNotice(data: Record<string, unknown>): string {
+	return `${subagentLabel(data)} started`;
+}
+
+function subagentIdleNotice(data: Record<string, unknown>): string {
+	const outcome = typeof data.outcome === "string" && data.outcome.trim() ? data.outcome.trim() : "completed";
+	const preview =
+		typeof data.summary_preview === "string" && data.summary_preview.trim()
+			? `: ${truncate(data.summary_preview.trim(), 180)}`
+			: "";
+	return `${subagentLabel(data)} idle (${outcome})${preview}`;
 }
 
 function activityFromEvent(event: EventFrame): SessionSummary["activity"] | null {
