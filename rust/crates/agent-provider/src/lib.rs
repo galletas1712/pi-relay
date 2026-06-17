@@ -11,6 +11,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub mod anthropic;
+mod common;
 mod http;
 pub mod openai;
 mod sse;

@@ -1,17 +1,18 @@
 use agent_tools::{tool_display, ProviderTool, ToolDisplayInput};
 use agent_vocab::{
-    AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
-    ProviderReplayItem, ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem,
-    UserMessage,
+    AssistantItem, AssistantMessage, ContentBlock, ProviderKind, ProviderReplayItem,
+    ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem, UserMessage,
 };
 use async_trait::async_trait;
-use reqwest::StatusCode;
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
 use crate::sse::read_json_sse_text;
 use crate::{
+    common::{
+        compaction_summary_text, ensure_success, push_text_item, response_excerpt, response_text,
+    },
     http::send_provider_generation_request,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
@@ -222,7 +223,7 @@ impl ModelProvider for AnthropicProvider {
             .send()
             .await?;
         let (status, text) = response_text(response).await?;
-        ensure_success(status, &text)?;
+        ensure_success(status, &text, response_error_message)?;
         parse_anthropic_count_tokens(&text)
     }
 }
@@ -367,22 +368,6 @@ fn anthropic_reasoning_effort(
     }
 }
 
-async fn response_text(response: reqwest::Response) -> ProviderResult<(StatusCode, String)> {
-    let status = response.status();
-    let bytes = response.bytes().await?;
-    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
-}
-
-fn ensure_success(status: StatusCode, body: &str) -> ProviderResult<()> {
-    if status.is_success() {
-        return Ok(());
-    }
-    Err(ProviderError::Status {
-        status: status.as_u16(),
-        message: response_error_message(body),
-    })
-}
-
 fn response_error_message(body: &str) -> String {
     serde_json::from_str::<Value>(body)
         .ok()
@@ -404,20 +389,6 @@ fn response_error_message(body: &str) -> String {
             })
         })
         .unwrap_or_else(|| response_excerpt(body))
-}
-
-fn response_excerpt(body: &str) -> String {
-    const MAX_CHARS: usize = 1200;
-    let trimmed = body.trim();
-    let mut excerpt = trimmed.chars().take(MAX_CHARS).collect::<String>();
-    if trimmed.chars().count() > MAX_CHARS {
-        excerpt.push_str("...");
-    }
-    if excerpt.is_empty() {
-        "empty response body".to_string()
-    } else {
-        excerpt
-    }
 }
 
 fn anthropic_tools(
@@ -731,27 +702,6 @@ fn anthropic_replay_blocks(replay: &[ProviderReplayItem]) -> ProviderResult<Vec<
         .filter(|record| record.provider == ProviderKind::Claude)
         .map(|record| record.raw_value().map_err(ProviderError::Json))
         .collect()
-}
-
-fn compaction_summary_text(summary: &CompactionSummary, prompt: &crate::PromptSections) -> String {
-    match &prompt.stable_prefix {
-        Some(pi_prompt) if !pi_prompt.trim().is_empty() => format!(
-            "The active PI.md system prompt is included below because it still applies after this compaction.
-
-{}
-
-The conversation history before this point was compacted into this summary:
-
-{}",
-            pi_prompt, summary.summary
-        ),
-        _ => format!(
-            "The conversation history before this point was compacted into this summary:
-
-{}",
-            summary.summary
-        ),
-    }
 }
 
 fn anthropic_user_content(message: &UserMessage) -> Value {
@@ -1121,17 +1071,6 @@ fn anthropic_provider_replay_display(block: &Value) -> Option<ReplayDisplay> {
         "server_tool_use" => tool_display(name, ToolDisplayInput::HostedTool, block.get("input")),
         "tool_use" => tool_display(name, ToolDisplayInput::LocalTool, block.get("input")),
         _ => None,
-    }
-}
-
-fn push_text_item(items: &mut Vec<AssistantItem>, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    if let Some(AssistantItem::Text(previous)) = items.last_mut() {
-        previous.push_str(text);
-    } else {
-        items.push(AssistantItem::Text(text.to_string()));
     }
 }
 
