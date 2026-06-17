@@ -23,7 +23,9 @@ in-flight future work lives under [`plans/`](plans/).
 4. Keep providers intentionally narrow: OpenAI/Codex and Anthropic/Claude only.
 5. Keep tools separate from the agent loop so tool sets can be customized
    without changing the FSM.
-6. Do not include subagent orchestration or generic injected-message routing.
+6. Support bounded parent/child subagent delegation (spawn/list/wait/steer/
+   interrupt over forked sessions) without a generic injected-message routing
+   layer or event bus between arbitrary sessions.
 
 ## Crate Stack
 
@@ -117,10 +119,18 @@ Implemented user-facing behavior:
   included by the template.
 - Real OpenAI/Codex (ChatGPT subscription transport) and Anthropic API-key
   provider paths, with prompt-cache shaping on both.
+- Subagent delegation: a parent spawns child sessions by role/skill (optionally
+  with a forked context snapshot and git source-refs), then lists, waits on,
+  reads, steers, and interrupts them. Children are regular forked sessions
+  driven through the same loop. `subagent.list` plus parent-scoped
+  `subagent.{spawned,running,idle}` lifecycle events are on the wire; spawn and
+  control flow through the in-process Python REPL `subagents` module. See
+  [agent-daemon](modules/agent-daemon.md).
 
 Not implemented by design:
 
-- Hierarchical subagent orchestration.
+- Generic cross-session message routing or an event bus. Subagent delegation is
+  bounded parent/child forks (see above), not arbitrary inter-session routing.
 - Approval UI or tool permission policy.
 - Explicit `open`/`close` or session-level `resume` RPC.
 - General plugin/provider marketplace.
@@ -132,7 +142,9 @@ Not implemented by design:
 - `agent-orchestrator` crate.
 - `SessionRegistry`.
 - Async channel `AgentRunner`.
-- Hierarchical subagent-specific control surfaces and routing metadata.
+- The TypeScript fork's hierarchical subagent routing metadata and generic
+  control surfaces. The Rust stack instead spawns children as plain forked
+  sessions with a small spawn/list/wait/steer/interrupt surface.
 - The old in-memory/JSONL `agent-store` layer.
 
 Durable storage is the registry. Process-local state only exists to drive

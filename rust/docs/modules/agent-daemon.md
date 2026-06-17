@@ -36,6 +36,10 @@ workspaces/        workspace base refresh, local/git source handling, sanitizati
 rpc_views.rs       response shaping (snapshots, queue state, transcript views, server_time_ms)
 model_metadata.rs  per-model context windows + 85% auto-compaction default limit
 provider_runtime/  provider selection, model/web-tool execution, compaction, token accounting
+subagents.rs       parent/child subagent spawn/list: role resolution, workspace
+                   fork, git source-ref import, child prompt + lifecycle events
+repl.rs            in-process Python REPL (repl.exec / PythonRepl tool) exposing
+                   the `subagents` orchestration module over a host-call bridge
 ```
 
 `runtime/` keeps ordering-sensitive behavior in named phases instead of a generic
