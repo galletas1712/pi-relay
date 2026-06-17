@@ -333,7 +333,12 @@ impl ToolExtension for FirstPartyToolExtension {
     }
 
     fn register(&self, registry: &mut ToolRegistry) {
-        register_runtime_tool(registry, "LoadSkill", "skill_loader", load_skill_definition());
+        register_runtime_tool(
+            registry,
+            "LoadSkill",
+            "skill_loader",
+            load_skill_definition(),
+        );
         register_runtime_tool(
             registry,
             "PythonRepl",

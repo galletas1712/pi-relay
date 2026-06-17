@@ -71,8 +71,7 @@ impl PostgresAgentStore {
         let payload: Value = row.get("payload");
         let source_leaf_id = model_action_context_leaf_id(&payload)
             .ok_or_else(|| anyhow!("model action has no compaction source leaf"))?;
-        let source_entries =
-            branch_entries_to_leaf(&mut *tx, session_id, &source_leaf_id).await?;
+        let source_entries = branch_entries_to_leaf(&mut *tx, session_id, &source_leaf_id).await?;
         if source_entries.is_empty() {
             return Err(anyhow!("transcript leaf not found: {source_leaf_id}"));
         }

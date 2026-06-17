@@ -284,7 +284,10 @@ impl SessionDriver {
             let active = self.active_session().await;
             let Some(active) = active else { break };
             if let Some(dispatches) = self.consume_ready_steer(active.clone()).await? {
-                if self.dispatch_and_check(dispatches, &mut dispatched_all).await? {
+                if self
+                    .dispatch_and_check(dispatches, &mut dispatched_all)
+                    .await?
+                {
                     break;
                 }
                 continue;
@@ -292,7 +295,10 @@ impl SessionDriver {
             let dispatched = self
                 .persist_active_outputs(active.clone(), None, None, None, Vec::new())
                 .await?;
-            if self.dispatch_and_check(dispatched, &mut dispatched_all).await? {
+            if self
+                .dispatch_and_check(dispatched, &mut dispatched_all)
+                .await?
+            {
                 break;
             }
 
@@ -332,7 +338,10 @@ impl SessionDriver {
                     let dispatched = self
                         .persist_active_outputs(active, None, Some(queued), None, Vec::new())
                         .await?;
-                    if self.dispatch_and_check(dispatched, &mut dispatched_all).await? {
+                    if self
+                        .dispatch_and_check(dispatched, &mut dispatched_all)
+                        .await?
+                    {
                         break;
                     }
                 }
