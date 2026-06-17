@@ -284,15 +284,7 @@ impl SessionDriver {
             let active = self.active_session().await;
             let Some(active) = active else { break };
             if let Some(dispatches) = self.consume_ready_steer(active.clone()).await? {
-                let has_dispatched_work = !dispatches.is_empty();
-                dispatched_all.extend(dispatches.clone());
-                self.dispatch(dispatches).await?;
-                if has_dispatched_work {
-                    break;
-                }
-                let pending_dispatched = self.dispatch_ready_actions().await?;
-                if !pending_dispatched.is_empty() {
-                    dispatched_all.extend(pending_dispatched);
+                if self.dispatch_and_check(dispatches, &mut dispatched_all).await? {
                     break;
                 }
                 continue;
@@ -300,15 +292,7 @@ impl SessionDriver {
             let dispatched = self
                 .persist_active_outputs(active.clone(), None, None, None, Vec::new())
                 .await?;
-            let has_dispatched_work = !dispatched.is_empty();
-            dispatched_all.extend(dispatched.clone());
-            self.dispatch(dispatched).await?;
-            if has_dispatched_work {
-                break;
-            }
-            let pending_dispatched = self.dispatch_ready_actions().await?;
-            if !pending_dispatched.is_empty() {
-                dispatched_all.extend(pending_dispatched);
+            if self.dispatch_and_check(dispatched, &mut dispatched_all).await? {
                 break;
             }
 
@@ -348,15 +332,7 @@ impl SessionDriver {
                     let dispatched = self
                         .persist_active_outputs(active, None, Some(queued), None, Vec::new())
                         .await?;
-                    let has_dispatched_work = !dispatched.is_empty();
-                    dispatched_all.extend(dispatched.clone());
-                    self.dispatch(dispatched).await?;
-                    if has_dispatched_work {
-                        break;
-                    }
-                    let pending_dispatched = self.dispatch_ready_actions().await?;
-                    if !pending_dispatched.is_empty() {
-                        dispatched_all.extend(pending_dispatched);
+                    if self.dispatch_and_check(dispatched, &mut dispatched_all).await? {
                         break;
                     }
                 }
@@ -379,6 +355,28 @@ impl SessionDriver {
             break;
         }
         Ok(dispatched_all)
+    }
+
+    /// Dispatch freshly persisted actions, then check readiness. Returns whether
+    /// the caller should break out of the drive loop (work was dispatched, or
+    /// ready actions were dispatched).
+    async fn dispatch_and_check(
+        &self,
+        dispatched: Vec<DispatchAction>,
+        dispatched_all: &mut Vec<DispatchAction>,
+    ) -> std::result::Result<bool, RpcError> {
+        let has_dispatched_work = !dispatched.is_empty();
+        dispatched_all.extend(dispatched.clone());
+        self.dispatch(dispatched).await?;
+        if has_dispatched_work {
+            return Ok(true);
+        }
+        let pending_dispatched = self.dispatch_ready_actions().await?;
+        if !pending_dispatched.is_empty() {
+            dispatched_all.extend(pending_dispatched);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(crate) async fn notify_subagent_parent_idle_if_needed(&self) {
