@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use agent_prompt::{
-    load_pi_compaction_md, load_pi_md, render_compaction_prompt, render_prompt, PromptContext,
-    PromptWorkspace, PromptWorkspaceKind, Skill, ToolSpec,
+    load_pi_compaction_md, load_pi_md, render_prompt, PromptContext, PromptWorkspace,
+    PromptWorkspaceKind, Skill, ToolSpec,
 };
 use agent_store::{SessionConfig, SessionWorkspace, WorkspaceKind};
 use agent_vocab::ProviderKind;
@@ -33,10 +33,7 @@ pub(super) fn render_pi_compaction_prompt(
     config: &SessionConfig,
 ) -> anyhow::Result<String> {
     let template = load_pi_compaction_md(&state.prompt_root)?;
-    Ok(render_compaction_prompt(
-        &template,
-        &prompt_context(state, config),
-    ))
+    Ok(render_prompt(&template, &prompt_context(state, config)))
 }
 
 pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> PromptContext {

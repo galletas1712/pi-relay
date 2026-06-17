@@ -213,27 +213,6 @@ impl ToolRegistry {
         }
     }
 
-    /// Back-compat registration hook for simple JSON tools.
-    pub fn register_for_provider(
-        &mut self,
-        provider: ProviderKind,
-        tool: impl AgentTool + 'static,
-    ) {
-        let definition = tool.definition();
-        let name = definition.name.clone();
-        let provider_tool = ProviderTool::function_json_named(
-            provider,
-            definition.name,
-            definition.description,
-            definition.input_schema,
-        );
-        self.register_tool(
-            ToolDescriptor::new(name)
-                .provider(provider, provider_tool)
-                .executor(provider, tool),
-        );
-    }
-
     pub fn provider_tools_for_provider(&self, provider: ProviderKind) -> Vec<ProviderTool> {
         let mut tools = self
             .provider_tools
@@ -245,6 +224,7 @@ impl ToolRegistry {
         tools
     }
 
+    #[cfg(test)]
     pub fn definitions_for_provider(&self, provider: ProviderKind) -> Vec<ToolDefinition> {
         self.provider_tools_for_provider(provider)
             .into_iter()
@@ -299,19 +279,6 @@ pub(crate) fn sort_tools_by_name(tools: &mut [ProviderTool]) {
             .then_with(|| left.name.cmp(&right.name))
             .then_with(|| left.canonical_name.cmp(&right.canonical_name))
     });
-}
-
-pub fn builtin_tool_definition(name: &str) -> Option<ToolDefinition> {
-    match name {
-        "LoadSkill" => Some(load_skill_definition()),
-        "PythonRepl" => Some(python_repl_definition()),
-        "Edit" | "apply_patch" => Some(ApplyPatchTool.definition()),
-        "Bash" => Some(BashTool.definition()),
-        "Grep" => Some(GrepTool.definition()),
-        "WebFetch" | "web_fetch" => Some(WebFetchTool.definition()),
-        "WebSearch" | "web_search" => Some(WebSearchTool.definition()),
-        _ => None,
-    }
 }
 
 fn load_skill_definition() -> ToolDefinition {

@@ -378,10 +378,6 @@ fn anthropic_tool_result_wire(result: &ToolResultMessage) -> Value {
 
 const RESIZED_IMAGE_BYTES_ESTIMATE: usize = 7373;
 
-pub fn approx_token_count(text: &str) -> usize {
-    approx_tokens_from_byte_count(text.len())
-}
-
 pub fn approx_tokens_from_byte_count(bytes: usize) -> usize {
     bytes.saturating_add(3) / 4
 }

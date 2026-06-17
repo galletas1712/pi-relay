@@ -115,10 +115,6 @@ pub fn render_prompt(template: &str, ctx: &PromptContext) -> String {
     render(template, ctx)
 }
 
-pub fn render_compaction_prompt(template: &str, ctx: &PromptContext) -> String {
-    render(template, ctx)
-}
-
 fn render(template: &str, ctx: &PromptContext) -> String {
     let mut env = Environment::new();
     env.add_template("prompt", template)
@@ -412,8 +408,7 @@ mod tests {
 
     #[test]
     fn renders_compaction_prompt() {
-        let rendered =
-            render_compaction_prompt(TEST_PI_COMPACTION_MD, &ctx(vec!["Bash"], Vec::new()));
+        let rendered = render_prompt(TEST_PI_COMPACTION_MD, &ctx(vec!["Bash"], Vec::new()));
         assert!(rendered.starts_with("Produce a concise continuation summary"));
         assert!(!rendered.contains("You are an expert coding assistant"));
     }

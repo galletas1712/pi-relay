@@ -21,4 +21,4 @@ pub use crate::event::{AgentInput, TurnInput};
 
 // `AgentState` and `Mailbox` are intentionally not re-exported: they are
 // implementation details of the core loop. Callers observe liveness via
-// `AgentCoreLoop::is_idle` and `AgentCoreLoop::has_pending_work`.
+// `AgentCoreLoop::is_idle`.

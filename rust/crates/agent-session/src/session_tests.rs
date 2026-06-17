@@ -2,8 +2,9 @@ use super::*;
 use crate::SessionActionKind;
 use agent_core::AgentInput;
 use agent_vocab::{
-    ActionId, AssistantItem, AssistantMessage, ProviderReplayItem, ToolCall, ToolCallId,
-    ToolResultMessage, ToolResultStatus, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+    ActionId, AssistantItem, AssistantMessage, CompactionSummary, ProviderReplayItem, ToolCall,
+    ToolCallId, ToolResultMessage, ToolResultStatus, TranscriptItem, TurnId, TurnOutcome,
+    UserMessage,
 };
 
 fn finished_model_context(input: &str) -> ModelContext {

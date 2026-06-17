@@ -152,10 +152,6 @@ fn parse_anthropic_count_tokens(text: &str) -> ProviderResult<ProviderTokenCount
 }
 
 impl AnthropicProvider {
-    pub fn new(api_key: impl Into<String>) -> Self {
-        Self::new_with_client(reqwest::Client::new(), api_key)
-    }
-
     pub fn new_with_client(client: reqwest::Client, api_key: impl Into<String>) -> Self {
         Self {
             client,
@@ -579,7 +575,9 @@ fn add_transcript_cache_breakpoints(messages: &mut [Value]) {
     //    block count from the start to (but not including) the tail block is
     //    larger than the lookback window. Otherwise the tail marker's
     //    automatic ~20-block walk already covers the whole prefix.
-    let total_cacheable = count_cacheable_blocks_through(messages, tail_index);
+    // `tail_index` is the count of cacheable blocks up to and including the tail,
+    // so the total cacheable-block count is exactly `tail_index`.
+    let total_cacheable = tail_index;
     if total_cacheable <= TRANSCRIPT_LOOKBACK_BLOCKS {
         return;
     }
@@ -620,15 +618,6 @@ fn mark_latest_cacheable_block(messages: &mut [Value], cache_control: Value) -> 
         }
     }
     None
-}
-
-/// Count cacheable blocks from the start up to and including the `tail_index`-th
-/// cacheable block.
-fn count_cacheable_blocks_through(messages: &[Value], tail_index: usize) -> usize {
-    // `tail_index` is the count-of-cacheable-blocks up to and including the
-    // tail, so the total cacheable blocks is exactly `tail_index`.
-    let _ = messages;
-    tail_index
 }
 
 /// Stamp `cache_control` on the `target`-th cacheable content block (1-based,

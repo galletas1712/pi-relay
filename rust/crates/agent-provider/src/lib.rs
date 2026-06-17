@@ -18,9 +18,8 @@ mod token_estimator;
 mod transcript;
 
 pub use token_estimator::{
-    approx_token_count, approx_tokens_from_byte_count, estimate_model_input,
-    estimate_model_input_tokens, estimate_transcript_entry, estimate_transcript_tokens,
-    TokenEstimate,
+    approx_tokens_from_byte_count, estimate_model_input, estimate_model_input_tokens,
+    estimate_transcript_entry, estimate_transcript_tokens, TokenEstimate,
 };
 pub use transcript::normalize_transcript_for_provider;
 

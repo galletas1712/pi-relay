@@ -170,10 +170,6 @@ impl Mailbox {
     pub(crate) fn steer_len(&self) -> usize {
         self.steer.len()
     }
-
-    pub(crate) fn total_len(&self) -> usize {
-        self.notifications.len() + self.steer.len() + self.follow_up.len()
-    }
 }
 
 #[cfg(test)]

@@ -703,14 +703,6 @@ pub struct QueuedInput {
 }
 
 #[derive(Debug, Clone)]
-pub struct QueuedInputPreview {
-    pub id: String,
-    pub priority: InputPriority,
-    pub content: UserMessage,
-    pub client_input_id: Option<String>,
-}
-
-#[derive(Debug, Clone)]
 pub struct StoredAction {
     pub kind: ActionKind,
     pub action_id: i64,
@@ -736,16 +728,6 @@ pub struct TokenUsageEstimate {
 }
 
 impl TokenUsageEstimate {
-    pub fn from_full_estimate(total_tokens: usize) -> Self {
-        Self {
-            total_tokens,
-            base_tokens: 0,
-            estimated_suffix_tokens: total_tokens,
-            suffix_start_leaf_id: None,
-            suffix_entries: Vec::new(),
-        }
-    }
-
     pub fn with_estimated_suffix_tokens(mut self, estimated_suffix_tokens: usize) -> Self {
         self.estimated_suffix_tokens = estimated_suffix_tokens;
         self.total_tokens = self.base_tokens.saturating_add(estimated_suffix_tokens);
@@ -756,14 +738,6 @@ impl TokenUsageEstimate {
         self.suffix_entries = suffix_entries;
         self
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct ResumableToolAction {
-    pub action_id: ActionId,
-    pub turn_id: TurnId,
-    pub status: ActionStatus,
-    pub tool_call: agent_vocab::ToolCall,
 }
 
 pub struct OutputBatch<'a> {
