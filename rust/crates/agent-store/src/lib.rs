@@ -3,82 +3,16 @@
 mod postgres;
 
 use std::fmt;
-use std::str::FromStr;
 
 use agent_session::{ModelContext, SessionAction, SessionEvent, TranscriptStorageNode};
 use agent_vocab::{
-    ActionId, ProviderConfig, ProviderKind, ProviderReplayItem, TranscriptItem, TurnId,
+    text_enum, ActionId, ProviderConfig, ProviderKind, ProviderReplayItem, TranscriptItem, TurnId,
     TurnOutcome, UserMessage,
 };
 pub use postgres::PostgresAgentStore;
-use serde::de::Error as _;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
-
-macro_rules! text_enum {
-    ($(
-        $(#[$meta:meta])*
-        pub enum $name:ident {
-            $($variant:ident => $wire:literal),+ $(,)?
-        }
-    )+) => {
-        $(
-            $(#[$meta])*
-            #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-            pub enum $name {
-                $($variant),+
-            }
-
-            impl $name {
-                pub fn as_str(self) -> &'static str {
-                    match self {
-                        $(Self::$variant => $wire),+
-                    }
-                }
-            }
-
-            impl fmt::Display for $name {
-                fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    f.write_str(self.as_str())
-                }
-            }
-
-            impl FromStr for $name {
-                type Err = String;
-
-                fn from_str(value: &str) -> Result<Self, Self::Err> {
-                    match value {
-                        $($wire => Ok(Self::$variant),)+
-                        other => Err(format!(
-                            "unknown {}: {other}",
-                            stringify!($name),
-                        )),
-                    }
-                }
-            }
-
-            impl Serialize for $name {
-                fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-                where
-                    S: Serializer,
-                {
-                    serializer.serialize_str(self.as_str())
-                }
-            }
-
-            impl<'de> Deserialize<'de> for $name {
-                fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-                where
-                    D: Deserializer<'de>,
-                {
-                    let value = String::deserialize(deserializer)?;
-                    Self::from_str(&value).map_err(D::Error::custom)
-                }
-            }
-        )+
-    };
-}
 
 text_enum! {
     pub enum InputPriority {

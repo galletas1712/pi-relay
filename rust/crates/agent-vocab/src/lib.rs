@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[macro_use]
+mod macros;
 mod ids;
 mod message;
 mod provider;
