@@ -3,8 +3,9 @@ use agent_vocab::{ReplayDisplay, ReplayDisplayKind};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolDisplayInput {
     LocalTool,
-    /// Legacy provider-replay display only. The tool-extension execution API
-    /// no longer has a hosted execution mode.
+    /// Display for provider-hosted tools (e.g. server-side web_search/web_fetch)
+    /// surfaced from provider-replay items. Tool execution itself is always
+    /// local; this variant only labels replayed hosted-tool calls.
     HostedTool,
 }
 

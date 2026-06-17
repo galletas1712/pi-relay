@@ -309,13 +309,7 @@ async fn remote_compaction_request(
             .tools
             .provider_tools_for_provider(config.provider.kind),
         reasoning_effort: config.provider.reasoning_effort,
-        prompt_cache_key: config
-            .provider
-            .prompt_cache
-            .as_ref()
-            .and_then(|value| value.get("key"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
         session_id: Some(session_id.to_string()),
     })
 }
@@ -402,10 +396,7 @@ fn local_summary_request(
         reasoning_effort: config.provider.reasoning_effort,
         prompt_cache_key: config
             .provider
-            .prompt_cache
-            .as_ref()
-            .and_then(|value| value.get("key"))
-            .and_then(Value::as_str)
+            .prompt_cache_key()
             .map(|key| format!("{key}:compaction")),
         // Local summary compaction uses an isolated compaction session id and
         // prompt-cache key. Remote OpenAI compaction intentionally does not.

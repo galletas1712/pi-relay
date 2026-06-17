@@ -25,7 +25,6 @@ pub(crate) struct RpcResponse {
 pub(crate) struct RpcErrorBody {
     pub(crate) code: String,
     pub(crate) message: String,
-    #[serde(default)]
     pub(crate) data: Value,
 }
 
@@ -76,7 +75,6 @@ pub(crate) enum RpcMethod {
     CompactionRequest,
     ReplExec,
     SubagentList,
-    SubagentSpawn,
     HarnessModelComplete,
     HarnessModelFail,
 }
@@ -116,7 +114,6 @@ impl RpcMethod {
             "compaction.request" => Some(Self::CompactionRequest),
             "repl.exec" => Some(Self::ReplExec),
             "subagent.list" => Some(Self::SubagentList),
-            "subagent.spawn" => Some(Self::SubagentSpawn),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
             _ => None,
@@ -196,10 +193,6 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("subagent.list"),
             Some(RpcMethod::SubagentList)
-        );
-        assert_eq!(
-            RpcMethod::parse("subagent.spawn"),
-            Some(RpcMethod::SubagentSpawn)
         );
         assert_eq!(
             RpcMethod::parse("history.switch"),

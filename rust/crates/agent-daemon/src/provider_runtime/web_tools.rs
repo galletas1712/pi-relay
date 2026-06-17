@@ -2,42 +2,22 @@ use agent_provider::{
     ModelRequest, ModelResponse, ModelTranscriptEntry, PromptSections, ProviderToolProfile,
 };
 use agent_store::SessionConfig;
-use agent_tools::{limit_tool_output_with_max_tokens, ProviderTool, ToolContext, ToolExecution};
+use agent_tools::{
+    limit_tool_output_with_max_tokens, nonempty_domains, ProviderTool, ToolContext, ToolExecution,
+    WebFetchArgs, WebSearchArgs,
+};
 use agent_vocab::{
     AssistantItem, ProviderKind, ProviderReplayItem, ToolCall, ToolResultMessage, TranscriptItem,
     UserMessage,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::state::AppState;
 
 use super::{run_model_sidecar, sidecar_session_id, ModelSidecarRequest};
 
-#[derive(Debug, Deserialize)]
-struct WebSearchArgs {
-    query: String,
-    #[serde(default)]
-    recency: Option<String>,
-    #[serde(default)]
-    allowed_domains: Option<Vec<String>>,
-    #[serde(default)]
-    blocked_domains: Option<Vec<String>>,
-    #[serde(default)]
-    max_output_tokens: Option<usize>,
-}
-
 fn web_sidecar_session_id(session_id: &str, call_id: &str) -> String {
     sidecar_session_id("web", session_id, &[call_id])
-}
-
-#[derive(Debug, Deserialize)]
-struct WebFetchArgs {
-    url: String,
-    #[serde(default)]
-    prompt: Option<String>,
-    #[serde(default)]
-    max_output_tokens: Option<usize>,
 }
 
 pub(crate) fn is_web_tool_name(name: &str) -> bool {
@@ -380,16 +360,6 @@ fn web_fetch_sidecar_prompt(args: &WebFetchArgs) -> String {
         prompt.push_str(&format!("\n\nInstruction: {instruction}"));
     }
     prompt
-}
-
-fn nonempty_domains(domains: Option<&[String]>) -> Option<Vec<String>> {
-    let domains = domains?
-        .iter()
-        .map(|domain| domain.trim())
-        .filter(|domain| !domain.is_empty())
-        .map(str::to_string)
-        .collect::<Vec<_>>();
-    (!domains.is_empty()).then_some(domains)
 }
 
 fn summarize_web_replay(replay: &[ProviderReplayItem]) -> String {

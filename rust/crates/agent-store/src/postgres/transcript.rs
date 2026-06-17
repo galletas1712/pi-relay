@@ -18,7 +18,7 @@ use crate::{
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
 use super::queue::bump_revisions_tx;
 use super::rows::{row_to_stored_entry, row_to_transcript_entry};
-use super::sql::{action_is_unfinished, lock_session_tx};
+use super::sql::{lock_session_tx, stale_unfinished_actions_for_session};
 use super::turn_cards::{active_branch_turn_card_page_tx, TurnCardPage};
 use super::PostgresAgentStore;
 
@@ -576,7 +576,7 @@ impl PostgresAgentStore {
         session_id: &str,
         leaf_id: &str,
     ) -> Result<ModelContext> {
-        let entries = self.branch_entries_to_leaf(session_id, leaf_id).await?;
+        let entries = branch_entries_to_leaf(&self.pool, session_id, leaf_id).await?;
         if entries.is_empty() {
             return Err(anyhow!("transcript leaf not found: {leaf_id}"));
         }
@@ -684,41 +684,6 @@ impl PostgresAgentStore {
         let records = active_branch_entry_records_tx(&mut tx, session_id, body_mode).await?;
         tx.commit().await?;
         Ok(records)
-    }
-
-    pub(crate) async fn branch_entries_to_leaf(
-        &self,
-        session_id: &str,
-        leaf_id: &str,
-    ) -> Result<Vec<StoredTranscriptEntry>> {
-        let rows = sqlx::query(
-            r#"
-            with recursive branch as (
-                select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence
-                from transcript_entries t
-                where t.session_id = $1
-                  and t.id = $2::text
-
-                union all
-
-                select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence
-                from transcript_entries parent
-                join branch child
-                  on parent.session_id = $1
-                 and parent.id = child.parent_id
-            )
-            select id, parent_id, timestamp_ms, item, provider_replay
-            from branch
-            order by sequence
-            "#,
-        )
-        .bind(session_id)
-        .bind(leaf_id)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.into_iter()
-            .map(|row| row_to_stored_entry(&row))
-            .collect()
     }
 
     pub async fn set_active_leaf(
@@ -873,10 +838,7 @@ impl PostgresAgentStore {
                 inserted_records.insert(record.id.clone(), record);
             }
         }
-        let unfinished_actions = action_is_unfinished(None);
-        let query = format!(
-            "update actions set status='stale', updated_at=now() where session_id=$1 and {unfinished_actions}",
-        );
+        let query = stale_unfinished_actions_for_session();
         sqlx::query(&query)
             .bind(session_id)
             .execute(&mut *tx)
@@ -920,6 +882,44 @@ impl PostgresAgentStore {
         tx.commit().await?;
         Ok(frames)
     }
+}
+
+pub(super) async fn branch_entries_to_leaf<'e, E>(
+    executor: E,
+    session_id: &str,
+    leaf_id: &str,
+) -> Result<Vec<StoredTranscriptEntry>>
+where
+    E: sqlx::Executor<'e, Database = Postgres>,
+{
+    let rows = sqlx::query(
+        r#"
+        with recursive branch as (
+            select t.id, t.parent_id, t.timestamp_ms, t.item, t.provider_replay, t.sequence
+            from transcript_entries t
+            where t.session_id = $1
+              and t.id = $2::text
+
+            union all
+
+            select parent.id, parent.parent_id, parent.timestamp_ms, parent.item, parent.provider_replay, parent.sequence
+            from transcript_entries parent
+            join branch child
+              on parent.session_id = $1
+             and parent.id = child.parent_id
+        )
+        select id, parent_id, timestamp_ms, item, provider_replay
+        from branch
+        order by sequence
+        "#,
+    )
+    .bind(session_id)
+    .bind(leaf_id)
+    .fetch_all(executor)
+    .await?;
+    rows.into_iter()
+        .map(|row| row_to_stored_entry(&row))
+        .collect()
 }
 
 #[derive(Debug, Clone)]

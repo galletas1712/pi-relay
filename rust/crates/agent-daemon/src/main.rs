@@ -288,7 +288,6 @@ async fn dispatch_request(
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
         RpcMethod::ReplExec => repl::repl_exec(state, params).await,
         RpcMethod::SubagentList => subagents::subagent_list(state, params).await,
-        RpcMethod::SubagentSpawn => subagents::subagent_spawn(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }

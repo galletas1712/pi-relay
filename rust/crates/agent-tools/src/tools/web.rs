@@ -16,19 +16,19 @@ pub struct WebSearchTool;
 pub struct WebFetchTool;
 
 #[derive(Debug, Deserialize)]
-struct WebSearchArgs {
-    query: String,
+pub struct WebSearchArgs {
+    pub query: String,
     #[serde(default)]
-    recency: Option<String>,
+    pub recency: Option<String>,
     #[serde(default)]
-    allowed_domains: Option<Vec<String>>,
+    pub allowed_domains: Option<Vec<String>>,
     #[serde(default)]
-    blocked_domains: Option<Vec<String>>,
+    pub blocked_domains: Option<Vec<String>>,
     #[serde(default)]
-    max_output_tokens: Option<usize>,
+    pub max_output_tokens: Option<usize>,
 }
 
-fn nonempty_domains(domains: Option<&[String]>) -> Option<Vec<String>> {
+pub fn nonempty_domains(domains: Option<&[String]>) -> Option<Vec<String>> {
     let domains = domains?
         .iter()
         .map(|domain| domain.trim())
@@ -41,12 +41,12 @@ fn nonempty_domains(domains: Option<&[String]>) -> Option<Vec<String>> {
 const WEB_FETCH_USER_AGENT: &str = "pi-relay-web-fetch/0.1";
 
 #[derive(Debug, Deserialize)]
-struct WebFetchArgs {
-    url: String,
+pub struct WebFetchArgs {
+    pub url: String,
     #[serde(default)]
-    prompt: Option<String>,
+    pub prompt: Option<String>,
     #[serde(default)]
-    max_output_tokens: Option<usize>,
+    pub max_output_tokens: Option<usize>,
 }
 
 #[async_trait]

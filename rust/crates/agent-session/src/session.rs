@@ -3,12 +3,12 @@ use std::collections::VecDeque;
 use crate::action::SessionAction;
 use crate::event::SessionEvent;
 use crate::input::{SessionInput, SessionInputError};
-use crate::model_context::{ModelContext, OpenTurnClosure};
+use crate::model_context::ModelContext;
 use crate::outstanding_actions::OutstandingActions;
 use crate::storage::StoredSession;
 use crate::transcript_store::{TranscriptStore, TranscriptStoreError};
 use agent_core::{AgentAction, AgentCoreLoop, AgentInput};
-use agent_vocab::{ActionId, CompactionSummary, ProviderReplayItem, TranscriptItem, TurnId};
+use agent_vocab::{ActionId, ProviderReplayItem, TranscriptItem, TurnId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryOperationError {
@@ -19,20 +19,6 @@ pub enum HistoryOperationError {
     /// An underlying transcript-store error: entry not found or not at a turn
     /// boundary.
     Store(TranscriptStoreError),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CompactionCheckpoint {
-    pub summary: String,
-    pub provider_replay: Vec<ProviderReplayItem>,
-    pub continuation_suffix: Vec<crate::transcript_store::TranscriptStorageNode>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InstalledCompaction {
-    pub new_root_id: String,
-    pub active_leaf_id: String,
-    pub entries: Vec<crate::transcript_store::TranscriptStorageNode>,
 }
 
 /// Session shell around the pure core loop.
@@ -108,7 +94,7 @@ impl AgentSession {
     }
 
     pub fn from_model_context(model_context: ModelContext) -> Self {
-        let model_context = model_context.close_open_turn(OpenTurnClosure::Crashed);
+        let model_context = model_context.close_open_turn();
         let last_turn_id = model_context.last_turn_id();
         let transcript_store = TranscriptStore::from_model_context(&model_context);
         let mut session = Self::new();
@@ -123,7 +109,7 @@ impl AgentSession {
     pub(crate) fn from_transcript_store(
         mut transcript_store: TranscriptStore,
     ) -> Result<Self, HistoryOperationError> {
-        Self::close_transcript_store_open_turn(&mut transcript_store, OpenTurnClosure::Crashed)?;
+        Self::close_transcript_store_open_turn(&mut transcript_store)?;
 
         let model_context = transcript_store.model_context();
         let last_turn_id = model_context.last_turn_id();
@@ -382,48 +368,6 @@ impl AgentSession {
         }
     }
 
-    pub fn install_compaction_checkpoint(
-        &mut self,
-        source_session_id: impl Into<String>,
-        source_leaf_id: impl Into<String>,
-        tokens_before: Option<usize>,
-        last_turn_id: TurnId,
-        checkpoint: CompactionCheckpoint,
-    ) -> InstalledCompaction {
-        let root_item = TranscriptItem::CompactionSummary(CompactionSummary::new(
-            source_session_id,
-            source_leaf_id,
-            checkpoint.summary,
-            tokens_before,
-            last_turn_id,
-        ));
-        let new_root_id = self
-            .transcript_store
-            .append_root_item(root_item, checkpoint.provider_replay);
-        let mut entry_ids = vec![new_root_id.clone()];
-        let mut suffix_parent = Some(new_root_id.clone());
-        for mut suffix in checkpoint.continuation_suffix {
-            suffix.parent_id = suffix_parent.clone();
-            let suffix_id = suffix.id.clone();
-            entry_ids.push(self.transcript_store.append_storage_node(suffix));
-            suffix_parent = Some(suffix_id);
-        }
-        let active_leaf_id = self
-            .transcript_store
-            .active_leaf_id()
-            .map(str::to_string)
-            .unwrap_or_else(|| new_root_id.clone());
-        let entries = entry_ids
-            .iter()
-            .filter_map(|id| self.transcript_store.get_entry(id).cloned())
-            .collect();
-        InstalledCompaction {
-            new_root_id,
-            active_leaf_id,
-            entries,
-        }
-    }
-
     pub fn restore_compacted_runtime(
         &mut self,
         active_leaf_id: &str,
@@ -601,7 +545,6 @@ impl AgentSession {
 
     fn close_transcript_store_open_turn(
         transcript_store: &mut TranscriptStore,
-        closure: OpenTurnClosure,
     ) -> Result<(), HistoryOperationError> {
         if transcript_store.is_turn_boundary() {
             return Ok(());
@@ -613,7 +556,7 @@ impl AgentSession {
         // continuing live tool execution. Persist a real turn boundary so APIs
         // that require boundary leaves never see a recovered tool_result leaf.
         let recovered_context =
-            ModelContext::from_transcript_items(items).close_open_turn_to_boundary(closure);
+            ModelContext::from_transcript_items(items).close_open_turn_to_boundary();
         let recovered = recovered_context.into_transcript_items();
         if recovered.len() == original_len {
             return Err(HistoryOperationError::Store(

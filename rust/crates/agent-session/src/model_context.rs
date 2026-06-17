@@ -46,20 +46,14 @@ impl ModelContext {
         }
     }
 
-    pub fn from_transcript_items_closing_open_turn_as_interrupted(
-        items: Vec<TranscriptItem>,
-    ) -> Self {
-        Self::from_transcript_items(items).close_open_turn(OpenTurnClosure::Interrupted)
-    }
-
-    pub(crate) fn close_open_turn(mut self, closure: OpenTurnClosure) -> Self {
-        Self::close_open_turn_items(&mut self.items, closure);
+    pub(crate) fn close_open_turn(mut self) -> Self {
+        Self::close_open_turn_items(&mut self.items);
         self.provider_replay.resize_with(self.items.len(), Vec::new);
         self
     }
 
-    pub(crate) fn close_open_turn_to_boundary(mut self, closure: OpenTurnClosure) -> Self {
-        Self::close_open_turn_items_to_boundary(&mut self.items, closure);
+    pub(crate) fn close_open_turn_to_boundary(mut self) -> Self {
+        Self::close_open_turn_items_to_boundary(&mut self.items);
         self.provider_replay.resize_with(self.items.len(), Vec::new);
         self
     }
@@ -102,25 +96,6 @@ impl ModelContext {
             .unwrap_or_default()
     }
 
-    pub fn open_turn_user_suffix(&self) -> Vec<TranscriptItem> {
-        let Some((_, turn_start)) = Self::open_turn_start(&self.items) else {
-            return Vec::new();
-        };
-        self.items[turn_start..]
-            .iter()
-            .filter_map(|item| match item {
-                TranscriptItem::TurnStarted { .. } | TranscriptItem::UserMessage(_) => {
-                    Some(item.clone())
-                }
-                TranscriptItem::AssistantMessage(_)
-                | TranscriptItem::ToolCallStarted { .. }
-                | TranscriptItem::ToolResult(_)
-                | TranscriptItem::TurnFinished { .. }
-                | TranscriptItem::CompactionSummary(_) => None,
-            })
-            .collect()
-    }
-
     pub fn split_before_open_turn(&self) -> Option<(Self, Vec<ModelContextEntry>)> {
         let Some((_, turn_start)) = Self::open_turn_start(&self.items) else {
             return None;
@@ -145,34 +120,31 @@ impl ModelContext {
         Self::open_turn_ready_to_continue_items(&self.items)
     }
 
-    fn close_open_turn_items(items: &mut Vec<TranscriptItem>, closure: OpenTurnClosure) {
+    fn close_open_turn_items(items: &mut Vec<TranscriptItem>) {
         let Some((turn_id, turn_start)) = Self::open_turn_start(items) else {
             return;
         };
 
-        Self::complete_open_tool_calls(items, turn_start, turn_id, closure);
+        Self::complete_open_tool_calls(items, turn_start, turn_id);
         if Self::open_turn_ready_to_continue_items(items).is_some() {
             return;
         }
         items.push(TranscriptItem::TurnFinished {
             turn_id,
-            outcome: closure.turn_outcome(),
+            outcome: TurnOutcome::Crashed,
         });
     }
 
-    fn close_open_turn_items_to_boundary(
-        items: &mut Vec<TranscriptItem>,
-        closure: OpenTurnClosure,
-    ) {
+    fn close_open_turn_items_to_boundary(items: &mut Vec<TranscriptItem>) {
         let Some((turn_id, turn_start)) = Self::open_turn_start(items) else {
             return;
         };
 
-        Self::complete_open_tool_calls(items, turn_start, turn_id, closure);
+        Self::complete_open_tool_calls(items, turn_start, turn_id);
         if !Self::is_turn_boundary_items(items) {
             items.push(TranscriptItem::TurnFinished {
                 turn_id,
-                outcome: closure.turn_outcome(),
+                outcome: TurnOutcome::Crashed,
             });
         }
     }
@@ -216,7 +188,6 @@ impl ModelContext {
         items: &mut Vec<TranscriptItem>,
         turn_start: usize,
         turn_id: TurnId,
-        closure: OpenTurnClosure,
     ) {
         let mut tool_calls = Vec::new();
         let mut started_tool_calls = Vec::<ToolCall>::new();
@@ -256,9 +227,10 @@ impl ModelContext {
             }) {
                 completed_tool_results.remove(index);
             } else {
-                items.push(TranscriptItem::ToolResult(
-                    closure.missing_tool_result(tool_call),
-                ));
+                items.push(TranscriptItem::ToolResult(ToolResultMessage::crashed(
+                    tool_call.id,
+                    tool_call.tool_name,
+                )));
             }
         }
     }
@@ -289,25 +261,6 @@ impl ModelContext {
             })
         });
         all_tools_have_results.then_some(turn_id)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum OpenTurnClosure {
-    Crashed,
-    Interrupted,
-}
-
-impl OpenTurnClosure {
-    fn turn_outcome(self) -> TurnOutcome {
-        match self {
-            Self::Crashed => TurnOutcome::Crashed,
-            Self::Interrupted => TurnOutcome::Interrupted,
-        }
-    }
-
-    fn missing_tool_result(self, tool_call: ToolCall) -> ToolResultMessage {
-        ToolResultMessage::crashed(tool_call.id, tool_call.tool_name)
     }
 }
 
@@ -452,7 +405,7 @@ mod tests {
             },
             TranscriptItem::ToolResult(tool_result(1, "bash")),
         ])
-        .close_open_turn(OpenTurnClosure::Crashed);
+        .close_open_turn();
 
         assert_eq!(
             transcript.transcript_items().last(),
@@ -493,7 +446,7 @@ mod tests {
             },
             TranscriptItem::ToolResult(tool_result(first.id.clone(), "bash")),
         ])
-        .close_open_turn_to_boundary(OpenTurnClosure::Crashed);
+        .close_open_turn_to_boundary();
 
         assert!(transcript.transcript_items().iter().any(|item| matches!(
             item,
@@ -525,7 +478,7 @@ mod tests {
                 items: vec![AssistantItem::ToolCall(tool_call.clone())],
             }),
         ])
-        .close_open_turn(OpenTurnClosure::Crashed);
+        .close_open_turn();
 
         assert_eq!(
             transcript.transcript_items()[3],

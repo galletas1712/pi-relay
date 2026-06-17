@@ -3,7 +3,6 @@ use agent_session::ModelContext;
 use agent_store::SessionConfig;
 use agent_vocab::TurnId;
 use anyhow::Result;
-use serde_json::Value;
 
 use crate::auth::Credentials;
 use crate::state::AppState;
@@ -16,10 +15,7 @@ use super::transcript::provider_transcript;
 pub(crate) fn model_prompt_cache_key(config: &SessionConfig, session_id: &str) -> String {
     config
         .provider
-        .prompt_cache
-        .as_ref()
-        .and_then(|value| value.get("key"))
-        .and_then(Value::as_str)
+        .prompt_cache_key()
         .map(str::to_string)
         .unwrap_or_else(|| session_id.to_string())
 }

@@ -96,19 +96,6 @@ impl AgentCoreLoop {
         matches!(self.state, AgentState::ReadyToContinue { .. })
     }
 
-    /// True when the mailbox still has queued inputs waiting to be processed.
-    ///
-    /// Exposed so callers can observe liveness without reaching into the
-    /// underlying `Mailbox`, which is a private implementation detail.
-    pub fn has_pending_work(&self) -> bool {
-        self.mailbox.total_len() > 0
-    }
-
-    /// The most recent turn id observed by the core.
-    pub fn last_turn_id(&self) -> TurnId {
-        self.last_turn_id
-    }
-
     pub fn next_action_id(&self) -> ActionId {
         self.next_action_id
     }
@@ -122,8 +109,7 @@ impl AgentCoreLoop {
     }
 
     /// Drain every queued user input (Steer then FollowUp) from the mailbox
-    /// without advancing the FSM. Preserves the `from` and `kind` tags each
-    /// input was enqueued with. Notifications and the interrupt flag are
+    /// without advancing the FSM. Notifications and the interrupt flag are
     /// untouched.
     ///
     /// Primarily intended for tests and for caller introspection.

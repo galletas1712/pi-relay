@@ -6,15 +6,15 @@ use uuid::Uuid;
 
 use crate::{
     CancelQueuedInputResult, EnqueueUserInputResult, EventType, InputPriority, InputRecord,
-    PromoteQueuedInputResult, QueueMutationError, QueueState, QueuedInput, QueuedInputPreview,
-    QueuedInputRecord, QueuedInputStatus, ReorderQueuedFollowUpsResult, SessionActivity,
-    UpdateQueuedInputResult,
+    PromoteQueuedInputResult, QueueMutationError, QueueState, QueuedInput, QueuedInputRecord,
+    QueuedInputStatus, ReorderQueuedFollowUpsResult, UpdateQueuedInputResult,
 };
 
 use super::events::insert_event_tx;
 use super::rows::row_text;
 use super::sql::{
-    lock_session_tx, queued_input_is_active, queued_input_is_editable, QUEUED_INPUT_DISPATCH_ORDER,
+    lock_session_tx, queued_input_is_active, queued_input_is_editable, session_activity,
+    QUEUED_INPUT_DISPATCH_ORDER,
 };
 use super::PostgresAgentStore;
 
@@ -132,41 +132,6 @@ impl PostgresAgentStore {
         })
     }
 
-    async fn peek_next_queued_input_matching(
-        &self,
-        session_id: &str,
-        priority: Option<InputPriority>,
-    ) -> Result<Option<QueuedInputPreview>> {
-        let editable_queue = queued_input_is_editable(None);
-        let priority_filter = priority.map(|priority| priority.as_str().to_string());
-        let query = format!(
-            r#"
-                select id, priority, content, client_input_id
-                from queued_inputs
-                where session_id=$1
-                    and {editable_queue}
-                    and ($2::text is null or priority=$2::text)
-                order by {QUEUED_INPUT_DISPATCH_ORDER}
-                limit 1
-                "#
-        );
-        let row = sqlx::query(&query)
-            .bind(session_id)
-            .bind(priority_filter.as_deref())
-            .fetch_optional(&self.pool)
-            .await?;
-        row.map(|row| {
-            let content: UserMessage = serde_json::from_value(row.get::<Value, _>("content"))?;
-            Ok(QueuedInputPreview {
-                id: row.get("id"),
-                priority: row_text::<InputPriority>(&row, "priority")?,
-                content,
-                client_input_id: row.get("client_input_id"),
-            })
-        })
-        .transpose()
-    }
-
     pub async fn find_client_input(
         &self,
         session_id: &str,
@@ -194,13 +159,6 @@ impl PostgresAgentStore {
 
     pub async fn take_next_queued_input(&self, session_id: &str) -> Result<Option<QueuedInput>> {
         self.take_next_queued_input_matching(session_id, None).await
-    }
-
-    pub async fn peek_next_queued_input(
-        &self,
-        session_id: &str,
-    ) -> Result<Option<QueuedInputPreview>> {
-        self.peek_next_queued_input_matching(session_id, None).await
     }
 
     pub async fn take_next_queued_steer_input(
@@ -745,13 +703,7 @@ pub(super) async fn queue_state_tx(
     .bind(session_id)
     .fetch_one(&mut **tx)
     .await?;
-    let activity = if unfinished_actions {
-        SessionActivity::Running
-    } else if !queued_rows.is_empty() {
-        SessionActivity::Queued
-    } else {
-        SessionActivity::Idle
-    };
+    let activity = session_activity(unfinished_actions, !queued_rows.is_empty());
     Ok(QueueState {
         session_revision: session.get("session_revision"),
         queue_revision: session.get("queue_revision"),

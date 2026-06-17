@@ -11,7 +11,7 @@ use super::action_records::model_action_context_leaf_id;
 use super::events::insert_event_with_activity_tx;
 use super::queue::bump_revisions_tx;
 use super::rows::row_text;
-use super::sql::{action_is_unfinished, lock_session_tx};
+use super::sql::{action_is_unfinished, lock_session_tx, stale_unfinished_actions_for_session};
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
@@ -42,10 +42,7 @@ impl PostgresAgentStore {
     pub async fn mark_unfinished_actions_stale(&self, session_id: &str) -> Result<u64> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
-        let unfinished_actions = action_is_unfinished(None);
-        let query = format!(
-            "update actions set status='stale', updated_at=now() where session_id=$1 and {unfinished_actions}",
-        );
+        let query = stale_unfinished_actions_for_session();
         let updated = sqlx::query(&query)
             .bind(session_id)
             .execute(&mut *tx)
@@ -67,23 +64,6 @@ impl PostgresAgentStore {
             .bind(session_id)
             .fetch_one(&self.pool)
             .await?)
-    }
-
-    pub async fn load_action(&self, session_id: &str, action_row_id: &str) -> Result<StoredAction> {
-        let row = sqlx::query(
-            "select kind, action_id, turn_id, attempt_id from actions where session_id=$1 and id=$2::text and status='running'",
-        )
-            .bind(session_id)
-            .bind(action_row_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or_else(|| anyhow!("action not found or not active: {action_row_id}"))?;
-        Ok(StoredAction {
-            kind: row_text::<ActionKind>(&row, "kind")?,
-            action_id: row.get("action_id"),
-            turn_id: row.get("turn_id"),
-            attempt_id: row.get("attempt_id"),
-        })
     }
 
     pub async fn load_harness_model_action(

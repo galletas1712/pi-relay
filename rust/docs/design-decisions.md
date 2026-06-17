@@ -415,8 +415,10 @@ Compaction
 installation lives in `agent-store` because it is a durable Postgres
 transaction.
 
-The websocket daemon is the process boundary and repository owner; it is not a
-general hierarchical subagent orchestrator.
+The websocket daemon is the process boundary and repository owner. It supports
+bounded parent/child subagent delegation (children are forked sessions with a
+spawn/list/wait/steer/interrupt surface), but it is not a general hierarchical
+orchestrator with cross-session message routing.
 
 ## Testing Decisions
 

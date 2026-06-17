@@ -1,5 +1,17 @@
+use crate::SessionActivity;
+
 const UNFINISHED_ACTION_STATUSES: &str = "'pending','blocked','running'";
 const ACTIVE_QUEUED_INPUT_STATUSES: &str = "'queued','consuming'";
+
+pub(super) fn session_activity(running: bool, queued: bool) -> SessionActivity {
+    if running {
+        SessionActivity::Running
+    } else if queued {
+        SessionActivity::Queued
+    } else {
+        SessionActivity::Idle
+    }
+}
 
 pub(super) const QUEUED_INPUT_DISPATCH_ORDER: &str = r#"
     case priority when 'steer' then 0 else 1 end,
@@ -19,6 +31,13 @@ pub(super) const QUEUED_INPUT_DISPATCH_ORDER: &str = r#"
 
 pub(super) fn action_is_unfinished(alias: Option<&str>) -> String {
     status_is_one_of(alias, UNFINISHED_ACTION_STATUSES)
+}
+
+/// The query that marks a single session's unfinished actions stale. Shared by
+/// per-session recovery (`recover_session`) and `mark_unfinished_actions_stale`.
+pub(super) fn stale_unfinished_actions_for_session() -> String {
+    let unfinished_actions = action_is_unfinished(None);
+    format!("update actions set status='stale', updated_at=now() where session_id=$1 and {unfinished_actions}")
 }
 
 pub(super) fn queued_input_is_active(alias: Option<&str>) -> String {

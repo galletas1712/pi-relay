@@ -1,14 +1,10 @@
 use agent_tools::{tool_display, ProviderTool, ToolDisplayInput};
 use agent_vocab::{
-    AssistantItem, AssistantMessage, CompactionSummary, ContentBlock, ProviderKind,
-    ProviderReplayItem, ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem,
-    TurnId, UserMessage,
+    AssistantItem, AssistantMessage, ContentBlock, ProviderKind, ProviderReplayItem,
+    ReasoningEffort, ReplayDisplay, ToolCall, ToolCallId, TranscriptItem, TurnId, UserMessage,
 };
 use async_trait::async_trait;
-use reqwest::{
-    header::{HeaderMap, ACCEPT, CONTENT_ENCODING, CONTENT_TYPE},
-    StatusCode,
-};
+use reqwest::header::{HeaderMap, ACCEPT, CONTENT_ENCODING, CONTENT_TYPE};
 use serde_json::{json, Value};
 use std::{
     io::Cursor,
@@ -23,6 +19,9 @@ use uuid::Uuid;
 #[cfg(test)]
 use crate::sse::read_json_sse_text;
 use crate::{
+    common::{
+        compaction_summary_text, ensure_success, push_text_item, response_excerpt, response_text,
+    },
     http::send_provider_generation_request,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopReason, ModelTranscriptEntry,
@@ -567,7 +566,7 @@ impl OpenAiProvider {
             .await?;
         let response_headers = OpenAiResponseHeaders::from_headers(response.headers());
         let (status, text) = response_text(response).await?;
-        ensure_success(status, &text)?;
+        ensure_success(status, &text, response_error_message)?;
         let mut parsed = parse_compact_response(&text)?;
         response_headers.attach_to_usage(&mut parsed.usage);
         Ok(parsed)
@@ -618,12 +617,6 @@ fn zstd_json_request(
         .body(compressed))
 }
 
-async fn response_text(response: reqwest::Response) -> ProviderResult<(StatusCode, String)> {
-    let status = response.status();
-    let bytes = response.bytes().await?;
-    Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
-}
-
 fn codex_window_generation(transcript: &[ModelTranscriptEntry]) -> u64 {
     // Codex CLI stores an explicit per-session window generation and increments
     // it after replacing history with a compacted transcript. Pi-relay's Rust
@@ -642,16 +635,6 @@ fn codex_window_generation(transcript: &[ModelTranscriptEntry]) -> u64 {
         .unwrap_or(0)
 }
 
-fn ensure_success(status: StatusCode, body: &str) -> ProviderResult<()> {
-    if status.is_success() {
-        return Ok(());
-    }
-    Err(ProviderError::Status {
-        status: status.as_u16(),
-        message: response_error_message(body),
-    })
-}
-
 fn response_error_message(body: &str) -> String {
     serde_json::from_str::<Value>(body)
         .ok()
@@ -663,20 +646,6 @@ fn response_error_message(body: &str) -> String {
                 .map(ToOwned::to_owned)
         })
         .unwrap_or_else(|| response_excerpt(body))
-}
-
-fn response_excerpt(body: &str) -> String {
-    const MAX_CHARS: usize = 1200;
-    let trimmed = body.trim();
-    let mut excerpt = trimmed.chars().take(MAX_CHARS).collect::<String>();
-    if trimmed.chars().count() > MAX_CHARS {
-        excerpt.push_str("...");
-    }
-    if excerpt.is_empty() {
-        "empty response body".to_string()
-    } else {
-        excerpt
-    }
 }
 
 fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Value> {
@@ -927,27 +896,6 @@ fn responses_user_content(message: &UserMessage) -> Vec<Value> {
             },
         })
         .collect()
-}
-
-fn compaction_summary_text(summary: &CompactionSummary, prompt: &crate::PromptSections) -> String {
-    match &prompt.stable_prefix {
-        Some(pi_prompt) if !pi_prompt.trim().is_empty() => format!(
-            "The active PI.md system prompt is included below because it still applies after this compaction.
-
-{}
-
-The conversation history before this point was compacted into this summary:
-
-{}",
-            pi_prompt, summary.summary
-        ),
-        _ => format!(
-            "The conversation history before this point was compacted into this summary:
-
-{}",
-            summary.summary
-        ),
-    }
 }
 
 async fn parse_responses_stream(
@@ -1230,17 +1178,6 @@ fn openai_wire_tool_name(canonical_name: &str) -> &str {
     }
 }
 
-fn push_text_item(items: &mut Vec<AssistantItem>, text: &str) {
-    if text.is_empty() {
-        return;
-    }
-    if let Some(AssistantItem::Text(previous)) = items.last_mut() {
-        previous.push_str(text);
-    } else {
-        items.push(AssistantItem::Text(text.to_string()));
-    }
-}
-
 fn openai_usage(value: &Value) -> Option<ProviderUsage> {
     Some(ProviderUsage {
         input_tokens: value
@@ -1268,7 +1205,7 @@ fn openai_usage(value: &Value) -> Option<ProviderUsage> {
 mod tests {
     use super::*;
     use crate::PromptSections;
-    use agent_vocab::{ToolCall, ToolResultMessage, TurnId};
+    use agent_vocab::{CompactionSummary, ToolCall, ToolResultMessage, TurnId};
     use reqwest::header::HeaderValue;
 
     fn test_tool(

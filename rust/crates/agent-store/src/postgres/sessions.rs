@@ -12,7 +12,7 @@ use agent_vocab::{ProviderConfig, UserMessage};
 use super::events::insert_event_tx;
 use super::outputs::persist_outputs_tx;
 use super::queue::bump_revisions_tx;
-use super::sql::{action_is_unfinished, lock_session_tx, queued_input_is_active};
+use super::sql::{action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity};
 use super::PostgresAgentStore;
 
 fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -470,13 +470,10 @@ impl PostgresAgentStore {
                 let id: String = row.get("id");
                 let provider: ProviderConfig =
                     serde_json::from_value(row.get::<Value, _>("provider_config"))?;
-                let activity = if row.get::<bool, _>("has_running_work") {
-                    SessionActivity::Running
-                } else if row.get::<bool, _>("has_queued_input") {
-                    SessionActivity::Queued
-                } else {
-                    SessionActivity::Idle
-                };
+                let activity = session_activity(
+                    row.get::<bool, _>("has_running_work"),
+                    row.get::<bool, _>("has_queued_input"),
+                );
                 Ok(SessionSummary {
                     session_id: id,
                     project_id: row.get("project_id"),

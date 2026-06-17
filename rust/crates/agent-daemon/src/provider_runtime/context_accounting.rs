@@ -3,7 +3,6 @@ use agent_session::{ModelContext, ModelContextEntry, TranscriptStorageNode};
 use agent_store::SessionConfig;
 use agent_vocab::{ProviderKind, TranscriptItem};
 use anyhow::Result;
-use serde_json::Value;
 
 use crate::auth::Credentials;
 use crate::state::AppState;
@@ -57,13 +56,7 @@ async fn count_claude_model_input_tokens_remotely(
             .provider_tools_for_provider(config.provider.kind),
         max_tokens: config.provider.max_tokens,
         reasoning_effort: config.provider.reasoning_effort,
-        prompt_cache_key: config
-            .provider
-            .prompt_cache
-            .as_ref()
-            .and_then(|value| value.get("key"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
         session_id: Some(session_id.to_string()),
     };
 
