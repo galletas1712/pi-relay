@@ -753,7 +753,7 @@ fn openai_reasoning_effort(effort: ReasoningEffort) -> ProviderResult<&'static s
     }
 }
 
-fn transcript_to_response_items(
+pub(crate) fn transcript_to_response_items(
     prompt: &crate::PromptSections,
     items: &[ModelTranscriptEntry],
 ) -> ProviderResult<Vec<Value>> {

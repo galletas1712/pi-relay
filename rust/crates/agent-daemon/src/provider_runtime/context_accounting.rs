@@ -1,4 +1,4 @@
-use agent_provider::{ProviderTokenCountRequest, ProviderToolProfile};
+use agent_provider::{PromptSections, ProviderTokenCountRequest, ProviderToolProfile};
 use agent_session::{ModelContext, ModelContextEntry, TranscriptStorageNode};
 use agent_store::SessionConfig;
 use agent_vocab::{ProviderKind, TranscriptItem};
@@ -100,9 +100,12 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
                     .collect(),
             );
             let suffix_transcript = provider_transcript(suffix_context);
+            // The usage anchor already accounts for the prompt; the suffix is a
+            // post-anchor transcript tail that never carries a compaction
+            // summary, so no PromptSections context is needed here.
             let suffix_tokens = agent_provider::estimate_transcript_tokens(
+                &PromptSections::default(),
                 &suffix_transcript,
-                config.provider.kind,
             )
             .tokens;
             return Ok(usage
@@ -135,6 +138,5 @@ async fn estimate_model_input_tokens_from_local_heuristic(
     Ok(agent_provider::estimate_model_input_tokens(
         &prompt,
         &transcript,
-        config.provider.kind,
     ))
 }
