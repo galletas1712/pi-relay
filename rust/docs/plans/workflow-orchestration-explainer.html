@@ -525,12 +525,12 @@
         <div class="mini-card">
           <span class="num">3</span>
           <h3>Artifact</h3>
-          <p>Handoffs, evidence, diffs, logs, source refs, snapshots, decisions, notes.</p>
+          <p>Handoffs, evidence, diffs (incl. code changes), logs, snapshots, decisions, notes.</p>
         </div>
         <div class="mini-card">
           <span class="num">4</span>
           <h3>Workspace source</h3>
-          <p>How a task sees files: no workspace, read parent, fork parent, from task, or sources.</p>
+          <p>How a task sees files: no workspace, read parent, fork parent, or from one prior task. Single ancestor only.</p>
         </div>
       </div>
 
@@ -1032,7 +1032,7 @@ Stopping condition:
       <div class="grid two">
         <div class="mini-card">
           <h3>Prefer artifacts over abstractions</h3>
-          <p>If a concept can be a handoff, evidence file, source ref, snapshot, or decision artifact, do not add a table.</p>
+          <p>If a concept can be a handoff, evidence file, diff, snapshot, or decision artifact, do not add a table.</p>
         </div>
         <div class="mini-card">
           <h3>Prefer plugin code over graph DSL</h3>
