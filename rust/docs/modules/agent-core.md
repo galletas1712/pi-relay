@@ -26,7 +26,7 @@ It does **not** own durable history, execute models or tools, or persist anythin
 - `drive()` — process mailbox events until quiescent (see below).
 - `drain_actions()` / `drain_transcript_items()` — take the accumulated outputs.
 - `drain_pending_inputs()` — remove queued user inputs without advancing the FSM (for introspection/tests; notifications and the interrupt flag are untouched).
-- `is_idle()`, `is_ready_to_continue()`, `has_pending_work()`, `last_turn_id()`, `next_action_id()` — liveness/inspection.
+- `is_idle()`, `is_ready_to_continue()`, `next_action_id()` — liveness/inspection.
 
 `AgentInput` (public) — external input delivered by the caller:
 
