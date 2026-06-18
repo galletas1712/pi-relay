@@ -159,9 +159,7 @@ the [`tools.list`](../websocket-rpc.md) RPC and `system.prompt` surface report.
 Registration uses provider-keyed maps. An alias table maps both the canonical
 name and the model-facing name (per provider) back to the canonical name, so an
 incoming `apply_patch` (OpenAI) or `str_replace_based_edit_tool` (Anthropic)
-call dispatches to the `Edit` executor for that provider. `register_for_provider`
-remains a thin hook for registering a simple JSON tool as both declaration and
-executor in one call.
+call dispatches to the `Edit` executor for that provider.
 
 ## Notes
 

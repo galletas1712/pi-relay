@@ -181,13 +181,23 @@ pub(crate) fn compaction_auto_state(config: &SessionConfig) -> CompactionAutoSta
         .unwrap_or_default()
 }
 
+/// Lower bound on the effective auto-compaction limit. A limit below the
+/// irreducible post-compaction context (system prompt + summary + the current
+/// open turn ≈ a few thousand tokens) makes auto-compaction re-fire every turn
+/// without ever creating headroom, since compaction can't shrink below that
+/// floor. Clamp the effective limit up so compaction always drops the context
+/// below it. This is far below any real window-derived limit (≥170k), so it only
+/// affects misconfigured tiny overrides.
+const MIN_AUTO_COMPACTION_LIMIT: usize = 8_000;
+
 pub(crate) fn auto_limit_tokens(config: &CompactionConfig) -> Option<usize> {
-    match (config.context_window, config.auto_limit_tokens) {
+    let limit = match (config.context_window, config.auto_limit_tokens) {
         (Some(window), Some(limit)) => Some(limit.min(window)),
         (Some(window), None) => Some(window.saturating_mul(85) / 100),
         (None, Some(limit)) => Some(limit),
         (None, None) => None,
-    }
+    };
+    limit.map(|limit| limit.max(MIN_AUTO_COMPACTION_LIMIT))
 }
 
 pub(crate) async fn run_compaction(
@@ -546,6 +556,39 @@ mod tests {
         assert_eq!(resolved.context_window, Some(272_000));
         assert_eq!(resolved.auto_limit_tokens, Some(231_200));
         assert_eq!(resolved.remote_mode, RemoteCompactionMode::Always);
+    }
+
+    #[test]
+    fn auto_limit_tokens_is_floored_to_prevent_compaction_churn() {
+        // A misconfigured tiny override clamps up to the churn floor, so
+        // auto-compaction can't re-fire every turn without creating headroom.
+        let tiny = CompactionConfig {
+            context_window: Some(272_000),
+            auto_limit_tokens: Some(3_700),
+            ..Default::default()
+        };
+        assert_eq!(auto_limit_tokens(&tiny), Some(MIN_AUTO_COMPACTION_LIMIT));
+        // A realistic explicit limit passes through unchanged.
+        let realistic = CompactionConfig {
+            context_window: Some(272_000),
+            auto_limit_tokens: Some(231_200),
+            ..Default::default()
+        };
+        assert_eq!(auto_limit_tokens(&realistic), Some(231_200));
+        // The window-derived default (85%) is far above the floor.
+        let windowed = CompactionConfig {
+            context_window: Some(272_000),
+            auto_limit_tokens: None,
+            ..Default::default()
+        };
+        assert_eq!(auto_limit_tokens(&windowed), Some(231_200));
+        // No window and no override means no automatic limit at all.
+        let unbounded = CompactionConfig {
+            context_window: None,
+            auto_limit_tokens: None,
+            ..Default::default()
+        };
+        assert_eq!(auto_limit_tokens(&unbounded), None);
     }
 
     #[test]
