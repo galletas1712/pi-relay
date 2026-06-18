@@ -384,9 +384,19 @@
 </head>
 <body>
   <main class="page">
+    <div style="margin:0 0 24px;padding:16px 20px;border:2px solid #b91c1c;border-radius:14px;background:#fef2f2;color:#7f1d1d;">
+      <strong>⚠️ Superseded.</strong> This explainer describes an earlier
+      Run/Task/Artifact + workflow-plugin design that has been replaced. The
+      canonical plan is now <code>workflow-orchestration.md</code>
+      (shared-filesystem subagents, read-only vs full subagent types,
+      time-serialized single-writer stages, and notification-driven parent
+      parking). The diagrams and primitives below are kept only as design
+      history and are <em>not</em> the current design. This file needs a rewrite
+      or deletion.
+    </div>
     <header class="hero">
       <div class="hero-main card">
-        <div class="eyebrow">pi-relay design explainer</div>
+        <div class="eyebrow">pi-relay design explainer · superseded</div>
         <h1>Workflow orchestration without the orchestration tax</h1>
         <p class="lead">
           The new plan replaces ad hoc Python REPL subagent orchestration with

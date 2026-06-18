@@ -1,1278 +1,542 @@
 # Minimal workflow orchestration plan
 
-Status: proposed. Last reviewed 2026-06-16 (refinement pass: removed the merger
-primitive and cross-task git source refs, made the runner single-flight with a
-pure `advance`, typed plugin outcomes, added human-resumption + testing +
-subagent-migration sections, and flagged the architecture-doc contradiction).
+Status: proposed. Last reviewed 2026-06-16 (rewrite: shared-filesystem subagents,
+read-only vs full subagent types, time-serialized single-writer model,
+notification-driven parent parking, workflows as parent-driven stage templates;
+removed workspace isolation, snapshots, git merge, multi-parent lineage, and the
+artifact table).
 
 ## Summary
 
-Keep the architecture small.
+Keep the architecture small. Orchestration needs far less than earlier drafts
+assumed once we serialize writes **in time** instead of isolating them **in
+space**.
 
-The workflow system only needs four durable concepts:
+The model is:
 
-1. **Run** — the overall goal and current status.
-2. **Task** — one unit of agent or deterministic work.
-3. **Artifact** — the durable handoff/evidence/change record between tasks.
-   Artifacts are the **only** channel that moves context (including code
-   changes, as diffs) between tasks.
-4. **Workspace source** — how a task sees files. Every task has **at most one**
-   workspace ancestor: `none`, `read_parent`, `fork_parent`, or `from_task`.
-   There is no multi-source workspace mode.
+- Subagents run in the **same filesystem** as the parent. No btrfs subvolume, no
+  snapshot, no fork, no per-subagent workspace, no git merge, no multi-parent
+  lineage, no artifact table.
+- There are exactly **two subagent types**: **read-only** (cannot write, cannot
+  be steered/interrupted) and **full** (can write, can be steered/interrupted).
+- Work happens in **stages**. A stage is either *one full subagent* or *a
+  parallel fan-out of read-only subagents* — never both.
+- The parent **does not wait or poll**. After launching a stage it ends its turn
+  and parks. The daemon notifies it when the stage completes (the "background
+  agents" pattern). The parent then decides what to do next.
+- A **workflow** is just a named template that *suggests* a sequence of stages.
+  The parent has full discretion over which stage to run, whether to re-run one,
+  and when to stop.
 
-Everything else should be derived from those concepts or left inside workflow
-plugin code.
+### The one property that makes shared filesystem safe
 
-Do **not** start with:
+> **At most one agent can write the workspace at any instant.**
 
-- a generic graph DSL;
-- a budget abstraction;
-- workflow variables;
-- a separate transition proposal table;
-- a general policy envelope object;
-- a workspace lease table;
-- custom graph editing UI;
-- a daemon-side cross-task merge mechanism (git source refs, synthetic merge
-  commits, or a `sources` workspace mode). See "Combining parallel work" below.
+This holds by construction from the three invariants below:
 
-Workflows should be discoverable plugins, not hardcoded branches in the daemon.
-Ship a small set of bundled plugins first:
+| Who is active | Writers | Why |
+| --- | --- | --- |
+| One full subagent (parent parked) | the full subagent only | inv. 1 forbids a co-active read-only fan-out; inv. 2 parks the parent |
+| N read-only subagents (parent parked) | none | read-only cannot write; inv. 2 parks the parent |
+| The parent, between stages | the parent only | a stage's subagents are all terminal before the parent resumes |
 
-- `explore`;
-- `hill_climb`;
-- `implement_review`;
-- `implement_review_test`;
-- `kubernetes_e2e`;
-- `parallel_race`.
+There is never a moment with two writers, so no isolation, snapshotting, or
+merging is needed. This is the whole point of the design.
 
-Each plugin is ordinary Rust code that creates tasks, waits for task outputs,
-reads artifacts, and schedules the next tasks. A top-level agent discovers and
-invokes workflows through normal tool calls, not through Python REPL code.
+### What this deletes from earlier drafts
+
+- workspace source modes (`fork_parent` / `from_task` / `sources`);
+- btrfs/reflink snapshot-per-subagent and the workspace fork primitives for
+  subagents;
+- cross-task git source refs and any daemon-side `git merge`;
+- multi-parent task lineage;
+- the `artifacts` table and the artifact-kind enumeration;
+- the pure `advance()` workflow state machine as the sole owner of control flow;
+- workflow variables, transition proposals, budgets, leases, graph DSL.
+
+### What this accepts as a tradeoff
+
+Parallel work can only be **read-only**. You cannot run N full subagents editing
+code in parallel, because they would share one filesystem. `parallel_race` /
+"N candidate implementations in parallel" is therefore **not supported** in this
+model. The intended substitute is: parallel read-only exploration to gather
+options, then a single full stage to implement the chosen one. This is a
+deliberate, conscious loss of capability in exchange for deleting all isolation
+machinery. See Open Questions.
+
+## The three invariants
+
+1. **A stage is homogeneous.** Within one fan-out there is either a single full
+   subagent or a set of read-only subagents — never a mix. (This is what keeps
+   "at most one writer" true during a stage.)
+2. **The parent never busy-waits.** After it launches a stage, the parent ends
+   its turn and becomes idle ("parked"). The daemon delivers a completion
+   notification as new input when the stage finishes, and the parent resumes
+   then. The parent is instructed in its system prompt to expect this and to
+   stop after launching a stage. While a stage is in flight the parent is not
+   running, so it is not a second writer.
+3. **Workflows are stages, but the parent has discretion.** A workflow is an
+   ordered list of suggested stages. The parent decides which stage to run next,
+   whether a stage needs re-execution, and when the run is done. The daemon
+   supplies the mechanism (typed subagents, the homogeneity rule, completion
+   notifications, durable stage records); the parent supplies the policy.
 
 ## Relationship to the stated architecture
 
-This plan deliberately reverses a documented non-goal. `architecture.md` lists
-"Do not include subagent orchestration" (Goal 6) and "Hierarchical subagent
+This plan reverses a documented non-goal. `architecture.md` lists "Do not
+include subagent orchestration" (Goal 6) and "Hierarchical subagent
 orchestration" under "Not implemented by design", and "Removed Pieces" still
-names the deleted `agent-orchestrator` crate. That guidance was written when the
-runtime had no durable multi-session work model. It is now stale: subagent
-sessions, parent links, the Python orchestration REPL, and source-ref merging
-all shipped. Before Phase 1, `architecture.md` must be updated in the same
-change so there is no silent contradiction at the top of the design. The
-durable runtime stays small; what changes is that orchestration is now an
-explicit, persisted concept instead of a forbidden one.
+names the deleted `agent-orchestrator` crate. That guidance predates durable
+subagent sessions, parent links, and lifecycle events, all of which have since
+shipped. Before Phase 1, `architecture.md` must be updated in the same change so
+the docs and this plan agree. The durable runtime stays small; orchestration
+becomes an explicit, persisted concept instead of a forbidden one.
 
 ### This is the third orchestration attempt; do not repeat the first two
 
-The runtime has already tried and discarded two orchestration designs. The new
-plan must avoid re-growing what sank them:
+The runtime has already tried and discarded two designs:
 
-1. **`agent-orchestrator` crate + `SessionRegistry` (removed).** A process-local
-   orchestrator owned control flow in RAM. It died because durable state, not a
-   live object graph, has to be the source of truth. *Lesson: the runner must be
-   stateless and reconstruct everything from Postgres on every step.*
-2. **`workflow_variables` + `work.*` RPCs + Python workflow SDK (deleted in
-   "Simplify subagent handles on the wire").** Control flow polled named
-   variables (`work.await` on `vars`), and orchestration logic lived in editable
-   Python templates. It died because the variable store became a second,
-   untyped state machine and the templates were ungoverned. *Lesson: no
-   general-purpose variable store, and no model-authored control-flow scripts as
-   the normal path.*
+1. **`agent-orchestrator` crate + `SessionRegistry` (removed).** Control flow
+   lived in a process-local object graph. *Lesson: durable Postgres state, not a
+   live object graph, is the source of truth.*
+2. **`workflow_variables` + `work.*` RPCs + Python workflow SDK (deleted).**
+   Control flow polled named variables and lived in editable Python templates.
+   *Lesson: no general-purpose variable store, and no model-authored
+   control-flow scripts as the normal path.*
 
-Two concrete guardrails follow directly from that history:
+A third lesson comes from the current Python REPL `subagents.*` API: the parent
+**busy-waits** (`subagents.wait(...)`) while children run. *Lesson: the parent
+must park and be woken by a notification, never spin.* Invariant 2 exists
+specifically to retire busy-waiting.
 
-- **`run.state` is not a variable store.** It holds only the small,
-  plugin-private bookkeeping a plugin needs to compute its next step (e.g. an
-  iteration counter, the current best artifact id). It must never become a
-  general key/value channel between tasks — that is what artifacts are for. If a
-  plugin wants to stash arbitrary cross-task data in `run.state`, that is the
-  `workflow_variables` failure returning under a new name; reject it in review.
-- **Control flow lives in compiled plugin code, never in model-authored
-  scripts.** The Python REPL stays an escape hatch for ad hoc delegation, not a
-  workflow runtime.
+Guardrails that follow:
 
-## What changed from the larger plan
+- No general cross-subagent state store. Handoffs are the subagent's final
+  result plus the shared filesystem (see "Handoffs").
+- Control flow is the parent reasoning over **durable stage records** and
+  **completion notifications**, never a running Python script and never a poll
+  loop.
 
-The prior plan was directionally right but too abstract. This version collapses
-several nouns:
+## Subagent types
 
-| Larger-plan concept | Minimal replacement |
-| --- | --- |
-| `WorkflowRun` | `Run` |
-| `WorkflowTask` | `Task` |
-| `WorkflowArtifact` | `Artifact` |
-| `TransitionProposal` | `Artifact { kind: "decision" }` or task result field |
-| `WorkspaceLease` | single-parent workspace lineage (one writer by construction) |
-| `WorkspaceInstance` table | workspace manager snapshot record |
-| cross-task git source refs / `sources` mode | `changes` artifacts (diffs) + an `integrate` task |
-| `merger` role | `select` / `integrate` / `reduce` patterns (see below) |
-| budget/policy envelope | plugin-specific stopping conditions and allowed outputs |
-| controller agent primitive | a normal task with role `controller` |
-| workflow variables | artifacts (+ tiny plugin-private `run.state`) |
-| custom graph DSL | workflow plugins |
+### Read-only subagent
 
-The core invariant remains:
+- **Cannot write the workspace.** This must be *enforced*, not advised, because
+  read-only subagents run in parallel against a shared filesystem; a stray write
+  would corrupt every sibling's view. (Enforcement mechanism is Open Question 1.)
+- **Cannot be steered or interrupted individually.** It is fire-and-forget; it
+  runs to a terminal result. This keeps the stage's completion barrier clean.
+- Used for investigation, code reading, review, classification, and any analysis
+  that does not need to build, test, or modify files.
+- Many can run in parallel in a single stage.
 
-> The daemon deterministically records state and starts/stops tasks. Agents
-> perform work and return structured outputs. Workflow plugin code decides the
-> next task from those outputs.
+### Full subagent
 
-## Combining parallel work
+- **Can write the workspace.** Exactly one runs at a time (a full stage is a
+  single subagent).
+- **Can be steered and interrupted** by the human and, where useful, by the
+  parent. It is the long-lived collaborator that does the real edits, builds,
+  and tests.
+- Non-recursive by default: a full subagent does not itself orchestrate stages
+  in v1 (keeps the one-writer argument one level deep). Recursion is deferred —
+  see Open Questions.
 
-There is no `merger` primitive and no daemon-side cross-task merge. "Merge" was
-the wrong noun: it bundled three different operations that have different right
-answers. Parallel tasks produce one of three output shapes, and the workflow
-plugin picks the matching pattern explicitly:
+A stage's subagents are non-recursive workers, not sub-orchestrators. If a
+workflow needs decomposition, that is another stage the parent runs.
 
-| Pattern | When parallel tasks are… | What happens | Workspace |
-| --- | --- | --- | --- |
-| **select** | redundant candidates for the *same* goal | an evaluator reads each candidate's `handoff`/`changes` artifact, picks one winner, the run continues `from_task(winner)`; losers are discarded | winner's fork is reused via `from_task` |
-| **integrate** | complementary, each owning a *different* slice | one integrator task starts `from_task(base)` and is handed the others' `changes` (diff) artifacts to apply with judgment in a single workspace | one writable fork |
-| **reduce** | producing *findings*, not code | a reducer writes one synthesis artifact; no workspace combination occurs | `none` or `read_parent` |
+## Stages
 
-Why this is better than a generic merger:
+A **stage** is one step of a run:
 
-- **It keeps one context-transfer channel.** Code crosses task boundaries as a
-  `changes` artifact (a diff, as text), exactly like every other handoff. There
-  is no second transport (git source refs / synthetic commits) that only works
-  for git workspaces and silently skips local-folder workspaces.
-- **One writer per workspace is true by construction.** Workspace lineage is a
-  tree of single-parent edges (`fork_parent` / `from_task`), so no two tasks
-  ever write the same directory and no lease table is needed.
-- **It is honest about cost.** Most parallel agent work wants *select* (throw
-  away all but one), sometimes *integrate* (re-apply disjoint diffs with
-  judgment), and only rarely a true 3-way merge — which an agent should perform
-  deliberately, not the daemon implicitly.
+- `kind = full` — exactly one full subagent.
+- `kind = readonly_fanout` — one or more read-only subagents.
 
-Escape hatch for the rare genuine merge: an `integrate` task may be granted
-read-only access to a sibling task's sealed workspace snapshot when a diff is
-too large to pass as an artifact. That is an explicit, logged exception a plugin
-requests — not a standing primitive, and never a writable cross-task workspace.
-
-This removes the git source-ref machinery
-(`snapshot_worktree_commit` → `refs/pi-relay/sources/*` → in-child `git merge`),
-the `sources` workspace mode, and the `merger` role. The
-`subagent-source-ref-merge-plan.md` document is superseded by this section.
-
-## Product model
-
-Humans should see:
+Stage lifecycle:
 
 ```text
-Run
-  goal, kind, status, current phase
-
-Task cards
-  role, status, latest summary, transcript link, controls
-
-Artifacts
-  handoffs, evidence, logs, diffs, snapshots, human notes
-
-Decision
-  latest next-step recommendation or human approval request
+parent calls stage.start_full / stage.start_readonly_fanout
+  -> daemon creates a durable stage row + child sessions (read-only or full)
+  -> parent ends its turn and parks (idle)
+  -> subagents run against the shared filesystem
+  -> when every subagent in the stage is terminal, the daemon:
+       - marks the stage done (single-flight transition),
+       - composes a completion notification (each subagent's result),
+       - enqueues that notification as input to the parent,
+       - drives the parent.
+  -> parent wakes, reads results, decides the next stage (or finishes)
 ```
 
-Humans should not have to think about graphs, transitions, leases, or workflow
-state machines.
+A stage is **terminal** when all of its subagents are terminal
+(`done`/`failed`/`cancelled`/`crashed`). The notification reports successes and
+failures; the parent decides whether to re-run, run a different stage, or stop.
 
-## Agent model
+The parent may cancel an in-flight stage (cancels all its subagents). It cannot
+steer an individual read-only subagent; it can steer the single full subagent of
+a full stage.
 
-A normal task agent gets a scoped task contract, not the whole workflow graph.
+## No busy-wait: notifications and parking
 
-Task prompt shape:
+Invariant 2 is implemented with the existing input/queue machinery, not a new
+control loop:
+
+- `stage.start_*` returns immediately with a `stage_id`. The parent's system
+  prompt instructs it to then **end its turn** — produce a short "launched stage
+  X, waiting" message and stop. The parent session goes idle.
+- On stage completion the daemon **enqueues a system-originated input** into the
+  parent (the completion notification) and drives it, exactly as a queued
+  follow-up would be delivered to an idle session today.
+- If the stage finishes before the parent's launching turn ends, the
+  notification simply queues and is delivered when the parent next idles. No
+  race, no poll.
+
+The notification is the handoff surface for the parent: it carries each
+subagent's terminal result (status, summary, `suggested_next`) and a link to
+each subagent session for deeper inspection. The parent does not need file
+diffs, because the subagents' file changes are already present in the shared
+workspace.
+
+This is the "background agents" pattern: launch, park, get notified, continue.
+
+## Workflows as stage templates
+
+A workflow is a **named, discoverable template** that suggests an ordered list
+of stages. It is not a compiled state machine and it does not own control flow.
 
 ```text
-You are task <task_id> in run <run_id>.
-
-Role:
-  <role name and SKILL.md content>
-
-Run goal:
-  <overall goal>
-
-Task goal:
-  <specific objective for this task>
-
-Context:
-  <selected handoff/evidence/changes artifacts>
-
-Workspace:
-  <path and one of: none | read_parent | fork_parent | from_task>
-
-Allowed outputs:
-  - complete with handoff
-  - fail with reason/evidence
-  - request human
-  - suggest next step, from this task's declared outcome set,
-    if this task is allowed to do that
-
-Stopping condition:
-  <task-specific stop condition>
+workflow.list      -> compact list of templates (id, title, description)
+workflow.describe  -> the suggested stages for a template
 ```
 
-The task agent's control flow is:
+`workflow.describe` returns something like:
 
-1. read the scoped prompt;
-2. use normal tools;
-3. write evidence/artifacts if needed;
-4. finish with one structured task result.
-
-The agent does not directly mutate workflow state.
-
-## Subagent model
-
-With workflows in place, subagents should no longer be the primary orchestration
-API. They are just an execution mode for tasks, plus an interactive delegation
-escape hatch.
-
-Use two modes:
-
-### 1. Workflow task agents
-
-These are the normal agents spawned by workflow plugins.
-
-Default behavior:
-
-- one task prompt;
-- one child session;
-- no recursive subagent spawning;
-- no Python REPL orchestration;
-- scoped task tools only;
-- child writes artifacts/results;
-- parent workflow runner observes completion through lifecycle events.
-
-They are "one-shot" in the sense that the workflow expects a terminal task
-result. They do not decide arbitrary control flow. They may still run for a long
-time and use normal tools, especially for Kubernetes/e2e.
-
-They should usually be interruptible/cancellable by the human and workflow
-runner. Making them literally uninterruptible would make long Kubernetes tests,
-stuck commands, or wrong assumptions painful. The simpler rule is:
-
-> workflow task agents are non-recursive and scoped, but still async,
-> observable, and interruptible.
-
-Read-only one-shot calls are still useful as an optimization for some tasks:
-
-```text
-task.execution = "inline_call"
-task.workspace.mode = "none" or "read_parent"
+```json
+{
+  "id": "implement_review_test",
+  "title": "Implement, review, then test",
+  "stages": [
+    { "kind": "full",            "role": "implementer", "hint": "implement the change" },
+    { "kind": "readonly_fanout", "roles": ["reviewer"], "hint": "review the diff" },
+    { "kind": "full",            "role": "tester",      "hint": "run tests; fix or report" }
+  ],
+  "guidance": "If review requests changes, re-run the implementer stage. If tests fail on a code issue, return to implement/review."
+}
 ```
 
-Use that for small exploration, summarization, review, or classification tasks.
-Do not make it the only subagent mode.
+The parent reads the template and runs the stages with discretion: skip, re-run,
+reorder, or stop based on each stage's results. Bundled templates ship as static
+Rust/JSON; disk/user templates can come later. Because the template is only
+guidance, there is no `advance()` to keep in sync with the model's judgment.
 
-### 2. Direct delegation agents
+Bundled templates to ship first (all expressible as full/read-only stages):
 
-These are user/top-level-agent spawned helpers outside a workflow run.
+- `explore` — one read-only fan-out, then the parent synthesizes.
+- `implement_review` — full implement, read-only review, repeat at parent's
+  discretion.
+- `implement_review_test` — as above plus a full test stage.
+- `kubernetes_e2e` — a single full stage with the `kubernetes-tester` role and
+  safety rules (it writes/builds and talks to a cluster, so it is full, not
+  read-only).
 
-Keep them more flexible:
+`hill_climb` and `parallel_race` from earlier drafts are intentionally **not**
+included: both assume parallel writers, which this model does not support.
 
-- async;
-- inspectable;
-- steerable;
-- interruptible;
-- able to have isolated workspaces;
-- able to be used for ad hoc exploration or implementation.
+## Shared filesystem
 
-Direct delegation remains useful even with workflows because a top-level agent may
-want to split a task into smaller chunks without creating a formal run.
+Subagents use the parent session's workspace directories directly. There is no
+per-subagent workspace instantiation for subagents (the project-session workspace
+materialization path is unchanged; only subagent forking is removed).
 
-However, direct subagent spawning should use regular tools, not Python REPL:
+Consequences:
 
-```text
-agent.spawn
-agent.status
-agent.read
-agent.cancel
-```
+- A full subagent's edits are immediately visible to the parent when the stage
+  completes — nothing to import or merge.
+- Read-only subagents see a stable tree, because nothing else writes while they
+  run (the one-writer property).
+- Durable code changes are committed with the parent's normal git workflow by
+  whichever agent did the writing; the daemon never auto-commits, snapshots, or
+  merges. Git is used by agents inside the shared workspace as usual, not as a
+  cross-subagent transport.
+- `read_parent`/`fork_parent`/`from_task`/`sources` modes are all gone; there is
+  only "the workspace".
 
-Do not expose recursive subagent spawning to workflow task agents by default. If
-a workflow needs decomposition, the workflow plugin should create additional
-tasks.
+## Handoffs
 
-### Coexistence and migration
+There is no artifact table. A handoff is two things, both already available:
 
-Three orchestration surfaces will exist during the transition. They must not
-remain three forever. The intended steady state and sequencing:
+1. **The shared filesystem.** Code, evidence files, scratch output — whatever a
+   subagent produced is simply present in the workspace for the parent and the
+   next stage to read.
+2. **The subagent's terminal result** — a small structured object the subagent
+   emits when it finishes: `{ status, summary, suggested_next? }`. This is the
+   "last assistant message" the parent receives in the completion notification.
+   `suggested_next` is typed against the workflow template's declared outcomes,
+   not free text, so the parent's branching is over a known set rather than
+   prose.
 
-| Surface | Today | Steady-state intent |
-| --- | --- | --- |
-| `workflow.*` plugins | new | the default way to run any multi-step/parallel work that has a reusable shape |
-| `agent.*` direct delegation tools | new | the only ad hoc, no-run delegation path; replaces REPL `subagents.*` |
-| Python REPL `subagents.*` | current primary API | demoted to an escape hatch; deprecated for orchestration once `agent.*` lands |
-
-Migration sequence (so we never run two ad hoc delegation APIs as equals):
-
-1. Ship `workflow.*` and `agent.*` (Phases 1–6).
-2. Re-point the `PI.md` "Subagent delegation" guidance at `agent.*` for ad hoc
-   work and at `workflow.*` for shaped work. The current eager-delegation
-   guidance that teaches `subagents.spawn/spawn_bulk/wait/...` moves to `agent.*`
-   verbs.
-3. Keep the Python REPL available as a raw escape hatch, but stop documenting
-   `subagents.*` as the normal orchestration path. Do not delete it in this
-   plan; deleting it is a separate follow-up once `agent.*` and `workflow.*`
-   have absorbed the real use cases.
-
-The litmus test for "is this ad hoc or a workflow": if the control flow is
-reusable and worth naming, it is a workflow plugin; if it is a one-off split the
-top-level agent is doing in the moment, it is `agent.*`. Neither should be the
-Python REPL.
+Anything durable that is not code (e.g. Kubernetes logs/events) is written to a
+file in the workspace by the subagent and/or summarized in its terminal result.
+There is no separate evidence store. See Open Question 5.
 
 ## Minimal durable schema
 
-### `runs`
+The durable footprint is intentionally tiny. Reuse `sessions` and
+`sessions.parent_session_id`; add one table and two columns.
+
+### `stages`
 
 ```text
-runs
+stages
   id text primary key
-  kind text not null
-    -- explore | hill_climb | implement_review | implement_review_test |
-    -- kubernetes_e2e | parallel_race
-  root_session_id text null references sessions(id)
-  status text not null
-    -- running | blocked | done | failed | cancelled
-  goal text not null
-  params jsonb not null default '{}'
-  state jsonb not null default '{}'
-  revision bigint not null default 0
-    -- bumped on every run transition; CAS guard for status changes
+  parent_session_id text not null references sessions(id) on delete cascade
+  workflow_id text null           -- template the parent was following, if any
+  label text null                 -- e.g. "explore auth options"
+  kind text not null              -- full | readonly_fanout
+  status text not null            -- running | done | cancelled | failed
+  attempt_id text not null        -- fences the completion transition
   created_at timestamptz not null default now()
   updated_at timestamptz not null default now()
 ```
 
-`params` contains plugin-specific input. Do not standardize more than needed.
-
-`state` is small, plugin-private bookkeeping only (e.g. iteration counter,
-current best artifact id). It is **not** a cross-task variable store: tasks never
-read or write `run.state`, and anything a task needs to hand to a later task is
-an artifact. Keeping arbitrary data here is the deleted `workflow_variables`
-failure returning under a new name.
-
-Examples:
-
-```json
-{
-  "kind": "implement_review_test",
-  "goal": "Add durable workflow runs",
-  "params": {
-    "review_until_approved": true,
-    "test_kind": "kubernetes_e2e",
-    "stop_when": "review approved and tests pass"
-  }
-}
-```
-
-```json
-{
-  "kind": "kubernetes_e2e",
-  "goal": "Run end-to-end tests for the operator",
-  "params": {
-    "context": "dynamo-nscale-dev",
-    "namespace": "schwinns",
-    "stop_when": "tests pass, human approval is needed, or a code issue is found"
-  }
-}
-```
-
-### `tasks`
+### `sessions` additions
 
 ```text
-tasks
-  id text primary key
-  run_id text not null references runs(id) on delete cascade
-  task_key text not null
-    -- plugin-chosen deterministic key; unique per run for idempotent upsert
-  session_id text null references sessions(id)
-  attempt_id text null
-    -- fences stale child completions, like the action attempt_id in agent-store
-  role text not null
-    -- explore | implementer | reviewer | tester | kubernetes-tester |
-    -- reducer | evaluator | integrator | controller | ...
-  status text not null
-    -- pending | running | blocked | done | failed | cancelled
-  prompt text not null
-  input_artifact_ids jsonb not null default '[]'
-  output_artifact_id text null
-  workspace jsonb not null default '{}'
-  result jsonb null
-  created_at timestamptz not null default now()
-  updated_at timestamptz not null default now()
-  unique (run_id, task_key)
+sessions
+  ...
+  stage_id text null references stages(id)   -- the stage this subagent belongs to
+  subagent_type text null                    -- full | read_only (null for top-level)
 ```
 
-`task_key` is what makes `advance` idempotent: the runner upserts desired tasks
-by `(run_id, task_key)`, so re-evaluating a plan never double-creates a task.
-`attempt_id` fences completion the same way `agent-store` fences action rows — a
-child-session completion only writes back if its attempt still matches.
+That is the whole schema delta. No `runs`, `tasks`, `artifacts`, workspace, or
+lease tables. A "run" is just a parent session and its ordered stages; the run
+board renders parent session -> stages -> subagents (+ their terminal results).
 
-`workspace` is intentionally just a small instruction blob with a single
-ancestor:
+## Stage runner
 
-```json
-{
-  "mode": "fork_parent"
-}
-```
-
-```json
-{
-  "mode": "from_task",
-  "task_id": "task_impl_2"
-}
-```
-
-```json
-{
-  "mode": "none"
-}
-```
-
-Supported workspace modes:
-
-- `none` — task does not need files.
-- `read_parent` — task reads parent/current workspace only.
-- `fork_parent` — task gets a writable Btrfs/copy snapshot of the parent.
-- `from_task` — task starts from exactly one prior task's output snapshot.
-
-There is intentionally no multi-source mode. To combine the output of several
-tasks, pick the `select` / `integrate` / `reduce` pattern from "Combining
-parallel work": the integrator starts `from_task(base)` and receives the other
-tasks' work as `changes` (diff) artifacts.
-
-One-writer safety is enforced by construction:
-
-- workspace lineage is a tree of single-parent edges;
-- tasks that write get their own `fork_parent` or `from_task` fork;
-- sequential tasks chain with `from_task`;
-- no two tasks ever name the same writable directory, so no two parallel tasks
-  can write the same files.
-
-The runner rejects a task whose `workspace.mode`/`task_id` would create a second
-writer for an already-claimed workspace lineage. No separate lease table is
-needed.
-
-### `artifacts`
-
-```text
-artifacts
-  id text primary key
-  run_id text not null references runs(id) on delete cascade
-  task_id text null references tasks(id)
-  kind text not null
-    -- context | handoff | evidence | changes | snapshot |
-    -- decision | human_request | human_note
-  content_text text null
-  content_json jsonb null
-  created_at timestamptz not null default now()
-```
-
-Artifacts are the only context-transfer primitive.
-
-Use artifacts for:
-
-- handoff notes;
-- test evidence;
-- Kubernetes logs/events/manifests;
-- code changes as diffs (`kind: changes`) — the only way code crosses a task
-  boundary;
-- snapshots;
-- human approval requests and human notes;
-- reducer/evaluator summaries;
-- hill-climb best-so-far records;
-- controller/agent next-step suggestions.
-
-There is no `source_refs` artifact kind. Cross-task code is a `changes` diff,
-not a git ref (see "Combining parallel work").
-
-## Task result shape
-
-Every task ends with a small structured result:
-
-```json
-{
-  "status": "done",
-  "summary": "Implemented the workflow run table and repository methods.",
-  "artifact_id": "artifact_impl_handoff",
-  "suggested_next": "review"
-}
-```
-
-or:
-
-```json
-{
-  "status": "failed",
-  "summary": "Kubernetes auth is expired.",
-  "artifact_id": "artifact_tsh_output",
-  "suggested_next": "request_human"
-}
-```
-
-or:
-
-```json
-{
-  "status": "done",
-  "summary": "Tests failed because the deployed image is stale.",
-  "artifact_id": "artifact_k8s_evidence",
-  "suggested_next": "rebuild_image"
-}
-```
-
-`suggested_next` is not a state mutation. It is input to the workflow plugin.
-
-It is also **not free text.** Each plugin declares a small typed `Outcome` enum
-(its accepted `suggested_next` values), and the task contract advertises exactly
-that set under "Allowed outputs". The runner validates the returned value
-against the plugin's enum before calling `advance`; an unrecognized value is
-recorded as a task error, not silently matched. This keeps control-flow
-vocabulary typed at the boundary, the same way the rest of the runtime treats
-wire enums, instead of coupling a plugin's `match` arms to a task agent's prose.
-
-Example: `kubernetes_e2e` accepts exactly
-`{ pass, product_failure, environment_retry, human_needed }`.
-
-## Workflow runner
-
-The runner is the one piece that must be as careful about concurrency as the
-rest of the runtime. It is stateless: it owns no in-memory run graph and
-reconstructs everything from Postgres on each step. It reuses the existing
-discipline — a per-row lock, an `attempt_id` fence, and revision counters —
-applied to runs instead of sessions.
-
-### `advance` is pure; the runner reconciles
-
-`advance` must be a **pure function** of `(run, tasks, artifacts) -> Plan`. It
-performs no I/O and creates nothing itself. It returns a declarative *desired
-next state*:
+The runner is small and does exactly one job with the same rigor `agent-store`
+applies to sessions: **detect stage completion and notify the parent, exactly
+once.**
 
 ```rust
-enum Plan {
-    /// The complete set of tasks that should exist for this run, keyed by a
-    /// plugin-chosen deterministic task key. The runner diffs this against the
-    /// tasks already in the database.
-    Tasks(Vec<DesiredTask>),
-    Block { reason: String },           // e.g. waiting on a human request
-    Complete { summary_artifact: ArtifactRef },
-    Fail { reason: String },
-}
-
-struct DesiredTask {
-    key: String,        // deterministic, stable across re-evaluation
-    role: String,
-    prompt_inputs: PromptInputs,
-    workspace: WorkspaceMode,
-    input_artifact_ids: Vec<String>,
-}
-```
-
-The runner turns a `Plan` into reality idempotently:
-
-- For each `DesiredTask`, **upsert by `(run_id, key)`**. A task whose key already
-  exists is left alone; only genuinely new keys create rows. This is what makes
-  a double-fired `advance` harmless: the second evaluation produces the same
-  keys and inserts nothing.
-- `Block` / `Complete` / `Fail` are compare-and-set transitions on `run.status`,
-  guarded by the run revision.
-
-Because `advance` is pure and the runner reconciles to a desired set, a crash
-mid-step is trivially recoverable: re-running `advance` from the persisted rows
-reproduces the same plan.
-
-### Single-flight per run
-
-Exactly one `advance` evaluation runs per run at a time, mirroring the
-per-session row lock in `agent-store`:
-
-1. Take the run row lock (`select ... for update`) — different runs proceed
-   concurrently; the same run is strictly serialized.
-2. Load tasks and artifacts in the same transaction (consistent snapshot).
-3. Reconcile any finished child sessions into task `result`/`output_artifact_id`
-   (fenced by the task's `attempt_id`, so a stale child completion matches zero
-   rows).
-4. Call `advance(run, tasks, artifacts)`.
-5. Apply the `Plan` (idempotent task upserts and/or a CAS run-status change),
-   bump `run.revision`, emit events, commit.
-
-### What triggers a step
-
-`advance` is evaluated on:
-
-- run creation (`workflow.start`);
-- any child task lifecycle event (`idle`/`done`/`failed`/`cancelled`) for a task
-  belonging to the run — reusing the parent-visible lifecycle events from PR
-  #150;
-- an explicit `workflow.signal` (e.g. a human response that unblocks a run);
-- crash recovery sweep at daemon startup, for runs left `running`.
-
-There is no polling loop and no timer in v1. Steps are event-driven,
-single-flight, and idempotent, so re-delivery of an event is safe.
-
-Pseudo-code:
-
-```rust
-async fn step(run_id: &str) -> Result<()> {
+async fn on_subagent_terminal(stage_id: &str) -> Result<()> {
     let mut tx = store.begin().await?;
-    let run = store.lock_run(&mut tx, run_id).await?;        // for update
-    let tasks = store.tasks_for_run(&mut tx, run_id).await?;
-    let artifacts = store.artifacts_for_run(&mut tx, run_id).await?;
-    store.reconcile_finished_tasks(&mut tx, &tasks).await?;  // attempt_id-fenced
+    let stage = store.lock_stage(&mut tx, stage_id).await?;     // select ... for update
+    if stage.status != Running { return tx.commit().await; }    // already handled
+    let subs = store.subagents_for_stage(&mut tx, stage_id).await?;
+    if subs.iter().any(|s| !s.is_terminal()) { return tx.commit().await; }
 
-    let plugin = workflow_registry.get(&run.kind)?;
-    let plan = plugin.advance(&run, &tasks, &artifacts);     // pure, no I/O
-
-    store.apply_plan(&mut tx, &run, plan).await?;            // idempotent upsert + CAS
-    store.bump_run_revision(&mut tx, run_id).await?;
-    tx.commit().await
+    // single-flight: only the transition that flips running->done enqueues.
+    store.set_stage_status(&mut tx, stage_id, Done, stage.attempt_id).await?; // CAS on attempt_id
+    let notice = compose_completion_notice(&stage, &subs);       // results + session links
+    store.enqueue_parent_input(&mut tx, &stage.parent_session_id, notice).await?;
+    tx.commit().await?;          // then drive the parent outside the lock
+    Ok(())
 }
 ```
 
-The plugin owns control flow. The generic runner only persists and dispatches.
-
-## Workflow plugins
-
-### Plugin shape
-
-A workflow plugin is the smallest unit of reusable orchestration.
-
-It provides:
-
-```text
-id
-  stable workflow kind, e.g. kubernetes_e2e
-
-title
-  human-readable name
-
-description
-  concise explanation for humans and agents
-
-input_schema
-  JSON schema for workflow.start params
-
-default_roles
-  role names the plugin may use
-
-outcomes
-  the typed set of suggested_next values this plugin accepts
-
-start(params) -> initial run state + initial DesiredTask(s)
-
-advance(run, tasks, artifacts) -> Plan        // PURE: no I/O, returns desired state
-```
-
-`start` and `advance` are pure and return declarative desired state; the runner
-performs all persistence and dispatch. This is enough for discovery, invocation,
-validation, and UI rendering.
-
-### Plugin manifests
-
-Each plugin should have a small manifest for discovery. For bundled Rust plugins,
-the manifest can be compiled into the daemon. Later, workspace/user plugins can
-provide the same manifest from disk.
-
-Example manifest:
-
-```json
-{
-  "id": "kubernetes_e2e",
-  "title": "Kubernetes e2e test",
-  "description": "Run adaptive end-to-end tests against a Kubernetes cluster.",
-  "input_schema": {
-    "type": "object",
-    "required": ["context", "namespace", "test_goal"],
-    "properties": {
-      "context": { "type": "string" },
-      "namespace": { "type": "string" },
-      "test_goal": { "type": "string" },
-      "stop_when": { "type": "string" }
-    }
-  },
-  "default_roles": ["kubernetes-tester"],
-  "outcomes": ["pass", "product_failure", "environment_retry", "human_needed"]
-}
-```
-
-### Plugin discovery
-
-Top-level agents should be able to discover workflows through tool calls:
-
-```text
-workflow.list
-workflow.describe
-```
-
-`workflow.list` returns compact plugin summaries:
-
-```json
-{
-  "workflows": [
-    {
-      "id": "explore",
-      "title": "Parallel exploration",
-      "description": "Spawn explorers and reduce findings."
-    },
-    {
-      "id": "kubernetes_e2e",
-      "title": "Kubernetes e2e test",
-      "description": "Run adaptive e2e tests in a Kubernetes cluster."
-    }
-  ]
-}
-```
-
-`workflow.describe({ "id": "kubernetes_e2e" })` returns the full manifest and
-input schema.
-
-### Plugin locations
-
-Start with bundled Rust plugins.
-
-Later support:
-
-```text
-repo/.agents/workflows/<workflow-id>/WORKFLOW.md
-repo/.agents/workflows/<workflow-id>/workflow.wasm or workflow binary
-~/.agents/workflows/<workflow-id>/WORKFLOW.md
-```
-
-Do not design the disk plugin ABI in v1. The important v1 decision is that
-workflow discovery/invocation goes through a registry, not a hardcoded prompt or
-Python helper.
-
-## Bundled workflow plugins
-
-### `explore`
-
-Use for RLM-style parallel exploration.
-
-Human UX:
-
-- user asks a broad question;
-- UI shows explorer task cards;
-- each explorer returns findings/evidence;
-- reducer summarizes;
-- human can ask for another round.
-
-Agent UX:
-
-- explorer gets a focused research question;
-- explorer returns an evidence artifact;
-- reducer gets explorer artifacts, not full transcripts by default.
-
-Control flow:
-
-```text
-start
-  -> spawn N explore tasks
-  -> when all done, spawn reducer
-  -> reducer writes synthesis
-  -> done
-```
-
-Minimal params:
-
-```json
-{
-  "question": "...",
-  "num_explorers": 4,
-  "context_artifact_ids": []
-}
-```
-
-### `hill_climb`
-
-Use for candidate search.
-
-Human UX:
-
-- see current best candidate;
-- see candidate/evaluator cards by iteration;
-- stop or promote a candidate whenever desired.
-
-Agent UX:
-
-- proposer sees best-so-far artifact and prior evaluator notes;
-- evaluator sees candidate and metric/criteria;
-- evaluator writes score/evidence.
-
-Control flow:
-
-```text
-start
-  -> propose candidate
-  -> evaluate candidate
-  -> if better, update best artifact
-  -> continue until stop_when is satisfied or human stops
-```
-
-Minimal params:
-
-```json
-{
-  "objective": "...",
-  "metric": "plain text or JSON scoring contract",
-  "stop_when": "good enough or human stops"
-}
-```
-
-No generic budget object is needed. If a caller wants a max iteration count, put
-`"max_iterations": 5` in this plugin's params.
-
-### `implement_review`
-
-Use when testing is not part of the workflow.
-
-Human UX:
-
-- see implementation task;
-- see reviewer verdict;
-- loop continues until reviewer approves, fails, or asks human.
-
-Agent UX:
-
-- implementer sees goal plus latest reviewer feedback;
-- reviewer sees the implementer's handoff and `changes` (diff) artifact plus
-  acceptance criteria;
-- reviewer writes verdict artifact.
-
-Control flow:
-
-```text
-start
-  -> implement
-  -> review
-  -> if approved: done
-  -> if changes requested: implement again from latest task
-  -> if blocked/human needed: blocked
-```
-
-Minimal params:
-
-```json
-{
-  "goal": "...",
-  "acceptance": "...",
-  "stop_when": "reviewer approves"
-}
-```
-
-### `implement_review_test`
-
-Use when code should be reviewed before testing.
-
-Human UX:
-
-- see implementation/review subloop;
-- after approval, see test task;
-- if tests fail, see whether failure returns to implement/review or asks for
-  human input.
-
-Agent UX:
-
-- implementer and reviewer behave as above;
-- tester sees approved implementation artifact and test instructions;
-- tester writes evidence and suggested next step.
-
-Control flow:
-
-```text
-start
-  -> implement_review subloop
-  -> test
-  -> if tests pass: done
-  -> if tester says code_issue: implement_review again
-  -> if tester says environment_retry: test again
-  -> if tester says human_needed: blocked
-  -> otherwise: failed
-```
-
-Minimal params:
-
-```json
-{
-  "goal": "...",
-  "acceptance": "...",
-  "test": "cargo test, kubernetes_e2e, or plain-text test instruction",
-  "stop_when": "reviewer approves and tests pass"
-}
-```
-
-### `kubernetes_e2e`
-
-Use when the agent should run adaptive end-to-end Kubernetes tests without an
-implementer/reviewer loop.
-
-Human UX:
-
-- see cluster/context/namespace;
-- see current operation and evidence;
-- see explicit human requests for auth or unsafe operations;
-- final output classifies the result.
-
-Agent UX:
-
-- Kubernetes tester gets the run goal, context, namespace, and safety rules;
-- it adapts to cluster state;
-- it writes evidence artifacts;
-- it returns a suggested next step.
-
-Control flow:
-
-```text
-start
-  -> kubernetes-tester
-  -> if pass: done
-  -> if environment_retry: kubernetes-tester again
-  -> if product_failure: failed with evidence
-  -> if human_needed: blocked
-```
-
-Minimal params:
-
-```json
-{
-  "context": "dynamo-nscale-dev",
-  "namespace": "schwinns",
-  "test_goal": "...",
-  "stop_when": "tests pass, code issue found, or human needed"
-}
-```
-
-The `kubernetes-tester` role `SKILL.md` should encode Kubernetes safety rules:
-
-- always pass explicit `--context` and namespace;
-- never rely on current kube context;
-- avoid unsafe cluster-scoped destructive operations;
-- request human approval for dangerous shared-cluster operations;
-- handle Teleport auth expiration by asking the user;
-- collect logs/events/manifests as evidence.
-
-### `parallel_race`
-
-Use when multiple implementers/candidates should race at the *same* goal. This
-is the **select** pattern: the run keeps one winner and discards the rest. It
-does not merge candidates.
-
-Human UX:
-
-- see candidate task cards in parallel;
-- see the evaluator card;
-- choose/promote the winning result.
-
-Agent UX:
-
-- each candidate agent gets the same goal and its own `fork_parent`;
-- the evaluator reads each candidate's `handoff` + `changes` (diff) artifacts —
-  not their workspaces — and picks one.
-
-Control flow:
-
-```text
-start
-  -> spawn N candidate tasks with fork_parent
-  -> when all done, spawn one evaluator task (workspace: none)
-       inputs: each candidate's handoff + changes artifacts
-  -> evaluator writes a decision artifact naming the winner
-  -> continue the run from_task(winner); discard the losing forks
-  -> done, or blocked for explicit human choice
-```
-
-If the goal was actually decomposable into disjoint slices rather than redundant
-candidates, use the **integrate** pattern instead (a single integrator task
-seeded `from_task(base)` that applies the others' `changes` diffs). `parallel_race`
-is specifically for redundant candidates.
-
-Minimal params:
-
-```json
-{
-  "goal": "...",
-  "num_candidates": 3,
-  "selection": "best reviewed candidate or human choice"
-}
-```
-
-## Workspace propagation
-
-Keep this simple.
-
-Every task gets exactly one workspace instruction with a single ancestor:
-
-```json
-{ "mode": "none" }
-```
-
-```json
-{ "mode": "fork_parent" }
-```
-
-```json
-{ "mode": "from_task", "task_id": "task_impl_1" }
-```
-
-The workspace manager decides how to implement that instruction:
-
-- Btrfs snapshot when available;
-- reflink/copy fallback otherwise.
-
-Do not expose Btrfs as a workflow concept. Btrfs is an implementation detail of
-fast fork/seal/copy.
-
-There is no multi-source workspace mode and no cross-task git ref import. Code
-moves between tasks as a `changes` (diff) artifact, applied by an `integrate`
-task in its own single workspace (see "Combining parallel work").
-
-## Context transfer
-
-Only artifacts transfer context between tasks.
-
-Avoid:
-
-- transcript scraping as the default;
-- workflow variables;
-- hidden global memory;
-- cross-task git refs.
-
-A task prompt should include:
-
-- run goal;
-- task goal;
-- role instructions;
-- selected prior artifact summaries (handoff / evidence / changes);
-- stopping condition;
-- required output schema (including its allowed `suggested_next` values).
-
-If an agent needs more detail, it can open linked artifacts or transcripts, but
-the default prompt should be compact.
+Properties, all reusing existing patterns:
+
+- **Single-flight per stage** via the stage row lock, mirroring the per-session
+  row lock.
+- **Idempotent**: re-delivery of a subagent lifecycle event re-runs the check; a
+  stage already `Done` short-circuits, so the parent is notified once.
+- **Attempt-fenced**: the `running -> done` transition is a compare-and-set on
+  `attempt_id`, so a stale completion cannot re-fire a notification.
+- **Crash-safe**: on daemon restart, a sweep re-evaluates `running` stages whose
+  subagents are all terminal and delivers the missed notification.
+
+The runner never decides the next stage. That is the parent's job (inv. 3).
 
 ## Tools
 
-Minimal workflow tools:
+Orchestration tools (parent / top-level agent):
 
 ```text
-workflow.list
-workflow.describe
-workflow.start
-workflow.status
-workflow.cancel
-workflow.signal
-workflow.read_artifact
+stage.start_full         -> { role, prompt }            ; one full subagent
+stage.start_readonly_fanout -> { tasks: [{role, prompt}, ...] }  ; N read-only subagents
+stage.status             -> inspect a stage and its subagents
+stage.cancel             -> cancel an in-flight stage (all its subagents)
+workflow.list            -> list templates
+workflow.describe        -> a template's suggested stages
 ```
 
-Top-level agents use `workflow.list` / `workflow.describe` to discover available
-workflow plugins, then call `workflow.start` with plugin-specific params.
+Steering/interrupt of the single full subagent reuses the existing subagent
+steer/interrupt path. Read-only subagents reject steer/interrupt by type.
 
-Minimal task tools:
+The parent is told, in its system prompt: launch at most one stage per turn,
+then end your turn and wait for the completion notification; never poll, never
+start a second stage while one is running, and never mix full and read-only work
+in one stage.
 
-```text
-task.write_artifact
-task.complete
-task.fail
-task.request_human
-```
+The Python REPL remains only as a raw escape hatch; `subagents.wait(...)`
+busy-waiting is no longer the orchestration path. See Migration.
 
-`task.complete` may include `suggested_next`.
+## Human-in-the-loop
 
-Do not add `workflow.propose_transition` or `task.propose_transition` in v1.
-They are just `task.complete({ suggested_next: ... })`.
+Human interaction is lighter here because the parent session is the user's
+session:
 
-Keep Python REPL as an escape hatch, not the normal workflow runtime.
+- The parent asks the user directly when it needs a decision.
+- A full subagent that needs the human ends with
+  `suggested_next = human_needed`; that surfaces in the completion notification,
+  and the parent relays it to the user.
+- While a stage is in flight the parent is parked. User input sent in the
+  meantime queues (existing queue semantics) and is seen when the parent next
+  resumes; to abort early the user cancels the stage. (Confirm in Open
+  Question 4.)
 
-Minimal direct delegation tools:
-
-```text
-agent.spawn
-agent.status
-agent.read
-agent.cancel
-```
-
-These replace the Python REPL as the normal way for a top-level agent to ask for
-ad hoc helper work. Workflow task agents should not receive these tools by
-default.
-
-## Human requests and resumption
-
-`blocked` is a first-class run state, and "a human must do something" is a
-normal, durable outcome — not an error. The mechanism is fully expressed with
-the existing primitives:
-
-1. A task calls `task.request_human(message)`. The runner writes an artifact
-   `{ kind: "human_request" }` (carrying the question/required action) and the
-   task completes with `suggested_next = human_needed`.
-2. `advance` sees the `human_request` artifact has no answering `human_note` and
-   returns `Plan::Block { reason }`. The run becomes `blocked`. No task is
-   spawned; nothing polls.
-3. The human answers in the run board ("answer human request"), which calls
-   `workflow.signal({ run_id, request_artifact_id, response })`. The runner
-   writes an artifact `{ kind: "human_note" }` referencing the request, then
-   triggers one `advance` step (the same single-flight path as a task event).
-4. `advance` now sees the request is answered and proceeds — typically creating
-   the next task seeded with the `human_note` as an input artifact.
-
-So resumption is just: `human_request` artifact → `blocked` → `human_note`
-artifact (via `workflow.signal`) → `advance` re-runs. No special resume state,
-no separate human-task table; a blocked run re-enters the ordinary runner step
-when its signal arrives. Auth-expiry (the Teleport case) and "approve this
-destructive operation" both use exactly this path.
+No blocked-run table, no signal artifact, no separate human-request store.
 
 ## Testing
 
-This subsystem must be testable without real model calls, the same way the
-runtime already resolves model actions deterministically with the dev harness
-(`harness.model.complete` / `harness.model.fail`).
+The subsystem must be testable without real model calls, reusing the dev harness
+that already resolves model actions deterministically (`harness.model.complete`
+/ `harness.model.fail`).
 
-- **Pure `advance` unit tests.** Because `advance` is a pure
-  `(run, tasks, artifacts) -> Plan`, every plugin's control flow is unit-tested
-  by constructing synthetic task results/artifacts and asserting the returned
-  `Plan`. No Postgres, no sessions, no models. This is where the bulk of plugin
-  correctness is proven.
-- **Runner reconciliation tests (real Postgres).** Assert idempotency directly:
-  running `step` twice for the same run state creates tasks once; a re-delivered
-  lifecycle event does not double-spawn; a stale task completion (wrong
-  `attempt_id`) matches zero rows. Inspect both the run/task/artifact rows and
-  the emitted events, mirroring the existing "check transcript order *and* DB
-  state" discipline.
-- **A task harness** that resolves a task's child session to a chosen
-  `{ status, summary, artifact, suggested_next }` without a provider, so
-  end-to-end run progression (e.g. `implement_review_test` looping on
-  `code_issue`) is exercised deterministically.
-- **Outcome validation tests.** A `suggested_next` outside a plugin's declared
-  outcome enum is recorded as a task error, not silently matched.
+- **Stage completion / notification (real Postgres).** Drive subagents to
+  terminal states via the harness and assert the parent receives exactly one
+  notification; assert re-delivered lifecycle events and restart sweeps do not
+  double-notify; assert a stale `attempt_id` cannot re-fire. Inspect both the
+  stage/session rows and the emitted events.
+- **Homogeneity enforcement.** `stage.start_*` rejects mixing full and read-only
+  in one stage, and rejects a second stage while one is running.
+- **Read-only enforcement.** A read-only subagent attempting to write the
+  workspace fails (mechanism per Open Question 1) — this is a correctness test,
+  not a nicety.
+- **Parking / resume.** A parent that launches a stage goes idle and is re-driven
+  only by the completion notification.
+- **Typed outcomes.** A `suggested_next` outside the template's declared outcome
+  set is recorded as a subagent error, not silently matched.
 
-## PR notes
+## Migration and coexistence
 
-PR #150, `fix/subagent-orchestration-api-notifications`, is still important
-because this minimal architecture needs parent-visible task lifecycle events:
+| Surface | Today | Steady state |
+| --- | --- | --- |
+| `stage.*` + `workflow.*` templates | new | the way to run multi-step and parallel-read work |
+| Python REPL `subagents.*` (busy-wait) | current primary API | demoted to a raw escape hatch; no longer documented for orchestration |
 
-- child spawned;
-- child running;
-- child idle/done;
-- stale child recovery;
-- event-driven UI refresh.
+Sequence:
 
-As of this revision PR #150's tip ("Improve subagent orchestration lifecycle")
-is **not yet on `origin/main`** — it is the parent of this plan's own branch.
-Phase 0 is therefore a real prerequisite, not a formality: land it on `main`
-(or port its lifecycle-event work) before Phase 2 relies on those events to
-drive `advance`.
-
-PR #149 is unrelated UI polish.
-
-Older workflow PR branches are useful design history only. Do not revive the old
-`session_relationships` table, the `workflow_variables` store, the `work.*`
-RPCs, or the editable Python workflow SDK. See "This is the third orchestration
-attempt" for why each of those is a known failure mode, not a starting point.
+1. Ship typed subagents, stages, and notifications (Phases 0–3).
+2. Repoint the `PI.md` "Subagent delegation" guidance at `stage.*` and the
+   park-and-wait pattern. Remove the eager `subagents.spawn/wait` guidance.
+3. Keep the Python REPL available but stop teaching `subagents.wait` as the way
+   to orchestrate. Removing it entirely is a later follow-up.
 
 ## Implementation phases
 
 ### Phase 0: lifecycle foundation
 
-- Merge or port PR #150 (its tip is not yet on `origin/main`).
+- Land PR #150 (parent-visible child lifecycle events) on `main`; its tip is not
+  yet there.
 - Keep using `sessions.parent_session_id`.
-- Ensure parent-visible child lifecycle events work reliably.
-- Update `architecture.md`: retire the "no subagent orchestration" non-goal and
-  the stale "Removed Pieces" framing so the docs and this plan agree. (See
-  "Relationship to the stated architecture".)
+- Update `architecture.md` to retire the "no subagent orchestration" non-goal.
 
-### Phase 1: minimal run/task/artifact tables
+### Phase 1: typed subagents on the shared filesystem
 
-- Add `runs`.
-- Add `tasks`.
-- Add `artifacts`.
-- Add repository methods.
-- Add basic UI/RPC views.
-- Add workflow plugin registry interfaces.
-- Add bundled plugin manifests.
+- Add `subagent_type` (full | read_only) to sessions.
+- Make subagents run in the parent's workspace directories; **remove subagent
+  workspace forking** (the btrfs/reflink fork-for-subagents path).
+- Implement read-only enforcement (Open Question 1).
 
-### Phase 2: task execution and the runner
+### Phase 2: stages and the homogeneity rule
 
-- Start an agent task as a child session.
-- Assemble scoped task prompt from run/task/artifacts.
-- Record task result and output artifact when child session finishes.
-- Support `task.write_artifact`, `task.complete`, `task.fail`,
-  `task.request_human`.
-- Ensure workflow task agents are non-recursive by default.
-- Implement the single-flight runner: per-run row lock, `attempt_id`-fenced
-  task-completion reconciliation, pure `advance`, idempotent
-  upsert-by-`(run_id, key)`, CAS run-status transitions, run revision counter.
-- Add the deterministic task harness and runner reconciliation tests (idempotent
-  re-step, no double-spawn on re-delivered events, stale completion rejected).
+- Add the `stages` table and `stage_id` on sessions.
+- Add `stage.start_full`, `stage.start_readonly_fanout`, `stage.status`,
+  `stage.cancel`.
+- Enforce inv. 1 (homogeneous stage) and "one stage at a time per parent".
 
-### Phase 3: workflow plugin tools
+### Phase 3: notifications and parking
 
-- Add `workflow.list`.
-- Add `workflow.describe`.
-- Add `workflow.start` by plugin id.
-- Add `workflow.status`, `workflow.cancel`, `workflow.signal`,
-  `workflow.read_artifact`.
-- Implement the human-request → `blocked` → `workflow.signal` → `advance`
-  resumption path.
+- Implement the stage runner: single-flight completion detection, completion
+  notification enqueued to the parent, attempt-fenced, crash-recovery sweep.
+- Add the system-prompt instructions for park-and-wait.
+- Deterministic tests for completion/notification idempotency.
 
-### Phase 4: bundled plugins
+### Phase 4: workflow templates
 
-Implement bundled plugins in this order. Each lands with its pure-`advance`
-unit tests and a declared outcome enum:
+- Add `workflow.list` / `workflow.describe` over bundled static templates.
+- Ship `explore`, `implement_review`, `implement_review_test`, `kubernetes_e2e`.
+- Type each template's outcomes and validate `suggested_next`.
 
-1. `explore` (reduce pattern);
-2. `implement_review`;
-3. `implement_review_test`;
-4. `kubernetes_e2e`;
-5. `parallel_race` (select pattern; add the `integrate` pattern only if a real
-   disjoint-fan-out workflow needs it);
-6. `hill_climb`.
+### Phase 5: UI
 
-### Phase 5: workspace lineage
+- Run board: parent session -> stages -> subagents with terminal results.
+- Show in-flight stage, per-subagent status, and pending human relays.
+- Controls: cancel stage, steer the full subagent, re-run a stage.
 
-- Implement task `workspace.mode` for `none` / `read_parent` / `fork_parent` /
-  `from_task` only.
-- Use existing Btrfs snapshot/fork support where available, reflink/copy
-  otherwise.
-- Enforce single-parent lineage in the runner: reject a task that would create a
-  second writer for an already-claimed workspace.
-- Implement `changes` (diff) artifact capture so `select`/`integrate` work
-  without cross-task git refs.
-- Do not implement a `sources` mode or git source-ref import.
+## Open questions
 
-### Phase 6: direct delegation tools
+1. **How is read-only enforced?** This is the linchpin of correctness: parallel
+   read-only subagents share the filesystem, so a write by one corrupts all.
+   Options, lightest to strongest:
+   - *Advisory only* — read-only agents get no `edit` tool and are told not to
+     write; `bash` can still write, so a buggy agent can corrupt the run.
+     Simplest, weakest.
+   - *Read-only workspace mount* — the workspace is bind-mounted read-only for
+     read-only subagents' tool execution (scratch/tmp stays writable). Honors
+     "same filesystem, no snapshot/subvolume" while actually preventing writes.
+     My recommended default.
+   - *OS user / perms* — run read-only subagents as a uid lacking write
+     permission on the workspace. Strong but host-specific.
+   A consequence of any real enforcement: read-only agents **cannot build or run
+   tests** (those write `target/`, caches). So "build/test" is always a full
+   stage. Confirm that rule.
 
-- Add regular tool-call replacements for Python REPL subagent orchestration:
-  - `agent.spawn`;
-  - `agent.status`;
-  - `agent.read`;
-  - `agent.cancel`.
-- Keep direct delegation agents async, observable, steerable/cancellable where
-  useful.
+2. **Is dropping parallel writes acceptable?** This model removes
+   `parallel_race` and any N-parallel-implementer pattern. The substitute is
+   parallel read-only exploration feeding a single full implementation stage. Is
+   that an acceptable permanent limitation, or do we need an isolated-parallel
+   escape hatch later (which would reintroduce snapshots)?
 
-### Phase 7: UI
+3. **How deterministic/replayable must runs be?** Parent-driven sequencing is
+   less replayable than a compiled `advance()` state machine: the "next stage"
+   is an LLM decision, not a pure function. Durable stage records make it
+   *recoverable*, but not *deterministic*. For a personal runtime this is likely
+   fine; confirm we are not giving up a replay/repro property we want.
 
-- Show runs.
-- Show task cards.
-- Show artifacts.
-- Show pending human requests.
-- Support cancel, retry, steer child session, and signal human response.
+4. **What happens to user input during an active stage?** Default proposal: the
+   parent stays parked and user follow-ups queue until the stage completes; the
+   user cancels the stage to intervene early. Alternative: user input
+   auto-cancels or pauses the stage. Which is the right default?
+
+5. **Where does non-code evidence live?** With no artifact table, durable
+   non-code output (k8s logs/events, profiling) is either committed as files in
+   the workspace or summarized in the subagent's terminal result. Is that
+   sufficient, or do we want a tiny optional evidence blob keyed to a subagent?
+
+6. **What does "re-run a stage" mean without snapshots?** Re-running does not
+   roll back the filesystem — the previous stage's writes persist. A clean
+   re-run requires the parent or user to `git reset`/`stash` first. Is
+   forward-only re-execution acceptable, or do we need a cheap rollback (which
+   pulls snapshots back in)?
+
+7. **Can full subagents orchestrate their own stages (recursion)?** Deferred in
+   v1 to keep the one-writer argument one level deep. If we later allow it, the
+   parking discipline must hold recursively (a full subagent that launches a
+   sub-stage must itself park). Worth deciding before the prompt/tooling
+   hardcodes "only the top-level parent orchestrates".
+
+8. **Notification size and shape.** What exactly goes in the completion notice —
+   only `summary` + `suggested_next` + session links, or also a bounded slice of
+   each subagent's output? How is it truncated for a large fan-out so it does not
+   blow the parent's context?
+
+9. **Failure policy for a fan-out.** If 3 of 5 read-only subagents fail, does the
+   stage report `done` with partial results, or `failed`? Proposed: always
+   deliver partial results and let the parent decide; the stage status reflects
+   "completed with failures". Confirm.
 
 ## Design rules
 
-1. If a concept can be an artifact, make it an artifact.
-2. If a transition can live in plugin code, do not make it a generic graph edge.
-3. If a task can suggest the next step in its result, do not add a proposal
-   table — but type that suggestion as a per-plugin outcome enum, not free text.
-4. If workspace safety can be achieved by single-parent forking, do not add
-   leases and do not add a multi-source mode.
-5. If a workflow can be a plugin, do not create a DSL yet.
-6. Keep the human UX to runs, task cards, artifacts, and human requests.
-7. Keep the agent UX to scoped task prompts and structured task results.
-8. Workflow task agents are scoped and non-recursive by default.
-9. Direct delegation agents may remain async/interruptible because they are still
-   useful outside formal workflows.
-10. Workflow discovery and invocation should be regular tool calls, not Python
-    REPL code.
-11. Code crosses task boundaries only as a `changes` (diff) artifact. There is
-    no daemon-side merge and no cross-task git ref. Combine parallel work with
-    `select` / `integrate` / `reduce`, never a generic `merger`.
-12. `advance` is a pure function and the runner reconciles to its desired state
-    idempotently under a per-run lock. Control flow is never model-authored and
-    never lives in `run.state`.
+1. Serialize writes in time, not space: at most one writer at any instant.
+2. Subagents share the parent filesystem. No snapshot, fork, or merge.
+3. A stage is homogeneous: one full subagent, or many read-only subagents.
+4. The parent never polls or busy-waits; it parks and is notified.
+5. Read-only means *enforced* read-only, because reads are concurrent.
+6. Handoffs are the shared filesystem plus the subagent's typed terminal result.
+   There is no artifact store and no cross-subagent variable store.
+7. Workflows are templates that suggest stages; the parent owns sequencing.
+8. The daemon owns mechanism (types, homogeneity, notifications, durable stages);
+   the model owns policy (which stage next, re-run, stop).
+9. Subagents are non-recursive in v1.
+10. Build/test work is a full stage, never a read-only fan-out.

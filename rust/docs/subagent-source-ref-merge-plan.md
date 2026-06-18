@@ -1,12 +1,13 @@
 # Subagent source-ref merge plan
 
-> **Superseded (2026-06-16).** The cross-task git source-ref / merge mechanism
-> described here is removed by `plans/workflow-orchestration.md` ("Combining
-> parallel work"). Code now crosses task boundaries only as a `changes` (diff)
-> artifact, combined via the `select` / `integrate` / `reduce` patterns — there
-> is no daemon-side merge, no `sources` workspace mode, and no `merger` role.
-> This document is retained as design history for the *current* REPL
-> `subagents.*` behavior only; do not extend it.
+> **Superseded (2026-06-16).** Cross-task git source refs / daemon-side merge are
+> removed. The current design (`plans/workflow-orchestration.md`) gives subagents
+> the **same shared filesystem** as the parent with no snapshots, forks, or
+> merges: writes are serialized in time (at most one writer at any instant) via
+> read-only vs full subagent types and homogeneous stages. There is therefore no
+> cross-subagent transport at all — the handoff is the shared filesystem plus
+> each subagent's terminal result. This document is retained only as history for
+> the legacy REPL `subagents.*` source-ref behavior; do not extend it.
 
 ## Goal
 
