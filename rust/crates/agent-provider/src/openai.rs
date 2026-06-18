@@ -649,7 +649,7 @@ fn response_error_message(body: &str) -> String {
 }
 
 fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Value> {
-    let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
+    let reasoning_effort = openai_reasoning_effort(request.reasoning_effort);
     let tool_profile = request.tool_profile;
     let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
     let tools = response_tools(tool_profile, &request_tools)?;
@@ -691,7 +691,7 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
 // `include`, `tool_choice`) out, but preserve the same request-affinity fields
 // Codex now carries into compaction (`prompt_cache_key`, `service_tier`).
 fn compact_body(request: ProviderCompactionRequest, session_id: &str) -> ProviderResult<Value> {
-    let reasoning_effort = openai_reasoning_effort(request.reasoning_effort)?;
+    let reasoning_effort = openai_reasoning_effort(request.reasoning_effort);
     let tool_profile = request.tool_profile;
     let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
     let tools = response_tools(tool_profile, &request_tools)?;
@@ -739,17 +739,21 @@ fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
     tools.iter().map(|tool| tool.declaration.clone()).collect()
 }
 
-fn openai_reasoning_effort(effort: ReasoningEffort) -> ProviderResult<&'static str> {
+// Map a reasoning effort to the OpenAI wire string. The daemon normalizes the
+// session effort to a model-supported value before building the request (see
+// `model_metadata::normalize_reasoning_effort`), so this should always receive a
+// value OpenAI accepts. Defensively clamp the two values gpt-5.x rejects
+// (`minimal` and `max`, confirmed by a 2026-06-17 live probe) to their nearest
+// supported neighbor rather than letting a stray value produce a 400.
+fn openai_reasoning_effort(effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::None
-        | ReasoningEffort::Minimal
         | ReasoningEffort::Low
         | ReasoningEffort::Medium
         | ReasoningEffort::High
-        | ReasoningEffort::XHigh => Ok(effort.as_str()),
-        ReasoningEffort::Max => Err(ProviderError::Provider(
-            "reasoning effort max is not supported by OpenAI".to_string(),
-        )),
+        | ReasoningEffort::XHigh => effort.as_str(),
+        ReasoningEffort::Minimal => ReasoningEffort::Low.as_str(),
+        ReasoningEffort::Max => ReasoningEffort::XHigh.as_str(),
     }
 }
 

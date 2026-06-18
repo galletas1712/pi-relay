@@ -308,7 +308,11 @@ async fn remote_compaction_request(
         tools: state
             .tools
             .provider_tools_for_provider(config.provider.kind),
-        reasoning_effort: config.provider.reasoning_effort,
+        reasoning_effort: model_metadata::normalize_reasoning_effort(
+            config.provider.kind,
+            &config.provider.model,
+            config.provider.reasoning_effort,
+        ),
         prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
         session_id: Some(session_id.to_string()),
     })
@@ -393,7 +397,11 @@ fn local_summary_request(
         tool_profile: ProviderToolProfile::None,
         tools: Vec::new(),
         max_tokens: config.provider.max_tokens,
-        reasoning_effort: config.provider.reasoning_effort,
+        reasoning_effort: model_metadata::normalize_reasoning_effort(
+            config.provider.kind,
+            &config.provider.model,
+            config.provider.reasoning_effort,
+        ),
         prompt_cache_key: config
             .provider
             .prompt_cache_key()
