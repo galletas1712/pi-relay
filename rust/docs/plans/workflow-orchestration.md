@@ -1,213 +1,217 @@
 # Minimal workflow orchestration plan
 
-Status: proposed. Last reviewed 2026-06-16 (rewrite: shared-filesystem subagents,
-read-only vs full subagent types, time-serialized single-writer model,
-notification-driven parent parking, workflows as parent-driven stage templates;
-removed workspace isolation, snapshots, git merge, multi-parent lineage, and the
-artifact table).
+Status: proposed. Last reviewed 2026-06-16 (rev: subagents run in disposable
+btrfs snapshots instead of a shared filesystem — isolation enforces
+"read-only", gives cheap rollback, and reuses the existing workspace-fork
+machinery; nothing is ever merged; recursion is banned; non-code evidence is
+passed as absolute paths in the subagent's final message).
 
 ## Summary
 
-Keep the architecture small. Orchestration needs far less than earlier drafts
-assumed once we serialize writes **in time** instead of isolating them **in
-space**.
+Keep the architecture small. The earlier drafts oscillated between heavy
+workspace isolation (forks + git merge + multi-parent lineage) and a fully
+shared filesystem (which needed hard-to-enforce read-only sandboxing). This
+revision takes the good half of each: **cheap per-subagent snapshots for
+isolation, but no merge — ever.**
 
-The model is:
+The model:
 
-- Subagents run in the **same filesystem** as the parent. No btrfs subvolume, no
-  snapshot, no fork, no per-subagent workspace, no git merge, no multi-parent
-  lineage, no artifact table.
-- There are exactly **two subagent types**: **read-only** (cannot write, cannot
-  be steered/interrupted) and **full** (can write, can be steered/interrupted).
+- Each subagent runs in its **own btrfs snapshot** of the parent's workspace
+  (reflink/copy fallback on non-btrfs hosts — this machinery already exists in
+  `instantiate.rs`). Snapshots are cheap and isolated.
+- There are two subagent types, distinguished by **what happens to their
+  snapshot when they finish**:
+  - **read-only (disposable):** the snapshot is **discarded**, never adopted.
+    The agent may still write inside its sandbox (so it can build, run, and
+    test), but those writes never reach the parent. Isolation is what makes
+    "read-only" safe — there is nothing to enforce.
+  - **full:** on success the snapshot is **adopted** as the parent's new
+    workspace (an atomic subvolume swap, performed while the parent is parked).
+    On failure or restart it is discarded.
 - Work happens in **stages**. A stage is either *one full subagent* or *a
-  parallel fan-out of read-only subagents* — never both.
+  parallel fan-out of read-only subagents* — never both, because at most one
+  snapshot can be adopted per stage.
 - The parent **does not wait or poll**. After launching a stage it ends its turn
-  and parks. The daemon notifies it when the stage completes (the "background
+  and parks; the daemon notifies it when the stage completes (the "background
   agents" pattern). The parent then decides what to do next.
-- A **workflow** is just a named template that *suggests* a sequence of stages.
-  The parent has full discretion over which stage to run, whether to re-run one,
-  and when to stop.
+- A **workflow** is a named template that *suggests* a sequence of stages. The
+  parent has full discretion over which stage to run, whether to re-run one, and
+  when to stop.
 
-### The one property that makes shared filesystem safe
+### What makes this safe and simple
 
-> **At most one agent can write the workspace at any instant.**
+> Snapshots isolate, so concurrent subagents never corrupt each other. At most
+> one snapshot is adopted per stage, and adoption is a **swap, never a merge** —
+> so there is no conflict resolution anywhere in the system.
 
-This holds by construction from the three invariants below:
+Because nothing is merged, the multi-parent / git-source-ref / `integrate`-agent
+machinery from earlier drafts is gone, and because snapshots are throwaway, the
+read-only-enforcement problem from the shared-filesystem draft is gone too.
 
-| Who is active | Writers | Why |
-| --- | --- | --- |
-| One full subagent (parent parked) | the full subagent only | inv. 1 forbids a co-active read-only fan-out; inv. 2 parks the parent |
-| N read-only subagents (parent parked) | none | read-only cannot write; inv. 2 parks the parent |
-| The parent, between stages | the parent only | a stage's subagents are all terminal before the parent resumes |
+### What this keeps, deletes, and accepts
 
-There is never a moment with two writers, so no isolation, snapshotting, or
-merging is needed. This is the whole point of the design.
+Keeps (reusing existing code):
 
-### What this deletes from earlier drafts
+- btrfs snapshot / reflink / copy workspace forking (`instantiate.rs`);
+- subagent sessions and `sessions.parent_session_id`;
+- subagent steer/interrupt and lifecycle events.
 
-- workspace source modes (`fork_parent` / `from_task` / `sources`);
-- btrfs/reflink snapshot-per-subagent and the workspace fork primitives for
-  subagents;
-- cross-task git source refs and any daemon-side `git merge`;
-- multi-parent task lineage;
-- the `artifacts` table and the artifact-kind enumeration;
+Deletes:
+
+- daemon-side `git merge`, cross-task git source refs, multi-parent lineage;
+- the `artifacts` table and artifact-kind enumeration;
+- the `sources` / `from_task` multi-ancestor workspace modes;
 - the pure `advance()` workflow state machine as the sole owner of control flow;
 - workflow variables, transition proposals, budgets, leases, graph DSL.
 
-### What this accepts as a tradeoff
+Accepts as a tradeoff:
 
-Parallel work can only be **read-only**. You cannot run N full subagents editing
-code in parallel, because they would share one filesystem. `parallel_race` /
-"N candidate implementations in parallel" is therefore **not supported** in this
-model. The intended substitute is: parallel read-only exploration to gather
-options, then a single full stage to implement the chosen one. This is a
-deliberate, conscious loss of capability in exchange for deleting all isolation
-machinery. See Open Questions.
+- By current invariant a stage adopts at most one snapshot, so there is **one
+  full (writing) subagent per stage**. Note that snapshot isolation now makes
+  parallel *writing* candidates technically safe (run N full subagents, adopt
+  one winner, discard the rest — i.e. `parallel_race`). We keep it to one full
+  per stage for now, but that door is reopened if we want it (Open Question 2).
 
 ## The three invariants
 
-1. **A stage is homogeneous.** Within one fan-out there is either a single full
-   subagent or a set of read-only subagents — never a mix. (This is what keeps
-   "at most one writer" true during a stage.)
-2. **The parent never busy-waits.** After it launches a stage, the parent ends
-   its turn and becomes idle ("parked"). The daemon delivers a completion
-   notification as new input when the stage finishes, and the parent resumes
-   then. The parent is instructed in its system prompt to expect this and to
-   stop after launching a stage. While a stage is in flight the parent is not
-   running, so it is not a second writer.
+1. **A stage is homogeneous.** One full subagent, or a fan-out of read-only
+   subagents — never a mix. Justification is now "at most one adoption per
+   stage", not "at most one writer" (snapshots already isolate writers).
+2. **The parent never busy-waits.** After launching a stage the parent ends its
+   turn and parks (idle). The daemon delivers a completion notification as new
+   input when the stage finishes. This is strictly required for a **full** stage
+   (adoption swaps the parent's workspace and must not race parent writes) and
+   kept for read-only stages for a uniform background-agents UX. (Snapshot
+   isolation means a non-blocking read-only fan-out is possible later — Open
+   Question 4.)
 3. **Workflows are stages, but the parent has discretion.** A workflow is an
-   ordered list of suggested stages. The parent decides which stage to run next,
-   whether a stage needs re-execution, and when the run is done. The daemon
-   supplies the mechanism (typed subagents, the homogeneity rule, completion
-   notifications, durable stage records); the parent supplies the policy.
+   ordered list of suggested stages. The parent decides which to run, whether to
+   re-run, and when the run is done. The daemon supplies mechanism (snapshots,
+   adoption, homogeneity, notifications, durable stage records); the parent
+   supplies policy.
 
 ## Relationship to the stated architecture
 
 This plan reverses a documented non-goal. `architecture.md` lists "Do not
-include subagent orchestration" (Goal 6) and "Hierarchical subagent
-orchestration" under "Not implemented by design", and "Removed Pieces" still
-names the deleted `agent-orchestrator` crate. That guidance predates durable
-subagent sessions, parent links, and lifecycle events, all of which have since
-shipped. Before Phase 1, `architecture.md` must be updated in the same change so
-the docs and this plan agree. The durable runtime stays small; orchestration
-becomes an explicit, persisted concept instead of a forbidden one.
+include subagent orchestration" (Goal 6) and names the removed
+`agent-orchestrator` crate under "Removed Pieces". That guidance predates durable
+subagent sessions, parent links, and lifecycle events, which have shipped. Before
+Phase 1, `architecture.md` must be updated in the same change so the docs and
+this plan agree.
 
 ### This is the third orchestration attempt; do not repeat the first two
 
-The runtime has already tried and discarded two designs:
-
 1. **`agent-orchestrator` crate + `SessionRegistry` (removed).** Control flow
-   lived in a process-local object graph. *Lesson: durable Postgres state, not a
-   live object graph, is the source of truth.*
+   lived in a process-local object graph. *Lesson: durable Postgres state is the
+   source of truth.*
 2. **`workflow_variables` + `work.*` RPCs + Python workflow SDK (deleted).**
    Control flow polled named variables and lived in editable Python templates.
-   *Lesson: no general-purpose variable store, and no model-authored
-   control-flow scripts as the normal path.*
+   *Lesson: no general variable store, no model-authored control-flow scripts.*
 
-A third lesson comes from the current Python REPL `subagents.*` API: the parent
-**busy-waits** (`subagents.wait(...)`) while children run. *Lesson: the parent
-must park and be woken by a notification, never spin.* Invariant 2 exists
-specifically to retire busy-waiting.
+A third lesson from the current Python REPL `subagents.*` API: the parent
+**busy-waits** (`subagents.wait`). *Lesson: park and be notified, never spin
+(invariant 2).*
 
-Guardrails that follow:
-
-- No general cross-subagent state store. Handoffs are the subagent's final
-  result plus the shared filesystem (see "Handoffs").
-- Control flow is the parent reasoning over **durable stage records** and
-  **completion notifications**, never a running Python script and never a poll
-  loop.
+Guardrails: handoffs are the adopted workspace plus the subagent's final result
+(see "Handoffs"); control flow is the parent reasoning over durable stage records
+and notifications, never a running script or a poll loop.
 
 ## Subagent types
 
-### Read-only subagent
+### Read-only (disposable) subagent
 
-- **Cannot write the workspace.** This must be *enforced*, not advised, because
-  read-only subagents run in parallel against a shared filesystem; a stray write
-  would corrupt every sibling's view. (Enforcement mechanism is Open Question 1.)
-- **Cannot be steered or interrupted individually.** It is fire-and-forget; it
-  runs to a terminal result. This keeps the stage's completion barrier clean.
-- Used for investigation, code reading, review, classification, and any analysis
-  that does not need to build, test, or modify files.
-- Many can run in parallel in a single stage.
+- Runs in its own snapshot. **May write inside its sandbox** (so it can build,
+  run, and test), but the snapshot is **discarded** — never adopted, never
+  merged. That is the entire meaning of "read-only": durable-with-respect-to-the
+  -parent, not literally non-writing.
+- **Cannot be steered or interrupted individually** (fire-and-forget; runs to a
+  terminal result, which keeps the stage barrier clean). A whole read-only stage
+  can be cancelled.
+- Many run in parallel in one stage, each isolated.
+- The name is slightly misleading because they can write their sandbox; if we
+  want a clearer term, "disposable" or "non-adopting" fits the mechanics better.
+  (Open Question 6.)
 
 ### Full subagent
 
-- **Can write the workspace.** Exactly one runs at a time (a full stage is a
-  single subagent).
-- **Can be steered and interrupted** by the human and, where useful, by the
-  parent. It is the long-lived collaborator that does the real edits, builds,
-  and tests.
-- Non-recursive by default: a full subagent does not itself orchestrate stages
-  in v1 (keeps the one-writer argument one level deep). Recursion is deferred —
-  see Open Questions.
+- Runs in its own snapshot. On **success** the daemon **adopts** the snapshot as
+  the parent's workspace (subvolume swap, while the parent is parked). On failure
+  or restart the snapshot is discarded and the parent's workspace is untouched.
+- Exactly one per stage (one adoption per stage).
+- **Can be steered and interrupted** by the human and, where useful, the parent.
 
-A stage's subagents are non-recursive workers, not sub-orchestrators. If a
-workflow needs decomposition, that is another stage the parent runs.
+### Both types are non-recursive
+
+**Subagents cannot spawn subagents.** This is a hard rule, not a default. Only
+the top-level parent orchestrates stages. If a workflow needs decomposition, that
+is another stage the parent runs. This keeps the snapshot/adoption reasoning one
+level deep and avoids nested parking.
 
 ## Stages
 
-A **stage** is one step of a run:
+A **stage** is one step of a run: `kind = full` (one full subagent) or
+`kind = readonly_fanout` (one or more read-only subagents).
 
-- `kind = full` — exactly one full subagent.
-- `kind = readonly_fanout` — one or more read-only subagents.
-
-Stage lifecycle:
+Lifecycle:
 
 ```text
 parent calls stage.start_full / stage.start_readonly_fanout
-  -> daemon creates a durable stage row + child sessions (read-only or full)
+  -> daemon snapshots the parent workspace once per subagent and starts the
+     child sessions in those snapshots
   -> parent ends its turn and parks (idle)
-  -> subagents run against the shared filesystem
+  -> subagents run, each isolated in its own snapshot
   -> when every subagent in the stage is terminal, the daemon:
-       - marks the stage done (single-flight transition),
-       - composes a completion notification (each subagent's result),
-       - enqueues that notification as input to the parent,
-       - drives the parent.
+       - for a successful full stage: adopts the full subagent's snapshot as the
+         parent's workspace (keeping the pre-adoption state as a rollback
+         checkpoint);
+       - for a read-only stage: adopts nothing;
+       - retains every non-adopted snapshot read-only (so reported artifact
+         paths stay valid) until run teardown;
+       - composes a completion notification (each subagent's terminal result +
+         absolute artifact paths + a session link);
+       - enqueues that notification as input to the parent and drives it.
   -> parent wakes, reads results, decides the next stage (or finishes)
 ```
 
-A stage is **terminal** when all of its subagents are terminal
-(`done`/`failed`/`cancelled`/`crashed`). The notification reports successes and
-failures; the parent decides whether to re-run, run a different stage, or stop.
+A stage is terminal when all its subagents are terminal
+(`done`/`failed`/`cancelled`/`crashed`). A failed full subagent is not adopted;
+its snapshot is retained read-only for inspection.
 
-The parent may cancel an in-flight stage (cancels all its subagents). It cannot
-steer an individual read-only subagent; it can steer the single full subagent of
-a full stage.
+## Snapshots, adoption, and rollback
 
-## No busy-wait: notifications and parking
+- **Snapshot** — taken from the parent's current workspace at stage launch, one
+  per subagent. btrfs subvolume snapshot where available; reflink/copy fallback
+  otherwise (existing behavior). Cheap, isolated.
+- **Adoption** — only for a successful full stage: the subagent's subvolume
+  replaces the parent's workspace at the same path (atomic swap while the parent
+  is parked). This is a single-writer swap, **not a merge**: no conflict
+  resolution exists in the system.
+- **Retention** — non-adopted snapshots (all read-only snapshots, plus failed
+  full snapshots) are kept **read-only** until the run is torn down, so the
+  parent can open files the subagent reported by absolute path.
+- **Rollback / restart** — discard a subagent's snapshot and re-snapshot from the
+  parent's current workspace, then re-run. For a full stage that was already
+  adopted, restore the pre-adoption checkpoint. Because the parent is parked
+  during stages, these operations never race live work.
+- **Retry vs restart** — proposed definition: *restart* = fresh snapshot from the
+  current parent state, run from scratch (clean). *retry* = the same as restart
+  by default (do not resume a half-broken sandbox); a "continue in the same dirty
+  snapshot" mode can be added later if a real need appears. (Open Question 3.)
 
-Invariant 2 is implemented with the existing input/queue machinery, not a new
-control loop:
-
-- `stage.start_*` returns immediately with a `stage_id`. The parent's system
-  prompt instructs it to then **end its turn** — produce a short "launched stage
-  X, waiting" message and stop. The parent session goes idle.
-- On stage completion the daemon **enqueues a system-originated input** into the
-  parent (the completion notification) and drives it, exactly as a queued
-  follow-up would be delivered to an idle session today.
-- If the stage finishes before the parent's launching turn ends, the
-  notification simply queues and is delivered when the parent next idles. No
-  race, no poll.
-
-The notification is the handoff surface for the parent: it carries each
-subagent's terminal result (status, summary, `suggested_next`) and a link to
-each subagent session for deeper inspection. The parent does not need file
-diffs, because the subagents' file changes are already present in the shared
-workspace.
-
-This is the "background agents" pattern: launch, park, get notified, continue.
+Non-btrfs hosts degrade to reflink/copy snapshots and a directory move for
+adoption; correctness is the same, only slower.
 
 ## Workflows as stage templates
 
-A workflow is a **named, discoverable template** that suggests an ordered list
-of stages. It is not a compiled state machine and it does not own control flow.
+A workflow is a **named, discoverable template** suggesting an ordered list of
+stages. It is not a compiled state machine and does not own control flow.
 
 ```text
 workflow.list      -> compact list of templates (id, title, description)
-workflow.describe  -> the suggested stages for a template
+workflow.describe  -> the suggested stages + guidance for a template
 ```
 
-`workflow.describe` returns something like:
+Example:
 
 ```json
 {
@@ -215,72 +219,52 @@ workflow.describe  -> the suggested stages for a template
   "title": "Implement, review, then test",
   "stages": [
     { "kind": "full",            "role": "implementer", "hint": "implement the change" },
-    { "kind": "readonly_fanout", "roles": ["reviewer"], "hint": "review the diff" },
+    { "kind": "readonly_fanout", "roles": ["reviewer"], "hint": "review the adopted diff" },
     { "kind": "full",            "role": "tester",      "hint": "run tests; fix or report" }
   ],
   "guidance": "If review requests changes, re-run the implementer stage. If tests fail on a code issue, return to implement/review."
 }
 ```
 
-The parent reads the template and runs the stages with discretion: skip, re-run,
-reorder, or stop based on each stage's results. Bundled templates ship as static
-Rust/JSON; disk/user templates can come later. Because the template is only
-guidance, there is no `advance()` to keep in sync with the model's judgment.
+The parent reads the template and runs the stages with discretion. Because the
+template is only guidance, there is no `advance()` to keep in sync with the
+model's judgment. Bundled templates ship as static Rust/JSON first; disk/user
+templates later.
 
-Bundled templates to ship first (all expressible as full/read-only stages):
+Bundled templates to ship first:
 
 - `explore` — one read-only fan-out, then the parent synthesizes.
-- `implement_review` — full implement, read-only review, repeat at parent's
-  discretion.
+- `implement_review` — full implement, read-only review, repeat at discretion.
 - `implement_review_test` — as above plus a full test stage.
 - `kubernetes_e2e` — a single full stage with the `kubernetes-tester` role and
-  safety rules (it writes/builds and talks to a cluster, so it is full, not
-  read-only).
+  safety rules.
 
-`hill_climb` and `parallel_race` from earlier drafts are intentionally **not**
-included: both assume parallel writers, which this model does not support.
-
-## Shared filesystem
-
-Subagents use the parent session's workspace directories directly. There is no
-per-subagent workspace instantiation for subagents (the project-session workspace
-materialization path is unchanged; only subagent forking is removed).
-
-Consequences:
-
-- A full subagent's edits are immediately visible to the parent when the stage
-  completes — nothing to import or merge.
-- Read-only subagents see a stable tree, because nothing else writes while they
-  run (the one-writer property).
-- Durable code changes are committed with the parent's normal git workflow by
-  whichever agent did the writing; the daemon never auto-commits, snapshots, or
-  merges. Git is used by agents inside the shared workspace as usual, not as a
-  cross-subagent transport.
-- `read_parent`/`fork_parent`/`from_task`/`sources` modes are all gone; there is
-  only "the workspace".
+Read-only fan-out can now run builds/tests (each in its own snapshot), so
+parallel analysis that compiles or runs the test suite is fine — unlike the
+prior draft, this no longer has to be a full stage.
 
 ## Handoffs
 
-There is no artifact table. A handoff is two things, both already available:
+There is no artifact table. A handoff is:
 
-1. **The shared filesystem.** Code, evidence files, scratch output — whatever a
-   subagent produced is simply present in the workspace for the parent and the
-   next stage to read.
-2. **The subagent's terminal result** — a small structured object the subagent
-   emits when it finishes: `{ status, summary, suggested_next? }`. This is the
-   "last assistant message" the parent receives in the completion notification.
-   `suggested_next` is typed against the workflow template's declared outcomes,
-   not free text, so the parent's branching is over a known set rather than
-   prose.
-
-Anything durable that is not code (e.g. Kubernetes logs/events) is written to a
-file in the workspace by the subagent and/or summarized in its terminal result.
-There is no separate evidence store. See Open Question 5.
+1. **Filesystem state.** For a full stage, the adopted workspace *is* the
+   parent's workspace — the changes are simply present. For read-only stages,
+   each subagent's snapshot is retained read-only and reachable by absolute path.
+2. **The subagent's terminal result** — `{ status, summary, suggested_next? }`,
+   delivered in the completion notification. `suggested_next` is typed against
+   the workflow template's declared outcomes, so the parent branches over a known
+   set rather than prose.
+3. **Absolute artifact paths.** The subagent's system prompt instructs it to
+   write any non-code evidence (logs, captured events, reports) to files in its
+   cwd and to **list the absolute paths in its final message before the turn
+   ends**. The parent receives those paths and can open them (retained snapshots
+   keep them valid). A structured artifacts view can be added later; for now,
+   passing paths is enough to give the parent context.
 
 ## Minimal durable schema
 
-The durable footprint is intentionally tiny. Reuse `sessions` and
-`sessions.parent_session_id`; add one table and two columns.
+Reuse `sessions`, `sessions.parent_session_id`, and the existing subagent
+workspace-fork metadata. Add one table and two columns.
 
 ### `stages`
 
@@ -289,10 +273,11 @@ stages
   id text primary key
   parent_session_id text not null references sessions(id) on delete cascade
   workflow_id text null           -- template the parent was following, if any
-  label text null                 -- e.g. "explore auth options"
+  label text null
   kind text not null              -- full | readonly_fanout
   status text not null            -- running | done | cancelled | failed
-  attempt_id text not null        -- fences the completion transition
+  adopted_session_id text null    -- the full subagent whose snapshot was adopted
+  attempt_id text not null        -- fences the completion/adoption transition
   created_at timestamptz not null default now()
   updated_at timestamptz not null default now()
 ```
@@ -306,237 +291,187 @@ sessions
   subagent_type text null                    -- full | read_only (null for top-level)
 ```
 
-That is the whole schema delta. No `runs`, `tasks`, `artifacts`, workspace, or
-lease tables. A "run" is just a parent session and its ordered stages; the run
-board renders parent session -> stages -> subagents (+ their terminal results).
+Snapshot subvolume paths and the rollback checkpoint reuse the existing
+per-session workspace metadata; no new workspace/lease tables. A "run" is just a
+parent session and its ordered stages.
 
 ## Stage runner
 
-The runner is small and does exactly one job with the same rigor `agent-store`
-applies to sessions: **detect stage completion and notify the parent, exactly
-once.**
+Small and single-purpose: **detect stage completion, perform adoption if it is a
+successful full stage, and notify the parent exactly once.**
 
 ```rust
 async fn on_subagent_terminal(stage_id: &str) -> Result<()> {
     let mut tx = store.begin().await?;
-    let stage = store.lock_stage(&mut tx, stage_id).await?;     // select ... for update
-    if stage.status != Running { return tx.commit().await; }    // already handled
+    let stage = store.lock_stage(&mut tx, stage_id).await?;       // select ... for update
+    if stage.status != Running { return tx.commit().await; }      // already handled
     let subs = store.subagents_for_stage(&mut tx, stage_id).await?;
     if subs.iter().any(|s| !s.is_terminal()) { return tx.commit().await; }
 
-    // single-flight: only the transition that flips running->done enqueues.
-    store.set_stage_status(&mut tx, stage_id, Done, stage.attempt_id).await?; // CAS on attempt_id
-    let notice = compose_completion_notice(&stage, &subs);       // results + session links
+    // single-flight: only the running->done transition (CAS on attempt_id) acts.
+    let adopted = stage.kind == Full && subs[0].succeeded();
+    if adopted { workspace.adopt(&stage.parent_session_id, &subs[0]).await?; }
+    store.finish_stage(&mut tx, stage_id, adopted.then(|| subs[0].id), stage.attempt_id).await?;
+    let notice = compose_completion_notice(&stage, &subs);        // results + paths + links
     store.enqueue_parent_input(&mut tx, &stage.parent_session_id, notice).await?;
-    tx.commit().await?;          // then drive the parent outside the lock
+    tx.commit().await?;     // then drive the parent outside the lock
     Ok(())
 }
 ```
 
-Properties, all reusing existing patterns:
-
-- **Single-flight per stage** via the stage row lock, mirroring the per-session
-  row lock.
-- **Idempotent**: re-delivery of a subagent lifecycle event re-runs the check; a
-  stage already `Done` short-circuits, so the parent is notified once.
-- **Attempt-fenced**: the `running -> done` transition is a compare-and-set on
-  `attempt_id`, so a stale completion cannot re-fire a notification.
-- **Crash-safe**: on daemon restart, a sweep re-evaluates `running` stages whose
-  subagents are all terminal and delivers the missed notification.
-
-The runner never decides the next stage. That is the parent's job (inv. 3).
+Properties (all reusing existing patterns): single-flight per stage via the stage
+row lock; idempotent (a stage already `Done` short-circuits, so the parent is
+notified once); attempt-fenced adoption/notification; crash-safe via a
+startup sweep over `running` stages whose subagents are all terminal. The runner
+never decides the next stage — that is the parent's job.
 
 ## Tools
 
-Orchestration tools (parent / top-level agent):
-
 ```text
-stage.start_full         -> { role, prompt }            ; one full subagent
-stage.start_readonly_fanout -> { tasks: [{role, prompt}, ...] }  ; N read-only subagents
-stage.status             -> inspect a stage and its subagents
-stage.cancel             -> cancel an in-flight stage (all its subagents)
-workflow.list            -> list templates
-workflow.describe        -> a template's suggested stages
+stage.start_full            -> { role, prompt }                         ; one full subagent
+stage.start_readonly_fanout -> { tasks: [{role, prompt}, ...] }         ; N read-only subagents
+stage.status                -> inspect a stage and its subagents
+stage.cancel                -> cancel an in-flight stage
+workflow.list               -> list templates
+workflow.describe           -> a template's suggested stages
 ```
 
-Steering/interrupt of the single full subagent reuses the existing subagent
-steer/interrupt path. Read-only subagents reject steer/interrupt by type.
-
-The parent is told, in its system prompt: launch at most one stage per turn,
-then end your turn and wait for the completion notification; never poll, never
-start a second stage while one is running, and never mix full and read-only work
-in one stage.
-
-The Python REPL remains only as a raw escape hatch; `subagents.wait(...)`
-busy-waiting is no longer the orchestration path. See Migration.
+Steer/interrupt of the single full subagent reuses the existing subagent path;
+read-only subagents reject steer/interrupt by type. System-prompt rule for the
+parent: launch at most one stage per turn, then end your turn and wait for the
+notification; never poll, never start a second stage while one runs, never mix
+full and read-only in one stage. The Python REPL remains a raw escape hatch only.
 
 ## Human-in-the-loop
 
-Human interaction is lighter here because the parent session is the user's
-session:
-
-- The parent asks the user directly when it needs a decision.
-- A full subagent that needs the human ends with
-  `suggested_next = human_needed`; that surfaces in the completion notification,
-  and the parent relays it to the user.
-- While a stage is in flight the parent is parked. User input sent in the
-  meantime queues (existing queue semantics) and is seen when the parent next
-  resumes; to abort early the user cancels the stage. (Confirm in Open
-  Question 4.)
-
-No blocked-run table, no signal artifact, no separate human-request store.
+Lighter, because the parent session is the user's session: the parent asks the
+user directly; a full subagent that needs the human ends with
+`suggested_next = human_needed`, which surfaces in the notification and the
+parent relays it. While a stage is in flight the parent is parked and user input
+queues (existing queue semantics); to intervene early the user cancels the stage.
+No blocked-run table, no signal artifact. (Confirm input behavior in Open
+Question 5.)
 
 ## Testing
 
-The subsystem must be testable without real model calls, reusing the dev harness
-that already resolves model actions deterministically (`harness.model.complete`
-/ `harness.model.fail`).
+Reuse the dev harness that resolves model actions deterministically
+(`harness.model.complete` / `harness.model.fail`).
 
-- **Stage completion / notification (real Postgres).** Drive subagents to
-  terminal states via the harness and assert the parent receives exactly one
-  notification; assert re-delivered lifecycle events and restart sweeps do not
-  double-notify; assert a stale `attempt_id` cannot re-fire. Inspect both the
-  stage/session rows and the emitted events.
-- **Homogeneity enforcement.** `stage.start_*` rejects mixing full and read-only
-  in one stage, and rejects a second stage while one is running.
-- **Read-only enforcement.** A read-only subagent attempting to write the
-  workspace fails (mechanism per Open Question 1) — this is a correctness test,
-  not a nicety.
-- **Parking / resume.** A parent that launches a stage goes idle and is re-driven
+- **Completion / adoption / notification (real Postgres + btrfs):** drive
+  subagents to terminal states; assert a successful full stage adopts exactly
+  once and swaps the parent workspace; assert read-only stages adopt nothing;
+  assert re-delivered events and restart sweeps do not double-notify or
+  double-adopt; assert a stale `attempt_id` cannot re-fire.
+- **Isolation:** a read-only subagent that writes does not affect the parent or
+  its siblings; its files are reachable read-only by the reported path until
+  teardown.
+- **Rollback:** discarding a snapshot restores the parent's workspace exactly;
+  restarting re-snapshots from current state.
+- **Homogeneity / single-flight:** `stage.start_*` rejects mixed stages and a
+  second concurrent stage.
+- **Parking / resume:** a parent that launches a stage idles and is re-driven
   only by the completion notification.
-- **Typed outcomes.** A `suggested_next` outside the template's declared outcome
-  set is recorded as a subagent error, not silently matched.
+- **Typed outcomes:** a `suggested_next` outside the template's set is recorded
+  as a subagent error.
 
 ## Migration and coexistence
 
 | Surface | Today | Steady state |
 | --- | --- | --- |
-| `stage.*` + `workflow.*` templates | new | the way to run multi-step and parallel-read work |
-| Python REPL `subagents.*` (busy-wait) | current primary API | demoted to a raw escape hatch; no longer documented for orchestration |
+| `stage.*` + `workflow.*` | new | the way to run staged and parallel-read work |
+| Python REPL `subagents.*` (busy-wait) | current primary | raw escape hatch; undocumented for orchestration |
 
-Sequence:
-
-1. Ship typed subagents, stages, and notifications (Phases 0–3).
-2. Repoint the `PI.md` "Subagent delegation" guidance at `stage.*` and the
-   park-and-wait pattern. Remove the eager `subagents.spawn/wait` guidance.
-3. Keep the Python REPL available but stop teaching `subagents.wait` as the way
-   to orchestrate. Removing it entirely is a later follow-up.
+Sequence: ship typed subagents + stages + notifications (Phases 0–3); repoint the
+`PI.md` "Subagent delegation" guidance at `stage.*` and park-and-wait; stop
+teaching `subagents.wait`. Full removal of the REPL orchestration path is a later
+follow-up.
 
 ## Implementation phases
 
 ### Phase 0: lifecycle foundation
 
-- Land PR #150 (parent-visible child lifecycle events) on `main`; its tip is not
-  yet there.
-- Keep using `sessions.parent_session_id`.
+- Land PR #150 (parent-visible child lifecycle events) on `main`.
 - Update `architecture.md` to retire the "no subagent orchestration" non-goal.
 
-### Phase 1: typed subagents on the shared filesystem
+### Phase 1: typed subagents in snapshots
 
 - Add `subagent_type` (full | read_only) to sessions.
-- Make subagents run in the parent's workspace directories; **remove subagent
-  workspace forking** (the btrfs/reflink fork-for-subagents path).
-- Implement read-only enforcement (Open Question 1).
+- Keep the existing workspace fork for every subagent's snapshot; add
+  **non-adoption** for read-only and **adopt-on-success** (subvolume swap +
+  rollback checkpoint) for full.
+- Add read-only snapshot **retention** until run teardown.
 
 ### Phase 2: stages and the homogeneity rule
 
 - Add the `stages` table and `stage_id` on sessions.
 - Add `stage.start_full`, `stage.start_readonly_fanout`, `stage.status`,
-  `stage.cancel`.
-- Enforce inv. 1 (homogeneous stage) and "one stage at a time per parent".
+  `stage.cancel`; enforce homogeneity and one-stage-at-a-time.
 
 ### Phase 3: notifications and parking
 
-- Implement the stage runner: single-flight completion detection, completion
-  notification enqueued to the parent, attempt-fenced, crash-recovery sweep.
-- Add the system-prompt instructions for park-and-wait.
-- Deterministic tests for completion/notification idempotency.
+- Stage runner: single-flight completion, adoption, completion notification to
+  the parent, attempt fencing, crash-recovery sweep.
+- System-prompt park-and-wait instructions; deterministic idempotency tests.
 
 ### Phase 4: workflow templates
 
-- Add `workflow.list` / `workflow.describe` over bundled static templates.
-- Ship `explore`, `implement_review`, `implement_review_test`, `kubernetes_e2e`.
-- Type each template's outcomes and validate `suggested_next`.
+- `workflow.list` / `workflow.describe` over bundled static templates.
+- Ship `explore`, `implement_review`, `implement_review_test`, `kubernetes_e2e`;
+  type each template's outcomes.
 
 ### Phase 5: UI
 
-- Run board: parent session -> stages -> subagents with terminal results.
-- Show in-flight stage, per-subagent status, and pending human relays.
-- Controls: cancel stage, steer the full subagent, re-run a stage.
+- Run board: parent session -> stages -> subagents with terminal results and
+  artifact paths; show adopted vs discarded snapshots.
+- Controls: cancel stage, steer the full subagent, re-run / rollback a stage.
 
 ## Open questions
 
-1. **How is read-only enforced?** This is the linchpin of correctness: parallel
-   read-only subagents share the filesystem, so a write by one corrupts all.
-   Options, lightest to strongest:
-   - *Advisory only* — read-only agents get no `edit` tool and are told not to
-     write; `bash` can still write, so a buggy agent can corrupt the run.
-     Simplest, weakest.
-   - *Read-only workspace mount* — the workspace is bind-mounted read-only for
-     read-only subagents' tool execution (scratch/tmp stays writable). Honors
-     "same filesystem, no snapshot/subvolume" while actually preventing writes.
-     My recommended default.
-   - *OS user / perms* — run read-only subagents as a uid lacking write
-     permission on the workspace. Strong but host-specific.
-   A consequence of any real enforcement: read-only agents **cannot build or run
-   tests** (those write `target/`, caches). So "build/test" is always a full
-   stage. Confirm that rule.
-
-2. **Is dropping parallel writes acceptable?** This model removes
-   `parallel_race` and any N-parallel-implementer pattern. The substitute is
-   parallel read-only exploration feeding a single full implementation stage. Is
-   that an acceptable permanent limitation, or do we need an isolated-parallel
-   escape hatch later (which would reintroduce snapshots)?
-
-3. **How deterministic/replayable must runs be?** Parent-driven sequencing is
-   less replayable than a compiled `advance()` state machine: the "next stage"
-   is an LLM decision, not a pure function. Durable stage records make it
-   *recoverable*, but not *deterministic*. For a personal runtime this is likely
-   fine; confirm we are not giving up a replay/repro property we want.
-
-4. **What happens to user input during an active stage?** Default proposal: the
-   parent stays parked and user follow-ups queue until the stage completes; the
-   user cancels the stage to intervene early. Alternative: user input
-   auto-cancels or pauses the stage. Which is the right default?
-
-5. **Where does non-code evidence live?** With no artifact table, durable
-   non-code output (k8s logs/events, profiling) is either committed as files in
-   the workspace or summarized in the subagent's terminal result. Is that
-   sufficient, or do we want a tiny optional evidence blob keyed to a subagent?
-
-6. **What does "re-run a stage" mean without snapshots?** Re-running does not
-   roll back the filesystem — the previous stage's writes persist. A clean
-   re-run requires the parent or user to `git reset`/`stash` first. Is
-   forward-only re-execution acceptable, or do we need a cheap rollback (which
-   pulls snapshots back in)?
-
-7. **Can full subagents orchestrate their own stages (recursion)?** Deferred in
-   v1 to keep the one-writer argument one level deep. If we later allow it, the
-   parking discipline must hold recursively (a full subagent that launches a
-   sub-stage must itself park). Worth deciding before the prompt/tooling
-   hardcodes "only the top-level parent orchestrates".
-
-8. **Notification size and shape.** What exactly goes in the completion notice —
-   only `summary` + `suggested_next` + session links, or also a bounded slice of
-   each subagent's output? How is it truncated for a large fan-out so it does not
-   blow the parent's context?
-
-9. **Failure policy for a fan-out.** If 3 of 5 read-only subagents fail, does the
-   stage report `done` with partial results, or `failed`? Proposed: always
-   deliver partial results and let the parent decide; the stage status reflects
-   "completed with failures". Confirm.
+1. **Does the full agent work in a snapshot adopted on success, or write the
+   parent's dir in place?** This rev assumes snapshot + adopt-on-success (uniform
+   with read-only, gives rollback). In-place is simpler but loses clean rollback.
+   Confirm the snapshot+adopt choice.
+2. **Revive parallel writers?** Snapshot isolation makes N full subagents +
+   adopt-one-winner (`parallel_race`) safe again. Keep the one-full-per-stage
+   invariant, or reopen parallel write candidates with an explicit winner-pick
+   step?
+3. **Retry semantics.** Proposed: retry == restart (fresh snapshot, run from
+   scratch); no "resume the dirty sandbox" mode in v1. Acceptable?
+4. **Non-blocking read-only fan-out?** Because read-only snapshots are isolated,
+   the parent could keep working while a read-only fan-out runs in the
+   background, instead of parking. Keep parking for uniformity, or allow
+   background read-only stages later?
+5. **User input during an active stage.** Default: parent stays parked, user
+   follow-ups queue, user cancels the stage to intervene early. Right default?
+6. **Naming.** "read-only" agents can write their sandbox; is "disposable" or
+   "non-adopting" a less misleading name?
+7. **Snapshot GC / disk pressure.** Retained read-only snapshots accumulate per
+   run. When are they reclaimed — on run teardown, on parent session close, or a
+   TTL? A long run with many read-only fan-outs could hold many subvolumes.
+8. **Adoption atomicity across multiple workspace dirs.** A session can have
+   several workspace subdirectories. Adoption must swap them consistently (all or
+   nothing) so a crash mid-adoption cannot leave a half-swapped workspace.
+9. **Notification size.** Bound the completion notice for large fan-outs
+   (summaries + paths + links, with truncation) so it does not blow the parent's
+   context.
+10. **Fan-out failure policy.** If some read-only subagents fail, deliver partial
+    results and let the parent decide (proposed), with stage status "completed
+    with failures".
 
 ## Design rules
 
-1. Serialize writes in time, not space: at most one writer at any instant.
-2. Subagents share the parent filesystem. No snapshot, fork, or merge.
-3. A stage is homogeneous: one full subagent, or many read-only subagents.
-4. The parent never polls or busy-waits; it parks and is notified.
-5. Read-only means *enforced* read-only, because reads are concurrent.
-6. Handoffs are the shared filesystem plus the subagent's typed terminal result.
-   There is no artifact store and no cross-subagent variable store.
-7. Workflows are templates that suggest stages; the parent owns sequencing.
-8. The daemon owns mechanism (types, homogeneity, notifications, durable stages);
-   the model owns policy (which stage next, re-run, stop).
-9. Subagents are non-recursive in v1.
-10. Build/test work is a full stage, never a read-only fan-out.
+1. Snapshots isolate; nothing is ever merged. Adoption is a single swap.
+2. Every subagent runs in its own snapshot of the parent workspace.
+3. read-only (disposable) snapshots are discarded; a successful full snapshot is
+   adopted. That distinction *is* the subagent-type distinction.
+4. A stage is homogeneous: one full, or many read-only (one adoption per stage).
+5. The parent never polls or busy-waits; it parks and is notified.
+6. Subagents cannot spawn subagents.
+7. Handoffs are the adopted/retained filesystem plus the subagent's typed
+   terminal result plus absolute artifact paths. No artifact store, no variable
+   store.
+8. Workflows are templates that suggest stages; the parent owns sequencing.
+9. The daemon owns mechanism (snapshots, adoption, homogeneity, notifications,
+   durable stages); the model owns policy (which stage next, re-run, rollback,
+   stop).
+10. Prefer rollback (discard a snapshot) over any attempt to undo writes in place.
