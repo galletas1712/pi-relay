@@ -389,12 +389,13 @@
       Run/Task/Artifact + workflow-plugin design that has been replaced. The
       canonical plan is now <code>workflow-orchestration.md</code>
       (one durable workspace; the single "full" subagent writes the parent's
-      dirs in place while "read-only" subagents run in disposable btrfs
-      snapshots destroyed on return and hand back only their final message;
-      nothing is merged, adopted, or rolled back; the parent parks and is
-      notified on stage completion). The diagrams and primitives below are kept
-      only as design history and are <em>not</em> the current design. This file
-      needs a rewrite or deletion.
+      dirs in place while "read-only (RO)" subagents run in disposable btrfs
+      snapshots destroyed on return; results propagate via a daemon-written
+      handoff directory — each subagent's final message + transcript as files —
+      with a short steer pointing the parent there; nothing is merged, adopted,
+      or rolled back; the parent parks but stays responsive). The diagrams and
+      primitives below are kept only as design history and are <em>not</em> the
+      current design. This file needs a rewrite or deletion.
     </div>
     <header class="hero">
       <div class="hero-main card">
