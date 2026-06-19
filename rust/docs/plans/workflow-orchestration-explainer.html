@@ -388,12 +388,13 @@
       <strong>⚠️ Superseded.</strong> This explainer describes an earlier
       Run/Task/Artifact + workflow-plugin design that has been replaced. The
       canonical plan is now <code>workflow-orchestration.md</code>
-      (each subagent runs in its own disposable btrfs snapshot; a successful
-      "full" subagent's snapshot is adopted via atomic swap while read-only
-      subagents' snapshots are discarded; nothing is ever merged; the parent
-      parks and is notified on stage completion). The diagrams and primitives
-      below are kept only as design history and are <em>not</em> the current
-      design. This file needs a rewrite or deletion.
+      (one durable workspace; the single "full" subagent writes the parent's
+      dirs in place while "read-only" subagents run in disposable btrfs
+      snapshots destroyed on return and hand back only their final message;
+      nothing is merged, adopted, or rolled back; the parent parks and is
+      notified on stage completion). The diagrams and primitives below are kept
+      only as design history and are <em>not</em> the current design. This file
+      needs a rewrite or deletion.
     </div>
     <header class="hero">
       <div class="hero-main card">
