@@ -1,9 +1,10 @@
 # Subagent stages & workflows — implementation plan
 
-Status: **design settled; ready to implement.** The only gating prerequisite is
-landing PR #150 on `main` (see Implementation guide → Prerequisite). This document
-is the canonical spec; the sibling `workflow-orchestration-explainer.html` is an
-earlier design and is superseded.
+Status: **design settled; ready to implement.** The former gating prerequisite —
+parent-visible child lifecycle events (PR #150) — has landed on `main`, so there
+is no longer a blocking dependency. This document is the canonical spec; the
+sibling `workflow-orchestration-explainer.html` is an earlier design and is
+superseded.
 
 ## Summary
 
@@ -77,11 +78,28 @@ tool behavior elsewhere).
 
 ## Relationship to the stated architecture
 
-This plan reverses a documented non-goal. `architecture.md` lists "Do not include
-subagent orchestration" (Goal 6) and names the removed `agent-orchestrator` crate
-under "Removed Pieces". That guidance predates durable subagent sessions, parent
-links, and lifecycle events, which have shipped. **Phase 0 updates
-`architecture.md`** in the same change so the docs and this plan agree.
+`architecture.md` already supports subagent delegation (Goal 6: "bounded
+parent/child subagent delegation … without a generic injected-message routing
+layer or event bus") and documents the current shape: a parent spawns forked
+child sessions by role/skill (optionally with a forked-context snapshot and git
+source-refs), then lists/waits/reads/steers/interrupts them, with
+`subagent.{spawned,running,idle}` lifecycle events on the wire and spawn/control
+flowing through the in-process Python REPL `subagents` module.
+
+So this plan **evolves documented behavior; it does not introduce orchestration
+into a void.** It changes three things the architecture currently describes, and
+those doc updates ship with the implementation:
+
+- **Control surface:** Python REPL `subagents.*` (busy-wait) → regular `stage.*`
+  tool calls + daemon steer notifications (no busy-wait).
+- **Workspace handoff:** forked-context snapshots and git source-refs between
+  subagents → one durable workspace (full writes in place; RO disposable
+  snapshots) with file-based handoff; no merge, no source-refs.
+- **Patterns:** ad hoc delegation → named workflow **skills** the parent drives.
+
+The architecture's bounded-parent/child model and "no generic event bus" stance
+are preserved: stages are still parent/child forks, and the only cross-session
+signal is the existing parent-scoped lifecycle event the barrier consumes.
 
 ### This is the third orchestration attempt; do not repeat the first two
 
@@ -92,7 +110,7 @@ links, and lifecycle events, which have shipped. **Phase 0 updates
    Control flow polled named variables and lived in editable Python templates.
    *Lesson: no general variable store, no model-authored control-flow scripts, no
    daemon-executed workflow graph.*
-3. **Python REPL `subagents.*` (current).** The parent **busy-waits**
+3. **Python REPL `subagents.*` (current, shipped).** The parent **busy-waits**
    (`subagents.wait`). *Lesson: park and be notified, never spin.*
 
 ## Subagent types
@@ -427,14 +445,13 @@ functions is a later cleanup.
 This is the build brief: what exists, what is new, and the exact seams. Verified
 against the tree at the time of writing.
 
-### Prerequisite (hard gate)
+### Prerequisite (satisfied)
 
-**PR #150 (`fix/subagent-orchestration-api-notifications`, tip `05efa72`) must
-land on `main` first.** As of writing its tip is **not on `origin/main`** (verify
-with `git merge-base --is-ancestor 05efa72 origin/main`). It adds the
-parent-visible child lifecycle events (`child spawned/running/idle/done`, stale
-recovery) that the stage runner's barrier subscribes to. Without it there is no
-completion signal to trigger the barrier.
+The former hard gate — parent-visible child lifecycle events
+(`subagent.{spawned,running,idle}`, stale recovery) from PR #150 — **has landed on
+`main`** (commit `00f14f9`, "Improve subagent orchestration lifecycle (#150)").
+The stage runner's barrier subscribes to those events. There is no remaining
+blocking dependency; implementation can start immediately.
 
 ### Code seams to build on (verified to exist)
 
@@ -501,10 +518,13 @@ busy-wait/poll loop.
 
 ## Implementation phases
 
-### Phase 0 — prerequisite
+### Phase 0 — docs alignment
 
-- Land PR #150 on `main`.
-- Update `architecture.md` to retire the "no subagent orchestration" non-goal.
+- PR #150 (lifecycle events) is already on `main`; no code prerequisite remains.
+- Update `architecture.md` and `agent-daemon.md` to describe the `stage.*` control
+  surface, the one-durable-workspace handoff model, and workflow skills, replacing
+  the current "spawn/control via the Python REPL `subagents` module" /
+  forked-context-snapshot / git-source-ref descriptions.
 
 ### Phase 1 — typed subagents
 
