@@ -2,9 +2,24 @@
 
 Status: **design settled; ready to implement.** The former gating prerequisite —
 parent-visible child lifecycle events (PR #150) — has landed on `main`, so there
-is no longer a blocking dependency. This document is the canonical spec; the
-sibling `workflow-orchestration-explainer.html` is an earlier design and is
-superseded.
+is no longer a blocking dependency. This document is the canonical spec.
+
+## Handoff package
+
+Everything a builder needs is under `rust/docs/plans/`:
+
+| File | What it is | Status |
+| --- | --- | --- |
+| `workflow-orchestration.md` (this file) | The canonical spec + build brief (Implementation guide, Appendices A/B). | authoritative |
+| `phase-0-doc-edits.md` | Exact `architecture.md` / `agent-daemon.md` edits, staged to apply **with** the `stage.*` landing. | apply in Phase 0 |
+| `workflow-skills/README.md` | How to install workflow skills (one loader line + copy files). | apply in Phase 4 |
+| `workflow-skills/workflow-*/SKILL.md` | The four bundled workflow-pattern skills, as inert drafts. | install in Phase 4 |
+
+Build in phase order (below). The design is settled and the open questions are
+all decided ("Decided defaults"); do not reopen them or the "Rejected options".
+Read the **Implementation guide** for the verified code seams, the net-new pieces,
+and where each lives. `subagent-source-ref-merge-plan.md` is retained only as
+history (it documents the legacy `sources=` path that this design removes).
 
 ## Summary
 
@@ -521,10 +536,10 @@ busy-wait/poll loop.
 ### Phase 0 — docs alignment
 
 - PR #150 (lifecycle events) is already on `main`; no code prerequisite remains.
-- Update `architecture.md` and `agent-daemon.md` to describe the `stage.*` control
-  surface, the one-durable-workspace handoff model, and workflow skills, replacing
-  the current "spawn/control via the Python REPL `subagents` module" /
-  forked-context-snapshot / git-source-ref descriptions.
+- Apply the staged doc edits in `phase-0-doc-edits.md` (architecture.md goals +
+  subagent-delegation bullet + not-implemented list; agent-daemon.md runtime
+  summary) **in the same change that lands `stage.*`**, so the docs never describe
+  unbuilt behavior.
 
 ### Phase 1 — typed subagents
 
@@ -549,8 +564,14 @@ busy-wait/poll loop.
 
 ### Phase 4 — workflow skills
 
-- Author `explore`, `implement_review`, `implement_review_test`, `kubernetes_e2e`
-  as `SKILL.md`; rewrite the `PI.md` "Subagent delegation" section.
+- Install the drafted skills in `workflow-skills/` (see its `README.md`): add a
+  `load_global_skills_from_dir(&prompt_root.join("workflows"))` call next to the
+  existing `subagent-roles` scan in
+  `agent-daemon/src/provider_runtime/skills.rs`, and copy each
+  `workflow-skills/<name>/SKILL.md` to `workflows/<name>/SKILL.md` at the prompt
+  root. Ships: `workflow-explore`, `workflow-implement-review`,
+  `workflow-implement-review-test`, `workflow-kubernetes-e2e`.
+- Replace the `PI.md` "Subagent delegation" section with Appendix B.
 
 ### Phase 5 — UI
 
