@@ -57,7 +57,7 @@ pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> Prompt
             })
             .collect(),
         tools: tool_specs(state, config.provider.kind),
-        skills: load_prompt_skills(config),
+        skills: load_prompt_skills(&state.prompt_root, config),
     }
 }
 
@@ -78,8 +78,11 @@ fn tool_specs(state: &AppState, provider: ProviderKind) -> Vec<ToolSpec> {
         .collect()
 }
 
-fn load_prompt_skills(config: &SessionConfig) -> Vec<Skill> {
-    load_skills_for_session_workspaces(&PathBuf::from(&config.outer_cwd), &config.workspaces)
+fn load_prompt_skills(prompt_root: &Path, config: &SessionConfig) -> Vec<Skill> {
+    let mut skills =
+        load_skills_for_session_workspaces(&PathBuf::from(&config.outer_cwd), &config.workspaces);
+    skills.extend(load_global_skills_from_dir(&prompt_root.join("workflows")));
+    skills
 }
 
 #[derive(Debug)]
@@ -391,6 +394,53 @@ mod tests {
         assert!(!skills.iter().any(|skill| skill.name == "reviewer"));
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn workflow_skills_are_prompt_skills_but_roles_stay_hidden() {
+        let prompt_root = make_temp_dir("workflow-skills-in-index");
+        let outer = prompt_root.join("outer");
+        let workspace = outer.join("repo");
+        std::fs::create_dir_all(&workspace).expect("workspace dir");
+        write_skill(
+            &prompt_root.join("workflows/workflow-explore/SKILL.md"),
+            "workflow-explore",
+            "parallel read-only exploration",
+        );
+        write_skill(
+            &prompt_root.join("subagent-roles/explore/SKILL.md"),
+            "explore",
+            "default subagent role",
+        );
+        write_skill(
+            &workspace.join(".agents/skills/visible/SKILL.md"),
+            "visible",
+            "normal skill",
+        );
+
+        let config = SessionConfig {
+            project_id: None,
+            outer_cwd: outer.to_string_lossy().to_string(),
+            workspaces: vec![SessionWorkspace::local("repo", "")],
+            system_prompt: String::new(),
+            provider: agent_vocab::ProviderConfig {
+                kind: ProviderKind::Claude,
+                model: "claude-opus-4-8".to_string(),
+                reasoning_effort: agent_vocab::ReasoningEffort::Medium,
+                max_tokens: None,
+                prompt_cache: None,
+            },
+            metadata: serde_json::Value::Null,
+        };
+
+        let skills = load_prompt_skills(&prompt_root, &config);
+        assert!(skills
+            .iter()
+            .any(|skill| skill.workspace.is_none() && skill.name == "workflow-explore"));
+        assert!(skills.iter().any(|skill| skill.name == "visible"));
+        assert!(!skills.iter().any(|skill| skill.name == "explore"));
+
+        std::fs::remove_dir_all(prompt_root).ok();
     }
 
     fn write_skill(path: &Path, name: &str, description: &str) {
