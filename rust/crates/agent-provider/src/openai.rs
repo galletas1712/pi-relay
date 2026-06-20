@@ -1924,9 +1924,17 @@ mod tests {
         assert_eq!(body["tools"][4]["type"], "function");
         assert_eq!(body["tools"][4]["name"], "PythonRepl");
         assert_eq!(body["tools"][5]["type"], "function");
-        assert_eq!(body["tools"][5]["name"], "web_fetch");
+        assert_eq!(body["tools"][5]["name"], "stage_cancel");
         assert_eq!(body["tools"][6]["type"], "function");
-        assert_eq!(body["tools"][6]["name"], "web_search");
+        assert_eq!(body["tools"][6]["name"], "stage_start_full");
+        assert_eq!(body["tools"][7]["type"], "function");
+        assert_eq!(body["tools"][7]["name"], "stage_start_readonly_fanout");
+        assert_eq!(body["tools"][8]["type"], "function");
+        assert_eq!(body["tools"][8]["name"], "stage_status");
+        assert_eq!(body["tools"][9]["type"], "function");
+        assert_eq!(body["tools"][9]["name"], "web_fetch");
+        assert_eq!(body["tools"][10]["type"], "function");
+        assert_eq!(body["tools"][10]["name"], "web_search");
     }
 
     #[test]

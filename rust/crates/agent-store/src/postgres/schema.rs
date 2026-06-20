@@ -122,6 +122,22 @@ create table if not exists events (
 );
 
 create index if not exists events_session_id_idx on events(session_id, id);
+
+create table if not exists stages (
+    id text primary key,
+    parent_session_id text not null references sessions(id) on delete cascade,
+    workflow text null,
+    label text null,
+    kind text not null,
+    status text not null,
+    attempt_id text not null,
+    created_at timestamptz not null default now(),
+    updated_at timestamptz not null default now()
+);
+
+create index if not exists stages_parent_created_idx on stages(parent_session_id, created_at, id);
+
+alter table sessions add column if not exists stage_id text null references stages(id);
 "#;
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {
