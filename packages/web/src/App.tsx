@@ -2246,11 +2246,7 @@ function compactionErrorNotice(data: Record<string, unknown>): string {
 
 function subagentLabel(data: Record<string, unknown>): string {
 	const label =
-		typeof data.display_name === "string" && data.display_name.trim()
-			? data.display_name.trim()
-			: typeof data.role === "string" && data.role.trim()
-				? data.role.trim()
-				: "subagent";
+		typeof data.role === "string" && data.role.trim() ? data.role.trim() : "subagent";
 	const child = typeof data.child_session_id === "string" ? data.child_session_id.slice(0, 13) : "";
 	return child ? `${label} ${child}` : label;
 }

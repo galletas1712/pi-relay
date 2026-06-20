@@ -15,7 +15,7 @@ use agent_store::{
     AcceptedInput, ActionUpdate, EventFrame, EventType, OutputBatch, QueuedInput, SessionActivity,
     SessionConfig, SubagentType,
 };
-use agent_vocab::{ProviderReplayItem, TranscriptItem, TurnOutcome};
+use agent_vocab::ProviderReplayItem;
 use anyhow::Context;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -470,8 +470,8 @@ impl SessionDriver {
     }
 
     async fn try_subagent_parent_idle_event(&self) -> Option<EventFrame> {
-        let notification = match self.subagent_idle_notification().await {
-            Ok(Some(notification)) => notification,
+        let notification_key = match self.subagent_idle_notification_key().await {
+            Ok(Some(notification_key)) => notification_key,
             Ok(None) => return None,
             Err(error) => {
                 eprintln!(
@@ -481,7 +481,6 @@ impl SessionDriver {
                 return None;
             }
         };
-        let (_parent_session_id, notification_key, _payload) = notification;
 
         // Every parentful subagent is a stage member (the only spawn path sets a
         // stage_id). A stage member's completion is delivered as ONE stage steer,
@@ -547,43 +546,29 @@ impl SessionDriver {
         }
     }
 
-    /// The parent-visible idle notification for this child: its parent id, the
-    /// once-gate dedup key (the terminal active leaf), and the event payload.
-    /// `None` when this session has no parent (a top-level session).
-    async fn subagent_idle_notification(
+    /// The once-gate dedup key (the terminal active leaf) for this child's
+    /// parent-visible idle. `None` when this session has no parent (a top-level
+    /// session). The caller only needs the key: a stage member's completion is
+    /// delivered as a single stage steer, not a per-child idle payload.
+    async fn subagent_idle_notification_key(
         &self,
-    ) -> std::result::Result<Option<(String, String, Value)>, RpcError> {
-        let Some(parent_session_id) = self
+    ) -> std::result::Result<Option<String>, RpcError> {
+        if self
             .state
             .repo
             .session_parent_id(&self.session_id)
             .await
             .map_err(anyhow::Error::from)?
-        else {
+            .is_none()
+        {
             return Ok(None);
-        };
-        let config = self
-            .state
-            .repo
-            .load_session_config(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        }
         let turns = self
             .state
             .repo
             .transcript_turns(&self.session_id, None, Some(20))
             .await
             .map_err(anyhow::Error::from)?;
-        // A subagent with no finished turn defaults to Crashed, consistent with
-        // the durable handoff classification (`handoff::subagent_outcome`): a
-        // session that reached idle without any TurnFinished did not finish
-        // gracefully.
-        let outcome = turns
-            .cards
-            .iter()
-            .rev()
-            .find_map(|card| card.outcome)
-            .unwrap_or(TurnOutcome::Crashed);
         let notification_key = turns
             .cards
             .iter()
@@ -597,30 +582,7 @@ impl SessionDriver {
                     .map(|active_leaf_id| format!("active_leaf:{active_leaf_id}"))
             })
             .unwrap_or_else(|| "empty".to_string());
-        let text = turns
-            .cards
-            .iter()
-            .rev()
-            .filter_map(|card| card.assistant_message.as_ref())
-            .find_map(|entry| match &entry.item {
-                TranscriptItem::AssistantMessage(message) => Some(message.text()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let summary_preview = if text.chars().count() > 500 {
-            format!("{}…", text.chars().take(500).collect::<String>())
-        } else {
-            text
-        };
-        let payload = json!({
-            "child_session_id": self.session_id,
-            "role": config.metadata.get("role_name").and_then(Value::as_str),
-            "role_workspace": config.metadata.get("role_workspace").and_then(Value::as_str),
-            "display_name": config.metadata.get("display_name").and_then(Value::as_str),
-            "outcome": outcome,
-            "summary_preview": summary_preview,
-        });
-        Ok(Some((parent_session_id, notification_key, payload)))
+        Ok(Some(notification_key))
     }
 
     async fn consume_ready_steer(

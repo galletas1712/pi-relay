@@ -947,6 +947,73 @@ async fn terminal_stage_member_yields_zero_parent_idle_rows() {
     env.cleanup().await;
 }
 
+/// Server-side guard: a `Steer`-priority input targeting a `read_only` subagent
+/// is rejected with `cannot_steer_read_only_subagent`, while a follow-up to the
+/// same subagent and a steer to a full subagent are both accepted.
+#[tokio::test]
+async fn steering_a_read_only_subagent_is_rejected_server_side() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "steer guard test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let stage = env
+        .state
+        .repo
+        .create_stage("parent", StageKind::Full, None, None, 2)
+        .await
+        .expect("create stage");
+    create_terminal_subagent(
+        &env, project_id, "parent", &stage.id, "ro", "reviewer", SubagentType::ReadOnly,
+        TurnOutcome::Graceful, "done",
+    )
+    .await;
+    create_terminal_subagent(
+        &env, project_id, "parent", &stage.id, "full", "implementer", SubagentType::Full,
+        TurnOutcome::Graceful, "done",
+    )
+    .await;
+
+    let steer = |session_id: &str| {
+        json!({
+            "session_id": session_id,
+            "priority": "steer",
+            "content": [{ "type": "text", "text": "stop" }],
+        })
+    };
+
+    // Steering the read-only subagent is rejected by the server guard.
+    let rejected = crate::input_user(&env.state, steer("ro"))
+        .await
+        .expect_err("steering a read_only subagent must be rejected");
+    assert_eq!(rejected.code, "cannot_steer_read_only_subagent");
+
+    // Steering the full subagent is accepted (only read_only is guarded).
+    crate::input_user(&env.state, steer("full"))
+        .await
+        .expect("steering a full subagent is allowed");
+
+    // A follow-up to the read-only subagent is unaffected by the steer guard.
+    crate::input_user(
+        &env.state,
+        json!({
+            "session_id": "ro",
+            "priority": "follow_up",
+            "content": [{ "type": "text", "text": "fyi" }],
+        }),
+    )
+    .await
+    .expect("a follow-up to a read_only subagent is allowed");
+
+    env.cleanup().await;
+}
+
 /// FIX E: a stage member whose initial dispatch fails produces no parent-visible
 /// `subagent.idle`. We exercise the spawn path with a provider error by spawning
 /// into a stage from a parent that will fail dispatch; the dispatch-failed

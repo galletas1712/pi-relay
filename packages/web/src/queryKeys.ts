@@ -7,7 +7,6 @@ export const queryKeys = {
 	tools: (provider: string) => ["tools", provider] as const,
 	sessions: (projectId: string | null) => ["sessions", projectId] as const,
 	stages: (parentSessionId: string | null) => ["stages", parentSessionId] as const,
-	stage: (parentSessionId: string | null, stageId: string) => ["stage", parentSessionId, stageId] as const,
 	session: (sessionId: string, scope: EntryScope = "full_tree") => ["session", sessionId, scope] as const,
 	historyTree: (sessionId: string, lastEventId: number) => ["history-tree", sessionId, lastEventId] as const,
 };
