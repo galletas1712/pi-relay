@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
 };
 
-use agent_store::{ProjectWorkspace, SessionConfig, SessionWorkspace, WorkspaceKind};
+use agent_store::{ProjectWorkspace, SessionWorkspace, WorkspaceKind};
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -24,8 +24,7 @@ use self::config::{
 };
 pub(crate) use self::git::validate_remote_branch;
 use self::git::{
-    fetch_local_commit_ref, fetch_session_branch_head, git_output, refresh_git_workspace_base,
-    run_git, snapshot_worktree_commit,
+    fetch_session_branch_head, git_output, refresh_git_workspace_base, run_git,
 };
 use self::instantiate::{
     create_workspace_dir, destroy_workspace_tree, instantiate_workspace_from_base,
@@ -44,15 +43,6 @@ const HANDOFF_DIR: &str = ".pi-handoff";
 pub(crate) struct WorkspaceManager {
     state_root: PathBuf,
     workspace_base_lock: Arc<Mutex<()>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SourceRefSpec {
-    pub(crate) source_id: String,
-    pub(crate) session_id: String,
-    pub(crate) workspace_dir: String,
-    pub(crate) git_ref: String,
-    pub(crate) commit: String,
 }
 
 impl WorkspaceManager {
@@ -234,47 +224,6 @@ impl WorkspaceManager {
         }
 
         Ok((child_cwd.to_string_lossy().into_owned(), child_workspaces))
-    }
-
-    pub(crate) async fn import_source_refs(
-        &self,
-        target_outer_cwd: &str,
-        target_workspaces: &[SessionWorkspace],
-        sources: &[(String, SessionConfig)],
-    ) -> Result<Vec<SourceRefSpec>> {
-        let mut refs = Vec::new();
-        let target_cwd = PathBuf::from(target_outer_cwd);
-        for (source_index, (source_session_id, source_config)) in sources.iter().enumerate() {
-            let source_id = source_ref_id(source_index, source_session_id, source_config);
-            for target_workspace in target_workspaces {
-                if target_workspace.kind != WorkspaceKind::Git {
-                    continue;
-                }
-                let workspace_dir = &target_workspace.workspace_dir;
-                let Some(source_workspace) = source_config.workspaces.iter().find(|workspace| {
-                    workspace.kind == WorkspaceKind::Git
-                        && workspace.workspace_dir == *workspace_dir
-                }) else {
-                    continue;
-                };
-                let source_repo =
-                    PathBuf::from(&source_config.outer_cwd).join(&source_workspace.workspace_dir);
-                let target_repo = target_cwd.join(&target_workspace.workspace_dir);
-                let message =
-                    format!("pi-relay source {source_id} from child session {source_session_id}");
-                let commit = snapshot_worktree_commit(&source_repo, &message).await?;
-                let git_ref = format!("refs/pi-relay/sources/{source_id}");
-                fetch_local_commit_ref(&target_repo, &source_repo, &commit, &git_ref).await?;
-                refs.push(SourceRefSpec {
-                    source_id: source_id.clone(),
-                    session_id: source_session_id.clone(),
-                    workspace_dir: workspace_dir.clone(),
-                    git_ref,
-                    commit,
-                });
-            }
-        }
-        Ok(refs)
     }
 
     /// Reclaim a session's entire workspace tree, including any btrfs
@@ -520,28 +469,6 @@ fn local_branch(session_id: &str, workspace_dir: &str) -> String {
         "pi/session/{}/{}",
         branch_component(session_id),
         branch_component(workspace_dir)
-    )
-}
-
-fn source_ref_id(
-    source_index: usize,
-    source_session_id: &str,
-    source_config: &SessionConfig,
-) -> String {
-    let role = source_config
-        .metadata
-        .get("role_name")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("child");
-    let suffix = source_session_id
-        .rsplit_once('-')
-        .map(|(_, suffix)| suffix)
-        .unwrap_or(source_session_id);
-    format!(
-        "source-{}-{}-{}",
-        source_index + 1,
-        branch_component(role),
-        branch_component(suffix)
     )
 }
 

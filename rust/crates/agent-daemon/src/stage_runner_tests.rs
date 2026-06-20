@@ -656,50 +656,6 @@ async fn subagent_cannot_start_a_nested_stage() {
 }
 
 #[tokio::test]
-async fn read_only_subagent_rejects_steer_and_interrupt() {
-    let Some(env) = test_env().await else {
-        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    env.state
-        .repo
-        .create_project(project_id, "guard test", &[], json!({}))
-        .await
-        .expect("create project");
-    create_parent(&env, project_id, "parent").await;
-    let stage = env
-        .state
-        .repo
-        .create_stage("parent", StageKind::ReadonlyFanout, None, None, 2)
-        .await
-        .expect("create stage");
-    create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "ro", "reviewer", SubagentType::ReadOnly,
-        TurnOutcome::Graceful, "reviewed",
-    )
-    .await;
-
-    for operation in ["steered", "interrupted"] {
-        let error = crate::repl::reject_read_only_control(&env.state, "ro", operation)
-            .await
-            .expect_err("read-only control must be rejected");
-        assert_eq!(error.code, "read_only_subagent");
-    }
-    // A full subagent is steerable/interruptible (the guard passes).
-    create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "full", "implementer", SubagentType::Full,
-        TurnOutcome::Graceful, "done",
-    )
-    .await;
-    assert!(crate::repl::reject_read_only_control(&env.state, "full", "steered")
-        .await
-        .is_ok());
-
-    env.cleanup().await;
-}
-
-#[tokio::test]
 async fn spawn_failure_leaves_no_running_stage() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -987,82 +943,6 @@ async fn terminal_stage_member_yields_zero_parent_idle_rows() {
         StageStatus::Done
     );
     assert_eq!(steers_to_parent(&env, "parent", &stage.id).await, 1);
-
-    env.cleanup().await;
-}
-
-/// FIX D non-regression: suppression is scoped to stage members only. A subagent
-/// with a parent but NO stage_id still surfaces exactly one parent-visible
-/// `subagent.idle` through the live seam, and a second firing is deduped by the
-/// once-gate.
-#[tokio::test]
-async fn non_stage_subagent_emits_exactly_one_parent_idle() {
-    let Some(env) = test_env().await else {
-        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
-        return;
-    };
-    let project_id = Uuid::new_v4();
-    env.state
-        .repo
-        .create_project(project_id, "barrier test", &[], json!({}))
-        .await
-        .expect("create project");
-    create_parent(&env, project_id, "parent").await;
-
-    let leaf = "loner_finish".to_string();
-    let entries = vec![
-        TranscriptStorageNode {
-            id: "loner_u".to_string(),
-            parent_id: None,
-            timestamp_ms: 1,
-            item: TranscriptItem::UserMessage(UserMessage::text("do the task")),
-            provider_replay: Vec::new(),
-        },
-        TranscriptStorageNode {
-            id: "loner_a".to_string(),
-            parent_id: Some("loner_u".to_string()),
-            timestamp_ms: 2,
-            item: TranscriptItem::AssistantMessage(AssistantMessage {
-                items: vec![AssistantItem::Text("done".to_string())],
-            }),
-            provider_replay: Vec::new(),
-        },
-        TranscriptStorageNode {
-            id: leaf.clone(),
-            parent_id: Some("loner_a".to_string()),
-            timestamp_ms: 3,
-            item: TranscriptItem::TurnFinished {
-                turn_id: TurnId(1),
-                outcome: TurnOutcome::Graceful,
-            },
-            provider_replay: Vec::new(),
-        },
-    ];
-    env.state
-        .repo
-        .start_session_outputs_with_parent(
-            "loner",
-            &session_config(&env, project_id, json!({ "created_by": "test", "role_name": "reviewer" })),
-            &entries,
-            Some(&leaf),
-            &[],
-            &[],
-            InputPriority::FollowUp,
-            &UserMessage::text("do the task"),
-            None,
-            Some("parent"),
-            Some(SubagentType::ReadOnly),
-            None,
-        )
-        .await
-        .expect("create non-stage subagent");
-
-    // Drive the live idle seam twice; the once-gate dedups to a single row.
-    let driver = SessionDriver::acquire(&env.state, "loner").await;
-    driver.notify_subagent_parent_idle_if_needed().await;
-    driver.notify_subagent_parent_idle_if_needed().await;
-
-    assert_eq!(parent_idle_rows(&env, "parent").await, 1);
 
     env.cleanup().await;
 }

@@ -481,21 +481,20 @@ impl SessionDriver {
                 return None;
             }
         };
-        let (parent_session_id, notification_key, payload) = notification;
+        let (_parent_session_id, notification_key, _payload) = notification;
 
-        // A stage member's completion is delivered as ONE stage steer, NOT a
-        // per-child idle (FIX D). Fire the once-gate WITHOUT writing a
+        // Every parentful subagent is a stage member (the only spawn path sets a
+        // stage_id). A stage member's completion is delivered as ONE stage steer,
+        // NOT a per-child idle (FIX D). Fire the once-gate WITHOUT writing a
         // parent-visible SubagentIdle row (so events_after / the run board never
-        // surface per-child idle for stage members), then — on that single firing
-        // — destroy the RO snapshot and run the barrier. The barrier is
-        // single-flighted by the DB stage-row CAS, so concurrent terminal children
-        // steer the parent exactly once. Return None: the per-child idle is
-        // suppressed for the parent in every case.
+        // surface per-child idle), then — on that single firing — destroy the RO
+        // snapshot and run the barrier. The barrier is single-flighted by the DB
+        // stage-row CAS, so concurrent terminal children steer the parent exactly
+        // once. Return None: the per-child idle is suppressed for the parent.
         let stage_id = match self.state.repo.session_stage_id(&self.session_id).await {
-            Ok(stage_id) => stage_id,
+            Ok(Some(stage_id)) => stage_id,
+            Ok(None) => return None,
             Err(error) => {
-                // Conservative on a lookup error: emit nothing rather than a
-                // possibly-wrong per-child idle for what may be a stage member.
                 eprintln!(
                     "failed to load stage id for subagent {}: {error:#}",
                     self.session_id
@@ -503,58 +502,26 @@ impl SessionDriver {
                 return None;
             }
         };
-        if let Some(stage_id) = stage_id {
-            let first_fire = match self
-                .state
-                .repo
-                .claim_subagent_idle_once(&self.session_id, &notification_key)
-                .await
-            {
-                Ok(first_fire) => first_fire,
-                Err(error) => {
-                    eprintln!(
-                        "failed to claim stage-member idle once-gate child={}: {error:#}",
-                        self.session_id
-                    );
-                    return None;
-                }
-            };
-            if first_fire {
-                self.destroy_read_only_subagent_workspaces().await;
-            }
-            self.try_stage_barrier(&stage_id).await;
-            return None;
-        }
-
-        // Non-stage subagent: the per-child idle IS the parent's signal. Insert it
-        // once (the same once-gate dedup), and on that single firing reclaim a
-        // read-only subagent's disposable snapshot — its handoff/transcript is
-        // durable in Postgres, so the snapshot is safe to destroy.
-        match self
+        let first_fire = match self
             .state
             .repo
-            .insert_subagent_idle_event_once(
-                &parent_session_id,
-                &self.session_id,
-                &notification_key,
-                payload,
-            )
+            .claim_subagent_idle_once(&self.session_id, &notification_key)
             .await
         {
-            Ok(event) => {
-                if event.is_some() {
-                    self.destroy_read_only_subagent_workspaces().await;
-                }
-                event
-            }
+            Ok(first_fire) => first_fire,
             Err(error) => {
                 eprintln!(
-                    "failed to publish parent subagent idle event child={}: {error:#}",
+                    "failed to claim stage-member idle once-gate child={}: {error:#}",
                     self.session_id
                 );
-                None
+                return None;
             }
+        };
+        if first_fire {
+            self.destroy_read_only_subagent_workspaces().await;
         }
+        self.try_stage_barrier(&stage_id).await;
+        None
     }
 
     /// The stage barrier: when a subagent of a stage reaches its once-only

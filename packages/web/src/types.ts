@@ -118,16 +118,6 @@ export interface EventFrame {
 	data: Record<string, unknown>;
 }
 
-export interface SubagentListItem {
-	child_session_id: string;
-	activity: Activity;
-}
-
-export interface SubagentListResult {
-	parent_session_id: string;
-	subagents: SubagentListItem[];
-}
-
 export type StageKind = "full" | "readonly_fanout";
 export type StageStatus = "running" | "done" | "done_with_failures" | "cancelled" | "failed";
 export type SubagentType = "full" | "read_only";

@@ -13,11 +13,9 @@ import type {
 	QueuedInputStatus,
 	SessionSnapshot,
 	SessionSummary,
-	Stage,
 	StageListResult,
 	ReadHandoffFileResult,
 	HandoffFileName,
-	SubagentListResult,
 	ToolListing,
 	TranscriptEntriesResult,
 	TranscriptEntry,
@@ -43,11 +41,9 @@ export interface AgentApi {
 	updateProject(params: UpdateProjectParams): Promise<Project>;
 	deleteProject(projectId: string): Promise<DeleteProjectResult>;
 	listSessions(limit?: number, projectId?: string | null): Promise<SessionSummary[]>;
-	listSubagents(parentSessionId: string): Promise<SubagentListResult>;
 	listStages(parentSessionId: string): Promise<StageListResult>;
 	startFullStage(params: StartFullStageParams): Promise<StartFullStageResult>;
 	startReadonlyFanout(params: StartReadonlyFanoutParams): Promise<StartReadonlyFanoutResult>;
-	getStage(parentSessionId: string, stageId: string): Promise<Stage>;
 	cancelStage(parentSessionId: string, stageId: string): Promise<{ cancelled: boolean }>;
 	readHandoffFile(params: ReadHandoffFileParams): Promise<ReadHandoffFileResult>;
 	steerSubagent(params: SteerSubagentParams): Promise<FollowUpResult>;
@@ -359,12 +355,6 @@ class AgentApiClient implements AgentApi {
 		return result.sessions;
 	}
 
-	listSubagents(parentSessionId: string): Promise<SubagentListResult> {
-		return this.client.request<SubagentListResult>("subagent.list", {
-			parent_session_id: parentSessionId
-		});
-	}
-
 	listStages(parentSessionId: string): Promise<StageListResult> {
 		return this.client.request<StageListResult>("stage.list", {
 			parent_session_id: parentSessionId
@@ -387,13 +377,6 @@ class AgentApiClient implements AgentApi {
 			tasks: params.tasks,
 			workflow: params.workflow ?? undefined,
 			label: params.label ?? undefined
-		});
-	}
-
-	getStage(parentSessionId: string, stageId: string): Promise<Stage> {
-		return this.client.request<Stage>("stage.status", {
-			parent_session_id: parentSessionId,
-			stage_id: stageId
 		});
 	}
 
