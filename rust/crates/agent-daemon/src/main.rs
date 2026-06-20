@@ -40,7 +40,7 @@ use agent_session::SessionInput;
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
     EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputStatus,
-    SessionConfig, TranscriptEntryBodyMode, TranscriptEntryScope, WorkspaceKind,
+    SessionConfig, SubagentType, TranscriptEntryBodyMode, TranscriptEntryScope, WorkspaceKind,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -901,7 +901,10 @@ fn events_unsubscribe(
     Ok(json!({ "session_id": session_id }))
 }
 
-async fn input_user(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+pub(crate) async fn input_user(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let priority = params
         .get("priority")
@@ -910,6 +913,23 @@ async fn input_user(state: &AppState, params: Value) -> std::result::Result<Valu
         .transpose()
         .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
         .unwrap_or(InputPriority::FollowUp);
+    // Server-side guard: a read-only subagent must never be steered. The legacy
+    // client-only check is not authoritative, so reject a Steer-priority input
+    // targeting a read_only subagent here. Follow-up inputs (and the barrier's
+    // top-level parent steer, which is never read_only) are unaffected.
+    if priority == InputPriority::Steer
+        && state
+            .repo
+            .session_subagent_type(&session_id)
+            .await
+            .map_err(anyhow::Error::from)?
+            == Some(SubagentType::ReadOnly)
+    {
+        return Err(RpcError::new(
+            "cannot_steer_read_only_subagent",
+            "a read-only subagent cannot be steered",
+        ));
+    }
     let client_input_id = params
         .get("client_input_id")
         .and_then(Value::as_str)

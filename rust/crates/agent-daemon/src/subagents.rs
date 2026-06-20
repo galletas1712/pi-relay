@@ -245,7 +245,6 @@ pub(crate) async fn subagent_lifecycle_payload(
         "child_session_id": child_session_id,
         "role": config.metadata.get("role_name").and_then(Value::as_str),
         "role_workspace": config.metadata.get("role_workspace").and_then(Value::as_str),
-        "display_name": config.metadata.get("display_name").and_then(Value::as_str),
     }))
 }
 
