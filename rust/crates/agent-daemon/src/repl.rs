@@ -679,6 +679,29 @@ async fn subagents_read_host(
     Ok(rpc_views::transcript_turns(turns))
 }
 
+/// A read-only subagent is fire-and-forget: it runs in a disposable snapshot
+/// and cannot be steered or interrupted individually (only a whole stage can be
+/// cancelled). Reject either operation for a read-only child.
+async fn reject_read_only_control(
+    state: &AppState,
+    child_session_id: &str,
+    operation: &str,
+) -> std::result::Result<(), RpcError> {
+    if state
+        .repo
+        .session_subagent_type(child_session_id)
+        .await
+        .map_err(anyhow::Error::from)?
+        == Some(agent_store::SubagentType::ReadOnly)
+    {
+        return Err(RpcError::new(
+            "read_only_subagent",
+            format!("a read-only subagent cannot be {operation}; cancel the stage instead"),
+        ));
+    }
+    Ok(())
+}
+
 async fn subagents_steer_host(
     state: &AppState,
     parent_session_id: &str,
@@ -687,6 +710,7 @@ async fn subagents_steer_host(
     let child_session_id = required_string(&params, "session_id")?;
     let message = required_string(&params, "message")?;
     require_known_subagent(state, parent_session_id, &child_session_id).await?;
+    reject_read_only_control(state, &child_session_id, "steered").await?;
     enqueue_session_input(
         state,
         SessionInputRequest {
@@ -708,6 +732,7 @@ async fn subagents_interrupt_host(
 ) -> std::result::Result<Value, RpcError> {
     let child_session_id = required_string(&params, "session_id")?;
     require_known_subagent(state, parent_session_id, &child_session_id).await?;
+    reject_read_only_control(state, &child_session_id, "interrupted").await?;
     interrupt_session(state, &child_session_id).await
 }
 

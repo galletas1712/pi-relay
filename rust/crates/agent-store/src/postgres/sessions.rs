@@ -225,6 +225,7 @@ impl PostgresAgentStore {
             client_input_id,
             None,
             None,
+            None,
         )
         .await
     }
@@ -242,6 +243,7 @@ impl PostgresAgentStore {
         client_input_id: Option<&str>,
         parent_session_id: Option<&str>,
         subagent_type: Option<SubagentType>,
+        stage_id: Option<&str>,
     ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
         if parent_session_id == Some(session_id) {
             return Err(anyhow!(
@@ -251,8 +253,8 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
             r#"
-                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, system_prompt, provider_config, metadata, parent_session_id, subagent_type)
-                values ($1, $2, $3, $4, $5::text, $6, $7, $8, $9::text, $10::text)
+                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, system_prompt, provider_config, metadata, parent_session_id, subagent_type, stage_id)
+                values ($1, $2, $3, $4, $5::text, $6, $7, $8, $9::text, $10::text, $11::text)
                 on conflict (id) do nothing
                 returning id
                 "#,
@@ -267,6 +269,7 @@ impl PostgresAgentStore {
         .bind(&config.metadata)
         .bind(parent_session_id)
         .bind(subagent_type.map(|subagent_type| subagent_type.as_str()))
+        .bind(stage_id)
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_none() {

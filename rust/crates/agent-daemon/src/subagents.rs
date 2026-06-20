@@ -89,8 +89,37 @@ struct SubagentListParams {
     parent_session_id: String,
 }
 
+/// A subagent spawned as part of a stage: fresh context (no parent-transcript
+/// fork, no source refs), tagged with its stage id and type.
+pub(crate) struct StageSubagentSpawn {
+    pub(crate) parent_session_id: String,
+    pub(crate) role: String,
+    pub(crate) task: String,
+    pub(crate) subagent_type: SubagentType,
+    pub(crate) stage_id: String,
+}
+
+impl From<StageSubagentSpawn> for SubagentSpawnRequest {
+    fn from(spawn: StageSubagentSpawn) -> Self {
+        Self {
+            parent_session_id: spawn.parent_session_id,
+            child_session_id: None,
+            role: spawn.role,
+            role_workspace: None,
+            task: spawn.task,
+            initial_context: None,
+            sources: Vec::new(),
+            display_name: None,
+            provider: None,
+            metadata: json!({}),
+            subagent_type: spawn.subagent_type,
+            stage_id: Some(spawn.stage_id),
+        }
+    }
+}
+
 #[derive(Debug)]
-struct SubagentSpawnRequest {
+pub(crate) struct SubagentSpawnRequest {
     parent_session_id: String,
     child_session_id: Option<String>,
     role: String,
@@ -102,6 +131,7 @@ struct SubagentSpawnRequest {
     provider: Option<ProviderConfig>,
     metadata: Value,
     subagent_type: SubagentType,
+    stage_id: Option<String>,
 }
 
 impl SubagentSpawnRequest {
@@ -167,6 +197,7 @@ impl SubagentSpawnRequest {
             provider: params.provider,
             metadata: params.metadata.unwrap_or_else(|| json!({})),
             subagent_type: params.subagent_type.unwrap_or(SubagentType::ReadOnly),
+            stage_id: None,
         })
     }
 }
@@ -186,15 +217,16 @@ struct SubagentSpawnParams {
     subagent_type: Option<SubagentType>,
 }
 
-struct SpawnedSubagent {
-    parent_session_id: String,
-    started: StartedSession,
+pub(crate) struct SpawnedSubagent {
+    pub(crate) parent_session_id: String,
+    pub(crate) started: StartedSession,
 }
 
-async fn spawn_subagent(
+pub(crate) async fn spawn_subagent(
     state: &AppState,
-    request: SubagentSpawnRequest,
+    request: impl Into<SubagentSpawnRequest>,
 ) -> std::result::Result<SpawnedSubagent, RpcError> {
+    let request = request.into();
     let parent_config = state
         .repo
         .load_session_config(&request.parent_session_id)
@@ -352,6 +384,7 @@ async fn spawn_subagent(
             client_input_id: None,
             parent_session_id: Some(request.parent_session_id.clone()),
             subagent_type: Some(subagent_type),
+            stage_id: request.stage_id.clone(),
             dispatch_mode: PreparedSessionDispatchMode::Deferred,
         },
     )

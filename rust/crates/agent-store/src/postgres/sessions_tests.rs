@@ -243,6 +243,7 @@ async fn subagent_type_round_trips_through_start_session_outputs() {
                 None,
                 Some("session_parent"),
                 subagent_type,
+                None,
             )
             .await
             .expect("child session starts");
