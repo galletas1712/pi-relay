@@ -14,6 +14,7 @@ import { randomId } from "./ids.ts";
 import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
+import { isStageRunning, reRunParamsForStage } from "./runBoard.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
@@ -86,6 +87,8 @@ import type {
 	ReasoningEffort,
 	SessionSnapshot,
 	SessionSummary,
+	Stage,
+	HandoffFileName,
 	ToolListing,
 	TranscriptEntry,
 	TranscriptTreeNode,
@@ -443,6 +446,36 @@ export function App() {
 		enabled: connection === "open" && subagentIds.length > 0,
 	});
 	const subagentSummaries = subagentSummariesQuery.data ?? [];
+	const stagesQuery = useQuery({
+		queryKey: queryKeys.stages(loadedSnapshot?.session_id ?? null),
+		queryFn: () => {
+			if (!loadedSnapshot) throw new Error("select a session first");
+			return api.listStages(loadedSnapshot.session_id);
+		},
+		enabled: connection === "open" && !!loadedSnapshot,
+		// The parent PARKS (goes idle) while a stage runs, so gate the poll on
+		// whether any stage is actually running — not on the parent's activity —
+		// or the missed-event safety net would be off exactly when it's needed.
+		refetchInterval: (query) =>
+			(query.state.data?.stages ?? []).some(isStageRunning) ? 2_000 : false,
+	});
+	const stages = stagesQuery.data?.stages ?? [];
+	const stageSubagentIds = useMemo(
+		() => stages.flatMap((stage) => stage.subagents.map((subagent) => subagent.id)),
+		[stages],
+	);
+	// Re-run needs the original prompts; stage.list carries each subagent's
+	// persisted task, so recover them from the stage data itself — no dependency
+	// on the legacy subagent.list surface (which Phase 6 retires).
+	const stageTaskBySessionId = useMemo(() => {
+		const map = new Map<string, string | null>();
+		for (const stage of stages) {
+			for (const subagent of stage.subagents) {
+				map.set(subagent.id, subagent.task ?? null);
+			}
+		}
+		return map;
+	}, [stages]);
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
 	const hasTranscriptEntries =
 		loadedSnapshot?.has_transcript_entries ??
@@ -885,6 +918,11 @@ export function App() {
 				scheduleSessionListRefresh();
 				if (loadedSnapshot?.session_id) {
 					void queryClient.invalidateQueries({ queryKey: queryKeys.subagents(loadedSnapshot.session_id) });
+					// The run board reads the stage.* surface; the backend emits no
+					// dedicated stage events, so the subagent lifecycle events (and the
+					// completion steer landing as a normal parent message) are the signal
+					// to refresh the board. The 2s poll covers any missed event.
+					void queryClient.invalidateQueries({ queryKey: queryKeys.stages(loadedSnapshot.session_id) });
 				}
 			}
 
@@ -1062,6 +1100,9 @@ export function App() {
 		for (const subagentId of subagentIds) {
 			desiredSessionIds.add(subagentId);
 		}
+		for (const stageSubagentId of stageSubagentIds) {
+			desiredSessionIds.add(stageSubagentId);
+		}
 		if (selectedId && selectedHasEventCursor) desiredSessionIds.add(selectedId);
 		for (const sessionId of Array.from(subscribedEventSessionIds.current)) {
 			if (desiredSessionIds.has(sessionId)) continue;
@@ -1097,6 +1138,7 @@ export function App() {
 		selectedId,
 		sessions,
 		subagentIds,
+		stageSubagentIds,
 	]);
 
 	const configureProvider = useCallback(
@@ -1534,6 +1576,71 @@ export function App() {
 			setStopping(false);
 		}
 	}, [api, pushNotice, queryClient, requireSelected, syncActiveBranchNow]);
+
+	const invalidateStages = useCallback(() => {
+		if (loadedSnapshot?.session_id) {
+			void queryClient.invalidateQueries({ queryKey: queryKeys.stages(loadedSnapshot.session_id) });
+		}
+	}, [loadedSnapshot?.session_id, queryClient]);
+
+	const cancelStage = useCallback(
+		(stageId: string) => {
+			const parentSessionId = loadedSnapshot?.session_id;
+			if (!parentSessionId) return;
+			void api
+				.cancelStage(parentSessionId, stageId)
+				.then(() => invalidateStages())
+				.catch((error) => pushNotice("error", errorMessage(error)));
+		},
+		[api, invalidateStages, loadedSnapshot?.session_id, pushNotice],
+	);
+
+	// Steer the full subagent: a steer-priority message into the subagent's own
+	// session (the composer only ever sends follow_up). The daemon rejects
+	// steering a read-only subagent, so the board only offers this for the full.
+	const steerSubagent = useCallback(
+		(subagentSessionId: string) => {
+			const text = window.prompt("Steer the full subagent with:");
+			if (!text || !text.trim()) return;
+			void api
+				.steerSubagent({
+					subagentSessionId,
+					clientInputId: randomId("web_steer"),
+					content: [{ type: "text", text: text.trim() }],
+				})
+				.then(() => pushNotice("success", "steered the subagent"))
+				.catch((error) => pushNotice("error", errorMessage(error)));
+		},
+		[api, pushNotice],
+	);
+
+	const reRunStage = useCallback(
+		(stage: Stage) => {
+			const parentSessionId = loadedSnapshot?.session_id;
+			if (!parentSessionId) return;
+			const reRun = reRunParamsForStage(stage, parentSessionId, stageTaskBySessionId);
+			if (!reRun) {
+				pushNotice("error", "cannot re-run: original prompts are unavailable");
+				return;
+			}
+			const start =
+				reRun.kind === "full" ? api.startFullStage(reRun.params) : api.startReadonlyFanout(reRun.params);
+			void start
+				.then(() => invalidateStages())
+				.catch((error) => pushNotice("error", errorMessage(error)));
+		},
+		[api, invalidateStages, loadedSnapshot?.session_id, pushNotice, stageTaskBySessionId],
+	);
+
+	const readHandoffFile = useCallback(
+		async (stageId: string, subagentId: string | null, file: HandoffFileName): Promise<string> => {
+			const parentSessionId = loadedSnapshot?.session_id;
+			if (!parentSessionId) throw new Error("select a session first");
+			const result = await api.readHandoffFile({ parentSessionId, stageId, subagentId, file });
+			return result.content;
+		},
+		[api, loadedSnapshot?.session_id],
+	);
 
 	const resumeTerminalTurn = useCallback(
 		async (leafId?: string | null) => {
@@ -2044,6 +2151,16 @@ export function App() {
 					subagentSummaries={subagentSummaries}
 					subagentsLoading={subagentsQuery.isLoading || subagentSummariesQuery.isLoading}
 					subagentsError={errorMessageOrNull(subagentsQuery.error ?? subagentSummariesQuery.error)}
+					stages={stages}
+					stagesLoading={stagesQuery.isLoading}
+					stagesError={errorMessageOrNull(stagesQuery.error)}
+					stageTaskBySessionId={stageTaskBySessionId}
+					runBoard={{
+						onCancelStage: cancelStage,
+						onSteerSubagent: steerSubagent,
+						onReRunStage: reRunStage,
+						readHandoffFile,
+					}}
 					tools={tools}
 					onSelectSession={(sessionId) => {
 						selectSession(sessionId);
