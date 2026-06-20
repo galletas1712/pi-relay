@@ -80,6 +80,7 @@ pub(crate) enum RpcMethod {
     StageStatus,
     StageCancel,
     StageList,
+    StageReadHandoffFile,
     HarnessModelComplete,
     HarnessModelFail,
 }
@@ -124,6 +125,7 @@ impl RpcMethod {
             "stage.status" => Some(Self::StageStatus),
             "stage.cancel" => Some(Self::StageCancel),
             "stage.list" => Some(Self::StageList),
+            "stage.read_handoff_file" => Some(Self::StageReadHandoffFile),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
             _ => None,
@@ -215,6 +217,10 @@ mod tests {
         assert_eq!(RpcMethod::parse("stage.status"), Some(RpcMethod::StageStatus));
         assert_eq!(RpcMethod::parse("stage.cancel"), Some(RpcMethod::StageCancel));
         assert_eq!(RpcMethod::parse("stage.list"), Some(RpcMethod::StageList));
+        assert_eq!(
+            RpcMethod::parse("stage.read_handoff_file"),
+            Some(RpcMethod::StageReadHandoffFile)
+        );
         assert_eq!(
             RpcMethod::parse("history.switch"),
             Some(RpcMethod::HistorySwitch)

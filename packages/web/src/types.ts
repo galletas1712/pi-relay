@@ -32,6 +32,8 @@ export interface SessionSummary {
 	session_id: string;
 	project_id: string | null;
 	parent_session_id?: string | null;
+	stage_id?: string | null;
+	subagent_type?: SubagentType | null;
 	outer_cwd: string;
 	workspaces: SessionWorkspace[];
 	activity: Activity;
@@ -75,6 +77,8 @@ export interface SessionSnapshot {
 	session_id: string;
 	project_id: string | null;
 	parent_session_id?: string | null;
+	stage_id?: string | null;
+	subagent_type?: SubagentType | null;
 	outer_cwd: string;
 	workspaces: SessionWorkspace[];
 	activity: Activity;
@@ -122,6 +126,45 @@ export interface SubagentListItem {
 export interface SubagentListResult {
 	parent_session_id: string;
 	subagents: SubagentListItem[];
+}
+
+export type StageKind = "full" | "readonly_fanout";
+export type StageStatus = "running" | "done" | "done_with_failures" | "cancelled" | "failed";
+export type SubagentType = "full" | "read_only";
+
+/** A subagent row inside a stage. `status` is the live session activity (idle/
+ * running), not the stage-level status; the durable per-subagent outcome lives
+ * in the handoff index.json. */
+export interface StageSubagent {
+	id: string;
+	status: Activity;
+	role?: string | null;
+	subagent_type?: SubagentType | null;
+	task?: string | null;
+}
+
+export interface Stage {
+	stage_id: string;
+	kind: StageKind;
+	status: StageStatus;
+	workflow?: string | null;
+	label?: string | null;
+	handoff_dir?: string;
+	subagents: StageSubagent[];
+}
+
+export interface StageListResult {
+	parent_session_id: string;
+	stages: Stage[];
+}
+
+export type HandoffFileName = "index.json" | "final_message.md" | "transcript.md";
+
+export interface ReadHandoffFileResult {
+	stage_id: string;
+	subagent_id: string | null;
+	file: HandoffFileName;
+	content: string;
 }
 
 export type SessionOverview = Omit<SessionSnapshot, "entries">;

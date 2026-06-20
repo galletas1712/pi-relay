@@ -13,6 +13,10 @@ import type {
 	QueuedInputStatus,
 	SessionSnapshot,
 	SessionSummary,
+	Stage,
+	StageListResult,
+	ReadHandoffFileResult,
+	HandoffFileName,
 	SubagentListResult,
 	ToolListing,
 	TranscriptEntriesResult,
@@ -40,6 +44,13 @@ export interface AgentApi {
 	deleteProject(projectId: string): Promise<DeleteProjectResult>;
 	listSessions(limit?: number, projectId?: string | null): Promise<SessionSummary[]>;
 	listSubagents(parentSessionId: string): Promise<SubagentListResult>;
+	listStages(parentSessionId: string): Promise<StageListResult>;
+	startFullStage(params: StartFullStageParams): Promise<StartFullStageResult>;
+	startReadonlyFanout(params: StartReadonlyFanoutParams): Promise<StartReadonlyFanoutResult>;
+	getStage(parentSessionId: string, stageId: string): Promise<Stage>;
+	cancelStage(parentSessionId: string, stageId: string): Promise<{ cancelled: boolean }>;
+	readHandoffFile(params: ReadHandoffFileParams): Promise<ReadHandoffFileResult>;
+	steerSubagent(params: SteerSubagentParams): Promise<FollowUpResult>;
 	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse>;
 	listTools(provider: string): Promise<ToolListing[]>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
@@ -134,6 +145,47 @@ export interface QueueFollowUpParams {
 	clientInputId: string;
 	expectedActiveLeafId?: string | null;
 	baseLeafId?: string | null;
+	content: ContentBlock[];
+}
+
+export interface StartFullStageParams {
+	parentSessionId: string;
+	role: string;
+	prompt: string;
+	workflow?: string | null;
+	label?: string | null;
+}
+
+export interface StartFullStageResult {
+	stage_id: string;
+	subagent_session_id: string;
+}
+
+export interface StartReadonlyFanoutParams {
+	parentSessionId: string;
+	tasks: { role: string; prompt: string }[];
+	workflow?: string | null;
+	label?: string | null;
+}
+
+export interface StartReadonlyFanoutResult {
+	stage_id: string;
+	subagent_session_ids: string[];
+}
+
+export interface ReadHandoffFileParams {
+	parentSessionId: string;
+	stageId: string;
+	subagentId?: string | null;
+	file: HandoffFileName;
+}
+
+/** Steer the full subagent: a steer-priority user message into the subagent's
+ * own session (the composer only ever sends follow_up). Read-only subagents are
+ * rejected by the daemon; only a stage's single full subagent is steerable. */
+export interface SteerSubagentParams {
+	subagentSessionId: string;
+	clientInputId: string;
 	content: ContentBlock[];
 }
 
@@ -310,6 +362,63 @@ class AgentApiClient implements AgentApi {
 	listSubagents(parentSessionId: string): Promise<SubagentListResult> {
 		return this.client.request<SubagentListResult>("subagent.list", {
 			parent_session_id: parentSessionId
+		});
+	}
+
+	listStages(parentSessionId: string): Promise<StageListResult> {
+		return this.client.request<StageListResult>("stage.list", {
+			parent_session_id: parentSessionId
+		});
+	}
+
+	startFullStage(params: StartFullStageParams): Promise<StartFullStageResult> {
+		return this.client.request<StartFullStageResult>("stage.start_full", {
+			parent_session_id: params.parentSessionId,
+			role: params.role,
+			prompt: params.prompt,
+			workflow: params.workflow ?? undefined,
+			label: params.label ?? undefined
+		});
+	}
+
+	startReadonlyFanout(params: StartReadonlyFanoutParams): Promise<StartReadonlyFanoutResult> {
+		return this.client.request<StartReadonlyFanoutResult>("stage.start_readonly_fanout", {
+			parent_session_id: params.parentSessionId,
+			tasks: params.tasks,
+			workflow: params.workflow ?? undefined,
+			label: params.label ?? undefined
+		});
+	}
+
+	getStage(parentSessionId: string, stageId: string): Promise<Stage> {
+		return this.client.request<Stage>("stage.status", {
+			parent_session_id: parentSessionId,
+			stage_id: stageId
+		});
+	}
+
+	cancelStage(parentSessionId: string, stageId: string): Promise<{ cancelled: boolean }> {
+		return this.client.request<{ cancelled: boolean }>("stage.cancel", {
+			parent_session_id: parentSessionId,
+			stage_id: stageId
+		});
+	}
+
+	readHandoffFile(params: ReadHandoffFileParams): Promise<ReadHandoffFileResult> {
+		return this.client.request<ReadHandoffFileResult>("stage.read_handoff_file", {
+			parent_session_id: params.parentSessionId,
+			stage_id: params.stageId,
+			subagent_id: params.subagentId ?? undefined,
+			file: params.file
+		});
+	}
+
+	steerSubagent(params: SteerSubagentParams): Promise<FollowUpResult> {
+		return this.client.request<FollowUpResult>("input.follow_up", {
+			session_id: params.subagentSessionId,
+			client_input_id: params.clientInputId,
+			priority: "steer",
+			content: params.content
 		});
 	}
 

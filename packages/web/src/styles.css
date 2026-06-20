@@ -2971,6 +2971,116 @@ pre {
 	color: var(--success);
 }
 
+.run-board {
+	display: flex;
+	flex-direction: column;
+	gap: 10px;
+}
+
+.run-board-stage {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	border: 1px solid var(--border);
+	border-radius: 8px;
+	padding: 8px;
+}
+
+.run-board-stage-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.run-board-stage-title {
+	flex: 1 1 auto;
+	min-width: 0;
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	font-size: var(--text-sm);
+	font-weight: 500;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.run-board-stage-kind {
+	flex: 0 0 auto;
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	padding: 1px 6px;
+	font-size: var(--text-2xs);
+	color: var(--muted-foreground);
+}
+
+.run-board-stage-controls,
+.run-board-handoff-links {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+}
+
+.chip-button {
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+	border: 1px solid var(--border);
+	border-radius: 999px;
+	background: transparent;
+	padding: 2px 8px;
+	font-size: var(--text-2xs);
+	color: var(--foreground);
+	cursor: pointer;
+}
+
+.chip-button:hover,
+.chip-button:focus-visible {
+	border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
+	color: var(--primary);
+	outline: none;
+}
+
+.run-board-subagents {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+}
+
+.run-board-subagent {
+	display: flex;
+	flex-direction: column;
+	gap: 4px;
+	border-left: 2px solid var(--border);
+	padding-left: 8px;
+}
+
+.run-board-subagent-head {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+}
+
+.run-board-subagent-head .link-button {
+	flex: 1 1 auto;
+	display: inline-flex;
+	align-items: center;
+	gap: 4px;
+}
+
+.run-board-file {
+	max-height: 240px;
+	overflow: auto;
+	margin: 0;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	padding: 6px 8px;
+	background: var(--muted, transparent);
+	font-size: var(--text-2xs);
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
 .link-button {
 	min-width: 0;
 	border: 0;
