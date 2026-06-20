@@ -185,23 +185,14 @@ pub(crate) async fn write_stage_handoff(
     let parent_config = state
         .repo
         .load_session_config(&stage.parent_session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     let dir = stage_dir(&parent_config.outer_cwd, &stage.id);
 
-    let subagents = state
-        .repo
-        .list_stage_subagents(&stage.id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let subagents = state.repo.list_stage_subagents(&stage.id).await?;
 
     let mut manifest = Vec::with_capacity(subagents.len());
     for subagent in &subagents {
-        let history = state
-            .repo
-            .active_branch(&subagent.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let history = state.repo.active_branch(&subagent.session_id).await?;
         let final_message = extract_final_message(&history);
         let transcript = render_transcript_markdown(&history);
         let status = subagent_status(subagent_outcome(&history));
@@ -211,9 +202,12 @@ pub(crate) async fn write_stage_handoff(
         tokio::fs::create_dir_all(&subagent_dir)
             .await
             .map_err(anyhow::Error::from)?;
-        tokio::fs::write(subagent_dir.join("final_message.md"), final_message.as_bytes())
-            .await
-            .map_err(anyhow::Error::from)?;
+        tokio::fs::write(
+            subagent_dir.join("final_message.md"),
+            final_message.as_bytes(),
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
         tokio::fs::write(subagent_dir.join("transcript.md"), transcript.as_bytes())
             .await
             .map_err(anyhow::Error::from)?;

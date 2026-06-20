@@ -59,8 +59,7 @@ async fn reject_if_stage_running(
     if state
         .repo
         .parent_has_running_stage(parent_session_id)
-        .await
-        .map_err(anyhow::Error::from)?
+        .await?
     {
         return Err(RpcError::new(
             "stage_already_running",
@@ -79,8 +78,7 @@ async fn reject_if_subagent(
     if state
         .repo
         .session_subagent_type(session_id)
-        .await
-        .map_err(anyhow::Error::from)?
+        .await?
         .is_some()
     {
         return Err(RpcError::new(
@@ -142,8 +140,7 @@ pub(crate) async fn start_full_core(
             params.label.as_deref(),
             1,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
 
     let spawned = match spawn_subagent(
         state,
@@ -182,10 +179,7 @@ pub(crate) async fn start_readonly_fanout_core(
 ) -> std::result::Result<Value, RpcError> {
     let params: StartFanoutParams = from_params(params)?;
     if params.tasks.is_empty() {
-        return Err(RpcError::new(
-            "invalid_params",
-            "tasks cannot be empty",
-        ));
+        return Err(RpcError::new("invalid_params", "tasks cannot be empty"));
     }
     let mut tasks = Vec::with_capacity(params.tasks.len());
     for task in &params.tasks {
@@ -208,8 +202,7 @@ pub(crate) async fn start_readonly_fanout_core(
             params.label.as_deref(),
             expected_subagents as i32,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
 
     let mut subagent_session_ids = Vec::with_capacity(expected_subagents);
     for (role, prompt) in tasks {
@@ -258,8 +251,7 @@ async fn load_stage_for_parent(
     let stage = state
         .repo
         .get_stage(stage_id)
-        .await
-        .map_err(anyhow::Error::from)?
+        .await?
         .ok_or_else(|| RpcError::new("stage_not_found", "stage not found"))?;
     if stage.parent_session_id != parent_session_id {
         return Err(RpcError::new("stage_not_found", "stage is not in scope"));
@@ -284,11 +276,7 @@ pub(crate) async fn status_core(
 ) -> std::result::Result<Value, RpcError> {
     let params: StageIdParams = from_params(params)?;
     let stage = load_stage_for_parent(state, parent_session_id, &params.stage_id).await?;
-    let subagents = state
-        .repo
-        .list_stage_subagents(&stage.id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let subagents = state.repo.list_stage_subagents(&stage.id).await?;
     let subagents = subagents
         .into_iter()
         .map(|subagent| {
@@ -298,11 +286,7 @@ pub(crate) async fn status_core(
             })
         })
         .collect::<Vec<_>>();
-    let parent_config = state
-        .repo
-        .load_session_config(parent_session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let parent_config = state.repo.load_session_config(parent_session_id).await?;
     Ok(stage_view(
         &stage,
         json!(subagents),
@@ -347,7 +331,9 @@ fn handoff_file_is_stage_root(file: &str) -> std::result::Result<bool, RpcError>
         "final_message.md" | "transcript.md" => Ok(false),
         other => Err(RpcError::new(
             "invalid_params",
-            format!("file must be one of index.json | final_message.md | transcript.md, got {other}"),
+            format!(
+                "file must be one of index.json | final_message.md | transcript.md, got {other}"
+            ),
         )),
     }
 }
@@ -400,10 +386,7 @@ fn resolve_handoff_file_path(
         }
     } else {
         let subagent_id = subagent_id.ok_or_else(|| {
-            RpcError::new(
-                "invalid_params",
-                format!("{file} requires a subagent_id"),
-            )
+            RpcError::new("invalid_params", format!("{file} requires a subagent_id"))
         })?;
         path.push(safe_path_segment(subagent_id, "subagent_id")?);
     }
@@ -426,11 +409,7 @@ pub(crate) async fn read_handoff_file_core(
     // A subagent-scoped read may only target a subagent that belongs to this
     // stage; otherwise a caller could probe arbitrary `<stage>/<segment>/` paths.
     if let Some(subagent_id) = params.subagent_id.as_deref() {
-        let members = state
-            .repo
-            .list_stage_subagents(&stage.id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let members = state.repo.list_stage_subagents(&stage.id).await?;
         if !members
             .iter()
             .any(|member| member.session_id == subagent_id)
@@ -441,11 +420,7 @@ pub(crate) async fn read_handoff_file_core(
             ));
         }
     }
-    let parent_config = state
-        .repo
-        .load_session_config(parent_session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let parent_config = state.repo.load_session_config(parent_session_id).await?;
     let path = resolve_handoff_file_path(
         &parent_config.outer_cwd,
         &stage.id,
@@ -466,7 +441,10 @@ pub(crate) async fn read_handoff_file_core(
         }
         Err(error) => {
             // Never leak the absolute host handoff path to the client.
-            eprintln!("failed to resolve handoff file {}: {error:#}", path.display());
+            eprintln!(
+                "failed to resolve handoff file {}: {error:#}",
+                path.display()
+            );
             return Err(RpcError::new(
                 "handoff_file_read_failed",
                 "failed to read handoff file",
@@ -502,7 +480,10 @@ pub(crate) async fn read_handoff_file_core(
         }
         Err(error) => {
             // Never leak the absolute host handoff path to the client.
-            eprintln!("failed to read handoff file {}: {error:#}", canonical.display());
+            eprintln!(
+                "failed to read handoff file {}: {error:#}",
+                canonical.display()
+            );
             return Err(RpcError::new(
                 "handoff_file_read_failed",
                 "failed to read handoff file",
@@ -579,23 +560,14 @@ pub(crate) async fn rpc_list(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let parent_session_id = parent_session_id_from_params(&params)?;
-    let parent_config = state
-        .repo
-        .load_session_config(&parent_session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let stages = state
-        .repo
-        .list_parent_stages(&parent_session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let parent_config = state.repo.load_session_config(&parent_session_id).await?;
+    let stages = state.repo.list_parent_stages(&parent_session_id).await?;
     let mut views = Vec::with_capacity(stages.len());
     for stage in &stages {
         let subagents = state
             .repo
             .list_stage_subagents(&stage.id)
-            .await
-            .map_err(anyhow::Error::from)?
+            .await?
             .into_iter()
             .map(|subagent| {
                 json!({
@@ -684,7 +656,10 @@ mod tests {
         let path = resolve_handoff_file_path(CWD, "stage-1", None, "index.json").unwrap();
         assert_eq!(
             path,
-            Path::new(CWD).join(".pi-handoff").join("stage-1").join("index.json")
+            Path::new(CWD)
+                .join(".pi-handoff")
+                .join("stage-1")
+                .join("index.json")
         );
     }
 
@@ -711,9 +686,11 @@ mod tests {
     #[test]
     fn rejects_traversal_in_stage_id() {
         for evil in ["..", "../other", "a/b", "/etc", "stage/../..", "."] {
-            let error =
-                resolve_handoff_file_path(CWD, evil, None, "index.json").unwrap_err();
-            assert_eq!(error.code, "invalid_params", "stage_id {evil} must be rejected");
+            let error = resolve_handoff_file_path(CWD, evil, None, "index.json").unwrap_err();
+            assert_eq!(
+                error.code, "invalid_params",
+                "stage_id {evil} must be rejected"
+            );
         }
     }
 
@@ -722,14 +699,16 @@ mod tests {
         for evil in ["..", "../x", "a/b", "/abs"] {
             let error =
                 resolve_handoff_file_path(CWD, "stage-1", Some(evil), "transcript.md").unwrap_err();
-            assert_eq!(error.code, "invalid_params", "subagent_id {evil} must be rejected");
+            assert_eq!(
+                error.code, "invalid_params",
+                "subagent_id {evil} must be rejected"
+            );
         }
     }
 
     #[test]
     fn requires_subagent_id_for_subagent_files() {
-        let error =
-            resolve_handoff_file_path(CWD, "stage-1", None, "transcript.md").unwrap_err();
+        let error = resolve_handoff_file_path(CWD, "stage-1", None, "transcript.md").unwrap_err();
         assert_eq!(error.code, "invalid_params");
     }
 

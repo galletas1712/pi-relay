@@ -36,8 +36,7 @@ pub(super) async fn run_tool_turn(
             &dispatch.attempt_id,
             EventType::ToolStarted,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     if events.is_empty() {
         return Ok(());
     }
@@ -49,8 +48,7 @@ pub(super) async fn run_tool_turn(
             &dispatch.config.outer_cwd,
             &dispatch.config.workspaces,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
 
     let tool_context =
         ToolContext::new(std::path::PathBuf::from(dispatch.config.outer_cwd.clone()));
@@ -97,8 +95,7 @@ pub(super) async fn run_tool_turn(
     if !state
         .repo
         .action_can_complete(&session_id, &dispatch.row_id, &dispatch.attempt_id)
-        .await
-        .map_err(anyhow::Error::from)?
+        .await?
     {
         return Ok(());
     }
@@ -124,12 +121,7 @@ pub(super) async fn run_tool_turn(
         runtime.session.is_ready_to_continue()
     };
     if is_ready_to_continue {
-        if let Some(queued) = state
-            .repo
-            .take_next_queued_steer_input(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?
-        {
+        if let Some(queued) = state.repo.take_next_queued_steer_input(&session_id).await? {
             let agent_input =
                 agent_input_from_queued_priority(queued.priority, queued.content.clone());
             let enqueue_result = {
@@ -140,8 +132,7 @@ pub(super) async fn run_tool_turn(
                 state
                     .repo
                     .reset_consuming_input(&session_id, &queued.id, &queued.claim_id)
-                    .await
-                    .map_err(anyhow::Error::from)?;
+                    .await?;
                 return Err(RpcError::new("invalid_input", error.to_string()));
             }
             consumed_input = Some(queued);

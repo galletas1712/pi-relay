@@ -42,11 +42,7 @@ pub(crate) async fn ensure_expected_active_leaf(
     if params.get("expected_active_leaf_id").is_none() {
         return Ok(());
     }
-    let active_leaf_id = state
-        .repo
-        .active_leaf_id(session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let active_leaf_id = state.repo.active_leaf_id(session_id).await?;
     ensure_expected_active_leaf_matches(&active_leaf_id, params)
 }
 
@@ -146,14 +142,8 @@ impl SessionDriver {
                 .state
                 .repo
                 .has_unfinished_actions(&self.session_id)
-                .await
-                .map_err(anyhow::Error::from)?
-            || self
-                .state
-                .repo
-                .has_queued_inputs(&self.session_id)
-                .await
-                .map_err(anyhow::Error::from)?
+                .await?
+            || self.state.repo.has_queued_inputs(&self.session_id).await?
         {
             return Err(RpcError::new(
                 "session_busy",
@@ -176,14 +166,12 @@ impl SessionDriver {
         self.state
             .repo
             .reset_abandoned_consuming_inputs(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         if self
             .state
             .repo
             .active_leaf_is_turn_boundary(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?
+            .await?
         {
             self.reconcile_abandoned_boundary_session().await?;
             return Ok(());
@@ -192,8 +180,7 @@ impl SessionDriver {
             .state
             .repo
             .load_stored_session(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let store = transcript_store_from_stored(&stored)?;
         if store.is_turn_boundary() {
             self.reconcile_abandoned_boundary_session().await?;
@@ -217,15 +204,9 @@ impl SessionDriver {
                 &new_entries,
                 recovered_stored.active_leaf_id.as_deref(),
             )
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let mut events = events;
-        let activity = self
-            .state
-            .repo
-            .activity(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let activity = self.state.repo.activity(&self.session_id).await?;
         if !should_continue && activity == SessionActivity::Idle {
             if let Some(event) = self.try_subagent_parent_idle_event().await {
                 events.push(event);
@@ -253,19 +234,16 @@ impl SessionDriver {
             .state
             .repo
             .load_session_config(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         self.state
             .workspaces
             .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let stored = self
             .state
             .repo
             .load_stored_session(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let session = AgentSession::from_stored_session(stored)
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         self.state.active.lock().await.insert(
@@ -325,8 +303,7 @@ impl SessionDriver {
                 .state
                 .repo
                 .has_unfinished_actions(&self.session_id)
-                .await
-                .map_err(anyhow::Error::from)?
+                .await?
             {
                 break;
             }
@@ -335,8 +312,7 @@ impl SessionDriver {
                 .state
                 .repo
                 .take_next_queued_input(&self.session_id)
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
             if let Some(queued) = maybe_input {
                 let agent_input =
                     agent_input_from_queued_priority(queued.priority, queued.content.clone());
@@ -350,8 +326,7 @@ impl SessionDriver {
                         self.state
                             .repo
                             .reset_consuming_input(&self.session_id, &queued.id, &queued.claim_id)
-                            .await
-                            .map_err(anyhow::Error::from)?;
+                            .await?;
                         return Err(RpcError::new("invalid_input", error.to_string()));
                     }
                     let dispatched = self
@@ -372,8 +347,7 @@ impl SessionDriver {
                 .state
                 .repo
                 .insert_event(&self.session_id, EventType::SessionIdle, json!({}))
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
             let mut events = vec![event];
             if let Some(event) = self.try_subagent_parent_idle_event().await {
                 events.push(event);
@@ -442,27 +416,16 @@ impl SessionDriver {
     }
 
     async fn reconcile_abandoned_boundary_session(&self) -> std::result::Result<(), RpcError> {
-        let activity = self
-            .state
-            .repo
-            .activity(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let activity = self.state.repo.activity(&self.session_id).await?;
         if activity == SessionActivity::Running
             && !session_has_live_tasks(&self.state, &self.session_id)
         {
             self.state
                 .repo
                 .mark_unfinished_actions_stale(&self.session_id)
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
         }
-        let activity = self
-            .state
-            .repo
-            .activity(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let activity = self.state.repo.activity(&self.session_id).await?;
         if activity == SessionActivity::Idle {
             self.notify_subagent_parent_idle_if_needed().await;
         }
@@ -557,8 +520,7 @@ impl SessionDriver {
             .state
             .repo
             .session_parent_id(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?
+            .await?
             .is_none()
         {
             return Ok(None);
@@ -567,8 +529,7 @@ impl SessionDriver {
             .state
             .repo
             .transcript_turns(&self.session_id, None, Some(20))
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let notification_key = turns
             .cards
             .iter()
@@ -601,8 +562,7 @@ impl SessionDriver {
             .state
             .repo
             .take_next_queued_steer_input(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?
+            .await?
         else {
             return Ok(None);
         };
@@ -616,8 +576,7 @@ impl SessionDriver {
             self.state
                 .repo
                 .reset_consuming_input(&self.session_id, &queued.id, &queued.claim_id)
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
             return Err(RpcError::new("invalid_input", error.to_string()));
         }
 
@@ -674,7 +633,6 @@ impl SessionDriver {
                 .repo
                 .action_can_complete(&self.session_id, &update.row_id, &update.attempt_id)
                 .await
-                .map_err(anyhow::Error::from)
                 .context("check action can complete")?
             {
                 return Err(RpcError::new(
@@ -696,19 +654,16 @@ impl SessionDriver {
             .state
             .repo
             .load_session_config(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         self.state
             .workspaces
             .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let stored = self
             .state
             .repo
             .load_stored_session(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let mut session = AgentSession::from_stored_session(stored)
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         session
@@ -760,7 +715,7 @@ impl SessionDriver {
             Ok(persisted) => persisted,
             Err(error) => {
                 self.state.active.lock().await.remove(&self.session_id);
-                return Err(anyhow::Error::from(error).into());
+                return Err(error.into());
             }
         };
         publish_events(&self.state, frames);
@@ -781,19 +736,16 @@ impl SessionDriver {
             .state
             .repo
             .pending_actions_for_dispatch(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let config = self
             .state
             .repo
             .load_session_config(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         self.state
             .workspaces
             .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let resolved = pending
             .into_iter()
             .map(|action| DispatchAction {

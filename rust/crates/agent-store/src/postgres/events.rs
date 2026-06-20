@@ -339,17 +339,15 @@ pub(super) async fn insert_transcript_item_events_tx(
                 .await?;
         fallback_record.as_ref()
     };
-    let entry_payload = if let Some(entry) = record.as_ref() {
-        Some(json!({
+    let entry_payload = record.as_ref().map(|entry| {
+        json!({
             "id": entry.id,
             "parent_id": entry.parent_id,
             "timestamp_ms": entry.timestamp_ms,
             "sequence": entry.sequence,
             "item": entry.item,
-        }))
-    } else {
-        None
-    };
+        })
+    });
     let tree_node = record.map(tree_node_from_entry);
     let mut frames = vec![
         insert_event_with_activity_tx(

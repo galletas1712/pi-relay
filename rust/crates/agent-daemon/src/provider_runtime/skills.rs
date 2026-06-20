@@ -31,7 +31,14 @@ fn load_skill_output(
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
 ) -> Result<String> {
-    load_skill_output_with_home(prompt_root, outer_cwd, workspaces, loaded_skills, call, None)
+    load_skill_output_with_home(
+        prompt_root,
+        outer_cwd,
+        workspaces,
+        loaded_skills,
+        call,
+        None,
+    )
 }
 
 fn load_skill_output_with_home(

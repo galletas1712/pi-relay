@@ -62,8 +62,7 @@ pub(crate) async fn spawn_subagent(
     let parent_config = state
         .repo
         .load_session_config(&request.parent_session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     if parent_config.project_id.is_none() {
         return Err(RpcError::new(
             "project_required",
@@ -91,16 +90,17 @@ pub(crate) async fn spawn_subagent(
             parent_config.outer_cwd.clone(),
             parent_config.workspaces.clone(),
         ),
-        SubagentType::ReadOnly => state
-            .workspaces
-            .fork_session_from_parent(
-                &request.parent_session_id,
-                &parent_config.outer_cwd,
-                &parent_config.workspaces,
-                &child_session_id,
-            )
-            .await
-            .map_err(anyhow::Error::from)?,
+        SubagentType::ReadOnly => {
+            state
+                .workspaces
+                .fork_session_from_parent(
+                    &request.parent_session_id,
+                    &parent_config.outer_cwd,
+                    &parent_config.workspaces,
+                    &child_session_id,
+                )
+                .await?
+        }
     };
 
     let child_metadata = subagent_metadata(
@@ -228,7 +228,6 @@ async fn subagent_parent_spawn_events(
             ],
         )
         .await
-        .map_err(anyhow::Error::from)
         .map_err(RpcError::from)
 }
 
@@ -236,11 +235,7 @@ pub(crate) async fn subagent_lifecycle_payload(
     state: &AppState,
     child_session_id: &str,
 ) -> std::result::Result<Value, RpcError> {
-    let config = state
-        .repo
-        .load_session_config(child_session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let config = state.repo.load_session_config(child_session_id).await?;
     Ok(json!({
         "child_session_id": child_session_id,
         "role": config.metadata.get("role_name").and_then(Value::as_str),
@@ -354,8 +349,7 @@ pub(crate) async fn require_known_subagent(
     let actual_parent_session_id = state
         .repo
         .session_parent_id(child_session_id)
-        .await
-        .map_err(anyhow::Error::from)?
+        .await?
         .ok_or_else(|| RpcError::new("subagent_not_found", "subagent is not in scope"))?;
     if actual_parent_session_id != parent_session_id {
         return Err(RpcError::new(
@@ -385,8 +379,10 @@ async fn cleanup_failed_spawn(
     match subagent_type {
         SubagentType::Full => {}
         SubagentType::ReadOnly => {
-            if let Err(workspace_error) =
-                state.workspaces.destroy_session_workspaces(child_session_id).await
+            if let Err(workspace_error) = state
+                .workspaces
+                .destroy_session_workspaces(child_session_id)
+                .await
             {
                 eprintln!(
                     "failed to clean up child workspace {child_session_id} after {reason}: {workspace_error:#}"
@@ -463,7 +459,7 @@ fn child_system_prompt(
     config: &SessionConfig,
     role: ChildPromptRole<'_>,
 ) -> std::result::Result<String, RpcError> {
-    let base = render_pi_prompt(state, config).map_err(anyhow::Error::from)?;
+    let base = render_pi_prompt(state, config)?;
     let workspace = role
         .workspace
         .map(|workspace| format!("workspace `{workspace}`"))

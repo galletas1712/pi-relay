@@ -54,8 +54,7 @@ pub(super) async fn run_model_turn(
     if !state
         .repo
         .action_can_complete(&session_id, &dispatch.row_id, &dispatch.attempt_id)
-        .await
-        .map_err(anyhow::Error::from)?
+        .await?
     {
         return Ok(());
     }
@@ -69,8 +68,7 @@ pub(super) async fn run_model_turn(
                 state
                     .repo
                     .reset_auto_compaction_failures(&session_id)
-                    .await
-                    .map_err(anyhow::Error::from)?;
+                    .await?;
             }
             let stop_reason = response.stop_reason;
             let max_output_tokens = matches!(
@@ -181,8 +179,7 @@ async fn run_model_for_action_with_retries(
             && !state
                 .repo
                 .action_can_complete(session_id, &dispatch.row_id, &dispatch.attempt_id)
-                .await
-                .map_err(anyhow::Error::from)?
+                .await?
         {
             return Err(RpcError::new(
                 "stale_action",
@@ -202,7 +199,7 @@ async fn run_model_for_action_with_retries(
             Err(error) => {
                 let Some(provider_error) = error.downcast_ref::<agent_provider::ProviderError>()
                 else {
-                    return Err(anyhow::Error::from(error).into());
+                    return Err(error.into());
                 };
                 let retryable = provider_error.is_retryable_transient();
                 if attempt >= MODEL_PROVIDER_MAX_ATTEMPTS || !retryable {
@@ -213,8 +210,7 @@ async fn run_model_for_action_with_retries(
                 if !state
                     .repo
                     .action_can_complete(session_id, &dispatch.row_id, &dispatch.attempt_id)
-                    .await
-                    .map_err(anyhow::Error::from)?
+                    .await?
                 {
                     return Err(RpcError::new(
                         "stale_action",
