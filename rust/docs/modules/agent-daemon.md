@@ -44,9 +44,6 @@ stage_runner.rs    stage barrier: all-terminal detect, attempt-fenced finish CAS
                    handoff write, one steer to the parent; boot crash sweep
 handoff.rs         renders index.json + per-subagent final_message.md / transcript.md
                    from the durable transcript
-repl.rs            in-process stateful Python scripting REPL (repl.exec /
-                   PythonRepl tool); a pure exec sandbox with no host bridge
-                   (raw escape hatch only; stage.* is the orchestration surface)
 ```
 
 Subagent work runs as **stages** (`stage.start_full` /

@@ -73,7 +73,6 @@ pub(crate) enum RpcMethod {
     TurnResume,
     ToolsList,
     CompactionRequest,
-    ReplExec,
     StageStartFull,
     StageStartReadonlyFanout,
     StageStatus,
@@ -117,7 +116,6 @@ impl RpcMethod {
             "turn.resume" => Some(Self::TurnResume),
             "tools.list" => Some(Self::ToolsList),
             "compaction.request" => Some(Self::CompactionRequest),
-            "repl.exec" => Some(Self::ReplExec),
             "stage.start_full" => Some(Self::StageStartFull),
             "stage.start_readonly_fanout" => Some(Self::StageStartReadonlyFanout),
             "stage.status" => Some(Self::StageStatus),
@@ -199,7 +197,6 @@ mod tests {
             Some(RpcMethod::TranscriptTurnDetail)
         );
         assert_eq!(RpcMethod::parse("turn.resume"), Some(RpcMethod::TurnResume));
-        assert_eq!(RpcMethod::parse("repl.exec"), Some(RpcMethod::ReplExec));
         assert_eq!(
             RpcMethod::parse("stage.start_full"),
             Some(RpcMethod::StageStartFull)
