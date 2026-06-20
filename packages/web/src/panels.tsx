@@ -39,10 +39,8 @@ import type {
 	Project,
 	ReasoningEffort,
 	SessionSnapshot,
-	SessionSummary,
 	Stage,
 	StageSubagent,
-	SubagentListResult,
 	ToolListing,
 } from "./types.ts";
 
@@ -76,69 +74,6 @@ export function SidebarHeader({
 			</div>
 		</div>
 	);
-}
-
-function SubagentsSection({
-	parentSessionId,
-	subagents,
-	summaries,
-	loading,
-	error,
-	onSelectSession,
-}: {
-	parentSessionId: string | null;
-	subagents: SubagentListResult | null;
-	summaries: SessionSummary[];
-	loading: boolean;
-	error: string | null;
-	onSelectSession?: (sessionId: string) => void;
-}) {
-	const summaryById = new Map(summaries.map((summary) => [summary.session_id, summary]));
-	const children = subagents?.subagents ?? [];
-	return (
-		<section className="inspect-section">
-			<h2>Subagents</h2>
-			{!parentSessionId ? <p className="muted">No session selected.</p> : null}
-			{loading ? <p className="muted">Loading subagents…</p> : null}
-			{error ? <p className="error-text">{error}</p> : null}
-			{parentSessionId && !loading && !error && children.length === 0 ? <p className="muted">No direct subagents yet.</p> : null}
-			{children.length > 0 ? (
-				<div className="subagent-list" role="list">
-					{children.map((child) => {
-						const summary = summaryById.get(child.child_session_id);
-						const activity = child.activity;
-						const roleName = roleLabel(summary);
-						return (
-							<button
-								className="subagent-row"
-								type="button"
-								key={child.child_session_id}
-								onClick={() => onSelectSession?.(child.child_session_id)}
-								title={`open ${child.child_session_id}`}
-							>
-								<span className={`status-rail ${displayActivity(activity)}`} />
-								<span className="subagent-main">
-									<span className="subagent-title">
-										<Bot size={13} />
-										{summary ? sessionTitle(summary) : child.child_session_id.slice(0, 13)}
-									</span>
-									<span className="subagent-sub">
-										{roleName ? `${roleName} · ` : ""}{summary?.provider.model ?? "session"} · {child.child_session_id.slice(0, 13)}
-									</span>
-								</span>
-								<span className={`subagent-activity ${displayActivity(activity)}`}>{displayActivity(activity)}</span>
-							</button>
-						);
-					})}
-				</div>
-			) : null}
-		</section>
-	);
-}
-
-function roleLabel(session: SessionSummary | undefined): string | null {
-	const role = session?.metadata?.role_name;
-	return typeof role === "string" && role.trim() ? role : null;
 }
 
 export interface RunBoardCallbacks {
@@ -851,10 +786,6 @@ export function NoticeStack({ notices, rightOpen }: { notices: Notice[]; rightOp
 
 export function Inspector({
 	snapshot,
-	subagents,
-	subagentSummaries,
-	subagentsLoading,
-	subagentsError,
 	stages,
 	stagesLoading,
 	stagesError,
@@ -865,10 +796,6 @@ export function Inspector({
 	onClose
 }: {
 	snapshot: SessionSnapshot | null;
-	subagents: SubagentListResult | null;
-	subagentSummaries: SessionSummary[];
-	subagentsLoading: boolean;
-	subagentsError: string | null;
 	stages: Stage[];
 	stagesLoading: boolean;
 	stagesError: string | null;
@@ -938,14 +865,6 @@ export function Inspector({
 				onSteerSubagent={runBoard.onSteerSubagent}
 				onReRunStage={runBoard.onReRunStage}
 				readHandoffFile={runBoard.readHandoffFile}
-			/>
-			<SubagentsSection
-				parentSessionId={snapshot?.session_id ?? null}
-				subagents={subagents}
-				summaries={subagentSummaries}
-				loading={subagentsLoading}
-				error={subagentsError}
-				onSelectSession={onSelectSession}
 			/>
 			<section className="inspect-section">
 				<h2>Pending</h2>

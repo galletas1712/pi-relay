@@ -1188,17 +1188,19 @@ tool-rerun semantics exist.
 
 ### `repl.exec`
 
-Executes a Python code cell in a stateful per-session REPL process. This is the
-websocket counterpart to the provider-visible `PythonRepl` tool. Python globals
-persist between calls for the same `session_id`; stdout/stderr are captured and
-returned with the last expression's `repr`.
+Executes a Python code cell in a stateful per-session scripting REPL process.
+This is the websocket counterpart to the provider-visible `PythonRepl` tool.
+Python globals persist between calls for the same `session_id`; stdout/stderr are
+captured and returned with the last expression's `repr`. The REPL is a pure
+Python sandbox with no host bridge — it cannot spawn or orchestrate subagents
+(use the `stage.*` RPCs for that).
 
 Request:
 
 ```json
 {
   "session_id": "session_parent",
-  "code": "review = subagents.spawn(role='reviewer', message='Review this patch')\nsubagents.wait(review)"
+  "code": "x = 41\nx + 1"
 }
 ```
 
@@ -1211,102 +1213,21 @@ Response:
   "ok": true,
   "stdout": "",
   "stderr": "",
-  "result_repr": "SubagentResult(session_id='session_child', role='reviewer', text='...')",
-  "result_json": {
-    "session_id": "session_child",
-    "role": "reviewer",
-    "text": "...",
-    "activity": "idle",
-    "transcript": {}
-  },
+  "result_repr": "42",
+  "result_json": 42,
   "error": null
 }
 ```
 
-The REPL exposes `subagents` directly; `import subagents` also works but is not required:
-
-```python
-handle = subagents.spawn(role="reviewer", message="Review this", fork_context=False)
-workers = [
-    subagents.spawn(role="worker", message="Try approach A", fork_context=True),
-    subagents.spawn(role="worker", message="Try approach B", fork_context=True),
-]
-result = subagents.wait(handle)
-results = subagents.wait(workers)
-merge = subagents.call(
-    role="merger",
-    message="Merge the useful parts of the worker proposals.",
-    sources=results,
-)
-children = subagents.list()
-turns = subagents[handle.session_id].transcript
-handle.steer("Change direction")
-handle.interrupt()
-subagents.steer(handle, "Change direction")
-subagents.interrupt(handle.session_id)
-```
-
-`subagents.spawn(...)` returns a `SubagentHandle` immediately after creating a
-child session. Spawn multiple children with repeated `spawn(...)` calls and keep
-the handles in a list. `subagents.wait(handle_or_handles)` is the explicit
-blocking operation: it waits until the selected child sessions are idle, then
-returns `SubagentResult` objects with final text/transcript snippets.
-If the latest terminal child turn is interrupted or crashed, `wait(...)` and
-`call(...)` raise `subagent_interrupted` or `subagent_crashed` instead of
-silently treating that terminal state as a successful result.
-`subagents.call(...)` is a convenience wrapper for spawn-then-wait and should
-only be used when the parent intentionally wants to block immediately. This
-helper does not have a subagent timeout; children may run for a long time and
-should either complete normally or be interrupted explicitly.
-Callers should retain handles for every spawned child, later `wait(...)`,
-`list()`, or read transcripts, and reconcile, steer, or interrupt those children
-before reporting final work.
-Each child runs in its own distinct session cwd/workspace clone. Parent prompts
-should describe the task and relevant files, not ask the child to operate in the
-parent cwd; child file edits do not appear in the parent workspace until they
-are explicitly inspected and merged.
 The provider-visible `PythonRepl` tool reports Python exceptions as tool errors
 with stdout/stderr and traceback, while the websocket `repl.exec` RPC returns the
 raw `ok: false` REPL payload.
 
-`subagents.list(parent_session_id=None)` returns a list of `SubagentHandle`
-objects (one per known child of the parent) carrying `session_id`, `role`
-(when available), and `activity`. The returned handles are immediately
-actionable: callers can `.steer(...)`, `.interrupt()`, `.wait()`, or read
-`.transcript` on them. `subagents.steer(session_id, message)` and
-`subagents.interrupt(session_id)` are top-level convenience methods that accept a
-session-id string, a `SubagentHandle`, a `SubagentResult`, or a dict containing
-`session_id`/`child_session_id`; they mirror the `handle.steer(message)` and
-`handle.interrupt()` instance methods.
-
-`sources=[...]` may be passed to `subagents.spawn(...)`/`subagents.call(...)` with known child
-`SubagentResult`s, `SubagentHandle`s, dicts containing `session_id`, or session-id
-strings. The daemon validates each source is a child of the current parent and
-prepares compact source metadata for the spawned child. For git workspaces, each
-source child's final worktree is made available in the new child's corresponding
-workspace as a local ref such as
-`refs/pi-relay/sources/source-1-implementer-a1b2c3d4`; local-folder workspaces
-are not merged or serialized.
-
-When a subagent is spawned, re-driven after being idle, or goes idle, the daemon
-emits parent-scoped `subagent.spawned`, `subagent.running`, and `subagent.idle`
-events. Idle notifications are de-duplicated per completed terminal child state,
-not for the child session lifetime, so a reused/steered child emits another
-running/idle cycle for its next piece of work. Parent sessions can subscribe to
-their normal event stream instead of polling `subagents.list()` to discover child
-completion.
-
-`role` can be a built-in role (`explore`, `worker`, `reviewer`, `tester`) or the name of an
-available skill. A unique workspace-scoped skill can be addressed by name alone;
-if multiple workspace skills share a role name, pass `role_workspace` to
-disambiguate. `fork_context=False` sends only the delegated task plus the normal
-session prompt, workspace/project context, and role instructions. `fork_context=True`
-also appends a bounded textual snapshot of the parent session's active branch to
-the child initial message.
-
-If a child turn crashes or is interrupted while a blocking helper is waiting, the
-helper raises an exception in the Python cell and the `repl.exec` response has
-`result.ok: false`.
+When a subagent is spawned (as part of a stage), re-driven after being idle, or
+goes idle, the daemon emits parent-scoped `subagent.spawned`, `subagent.running`,
+and `subagent.idle` events. Idle notifications are de-duplicated per completed
+terminal child state, not for the child session lifetime. Parent sessions
+subscribe to their normal event stream to observe stage-member progress.
 
 ## Tools
 

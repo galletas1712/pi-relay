@@ -302,7 +302,6 @@ async fn dispatch_request(
         RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
         RpcMethod::ReplExec => repl::repl_exec(state, params).await,
-        RpcMethod::SubagentList => subagents::subagent_list(state, params).await,
         RpcMethod::StageStartFull => stage_tools::rpc_start_full(state, params).await,
         RpcMethod::StageStartReadonlyFanout => {
             stage_tools::rpc_start_readonly_fanout(state, params).await
@@ -536,6 +535,9 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
             .provider_connections
             .remove_session(candidate_session_id)
             .await;
+        // Reap the per-session python3 REPL child so deleting a session that ran
+        // a PythonRepl cell never leaks a live process until daemon shutdown.
+        state.repls.remove_and_kill(candidate_session_id).await;
     }
 
     Ok(json!({

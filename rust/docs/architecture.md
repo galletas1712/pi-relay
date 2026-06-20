@@ -142,9 +142,7 @@ Not implemented by design:
   once the websocket path became Postgres-only.
 - Cross-subagent workspace merging. There is one durable workspace with a single
   writer in time; read-only subagents are isolated in throwaway snapshots and
-  never merged back. (The legacy `subagents.spawn(sources=…)` git-source-ref
-  merge path is removed by this design; see
-  `plans/subagent-source-ref-merge-plan.md`, retained as history.)
+  never merged back.
 - Daemon-executed workflow graphs/DSLs and a workflow variable store. Workflow
   control flow lives in parent-interpreted skills.
 

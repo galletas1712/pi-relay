@@ -2,11 +2,9 @@ use std::path::PathBuf;
 
 use agent_store::{EventFrame, EventType, InputPriority, SessionConfig, SubagentType};
 use agent_vocab::{ProviderConfig, UserMessage};
-use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::codec::from_params;
 use crate::provider_runtime::{render_pi_prompt, resolve_skill_role};
 use crate::runtime::{publish_events, SessionDriver};
 use crate::session_start::{
@@ -14,80 +12,6 @@ use crate::session_start::{
 };
 use crate::state::AppState;
 use crate::types::RpcError;
-
-const MAX_INITIAL_CONTEXT_BYTES: usize = 64 * 1024;
-
-pub(crate) async fn subagent_list(
-    state: &AppState,
-    params: Value,
-) -> std::result::Result<Value, RpcError> {
-    let params: SubagentListParams = from_params(params)?;
-    let parent_session_id = params.parent_session_id.trim().to_string();
-    if parent_session_id.is_empty() {
-        return Err(RpcError::new(
-            "invalid_params",
-            "parent_session_id cannot be empty",
-        ));
-    }
-    let child_session_ids = state
-        .repo
-        .list_child_session_ids(&parent_session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let mut subagents = Vec::with_capacity(child_session_ids.len());
-    for child_session_id in child_session_ids {
-        let activity = state
-            .repo
-            .activity(&child_session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-        // Best-effort: surface the child's role so list() handles carry it.
-        let role = state
-            .repo
-            .load_session_config(&child_session_id)
-            .await
-            .ok()
-            .and_then(|config| {
-                config
-                    .metadata
-                    .get("role_name")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            });
-        subagents.push(json!({
-            "child_session_id": child_session_id,
-            "activity": activity,
-            "role": role,
-        }));
-    }
-    Ok(json!({
-        "parent_session_id": parent_session_id,
-        "subagents": subagents,
-    }))
-}
-
-pub(crate) async fn subagent_spawn_from_active_parent(
-    state: &AppState,
-    params: Value,
-) -> std::result::Result<Value, RpcError> {
-    let request = SubagentSpawnRequest::from_params(params)?;
-    let spawned = spawn_subagent(state, request).await?;
-    Ok(spawned_subagent_view(spawned))
-}
-
-fn spawned_subagent_view(spawned: SpawnedSubagent) -> Value {
-    json!({
-        "parent_session_id": spawned.parent_session_id,
-        "child_session_id": spawned.started.session_id,
-        "activity": spawned.started.activity,
-        "replayed": spawned.started.replayed,
-    })
-}
-
-#[derive(Debug, Deserialize)]
-struct SubagentListParams {
-    parent_session_id: String,
-}
 
 /// A subagent spawned as part of a stage: fresh context (no parent-transcript
 /// fork, no source refs), tagged with its stage id and type.
@@ -103,13 +27,9 @@ impl From<StageSubagentSpawn> for SubagentSpawnRequest {
     fn from(spawn: StageSubagentSpawn) -> Self {
         Self {
             parent_session_id: spawn.parent_session_id,
-            child_session_id: None,
             role: spawn.role,
             role_workspace: None,
             task: spawn.task,
-            initial_context: None,
-            sources: Vec::new(),
-            display_name: None,
             provider: None,
             metadata: json!({}),
             subagent_type: spawn.subagent_type,
@@ -121,104 +41,16 @@ impl From<StageSubagentSpawn> for SubagentSpawnRequest {
 #[derive(Debug)]
 pub(crate) struct SubagentSpawnRequest {
     parent_session_id: String,
-    child_session_id: Option<String>,
     role: String,
     role_workspace: Option<String>,
     task: String,
-    initial_context: Option<String>,
-    sources: Vec<String>,
-    display_name: Option<String>,
     provider: Option<ProviderConfig>,
     metadata: Value,
     subagent_type: SubagentType,
     stage_id: Option<String>,
 }
 
-impl SubagentSpawnRequest {
-    fn from_params(params: Value) -> std::result::Result<Self, RpcError> {
-        let params: SubagentSpawnParams = from_params(params)?;
-        let parent_session_id = params.parent_session_id.trim().to_string();
-        if parent_session_id.is_empty() {
-            return Err(RpcError::new(
-                "invalid_params",
-                "parent_session_id cannot be empty",
-            ));
-        }
-        let role = params.role.trim().to_string();
-        if role.is_empty() {
-            return Err(RpcError::new("invalid_params", "role cannot be empty"));
-        }
-        let role_workspace = params
-            .role_workspace
-            .map(|workspace| workspace.trim().to_string())
-            .filter(|workspace| !workspace.is_empty());
-        let task = params.task.trim().to_string();
-        if task.is_empty() {
-            return Err(RpcError::new("invalid_params", "task cannot be empty"));
-        }
-        let initial_context = params
-            .initial_context
-            .map(|context| context.trim().to_string())
-            .filter(|context| !context.is_empty());
-        if initial_context
-            .as_ref()
-            .map(String::len)
-            .unwrap_or_default()
-            > MAX_INITIAL_CONTEXT_BYTES
-        {
-            return Err(RpcError::new(
-                "initial_context_too_large",
-                format!("initial_context exceeds {MAX_INITIAL_CONTEXT_BYTES} bytes"),
-            ));
-        }
-        let child_session_id = params
-            .child_session_id
-            .map(|session_id| session_id.trim().to_string())
-            .filter(|session_id| !session_id.is_empty());
-        let mut sources = Vec::new();
-        for source in params.sources.unwrap_or_default() {
-            let Some(source_session_id) = source_session_id(source) else {
-                return Err(RpcError::new(
-                    "invalid_params",
-                    "each source must be a session id string or an object containing session_id or child_session_id",
-                ));
-            };
-            sources.push(source_session_id);
-        }
-        Ok(Self {
-            parent_session_id,
-            child_session_id,
-            role,
-            role_workspace,
-            task,
-            initial_context,
-            sources,
-            display_name: params.display_name,
-            provider: params.provider,
-            metadata: params.metadata.unwrap_or_else(|| json!({})),
-            subagent_type: params.subagent_type.unwrap_or(SubagentType::ReadOnly),
-            stage_id: None,
-        })
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct SubagentSpawnParams {
-    parent_session_id: String,
-    child_session_id: Option<String>,
-    role: String,
-    role_workspace: Option<String>,
-    task: String,
-    initial_context: Option<String>,
-    sources: Option<Vec<Value>>,
-    display_name: Option<String>,
-    provider: Option<ProviderConfig>,
-    metadata: Option<Value>,
-    subagent_type: Option<SubagentType>,
-}
-
 pub(crate) struct SpawnedSubagent {
-    pub(crate) parent_session_id: String,
     pub(crate) started: StartedSession,
 }
 
@@ -238,51 +70,10 @@ pub(crate) async fn spawn_subagent(
             "subagents can only be spawned from project sessions",
         ));
     }
-    let existing_child_session_id = match request.child_session_id.as_deref() {
-        Some(child_session_id) => state
-            .repo
-            .session_exists(child_session_id)
-            .await
-            .map_err(anyhow::Error::from)?
-            .then_some(child_session_id),
-        None => None,
-    };
-    if let Some(child_session_id) = existing_child_session_id {
-        require_known_subagent(state, &request.parent_session_id, child_session_id).await?;
-        let activity = state
-            .repo
-            .activity(child_session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-        return Ok(SpawnedSubagent {
-            parent_session_id: request.parent_session_id,
-            started: StartedSession {
-                session_id: child_session_id.to_string(),
-                project_id: parent_config.project_id,
-                activity,
-                replayed: true,
-                dispatches: Vec::new(),
-            },
-        });
-    }
-
     let parent_driver = SessionDriver::acquire(state, &request.parent_session_id).await;
     parent_driver.recover_if_needed().await?;
 
-    let child_session_id = request
-        .child_session_id
-        .unwrap_or_else(|| format!("session_{}", Uuid::new_v4()));
-    if state
-        .repo
-        .session_exists(&child_session_id)
-        .await
-        .map_err(anyhow::Error::from)?
-    {
-        return Err(RpcError::new(
-            "session_exists",
-            format!("child session already exists and is not reusable: {child_session_id}"),
-        ));
-    }
+    let child_session_id = format!("session_{}", Uuid::new_v4());
 
     let role = resolve_skill_role(
         &state.prompt_root,
@@ -316,7 +107,6 @@ pub(crate) async fn spawn_subagent(
         request.metadata,
         &role.name,
         role.workspace.as_deref(),
-        request.display_name.as_deref(),
         &request.task,
         &role.file_path,
         &parent_config.metadata,
@@ -340,39 +130,8 @@ pub(crate) async fn spawn_subagent(
             parent_session_id: &request.parent_session_id,
         },
     )?;
-    // Source refs are only meaningful for a forked (read-only) child with its
-    // own private dirs; a full subagent writes the parent's dirs in place and
-    // carries no sources. Skip the import (and its teardown, which would delete
-    // the shared parent workspace) entirely for full.
-    let source_refs = match request.subagent_type {
-        SubagentType::Full => Vec::new(),
-        SubagentType::ReadOnly => {
-            let source_configs =
-                load_source_configs(state, &request.parent_session_id, &request.sources)
-                    .await?
-                    .into_iter()
-                    .collect::<Vec<_>>();
-            match state
-                .workspaces
-                .import_source_refs(&outer_cwd, &child_config.workspaces, &source_configs)
-                .await
-            {
-                Ok(source_refs) => source_refs,
-                Err(error) => {
-                    let _ = state.workspaces.remove_session_dir(&child_session_id).await;
-                    return Err(anyhow::Error::from(error).into());
-                }
-            }
-        }
-    };
-
     let task = request.task;
-    let initial_task = child_initial_task_message(
-        &request.parent_session_id,
-        &task,
-        request.initial_context.as_deref(),
-        &source_refs,
-    );
+    let initial_task = child_initial_task_message(&request.parent_session_id, &task);
     let subagent_type = request.subagent_type;
     let started = start_prepared_session(
         state,
@@ -397,7 +156,6 @@ pub(crate) async fn spawn_subagent(
         &started.session_id,
         &role.name,
         role.workspace.as_deref(),
-        request.display_name.as_deref(),
     )
     .await
     {
@@ -423,7 +181,6 @@ pub(crate) async fn spawn_subagent(
             &started.session_id,
             &role.name,
             role.workspace.as_deref(),
-            request.display_name.as_deref(),
             &error,
         )
         .await;
@@ -437,10 +194,7 @@ pub(crate) async fn spawn_subagent(
         return Err(error);
     }
 
-    Ok(SpawnedSubagent {
-        parent_session_id: request.parent_session_id,
-        started,
-    })
+    Ok(SpawnedSubagent { started })
 }
 
 async fn subagent_parent_spawn_events(
@@ -449,7 +203,6 @@ async fn subagent_parent_spawn_events(
     child_session_id: &str,
     role: &str,
     role_workspace: Option<&str>,
-    display_name: Option<&str>,
 ) -> std::result::Result<Vec<EventFrame>, RpcError> {
     state
         .repo
@@ -462,7 +215,6 @@ async fn subagent_parent_spawn_events(
                         "child_session_id": child_session_id,
                         "role": role,
                         "role_workspace": role_workspace,
-                        "display_name": display_name,
                     }),
                 ),
                 (
@@ -471,7 +223,6 @@ async fn subagent_parent_spawn_events(
                         "child_session_id": child_session_id,
                         "role": role,
                         "role_workspace": role_workspace,
-                        "display_name": display_name,
                     }),
                 ),
             ],
@@ -540,7 +291,6 @@ async fn publish_subagent_parent_dispatch_failed_event(
     child_session_id: &str,
     role: &str,
     role_workspace: Option<&str>,
-    display_name: Option<&str>,
     error: &RpcError,
 ) {
     // A stage member's failure is owned by the stage (FIX E): the stage_tools
@@ -565,7 +315,6 @@ async fn publish_subagent_parent_dispatch_failed_event(
                 "child_session_id": child_session_id,
                 "role": role,
                 "role_workspace": role_workspace,
-                "display_name": display_name,
                 "outcome": "Crashed",
                 "summary_preview": summary_preview,
             }),
@@ -593,47 +342,9 @@ pub(crate) async fn publish_subagent_parent_dispatch_failed_event_for_test(
         child_session_id,
         role,
         None,
-        None,
         &RpcError::new("provider_error", "simulated initial dispatch failure"),
     )
     .await;
-}
-
-fn source_session_id(value: Value) -> Option<String> {
-    match value {
-        Value::String(session_id) => {
-            let session_id = session_id.trim();
-            (!session_id.is_empty()).then(|| session_id.to_string())
-        }
-        Value::Object(map) => map
-            .get("session_id")
-            .or_else(|| map.get("child_session_id"))
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|session_id| !session_id.is_empty())
-            .map(str::to_string),
-        _ => None,
-    }
-}
-
-async fn load_source_configs(
-    state: &AppState,
-    parent_session_id: &str,
-    source_session_ids: &[String],
-) -> std::result::Result<Vec<(String, SessionConfig)>, RpcError> {
-    let mut sources = Vec::with_capacity(source_session_ids.len());
-    for source_session_id in source_session_ids {
-        require_known_subagent(state, parent_session_id, source_session_id).await?;
-        let source_driver = SessionDriver::acquire(state, source_session_id).await;
-        source_driver.ensure_idle_for_source_mutation().await?;
-        let config = state
-            .repo
-            .load_session_config(source_session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-        sources.push((source_session_id.clone(), config));
-    }
-    Ok(sources)
 }
 
 pub(crate) async fn require_known_subagent(
@@ -694,7 +405,6 @@ fn subagent_metadata(
     metadata: Value,
     role_name: &str,
     role_workspace: Option<&str>,
-    display_name: Option<&str>,
     task: &str,
     role_file_path: &PathBuf,
     parent_metadata: &Value,
@@ -728,57 +438,17 @@ fn subagent_metadata(
     if let Some(role_workspace) = role_workspace {
         map.insert("role_workspace".to_string(), json!(role_workspace));
     }
-    if let Some(display_name) = display_name {
-        map.insert("display_name".to_string(), json!(display_name));
-    }
     map.insert("task".to_string(), json!(task));
     map.insert("role_file_path".to_string(), json!(role_file_path));
     metadata
 }
 
-fn child_initial_task_message(
-    parent_session_id: &str,
-    task: &str,
-    initial_context: Option<&str>,
-    source_refs: &[crate::workspaces::SourceRefSpec],
-) -> String {
-    let mut message = format!(
-        "# Delegated task\n\nParent session: `{parent_session_id}`\n\n{task}\n\n# Parent active context\n\n"
-    );
-    if let Some(initial_context) = initial_context {
-        message.push_str(
-            "The parent requested `fork_context=True`; the following is a bounded textual snapshot \
-of the parent's active branch at delegation time.\n\n",
-        );
-        message.push_str(initial_context.trim());
-    } else {
-        message.push_str(
-            "No parent transcript/context snapshot was included for this call (`fork_context=False`). \
-Use the delegated task, role instructions, workspace/project context, and any files/tools you inspect.",
-        );
-    }
-    if !source_refs.is_empty() {
-        message.push_str("\n\n# Source child sessions\n\n");
-        message.push_str(
-            "The following child session outputs are available as local git refs in your workspace. \
-Inspect or merge them with git commands as needed; do not assume they are already applied.\n",
-        );
-        let mut current_source = "";
-        for source_ref in source_refs {
-            if current_source != source_ref.source_id {
-                current_source = &source_ref.source_id;
-                message.push_str(&format!(
-                    "\n## {}\n\n- Session: `{}`\n- Git refs:\n",
-                    source_ref.source_id, source_ref.session_id
-                ));
-            }
-            message.push_str(&format!(
-                "  - workspace `{}`: `{}`\n",
-                source_ref.workspace_dir, source_ref.git_ref
-            ));
-        }
-    }
-    message
+fn child_initial_task_message(parent_session_id: &str, task: &str) -> String {
+    format!(
+        "# Delegated task\n\nParent session: `{parent_session_id}`\n\n{task}\n\n# Parent active context\n\n\
+A subagent runs with fresh context: no parent transcript snapshot is included. \
+Use the delegated task, role instructions, workspace/project context, and any files/tools you inspect."
+    )
 }
 
 struct ChildPromptRole<'a> {
@@ -822,50 +492,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_validation_trims_role_and_rejects_empty_task() {
-        let request = SubagentSpawnRequest::from_params(json!({
-            "parent_session_id": " parent ",
-            "role": " reviewer ",
-            "role_workspace": " repo ",
-            "task": " Review this ",
-            "initial_context": " Context ",
-        }))
-        .expect("request parses");
-        assert_eq!(request.parent_session_id, "parent");
-        assert_eq!(request.role, "reviewer");
-        assert_eq!(request.role_workspace.as_deref(), Some("repo"));
-        assert_eq!(request.task, "Review this");
-        assert_eq!(request.initial_context.as_deref(), Some("Context"));
-
-        let request = SubagentSpawnRequest::from_params(json!({
-            "parent_session_id": "parent",
-            "role": "merger",
-            "task": "Merge this",
-            "sources": [
-                " child-a ",
-                { "session_id": " child-b " },
-                { "child_session_id": " child-c " }
-            ]
-        }))
-        .expect("request parses sources");
-        assert_eq!(request.sources, ["child-a", "child-b", "child-c"]);
-
-        let error = SubagentSpawnRequest::from_params(json!({
-            "parent_session_id": "parent",
-            "role": "reviewer",
-            "task": "  ",
-        }))
-        .expect_err("empty task rejected");
-        assert_eq!(error.code, "invalid_params");
-    }
-
-    #[test]
     fn subagent_metadata_marks_session_hidden() {
         let metadata = subagent_metadata(
             json!({ "custom": true }),
             "reviewer",
             Some("repo"),
-            Some("Review"),
             "Review this",
             &PathBuf::from("/tmp/reviewer/SKILL.md"),
             &json!({ "harness": true, "auto_title_disabled": true }),
@@ -880,7 +511,6 @@ mod tests {
                 "subagent": true,
                 "role_name": "reviewer",
                 "role_workspace": "repo",
-                "display_name": "Review",
                 "task": "Review this",
                 "role_file_path": "/tmp/reviewer/SKILL.md",
             })
@@ -888,49 +518,12 @@ mod tests {
     }
 
     #[test]
-    fn child_initial_task_message_marks_absent_parent_context() {
-        let message = child_initial_task_message("parent", "Inspect the repo.", None, &[]);
+    fn child_initial_task_message_marks_fresh_context() {
+        let message = child_initial_task_message("parent", "Inspect the repo.");
 
         assert!(message.contains("# Delegated task"));
         assert!(message.contains("Parent session: `parent`"));
         assert!(message.contains("Inspect the repo."));
-        assert!(message.contains(
-            "No parent transcript/context snapshot was included for this call (`fork_context=False`)."
-        ));
-    }
-
-    #[test]
-    fn child_initial_task_message_labels_forked_parent_context() {
-        let message = child_initial_task_message(
-            "parent",
-            "Continue the investigation.",
-            Some("Parent session `parent` active context:\n\nAssistant:\nprior answer"),
-            &[],
-        );
-
-        assert!(message.contains("# Delegated task"));
-        assert!(message.contains("The parent requested `fork_context=True`"));
-        assert!(message.contains("Parent session `parent` active context:"));
-        assert!(message.contains("prior answer"));
-    }
-
-    #[test]
-    fn child_initial_task_message_lists_source_refs_without_diff_payload() {
-        let refs = vec![crate::workspaces::SourceRefSpec {
-            source_id: "source-1-implementer-abc123".to_string(),
-            session_id: "session_abc123".to_string(),
-            workspace_dir: "repo".to_string(),
-            git_ref: "refs/pi-relay/sources/source-1-implementer-abc123".to_string(),
-            commit: "deadbeef".to_string(),
-        }];
-        let message = child_initial_task_message("parent", "Merge this.", None, &refs);
-
-        assert!(message.contains("# Source child sessions"));
-        assert!(message.contains("## source-1-implementer-abc123"));
-        assert!(message.contains("- Session: `session_abc123`"));
-        assert!(message
-            .contains("- workspace `repo`: `refs/pi-relay/sources/source-1-implementer-abc123`"));
-        assert!(!message.contains("deadbeef"));
-        assert!(!message.contains("```diff"));
+        assert!(message.contains("A subagent runs with fresh context"));
     }
 }

@@ -36,7 +36,7 @@ workspaces/        workspace base refresh, local/git source handling, sanitizati
 rpc_views.rs       response shaping (snapshots, queue state, transcript views, server_time_ms)
 model_metadata.rs  per-model context windows + 85% auto-compaction default limit
 provider_runtime/  provider selection, model/web-tool execution, compaction, token accounting
-subagents.rs       parent/child subagent spawn/list: role resolution, full vs
+subagents.rs       stage subagent spawn core: role resolution, full vs
                    read-only workspace handling, child prompt + lifecycle events
 stage_tools.rs     stage.* RPC/tool surface (start_full / start_readonly_fanout /
                    status / cancel / list) + homogeneity/one-stage-per-parent guards
@@ -44,8 +44,8 @@ stage_runner.rs    stage barrier: all-terminal detect, attempt-fenced finish CAS
                    handoff write, one steer to the parent; boot crash sweep
 handoff.rs         renders index.json + per-subagent final_message.md / transcript.md
                    from the durable transcript
-repl.rs            in-process Python REPL (repl.exec / PythonRepl tool) exposing
-                   the `subagents` orchestration module over a host-call bridge
+repl.rs            in-process stateful Python scripting REPL (repl.exec /
+                   PythonRepl tool); a pure exec sandbox with no host bridge
                    (raw escape hatch only; stage.* is the orchestration surface)
 ```
 
