@@ -36,11 +36,28 @@ workspaces/        workspace base refresh, local/git source handling, sanitizati
 rpc_views.rs       response shaping (snapshots, queue state, transcript views, server_time_ms)
 model_metadata.rs  per-model context windows + 85% auto-compaction default limit
 provider_runtime/  provider selection, model/web-tool execution, compaction, token accounting
-subagents.rs       parent/child subagent spawn/list: role resolution, workspace
-                   fork, git source-ref import, child prompt + lifecycle events
+subagents.rs       parent/child subagent spawn/list: role resolution, full vs
+                   read-only workspace handling, child prompt + lifecycle events
+stage_tools.rs     stage.* RPC/tool surface (start_full / start_readonly_fanout /
+                   status / cancel / list) + homogeneity/one-stage-per-parent guards
+stage_runner.rs    stage barrier: all-terminal detect, attempt-fenced finish CAS,
+                   handoff write, one steer to the parent; boot crash sweep
+handoff.rs         renders index.json + per-subagent final_message.md / transcript.md
+                   from the durable transcript
 repl.rs            in-process Python REPL (repl.exec / PythonRepl tool) exposing
                    the `subagents` orchestration module over a host-call bridge
+                   (raw escape hatch only; stage.* is the orchestration surface)
 ```
+
+Subagent work runs as **stages** (`stage.start_full` /
+`stage.start_readonly_fanout` / `stage.status` / `stage.cancel`). Full subagents
+reuse the parent's workspace dirs in place; read-only subagents get a forked
+snapshot destroyed on return. The stage runner watches
+`subagent.{spawned,running,idle}` events, applies a single-flight,
+`attempt_id`-fenced barrier when all subagents of a stage are terminal, writes
+the handoff directory, and enqueues one `InputPriority::Steer` notification to
+the parent. The runner never decides the next stage — the parent does, guided by
+workflow skills.
 
 `runtime/` keeps ordering-sensitive behavior in named phases instead of a generic
 hook/event bus: queued inputs are persisted before dispatch, model dispatch is

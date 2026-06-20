@@ -140,6 +140,7 @@ pub(crate) async fn start_full_core(
             StageKind::Full,
             params.workflow.as_deref(),
             params.label.as_deref(),
+            1,
         )
         .await
         .map_err(anyhow::Error::from)?;
@@ -197,6 +198,7 @@ pub(crate) async fn start_readonly_fanout_core(
     reject_if_subagent(state, parent_session_id).await?;
     reject_if_stage_running(state, parent_session_id).await?;
 
+    let expected_subagents = tasks.len();
     let stage = state
         .repo
         .create_stage(
@@ -204,11 +206,12 @@ pub(crate) async fn start_readonly_fanout_core(
             StageKind::ReadonlyFanout,
             params.workflow.as_deref(),
             params.label.as_deref(),
+            expected_subagents as i32,
         )
         .await
         .map_err(anyhow::Error::from)?;
 
-    let mut subagent_session_ids = Vec::with_capacity(tasks.len());
+    let mut subagent_session_ids = Vec::with_capacity(expected_subagents);
     for (role, prompt) in tasks {
         match spawn_subagent(
             state,

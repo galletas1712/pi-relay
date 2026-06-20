@@ -137,6 +137,11 @@ create table if not exists stages (
 
 create index if not exists stages_parent_created_idx on stages(parent_session_id, created_at, id);
 
+-- The number of subagents the stage will eventually spawn. The barrier requires
+-- the full set to exist (and be terminal) before completing, so a partial spawn
+-- (subagent #1 terminal while #2 is not yet inserted) cannot complete the stage.
+alter table stages add column if not exists expected_subagents integer not null default 1;
+
 alter table sessions add column if not exists stage_id text null references stages(id);
 "#;
 

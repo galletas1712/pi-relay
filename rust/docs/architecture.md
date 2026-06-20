@@ -23,9 +23,10 @@ in-flight future work lives under [`plans/`](plans/).
 4. Keep providers intentionally narrow: OpenAI/Codex and Anthropic/Claude only.
 5. Keep tools separate from the agent loop so tool sets can be customized
    without changing the FSM.
-6. Support bounded parent/child subagent delegation (spawn/list/wait/steer/
-   interrupt over forked sessions) without a generic injected-message routing
-   layer or event bus between arbitrary sessions.
+6. Support bounded parent/child subagent delegation as **stages**: the parent
+   runs one full (writing) subagent or a parallel fan-out of read-only
+   subagents, parks, and is steered with a completion notification. No generic
+   injected-message routing layer or event bus between arbitrary sessions.
 
 ## Crate Stack
 
@@ -119,13 +120,16 @@ Implemented user-facing behavior:
   included by the template.
 - Real OpenAI/Codex (ChatGPT subscription transport) and Anthropic API-key
   provider paths, with prompt-cache shaping on both.
-- Subagent delegation: a parent spawns child sessions by role/skill (optionally
-  with a forked context snapshot and git source-refs), then lists, waits on,
-  reads, steers, and interrupts them. Children are regular forked sessions
-  driven through the same loop. `subagent.list` plus parent-scoped
-  `subagent.{spawned,running,idle}` lifecycle events are on the wire; spawn and
-  control flow through the in-process Python REPL `subagents` module. See
-  [agent-daemon](modules/agent-daemon.md).
+- Subagent delegation runs as **stages** through regular `stage.*` RPC tools.
+  A stage is one **full** subagent (writes the parent's workspace in place) or a
+  parallel fan-out of **read-only** subagents (each in a disposable btrfs
+  snapshot, destroyed on return). The parent parks after launching a stage and
+  is delivered a parent-scoped completion **steer** pointing at a handoff
+  directory (`index.json` + per-subagent final message and transcript).
+  `subagent.{spawned,running,idle}` lifecycle events drive the stage barrier.
+  Reusable patterns are **workflow skills** (`SKILL.md` + `LoadSkill`), not a
+  DSL. The Python REPL `subagents` module remains only as a raw escape hatch.
+  See [agent-daemon](modules/agent-daemon.md).
 
 Not implemented by design:
 
@@ -136,6 +140,13 @@ Not implemented by design:
 - General plugin/provider marketplace.
 - Non-Postgres storage backends. The old in-memory/JSONL store layer was removed
   once the websocket path became Postgres-only.
+- Cross-subagent workspace merging. There is one durable workspace with a single
+  writer in time; read-only subagents are isolated in throwaway snapshots and
+  never merged back. (The legacy `subagents.spawn(sources=…)` git-source-ref
+  merge path is removed by this design; see
+  `plans/subagent-source-ref-merge-plan.md`, retained as history.)
+- Daemon-executed workflow graphs/DSLs and a workflow variable store. Workflow
+  control flow lives in parent-interpreted skills.
 
 ## Removed Pieces
 

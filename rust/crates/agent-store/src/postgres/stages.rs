@@ -1,10 +1,14 @@
+use agent_vocab::UserMessage;
 use anyhow::Result;
-use serde_json::Value;
+use serde_json::{json, Value};
 use sqlx::Row;
 use uuid::Uuid;
 
+use super::events::insert_event_tx;
+use super::queue::bump_revisions_tx;
+use super::sql::lock_session_tx;
 use super::PostgresAgentStore;
-use crate::{SessionActivity, StageKind, StageStatus, SubagentType};
+use crate::{EventType, InputPriority, SessionActivity, StageKind, StageStatus, SubagentType};
 
 /// A durable stage row: an ordered unit of work under a parent session that is
 /// either one full subagent or a fan-out of read-only subagents.
@@ -17,6 +21,10 @@ pub struct Stage {
     pub kind: StageKind,
     pub status: StageStatus,
     pub attempt_id: String,
+    /// The full subagent set this stage will spawn (1 for a full stage,
+    /// `tasks.len()` for a fan-out). The barrier never completes until exactly
+    /// this many subagents exist and are all terminal.
+    pub expected_subagents: i32,
 }
 
 /// A subagent session belonging to a stage, with the fields `stage.status`
@@ -38,13 +46,14 @@ impl PostgresAgentStore {
         kind: StageKind,
         workflow: Option<&str>,
         label: Option<&str>,
+        expected_subagents: i32,
     ) -> Result<Stage> {
         let id = format!("stage_{}", Uuid::new_v4());
         let attempt_id = Uuid::new_v4().to_string();
         sqlx::query(
             r#"
-            insert into stages (id, parent_session_id, workflow, label, kind, status, attempt_id)
-            values ($1, $2, $3, $4, $5, $6, $7)
+            insert into stages (id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents)
+            values ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
         .bind(&id)
@@ -54,6 +63,7 @@ impl PostgresAgentStore {
         .bind(kind.as_str())
         .bind(StageStatus::Running.as_str())
         .bind(&attempt_id)
+        .bind(expected_subagents)
         .execute(&self.pool)
         .await?;
         Ok(Stage {
@@ -64,13 +74,14 @@ impl PostgresAgentStore {
             kind,
             status: StageStatus::Running,
             attempt_id,
+            expected_subagents,
         })
     }
 
     pub async fn get_stage(&self, stage_id: &str) -> Result<Option<Stage>> {
         let Some(row) = sqlx::query(
             r#"
-            select id, parent_session_id, workflow, label, kind, status, attempt_id
+            select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
             from stages
             where id=$1
             "#,
@@ -81,17 +92,7 @@ impl PostgresAgentStore {
         else {
             return Ok(None);
         };
-        let kind: String = row.get("kind");
-        let status: String = row.get("status");
-        Ok(Some(Stage {
-            id: row.get("id"),
-            parent_session_id: row.get("parent_session_id"),
-            workflow: row.get("workflow"),
-            label: row.get("label"),
-            kind: kind.parse().map_err(anyhow::Error::msg)?,
-            status: status.parse().map_err(anyhow::Error::msg)?,
-            attempt_id: row.get("attempt_id"),
-        }))
+        Ok(Some(row_to_stage(&row)?))
     }
 
     /// The subagent sessions of a stage, ordered by creation, with the activity
@@ -136,7 +137,7 @@ impl PostgresAgentStore {
     pub async fn list_parent_stages(&self, parent_session_id: &str) -> Result<Vec<Stage>> {
         let rows = sqlx::query(
             r#"
-            select id, parent_session_id, workflow, label, kind, status, attempt_id
+            select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
             from stages
             where parent_session_id=$1
             order by created_at, id
@@ -145,21 +146,7 @@ impl PostgresAgentStore {
         .bind(parent_session_id)
         .fetch_all(&self.pool)
         .await?;
-        let mut stages = Vec::with_capacity(rows.len());
-        for row in rows {
-            let kind: String = row.get("kind");
-            let status: String = row.get("status");
-            stages.push(Stage {
-                id: row.get("id"),
-                parent_session_id: row.get("parent_session_id"),
-                workflow: row.get("workflow"),
-                label: row.get("label"),
-                kind: kind.parse().map_err(anyhow::Error::msg)?,
-                status: status.parse().map_err(anyhow::Error::msg)?,
-                attempt_id: row.get("attempt_id"),
-            });
-        }
-        Ok(stages)
+        rows.iter().map(row_to_stage).collect()
     }
 
     /// Whether the parent already owns a `running` stage. Backs the
@@ -181,7 +168,7 @@ impl PostgresAgentStore {
     }
 
     /// Mark a stage's status, e.g. when `stage.cancel` cancels it. The barrier's
-    /// attempt-fenced completion CAS lands in Phase 3.
+    /// attempt-fenced completion lives in `finish_stage`.
     pub async fn set_stage_status(&self, stage_id: &str, status: StageStatus) -> Result<()> {
         sqlx::query("update stages set status=$2, updated_at=now() where id=$1")
             .bind(stage_id)
@@ -190,6 +177,198 @@ impl PostgresAgentStore {
             .await?;
         Ok(())
     }
+
+    /// The stage barrier's completion CAS, atomic with the parent steer (FIX B).
+    ///
+    /// Single-flight via the stage row's `for update` lock; idempotent via the
+    /// `status='running'` + `attempt_id` fence. When the CAS wins, the SAME
+    /// transaction inserts the parent's steer as a durable `queued_input`
+    /// (`InputPriority::Steer`) keyed by a deterministic `client_input_id`
+    /// derived from `stage_id`+`attempt_id`. So a commit means the steer is
+    /// durably queued: a crash in the old gap between the CAS commit and a
+    /// separate enqueue can no longer strand the parent, and a replay/sweep
+    /// re-running this with the same key cannot double-enqueue (the unique
+    /// `(session_id, client_input_id)` index makes the insert a no-op).
+    ///
+    /// Returns whether this call won the transition (`rows_affected()==1`), so
+    /// exactly one caller renders the handoff and drives the parent. A missing
+    /// stage is a benign no-op (a late lifecycle event for a deleted stage).
+    pub async fn finish_stage(
+        &self,
+        stage_id: &str,
+        attempt_id: &str,
+        status: StageStatus,
+        parent_session_id: &str,
+        steer_message: &str,
+        steer_client_input_id: &str,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let locked = sqlx::query("select id from stages where id=$1 for update")
+            .bind(stage_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if locked.is_none() {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let updated = sqlx::query(
+            "update stages set status=$3, updated_at=now() where id=$1 and attempt_id=$2 and status='running'",
+        )
+        .bind(stage_id)
+        .bind(attempt_id)
+        .bind(status.as_str())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated == 1 {
+            enqueue_steer_tx(
+                &mut tx,
+                parent_session_id,
+                steer_message,
+                steer_client_input_id,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(updated == 1)
+    }
+
+    /// Whether every subagent of a stage is terminal. Two fences guard against a
+    /// premature completion:
+    ///
+    /// 1. Expected-count fence (FIX A): the stage must have spawned its FULL set
+    ///    of subagents. A fan-out spawns its children in a loop while each child
+    ///    drives in a detached task, so subagent #1 can reach terminal before #2
+    ///    is even inserted. Requiring `count(sessions where stage_id) ==
+    ///    expected_subagents` keeps the barrier closed during that window.
+    ///
+    /// 2. Transcript-boundary terminality (FIX C): a subagent is terminal only
+    ///    when its active leaf is a genuine turn boundary (`TurnFinished` /
+    ///    compaction summary). This is independent of action/queue status — so a
+    ///    subagent that crashed MID-TURN (boot's `mark_all_unfinished_actions_stale`
+    ///    erased its unfinished action, and it had no queued input) is correctly
+    ///    NON-terminal and stays in the stage until it is recovered to a boundary
+    ///    (where it either continues or settles as a genuine terminal outcome).
+    pub async fn stage_subagents_all_terminal(&self, stage_id: &str) -> Result<bool> {
+        let session_ids: Vec<String> =
+            sqlx::query_scalar("select id from sessions where stage_id=$1")
+                .bind(stage_id)
+                .fetch_all(&self.pool)
+                .await?;
+        if (session_ids.len() as i32) != self.stage_expected_subagents(stage_id).await? {
+            return Ok(false);
+        }
+        for session_id in &session_ids {
+            if !self.active_leaf_is_turn_boundary(session_id).await? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    async fn stage_expected_subagents(&self, stage_id: &str) -> Result<i32> {
+        sqlx::query_scalar("select expected_subagents from stages where id=$1")
+            .bind(stage_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Running stages whose subagents are all terminal — the boot-sweep input.
+    /// A crash mid-barrier leaves such a stage `running` with every subagent
+    /// idle; the sweep re-runs `finish_stage` so it completes exactly once.
+    pub async fn sweep_running_stages(&self) -> Result<Vec<Stage>> {
+        let running = self.list_running_stages().await?;
+        let mut ready = Vec::new();
+        for stage in running {
+            if self.stage_subagents_all_terminal(&stage.id).await? {
+                ready.push(stage);
+            }
+        }
+        Ok(ready)
+    }
+
+    async fn list_running_stages(&self) -> Result<Vec<Stage>> {
+        let rows = sqlx::query(
+            r#"
+            select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
+            from stages
+            where status='running'
+            order by created_at, id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_stage).collect()
+    }
+}
+
+/// Insert the parent's stage-completion steer as a durable queued input inside
+/// the caller's transaction, idempotent on `(session_id, client_input_id)`. A
+/// re-run with the same key (replay/boot sweep) inserts nothing and emits no
+/// duplicate event. Mirrors the steer branch of `enqueue_user_input`.
+async fn enqueue_steer_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    parent_session_id: &str,
+    message: &str,
+    client_input_id: &str,
+) -> Result<()> {
+    lock_session_tx(tx, parent_session_id).await?;
+    let content = UserMessage::text(message);
+    let id = format!("input_{}", Uuid::new_v4());
+    let inserted = sqlx::query(
+        r#"
+            insert into queued_inputs (
+                id, session_id, priority, content, status, client_input_id, origin
+            )
+            values (
+                $1, $2, 'steer', $3, 'queued', $4,
+                jsonb_build_object('promoted_at', clock_timestamp()::text)
+            )
+            on conflict (session_id, client_input_id) where client_input_id is not null
+            do nothing
+            returning id
+            "#,
+    )
+    .bind(&id)
+    .bind(parent_session_id)
+    .bind(serde_json::to_value(&content)?)
+    .bind(client_input_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(inserted) = inserted else {
+        return Ok(());
+    };
+    bump_revisions_tx(tx, parent_session_id, true, false).await?;
+    let input_id: String = inserted.get("id");
+    insert_event_tx(
+        tx,
+        parent_session_id,
+        EventType::InputQueued,
+        json!({
+            "input_id": input_id,
+            "priority": InputPriority::Steer,
+            "client_input_id": client_input_id,
+            "content": content.content.clone(),
+        }),
+    )
+    .await?;
+    Ok(())
+}
+
+fn row_to_stage(row: &sqlx::postgres::PgRow) -> Result<Stage> {
+    let kind: String = row.get("kind");
+    let status: String = row.get("status");
+    Ok(Stage {
+        id: row.get("id"),
+        parent_session_id: row.get("parent_session_id"),
+        workflow: row.get("workflow"),
+        label: row.get("label"),
+        kind: kind.parse().map_err(anyhow::Error::msg)?,
+        status: status.parse().map_err(anyhow::Error::msg)?,
+        attempt_id: row.get("attempt_id"),
+        expected_subagents: row.get("expected_subagents"),
+    })
 }
 
 #[cfg(test)]
