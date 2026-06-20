@@ -100,10 +100,10 @@ impl TranscriptStore {
         let Some(entry) = self.get_entry(id) else {
             return false;
         };
-        match &entry.item {
-            TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_) => true,
-            _ => false,
-        }
+        matches!(
+            &entry.item,
+            TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_)
+        )
     }
 
     pub fn get_entry(&self, id: &str) -> Option<&TranscriptStorageNode> {

@@ -151,7 +151,7 @@ impl PostgresAgentStore {
                         and status='running'
                 )
                 "#;
-        Ok(sqlx::query_scalar(&query)
+        Ok(sqlx::query_scalar(query)
             .bind(session_id)
             .bind(action_row_id)
             .bind(attempt_id)
@@ -169,7 +169,7 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let query = "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and status='pending'";
-        let updated = sqlx::query(&query)
+        let updated = sqlx::query(query)
             .bind(session_id)
             .bind(action_row_id)
             .bind(attempt_id)

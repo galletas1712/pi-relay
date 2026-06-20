@@ -238,7 +238,7 @@ fn run_embedded_web_tool_calls(response: &ModelResponse, initial_text: &str) -> 
         match item {
             AssistantItem::Text(_) => {}
             AssistantItem::ToolCall(tool_call) => {
-                if let Some(line) = embedded_tool_call_to_summary(&tool_call) {
+                if let Some(line) = embedded_tool_call_to_summary(tool_call) {
                     transcript.push(line);
                 }
             }

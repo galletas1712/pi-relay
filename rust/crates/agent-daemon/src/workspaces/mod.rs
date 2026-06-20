@@ -23,9 +23,7 @@ use self::config::{
     WORKSPACE_BASE_DIR, WORKSPACE_BASE_METADATA,
 };
 pub(crate) use self::git::validate_remote_branch;
-use self::git::{
-    fetch_session_branch_head, git_output, refresh_git_workspace_base, run_git,
-};
+use self::git::{fetch_session_branch_head, git_output, refresh_git_workspace_base, run_git};
 use self::instantiate::{
     create_workspace_dir, destroy_workspace_tree, instantiate_workspace_from_base,
     materialize_tree_from_source_exact,
@@ -199,9 +197,11 @@ impl WorkspaceManager {
         // under the parent). The fork copies the whole cwd, so drop it here.
         let child_handoff = child_cwd.join(HANDOFF_DIR);
         if child_handoff.exists() {
-            destroy_workspace_tree(&child_handoff).await.with_context(|| {
-                format!("exclude handoff dir from fork {}", child_handoff.display())
-            })?;
+            destroy_workspace_tree(&child_handoff)
+                .await
+                .with_context(|| {
+                    format!("exclude handoff dir from fork {}", child_handoff.display())
+                })?;
         }
 
         let mut child_workspaces = Vec::with_capacity(parent_workspaces.len());

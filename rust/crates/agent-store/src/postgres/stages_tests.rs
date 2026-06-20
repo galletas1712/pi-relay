@@ -325,12 +325,26 @@ async fn finish_stage_cas_is_attempt_fenced_and_idempotent() {
     // The real attempt id wins exactly once; a replay is a no-op.
     assert!(db
         .store
-        .finish_stage(&stage.id, &stage.attempt_id, StageStatus::Done, "parent", "done", &key)
+        .finish_stage(
+            &stage.id,
+            &stage.attempt_id,
+            StageStatus::Done,
+            "parent",
+            "done",
+            &key
+        )
         .await
         .expect("first finish wins"));
     assert!(!db
         .store
-        .finish_stage(&stage.id, &stage.attempt_id, StageStatus::Done, "parent", "done", &key)
+        .finish_stage(
+            &stage.id,
+            &stage.attempt_id,
+            StageStatus::Done,
+            "parent",
+            "done",
+            &key
+        )
         .await
         .expect("replay is a no-op"));
 
@@ -345,7 +359,14 @@ async fn finish_stage_cas_is_attempt_fenced_and_idempotent() {
         .expect("reopen");
     assert!(!db
         .store
-        .finish_stage(&stage.id, "stale", StageStatus::Done, "parent", "done", &key)
+        .finish_stage(
+            &stage.id,
+            "stale",
+            StageStatus::Done,
+            "parent",
+            "done",
+            &key
+        )
         .await
         .expect("stale attempt rejected"));
     assert_eq!(
@@ -356,7 +377,14 @@ async fn finish_stage_cas_is_attempt_fenced_and_idempotent() {
     // A missing stage is a benign no-op (late lifecycle event for a deleted stage).
     assert!(!db
         .store
-        .finish_stage("stage_missing", "whatever", StageStatus::Done, "parent", "done", "k")
+        .finish_stage(
+            "stage_missing",
+            "whatever",
+            StageStatus::Done,
+            "parent",
+            "done",
+            "k"
+        )
         .await
         .expect("missing stage is benign"));
 
@@ -389,13 +417,24 @@ async fn all_terminal_predicate_and_boot_sweep() {
         .stage_subagents_all_terminal(&stage.id)
         .await
         .expect("empty stage not terminal"));
-    assert!(db.store.sweep_running_stages().await.expect("sweep").is_empty());
+    assert!(db
+        .store
+        .sweep_running_stages()
+        .await
+        .expect("sweep")
+        .is_empty());
 
     // One spawned subagent (of the expected two) is at a boundary, but the
     // expected-count fence keeps the stage non-terminal — this is the partial
     // spawn window the barrier must never complete (FIX A).
     create_stage_subagent(
-        &db, "child_a", project_id, "parent", SubagentType::ReadOnly, "reviewer", &stage.id,
+        &db,
+        "child_a",
+        project_id,
+        "parent",
+        SubagentType::ReadOnly,
+        "reviewer",
+        &stage.id,
     )
     .await;
     assert!(!db
@@ -403,12 +442,23 @@ async fn all_terminal_predicate_and_boot_sweep() {
         .stage_subagents_all_terminal(&stage.id)
         .await
         .expect("partial spawn (1 of 2) is NOT terminal"));
-    assert!(db.store.sweep_running_stages().await.expect("sweep").is_empty());
+    assert!(db
+        .store
+        .sweep_running_stages()
+        .await
+        .expect("sweep")
+        .is_empty());
 
     // Both subagents now exist and both are at a boundary (empty transcript /
     // no active leaf) -> all terminal, and the running stage is sweep-ready.
     create_stage_subagent(
-        &db, "child_b", project_id, "parent", SubagentType::ReadOnly, "reviewer", &stage.id,
+        &db,
+        "child_b",
+        project_id,
+        "parent",
+        SubagentType::ReadOnly,
+        "reviewer",
+        &stage.id,
     )
     .await;
     assert!(db
@@ -423,10 +473,22 @@ async fn all_terminal_predicate_and_boot_sweep() {
     // A non-running (finished) stage is not swept again.
     let key = format!("stage-steer:{}:{}", stage.id, stage.attempt_id);
     db.store
-        .finish_stage(&stage.id, &stage.attempt_id, StageStatus::Done, "parent", "done", &key)
+        .finish_stage(
+            &stage.id,
+            &stage.attempt_id,
+            StageStatus::Done,
+            "parent",
+            "done",
+            &key,
+        )
         .await
         .expect("finish");
-    assert!(db.store.sweep_running_stages().await.expect("sweep").is_empty());
+    assert!(db
+        .store
+        .sweep_running_stages()
+        .await
+        .expect("sweep")
+        .is_empty());
 
     db.cleanup().await;
 }

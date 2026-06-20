@@ -32,36 +32,22 @@ pub(crate) async fn session_start(
     let content = parse_user_message(params.content)?;
 
     let driver = SessionDriver::acquire(state, &session_id).await;
-    if state
-        .repo
-        .session_exists(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?
-    {
-        let current = state
-            .repo
-            .load_session_config(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+    if state.repo.session_exists(&session_id).await? {
+        let current = state.repo.load_session_config(&session_id).await?;
         state
             .workspaces
             .ensure_session(&session_id, &current.outer_cwd, &current.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         return Ok(json!({
             "session_id": session_id,
             "project_id": current.project_id,
-            "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?,
+            "activity": state.repo.activity(&session_id).await?,
             "replayed": true,
         }));
     }
 
     let (outer_cwd, workspaces) = if let Some(project_id) = project_id {
-        let project = state
-            .repo
-            .get_project(project_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let project = state.repo.get_project(project_id).await?;
         let selection = WorkspaceSelection::from_requested(
             params
                 .workspaces
@@ -73,8 +59,7 @@ pub(crate) async fn session_start(
         state
             .workspaces
             .materialize_session(project_id, &session_id, &project.workspaces, &selected)
-            .await
-            .map_err(anyhow::Error::from)?
+            .await?
     } else {
         let cwd = home_dir_for_ephemeral_session()?
             .to_string_lossy()
@@ -89,7 +74,7 @@ pub(crate) async fn session_start(
         provider: params.provider,
         metadata: params.metadata.unwrap_or_else(|| json!({})),
     };
-    config.system_prompt = render_pi_prompt(state, &config).map_err(anyhow::Error::from)?;
+    config.system_prompt = render_pi_prompt(state, &config)?;
 
     let started = start_prepared_session_with_driver(
         state,
@@ -166,30 +151,16 @@ async fn start_prepared_session_with_driver(
     } = request;
     let project_id = config.project_id;
 
-    if state
-        .repo
-        .session_exists(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?
-    {
-        let current = state
-            .repo
-            .load_session_config(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+    if state.repo.session_exists(&session_id).await? {
+        let current = state.repo.load_session_config(&session_id).await?;
         state
             .workspaces
             .ensure_session(&session_id, &current.outer_cwd, &current.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         return Ok(StartedSession {
             session_id: session_id.clone(),
             project_id: current.project_id,
-            activity: state
-                .repo
-                .activity(&session_id)
-                .await
-                .map_err(anyhow::Error::from)?,
+            activity: state.repo.activity(&session_id).await?,
             replayed: true,
             dispatches: Vec::new(),
         });
@@ -198,8 +169,7 @@ async fn start_prepared_session_with_driver(
     state
         .workspaces
         .ensure_session(&session_id, &config.outer_cwd, &config.workspaces)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
 
     let mut session = AgentSession::new();
     session
@@ -224,18 +194,13 @@ async fn start_prepared_session_with_driver(
             subagent_type,
             stage_id.as_deref(),
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
 
     if frames.is_empty() {
         return Ok(StartedSession {
             session_id: session_id.clone(),
             project_id,
-            activity: state
-                .repo
-                .activity(&session_id)
-                .await
-                .map_err(anyhow::Error::from)?,
+            activity: state.repo.activity(&session_id).await?,
             replayed: true,
             dispatches: Vec::new(),
         });
@@ -256,11 +221,7 @@ async fn start_prepared_session_with_driver(
     Ok(StartedSession {
         session_id: session_id.clone(),
         project_id,
-        activity: state
-            .repo
-            .activity(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?,
+        activity: state.repo.activity(&session_id).await?,
         replayed: false,
         dispatches,
     })

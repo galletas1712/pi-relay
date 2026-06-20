@@ -104,7 +104,10 @@ async fn test_env() -> Option<TestEnv> {
     let store = PostgresAgentStore::connect(&database_url)
         .await
         .expect("connect isolated test database");
-    store.migrate().await.expect("migrate isolated test database");
+    store
+        .migrate()
+        .await
+        .expect("migrate isolated test database");
 
     let state_dir = TempDir::new("state");
     let cwd = TempDir::new("cwd");
@@ -165,7 +168,11 @@ async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
         .repo
         .start_session_outputs(
             parent_id,
-            &session_config(env, project_id, json!({ "created_by": "test", "harness": true })),
+            &session_config(
+                env,
+                project_id,
+                json!({ "created_by": "test", "harness": true }),
+            ),
             &[],
             None,
             &[],
@@ -181,6 +188,8 @@ async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
 /// Create a stage subagent whose durable transcript carries one assistant turn
 /// finished with `outcome`, then settle it terminal (no queued input, no
 /// unfinished action) so the all-terminal predicate sees it as done.
+// Test fixture: each argument shapes a distinct field of the subagent transcript.
+#[allow(clippy::too_many_arguments)]
 async fn create_terminal_subagent(
     env: &TestEnv,
     project_id: Uuid,
@@ -225,7 +234,11 @@ async fn create_terminal_subagent(
         .repo
         .start_session_outputs_with_parent(
             session_id,
-            &session_config(env, project_id, json!({ "created_by": "test", "role_name": role })),
+            &session_config(
+                env,
+                project_id,
+                json!({ "created_by": "test", "role_name": role }),
+            ),
             &entries,
             Some(&leaf),
             &[],
@@ -297,7 +310,11 @@ async fn create_running_subagent(
         .repo
         .start_session_outputs_with_parent(
             session_id,
-            &session_config(env, project_id, json!({ "created_by": "test", "role_name": role })),
+            &session_config(
+                env,
+                project_id,
+                json!({ "created_by": "test", "role_name": role }),
+            ),
             &entries,
             Some(&mid_turn),
             &[],
@@ -387,25 +404,53 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     let stage = env
         .state
         .repo
-        .create_stage("parent", StageKind::ReadonlyFanout, Some("implement_review_test"), Some("review"), 2)
+        .create_stage(
+            "parent",
+            StageKind::ReadonlyFanout,
+            Some("implement_review_test"),
+            Some("review"),
+            2,
+        )
         .await
         .expect("create stage");
 
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "ok_a", "reviewer", SubagentType::ReadOnly,
-        TurnOutcome::Graceful, "All good.\n\nsuggested_next: approved",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "ok_a",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "All good.\n\nsuggested_next: approved",
     )
     .await;
-    let boundary_leaf =
-        create_running_subagent(&env, project_id, "parent", &stage.id, "still_running", "reviewer", TurnOutcome::Crashed)
-            .await;
+    let boundary_leaf = create_running_subagent(
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "still_running",
+        "reviewer",
+        TurnOutcome::Crashed,
+    )
+    .await;
 
     // Not all subagents terminal yet (the second is mid-turn) -> barrier must not
     // fire. Recovery of an idle mid-turn subagent leaves it at its non-boundary
     // leaf, so it stays non-terminal.
-    complete_stage_if_ready(&env.state, &stage.id).await.expect("barrier (partial)");
+    complete_stage_if_ready(&env.state, &stage.id)
+        .await
+        .expect("barrier (partial)");
     assert_eq!(
-        env.state.repo.get_stage(&stage.id).await.unwrap().unwrap().status,
+        env.state
+            .repo
+            .get_stage(&stage.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         StageStatus::Running
     );
     assert_eq!(steers_to_parent(&env, "parent", &stage.id).await, 0);
@@ -416,15 +461,25 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     settle_subagent_terminal(&env, "still_running", &boundary_leaf).await;
 
     // Now all terminal -> exactly one steer, done_with_failures, handoff for all.
-    complete_stage_if_ready(&env.state, &stage.id).await.expect("barrier (complete)");
+    complete_stage_if_ready(&env.state, &stage.id)
+        .await
+        .expect("barrier (complete)");
     assert_eq!(
-        env.state.repo.get_stage(&stage.id).await.unwrap().unwrap().status,
+        env.state
+            .repo
+            .get_stage(&stage.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         StageStatus::DoneWithFailures
     );
     assert_eq!(steers_to_parent(&env, "parent", &stage.id).await, 1);
 
     // Re-delivered events must not double-steer (idempotent via the CAS).
-    complete_stage_if_ready(&env.state, &stage.id).await.expect("barrier (replay)");
+    complete_stage_if_ready(&env.state, &stage.id)
+        .await
+        .expect("barrier (replay)");
     sweep_running_stages_on_boot(&env.state).await;
     assert_eq!(steers_to_parent(&env, "parent", &stage.id).await, 1);
 
@@ -438,13 +493,19 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     for subagent in subagents {
         let id = subagent["id"].as_str().unwrap();
         let base = env.cwd.path().join(".pi-handoff").join(&stage.id).join(id);
-        assert!(base.join("final_message.md").exists(), "final_message for {id}");
+        assert!(
+            base.join("final_message.md").exists(),
+            "final_message for {id}"
+        );
         assert!(base.join("transcript.md").exists(), "transcript for {id}");
     }
     let ok = subagents.iter().find(|s| s["id"] == "ok_a").unwrap();
     assert_eq!(ok["status"], "done");
     assert_eq!(ok["suggested_next"], "approved");
-    let failed = subagents.iter().find(|s| s["id"] == "still_running").unwrap();
+    let failed = subagents
+        .iter()
+        .find(|s| s["id"] == "still_running")
+        .unwrap();
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["suggested_next"], serde_json::Value::Null);
 
@@ -471,15 +532,27 @@ async fn out_of_set_suggested_next_is_recorded_verbatim() {
         .await
         .expect("create stage");
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "impl", "implementer", SubagentType::Full,
-        TurnOutcome::Graceful, "Done.\nsuggested_next: ship_it_immediately",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "impl",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "Done.\nsuggested_next: ship_it_immediately",
     )
     .await;
 
-    complete_stage_if_ready(&env.state, &stage.id).await.expect("barrier");
+    complete_stage_if_ready(&env.state, &stage.id)
+        .await
+        .expect("barrier");
     let index = read_index(&env, &stage.id);
     assert_eq!(index["status"], "done");
-    assert_eq!(index["subagents"][0]["suggested_next"], "ship_it_immediately");
+    assert_eq!(
+        index["subagents"][0]["suggested_next"],
+        "ship_it_immediately"
+    );
 
     env.cleanup().await;
 }
@@ -509,14 +582,28 @@ async fn stale_attempt_id_cannot_finish_stage() {
     assert!(env
         .state
         .repo
-        .finish_stage(&stage.id, &stage.attempt_id, StageStatus::Done, "parent", "done", &key)
+        .finish_stage(
+            &stage.id,
+            &stage.attempt_id,
+            StageStatus::Done,
+            "parent",
+            "done",
+            &key
+        )
         .await
         .expect("finish"));
     // A second call with the same id is a no-op (status no longer running).
     assert!(!env
         .state
         .repo
-        .finish_stage(&stage.id, &stage.attempt_id, StageStatus::Done, "parent", "done", &key)
+        .finish_stage(
+            &stage.id,
+            &stage.attempt_id,
+            StageStatus::Done,
+            "parent",
+            "done",
+            &key
+        )
         .await
         .expect("finish again"));
 
@@ -529,11 +616,24 @@ async fn stale_attempt_id_cannot_finish_stage() {
     assert!(!env
         .state
         .repo
-        .finish_stage(&stage.id, "stale-attempt-id", StageStatus::Done, "parent", "done", &key)
+        .finish_stage(
+            &stage.id,
+            "stale-attempt-id",
+            StageStatus::Done,
+            "parent",
+            "done",
+            &key
+        )
         .await
         .expect("stale finish"));
     assert_eq!(
-        env.state.repo.get_stage(&stage.id).await.unwrap().unwrap().status,
+        env.state
+            .repo
+            .get_stage(&stage.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         StageStatus::Running
     );
 
@@ -560,8 +660,15 @@ async fn boot_sweep_completes_a_crash_mid_barrier_stage_exactly_once() {
         .await
         .expect("create stage");
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "impl", "implementer", SubagentType::Full,
-        TurnOutcome::Graceful, "Implemented.",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "impl",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "Implemented.",
     )
     .await;
 
@@ -569,7 +676,13 @@ async fn boot_sweep_completes_a_crash_mid_barrier_stage_exactly_once() {
     // mid-barrier. The boot sweep completes it exactly once.
     sweep_running_stages_on_boot(&env.state).await;
     assert_eq!(
-        env.state.repo.get_stage(&stage.id).await.unwrap().unwrap().status,
+        env.state
+            .repo
+            .get_stage(&stage.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         StageStatus::Done
     );
     assert_eq!(steers_to_parent(&env, "parent", &stage.id).await, 1);
@@ -635,8 +748,15 @@ async fn subagent_cannot_start_a_nested_stage() {
         .await
         .expect("create stage");
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "child", "implementer", SubagentType::Full,
-        TurnOutcome::Graceful, "done",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "child",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "done",
     )
     .await;
 
@@ -747,28 +867,58 @@ async fn partial_spawn_does_not_complete_stage() {
         .expect("create stage");
     // Only subagent #1 exists so far and is terminal-on-arrival.
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "first", "reviewer", SubagentType::ReadOnly,
-        TurnOutcome::Graceful, "fast review done",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "first",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "fast review done",
     )
     .await;
 
     // The barrier must not fire while the sibling is still unspawned.
-    complete_stage_if_ready(&env.state, &stage.id).await.expect("barrier (partial spawn)");
+    complete_stage_if_ready(&env.state, &stage.id)
+        .await
+        .expect("barrier (partial spawn)");
     assert_eq!(
-        env.state.repo.get_stage(&stage.id).await.unwrap().unwrap().status,
+        env.state
+            .repo
+            .get_stage(&stage.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         StageStatus::Running
     );
     assert_eq!(steers_to_parent(&env, "parent", &stage.id).await, 0);
 
     // The sibling arrives terminal too; now the full set exists -> one steer.
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "second", "reviewer", SubagentType::ReadOnly,
-        TurnOutcome::Graceful, "second review done",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "second",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "second review done",
     )
     .await;
-    complete_stage_if_ready(&env.state, &stage.id).await.expect("barrier (full set)");
+    complete_stage_if_ready(&env.state, &stage.id)
+        .await
+        .expect("barrier (full set)");
     assert_eq!(
-        env.state.repo.get_stage(&stage.id).await.unwrap().unwrap().status,
+        env.state
+            .repo
+            .get_stage(&stage.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         StageStatus::Done
     );
     assert_eq!(steers_to_parent(&env, "parent", &stage.id).await, 1);
@@ -799,8 +949,15 @@ async fn steer_is_durable_after_finish_and_not_double_enqueued() {
         .await
         .expect("create stage");
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "impl", "implementer", SubagentType::Full,
-        TurnOutcome::Graceful, "implemented",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "impl",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "implemented",
     )
     .await;
 
@@ -811,7 +968,14 @@ async fn steer_is_durable_after_finish_and_not_double_enqueued() {
     assert!(env
         .state
         .repo
-        .finish_stage(&stage.id, &stage.attempt_id, StageStatus::Done, "parent", "stage finished", &key)
+        .finish_stage(
+            &stage.id,
+            &stage.attempt_id,
+            StageStatus::Done,
+            "parent",
+            "stage finished",
+            &key
+        )
         .await
         .expect("finish wins"));
     let durable = env
@@ -820,7 +984,10 @@ async fn steer_is_durable_after_finish_and_not_double_enqueued() {
         .find_client_input("parent", &key)
         .await
         .expect("find steer");
-    assert!(durable.is_some(), "steer must be durably queued after the CAS commit");
+    assert!(
+        durable.is_some(),
+        "steer must be durably queued after the CAS commit"
+    );
 
     // Re-open the stage and re-run with the same deterministic key (a replay /
     // boot sweep racing the original winner): the CAS wins again, but the steer
@@ -834,7 +1001,14 @@ async fn steer_is_durable_after_finish_and_not_double_enqueued() {
     assert!(env
         .state
         .repo
-        .finish_stage(&stage.id, &stage.attempt_id, StageStatus::Done, "parent", "stage finished", &key)
+        .finish_stage(
+            &stage.id,
+            &stage.attempt_id,
+            StageStatus::Done,
+            "parent",
+            "stage finished",
+            &key
+        )
         .await
         .expect("replay CAS wins again"));
     let queued_steers = env
@@ -847,7 +1021,10 @@ async fn steer_is_durable_after_finish_and_not_double_enqueued() {
         .into_iter()
         .filter(|input| input.priority == InputPriority::Steer)
         .count();
-    assert_eq!(queued_steers, 1, "exactly one durable steer, no double-enqueue");
+    assert_eq!(
+        queued_steers, 1,
+        "exactly one durable steer, no double-enqueue"
+    );
 
     env.cleanup().await;
 }
@@ -877,7 +1054,13 @@ async fn boot_sweep_does_not_complete_mid_turn_subagent() {
     // A single full subagent stuck mid-turn (active leaf is an assistant message,
     // not a boundary). create_running_subagent leaves it at the non-boundary leaf.
     create_running_subagent(
-        &env, project_id, "parent", &stage.id, "mid_turn", "implementer", TurnOutcome::Graceful,
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "mid_turn",
+        "implementer",
+        TurnOutcome::Graceful,
     )
     .await;
     // Emulate the boot stale-mark that erases any unfinished action globally, so
@@ -892,7 +1075,13 @@ async fn boot_sweep_does_not_complete_mid_turn_subagent() {
     // and a mid-turn leaf is not a boundary.
     sweep_running_stages_on_boot(&env.state).await;
     assert_eq!(
-        env.state.repo.get_stage(&stage.id).await.unwrap().unwrap().status,
+        env.state
+            .repo
+            .get_stage(&stage.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         StageStatus::Running
     );
     assert_eq!(steers_to_parent(&env, "parent", &stage.id).await, 0);
@@ -924,8 +1113,15 @@ async fn terminal_stage_member_yields_zero_parent_idle_rows() {
         .await
         .expect("create stage");
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "member", "implementer", SubagentType::Full,
-        TurnOutcome::Graceful, "done",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "member",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "done",
     )
     .await;
 
@@ -937,7 +1133,13 @@ async fn terminal_stage_member_yields_zero_parent_idle_rows() {
     assert_eq!(parent_idle_rows(&env, "parent").await, 0);
     // ...yet the stage completed and the single steer was delivered.
     assert_eq!(
-        env.state.repo.get_stage(&stage.id).await.unwrap().unwrap().status,
+        env.state
+            .repo
+            .get_stage(&stage.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         StageStatus::Done
     );
     assert_eq!(steers_to_parent(&env, "parent", &stage.id).await, 1);
@@ -968,13 +1170,27 @@ async fn steering_a_read_only_subagent_is_rejected_server_side() {
         .await
         .expect("create stage");
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "ro", "reviewer", SubagentType::ReadOnly,
-        TurnOutcome::Graceful, "done",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "ro",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "done",
     )
     .await;
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "full", "implementer", SubagentType::Full,
-        TurnOutcome::Graceful, "done",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "full",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "done",
     )
     .await;
 
@@ -1039,8 +1255,15 @@ async fn dispatch_failure_for_stage_member_emits_no_parent_idle() {
     // dispatch failure for it through the gate. The gate must suppress the
     // parent-visible idle because the child belongs to a stage.
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "ro_member", "reviewer", SubagentType::ReadOnly,
-        TurnOutcome::Graceful, "n/a",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "ro_member",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "n/a",
     )
     .await;
 
@@ -1080,13 +1303,27 @@ async fn two_siblings_steer_parent_exactly_once_via_live_seam() {
         .await
         .expect("create stage");
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "sib_a", "reviewer", SubagentType::ReadOnly,
-        TurnOutcome::Graceful, "a done",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "sib_a",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "a done",
     )
     .await;
     create_terminal_subagent(
-        &env, project_id, "parent", &stage.id, "sib_b", "reviewer", SubagentType::ReadOnly,
-        TurnOutcome::Graceful, "b done",
+        &env,
+        project_id,
+        "parent",
+        &stage.id,
+        "sib_b",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "b done",
     )
     .await;
 
@@ -1105,7 +1342,13 @@ async fn two_siblings_steer_parent_exactly_once_via_live_seam() {
 
     assert_eq!(parent_idle_rows(&env, "parent").await, 0);
     assert_eq!(
-        env.state.repo.get_stage(&stage.id).await.unwrap().unwrap().status,
+        env.state
+            .repo
+            .get_stage(&stage.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
         StageStatus::Done
     );
     assert_eq!(steers_to_parent(&env, "parent", &stage.id).await, 1);

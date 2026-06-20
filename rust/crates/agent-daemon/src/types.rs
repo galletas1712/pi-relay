@@ -205,8 +205,14 @@ mod tests {
             RpcMethod::parse("stage.start_readonly_fanout"),
             Some(RpcMethod::StageStartReadonlyFanout)
         );
-        assert_eq!(RpcMethod::parse("stage.status"), Some(RpcMethod::StageStatus));
-        assert_eq!(RpcMethod::parse("stage.cancel"), Some(RpcMethod::StageCancel));
+        assert_eq!(
+            RpcMethod::parse("stage.status"),
+            Some(RpcMethod::StageStatus)
+        );
+        assert_eq!(
+            RpcMethod::parse("stage.cancel"),
+            Some(RpcMethod::StageCancel)
+        );
         assert_eq!(RpcMethod::parse("stage.list"), Some(RpcMethod::StageList));
         assert_eq!(
             RpcMethod::parse("stage.read_handoff_file"),
