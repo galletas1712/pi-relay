@@ -155,9 +155,11 @@ async fn create_stage_persists_kind_status_and_attempt() {
             StageKind::ReadonlyFanout,
             Some("implement_review_test"),
             Some("review fan-out"),
+            3,
         )
         .await
         .expect("create stage");
+    assert_eq!(stage.expected_subagents, 3);
     assert_eq!(stage.kind, StageKind::ReadonlyFanout);
     assert_eq!(stage.status, StageStatus::Running);
     assert!(!stage.attempt_id.is_empty());
@@ -197,7 +199,7 @@ async fn parent_has_running_stage_tracks_status() {
 
     let stage = db
         .store
-        .create_stage("parent", StageKind::Full, None, None)
+        .create_stage("parent", StageKind::Full, None, None, 1)
         .await
         .expect("create stage");
     assert!(db
@@ -234,12 +236,12 @@ async fn list_stage_subagents_returns_only_its_members() {
 
     let stage = db
         .store
-        .create_stage("parent", StageKind::ReadonlyFanout, None, None)
+        .create_stage("parent", StageKind::ReadonlyFanout, None, None, 2)
         .await
         .expect("create stage");
     let other = db
         .store
-        .create_stage("parent", StageKind::Full, None, None)
+        .create_stage("parent", StageKind::Full, None, None, 1)
         .await
         .expect("create other stage");
 
@@ -299,4 +301,143 @@ async fn list_stage_subagents_returns_only_its_members() {
     assert_eq!(parent_stages[1].id, other.id);
 
     db.cleanup().await;
+}
+
+#[tokio::test]
+async fn finish_stage_cas_is_attempt_fenced_and_idempotent() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "stages test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    let stage = db
+        .store
+        .create_stage("parent", StageKind::Full, None, None, 1)
+        .await
+        .expect("create stage");
+    let key = format!("stage-steer:{}:{}", stage.id, stage.attempt_id);
+
+    // The real attempt id wins exactly once; a replay is a no-op.
+    assert!(db
+        .store
+        .finish_stage(&stage.id, &stage.attempt_id, StageStatus::Done, "parent", "done", &key)
+        .await
+        .expect("first finish wins"));
+    assert!(!db
+        .store
+        .finish_stage(&stage.id, &stage.attempt_id, StageStatus::Done, "parent", "done", &key)
+        .await
+        .expect("replay is a no-op"));
+
+    // The steer was enqueued atomically with the winning CAS, exactly once
+    // (the deterministic client_input_id makes a replay a no-op).
+    assert_eq!(steer_count(&db, "parent", &key).await, 1);
+
+    // A stale attempt id cannot re-fire a re-opened stage.
+    db.store
+        .set_stage_status(&stage.id, StageStatus::Running)
+        .await
+        .expect("reopen");
+    assert!(!db
+        .store
+        .finish_stage(&stage.id, "stale", StageStatus::Done, "parent", "done", &key)
+        .await
+        .expect("stale attempt rejected"));
+    assert_eq!(
+        db.store.get_stage(&stage.id).await.unwrap().unwrap().status,
+        StageStatus::Running
+    );
+
+    // A missing stage is a benign no-op (late lifecycle event for a deleted stage).
+    assert!(!db
+        .store
+        .finish_stage("stage_missing", "whatever", StageStatus::Done, "parent", "done", "k")
+        .await
+        .expect("missing stage is benign"));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn all_terminal_predicate_and_boot_sweep() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "stages test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    // The stage expects TWO subagents (FIX A: the expected-count fence).
+    let stage = db
+        .store
+        .create_stage("parent", StageKind::ReadonlyFanout, None, None, 2)
+        .await
+        .expect("create stage");
+
+    // An empty stage (no subagents yet) is NOT terminal — a stage whose spawn
+    // races the barrier must not complete prematurely.
+    assert!(!db
+        .store
+        .stage_subagents_all_terminal(&stage.id)
+        .await
+        .expect("empty stage not terminal"));
+    assert!(db.store.sweep_running_stages().await.expect("sweep").is_empty());
+
+    // One spawned subagent (of the expected two) is at a boundary, but the
+    // expected-count fence keeps the stage non-terminal — this is the partial
+    // spawn window the barrier must never complete (FIX A).
+    create_stage_subagent(
+        &db, "child_a", project_id, "parent", SubagentType::ReadOnly, "reviewer", &stage.id,
+    )
+    .await;
+    assert!(!db
+        .store
+        .stage_subagents_all_terminal(&stage.id)
+        .await
+        .expect("partial spawn (1 of 2) is NOT terminal"));
+    assert!(db.store.sweep_running_stages().await.expect("sweep").is_empty());
+
+    // Both subagents now exist and both are at a boundary (empty transcript /
+    // no active leaf) -> all terminal, and the running stage is sweep-ready.
+    create_stage_subagent(
+        &db, "child_b", project_id, "parent", SubagentType::ReadOnly, "reviewer", &stage.id,
+    )
+    .await;
+    assert!(db
+        .store
+        .stage_subagents_all_terminal(&stage.id)
+        .await
+        .expect("both spawned and at a boundary -> terminal"));
+    let ready = db.store.sweep_running_stages().await.expect("sweep");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].id, stage.id);
+
+    // A non-running (finished) stage is not swept again.
+    let key = format!("stage-steer:{}:{}", stage.id, stage.attempt_id);
+    db.store
+        .finish_stage(&stage.id, &stage.attempt_id, StageStatus::Done, "parent", "done", &key)
+        .await
+        .expect("finish");
+    assert!(db.store.sweep_running_stages().await.expect("sweep").is_empty());
+
+    db.cleanup().await;
+}
+
+async fn steer_count(db: &TestDb, session_id: &str, client_input_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "select count(*) from queued_inputs where session_id=$1 and client_input_id=$2 and priority='steer'",
+    )
+    .bind(session_id)
+    .bind(client_input_id)
+    .fetch_one(&db.store.pool)
+    .await
+    .expect("count steers")
 }

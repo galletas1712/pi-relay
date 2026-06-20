@@ -682,7 +682,7 @@ async fn subagents_read_host(
 /// A read-only subagent is fire-and-forget: it runs in a disposable snapshot
 /// and cannot be steered or interrupted individually (only a whole stage can be
 /// cancelled). Reject either operation for a read-only child.
-async fn reject_read_only_control(
+pub(crate) async fn reject_read_only_control(
     state: &AppState,
     child_session_id: &str,
     operation: &str,

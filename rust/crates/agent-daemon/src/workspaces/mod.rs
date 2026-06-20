@@ -77,6 +77,11 @@ impl WorkspaceManager {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_tests(state_root: PathBuf) -> Self {
+        Self::new(state_root)
+    }
+
     /// Materialize a new session's workspaces under a private `outer_cwd`.
     ///
     /// `project_workspaces` is the project's full declared set and is used to

@@ -542,6 +542,14 @@ impl PostgresAgentStore {
             .transpose()
     }
 
+    pub async fn session_stage_id(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(sqlx::query_scalar("select stage_id from sessions where id=$1")
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .flatten())
+    }
+
     pub async fn activity(&self, session_id: &str) -> Result<SessionActivity> {
         if self.has_unfinished_actions(session_id).await? {
             return Ok(SessionActivity::Running);
