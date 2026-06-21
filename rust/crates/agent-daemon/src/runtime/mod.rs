@@ -101,7 +101,7 @@ impl SessionDriver {
 
     /// Acquire only if the session's driver lock is free. Returns `None` if it
     /// is already held (the session is being driven or recovered elsewhere on
-    /// the stack), letting the stage barrier recover sibling tails without
+    /// the stack), letting the delegation barrier recover sibling tails without
     /// blocking on — or deadlocking against — a lock held further up the call
     /// chain (e.g. the firing child whose terminal idle triggered the barrier).
     pub(crate) async fn try_acquire(
@@ -445,20 +445,26 @@ impl SessionDriver {
             }
         };
 
-        // Every parentful subagent is a stage member (the only spawn path sets a
-        // stage_id). A stage member's completion is delivered as ONE stage steer,
+        // Every parentful subagent is a delegation member (the only spawn path
+        // sets a delegation_id). A delegation member's completion is delivered as
+        // ONE delegation steer,
         // NOT a per-child idle. Fire the once-gate WITHOUT writing a
         // parent-visible SubagentIdle row (so events_after / the run board never
         // surface per-child idle), then — on that single firing — destroy the RO
         // snapshot and run the barrier. The barrier is single-flighted by the DB
-        // stage-row CAS, so concurrent terminal children steer the parent exactly
+        // delegation-row CAS, so concurrent terminal children steer the parent exactly
         // once. Return None: the per-child idle is suppressed for the parent.
-        let stage_id = match self.state.repo.session_stage_id(&self.session_id).await {
-            Ok(Some(stage_id)) => stage_id,
+        let delegation_id = match self
+            .state
+            .repo
+            .session_delegation_id(&self.session_id)
+            .await
+        {
+            Ok(Some(delegation_id)) => delegation_id,
             Ok(None) => return None,
             Err(error) => {
                 eprintln!(
-                    "failed to load stage id for subagent {}: {error:#}",
+                    "failed to load delegation id for subagent {}: {error:#}",
                     self.session_id
                 );
                 return None;
@@ -473,7 +479,7 @@ impl SessionDriver {
             Ok(first_fire) => first_fire,
             Err(error) => {
                 eprintln!(
-                    "failed to claim stage-member idle once-gate child={}: {error:#}",
+                    "failed to claim delegation-member idle once-gate child={}: {error:#}",
                     self.session_id
                 );
                 return None;
@@ -482,28 +488,28 @@ impl SessionDriver {
         if first_fire {
             self.destroy_read_only_subagent_workspaces().await;
         }
-        self.try_stage_barrier(&stage_id).await;
+        self.try_delegation_barrier(&delegation_id).await;
         None
     }
 
-    /// The stage barrier: when a subagent of a stage reaches its once-only
-    /// terminal idle, complete the stage iff every subagent is terminal. The
-    /// `finish_stage` CAS (stage-row `for update` lock + `status='running'`
-    /// fence) is the single-flight for terminal stage status and parent steer
-    /// enqueue; handoff rendering is idempotent and may happen before/around the
-    /// CAS.
-    async fn try_stage_barrier(&self, stage_id: &str) {
+    /// The delegation barrier: when a subagent of a delegation reaches its
+    /// once-only terminal idle, complete the delegation iff every subagent is
+    /// terminal. The `finish_delegation` CAS (delegation-row `for update` lock +
+    /// `status='running'` fence) is the single-flight for terminal delegation
+    /// status and parent steer enqueue; handoff rendering is idempotent and may
+    /// happen before/around the CAS.
+    async fn try_delegation_barrier(&self, delegation_id: &str) {
         // `recover_if_needed` -> terminal idle -> barrier -> sibling
         // `recover_if_needed` is a recursive async cycle; box it to break the
         // infinitely-sized future. The cycle terminates because each sibling's
-        // barrier short-circuits once the stage is no longer `running`.
-        let future = Box::pin(crate::stage_runner::complete_stage_if_ready(
+        // barrier short-circuits once the delegation is no longer `running`.
+        let future = Box::pin(crate::delegation_runner::complete_delegation_if_ready(
             &self.state,
-            stage_id,
+            delegation_id,
         ));
         if let Err(error) = future.await {
             eprintln!(
-                "stage barrier failed for stage {stage_id} (child {}): {}: {}",
+                "delegation barrier failed for delegation {delegation_id} (child {}): {}: {}",
                 self.session_id, error.code, error.message
             );
         }
@@ -511,8 +517,8 @@ impl SessionDriver {
 
     /// The once-gate dedup key (the terminal active leaf) for this child's
     /// parent-visible idle. `None` when this session has no parent (a top-level
-    /// session). The caller only needs the key: a stage member's completion is
-    /// delivered as a single stage steer, not a per-child idle payload.
+    /// session). The caller only needs the key: a delegation member's completion
+    /// is delivered as a single delegation steer, not a per-child idle payload.
     async fn subagent_idle_notification_key(
         &self,
     ) -> std::result::Result<Option<String>, RpcError> {

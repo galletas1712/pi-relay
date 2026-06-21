@@ -23,7 +23,7 @@ in-flight future work lives under [`plans/`](plans/).
 4. Keep providers intentionally narrow: OpenAI/Codex and Anthropic/Claude only.
 5. Keep tools separate from the agent loop so tool sets can be customized
    without changing the FSM.
-6. Support bounded parent/child subagent delegation as **stages**: the parent
+6. Support bounded parent/child subagent delegation as **delegations**: the parent
    runs one full (writing) subagent or a parallel fan-out of read-only
    subagents, parks, and is steered with a completion notification. No generic
    injected-message routing layer or event bus between arbitrary sessions.
@@ -120,18 +120,19 @@ Implemented user-facing behavior:
   included by the template.
 - Real OpenAI/Codex (ChatGPT subscription transport) and Anthropic API-key
   provider paths, with prompt-cache shaping on both.
-- Subagent delegation runs as **stages** through provider-visible delegation
+- Subagent delegation runs as **delegations** through provider-visible delegation
   tools (`delegate_writing_task`, `delegate_readonly_tasks`,
-  `inspect_delegation`, `cancel_delegation`). A stage is one **full** subagent
+  `inspect_delegation`, `cancel_delegation`). A delegation is one **full** subagent
   (writes the parent's workspace in place) or a parallel fan-out of
   **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
-  return). The parent parks after launching a stage and is delivered a
+  return). The parent parks after launching a delegation and is delivered a
   parent-scoped completion **steer** pointing at a handoff directory
   (`index.json` + per-subagent final message and transcript).
-  Stage subagents may emit `subagent.spawned`/`subagent.running` progress
-  events, but parent-visible completion is the stage steer/handoff, not a
+  Delegation subagents may emit `subagent.spawned`/`subagent.running` progress
+  events, but parent-visible completion is the delegation steer/handoff, not a
   per-child idle event. Reusable patterns are **workflow skills** (`SKILL.md` +
-  `LoadSkill`), not a DSL. Web/inspector RPCs still use the `stage.*` client API. See
+  `LoadSkill`), not a DSL. Web/inspector RPCs use the canonical
+  `delegation.*` client API. See
   [agent-daemon](modules/agent-daemon.md).
 
 Not implemented by design:

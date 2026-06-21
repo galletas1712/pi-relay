@@ -1,20 +1,21 @@
-//! The stage handoff directory writer.
+//! The delegation handoff directory writer.
 //!
-//! On the stage barrier, for every subagent (success or failure) the daemon
+//! On the delegation barrier, for every subagent (success or failure) the daemon
 //! renders two files from the durable Postgres transcript — `final_message.md`
-//! and an exhaustive, greppable `transcript.md` — plus a per-stage `index.json`
-//! manifest, all under `<parent.outer_cwd>/.pi-handoff/<stage_id>/`. Everything
-//! renders from `active_branch` (Ui body mode), so it survives an RO subagent's
-//! snapshot being destroyed and a crashed subagent's partial tail.
+//! and an exhaustive, greppable `transcript.md` — plus a per-delegation
+//! `index.json` manifest, all under
+//! `<parent.outer_cwd>/.pi-handoff/<delegation_id>/`. Everything renders from
+//! `active_branch` (Ui body mode), so it survives an RO subagent's snapshot
+//! being destroyed and a crashed subagent's partial tail.
 //!
-//! The writer is intentionally idempotent: stage completion may render/rewrite
+//! The writer is intentionally idempotent: delegation completion may render/rewrite
 //! the same durable transcript files before/around the DB terminal CAS. The CAS
-//! single-flights the stage status and parent steer enqueue; file rendering
+//! single-flights the delegation status and parent steer enqueue; file rendering
 //! itself is safe to replay.
 
 use std::path::{Path, PathBuf};
 
-use agent_store::{HistoryTree, Stage, StageKind, StageStatus};
+use agent_store::{Delegation, DelegationKind, DelegationStatus, HistoryTree};
 use agent_vocab::{
     AssistantMessage, ContentBlock, ToolResultStatus, TranscriptItem, TurnOutcome, UserMessage,
 };
@@ -174,28 +175,31 @@ struct SubagentHandoff {
     suggested_next: Option<String>,
 }
 
-fn stage_dir(parent_outer_cwd: &str, stage_id: &str) -> PathBuf {
-    Path::new(parent_outer_cwd).join(HANDOFF_DIR).join(stage_id)
+fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
+    Path::new(parent_outer_cwd)
+        .join(HANDOFF_DIR)
+        .join(delegation_id)
 }
 
-/// Render and write the whole handoff directory for a completed stage. This is
-/// a pure function of durable transcripts and stage metadata, so the barrier may
-/// run it before/around the `finish_stage` CAS and safely replay it. The CAS,
-/// not this writer, single-flights the terminal status and parent steer enqueue.
-/// `stage_status` is the terminal status the caller is attempting to commit
+/// Render and write the whole handoff directory for a completed delegation.
+/// This is a pure function of durable transcripts and delegation metadata, so
+/// the barrier may run it before/around the `finish_delegation` CAS and safely
+/// replay it. The CAS, not this writer, single-flights the terminal status and
+/// parent steer enqueue. `delegation_status` is the terminal status the caller
+/// is attempting to commit
 /// (`done` vs `done_with_failures`).
-pub(crate) async fn write_stage_handoff(
+pub(crate) async fn write_delegation_handoff(
     state: &AppState,
-    stage: &Stage,
-    stage_status: StageStatus,
+    delegation: &Delegation,
+    delegation_status: DelegationStatus,
 ) -> std::result::Result<PathBuf, RpcError> {
     let parent_config = state
         .repo
-        .load_session_config(&stage.parent_session_id)
+        .load_session_config(&delegation.parent_session_id)
         .await?;
-    let dir = stage_dir(&parent_config.outer_cwd, &stage.id);
+    let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
 
-    let subagents = state.repo.list_stage_subagents(&stage.id).await?;
+    let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
 
     let mut manifest = Vec::with_capacity(subagents.len());
     for subagent in &subagents {
@@ -227,7 +231,7 @@ pub(crate) async fn write_stage_handoff(
         });
     }
 
-    let index = index_json(stage, stage_status, &manifest);
+    let index = index_json(delegation, delegation_status, &manifest);
     tokio::fs::write(
         dir.join("index.json"),
         serde_json::to_vec_pretty(&index).map_err(anyhow::Error::from)?,
@@ -238,9 +242,13 @@ pub(crate) async fn write_stage_handoff(
     Ok(dir)
 }
 
-/// The per-stage `index.json` manifest: the parent's entry point. Paths are
-/// relative to the stage dir, so the parent navigates without scanning.
-fn index_json(stage: &Stage, stage_status: StageStatus, subagents: &[SubagentHandoff]) -> Value {
+/// The per-delegation `index.json` manifest: the parent's entry point. Paths
+/// are relative to the delegation dir, so the parent navigates without scanning.
+fn index_json(
+    delegation: &Delegation,
+    delegation_status: DelegationStatus,
+    subagents: &[SubagentHandoff],
+) -> Value {
     let subagents = subagents
         .iter()
         .map(|subagent| {
@@ -255,37 +263,37 @@ fn index_json(stage: &Stage, stage_status: StageStatus, subagents: &[SubagentHan
         })
         .collect::<Vec<_>>();
     json!({
-        "stage_id": stage.id,
-        "kind": stage.kind.as_str(),
-        "workflow": stage.workflow,
-        "status": stage_status.as_str(),
+        "delegation_id": delegation.id,
+        "kind": delegation.kind.as_str(),
+        "workflow": delegation.workflow,
+        "status": delegation_status.as_str(),
         "subagents": subagents,
     })
 }
 
-/// The short completion steer delivered to the parent. It names the stage, the
-/// ok/failed counts, and points at `index.json` — it never inlines messages.
+/// The short completion steer delivered to the parent. It names the delegation,
+/// the ok/failed counts, and points at `index.json` — it never inlines messages.
 pub(crate) fn steer_message(
-    stage: &Stage,
+    delegation: &Delegation,
     handoff_dir: &Path,
     ok: usize,
     failed: usize,
     failed_ids: &[String],
 ) -> String {
-    let kind = match stage.kind {
-        StageKind::Full => "full subagent",
-        StageKind::ReadonlyFanout => "read-only fan-out",
+    let kind = match delegation.kind {
+        DelegationKind::Full => "full subagent",
+        DelegationKind::ReadonlyFanout => "read-only fan-out",
     };
-    let label = stage
+    let label = delegation
         .label
         .as_deref()
         .map(|label| format!(" ({label})"))
         .unwrap_or_default();
     let index = handoff_dir.join("index.json");
     let mut message = format!(
-        "Stage {} ({kind}){label} finished: {ok} ok, {failed} failed. \
+        "Delegation {} ({kind}){label} finished: {ok} ok, {failed} failed. \
          Read {}, then the per-subagent final_message.md files.",
-        stage.id,
+        delegation.id,
         index.display(),
     );
     if !failed_ids.is_empty() {

@@ -3,14 +3,14 @@
 mod auth;
 mod codec;
 mod config;
+mod delegation_runner;
+mod delegation_tools;
 mod handoff;
 mod model_metadata;
 mod provider_runtime;
 mod rpc_views;
 mod runtime;
 mod session_start;
-mod stage_runner;
-mod stage_tools;
 mod state;
 mod subagents;
 mod types;
@@ -79,17 +79,17 @@ async fn main() -> Result<()> {
         prompt_root,
     };
 
-    // Complete any stage that crashed mid-barrier: a `running` stage whose
+    // Complete any delegation that crashed mid-barrier: a `running` delegation whose
     // subagents are all terminal is finished (handoff + steer) exactly once via
     // the same attempt-fenced CAS the live barrier uses.
     //
     // This runs AFTER the global stale-mark above, but that ordering is safe:
-    // stage terminality is transcript-boundary based, independent of action
+    // delegation terminality is transcript-boundary based, independent of action
     // status, so a subagent stale-marked mid-turn is still NON-terminal. The
     // sweep recovers each subagent to a boundary first, so a resumable mid-turn
-    // child re-establishes live work (stage stays running) instead of being
+    // child re-establishes live work (delegation stays running) instead of being
     // abandoned as a failure.
-    stage_runner::sweep_running_stages_on_boot(&state).await;
+    delegation_runner::sweep_running_delegations_on_boot(&state).await;
 
     let listener = TcpListener::bind(&config.bind).await?;
     println!("pi-agentd listening on ws://{}", config.bind);
@@ -298,14 +298,16 @@ async fn dispatch_request(
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
-        RpcMethod::StageStartFull => stage_tools::rpc_start_full(state, params).await,
-        RpcMethod::StageStartReadonlyFanout => {
-            stage_tools::rpc_start_readonly_fanout(state, params).await
+        RpcMethod::DelegationStartFull => delegation_tools::rpc_start_full(state, params).await,
+        RpcMethod::DelegationStartReadonlyFanout => {
+            delegation_tools::rpc_start_readonly_fanout(state, params).await
         }
-        RpcMethod::StageStatus => stage_tools::rpc_status(state, params).await,
-        RpcMethod::StageCancel => stage_tools::rpc_cancel(state, params).await,
-        RpcMethod::StageList => stage_tools::rpc_list(state, params).await,
-        RpcMethod::StageReadHandoffFile => stage_tools::rpc_read_handoff_file(state, params).await,
+        RpcMethod::DelegationStatus => delegation_tools::rpc_status(state, params).await,
+        RpcMethod::DelegationCancel => delegation_tools::rpc_cancel(state, params).await,
+        RpcMethod::DelegationList => delegation_tools::rpc_list(state, params).await,
+        RpcMethod::DelegationReadHandoffFile => {
+            delegation_tools::rpc_read_handoff_file(state, params).await
+        }
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }

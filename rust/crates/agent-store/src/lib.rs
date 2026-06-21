@@ -9,7 +9,7 @@ use agent_vocab::{
     text_enum, ActionId, ProviderConfig, ProviderKind, ProviderReplayItem, TranscriptItem, TurnId,
     TurnOutcome, UserMessage,
 };
-pub use postgres::{PostgresAgentStore, Stage, StageSubagent};
+pub use postgres::{Delegation, DelegationSubagent, PostgresAgentStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -54,12 +54,12 @@ text_enum! {
         ReadOnly => "read_only",
     }
 
-    pub enum StageKind {
+    pub enum DelegationKind {
         Full => "full",
         ReadonlyFanout => "readonly_fanout",
     }
 
-    pub enum StageStatus {
+    pub enum DelegationStatus {
         Running => "running",
         Done => "done",
         DoneWithFailures => "done_with_failures",

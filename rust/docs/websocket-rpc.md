@@ -93,6 +93,9 @@ active_leaf_id text null
 system_prompt text not null
 provider_config jsonb not null
 metadata jsonb not null default '{}'::jsonb
+parent_session_id text null references sessions(id) on delete set null
+subagent_type text null
+delegation_id text null references delegations(id)
 session_revision bigint not null default 0
 queue_revision bigint not null default 0
 transcript_revision bigint not null default 0
@@ -297,6 +300,28 @@ History operations remain transcript-driven:
 
 The old embedded `model_context` payloads have been migrated away. Model action
 recovery now requires `context_leaf_id`.
+
+### `delegations`
+
+Durable parent/child subagent delegation units:
+
+```text
+id text primary key
+parent_session_id text not null references sessions(id) on delete cascade
+workflow text null
+label text null
+kind text not null              -- full | readonly_fanout
+status text not null            -- running | done | done_with_failures | cancelled | failed
+attempt_id text not null
+expected_subagents integer not null default 1
+created_at timestamptz not null default now()
+updated_at timestamptz not null default now()
+```
+
+Child sessions link back through `sessions.delegation_id`. The
+`delegations_parent_created_idx` index supports the per-parent run-board feed.
+The completion runner uses `attempt_id` as an idempotency fence and queues a
+deterministic parent steer keyed as `delegation-steer:<delegation_id>:<attempt_id>`.
 
 ### `events`
 
@@ -1184,17 +1209,171 @@ turns fail with `not_resumable`, non-terminal targets fail with
 whose terminal work was tool execution fail with `not_resumable` until explicit
 tool-rerun semantics exist.
 
+## Delegation RPC
+
+Delegations are the frontend-facing unit for bounded parent/child subagent work.
+A delegation is either one full (writing) subagent or a read-only fan-out. The
+websocket API only accepts the canonical `delegation.*` methods below.
+
+### `delegation.start_full`
+
+Starts one full subagent that writes in the parent workspace.
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "role": "implementer",
+  "prompt": "Implement the requested change.",
+  "workflow": "workflow-implement-review",
+  "label": "implement change"
+}
+```
+
+Result:
+
+```json
+{
+  "delegation_id": "delegation_...",
+  "subagent_session_id": "session_..."
+}
+```
+
+### `delegation.start_readonly_fanout`
+
+Starts one read-only subagent per task, each in a disposable snapshot.
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "tasks": [
+    { "role": "reviewer", "prompt": "Review the backend changes." },
+    { "role": "tester", "prompt": "Run focused validation." }
+  ],
+  "workflow": "workflow-implement-review-test",
+  "label": "review and test"
+}
+```
+
+Result:
+
+```json
+{
+  "delegation_id": "delegation_...",
+  "subagent_session_ids": ["session_...", "session_..."]
+}
+```
+
+### `delegation.status`
+
+Returns one in-scope delegation and its current subagent statuses.
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "delegation_id": "delegation_..."
+}
+```
+
+Result:
+
+```json
+{
+  "delegation_id": "delegation_...",
+  "kind": "readonly_fanout",
+  "status": "running",
+  "subagents": [
+    { "id": "session_...", "status": "running" }
+  ],
+  "handoff_dir": "/.../.pi-handoff/delegation_..."
+}
+```
+
+### `delegation.cancel`
+
+Interrupts all running subagents in a delegation and marks the delegation
+cancelled. Terminal delegations are left unchanged and return
+`{ "cancelled": false }`.
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "delegation_id": "delegation_..."
+}
+```
+
+### `delegation.list`
+
+Lists all delegations for a parent session, newest first. This is the run-board
+feed used by the web UI.
+
+```json
+{ "parent_session_id": "parent-session" }
+```
+
+Result:
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "delegations": [
+    {
+      "delegation_id": "delegation_...",
+      "kind": "full",
+      "status": "done",
+      "workflow": "workflow-implement-review",
+      "label": "implement change",
+      "subagents": [
+        {
+          "id": "session_...",
+          "status": "idle",
+          "role": "implementer",
+          "subagent_type": "full",
+          "task": "Implement the requested change."
+        }
+      ],
+      "handoff_dir": "/.../.pi-handoff/delegation_..."
+    }
+  ]
+}
+```
+
+### `delegation.read_handoff_file`
+
+Reads `index.json` from the delegation root, or `final_message.md` /
+`transcript.md` from a delegation subagent directory. `index.json` is read
+without `subagent_id`; subagent files require it.
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "delegation_id": "delegation_...",
+  "subagent_id": "session_...",
+  "file": "final_message.md"
+}
+```
+
+Result:
+
+```json
+{
+  "delegation_id": "delegation_...",
+  "subagent_id": "session_...",
+  "file": "final_message.md",
+  "content": "..."
+}
+```
+
 ## Subagent events
 
-When a stage subagent is spawned or re-driven, the daemon may emit
+When a delegation subagent is spawned or re-driven, the daemon may emit
 parent-scoped `subagent.spawned` and `subagent.running` progress events. These
-are progress hints only. Parent-visible stage completion is not a per-child
+are progress hints only. Parent-visible delegation completion is not a per-child
 `subagent.idle`; it is one `InputPriority::Steer` queued to the parent after the
-stage barrier completes, pointing at the handoff directory (`index.json` plus
+delegation barrier completes, pointing at the handoff directory (`index.json` plus
 per-subagent `final_message.md`/`transcript.md`).
 
-`subagent.idle` remains an event type for legacy/non-stage compatibility (for
-example, defensive dispatch-failure compensation). When emitted, idle
+`subagent.idle` remains an event type for non-delegation subagent compatibility
+(for example, defensive dispatch-failure compensation). When emitted, idle
 notifications are de-duplicated per completed terminal child state, not for the
 child session lifetime.
 
@@ -1308,8 +1487,8 @@ subagent.running
 subagent.idle
 ```
 
-`subagent.idle` is listed for compatibility; stage-member completion is
-reported by the stage steer/handoff described above.
+`subagent.idle` is listed for compatibility; delegation-member completion is
+reported by the delegation steer/handoff described above.
 
 No approval or awaiting-approval events are emitted.
 

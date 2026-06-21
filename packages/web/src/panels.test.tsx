@@ -1,16 +1,16 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { Inspector, type RunBoardCallbacks } from "./panels.tsx";
-import type { HandoffFileName, SessionSnapshot, Stage, ToolListing } from "./types.ts";
+import type { HandoffFileName, SessionSnapshot, Delegation, ToolListing } from "./types.ts";
 
-function stage(overrides: Partial<Stage> = {}): Stage {
+function delegation(overrides: Partial<Delegation> = {}): Delegation {
 	return {
-		stage_id: "stage-1",
+		delegation_id: "delegation-1",
 		kind: "readonly_fanout",
 		status: "done",
 		workflow: null,
 		label: "review",
-		handoff_dir: "/workspace/.pi-handoff/stage-1",
+		handoff_dir: "/workspace/.pi-handoff/delegation-1",
 		subagents: [
 			{
 				id: "child-1",
@@ -43,20 +43,20 @@ function snapshot(): SessionSnapshot {
 
 function callbacks(): Omit<RunBoardCallbacks, "onSelectSession"> {
 	return {
-		onCancelStage: () => {},
+		onCancelDelegation: () => {},
 		onSteerSubagent: () => {},
-		onReRunStage: () => {},
-		readHandoffFile: (_stageId: string, _subagentId: string | null, _file: HandoffFileName) => Promise.resolve(""),
+		onReRunDelegation: () => {},
+		readHandoffFile: (_delegationId: string, _subagentId: string | null, _file: HandoffFileName) => Promise.resolve(""),
 	};
 }
 
-function renderInspector(stages: Stage[]): string {
+function renderInspector(delegations: Delegation[]): string {
 	return renderToStaticMarkup(
 		<Inspector
 			snapshot={snapshot()}
-			stages={stages}
-			stagesLoading={false}
-			stagesError={null}
+			delegations={delegations}
+			delegationsLoading={false}
+			delegationsError={null}
 			runBoard={callbacks()}
 			tools={[] satisfies ToolListing[]}
 		/>,
@@ -64,28 +64,28 @@ function renderInspector(stages: Stage[]): string {
 }
 
 describe("Inspector run board handoff links", () => {
-	it("shows handoff path and file buttons for completed stages", () => {
-		const html = renderInspector([stage({ status: "done_with_failures" })]);
+	it("shows handoff path and file buttons for completed delegations", () => {
+		const html = renderInspector([delegation({ status: "done_with_failures" })]);
 
-		expect(html).toContain("handoff /workspace/.pi-handoff/stage-1");
+		expect(html).toContain("handoff /workspace/.pi-handoff/delegation-1");
 		expect(html).toContain("index.json");
 		expect(html).toContain("final message");
 		expect(html).toContain("transcript");
 	});
 
-	it("does not show handoff path or file buttons for cancelled stages", () => {
-		const html = renderInspector([stage({ status: "cancelled" })]);
+	it("does not show handoff path or file buttons for cancelled delegations", () => {
+		const html = renderInspector([delegation({ status: "cancelled" })]);
 
-		expect(html).not.toContain("handoff /workspace/.pi-handoff/stage-1");
+		expect(html).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
 		expect(html).not.toContain("index.json");
 		expect(html).not.toContain("final message");
 		expect(html).not.toContain("transcript");
 	});
 
-	it("does not show handoff path or file buttons for failed stages", () => {
-		const html = renderInspector([stage({ status: "failed" })]);
+	it("does not show handoff path or file buttons for failed delegations", () => {
+		const html = renderInspector([delegation({ status: "failed" })]);
 
-		expect(html).not.toContain("handoff /workspace/.pi-handoff/stage-1");
+		expect(html).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
 		expect(html).not.toContain("index.json");
 		expect(html).not.toContain("final message");
 		expect(html).not.toContain("transcript");

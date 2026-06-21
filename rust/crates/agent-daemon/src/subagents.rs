@@ -13,18 +13,19 @@ use crate::session_start::{
 use crate::state::AppState;
 use crate::types::RpcError;
 
-/// A subagent spawned as part of a stage: fresh context (no parent-transcript
-/// fork, no source refs), tagged with its stage id and type.
-pub(crate) struct StageSubagentSpawn {
+/// A subagent spawned as part of a delegation: fresh context (no
+/// parent-transcript fork, no source refs), tagged with its delegation id and
+/// type.
+pub(crate) struct DelegationSubagentSpawn {
     pub(crate) parent_session_id: String,
     pub(crate) role: String,
     pub(crate) task: String,
     pub(crate) subagent_type: SubagentType,
-    pub(crate) stage_id: String,
+    pub(crate) delegation_id: String,
 }
 
-impl From<StageSubagentSpawn> for SubagentSpawnRequest {
-    fn from(spawn: StageSubagentSpawn) -> Self {
+impl From<DelegationSubagentSpawn> for SubagentSpawnRequest {
+    fn from(spawn: DelegationSubagentSpawn) -> Self {
         Self {
             parent_session_id: spawn.parent_session_id,
             role: spawn.role,
@@ -33,7 +34,7 @@ impl From<StageSubagentSpawn> for SubagentSpawnRequest {
             provider: None,
             metadata: json!({}),
             subagent_type: spawn.subagent_type,
-            stage_id: Some(spawn.stage_id),
+            delegation_id: Some(spawn.delegation_id),
         }
     }
 }
@@ -47,7 +48,7 @@ pub(crate) struct SubagentSpawnRequest {
     provider: Option<ProviderConfig>,
     metadata: Value,
     subagent_type: SubagentType,
-    stage_id: Option<String>,
+    delegation_id: Option<String>,
 }
 
 pub(crate) struct SpawnedSubagent {
@@ -82,9 +83,9 @@ pub(crate) async fn spawn_subagent(
         request.role_workspace.as_deref(),
     )
     .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
-    // A full subagent is the durable workspace's single writer for its stage:
-    // it runs against the parent's dirs in place (no fork). A read-only subagent
-    // forks the parent into its own disposable snapshot.
+    // A full subagent is the durable workspace's single writer for its
+    // delegation: it runs against the parent's dirs in place (no fork). A
+    // read-only subagent forks the parent into its own disposable snapshot.
     let (outer_cwd, workspaces) = match request.subagent_type {
         SubagentType::Full => (
             parent_config.outer_cwd.clone(),
@@ -143,7 +144,7 @@ pub(crate) async fn spawn_subagent(
             client_input_id: None,
             parent_session_id: Some(request.parent_session_id.clone()),
             subagent_type: Some(subagent_type),
-            stage_id: request.stage_id.clone(),
+            delegation_id: request.delegation_id.clone(),
             dispatch_mode: PreparedSessionDispatchMode::Deferred,
         },
     )
@@ -287,15 +288,16 @@ async fn publish_subagent_parent_dispatch_failed_event(
     role_workspace: Option<&str>,
     error: &RpcError,
 ) {
-    // A stage member's failure is owned by the stage: stage_tools spawn-failure
-    // compensation fails the stage and the tool returns Err synchronously.
+    // A delegation member's failure is owned by the delegation:
+    // delegation_tools spawn-failure compensation fails the delegation and the
+    // tool returns Err synchronously.
     // Suppress the per-child idle so the parent never sees a per-child
-    // notification for a stage member (matching the live idle gate).
-    match state.repo.session_stage_id(child_session_id).await {
+    // notification for a delegation member (matching the live idle gate).
+    match state.repo.session_delegation_id(child_session_id).await {
         Ok(Some(_)) => return,
         Ok(None) => {}
-        Err(stage_error) => eprintln!(
-            "failed to load stage id for dispatch-failed child={child_session_id}: {stage_error:#}"
+        Err(delegation_error) => eprintln!(
+            "failed to load delegation id for dispatch-failed child={child_session_id}: {delegation_error:#}"
         ),
     }
     let summary_preview = format!("initial dispatch failed: {}: {}", error.code, error.message);
