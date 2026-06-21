@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use agent_session::{ModelContext, SessionAction, TranscriptStorageNode};
+use agent_session::{AgentSession, ModelContext, SessionAction, TranscriptStorageNode};
 use agent_store::{
     DelegationKind, DelegationStatus, EventType, InputPriority, PostgresAgentStore,
     QueuedInputStatus, SessionConfig, SubagentType,
@@ -55,6 +55,7 @@ impl Drop for TempDir {
 use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
 use crate::runtime::SessionDriver;
 use crate::state::AppState;
+use crate::types::RuntimeSession;
 use crate::workspaces::WorkspaceManager;
 
 use super::{
@@ -1598,21 +1599,33 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     assert_eq!(index["status"], "done");
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
 
-    // A second repair sweep must not double-enqueue or double-drive.
-    sweep_running_delegations_on_boot(&env.state).await;
-    let queued_steers = env
+    let repaired_input = env
         .state
         .repo
-        .queue_state("parent")
+        .find_client_input("parent", &key)
         .await
-        .expect("queue state")
-        .queued_inputs
-        .into_iter()
-        .filter(|input| input.priority == InputPriority::Steer)
-        .count();
+        .expect("find repaired steer")
+        .expect("repaired steer exists");
+    assert!(matches!(
+        repaired_input.status,
+        QueuedInputStatus::Queued | QueuedInputStatus::Consuming | QueuedInputStatus::Consumed
+    ));
+
+    // A second repair sweep must not double-publish or double-drive. The first
+    // repair may already have driven the idle parent and consumed the queued
+    // input, so assert the deterministic idempotency row rather than requiring
+    // the steer to remain in the active queue.
+    sweep_running_delegations_on_boot(&env.state).await;
+    let repaired_again = env
+        .state
+        .repo
+        .find_client_input("parent", &key)
+        .await
+        .expect("find repaired steer after replay")
+        .expect("repaired steer still exists");
     assert_eq!(
-        queued_steers, 1,
-        "exactly one durable steer, no double-enqueue"
+        repaired_again.input_id, repaired_input.input_id,
+        "deterministic steer client id reuses the original row"
     );
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
 
@@ -1738,8 +1751,8 @@ async fn terminal_delegation_member_yields_zero_parent_idle_rows() {
 }
 
 /// Server-side guard: a `Steer`-priority input targeting a `read_only` subagent
-/// is rejected with `cannot_steer_read_only_subagent`, while a follow-up to the
-/// same subagent and a steer to a full subagent are both accepted.
+/// is rejected with `cannot_steer_read_only_subagent`, a steer to a running full
+/// subagent is accepted, and terminal subagents are not reactivated.
 #[tokio::test]
 async fn steering_a_read_only_subagent_is_rejected_server_side() {
     let Some(env) = test_env().await else {
@@ -1771,18 +1784,18 @@ async fn steering_a_read_only_subagent_is_rejected_server_side() {
         "done",
     )
     .await;
-    create_terminal_subagent(
-        &env,
-        project_id,
-        "parent",
-        &delegation.id,
-        "full",
-        "implementer",
-        SubagentType::Full,
-        TurnOutcome::Graceful,
-        "done",
-    )
-    .await;
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "full_running").await;
+    env.state.active.lock().await.insert(
+        "full_running".to_string(),
+        Arc::new(Mutex::new(RuntimeSession {
+            session: AgentSession::new(),
+            config: session_config(
+                &env,
+                project_id,
+                json!({ "created_by": "test", "role_name": "implementer", "harness": true }),
+            ),
+        })),
+    );
 
     let steer = |session_id: &str| {
         json!({
@@ -1798,10 +1811,11 @@ async fn steering_a_read_only_subagent_is_rejected_server_side() {
         .expect_err("steering a read_only subagent must be rejected");
     assert_eq!(rejected.code, "cannot_steer_read_only_subagent");
 
-    // Steering the full subagent is accepted (only read_only is guarded).
-    crate::input_user(&env.state, steer("full"))
+    // Steering a genuinely running full subagent is accepted.
+    let accepted = crate::input_user(&env.state, steer("full_running"))
         .await
-        .expect("steering a full subagent is allowed");
+        .expect("steering a running full subagent is allowed");
+    assert_eq!(accepted["accepted"], true);
 
     // A follow-up to the read-only subagent is unaffected by the steer guard.
     crate::input_user(
@@ -1814,6 +1828,25 @@ async fn steering_a_read_only_subagent_is_rejected_server_side() {
     )
     .await
     .expect("a follow-up to a read_only subagent is allowed");
+
+    // A full subagent that is already terminal must not be reactivated by a
+    // steer-priority input.
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "full_terminal",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "done",
+    )
+    .await;
+    let rejected = crate::input_user(&env.state, steer("full_terminal"))
+        .await
+        .expect_err("steering a terminal full subagent must be rejected");
+    assert_eq!(rejected.code, "subagent_terminal");
 
     env.cleanup().await;
 }
