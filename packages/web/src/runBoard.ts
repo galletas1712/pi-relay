@@ -7,6 +7,13 @@ export function isStageRunning(stage: Stage): boolean {
 	return stage.status === "running";
 }
 
+/** The daemon only writes handoff files from the stage barrier, which completes
+ * stages as `done` or `done_with_failures`. Other terminal states are real, but
+ * do not have an index.json or per-subagent handoff files behind them. */
+export function stageHasHandoff(stage: Stage): boolean {
+	return stage.status === "done" || stage.status === "done_with_failures";
+}
+
 const STAGE_STATUS_LABELS: Record<StageStatus, string> = {
 	running: "running",
 	done: "done",
@@ -35,6 +42,18 @@ export function canReRunStage(stage: Stage): boolean {
 	return reRunTaskPlan(stage) !== null;
 }
 
+function isReRunnableStageStatus(status: StageStatus): boolean {
+	switch (status as string) {
+		case "done":
+		case "done_with_failures":
+		case "cancelled":
+		case "failed":
+			return true;
+		default:
+			return false;
+	}
+}
+
 function subagentTask(subagent: StageSubagent): { role: string; prompt: string } | null {
 	const prompt = subagent.task;
 	const role = subagent.role;
@@ -49,17 +68,21 @@ type ReRunTaskPlan =
 	| { kind: "readonly_fanout"; tasks: ReRunTask[] };
 
 function reRunTaskPlan(stage: Stage): ReRunTaskPlan | null {
-	if (isStageRunning(stage)) return null;
+	if (!isReRunnableStageStatus(stage.status)) return null;
 	if (stage.subagents.length === 0) return null;
 	const tasks = stage.subagents.map((subagent) => subagentTask(subagent));
 	if (tasks.some((task) => task === null)) return null;
 	const resolved = tasks as ReRunTask[];
-	if (stage.kind === "full") {
+	const kind = stage.kind as string;
+	if (kind === "full") {
 		const only = resolved[0];
 		if (!only || resolved.length !== 1) return null;
 		return { kind: "full", task: only };
 	}
-	return { kind: "readonly_fanout", tasks: resolved };
+	if (kind === "readonly_fanout") {
+		return { kind: "readonly_fanout", tasks: resolved };
+	}
+	return null;
 }
 
 /** Reconstruct the `stage.start_*` params to re-run a finished stage. The board

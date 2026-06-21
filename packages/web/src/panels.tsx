@@ -30,6 +30,7 @@ import { truncate } from "./text.ts";
 import {
 	canReRunStage,
 	isStageRunning,
+	stageHasHandoff,
 	stageStatusLabel,
 	steerableSubagentId,
 } from "./runBoard.ts";
@@ -110,9 +111,7 @@ function SubagentRow({
 }) {
 	const finalKey = `${subagent.id}:final_message.md`;
 	const transcriptKey = `${subagent.id}:transcript.md`;
-	// Handoff files only exist once the stage is terminal (the daemon writes them
-	// inside the barrier). While running, the row links to the live session only.
-	const handoffReady = !isStageRunning(stage);
+	const handoffReady = stageHasHandoff(stage);
 	const openFinal = open && open.key === finalKey ? open : null;
 	const openTranscript = open && open.key === transcriptKey ? open : null;
 	return (
@@ -184,7 +183,7 @@ function StageCard({
 	const title = stage.label ?? stage.workflow ?? stage.stage_id.slice(0, 13);
 	const indexKey = `stage:index.json`;
 	const openIndex = open && open.key === indexKey ? open : null;
-	const handoffReady = !running;
+	const handoffReady = stageHasHandoff(stage);
 	return (
 		<div className="run-board-stage">
 			<div className="run-board-stage-head">
@@ -195,7 +194,7 @@ function StageCard({
 				</span>
 				<span className={`subagent-activity ${running ? "running" : "idle"}`}>{stageStatusLabel(stage.status)}</span>
 			</div>
-			{stage.handoff_dir ? (
+			{handoffReady && stage.handoff_dir ? (
 				<div className="run-board-handoff-path" title={stage.handoff_dir}>
 					handoff {stage.handoff_dir}
 				</div>

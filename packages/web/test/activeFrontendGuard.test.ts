@@ -23,7 +23,7 @@ async function activeSourceFiles(dir: string): Promise<string[]> {
 
 describe("active frontend subagent surface", () => {
 	it("does not call the retired subagent.list UI/RPC path", async () => {
-		const forbidden = [/subagent\.list/, /\blistSubagents\b/, /\bSubagentsSection\b/];
+		const forbidden = [/subagent\.list/, /\blistSubagents\b/, /\bSubagentsSection\b/, /\btaskBySessionId\b/];
 		const matches: string[] = [];
 
 		for (const file of await activeSourceFiles(SRC_ROOT)) {
