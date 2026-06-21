@@ -1050,8 +1050,8 @@ async fn drop_column_constraints(
           and t.relname = $1
           and exists (
             select 1
-            from unnest(c.conkey) attnum
-            join pg_attribute a on a.attrelid = t.oid and a.attnum = attnum
+            from unnest(c.conkey) as ck(attnum)
+            join pg_attribute a on a.attrelid = t.oid and a.attnum = ck.attnum
             where a.attname = $2
           )
         "#,
