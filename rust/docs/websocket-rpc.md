@@ -1299,7 +1299,7 @@ Result:
       "steerable": false,
       "final_message": "Looks good.\n\nsuggested_next: approved",
       "suggested_next": "approved",
-      "final_message_path": "/.../.pi-handoff/delegation_.../session_.../final_message.md",
+      "final_message_path": null,
       "transcript_path": "/.../.pi-handoff/delegation_.../session_.../transcript.md"
     }
   ],
@@ -1358,9 +1358,13 @@ Result:
 
 ### `delegation.read_handoff_file`
 
-Reads `final_message.md` or `transcript.md` from a delegation subagent
-directory. The structured delegation snapshot comes from
-`delegation.status`/`inspect_delegation`, not from a handoff `index.json`.
+Reads a valid delegation handoff file. Normal running/done delegations expose
+per-subagent `transcript.md`; terminal done/done_with_failures delegations also
+expose per-subagent `final_message.md`. Cancelled delegations expose only the
+transcript-only cancellation artifact path reported by `inspect_delegation`, for
+example `cancelled/<subagent_id>.transcript.md`. The structured delegation
+snapshot comes from `delegation.status`/`inspect_delegation`, not from a handoff
+manifest file.
 
 ```json
 {

@@ -317,8 +317,9 @@ Run after each major step; all must pass and the new surface must be unaffected:
 - [ ] **delegation smoke test (new surface unaffected):** start a session, call
       `delegate_readonly_tasks` with 2 tasks and `delegate_writing_task` with 1, confirm
       the run board shows live subagents, the barrier fires once, the handoff dir is
-      written (`index.json` + per-subagent `final_message.md`/`transcript.md`),
-      `stage.read_handoff_file` reads them, `stage.cancel` cancels a running stage, and
+      written (per-subagent `final_message.md`/`transcript.md`; structured state via
+      `inspect_delegation`), `delegation.read_handoff_file` reads them,
+      `delegation.cancel` cancels a running delegation, and
       the completion steer lands as a parent message. The real-model e2e (Task #8)
       remains the gold check.
 - [ ] grep guard: `grep -rn "subagents\.\(spawn\|wait\|call\|list\|steer\|interrupt\)\|fork_context\|subagent\.list\|import_source_refs\|SourceRefSpec" rust packages/web/src`
