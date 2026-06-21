@@ -336,13 +336,14 @@ system prompt remains global.
 
 Provider requests now carry `PromptSections`: a stable prefix and dynamic
 context. The stable prefix is the global system prompt. The daemon appends
-dynamic runtime context after it, currently the workspace cwd, and only then
-does the provider render transcript history. OpenAI Responses renders the
-stable prefix as `instructions` and the dynamic context as the first input item.
-Anthropic renders the stable prefix as a cache-marked system block and the
-dynamic context as an uncached system suffix. The rendered prompt does not
-include an artificial "dynamic context" heading; that split is an internal
-cache-layout detail, not model-facing instruction text.
+dynamic runtime context after it, including the compact `## Current delegations`
+section for top-level parent sessions, and only then does the provider render
+transcript history. OpenAI Responses renders the stable prefix as `instructions`
+and the dynamic context as the first input item. Anthropic renders the stable
+prefix as a cache-marked system block and the dynamic context as an uncached
+system suffix. The prompt split itself does not add an artificial "dynamic
+context" heading; any heading present is owned by the dynamic section content
+(for example `## Current delegations`).
 
 Prompt caching works best when the beginning of the prompt is identical across
 requests. That means the long-lived global system prompt, stable tool

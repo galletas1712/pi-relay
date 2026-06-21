@@ -121,8 +121,9 @@ session.start (workspaces materialized)
         |
         v
 model call: assemble_agent_prompt
-  -> PromptSections::stable(config.system_prompt)   (stable_prefix only)
-  -> daemon appends dynamic runtime context (e.g. cwd) as PromptSections.dynamic_context
+  -> PromptSections.stable_prefix = config.system_prompt
+  -> daemon appends dynamic runtime context (currently ## Current delegations
+     for top-level parents) as PromptSections.dynamic_context
   -> agent-provider renders prefix, then dynamic context, then transcript
 ```
 
@@ -130,12 +131,21 @@ The prompt is rendered exactly once, at `session.start`, after project workspace
 
 ## Stable prefix vs dynamic context
 
-The rendered `PI.md` is the **stable prefix** of [agent-provider](./agent-provider.md)'s `PromptSections`. The daemon's `assemble_agent_prompt` wraps the stored `system_prompt` as `PromptSections::stable(..)`; any per-request runtime data (currently the workspace cwd) is added separately as the `dynamic_context` field. Providers render the stable prefix first (OpenAI Responses `instructions` / an Anthropic cache-marked system block), then the dynamic context, then transcript history. Keeping the long-lived prompt identical across requests is what makes prompt caching effective — see the prompt-caching and provider notes in [design decisions](../design-decisions.md#provider-scope-is-intentionally-small).
+The rendered `PI.md` is the **stable prefix** of [agent-provider](./agent-provider.md)'s `PromptSections`. The daemon's `assemble_agent_prompt` wraps the stored `system_prompt` as the stable prefix and adds per-request runtime data as `dynamic_context`. Providers render the stable prefix first (OpenAI Responses `instructions` / an Anthropic cache-marked system block), then the dynamic context, then transcript history. Keeping the long-lived prompt identical across requests is what makes prompt caching effective — see the prompt-caching and provider notes in [design decisions](../design-decisions.md#provider-scope-is-intentionally-small).
+
+For top-level parent sessions, the daemon currently injects a compact
+`## Current delegations` dynamic section immediately after the rendered PI.md
+prefix. It contains all running delegations plus the latest three terminal
+delegations, bounded progress/subagent fields, cheap final-message snippets when
+available, and artifact paths. It deliberately does not inline full transcripts
+or refresh handoff artifacts on every context build; use `inspect_delegation` to
+refresh or retrieve the full structured snapshot. Subagent sessions do not
+receive the parent's delegation summary.
 
 ## Notes
 
-- No date, time, or cwd is injected implicitly. If `PI.md` does not reference `session.cwd`, the cwd never appears. The crate's tests assert a default render contains no "Current date" / "Starting working directory" line.
-- Because the template can choose to surface `session.cwd` / `session.workspaces_markdown` / `tools.specs`, a custom template *can* place dynamic-looking data in the rendered text — but that text is still part of the stable prefix and will churn the prompt cache. Keep volatile data in the daemon's `dynamic_context`, not in `PI.md`.
+- The `agent-prompt` crate itself injects no date, time, or cwd implicitly. If `PI.md` does not reference `session.cwd`, the rendered stable prefix never includes it. Daemon-owned dynamic sections, such as `## Current delegations`, are added later by `agent-daemon`.
+- Because the template can choose to surface `session.cwd` / `session.workspaces_markdown` / `tools.specs`, a custom template *can* place dynamic-looking data in the rendered text — but that text is still part of the stable prefix and will churn the prompt cache. Keep volatile data in daemon-owned `dynamic_context`, not in `PI.md`.
 - The prompt is rendered once and stored; editing `PI.md` does not retroactively change existing sessions. New sessions pick up the new template.
 - `render` panics on a malformed template. This is intentional for a repo-authored file; do not feed untrusted templates through this crate.
 - Thinking/reasoning blocks never reach the prompt. The provider parse layer keeps only `Text` and `ToolCall` assistant items, so the prompt has no notion of reasoning content.

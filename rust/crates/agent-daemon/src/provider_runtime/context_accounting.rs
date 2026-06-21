@@ -46,7 +46,7 @@ async fn count_claude_model_input_tokens_remotely(
     // Claude has an authoritative remote preflight backend. Count the exact
     // local tool surface sent on the next /messages call, including web
     // wrappers now that they are normal client JSON tools.
-    let prompt = assemble_agent_prompt(state, config).await?;
+    let prompt = assemble_agent_prompt(state, config, session_id).await?;
     let request = ProviderTokenCountRequest {
         model: config.provider.model.clone(),
         prompt,
@@ -105,21 +105,30 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
                     .collect(),
             );
             let suffix_transcript = provider_transcript(suffix_context);
-            // The usage anchor already accounts for the prompt; the suffix is a
-            // post-anchor transcript tail that never carries a compaction
-            // summary, so no PromptSections context is needed here.
+            // The usage anchor already accounts for the prompt that was sent
+            // with that older model action, but daemon-owned dynamic context
+            // (for example the compact current-delegations block) can change
+            // without a transcript suffix. Conservatively include the current
+            // dynamic section again so a newly-visible delegation summary is
+            // not ignored by the context gate.
+            let prompt = assemble_agent_prompt(state, config, session_id).await?;
+            let dynamic_prompt_tokens = agent_provider::estimate_model_input_tokens(
+                &PromptSections::new(None, prompt.dynamic_context.clone()),
+                &[],
+            );
             let suffix_tokens = agent_provider::estimate_transcript_tokens(
                 &PromptSections::default(),
                 &suffix_transcript,
             )
-            .tokens;
+            .tokens
+            .saturating_add(dynamic_prompt_tokens);
             return Ok(usage
                 .with_estimated_suffix_tokens(suffix_tokens)
                 .total_tokens);
         }
     }
 
-    estimate_model_input_tokens_from_local_heuristic(state, config, model_context).await
+    estimate_model_input_tokens_from_local_heuristic(state, config, session_id, model_context).await
 }
 
 fn suffix_after_first_model_generated_item(
@@ -136,9 +145,10 @@ fn suffix_after_first_model_generated_item(
 async fn estimate_model_input_tokens_from_local_heuristic(
     state: &AppState,
     config: &SessionConfig,
+    session_id: &str,
     model_context: ModelContext,
 ) -> Result<usize> {
-    let prompt = assemble_agent_prompt(state, config).await?;
+    let prompt = assemble_agent_prompt(state, config, session_id).await?;
     let transcript = provider_transcript(model_context);
     Ok(agent_provider::estimate_model_input_tokens(
         &prompt,

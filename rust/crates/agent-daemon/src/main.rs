@@ -3,6 +3,7 @@
 mod auth;
 mod codec;
 mod config;
+mod delegation_context;
 mod delegation_runner;
 mod delegation_snapshot;
 mod delegation_tools;
