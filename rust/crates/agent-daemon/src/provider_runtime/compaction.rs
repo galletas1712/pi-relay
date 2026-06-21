@@ -314,12 +314,11 @@ pub(crate) async fn remote_compaction_request(
     session_id: &str,
     transcript: Vec<ModelTranscriptEntry>,
 ) -> Result<ProviderCompactionRequest> {
-    let transcript = compaction_input_transcript(transcript);
     Ok(ProviderCompactionRequest {
         model: config.provider.model.clone(),
         // Compaction uses the stable prompt plus transcript/model history. Any
-        // previous post-compaction delegation ledger is stripped from compacted
-        // summaries before the provider sees the input; fresh parent state is
+        // previous post-compaction delegation ledger already present in the
+        // transcript is ordinary prior summary text; fresh parent state is
         // appended to the stored compaction result after the provider returns.
         prompt: PromptSections::stable(config.system_prompt.clone()),
         transcript,
@@ -343,11 +342,10 @@ pub(crate) async fn append_delegation_ledger_to_output(
     mut output: CompactionOutput,
 ) -> Result<CompactionOutput> {
     if let Some(ledger) = compaction_delegation_ledger(state, session_id).await? {
-        let base_summary = strip_appended_delegation_ledger(&output.summary);
-        output.summary = if base_summary.trim().is_empty() {
+        output.summary = if output.summary.trim().is_empty() {
             ledger
         } else {
-            format!("{}\n\n{}", base_summary.trim_end(), ledger)
+            format!("{}\n\n{}", output.summary.trim_end(), ledger)
         };
     }
     Ok(output)
@@ -423,7 +421,7 @@ pub(crate) async fn local_summary_request(
     compaction_session_id: &str,
     transcript: Vec<ModelTranscriptEntry>,
 ) -> Result<ModelRequest> {
-    let mut transcript = compaction_input_transcript(transcript);
+    let mut transcript = transcript;
     let compaction_request = render_pi_compaction_prompt(state, config)?;
     transcript.push(TranscriptItem::UserMessage(UserMessage::text(compaction_request)).into());
     Ok(ModelRequest {
@@ -448,31 +446,6 @@ pub(crate) async fn local_summary_request(
         session_id: Some(compaction_session_id.to_string()),
         turn_id: None,
     })
-}
-
-const DELEGATION_LEDGER_HEADING: &str = "## Delegation state at compaction time";
-
-fn compaction_input_transcript(transcript: Vec<ModelTranscriptEntry>) -> Vec<ModelTranscriptEntry> {
-    transcript
-        .into_iter()
-        .map(|mut entry| {
-            if let TranscriptItem::CompactionSummary(summary) = &mut entry.item {
-                summary.summary = strip_appended_delegation_ledger(&summary.summary)
-                    .trim_end()
-                    .to_string();
-            }
-            entry
-        })
-        .collect()
-}
-
-fn strip_appended_delegation_ledger(summary: &str) -> &str {
-    summary
-        .find(DELEGATION_LEDGER_HEADING)
-        .map_or(summary, |index| {
-            let before_heading = &summary[..index];
-            before_heading.trim_end()
-        })
 }
 
 #[derive(Debug, Clone)]

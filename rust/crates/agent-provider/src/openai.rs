@@ -303,7 +303,6 @@ fn is_synthetic_compact_user_text(text: &str) -> bool {
         || lower.starts_with("current working directory:")
         || lower.contains("the bash tool runs each command in a fresh shell rooted here")
         || lower.starts_with("the conversation history before this point was compacted")
-        || lower.starts_with("## delegation state at compaction time")
         || lower.starts_with("x-anthropic-billing-header:")
 }
 
@@ -824,7 +823,7 @@ pub(crate) fn transcript_to_response_items(
 
 fn appended_delegation_ledger(summary: &str) -> Option<&str> {
     const HEADING: &str = "## Delegation state at compaction time";
-    let index = summary.find(HEADING)?;
+    let index = summary.rfind(HEADING)?;
     Some(summary[index..].trim()).filter(|value| !value.is_empty())
 }
 
@@ -1658,13 +1657,13 @@ mod tests {
     }
 
     #[test]
-    fn compact_parser_drops_synthetic_delegation_ledger_echo() {
+    fn compact_parser_preserves_delegation_ledger_user_text() {
         let response = parse_compact_response(
             r###"{"output":[{"id":"msg_ledger","type":"message","role":"user","content":[{"type":"input_text","text":"## Delegation state at compaction time\n\n- delegation_id: `delegation_1`; status: running"}]},{"id":"msg_real","type":"message","role":"user","content":[{"type":"input_text","text":"real user fact"}]},{"id":"cmp_1","type":"compaction_summary","encrypted_content":"opaque"}]}"###,
         )
         .expect("compaction response should parse");
 
-        assert_eq!(response.provider_replay.len(), 2);
+        assert_eq!(response.provider_replay.len(), 3);
         assert!(response.summary.is_none());
         let replay_text = response
             .provider_replay
@@ -1673,7 +1672,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(replay_text.contains("real user fact"));
-        assert!(!replay_text.contains("Delegation state at compaction time"));
+        assert!(replay_text.contains("Delegation state at compaction time"));
     }
 
     #[test]
@@ -2201,6 +2200,36 @@ data: [DONE]
         assert_eq!(
             items[1]["content"][0]["text"],
             "## Delegation state at compaction time\n\n- delegation_id: `delegation_1`; status: running"
+        );
+    }
+
+    #[test]
+    fn responses_input_appends_latest_delegation_ledger_after_compaction_replay() {
+        let raw = json!({
+            "type": "compaction_summary",
+            "encrypted_content": "opaque",
+        });
+        let items = transcript_to_response_items(
+            &crate::PromptSections::default(),
+            &[ModelTranscriptEntry {
+                item: TranscriptItem::CompactionSummary(CompactionSummary::new(
+                    "session",
+                    "leaf",
+                    "provider summary\n\n## Delegation state at compaction time\n\nold ledger\n\nfresh summary bridge\n\n## Delegation state at compaction time\n\nlatest ledger",
+                    Some(123),
+                    TurnId(3),
+                )),
+                provider_replay: vec![ProviderReplayItem::new(ProviderKind::OpenAi, &raw).unwrap()],
+            }],
+        )
+        .expect("responses input renders");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], raw);
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(
+            items[1]["content"][0]["text"],
+            "## Delegation state at compaction time\n\nlatest ledger"
         );
     }
 

@@ -73,8 +73,8 @@ PI/system prompt plus transcript history.
 
 Compaction is the special case, but the live ledger is not a provider input. For
 top-level parent sessions, the provider compacts only transcript/model history
-(with stale previously-appended delegation ledgers stripped out). After the
-provider returns, the daemon appends a fresh
+(including any older point-in-time ledgers already present as prior summary
+text). After the provider returns, the daemon appends a fresh
 `## Delegation state at compaction time` section to the stored compaction
 summary. The ledger lists every delegation row for that parent session across
 all statuses (`running`, `done`, `done_with_failures`, `cancelled`, `failed`),
@@ -82,10 +82,11 @@ with bounded subagent/progress details, cheap final-message snippets when
 available, and artifact paths. It does not refresh artifacts or inline
 transcript bodies. A `running` entry is a point-in-time compaction fact, not a
 final outcome; later completion steers or `inspect_delegation` provide fresh
-state. Subagent compactions do not receive or append the parent ledger, sibling
-subagent state, or `## Current delegations` information; subagents summarize
-only their own role contract, delegated task, transcript/model history, and tool
-results/facts.
+state. If older ledger text remains in prior summaries, the newly appended
+ledger supersedes it by being the latest section. Subagent compactions do not
+receive or append the parent ledger, sibling subagent state, or `## Current
+delegations` information; subagents summarize only their own role contract,
+delegated task, transcript/model history, and tool results/facts.
 
 The web/inspector RPC surface remains `delegation.start_full`,
 `delegation.start_readonly_fanout`, `delegation.status`, `delegation.cancel`, and `delegation.list`;

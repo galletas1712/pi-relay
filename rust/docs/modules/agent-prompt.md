@@ -147,9 +147,10 @@ cancelled, failed) with bounded progress/subagent fields, cheap final-message
 snippets when available, and artifact paths. It deliberately does not inline
 full transcripts or refresh handoff artifacts. Running entries are
 point-in-time facts; summaries must not assume they completed before a later
-completion steer or refreshed `inspect_delegation`. Before a future compaction
-provider call, any prior appended ledger is stripped and replaced afterward with
-fresh state.
+completion steer or refreshed `inspect_delegation`. Future compactions summarize
+prior summary text normally, including any older point-in-time ledgers, then
+append a fresh ledger again. The latest appended ledger supersedes older ledger
+text by position.
 
 Subagent compactions do **not** receive the parent delegation ledger, sibling
 subagent state, or `## Current delegations` information. A subagent summary is
