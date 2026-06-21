@@ -1439,6 +1439,59 @@ async fn parent_idle_rows(env: &TestEnv, parent_id: &str) -> usize {
         .count()
 }
 
+/// Count durable parent `input.queued` completion-steer events for a delegation.
+///
+/// This is intentionally based on the persistent event log rather than the
+/// queue row or parent transcript: if replay accidentally publishes a second
+/// steer with a fresh/non-deterministic client id, the row and transcript checks
+/// can miss it after the first steer is already consumed, but the event log keeps
+/// both publishes.
+async fn durable_parent_completion_steers(
+    env: &TestEnv,
+    parent_id: &str,
+    delegation_id: &str,
+) -> usize {
+    env.state
+        .repo
+        .events_after(parent_id, None)
+        .await
+        .expect("parent events")
+        .into_iter()
+        .filter(|event| {
+            event.event == EventType::InputQueued
+                && event
+                    .data
+                    .get("priority")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(InputPriority::Steer.as_str())
+                && event_payload_text_mentions(&event.data, delegation_id, "finished")
+        })
+        .count()
+}
+
+fn event_payload_text_mentions(
+    payload: &serde_json::Value,
+    delegation_id: &str,
+    other_needle: &str,
+) -> bool {
+    payload_texts(payload)
+        .iter()
+        .any(|text| text.contains(delegation_id) && text.contains(other_needle))
+}
+
+fn payload_texts(value: &serde_json::Value) -> Vec<&str> {
+    match value {
+        serde_json::Value::String(text) => vec![text.as_str()],
+        serde_json::Value::Array(items) => items.iter().flat_map(payload_texts).collect(),
+        serde_json::Value::Object(map) => ["message", "content", "text"]
+            .into_iter()
+            .filter_map(|key| map.get(key))
+            .flat_map(payload_texts)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 /// FIX A: a fan-out whose subagent #1 is terminal while #2 has not yet been
 /// inserted must NOT complete — the expected-count fence keeps the barrier shut.
 #[tokio::test]
@@ -1586,6 +1639,10 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
         .join(&delegation.id)
         .join("index.json")
         .exists());
+    assert_eq!(
+        durable_parent_completion_steers(&env, "parent", &delegation.id).await,
+        0
+    );
 
     sweep_running_delegations_on_boot(&env.state).await;
     assert!(env
@@ -1598,6 +1655,11 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     let index = read_index(&env, &delegation.id);
     assert_eq!(index["status"], "done");
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        durable_parent_completion_steers(&env, "parent", &delegation.id).await,
+        1,
+        "first repair publishes exactly one durable completion steer"
+    );
 
     let repaired_input = env
         .state
@@ -1628,6 +1690,11 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
         "deterministic steer client id reuses the original row"
     );
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        durable_parent_completion_steers(&env, "parent", &delegation.id).await,
+        1,
+        "second repair must not publish any duplicate durable completion steer"
+    );
 
     env.cleanup().await;
 }
