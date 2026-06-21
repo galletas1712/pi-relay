@@ -2922,7 +2922,7 @@ pre {
 	gap: 10px;
 }
 
-.run-board-stage {
+.run-board-delegation {
 	display: flex;
 	flex-direction: column;
 	gap: 6px;
@@ -2931,13 +2931,13 @@ pre {
 	padding: 8px;
 }
 
-.run-board-stage-head {
+.run-board-delegation-head {
 	display: flex;
 	align-items: center;
 	gap: 8px;
 }
 
-.run-board-stage-title {
+.run-board-delegation-title {
 	flex: 1 1 auto;
 	min-width: 0;
 	display: flex;
@@ -2950,7 +2950,7 @@ pre {
 	white-space: nowrap;
 }
 
-.run-board-stage-kind {
+.run-board-delegation-kind {
 	flex: 0 0 auto;
 	border: 1px solid var(--border);
 	border-radius: 999px;
@@ -2968,7 +2968,7 @@ pre {
 	font-size: var(--text-2xs);
 }
 
-.run-board-stage-controls,
+.run-board-delegation-controls,
 .run-board-handoff-links {
 	display: flex;
 	flex-wrap: wrap;

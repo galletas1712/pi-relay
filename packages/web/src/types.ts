@@ -32,7 +32,7 @@ export interface SessionSummary {
 	session_id: string;
 	project_id: string | null;
 	parent_session_id?: string | null;
-	stage_id?: string | null;
+	delegation_id?: string | null;
 	subagent_type?: SubagentType | null;
 	outer_cwd: string;
 	workspaces: SessionWorkspace[];
@@ -77,7 +77,7 @@ export interface SessionSnapshot {
 	session_id: string;
 	project_id: string | null;
 	parent_session_id?: string | null;
-	stage_id?: string | null;
+	delegation_id?: string | null;
 	subagent_type?: SubagentType | null;
 	outer_cwd: string;
 	workspaces: SessionWorkspace[];
@@ -118,14 +118,14 @@ export interface EventFrame {
 	data: Record<string, unknown>;
 }
 
-export type StageKind = "full" | "readonly_fanout";
-export type StageStatus = "running" | "done" | "done_with_failures" | "cancelled" | "failed";
+export type DelegationKind = "full" | "readonly_fanout";
+export type DelegationStatus = "running" | "done" | "done_with_failures" | "cancelled" | "failed";
 export type SubagentType = "full" | "read_only";
 
-/** A subagent row inside a stage. `status` is the live session activity (idle/
- * running), not the stage-level status; the durable per-subagent outcome lives
- * in the handoff index.json. */
-export interface StageSubagent {
+/** A subagent row inside a delegation. `status` is the live session activity
+ * (idle/running), not the delegation-level status; the durable per-subagent
+ * outcome lives in the handoff index.json. */
+export interface DelegationSubagent {
 	id: string;
 	status: Activity;
 	role?: string | null;
@@ -133,25 +133,25 @@ export interface StageSubagent {
 	task?: string | null;
 }
 
-export interface Stage {
-	stage_id: string;
-	kind: StageKind;
-	status: StageStatus;
+export interface Delegation {
+	delegation_id: string;
+	kind: DelegationKind;
+	status: DelegationStatus;
 	workflow?: string | null;
 	label?: string | null;
 	handoff_dir?: string;
-	subagents: StageSubagent[];
+	subagents: DelegationSubagent[];
 }
 
-export interface StageListResult {
+export interface DelegationListResult {
 	parent_session_id: string;
-	stages: Stage[];
+	delegations: Delegation[];
 }
 
 export type HandoffFileName = "index.json" | "final_message.md" | "transcript.md";
 
 export interface ReadHandoffFileResult {
-	stage_id: string;
+	delegation_id: string;
 	subagent_id: string | null;
 	file: HandoffFileName;
 	content: string;

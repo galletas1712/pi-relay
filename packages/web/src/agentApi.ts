@@ -13,7 +13,7 @@ import type {
 	QueuedInputStatus,
 	SessionSnapshot,
 	SessionSummary,
-	StageListResult,
+	DelegationListResult,
 	ReadHandoffFileResult,
 	HandoffFileName,
 	ToolListing,
@@ -41,10 +41,10 @@ export interface AgentApi {
 	updateProject(params: UpdateProjectParams): Promise<Project>;
 	deleteProject(projectId: string): Promise<DeleteProjectResult>;
 	listSessions(limit?: number, projectId?: string | null): Promise<SessionSummary[]>;
-	listStages(parentSessionId: string): Promise<StageListResult>;
-	startFullStage(params: StartFullStageParams): Promise<StartFullStageResult>;
-	startReadonlyFanout(params: StartReadonlyFanoutParams): Promise<StartReadonlyFanoutResult>;
-	cancelStage(parentSessionId: string, stageId: string): Promise<{ cancelled: boolean }>;
+	listDelegations(parentSessionId: string): Promise<DelegationListResult>;
+	startFullDelegation(params: StartFullDelegationParams): Promise<StartFullDelegationResult>;
+	startReadonlyDelegationFanout(params: StartReadonlyDelegationFanoutParams): Promise<StartReadonlyDelegationFanoutResult>;
+	cancelDelegation(parentSessionId: string, delegationId: string): Promise<{ cancelled: boolean }>;
 	readHandoffFile(params: ReadHandoffFileParams): Promise<ReadHandoffFileResult>;
 	steerSubagent(params: SteerSubagentParams): Promise<FollowUpResult>;
 	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse>;
@@ -144,7 +144,7 @@ export interface QueueFollowUpParams {
 	content: ContentBlock[];
 }
 
-export interface StartFullStageParams {
+export interface StartFullDelegationParams {
 	parentSessionId: string;
 	role: string;
 	prompt: string;
@@ -152,33 +152,34 @@ export interface StartFullStageParams {
 	label?: string | null;
 }
 
-export interface StartFullStageResult {
-	stage_id: string;
+export interface StartFullDelegationResult {
+	delegation_id: string;
 	subagent_session_id: string;
 }
 
-export interface StartReadonlyFanoutParams {
+export interface StartReadonlyDelegationFanoutParams {
 	parentSessionId: string;
 	tasks: { role: string; prompt: string }[];
 	workflow?: string | null;
 	label?: string | null;
 }
 
-export interface StartReadonlyFanoutResult {
-	stage_id: string;
+export interface StartReadonlyDelegationFanoutResult {
+	delegation_id: string;
 	subagent_session_ids: string[];
 }
 
 export interface ReadHandoffFileParams {
 	parentSessionId: string;
-	stageId: string;
+	delegationId: string;
 	subagentId?: string | null;
 	file: HandoffFileName;
 }
 
 /** Steer the full subagent: a steer-priority user message into the subagent's
  * own session (the composer only ever sends follow_up). Read-only subagents are
- * rejected by the daemon; only a stage's single full subagent is steerable. */
+ * rejected by the daemon; only a delegation's single full subagent is
+ * steerable. */
 export interface SteerSubagentParams {
 	subagentSessionId: string;
 	clientInputId: string;
@@ -355,14 +356,14 @@ class AgentApiClient implements AgentApi {
 		return result.sessions;
 	}
 
-	listStages(parentSessionId: string): Promise<StageListResult> {
-		return this.client.request<StageListResult>("stage.list", {
+	listDelegations(parentSessionId: string): Promise<DelegationListResult> {
+		return this.client.request<DelegationListResult>("delegation.list", {
 			parent_session_id: parentSessionId
 		});
 	}
 
-	startFullStage(params: StartFullStageParams): Promise<StartFullStageResult> {
-		return this.client.request<StartFullStageResult>("stage.start_full", {
+	startFullDelegation(params: StartFullDelegationParams): Promise<StartFullDelegationResult> {
+		return this.client.request<StartFullDelegationResult>("delegation.start_full", {
 			parent_session_id: params.parentSessionId,
 			role: params.role,
 			prompt: params.prompt,
@@ -371,8 +372,8 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	startReadonlyFanout(params: StartReadonlyFanoutParams): Promise<StartReadonlyFanoutResult> {
-		return this.client.request<StartReadonlyFanoutResult>("stage.start_readonly_fanout", {
+	startReadonlyDelegationFanout(params: StartReadonlyDelegationFanoutParams): Promise<StartReadonlyDelegationFanoutResult> {
+		return this.client.request<StartReadonlyDelegationFanoutResult>("delegation.start_readonly_fanout", {
 			parent_session_id: params.parentSessionId,
 			tasks: params.tasks,
 			workflow: params.workflow ?? undefined,
@@ -380,17 +381,17 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	cancelStage(parentSessionId: string, stageId: string): Promise<{ cancelled: boolean }> {
-		return this.client.request<{ cancelled: boolean }>("stage.cancel", {
+	cancelDelegation(parentSessionId: string, delegationId: string): Promise<{ cancelled: boolean }> {
+		return this.client.request<{ cancelled: boolean }>("delegation.cancel", {
 			parent_session_id: parentSessionId,
-			stage_id: stageId
+			delegation_id: delegationId
 		});
 	}
 
 	readHandoffFile(params: ReadHandoffFileParams): Promise<ReadHandoffFileResult> {
-		return this.client.request<ReadHandoffFileResult>("stage.read_handoff_file", {
+		return this.client.request<ReadHandoffFileResult>("delegation.read_handoff_file", {
 			parent_session_id: params.parentSessionId,
-			stage_id: params.stageId,
+			delegation_id: params.delegationId,
 			subagent_id: params.subagentId ?? undefined,
 			file: params.file
 		});

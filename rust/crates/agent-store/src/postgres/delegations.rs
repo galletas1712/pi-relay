@@ -8,29 +8,31 @@ use super::events::insert_event_tx;
 use super::queue::bump_revisions_tx;
 use super::sql::lock_session_tx;
 use super::PostgresAgentStore;
-use crate::{EventType, InputPriority, SessionActivity, StageKind, StageStatus, SubagentType};
+use crate::{
+    DelegationKind, DelegationStatus, EventType, InputPriority, SessionActivity, SubagentType,
+};
 
-/// A durable stage row: an ordered unit of work under a parent session that is
-/// either one full subagent or a fan-out of read-only subagents.
+/// A durable delegation row: an ordered unit of work under a parent session that
+/// is either one full subagent or a fan-out of read-only subagents.
 #[derive(Debug, Clone)]
-pub struct Stage {
+pub struct Delegation {
     pub id: String,
     pub parent_session_id: String,
     pub workflow: Option<String>,
     pub label: Option<String>,
-    pub kind: StageKind,
-    pub status: StageStatus,
+    pub kind: DelegationKind,
+    pub status: DelegationStatus,
     pub attempt_id: String,
-    /// The full subagent set this stage will spawn (1 for a full stage,
+    /// The full subagent set this delegation will spawn (1 for a full delegation,
     /// `tasks.len()` for a fan-out). The barrier never completes until exactly
     /// this many subagents exist and are all terminal.
     pub expected_subagents: i32,
 }
 
-/// A subagent session belonging to a stage, with the fields `stage.status`
-/// needs to report per-subagent state.
+/// A subagent session belonging to a delegation, with the fields
+/// `delegation.status` needs to report per-subagent state.
 #[derive(Debug, Clone)]
-pub struct StageSubagent {
+pub struct DelegationSubagent {
     pub session_id: String,
     pub activity: SessionActivity,
     pub subagent_type: Option<SubagentType>,
@@ -39,21 +41,22 @@ pub struct StageSubagent {
 }
 
 impl PostgresAgentStore {
-    /// Insert a fresh `running` stage, minting its completion-fencing attempt id.
-    /// The stage row is created before its subagents so their `stage_id` FK holds.
-    pub async fn create_stage(
+    /// Insert a fresh `running` delegation, minting its completion-fencing attempt
+    /// id. The delegation row is created before its subagents so their
+    /// `delegation_id` FK holds.
+    pub async fn create_delegation(
         &self,
         parent_session_id: &str,
-        kind: StageKind,
+        kind: DelegationKind,
         workflow: Option<&str>,
         label: Option<&str>,
         expected_subagents: i32,
-    ) -> Result<Stage> {
-        let id = format!("stage_{}", Uuid::new_v4());
+    ) -> Result<Delegation> {
+        let id = format!("delegation_{}", Uuid::new_v4());
         let attempt_id = Uuid::new_v4().to_string();
         sqlx::query(
             r#"
-            insert into stages (id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents)
+            insert into delegations (id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents)
             values ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
@@ -62,52 +65,55 @@ impl PostgresAgentStore {
         .bind(workflow)
         .bind(label)
         .bind(kind.as_str())
-        .bind(StageStatus::Running.as_str())
+        .bind(DelegationStatus::Running.as_str())
         .bind(&attempt_id)
         .bind(expected_subagents)
         .execute(&self.pool)
         .await?;
-        Ok(Stage {
+        Ok(Delegation {
             id,
             parent_session_id: parent_session_id.to_string(),
             workflow: workflow.map(str::to_string),
             label: label.map(str::to_string),
             kind,
-            status: StageStatus::Running,
+            status: DelegationStatus::Running,
             attempt_id,
             expected_subagents,
         })
     }
 
-    pub async fn get_stage(&self, stage_id: &str) -> Result<Option<Stage>> {
+    pub async fn get_delegation(&self, delegation_id: &str) -> Result<Option<Delegation>> {
         let Some(row) = sqlx::query(
             r#"
             select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
-            from stages
+            from delegations
             where id=$1
             "#,
         )
-        .bind(stage_id)
+        .bind(delegation_id)
         .fetch_optional(&self.pool)
         .await?
         else {
             return Ok(None);
         };
-        Ok(Some(row_to_stage(&row)?))
+        Ok(Some(row_to_delegation(&row)?))
     }
 
-    /// The subagent sessions of a stage, ordered by creation, with the activity
-    /// and type `stage.status`/`stage.cancel` need.
-    pub async fn list_stage_subagents(&self, stage_id: &str) -> Result<Vec<StageSubagent>> {
+    /// The subagent sessions of a delegation, ordered by creation, with the
+    /// activity and type `delegation.status`/`delegation.cancel` need.
+    pub async fn list_delegation_subagents(
+        &self,
+        delegation_id: &str,
+    ) -> Result<Vec<DelegationSubagent>> {
         let rows = sqlx::query(
             r#"
             select id, subagent_type, metadata
             from sessions
-            where stage_id=$1
+            where delegation_id=$1
             order by created_at, id
             "#,
         )
-        .bind(stage_id)
+        .bind(delegation_id)
         .fetch_all(&self.pool)
         .await?;
         let mut subagents = Vec::with_capacity(rows.len());
@@ -123,14 +129,14 @@ impl PostgresAgentStore {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             // The subagent's task prompt, persisted at spawn — carried in
-            // stage.list so the run board can re-run a stage from the stage data
-            // itself.
+            // delegation.list so the run board can re-run a delegation from
+            // the delegation data itself.
             let task = metadata
                 .get("task")
                 .and_then(Value::as_str)
                 .map(str::to_string);
             let activity = self.activity(&session_id).await?;
-            subagents.push(StageSubagent {
+            subagents.push(DelegationSubagent {
                 session_id,
                 activity,
                 subagent_type,
@@ -141,13 +147,17 @@ impl PostgresAgentStore {
         Ok(subagents)
     }
 
-    /// All stages of a parent, oldest first. Backs the per-parent `stage.list`
-    /// the run board needs (the spec only defines per-id status).
-    pub async fn list_parent_stages(&self, parent_session_id: &str) -> Result<Vec<Stage>> {
+    /// All delegations of a parent, oldest first. Backs the per-parent
+    /// `delegation.list` the run board needs (the spec only defines per-id
+    /// status).
+    pub async fn list_parent_delegations(
+        &self,
+        parent_session_id: &str,
+    ) -> Result<Vec<Delegation>> {
         let rows = sqlx::query(
             r#"
             select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
-            from stages
+            from delegations
             where parent_session_id=$1
             order by created_at, id
             "#,
@@ -155,45 +165,49 @@ impl PostgresAgentStore {
         .bind(parent_session_id)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_stage).collect()
+        rows.iter().map(row_to_delegation).collect()
     }
 
-    /// Whether the parent already owns a `running` stage. Backs the
-    /// one-stage-per-parent guard.
-    pub async fn parent_has_running_stage(&self, parent_session_id: &str) -> Result<bool> {
+    /// Whether the parent already owns a `running` delegation. Backs the
+    /// one-delegation-per-parent guard.
+    pub async fn parent_has_running_delegation(&self, parent_session_id: &str) -> Result<bool> {
         let exists: bool = sqlx::query_scalar(
             r#"
             select exists(
-                select 1 from stages
+                select 1 from delegations
                 where parent_session_id=$1 and status=$2
             )
             "#,
         )
         .bind(parent_session_id)
-        .bind(StageStatus::Running.as_str())
+        .bind(DelegationStatus::Running.as_str())
         .fetch_one(&self.pool)
         .await?;
         Ok(exists)
     }
 
-    /// Mark a stage's status, e.g. when `stage.cancel` cancels it. The barrier's
-    /// attempt-fenced completion lives in `finish_stage`.
-    pub async fn set_stage_status(&self, stage_id: &str, status: StageStatus) -> Result<()> {
-        sqlx::query("update stages set status=$2, updated_at=now() where id=$1")
-            .bind(stage_id)
+    /// Mark a delegation's status, e.g. when `delegation.cancel` cancels it. The
+    /// barrier's attempt-fenced completion lives in `finish_delegation`.
+    pub async fn set_delegation_status(
+        &self,
+        delegation_id: &str,
+        status: DelegationStatus,
+    ) -> Result<()> {
+        sqlx::query("update delegations set status=$2, updated_at=now() where id=$1")
+            .bind(delegation_id)
             .bind(status.as_str())
             .execute(&self.pool)
             .await?;
         Ok(())
     }
 
-    /// The stage barrier's completion CAS, atomic with the parent steer.
+    /// The delegation barrier's completion CAS, atomic with the parent steer.
     ///
-    /// Single-flight via the stage row's `for update` lock; idempotent via the
+    /// Single-flight via the delegation row's `for update` lock; idempotent via the
     /// `status='running'` + `attempt_id` fence. When the CAS wins, the SAME
     /// transaction inserts the parent's steer as a durable `queued_input`
     /// (`InputPriority::Steer`) keyed by a deterministic `client_input_id`
-    /// derived from `stage_id`+`attempt_id`. So a commit means the steer is
+    /// derived from `delegation_id`+`attempt_id`. So a commit means the steer is
     /// durably queued: a crash in the old gap between the CAS commit and a
     /// separate enqueue can no longer strand the parent, and a replay/sweep
     /// re-running this with the same key cannot double-enqueue (the unique
@@ -202,20 +216,20 @@ impl PostgresAgentStore {
     /// Returns whether this call won the transition (`rows_affected()==1`), so
     /// exactly one caller drives the parent after the steer is queued. Handoff
     /// rendering happens outside this transaction and is intentionally
-    /// idempotent. A missing stage is a benign no-op (a late lifecycle event for
-    /// a deleted stage).
-    pub async fn finish_stage(
+    /// idempotent. A missing delegation is a benign no-op (a late lifecycle event
+    /// for a deleted delegation).
+    pub async fn finish_delegation(
         &self,
-        stage_id: &str,
+        delegation_id: &str,
         attempt_id: &str,
-        status: StageStatus,
+        status: DelegationStatus,
         parent_session_id: &str,
         steer_message: &str,
         steer_client_input_id: &str,
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
-        let locked = sqlx::query("select id from stages where id=$1 for update")
-            .bind(stage_id)
+        let locked = sqlx::query("select id from delegations where id=$1 for update")
+            .bind(delegation_id)
             .fetch_optional(&mut *tx)
             .await?;
         if locked.is_none() {
@@ -223,9 +237,9 @@ impl PostgresAgentStore {
             return Ok(false);
         }
         let updated = sqlx::query(
-            "update stages set status=$3, updated_at=now() where id=$1 and attempt_id=$2 and status='running'",
+            "update delegations set status=$3, updated_at=now() where id=$1 and attempt_id=$2 and status='running'",
         )
-        .bind(stage_id)
+        .bind(delegation_id)
         .bind(attempt_id)
         .bind(status.as_str())
         .execute(&mut *tx)
@@ -244,13 +258,13 @@ impl PostgresAgentStore {
         Ok(updated == 1)
     }
 
-    /// Whether every subagent of a stage is terminal. Two fences guard against a
-    /// premature completion:
+    /// Whether every subagent of a delegation is terminal. Two fences guard
+    /// against a premature completion:
     ///
-    /// 1. Expected-count fence: the stage must have spawned its FULL set of
+    /// 1. Expected-count fence: the delegation must have spawned its FULL set of
     ///    subagents. A fan-out spawns its children in a loop while each child
     ///    drives in a detached task, so subagent #1 can reach terminal before #2
-    ///    is even inserted. Requiring `count(sessions where stage_id) ==
+    ///    is even inserted. Requiring `count(sessions where delegation_id) ==
     ///    expected_subagents` keeps the barrier closed during that window.
     ///
     /// 2. Transcript-boundary terminality: a subagent is terminal only when its
@@ -258,15 +272,16 @@ impl PostgresAgentStore {
     ///    summary). This is independent of action/queue status — so a subagent
     ///    that crashed MID-TURN (boot's `mark_all_unfinished_actions_stale`
     ///    erased its unfinished action, and it had no queued input) is correctly
-    ///    NON-terminal and stays in the stage until it is recovered to a boundary
-    ///    (where it either continues or settles as a genuine terminal outcome).
-    pub async fn stage_subagents_all_terminal(&self, stage_id: &str) -> Result<bool> {
+    ///    NON-terminal and stays in the delegation until it is recovered to a
+    ///    boundary (where it either continues or settles as a genuine terminal
+    ///    outcome).
+    pub async fn delegation_subagents_all_terminal(&self, delegation_id: &str) -> Result<bool> {
         let session_ids: Vec<String> =
-            sqlx::query_scalar("select id from sessions where stage_id=$1")
-                .bind(stage_id)
+            sqlx::query_scalar("select id from sessions where delegation_id=$1")
+                .bind(delegation_id)
                 .fetch_all(&self.pool)
                 .await?;
-        if (session_ids.len() as i32) != self.stage_expected_subagents(stage_id).await? {
+        if (session_ids.len() as i32) != self.delegation_expected_subagents(delegation_id).await? {
             return Ok(false);
         }
         for session_id in &session_ids {
@@ -277,44 +292,48 @@ impl PostgresAgentStore {
         Ok(true)
     }
 
-    async fn stage_expected_subagents(&self, stage_id: &str) -> Result<i32> {
-        sqlx::query_scalar("select expected_subagents from stages where id=$1")
-            .bind(stage_id)
+    async fn delegation_expected_subagents(&self, delegation_id: &str) -> Result<i32> {
+        sqlx::query_scalar("select expected_subagents from delegations where id=$1")
+            .bind(delegation_id)
             .fetch_one(&self.pool)
             .await
             .map_err(Into::into)
     }
 
-    /// Running stages whose subagents are all terminal — the boot-sweep input.
-    /// A crash mid-barrier leaves such a stage `running` with every subagent
-    /// idle; the sweep re-runs `finish_stage` so it completes exactly once.
-    pub async fn sweep_running_stages(&self) -> Result<Vec<Stage>> {
-        let running = self.list_running_stages().await?;
+    /// Running delegations whose subagents are all terminal — the boot-sweep
+    /// input. A crash mid-barrier leaves such a delegation `running` with every
+    /// subagent
+    /// idle; the sweep re-runs `finish_delegation` so it completes exactly once.
+    pub async fn sweep_running_delegations(&self) -> Result<Vec<Delegation>> {
+        let running = self.list_running_delegations().await?;
         let mut ready = Vec::new();
-        for stage in running {
-            if self.stage_subagents_all_terminal(&stage.id).await? {
-                ready.push(stage);
+        for delegation in running {
+            if self
+                .delegation_subagents_all_terminal(&delegation.id)
+                .await?
+            {
+                ready.push(delegation);
             }
         }
         Ok(ready)
     }
 
-    async fn list_running_stages(&self) -> Result<Vec<Stage>> {
+    async fn list_running_delegations(&self) -> Result<Vec<Delegation>> {
         let rows = sqlx::query(
             r#"
             select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
-            from stages
+            from delegations
             where status='running'
             order by created_at, id
             "#,
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.iter().map(row_to_stage).collect()
+        rows.iter().map(row_to_delegation).collect()
     }
 }
 
-/// Insert the parent's stage-completion steer as a durable queued input inside
+/// Insert the parent's delegation-completion steer as a durable queued input inside
 /// the caller's transaction, idempotent on `(session_id, client_input_id)`. A
 /// re-run with the same key (replay/boot sweep) inserts nothing and emits no
 /// duplicate event. Mirrors the steer branch of `enqueue_user_input`.
@@ -367,10 +386,10 @@ async fn enqueue_steer_tx(
     Ok(())
 }
 
-fn row_to_stage(row: &sqlx::postgres::PgRow) -> Result<Stage> {
+fn row_to_delegation(row: &sqlx::postgres::PgRow) -> Result<Delegation> {
     let kind: String = row.get("kind");
     let status: String = row.get("status");
-    Ok(Stage {
+    Ok(Delegation {
         id: row.get("id"),
         parent_session_id: row.get("parent_session_id"),
         workflow: row.get("workflow"),
@@ -383,5 +402,5 @@ fn row_to_stage(row: &sqlx::postgres::PgRow) -> Result<Stage> {
 }
 
 #[cfg(test)]
-#[path = "stages_tests.rs"]
+#[path = "delegations_tests.rs"]
 mod tests;

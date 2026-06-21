@@ -247,7 +247,7 @@ impl PostgresAgentStore {
         client_input_id: Option<&str>,
         parent_session_id: Option<&str>,
         subagent_type: Option<SubagentType>,
-        stage_id: Option<&str>,
+        delegation_id: Option<&str>,
     ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
         if parent_session_id == Some(session_id) {
             return Err(anyhow!(
@@ -257,7 +257,7 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
             r#"
-                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, system_prompt, provider_config, metadata, parent_session_id, subagent_type, stage_id)
+                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, system_prompt, provider_config, metadata, parent_session_id, subagent_type, delegation_id)
                 values ($1, $2, $3, $4, $5::text, $6, $7, $8, $9::text, $10::text, $11::text)
                 on conflict (id) do nothing
                 returning id
@@ -273,7 +273,7 @@ impl PostgresAgentStore {
         .bind(&config.metadata)
         .bind(parent_session_id)
         .bind(subagent_type.map(|subagent_type| subagent_type.as_str()))
-        .bind(stage_id)
+        .bind(delegation_id)
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_none() {
@@ -546,9 +546,9 @@ impl PostgresAgentStore {
             .transpose()
     }
 
-    pub async fn session_stage_id(&self, session_id: &str) -> Result<Option<String>> {
+    pub async fn session_delegation_id(&self, session_id: &str) -> Result<Option<String>> {
         Ok(
-            sqlx::query_scalar("select stage_id from sessions where id=$1")
+            sqlx::query_scalar("select delegation_id from sessions where id=$1")
                 .bind(session_id)
                 .fetch_optional(&self.pool)
                 .await?

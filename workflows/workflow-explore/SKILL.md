@@ -8,7 +8,7 @@ description: Parallel read-only exploration of a question, then synthesis. Use w
 Investigate a question from several angles in parallel (read-only), then
 synthesize the findings yourself. Nothing is changed in the workspace.
 
-## Stages
+## Delegations
 - explorer — read-only subagent(s), run in parallel, one per angle.
 
 ## Outcomes (suggested_next, in index.json)
@@ -25,7 +25,7 @@ synthesize the findings yourself. Nothing is changed in the workspace.
    read-only fan-out with refined prompts. Stop when you can answer confidently
    or the user should weigh in.
 
-## Running the stage (one stage per turn, then end your turn)
+## Running the delegation (one delegation per turn, then end your turn)
 - explore: delegate_readonly_tasks({
     tasks: [
       { role: "explore", prompt: "<angle 1: question + where to look>" },
@@ -39,4 +39,4 @@ Notes:
 - Explorers return only their final message (their snapshot is discarded), so
   instruct each to summarize findings and quote key evidence inline, and to end
   with a line `suggested_next: done` or `suggested_next: inconclusive`.
-- This workflow never edits the workspace; do not use a full stage here.
+- This workflow never edits the workspace; do not use a full delegation here.

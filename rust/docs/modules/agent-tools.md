@@ -65,10 +65,10 @@ semantics justify it.
 | `WebSearch`  | `web_search` (JSON function)              | `web_search` (JSON client tool)                 | `web_search`       | `WebSearchTool`                  |
 | `WebFetch`   | `web_fetch` (JSON function)               | `web_fetch` (JSON client tool)                  | `web_fetch`        | `WebFetchTool`                   |
 | `LoadSkill`  | `LoadSkill` (JSON function)               | `LoadSkill` (JSON client tool)                  | `skill_loader`     | runtime-handled (no registry executor) |
-| `delegate_writing_task` | `delegate_writing_task` (JSON function) | `delegate_writing_task` (JSON client tool) | `stage` | runtime-handled (no registry executor) |
-| `delegate_readonly_tasks` | `delegate_readonly_tasks` (JSON function) | `delegate_readonly_tasks` (JSON client tool) | `stage` | runtime-handled (no registry executor) |
-| `inspect_delegation` | `inspect_delegation` (JSON function) | `inspect_delegation` (JSON client tool) | `stage` | runtime-handled (no registry executor) |
-| `cancel_delegation` | `cancel_delegation` (JSON function) | `cancel_delegation` (JSON client tool) | `stage` | runtime-handled (no registry executor) |
+| `delegate_writing_task` | `delegate_writing_task` (JSON function) | `delegate_writing_task` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
+| `delegate_readonly_tasks` | `delegate_readonly_tasks` (JSON function) | `delegate_readonly_tasks` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
+| `inspect_delegation` | `inspect_delegation` (JSON function) | `inspect_delegation` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
+| `cancel_delegation` | `cancel_delegation` (JSON function) | `cancel_delegation` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 
 There are no `read`/`write` tools. File reads go through `Edit`'s `view`
 command (Anthropic) or through `Bash` (`cat`, `sed`, `rg`, …) on OpenAI.
@@ -147,19 +147,20 @@ it against the session's loaded-skill set and workspace skills.
 `delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, and
 `cancel_delegation` are provider-visible JSON tools registered by
 `FirstPartyToolExtension`, but they have no registry executor. The daemon
-runtime intercepts them and dispatches to the stage engine in `stage_tools.rs`.
-`delegate_writing_task` launches the single full/writing stage subagent;
+runtime intercepts them and dispatches to the delegation engine in
+`delegation_tools.rs`.
+`delegate_writing_task` launches the single full/writing delegation subagent;
 `delegate_readonly_tasks` launches a homogeneous fan-out of read-only
 subagents; `inspect_delegation` and `cancel_delegation` inspect or cancel an
-existing stage. Stage subagents may produce `subagent.spawned`/`subagent.running`
-progress events, but stage completion arrives later as a parent steer pointing
-at the handoff directory, not as a model tool result or per-child idle event.
+existing delegation. Delegation subagents may produce
+`subagent.spawned`/`subagent.running` progress events, but delegation completion
+arrives later as a parent steer pointing at the handoff directory, not as a
+model tool result or per-child idle event.
 
-Their internal stage types, handoff `stage_id`, and web/inspector RPC methods
-(`stage.start_full`, `stage.start_readonly_fanout`, `stage.status`,
-`stage.cancel`, `stage.list`) intentionally keep their existing names. Those
-`stage.*` methods are client JSON-RPC APIs for the web/inspector surface, not
-provider-visible tool names.
+Their internal delegation types, handoff `delegation_id`, and web/inspector RPC methods
+(`delegation.start_full`, `delegation.start_readonly_fanout`, `delegation.status`,
+`delegation.cancel`, `delegation.list`) are client JSON-RPC APIs for the
+web/inspector surface, not provider-visible tool names.
 
 ## How it works
 
@@ -168,7 +169,7 @@ model emits tool call (provider wire name, e.g. "apply_patch")
   -> daemon: ToolContext::new(session outer_cwd)   [timeout 30s]
   -> LoadSkill?  -> runtime skill loader (no registry executor)
   -> web tool?   -> runtime web dispatch (WebSearch/WebFetch)
-  -> delegation? -> runtime stage dispatch (no registry executor)
+  -> delegation? -> runtime delegation dispatch (no registry executor)
   -> else        -> registry.execute(provider, call, ctx)
                       canonical_tool_name_for_provider() maps wire name
                       -> canonical name  (apply_patch -> Edit)

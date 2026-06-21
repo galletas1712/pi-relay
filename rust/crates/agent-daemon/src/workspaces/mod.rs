@@ -33,8 +33,8 @@ use self::selection::SelectedWorkspace;
 pub(crate) use self::selection::{RequestedWorkspace, WorkspaceSelection};
 
 /// Sibling of the workspace dirs under the cwd root. Owned by the daemon for
-/// stage handoff files; it is never a workspace, never snapshotted into an RO
-/// fork.
+/// delegation handoff files; it is never a workspace, never snapshotted into an
+/// RO fork.
 const HANDOFF_DIR: &str = ".pi-handoff";
 
 #[derive(Clone)]

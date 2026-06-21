@@ -4,7 +4,7 @@ use agent_vocab::{ProviderConfig, ProviderKind, ReasoningEffort, UserMessage};
 use serde_json::json;
 use uuid::Uuid;
 
-use crate::{SessionConfig, StageKind, StageStatus, SubagentType};
+use crate::{DelegationKind, DelegationStatus, SessionConfig, SubagentType};
 
 use super::*;
 
@@ -31,7 +31,7 @@ impl TestDb {
 async fn test_store() -> Option<TestDb> {
     let admin_url = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok()?;
     let name = format!(
-        "pi_relay_stages_test_{}_{}",
+        "pi_relay_delegations_test_{}_{}",
         std::process::id(),
         TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
     );
@@ -107,14 +107,14 @@ async fn create_session(db: &TestDb, session_id: &str, project_id: Uuid) {
         .expect("create session");
 }
 
-async fn create_stage_subagent(
+async fn create_delegation_subagent(
     db: &TestDb,
     session_id: &str,
     project_id: Uuid,
     parent_session_id: &str,
     subagent_type: SubagentType,
     role_name: &str,
-    stage_id: &str,
+    delegation_id: &str,
 ) {
     db.store
         .start_session_outputs_with_parent(
@@ -129,143 +129,143 @@ async fn create_stage_subagent(
             None,
             Some(parent_session_id),
             Some(subagent_type),
-            Some(stage_id),
+            Some(delegation_id),
         )
         .await
-        .expect("create stage subagent");
+        .expect("create delegation subagent");
 }
 
 #[tokio::test]
-async fn create_stage_persists_kind_status_and_attempt() {
+async fn create_delegation_persists_kind_status_and_attempt() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "stages test", &[], json!({}))
+        .create_project(project_id, "delegations test", &[], json!({}))
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
 
-    let stage = db
+    let delegation = db
         .store
-        .create_stage(
+        .create_delegation(
             "parent",
-            StageKind::ReadonlyFanout,
+            DelegationKind::ReadonlyFanout,
             Some("implement_review_test"),
             Some("review fan-out"),
             3,
         )
         .await
-        .expect("create stage");
-    assert_eq!(stage.expected_subagents, 3);
-    assert_eq!(stage.kind, StageKind::ReadonlyFanout);
-    assert_eq!(stage.status, StageStatus::Running);
-    assert!(!stage.attempt_id.is_empty());
+        .expect("create delegation");
+    assert_eq!(delegation.expected_subagents, 3);
+    assert_eq!(delegation.kind, DelegationKind::ReadonlyFanout);
+    assert_eq!(delegation.status, DelegationStatus::Running);
+    assert!(!delegation.attempt_id.is_empty());
 
     let loaded = db
         .store
-        .get_stage(&stage.id)
+        .get_delegation(&delegation.id)
         .await
-        .expect("get stage")
-        .expect("stage exists");
+        .expect("get delegation")
+        .expect("delegation exists");
     assert_eq!(loaded.parent_session_id, "parent");
     assert_eq!(loaded.workflow.as_deref(), Some("implement_review_test"));
     assert_eq!(loaded.label.as_deref(), Some("review fan-out"));
-    assert_eq!(loaded.status, StageStatus::Running);
+    assert_eq!(loaded.status, DelegationStatus::Running);
 
     db.cleanup().await;
 }
 
 #[tokio::test]
-async fn parent_has_running_stage_tracks_status() {
+async fn parent_has_running_delegation_tracks_status() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "stages test", &[], json!({}))
+        .create_project(project_id, "delegations test", &[], json!({}))
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
 
     assert!(!db
         .store
-        .parent_has_running_stage("parent")
+        .parent_has_running_delegation("parent")
         .await
-        .expect("no stage yet"));
+        .expect("no delegation yet"));
 
-    let stage = db
+    let delegation = db
         .store
-        .create_stage("parent", StageKind::Full, None, None, 1)
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
         .await
-        .expect("create stage");
+        .expect("create delegation");
     assert!(db
         .store
-        .parent_has_running_stage("parent")
+        .parent_has_running_delegation("parent")
         .await
-        .expect("running stage detected"));
+        .expect("running delegation detected"));
 
     db.store
-        .set_stage_status(&stage.id, StageStatus::Cancelled)
+        .set_delegation_status(&delegation.id, DelegationStatus::Cancelled)
         .await
-        .expect("cancel stage");
+        .expect("cancel delegation");
     assert!(!db
         .store
-        .parent_has_running_stage("parent")
+        .parent_has_running_delegation("parent")
         .await
-        .expect("cancelled stage no longer running"));
+        .expect("cancelled delegation no longer running"));
 
     db.cleanup().await;
 }
 
 #[tokio::test]
-async fn list_stage_subagents_returns_only_its_members() {
+async fn list_delegation_subagents_returns_only_its_members() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "stages test", &[], json!({}))
+        .create_project(project_id, "delegations test", &[], json!({}))
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
 
-    let stage = db
+    let delegation = db
         .store
-        .create_stage("parent", StageKind::ReadonlyFanout, None, None, 2)
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
         .await
-        .expect("create stage");
+        .expect("create delegation");
     let other = db
         .store
-        .create_stage("parent", StageKind::Full, None, None, 1)
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
         .await
-        .expect("create other stage");
+        .expect("create other delegation");
 
-    create_stage_subagent(
+    create_delegation_subagent(
         &db,
         "child_a",
         project_id,
         "parent",
         SubagentType::ReadOnly,
         "reviewer",
-        &stage.id,
+        &delegation.id,
     )
     .await;
-    create_stage_subagent(
+    create_delegation_subagent(
         &db,
         "child_b",
         project_id,
         "parent",
         SubagentType::ReadOnly,
         "reviewer",
-        &stage.id,
+        &delegation.id,
     )
     .await;
-    create_stage_subagent(
+    create_delegation_subagent(
         &db,
         "child_other",
         project_id,
@@ -278,9 +278,9 @@ async fn list_stage_subagents_returns_only_its_members() {
 
     let subagents = db
         .store
-        .list_stage_subagents(&stage.id)
+        .list_delegation_subagents(&delegation.id)
         .await
-        .expect("list stage subagents");
+        .expect("list delegation subagents");
     let ids = subagents
         .iter()
         .map(|subagent| subagent.session_id.clone())
@@ -291,44 +291,47 @@ async fn list_stage_subagents_returns_only_its_members() {
         .all(|subagent| subagent.subagent_type == Some(SubagentType::ReadOnly)));
     assert_eq!(subagents[0].role.as_deref(), Some("reviewer"));
 
-    let parent_stages = db
+    let parent_delegations = db
         .store
-        .list_parent_stages("parent")
+        .list_parent_delegations("parent")
         .await
-        .expect("list parent stages");
-    assert_eq!(parent_stages.len(), 2);
-    assert_eq!(parent_stages[0].id, stage.id);
-    assert_eq!(parent_stages[1].id, other.id);
+        .expect("list parent delegations");
+    assert_eq!(parent_delegations.len(), 2);
+    assert_eq!(parent_delegations[0].id, delegation.id);
+    assert_eq!(parent_delegations[1].id, other.id);
 
     db.cleanup().await;
 }
 
 #[tokio::test]
-async fn finish_stage_cas_is_attempt_fenced_and_idempotent() {
+async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "stages test", &[], json!({}))
+        .create_project(project_id, "delegations test", &[], json!({}))
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
-    let stage = db
+    let delegation = db
         .store
-        .create_stage("parent", StageKind::Full, None, None, 1)
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
         .await
-        .expect("create stage");
-    let key = format!("stage-steer:{}:{}", stage.id, stage.attempt_id);
+        .expect("create delegation");
+    let key = format!(
+        "delegation-steer:{}:{}",
+        delegation.id, delegation.attempt_id
+    );
 
     // The real attempt id wins exactly once; a replay is a no-op.
     assert!(db
         .store
-        .finish_stage(
-            &stage.id,
-            &stage.attempt_id,
-            StageStatus::Done,
+        .finish_delegation(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Done,
             "parent",
             "done",
             &key
@@ -337,10 +340,10 @@ async fn finish_stage_cas_is_attempt_fenced_and_idempotent() {
         .expect("first finish wins"));
     assert!(!db
         .store
-        .finish_stage(
-            &stage.id,
-            &stage.attempt_id,
-            StageStatus::Done,
+        .finish_delegation(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Done,
             "parent",
             "done",
             &key
@@ -352,17 +355,17 @@ async fn finish_stage_cas_is_attempt_fenced_and_idempotent() {
     // (the deterministic client_input_id makes a replay a no-op).
     assert_eq!(steer_count(&db, "parent", &key).await, 1);
 
-    // A stale attempt id cannot re-fire a re-opened stage.
+    // A stale attempt id cannot re-fire a re-opened delegation.
     db.store
-        .set_stage_status(&stage.id, StageStatus::Running)
+        .set_delegation_status(&delegation.id, DelegationStatus::Running)
         .await
         .expect("reopen");
     assert!(!db
         .store
-        .finish_stage(
-            &stage.id,
+        .finish_delegation(
+            &delegation.id,
             "stale",
-            StageStatus::Done,
+            DelegationStatus::Done,
             "parent",
             "done",
             &key
@@ -370,23 +373,28 @@ async fn finish_stage_cas_is_attempt_fenced_and_idempotent() {
         .await
         .expect("stale attempt rejected"));
     assert_eq!(
-        db.store.get_stage(&stage.id).await.unwrap().unwrap().status,
-        StageStatus::Running
+        db.store
+            .get_delegation(&delegation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DelegationStatus::Running
     );
 
-    // A missing stage is a benign no-op (late lifecycle event for a deleted stage).
+    // A missing delegation is a benign no-op (late lifecycle event for a deleted delegation).
     assert!(!db
         .store
-        .finish_stage(
-            "stage_missing",
+        .finish_delegation(
+            "delegation_missing",
             "whatever",
-            StageStatus::Done,
+            DelegationStatus::Done,
             "parent",
             "done",
             "k"
         )
         .await
-        .expect("missing stage is benign"));
+        .expect("missing delegation is benign"));
 
     db.cleanup().await;
 }
@@ -399,84 +407,87 @@ async fn all_terminal_predicate_and_boot_sweep() {
     };
     let project_id = Uuid::new_v4();
     db.store
-        .create_project(project_id, "stages test", &[], json!({}))
+        .create_project(project_id, "delegations test", &[], json!({}))
         .await
         .expect("create project");
     create_session(&db, "parent", project_id).await;
-    // The stage expects TWO subagents (FIX A: the expected-count fence).
-    let stage = db
+    // The delegation expects TWO subagents (FIX A: the expected-count fence).
+    let delegation = db
         .store
-        .create_stage("parent", StageKind::ReadonlyFanout, None, None, 2)
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
         .await
-        .expect("create stage");
+        .expect("create delegation");
 
-    // An empty stage (no subagents yet) is NOT terminal — a stage whose spawn
+    // An empty delegation (no subagents yet) is NOT terminal — a delegation whose spawn
     // races the barrier must not complete prematurely.
     assert!(!db
         .store
-        .stage_subagents_all_terminal(&stage.id)
+        .delegation_subagents_all_terminal(&delegation.id)
         .await
-        .expect("empty stage not terminal"));
+        .expect("empty delegation not terminal"));
     assert!(db
         .store
-        .sweep_running_stages()
+        .sweep_running_delegations()
         .await
         .expect("sweep")
         .is_empty());
 
     // One spawned subagent (of the expected two) is at a boundary, but the
-    // expected-count fence keeps the stage non-terminal — this is the partial
+    // expected-count fence keeps the delegation non-terminal — this is the partial
     // spawn window the barrier must never complete (FIX A).
-    create_stage_subagent(
+    create_delegation_subagent(
         &db,
         "child_a",
         project_id,
         "parent",
         SubagentType::ReadOnly,
         "reviewer",
-        &stage.id,
+        &delegation.id,
     )
     .await;
     assert!(!db
         .store
-        .stage_subagents_all_terminal(&stage.id)
+        .delegation_subagents_all_terminal(&delegation.id)
         .await
         .expect("partial spawn (1 of 2) is NOT terminal"));
     assert!(db
         .store
-        .sweep_running_stages()
+        .sweep_running_delegations()
         .await
         .expect("sweep")
         .is_empty());
 
     // Both subagents now exist and both are at a boundary (empty transcript /
-    // no active leaf) -> all terminal, and the running stage is sweep-ready.
-    create_stage_subagent(
+    // no active leaf) -> all terminal, and the running delegation is sweep-ready.
+    create_delegation_subagent(
         &db,
         "child_b",
         project_id,
         "parent",
         SubagentType::ReadOnly,
         "reviewer",
-        &stage.id,
+        &delegation.id,
     )
     .await;
     assert!(db
         .store
-        .stage_subagents_all_terminal(&stage.id)
+        .delegation_subagents_all_terminal(&delegation.id)
         .await
         .expect("both spawned and at a boundary -> terminal"));
-    let ready = db.store.sweep_running_stages().await.expect("sweep");
+    let ready = db.store.sweep_running_delegations().await.expect("sweep");
     assert_eq!(ready.len(), 1);
-    assert_eq!(ready[0].id, stage.id);
+    assert_eq!(ready[0].id, delegation.id);
 
-    // A non-running (finished) stage is not swept again.
-    let key = format!("stage-steer:{}:{}", stage.id, stage.attempt_id);
+    // A non-running (finished) delegation is not swept again.
+    let key = format!(
+        "delegation-steer:{}:{}",
+        delegation.id, delegation.attempt_id
+    );
     db.store
-        .finish_stage(
-            &stage.id,
-            &stage.attempt_id,
-            StageStatus::Done,
+        .finish_delegation(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Done,
             "parent",
             "done",
             &key,
@@ -485,7 +496,7 @@ async fn all_terminal_predicate_and_boot_sweep() {
         .expect("finish");
     assert!(db
         .store
-        .sweep_running_stages()
+        .sweep_running_delegations()
         .await
         .expect("sweep")
         .is_empty());

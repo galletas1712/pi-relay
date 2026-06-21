@@ -306,7 +306,7 @@ fn load_skill_definition() -> ToolDefinition {
 fn delegate_writing_task_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_writing_task",
-        "Launch the single full (writing) subagent for a delegation stage. It edits the workspace in place; there is exactly one full subagent at a time. End your turn after calling; completion arrives later as a steer pointing at the stage handoff directory.",
+        "Launch the single full (writing) subagent for a delegation. It edits the workspace in place; there is exactly one full subagent at a time. End your turn after calling; completion arrives later as a steer pointing at the delegation handoff directory.",
         json!({
             "type": "object",
             "properties": {
@@ -320,11 +320,11 @@ fn delegate_writing_task_definition() -> ToolDefinition {
                 },
                 "workflow": {
                     "type": "string",
-                    "description": "Optional workflow skill name this stage belongs to (a grouping label only)."
+                    "description": "Optional workflow skill name this delegation belongs to (a grouping label only)."
                 },
                 "label": {
                     "type": "string",
-                    "description": "Optional short human-readable label for the stage."
+                    "description": "Optional short human-readable label for the delegation."
                 }
             },
             "required": ["role", "prompt"],
@@ -361,11 +361,11 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
                 },
                 "workflow": {
                     "type": "string",
-                    "description": "Optional workflow skill name this stage belongs to (a grouping label only)."
+                    "description": "Optional workflow skill name this delegation belongs to (a grouping label only)."
                 },
                 "label": {
                     "type": "string",
-                    "description": "Optional short human-readable label for the stage."
+                    "description": "Optional short human-readable label for the delegation."
                 }
             },
             "required": ["tasks"],
@@ -377,16 +377,16 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
 fn inspect_delegation_definition() -> ToolDefinition {
     ToolDefinition::new(
         "inspect_delegation",
-        "Inspect a stage and its subagents (also readable via the handoff index.json once complete).",
+        "Inspect a delegation and its subagents (also readable via the handoff index.json once complete).",
         json!({
             "type": "object",
             "properties": {
-                "stage_id": {
+                "delegation_id": {
                     "type": "string",
-                    "description": "The stage id returned by delegate_writing_task / delegate_readonly_tasks."
+                    "description": "The delegation id returned by delegate_writing_task / delegate_readonly_tasks."
                 }
             },
-            "required": ["stage_id"],
+            "required": ["delegation_id"],
             "additionalProperties": false
         }),
     )
@@ -395,16 +395,16 @@ fn inspect_delegation_definition() -> ToolDefinition {
 fn cancel_delegation_definition() -> ToolDefinition {
     ToolDefinition::new(
         "cancel_delegation",
-        "Cancel an in-flight stage and all of its subagents.",
+        "Cancel an in-flight delegation and all of its subagents.",
         json!({
             "type": "object",
             "properties": {
-                "stage_id": {
+                "delegation_id": {
                     "type": "string",
-                    "description": "The stage id to cancel."
+                    "description": "The delegation id to cancel."
                 }
             },
-            "required": ["stage_id"],
+            "required": ["delegation_id"],
             "additionalProperties": false
         }),
     )
@@ -427,25 +427,25 @@ impl ToolExtension for FirstPartyToolExtension {
         register_runtime_tool(
             registry,
             "delegate_writing_task",
-            "stage",
+            "delegation",
             delegate_writing_task_definition(),
         );
         register_runtime_tool(
             registry,
             "delegate_readonly_tasks",
-            "stage",
+            "delegation",
             delegate_readonly_tasks_definition(),
         );
         register_runtime_tool(
             registry,
             "inspect_delegation",
-            "stage",
+            "delegation",
             inspect_delegation_definition(),
         );
         register_runtime_tool(
             registry,
             "cancel_delegation",
-            "stage",
+            "delegation",
             cancel_delegation_definition(),
         );
         register_edit(registry);

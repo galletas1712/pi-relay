@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use agent_store::{Stage, StageKind, StageStatus, SubagentType};
+use agent_store::{Delegation, DelegationKind, DelegationStatus, SubagentType};
 use agent_vocab::{ToolCall, ToolResultMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -8,13 +8,20 @@ use serde_json::{json, Value};
 use crate::codec::from_params;
 use crate::interrupt_session;
 use crate::state::AppState;
-use crate::subagents::{spawn_subagent, StageSubagentSpawn};
+use crate::subagents::{spawn_subagent, DelegationSubagentSpawn};
 use crate::types::RpcError;
 
 const HANDOFF_DIR: &str = ".pi-handoff";
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartFullParams {
+    /// Present for websocket `delegation.start_full`, absent for the
+    /// model-facing `delegate_writing_task` tool. The core receives the already
+    /// extracted parent id separately; this field exists so serde can reject
+    /// every other unknown key instead of silently accepting stale vocabulary.
+    #[serde(rename = "parent_session_id")]
+    _parent_session_id: Option<String>,
     role: String,
     prompt: String,
     workflow: Option<String>,
@@ -22,21 +29,32 @@ struct StartFullParams {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FanoutTask {
     role: String,
     prompt: String,
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StartFanoutParams {
+    /// Present for websocket `delegation.start_readonly_fanout`, absent for the
+    /// model-facing `delegate_readonly_tasks` tool.
+    #[serde(rename = "parent_session_id")]
+    _parent_session_id: Option<String>,
     tasks: Vec<FanoutTask>,
     workflow: Option<String>,
     label: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
-struct StageIdParams {
-    stage_id: String,
+#[serde(deny_unknown_fields)]
+struct DelegationIdParams {
+    /// Present for websocket `delegation.status`/`delegation.cancel`, absent for
+    /// model-facing `inspect_delegation`/`cancel_delegation`.
+    #[serde(rename = "parent_session_id")]
+    _parent_session_id: Option<String>,
+    delegation_id: String,
 }
 
 fn trim_required(value: &str, field: &str) -> std::result::Result<String, RpcError> {
@@ -50,27 +68,28 @@ fn trim_required(value: &str, field: &str) -> std::result::Result<String, RpcErr
     Ok(trimmed.to_string())
 }
 
-/// One-stage-per-parent guard: a parent may not start a stage while another of
-/// its stages is still running.
-async fn reject_if_stage_running(
+/// One-delegation-per-parent guard: a parent may not start a delegation while
+/// another of its delegations is still running.
+async fn reject_if_delegation_running(
     state: &AppState,
     parent_session_id: &str,
 ) -> std::result::Result<(), RpcError> {
     if state
         .repo
-        .parent_has_running_stage(parent_session_id)
+        .parent_has_running_delegation(parent_session_id)
         .await?
     {
         return Err(RpcError::new(
-            "stage_already_running",
-            "a stage is already running for this session; wait for it to finish before starting another",
+            "delegation_already_running",
+            "a delegation is already running for this session; wait for it to finish before starting another",
         ));
     }
     Ok(())
 }
 
-/// Non-recursive invariant: only the top-level session orchestrates stages. A
-/// subagent (full or read-only) must never spawn its own stage.
+/// Non-recursive invariant: only the top-level session orchestrates
+/// delegations. A subagent (full or read-only) must never spawn its own
+/// delegation.
 async fn reject_if_subagent(
     state: &AppState,
     session_id: &str,
@@ -82,41 +101,47 @@ async fn reject_if_subagent(
         .is_some()
     {
         return Err(RpcError::new(
-            "stages_not_allowed_for_subagent",
-            "only the top-level session can run stages; subagents cannot spawn subagents",
+            "delegations_not_allowed_for_subagent",
+            "only the top-level session can run delegations; subagents cannot spawn subagents",
         ));
     }
     Ok(())
 }
 
-/// Move a stage to a terminal status, interrupting any subagents already
+/// Move a delegation to a terminal status, interrupting any subagents already
 /// spawned for it. Shared by cancel and by the spawn-failure compensation path,
-/// so a half-started stage never strands the parent behind the
-/// one-stage-per-parent guard. Uses the low-level interrupt (the read-only
+/// so a half-started delegation never strands the parent behind the
+/// one-delegation-per-parent guard. Uses the low-level interrupt (the read-only
 /// steer/interrupt guard only blocks the model/parent from poking an individual
-/// RO subagent; tearing the whole stage down is allowed).
-async fn terminate_stage(state: &AppState, stage_id: &str, status: StageStatus) {
-    match state.repo.list_stage_subagents(stage_id).await {
+/// RO subagent; tearing the whole delegation down is allowed).
+async fn terminate_delegation(state: &AppState, delegation_id: &str, status: DelegationStatus) {
+    match state.repo.list_delegation_subagents(delegation_id).await {
         Ok(subagents) => {
             for subagent in &subagents {
                 if let Err(error) = interrupt_session(state, &subagent.session_id).await {
                     eprintln!(
-                        "failed to interrupt subagent {} while terminating stage {}: {}: {}",
-                        subagent.session_id, stage_id, error.code, error.message
+                        "failed to interrupt subagent {} while terminating delegation {}: {}: {}",
+                        subagent.session_id, delegation_id, error.code, error.message
                     );
                 }
             }
         }
         Err(error) => {
-            eprintln!("failed to list subagents while terminating stage {stage_id}: {error:#}")
+            eprintln!(
+                "failed to list subagents while terminating delegation {delegation_id}: {error:#}"
+            )
         }
     }
-    if let Err(error) = state.repo.set_stage_status(stage_id, status).await {
-        eprintln!("failed to set stage {stage_id} to a terminal status: {error:#}");
+    if let Err(error) = state
+        .repo
+        .set_delegation_status(delegation_id, status)
+        .await
+    {
+        eprintln!("failed to set delegation {delegation_id} to a terminal status: {error:#}");
     }
 }
 
-/// Start the single full (writing) subagent of a stage. Homogeneity and the
+/// Start the single full (writing) subagent of a delegation. Homogeneity and the
 /// single-full invariant are structural: the schema accepts exactly one scalar
 /// role/prompt, so no caller can mix kinds or request a second writer.
 pub(crate) async fn start_full_core(
@@ -129,13 +154,13 @@ pub(crate) async fn start_full_core(
     let prompt = trim_required(&params.prompt, "prompt")?;
 
     reject_if_subagent(state, parent_session_id).await?;
-    reject_if_stage_running(state, parent_session_id).await?;
+    reject_if_delegation_running(state, parent_session_id).await?;
 
-    let stage = state
+    let delegation = state
         .repo
-        .create_stage(
+        .create_delegation(
             parent_session_id,
-            StageKind::Full,
+            DelegationKind::Full,
             params.workflow.as_deref(),
             params.label.as_deref(),
             1,
@@ -144,27 +169,28 @@ pub(crate) async fn start_full_core(
 
     let spawned = match spawn_subagent(
         state,
-        StageSubagentSpawn {
+        DelegationSubagentSpawn {
             parent_session_id: parent_session_id.to_string(),
             role,
             task: prompt,
             subagent_type: SubagentType::Full,
-            stage_id: stage.id.clone(),
+            delegation_id: delegation.id.clone(),
         },
     )
     .await
     {
         Ok(spawned) => spawned,
         Err(error) => {
-            // The stage row already exists; fail it so the one-stage-per-parent
-            // guard releases rather than blocking the parent forever.
-            terminate_stage(state, &stage.id, StageStatus::Failed).await;
+            // The delegation row already exists; fail it so the
+            // one-delegation-per-parent guard releases rather than blocking the
+            // parent forever.
+            terminate_delegation(state, &delegation.id, DelegationStatus::Failed).await;
             return Err(error);
         }
     };
 
     Ok(json!({
-        "stage_id": stage.id,
+        "delegation_id": delegation.id,
         "subagent_session_id": spawned.started.session_id,
     }))
 }
@@ -190,14 +216,14 @@ pub(crate) async fn start_readonly_fanout_core(
     }
 
     reject_if_subagent(state, parent_session_id).await?;
-    reject_if_stage_running(state, parent_session_id).await?;
+    reject_if_delegation_running(state, parent_session_id).await?;
 
     let expected_subagents = tasks.len();
-    let stage = state
+    let delegation = state
         .repo
-        .create_stage(
+        .create_delegation(
             parent_session_id,
-            StageKind::ReadonlyFanout,
+            DelegationKind::ReadonlyFanout,
             params.workflow.as_deref(),
             params.label.as_deref(),
             expected_subagents as i32,
@@ -208,62 +234,66 @@ pub(crate) async fn start_readonly_fanout_core(
     for (role, prompt) in tasks {
         match spawn_subagent(
             state,
-            StageSubagentSpawn {
+            DelegationSubagentSpawn {
                 parent_session_id: parent_session_id.to_string(),
                 role,
                 task: prompt,
                 subagent_type: SubagentType::ReadOnly,
-                stage_id: stage.id.clone(),
+                delegation_id: delegation.id.clone(),
             },
         )
         .await
         {
             Ok(spawned) => subagent_session_ids.push(spawned.started.session_id),
             Err(error) => {
-                // Tear down the subagents already spawned for this stage and
-                // fail it, so a partial fan-out never leaves running children
-                // or blocks the parent behind the one-stage-per-parent guard.
-                terminate_stage(state, &stage.id, StageStatus::Failed).await;
+                // Tear down the subagents already spawned for this delegation
+                // and fail it, so a partial fan-out never leaves running
+                // children or blocks the parent behind the
+                // one-delegation-per-parent guard.
+                terminate_delegation(state, &delegation.id, DelegationStatus::Failed).await;
                 return Err(error);
             }
         }
     }
 
     Ok(json!({
-        "stage_id": stage.id,
+        "delegation_id": delegation.id,
         "subagent_session_ids": subagent_session_ids,
     }))
 }
 
-fn handoff_dir(parent_outer_cwd: &str, stage_id: &str) -> String {
+fn handoff_dir(parent_outer_cwd: &str, delegation_id: &str) -> String {
     Path::new(parent_outer_cwd)
         .join(HANDOFF_DIR)
-        .join(stage_id)
+        .join(delegation_id)
         .to_string_lossy()
         .into_owned()
 }
 
-async fn load_stage_for_parent(
+async fn load_delegation_for_parent(
     state: &AppState,
     parent_session_id: &str,
-    stage_id: &str,
-) -> std::result::Result<Stage, RpcError> {
-    let stage = state
+    delegation_id: &str,
+) -> std::result::Result<Delegation, RpcError> {
+    let delegation = state
         .repo
-        .get_stage(stage_id)
+        .get_delegation(delegation_id)
         .await?
-        .ok_or_else(|| RpcError::new("stage_not_found", "stage not found"))?;
-    if stage.parent_session_id != parent_session_id {
-        return Err(RpcError::new("stage_not_found", "stage is not in scope"));
+        .ok_or_else(|| RpcError::new("delegation_not_found", "delegation not found"))?;
+    if delegation.parent_session_id != parent_session_id {
+        return Err(RpcError::new(
+            "delegation_not_found",
+            "delegation is not in scope",
+        ));
     }
-    Ok(stage)
+    Ok(delegation)
 }
 
-fn stage_view(stage: &Stage, subagents: Value, handoff_dir: String) -> Value {
+fn delegation_view(delegation: &Delegation, subagents: Value, handoff_dir: String) -> Value {
     json!({
-        "stage_id": stage.id,
-        "kind": stage.kind,
-        "status": stage.status,
+        "delegation_id": delegation.id,
+        "kind": delegation.kind,
+        "status": delegation.status,
         "subagents": subagents,
         "handoff_dir": handoff_dir,
     })
@@ -274,9 +304,10 @@ pub(crate) async fn status_core(
     parent_session_id: &str,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
-    let params: StageIdParams = from_params(params)?;
-    let stage = load_stage_for_parent(state, parent_session_id, &params.stage_id).await?;
-    let subagents = state.repo.list_stage_subagents(&stage.id).await?;
+    let params: DelegationIdParams = from_params(params)?;
+    let delegation =
+        load_delegation_for_parent(state, parent_session_id, &params.delegation_id).await?;
+    let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
     let subagents = subagents
         .into_iter()
         .map(|subagent| {
@@ -287,45 +318,51 @@ pub(crate) async fn status_core(
         })
         .collect::<Vec<_>>();
     let parent_config = state.repo.load_session_config(parent_session_id).await?;
-    Ok(stage_view(
-        &stage,
+    Ok(delegation_view(
+        &delegation,
         json!(subagents),
-        handoff_dir(&parent_config.outer_cwd, &stage.id),
+        handoff_dir(&parent_config.outer_cwd, &delegation.id),
     ))
 }
 
-/// Cancel an in-flight stage: interrupt each of its subagents and mark the
-/// stage cancelled. Interrupting a read-only subagent is allowed here because
-/// the whole stage is being torn down (the per-subagent guard only blocks the
-/// model/parent from steering or interrupting an individual RO subagent).
+/// Cancel an in-flight delegation: interrupt each of its subagents and mark the
+/// delegation cancelled. Interrupting a read-only subagent is allowed here
+/// because the whole delegation is being torn down (the per-subagent guard only
+/// blocks the model/parent from steering or interrupting an individual RO
+/// subagent).
 pub(crate) async fn cancel_core(
     state: &AppState,
     parent_session_id: &str,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
-    let params: StageIdParams = from_params(params)?;
-    let stage = load_stage_for_parent(state, parent_session_id, &params.stage_id).await?;
-    // Only an in-flight stage can be cancelled; a terminal stage keeps its
-    // status (never clobber a done/failed stage or report a false cancel).
-    if stage.status != StageStatus::Running {
+    let params: DelegationIdParams = from_params(params)?;
+    let delegation =
+        load_delegation_for_parent(state, parent_session_id, &params.delegation_id).await?;
+    // Only an in-flight delegation can be cancelled; a terminal delegation keeps
+    // its status (never clobber a done/failed delegation or report a false
+    // cancel).
+    if delegation.status != DelegationStatus::Running {
         return Ok(json!({ "cancelled": false }));
     }
-    terminate_stage(state, &stage.id, StageStatus::Cancelled).await;
+    terminate_delegation(state, &delegation.id, DelegationStatus::Cancelled).await;
     Ok(json!({ "cancelled": true }))
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ReadHandoffFileParams {
-    stage_id: String,
+    #[serde(rename = "parent_session_id")]
+    _parent_session_id: Option<String>,
+    delegation_id: String,
     subagent_id: Option<String>,
     file: String,
 }
 
-/// The handoff files a client may read. `index.json` lives at the stage root;
+/// The handoff files a client may read. `index.json` lives at the delegation root;
 /// `final_message.md`/`transcript.md` live under a subagent dir. The variant
 /// determines whether a `subagent_id` is required, which is the whole reason a
 /// caller cannot smuggle an arbitrary filename.
-fn handoff_file_is_stage_root(file: &str) -> std::result::Result<bool, RpcError> {
+fn handoff_file_is_delegation_root(file: &str) -> std::result::Result<bool, RpcError> {
     match file {
         "index.json" => Ok(true),
         "final_message.md" | "transcript.md" => Ok(false),
@@ -363,21 +400,21 @@ fn safe_path_segment(segment: &str, field: &str) -> std::result::Result<String, 
 }
 
 /// Resolve a handoff file request to an absolute path strictly under
-/// `<parent_outer_cwd>/.pi-handoff/<stage_id>/`. Every dynamic segment
-/// (`stage_id`, optional `subagent_id`, `file`) is validated as a single safe
+/// `<parent_outer_cwd>/.pi-handoff/<delegation_id>/`. Every dynamic segment
+/// (`delegation_id`, optional `subagent_id`, `file`) is validated as a single safe
 /// path component, so the result can never traverse out of the handoff subtree.
 fn resolve_handoff_file_path(
     parent_outer_cwd: &str,
-    stage_id: &str,
+    delegation_id: &str,
     subagent_id: Option<&str>,
     file: &str,
 ) -> std::result::Result<PathBuf, RpcError> {
-    let is_stage_root = handoff_file_is_stage_root(file)?;
-    let stage_segment = safe_path_segment(stage_id, "stage_id")?;
+    let is_delegation_root = handoff_file_is_delegation_root(file)?;
+    let delegation_segment = safe_path_segment(delegation_id, "delegation_id")?;
     let mut path = Path::new(parent_outer_cwd)
         .join(HANDOFF_DIR)
-        .join(stage_segment);
-    if is_stage_root {
+        .join(delegation_segment);
+    if is_delegation_root {
         if subagent_id.is_some() {
             return Err(RpcError::new(
                 "invalid_params",
@@ -397,33 +434,36 @@ fn resolve_handoff_file_path(
 
 /// Read one handoff file for the run board. The web client cannot read host
 /// files directly; this is the only path through which it reaches the handoff
-/// subtree, and it is scoped to the parent (the stage must belong to it, exactly
-/// like `stage.status`) and traversal-safe (every segment is validated).
+/// subtree, and it is scoped to the parent (the delegation must belong to it,
+/// exactly like `delegation.status`) and traversal-safe (every segment is
+/// validated).
 pub(crate) async fn read_handoff_file_core(
     state: &AppState,
     parent_session_id: &str,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let params: ReadHandoffFileParams = from_params(params)?;
-    let stage = load_stage_for_parent(state, parent_session_id, &params.stage_id).await?;
+    let delegation =
+        load_delegation_for_parent(state, parent_session_id, &params.delegation_id).await?;
     // A subagent-scoped read may only target a subagent that belongs to this
-    // stage; otherwise a caller could probe arbitrary `<stage>/<segment>/` paths.
+    // delegation; otherwise a caller could probe arbitrary
+    // `<delegation>/<segment>/` paths.
     if let Some(subagent_id) = params.subagent_id.as_deref() {
-        let members = state.repo.list_stage_subagents(&stage.id).await?;
+        let members = state.repo.list_delegation_subagents(&delegation.id).await?;
         if !members
             .iter()
             .any(|member| member.session_id == subagent_id)
         {
             return Err(RpcError::new(
                 "handoff_file_not_found",
-                "subagent does not belong to this stage",
+                "subagent does not belong to this delegation",
             ));
         }
     }
     let parent_config = state.repo.load_session_config(parent_session_id).await?;
     let path = resolve_handoff_file_path(
         &parent_config.outer_cwd,
-        &stage.id,
+        &delegation.id,
         params.subagent_id.as_deref(),
         &params.file,
     )?;
@@ -436,7 +476,7 @@ pub(crate) async fn read_handoff_file_core(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(RpcError::new(
                 "handoff_file_not_found",
-                "handoff file not found; the stage may not have finished yet",
+                "handoff file not found; the delegation may not have finished yet",
             ))
         }
         Err(error) => {
@@ -475,7 +515,7 @@ pub(crate) async fn read_handoff_file_core(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Err(RpcError::new(
                 "handoff_file_not_found",
-                "handoff file not found; the stage may not have finished yet",
+                "handoff file not found; the delegation may not have finished yet",
             ))
         }
         Err(error) => {
@@ -491,7 +531,7 @@ pub(crate) async fn read_handoff_file_core(
         }
     };
     Ok(json!({
-        "stage_id": stage.id,
+        "delegation_id": delegation.id,
         "subagent_id": params.subagent_id,
         "file": params.file,
         "content": content,
@@ -553,20 +593,24 @@ pub(crate) async fn rpc_cancel(
     cancel_core(state, &parent_session_id, params).await
 }
 
-/// Per-parent stage list for the run board: each stage with its kind/status and
-/// its subagents' ids/status. (The model-facing tool surface has no list.)
+/// Per-parent delegation list for the run board: each delegation with its
+/// kind/status and its subagents' ids/status. (The model-facing tool surface
+/// has no list.)
 pub(crate) async fn rpc_list(
     state: &AppState,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let parent_session_id = parent_session_id_from_params(&params)?;
     let parent_config = state.repo.load_session_config(&parent_session_id).await?;
-    let stages = state.repo.list_parent_stages(&parent_session_id).await?;
-    let mut views = Vec::with_capacity(stages.len());
-    for stage in &stages {
+    let delegations = state
+        .repo
+        .list_parent_delegations(&parent_session_id)
+        .await?;
+    let mut views = Vec::with_capacity(delegations.len());
+    for delegation in &delegations {
         let subagents = state
             .repo
-            .list_stage_subagents(&stage.id)
+            .list_delegation_subagents(&delegation.id)
             .await?
             .into_iter()
             .map(|subagent| {
@@ -580,41 +624,34 @@ pub(crate) async fn rpc_list(
             })
             .collect::<Vec<_>>();
         views.push(json!({
-            "stage_id": stage.id,
-            "kind": stage.kind,
-            "status": stage.status,
-            "workflow": stage.workflow,
-            "label": stage.label,
+            "delegation_id": delegation.id,
+            "kind": delegation.kind,
+            "status": delegation.status,
+            "workflow": delegation.workflow,
+            "label": delegation.label,
             "subagents": subagents,
-            "handoff_dir": handoff_dir(&parent_config.outer_cwd, &stage.id),
+            "handoff_dir": handoff_dir(&parent_config.outer_cwd, &delegation.id),
         }));
     }
     Ok(json!({
         "parent_session_id": parent_session_id,
-        "stages": views,
+        "delegations": views,
     }))
 }
 
-pub(crate) fn is_stage_tool_name(name: &str) -> bool {
+pub(crate) fn is_delegation_tool_name(name: &str) -> bool {
     matches!(
         name,
         "delegate_writing_task"
             | "delegate_readonly_tasks"
             | "inspect_delegation"
             | "cancel_delegation"
-            // Hidden short-term compatibility aliases. These are accepted by
-            // dispatch only; agent-tools does not expose them in the provider
-            // registry/tool list.
-            | "stage_start_full"
-            | "stage_start_readonly_fanout"
-            | "stage_status"
-            | "stage_cancel"
     )
 }
 
-/// Model-facing dispatch: run the core fn for the named stage tool and wrap the
-/// result as a tool result message. The session id is the parent's.
-pub(crate) async fn run_stage_tool(
+/// Model-facing dispatch: run the core fn for the named delegation tool and
+/// wrap the result as a tool result message. The session id is the parent's.
+pub(crate) async fn run_delegation_tool(
     state: &AppState,
     parent_session_id: &str,
     call: &ToolCall,
@@ -630,19 +667,15 @@ pub(crate) async fn run_stage_tool(
         }
     };
     let result = match call.tool_name.as_str() {
-        "delegate_writing_task" | "stage_start_full" => {
-            start_full_core(state, parent_session_id, params).await
-        }
-        "delegate_readonly_tasks" | "stage_start_readonly_fanout" => {
+        "delegate_writing_task" => start_full_core(state, parent_session_id, params).await,
+        "delegate_readonly_tasks" => {
             start_readonly_fanout_core(state, parent_session_id, params).await
         }
-        "inspect_delegation" | "stage_status" => {
-            status_core(state, parent_session_id, params).await
-        }
-        "cancel_delegation" | "stage_cancel" => cancel_core(state, parent_session_id, params).await,
+        "inspect_delegation" => status_core(state, parent_session_id, params).await,
+        "cancel_delegation" => cancel_core(state, parent_session_id, params).await,
         other => Err(RpcError::new(
             "unknown_tool",
-            format!("unknown stage tool: {other}"),
+            format!("unknown delegation tool: {other}"),
         )),
     };
     match result {
@@ -666,32 +699,58 @@ mod tests {
     const CWD: &str = "/home/u/.local/state/pi-relay/sessions/parent/cwd";
 
     #[test]
-    fn stage_tool_interception_accepts_new_names_and_hidden_aliases() {
+    fn delegation_tool_interception_accepts_only_canonical_names() {
         for name in [
             "delegate_writing_task",
             "delegate_readonly_tasks",
             "inspect_delegation",
             "cancel_delegation",
-            // Hidden daemon-only aliases; not registered provider tools.
+        ] {
+            assert!(
+                is_delegation_tool_name(name),
+                "{name} should be intercepted"
+            );
+        }
+        for old in [
             "stage_start_full",
             "stage_start_readonly_fanout",
             "stage_status",
             "stage_cancel",
         ] {
-            assert!(is_stage_tool_name(name), "{name} should be intercepted");
+            assert!(
+                !is_delegation_tool_name(old),
+                "{old} must not be intercepted"
+            );
         }
-        assert!(!is_stage_tool_name("stage.list"));
-        assert!(!is_stage_tool_name("stage.start_full"));
+        assert!(!is_delegation_tool_name("delegation.list"));
+        assert!(!is_delegation_tool_name("delegation.start_full"));
     }
 
     #[test]
-    fn resolves_index_json_at_stage_root() {
-        let path = resolve_handoff_file_path(CWD, "stage-1", None, "index.json").unwrap();
+    fn stale_stage_id_parameter_is_rejected() {
+        let error: RpcError = from_params::<DelegationIdParams>(json!({
+            "stage_id": "delegation-1",
+        }))
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_params");
+
+        let error: RpcError = from_params::<DelegationIdParams>(json!({
+            "parent_session_id": "parent",
+            "delegation_id": "delegation-1",
+            "stage_id": "delegation-1",
+        }))
+        .unwrap_err();
+        assert_eq!(error.code, "invalid_params");
+    }
+
+    #[test]
+    fn resolves_index_json_at_delegation_root() {
+        let path = resolve_handoff_file_path(CWD, "delegation-1", None, "index.json").unwrap();
         assert_eq!(
             path,
             Path::new(CWD)
                 .join(".pi-handoff")
-                .join("stage-1")
+                .join("delegation-1")
                 .join("index.json")
         );
     }
@@ -699,12 +758,13 @@ mod tests {
     #[test]
     fn resolves_subagent_file_under_subagent_dir() {
         let path =
-            resolve_handoff_file_path(CWD, "stage-1", Some("child-9"), "final_message.md").unwrap();
+            resolve_handoff_file_path(CWD, "delegation-1", Some("child-9"), "final_message.md")
+                .unwrap();
         assert_eq!(
             path,
             Path::new(CWD)
                 .join(".pi-handoff")
-                .join("stage-1")
+                .join("delegation-1")
                 .join("child-9")
                 .join("final_message.md")
         );
@@ -712,17 +772,18 @@ mod tests {
 
     #[test]
     fn rejects_unknown_file_name() {
-        let error = resolve_handoff_file_path(CWD, "stage-1", None, "secrets.env").unwrap_err();
+        let error =
+            resolve_handoff_file_path(CWD, "delegation-1", None, "secrets.env").unwrap_err();
         assert_eq!(error.code, "invalid_params");
     }
 
     #[test]
-    fn rejects_traversal_in_stage_id() {
-        for evil in ["..", "../other", "a/b", "/etc", "stage/../..", "."] {
+    fn rejects_traversal_in_delegation_id() {
+        for evil in ["..", "../other", "a/b", "/etc", "delegation/../..", "."] {
             let error = resolve_handoff_file_path(CWD, evil, None, "index.json").unwrap_err();
             assert_eq!(
                 error.code, "invalid_params",
-                "stage_id {evil} must be rejected"
+                "delegation_id {evil} must be rejected"
             );
         }
     }
@@ -730,8 +791,8 @@ mod tests {
     #[test]
     fn rejects_traversal_in_subagent_id() {
         for evil in ["..", "../x", "a/b", "/abs"] {
-            let error =
-                resolve_handoff_file_path(CWD, "stage-1", Some(evil), "transcript.md").unwrap_err();
+            let error = resolve_handoff_file_path(CWD, "delegation-1", Some(evil), "transcript.md")
+                .unwrap_err();
             assert_eq!(
                 error.code, "invalid_params",
                 "subagent_id {evil} must be rejected"
@@ -741,14 +802,15 @@ mod tests {
 
     #[test]
     fn requires_subagent_id_for_subagent_files() {
-        let error = resolve_handoff_file_path(CWD, "stage-1", None, "transcript.md").unwrap_err();
+        let error =
+            resolve_handoff_file_path(CWD, "delegation-1", None, "transcript.md").unwrap_err();
         assert_eq!(error.code, "invalid_params");
     }
 
     #[test]
     fn rejects_subagent_id_for_index_json() {
-        let error =
-            resolve_handoff_file_path(CWD, "stage-1", Some("child-9"), "index.json").unwrap_err();
+        let error = resolve_handoff_file_path(CWD, "delegation-1", Some("child-9"), "index.json")
+            .unwrap_err();
         assert_eq!(error.code, "invalid_params");
     }
 }
