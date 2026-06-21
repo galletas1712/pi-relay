@@ -225,7 +225,9 @@ pub(crate) fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> Pat
 /// subagents in a running delegation, but normal final-message files are only
 /// published for completed delegations. Running inspections pass `false`: their
 /// transcript files are kept current, but no normal final-message artifact is
-/// published before the completion CAS wins.
+/// published before the completion CAS wins. Cancelled and failed delegations do
+/// not publish normal per-subagent handoff artifacts; cancellation has its own
+/// transcript-only artifact path.
 pub(crate) async fn refresh_delegation_handoff_artifacts(
     state: &AppState,
     delegation: &Delegation,
@@ -236,6 +238,13 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         .load_session_config(&delegation.parent_session_id)
         .await?;
     let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+
+    if matches!(
+        delegation.status,
+        DelegationStatus::Cancelled | DelegationStatus::Failed
+    ) {
+        return Ok((dir, Vec::new()));
+    }
 
     let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
 

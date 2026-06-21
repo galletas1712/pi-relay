@@ -50,7 +50,7 @@ with:
 >   parallel fan-out of **read-only** subagents (each in a disposable btrfs
 >   snapshot, destroyed on return). The parent parks after launching a stage and
 >   is delivered a parent-scoped completion **steer** pointing at a handoff
->   directory (`index.json` + per-subagent final message and transcript).
+>   directory (per-subagent final message and transcript; structured state via `inspect_delegation`).
 >   `subagent.{spawned,running,idle}` lifecycle events drive the stage barrier.
 >   Reusable patterns are **workflow skills** (`SKILL.md` + `LoadSkill`), not a
 >   DSL. The Python REPL `subagents` module remains only as a raw escape hatch.

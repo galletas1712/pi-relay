@@ -62,7 +62,9 @@ use super::{
     complete_delegation_if_ready, sweep_running_delegations_on_boot,
     try_claim_and_publish_completed_delegation,
 };
-use crate::delegation_tools::{cancel_core, run_delegation_tool, status_core, steer_subagent_core};
+use crate::delegation_tools::{
+    cancel_core, read_handoff_file_core, run_delegation_tool, status_core, steer_subagent_core,
+};
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(90_000);
 
@@ -817,6 +819,17 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     assert_eq!(subagent["status"], "cancelled");
     assert_eq!(subagent["final_message"], serde_json::Value::Null);
     assert_eq!(subagent["final_message_path"], serde_json::Value::Null);
+    assert_eq!(
+        subagent["final_message_relative_path"],
+        serde_json::Value::Null
+    );
+    assert_eq!(subagent["final_message_file"], serde_json::Value::Null);
+    assert_eq!(subagent["transcript_path"], serde_json::Value::Null);
+    assert_eq!(
+        subagent["transcript_relative_path"],
+        serde_json::Value::Null
+    );
+    assert_eq!(subagent["transcript_file"], serde_json::Value::Null);
     assert_eq!(subagent["cancellation_transcript_path"], transcript_path);
     assert_eq!(
         subagent["cancellation_transcript_relative_path"],
@@ -834,6 +847,53 @@ async fn cancel_delegation_returns_transcript_only_paths() {
         .join("impl_to_cancel")
         .join("final_message.md")
         .exists());
+    assert!(!env
+        .cwd
+        .path()
+        .join(".pi-handoff")
+        .join(&delegation.id)
+        .join("impl_to_cancel")
+        .join("transcript.md")
+        .exists());
+    let normal_read = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "subagent_id": "impl_to_cancel",
+            "file": "transcript.md",
+        }),
+    )
+    .await
+    .expect_err("normal transcript read rejected for cancellation");
+    assert_eq!(normal_read.code, "handoff_file_not_found");
+    assert!(!env
+        .cwd
+        .path()
+        .join(".pi-handoff")
+        .join(&delegation.id)
+        .join("impl_to_cancel")
+        .join("transcript.md")
+        .exists());
+    let cancellation_read = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "file": "cancelled/impl_to_cancel.transcript.md",
+        }),
+    )
+    .await
+    .expect("cancelled transcript readable");
+    assert_eq!(cancellation_read["subagent_id"], "impl_to_cancel");
+    assert_eq!(
+        cancellation_read["file"],
+        "cancelled/impl_to_cancel.transcript.md"
+    );
+    assert!(cancellation_read["content"]
+        .as_str()
+        .expect("cancelled transcript content")
+        .contains("working..."));
     assert_eq!(
         env.state
             .repo
@@ -1205,6 +1265,64 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
     let refreshed = std::fs::read_to_string(root.join("done_child").join("transcript.md")).unwrap();
     assert!(refreshed.contains("Found the answer."));
     assert!(!refreshed.contains("stale local artifact"));
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_delegation_does_not_publish_normal_handoff_on_inspect_or_read() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "failed inspect test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_failed").await;
+    env.state
+        .repo
+        .set_delegation_status(&delegation.id, DelegationStatus::Failed)
+        .await
+        .expect("mark failed");
+
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
+    assert_eq!(snapshot["status"], "failed");
+    assert_eq!(subagent["status"], "failed");
+    assert_eq!(subagent["final_message"], serde_json::Value::Null);
+    assert_eq!(subagent["final_message_path"], serde_json::Value::Null);
+    assert_eq!(subagent["transcript_path"], serde_json::Value::Null);
+    let root = handoff_root(&env, &delegation.id);
+    assert!(
+        !root.join("impl_failed").join("transcript.md").exists(),
+        "failed inspection must not create normal transcript artifacts"
+    );
+    let error = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "subagent_id": "impl_failed",
+            "file": "transcript.md",
+        }),
+    )
+    .await
+    .expect_err("failed delegation normal read rejected");
+    assert_eq!(error.code, "handoff_file_not_found");
+    assert!(
+        !root.join("impl_failed").join("transcript.md").exists(),
+        "failed read must not create normal transcript artifacts"
+    );
 
     env.cleanup().await;
 }
