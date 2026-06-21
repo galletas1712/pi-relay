@@ -1387,7 +1387,7 @@ surface is provider-shaped (e.g. OpenAI `apply_patch` vs Anthropic
 `text_editor_20250728` for editing). The registered builtins are `edit`, `bash`,
 `grep`, `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools
 (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`,
-`cancel_delegation`) - there are no `read`/`write` tools. Each returned entry
+`cancel_delegation`, `steer_subagent`) - there are no `read`/`write` tools. Each returned entry
 carries `name`, `description`, `input_schema`, `canonical_name`, `prompt_alias`,
 `execution`, and `kind: "local_tool"`.
 

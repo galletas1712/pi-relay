@@ -62,6 +62,13 @@ Rules:
   knows what you put in its prompt (and any handoff/workspace paths you cite).
 - While a full subagent is running, supervise and read — do not edit the workspace
   yourself until it returns.
+- If a running full subagent needs a correction, clarification, or additional
+  information, prefer `steer_subagent` over cancelling and restarting. Use the
+  subagent session id shown by `inspect_delegation`.
+- Cancellation is terminal. Use `cancel_delegation` when you intend to abandon
+  the current subagent/delegation. Cancellation does not roll back workspace
+  edits or remote-state side effects; inspect the transcript-only paths returned
+  by cancellation before deciding follow-up work.
 - Never mix RO and full work in one delegation.
 - To run a known pattern (e.g. implement → review → test), `LoadSkill` the matching
   workflow skill and follow its delegation state machine, branching on the typed

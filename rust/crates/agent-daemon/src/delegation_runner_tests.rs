@@ -10,15 +10,15 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use agent_session::TranscriptStorageNode;
+use agent_session::{ModelContext, SessionAction, TranscriptStorageNode};
 use agent_store::{
-    DelegationKind, DelegationStatus, EventType, InputPriority, PostgresAgentStore, SessionConfig,
-    SubagentType,
+    DelegationKind, DelegationStatus, EventType, InputPriority, PostgresAgentStore,
+    QueuedInputStatus, SessionConfig, SubagentType,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{
-    AssistantItem, AssistantMessage, ProviderConfig, ProviderKind, ReasoningEffort, TranscriptItem,
-    TurnId, TurnOutcome, UserMessage,
+    ActionId, AssistantItem, AssistantMessage, ProviderConfig, ProviderKind, ReasoningEffort,
+    ToolCall, ToolCallId, TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
@@ -58,6 +58,7 @@ use crate::state::AppState;
 use crate::workspaces::WorkspaceManager;
 
 use super::{complete_delegation_if_ready, sweep_running_delegations_on_boot};
+use crate::delegation_tools::{cancel_core, run_delegation_tool, steer_subagent_core};
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(90_000);
 
@@ -339,6 +340,69 @@ async fn create_running_subagent(
     boundary
 }
 
+/// A full subagent with an active, unfinished model action. This keeps the
+/// session genuinely busy so a steer-priority input should be queued rather
+/// than immediately consumed into a new turn.
+async fn create_busy_full_subagent(
+    env: &TestEnv,
+    project_id: Uuid,
+    parent_id: &str,
+    delegation_id: &str,
+    session_id: &str,
+) {
+    let active_leaf = format!("{session_id}_a");
+    let entries = vec![
+        TranscriptStorageNode {
+            id: format!("{session_id}_u"),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::UserMessage(UserMessage::text("keep working")),
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: active_leaf.clone(),
+            parent_id: Some(format!("{session_id}_u")),
+            timestamp_ms: 2,
+            item: TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("working...".to_string())],
+            }),
+            provider_replay: Vec::new(),
+        },
+    ];
+    let actions = vec![SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::new(),
+        context_leaf_id: Some(active_leaf.clone()),
+    }];
+    env.state
+        .repo
+        .start_session_outputs_with_parent(
+            session_id,
+            &session_config(
+                env,
+                project_id,
+                json!({ "created_by": "test", "role_name": "implementer", "harness": true }),
+            ),
+            &entries,
+            Some(&active_leaf),
+            &[],
+            &actions,
+            InputPriority::FollowUp,
+            &UserMessage::text("keep working"),
+            None,
+            Some(parent_id),
+            Some(SubagentType::Full),
+            Some(delegation_id),
+        )
+        .await
+        .expect("create busy full subagent");
+    assert_eq!(
+        env.state.repo.activity(session_id).await.expect("activity"),
+        agent_store::SessionActivity::Running
+    );
+}
+
 /// Settle a subagent created by `create_running_subagent` terminal by switching
 /// its active leaf to the pre-attached `TurnFinished` boundary node.
 async fn settle_subagent_terminal(env: &TestEnv, session_id: &str, boundary_leaf: &str) {
@@ -386,6 +450,399 @@ fn read_index(env: &TestEnv, delegation_id: &str) -> serde_json::Value {
         .join("index.json");
     let raw = std::fs::read_to_string(path).expect("index.json exists");
     serde_json::from_str(&raw).expect("index.json parses")
+}
+
+#[tokio::test]
+async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "steer test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
+
+    let tool_result = run_delegation_tool(
+        &env.state,
+        "parent",
+        &ToolCall {
+            id: ToolCallId::new("call_steer"),
+            tool_name: "steer_subagent".to_string(),
+            args_json: json!({
+                "subagent_id": "impl_busy",
+                "message": "Please also update the docs."
+            })
+            .to_string(),
+        },
+    )
+    .await;
+    assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Success);
+    let output: serde_json::Value =
+        serde_json::from_str(&tool_result.output).expect("tool output JSON");
+    assert_eq!(output["subagent_id"], "impl_busy");
+    assert_eq!(output["queued"], true);
+    assert!(output["input_id"].as_str().is_some());
+
+    let queue = env
+        .state
+        .repo
+        .queue_state("impl_busy")
+        .await
+        .expect("queue state");
+    assert_eq!(queue.queued_inputs.len(), 1);
+    let queued = &queue.queued_inputs[0];
+    assert_eq!(queued.priority, InputPriority::Steer);
+    assert_eq!(queued.status, QueuedInputStatus::Queued);
+    assert_eq!(
+        queued.content.as_text(),
+        Some("Please also update the docs.")
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn steer_subagent_rejects_read_only_subagents() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "steer test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
+        .await
+        .expect("create delegation");
+    let _boundary = create_running_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "readonly_running",
+        "reviewer",
+        TurnOutcome::Graceful,
+    )
+    .await;
+
+    let tool_result = run_delegation_tool(
+        &env.state,
+        "parent",
+        &ToolCall {
+            id: ToolCallId::new("call_readonly"),
+            tool_name: "steer_subagent".to_string(),
+            args_json: json!({
+                "subagent_id": "readonly_running",
+                "message": "Please check one more file."
+            })
+            .to_string(),
+        },
+    )
+    .await;
+    assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Error);
+    assert!(tool_result
+        .output
+        .contains("cannot_steer_read_only_subagent"));
+    assert!(env
+        .state
+        .repo
+        .queue_state("readonly_running")
+        .await
+        .expect("queue state")
+        .queued_inputs
+        .is_empty());
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_it() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "steer test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+    let active_leaf = "impl_idle_a";
+    let entries = vec![
+        TranscriptStorageNode {
+            id: "impl_idle_u".to_string(),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::UserMessage(UserMessage::text("keep working")),
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: active_leaf.to_string(),
+            parent_id: Some("impl_idle_u".to_string()),
+            timestamp_ms: 2,
+            item: TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("mid turn".to_string())],
+            }),
+            provider_replay: Vec::new(),
+        },
+    ];
+    env.state
+        .repo
+        .start_session_outputs_with_parent(
+            "impl_idle",
+            &session_config(
+                &env,
+                project_id,
+                json!({ "created_by": "test", "role_name": "implementer" }),
+            ),
+            &entries,
+            Some(active_leaf),
+            &[],
+            &[],
+            InputPriority::FollowUp,
+            &UserMessage::text("keep working"),
+            None,
+            Some("parent"),
+            Some(SubagentType::Full),
+            Some(&delegation.id),
+        )
+        .await
+        .expect("create idle nonterminal subagent");
+    assert!(!env
+        .state
+        .repo
+        .active_leaf_is_turn_boundary("impl_idle")
+        .await
+        .expect("nonterminal"));
+    assert_eq!(
+        env.state
+            .repo
+            .activity("impl_idle")
+            .await
+            .expect("activity"),
+        agent_store::SessionActivity::Idle
+    );
+
+    let error = steer_subagent_core(
+        &env.state,
+        "parent",
+        json!({ "subagent_id": "impl_idle", "message": "one more thing" }),
+    )
+    .await
+    .expect_err("idle nonterminal subagent rejected");
+    assert_eq!(error.code, "subagent_not_running");
+    assert!(env
+        .state
+        .repo
+        .queue_state("impl_idle")
+        .await
+        .expect("queue")
+        .queued_inputs
+        .is_empty());
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn steer_subagent_rejects_terminal_or_cancelled_delegations() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "steer test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+
+    let done = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create done delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &done.id,
+        "impl_done",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "Done.",
+    )
+    .await;
+    env.state
+        .repo
+        .set_delegation_status(&done.id, DelegationStatus::Done)
+        .await
+        .expect("mark done");
+    let tool_result = run_delegation_tool(
+        &env.state,
+        "parent",
+        &ToolCall {
+            id: ToolCallId::new("call_done"),
+            tool_name: "steer_subagent".to_string(),
+            args_json: json!({ "subagent_id": "impl_done", "message": "one more thing" })
+                .to_string(),
+        },
+    )
+    .await;
+    assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Error);
+    assert!(tool_result.output.contains("delegation_not_running"));
+
+    let cancelled = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create cancelled delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &cancelled.id, "impl_cancelled").await;
+    env.state
+        .repo
+        .set_delegation_status(&cancelled.id, DelegationStatus::Cancelled)
+        .await
+        .expect("mark cancelled");
+    let tool_result = run_delegation_tool(
+        &env.state,
+        "parent",
+        &ToolCall {
+            id: ToolCallId::new("call_cancelled"),
+            tool_name: "steer_subagent".to_string(),
+            args_json: json!({ "subagent_id": "impl_cancelled", "message": "one more thing" })
+                .to_string(),
+        },
+    )
+    .await;
+    assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Error);
+    assert!(tool_result.output.contains("delegation_not_running"));
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn cancel_delegation_returns_transcript_only_paths() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "cancel test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_to_cancel").await;
+    env.state
+        .repo
+        .enqueue_user_input(
+            "impl_to_cancel",
+            InputPriority::FollowUp,
+            &UserMessage::text("queued work that must not run after cancellation"),
+            Some("queued-before-cancel"),
+        )
+        .await
+        .expect("queue follow-up before cancellation");
+
+    let result = cancel_core(
+        &env.state,
+        "parent",
+        json!({ "delegation_id": delegation.id }),
+    )
+    .await
+    .expect("cancel delegation");
+    assert_eq!(result["cancelled"], true);
+    let transcripts = result["transcripts"].as_array().expect("transcripts array");
+    assert_eq!(transcripts.len(), 1);
+    assert_eq!(transcripts[0]["subagent_id"], "impl_to_cancel");
+    let transcript_path = transcripts[0]["transcript"]
+        .as_str()
+        .expect("transcript path");
+    assert!(
+        transcript_path.ends_with(&format!(
+            ".pi-handoff/{}/cancelled/impl_to_cancel.transcript.md",
+            delegation.id
+        )),
+        "unexpected transcript path: {transcript_path}"
+    );
+    let transcript = std::fs::read_to_string(transcript_path).expect("transcript readable");
+    assert!(transcript.contains("## User"));
+    assert!(transcript.contains("keep working"));
+    assert!(transcript.contains("## Assistant"));
+    assert!(transcript.contains("working..."));
+    assert!(!env
+        .cwd
+        .path()
+        .join(".pi-handoff")
+        .join(&delegation.id)
+        .join("index.json")
+        .exists());
+    assert!(!env
+        .cwd
+        .path()
+        .join(".pi-handoff")
+        .join(&delegation.id)
+        .join("impl_to_cancel")
+        .join("final_message.md")
+        .exists());
+    assert_eq!(
+        env.state
+            .repo
+            .get_delegation(&delegation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DelegationStatus::Cancelled
+    );
+    let queue = env
+        .state
+        .repo
+        .queue_state("impl_to_cancel")
+        .await
+        .expect("queue state after cancellation");
+    assert_eq!(queue.queued_inputs.len(), 1);
+    assert_eq!(queue.queued_inputs[0].status, QueuedInputStatus::Queued);
+    assert_eq!(
+        queue.queued_inputs[0].content.as_text(),
+        Some("queued work that must not run after cancellation")
+    );
+
+    env.cleanup().await;
 }
 
 #[tokio::test]

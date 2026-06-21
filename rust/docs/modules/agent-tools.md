@@ -69,6 +69,7 @@ semantics justify it.
 | `delegate_readonly_tasks` | `delegate_readonly_tasks` (JSON function) | `delegate_readonly_tasks` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 | `inspect_delegation` | `inspect_delegation` (JSON function) | `inspect_delegation` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 | `cancel_delegation` | `cancel_delegation` (JSON function) | `cancel_delegation` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
+| `steer_subagent` | `steer_subagent` (JSON function) | `steer_subagent` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 
 There are no `read`/`write` tools. File reads go through `Edit`'s `view`
 command (Anthropic) or through `Bash` (`cat`, `sed`, `rg`, …) on OpenAI.
@@ -144,15 +145,16 @@ it against the session's loaded-skill set and workspace skills.
 
 ### delegation tools
 
-`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, and
-`cancel_delegation` are provider-visible JSON tools registered by
+`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`,
+`cancel_delegation`, and `steer_subagent` are provider-visible JSON tools registered by
 `FirstPartyToolExtension`, but they have no registry executor. The daemon
 runtime intercepts them and dispatches to the delegation engine in
 `delegation_tools.rs`.
 `delegate_writing_task` launches the single full/writing delegation subagent;
 `delegate_readonly_tasks` launches a homogeneous fan-out of read-only
 subagents; `inspect_delegation` and `cancel_delegation` inspect or cancel an
-existing delegation. Delegation subagents may produce
+existing delegation; `steer_subagent` queues an additional instruction to a
+running full subagent. Delegation subagents may produce
 `subagent.spawned`/`subagent.running` progress events, but delegation completion
 arrives later as a parent steer pointing at the handoff directory, not as a
 model tool result or per-child idle event.
