@@ -4,10 +4,19 @@
 //! once against an existing database before restarting code that has removed the
 //! old `stage` vocabulary, then delete/abandon this temporary branch.
 //!
+//! The rename is intentionally hard: no long-term compatibility aliases are
+//! added for old table names, RPC methods, or provider-visible tool names. The
+//! migration updates the durable state the post-rename daemon needs, and fails
+//! closed when old partial fan-out state cannot be inferred safely.
+//!
 //! The migration preserves existing row IDs, including IDs with a `stage_`
 //! prefix. The post-rename runtime treats delegation IDs as opaque `text`; only
 //! newly-created IDs use the `delegation_` prefix. Preserving IDs avoids a
 //! risky global primary-key rewrite and keeps historical handoff paths stable.
+//!
+//! See `rust/docs/temp-stage-to-delegation-migration.md` for the operator
+//! runbook, idempotency/rollback notes, and the exact data that is deliberately
+//! not rewritten.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -251,6 +260,132 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+async fn ensure_expected_subagents_shape(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    config: &Config,
+    stats: &mut MigrationStats,
+) -> Result<()> {
+    let has_column = column_exists(tx, "delegations", "expected_subagents").await?;
+    if !has_column {
+        validate_expected_subagents_inference(tx, "delegations").await?;
+        stats.schema_operations.push(
+            "add delegations.expected_subagents inferred from kind and existing child sessions"
+                .to_string(),
+        );
+        if config.apply {
+            sqlx::query("alter table delegations add column expected_subagents integer null")
+                .execute(&mut **tx)
+                .await
+                .context("add nullable delegations.expected_subagents")?;
+            populate_missing_delegation_expected_subagents(tx).await?;
+            sqlx::query("alter table delegations alter column expected_subagents set default 1")
+                .execute(&mut **tx)
+                .await
+                .context("set default on delegations.expected_subagents")?;
+            sqlx::query("alter table delegations alter column expected_subagents set not null")
+                .execute(&mut **tx)
+                .await
+                .context("set delegations.expected_subagents not null")?;
+        }
+        return Ok(());
+    }
+
+    let null_count: i64 = sqlx::query_scalar(
+        "select count(*)::bigint from delegations where expected_subagents is null",
+    )
+    .fetch_one(&mut **tx)
+    .await
+    .context("count null delegations.expected_subagents")?;
+    if null_count > 0 {
+        validate_expected_subagents_inference(tx, "delegations").await?;
+        stats.schema_operations.push(format!(
+            "populate {null_count} null delegations.expected_subagents values by inference"
+        ));
+        if config.apply {
+            populate_missing_delegation_expected_subagents(tx).await?;
+        }
+    }
+
+    let under_counted = under_counted_readonly_fanouts(tx).await?;
+    if under_counted > 0 {
+        stats.schema_operations.push(format!(
+            "repair {under_counted} readonly_fanout delegations whose expected_subagents is lower than the existing child-session count"
+        ));
+        if config.apply {
+            repair_under_counted_readonly_fanouts(tx).await?;
+        }
+    }
+
+    if config.apply {
+        sqlx::query("alter table delegations alter column expected_subagents set default 1")
+            .execute(&mut **tx)
+            .await
+            .context("set default on delegations.expected_subagents")?;
+        sqlx::query("alter table delegations alter column expected_subagents set not null")
+            .execute(&mut **tx)
+            .await
+            .context("set delegations.expected_subagents not null")?;
+    }
+    Ok(())
+}
+
+async fn under_counted_readonly_fanouts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<i64> {
+    let child_count = child_session_count_expr(tx, "d").await?;
+    let sql = format!(
+        r#"
+        select count(*)::bigint
+        from delegations d
+        where d.kind = 'readonly_fanout'
+          and d.expected_subagents is not null
+          and ({child_count}) > d.expected_subagents
+        "#
+    );
+    sqlx::query_scalar(&sql)
+        .fetch_one(&mut **tx)
+        .await
+        .context("count under-counted readonly_fanout delegations")
+}
+
+async fn repair_under_counted_readonly_fanouts(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    let child_count = child_session_count_expr(tx, "d").await?;
+    let sql = format!(
+        r#"
+        update delegations d
+        set expected_subagents = ({child_count})
+        where d.kind = 'readonly_fanout'
+          and d.expected_subagents is not null
+          and ({child_count}) > d.expected_subagents
+        "#
+    );
+    sqlx::query(&sql)
+        .execute(&mut **tx)
+        .await
+        .context("repair under-counted readonly_fanout delegations")?;
+    Ok(())
+}
+
+async fn populate_missing_delegation_expected_subagents(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<()> {
+    let expected_expr = expected_subagents_expr(tx, "delegations", Some("d")).await?;
+    let sql = format!(
+        r#"
+        update delegations d
+        set expected_subagents = {expected_expr}
+        where d.expected_subagents is null
+        "#
+    );
+    sqlx::query(&sql)
+        .execute(&mut **tx)
+        .await
+        .context("populate missing delegations.expected_subagents")?;
+    Ok(())
+}
+
 async fn detect_client_input_id_rewrite_conflicts(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     stage_rows: &[PgRow],
@@ -344,12 +479,10 @@ async fn copy_missing_stage_rows_into_delegations(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
 ) -> Result<()> {
     if !column_exists(tx, "delegations", "expected_subagents").await? {
-        sqlx::query(
-            "alter table delegations add column expected_subagents integer not null default 1",
-        )
-        .execute(&mut **tx)
-        .await
-        .context("add delegations.expected_subagents before copying stages")?;
+        sqlx::query("alter table delegations add column expected_subagents integer null")
+            .execute(&mut **tx)
+            .await
+            .context("add nullable delegations.expected_subagents before copying stages")?;
     }
     let expected_expr = expected_subagents_expr(tx, "stages", Some("s")).await?;
     let sql = format!(
@@ -378,15 +511,112 @@ async fn expected_subagents_expr(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     table: &str,
     alias: Option<&str>,
-) -> Result<&'static str> {
+) -> Result<String> {
     let exists = column_exists(tx, table, "expected_subagents").await?;
-    Ok(match (exists, alias) {
-        (true, Some("s")) => "coalesce(s.expected_subagents, 1)",
-        (true, Some("d")) => "coalesce(d.expected_subagents, 1)",
-        (true, Some(_)) => bail!("unexpected alias for expected_subagents expression"),
-        (true, None) => "coalesce(expected_subagents, 1)",
-        (false, _) => "1",
+    let reference = alias.unwrap_or(table);
+    let inferred = inferred_expected_subagents_expr(tx, table, reference).await?;
+    if exists {
+        Ok(format!(
+            "coalesce({reference}.expected_subagents, {inferred})"
+        ))
+    } else {
+        validate_expected_subagents_inference(tx, table).await?;
+        Ok(inferred)
+    }
+}
+
+async fn inferred_expected_subagents_expr(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+    reference: &str,
+) -> Result<String> {
+    let child_count = child_session_count_expr(tx, reference).await?;
+    Ok(match table {
+        "stages" | "delegations" => format!(
+            r#"
+            case
+              when {reference}.kind = 'full' then 1
+              when {reference}.kind = 'readonly_fanout' then
+                case when ({child_count}) > 0 then ({child_count}) else 1 end
+              else 1
+            end
+            "#
+        ),
+        other => bail!("cannot infer expected_subagents for unexpected table {other}"),
     })
+}
+
+async fn child_session_count_expr(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    delegation_reference: &str,
+) -> Result<String> {
+    let mut predicates = Vec::new();
+    if column_exists(tx, "sessions", "stage_id").await? {
+        predicates.push(format!("child.stage_id = {delegation_reference}.id"));
+    }
+    if column_exists(tx, "sessions", "delegation_id").await? {
+        predicates.push(format!("child.delegation_id = {delegation_reference}.id"));
+    }
+    if predicates.is_empty() {
+        Ok("0".to_string())
+    } else {
+        Ok(format!(
+            "select count(distinct child.id)::integer from sessions child where {}",
+            predicates.join(" or ")
+        ))
+    }
+}
+
+async fn validate_expected_subagents_inference(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+) -> Result<()> {
+    let child_count = child_session_count_expr(tx, table).await?;
+
+    let ambiguous_sql = format!(
+        r#"
+        select id
+        from {table}
+        where kind = 'readonly_fanout'
+          and status = 'running'
+          and ({child_count}) = 0
+        order by created_at, id
+        limit 5
+        "#
+    );
+    let ambiguous: Vec<String> = sqlx::query_scalar(&ambiguous_sql)
+        .fetch_all(&mut **tx)
+        .await
+        .with_context(|| format!("check ambiguous running fan-out rows in {table}"))?;
+    if !ambiguous.is_empty() {
+        bail!(
+            "cannot infer expected_subagents for running readonly_fanout rows without child sessions in {table}: {}. Stop the daemon, inspect these old stages, and either let spawning finish before migration or manually add/populate expected_subagents before rerunning.",
+            ambiguous.join(", ")
+        );
+    }
+
+    let corrupt_full_sql = format!(
+        r#"
+        select id
+        from {table}
+        where kind = 'full'
+          and ({child_count}) > 1
+        order by created_at, id
+        limit 5
+        "#
+    );
+    let corrupt_full: Vec<String> = sqlx::query_scalar(&corrupt_full_sql)
+        .fetch_all(&mut **tx)
+        .await
+        .with_context(|| format!("check multi-child full rows in {table}"))?;
+    if !corrupt_full.is_empty() {
+        bail!(
+            "cannot safely migrate full rows with more than one child session in {table}: {}. A full delegation must have exactly one subagent; inspect/repair the old rows before rerunning.",
+            corrupt_full.join(", ")
+        );
+    }
+
+    Ok(())
 }
 
 fn print_usage() {
@@ -399,13 +629,33 @@ Options:
   --apply                   Mutate database/files. Without this flag the script is a dry-run.
   --dry-run                 Explicit dry-run (default).
   --no-backups              Skip table backup copies on --apply.
-  --handoff-root PATH       Scan PATH/.pi-handoff for stage-era manifests.
+  --handoff-root PATH       Scan PATH/.pi-handoff for structured index.json manifests only.
   --help                    Show this help.
 
-Run with pi-agentd stopped. Take a pg_dump before --apply. This is a temporary
-one-time migration for the hard stage->delegation vocabulary rename; remove it
-after existing state has been migrated. Existing stage_* IDs are preserved, so
-.pi-handoff/stage_* directory names are also preserved.
+Recommended wrapper:
+  rust/scripts/migrate-stage-to-delegation-state.sh [same options]
+
+Runbook:
+  1. Stop pi-agentd. This migration is not safe against a live daemon.
+  2. Take a pg_dump backup.
+  3. Run dry-run (default) and inspect the summary/conflicts.
+  4. Run with --apply.
+  5. Restart the post-rename daemon.
+
+Policy:
+  - Temporary one-time migration for the hard stage->delegation vocabulary rename;
+    abandon/remove this branch/script after existing state has been migrated.
+  - No compatibility aliases are added.
+  - Existing stage_* IDs are preserved as opaque delegation IDs, so
+    .pi-handoff/stage_* directory names are also preserved.
+  - Arbitrary transcript/user/tool output text and handoff markdown are NOT
+    rewritten. Only known structured DB/API/tool/RPC fields and handoff
+    index.json manifests are migrated.
+  - Old schemas without expected_subagents infer fan-out counts from existing
+    child sessions and fail closed for ambiguous running zero-child fan-outs.
+
+Detailed rationale and rollback guidance:
+  rust/docs/temp-stage-to-delegation-migration.md
 "#
     );
 }
@@ -490,6 +740,10 @@ async fn migrate_schema(
     )
     .await?;
 
+    if has_stages && !column_exists(tx, "stages", "expected_subagents").await? {
+        validate_expected_subagents_inference(tx, "stages").await?;
+    }
+
     if config.apply && has_stages && has_delegations {
         copy_missing_stage_rows_into_delegations(tx).await?;
     }
@@ -564,19 +818,7 @@ async fn ensure_delegation_schema_shape(
         }
     }
 
-    if !column_exists(tx, "delegations", "expected_subagents").await? {
-        stats
-            .schema_operations
-            .push("add delegations.expected_subagents integer not null default 1".to_string());
-        if config.apply {
-            sqlx::query(
-                "alter table delegations add column expected_subagents integer not null default 1",
-            )
-            .execute(&mut **tx)
-            .await
-            .context("add delegations.expected_subagents")?;
-        }
-    }
+    ensure_expected_subagents_shape(tx, config, stats).await?;
 
     rename_constraints(tx, config, stats).await?;
 
@@ -1023,6 +1265,7 @@ async fn migrate_persisted_json(
         |stats| stats.queued_origin_rows += 1,
     )
     .await?;
+    migrate_generated_completion_steer_content(tx, config, stats).await?;
     migrate_json_column(tx, config, stats, "events", &["id"], "payload", |stats| {
         stats.event_payload_rows += 1
     })
@@ -1082,6 +1325,85 @@ async fn migrate_client_input_ids(
     Ok(())
 }
 
+async fn migrate_generated_completion_steer_content(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    config: &Config,
+    stats: &mut MigrationStats,
+) -> Result<()> {
+    if !table_exists(tx, "queued_inputs").await?
+        || !column_exists(tx, "queued_inputs", "client_input_id").await?
+        || !column_exists(tx, "queued_inputs", "content").await?
+    {
+        return Ok(());
+    }
+    let rows = sqlx::query(
+        r#"
+        select id, content
+        from queued_inputs
+        where client_input_id like 'stage-steer:%'
+           or client_input_id like 'delegation-steer:%'
+        "#,
+    )
+    .fetch_all(&mut **tx)
+    .await
+    .context("read generated delegation completion steers")?;
+
+    for row in rows {
+        let id: String = row.get("id");
+        let mut content: Value = row.get("content");
+        let replacements = rewrite_generated_completion_steer_value(&mut content);
+        if replacements == 0 {
+            continue;
+        }
+        stats.queued_content_rows += 1;
+        stats.text_rewrites.record(
+            "queued_inputs.content generated completion steer",
+            replacements,
+        );
+        if config.apply {
+            sqlx::query("update queued_inputs set content=$2 where id=$1")
+                .bind(&id)
+                .bind(&content)
+                .execute(&mut **tx)
+                .await
+                .with_context(|| format!("update generated completion steer {id}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn rewrite_generated_completion_steer_value(value: &mut Value) -> usize {
+    match value {
+        Value::Object(map) => map
+            .values_mut()
+            .map(rewrite_generated_completion_steer_value)
+            .sum(),
+        Value::Array(items) => items
+            .iter_mut()
+            .map(rewrite_generated_completion_steer_value)
+            .sum(),
+        Value::String(text) => {
+            let rewritten = rewrite_generated_completion_steer_text(text);
+            if rewritten == *text {
+                0
+            } else {
+                *text = rewritten;
+                1
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => 0,
+    }
+}
+
+fn rewrite_generated_completion_steer_text(input: &str) -> String {
+    let mut output = input.to_string();
+    if let Some(rest) = output.strip_prefix("Stage ") {
+        output = format!("Delegation {rest}");
+    }
+    output = output.replace("stage handoff", "delegation handoff");
+    output
+}
+
 async fn migrate_json_column<F>(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     config: &Config,
@@ -1108,7 +1430,8 @@ where
 
     for row in rows {
         let mut value: Value = row.get(json_column);
-        let rewrite_stats = rewrite_json_value(&mut value);
+        let rewrite_stats = rewrite_json_value(&mut value)
+            .with_context(|| format!("rewrite {table}.{json_column} JSON"))?;
         if !rewrite_stats.changed() {
             continue;
         }
@@ -1170,7 +1493,7 @@ async fn migrate_session_prompts(
     for row in rows {
         let id: String = row.get("id");
         let prompt: String = row.get("system_prompt");
-        let (rewritten, text_stats) = rewrite_text(&prompt);
+        let (rewritten, text_stats) = rewrite_system_prompt(&prompt);
         if !text_stats.changed() {
             continue;
         }
@@ -1188,78 +1511,86 @@ async fn migrate_session_prompts(
     Ok(())
 }
 
-fn rewrite_json_value(value: &mut Value) -> JsonRewriteStats {
-    let mut stats = JsonRewriteStats::default();
-    rewrite_json_value_inner(value, &mut stats);
-    stats
+fn rewrite_json_value(value: &mut Value) -> Result<JsonRewriteStats> {
+    rewrite_json_value_with_id_keys(value, true)
 }
 
-fn rewrite_json_value_inner(value: &mut Value, stats: &mut JsonRewriteStats) {
+fn rewrite_json_value_with_id_keys(
+    value: &mut Value,
+    rewrite_id_keys: bool,
+) -> Result<JsonRewriteStats> {
+    let mut stats = JsonRewriteStats::default();
+    rewrite_json_value_inner(value, &mut stats, rewrite_id_keys)?;
+    Ok(stats)
+}
+
+fn rewrite_json_value_inner(
+    value: &mut Value,
+    stats: &mut JsonRewriteStats,
+    rewrite_id_keys: bool,
+) -> Result<()> {
     match value {
         Value::Object(map) => {
-            rewrite_object_keys(map, stats);
-            rewrite_contextual_object_values(map, stats);
+            if rewrite_id_keys {
+                rewrite_object_keys(map, stats)?;
+            }
+            rewrite_contextual_object_values(map, stats)?;
             for child in map.values_mut() {
-                rewrite_json_value_inner(child, stats);
+                rewrite_json_value_inner(child, stats, rewrite_id_keys)?;
             }
         }
         Value::Array(items) => {
             for item in items {
-                rewrite_json_value_inner(item, stats);
+                rewrite_json_value_inner(item, stats, rewrite_id_keys)?;
             }
         }
-        Value::String(text) => {
-            if looks_like_embedded_json(text) {
-                if let Ok(mut embedded) = serde_json::from_str::<Value>(text) {
-                    let nested = rewrite_json_value(&mut embedded);
-                    if nested.changed() {
-                        if let Ok(serialized) = serde_json::to_string(&embedded) {
-                            *text = serialized;
-                            stats.embedded_json_strings += 1;
-                            stats.add(&nested);
-                        }
-                        return;
-                    }
-                }
-            }
-            let (rewritten, text_stats) = rewrite_text(text);
-            if text_stats.changed() {
-                *text = rewritten;
-                stats.string_values += text_stats.replacements.values().sum::<usize>();
-            }
-        }
-        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        Value::String(_) | Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
+    Ok(())
 }
 
-fn rewrite_object_keys(map: &mut Map<String, Value>, stats: &mut JsonRewriteStats) {
-    for (old, new) in [
-        ("stage_id", "delegation_id"),
-        ("stageId", "delegationId"),
-        ("stages", "delegations"),
-        ("stage", "delegation"),
-    ] {
-        if let (Some(old_value), Some(new_value)) = (map.get(old), map.get(new)) {
-            if old_value != new_value && !old_value.is_null() && !new_value.is_null() {
-                // Ambiguous historical JSON payload: keep both keys and do
-                // not count this as a migration change, so reruns stay quiet.
-                continue;
-            }
-        }
-        if let Some(old_value) = map.remove(old) {
-            stats.object_keys += 1;
-            match map.get(new) {
-                Some(_) => {}
-                None => {
-                    map.insert(new.to_string(), old_value);
-                }
-            }
-        }
+fn rewrite_object_keys(map: &mut Map<String, Value>, stats: &mut JsonRewriteStats) -> Result<()> {
+    for (old, new) in [("stage_id", "delegation_id"), ("stageId", "delegationId")] {
+        rewrite_known_object_key(map, stats, old, new)?;
     }
+    Ok(())
 }
 
-fn rewrite_contextual_object_values(map: &mut Map<String, Value>, stats: &mut JsonRewriteStats) {
-    for key in ["tool_name", "name", "canonical_name", "prompt_alias"] {
+fn rewrite_known_object_key(
+    map: &mut Map<String, Value>,
+    stats: &mut JsonRewriteStats,
+    old: &'static str,
+    new: &'static str,
+) -> Result<()> {
+    let Some(old_value) = map.get(old).cloned() else {
+        return Ok(());
+    };
+
+    if let Some(new_value) = map.get(new).cloned() {
+        if !old_value.is_null() && !new_value.is_null() && old_value != new_value {
+            bail!(
+                "conflicting JSON keys {old:?} and {new:?}: old value {old_value:?}, new value {new_value:?}"
+            );
+        }
+        if new_value.is_null() && !old_value.is_null() {
+            map.insert(new.to_string(), old_value);
+        }
+        map.remove(old);
+        stats.object_keys += 1;
+        return Ok(());
+    }
+
+    map.remove(old);
+    map.insert(new.to_string(), old_value);
+    stats.object_keys += 1;
+    Ok(())
+}
+
+fn rewrite_contextual_object_values(
+    map: &mut Map<String, Value>,
+    stats: &mut JsonRewriteStats,
+) -> Result<()> {
+    for key in ["tool_name", "canonical_name", "prompt_alias"] {
         let Some(Value::String(text)) = map.get_mut(key) else {
             continue;
         };
@@ -1270,7 +1601,27 @@ fn rewrite_contextual_object_values(map: &mut Map<String, Value>, stats: &mut Js
         }
     }
 
-    for key in ["method", "rpc", "type"] {
+    if object_type_is_rpc_context(map) {
+        if let Some(Value::String(text)) = map.get_mut("type") {
+            let rewritten = rewrite_rpc_token(text);
+            if rewritten != *text {
+                *text = rewritten;
+                stats.tool_names += 1;
+            }
+        }
+    }
+
+    if object_name_is_tool_context(map) {
+        if let Some(Value::String(text)) = map.get_mut("name") {
+            let rewritten = rewrite_model_tool_token(text);
+            if rewritten != *text {
+                *text = rewritten;
+                stats.tool_names += 1;
+            }
+        }
+    }
+
+    for key in ["method", "rpc"] {
         let Some(Value::String(text)) = map.get_mut(key) else {
             continue;
         };
@@ -1288,11 +1639,163 @@ fn rewrite_contextual_object_values(map: &mut Map<String, Value>, stats: &mut Js
             stats.tool_names += 1;
         }
     }
+
+    if object_is_provider_replay_item(map) {
+        rewrite_json_string_field(map, stats, "raw_json")?;
+    }
+
+    if object_has_delegation_tool_name(map) {
+        for key in ["args_json", "arguments"] {
+            rewrite_json_string_field(map, stats, key)?;
+        }
+        rewrite_tool_result_output(map, stats)?;
+    }
+
+    if object_has_delegation_context(map) {
+        rewrite_object_keys(map, stats)?;
+    }
+
+    Ok(())
 }
 
-fn looks_like_embedded_json(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    trimmed.starts_with('{') || trimmed.starts_with('[')
+fn rewrite_json_string_field(
+    map: &mut Map<String, Value>,
+    stats: &mut JsonRewriteStats,
+    key: &'static str,
+) -> Result<()> {
+    let Some(Value::String(text)) = map.get_mut(key) else {
+        return Ok(());
+    };
+    let Ok(mut embedded) = serde_json::from_str::<Value>(text) else {
+        return Ok(());
+    };
+    let nested = rewrite_json_value_with_id_keys(&mut embedded, true)?;
+    if !nested.changed() {
+        return Ok(());
+    }
+    *text = serde_json::to_string(&embedded)
+        .with_context(|| format!("serialize rewritten JSON string field {key}"))?;
+    stats.embedded_json_strings += 1;
+    stats.add(&nested);
+    Ok(())
+}
+
+fn rewrite_tool_result_output(
+    map: &mut Map<String, Value>,
+    stats: &mut JsonRewriteStats,
+) -> Result<()> {
+    let Some(Value::String(text)) = map.get_mut("output") else {
+        return Ok(());
+    };
+    if let Ok(mut embedded) = serde_json::from_str::<Value>(text) {
+        let nested = rewrite_json_value_with_id_keys(&mut embedded, true)?;
+        if nested.changed() {
+            *text = serde_json::to_string(&embedded)
+                .context("serialize rewritten delegation tool output JSON")?;
+            stats.embedded_json_strings += 1;
+            stats.add(&nested);
+        }
+        return Ok(());
+    }
+
+    let mut rewritten = text.replace("\"stage_id\"", "\"delegation_id\"");
+    rewritten = rewritten.replace("\"stageId\"", "\"delegationId\"");
+    if rewritten != *text {
+        *text = rewritten;
+        stats.string_values += 1;
+    }
+    Ok(())
+}
+
+fn object_has_delegation_tool_name(map: &Map<String, Value>) -> bool {
+    ["tool_name", "canonical_name", "prompt_alias"]
+        .iter()
+        .filter_map(|key| map.get(*key).and_then(Value::as_str))
+        .any(is_old_or_new_delegation_tool_name)
+        || object_name_is_tool_context(map)
+}
+
+fn object_is_provider_replay_item(map: &Map<String, Value>) -> bool {
+    map.contains_key("raw_json") && map.get("provider").and_then(Value::as_str).is_some()
+}
+
+fn object_name_is_tool_context(map: &Map<String, Value>) -> bool {
+    map.get("name")
+        .and_then(Value::as_str)
+        .is_some_and(is_old_or_new_delegation_tool_name)
+        && (map.contains_key("arguments")
+            || map.contains_key("input_schema")
+            || map.contains_key("description")
+            || map.get("type").and_then(Value::as_str) == Some("function_call")
+            || map.get("type").and_then(Value::as_str) == Some("tool_use"))
+}
+
+fn object_type_is_rpc_context(map: &Map<String, Value>) -> bool {
+    map.get("type")
+        .and_then(Value::as_str)
+        .is_some_and(is_old_or_new_delegation_rpc_name)
+        && (map.contains_key("stage_id")
+            || map.contains_key("delegation_id")
+            || map.contains_key("stageId")
+            || map.contains_key("delegationId")
+            || map.contains_key("params")
+            || map.contains_key("payload")
+            || map.contains_key("method")
+            || map.contains_key("rpc"))
+}
+
+fn object_has_delegation_context(map: &Map<String, Value>) -> bool {
+    object_has_delegation_tool_name(map)
+        || ["method", "rpc"]
+            .iter()
+            .filter_map(|key| map.get(*key).and_then(Value::as_str))
+            .any(is_old_or_new_delegation_rpc_name)
+        || object_type_is_rpc_context(map)
+}
+
+fn is_old_or_new_delegation_tool_name(value: &str) -> bool {
+    matches!(
+        value,
+        "delegate_writing_task"
+            | "delegate_readonly_tasks"
+            | "inspect_delegation"
+            | "cancel_delegation"
+            | "stage.full"
+            | "stage.start_full"
+            | "stage_start_full"
+            | "stage_full"
+            | "stage.fanout"
+            | "stage.start_ro_fan"
+            | "stage.start_readonly_fanout"
+            | "stage_start_readonly_fanout"
+            | "stage_start_ro_fan"
+            | "stage_fanout"
+            | "stage.status"
+            | "stage_status"
+            | "stage.cancel"
+            | "stage_cancel"
+    )
+}
+
+fn is_old_or_new_delegation_rpc_name(value: &str) -> bool {
+    matches!(
+        value,
+        "delegation.start_full"
+            | "delegation.start_readonly_fanout"
+            | "delegation.status"
+            | "delegation.cancel"
+            | "delegation.list"
+            | "delegation.read_handoff_file"
+            | "stage.full"
+            | "stage.start_full"
+            | "stage.fanout"
+            | "stage.start_ro_fan"
+            | "stage.start_readonly_fanout"
+            | "stage.status"
+            | "stage.cancel"
+            | "stage.list"
+            | "stage.read_handoff_file"
+    )
 }
 
 fn rewrite_model_tool_token(value: &str) -> String {
@@ -1346,9 +1849,53 @@ fn rewrite_token(value: &str) -> String {
     rewrite_client_input_id_token(value)
 }
 
-fn rewrite_text(input: &str) -> (String, TextRewriteStats) {
+const CURRENT_SUBAGENT_DELEGATION_SECTION: &str = r#"## Subagent delegation
+
+Delegate work to subagents through delegation tool calls. Do not use the Python REPL
+to orchestrate subagents.
+
+Two kinds of subagent:
+
+- **read-only (RO)** — for investigation, review, analysis, and running
+  builds/tests to gather information. RO subagents run in a private throwaway copy
+  of the workspace; nothing they write reaches your workspace. Use
+  `delegate_readonly_tasks` to run several in parallel.
+- **full** — for making changes. A full subagent edits your workspace in place.
+  Use `delegate_writing_task`. There is exactly one full subagent at a time.
+
+Rules:
+
+- Launch at most one delegation per turn, then end your turn. Do not poll or loop —
+  you will be notified.
+- When a delegation finishes you receive a short message pointing at a handoff
+  directory. Read its `index.json` first, then each subagent's
+  `final_message.md`; open `transcript.md` only if you need detail.
+- Give each subagent a self-contained task: it starts with fresh context and only
+  knows what you put in its prompt (and any handoff/workspace paths you cite).
+- While a full subagent is running, supervise and read — do not edit the workspace
+  yourself until it returns.
+- If a running full subagent needs a correction, clarification, or additional
+  information, prefer `steer_subagent` over cancelling and restarting. Use the
+  subagent session id shown by `inspect_delegation`.
+- Cancellation is terminal. Use `cancel_delegation` when you intend to abandon
+  the current subagent/delegation. Cancellation does not roll back workspace
+  edits or remote-state side effects; inspect the transcript-only paths returned
+  by cancellation before deciding follow-up work.
+- Never mix RO and full work in one delegation.
+- To run a known pattern (e.g. implement → review → test), `LoadSkill` the matching
+  workflow skill and follow its delegation state machine, branching on the typed
+  outcomes in `index.json`, with your own judgment (skip, re-run, escalate, stop).
+"#;
+
+fn rewrite_system_prompt(input: &str) -> (String, TextRewriteStats) {
     let mut output = input.to_string();
     let mut stats = TextRewriteStats::default();
+
+    if let Some((start, end)) = subagent_delegation_section_bounds(&output) {
+        output.replace_range(start..end, CURRENT_SUBAGENT_DELEGATION_SECTION);
+        stats.record("system_prompt subagent delegation section", 1);
+    }
+
     for (label, old, new) in [
         ("stage.full", "stage.full", "delegate_writing_task"),
         (
@@ -1397,7 +1944,6 @@ fn rewrite_text(input: &str) -> (String, TextRewriteStats) {
         ("stage_id", "stage_id", "delegation_id"),
         ("stageId", "stageId", "delegationId"),
         ("stage-steer", "stage-steer:", "delegation-steer:"),
-        ("delegation stage", "delegation stage", "delegation"),
         (
             "through stage tool calls",
             "through stage tool calls",
@@ -1413,13 +1959,6 @@ fn rewrite_text(input: &str) -> (String, TextRewriteStats) {
             "When a stage finishes",
             "When a delegation finishes",
         ),
-        ("Stage ", "Stage ", "Delegation "),
-        (" stage root", " stage root", " delegation root"),
-        (
-            " stage may not have finished",
-            " stage may not have finished",
-            " delegation may not have finished",
-        ),
         (
             "stage state machine",
             "stage state machine",
@@ -1432,7 +1971,11 @@ fn rewrite_text(input: &str) -> (String, TextRewriteStats) {
         ),
         ("stage belongs", "stage belongs", "delegation belongs"),
         ("stage id", "stage id", "delegation id"),
-        ("stage and", "stage and", "delegation and"),
+        (
+            "Never mix RO and full work in one stage.",
+            "Never mix RO and full work in one stage.",
+            "Never mix RO and full work in one delegation.",
+        ),
         (
             "Cancel an in-flight stage",
             "Cancel an in-flight stage",
@@ -1460,6 +2003,16 @@ fn rewrite_text(input: &str) -> (String, TextRewriteStats) {
     (output, stats)
 }
 
+fn subagent_delegation_section_bounds(input: &str) -> Option<(usize, usize)> {
+    let start = input.find("## Subagent delegation")?;
+    let after_heading = start + "## Subagent delegation".len();
+    let end = input[after_heading..]
+        .find("\n## ")
+        .map(|offset| after_heading + offset)
+        .unwrap_or(input.len());
+    Some((start, end))
+}
+
 fn migrate_handoff_artifacts(
     root: &Path,
     config: &Config,
@@ -1481,8 +2034,6 @@ fn migrate_handoff_artifacts(
     visit_files(&handoff_root, &mut |path| {
         if path.file_name().and_then(|name| name.to_str()) == Some("index.json") {
             migrate_handoff_manifest(path, config, stats)?;
-        } else if path.extension().and_then(|extension| extension.to_str()) == Some("md") {
-            migrate_handoff_text_file(path, config, stats)?;
         }
         Ok(())
     })?;
@@ -1538,7 +2089,7 @@ fn migrate_handoff_manifest(
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut value: Value =
         serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
-    let rewrite_stats = rewrite_json_value(&mut value);
+    let rewrite_stats = rewrite_json_value_with_id_keys(&mut value, true)?;
     if !rewrite_stats.changed() {
         return Ok(());
     }
@@ -1548,23 +2099,6 @@ fn migrate_handoff_manifest(
         let body = serde_json::to_string_pretty(&value)?;
         fs::write(path, format!("{body}\n"))
             .with_context(|| format!("write {}", path.display()))?;
-    }
-    Ok(())
-}
-
-fn migrate_handoff_text_file(
-    path: &Path,
-    config: &Config,
-    stats: &mut MigrationStats,
-) -> Result<()> {
-    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let (rewritten, text_stats) = rewrite_text(&raw);
-    if !text_stats.changed() {
-        return Ok(());
-    }
-    stats.add_text(&text_stats);
-    if config.apply {
-        fs::write(path, rewritten).with_context(|| format!("write {}", path.display()))?;
     }
     Ok(())
 }
@@ -1591,7 +2125,7 @@ mod tests {
             }
         });
 
-        let stats = rewrite_json_value(&mut value);
+        let stats = rewrite_json_value(&mut value).unwrap();
 
         assert!(stats.changed());
         assert_eq!(value["tool_call"]["tool_name"], "inspect_delegation");
@@ -1613,7 +2147,7 @@ mod tests {
             "raw_json": "{\"type\":\"function_call\",\"name\":\"stage_cancel\",\"arguments\":\"{\\\"stage_id\\\":\\\"stage_abc\\\"}\"}"
         }]);
 
-        rewrite_json_value(&mut value);
+        rewrite_json_value(&mut value).unwrap();
 
         let raw_json = value[0]["raw_json"].as_str().unwrap();
         let raw: Value = serde_json::from_str(raw_json).unwrap();
@@ -1627,46 +2161,76 @@ mod tests {
             "tool_name": "stage.cancel",
             "method": "stage.cancel",
             "payload": {
-                "type": "stage.status"
+                "type": "stage.status",
+                "stage_id": "stage_abc"
             }
         });
 
-        rewrite_json_value(&mut value);
+        rewrite_json_value(&mut value).unwrap();
 
         assert_eq!(value["tool_name"], "cancel_delegation");
         assert_eq!(value["method"], "delegation.cancel");
         assert_eq!(value["payload"]["type"], "delegation.status");
+        assert_eq!(value["payload"]["delegation_id"], "stage_abc");
     }
 
     #[test]
     fn embedded_json_strings_preserve_rpc_context() {
         let mut value = json!({
-            "raw": "{\"method\":\"stage.status\",\"params\":{\"stage_id\":\"stage_abc\"}}"
+            "provider": "openai",
+            "raw_json": "{\"method\":\"stage.status\",\"params\":{\"stage_id\":\"stage_abc\"}}"
         });
 
-        rewrite_json_value(&mut value);
+        rewrite_json_value(&mut value).unwrap();
 
-        let raw: Value = serde_json::from_str(value["raw"].as_str().unwrap()).unwrap();
+        let raw: Value = serde_json::from_str(value["raw_json"].as_str().unwrap()).unwrap();
         assert_eq!(raw["method"], "delegation.status");
         assert_eq!(raw["params"]["delegation_id"], "stage_abc");
     }
 
     #[test]
-    fn preserves_stage_prefixed_ids_as_values() {
+    fn preserves_unrelated_user_text_and_json_keys() {
         let mut value = json!({
-            "stage_id": "stage_abc",
+            "type": "user_message",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Stage lighting notes: keep stage and screen aligned."
+                }
+            ],
+            "stage": "prod",
+            "stages": ["dev", "prod"],
+            "raw_json": "{\"stage_id\":\"not-an-orchestration-payload\"}",
+            "note": "handoff for stage_abc"
+        });
+        let original = value.clone();
+
+        let stats = rewrite_json_value(&mut value).unwrap();
+
+        assert!(!stats.changed());
+        assert_eq!(value, original);
+    }
+
+    #[test]
+    fn preserves_stage_prefixed_ids_as_values_in_structured_payloads() {
+        let mut value = json!({
+            "method": "stage.status",
+            "params": {
+                "stage_id": "stage_abc"
+            },
             "text": "handoff for stage_abc"
         });
 
-        rewrite_json_value(&mut value);
+        rewrite_json_value(&mut value).unwrap();
 
-        assert_eq!(value["delegation_id"], "stage_abc");
+        assert_eq!(value["method"], "delegation.status");
+        assert_eq!(value["params"]["delegation_id"], "stage_abc");
         assert_eq!(value["text"], "handoff for stage_abc");
     }
 
     #[test]
     fn rewrites_old_prompt_vocabulary() {
-        let (rewritten, stats) = rewrite_text(
+        let (rewritten, stats) = rewrite_system_prompt(
             "Delegate work through stage tool calls. Launch at most one stage per turn. Inspect a stage with stage_status and stage_id.",
         );
 
@@ -1675,6 +2239,44 @@ mod tests {
         assert!(rewritten.contains("one delegation per turn"));
         assert!(rewritten.contains("inspect_delegation"));
         assert!(rewritten.contains("delegation_id"));
+    }
+
+    #[test]
+    fn rewrites_realistic_old_subagent_delegation_prompt_section() {
+        let old_prompt = r#"# Instructions
+
+## Subagent delegation
+
+Delegate work to subagents through stage tool calls. Do not use the Python REPL
+to orchestrate subagents.
+
+Rules:
+
+- Launch at most one stage per turn, then end your turn.
+- When a stage finishes you receive a short message pointing at a handoff
+  directory.
+- Never mix RO and full work in one stage.
+- Call stage.full, stage.fanout, stage.status, or stage.cancel.
+
+## Skills
+
+Use skills when relevant.
+"#;
+
+        let (rewritten, stats) = rewrite_system_prompt(old_prompt);
+
+        assert!(stats.changed());
+        assert!(rewritten.contains("through delegation tool calls"));
+        assert!(rewritten.contains("Never mix RO and full work in one delegation."));
+        assert!(rewritten.contains("delegate_writing_task"));
+        assert!(rewritten.contains("delegate_readonly_tasks"));
+        assert!(rewritten.contains("inspect_delegation"));
+        assert!(rewritten.contains("cancel_delegation"));
+        assert!(!rewritten.contains("through stage tool calls"));
+        assert!(!rewritten.contains("one stage per turn"));
+        assert!(!rewritten.contains("Never mix RO and full work in one stage."));
+        assert!(!rewritten.contains("stage.full"));
+        assert!(rewritten.contains("## Skills"));
     }
 
     #[test]
@@ -1718,17 +2320,49 @@ mod tests {
     }
 
     #[test]
-    fn object_key_conflict_keeps_old_key_without_counting_rerun_change() {
+    fn object_key_null_merge_preserves_non_null_old_value() {
         let mut value = json!({
+            "tool_name": "stage.status",
+            "stage_id": "stage_abc",
+            "delegation_id": null
+        });
+
+        let stats = rewrite_json_value(&mut value).unwrap();
+
+        assert!(stats.changed());
+        assert!(value.get("stage_id").is_none());
+        assert_eq!(value["delegation_id"], "stage_abc");
+    }
+
+    #[test]
+    fn object_key_conflicting_non_null_values_abort() {
+        let mut value = json!({
+            "tool_name": "stage.status",
             "stage_id": "old",
             "delegation_id": "new"
         });
 
-        let stats = rewrite_json_value(&mut value);
+        let error = rewrite_json_value(&mut value).unwrap_err();
 
-        assert!(!stats.changed());
-        assert_eq!(value["stage_id"], "old");
-        assert_eq!(value["delegation_id"], "new");
+        assert!(format!("{error:#}").contains("conflicting JSON keys"));
+    }
+
+    #[test]
+    fn rewrites_generated_completion_steer_text_only_when_scoped_by_queue_row() {
+        let mut value = json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Stage stage_7 (reviewer fan-out) finished: 2 ok, 0 failed. Read /tmp/.pi-handoff/stage_7/index.json."
+                }
+            ]
+        });
+
+        assert_eq!(rewrite_generated_completion_steer_value(&mut value), 1);
+        assert_eq!(
+            value["content"][0]["text"],
+            "Delegation stage_7 (reviewer fan-out) finished: 2 ok, 0 failed. Read /tmp/.pi-handoff/stage_7/index.json."
+        );
     }
 
     #[test]
@@ -1739,7 +2373,7 @@ mod tests {
             "status": "done"
         });
 
-        rewrite_json_value(&mut value);
+        rewrite_json_value_with_id_keys(&mut value, true).unwrap();
 
         assert!(value.get("stage_id").is_none());
         assert_eq!(value["delegation_id"], "stage_abc");
@@ -1756,6 +2390,12 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let manifest = dir.join("index.json");
         fs::write(&manifest, r#"{"stage_id":"stage_abc","status":"done"}"#).unwrap();
+        let final_message = dir.join("final_message.md");
+        fs::write(
+            &final_message,
+            "Stage lighting notes: keep stage and screen aligned.\n",
+        )
+        .unwrap();
 
         let config = Config {
             database_url: None,
@@ -1772,6 +2412,10 @@ mod tests {
         assert_eq!(
             fs::read_to_string(&manifest).unwrap(),
             r#"{"stage_id":"stage_abc","status":"done"}"#
+        );
+        assert_eq!(
+            fs::read_to_string(&final_message).unwrap(),
+            "Stage lighting notes: keep stage and screen aligned.\n"
         );
         assert!(dir.exists());
         fs::remove_dir_all(&base).unwrap();
@@ -1791,6 +2435,11 @@ mod tests {
             r#"{"stage_id":"stage_abc","status":"done"}"#,
         )
         .unwrap();
+        fs::write(
+            dir.join("transcript.md"),
+            "Stage lighting notes: keep stage and screen aligned.\n",
+        )
+        .unwrap();
 
         let config = Config {
             database_url: None,
@@ -1806,6 +2455,10 @@ mod tests {
         assert!(!base.join(".pi-handoff").join("delegation_abc").exists());
         let rewritten = fs::read_to_string(dir.join("index.json")).unwrap();
         assert!(rewritten.contains("\"delegation_id\": \"stage_abc\""));
+        assert_eq!(
+            fs::read_to_string(dir.join("transcript.md")).unwrap(),
+            "Stage lighting notes: keep stage and screen aligned.\n"
+        );
         fs::remove_dir_all(&base).unwrap();
     }
 
@@ -1912,6 +2565,16 @@ mod tests {
         .expect("client_input_id");
         assert_eq!(client_input_id, "delegation-steer:stage_abc:attempt_1");
 
+        let queued_content: Value =
+            sqlx::query_scalar("select content from queued_inputs where id='input_completion'")
+                .fetch_one(&pool)
+                .await
+                .expect("queued content");
+        assert_eq!(
+            queued_content["content"][0]["text"],
+            "Delegation stage_abc finished"
+        );
+
         let event_type: String = sqlx::query_scalar("select type from events where id=1")
             .fetch_one(&pool)
             .await
@@ -1944,6 +2607,76 @@ mod tests {
         assert_eq!(rerun_stats.queued_client_input_id_rows, 0);
         assert_eq!(rerun_stats.event_type_rows, 0);
         assert!(rerun_stats.schema_operations.is_empty());
+
+        pool.close().await;
+        drop_test_database(&admin_url, &database_name).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_fixture_infers_pre_expected_readonly_fanout_child_count() {
+        let Some((admin_url, database_url, database_name)) = create_test_database().await else {
+            eprintln!("skipping postgres migration fixture; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect test db");
+        create_pre_expected_fanout_fixture(&pool, 2).await;
+
+        let config = Config {
+            database_url: Some(database_url.clone()),
+            apply: true,
+            no_backups: true,
+            handoff_root: None,
+        };
+        {
+            let mut tx = pool.begin().await.expect("begin apply");
+            migrate_schema(&mut tx, &config, &mut MigrationStats::default())
+                .await
+                .expect("apply schema migration");
+            tx.commit().await.expect("commit apply");
+        }
+
+        let expected_subagents: i32 = sqlx::query_scalar(
+            "select expected_subagents from delegations where id='stage_fanout'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("expected_subagents");
+        assert_eq!(expected_subagents, 2);
+
+        pool.close().await;
+        drop_test_database(&admin_url, &database_name).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_fixture_fails_closed_for_running_pre_expected_fanout_with_no_children() {
+        let Some((admin_url, database_url, database_name)) = create_test_database().await else {
+            eprintln!("skipping postgres migration fixture; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect test db");
+        create_pre_expected_fanout_fixture(&pool, 0).await;
+
+        let config = Config {
+            database_url: Some(database_url.clone()),
+            apply: false,
+            no_backups: true,
+            handoff_root: None,
+        };
+        let error = {
+            let mut tx = pool.begin().await.expect("begin dry-run");
+            let error = migrate_schema(&mut tx, &config, &mut MigrationStats::default())
+                .await
+                .expect_err("ambiguous fanout should fail");
+            tx.rollback().await.expect("rollback dry run");
+            error
+        };
+        assert!(format!("{error:#}").contains("cannot infer expected_subagents"));
 
         pool.close().await;
         drop_test_database(&admin_url, &database_name).await;
@@ -2065,7 +2798,7 @@ mod tests {
                 'input_completion',
                 'parent',
                 'steer',
-                '{"content":[{"type":"text","text":"stage stage_abc finished"}]}',
+                '{"content":[{"type":"text","text":"Stage stage_abc finished"}]}',
                 'queued',
                 'stage-steer:stage_abc:attempt_1',
                 '{"client_input_id":"stage-steer:stage_abc:attempt_1"}'
@@ -2077,6 +2810,67 @@ mod tests {
         .execute(pool)
         .await
         .expect("create old-shape fixture");
+    }
+
+    async fn create_pre_expected_fanout_fixture(pool: &PgPool, child_count: usize) {
+        sqlx::raw_sql(
+            r#"
+            create table sessions (
+                id text primary key,
+                outer_cwd text not null,
+                workspaces jsonb not null default '[]'::jsonb,
+                created_at timestamptz not null default now(),
+                updated_at timestamptz not null default now(),
+                active_leaf_id text null,
+                system_prompt text not null,
+                provider_config jsonb not null,
+                metadata jsonb not null default '{}'::jsonb,
+                parent_session_id text null references sessions(id) on delete set null,
+                session_revision bigint not null default 0,
+                queue_revision bigint not null default 0,
+                transcript_revision bigint not null default 0,
+                subagent_type text null
+            );
+            create table stages (
+                id text primary key,
+                parent_session_id text not null references sessions(id) on delete cascade,
+                workflow text null,
+                label text null,
+                kind text not null,
+                status text not null,
+                attempt_id text not null,
+                created_at timestamptz not null default now(),
+                updated_at timestamptz not null default now()
+            );
+            create index stages_parent_created_idx on stages(parent_session_id, created_at, id);
+            alter table sessions add column stage_id text null references stages(id);
+            insert into sessions (id, outer_cwd, system_prompt, provider_config, metadata)
+            values ('parent', '/tmp', '', '{"kind":"openai","model":"gpt-5"}', '{}');
+            insert into stages (id, parent_session_id, kind, status, attempt_id)
+            values ('stage_fanout', 'parent', 'readonly_fanout', 'running', 'attempt_1');
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("create pre-expected fanout fixture");
+
+        for index in 0..child_count {
+            let child_id = format!("child_{index}");
+            sqlx::query(
+                r#"
+                insert into sessions (
+                    id, outer_cwd, system_prompt, provider_config, metadata,
+                    parent_session_id, subagent_type, stage_id
+                )
+                values ($1, '/tmp', '', '{"kind":"openai","model":"gpt-5"}', '{}',
+                    'parent', 'read_only', 'stage_fanout')
+                "#,
+            )
+            .bind(child_id)
+            .execute(pool)
+            .await
+            .expect("insert fanout child");
+        }
     }
 
     async fn create_test_database() -> Option<(String, String, String)> {
