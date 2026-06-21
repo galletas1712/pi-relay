@@ -164,9 +164,7 @@ pub(crate) fn resolve_skill_role(
 }
 
 fn load_packaged_role_skills(prompt_root: &Path) -> Vec<Skill> {
-    let mut skills = load_global_skills_from_dir(&prompt_root.join("subagent-roles"));
-    skills.extend(load_global_skills_from_dir(&prompt_root.join("workflows")));
-    skills
+    load_global_skills_from_dir(&prompt_root.join("subagent-roles"))
 }
 
 fn packaged_role(prompt_root: &Path, name: &str) -> Option<Skill> {
@@ -239,30 +237,44 @@ mod tests {
     }
 
     #[test]
-    fn load_skill_result_loads_installed_workflow_skill() {
+    fn workflow_skills_load_but_do_not_resolve_as_packaged_roles() {
         let prompt_root = make_temp_dir("load-workflow-skill");
         let outer_cwd = prompt_root.join("outer");
         std::fs::create_dir_all(&outer_cwd).expect("outer cwd");
-        let skill_dir = prompt_root.join("workflows/workflow-explore");
+        let skill_dir = prompt_root.join("workflows/workflow-only-test-role");
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: workflow-explore\ndescription: Parallel read-only exploration.\n---\n\nUse delegate_readonly_tasks to fan out.\n",
+            "---\nname: workflow-only-test-role\ndescription: Test workflow skill.\n---\n\nUse delegate_readonly_tasks to fan out.\n",
         )
         .expect("skill file");
 
         let call = ToolCall {
             id: ToolCallId::from_u64(1),
             tool_name: "LoadSkill".to_string(),
-            args_json: r#"{"name":"workflow-explore"}"#.to_string(),
+            args_json: r#"{"name":"workflow-only-test-role"}"#.to_string(),
         };
         let loaded = std::collections::BTreeSet::new();
 
         let result = load_skill_result(&prompt_root, &outer_cwd, &[], &loaded, &call);
         assert_eq!(result.status, agent_vocab::ToolResultStatus::Success);
-        assert!(result.output.contains("<name>workflow-explore</name>"));
+        assert!(result
+            .output
+            .contains("<name>workflow-only-test-role</name>"));
         assert!(!result.output.contains("<workspace>"));
         assert!(result.output.contains("delegate_readonly_tasks"));
+
+        let error = resolve_skill_role(
+            &prompt_root,
+            &outer_cwd,
+            &[],
+            "workflow-only-test-role",
+            None,
+        )
+        .expect_err("workflow skills are not packaged subagent roles");
+        assert!(error
+            .to_string()
+            .contains("role skill not found: workflow-only-test-role"));
 
         std::fs::remove_dir_all(prompt_root).ok();
     }

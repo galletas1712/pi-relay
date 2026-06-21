@@ -1091,7 +1091,7 @@ async fn boot_sweep_does_not_complete_mid_turn_subagent() {
 
 /// FIX D: a terminal stage member produces ZERO parent-visible `subagent.idle`
 /// rows, yet the single stage steer is still delivered (and the once-gate fired).
-/// Driven through the LIVE seam (`notify_subagent_parent_idle_if_needed`), which
+/// Driven through the LIVE seam (`handle_subagent_terminal_for_parent_if_needed`), which
 /// is FIX F's live-seam coverage for the suppression path.
 #[tokio::test]
 async fn terminal_stage_member_yields_zero_parent_idle_rows() {
@@ -1127,7 +1127,7 @@ async fn terminal_stage_member_yields_zero_parent_idle_rows() {
 
     // Drive the LIVE idle seam for the stage member.
     let driver = SessionDriver::acquire(&env.state, "member").await;
-    driver.notify_subagent_parent_idle_if_needed().await;
+    driver.handle_subagent_terminal_for_parent_if_needed().await;
 
     // Zero per-child idle surfaced to the parent...
     assert_eq!(parent_idle_rows(&env, "parent").await, 0);
@@ -1333,11 +1333,11 @@ async fn two_siblings_steer_parent_exactly_once_via_live_seam() {
     // stage.
     SessionDriver::acquire(&env.state, "sib_a")
         .await
-        .notify_subagent_parent_idle_if_needed()
+        .handle_subagent_terminal_for_parent_if_needed()
         .await;
     SessionDriver::acquire(&env.state, "sib_b")
         .await
-        .notify_subagent_parent_idle_if_needed()
+        .handle_subagent_terminal_for_parent_if_needed()
         .await;
 
     assert_eq!(parent_idle_rows(&env, "parent").await, 0);

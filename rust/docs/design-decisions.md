@@ -361,9 +361,9 @@ that field and Anthropic recommends a large cap for `xhigh`/`max`.
 
 Tool definitions and execution live outside `agent-core`. The core only models
 tool requests and tool results. The daemon's builtin registry currently owns the
-actual `edit`, `bash`, `grep`, `web_search`, `web_fetch`, and `load_skill`
-behavior and always executes allowed tool calls. (`web_search` is registered but
-has no configured backend yet, so it returns an error result.)
+actual `edit`, `bash`, `grep`, `web_search`, `web_fetch`, `LoadSkill`, and
+delegation-tool behavior and always executes allowed tool calls. (`web_search`
+is registered but has no configured backend yet, so it returns an error result.)
 
 This keeps core portable and makes future tool customization a daemon/runtime
 choice.
