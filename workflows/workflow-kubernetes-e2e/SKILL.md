@@ -14,7 +14,7 @@ result. You decide what to do with that result.
   workspace and reports their paths). The generic `tester` role carries the
   kubernetes specifics in its delegation prompt.
 
-## Outcomes (suggested_next, in inspect_delegation)
+## Outcomes (suggested_next, in the delegation snapshot)
 - tester: pass | product_failure | environment_retry | human_needed
 
 ## Control flow
@@ -37,6 +37,8 @@ result. You decide what to do with that result.
 The `tester` role is generic; put all kubernetes-specific guidance below in the
 delegation prompt, and REQUIRE the tester to end its final message with a line
 `suggested_next: pass | product_failure | environment_retry | human_needed`.
+When the completion steer arrives, branch on the delivered snapshot; call
+`inspect_delegation` only to refresh/recover state or inspect later/running.
 
 Cluster-safety rules to put in the tester's prompt:
 - Always pass an explicit `--context` and namespace; never rely on the current

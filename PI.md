@@ -55,10 +55,11 @@ Rules:
 
 - Launch at most one delegation per turn, then end your turn. Do not poll or loop —
   you will be notified.
-- When a delegation finishes you receive a short message pointing at a handoff
-  directory. Call `inspect_delegation` for the structured state/outcome
-  snapshot; read `final_message.md` or `transcript.md` files only if you need
-  detail.
+- When a delegation finishes you receive a wakeup steer with a structured
+  snapshot equivalent to `inspect_delegation`. Branch on the delivered
+  `suggested_next`/status fields; call `inspect_delegation` only to refresh or
+  recover state, or to inspect a delegation later/running. Read artifact paths
+  (`final_message.md`/`transcript.md`) only if you need more detail.
 - Give each subagent a self-contained task: it starts with fresh context and only
   knows what you put in its prompt (and any handoff/workspace paths you cite).
 - While a full subagent is running, supervise and read — do not edit the workspace
@@ -73,8 +74,8 @@ Rules:
 - Never mix RO and full work in one delegation.
 - To run a known pattern (e.g. implement → review → test), `LoadSkill` the matching
   workflow skill and follow its delegation state machine, branching on the typed
-  outcomes in `inspect_delegation`, with your own judgment (skip, re-run,
-  escalate, stop).
+  outcomes in the delivered snapshot (or a refreshed `inspect_delegation`
+  snapshot), with your own judgment (skip, re-run, escalate, stop).
 
 {% if skills.index %}
 ## Skills
