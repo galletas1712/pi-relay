@@ -11,16 +11,18 @@ synthesize the findings yourself. Nothing is changed in the workspace.
 ## Delegations
 - explorer — read-only subagent(s), run in parallel, one per angle.
 
-## Outcomes (suggested_next, in inspect_delegation)
+## Outcomes (suggested_next, in the delegation snapshot)
 - explorer: done | inconclusive
 
 ## Control flow
 1. Decide the angles (e.g. "current behavior", "prior art in the repo",
    "failure modes", "simplest option"). One explorer per angle.
 2. Run a single read-only fan-out with all explorers.
-3. When the handoff steer arrives, call `inspect_delegation` and read each
-   explorer's final_message.md if you need more detail. Synthesize the answer
-   yourself (you are the reducer — there is no reducer subagent).
+3. When the completion steer arrives, branch on the delivered delegation
+   snapshot. Read each explorer's final_message.md only if you need more detail.
+   Call `inspect_delegation` only to refresh/recover state or inspect later.
+   Synthesize the answer yourself (you are the reducer — there is no reducer
+   subagent).
 4. If key angles came back `inconclusive` or revealed new questions, run another
    read-only fan-out with refined prompts. Stop when you can answer confidently
    or the user should weigh in.

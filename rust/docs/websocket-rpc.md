@@ -1392,9 +1392,12 @@ When a delegation subagent is spawned or re-driven, the daemon may emit
 parent-scoped `subagent.spawned` and `subagent.running` progress events. These
 are progress hints only. Parent-visible delegation completion is not a per-child
 `subagent.idle`; it is one `InputPriority::Steer` queued to the parent after the
-delegation barrier completes, pointing at the handoff directory. Use
-`inspect_delegation`/`delegation.status` for structured state and the
-per-subagent `final_message.md`/`transcript.md` files for details.
+delegation barrier completes. The steer includes a JSON delegation snapshot
+equivalent to `inspect_delegation`/`delegation.status`, including per-subagent
+final messages, `suggested_next`, and artifact paths. Use
+`inspect_delegation`/`delegation.status` to refresh/recover state or inspect
+later/running; use the per-subagent `final_message.md`/`transcript.md` files for
+extra detail.
 
 `subagent.idle` remains an event type for non-delegation subagent compatibility
 (for example, defensive dispatch-failure compensation). When emitted, idle

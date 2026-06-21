@@ -44,12 +44,12 @@ Subagent orchestration with the smallest possible runtime:
   filesystem", not literally non-writing.
 - Work happens in **stages**: either *one full subagent* or *a parallel fan-out of
   RO subagents* — never both, and never multiple full (writing) subagents.
-- Results propagate through `inspect_delegation` as the canonical structured
-  snapshot plus a **handoff directory** of per-subagent files (final message +
-  full transcript), not through model context. The parent **does not busy-wait**:
-  after launching a stage it parks, and the daemon delivers a short **steer**
-  when the stage completes. The parent stays responsive to the user the whole
-  time.
+- Results propagate through a canonical structured delegation snapshot plus a
+  **handoff directory** of per-subagent files (final message + full transcript),
+  not through model context. The parent **does not busy-wait**: after launching
+  a stage it parks, and the daemon delivers a short **steer** containing an
+  `inspect_delegation`-equivalent snapshot when the stage completes. The parent
+  stays responsive to the user the whole time.
 - A **workflow** is a **skill** (`SKILL.md`) describing a possibly-cyclic state
   machine of stages. The parent loads it with `LoadSkill` and drives it with
   discretion, branching on subagents' typed outcomes. There is no workflow tool
@@ -194,24 +194,24 @@ stays bounded no matter how large a fan-out or transcript is.
 
   All are rendered from the durable transcript, so they exist even after an RO
   snapshot is gone and even when the subagent crashed.
-- **`inspect_delegation`** is the parent's entry point — a compact,
-  structured snapshot with per-subagent status, suggested_next, and handoff file
-  paths so the parent branches without parsing prose.
+- The parent receives the same compact structured snapshot in the completion
+  steer and can refresh it later with **`inspect_delegation`**. It includes
+  per-subagent status, final_message, suggested_next, and handoff file paths so
+  the parent branches without parsing prose or reading files first.
 - The daemon then delivers the notification by enqueuing a **short steer** to the
   parent (it appears as a user message in the parent's transcript). It names the
-  stage, says how many succeeded/failed, and points at the handoff directory;
-  use `inspect_delegation` for the structured snapshot. It does **not** inline
-  messages:
+  stage, says how many succeeded/failed, and embeds the snapshot JSON. It does
+  **not** inline full transcripts:
 
   ```text
-  Stage stage_7 (reviewer fan-out) finished: 3 ok, 1 failed.
-  Use inspect_delegation for the structured snapshot; transcript details are
-  in <cwd>/.pi-handoff/stage_7/. Failed: reviewer-c.
+  Stage stage_7 (reviewer fan-out) completed: 3 ok, 1 failed.
+  Snapshot JSON (equivalent to inspect_delegation at wakeup time):
+  { ... final_message, suggested_next, final_message_path, transcript_path ... }
   ```
 
-- The parent inspects the delegation first, then reads `final_message.md`
-  (summaries), and opens `transcript.md` only when it needs detail — with its
-  normal file tools.
+- The parent branches on the delivered snapshot first, then reads
+  `final_message.md` or opens `transcript.md` only when it needs more detail —
+  with its normal file tools.
   For a full stage, the full subagent's actual edits are already in the workspace.
 
 The handoff directory is **never cleaned up automatically**; its files double as
@@ -232,9 +232,9 @@ parent calls delegate_writing_task / delegate_readonly_tasks
   -> subagents run; as each RO subagent returns, destroy its snapshot
   -> the daemon BLOCKS until every subagent is terminal (one barrier)
   -> the daemon writes final_message.md + transcript.md for every subagent,
-     then enqueues ONE short steer to the parent pointing at the handoff dir
-  -> parent (woken by the steer) reads the handoff files and decides the next
-     stage, a re-run, or done
+     then enqueues ONE short steer to the parent with the structured snapshot
+  -> parent (woken by the steer) branches on the snapshot and decides the next
+     stage, a re-run, done, or whether to read artifact files for more detail
 ```
 
 A stage is terminal when all its subagents are terminal
@@ -320,10 +320,11 @@ outcomes each subagent reports in `inspect_delegation`.
 - test:      delegate_writing_task({ role:"tester",
     prompt:<how to test>, workflow:"implement_review_test" })
 
-When the handoff steer arrives, call `inspect_delegation`, then read the
-relevant `final_message.md`, and take the branch above. Subagents start fresh,
-so carry the prior stage's findings (from the handoff files) into the next
-stage's prompt.
+When the completion steer arrives, branch on the delivered snapshot. Read the
+relevant `final_message.md` only if you need more detail, and call
+`inspect_delegation` only to refresh/recover state or inspect later/running.
+Subagents start fresh, so carry the prior stage's findings into the next stage's
+prompt.
 ```
 
 Gates are **not** hard-enforced; mitigations are the skill's termination rules,
@@ -381,7 +382,7 @@ on a subagent of stage S reaching a terminal lifecycle state:
   if any subagent of S not terminal: return     # barrier not met
   set S.status = done|done_with_failures         # CAS on attempt_id
   render handoff files for every subagent of S   # per-subagent md
-  enqueue a steer to S.parent_session_id pointing at the handoff dir
+  enqueue a steer to S.parent_session_id containing the structured snapshot
   commit; then drive the parent
 ```
 
@@ -409,7 +410,7 @@ the existing subagent path; RO subagents reject steer/interrupt by type.
 System-prompt rules for the parent (Appendix B): launch at most one stage per
 turn then end your turn; never poll; never start a second stage while one runs;
 never mix full and RO in one stage; while a full subagent runs, supervise and read
-but do not edit; on a handoff steer, call `inspect_delegation` first.
+but do not edit; on a completion steer, branch on the delivered snapshot first.
 
 The `PythonRepl` tool remains a raw escape hatch only; it is no longer the
 orchestration surface.
@@ -600,11 +601,12 @@ Reuse the dev harness that resolves model actions deterministically
 3. RO subagents run in disposable snapshots, may build/test in them, and are GC'd
    on return; they return no files.
 4. A stage is homogeneous: one full, or many RO. Never parallel writers.
-5. The parent parks (no spin) but stays responsive; completion arrives as a steer.
+5. The parent parks (no spin) but stays responsive; completion arrives as a steer
+   containing the structured snapshot.
 6. Subagents cannot spawn subagents; subagent context is fresh.
-7. Results propagate through the handoff directory (index + final message +
-   transcript) plus, for full stages, the durable workspace. No artifact store, no
-   variable store, no context dump.
+7. Results propagate through the delivered snapshot plus the handoff directory
+   (final message + transcript) and, for full stages, the durable workspace. No
+   root index manifest, no artifact store, no variable store, no context dump.
 8. Recovery is "continue where we left off" — no git recovery, no rollback in v1.
 9. Workflows are skills (`SKILL.md` + `LoadSkill`) describing a parent-interpreted,
    possibly-cyclic stage state machine. No DSL, no daemon graph, no `workflow.*`
@@ -645,8 +647,8 @@ method names.
 
 Daemon-enforced errors: starting a second stage while one is running; mixing full
 and RO in one stage; more than one full subagent; steering an RO subagent.
-Completion is **not** a tool result — it arrives later as a steer pointing at the
-handoff directory; call `inspect_delegation` for structured state. The
+Completion is **not** a tool result — it arrives later as a steer containing an
+`inspect_delegation`-equivalent snapshot with handoff artifact paths. The
 `workflow` field is an optional grouping label only.
 
 ## Appendix B: draft `PI.md` "Subagent delegation" block
@@ -673,9 +675,11 @@ Rules:
 
 - Launch at most one stage per turn, then end your turn. Do not poll or loop —
   you will be notified.
-- When a stage finishes you receive a short message pointing at a handoff
-  directory. Call `inspect_delegation` first, then read each subagent's
-  `final_message.md`; open `transcript.md` only if you need detail.
+- When a stage finishes you receive a short message containing a delegation
+  snapshot equivalent to `inspect_delegation`. Branch on the delivered snapshot;
+  call `inspect_delegation` only to refresh/recover state or inspect
+  later/running. Read `final_message.md`/`transcript.md` artifacts only if you
+  need detail.
 - Give each subagent a self-contained task: it starts with fresh context and only
   knows what you put in its prompt (and any handoff/workspace paths you cite).
 - While a full subagent is running, supervise and read — do not edit the workspace

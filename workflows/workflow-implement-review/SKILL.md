@@ -6,13 +6,14 @@ description: Implement a change, then loop implementer<->reviewer until a review
 # Workflow: implement -> review
 
 Implement a change, then loop with a reviewer until the reviewer approves. You
-drive the loop; branch on the typed outcomes in `inspect_delegation`.
+drive the loop; branch on the typed outcomes in the delivered delegation
+snapshot.
 
 ## Delegations
 - implementer — full subagent (writes the workspace in place).
 - reviewer    — read-only subagent(s) (review only; never write).
 
-## Outcomes (suggested_next, in inspect_delegation)
+## Outcomes (suggested_next, in the delegation snapshot)
 - reviewer: approved | changes_requested
 
 ## Control flow
@@ -30,12 +31,13 @@ drive the loop; branch on the typed outcomes in `inspect_delegation`.
     prompt: "<what to review + acceptance criteria>" } ], workflow: "implement_review" })
 
 Notes:
-- After launching a delegation, end your turn; you will be steered when it completes.
+- After launching a delegation, end your turn; you will be steered when it
+  completes with an `inspect_delegation`-equivalent snapshot.
 - Subagents start fresh — carry the prior delegation's findings (from the handoff
   files) into the next delegation's prompt.
 - In each reviewer's prompt, REQUIRE it to end its final message with a line
   `suggested_next: approved` or `suggested_next: changes_requested` — that line
-  is what `inspect_delegation` records and you branch on.
+  is what the delivered snapshot records and you branch on.
 - While the implementer (full) runs, supervise and read; do not edit yourself.
 - A single reviewer is usually enough; fan out multiple reviewers only when you
   want distinct lenses (e.g. correctness vs security).

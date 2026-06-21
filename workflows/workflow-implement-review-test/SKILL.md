@@ -7,14 +7,15 @@ description: Implement, loop implementer<->reviewer until approved, then test; t
 
 Implement a change, review it until a reviewer is satisfied, then test. Test
 failures send it back to the implementer and the loop restarts. You drive this;
-branch on the typed outcomes each subagent reports in `inspect_delegation`.
+branch on the typed outcomes each subagent reports in the delivered delegation
+snapshot.
 
 ## Delegations
 - implementer — full subagent (writes the workspace in place).
 - reviewer    — read-only subagent(s) (review only; never write).
 - tester      — full subagent (runs the suite; reports results).
 
-## Outcomes (suggested_next, in inspect_delegation)
+## Outcomes (suggested_next, in the delegation snapshot)
 - reviewer: approved | changes_requested
 - tester:   pass | bugs_found | environment_issue
 
@@ -42,11 +43,12 @@ branch on the typed outcomes each subagent reports in `inspect_delegation`.
 Notes:
 - The tester is a full delegation because building/running tests writes the workspace
   (build outputs); it edits in place like the implementer.
-- After launching a delegation, end your turn; you will be steered when it completes.
+- After launching a delegation, end your turn; you will be steered when it
+  completes with an `inspect_delegation`-equivalent snapshot.
 - Subagents start fresh — carry the prior delegation's findings (from the handoff
   files) into the next delegation's prompt.
 - In each subagent's prompt, REQUIRE it to end its final message with a line
   `suggested_next: <one of the outcomes above>` — that line is what
-  `inspect_delegation` records and you branch on; without it the recorded outcome
-  is null.
+  the delivered snapshot records and you branch on; without it the recorded
+  outcome is null.
 - Do not mark DONE without a tester `pass`.

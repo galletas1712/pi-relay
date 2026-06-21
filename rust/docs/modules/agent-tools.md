@@ -157,8 +157,8 @@ snapshot (with artifact paths, not inline full transcripts);
 `cancel_delegation` cancels an existing delegation; `steer_subagent` queues an
 additional instruction to a running full subagent. Delegation subagents may produce
 `subagent.spawned`/`subagent.running` progress events, but delegation completion
-arrives later as a parent steer pointing at the handoff directory, not as a
-model tool result or per-child idle event.
+arrives later as a parent steer containing an `inspect_delegation`-equivalent
+snapshot plus artifact paths, not as a model tool result or per-child idle event.
 
 Their internal delegation types, handoff `delegation_id`, and web/inspector RPC methods
 (`delegation.start_full`, `delegation.start_readonly_fanout`, `delegation.status`,
