@@ -1,176 +1,180 @@
-# PR stack: inspector status + graph view
+# PR stack: inspector status + interactive graph view
 
 Status: planned. Last reviewed 2026-06-21.
 
 ## Motivation
 
 Sessions check out git workspaces on per-session local branches, and the
-intended workflow (see `PI.md`) is for the agent to push a descriptive branch
-and open a PR. When you run many sessions against large open-source repos, it is
-hard to keep track of which session owns which branch/PR, how those PRs stack on
-each other, and whether any of them have fallen behind their base.
+intended workflow (see `PI.md`) is for the agent to push a descriptive branch and
+open a PR. When you run many sessions against large open-source repos, it is hard
+to keep track of which session owns which branch/PR, how those PRs stack on each
+other, and whether any have fallen behind their base.
 
 Two additions close that gap:
 
 1. **Inspector PR status** — for a top-level session, show each git workspace's
-   branch, the PR it corresponds to (one you own), and whether that PR is out of
-   date (behind its base). The unmerged PR *stack* the PR sits in is shown as
-   context, since a PR is rarely meaningful in isolation.
-2. **Graph view** — a new top-level view (alongside chat) that visualizes the
-   unmerged PR stacks across idle, unarchived, top-level sessions, so the
-   lineage of your in-flight PRs is visible at a glance.
+   branch, the PR it corresponds to (one you own), whether that PR is out of date
+   (behind its base), and the unmerged stack it sits in.
+2. **Interactive PR graph view** — a new top-level view (alongside chat) where
+   each node is one of your unmerged PRs and edges are base→head stacking. Click
+   a node to highlight its full lineage path down to `main`, see every session
+   whose workspace is checked out at that PR's branch, and open a PR detail panel
+   sourced from the GitHub API.
 
-This doc tracks only this work. The session/workspace data model and RPC surface
-it builds on are documented in [architecture](../architecture.md) and
-[websocket-rpc](../websocket-rpc.md); do not re-litigate those here.
+## Topology: GitHub access lives in the frontend, not the daemon
+
+This functionality is implemented **mostly outside the daemon**, in an isolated
+frontend feature module. The daemon's only role is the part that *must* be
+server-side: reporting git state of the session clones it owns (which the browser
+cannot see). It gains **no GitHub knowledge** — no `gh`, no token, no PR types.
+
+> Note: this supersedes the earlier "shell out to `gh` in the daemon" idea. `gh`
+> cannot run in the browser, and putting GitHub logic in the daemon contradicts
+> the isolation goal. We use the GitHub **REST/GraphQL API from the browser**
+> instead.
+
+Three topologies were considered; **A is chosen** (pending confirmation of the
+browser-token tradeoff):
+
+- **A (chosen) — Browser → GitHub API directly.** A user-supplied PAT (stored in
+  the browser) is used by the isolated module to call GitHub. Daemon stays
+  GitHub-free; the whole feature is one frontend folder + one tiny daemon RPC.
+  Tradeoff: a fine-grained read-only PAT lives in browser storage.
+- B — `gh` inside the daemon (one PR RPC). Simplest auth, but puts GitHub logic
+  in the daemon, which we are explicitly avoiding.
+- C — a small sidecar process runs `gh` server-side. Honors isolation + keeps
+  auth server-side, but adds a new deployable. Defer unless the browser-token
+  tradeoff in A is unacceptable.
 
 ## Non-goals (explicitly cut to avoid cruft)
 
-- No bespoke GitHub HTTP client, no `remote_url`→owner/repo parser, no
-  `GITHUB_TOKEN` wiring. We shell out to the **`gh` CLI** inside the workspace
-  clone, which auto-detects the repo from `origin` and carries its own auth.
-- No separate git-only freshness RPC, no `sessions.lineage` RPC. One RPC serves
-  both the inspector and the graph.
-- No caching/TTL/fetch-serialization layer. React-query `staleTime` on the
-  frontend is sufficient; `gh`'s authenticated rate limit is not a constraint
-  for a personal tool.
+- No GitHub logic in the daemon (no `gh`, no token, no owner/repo parsing, no PR
+  RPC). The daemon exposes only git state of clones it already owns.
+- No iframe embed of github.com — it sends `X-Frame-Options: DENY`, so a literal
+  page embed is impossible. The "embedded PR view" is a detail **panel** rendered
+  from the GitHub API (title/body/state/checks/reviewers) plus an "open on
+  GitHub" link.
 - No GitLab/Forgejo support, no cross-project graph, no subagents in either
-  surface, no persisted view toggle, no interactive mermaid nodes.
+  surface, no persisted view toggle.
 - No session delegation (parent/child) edges in the graph. The graph shows **PR
-  base→head stacks**, which is the lineage that was asked for. (Delegation
-  overlay can be added later if it proves useful; it is not part of this work.)
+  base→head stacks** — the lineage that was asked for. Delegation overlay can be
+  added later; it is out of scope here.
+- No caching/TTL layer beyond react-query `staleTime`.
 
 ## Key decisions
 
-### Branch→PR matching is by commit SHA, not branch name
+### The daemon's one job: git state of clones
 
-The session's pushed branch name is whatever descriptive name the agent chose,
-and is not recorded anywhere. Rather than introduce machinery to record it, we
-match by commit identity: `gh pr list --author @me --state open --json
-number,title,url,headRefName,baseRefName,headRefOid` gives our open PRs with
-their head SHAs; the session's clone already contains the commits it pushed, so
-
-```
-git cat-file -e <pr_head_oid>^{commit}     # is this PR's head present in this clone?
-```
-
-(or `git merge-base --is-ancestor <pr_head_oid> HEAD`) identifies which PR this
-workspace produced, independent of branch naming, forks, or rebases.
-
-`gh pr list` and the `git` queries run with the workspace clone as cwd, reusing
-the daemon's existing `git_output`/`run_git` helpers in
-`rust/crates/agent-daemon/src/workspaces/` (a sibling `gh_output` helper that
-shells out the same way). No new HTTP stack, no token plumbing.
-
-### "Out of date" comes straight from `gh`
-
-`gh` reports merge state directly, so no local `rev-list`/`compare` math is
-needed:
-
-```
-gh pr view <number> --json mergeStateStatus,mergeable
-```
-
-`out_of_date = mergeStateStatus == "BEHIND"` (PR head is behind its base). We do
-not compute dirty/unpushed signals — out of date means "the PR needs to catch up
-to its base."
-
-### The unmerged stack
-
-From the same `gh pr list` result (all our open PRs in the repo), a PR `B` is
-stacked on PR `A` when `B.baseRefName == A.headRefName`. Walking these edges from
-the session's matched PR yields the unmerged stack it belongs to. The stack is
-attached to the workspace status (inspector context) and is the edge set the
-graph renders.
-
-### Top-level sessions only
-
-Subagents carry `metadata.subagent == true` (and `metadata.hidden == true`, so
-they are already excluded from `session.list` and the graph). The inspector PR
-section is additionally gated on `metadata.subagent !== true`. Rationale: full
-subagents inherit the parent's workspace fork (their branch/PR state is the
-parent's), and read-only subagents never persist changes to the parent's
-filesystem — so per-subagent PR status is noise.
-
-## Backend: one RPC
-
-`session.pull_requests` — params `{ session_id }`. Refuses (or returns empty)
-for sessions with `metadata.subagent == true`.
-
-For each **git** workspace of the session, run, with the workspace clone as cwd:
-
-1. `gh pr list --author @me --state open --json number,title,url,headRefName,baseRefName,headRefOid`
-   (repo auto-detected from `origin`).
-2. Match the workspace to a PR by head-SHA presence in the clone (above).
-3. For the matched PR, `gh pr view --json mergeStateStatus` → `out_of_date`.
-4. Build the unmerged stack via `baseRefName`/`headRefName` edges among the
-   listed PRs.
-
-Returns, per workspace:
+New tiny RPC `session.workspace_heads` — params `{ session_id }`, refused/empty
+for `metadata.subagent == true`. For each **git** workspace, using the clone as
+cwd via the existing `git_output` helper (`rust/crates/agent-daemon/src/
+workspaces/`):
 
 ```jsonc
 {
   "workspace_dir": "repo",
   "local_branch": "pi/session/.../repo",
   "base_branch": "main",                 // remote_branch
-  "pr": {                                 // null if no match
-    "number": 123, "title": "...", "url": "...",
-    "state": "open", "out_of_date": false
-  },
-  "stack": [                              // unmerged PRs base→head, [] if none
-    { "number": 120, "title": "...", "url": "...", "base_ref": "main",    "head_ref": "feat-a" },
-    { "number": 123, "title": "...", "url": "...", "base_ref": "feat-a",  "head_ref": "feat-b" }
-  ]
+  "head_sha": "<git rev-parse HEAD>",
+  "pushed_branch": "feat-b"              // best-effort: rev-parse --abbrev-ref @{u}, else null
 }
 ```
 
-Wiring mirrors `subagent.list`: add the `RpcMethod` variant in
-`rust/crates/agent-daemon/src/types.rs` (parse table), dispatch in `main.rs`,
-serialize the view in `rpc_views.rs`. `gh` absence or non-git workspaces degrade
-to `pr: null, stack: []` (no hard error).
+That is the entire backend change. No GitHub anything. Wiring mirrors
+`subagent.list`: `RpcMethod` variant in `types.rs`, dispatch in `main.rs`, view
+in `rpc_views.rs`.
 
-## Frontend
+### Branch→PR matching happens in the browser
 
-One react-query hook over `session.pull_requests` (key in `queryKeys.ts`, method
-in `agentApi.ts`), consumed by both surfaces.
+The isolated module fetches your open PRs for a repo (`search` / `pulls`) with
+their `head.ref` and `head.sha`, then links a session workspace to a PR by:
 
-### Inspector "Workspaces" section (`panels.tsx`)
+1. `pushed_branch == pr.head.ref` (preferred, when the daemon could resolve an
+   upstream), else
+2. `head_sha == pr.head.sha` (exact tip match).
 
-Rendered only when `snapshot.metadata.subagent !== true`. Reuses the existing
-`.kv` row pattern under a new `inspect-section`:
+Ancestry matching (session committed past the pushed tip) is a known limitation
+deferred to a later refinement; it would need a daemon round-trip with candidate
+SHAs and is intentionally not built now.
 
-- `workspace_dir` → `local_branch`
-- `base` → `base_branch`
-- `PR` → `#123 title` (link to `url`) or "none"
-- `status` → "up to date" / "behind base" chip
-- the unmerged stack listed compactly beneath (each PR linked), highlighting the
-  current workspace's PR
+### The unmerged stack and "out of date"
 
-PR/status fill in async with a "checking…" state; branch/base render
-immediately from the snapshot.
+From your open PRs in the repo, PR `B` is stacked on PR `A` when
+`B.base.ref == A.head.ref`. Walking those edges yields the unmerged stack, all in
+the browser. "Out of date" = the GitHub `mergeable_state == "behind"` (head
+behind base). The bottom of every stack points at the repo default branch
+(`main`).
 
-### Graph view (`App.tsx` + new `GraphPane`)
+### Top-level sessions only
 
-- `topView: "chat" | "graph"` state in `App.tsx`; a toggle in the sidebar header
-  (and mobile topbar) swaps the center grid region. Not persisted.
-- Scope: idle + unarchived + top-level sessions of the selected project
-  (`activity === "idle" && !isArchivedSession(s)`; subagents already absent from
-  `session.list`).
-- Build a mermaid `flowchart` string: nodes = unmerged PRs (labeled with PR
-  number/title and the owning session), edges = base→head stack relationships.
-  Render via the already-bundled `MermaidBlock` (`mermaidBlock.tsx`) — no new
-  dependency. Read-only; a side legend lists sessions for navigation.
+Subagents carry `metadata.subagent == true` (and `metadata.hidden == true`, so
+they are already excluded from `session.list`/the graph). The inspector PR
+section is additionally gated on `metadata.subagent !== true`. Full subagents
+inherit the parent's workspace fork; read-only subagents never persist changes to
+the parent — so per-subagent PR status is noise.
+
+## Frontend: one isolated feature module
+
+Everything lives in `packages/web/src/pr-graph/` and is self-contained:
+
+```
+pr-graph/
+  github.ts          // browser GitHub API client (plain fetch; token from settings)
+  token.ts           // PAT storage (localStorage) + a small settings input
+  stack.ts           // build PR stacks + lineage paths from a PR list (pure, unit-tested)
+  match.ts           // link sessions↔PRs from workspace_heads + PR list (pure, unit-tested)
+  usePrGraph.ts      // react-query hooks: workspace_heads (daemon) + PRs (GitHub)
+  GraphPane.tsx      // interactive graph (React Flow) + click-to-highlight lineage
+  PrDetailPanel.tsx  // GitHub-API-sourced PR detail ("embedded" view) + open-on-GitHub
+  SessionsForPr.tsx  // sessions whose workspace is checked out at the PR's branch
+  inspectorSection.tsx // the inspector "Workspaces" section (consumed by panels.tsx)
+```
+
+`stack.ts` and `match.ts` are pure functions over plain data, so the graph logic
+is testable without a daemon or network.
+
+### Interactive graph (`GraphPane.tsx`)
+
+- Library: **React Flow** (`@xyflow/react`) for an actual interactive DAG, with a
+  small auto-layout pass (dagre/elk) bottom (`main`) → top (leaf PRs). Mermaid is
+  **not** used here (it can't do click-to-highlight); it stays only for
+  transcript diagrams.
+- Each node = one unmerged PR (number, title, owning session(s), out-of-date
+  badge). A synthetic `main` node anchors each stack's base.
+- **Click a node** → highlight the lineage path from that PR down to `main`
+  (ancestors via base→head edges), dim the rest, and open the selection panel:
+  - **Stacked-on**: the PR(s) it sits on top of, down to `main`.
+  - **Sessions**: every session whose workspace is checked out at that PR's
+    branch (from `workspace_heads` ↔ PR matching), each linking back to its chat.
+  - **PR detail** (`PrDetailPanel`): title/body/state/checks/reviewers from the
+    GitHub API + "open on GitHub". (Separate panel, not an iframe — see
+    non-goals.)
+
+### Integration seams (the only edits to existing files)
+
+- `App.tsx`: a `topView: "chat" | "graph"` state + a sidebar/topbar toggle that
+  swaps the center grid region for `<GraphPane/>`. Graph scope = idle + unarchived
+  top-level sessions of the selected project.
+- `panels.tsx`: render `<InspectorWorkspacesSection/>` from `pr-graph/`, gated on
+  `snapshot.metadata.subagent !== true`.
+- `queryKeys.ts` / `agentApi.ts`: the one `session.workspace_heads` method + key.
+
+Everything else stays inside `pr-graph/`.
 
 ## Build order
 
-1. `session.pull_requests` RPC (`gh` + git SHA match + stack assembly).
-2. Inspector Workspaces section.
-3. Graph view.
+1. `session.workspace_heads` RPC (the only backend change; GitHub-free).
+2. `pr-graph/` core: `github.ts`, `token.ts`, `stack.ts`, `match.ts` + unit
+   tests for the two pure modules.
+3. Inspector Workspaces section.
+4. Interactive `GraphPane` + `PrDetailPanel` + `SessionsForPr`.
 
-Each step is independently shippable; step 1 is the only backend change.
+## Open risks
 
-## Open risk
-
-`gh` must be available and authenticated in the daemon's environment. If it is
-absent, both surfaces simply show no PR data (graceful degradation), which is the
-intended behavior rather than an error.
+- **Browser-held PAT** (topology A). Mitigation: fine-grained read-only token,
+  clearly scoped, with an option to fall back to topology C (server-side `gh`
+  sidecar) if unacceptable.
+- **GitHub rate limits / CORS.** The REST/GraphQL APIs are CORS-enabled for
+  token auth; authenticated limits (5k/hr) are ample for a personal tool.
+- **Match precision.** Branch-name/exact-sha matching can miss when a session
+  commits past its pushed tip (deferred ancestry refinement).
