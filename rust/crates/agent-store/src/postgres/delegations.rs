@@ -179,46 +179,6 @@ impl PostgresAgentStore {
         rows.iter().map(row_to_delegation).collect()
     }
 
-    /// Current/recent delegations for compact model-context recovery.
-    ///
-    /// There is no durable parent-acknowledgement state today, so this returns
-    /// every running delegation plus a bounded window of the most recently
-    /// updated terminal delegations. The running set is always included even if
-    /// it exceeds the terminal window.
-    pub async fn list_parent_current_delegations(
-        &self,
-        parent_session_id: &str,
-        recent_terminal_limit: i64,
-    ) -> Result<Vec<Delegation>> {
-        let terminal_limit = recent_terminal_limit.max(0);
-        let rows = sqlx::query(
-            r#"
-            with current_delegations as (
-                select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents, updated_at, created_at, 0 as group_order
-                from delegations
-                where parent_session_id=$1 and status='running'
-                union all
-                select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents, updated_at, created_at, 1 as group_order
-                from (
-                    select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents, updated_at, created_at
-                    from delegations
-                    where parent_session_id=$1 and status <> 'running'
-                    order by updated_at desc, id desc
-                    limit $2
-                ) recent_terminal
-            )
-            select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
-            from current_delegations
-            order by group_order, updated_at desc, created_at desc, id desc
-            "#,
-        )
-        .bind(parent_session_id)
-        .bind(terminal_limit)
-        .fetch_all(&self.pool)
-        .await?;
-        rows.iter().map(row_to_delegation).collect()
-    }
-
     /// Compute compact progress counts for a delegation without materializing
     /// active branches. Terminality comes from each subagent's active leaf; a
     /// `TurnFinished` leaf with `Graceful` is a terminal success, other

@@ -106,11 +106,10 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
             );
             let suffix_transcript = provider_transcript(suffix_context);
             // The usage anchor already accounts for the prompt that was sent
-            // with that older model action, but daemon-owned dynamic context
-            // (for example the compact current-delegations block) can change
-            // without a transcript suffix. Conservatively include the current
-            // dynamic section again so a newly-visible delegation summary is
-            // not ignored by the context gate.
+            // with that older model action. Include any current daemon-owned
+            // dynamic tail context as a suffix adjustment; normal model turns
+            // currently have none, but this keeps the estimator correct if a
+            // future bounded dynamic section is enabled.
             let prompt = assemble_agent_prompt(state, config, session_id).await?;
             let dynamic_prompt_tokens = agent_provider::estimate_model_input_tokens(
                 &PromptSections::new(None, prompt.dynamic_context.clone()),

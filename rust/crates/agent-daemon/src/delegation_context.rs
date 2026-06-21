@@ -5,45 +5,45 @@ use agent_store::{Delegation, DelegationStatus, SessionActivity, SubagentType};
 use crate::handoff::delegation_dir;
 use crate::state::AppState;
 
-const RECENT_TERMINAL_DELEGATION_LIMIT: i64 = 3;
 const MAX_SUBAGENTS_PER_DELEGATION: usize = 8;
 const MAX_FINAL_MESSAGE_CHARS: usize = 700;
 
-/// Build the compact model-context block injected after the rendered PI.md.
+/// Build the compaction-only delegation ledger for a top-level parent session.
+///
+/// Normal parent model requests are transcript-driven and do not receive this
+/// block. Compaction is the special case: older delegation start/completion
+/// steers may be summarized away, so the daemon appends a bounded but complete
+/// ledger of every delegation row owned by the parent session after the provider
+/// returns its compacted summary.
+///
+/// Subagent sessions deliberately receive no parent/sibling delegation ledger:
+/// subagents summarize only their own role contract, delegated task, transcript,
+/// and tool results. Parent sessions own orchestration state, and nested
+/// delegations are currently rejected.
 ///
 /// This is intentionally much lighter than `inspect_delegation`: it uses
 /// bounded DB reads plus existing artifact path conventions and never refreshes
 /// or inlines transcript artifacts. The parent can call `inspect_delegation`
-/// for fresh structured state and artifact publication.
-pub(crate) async fn current_delegations_context(
+/// after compaction for fresh structured state and artifact publication.
+pub(crate) async fn compaction_delegation_ledger(
     state: &AppState,
     session_id: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Option<String>> {
     if state
         .repo
         .session_subagent_type(session_id)
         .await?
         .is_some()
     {
-        return Ok(String::new());
+        return Ok(None);
     }
 
-    let delegations = state
-        .repo
-        .list_parent_current_delegations(session_id, RECENT_TERMINAL_DELEGATION_LIMIT)
-        .await?;
-    let Some(first) = delegations.first() else {
-        return Ok(empty_current_delegations_context());
+    let parent_config = state.repo.load_session_config(session_id).await?;
+    let delegations = state.repo.list_parent_delegations(session_id).await?;
+    let Some(_) = delegations.first() else {
+        return Ok(Some(empty_compaction_delegation_ledger()));
     };
-
-    let parent_config = state
-        .repo
-        .load_session_config(&first.parent_session_id)
-        .await?;
-    let mut out = String::from("## Current delegations\n\n");
-    out.push_str(
-        "Compact daemon snapshot for context recovery. Running delegations are always listed; terminal delegations are the most recent 3 because there is no parent-acknowledgement state. Call `inspect_delegation` for fresh full structured state and artifact paths. Full transcript contents are not inlined.\n",
-    );
+    let mut out = ledger_header();
 
     for delegation in &delegations {
         let progress = state.repo.delegation_progress(delegation).await?;
@@ -59,6 +59,7 @@ pub(crate) async fn current_delegations_context(
             progress.running,
             progress.failed,
         ));
+        append_compaction_status_note(&mut out, delegation.status);
         if let Some(workflow) = delegation
             .workflow
             .as_deref()
@@ -81,12 +82,37 @@ pub(crate) async fn current_delegations_context(
         append_subagents(state, &mut out, delegation, progress.spawned, &handoff_dir).await?;
     }
 
-    Ok(out.trim_end().to_string())
+    Ok(Some(out.trim_end().to_string()))
 }
 
-fn empty_current_delegations_context() -> String {
-    "## Current delegations\n\nNo running delegations and no recent terminal delegations."
-        .to_string()
+fn ledger_header() -> String {
+    let mut out = String::from("## Delegation state at compaction time\n\n");
+    out.push_str(
+        "Point-in-time compaction ledger for this parent session. It lists every delegation row for the parent session, including running, done, done_with_failures, cancelled, and failed statuses. Per-subagent details and final-message snippets are bounded. Full transcript contents are not inlined.\n\n",
+    );
+    out.push_str(
+        "This section is appended after provider compaction so fresh delegation facts cross the compaction boundary. Distinguish delegations that completed, were cancelled, or failed before compaction from delegations that were still running at compaction time. A running delegation entry is only a point-in-time fact: do not assume it completed; wait for a later completion steer or call `inspect_delegation`.\n",
+    );
+    out
+}
+
+fn empty_compaction_delegation_ledger() -> String {
+    let mut out = ledger_header();
+    out.push_str("\nNo delegations existed for this parent session at compaction time.");
+    out
+}
+
+fn append_compaction_status_note(out: &mut String, status: DelegationStatus) {
+    let note = match status {
+        DelegationStatus::Running => {
+            "running at compaction time; point-in-time only; await later completion steer or inspect_delegation"
+        }
+        DelegationStatus::Done => "completed before compaction",
+        DelegationStatus::DoneWithFailures => "completed with failures before compaction",
+        DelegationStatus::Cancelled => "cancelled before compaction",
+        DelegationStatus::Failed => "failed before compaction",
+    };
+    out.push_str(&format!("; compaction_note: {note}"));
 }
 
 async fn append_subagents(
@@ -157,7 +183,7 @@ async fn append_subagents(
         .max(subagents.len().saturating_sub(shown));
     if omitted > 0 {
         out.push_str(&format!(
-            "  - ... {} more subagent(s) omitted from compact context; call `inspect_delegation`.\n",
+            "  - ... {} more subagent(s) omitted from compaction ledger; call `inspect_delegation`.\n",
             omitted
         ));
     }
@@ -272,12 +298,12 @@ fn inline_code(value: &str) -> String {
 }
 
 #[cfg(test)]
-pub(crate) fn test_empty_current_delegations_context() -> String {
-    empty_current_delegations_context()
+pub(crate) fn test_empty_compaction_delegation_ledger() -> String {
+    empty_compaction_delegation_ledger()
 }
 
 #[cfg(test)]
-pub(crate) fn test_context_from_snapshots(
+pub(crate) fn test_ledger_from_snapshots(
     delegations: Vec<(
         Delegation,
         agent_store::DelegationProgress,
@@ -285,14 +311,11 @@ pub(crate) fn test_context_from_snapshots(
     )>,
     parent_outer_cwd: &str,
 ) -> anyhow::Result<String> {
-    let mut out = String::from("## Current delegations\n\n");
-    out.push_str(
-        "Compact daemon snapshot for context recovery. Running delegations are always listed; terminal delegations are the most recent 3 because there is no parent-acknowledgement state. Call `inspect_delegation` for fresh full structured state and artifact paths. Full transcript contents are not inlined.\n",
-    );
+    let mut out = ledger_header();
     for (delegation, progress, subagents) in delegations {
         let handoff_dir = delegation_dir(parent_outer_cwd, &delegation.id);
         out.push_str(&format!(
-            "\n- delegation_id: `{}`; kind: {}; status: {}; progress: expected {}, spawned {}, terminal {}, running {}, failed {}; handoff_dir: `{}`\n",
+            "\n- delegation_id: `{}`; kind: {}; status: {}; progress: expected {}, spawned {}, terminal {}, running {}, failed {}",
             inline_code(&delegation.id),
             delegation.kind,
             delegation.status,
@@ -301,6 +324,10 @@ pub(crate) fn test_context_from_snapshots(
             progress.terminal,
             progress.running,
             progress.failed,
+        ));
+        append_compaction_status_note(&mut out, delegation.status);
+        out.push_str(&format!(
+            "; handoff_dir: `{}`\n",
             inline_code(&handoff_dir.to_string_lossy())
         ));
         let shown = subagents.len().min(MAX_SUBAGENTS_PER_DELEGATION);
@@ -346,7 +373,7 @@ pub(crate) fn test_context_from_snapshots(
             .max(subagents.len().saturating_sub(shown));
         if omitted > 0 {
             out.push_str(&format!(
-                "  - ... {} more subagent(s) omitted from compact context; call `inspect_delegation`.\n",
+                "  - ... {} more subagent(s) omitted from compaction ledger; call `inspect_delegation`.\n",
                 omitted
             ));
         }
@@ -385,15 +412,15 @@ mod tests {
     }
 
     #[test]
-    fn empty_context_is_explicit_and_compact() {
-        assert_eq!(
-            test_empty_current_delegations_context(),
-            "## Current delegations\n\nNo running delegations and no recent terminal delegations."
-        );
+    fn empty_compaction_ledger_is_explicit_and_compact() {
+        let text = test_empty_compaction_delegation_ledger();
+        assert!(text.starts_with("## Delegation state at compaction time"));
+        assert!(text.contains("No delegations existed for this parent session at compaction time."));
+        assert!(!text.contains("## Current delegations"));
     }
 
     #[test]
-    fn bounded_context_omits_transcript_bodies_and_truncates_final_message() {
+    fn bounded_compaction_ledger_omits_transcript_bodies_and_truncates_final_message() {
         let long_final = format!(
             "{}\n\nsuggested_next: approved",
             "final-message ".repeat(100)
@@ -409,7 +436,7 @@ mod tests {
                 final_message: Some(long_final.clone()),
             })
             .collect::<Vec<_>>();
-        let text = test_context_from_snapshots(
+        let text = test_ledger_from_snapshots(
             vec![(
                 delegation("delegation_1", DelegationStatus::Done),
                 DelegationProgress {
@@ -425,7 +452,8 @@ mod tests {
         )
         .expect("render context");
 
-        assert!(text.starts_with("## Current delegations"));
+        assert!(text.starts_with("## Delegation state at compaction time"));
+        assert!(text.contains("completed before compaction"));
         assert!(text.contains("... 2 more subagent(s) omitted"));
         assert!(text.contains("final_message_file: `child_0/final_message.md`"));
         assert!(text.contains("suggested_next"));
@@ -438,8 +466,8 @@ mod tests {
     }
 
     #[test]
-    fn running_context_has_steerability_and_no_final_message_inline() {
-        let text = test_context_from_snapshots(
+    fn running_compaction_ledger_has_point_in_time_status_and_no_final_message_inline() {
+        let text = test_ledger_from_snapshots(
             vec![(
                 delegation("delegation_running", DelegationStatus::Running),
                 DelegationProgress {
@@ -464,6 +492,7 @@ mod tests {
         .expect("render context");
 
         assert!(text.contains("status: running"));
+        assert!(text.contains("running at compaction time; point-in-time only"));
         assert!(text.contains("steerable: true"));
         assert!(text.contains("transcript_file: `impl/transcript.md`"));
         assert!(!text.contains("final_message:"));
@@ -483,7 +512,7 @@ mod tests {
                 final_message: None,
             })
             .collect::<Vec<_>>();
-        let text = test_context_from_snapshots(
+        let text = test_ledger_from_snapshots(
             vec![(
                 delegation("delegation_large", DelegationStatus::Done),
                 DelegationProgress {
@@ -505,8 +534,8 @@ mod tests {
     }
 
     #[test]
-    fn failed_delegation_context_does_not_point_at_normal_transcript_artifacts() {
-        let text = test_context_from_snapshots(
+    fn failed_delegation_ledger_does_not_point_at_normal_transcript_artifacts() {
+        let text = test_ledger_from_snapshots(
             vec![(
                 delegation("delegation_failed", DelegationStatus::Failed),
                 DelegationProgress {
@@ -531,6 +560,7 @@ mod tests {
         .expect("render context");
 
         assert!(text.contains("transcript_file: null"));
+        assert!(text.contains("failed before compaction"));
         assert!(!text.contains("impl_failed/transcript.md"));
         assert!(!text.contains("final_message_file:"));
     }

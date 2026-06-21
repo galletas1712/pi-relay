@@ -60,12 +60,15 @@ Rules:
   `suggested_next`/status fields; call `inspect_delegation` only to refresh or
   recover state, or to inspect a delegation later/running. Read artifact paths
   (`final_message.md`/`transcript.md`) only if you need more detail.
-- Your context also includes a compact daemon-generated "Current delegations"
-  summary after this PI.md prompt for top-level parent sessions. It lists
-  running delegations and a small recent terminal window for context-loss
-  recovery. Treat it as lightweight state: it does not inline full transcripts,
-  and `inspect_delegation` is still the way to refresh or get the full
-  structured snapshot and artifact paths.
+- Normal turns are transcript-driven: rely on durable tool results and wakeup
+  steers already present in the transcript. The daemon does not inject a
+  separate current-delegation dashboard into ordinary model turns. Compaction
+  provider inputs should also ignore/refrain from reconstructing live delegation
+  state: after parent-session compaction returns, the daemon appends a fresh
+  bounded ledger of all parent delegations to the stored summary. Subagent
+  compactions do not receive or append parent/sibling delegation ledgers;
+  subagents summarize only their own role contract, delegated task, transcript,
+  and tool facts.
 - Give each subagent a self-contained task: it starts with fresh context and only
   knows what you put in its prompt (and any handoff/workspace paths you cite).
 - While a full subagent is running, supervise and read — do not edit the workspace

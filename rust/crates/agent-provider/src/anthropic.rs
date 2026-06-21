@@ -324,11 +324,14 @@ fn transcript_to_messages_for_request(
     input: &AnthropicRequestBodyInput,
 ) -> ProviderResult<Vec<Value>> {
     if !input.cache_transcript {
-        return transcript_to_messages(&input.prompt, &input.transcript);
+        let mut messages = transcript_to_messages(&input.prompt, &input.transcript)?;
+        append_dynamic_context_message(&input.prompt, &mut messages);
+        return Ok(messages);
     }
     let Some(prefix_len) = input.transcript_cache_prefix_len else {
         let mut messages = transcript_to_messages(&input.prompt, &input.transcript)?;
         add_transcript_cache_breakpoints(&mut messages);
+        append_dynamic_context_message(&input.prompt, &mut messages);
         return Ok(messages);
     };
 
@@ -337,7 +340,21 @@ fn transcript_to_messages_for_request(
     let mut messages = transcript_to_messages(&input.prompt, prefix)?;
     add_transcript_cache_breakpoints(&mut messages);
     messages.extend(transcript_to_messages(&input.prompt, suffix)?);
+    append_dynamic_context_message(&input.prompt, &mut messages);
     Ok(messages)
+}
+
+fn append_dynamic_context_message(prompt: &crate::PromptSections, messages: &mut Vec<Value>) {
+    if let Some(dynamic) = prompt
+        .dynamic_context
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        messages.push(json!({
+            "role": "user",
+            "content": [{ "type": "text", "text": dynamic }],
+        }));
+    }
 }
 
 fn client_request_id() -> String {
@@ -452,12 +469,6 @@ fn anthropic_system_blocks(
             "type": "text",
             "text": stable,
             "cache_control": cache_control_1h(),
-        }));
-    }
-    if let Some(dynamic) = &prompt.dynamic_context {
-        blocks.push(json!({
-            "type": "text",
-            "text": dynamic,
         }));
     }
     (!blocks.is_empty()).then_some(blocks)
@@ -1488,6 +1499,42 @@ mod tests {
             json!({
                 "type": "ephemeral",
             })
+        );
+        assert!(body["messages"][1]["content"][0]
+            .get("cache_control")
+            .is_none());
+    }
+
+    #[test]
+    fn messages_body_tail_positions_dynamic_context_out_of_system() {
+        let body = messages_body(ModelRequest {
+            model: "claude-opus-4-7".to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::new(
+                Some("stable rules".to_string()),
+                Some("volatile context".to_string()),
+            ),
+            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::Medium,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        })
+        .expect("body renders");
+
+        assert_eq!(body["system"][1]["text"], "stable rules");
+        assert!(!body["system"].to_string().contains("volatile context"));
+        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
+        assert_eq!(
+            body["messages"][0]["content"][0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+        assert_eq!(
+            body["messages"][1]["content"][0]["text"],
+            "volatile context"
         );
         assert!(body["messages"][1]["content"][0]
             .get("cache_control")

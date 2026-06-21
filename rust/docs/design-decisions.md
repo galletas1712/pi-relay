@@ -334,23 +334,31 @@ stable cache cohort key from the model, stable system prompt, and sorted tool
 schema so repeated local sessions route toward the same prompt cache. The actual
 system prompt remains global.
 
-Provider requests now carry `PromptSections`: a stable prefix and dynamic
-context. The stable prefix is the global system prompt. The daemon appends
-dynamic runtime context after it, including the compact `## Current delegations`
-section for top-level parent sessions, and only then does the provider render
-transcript history. OpenAI Responses renders the stable prefix as `instructions`
-and the dynamic context as the first input item. Anthropic renders the stable
-prefix as a cache-marked system block and the dynamic context as an uncached
-system suffix. The prompt split itself does not add an artificial "dynamic
-context" heading; any heading present is owned by the dynamic section content
-(for example `## Current delegations`).
+Provider requests now carry `PromptSections`: a stable prefix and optional
+dynamic context. The stable prefix is the global system prompt. Normal turns keep
+dynamic context empty and rely on transcript history for runtime facts. If
+dynamic context is used, providers place it at the tail: OpenAI Responses emits
+it after transcript input items, and Anthropic appends it as a final uncached
+user message after transcript messages. The prompt split itself does not add an
+artificial "dynamic context" heading; any heading present is owned by the
+dynamic section content.
+
+Delegation state is intentionally not injected into normal parent turns or into
+compaction provider inputs. The special case happens after compaction: once the
+provider returns a compacted summary, top-level parent compaction appends a fresh
+`## Delegation state at compaction time` ledger to the stored summary. That
+ledger lists every parent delegation row/status with bounded details and no
+transcript body inlining. Before a later compaction is sent to a provider, any
+previous appended ledger is stripped from the compaction input and replaced
+afterward with fresh state. Subagent compaction omits parent/sibling delegation
+state entirely, because subagents do not orchestrate the delegation tree.
 
 Prompt caching works best when the beginning of the prompt is identical across
 requests. That means the long-lived global system prompt, stable tool
-definitions, and any reusable static project instructions stay before
-conversation-specific state, restored drafts, and user messages. The daemon
-does not include a timestamp in dynamic context because that would churn the
-prefix-adjacent prompt for little value.
+definitions, transcript prefix, and any reusable static project instructions
+stay before volatile conversation-specific state. The daemon does not include a
+timestamp in dynamic context because that would churn the prompt for little
+value.
 
 The daemon also no longer imposes a default OpenAI/Codex output-token cap.
 `provider.max_tokens` remains an optional explicit cap if a particular session
