@@ -1200,10 +1200,11 @@ Requires a `provider` parameter (`"openai"` or `"anthropic"`/`"claude"`) and
 returns the model-visible tool definitions for that provider, because the tool
 surface is provider-shaped (e.g. OpenAI `apply_patch` vs Anthropic
 `text_editor_20250728` for editing). The registered builtins are `edit`, `bash`,
-`grep`, `web_search`, `web_fetch`, `load_skill`, and the `stage_*` tools - there
-are no `read`/`write` tools. Each returned entry carries `name`, `description`,
-`input_schema`, `canonical_name`, `prompt_alias`, `execution`, and
-`kind: "local_tool"`.
+`grep`, `web_search`, `web_fetch`, `load_skill`, and the delegation tools
+(`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`,
+`cancel_delegation`) - there are no `read`/`write` tools. Each returned entry
+carries `name`, `description`, `input_schema`, `canonical_name`, `prompt_alias`,
+`execution`, and `kind: "local_tool"`.
 
 No other tool RPC exists. Tool requests are automatic. A tool-level failure,
 such as a missing file, missing edit target, malformed args, non-zero bash exit,

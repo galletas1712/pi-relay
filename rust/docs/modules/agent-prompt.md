@@ -51,7 +51,7 @@ Input types the caller fills in:
 Use `{{ tools.aliases.workspace_search | default(value="Grep") }}` instead of calling `grep` directly.
 ```
 
-The registered builtin tools and their aliases are owned by the daemon tool registry, not this crate. Current tools: `edit` (rendered as `apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `grep` (uniform JSON `Grep`), `web_search`, `web_fetch`, and `load_skill`. See [agent-tools](./agent-tools.md) and [websocket-rpc](../websocket-rpc.md) (`tools.list`).
+The registered builtin tools and their aliases are owned by the daemon tool registry, not this crate. Current tools: `edit` (rendered as `apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `grep` (uniform JSON `Grep`), `web_search`, `web_fetch`, `load_skill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`). See [agent-tools](./agent-tools.md) and [websocket-rpc](../websocket-rpc.md) (`tools.list`).
 
 ## How it works
 

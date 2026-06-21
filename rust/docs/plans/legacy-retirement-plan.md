@@ -5,6 +5,13 @@ Goal: fully retire the legacy REPL-subagent orchestration surface while leaving 
 live `stage.*` path (runtime tools + client RPCs + barrier/handoff/steer runner +
 workflow skills) byte-for-byte unaffected.
 
+Historical note: this Phase 6 plan predates the provider-visible delegation-tool
+rename. The diagram below uses the old model-facing names
+(`stage_start_full`, `stage_start_readonly_fanout`, `stage_status`,
+`stage_cancel`) as historical labels. Current agents should use
+`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, and
+`cancel_delegation`; the `stage.*` names remain web/client RPCs.
+
 Decided invariants (do not relitigate):
 - KEEP the `PythonRepl` *scripting* tool (arbitrary Python exec) as an escape hatch.
 - REMOVE the `subagents.*` REPL orchestration module (the Python bootstrap classes
@@ -302,8 +309,8 @@ Run after each major step; all must pass and the new surface must be unaffected:
       `handoff_tests`, `stages_tests`, `workspaces::tests`, `types` all green.
 - [ ] `cargo clippy --workspace -- -D warnings` (catches dead code / unused imports).
 - [ ] web: `tsc --noEmit`, `vitest run` (esp. `runBoard.test.ts`), `vite build`.
-- [ ] **stage.* smoke test (new surface unaffected):** start a session, call
-      `stage_start_readonly_fanout` with 2 tasks and `stage_start_full` with 1, confirm
+- [ ] **delegation smoke test (new surface unaffected):** start a session, call
+      `delegate_readonly_tasks` with 2 tasks and `delegate_writing_task` with 1, confirm
       the run board shows live subagents, the barrier fires once, the handoff dir is
       written (`index.json` + per-subagent `final_message.md`/`transcript.md`),
       `stage.read_handoff_file` reads them, `stage.cancel` cancels a running stage, and

@@ -1357,12 +1357,12 @@ mod tests {
             names,
             [
                 "Bash",
+                "cancel_delegation",
+                "delegate_readonly_tasks",
+                "delegate_writing_task",
                 "Grep",
+                "inspect_delegation",
                 "LoadSkill",
-                "stage_cancel",
-                "stage_start_full",
-                "stage_start_readonly_fanout",
-                "stage_status",
                 "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search"
@@ -1396,17 +1396,17 @@ mod tests {
 
         assert_eq!(body["tools"][0]["name"], "Bash");
         assert!(body["tools"][0].get("type").is_none());
-        assert_eq!(body["tools"][1]["name"], "Grep");
+        assert_eq!(body["tools"][1]["name"], "cancel_delegation");
         assert!(body["tools"][1].get("type").is_none());
-        assert_eq!(body["tools"][2]["name"], "LoadSkill");
+        assert_eq!(body["tools"][2]["name"], "delegate_readonly_tasks");
         assert!(body["tools"][2].get("type").is_none());
-        assert_eq!(body["tools"][3]["name"], "stage_cancel");
+        assert_eq!(body["tools"][3]["name"], "delegate_writing_task");
         assert!(body["tools"][3].get("type").is_none());
-        assert_eq!(body["tools"][4]["name"], "stage_start_full");
+        assert_eq!(body["tools"][4]["name"], "Grep");
         assert!(body["tools"][4].get("type").is_none());
-        assert_eq!(body["tools"][5]["name"], "stage_start_readonly_fanout");
+        assert_eq!(body["tools"][5]["name"], "inspect_delegation");
         assert!(body["tools"][5].get("type").is_none());
-        assert_eq!(body["tools"][6]["name"], "stage_status");
+        assert_eq!(body["tools"][6]["name"], "LoadSkill");
         assert!(body["tools"][6].get("type").is_none());
         assert_eq!(body["tools"][7]["type"], "text_editor_20250728");
         assert_eq!(body["tools"][7]["name"], "str_replace_based_edit_tool");

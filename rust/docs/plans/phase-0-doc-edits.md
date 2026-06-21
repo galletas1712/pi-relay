@@ -1,10 +1,11 @@
-# Phase 0 doc edits (apply when `stage.*` lands)
+# Phase 0 doc edits (apply when delegation tools land)
 
 These are the exact documentation edits for Phase 0 of
 `../workflow-orchestration.md`. They are staged here (not applied to the live
-docs) because they describe the `stage.*` surface and the one-durable-workspace
-model, which do not exist yet. Apply them in the same change that lands the
-`stage.*` tools so the docs never describe unbuilt behavior.
+docs) because they describe the delegation-tool surface and the
+one-durable-workspace model, which do not exist yet. Apply them in the same
+change that lands the delegation tools so the docs never describe unbuilt
+behavior.
 
 The current docs were updated by #151 and now describe subagent delegation as
 spawn/control through the Python REPL `subagents` module, with optional
@@ -36,7 +37,9 @@ spawn and control flow through the in-process Python REPL `subagents` module"
 
 with:
 
-> - Subagent delegation runs as **stages** through regular `stage.*` RPC tools.
+> - Subagent delegation runs as **stages** through provider-visible delegation
+>   tools (`delegate_writing_task`, `delegate_readonly_tasks`,
+>   `inspect_delegation`, `cancel_delegation`).
 >   A stage is one **full** subagent (writes the parent's workspace in place) or a
 >   parallel fan-out of **read-only** subagents (each in a disposable btrfs
 >   snapshot, destroyed on return). The parent parks after launching a stage and
@@ -64,8 +67,8 @@ Add:
 In the subagent/runtime section, replace the description of REPL-driven
 spawn/wait/steer with a short summary of the stage runtime:
 
-> Subagent work runs as **stages** (`stage.start_full` /
-> `stage.start_readonly_fanout` / `stage.status` / `stage.cancel`). Full
+> Subagent work runs as **stages** (`delegate_writing_task` /
+> `delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation`). Full
 > subagents reuse the parent's workspace dirs in place; read-only subagents get a
 > forked snapshot destroyed on return. A stage runner watches
 > `subagent.{spawned,running,idle}` events, applies a single-flight,

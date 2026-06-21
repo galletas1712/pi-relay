@@ -2,7 +2,7 @@
 
 These are **drafts**, not live skills. They are intentionally kept out of any
 directory the skill loader scans (`subagent-roles/` and workspace skill dirs) so
-that running agents do not see guidance for `stage.*` tools that do not exist
+that running agents do not see guidance for delegation tools that do not exist
 yet.
 
 Install them in **Phase 4** of `../workflow-orchestration.md`:
@@ -20,7 +20,7 @@ subagent **role** skills of the same topic (e.g. the `explore` role vs the
 `workflow-explore` pattern).
 
 Each skill documents a parent-interpreted, possibly-cyclic **stage state
-machine**. The parent drives it with `stage.start_full` /
-`stage.start_readonly_fanout`, branching on the typed `suggested_next` outcomes
+machine**. The parent drives it with `delegate_writing_task` /
+`delegate_readonly_tasks`, branching on the typed `suggested_next` outcomes
 that appear in each stage's handoff `index.json`. See "Workflows are skills, not
 a DSL" in the spec.
