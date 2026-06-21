@@ -7,7 +7,7 @@
 //!   if any subagent of D is not terminal: return            # barrier not met
 //!   finish_delegation CAS (running -> done|done_with_failures)    # single-flight status claim
 //!   if the CAS won:
-//!     render/refresh handoff dir (index.json + per-subagent md)
+//!     render/refresh handoff dir (per-subagent md)
 //!     enqueue deterministic parent steer
 //!     drive parent to consume the queued steer
 //! ```
@@ -131,7 +131,7 @@ pub(crate) async fn try_claim_and_publish_completed_delegation(
 async fn publish_completed_delegation(
     state: &AppState,
     delegation: &Delegation,
-    status: DelegationStatus,
+    _status: DelegationStatus,
     ok: usize,
     failed: usize,
     failed_ids: &[String],
@@ -143,7 +143,7 @@ async fn publish_completed_delegation(
     let handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
     let message = steer_message(delegation, &handoff_dir, ok, failed, failed_ids);
     let steer_client_input_id = delegation_steer_client_input_id(delegation);
-    write_delegation_handoff(state, delegation, status).await?;
+    write_delegation_handoff(state, delegation).await?;
     state
         .repo
         .enqueue_delegation_steer(

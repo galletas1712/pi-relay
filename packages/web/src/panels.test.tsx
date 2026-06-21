@@ -68,7 +68,7 @@ describe("Inspector run board handoff links", () => {
 		const html = renderInspector([delegation({ status: "done_with_failures" })]);
 
 		expect(html).toContain("handoff /workspace/.pi-handoff/delegation-1");
-		expect(html).toContain("index.json");
+		expect(html).not.toContain("index.json");
 		expect(html).toContain("final message");
 		expect(html).toContain("transcript");
 	});

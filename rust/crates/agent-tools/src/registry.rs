@@ -377,7 +377,7 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
 fn inspect_delegation_definition() -> ToolDefinition {
     ToolDefinition::new(
         "inspect_delegation",
-        "Inspect a delegation and its subagents (also readable via the handoff index.json once complete).",
+        "Inspect a delegation and its subagents, including progress, outcomes, final messages, and artifact paths.",
         json!({
             "type": "object",
             "properties": {
