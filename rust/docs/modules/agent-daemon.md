@@ -57,8 +57,8 @@ reuse the parent's workspace dirs in place; read-only subagents get a forked
 snapshot destroyed on return. Delegation subagents may emit
 `subagent.spawned`/`subagent.running` progress events; their terminal hook fires
 a single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
-terminal. The runner writes the handoff directory idempotently and the DB
-finish CAS enqueues one `InputPriority::Steer` notification to the parent.
+terminal. After the DB finish CAS wins, the runner writes the handoff directory
+and then enqueues one `InputPriority::Steer` notification to the parent.
 Completion is that steer/handoff, not a parent-visible per-child idle event. The
 runner never decides the next delegation — the parent does, guided by workflow
 skills. Cancellation is terminal and exports transcript-only files for the
