@@ -112,7 +112,7 @@ Every handler that touches session state calls `SessionDriver::acquire`, which f
 
 ### Automatic tool dispatch
 
-Tool actions are dispatched immediately. `spawn_claimed_dispatch` runs `run_tool_turn` in a registered background task: it marks the action running, ensures the workspace, executes the tool, feeds the `ToolResultMessage` back into the live session, drains, and re-drives. `LoadSkill` and the web tools (`web_search`/`web_fetch`) are handled in-daemon; all other tools route to the `ToolRegistry` keyed by provider kind. There is no approval interface — tools execute automatically.
+Tool actions are dispatched immediately. `spawn_claimed_dispatch` runs `run_tool_turn` in a registered background task: it marks the action running, ensures the workspace, executes the tool, feeds the `ToolResultMessage` back into the live session, drains, and re-drives. Runtime/local tools such as `LoadSkill`, the web tools (`web_search`/`web_fetch`), and delegation tools are handled in-daemon; provider-executed registry tools route through the `ToolRegistry` keyed by provider kind as appropriate. There is no approval interface — tools execute automatically.
 
 ### Model dispatch, retries, and auth recovery
 
