@@ -57,7 +57,10 @@ use crate::runtime::SessionDriver;
 use crate::state::AppState;
 use crate::workspaces::WorkspaceManager;
 
-use super::{complete_delegation_if_ready, sweep_running_delegations_on_boot};
+use super::{
+    complete_delegation_if_ready, sweep_running_delegations_on_boot,
+    try_claim_and_publish_completed_delegation,
+};
 use crate::delegation_tools::{cancel_core, run_delegation_tool, steer_subagent_core};
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(90_000);
@@ -846,6 +849,79 @@ async fn cancel_delegation_returns_transcript_only_paths() {
 }
 
 #[tokio::test]
+async fn cancel_delegation_does_not_clobber_completed_delegation_or_write_artifacts() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "cancel race test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "impl_done_before_cancel",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "Done.",
+    )
+    .await;
+
+    assert!(env
+        .state
+        .repo
+        .finish_delegation(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::DoneWithFailures,
+        )
+        .await
+        .expect("simulate completion winning first"));
+    let result = cancel_core(
+        &env.state,
+        "parent",
+        json!({ "delegation_id": delegation.id }),
+    )
+    .await
+    .expect("cancel after completion");
+    assert_eq!(result, json!({ "cancelled": false }));
+    assert_eq!(
+        env.state
+            .repo
+            .get_delegation(&delegation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DelegationStatus::DoneWithFailures
+    );
+    let handoff_root = env.cwd.path().join(".pi-handoff").join(&delegation.id);
+    assert!(
+        !handoff_root.join("cancelled").exists(),
+        "cancel-loser must not write transcript-only artifacts"
+    );
+    assert!(
+        !handoff_root.join("index.json").exists(),
+        "direct status completion did not publish normal handoff either"
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
 async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -975,6 +1051,77 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
 }
 
 #[tokio::test]
+async fn completion_loser_after_cancellation_does_not_write_normal_handoff() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "completion cancel race test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "impl_cancel_wins",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "Done.",
+    )
+    .await;
+
+    // Simulate the barrier having already loaded this Running delegation and
+    // classified its terminal subagent. Cancellation wins before the completion
+    // status CAS, so the completion path must return false and publish no
+    // normal handoff artifacts.
+    assert!(env
+        .state
+        .repo
+        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
+        .await
+        .expect("cancellation wins"));
+    let won_completion = try_claim_and_publish_completed_delegation(
+        &env.state,
+        &delegation,
+        DelegationStatus::Done,
+        1,
+        0,
+        &[],
+    )
+    .await
+    .expect("completion loser returns cleanly");
+    assert!(!won_completion);
+    assert_eq!(
+        env.state
+            .repo
+            .get_delegation(&delegation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DelegationStatus::Cancelled
+    );
+    let handoff_root = env.cwd.path().join(".pi-handoff").join(&delegation.id);
+    assert!(!handoff_root.join("index.json").exists());
+    assert!(!handoff_root.join("impl_cancel_wins").exists());
+    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
 async fn out_of_set_suggested_next_is_recorded_verbatim() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -1039,10 +1186,6 @@ async fn stale_attempt_id_cannot_finish_delegation() {
         .await
         .expect("create delegation");
 
-    let key = format!(
-        "delegation-steer:{}:{}",
-        delegation.id, delegation.attempt_id
-    );
     // The real attempt_id wins exactly once.
     assert!(env
         .state
@@ -1050,10 +1193,7 @@ async fn stale_attempt_id_cannot_finish_delegation() {
         .finish_delegation(
             &delegation.id,
             &delegation.attempt_id,
-            DelegationStatus::Done,
-            "parent",
-            "done",
-            &key
+            DelegationStatus::Done
         )
         .await
         .expect("finish"));
@@ -1064,10 +1204,7 @@ async fn stale_attempt_id_cannot_finish_delegation() {
         .finish_delegation(
             &delegation.id,
             &delegation.attempt_id,
-            DelegationStatus::Done,
-            "parent",
-            "done",
-            &key
+            DelegationStatus::Done
         )
         .await
         .expect("finish again"));
@@ -1081,14 +1218,7 @@ async fn stale_attempt_id_cannot_finish_delegation() {
     assert!(!env
         .state
         .repo
-        .finish_delegation(
-            &delegation.id,
-            "stale-attempt-id",
-            DelegationStatus::Done,
-            "parent",
-            "done",
-            &key
-        )
+        .finish_delegation(&delegation.id, "stale-attempt-id", DelegationStatus::Done)
         .await
         .expect("stale finish"));
     assert_eq!(
@@ -1391,11 +1521,11 @@ async fn partial_spawn_does_not_complete_delegation() {
     env.cleanup().await;
 }
 
-/// FIX B: simulate a crash after the finish_delegation commit (the parent is never
-/// driven). The steer must be durably queued, and a re-run (boot sweep) must not
-/// enqueue a second one.
+/// Simulate a crash after the finish_delegation status claim but before handoff
+/// files / steer publication. Boot repair must publish the files, enqueue the
+/// deterministic steer, and remain idempotent on later restarts.
 #[tokio::test]
-async fn steer_is_durable_after_finish_and_not_double_enqueued() {
+async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -1426,9 +1556,7 @@ async fn steer_is_durable_after_finish_and_not_double_enqueued() {
     )
     .await;
 
-    // Run the CAS + atomic steer-enqueue directly (the same call the runner makes),
-    // WITHOUT driving the parent — i.e. a crash in the old gap. The steer is part
-    // of the committed CAS tx, so it is durably queued.
+    // Claim only the terminal status, then "crash" before normal publication.
     let key = format!(
         "delegation-steer:{}:{}",
         delegation.id, delegation.attempt_id
@@ -1439,46 +1567,39 @@ async fn steer_is_durable_after_finish_and_not_double_enqueued() {
         .finish_delegation(
             &delegation.id,
             &delegation.attempt_id,
-            DelegationStatus::Done,
-            "parent",
-            "delegation finished",
-            &key
+            DelegationStatus::Done
         )
         .await
         .expect("finish wins"));
-    let durable = env
+    assert!(env
         .state
         .repo
         .find_client_input("parent", &key)
         .await
-        .expect("find steer");
-    assert!(
-        durable.is_some(),
-        "steer must be durably queued after the CAS commit"
-    );
+        .expect("find steer")
+        .is_none());
+    assert!(!env
+        .cwd
+        .path()
+        .join(".pi-handoff")
+        .join(&delegation.id)
+        .join("index.json")
+        .exists());
 
-    // Re-open the delegation and re-run with the same deterministic key (a replay /
-    // boot sweep racing the original winner): the CAS wins again, but the steer
-    // insert is a no-op on the unique (session_id, client_input_id) index, so no
-    // second steer is queued. The parent's queue still holds exactly one steer.
-    env.state
-        .repo
-        .set_delegation_status(&delegation.id, DelegationStatus::Running)
-        .await
-        .expect("reopen");
+    sweep_running_delegations_on_boot(&env.state).await;
     assert!(env
         .state
         .repo
-        .finish_delegation(
-            &delegation.id,
-            &delegation.attempt_id,
-            DelegationStatus::Done,
-            "parent",
-            "delegation finished",
-            &key
-        )
+        .find_client_input("parent", &key)
         .await
-        .expect("replay CAS wins again"));
+        .expect("find repaired steer")
+        .is_some());
+    let index = read_index(&env, &delegation.id);
+    assert_eq!(index["status"], "done");
+    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+
+    // A second repair sweep must not double-enqueue or double-drive.
+    sweep_running_delegations_on_boot(&env.state).await;
     let queued_steers = env
         .state
         .repo
@@ -1493,6 +1614,7 @@ async fn steer_is_durable_after_finish_and_not_double_enqueued() {
         queued_steers, 1,
         "exactly one durable steer, no double-enqueue"
     );
+    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
 
     env.cleanup().await;
 }

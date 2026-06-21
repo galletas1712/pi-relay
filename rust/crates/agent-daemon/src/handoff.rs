@@ -8,10 +8,11 @@
 //! `active_branch` (Ui body mode), so it survives an RO subagent's snapshot
 //! being destroyed and a crashed subagent's partial tail.
 //!
-//! The writer is intentionally idempotent: delegation completion may render/rewrite
-//! the same durable transcript files before/around the DB terminal CAS. The CAS
-//! single-flights the delegation status and parent steer enqueue; file rendering
-//! itself is safe to replay.
+//! The writer is intentionally idempotent, but normal completion only publishes
+//! these files after it wins the DB terminal-status CAS. That ordering prevents
+//! a concurrent cancellation from receiving a normal completed handoff. Boot
+//! repair may re-render the same files for already-completed delegations if the
+//! daemon crashed after the status CAS but before publication.
 
 use std::path::{Path, PathBuf};
 
@@ -175,18 +176,18 @@ struct SubagentHandoff {
     suggested_next: Option<String>,
 }
 
-fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
+pub(crate) fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
     Path::new(parent_outer_cwd)
         .join(HANDOFF_DIR)
         .join(delegation_id)
 }
 
 /// Render and write the whole handoff directory for a completed delegation.
-/// This is a pure function of durable transcripts and delegation metadata, so
-/// the barrier may run it before/around the `finish_delegation` CAS and safely
-/// replay it. The CAS, not this writer, single-flights the terminal status and
-/// parent steer enqueue. `delegation_status` is the terminal status the caller
-/// is attempting to commit
+/// This is a pure function of durable transcripts and delegation metadata and
+/// is safe to replay, but it must not be used as the single-flight. The normal
+/// barrier calls it only after winning the `finish_delegation` CAS; otherwise a
+/// cancellation that wins the same race could be left with completed handoff
+/// artifacts. `delegation_status` is the terminal status the caller committed
 /// (`done` vs `done_with_failures`).
 pub(crate) async fn write_delegation_handoff(
     state: &AppState,

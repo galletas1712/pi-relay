@@ -494,10 +494,11 @@ impl SessionDriver {
 
     /// The delegation barrier: when a subagent of a delegation reaches its
     /// once-only terminal idle, complete the delegation iff every subagent is
-    /// terminal. The `finish_delegation` CAS (delegation-row `for update` lock +
-    /// `status='running'` fence) is the single-flight for terminal delegation
-    /// status and parent steer enqueue; handoff rendering is idempotent and may
-    /// happen before/around the CAS.
+    /// terminal. The `finish_delegation` CAS (`status='running'` +
+    /// `attempt_id` fence) is the single-flight for terminal delegation status;
+    /// only its winner publishes normal handoff files and then enqueues the
+    /// deterministic parent steer. A cancellation winner therefore remains
+    /// transcript-only.
     async fn try_delegation_barrier(&self, delegation_id: &str) {
         // `recover_if_needed` -> terminal idle -> barrier -> sibling
         // `recover_if_needed` is a recursive async cycle; box it to break the
