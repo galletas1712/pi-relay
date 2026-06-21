@@ -348,10 +348,12 @@ compaction provider inputs. The special case happens after compaction: once the
 provider returns a compacted summary, top-level parent compaction appends a fresh
 `## Delegation state at compaction time` ledger to the stored summary. That
 ledger lists every parent delegation row/status with bounded details and no
-transcript body inlining. Before a later compaction is sent to a provider, any
-previous appended ledger is stripped from the compaction input and replaced
-afterward with fresh state. Subagent compaction omits parent/sibling delegation
-state entirely, because subagents do not orchestrate the delegation tree.
+transcript body inlining. Later compactions let the provider summarize whatever
+prior summary text exists, including older point-in-time ledgers, then append a
+fresh ledger again. The latest appended ledger is authoritative and supersedes
+older ledger text by position. Subagent compaction omits parent/sibling
+delegation state entirely, because subagents do not orchestrate the delegation
+tree.
 
 Prompt caching works best when the beginning of the prompt is identical across
 requests. That means the long-lived global system prompt, stable tool

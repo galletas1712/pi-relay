@@ -514,6 +514,17 @@ fn last_user_text(entries: &[ModelTranscriptEntry]) -> &str {
         .expect("request has a final user message")
 }
 
+fn compaction_input_texts(entries: &[ModelTranscriptEntry]) -> Vec<&str> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry.item() {
+            TranscriptItem::UserMessage(message) => message.as_text(),
+            TranscriptItem::CompactionSummary(summary) => Some(summary.summary.as_str()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn test_compaction_output(summary: &str) -> CompactionOutput {
     CompactionOutput {
         summary: summary.to_string(),
@@ -839,7 +850,7 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         TranscriptItem::CompactionSummary(CompactionSummary::new(
             "parent",
             "old_leaf",
-            "older provider summary\n\n## Delegation state at compaction time\n\nold stale delegation ledger",
+            "older provider summary\n\n## Delegation state at compaction time\n\nold prior delegation ledger",
             Some(123),
             TurnId(1),
         ))
@@ -863,38 +874,55 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         remote_request.prompt.dynamic_context.is_none(),
         "compaction ledger must not be PromptSections.dynamic_context"
     );
-    let remote_user_texts = user_texts(&remote_request.transcript);
-    assert!(remote_user_texts
+    let remote_input_texts = compaction_input_texts(&remote_request.transcript);
+    assert!(remote_input_texts
         .iter()
         .any(|text| text.contains("older provider summary")));
     assert!(
-        !remote_user_texts
+        remote_input_texts
             .iter()
-            .any(|text| text.contains("old stale delegation ledger")),
-        "remote compaction input should strip previously appended stale delegation ledgers: {remote_user_texts:?}"
+            .any(|text| text.contains("old prior delegation ledger")),
+        "remote compaction input should preserve prior summary text, including old ledgers: {remote_input_texts:?}"
     );
-    assert!(remote_user_texts.contains(&"history before compaction"));
+    assert!(remote_input_texts.contains(&"history before compaction"));
     assert!(
-        !remote_user_texts
+        remote_input_texts
             .iter()
             .any(|text| text.contains("## Delegation state at compaction time")),
-        "remote compaction input should not include live delegation ledger: {remote_user_texts:?}"
+        "remote compaction input should preserve old ledger text only as ordinary prior summary text: {remote_input_texts:?}"
     );
+    let remote_joined = remote_input_texts.join("\n\n");
+    assert!(!remote_joined.contains(&format!("delegation_id: `{}`", running.id)));
+    assert!(!remote_joined.contains(&format!("delegation_id: `{}`", failed.id)));
+    assert!(!remote_joined.contains("## Current delegations"));
 
     let output = append_delegation_ledger_to_output(
         &env.state,
         "parent",
-        test_compaction_output("provider summary"),
+        test_compaction_output(
+            "provider summary\n\n## Delegation state at compaction time\n\nold provider-emitted ledger text",
+        ),
     )
     .await
     .expect("append ledger to output");
     assert!(output.summary.starts_with("provider summary\n\n"));
+    assert!(
+        output.summary.contains("old provider-emitted ledger text"),
+        "provider output should not have old ledger text manually stripped: {}",
+        output.summary
+    );
+    let marker = "## Delegation state at compaction time";
+    assert_eq!(
+        output.summary.matches(marker).count(),
+        2,
+        "fresh appended ledger supersedes any older ledger by being the latest section: {}",
+        output.summary
+    );
     let ledger = output
         .summary
-        .split("## Delegation state at compaction time")
-        .nth(1)
-        .map(|rest| format!("## Delegation state at compaction time{rest}"))
-        .expect("post-compaction summary includes ledger");
+        .rsplit_once(marker)
+        .map(|(_, rest)| format!("{marker}{rest}"))
+        .expect("post-compaction summary includes fresh ledger");
     assert!(ledger.starts_with("## Delegation state at compaction time"));
     assert!(!ledger.contains("## Current delegations"));
     assert!(ledger.contains(&format!("delegation_id: `{}`", running.id)));
@@ -934,10 +962,10 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
     .expect("build local compaction request");
     assert!(local_request.prompt.dynamic_context.is_none());
     let local_tail = last_user_text(&local_request.transcript);
-    let local_joined = user_texts(&local_request.transcript).join("\n\n");
+    let local_joined = compaction_input_texts(&local_request.transcript).join("\n\n");
     assert!(
-        !local_joined.contains("old stale delegation ledger"),
-        "local compaction input should strip previously appended stale delegation ledgers: {local_joined}"
+        local_joined.contains("old prior delegation ledger"),
+        "local compaction input should preserve prior summary text, including old ledgers: {local_joined}"
     );
     assert!(local_tail.contains("Produce a compact continuation summary."));
     assert!(
