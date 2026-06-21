@@ -880,70 +880,53 @@ async fn detect_schema_conflicts(
     has_delegation_id: bool,
 ) -> Result<()> {
     if has_stages && has_delegations {
-        let stage_expected = expected_subagents_expr(tx, "stages", None).await?;
-        let delegation_expected = expected_subagents_expr(tx, "delegations", None).await?;
-        let old_count: i64 = sqlx::query_scalar("select count(*)::bigint from stages")
-            .fetch_one(&mut **tx)
-            .await
-            .context("count stages")?;
-        let new_count: i64 = sqlx::query_scalar("select count(*)::bigint from delegations")
-            .fetch_one(&mut **tx)
-            .await
-            .context("count delegations")?;
-        let diff_sql = format!(
+        let non_expected_conflicts: Vec<String> = sqlx::query_scalar(
             r#"
-            select count(*)::bigint
-            from (
-                (select id, parent_session_id, workflow, label, kind, status, attempt_id,
-                    created_at, updated_at,
-                    {stage_expected} as expected_subagents
-                 from stages
-                 except
-                 select id, parent_session_id, workflow, label, kind, status, attempt_id,
-                    created_at, updated_at,
-                    {delegation_expected} as expected_subagents
-                 from delegations)
-                union all
-                (select id, parent_session_id, workflow, label, kind, status, attempt_id,
-                    created_at, updated_at,
-                    {delegation_expected} as expected_subagents
-                 from delegations
-                 except
-                 select id, parent_session_id, workflow, label, kind, status, attempt_id,
-                    created_at, updated_at,
-                    {stage_expected} as expected_subagents
-                 from stages)
-            ) diff
+            select s.id
+            from stages s
+            join delegations d using (id)
+            where (s.parent_session_id, s.workflow, s.label, s.kind, s.status, s.attempt_id,
+                   s.created_at, s.updated_at)
+               is distinct from
+                  (d.parent_session_id, d.workflow, d.label, d.kind, d.status, d.attempt_id,
+                   d.created_at, d.updated_at)
+            order by s.created_at, s.id
+            limit 5
             "#,
-        );
-        let diff: i64 = sqlx::query_scalar(&diff_sql)
-            .fetch_one(&mut **tx)
-            .await
-            .context("compare stages/delegations rows")?;
-        if old_count > 0 && new_count > 0 && diff > 0 {
-            let stage_expected = expected_subagents_expr(tx, "stages", Some("s")).await?;
-            let delegation_expected = expected_subagents_expr(tx, "delegations", Some("d")).await?;
-            let overlap_sql = format!(
-                r#"
-                select count(*)::bigint
-                from stages s
-                join delegations d using (id)
-                where (s.parent_session_id, s.workflow, s.label, s.kind, s.status, s.attempt_id,
-                       s.created_at, s.updated_at, {stage_expected})
-                   is distinct from
-                      (d.parent_session_id, d.workflow, d.label, d.kind, d.status, d.attempt_id,
-                       d.created_at, d.updated_at, {delegation_expected})
-                "#,
+        )
+        .fetch_all(&mut **tx)
+        .await
+        .context("compare overlapping stages/delegations non-expected rows")?;
+        if !non_expected_conflicts.is_empty() {
+            bail!(
+                "both stages and delegations contain conflicting non-expected rows for the same IDs: {}; refusing to merge automatically",
+                non_expected_conflicts.join(", ")
             );
-            let overlap_conflicts: i64 = sqlx::query_scalar(&overlap_sql)
-                .fetch_one(&mut **tx)
-                .await
-                .context("compare overlapping stages/delegations rows")?;
-            if overlap_conflicts > 0 {
-                bail!(
-                    "both stages and delegations contain conflicting rows for the same IDs; refusing to merge automatically"
-                );
-            }
+        }
+
+        let stage_expected =
+            expected_subagents_expr_after_safe_readonly_repairs(tx, "stages", "s").await?;
+        let delegation_expected =
+            expected_subagents_expr_after_safe_readonly_repairs(tx, "delegations", "d").await?;
+        let expected_conflict_sql = format!(
+            r#"
+            select s.id
+            from stages s
+            join delegations d using (id)
+            where ({stage_expected}) is distinct from ({delegation_expected})
+            order by s.created_at, s.id
+            limit 5
+            "#
+        );
+        let expected_conflicts: Vec<String> = sqlx::query_scalar(&expected_conflict_sql)
+            .fetch_all(&mut **tx)
+            .await
+            .context("compare overlapping stages/delegations expected_subagents")?;
+        if !expected_conflicts.is_empty() {
+            bail!(
+                "both stages and delegations contain conflicting expected_subagents for the same IDs after allowing safe readonly_fanout under-count repairs: {}; refusing to merge automatically",
+                expected_conflicts.join(", ")
+            );
         }
     }
 
@@ -966,6 +949,30 @@ async fn detect_schema_conflicts(
     }
 
     Ok(())
+}
+
+async fn expected_subagents_expr_after_safe_readonly_repairs(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    table: &str,
+    alias: &str,
+) -> Result<String> {
+    let expected = expected_subagents_expr(tx, table, Some(alias)).await?;
+    if !column_exists(tx, table, "expected_subagents").await? {
+        return Ok(expected);
+    }
+
+    let child_count = child_session_count_expr(tx, alias).await?;
+    Ok(format!(
+        r#"
+        case
+          when {alias}.kind = 'readonly_fanout'
+            and {alias}.expected_subagents is not null
+            and ({child_count}) > {alias}.expected_subagents
+          then ({child_count})
+          else {expected}
+        end
+        "#
+    ))
 }
 
 async fn create_table_backups(
@@ -1892,8 +1899,11 @@ fn rewrite_system_prompt(input: &str) -> (String, TextRewriteStats) {
     let mut stats = TextRewriteStats::default();
 
     if let Some((start, end)) = subagent_delegation_section_bounds(&output) {
-        output.replace_range(start..end, CURRENT_SUBAGENT_DELEGATION_SECTION);
-        stats.record("system_prompt subagent delegation section", 1);
+        let existing_section = &output[start..end];
+        if !subagent_delegation_section_is_current(existing_section, &output[end..]) {
+            output.replace_range(start..end, CURRENT_SUBAGENT_DELEGATION_SECTION);
+            stats.record("system_prompt subagent delegation section", 1);
+        }
     }
 
     for (label, old, new) in [
@@ -2001,6 +2011,16 @@ fn rewrite_system_prompt(input: &str) -> (String, TextRewriteStats) {
         }
     }
     (output, stats)
+}
+
+fn subagent_delegation_section_is_current(existing_section: &str, following: &str) -> bool {
+    existing_section == CURRENT_SUBAGENT_DELEGATION_SECTION
+        || (following.starts_with("\n## ")
+            && CURRENT_SUBAGENT_DELEGATION_SECTION
+                .strip_suffix('\n')
+                .is_some_and(|current_without_trailing_newline| {
+                    existing_section == current_without_trailing_newline
+                }))
 }
 
 fn subagent_delegation_section_bounds(input: &str) -> Option<(usize, usize)> {
@@ -2277,6 +2297,30 @@ Use skills when relevant.
         assert!(!rewritten.contains("Never mix RO and full work in one stage."));
         assert!(!rewritten.contains("stage.full"));
         assert!(rewritten.contains("## Skills"));
+    }
+
+    #[test]
+    fn current_subagent_delegation_prompt_section_is_idempotent() {
+        let prompt = format!(
+            "# Instructions\n\n{CURRENT_SUBAGENT_DELEGATION_SECTION}\n## Skills\n\nUse skills when relevant.\n"
+        );
+
+        let (rewritten, stats) = rewrite_system_prompt(&prompt);
+
+        assert!(!stats.changed());
+        assert_eq!(rewritten, prompt);
+    }
+
+    #[test]
+    fn current_subagent_delegation_prompt_section_before_next_heading_is_idempotent() {
+        let prompt = format!(
+            "# Instructions\n\n{CURRENT_SUBAGENT_DELEGATION_SECTION}## Skills\n\nUse skills when relevant.\n"
+        );
+
+        let (rewritten, stats) = rewrite_system_prompt(&prompt);
+
+        assert!(!stats.changed());
+        assert_eq!(rewritten, prompt);
     }
 
     #[test]
@@ -2606,6 +2650,7 @@ Use skills when relevant.
         assert_eq!(rerun_stats.transcript_item_rows, 0);
         assert_eq!(rerun_stats.queued_client_input_id_rows, 0);
         assert_eq!(rerun_stats.event_type_rows, 0);
+        assert_eq!(rerun_stats.session_system_prompt_rows, 0);
         assert!(rerun_stats.schema_operations.is_empty());
 
         pool.close().await;
@@ -2645,6 +2690,80 @@ Use skills when relevant.
         .await
         .expect("expected_subagents");
         assert_eq!(expected_subagents, 2);
+
+        pool.close().await;
+        drop_test_database(&admin_url, &database_name).await;
+    }
+
+    #[tokio::test]
+    async fn postgres_fixture_repairs_mixed_partial_readonly_fanout_under_count() {
+        let Some((admin_url, database_url, database_name)) = create_test_database().await else {
+            eprintln!("skipping postgres migration fixture; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("connect test db");
+        create_mixed_partial_under_count_fixture(&pool).await;
+
+        let config = Config {
+            database_url: Some(database_url.clone()),
+            apply: true,
+            no_backups: true,
+            handoff_root: None,
+        };
+        let mut apply_stats = MigrationStats::default();
+        {
+            let mut tx = pool.begin().await.expect("begin apply");
+            migrate_schema(&mut tx, &config, &mut apply_stats)
+                .await
+                .expect("apply mixed partial schema migration");
+            tx.commit().await.expect("commit apply");
+        }
+
+        assert!(!table_exists_in_pool(&pool, "stages").await);
+        assert!(table_exists_in_pool(&pool, "delegations").await);
+        assert!(!column_exists_in_pool(&pool, "sessions", "stage_id").await);
+        assert!(column_exists_in_pool(&pool, "sessions", "delegation_id").await);
+        assert!(apply_stats
+            .schema_operations
+            .iter()
+            .any(|operation| operation.contains("repair 1 readonly_fanout delegations")));
+
+        let expected_subagents: i32 = sqlx::query_scalar(
+            "select expected_subagents from delegations where id='stage_mixed_fanout'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("expected_subagents");
+        assert_eq!(expected_subagents, 2);
+
+        let child_count: i64 = sqlx::query_scalar(
+            "select count(*)::bigint from sessions where delegation_id='stage_mixed_fanout'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("child count");
+        assert_eq!(child_count, 2);
+
+        let mut rerun_stats = MigrationStats::default();
+        {
+            let mut tx = pool.begin().await.expect("begin rerun");
+            migrate_schema(&mut tx, &config, &mut rerun_stats)
+                .await
+                .expect("rerun mixed partial schema migration");
+            tx.commit().await.expect("commit rerun");
+        }
+        assert!(rerun_stats.schema_operations.is_empty());
+
+        let expected_subagents_after_rerun: i32 = sqlx::query_scalar(
+            "select expected_subagents from delegations where id='stage_mixed_fanout'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("expected_subagents after rerun");
+        assert_eq!(expected_subagents_after_rerun, 2);
 
         pool.close().await;
         drop_test_database(&admin_url, &database_name).await;
@@ -2765,7 +2884,7 @@ Use skills when relevant.
             );
             insert into sessions (id, outer_cwd, system_prompt, provider_config, metadata)
             values
-                ('parent', '/tmp', 'Delegate work through stage tool calls. Launch at most one stage per turn.', '{"kind":"openai","model":"gpt-5"}', '{"stage_id":"stage_abc"}'),
+                ('parent', '/tmp', E'# Instructions\n\n## Subagent delegation\n\nDelegate work to subagents through stage tool calls. Do not use the Python REPL\nto orchestrate subagents.\n\nRules:\n\n- Launch at most one stage per turn, then end your turn.\n- When a stage finishes you receive a short message pointing at a handoff\n  directory.\n- Never mix RO and full work in one stage.\n- Call stage.full, stage.fanout, stage.status, or stage.cancel.\n\n## Skills\n\nUse skills when relevant.\n', '{"kind":"openai","model":"gpt-5"}', '{"stage_id":"stage_abc"}'),
                 ('child', '/tmp', '', '{"kind":"openai","model":"gpt-5"}', '{}');
             insert into stages (id, parent_session_id, kind, status, attempt_id, expected_subagents)
             values ('stage_abc', 'parent', 'full', 'running', 'attempt_1', 1);
@@ -2810,6 +2929,87 @@ Use skills when relevant.
         .execute(pool)
         .await
         .expect("create old-shape fixture");
+    }
+
+    async fn create_mixed_partial_under_count_fixture(pool: &PgPool) {
+        sqlx::raw_sql(
+            r#"
+            create table sessions (
+                id text primary key,
+                outer_cwd text not null,
+                workspaces jsonb not null default '[]'::jsonb,
+                created_at timestamptz not null default now(),
+                updated_at timestamptz not null default now(),
+                active_leaf_id text null,
+                system_prompt text not null,
+                provider_config jsonb not null,
+                metadata jsonb not null default '{}'::jsonb,
+                parent_session_id text null references sessions(id) on delete set null,
+                session_revision bigint not null default 0,
+                queue_revision bigint not null default 0,
+                transcript_revision bigint not null default 0,
+                subagent_type text null
+            );
+            create table stages (
+                id text primary key,
+                parent_session_id text not null references sessions(id) on delete cascade,
+                workflow text null,
+                label text null,
+                kind text not null,
+                status text not null,
+                attempt_id text not null,
+                created_at timestamptz not null default now(),
+                updated_at timestamptz not null default now()
+            );
+            create table delegations (
+                id text primary key,
+                parent_session_id text not null references sessions(id) on delete cascade,
+                workflow text null,
+                label text null,
+                kind text not null,
+                status text not null,
+                attempt_id text not null,
+                created_at timestamptz not null default now(),
+                updated_at timestamptz not null default now(),
+                expected_subagents integer not null default 1
+            );
+            create index stages_parent_created_idx on stages(parent_session_id, created_at, id);
+            alter table sessions add column stage_id text null references stages(id);
+            alter table sessions add column delegation_id text null references delegations(id);
+            insert into sessions (id, outer_cwd, system_prompt, provider_config, metadata)
+            values ('parent', '/tmp', '', '{"kind":"openai","model":"gpt-5"}', '{}');
+            insert into stages (
+                id, parent_session_id, workflow, label, kind, status, attempt_id,
+                created_at, updated_at
+            )
+            values (
+                'stage_mixed_fanout', 'parent', 'workflow-x', 'fanout label',
+                'readonly_fanout', 'running', 'attempt_1',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z'
+            );
+            insert into delegations (
+                id, parent_session_id, workflow, label, kind, status, attempt_id,
+                created_at, updated_at, expected_subagents
+            )
+            values (
+                'stage_mixed_fanout', 'parent', 'workflow-x', 'fanout label',
+                'readonly_fanout', 'running', 'attempt_1',
+                '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z', 1
+            );
+            insert into sessions (
+                id, outer_cwd, system_prompt, provider_config, metadata,
+                parent_session_id, subagent_type, stage_id, delegation_id
+            )
+            values
+                ('child_0', '/tmp', '', '{"kind":"openai","model":"gpt-5"}', '{}',
+                    'parent', 'read_only', 'stage_mixed_fanout', 'stage_mixed_fanout'),
+                ('child_1', '/tmp', '', '{"kind":"openai","model":"gpt-5"}', '{}',
+                    'parent', 'read_only', 'stage_mixed_fanout', 'stage_mixed_fanout');
+            "#,
+        )
+        .execute(pool)
+        .await
+        .expect("create mixed partial under-count fixture");
     }
 
     async fn create_pre_expected_fanout_fixture(pool: &PgPool, child_count: usize) {
