@@ -25,12 +25,14 @@ Two additions close that gap:
 
 - **G1.** In the inspector, for a **top-level** session only, show a "Workspaces"
   section: per git workspace → local branch, base branch, matched PR (number +
-  title + link), an out-of-date indicator, and the unmerged stack the PR is in.
+  title + link), out-of-date indicators (see G6), and the unmerged stack the PR
+  is in.
 - **G2.** A toggle switches the center pane between **Chat** and **Graph**.
 - **G3.** The graph shows, for the selected project's **idle + unarchived +
   top-level** sessions, the unmerged PRs you own (matched to those sessions),
-  drawn as base→head stacks per repo, with a synthetic base-branch node anchoring
-  each stack.
+  drawn as base→head stacks. **One subgraph per repo** (a multi-repo project
+  renders separate stacks per repo); a synthetic base-branch node anchors each
+  stack. The canvas is always single-project — projects are never mixed.
 - **G4.** Clicking a PR node:
   - highlights the lineage path from that PR down to its base branch (ancestors),
     dimming unrelated nodes;
@@ -38,8 +40,14 @@ Two additions close that gap:
     linking back to its chat;
   - opens a PR detail panel (title/body/state/checks/reviewers) with an "open on
     GitHub" link.
-- **G5.** All of GitHub is read-only; nothing in this feature can create/merge/edit
-  PRs.
+- **G5.** Node color distinguishes **draft** vs **ready-for-review** PRs (both are
+  open); merged/closed PRs are not shown.
+- **G6.** Two independent "out of date" signals are surfaced per PR/workspace:
+  - **behind base** — the PR's head branch is behind its base branch (needs a
+    rebase/merge from base);
+  - **behind tip** — the session's local checkout is not fast-forwarded to the
+    remote PR branch's tip (the published branch has commits the checkout lacks).
+- **G7.** All of GitHub is read-only; nothing can create/merge/edit PRs.
 
 ## 3. Topology: a read-only `gh` sidecar, GitHub kept out of the daemon
 
@@ -88,8 +96,9 @@ browser ── websocket ──▶ daemon       (sessions + session.workspace_he
 - No iframe embed of github.com — it sends `X-Frame-Options: DENY`. The "embedded
   PR view" is a detail **panel** from sidecar-proxied data + an "open on GitHub"
   link.
-- No GitLab/Forgejo support, no cross-project graph, no subagents in either
-  surface, no persisted view toggle.
+- No GitLab/Forgejo support, **no cross-project graph** (the canvas is always a
+  single project; projects are never shown on the same canvas), no subagents in
+  either surface, no persisted view toggle.
 - No session delegation (parent/child) edges in the graph. The graph shows **PR
   base→head stacks** only. Delegation overlay is out of scope.
 - No server-side caching/TTL layer beyond react-query `staleTime`.
@@ -99,10 +108,11 @@ browser ── websocket ──▶ daemon       (sessions + session.workspace_he
 
 ### 5.1 Daemon RPC: `session.workspace_heads` (the only backend change)
 
-**Why it must be in the daemon:** matching a session to a PR needs the clone's
-current HEAD sha and (best-effort) the pushed/upstream branch. `local_branch`
-(`pi/session/...`) is never pushed and `base_sha` is checkout-time, so neither
-identifies the PR head; only the daemon can read the live clone.
+**Why it must be in the daemon:** matching a session to a PR and computing
+"behind tip" both need live git state of the clone — its checked-out branch, its
+upstream, the upstream's tip sha, and ahead/behind counts. `local_branch`
+(`pi/session/...`) and `base_sha` (checkout-time) don't carry this; only the
+daemon can read the live clone (the session's btrfs subvolume checkout).
 
 **Params (batch, to avoid N+1 from the graph):**
 
@@ -120,26 +130,43 @@ identifies the PR head; only the daemon can read the live clone.
         "workspace_dir": "repo",
         "kind": "git",
         "remote_url": "https://github.com/owner/repo.git",
-        "local_branch": "pi/session/session_abc/repo",
+        "local_branch": "pi/session/session_abc/repo",  // daemon-assigned at materialization
+        "current_branch": "feat-b",     // live `git rev-parse --abbrev-ref HEAD` (may be an agent-created branch)
         "base_branch": "main",          // = SessionWorkspace.remote_branch
         "head_sha": "<git rev-parse HEAD>",
-        "pushed_branch": "feat-b"       // best-effort upstream short name, else null
+        "upstream_branch": "feat-b",    // short name of @{u}, else null
+        "upstream_sha": "<sha of @{u}>",// remote-tracking tip the clone knows, else null
+        "behind_upstream": 3,           // commits @{u} has that HEAD lacks (not fast-forwarded), else null
+        "ahead_upstream": 0             // commits HEAD has that @{u} lacks, else null
       }
     ]
   }
 }
 ```
 
-- Sessions with `metadata.subagent == true` are **omitted** from the response
-  (server-side guard; the frontend also gates display).
+- Sessions with `metadata.subagent == true` are **omitted** (server-side guard;
+  the frontend also gates display).
 - Local (non-git) workspaces are omitted from a session's array.
 - Per git workspace, with `cwd = <snapshot.outer_cwd>/<workspace_dir>`:
   - `head_sha` = `git rev-parse HEAD`.
-  - `pushed_branch` = `git rev-parse --abbrev-ref --symbolic-full-name @{u}`
-    stripped of the `origin/` prefix; `null` if there is no upstream (the common
-    case unless the agent pushed with `-u`).
-- A workspace whose git read fails (missing clone, detached, etc.) is returned
-  with `head_sha: null` rather than failing the whole call.
+  - `current_branch` = `git rev-parse --abbrev-ref HEAD` (the branch actually
+    checked out in the subvolume — per `PI.md` the agent typically `git switch
+    -c`s a descriptive branch before pushing, so this, not the daemon-assigned
+    `local_branch`, is what becomes the PR head ref).
+  - `upstream_branch` = `git rev-parse --abbrev-ref --symbolic-full-name @{u}`
+    minus the `origin/` prefix; `null` if there is no upstream.
+  - `upstream_sha` = `git rev-parse @{u}` (the remote-tracking tip the clone last
+    fetched); `null` if no upstream.
+  - `behind_upstream` / `ahead_upstream` = `git rev-list --left-right --count
+    @{u}...HEAD` (left = behind, right = ahead); `null` if no upstream.
+- **Freshness note:** `upstream_sha`/`behind_upstream` reflect the clone's
+  remote-tracking ref, which is only as current as its last fetch. The browser
+  cross-checks `upstream_sha` against the live `pr.headRefOid` from the sidecar:
+  if they differ, the published branch moved since the clone last fetched, which
+  is itself a "behind tip" condition (see §5.4). The daemon does **no network**
+  here (no fetch) — keeping the RPC fast and offline.
+- A workspace whose git read fails (missing clone, detached, no upstream, etc.)
+  returns the fields it can with the rest `null`, rather than failing the call.
 
 **Implementation placement (keeps git in one place, mirrors `subagent.list`):**
 - Add `pub(crate) async fn workspace_heads(outer_cwd, &[SessionWorkspace])` to
@@ -228,22 +255,33 @@ pr-graph/
   *.test.ts          // unit tests for stack.ts and match.ts (pure, no network)
 ```
 
-**Matching algorithm (`match.ts`, pure):** for each `(session, workspace)` whose
-`remote_url` maps to repo R, against R's pulls:
-1. if `pushed_branch` set and `pushed_branch === pull.headRefName` → match;
-2. else if `head_sha === pull.headRefOid` → match (disambiguates fork PRs that
-   share a branch name);
-3. else no match.
-Produce both directions: `prNumber → SessionRef[]` (for G4) and
-`(sessionId, workspaceDir) → prNumber` (for G1). At most one PR per workspace; if
-several match a sha, prefer the open, most-recently-updated.
+**Matching algorithm (`match.ts`, pure) — branch-level.** For each
+`(session, workspace)` whose `remote_url` maps to repo R, against R's pulls. The
+match key is the **checkout's branch name** = `upstream_branch` if set, else
+`current_branch` (the branch live in the session's subvolume):
+1. `branchKey === pull.headRefName` → match (primary, branch-level rule: the
+   branch checked out in the session's subvolume == the PR's head ref);
+2. fallback only when no branch info is available: `head_sha === pull.headRefOid`.
+At most one PR per workspace; if several match, prefer open + most-recently
+updated. Produce both directions: `prNumber → SessionRef[]` (G4) and
+`(sessionId, workspaceDir) → prNumber` (G1).
 
-**Stack algorithm (`stack.ts`, pure):** nodes = a repo's open pulls. Edge `A→B`
-("B stacked on A") iff `B.baseRefName === A.headRefName`. A pull whose
-`baseRefName` is **not** any pull's `headRefName` is a stack root; add a synthetic
-**base-branch node** labeled with that `baseRefName` (`main`/`master`/`develop`/…
-— never hardcoded). `lineageOf(prNumber)` walks `baseRefName` links to the
-terminal base node.
+**Out-of-date derivation (per matched workspace+PR):**
+- **behind base** ← from the sidecar PR *detail*: `mergeStateStatus == "BEHIND"`.
+  `UNKNOWN` ⇒ neutral "checking" chip.
+- **behind tip** ← from `workspace_heads` + the PR's live head sha:
+  - if `behind_upstream > 0` → the checkout is behind its known remote tip; OR
+  - if `upstream_sha !== pull.headRefOid` → the published branch advanced since
+    the clone last fetched (also "behind tip").
+  Either condition ⇒ "behind tip" (not fast-forwarded to the PR branch tip).
+
+**Stack algorithm (`stack.ts`, pure):** a PR stack is a **tree** — each PR has
+exactly one `baseRefName`. Nodes = a repo's open pulls. Edge `A→B` ("B stacked on
+A") iff `B.baseRefName === A.headRefName`. A pull whose `baseRefName` is **not**
+any pull's `headRefName` is a stack root; add a synthetic **base-branch node**
+labeled with that `baseRefName` (`main`/`master`/`develop`/… — never hardcoded).
+`lineageOf(prNumber)` walks `baseRefName` links to the terminal base node. Each
+node carries `isDraft` for G5 coloring.
 
 `owner/repo` is derived **in the browser** from `remote_url` (handles
 `https://…/o/r(.git)` and `git@host:o/r(.git)`); this is the only URL parsing and
@@ -251,16 +289,22 @@ it lives in `ghClient.ts`.
 
 ### 5.5 Interactive graph (`GraphPane.tsx`)
 
-- **Library: React Flow (`@xyflow/react`)** + a layout pass (**dagre** via
-  `@dagrejs/dagre`) laying base node → leaf PRs. Mermaid is **not** used here (it
-  can't do click-to-highlight); it stays only for transcript diagrams.
-- One subgraph per repo present among the in-scope sessions (multi-repo projects
-  render multiple stacks; see open questions).
-- Node = one open PR: number, title, owning session count, out-of-date badge
-  (filled once detail is fetched), draft styling. Synthetic base node per stack.
+- **Library: React Flow (`@xyflow/react`)** — actively maintained by the xyflow
+  team. **No layout dependency:** because a PR stack is a tree (each PR has one
+  base), positions are computed in-module by simple depth-from-base layering
+  (base node at the bottom, children stacked upward; siblings spread on one row).
+  This avoids pulling in a less-actively-maintained layout lib (dagre/elk).
+  Mermaid is **not** used here (it can't do click-to-highlight); it stays only for
+  transcript diagrams.
+- **One subgraph per repo** present among the in-scope sessions (multi-repo
+  projects render multiple stacks; the canvas is always single-project).
+- Node = one open PR: number, title, owning session count, and badges for
+  **behind base** and **behind tip** (G6, filled once detail/heads resolve).
+  Node **color = draft vs ready-for-review** (G5); synthetic base node per stack
+  is styled distinctly.
 - **Click a node** (G4): compute `lineageOf` → highlight that path, dim the rest;
   open the selection panel with `SessionsForPr` (from `match.ts`) and
-  `PrDetailPanel` (lazy `usePulls`→detail fetch).
+  `PrDetailPanel` (lazy detail fetch).
 - Read-only canvas (pan/zoom/select). No editing affordances.
 
 ### 5.6 Inspector "Workspaces" section (`inspectorSection.tsx`)
@@ -268,10 +312,12 @@ it lives in `ghClient.ts`.
 - Rendered by `panels.tsx` **only when** `snapshot.metadata.subagent !== true`.
 - Reuses the existing `.kv` row pattern under a new `.inspect-section`.
 - Per git workspace: local branch, base branch, matched PR (`#N title`, linked),
-  out-of-date chip ("behind base" / "up to date" / "checking"), and the unmerged
-  stack listed compactly beneath, highlighting this workspace's PR.
+  **two** chips — "behind base" and "behind tip" (each: yes / no / "checking") —
+  and the unmerged stack listed compactly beneath, highlighting this workspace's
+  PR (draft vs ready-for-review distinguished, per G5).
 - Branch/base render immediately from the snapshot + `useWorkspaceHeads([id])`;
-  PR/status fill in async from `usePulls(repo)` + matched-PR detail.
+  PR match + "behind tip" come from heads + the PR list; "behind base" fills in
+  async from the matched-PR detail.
 
 ### 5.7 Integration seams (the only edits to existing files)
 
@@ -301,7 +347,7 @@ Everything else stays inside `pr-graph/` and `packages/gh-sidecar/`.
 4. **Inspector Workspaces section** — `inspectorSection.tsx` + the `panels.tsx`
    seam. First user-visible PR data.
 5. **Interactive graph** — `GraphPane.tsx`, `PrDetailPanel.tsx`,
-   `SessionsForPr.tsx` + the `App.tsx` toggle and React Flow/dagre deps.
+   `SessionsForPr.tsx` + the `App.tsx` toggle and the React Flow dependency.
 
 ## 7. Testing strategy
 
@@ -310,48 +356,54 @@ Everything else stays inside `pr-graph/` and `packages/gh-sidecar/`.
   remotes and push) and asserts `head_sha`/`base_branch`, plus the subagent-omit
   guard.
 - **Pure TS (`stack.ts`, `match.ts`):** table-driven vitest — linear stack,
-  branched stack, root-at-non-main base, fork PRs sharing a branch name
-  (sha-disambiguated), no-match, multi-PR-per-sha tie-break.
+  branched stack (tree), root-at-non-`main` base, branch-level match via
+  `upstream_branch` and via `current_branch`, sha fallback when no branch info,
+  "behind tip" from `behind_upstream` and from `upstream_sha != headRefOid`,
+  no-match, and tree layout layering.
 - **Sidecar:** unit-test the route→argv mapping and `repo`/`number` validation
   with `gh` stubbed; assert no non-`--json`/write subcommands are constructible.
 - **Manual/e2e:** documented checklist (idle+unarchived filtering, subagent
   hidden from inspector, degraded GitHub state, click-to-highlight).
 
-## 8. Open questions / loose ends
+## 8. Resolved decisions & remaining loose ends
 
-1. **Multi-repo projects.** A project/session can have several git workspaces
-   (different repos). Proposed: one stack subgraph per repo in the graph, repo
-   shown as a node group/lane. Confirm vs. a single combined canvas.
-2. **Cross-project scope.** v1 scopes the graph to the selected project (matches
-   the sidebar). You mentioned "all idle sessions" generally — confirm per-project
-   is acceptable for v1, or we add a project-less session list later.
-3. **Partially-merged stacks.** v1 fetches only **open** PRs. When a lower PR
-   merges, GitHub auto-retargets the upper PR's base to the merged base, so the
-   upper correctly bottoms out at the base branch — but we won't *show* the merged
-   ancestor. Acceptable, or do we also fetch recently-merged PRs to render them as
-   dimmed/checked nodes?
-4. **`mergeStateStatus == UNKNOWN`.** GitHub computes mergeability lazily; first
-   read can be `UNKNOWN`. Proposed: show a neutral "checking" chip and let
-   react-query refetch. Confirm we don't want an explicit poll.
-5. **Match precision / ancestry.** Branch-name/exact-sha matching misses when a
-   session commits *past* its pushed tip (HEAD ≠ PR head). A later refinement
-   could send candidate PR head shas to the daemon to test ancestry
-   (`merge-base --is-ancestor`) in the clone. Out of scope for v1 — confirm.
-6. **Enterprise / multiple GitHub hosts.** The sidecar uses the host's default
-   `gh` auth. Multi-account/GHE (`GH_HOST`) is out of scope; document the single
-   assumed auth.
-7. **`vite preview` proxy.** Need to confirm `preview.proxy` is honored by the
-   pinned Vite version; otherwise use the tailscale-serve route + a direct
-   `VITE_PI_GH_BASE` with sidecar CORS (build step 2 check).
-8. **React Flow + dagre dependencies.** Two new frontend deps (`@xyflow/react`,
-   `@dagrejs/dagre`), justified by the interactive requirement. Confirm acceptable
-   vs. a lighter hand-rolled SVG DAG.
-9. **Live-git cost.** `workspace_heads` shells `git` per workspace per in-scope
-   session. Fine for a handful of idle sessions; if it ever bites, the mitigation
-   is batching/short server cache — deliberately deferred per non-goals.
-10. **"Out of date" definition.** Locked to "PR head is behind its base"
-    (`mergeStateStatus == BEHIND`). Not surfacing local dirty/unpushed signals —
-    confirm that's the only signal wanted.
+**Resolved (locked):**
+- **Multi-repo:** one stack subgraph per repo. *(G3)*
+- **Scope:** per-project canvas only; never cross-project. *(non-goals, G3)*
+- **PR set:** open PRs only; **draft vs ready-for-review distinguished by node
+  color**. *(G5)*
+- **Out of date = two signals:** "behind base" (`mergeStateStatus == BEHIND`) and
+  "behind tip" (checkout not fast-forwarded to the remote PR branch tip, from
+  `behind_upstream` / `upstream_sha` vs `headRefOid`). *(G6, §5.4)*
+- **Matching:** branch-level — the checkout's branch (`upstream_branch` else
+  `current_branch`) vs `pull.headRefName`; sha only as a no-branch fallback.
+  *(§5.4)*
+- **Frontend deps:** **React Flow only** (well maintained); no layout lib — the
+  PR stack is a tree, so layout is hand-rolled depth-from-base layering. *(§5.5)*
+
+**Remaining loose ends:**
+1. **`mergeStateStatus == UNKNOWN`.** GitHub computes mergeability lazily; first
+   read can be `UNKNOWN`. Proposed: neutral "checking" chip + react-query refetch,
+   no explicit poll. Confirm.
+2. **Stale "behind tip" without a fetch.** `behind_upstream` uses the clone's
+   remote-tracking ref (as of its last fetch); the `upstream_sha != headRefOid`
+   cross-check catches the "remote moved since last fetch" case. We deliberately
+   do **not** trigger a `git fetch` from the RPC (keeps it fast/offline). Confirm
+   that's acceptable, or we add an opt-in refresh later.
+3. **Partially-merged stacks.** Open PRs only; when a lower PR merges, GitHub
+   auto-retargets the upper PR's base, so it correctly bottoms out at the base
+   branch — we just won't render the merged ancestor. Accepted per your call.
+4. **No upstream set.** If the agent pushes without tracking and we can't read
+   `@{u}`, matching falls back to `current_branch === headRefName`, then to sha.
+   Edge case: a descriptive branch renamed locally after push. Accept for v1.
+5. **Enterprise / multiple GitHub hosts.** Sidecar uses the host's default `gh`
+   auth; multi-account/GHE (`GH_HOST`) is out of scope — document the assumption.
+6. **`vite preview` proxy.** Confirm the pinned Vite honors `preview.proxy`;
+   otherwise use the tailscale-serve route + `VITE_PI_GH_BASE` direct (with
+   sidecar CORS). Build step 2 check.
+7. **Live-git cost.** `workspace_heads` shells a few `git` reads per workspace per
+   in-scope session — fine for a handful of idle sessions; batch/cache only if it
+   ever bites (deferred per non-goals).
 
 ## 9. Security considerations
 
