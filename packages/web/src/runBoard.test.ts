@@ -5,9 +5,8 @@ import {
 	reRunParamsForStage,
 	stageStatusLabel,
 	steerableSubagentId,
-	taskBySessionId,
 } from "./runBoard.ts";
-import type { SessionSummary, Stage } from "./types.ts";
+import type { Stage } from "./types.ts";
 
 function fullStage(overrides: Partial<Stage> = {}): Stage {
 	return {
@@ -16,7 +15,15 @@ function fullStage(overrides: Partial<Stage> = {}): Stage {
 		status: "done",
 		workflow: "workflow-implement-review",
 		label: "ship it",
-		subagents: [{ id: "child-1", status: "idle", role: "implement", subagent_type: "full" }],
+		subagents: [
+			{
+				id: "child-1",
+				status: "idle",
+				role: "implement",
+				subagent_type: "full",
+				task: "implement the feature",
+			},
+		],
 		...overrides,
 	};
 }
@@ -29,25 +36,22 @@ function fanoutStage(overrides: Partial<Stage> = {}): Stage {
 		workflow: null,
 		label: null,
 		subagents: [
-			{ id: "child-a", status: "idle", role: "explore", subagent_type: "read_only" },
-			{ id: "child-b", status: "idle", role: "explore", subagent_type: "read_only" },
+			{
+				id: "child-a",
+				status: "idle",
+				role: "explore",
+				subagent_type: "read_only",
+				task: "explore module a",
+			},
+			{
+				id: "child-b",
+				status: "idle",
+				role: "explore",
+				subagent_type: "read_only",
+				task: "explore module b",
+			},
 		],
 		...overrides,
-	};
-}
-
-function summary(sessionId: string, task: unknown): SessionSummary {
-	return {
-		session_id: sessionId,
-		project_id: null,
-		outer_cwd: "/cwd",
-		workspaces: [],
-		activity: "idle",
-		active_leaf_id: null,
-		provider: { kind: "claude", model: "claude-opus-4-8" },
-		metadata: task === undefined ? {} : { task },
-		created_at: "",
-		updated_at: "",
 	};
 }
 
@@ -78,38 +82,44 @@ describe("steerableSubagentId", () => {
 	});
 });
 
-describe("taskBySessionId", () => {
-	it("maps the metadata.task prompt and records missing tasks as null", () => {
-		const map = taskBySessionId([summary("child-1", "do the work"), summary("child-2", undefined)]);
-		expect(map.get("child-1")).toBe("do the work");
-		expect(map.get("child-2")).toBeNull();
-	});
-});
-
 describe("canReRunStage", () => {
-	it("allows re-run of a finished stage when every prompt is recoverable", () => {
-		const tasks = new Map([["child-1", "implement the feature"]]);
-		expect(canReRunStage(fullStage({ status: "done" }), tasks)).toBe(true);
+	it("allows re-run of a finished stage when every prompt and role is present", () => {
+		expect(canReRunStage(fullStage({ status: "done" }))).toBe(true);
 	});
 
 	it("forbids re-run while the stage is running", () => {
-		const tasks = new Map([["child-1", "implement the feature"]]);
-		expect(canReRunStage(fullStage({ status: "running" }), tasks)).toBe(false);
+		expect(canReRunStage(fullStage({ status: "running" }))).toBe(false);
 	});
 
 	it("forbids re-run when any prompt is missing", () => {
-		const tasks = new Map<string, string | null>([
-			["child-a", "look here"],
-			["child-b", null],
-		]);
-		expect(canReRunStage(fanoutStage(), tasks)).toBe(false);
+		const stage = fanoutStage({
+			subagents: [
+				{ id: "child-a", status: "idle", role: "explore", subagent_type: "read_only", task: "look here" },
+				{ id: "child-b", status: "idle", role: "explore", subagent_type: "read_only", task: null },
+			],
+		});
+		expect(canReRunStage(stage)).toBe(false);
+	});
+
+	it("forbids re-run when any role is missing", () => {
+		const stage = fullStage({
+			subagents: [
+				{
+					id: "child-1",
+					status: "idle",
+					role: null,
+					subagent_type: "full",
+					task: "implement the feature",
+				},
+			],
+		});
+		expect(canReRunStage(stage)).toBe(false);
 	});
 });
 
 describe("reRunParamsForStage", () => {
-	it("reconstructs a full stage start with the recovered prompt", () => {
-		const tasks = new Map([["child-1", "implement the feature"]]);
-		const result = reRunParamsForStage(fullStage({ status: "done" }), "parent", tasks);
+	it("reconstructs a full stage start with the subagent task", () => {
+		const result = reRunParamsForStage(fullStage({ status: "done" }), "parent");
 		expect(result).toEqual({
 			kind: "full",
 			params: {
@@ -123,11 +133,7 @@ describe("reRunParamsForStage", () => {
 	});
 
 	it("reconstructs a fan-out with one task per subagent", () => {
-		const tasks = new Map([
-			["child-a", "explore module a"],
-			["child-b", "explore module b"],
-		]);
-		const result = reRunParamsForStage(fanoutStage(), "parent", tasks);
+		const result = reRunParamsForStage(fanoutStage(), "parent");
 		expect(result).toEqual({
 			kind: "readonly_fanout",
 			params: {
@@ -143,7 +149,29 @@ describe("reRunParamsForStage", () => {
 	});
 
 	it("returns null when a prompt cannot be recovered", () => {
-		const tasks = new Map<string, string | null>([["child-1", null]]);
-		expect(reRunParamsForStage(fullStage({ status: "done" }), "parent", tasks)).toBeNull();
+		const stage = fullStage({
+			subagents: [{ id: "child-1", status: "idle", role: "implement", subagent_type: "full", task: null }],
+		});
+		expect(reRunParamsForStage(stage, "parent")).toBeNull();
+	});
+
+	it("returns null when a role cannot be recovered", () => {
+		const stage = fullStage({
+			subagents: [
+				{
+					id: "child-1",
+					status: "idle",
+					role: undefined,
+					subagent_type: "full",
+					task: "implement the feature",
+				},
+			],
+		});
+		expect(reRunParamsForStage(stage, "parent")).toBeNull();
+	});
+
+	it("returns null while running or when a stage has no subagents", () => {
+		expect(reRunParamsForStage(fullStage({ status: "running" }), "parent")).toBeNull();
+		expect(reRunParamsForStage(fullStage({ subagents: [] }), "parent")).toBeNull();
 	});
 });
