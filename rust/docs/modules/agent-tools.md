@@ -52,8 +52,10 @@ through it.
 `with_builtin_tools()` registers the canonical first-party tools through
 `FirstPartyToolExtension`. They all execute inside pi-relay; some have registry
 executors and some are intercepted by the daemon runtime before registry
-execution. The model-visible form differs only where provider semantics justify
-it.
+execution. "Runtime-handled" means the tool is declared to the provider and
+reported by `tools.list`, but `run_tool_turn` handles the call before the
+registry executor table. The model-visible form differs only where provider
+semantics justify it.
 
 | Canonical    | OpenAI form                               | Anthropic form                                  | prompt_alias       | Executor                         |
 |--------------|-------------------------------------------|-------------------------------------------------|--------------------|----------------------------------|
@@ -132,7 +134,7 @@ table.
   wired. The provider-neutral wrapper shape lets a real backend (or a
   provider-native sidecar call) drop in later without changing the model surface.
 
-### load_skill
+### LoadSkill
 
 `LoadSkill` activates an available skill by name (optionally scoped to a
 workspace dir) so its instructions are injected into model context. It is
@@ -146,9 +148,18 @@ it against the session's loaded-skill set and workspace skills.
 `cancel_delegation` are provider-visible JSON tools registered by
 `FirstPartyToolExtension`, but they have no registry executor. The daemon
 runtime intercepts them and dispatches to the stage engine in `stage_tools.rs`.
+`delegate_writing_task` launches the single full/writing stage subagent;
+`delegate_readonly_tasks` launches a homogeneous fan-out of read-only
+subagents; `inspect_delegation` and `cancel_delegation` inspect or cancel an
+existing stage. Stage subagents may produce `subagent.spawned`/`subagent.running`
+progress events, but stage completion arrives later as a parent steer pointing
+at the handoff directory, not as a model tool result or per-child idle event.
+
 Their internal stage types, handoff `stage_id`, and web/inspector RPC methods
 (`stage.start_full`, `stage.start_readonly_fanout`, `stage.status`,
-`stage.cancel`, `stage.list`) intentionally keep their existing names.
+`stage.cancel`, `stage.list`) intentionally keep their existing names. Those
+`stage.*` methods are client JSON-RPC APIs for the web/inspector surface, not
+provider-visible tool names.
 
 ## How it works
 

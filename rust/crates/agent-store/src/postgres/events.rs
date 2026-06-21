@@ -57,6 +57,10 @@ impl PostgresAgentStore {
         Ok(frames)
     }
 
+    /// Legacy/non-stage compatibility writer for parent-visible
+    /// `subagent.idle`. Stage members do not call this on terminal completion;
+    /// they use `claim_subagent_idle_once` below to fire cleanup/barrier work
+    /// without surfacing a per-child idle event to the parent.
     pub async fn insert_subagent_idle_event_once(
         &self,
         parent_session_id: &str,

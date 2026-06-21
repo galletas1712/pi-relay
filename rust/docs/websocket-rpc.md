@@ -1186,11 +1186,17 @@ tool-rerun semantics exist.
 
 ## Subagent events
 
-When a subagent is spawned (as part of a stage), re-driven after being idle, or
-goes idle, the daemon emits parent-scoped `subagent.spawned`, `subagent.running`,
-and `subagent.idle` events. Idle notifications are de-duplicated per completed
-terminal child state, not for the child session lifetime. Parent sessions
-subscribe to their normal event stream to observe stage-member progress.
+When a stage subagent is spawned or re-driven, the daemon may emit
+parent-scoped `subagent.spawned` and `subagent.running` progress events. These
+are progress hints only. Parent-visible stage completion is not a per-child
+`subagent.idle`; it is one `InputPriority::Steer` queued to the parent after the
+stage barrier completes, pointing at the handoff directory (`index.json` plus
+per-subagent `final_message.md`/`transcript.md`).
+
+`subagent.idle` remains an event type for legacy/non-stage compatibility (for
+example, defensive dispatch-failure compensation). When emitted, idle
+notifications are de-duplicated per completed terminal child state, not for the
+child session lifetime.
 
 ## Tools
 
@@ -1200,7 +1206,7 @@ Requires a `provider` parameter (`"openai"` or `"anthropic"`/`"claude"`) and
 returns the model-visible tool definitions for that provider, because the tool
 surface is provider-shaped (e.g. OpenAI `apply_patch` vs Anthropic
 `text_editor_20250728` for editing). The registered builtins are `edit`, `bash`,
-`grep`, `web_search`, `web_fetch`, `load_skill`, and the delegation tools
+`grep`, `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools
 (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`,
 `cancel_delegation`) - there are no `read`/`write` tools. Each returned entry
 carries `name`, `description`, `input_schema`, `canonical_name`, `prompt_alias`,
@@ -1301,6 +1307,9 @@ subagent.spawned
 subagent.running
 subagent.idle
 ```
+
+`subagent.idle` is listed for compatibility; stage-member completion is
+reported by the stage steer/handoff described above.
 
 No approval or awaiting-approval events are emitted.
 

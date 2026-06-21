@@ -6,6 +6,11 @@
 //! manifest, all under `<parent.outer_cwd>/.pi-handoff/<stage_id>/`. Everything
 //! renders from `active_branch` (Ui body mode), so it survives an RO subagent's
 //! snapshot being destroyed and a crashed subagent's partial tail.
+//!
+//! The writer is intentionally idempotent: stage completion may render/rewrite
+//! the same durable transcript files before/around the DB terminal CAS. The CAS
+//! single-flights the stage status and parent steer enqueue; file rendering
+//! itself is safe to replay.
 
 use std::path::{Path, PathBuf};
 
@@ -173,9 +178,11 @@ fn stage_dir(parent_outer_cwd: &str, stage_id: &str) -> PathBuf {
     Path::new(parent_outer_cwd).join(HANDOFF_DIR).join(stage_id)
 }
 
-/// Render and write the whole handoff directory for a completed stage. Runs
-/// inside the barrier (after the `finish_stage` CAS is won), so it executes
-/// exactly once per stage. `stage_status` is the won terminal status
+/// Render and write the whole handoff directory for a completed stage. This is
+/// a pure function of durable transcripts and stage metadata, so the barrier may
+/// run it before/around the `finish_stage` CAS and safely replay it. The CAS,
+/// not this writer, single-flights the terminal status and parent steer enqueue.
+/// `stage_status` is the terminal status the caller is attempting to commit
 /// (`done` vs `done_with_failures`).
 pub(crate) async fn write_stage_handoff(
     state: &AppState,
