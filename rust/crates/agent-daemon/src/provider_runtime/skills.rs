@@ -247,7 +247,7 @@ mod tests {
         std::fs::create_dir_all(&skill_dir).expect("skill dir");
         std::fs::write(
             skill_dir.join("SKILL.md"),
-            "---\nname: workflow-explore\ndescription: Parallel read-only exploration.\n---\n\nUse stage_start_readonly_fanout to fan out.\n",
+            "---\nname: workflow-explore\ndescription: Parallel read-only exploration.\n---\n\nUse delegate_readonly_tasks to fan out.\n",
         )
         .expect("skill file");
 
@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(result.status, agent_vocab::ToolResultStatus::Success);
         assert!(result.output.contains("<name>workflow-explore</name>"));
         assert!(!result.output.contains("<workspace>"));
-        assert!(result.output.contains("stage_start_readonly_fanout"));
+        assert!(result.output.contains("delegate_readonly_tasks"));
 
         std::fs::remove_dir_all(prompt_root).ok();
     }

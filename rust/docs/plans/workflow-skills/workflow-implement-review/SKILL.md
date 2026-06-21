@@ -24,9 +24,9 @@ drive the loop; branch on the typed outcomes in the handoff index.json.
    human rather than looping indefinitely.
 
 ## Running each stage (one stage per turn, then end your turn)
-- implement: stage.start_full({ role: "implementer",
+- implement: delegate_writing_task({ role: "implementer",
     prompt: "<goal + latest reviewer notes>", workflow: "implement_review" })
-- review:    stage.start_readonly_fanout({ tasks: [ { role: "reviewer",
+- review:    delegate_readonly_tasks({ tasks: [ { role: "reviewer",
     prompt: "<what to review + acceptance criteria>" } ], workflow: "implement_review" })
 
 Notes:

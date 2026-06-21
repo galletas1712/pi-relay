@@ -49,9 +49,11 @@ through it.
 
 ## Registered tools
 
-`with_builtin_tools()` registers seven canonical tools through
-`FirstPartyToolExtension`. Each is local-executed; the model-visible form
-differs only where provider semantics justify it.
+`with_builtin_tools()` registers the canonical first-party tools through
+`FirstPartyToolExtension`. They all execute inside pi-relay; some have registry
+executors and some are intercepted by the daemon runtime before registry
+execution. The model-visible form differs only where provider semantics justify
+it.
 
 | Canonical    | OpenAI form                               | Anthropic form                                  | prompt_alias       | Executor                         |
 |--------------|-------------------------------------------|-------------------------------------------------|--------------------|----------------------------------|
@@ -61,6 +63,10 @@ differs only where provider semantics justify it.
 | `WebSearch`  | `web_search` (JSON function)              | `web_search` (JSON client tool)                 | `web_search`       | `WebSearchTool`                  |
 | `WebFetch`   | `web_fetch` (JSON function)               | `web_fetch` (JSON client tool)                  | `web_fetch`        | `WebFetchTool`                   |
 | `LoadSkill`  | `LoadSkill` (JSON function)               | `LoadSkill` (JSON client tool)                  | `skill_loader`     | runtime-handled (no registry executor) |
+| `delegate_writing_task` | `delegate_writing_task` (JSON function) | `delegate_writing_task` (JSON client tool) | `stage` | runtime-handled (no registry executor) |
+| `delegate_readonly_tasks` | `delegate_readonly_tasks` (JSON function) | `delegate_readonly_tasks` (JSON client tool) | `stage` | runtime-handled (no registry executor) |
+| `inspect_delegation` | `inspect_delegation` (JSON function) | `inspect_delegation` (JSON client tool) | `stage` | runtime-handled (no registry executor) |
+| `cancel_delegation` | `cancel_delegation` (JSON function) | `cancel_delegation` (JSON client tool) | `stage` | runtime-handled (no registry executor) |
 
 There are no `read`/`write` tools. File reads go through `Edit`'s `view`
 command (Anthropic) or through `Bash` (`cat`, `sed`, `rg`, …) on OpenAI.
@@ -134,6 +140,16 @@ registered as a provider tool for declaration/replay, but has no registry
 executor — the daemon runtime intercepts `tool_name == "LoadSkill"` and resolves
 it against the session's loaded-skill set and workspace skills.
 
+### delegation tools
+
+`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, and
+`cancel_delegation` are provider-visible JSON tools registered by
+`FirstPartyToolExtension`, but they have no registry executor. The daemon
+runtime intercepts them and dispatches to the stage engine in `stage_tools.rs`.
+Their internal stage types, handoff `stage_id`, and web/inspector RPC methods
+(`stage.start_full`, `stage.start_readonly_fanout`, `stage.status`,
+`stage.cancel`, `stage.list`) intentionally keep their existing names.
+
 ## How it works
 
 ```
@@ -141,6 +157,7 @@ model emits tool call (provider wire name, e.g. "apply_patch")
   -> daemon: ToolContext::new(session outer_cwd)   [timeout 30s]
   -> LoadSkill?  -> runtime skill loader (no registry executor)
   -> web tool?   -> runtime web dispatch (WebSearch/WebFetch)
+  -> delegation? -> runtime stage dispatch (no registry executor)
   -> else        -> registry.execute(provider, call, ctx)
                       canonical_tool_name_for_provider() maps wire name
                       -> canonical name  (apply_patch -> Edit)

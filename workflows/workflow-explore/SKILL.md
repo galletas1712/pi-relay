@@ -26,7 +26,7 @@ synthesize the findings yourself. Nothing is changed in the workspace.
    or the user should weigh in.
 
 ## Running the stage (one stage per turn, then end your turn)
-- explore: stage_start_readonly_fanout({
+- explore: delegate_readonly_tasks({
     tasks: [
       { role: "explore", prompt: "<angle 1: question + where to look>" },
       { role: "explore", prompt: "<angle 2: ...>" }

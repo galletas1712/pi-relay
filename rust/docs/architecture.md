@@ -120,16 +120,19 @@ Implemented user-facing behavior:
   included by the template.
 - Real OpenAI/Codex (ChatGPT subscription transport) and Anthropic API-key
   provider paths, with prompt-cache shaping on both.
-- Subagent delegation runs as **stages** through regular `stage.*` RPC tools.
-  A stage is one **full** subagent (writes the parent's workspace in place) or a
-  parallel fan-out of **read-only** subagents (each in a disposable btrfs
-  snapshot, destroyed on return). The parent parks after launching a stage and
-  is delivered a parent-scoped completion **steer** pointing at a handoff
-  directory (`index.json` + per-subagent final message and transcript).
+- Subagent delegation runs as **stages** through provider-visible delegation
+  tools (`delegate_writing_task`, `delegate_readonly_tasks`,
+  `inspect_delegation`, `cancel_delegation`). A stage is one **full** subagent
+  (writes the parent's workspace in place) or a parallel fan-out of
+  **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
+  return). The parent parks after launching a stage and is delivered a
+  parent-scoped completion **steer** pointing at a handoff directory
+  (`index.json` + per-subagent final message and transcript).
   `subagent.{spawned,running,idle}` lifecycle events drive the stage barrier.
   Reusable patterns are **workflow skills** (`SKILL.md` + `LoadSkill`), not a
-  DSL. The Python REPL `subagents` module remains only as a raw escape hatch.
-  See [agent-daemon](modules/agent-daemon.md).
+  DSL. Web/inspector RPCs still use the `stage.*` client API. The Python REPL
+  `subagents` module remains only as a raw escape hatch. See
+  [agent-daemon](modules/agent-daemon.md).
 
 Not implemented by design:
 
