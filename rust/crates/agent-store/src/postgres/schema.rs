@@ -138,6 +138,14 @@ create table if not exists delegations (
 
 create index if not exists delegations_parent_created_idx on delegations(parent_session_id, created_at, id);
 
+create index if not exists delegations_parent_running_updated_idx
+    on delegations(parent_session_id, updated_at desc, created_at desc, id desc)
+    where status='running';
+
+create index if not exists delegations_parent_terminal_updated_idx
+    on delegations(parent_session_id, updated_at desc, id desc)
+    where status <> 'running';
+
 -- The number of subagents the delegation will eventually spawn. The barrier
 -- requires the full set to exist (and be terminal) before completing, so a
 -- partial spawn (subagent #1 terminal while #2 is not yet inserted) cannot
@@ -145,6 +153,10 @@ create index if not exists delegations_parent_created_idx on delegations(parent_
 alter table delegations add column if not exists expected_subagents integer not null default 1;
 
 alter table sessions add column if not exists delegation_id text null references delegations(id);
+
+create index if not exists sessions_delegation_created_idx
+    on sessions(delegation_id, created_at, id)
+    where delegation_id is not null;
 "#;
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {

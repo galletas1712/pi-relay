@@ -651,6 +651,151 @@ async fn subagent_model_context_does_not_get_parent_delegation_summary() {
 }
 
 #[tokio::test]
+async fn parent_model_context_bounds_large_fanout_subagents() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "delegation context bound test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+
+    let delegation = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            Some("large"),
+            12,
+        )
+        .await
+        .expect("create large delegation");
+    for index in 0..12 {
+        create_terminal_subagent(
+            &env,
+            project_id,
+            "parent",
+            &delegation.id,
+            &format!("review_{index:02}"),
+            "reviewer",
+            SubagentType::ReadOnly,
+            TurnOutcome::Graceful,
+            "Done.",
+        )
+        .await;
+    }
+    assert!(env
+        .state
+        .repo
+        .finish_delegation(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Done
+        )
+        .await
+        .expect("finish large delegation"));
+
+    let mut config = env
+        .state
+        .repo
+        .load_session_config("parent")
+        .await
+        .expect("parent config");
+    config.system_prompt = "PI stable prompt".to_string();
+    let request = build_model_request(&env.state, &config, "parent", None, ModelContext::new())
+        .await
+        .expect("build model request");
+    let dynamic = request
+        .prompt
+        .dynamic_context
+        .as_deref()
+        .expect("current delegations dynamic context");
+
+    assert!(dynamic.contains(&format!("delegation_id: `{}`", delegation.id)));
+    assert!(dynamic.contains("progress: expected 12, spawned 12"));
+    assert!(dynamic.contains("... 4 more subagent(s) omitted"));
+    assert!(dynamic.contains("subagent_id: `review_00`"));
+    assert!(dynamic.contains("subagent_id: `review_07`"));
+    assert!(
+        !dynamic.contains("subagent_id: `review_08`"),
+        "limit+1 probe row must not be rendered: {dynamic}"
+    );
+    assert!(!dynamic.contains("review_11/final_message.md"));
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn parent_model_context_marks_failed_transcripts_unavailable() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "failed delegation context test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("failed"), 1)
+        .await
+        .expect("create delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "impl_failed",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Crashed,
+        "Failed before handoff publication.",
+    )
+    .await;
+    env.state
+        .repo
+        .set_delegation_status(&delegation.id, DelegationStatus::Failed)
+        .await
+        .expect("mark failed");
+
+    let mut config = env
+        .state
+        .repo
+        .load_session_config("parent")
+        .await
+        .expect("parent config");
+    config.system_prompt = "PI stable prompt".to_string();
+    let request = build_model_request(&env.state, &config, "parent", None, ModelContext::new())
+        .await
+        .expect("build model request");
+    let dynamic = request
+        .prompt
+        .dynamic_context
+        .as_deref()
+        .expect("current delegations dynamic context");
+
+    assert!(dynamic.contains(&format!("delegation_id: `{}`", delegation.id)));
+    assert!(dynamic.contains("status: failed"));
+    assert!(dynamic.contains("subagent_id: `impl_failed`"));
+    assert!(dynamic.contains("transcript_file: null"));
+    assert!(!dynamic.contains("impl_failed/transcript.md"));
+    assert!(!dynamic.contains("final_message_file: `impl_failed/final_message.md`"));
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
 async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
