@@ -178,3 +178,28 @@ fn outcome_defaults_to_crashed_without_a_finished_turn() {
     )]);
     assert_eq!(subagent_outcome(&interrupted), TurnOutcome::Interrupted);
 }
+
+#[test]
+fn active_branch_terminality_uses_the_active_leaf_boundary() {
+    let mut mid_turn = history(vec![
+        entry("u", TranscriptItem::UserMessage(UserMessage::text("hi"))),
+        entry(
+            "a",
+            TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("still working".to_string())],
+            }),
+        ),
+        entry(
+            "tf",
+            TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            },
+        ),
+    ]);
+    mid_turn.active_leaf_id = Some("a".to_string());
+    assert!(!active_branch_is_terminal(&mid_turn));
+
+    mid_turn.active_leaf_id = Some("tf".to_string());
+    assert!(active_branch_is_terminal(&mid_turn));
+}

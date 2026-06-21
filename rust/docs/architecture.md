@@ -127,7 +127,8 @@ Implemented user-facing behavior:
   **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
   return). The parent parks after launching a delegation and is delivered a
   parent-scoped completion **steer** pointing at a handoff directory
-  (`index.json` + per-subagent final message and transcript).
+  containing per-subagent final messages and transcripts. The structured
+  delegation state is `inspect_delegation`.
   Delegation subagents may emit `subagent.spawned`/`subagent.running` progress
   events, but parent-visible completion is the delegation steer/handoff, not a
   per-child idle event. Reusable patterns are **workflow skills** (`SKILL.md` +

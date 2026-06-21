@@ -6,13 +6,13 @@ description: Implement a change, then loop implementer<->reviewer until a review
 # Workflow: implement -> review
 
 Implement a change, then loop with a reviewer until the reviewer approves. You
-drive the loop; branch on the typed outcomes in the handoff index.json.
+drive the loop; branch on the typed outcomes in `inspect_delegation`.
 
 ## Delegations
 - implementer — full subagent (writes the workspace in place).
 - reviewer    — read-only subagent(s) (review only; never write).
 
-## Outcomes (suggested_next, in index.json)
+## Outcomes (suggested_next, in inspect_delegation)
 - reviewer: approved | changes_requested
 
 ## Control flow
@@ -35,7 +35,7 @@ Notes:
   files) into the next delegation's prompt.
 - In each reviewer's prompt, REQUIRE it to end its final message with a line
   `suggested_next: approved` or `suggested_next: changes_requested` — that line
-  is what the handoff index.json records and you branch on.
+  is what `inspect_delegation` records and you branch on.
 - While the implementer (full) runs, supervise and read; do not edit yourself.
 - A single reviewer is usually enough; fan out multiple reviewers only when you
   want distinct lenses (e.g. correctness vs security).
