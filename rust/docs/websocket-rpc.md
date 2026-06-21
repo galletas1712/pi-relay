@@ -175,7 +175,10 @@ updated_at timestamptz not null default now()
 The `PI.md` is the prompt composition template. It is not
 stored per session. The provider request renders that global prompt as the
 stable prefix, followed by daemon-generated dynamic context such as the current
-workspace, then transcript history.
+workspace and, for top-level parent sessions, a compact `## Current delegations`
+summary, then transcript history. The delegation summary is bounded and does not
+inline transcript bodies; call `inspect_delegation` / `delegation.status` to
+refresh or retrieve the full structured snapshot and artifact paths.
 
 ### `transcript_entries`
 

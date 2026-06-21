@@ -9,7 +9,7 @@ use agent_vocab::{
     text_enum, ActionId, ProviderConfig, ProviderKind, ProviderReplayItem, TranscriptItem, TurnId,
     TurnOutcome, UserMessage,
 };
-pub use postgres::{Delegation, DelegationSubagent, PostgresAgentStore};
+pub use postgres::{Delegation, DelegationProgress, DelegationSubagent, PostgresAgentStore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;

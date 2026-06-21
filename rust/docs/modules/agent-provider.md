@@ -63,6 +63,11 @@ transcript ────  TranscriptItem + provider_replay sidecars (replay-first
 - OpenAI renders `stable_prefix` as Responses `instructions` and `dynamic_context` as the first `input` item (a synthetic user message), then transcript history.
 - Anthropic renders an attribution `system[0]` header, then `stable_prefix` as a `cache_control` system block, then `dynamic_context` as an uncached system suffix. There is no model-facing "dynamic context" heading; the split is purely a cache-layout detail.
 
+The daemon-owned dynamic context can include model-facing sections such as the
+compact `## Current delegations` summary for top-level parent sessions. Those
+sections are bounded request-time context, not part of the cacheable PI.md
+stable prefix.
+
 ### OpenAI / Codex (Responses API)
 
 Requests go to `https://chatgpt.com/backend-api/codex/responses`, streamed (`Accept: text/event-stream`), with the body zstd-compressed (`Content-Encoding: zstd`, level 3). The Codex request envelope is byte-for-byte aligned with the Codex CLI so the backend's routing and anti-abuse heuristics treat pi-relay like a real Codex client: `originator: codex_cli_rs`, a `codex_cli_rs/<version>` User-Agent, bearer ChatGPT token, optional `ChatGPT-Account-ID`, optional `x-codex-installation-id`, the `x-openai-internal-codex-residency: us` header, a `x-codex-window-id`, and the session id echoed across `session_id`/`session-id`/`thread_id`/`thread-id`/`x-client-request-id`.

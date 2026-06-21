@@ -66,6 +66,14 @@ runner never decides the next delegation — the parent does, guided by workflow
 skills. Cancellation is terminal and exports transcript-only files for the
 cancelled subagents instead of running the normal completion handoff.
 
+Top-level parent model requests also receive a compact daemon-generated
+`## Current delegations` dynamic-context section immediately after the rendered
+PI.md stable prefix. It lists all running delegations and the latest three
+terminal delegations (there is no parent-acknowledgement state yet), with bounded
+progress/subagent fields, existing final-message snippets when cheap, and
+artifact paths. It does not refresh artifacts or inline transcript bodies;
+`inspect_delegation` remains the canonical refresh/full snapshot path.
+
 The web/inspector RPC surface remains `delegation.start_full`,
 `delegation.start_readonly_fanout`, `delegation.status`, `delegation.cancel`, and `delegation.list`;
 those names are client APIs, not the provider-visible model tool names.
@@ -77,7 +85,7 @@ driver loop after its durable store update. The narrow extension precedent
 remains `ToolRegistry`/`ToolExtension`, where the variation point is real and
 does not own session durability.
 
-`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (remote/local compaction), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization).
+`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (remote/local compaction), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery + dynamic prompt sections), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization). The adjacent `delegation_context.rs` builds the compact "Current delegations" dynamic section for top-level parent model requests.
 
 ## Key types
 

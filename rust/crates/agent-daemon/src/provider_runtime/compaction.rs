@@ -14,7 +14,7 @@ use crate::model_metadata;
 use crate::state::AppState;
 
 use super::auth_retry::{compact_with_auth_retry, complete_with_auth_retry};
-use super::prompt::{assemble_agent_prompt, render_pi_compaction_prompt};
+use super::prompt::render_pi_compaction_prompt;
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
 
@@ -312,7 +312,10 @@ async fn remote_compaction_request(
 ) -> Result<ProviderCompactionRequest> {
     Ok(ProviderCompactionRequest {
         model: config.provider.model.clone(),
-        prompt: assemble_agent_prompt(state, config).await?,
+        // Compaction summarizes transcript/model history only. Keep volatile
+        // request-time daemon context, such as current delegation summaries,
+        // out of the compaction input so it is not baked into durable summaries.
+        prompt: PromptSections::stable(config.system_prompt.clone()),
         transcript,
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools: state

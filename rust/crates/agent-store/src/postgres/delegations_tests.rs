@@ -1,6 +1,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_vocab::{ProviderConfig, ProviderKind, ReasoningEffort, UserMessage};
+use agent_session::TranscriptStorageNode;
+use agent_vocab::{
+    AssistantMessage, ProviderConfig, ProviderKind, ReasoningEffort, TranscriptItem, TurnId,
+    TurnOutcome, UserMessage,
+};
 use serde_json::json;
 use uuid::Uuid;
 
@@ -135,6 +139,42 @@ async fn create_delegation_subagent(
         .expect("create delegation subagent");
 }
 
+async fn create_delegation_subagent_with_leaf(
+    db: &TestDb,
+    session_id: &str,
+    project_id: Uuid,
+    parent_session_id: &str,
+    subagent_type: SubagentType,
+    role_name: &str,
+    delegation_id: &str,
+    active_leaf: TranscriptItem,
+) {
+    let leaf = format!("{session_id}_leaf");
+    db.store
+        .start_session_outputs_with_parent(
+            session_id,
+            &session_config(project_id, Some(role_name)),
+            &[TranscriptStorageNode {
+                id: leaf.clone(),
+                parent_id: None,
+                timestamp_ms: 1,
+                item: active_leaf,
+                provider_replay: Vec::new(),
+            }],
+            Some(&leaf),
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("go"),
+            None,
+            Some(parent_session_id),
+            Some(subagent_type),
+            Some(delegation_id),
+        )
+        .await
+        .expect("create delegation subagent");
+}
+
 #[tokio::test]
 async fn create_delegation_persists_kind_status_and_attempt() {
     let Some(db) = test_store().await else {
@@ -217,6 +257,178 @@ async fn parent_has_running_delegation_tracks_status() {
         .parent_has_running_delegation("parent")
         .await
         .expect("cancelled delegation no longer running"));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn current_delegations_include_running_and_bounded_recent_terminals() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegations test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+
+    let old_terminal = db
+        .store
+        .create_delegation("parent", DelegationKind::Full, None, Some("old"), 1)
+        .await
+        .expect("create old terminal");
+    db.store
+        .set_delegation_status(&old_terminal.id, DelegationStatus::Done)
+        .await
+        .expect("finish old terminal");
+    sqlx::query("update delegations set updated_at = now() - interval '10 seconds' where id=$1")
+        .bind(&old_terminal.id)
+        .execute(&db.store.pool)
+        .await
+        .expect("age old terminal");
+    let recent_terminal = db
+        .store
+        .create_delegation("parent", DelegationKind::Full, None, Some("recent"), 1)
+        .await
+        .expect("create recent terminal");
+    db.store
+        .set_delegation_status(&recent_terminal.id, DelegationStatus::Cancelled)
+        .await
+        .expect("cancel recent terminal");
+    sqlx::query("update delegations set updated_at = now() where id=$1")
+        .bind(&recent_terminal.id)
+        .execute(&db.store.pool)
+        .await
+        .expect("freshen recent terminal");
+    let running = db
+        .store
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            Some("running"),
+            2,
+        )
+        .await
+        .expect("create running delegation");
+
+    let current = db
+        .store
+        .list_parent_current_delegations("parent", 1)
+        .await
+        .expect("list current delegations");
+    let ids = current
+        .iter()
+        .map(|delegation| delegation.id.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(ids, vec![running.id.as_str(), recent_terminal.id.as_str()]);
+    assert!(!ids.contains(&old_terminal.id.as_str()));
+
+    let running_only = db
+        .store
+        .list_parent_current_delegations("parent", 0)
+        .await
+        .expect("list running-only current delegations");
+    assert_eq!(running_only.len(), 1);
+    assert_eq!(running_only[0].id, running.id);
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn delegation_progress_is_lightweight_and_counts_terminal_failures() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegations test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+
+    let delegation = db
+        .store
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 4)
+        .await
+        .expect("create delegation");
+    create_delegation_subagent_with_leaf(
+        &db,
+        "child_done",
+        project_id,
+        "parent",
+        SubagentType::ReadOnly,
+        "reviewer",
+        &delegation.id,
+        TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Graceful,
+        },
+    )
+    .await;
+    create_delegation_subagent_with_leaf(
+        &db,
+        "child_failed",
+        project_id,
+        "parent",
+        SubagentType::ReadOnly,
+        "reviewer",
+        &delegation.id,
+        TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Crashed,
+        },
+    )
+    .await;
+    create_delegation_subagent_with_leaf(
+        &db,
+        "child_running",
+        project_id,
+        "parent",
+        SubagentType::ReadOnly,
+        "reviewer",
+        &delegation.id,
+        TranscriptItem::AssistantMessage(AssistantMessage { items: Vec::new() }),
+    )
+    .await;
+
+    let progress = db
+        .store
+        .delegation_progress(&delegation)
+        .await
+        .expect("progress");
+    assert_eq!(
+        progress,
+        DelegationProgress {
+            expected: 4,
+            spawned: 3,
+            terminal: 2,
+            running: 2,
+            failed: 1,
+        }
+    );
+
+    db.store
+        .set_delegation_status(&delegation.id, DelegationStatus::DoneWithFailures)
+        .await
+        .expect("terminal status");
+    let terminal_delegation = db
+        .store
+        .get_delegation(&delegation.id)
+        .await
+        .expect("load")
+        .expect("delegation");
+    let terminal_progress = db
+        .store
+        .delegation_progress(&terminal_delegation)
+        .await
+        .expect("terminal progress");
+    assert_eq!(terminal_progress.running, 0);
+    assert_eq!(terminal_progress.failed, 1);
 
     db.cleanup().await;
 }

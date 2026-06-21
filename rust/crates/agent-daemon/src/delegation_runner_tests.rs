@@ -52,7 +52,9 @@ impl Drop for TempDir {
     }
 }
 
-use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
+use crate::provider_runtime::{
+    build_model_request, ProviderConnectionRegistry, SessionTitleScheduler,
+};
 use crate::runtime::SessionDriver;
 use crate::state::AppState;
 use crate::types::RuntimeSession;
@@ -490,6 +492,162 @@ async fn inspect_delegation_snapshot(env: &TestEnv, delegation_id: &str) -> serd
 
 fn handoff_root(env: &TestEnv, delegation_id: &str) -> PathBuf {
     env.cwd.path().join(".pi-handoff").join(delegation_id)
+}
+
+#[tokio::test]
+async fn parent_model_context_injects_current_delegations_after_system_prompt() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "delegation context test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+
+    let running = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::Full,
+            Some("workflow-implement-review"),
+            Some("implement"),
+            1,
+        )
+        .await
+        .expect("create running delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &running.id, "impl_busy").await;
+
+    let done = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            Some("review"),
+            1,
+        )
+        .await
+        .expect("create done delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &done.id,
+        "review_done",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "Looks good.\n\nsuggested_next: approved",
+    )
+    .await;
+    assert!(env
+        .state
+        .repo
+        .finish_delegation(&done.id, &done.attempt_id, DelegationStatus::Done)
+        .await
+        .expect("finish done"));
+    std::fs::create_dir_all(handoff_root(&env, &done.id).join("review_done")).expect("handoff dir");
+    std::fs::write(
+        handoff_root(&env, &done.id)
+            .join("review_done")
+            .join("final_message.md"),
+        "Looks good.\n\nsuggested_next: approved",
+    )
+    .expect("write final message artifact");
+
+    let mut config = env
+        .state
+        .repo
+        .load_session_config("parent")
+        .await
+        .expect("parent config");
+    config.system_prompt = "PI stable prompt".to_string();
+    let request = build_model_request(&env.state, &config, "parent", None, ModelContext::new())
+        .await
+        .expect("build model request");
+
+    assert_eq!(
+        request.prompt.stable_prefix.as_deref(),
+        Some("PI stable prompt")
+    );
+    let dynamic = request
+        .prompt
+        .dynamic_context
+        .as_deref()
+        .expect("current delegations dynamic context");
+    assert!(dynamic.starts_with("## Current delegations"));
+    assert!(dynamic.contains(&format!("delegation_id: `{}`", running.id)));
+    assert!(dynamic.contains("workflow: `workflow-implement-review`"));
+    assert!(dynamic.contains("label: `implement`"));
+    assert!(dynamic.contains("steerable: true"));
+    assert!(dynamic.contains(&format!("delegation_id: `{}`", done.id)));
+    assert!(dynamic.contains("final_message_file: `review_done/final_message.md`"));
+    assert!(dynamic.contains("\"Looks good.\\n\\nsuggested_next: approved\""));
+    assert!(dynamic.contains("suggested_next: \"approved\""));
+    assert!(dynamic.contains("Full transcript contents are not inlined"));
+    assert!(!dynamic.contains("## User"));
+    assert!(!dynamic.contains("## Assistant"));
+    let joined = request.prompt.render_joined().expect("joined prompt");
+    assert!(
+        joined.starts_with("PI stable prompt\n\n## Current delegations"),
+        "dynamic context should render immediately after PI/system prompt: {joined}"
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn subagent_model_context_does_not_get_parent_delegation_summary() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "subagent context test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
+
+    let mut config = env
+        .state
+        .repo
+        .load_session_config("impl_busy")
+        .await
+        .expect("subagent config");
+    config.system_prompt = "Subagent PI prompt".to_string();
+    let request = build_model_request(&env.state, &config, "impl_busy", None, ModelContext::new())
+        .await
+        .expect("build subagent model request");
+
+    assert_eq!(
+        request.prompt.stable_prefix.as_deref(),
+        Some("Subagent PI prompt")
+    );
+    assert!(
+        request.prompt.dynamic_context.is_none(),
+        "subagents should not receive parent current-delegations context"
+    );
+    assert_eq!(
+        request.prompt.render_joined().as_deref(),
+        Some("Subagent PI prompt")
+    );
+
+    env.cleanup().await;
 }
 
 #[tokio::test]
