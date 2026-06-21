@@ -18,8 +18,9 @@
  *        pg_dump "$DATABASE_URL" > pi-relay-before-delegation-tool-migration.sql
  *   3. Dry-run:
  *        DATABASE_URL=postgres://... node scripts/migrate-delegation-tool-names.mjs
- *      Optionally scope a test run with:
+ *      Optionally scope a test run to exactly one session with:
  *        ... --session-id session_...
+ *      Child/subagent sessions are not included; unscoped mode scans all sessions.
  *   4. Apply:
  *        DATABASE_URL=postgres://... node scripts/migrate-delegation-tool-names.mjs --apply
  *   5. Restart the daemon.
@@ -338,7 +339,8 @@ Options:
   --apply                 Mutate the database. Without this flag, dry-run only.
   --dry-run               Explicit dry-run/read-only mode (default).
   --database-url <url>    Postgres URL. Defaults to DATABASE_URL env var.
-  --session-id <id>       Scope session-owned tables to one session for testing.
+  --session-id <id>       Scope session-owned tables to exactly this session only.
+                          Child/subagent sessions are not included; unscoped scans all.
                           daemon_config is global and is skipped when scoped.
   --self-test             Run migration logic tests without a database.
   --help                  Show this help.
@@ -558,9 +560,9 @@ function printPlan(plan, { apply, sessionId }) {
 
 	console.log(`Mode: ${apply ? "APPLY" : "DRY-RUN (read-only)"}`);
 	if (sessionId) {
-		console.log(`Session scope: ${sessionId}`);
+		console.log(`Session scope: ${sessionId} (exact session only; child/subagent sessions not included)`);
 	} else {
-		console.log("Session scope: all sessions");
+		console.log("Session scope: all sessions (unscoped)");
 	}
 	console.log("");
 
@@ -715,6 +717,28 @@ function runSelfTest() {
 
 	const text = migrateTextValue("Use stage_status, but web RPC stage.status stays.");
 	assert.equal(text.value, "Use inspect_delegation, but web RPC stage.status stays.");
+
+	const invalidObjectString = migrateJsonValue('{"tool_name":"stage_status",}');
+	assert.equal(invalidObjectString.changed, true);
+	assert.equal(invalidObjectString.value, '{"tool_name":"inspect_delegation",}');
+	assert.equal(invalidObjectString.counts.stage_status, 1);
+
+	const invalidArrayString = migrateJsonValue('["stage_start_full",]');
+	assert.equal(invalidArrayString.changed, true);
+	assert.equal(invalidArrayString.value, '["delegate_writing_task",]');
+	assert.equal(invalidArrayString.counts.stage_start_full, 1);
+
+	for (const primitive of [null, 0, 42, true, false]) {
+		const result = migrateJsonValue(primitive);
+		assert.equal(result.changed, false);
+		assert.equal(result.value, primitive);
+		assert.equal(totalCount(result.counts), 0);
+	}
+
+	const nullText = migrateTextValue(null);
+	assert.equal(nullText.changed, false);
+	assert.equal(nullText.value, null);
+	assert.equal(totalCount(nullText.counts), 0);
 
 	console.log("Self-test passed.");
 }
