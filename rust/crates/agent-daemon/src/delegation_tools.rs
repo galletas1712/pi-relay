@@ -236,12 +236,13 @@ async fn reject_if_subagent(
     Ok(())
 }
 
-/// Move a delegation to a terminal status, cancelling any unfinished work for
-/// subagents already spawned for it. Shared by cancel and by the spawn-failure
-/// compensation path, so a half-started delegation never strands the parent
-/// behind the one-delegation-per-parent guard. This deliberately does not drive
-/// subagent queued inputs after cancellation; a cancelled delegation is
-/// terminal, and its subagents must not be reactivated by queued follow-up work.
+/// Spawn-failure compensation: move a half-created delegation to a terminal
+/// status and interrupt any subagents already spawned for it so the parent is
+/// not stranded behind the one-delegation-per-parent guard. This is deliberately
+/// unconditional because spawn failure owns the just-created delegation row.
+/// User-visible cancellation does NOT use this helper; it uses
+/// `cancel_running_delegation` so it cannot clobber a concurrent normal
+/// completion.
 async fn terminate_delegation(state: &AppState, delegation_id: &str, status: DelegationStatus) {
     if let Err(error) = state
         .repo
@@ -495,11 +496,13 @@ pub(crate) async fn status_core(
     ))
 }
 
-/// Cancel an in-flight delegation: interrupt each of its subagents and mark the
-/// delegation cancelled. Interrupting a read-only subagent is allowed here
-/// because the whole delegation is being torn down (the per-subagent guard only
-/// blocks the model/parent from steering or interrupting an individual RO
-/// subagent).
+/// Cancel an in-flight delegation. Cancellation first wins an attempt-fenced
+/// `running -> cancelled` CAS; only the CAS winner interrupts subagents and
+/// writes transcript-only artifacts. If completion or another cancellation wins
+/// first, this returns `{ "cancelled": false }` and leaves existing artifacts
+/// untouched. Interrupting a read-only subagent is allowed here because the
+/// whole delegation is being torn down (the per-subagent guard only blocks the
+/// model/parent from steering or interrupting an individual RO subagent).
 pub(crate) async fn cancel_core(
     state: &AppState,
     parent_session_id: &str,
@@ -514,12 +517,45 @@ pub(crate) async fn cancel_core(
     if delegation.status != DelegationStatus::Running {
         return Ok(json!({ "cancelled": false }));
     }
-    terminate_delegation(state, &delegation.id, DelegationStatus::Cancelled).await;
+    let won_cancel = state
+        .repo
+        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
+        .await?;
+    if !won_cancel {
+        return Ok(json!({ "cancelled": false }));
+    }
+    cancel_delegation_subagents_without_reactivation(state, &delegation.id).await;
     let transcript_paths = write_cancelled_subagent_transcripts(state, &delegation).await?;
     Ok(json!({
         "cancelled": true,
         "transcripts": transcript_paths,
     }))
+}
+
+async fn cancel_delegation_subagents_without_reactivation(state: &AppState, delegation_id: &str) {
+    match state.repo.list_delegation_subagents(delegation_id).await {
+        Ok(subagents) => {
+            for subagent in &subagents {
+                if let Err(error) = cancel_subagent_without_reactivation(
+                    state,
+                    &subagent.session_id,
+                    subagent.subagent_type,
+                )
+                .await
+                {
+                    eprintln!(
+                        "failed to cancel subagent {} while cancelling delegation {}: {}: {}",
+                        subagent.session_id, delegation_id, error.code, error.message
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "failed to list subagents while cancelling delegation {delegation_id}: {error:#}"
+            )
+        }
+    }
 }
 
 async fn write_cancelled_subagent_transcripts(

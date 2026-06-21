@@ -5,23 +5,27 @@
 //! on a subagent of delegation D reaching its once-only terminal idle (or boot):
 //!   recover each subagent's tail to a turn boundary          # don't miss a crashed final message
 //!   if any subagent of D is not terminal: return            # barrier not met
-//!   render/refresh handoff dir (index.json + per-subagent md)
-//!   finish_delegation CAS (running -> done|done_with_failures)    # single-flight status + steer
-//!   if the CAS won: drive parent to consume the queued steer
+//!   finish_delegation CAS (running -> done|done_with_failures)    # single-flight status claim
+//!   if the CAS won:
+//!     render/refresh handoff dir (index.json + per-subagent md)
+//!     enqueue deterministic parent steer
+//!     drive parent to consume the queued steer
 //! ```
 //!
-//! Handoff rendering is an idempotent pure function of durable transcripts and
-//! may safely happen before/around the terminal CAS. The single-flight and
-//! exactly-once guarantee for terminal delegation status and parent steer
-//! enqueue is the DB `finish_delegation` CAS (delegation-row `for update` lock +
-//! `status='running'` fence), NOT the in-process `SessionDriver` mutex — so
-//! concurrent terminal children and a restart sweep steer the parent exactly
+//! The terminal-status CAS runs before normal handoff rendering so a concurrent
+//! cancellation cannot win and then be left with normal completed handoff
+//! artifacts. The steer is enqueued only after the files exist; if the daemon
+//! crashes after the status CAS but before publishing files/steer, the boot
+//! sweep repairs already-completed delegations by re-rendering the handoff and
+//! idempotently enqueueing the deterministic steer. The single-flight is the DB
+//! `finish_delegation` CAS, NOT the in-process `SessionDriver` mutex — so
+//! concurrent terminal children and restart repair steer the parent exactly
 //! once.
 
-use agent_store::{Delegation, DelegationStatus};
+use agent_store::{Delegation, DelegationStatus, QueuedInputStatus};
 use agent_vocab::TurnOutcome;
 
-use crate::handoff::{steer_message, subagent_outcome, write_delegation_handoff};
+use crate::handoff::{delegation_dir, steer_message, subagent_outcome, write_delegation_handoff};
 use crate::runtime::SessionDriver;
 use crate::state::AppState;
 use crate::types::RpcError;
@@ -35,11 +39,13 @@ use crate::types::RpcError;
 ///   recover each subagent's tail to a boundary  # mid-turn crash either resumes
 ///                                                # or settles terminal
 ///   if not all terminal: return                 # barrier not met
-///   write handoff files                         # pure fn of the durable
-///                                                # transcript; safe before/again
-///   finish_delegation CAS + steer-enqueue (one tx)   # commit => steer durably queued
-///   if won: drive the parent                    # idempotent; durable steer is
-///                                                # the crash backstop
+///   finish_delegation CAS                       # claim terminal status before
+///                                                # any normal handoff files
+///   if won: write handoff files                 # parent steer is not queued
+///                                                # until these exist
+///   enqueue deterministic steer                 # idempotent; boot repair
+///                                                # retries after CAS/file gaps
+///   drive the parent
 pub(crate) async fn complete_delegation_if_ready(
     state: &AppState,
     delegation_id: &str,
@@ -71,39 +77,106 @@ pub(crate) async fn complete_delegation_if_ready(
 
     let (won_status, ok, failed, failed_ids) = classify_subagents(state, &delegation).await?;
 
-    // Render the handoff BEFORE the CAS: it is a pure function of the durable
-    // transcript, so a re-run (replay/sweep) safely rewrites identical files.
-    let handoff_dir = write_delegation_handoff(state, &delegation, won_status).await?;
-    let message = steer_message(&delegation, &handoff_dir, ok, failed, &failed_ids);
-    // Deterministic key: a replay or boot sweep re-running finish_delegation with the
-    // same delegation+attempt cannot enqueue a second steer (unique-index no-op).
-    let steer_client_input_id = format!(
-        "delegation-steer:{}:{}",
-        delegation.id, delegation.attempt_id
-    );
+    let won = try_claim_and_publish_completed_delegation(
+        state,
+        &delegation,
+        won_status,
+        ok,
+        failed,
+        &failed_ids,
+    )
+    .await?;
+    if !won {
+        // Another terminal child, the boot sweep, or cancellation already won
+        // the status CAS. Only the winner may publish normal handoff files; a
+        // cancellation winner must remain transcript-only.
+        return Ok(());
+    }
 
+    // The steer is durably queued. Drive the parent so it consumes the steer
+    // promptly; driving is idempotent and replayable, and the durable
+    // queued_input is the crash backstop if this drive never runs.
+    drive_parent_after_steer(state, &delegation.parent_session_id).await;
+    Ok(())
+}
+
+pub(crate) async fn try_claim_and_publish_completed_delegation(
+    state: &AppState,
+    delegation: &Delegation,
+    status: DelegationStatus,
+    ok: usize,
+    failed: usize,
+    failed_ids: &[String],
+) -> std::result::Result<bool, RpcError> {
     let won = state
         .repo
-        .finish_delegation(
-            &delegation.id,
-            &delegation.attempt_id,
-            won_status,
+        .finish_delegation(&delegation.id, &delegation.attempt_id, status)
+        .await?;
+    if !won {
+        return Ok(false);
+    }
+    // Publish normal handoff only after winning the terminal status claim; this
+    // keeps a cancelled delegation from getting completed artifacts. If the
+    // daemon crashes in this gap, boot repair re-renders completed delegations
+    // and enqueues the same deterministic steer.
+    publish_completed_delegation(state, delegation, status, ok, failed, failed_ids).await?;
+    Ok(true)
+}
+
+/// Render a completed delegation's normal handoff files and then enqueue the
+/// deterministic parent steer. This helper is intentionally replayable:
+/// `write_delegation_handoff` rewrites the same content from durable
+/// transcripts, and `enqueue_delegation_steer` is keyed by
+/// delegation-id+attempt-id so repair cannot double-enqueue.
+async fn publish_completed_delegation(
+    state: &AppState,
+    delegation: &Delegation,
+    status: DelegationStatus,
+    ok: usize,
+    failed: usize,
+    failed_ids: &[String],
+) -> std::result::Result<(), RpcError> {
+    let parent_config = state
+        .repo
+        .load_session_config(&delegation.parent_session_id)
+        .await?;
+    let handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+    let message = steer_message(delegation, &handoff_dir, ok, failed, failed_ids);
+    let steer_client_input_id = delegation_steer_client_input_id(delegation);
+    write_delegation_handoff(state, delegation, status).await?;
+    state
+        .repo
+        .enqueue_delegation_steer(
             &delegation.parent_session_id,
             &message,
             &steer_client_input_id,
         )
         .await?;
-    if !won {
-        // Another terminal child or the boot sweep already won the CAS; that
-        // winner enqueued the single steer in its own tx. Nothing more to do.
-        return Ok(());
-    }
-
-    // The steer is durably queued (committed in the CAS tx). Drive the parent so
-    // it consumes the steer promptly; driving is idempotent and replayable, and
-    // the durable queued_input is the crash backstop if this drive never runs.
-    drive_parent_after_steer(state, &delegation.parent_session_id).await;
     Ok(())
+}
+
+fn delegation_steer_client_input_id(delegation: &Delegation) -> String {
+    format!(
+        "delegation-steer:{}:{}",
+        delegation.id, delegation.attempt_id
+    )
+}
+
+async fn completion_steer_needs_drive(
+    state: &AppState,
+    delegation: &Delegation,
+) -> std::result::Result<bool, RpcError> {
+    let key = delegation_steer_client_input_id(delegation);
+    Ok(state
+        .repo
+        .find_client_input(&delegation.parent_session_id, &key)
+        .await?
+        .is_some_and(|record| {
+            matches!(
+                record.status,
+                QueuedInputStatus::Queued | QueuedInputStatus::Consuming
+            )
+        }))
 }
 
 /// Drive the parent so it picks up the just-queued completion steer. The steer
@@ -193,26 +266,30 @@ async fn classify_subagents(
     Ok((status, ok, failed, failed_ids))
 }
 
-/// Boot crash sweep: complete every `running` delegation whose subagents are all
-/// terminal. A crash mid-barrier leaves such a delegation `running` with every
-/// subagent idle; idempotent handoff rendering plus the `finish_delegation` CAS
-/// makes terminal status + steer enqueue happen exactly once even if it raced a
-/// live terminal child. This completes delegations — it never stale-marks them.
+/// Boot crash sweep:
+///
+/// 1. Complete every `running` delegation whose subagents are all terminal. A
+///    crash before the terminal-status claim leaves such a delegation `running`
+///    with every subagent idle; the ordinary barrier path handles it.
+/// 2. Repair already-completed delegations that may have crashed after the
+///    status CAS but before normal handoff files and the parent steer were
+///    published. This repair is idempotent and only covers `done` /
+///    `done_with_failures`; cancelled delegations remain transcript-only and
+///    are never reactivated.
 pub(crate) async fn sweep_running_delegations_on_boot(state: &AppState) {
     let ready = match state.repo.sweep_running_delegations().await {
         Ok(ready) => ready,
         Err(error) => {
             eprintln!("boot delegation sweep could not list running delegations: {error:#}");
-            return;
+            Vec::new()
         }
     };
-    if ready.is_empty() {
-        return;
+    if !ready.is_empty() {
+        eprintln!(
+            "boot delegation sweep completing {} ready delegation(s)",
+            ready.len()
+        );
     }
-    eprintln!(
-        "boot delegation sweep completing {} ready delegation(s)",
-        ready.len()
-    );
     for delegation in ready {
         if let Err(error) = complete_delegation_if_ready(state, &delegation.id).await {
             eprintln!(
@@ -221,6 +298,68 @@ pub(crate) async fn sweep_running_delegations_on_boot(state: &AppState) {
             );
         }
     }
+
+    repair_completed_delegation_publications_on_boot(state).await;
+}
+
+async fn repair_completed_delegation_publications_on_boot(state: &AppState) {
+    let completed = match state.repo.list_completed_delegations_for_repair().await {
+        Ok(completed) => completed,
+        Err(error) => {
+            eprintln!("boot delegation sweep could not list completed delegations: {error:#}");
+            return;
+        }
+    };
+    if completed.is_empty() {
+        return;
+    }
+    eprintln!(
+        "boot delegation sweep repairing {} completed delegation publication(s)",
+        completed.len()
+    );
+    for delegation in completed {
+        let status = delegation.status;
+        let Err(error) = repair_completed_delegation_publication(state, &delegation, status).await
+        else {
+            continue;
+        };
+        eprintln!(
+            "boot delegation sweep failed to repair completed delegation {}: {}: {}",
+            delegation.id, error.code, error.message
+        );
+    }
+}
+
+async fn repair_completed_delegation_publication(
+    state: &AppState,
+    delegation: &Delegation,
+    status: DelegationStatus,
+) -> std::result::Result<(), RpcError> {
+    if !matches!(
+        status,
+        DelegationStatus::Done | DelegationStatus::DoneWithFailures
+    ) {
+        return Ok(());
+    }
+    let (classified_status, ok, failed, failed_ids) = classify_subagents(state, delegation).await?;
+    let status = if classified_status == status {
+        status
+    } else {
+        // The committed DB status is authoritative after the CAS. This mismatch
+        // should not happen unless transcripts were manually edited, but repair
+        // still publishes a manifest that matches the terminal row the parent
+        // will observe.
+        eprintln!(
+            "completed delegation {} repair classified {:?} but row is {:?}; using row status",
+            delegation.id, classified_status, status
+        );
+        status
+    };
+    publish_completed_delegation(state, delegation, status, ok, failed, &failed_ids).await?;
+    if completion_steer_needs_drive(state, delegation).await? {
+        drive_parent_after_steer(state, &delegation.parent_session_id).await;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -320,21 +320,13 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
         .create_delegation("parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
-    let key = format!(
-        "delegation-steer:{}:{}",
-        delegation.id, delegation.attempt_id
-    );
-
     // The real attempt id wins exactly once; a replay is a no-op.
     assert!(db
         .store
         .finish_delegation(
             &delegation.id,
             &delegation.attempt_id,
-            DelegationStatus::Done,
-            "parent",
-            "done",
-            &key
+            DelegationStatus::Done
         )
         .await
         .expect("first finish wins"));
@@ -343,16 +335,27 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
         .finish_delegation(
             &delegation.id,
             &delegation.attempt_id,
-            DelegationStatus::Done,
-            "parent",
-            "done",
-            &key
+            DelegationStatus::Done
         )
         .await
         .expect("replay is a no-op"));
 
-    // The steer was enqueued atomically with the winning CAS, exactly once
-    // (the deterministic client_input_id makes a replay a no-op).
+    // The status CAS no longer enqueues the steer. Publication happens after
+    // the handoff files exist, but the deterministic client_input_id still
+    // makes the enqueue idempotent.
+    let key = format!(
+        "delegation-steer:{}:{}",
+        delegation.id, delegation.attempt_id
+    );
+    assert_eq!(steer_count(&db, "parent", &key).await, 0);
+    db.store
+        .enqueue_delegation_steer("parent", "done", &key)
+        .await
+        .expect("enqueue steer");
+    db.store
+        .enqueue_delegation_steer("parent", "done", &key)
+        .await
+        .expect("enqueue steer idempotent");
     assert_eq!(steer_count(&db, "parent", &key).await, 1);
 
     // A stale attempt id cannot re-fire a re-opened delegation.
@@ -362,14 +365,7 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
         .expect("reopen");
     assert!(!db
         .store
-        .finish_delegation(
-            &delegation.id,
-            "stale",
-            DelegationStatus::Done,
-            "parent",
-            "done",
-            &key
-        )
+        .finish_delegation(&delegation.id, "stale", DelegationStatus::Done)
         .await
         .expect("stale attempt rejected"));
     assert_eq!(
@@ -385,16 +381,118 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
     // A missing delegation is a benign no-op (late lifecycle event for a deleted delegation).
     assert!(!db
         .store
-        .finish_delegation(
-            "delegation_missing",
-            "whatever",
-            DelegationStatus::Done,
-            "parent",
-            "done",
-            "k"
-        )
+        .finish_delegation("delegation_missing", "whatever", DelegationStatus::Done)
         .await
         .expect("missing delegation is benign"));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn cancel_running_delegation_is_attempt_fenced_and_terminal_safe() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegations test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+
+    let delegation = db
+        .store
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+    assert!(!db
+        .store
+        .cancel_running_delegation(&delegation.id, "stale-attempt-id")
+        .await
+        .expect("stale cancel loses"));
+    assert_eq!(
+        db.store
+            .get_delegation(&delegation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DelegationStatus::Running
+    );
+    assert!(db
+        .store
+        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
+        .await
+        .expect("real cancel wins"));
+    assert!(!db
+        .store
+        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
+        .await
+        .expect("cancel replay loses"));
+    assert_eq!(
+        db.store
+            .get_delegation(&delegation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DelegationStatus::Cancelled
+    );
+
+    let done = db
+        .store
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create done delegation");
+    assert!(db
+        .store
+        .finish_delegation(&done.id, &done.attempt_id, DelegationStatus::Done)
+        .await
+        .expect("finish done"));
+    assert!(!db
+        .store
+        .cancel_running_delegation(&done.id, &done.attempt_id)
+        .await
+        .expect("cancel after done loses"));
+    assert_eq!(
+        db.store
+            .get_delegation(&done.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DelegationStatus::Done
+    );
+
+    let failed = db
+        .store
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create done_with_failures delegation");
+    assert!(db
+        .store
+        .finish_delegation(
+            &failed.id,
+            &failed.attempt_id,
+            DelegationStatus::DoneWithFailures,
+        )
+        .await
+        .expect("finish done_with_failures"));
+    assert!(!db
+        .store
+        .cancel_running_delegation(&failed.id, &failed.attempt_id)
+        .await
+        .expect("cancel after done_with_failures loses"));
+    assert_eq!(
+        db.store
+            .get_delegation(&failed.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DelegationStatus::DoneWithFailures
+    );
 
     db.cleanup().await;
 }
@@ -479,18 +577,11 @@ async fn all_terminal_predicate_and_boot_sweep() {
     assert_eq!(ready[0].id, delegation.id);
 
     // A non-running (finished) delegation is not swept again.
-    let key = format!(
-        "delegation-steer:{}:{}",
-        delegation.id, delegation.attempt_id
-    );
     db.store
         .finish_delegation(
             &delegation.id,
             &delegation.attempt_id,
             DelegationStatus::Done,
-            "parent",
-            "done",
-            &key,
         )
         .await
         .expect("finish");
