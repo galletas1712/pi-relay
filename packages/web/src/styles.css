@@ -2959,6 +2959,15 @@ pre {
 	color: var(--muted-foreground);
 }
 
+.run-board-handoff-path {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	color: var(--muted-foreground);
+	font-family: var(--font-mono);
+	font-size: var(--text-2xs);
+}
+
 .run-board-stage-controls,
 .run-board-handoff-links {
 	display: flex;
