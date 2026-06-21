@@ -219,7 +219,7 @@ async fn create_delegation_persists_kind_status_and_attempt() {
 }
 
 #[tokio::test]
-async fn migration_creates_context_query_indexes() {
+async fn migration_creates_delegation_ledger_query_indexes() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -232,8 +232,7 @@ async fn migration_creates_context_query_indexes() {
         where schemaname='public'
           and indexname in (
               'sessions_delegation_created_idx',
-              'delegations_parent_running_updated_idx',
-              'delegations_parent_terminal_updated_idx'
+              'delegations_parent_created_idx'
           )
         order by indexname
         "#,
@@ -245,8 +244,7 @@ async fn migration_creates_context_query_indexes() {
     assert_eq!(
         index_names,
         vec![
-            "delegations_parent_running_updated_idx".to_string(),
-            "delegations_parent_terminal_updated_idx".to_string(),
+            "delegations_parent_created_idx".to_string(),
             "sessions_delegation_created_idx".to_string(),
         ]
     );
@@ -352,7 +350,7 @@ async fn parent_has_running_delegation_tracks_status() {
 }
 
 #[tokio::test]
-async fn current_delegations_include_all_running_latest_terminals_and_only_parent() {
+async fn parent_delegations_include_complete_parent_set_across_statuses() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -365,12 +363,12 @@ async fn current_delegations_include_all_running_latest_terminals_and_only_paren
     create_session(&db, "parent", project_id).await;
     create_session(&db, "other_parent", project_id).await;
 
-    let other_parent_running = db
+    let other_parent = db
         .store
         .create_delegation("other_parent", DelegationKind::Full, None, Some("other"), 1)
         .await
-        .expect("create other parent running");
-    let running_old = db
+        .expect("create other parent delegation");
+    let running = db
         .store
         .create_delegation(
             "parent",
@@ -380,99 +378,75 @@ async fn current_delegations_include_all_running_latest_terminals_and_only_paren
             2,
         )
         .await
-        .expect("create old running delegation");
-    sqlx::query("update delegations set updated_at = now() - interval '1 hour' where id=$1")
-        .bind(&running_old.id)
-        .execute(&db.store.pool)
-        .await
-        .expect("age old running delegation");
-    let running_new = db
+        .expect("create running delegation");
+    let done = db
         .store
-        .create_delegation("parent", DelegationKind::Full, None, Some("running-new"), 1)
+        .create_delegation("parent", DelegationKind::Full, None, Some("done"), 1)
         .await
-        .expect("create new running delegation");
-
-    let mut terminals = Vec::new();
-    for index in 0..5 {
-        let label = format!("terminal-{index}");
-        let terminal = db
-            .store
-            .create_delegation("parent", DelegationKind::Full, None, Some(&label), 1)
-            .await
-            .expect("create terminal delegation");
-        db.store
-            .set_delegation_status(&terminal.id, DelegationStatus::Done)
-            .await
-            .expect("finish terminal delegation");
-        sqlx::query(
-            "update delegations set updated_at = now() - ($2::int * interval '1 second') where id=$1",
-        )
-        .bind(&terminal.id)
-        .bind(10 - index)
-        .execute(&db.store.pool)
+        .expect("create done delegation");
+    db.store
+        .set_delegation_status(&done.id, DelegationStatus::Done)
         .await
-        .expect("set terminal recency");
-        terminals.push(terminal);
-    }
-    let other_parent_terminal = db
+        .expect("finish done delegation");
+    let done_with_failures = db
         .store
         .create_delegation(
-            "other_parent",
-            DelegationKind::Full,
+            "parent",
+            DelegationKind::ReadonlyFanout,
             None,
-            Some("other-done"),
-            1,
+            Some("done-with-failures"),
+            2,
         )
         .await
-        .expect("create other parent terminal");
+        .expect("create done_with_failures delegation");
     db.store
-        .set_delegation_status(&other_parent_terminal.id, DelegationStatus::Done)
+        .set_delegation_status(&done_with_failures.id, DelegationStatus::DoneWithFailures)
         .await
-        .expect("finish other parent terminal");
-    sqlx::query("update delegations set updated_at = now() where id=$1")
-        .bind(&other_parent_terminal.id)
-        .execute(&db.store.pool)
-        .await
-        .expect("freshen other parent terminal");
-
-    let current = db
+        .expect("finish done_with_failures delegation");
+    let cancelled = db
         .store
-        .list_parent_current_delegations("parent", 3)
+        .create_delegation("parent", DelegationKind::Full, None, Some("cancelled"), 1)
         .await
-        .expect("list current delegations");
-    let ids = current
-        .iter()
-        .map(|delegation| delegation.id.as_str())
-        .collect::<Vec<_>>();
+        .expect("create cancelled delegation");
+    db.store
+        .set_delegation_status(&cancelled.id, DelegationStatus::Cancelled)
+        .await
+        .expect("cancel delegation");
+    let failed = db
+        .store
+        .create_delegation("parent", DelegationKind::Full, None, Some("failed"), 1)
+        .await
+        .expect("create failed delegation");
+    db.store
+        .set_delegation_status(&failed.id, DelegationStatus::Failed)
+        .await
+        .expect("fail delegation");
 
+    let parent_delegations = db
+        .store
+        .list_parent_delegations("parent")
+        .await
+        .expect("list all parent delegations");
+    let ids_and_statuses = parent_delegations
+        .iter()
+        .map(|delegation| (delegation.id.as_str(), delegation.status))
+        .collect::<Vec<_>>();
     assert_eq!(
-        ids,
+        ids_and_statuses,
         vec![
-            running_new.id.as_str(),
-            running_old.id.as_str(),
-            terminals[4].id.as_str(),
-            terminals[3].id.as_str(),
-            terminals[2].id.as_str(),
+            (running.id.as_str(), DelegationStatus::Running),
+            (done.id.as_str(), DelegationStatus::Done),
+            (
+                done_with_failures.id.as_str(),
+                DelegationStatus::DoneWithFailures
+            ),
+            (cancelled.id.as_str(), DelegationStatus::Cancelled),
+            (failed.id.as_str(), DelegationStatus::Failed),
         ]
     );
-    assert!(!ids.contains(&terminals[0].id.as_str()));
-    assert!(!ids.contains(&terminals[1].id.as_str()));
-    assert!(!ids.contains(&other_parent_running.id.as_str()));
-    assert!(!ids.contains(&other_parent_terminal.id.as_str()));
-
-    let running_only = db
-        .store
-        .list_parent_current_delegations("parent", 0)
-        .await
-        .expect("list running-only current delegations");
-    let running_only_ids = running_only
+    assert!(!parent_delegations
         .iter()
-        .map(|delegation| delegation.id.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(
-        running_only_ids,
-        vec![running_new.id.as_str(), running_old.id.as_str()]
-    );
+        .any(|delegation| delegation.id == other_parent.id));
 
     db.cleanup().await;
 }

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use agent_provider::ModelTranscriptEntry;
 use agent_session::{AgentSession, ModelContext, SessionAction, TranscriptStorageNode};
 use agent_store::{
     DelegationKind, DelegationStatus, EventType, InputPriority, PostgresAgentStore,
@@ -17,8 +18,8 @@ use agent_store::{
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{
-    ActionId, AssistantItem, AssistantMessage, ProviderConfig, ProviderKind, ReasoningEffort,
-    ToolCall, ToolCallId, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+    ActionId, AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
+    ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
@@ -53,7 +54,9 @@ impl Drop for TempDir {
 }
 
 use crate::provider_runtime::{
-    build_model_request, ProviderConnectionRegistry, SessionTitleScheduler,
+    append_delegation_ledger_to_output, build_model_request, local_summary_request,
+    remote_compaction_request, CompactionOutput, CompactionSummaryKind, ProviderConnectionRegistry,
+    SessionTitleScheduler,
 };
 use crate::runtime::SessionDriver;
 use crate::state::AppState;
@@ -494,8 +497,36 @@ fn handoff_root(env: &TestEnv, delegation_id: &str) -> PathBuf {
     env.cwd.path().join(".pi-handoff").join(delegation_id)
 }
 
+fn user_texts(entries: &[ModelTranscriptEntry]) -> Vec<&str> {
+    entries
+        .iter()
+        .filter_map(|entry| match entry.item() {
+            TranscriptItem::UserMessage(message) => message.as_text(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn last_user_text(entries: &[ModelTranscriptEntry]) -> &str {
+    user_texts(entries)
+        .into_iter()
+        .last()
+        .expect("request has a final user message")
+}
+
+fn test_compaction_output(summary: &str) -> CompactionOutput {
+    CompactionOutput {
+        summary: summary.to_string(),
+        summary_kind: CompactionSummaryKind::ProviderText,
+        provider_replay: Vec::new(),
+        remote: true,
+        provider: ProviderKind::OpenAi,
+        usage: None,
+    }
+}
+
 #[tokio::test]
-async fn parent_model_context_injects_current_delegations_after_system_prompt() {
+async fn parent_model_context_does_not_inject_current_delegations() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -576,27 +607,21 @@ async fn parent_model_context_injects_current_delegations_after_system_prompt() 
         request.prompt.stable_prefix.as_deref(),
         Some("PI stable prompt")
     );
-    let dynamic = request
-        .prompt
-        .dynamic_context
-        .as_deref()
-        .expect("current delegations dynamic context");
-    assert!(dynamic.starts_with("## Current delegations"));
-    assert!(dynamic.contains(&format!("delegation_id: `{}`", running.id)));
-    assert!(dynamic.contains("workflow: `workflow-implement-review`"));
-    assert!(dynamic.contains("label: `implement`"));
-    assert!(dynamic.contains("steerable: true"));
-    assert!(dynamic.contains(&format!("delegation_id: `{}`", done.id)));
-    assert!(dynamic.contains("final_message_file: `review_done/final_message.md`"));
-    assert!(dynamic.contains("\"Looks good.\\n\\nsuggested_next: approved\""));
-    assert!(dynamic.contains("suggested_next: \"approved\""));
-    assert!(dynamic.contains("Full transcript contents are not inlined"));
-    assert!(!dynamic.contains("## User"));
-    assert!(!dynamic.contains("## Assistant"));
-    let joined = request.prompt.render_joined().expect("joined prompt");
     assert!(
-        joined.starts_with("PI stable prompt\n\n## Current delegations"),
-        "dynamic context should render immediately after PI/system prompt: {joined}"
+        request.prompt.dynamic_context.is_none(),
+        "normal parent turns should not receive current-delegations dynamic context"
+    );
+    assert_eq!(
+        request.prompt.render_joined().as_deref(),
+        Some("PI stable prompt")
+    );
+    assert!(
+        !request
+            .prompt
+            .render_joined()
+            .unwrap_or_default()
+            .contains("## Current delegations"),
+        "normal parent prompt must be stable PI/system prompt only"
     );
 
     env.cleanup().await;
@@ -651,7 +676,411 @@ async fn subagent_model_context_does_not_get_parent_delegation_summary() {
 }
 
 #[tokio::test]
-async fn parent_model_context_bounds_large_fanout_subagents() {
+async fn parent_compaction_output_appends_complete_delegation_ledger_after_provider_summary() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    std::fs::write(
+        env.cwd.path().join("PI.compaction.md"),
+        "Produce a compact continuation summary.",
+    )
+    .expect("write compaction prompt");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "parent compaction ledger test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+
+    let running = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::Full,
+            Some("workflow-implement-review"),
+            Some("implement"),
+            1,
+        )
+        .await
+        .expect("create running delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &running.id, "impl_running").await;
+
+    let done = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            Some("review"),
+            1,
+        )
+        .await
+        .expect("create done delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &done.id,
+        "review_done",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "Looks good.\n\nsuggested_next: approved",
+    )
+    .await;
+    assert!(env
+        .state
+        .repo
+        .finish_delegation(&done.id, &done.attempt_id, DelegationStatus::Done)
+        .await
+        .expect("finish done"));
+    std::fs::create_dir_all(handoff_root(&env, &done.id).join("review_done")).expect("handoff dir");
+    std::fs::write(
+        handoff_root(&env, &done.id)
+            .join("review_done")
+            .join("final_message.md"),
+        "Looks good.\n\nsuggested_next: approved",
+    )
+    .expect("write final message artifact");
+
+    let done_with_failures = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            Some("review-failed"),
+            1,
+        )
+        .await
+        .expect("create done_with_failures delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &done_with_failures.id,
+        "review_failed",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Crashed,
+        "Tests failed.\n\nsuggested_next: changes_requested",
+    )
+    .await;
+    assert!(env
+        .state
+        .repo
+        .finish_delegation(
+            &done_with_failures.id,
+            &done_with_failures.attempt_id,
+            DelegationStatus::DoneWithFailures,
+        )
+        .await
+        .expect("finish done_with_failures"));
+    std::fs::create_dir_all(handoff_root(&env, &done_with_failures.id).join("review_failed"))
+        .expect("handoff dir");
+    std::fs::write(
+        handoff_root(&env, &done_with_failures.id)
+            .join("review_failed")
+            .join("final_message.md"),
+        "Tests failed.\n\nsuggested_next: changes_requested",
+    )
+    .expect("write final message artifact");
+
+    let cancelled = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("cancelled"), 1)
+        .await
+        .expect("create cancelled delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &cancelled.id, "impl_cancelled").await;
+    env.state
+        .repo
+        .set_delegation_status(&cancelled.id, DelegationStatus::Cancelled)
+        .await
+        .expect("mark cancelled");
+
+    let failed = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("failed"), 1)
+        .await
+        .expect("create failed delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &failed.id,
+        "impl_failed",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Crashed,
+        "Failed before handoff publication.",
+    )
+    .await;
+    env.state
+        .repo
+        .set_delegation_status(&failed.id, DelegationStatus::Failed)
+        .await
+        .expect("mark failed");
+
+    let mut config = env
+        .state
+        .repo
+        .load_session_config("parent")
+        .await
+        .expect("parent config");
+    config.system_prompt = "PI stable prompt".to_string();
+    let transcript = vec![
+        TranscriptItem::CompactionSummary(CompactionSummary::new(
+            "parent",
+            "old_leaf",
+            "older provider summary\n\n## Delegation state at compaction time\n\nold stale delegation ledger",
+            Some(123),
+            TurnId(1),
+        ))
+        .into(),
+        TranscriptItem::UserMessage(UserMessage::text("history before compaction")).into(),
+        TranscriptItem::AssistantMessage(AssistantMessage {
+            items: vec![AssistantItem::Text("assistant history".to_string())],
+        })
+        .into(),
+    ];
+    let remote_request =
+        remote_compaction_request(&env.state, &config, "parent", transcript.clone())
+            .await
+            .expect("build remote compaction request");
+
+    assert_eq!(
+        remote_request.prompt.stable_prefix.as_deref(),
+        Some("PI stable prompt")
+    );
+    assert!(
+        remote_request.prompt.dynamic_context.is_none(),
+        "compaction ledger must not be PromptSections.dynamic_context"
+    );
+    let remote_user_texts = user_texts(&remote_request.transcript);
+    assert!(remote_user_texts
+        .iter()
+        .any(|text| text.contains("older provider summary")));
+    assert!(
+        !remote_user_texts
+            .iter()
+            .any(|text| text.contains("old stale delegation ledger")),
+        "remote compaction input should strip previously appended stale delegation ledgers: {remote_user_texts:?}"
+    );
+    assert!(remote_user_texts.contains(&"history before compaction"));
+    assert!(
+        !remote_user_texts
+            .iter()
+            .any(|text| text.contains("## Delegation state at compaction time")),
+        "remote compaction input should not include live delegation ledger: {remote_user_texts:?}"
+    );
+
+    let output = append_delegation_ledger_to_output(
+        &env.state,
+        "parent",
+        test_compaction_output("provider summary"),
+    )
+    .await
+    .expect("append ledger to output");
+    assert!(output.summary.starts_with("provider summary\n\n"));
+    let ledger = output
+        .summary
+        .split("## Delegation state at compaction time")
+        .nth(1)
+        .map(|rest| format!("## Delegation state at compaction time{rest}"))
+        .expect("post-compaction summary includes ledger");
+    assert!(ledger.starts_with("## Delegation state at compaction time"));
+    assert!(!ledger.contains("## Current delegations"));
+    assert!(ledger.contains(&format!("delegation_id: `{}`", running.id)));
+    assert!(
+        ledger.contains("status: running; progress: expected 1, spawned 1, terminal 0, running 1")
+    );
+    assert!(ledger.contains("running at compaction time; point-in-time only"));
+    assert!(ledger.contains(&format!("delegation_id: `{}`", done.id)));
+    assert!(ledger.contains("status: done"));
+    assert!(ledger.contains("completed before compaction"));
+    assert!(ledger.contains("final_message_file: `review_done/final_message.md`"));
+    assert!(ledger.contains("\"Looks good.\\n\\nsuggested_next: approved\""));
+    assert!(ledger.contains(&format!("delegation_id: `{}`", done_with_failures.id)));
+    assert!(ledger.contains("status: done_with_failures"));
+    assert!(ledger.contains("completed with failures before compaction"));
+    assert!(ledger.contains(&format!("delegation_id: `{}`", cancelled.id)));
+    assert!(ledger.contains("status: cancelled"));
+    assert!(ledger.contains("cancelled before compaction"));
+    assert!(ledger.contains("transcript_file: `cancelled/impl_cancelled.transcript.md`"));
+    assert!(ledger.contains(&format!("delegation_id: `{}`", failed.id)));
+    assert!(ledger.contains("status: failed"));
+    assert!(ledger.contains("failed before compaction"));
+    assert!(ledger.contains("transcript_file: null"));
+    assert!(ledger.contains("Full transcript contents are not inlined"));
+    assert!(!ledger.contains("## User"));
+    assert!(!ledger.contains("## Assistant"));
+    assert!(!ledger.contains("transcript body"));
+
+    let local_request = local_summary_request(
+        &env.state,
+        &config,
+        "parent",
+        "parent:compaction",
+        transcript,
+    )
+    .await
+    .expect("build local compaction request");
+    assert!(local_request.prompt.dynamic_context.is_none());
+    let local_tail = last_user_text(&local_request.transcript);
+    let local_joined = user_texts(&local_request.transcript).join("\n\n");
+    assert!(
+        !local_joined.contains("old stale delegation ledger"),
+        "local compaction input should strip previously appended stale delegation ledgers: {local_joined}"
+    );
+    assert!(local_tail.contains("Produce a compact continuation summary."));
+    assert!(
+        !local_tail.contains("## Delegation state at compaction time"),
+        "local compaction input should not include live delegation ledger: {local_tail}"
+    );
+    assert!(!local_tail.contains(&format!("delegation_id: `{}`", running.id)));
+    assert!(!local_tail.contains(&format!("delegation_id: `{}`", failed.id)));
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn subagent_compaction_excludes_parent_delegation_ledger_and_sibling_state() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    std::fs::write(
+        env.cwd.path().join("PI.compaction.md"),
+        "Produce a subagent continuation summary.",
+    )
+    .expect("write compaction prompt");
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "subagent compaction ledger test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+
+    let parent_delegation = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            Some("workflow-explore"),
+            Some("fanout"),
+            2,
+        )
+        .await
+        .expect("create parent delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &parent_delegation.id,
+        "subagent_under_compaction",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "Own subagent facts should remain available.",
+    )
+    .await;
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &parent_delegation.id,
+        "sibling_subagent",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "Sibling-only state must not be injected into subagent compaction.",
+    )
+    .await;
+
+    let mut subagent_config = env
+        .state
+        .repo
+        .load_session_config("subagent_under_compaction")
+        .await
+        .expect("subagent config");
+    subagent_config.system_prompt = "Subagent role contract".to_string();
+    let own_transcript = vec![
+        TranscriptItem::UserMessage(UserMessage::text("delegated task context")).into(),
+        TranscriptItem::AssistantMessage(AssistantMessage {
+            items: vec![AssistantItem::Text(
+                "Own subagent observation and tool facts.".to_string(),
+            )],
+        })
+        .into(),
+    ];
+
+    let remote_request = remote_compaction_request(
+        &env.state,
+        &subagent_config,
+        "subagent_under_compaction",
+        own_transcript.clone(),
+    )
+    .await
+    .expect("build remote subagent compaction request");
+    assert_eq!(
+        remote_request.transcript.len(),
+        own_transcript.len(),
+        "subagent remote compaction should not append parent delegation state"
+    );
+    let remote_joined = user_texts(&remote_request.transcript).join("\n\n");
+    assert!(remote_joined.contains("delegated task context"));
+    assert!(!remote_joined.contains("## Delegation state at compaction time"));
+    assert!(!remote_joined.contains("## Current delegations"));
+    assert!(!remote_joined.contains(&parent_delegation.id));
+    assert!(!remote_joined.contains("sibling_subagent"));
+    assert!(!remote_joined.contains("workflow-explore"));
+
+    let local_request = local_summary_request(
+        &env.state,
+        &subagent_config,
+        "subagent_under_compaction",
+        "subagent_under_compaction:compaction",
+        own_transcript,
+    )
+    .await
+    .expect("build local subagent compaction request");
+    let local_joined = user_texts(&local_request.transcript).join("\n\n");
+    assert!(local_joined.contains("delegated task context"));
+    assert!(local_joined.contains("Produce a subagent continuation summary."));
+    assert!(!local_joined.contains("## Delegation state at compaction time"));
+    assert!(!local_joined.contains("## Current delegations"));
+    assert!(!local_joined.contains(&parent_delegation.id));
+    assert!(!local_joined.contains("sibling_subagent"));
+    assert!(!local_joined.contains("workflow-explore"));
+
+    let output = append_delegation_ledger_to_output(
+        &env.state,
+        "subagent_under_compaction",
+        test_compaction_output("subagent provider summary"),
+    )
+    .await
+    .expect("post-process subagent compaction output");
+    assert_eq!(output.summary, "subagent provider summary");
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn parent_compaction_ledger_bounds_large_fanout_subagents() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -701,38 +1130,32 @@ async fn parent_model_context_bounds_large_fanout_subagents() {
         .await
         .expect("finish large delegation"));
 
-    let mut config = env
-        .state
-        .repo
-        .load_session_config("parent")
-        .await
-        .expect("parent config");
-    config.system_prompt = "PI stable prompt".to_string();
-    let request = build_model_request(&env.state, &config, "parent", None, ModelContext::new())
-        .await
-        .expect("build model request");
-    let dynamic = request
-        .prompt
-        .dynamic_context
-        .as_deref()
-        .expect("current delegations dynamic context");
+    let output = append_delegation_ledger_to_output(
+        &env.state,
+        "parent",
+        test_compaction_output("provider summary"),
+    )
+    .await
+    .expect("append ledger to output");
+    let ledger = output.summary;
 
-    assert!(dynamic.contains(&format!("delegation_id: `{}`", delegation.id)));
-    assert!(dynamic.contains("progress: expected 12, spawned 12"));
-    assert!(dynamic.contains("... 4 more subagent(s) omitted"));
-    assert!(dynamic.contains("subagent_id: `review_00`"));
-    assert!(dynamic.contains("subagent_id: `review_07`"));
+    assert!(ledger.contains("## Delegation state at compaction time"));
+    assert!(ledger.contains(&format!("delegation_id: `{}`", delegation.id)));
+    assert!(ledger.contains("progress: expected 12, spawned 12"));
+    assert!(ledger.contains("... 4 more subagent(s) omitted"));
+    assert!(ledger.contains("subagent_id: `review_00`"));
+    assert!(ledger.contains("subagent_id: `review_07`"));
     assert!(
-        !dynamic.contains("subagent_id: `review_08`"),
-        "limit+1 probe row must not be rendered: {dynamic}"
+        !ledger.contains("subagent_id: `review_08`"),
+        "limit+1 probe row must not be rendered: {ledger}"
     );
-    assert!(!dynamic.contains("review_11/final_message.md"));
+    assert!(!ledger.contains("review_11/final_message.md"));
 
     env.cleanup().await;
 }
 
 #[tokio::test]
-async fn parent_model_context_marks_failed_transcripts_unavailable() {
+async fn parent_compaction_ledger_marks_failed_transcripts_unavailable() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -769,28 +1192,22 @@ async fn parent_model_context_marks_failed_transcripts_unavailable() {
         .await
         .expect("mark failed");
 
-    let mut config = env
-        .state
-        .repo
-        .load_session_config("parent")
-        .await
-        .expect("parent config");
-    config.system_prompt = "PI stable prompt".to_string();
-    let request = build_model_request(&env.state, &config, "parent", None, ModelContext::new())
-        .await
-        .expect("build model request");
-    let dynamic = request
-        .prompt
-        .dynamic_context
-        .as_deref()
-        .expect("current delegations dynamic context");
+    let output = append_delegation_ledger_to_output(
+        &env.state,
+        "parent",
+        test_compaction_output("provider summary"),
+    )
+    .await
+    .expect("append ledger to output");
+    let ledger = output.summary;
 
-    assert!(dynamic.contains(&format!("delegation_id: `{}`", delegation.id)));
-    assert!(dynamic.contains("status: failed"));
-    assert!(dynamic.contains("subagent_id: `impl_failed`"));
-    assert!(dynamic.contains("transcript_file: null"));
-    assert!(!dynamic.contains("impl_failed/transcript.md"));
-    assert!(!dynamic.contains("final_message_file: `impl_failed/final_message.md`"));
+    assert!(ledger.contains(&format!("delegation_id: `{}`", delegation.id)));
+    assert!(ledger.contains("status: failed"));
+    assert!(ledger.contains("failed before compaction"));
+    assert!(ledger.contains("subagent_id: `impl_failed`"));
+    assert!(ledger.contains("transcript_file: null"));
+    assert!(!ledger.contains("impl_failed/transcript.md"));
+    assert!(!ledger.contains("final_message_file: `impl_failed/final_message.md`"));
 
     env.cleanup().await;
 }

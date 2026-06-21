@@ -66,13 +66,26 @@ runner never decides the next delegation — the parent does, guided by workflow
 skills. Cancellation is terminal and exports transcript-only files for the
 cancelled subagents instead of running the normal completion handoff.
 
-Top-level parent model requests also receive a compact daemon-generated
-`## Current delegations` dynamic-context section immediately after the rendered
-PI.md stable prefix. It lists all running delegations and the latest three
-terminal delegations (there is no parent-acknowledgement state yet), with bounded
-progress/subagent fields, existing final-message snippets when cheap, and
-artifact paths. It does not refresh artifacts or inline transcript bodies;
-`inspect_delegation` remains the canonical refresh/full snapshot path.
+Normal top-level parent model requests do not receive a daemon-generated
+delegation dashboard. They are transcript-driven: durable delegate tool results
+and wakeup steers already live in history, so the provider input stays as stable
+PI/system prompt plus transcript history.
+
+Compaction is the special case, but the live ledger is not a provider input. For
+top-level parent sessions, the provider compacts only transcript/model history
+(with stale previously-appended delegation ledgers stripped out). After the
+provider returns, the daemon appends a fresh
+`## Delegation state at compaction time` section to the stored compaction
+summary. The ledger lists every delegation row for that parent session across
+all statuses (`running`, `done`, `done_with_failures`, `cancelled`, `failed`),
+with bounded subagent/progress details, cheap final-message snippets when
+available, and artifact paths. It does not refresh artifacts or inline
+transcript bodies. A `running` entry is a point-in-time compaction fact, not a
+final outcome; later completion steers or `inspect_delegation` provide fresh
+state. Subagent compactions do not receive or append the parent ledger, sibling
+subagent state, or `## Current delegations` information; subagents summarize
+only their own role contract, delegated task, transcript/model history, and tool
+results/facts.
 
 The web/inspector RPC surface remains `delegation.start_full`,
 `delegation.start_readonly_fanout`, `delegation.status`, `delegation.cancel`, and `delegation.list`;
@@ -85,7 +98,7 @@ driver loop after its durable store update. The narrow extension precedent
 remains `ToolRegistry`/`ToolExtension`, where the variation point is real and
 does not own session durability.
 
-`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (remote/local compaction), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery + dynamic prompt sections), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization). The adjacent `delegation_context.rs` builds the compact "Current delegations" dynamic section for top-level parent model requests.
+`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (remote/local compaction and parent-only post-compaction delegation ledger append), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery + stable prompt sections), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization). The adjacent `delegation_context.rs` builds the bounded compaction ledger for top-level parent sessions.
 
 ## Key types
 

@@ -8,18 +8,15 @@ use agent_store::{SessionConfig, SessionWorkspace, WorkspaceKind};
 use agent_vocab::ProviderKind;
 use anyhow::{anyhow, Context};
 
-use crate::delegation_context::current_delegations_context;
 use crate::state::AppState;
 
 pub(super) async fn assemble_agent_prompt(
-    state: &AppState,
+    _state: &AppState,
     config: &SessionConfig,
-    session_id: &str,
+    _session_id: &str,
 ) -> anyhow::Result<agent_provider::PromptSections> {
-    let current_delegations = current_delegations_context(state, session_id).await?;
-    Ok(agent_provider::PromptSections::new(
-        Some(config.system_prompt.clone()),
-        Some(current_delegations),
+    Ok(agent_provider::PromptSections::stable(
+        config.system_prompt.clone(),
     ))
 }
 

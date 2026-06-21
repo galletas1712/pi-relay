@@ -60,13 +60,15 @@ transcript ────  TranscriptItem + provider_replay sidecars (replay-first
 
 `PromptSections` splits the prompt so the cacheable bytes come first and request-specific context comes after:
 
-- OpenAI renders `stable_prefix` as Responses `instructions` and `dynamic_context` as the first `input` item (a synthetic user message), then transcript history.
-- Anthropic renders an attribution `system[0]` header, then `stable_prefix` as a `cache_control` system block, then `dynamic_context` as an uncached system suffix. There is no model-facing "dynamic context" heading; the split is purely a cache-layout detail.
+- OpenAI renders `stable_prefix` as Responses `instructions`, then transcript history, then `dynamic_context` as a final synthetic user input when present.
+- Anthropic renders an attribution `system[0]` header, then `stable_prefix` as a `cache_control` system block. Transcript messages come next; `dynamic_context`, when present, is appended as a final uncached user message so the stable/system and transcript prefix remain cacheable.
 
-The daemon-owned dynamic context can include model-facing sections such as the
-compact `## Current delegations` summary for top-level parent sessions. Those
-sections are bounded request-time context, not part of the cacheable PI.md
-stable prefix.
+Normal daemon model requests usually leave `dynamic_context` empty. Parent
+delegation preservation is handled after provider compaction returns: the daemon
+appends `## Delegation state at compaction time` to the stored compaction
+summary for top-level parent sessions only. The compaction provider input does
+not receive live parent/sibling delegation state, and subagent compactions do
+not append it afterward.
 
 ### OpenAI / Codex (Responses API)
 
