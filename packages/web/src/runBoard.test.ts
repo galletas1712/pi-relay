@@ -3,6 +3,7 @@ import {
 	canReRunStage,
 	isStageRunning,
 	reRunParamsForStage,
+	stageHasHandoff,
 	stageStatusLabel,
 	steerableSubagentId,
 } from "./runBoard.ts";
@@ -71,6 +72,16 @@ describe("stageStatusLabel", () => {
 	});
 });
 
+describe("stageHasHandoff", () => {
+	it("is true only for barrier-completed stages", () => {
+		expect(stageHasHandoff(fullStage({ status: "done" }))).toBe(true);
+		expect(stageHasHandoff(fullStage({ status: "done_with_failures" }))).toBe(true);
+		expect(stageHasHandoff(fullStage({ status: "running" }))).toBe(false);
+		expect(stageHasHandoff(fullStage({ status: "cancelled" }))).toBe(false);
+		expect(stageHasHandoff(fullStage({ status: "failed" }))).toBe(false);
+	});
+});
+
 describe("steerableSubagentId", () => {
 	it("returns the full subagent only while the stage is running", () => {
 		expect(steerableSubagentId(fullStage({ status: "running" }))).toBe("child-1");
@@ -113,6 +124,16 @@ describe("canReRunStage", () => {
 				},
 			],
 		});
+		expect(canReRunStage(stage)).toBe(false);
+	});
+
+	it("forbids re-run for unknown stage kinds", () => {
+		const stage = fanoutStage({ kind: "bogus" as Stage["kind"] });
+		expect(canReRunStage(stage)).toBe(false);
+	});
+
+	it("forbids re-run for unknown stage statuses", () => {
+		const stage = fullStage({ status: "stale" as Stage["status"] });
 		expect(canReRunStage(stage)).toBe(false);
 	});
 });
@@ -173,5 +194,15 @@ describe("reRunParamsForStage", () => {
 	it("returns null while running or when a stage has no subagents", () => {
 		expect(reRunParamsForStage(fullStage({ status: "running" }), "parent")).toBeNull();
 		expect(reRunParamsForStage(fullStage({ subagents: [] }), "parent")).toBeNull();
+	});
+
+	it("returns null instead of treating an unknown kind as fan-out", () => {
+		const stage = fanoutStage({ kind: "bogus" as Stage["kind"] });
+		expect(reRunParamsForStage(stage, "parent")).toBeNull();
+	});
+
+	it("returns null for an unknown status", () => {
+		const stage = fullStage({ status: "stale" as Stage["status"] });
+		expect(reRunParamsForStage(stage, "parent")).toBeNull();
 	});
 });
