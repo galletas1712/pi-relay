@@ -78,7 +78,7 @@ pub(crate) async fn current_delegations_context(
             inline_code(&handoff_dir.to_string_lossy())
         ));
         out.push('\n');
-        append_subagents(state, &mut out, delegation, &handoff_dir).await?;
+        append_subagents(state, &mut out, delegation, progress.spawned, &handoff_dir).await?;
     }
 
     Ok(out.trim_end().to_string())
@@ -93,9 +93,13 @@ async fn append_subagents(
     state: &AppState,
     out: &mut String,
     delegation: &Delegation,
+    spawned_count: i32,
     handoff_dir: &Path,
 ) -> anyhow::Result<()> {
-    let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
+    let subagents = state
+        .repo
+        .list_delegation_subagents_for_context(&delegation.id, MAX_SUBAGENTS_PER_DELEGATION as i64)
+        .await?;
     let shown = subagents.len().min(MAX_SUBAGENTS_PER_DELEGATION);
     for subagent in subagents.iter().take(shown) {
         let terminal = state
@@ -113,16 +117,15 @@ async fn append_subagents(
             && subagent.subagent_type == Some(SubagentType::Full)
             && !terminal
             && has_active_work;
-        let transcript_file = transcript_file_for(delegation.status, &subagent.session_id);
         out.push_str(&format!(
-            "  - subagent_id: `{}`; role: {}; type: {}; activity: {}; status: {}; steerable: {}; transcript_file: `{}`",
+            "  - subagent_id: `{}`; role: {}; type: {}; activity: {}; status: {}; steerable: {}; transcript_file: {}",
             inline_code(&subagent.session_id),
             optional_inline_code(subagent.role.as_deref()),
             optional_type(subagent.subagent_type),
             subagent.activity,
             status,
             steerable,
-            inline_code(&transcript_file),
+            optional_transcript_file(delegation.status, &subagent.session_id),
         ));
         if final_message_relevant(delegation.status) {
             let final_message_path = handoff_dir
@@ -149,10 +152,13 @@ async fn append_subagents(
         }
         out.push('\n');
     }
-    if subagents.len() > shown {
+    let omitted = (spawned_count.max(0) as usize)
+        .saturating_sub(shown)
+        .max(subagents.len().saturating_sub(shown));
+    if omitted > 0 {
         out.push_str(&format!(
             "  - ... {} more subagent(s) omitted from compact context; call `inspect_delegation`.\n",
-            subagents.len() - shown
+            omitted
         ));
     }
     Ok(())
@@ -180,10 +186,17 @@ fn subagent_status(
     }
 }
 
-fn transcript_file_for(status: DelegationStatus, subagent_id: &str) -> String {
+fn optional_transcript_file(status: DelegationStatus, subagent_id: &str) -> String {
+    transcript_file_for(status, subagent_id)
+        .map(|file| format!("`{}`", inline_code(&file)))
+        .unwrap_or_else(|| "null".to_string())
+}
+
+fn transcript_file_for(status: DelegationStatus, subagent_id: &str) -> Option<String> {
     match status {
-        DelegationStatus::Cancelled => format!("cancelled/{subagent_id}.transcript.md"),
-        _ => format!("{subagent_id}/transcript.md"),
+        DelegationStatus::Cancelled => Some(format!("cancelled/{subagent_id}.transcript.md")),
+        DelegationStatus::Failed => None,
+        _ => Some(format!("{subagent_id}/transcript.md")),
     }
 }
 
@@ -293,17 +306,14 @@ pub(crate) fn test_context_from_snapshots(
         let shown = subagents.len().min(MAX_SUBAGENTS_PER_DELEGATION);
         for subagent in subagents.iter().take(shown) {
             out.push_str(&format!(
-                "  - subagent_id: `{}`; role: {}; type: {}; activity: {}; status: {}; steerable: {}; transcript_file: `{}`",
+                "  - subagent_id: `{}`; role: {}; type: {}; activity: {}; status: {}; steerable: {}; transcript_file: {}",
                 inline_code(&subagent.session_id),
                 optional_inline_code(subagent.role.as_deref()),
                 optional_type(subagent.subagent_type),
                 subagent.activity,
                 subagent.status,
                 subagent.steerable,
-                inline_code(&transcript_file_for(
-                    delegation.status,
-                    &subagent.session_id
-                )),
+                optional_transcript_file(delegation.status, &subagent.session_id),
             ));
             if final_message_relevant(delegation.status) {
                 out.push_str(&format!(
@@ -331,10 +341,13 @@ pub(crate) fn test_context_from_snapshots(
             }
             out.push('\n');
         }
-        if subagents.len() > shown {
+        let omitted = (progress.spawned.max(0) as usize)
+            .saturating_sub(shown)
+            .max(subagents.len().saturating_sub(shown));
+        if omitted > 0 {
             out.push_str(&format!(
                 "  - ... {} more subagent(s) omitted from compact context; call `inspect_delegation`.\n",
-                subagents.len() - shown
+                omitted
             ));
         }
     }
@@ -455,5 +468,70 @@ mod tests {
         assert!(text.contains("transcript_file: `impl/transcript.md`"));
         assert!(!text.contains("final_message:"));
         assert!(!text.contains("not yet relevant"));
+    }
+
+    #[test]
+    fn omitted_count_uses_spawned_progress_not_loaded_subagent_count() {
+        let subagents = (0..9)
+            .map(|index| TestSubagent {
+                session_id: format!("child_{index}"),
+                role: Some("reviewer".to_string()),
+                subagent_type: Some(SubagentType::ReadOnly),
+                activity: SessionActivity::Idle,
+                status: "terminal".to_string(),
+                steerable: false,
+                final_message: None,
+            })
+            .collect::<Vec<_>>();
+        let text = test_context_from_snapshots(
+            vec![(
+                delegation("delegation_large", DelegationStatus::Done),
+                DelegationProgress {
+                    expected: 20,
+                    spawned: 20,
+                    terminal: 20,
+                    running: 0,
+                    failed: 0,
+                },
+                subagents,
+            )],
+            "/tmp/session",
+        )
+        .expect("render context");
+
+        assert!(text.contains("... 12 more subagent(s) omitted"));
+        assert!(text.contains("subagent_id: `child_7`"));
+        assert!(!text.contains("subagent_id: `child_8`"));
+    }
+
+    #[test]
+    fn failed_delegation_context_does_not_point_at_normal_transcript_artifacts() {
+        let text = test_context_from_snapshots(
+            vec![(
+                delegation("delegation_failed", DelegationStatus::Failed),
+                DelegationProgress {
+                    expected: 1,
+                    spawned: 1,
+                    terminal: 0,
+                    running: 0,
+                    failed: 0,
+                },
+                vec![TestSubagent {
+                    session_id: "impl_failed".to_string(),
+                    role: Some("implementer".to_string()),
+                    subagent_type: Some(SubagentType::Full),
+                    activity: SessionActivity::Idle,
+                    status: "failed".to_string(),
+                    steerable: false,
+                    final_message: None,
+                }],
+            )],
+            "/tmp/session",
+        )
+        .expect("render context");
+
+        assert!(text.contains("transcript_file: null"));
+        assert!(!text.contains("impl_failed/transcript.md"));
+        assert!(!text.contains("final_message_file:"));
     }
 }
