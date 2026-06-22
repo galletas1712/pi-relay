@@ -68,7 +68,8 @@ use super::{
     try_claim_and_publish_completed_delegation,
 };
 use crate::delegation_tools::{
-    cancel_core, read_handoff_file_core, run_delegation_tool, status_core, steer_subagent_core,
+    cancel_core, read_handoff_file_core, rpc_list, run_delegation_tool, status_core,
+    steer_subagent_core,
 };
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(90_000);
@@ -1614,6 +1615,20 @@ async fn cancel_delegation_returns_transcript_only_paths() {
         subagent["cancellation_transcript_relative_path"],
         format!("cancelled/{}.transcript.md", "impl_to_cancel")
     );
+    let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
+        .await
+        .expect("list delegations");
+    let listed_subagent = &list["delegations"].as_array().unwrap()[0]["subagents"]
+        .as_array()
+        .unwrap()[0];
+    assert_eq!(
+        listed_subagent["cancellation_transcript_path"],
+        transcript_path
+    );
+    assert_eq!(
+        listed_subagent["cancellation_transcript_relative_path"],
+        "cancelled/impl_to_cancel.transcript.md"
+    );
     assert_eq!(snapshot["progress"]["running"], 0);
     assert!(!handoff_root(&env, &delegation.id)
         .join("index.json")
@@ -1867,7 +1882,7 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     sweep_running_delegations_on_boot(&env.state).await;
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
 
-    // Handoff: inspect_delegation is the manifest-equivalent snapshot; the
+    // Handoff: inspect_delegation is the control-flow snapshot; the
     // handoff dir contains per-subagent files for EVERY subagent (incl. failed)
     // but no delegation-root index.json.
     let root = handoff_root(&env, &delegation.id);

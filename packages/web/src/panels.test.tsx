@@ -73,12 +73,36 @@ describe("Inspector run board handoff links", () => {
 		expect(html).toContain("transcript");
 	});
 
-	it("does not show handoff path or file buttons for cancelled delegations", () => {
+	it("shows cancellation transcript links for cancelled delegations when the artifact is reported", () => {
+		const html = renderInspector([
+			delegation({
+				status: "cancelled",
+				subagents: [
+					{
+						id: "child-1",
+						status: "idle",
+						role: "reviewer",
+						subagent_type: "read_only",
+						task: "review the change",
+						cancellation_transcript_relative_path: "cancelled/child-1.transcript.md",
+					},
+				],
+			}),
+		]);
+
+		expect(html).toContain("handoff /workspace/.pi-handoff/delegation-1");
+		expect(html).not.toContain("index.json");
+		expect(html).not.toContain("final message");
+		expect(html).toContain("cancellation transcript");
+	});
+
+	it("does not show file buttons for cancelled delegations without a cancellation transcript artifact", () => {
 		const html = renderInspector([delegation({ status: "cancelled" })]);
 
 		expect(html).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
 		expect(html).not.toContain("index.json");
 		expect(html).not.toContain("final message");
+		expect(html).not.toContain("cancellation transcript");
 		expect(html).not.toContain("transcript");
 	});
 

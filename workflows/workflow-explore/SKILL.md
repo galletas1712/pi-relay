@@ -19,8 +19,10 @@ synthesize the findings yourself. Nothing is changed in the workspace.
    "failure modes", "simplest option"). One explorer per angle.
 2. Run a single read-only fan-out with all explorers.
 3. When the completion steer arrives, branch on the delivered delegation
-   snapshot. Read each explorer's final_message.md only if you need more detail.
-   Call `inspect_delegation` only to refresh/recover state or inspect later.
+   snapshot. Carry findings from that snapshot/final messages into your
+   synthesis; read an explorer's final_message.md or transcript only when you
+   need more detail. Call `inspect_delegation` only to refresh/recover state or
+   inspect later.
    Synthesize the answer yourself (you are the reducer — there is no reducer
    subagent).
 4. If key angles came back `inconclusive` or revealed new questions, run another
@@ -38,7 +40,7 @@ synthesize the findings yourself. Nothing is changed in the workspace.
 Notes:
 - Explorers start with fresh context: put the question and any pointers (files,
   prior handoff paths) in each prompt.
-- Explorers return only their final message (their snapshot is discarded), so
+- Explorers return only their final message in the delegation snapshot, so
   instruct each to summarize findings and quote key evidence inline, and to end
   with a line `suggested_next: done` or `suggested_next: inconclusive`.
 - This workflow never edits the workspace; do not use a full delegation here.

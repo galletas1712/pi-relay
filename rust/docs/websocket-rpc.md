@@ -1369,7 +1369,16 @@ expose per-subagent `final_message.md`. Cancelled delegations expose only the
 transcript-only cancellation artifact path reported by `inspect_delegation`, for
 example `cancelled/<subagent_id>.transcript.md`. The structured delegation
 snapshot comes from `delegation.status`/`inspect_delegation`, not from a handoff
-manifest file.
+root artifact file. Full transcript bodies are never inlined in delegation snapshots,
+daemon observations, or compaction ledgers; use this RPC to read an artifact
+body explicitly when detail is needed.
+
+Allowed `file` values are exactly:
+
+- `final_message.md` with matching `subagent_id`
+- `transcript.md` with matching `subagent_id`
+- `cancelled/<subagent_id>.transcript.md` (the `subagent_id` parameter is
+  optional, but if present it must match the path)
 
 ```json
 {
@@ -1380,14 +1389,24 @@ manifest file.
 }
 ```
 
+Cancellation transcript request:
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "delegation_id": "delegation_...",
+  "file": "cancelled/session_abc.transcript.md"
+}
+```
+
 Result:
 
 ```json
 {
   "delegation_id": "delegation_...",
-  "subagent_id": "session_...",
-  "file": "final_message.md",
-  "content": "..."
+  "subagent_id": "session_abc",
+  "file": "cancelled/session_abc.transcript.md",
+  "content": "# Transcript for cancelled subagent session_abc\n\n..."
 }
 ```
 

@@ -329,10 +329,11 @@ OpenAI request path. The Codex Responses request hardcodes the low-variance
 request policy we want for personal use: `parallel_tool_calls = true`,
 `service_tier = "priority"`, and `store = false`. It intentionally omits
 `prompt_cache_retention` because pi-relay does not use the plain OpenAI API-key
-path. If no explicit `prompt_cache.key` is provided, the provider derives a
-stable cache cohort key from the model, stable system prompt, and sorted tool
-schema so repeated local sessions route toward the same prompt cache. The actual
-system prompt remains global.
+path. OpenAI prompt-cache cohort selection is explicit
+`ProviderConfig.prompt_cache.key` first, then the pi-relay session id (matching
+Codex CLI's `thread_id`/`prompt_cache_key` behavior), then a fresh UUID fallback
+for CLI/test paths that do not carry a session. The actual system prompt remains
+global.
 
 Provider requests now carry `PromptSections`: a stable prefix and optional
 dynamic context. The stable prefix is the global system prompt. Normal turns keep

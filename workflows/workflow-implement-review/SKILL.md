@@ -33,8 +33,9 @@ snapshot.
 Notes:
 - After launching a delegation, end your turn; you will be steered when it
   completes with an `inspect_delegation`-equivalent snapshot.
-- Subagents start fresh — carry the prior delegation's findings (from the handoff
-  files) into the next delegation's prompt.
+- Subagents start fresh — carry the prior delegation's findings from the
+  delivered snapshot/final messages into the next delegation's prompt. Read
+  transcript/final-message files only when more detail is needed.
 - In each reviewer's prompt, REQUIRE it to end its final message with a line
   `suggested_next: approved` or `suggested_next: changes_requested` — that line
   is what the delivered snapshot records and you branch on.
