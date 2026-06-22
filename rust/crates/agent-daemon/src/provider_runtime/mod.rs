@@ -11,6 +11,11 @@ mod skills;
 mod transcript;
 mod web_tools;
 
+#[cfg(test)]
+pub(crate) use compaction::{
+    append_delegation_ledger_to_output, local_summary_request, remote_compaction_request,
+    CompactionOutput, CompactionSummaryKind,
+};
 pub(crate) use compaction::{
     auto_limit_tokens, compaction_auto_state, compaction_config, run_compaction,
 };

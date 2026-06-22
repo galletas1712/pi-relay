@@ -172,10 +172,15 @@ value jsonb not null
 updated_at timestamptz not null default now()
 ```
 
-The `PI.md` is the prompt composition template. It is not
-stored per session. The provider request renders that global prompt as the
-stable prefix, followed by daemon-generated dynamic context such as the current
-workspace, then transcript history.
+The `PI.md` is the prompt composition template. It is not stored per session.
+Normal provider requests use the rendered prompt as the stable prefix followed
+by transcript history; the daemon does not inject a top-level
+`## Current delegations` dashboard into ordinary turns. Parent-session
+compaction inputs also exclude live delegation dashboards. After the provider
+returns a compacted summary, the daemon appends a fresh bounded
+`## Delegation state at compaction time` ledger to the stored summary so every
+delegation row/status crosses the compaction boundary without inlining
+transcript bodies. Subagent compactions exclude parent/sibling delegation state.
 
 ### `transcript_entries`
 

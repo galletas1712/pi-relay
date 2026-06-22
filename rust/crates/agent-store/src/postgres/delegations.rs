@@ -1,7 +1,7 @@
-use agent_vocab::UserMessage;
+use agent_vocab::{TranscriptItem, UserMessage};
 use anyhow::Result;
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{postgres::PgRow, Row};
 use uuid::Uuid;
 
 use super::events::insert_event_tx;
@@ -38,6 +38,17 @@ pub struct DelegationSubagent {
     pub subagent_type: Option<SubagentType>,
     pub role: Option<String>,
     pub task: Option<String>,
+}
+
+/// Lightweight progress counts for a delegation. This intentionally does not
+/// read or render transcript bodies; it only inspects each subagent active leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DelegationProgress {
+    pub expected: i32,
+    pub spawned: i32,
+    pub terminal: i32,
+    pub running: i32,
+    pub failed: i32,
 }
 
 impl PostgresAgentStore {
@@ -116,35 +127,35 @@ impl PostgresAgentStore {
         .bind(delegation_id)
         .fetch_all(&self.pool)
         .await?;
-        let mut subagents = Vec::with_capacity(rows.len());
-        for row in rows {
-            let session_id: String = row.get("id");
-            let subagent_type: Option<String> = row.get("subagent_type");
-            let subagent_type = subagent_type
-                .map(|raw| raw.parse::<SubagentType>().map_err(anyhow::Error::msg))
-                .transpose()?;
-            let metadata: Value = row.get("metadata");
-            let role = metadata
-                .get("role_name")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            // The subagent's task prompt, persisted at spawn — carried in
-            // delegation.list so the run board can re-run a delegation from
-            // the delegation data itself.
-            let task = metadata
-                .get("task")
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            let activity = self.activity(&session_id).await?;
-            subagents.push(DelegationSubagent {
-                session_id,
-                activity,
-                subagent_type,
-                role,
-                task,
-            });
-        }
-        Ok(subagents)
+        self.rows_to_delegation_subagents(rows).await
+    }
+
+    /// Context-bounded subagent sessions of a delegation, ordered by creation.
+    ///
+    /// This intentionally fetches at most `render_limit + 1` rows: enough for
+    /// the compact context renderer to show its bounded window and detect that
+    /// additional rows exist, without doing activity lookups for an unbounded
+    /// fan-out.
+    pub async fn list_delegation_subagents_for_context(
+        &self,
+        delegation_id: &str,
+        render_limit: i64,
+    ) -> Result<Vec<DelegationSubagent>> {
+        let query_limit = render_limit.max(0).saturating_add(1);
+        let rows = sqlx::query(
+            r#"
+            select id, subagent_type, metadata
+            from sessions
+            where delegation_id=$1
+            order by created_at, id
+            limit $2
+            "#,
+        )
+        .bind(delegation_id)
+        .bind(query_limit)
+        .fetch_all(&self.pool)
+        .await?;
+        self.rows_to_delegation_subagents(rows).await
     }
 
     /// All delegations of a parent, oldest first. Backs the per-parent
@@ -166,6 +177,66 @@ impl PostgresAgentStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_delegation).collect()
+    }
+
+    /// Compute compact progress counts for a delegation without materializing
+    /// active branches. Terminality comes from each subagent's active leaf; a
+    /// `TurnFinished` leaf with `Graceful` is a terminal success, other
+    /// `TurnFinished` outcomes are terminal failures, and a compaction summary
+    /// is terminal success.
+    pub async fn delegation_progress(&self, delegation: &Delegation) -> Result<DelegationProgress> {
+        let rows = sqlx::query(
+            r#"
+            select s.id, s.active_leaf_id, te.item
+            from sessions s
+            left join transcript_entries te
+                on te.session_id = s.id
+               and te.id = s.active_leaf_id
+            where s.delegation_id=$1
+            "#,
+        )
+        .bind(&delegation.id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut terminal = 0i32;
+        let mut failed = 0i32;
+        for row in &rows {
+            let active_leaf_id: Option<String> = row.get("active_leaf_id");
+            if active_leaf_id.is_none() {
+                terminal += 1;
+                continue;
+            }
+            let item: Option<Value> = row.get("item");
+            if let Some(item) = item {
+                let item: TranscriptItem = serde_json::from_value(item)?;
+                match item {
+                    TranscriptItem::TurnFinished { outcome, .. } => {
+                        terminal += 1;
+                        if outcome != agent_vocab::TurnOutcome::Graceful {
+                            failed += 1;
+                        }
+                    }
+                    TranscriptItem::CompactionSummary(_) => {
+                        terminal += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let spawned = rows.len() as i32;
+        let missing = delegation.expected_subagents.saturating_sub(spawned).max(0);
+        let running = match delegation.status {
+            DelegationStatus::Running => spawned.saturating_sub(terminal) + missing,
+            _ => 0,
+        };
+        Ok(DelegationProgress {
+            expected: delegation.expected_subagents,
+            spawned,
+            terminal,
+            running,
+            failed,
+        })
     }
 
     /// Whether the parent already owns a `running` delegation. Backs the
@@ -354,6 +425,41 @@ impl PostgresAgentStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_delegation).collect()
+    }
+
+    async fn rows_to_delegation_subagents(
+        &self,
+        rows: Vec<PgRow>,
+    ) -> Result<Vec<DelegationSubagent>> {
+        let mut subagents = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session_id: String = row.get("id");
+            let subagent_type: Option<String> = row.get("subagent_type");
+            let subagent_type = subagent_type
+                .map(|raw| raw.parse::<SubagentType>().map_err(anyhow::Error::msg))
+                .transpose()?;
+            let metadata: Value = row.get("metadata");
+            let role = metadata
+                .get("role_name")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            // The subagent's task prompt, persisted at spawn — carried in
+            // delegation.list so the run board can re-run a delegation from
+            // the delegation data itself.
+            let task = metadata
+                .get("task")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let activity = self.activity(&session_id).await?;
+            subagents.push(DelegationSubagent {
+                session_id,
+                activity,
+                subagent_type,
+                role,
+                task,
+            });
+        }
+        Ok(subagents)
     }
 
     /// Completed delegations that may need boot-time publication repair. The

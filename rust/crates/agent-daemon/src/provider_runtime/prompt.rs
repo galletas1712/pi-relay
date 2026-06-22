@@ -13,6 +13,7 @@ use crate::state::AppState;
 pub(super) async fn assemble_agent_prompt(
     _state: &AppState,
     config: &SessionConfig,
+    _session_id: &str,
 ) -> anyhow::Result<agent_provider::PromptSections> {
     Ok(agent_provider::PromptSections::stable(
         config.system_prompt.clone(),

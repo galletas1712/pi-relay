@@ -145,6 +145,10 @@ create index if not exists delegations_parent_created_idx on delegations(parent_
 alter table delegations add column if not exists expected_subagents integer not null default 1;
 
 alter table sessions add column if not exists delegation_id text null references delegations(id);
+
+create index if not exists sessions_delegation_created_idx
+    on sessions(delegation_id, created_at, id)
+    where delegation_id is not null;
 "#;
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {

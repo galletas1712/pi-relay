@@ -66,6 +66,28 @@ runner never decides the next delegation — the parent does, guided by workflow
 skills. Cancellation is terminal and exports transcript-only files for the
 cancelled subagents instead of running the normal completion handoff.
 
+Normal top-level parent model requests do not receive a daemon-generated
+delegation dashboard. They are transcript-driven: durable delegate tool results
+and wakeup steers already live in history, so the provider input stays as stable
+PI/system prompt plus transcript history.
+
+Compaction is the special case, but the live ledger is not a provider input. For
+top-level parent sessions, the provider compacts only transcript/model history
+(including any older point-in-time ledgers already present as prior summary
+text). After the provider returns, the daemon appends a fresh
+`## Delegation state at compaction time` section to the stored compaction
+summary. The ledger lists every delegation row for that parent session across
+all statuses (`running`, `done`, `done_with_failures`, `cancelled`, `failed`),
+with bounded subagent/progress details, cheap final-message snippets when
+available, and artifact paths. It does not refresh artifacts or inline
+transcript bodies. A `running` entry is a point-in-time compaction fact, not a
+final outcome; later completion steers or `inspect_delegation` provide fresh
+state. If older ledger text remains in prior summaries, the newly appended
+ledger supersedes it by being the latest section. Subagent compactions do not
+receive or append the parent ledger, sibling subagent state, or `## Current
+delegations` information; subagents summarize only their own role contract,
+delegated task, transcript/model history, and tool results/facts.
+
 The web/inspector RPC surface remains `delegation.start_full`,
 `delegation.start_readonly_fanout`, `delegation.status`, `delegation.cancel`, and `delegation.list`;
 those names are client APIs, not the provider-visible model tool names.
@@ -77,7 +99,7 @@ driver loop after its durable store update. The narrow extension precedent
 remains `ToolRegistry`/`ToolExtension`, where the variation point is real and
 does not own session durability.
 
-`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (remote/local compaction), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization).
+`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (remote/local compaction and parent-only post-compaction delegation ledger append), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery + stable prompt sections), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization). The adjacent `delegation_context.rs` builds the bounded compaction ledger for top-level parent sessions.
 
 ## Key types
 

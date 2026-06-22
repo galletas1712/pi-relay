@@ -10,11 +10,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::auth::Credentials;
+use crate::delegation_context::compaction_delegation_ledger;
 use crate::model_metadata;
 use crate::state::AppState;
 
 use super::auth_retry::{compact_with_auth_retry, complete_with_auth_retry};
-use super::prompt::{assemble_agent_prompt, render_pi_compaction_prompt};
+use super::prompt::render_pi_compaction_prompt;
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
 
@@ -222,7 +223,9 @@ pub(crate) async fn run_compaction(
         match run_remote_compaction_with_trimming(state, config, session_id, model_context.clone())
             .await
         {
-            Ok(output) => return Ok(output),
+            Ok(output) => {
+                return append_delegation_ledger_to_output(state, session_id, output).await
+            }
             Err(error)
                 if remote_mode == RemoteCompactionMode::Auto
                     && config.provider.kind != ProviderKind::OpenAi =>
@@ -238,7 +241,8 @@ pub(crate) async fn run_compaction(
         ));
     }
 
-    run_local_summary_compaction(state, config, session_id, model_context).await
+    let output = run_local_summary_compaction(state, config, session_id, model_context).await?;
+    append_delegation_ledger_to_output(state, session_id, output).await
 }
 
 async fn run_remote_compaction_with_trimming(
@@ -304,7 +308,7 @@ fn remote_compaction_output(
     }
 }
 
-async fn remote_compaction_request(
+pub(crate) async fn remote_compaction_request(
     state: &AppState,
     config: &SessionConfig,
     session_id: &str,
@@ -312,7 +316,11 @@ async fn remote_compaction_request(
 ) -> Result<ProviderCompactionRequest> {
     Ok(ProviderCompactionRequest {
         model: config.provider.model.clone(),
-        prompt: assemble_agent_prompt(state, config).await?,
+        // Compaction uses the stable prompt plus transcript/model history. Any
+        // previous post-compaction delegation ledger already present in the
+        // transcript is ordinary prior summary text; fresh parent state is
+        // appended to the stored compaction result after the provider returns.
+        prompt: PromptSections::stable(config.system_prompt.clone()),
         transcript,
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
         tools: state
@@ -326,6 +334,21 @@ async fn remote_compaction_request(
         prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
         session_id: Some(session_id.to_string()),
     })
+}
+
+pub(crate) async fn append_delegation_ledger_to_output(
+    state: &AppState,
+    session_id: &str,
+    mut output: CompactionOutput,
+) -> Result<CompactionOutput> {
+    if let Some(ledger) = compaction_delegation_ledger(state, session_id).await? {
+        output.summary = if output.summary.trim().is_empty() {
+            ledger
+        } else {
+            format!("{}\n\n{}", output.summary.trim_end(), ledger)
+        };
+    }
+    Ok(output)
 }
 
 async fn run_local_summary_compaction(
@@ -345,7 +368,8 @@ async fn run_local_summary_compaction(
             session_id,
             &compaction_session_id,
             entries_from_groups(&groups),
-        )?;
+        )
+        .await?;
         let credentials = Credentials::load();
         let provider =
             provider_for_config(state, config, &credentials, &compaction_session_id).await?;
@@ -390,13 +414,14 @@ async fn run_local_summary_compaction(
     ))
 }
 
-fn local_summary_request(
+pub(crate) async fn local_summary_request(
     state: &AppState,
     config: &SessionConfig,
     _session_id: &str,
     compaction_session_id: &str,
-    mut transcript: Vec<ModelTranscriptEntry>,
+    transcript: Vec<ModelTranscriptEntry>,
 ) -> Result<ModelRequest> {
+    let mut transcript = transcript;
     let compaction_request = render_pi_compaction_prompt(state, config)?;
     transcript.push(TranscriptItem::UserMessage(UserMessage::text(compaction_request)).into());
     Ok(ModelRequest {
