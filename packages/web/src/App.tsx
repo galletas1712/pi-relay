@@ -2460,7 +2460,7 @@ function DeleteSessionDialog({
 						Cancel
 					</button>
 					<button type="button" className="primary-button destructive" onClick={onConfirm} disabled={deleting}>
-						{deleting ? "Deleting..." : "Delete"}
+						{deleting ? "Deleting…" : "Delete"}
 					</button>
 				</div>
 			</div>
@@ -2618,7 +2618,7 @@ function ProjectDialog({
 							Cancel
 						</button>
 						<button type="submit" className="primary-button" disabled={state.saving}>
-							{state.saving ? "Saving..." : "Save"}
+							{state.saving ? "Saving…" : "Save"}
 						</button>
 					</div>
 				</form>

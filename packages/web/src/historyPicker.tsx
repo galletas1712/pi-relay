@@ -111,7 +111,7 @@ export function HistoryPickerDialog({
 					{loading ? (
 						<div className="history-loading">
 							<Loader2 className="spin" size={16} />
-							<span>Loading full history...</span>
+							<span>Loading full history…</span>
 						</div>
 					) : error ? (
 						<div className="history-empty error">{error}</div>

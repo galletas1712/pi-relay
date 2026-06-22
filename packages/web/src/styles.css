@@ -58,6 +58,32 @@
 	--text-xl: 16px;
 	--text-2xl: 18px;
 	--text-input-mobile: 17px; /* mobile inputs (>=16px avoids iOS auto-zoom) */
+
+	/*
+	 * Spacing scale (4px base). Theme-independent — defined once here, not
+	 * duplicated in the dark blocks. Established for incremental adoption; this
+	 * PR does NOT sweep existing spacing literals onto it.
+	 */
+	--space-1: 4px;
+	--space-2: 8px;
+	--space-3: 12px;
+	--space-4: 16px;
+	--space-5: 24px;
+	--space-6: 32px;
+
+	/* Radius scale. --radius: 8px (above) stays the workhorse. */
+	--radius-sm: 5px;
+	--radius-lg: 12px;
+
+	/*
+	 * Elevation ladder. --elev-modal reproduces the dialog shadow exactly.
+	 * --elev-pop is the shared lift for floating surfaces (popover/menu/toast);
+	 * the toast's lift is consolidated onto it. color-mix(var(--foreground) …)
+	 * resolves per-theme, so a single definition renders identically in light
+	 * and dark.
+	 */
+	--elev-modal: 0 20px 70px color-mix(in oklch, var(--foreground) 18%, transparent);
+	--elev-pop: 0 12px 40px color-mix(in oklch, var(--foreground) 14%, transparent);
 }
 
 .project-dialog {
@@ -586,7 +612,11 @@ pre {
 .search-clear-button:focus-visible {
 	background: var(--muted);
 	color: var(--foreground);
-	outline: none;
+}
+
+.search-clear-button:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
 }
 
 .session-list {
@@ -721,7 +751,11 @@ pre {
 .session-row-action:focus-visible {
 	background: var(--muted);
 	color: var(--foreground);
-	outline: none;
+}
+
+.session-row-action:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
 }
 
 .session-row-action.danger:hover,
@@ -894,6 +928,7 @@ pre {
 	border-radius: 999px;
 	background: color-mix(in oklch, var(--card) 94%, transparent);
 	color: var(--foreground);
+	/* tighter shadow than --elev-pop: this is a small 34px FAB, not a surface */
 	box-shadow: 0 8px 24px color-mix(in oklch, var(--foreground) 14%, transparent);
 	cursor: pointer;
 	pointer-events: auto;
@@ -962,7 +997,7 @@ pre {
 
 .turn-card-expand {
 	border: 1px solid var(--border);
-	border-radius: 999px;
+	border-radius: var(--radius-sm);
 	background: var(--card);
 	padding: 4px 10px;
 	font-size: var(--text-xs);
@@ -1042,7 +1077,6 @@ pre {
 	border-radius: 16px 16px 4px 16px;
 	background: var(--card);
 	padding: 9px 12px;
-	box-shadow: 0 1px 2px color-mix(in oklch, var(--foreground) 8%, transparent);
 }
 
 .assistant-block {
@@ -1351,7 +1385,7 @@ pre {
 	gap: 5px;
 	height: 24px;
 	border: 1px solid color-mix(in oklch, currentColor 32%, var(--border));
-	border-radius: 999px;
+	border-radius: var(--radius-sm);
 	background: var(--card);
 	padding: 0 8px;
 	font-size: var(--text-2xs);
@@ -1388,7 +1422,7 @@ pre {
 	border-radius: var(--radius);
 	background: color-mix(in oklch, var(--card) 96%, transparent);
 	padding: 8px 10px;
-	box-shadow: 0 10px 32px color-mix(in oklch, var(--foreground) 14%, transparent);
+	box-shadow: var(--elev-pop);
 	font-size: var(--text-sm);
 	color: var(--foreground);
 }
@@ -1414,7 +1448,6 @@ pre {
 	border-radius: var(--radius);
 	background: color-mix(in oklch, var(--muted) 45%, transparent);
 	overflow: hidden;
-	box-shadow: 0 1px 2px color-mix(in oklch, var(--foreground) 5%, transparent);
 }
 
 .tool-run-group.error,
@@ -1525,11 +1558,12 @@ pre {
 	align-items: center;
 	min-height: 20px;
 	border: 1px solid var(--border);
-	border-radius: 999px;
+	border-radius: var(--radius-sm);
 	background: color-mix(in oklch, var(--background) 62%, transparent);
 	padding: 2px 7px;
 	font-size: var(--text-2xs);
 	color: var(--muted-foreground);
+	font-variant-numeric: tabular-nums;
 }
 
 .tool-run-head-status,
@@ -1747,6 +1781,7 @@ pre {
 .edit-count {
 	font-family: var(--font-sans);
 	font-weight: 500;
+	font-variant-numeric: tabular-nums;
 }
 
 .edit-count.add {
@@ -1862,9 +1897,9 @@ pre {
 	flex-direction: column;
 	overflow: hidden;
 	border: 1px solid var(--border);
-	border-radius: var(--radius);
+	border-radius: var(--radius-lg);
 	background: var(--card);
-	box-shadow: 0 20px 70px color-mix(in oklch, var(--foreground) 18%, transparent);
+	box-shadow: var(--elev-modal);
 }
 
 .history-dialog-head {
@@ -1950,9 +1985,9 @@ pre {
 	flex-direction: column;
 	overflow: hidden;
 	border: 1px solid var(--border);
-	border-radius: var(--radius);
+	border-radius: var(--radius-lg);
 	background: var(--card);
-	box-shadow: 0 20px 70px color-mix(in oklch, var(--foreground) 18%, transparent);
+	box-shadow: var(--elev-modal);
 }
 
 .system-prompt-dialog {
@@ -2327,7 +2362,7 @@ pre {
 	align-items: center;
 	justify-content: center;
 	border: 1px solid var(--border);
-	border-radius: 999px;
+	border-radius: var(--radius-sm);
 	font-size: var(--text-xs);
 	color: var(--muted-foreground);
 }
@@ -2373,14 +2408,16 @@ pre {
 .history-option-meta {
 	font-size: var(--text-2xs);
 	white-space: nowrap;
+	font-variant-numeric: tabular-nums;
 }
 
 .history-badge {
 	border: 1px solid var(--border);
-	border-radius: 999px;
+	border-radius: var(--radius-sm);
 	padding: 1px 6px;
 	font-size: var(--text-2xs);
 	font-weight: 400;
+	font-family: var(--font-mono);
 	color: var(--muted-foreground);
 }
 
@@ -2485,6 +2522,8 @@ pre {
 
 .workspace-scope-branch:focus {
 	border-color: var(--ring);
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
 }
 
 .workspace-scope-branch:disabled {
@@ -2563,9 +2602,9 @@ pre {
 	max-height: min(360px, 46dvh);
 	overflow: hidden;
 	border: 1px solid var(--border);
-	border-radius: var(--radius);
+	border-radius: var(--radius-lg);
 	background: var(--card);
-	box-shadow: 0 12px 40px color-mix(in oklch, var(--foreground) 14%, transparent);
+	box-shadow: var(--elev-pop);
 	animation: queue-pane-in 120ms ease-out;
 }
 
@@ -2672,9 +2711,9 @@ pre {
 	max-height: 260px;
 	overflow: auto;
 	border: 1px solid var(--border);
-	border-radius: var(--radius);
+	border-radius: var(--radius-lg);
 	background: var(--card);
-	box-shadow: 0 12px 40px color-mix(in oklch, var(--foreground) 14%, transparent);
+	box-shadow: var(--elev-pop);
 }
 
 .slash-row {
@@ -2927,7 +2966,7 @@ pre {
 	flex-direction: column;
 	gap: 6px;
 	border: 1px solid var(--border);
-	border-radius: 8px;
+	border-radius: var(--radius);
 	padding: 8px;
 }
 
@@ -2953,9 +2992,10 @@ pre {
 .run-board-delegation-kind {
 	flex: 0 0 auto;
 	border: 1px solid var(--border);
-	border-radius: 999px;
+	border-radius: var(--radius-sm);
 	padding: 1px 6px;
 	font-size: var(--text-2xs);
+	font-family: var(--font-mono);
 	color: var(--muted-foreground);
 }
 
@@ -2975,6 +3015,7 @@ pre {
 	gap: 6px;
 	color: var(--muted-foreground);
 	font-size: var(--text-2xs);
+	font-variant-numeric: tabular-nums;
 }
 
 .run-board-subagent-summary strong {
@@ -2994,7 +3035,7 @@ pre {
 	align-items: center;
 	gap: 4px;
 	border: 1px solid var(--border);
-	border-radius: 999px;
+	border-radius: var(--radius-sm);
 	background: transparent;
 	padding: 2px 8px;
 	font-size: var(--text-2xs);
@@ -3006,7 +3047,11 @@ pre {
 .chip-button:focus-visible {
 	border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
 	color: var(--primary);
-	outline: none;
+}
+
+.chip-button:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
 }
 
 .chip-button.pressed {
@@ -3051,7 +3096,7 @@ pre {
 	flex-direction: column;
 	gap: 3px;
 	border: 1px solid var(--border);
-	border-radius: 6px;
+	border-radius: var(--radius-sm);
 	padding: 6px;
 	background: color-mix(in oklch, var(--muted) 60%, transparent);
 }
@@ -3081,7 +3126,7 @@ pre {
 	overflow: auto;
 	margin: 0;
 	border: 1px solid var(--border);
-	border-radius: 6px;
+	border-radius: var(--radius-sm);
 	padding: 6px 8px;
 	background: var(--muted, transparent);
 	font-size: var(--text-2xs);
@@ -3106,7 +3151,11 @@ pre {
 .link-button:hover,
 .link-button:focus-visible {
 	text-decoration: underline;
-	outline: none;
+}
+
+.link-button:focus-visible {
+	outline: 2px solid var(--ring);
+	outline-offset: 2px;
 }
 
 .tool-list {
@@ -3117,9 +3166,10 @@ pre {
 
 .tool-list span {
 	border: 1px solid var(--border);
-	border-radius: 999px;
+	border-radius: var(--radius-sm);
 	padding: 3px 7px;
 	font-size: var(--text-xs);
+	font-family: var(--font-mono);
 	color: var(--muted-foreground);
 }
 
@@ -3174,9 +3224,9 @@ pre {
 	flex-direction: column;
 	overflow: hidden;
 	border: 1px solid var(--border);
-	border-radius: var(--radius);
+	border-radius: var(--radius-lg);
 	background: var(--card);
-	box-shadow: 0 20px 70px color-mix(in oklch, var(--foreground) 18%, transparent);
+	box-shadow: var(--elev-modal);
 }
 
 .export-dialog-head {
@@ -3677,5 +3727,16 @@ pre {
 	.inspector {
 		width: min(92vw, 380px);
 		max-width: calc(100vw - 28px);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	*,
+	*::before,
+	*::after {
+		animation-duration: 0.001ms !important;
+		animation-iteration-count: 1 !important;
+		transition-duration: 0.001ms !important;
+		scroll-behavior: auto !important;
 	}
 }

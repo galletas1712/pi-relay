@@ -460,7 +460,7 @@ export const MessageList = memo(function MessageList({
 				<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 					<div className="empty-state">
 						<Loader2 className="spin" size={28} />
-						<span>Loading session...</span>
+						<span>Loading session…</span>
 					</div>
 				</div>
 			</div>
@@ -716,7 +716,7 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 				action={
 					canResume
 						? {
-								label: resuming ? "Starting..." : actionLabel,
+								label: resuming ? "Starting…" : actionLabel,
 								disabled: resuming,
 								onClick: () => onResumeTurn?.(resumeEntryId, resumableOutcome)
 							}

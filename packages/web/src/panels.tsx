@@ -725,7 +725,7 @@ export function SidebarToolbar({
 							if (query.trim()) onQueryChange("");
 							else setSearchOpen(false);
 						}}
-						placeholder="Filter Sessions..."
+						placeholder="Filter Sessions…"
 						disabled={disabled}
 					/>
 					{query ? (
