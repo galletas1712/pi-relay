@@ -49,6 +49,21 @@ export function displayActivity(activity: Activity): SessionDisplayActivity {
 	return activity === "idle" ? "idle" : "running";
 }
 
+export type SessionStatus = "idle" | "running" | "delegating";
+
+/** Three-state status for a session whose running-delegation signal is known
+ * (currently only the selected session). `delegating` = parent parked but
+ * subagents in flight.
+ *
+ * The sidebar rows / activity-count tally still use the binary
+ * `displayActivity`/`tallyActivities` above, because they only have
+ * `SessionSummary` (no delegation data). A sidebar-wide three-state version
+ * awaits a `SessionSummary.has_running_delegations` backend field. */
+export function sessionStatusWithDelegations(activity: Activity, hasRunningDelegations: boolean): SessionStatus {
+	if (activity !== "idle") return "running"; // parent itself running (or queued)
+	return hasRunningDelegations ? "delegating" : "idle";
+}
+
 export function tallyActivities(sessions: SessionListItem[]): Record<SessionDisplayActivity, number> {
 	return sessions.reduce<Record<SessionDisplayActivity, number>>(
 		(counts, session) => {

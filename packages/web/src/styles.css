@@ -815,6 +815,15 @@ pre {
 	color: var(--primary);
 }
 
+/* `delegating` = parent parked (reports idle) while its subagents run. Same
+   primary color family as `.running`, but a dashed border marks it as
+   "running, but the work is delegated" — without needing an icon. */
+.session-state.delegating {
+	border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
+	color: var(--primary);
+	border-style: dashed;
+}
+
 .session-state.idle {
 	border-color: color-mix(in oklch, var(--success) 40%, var(--border));
 	color: var(--success);
