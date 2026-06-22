@@ -129,6 +129,17 @@ When replay items exist for an assistant/compaction entry, `transcript_to_messag
 
 Replay records canonicalize local client-tool names to pi-relay names (e.g. `apply_patch`/`str_replace_based_edit_tool` → `Edit`, `web_search` → `WebSearch`) but keep provider-hosted blocks (`server_tool_use`, `web_search_call`) under their native wire names so a stateless replay is byte-for-byte and the web UI can still pair hosted result blocks.
 
+Daemon-authored observations, such as delegation completion wakeups carrying an
+`inspect_delegation`-equivalent snapshot, are not provider replay. They render
+through the normal `UserMessage` path as user-role text for both providers. This
+is conservative on purpose: OpenAI's Responses input uses `function_call` /
+`function_call_output` (or custom-tool variants) while Anthropic requires
+assistant `tool_use` blocks paired with user `tool_result` blocks, and both APIs
+can reject malformed or non-adjacent tool histories. Pi-relay therefore does not
+blindly fabricate assistant tool calls that the model never generated. A
+provider-specific synthetic tool-pair renderer can be added later only where the
+wire shape is proven safe and gated by tests.
+
 ### Compaction: provider-native vs local summary
 
 `supports_remote_compaction()` is `true` for OpenAI, `false` for Anthropic.

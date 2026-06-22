@@ -55,8 +55,8 @@ Rules:
 
 - Launch at most one delegation per turn, then end your turn. Do not poll or loop —
   you will be notified.
-- When a delegation finishes you receive a wakeup steer with a structured
-  snapshot equivalent to `inspect_delegation`. Branch on the delivered
+- When a delegation finishes you receive a daemon-authored wakeup steer with a
+  structured snapshot equivalent to `inspect_delegation`. Branch on the delivered
   `suggested_next`/status fields; call `inspect_delegation` only to refresh or
   recover state, or to inspect a delegation later/running. Read artifact paths
   (`final_message.md`/`transcript.md`) only if you need more detail.

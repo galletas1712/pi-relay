@@ -1128,6 +1128,7 @@ fn merge_anthropic_usage(current: &mut Option<ProviderUsage>, update: ProviderUs
 mod tests {
     use super::*;
     use crate::PromptSections;
+    use agent_vocab::ToolResultMessage;
 
     fn test_tool(
         provider: ProviderKind,
@@ -1743,6 +1744,90 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         .expect("messages render");
 
         assert_eq!(messages[0]["content"], json!([raw]));
+    }
+
+    #[test]
+    fn daemon_observation_renders_as_user_text_not_synthetic_tool_result() {
+        let observation = agent_vocab::DaemonObservation::inspect_delegation(
+            "delegation_1",
+            Some("Delegation delegation_1 completed with status done: 1 ok, 0 failed.".to_string()),
+            json!({
+                "delegation_id": "delegation_1",
+                "status": "done",
+                "subagents": [{
+                    "id": "child_1",
+                    "transcript_path": "/tmp/.pi-handoff/delegation_1/child_1/transcript.md",
+                }],
+            }),
+        )
+        .into_user_message()
+        .expect("observation renders");
+
+        let messages = transcript_to_messages(
+            &crate::PromptSections::default(),
+            &[TranscriptItem::UserMessage(observation).into()],
+        )
+        .expect("messages render");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["type"], "text");
+        let text = messages[0]["content"][0]["text"]
+            .as_str()
+            .expect("observation text");
+        assert!(text.contains("Daemon observation: inspect_delegation"));
+        assert!(text.contains("not by an assistant tool call"));
+        assert!(text.contains("Snapshot JSON follows"));
+        assert!(text.contains("\"delegation_id\": \"delegation_1\""));
+        assert_ne!(messages[0]["content"][0]["type"], "tool_result");
+        assert!(messages[0]["content"][0].get("tool_use_id").is_none());
+    }
+
+    #[test]
+    fn daemon_observation_after_tool_result_does_not_split_anthropic_tool_pair() {
+        let tool_call = ToolCall {
+            id: ToolCallId::new("toolu_1"),
+            tool_name: "read".to_string(),
+            args_json: "{\"path\":\"README.md\"}".to_string(),
+        };
+        let observation = agent_vocab::DaemonObservation::inspect_delegation(
+            "delegation_1",
+            None,
+            json!({ "delegation_id": "delegation_1", "status": "done" }),
+        )
+        .into_user_message()
+        .expect("observation renders");
+
+        let messages = transcript_to_messages(
+            &crate::PromptSections::default(),
+            &[
+                TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::ToolCall(tool_call.clone())],
+                })
+                .into(),
+                TranscriptItem::ToolResult(ToolResultMessage::success(
+                    tool_call.id,
+                    "read",
+                    "contents",
+                ))
+                .into(),
+                TranscriptItem::UserMessage(observation).into(),
+            ],
+        )
+        .expect("messages render");
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"][0]["type"], "tool_use");
+        assert_eq!(messages[0]["content"][0]["id"], "toolu_1");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"][0]["type"], "tool_result");
+        assert_eq!(messages[1]["content"][0]["tool_use_id"], "toolu_1");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[2]["content"][0]["type"], "text");
+        assert!(messages[2]["content"][0]["text"]
+            .as_str()
+            .expect("observation text")
+            .contains("Daemon observation: inspect_delegation"));
     }
 
     #[test]
