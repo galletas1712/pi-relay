@@ -121,7 +121,10 @@ impl RecordedCompletion {
                 tool_call_id: result.tool_call_id.clone(),
                 tool_name: result.tool_name.clone(),
             }),
-            AgentInput::Interrupt | AgentInput::Steer { .. } | AgentInput::FollowUp { .. } => None,
+            AgentInput::Interrupt
+            | AgentInput::Steer { .. }
+            | AgentInput::FollowUp { .. }
+            | AgentInput::DaemonObservation { .. } => None,
         }
     }
 

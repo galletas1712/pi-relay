@@ -46,6 +46,7 @@ type TranscriptDisplayNode =
 	| { type: "tool_group"; key: string; id: string; items: ToolRunItem[]; turnId: number | null; turnOpen: boolean; isLive: boolean }
 	| { type: "turn_finished"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "turn_finished" }> } }
 	| { type: "tool_result"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "tool_result" }> } }
+	| { type: "daemon_tool_observation"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "daemon_tool_observation" }> } }
 	| { type: "compaction_summary"; key: string; entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "compaction_summary" }> } }
 	| { type: "compaction_in_progress"; key: string; trigger: "auto" | "manual"; reason: string | null };
 
@@ -729,6 +730,15 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 		if (toolIndex.calls.has(item.tool_call_id)) return null;
 		return <ToolResultCard item={item} entryId={node.entry.id} />;
 	}
+	if (node.type === "daemon_tool_observation") {
+		const item = node.entry.item;
+		const delegationId = delegationIdFromDaemonObservation(item);
+		const status = delegationStatusFromDaemonObservation(item);
+		const parts = [item.summary?.trim() || `Daemon observed ${item.tool_name}`];
+		if (delegationId && !parts[0].includes(delegationId)) parts.push(`delegation ${delegationId}`);
+		if (status) parts.push(`status ${status}`);
+		return <SystemMessage tone="info" text={parts.join(" · ")} entryId={node.entry.id} />;
+	}
 	if (node.type === "compaction_summary") {
 		const item = node.entry.item;
 		const tokens = typeof item.tokens_before === "number" ? formatCompactionTokens(item.tokens_before) : null;
@@ -757,6 +767,24 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 	}
 	return null;
 });
+
+function delegationIdFromDaemonObservation(item: Extract<TranscriptItem, { type: "daemon_tool_observation" }>): string | null {
+	try {
+		const args = JSON.parse(item.args_json) as unknown;
+		if (isRecord(args) && typeof args.delegation_id === "string") return args.delegation_id;
+	} catch {
+		// Ignore malformed historical args; the raw JSON remains available in transcript data.
+	}
+	const result = item.result_json;
+	if (isRecord(result) && typeof result.delegation_id === "string") return result.delegation_id;
+	return null;
+}
+
+function delegationStatusFromDaemonObservation(item: Extract<TranscriptItem, { type: "daemon_tool_observation" }>): string | null {
+	const result = item.result_json;
+	if (isRecord(result) && typeof result.status === "string") return result.status;
+	return null;
+}
 
 const TurnCardRow = memo(function TurnCardRow({
 	turn,
@@ -999,6 +1027,11 @@ class TranscriptDisplayBuilder {
 			return;
 		}
 		if (item.type === "tool_call_started") return;
+		if (item.type === "daemon_tool_observation") {
+			this.flushGroup();
+			this.nodes.push({ type: "daemon_tool_observation", key: entry.id, entry: entry as Extract<TranscriptDisplayNode, { type: "daemon_tool_observation" }>["entry"] });
+			return;
+		}
 		if (item.type === "turn_finished") {
 			this.flushGroup();
 			this.nodes.push({ type: "turn_finished", key: entry.id, entry: entry as Extract<TranscriptDisplayNode, { type: "turn_finished" }>["entry"] });

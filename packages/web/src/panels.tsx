@@ -118,11 +118,13 @@ function SubagentRow({
 }) {
 	const finalKey = `${subagent.id}:final_message.md`;
 	const transcriptKey = `${subagent.id}:transcript.md`;
+	const taskPromptKey = `${subagent.id}:task_prompt.md`;
 	const cancellationFile = cancellationTranscriptFile(subagent);
 	const cancellationKey = cancellationFile ? `${subagent.id}:${cancellationFile}` : null;
 	const handoffReady = delegationHasHandoff(delegation);
 	const openFinal = open && open.key === finalKey ? open : null;
 	const openTranscript = open && open.key === transcriptKey ? open : null;
+	const openTaskPrompt = open && open.key === taskPromptKey ? open : null;
 	const openCancellation = open && cancellationKey && open.key === cancellationKey ? open : null;
 	const liveActivity =
 		subagent.activity ??
@@ -142,6 +144,18 @@ function SubagentRow({
 					{displayActivity(liveActivity)}
 				</span>
 			</div>
+			{subagent.task_prompt_file || subagent.task_prompt_relative_path ? (
+				<div className="run-board-handoff-links">
+					<button
+						className="chip-button"
+						type="button"
+						onClick={() => (openTaskPrompt ? onCloseFile() : onOpenFile(subagent.id, "task_prompt.md"))}
+						title="show task_prompt.md"
+					>
+						<FileText size={11} /> task prompt
+					</button>
+				</div>
+			) : null}
 			{handoffReady ? (
 				<div className="run-board-handoff-links">
 					<button
@@ -176,6 +190,7 @@ function SubagentRow({
 			) : null}
 			{openFinal ? <HandoffFileView open={openFinal} /> : null}
 			{openTranscript ? <HandoffFileView open={openTranscript} /> : null}
+			{openTaskPrompt ? <HandoffFileView open={openTaskPrompt} /> : null}
 			{openCancellation ? <HandoffFileView open={openCancellation} /> : null}
 		</div>
 	);

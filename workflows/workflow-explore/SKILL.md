@@ -18,7 +18,7 @@ synthesize the findings yourself. Nothing is changed in the workspace.
 1. Decide the angles (e.g. "current behavior", "prior art in the repo",
    "failure modes", "simplest option"). One explorer per angle.
 2. Run a single read-only fan-out with all explorers.
-3. When the completion steer arrives, branch on the delivered delegation
+3. When the completion observation arrives, branch on the delivered delegation
    snapshot. Carry findings from that snapshot/final messages into your
    synthesis; read an explorer's final_message.md or transcript only when you
    need more detail. Call `inspect_delegation` only to refresh/recover state or

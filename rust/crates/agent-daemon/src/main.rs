@@ -40,8 +40,9 @@ use agent_core::AgentInput;
 use agent_session::SessionInput;
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
-    EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputStatus,
-    SessionConfig, SubagentType, TranscriptEntryBodyMode, TranscriptEntryScope, WorkspaceKind,
+    EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputContent,
+    QueuedInputStatus, SessionConfig, SubagentType, TranscriptEntryBodyMode, TranscriptEntryScope,
+    WorkspaceKind,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -992,7 +993,10 @@ pub(crate) async fn enqueue_session_input(
                 let mut runtime = active.lock().await;
                 runtime
                     .session
-                    .enqueue_input(agent_input_from_queued_priority(priority, content.clone()))
+                    .enqueue_input(agent_input_from_queued_priority(
+                        priority,
+                        QueuedInputContent::user_message(content.clone()),
+                    ))
                     .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
             }
             let dispatches = driver

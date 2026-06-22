@@ -43,7 +43,7 @@ snapshot.
 Notes:
 - The tester is a full delegation because building/running tests writes the workspace
   (build outputs); it edits in place like the implementer.
-- After launching a delegation, end your turn; you will be steered when it
+- After launching a delegation, end your turn; you will receive a completion observation when it
   completes with an `inspect_delegation`-equivalent snapshot.
 - Subagents start fresh — carry the prior delegation's findings from the
   delivered snapshot/final messages into the next delegation's prompt. Read

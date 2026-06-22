@@ -126,10 +126,11 @@ Implemented user-facing behavior:
   (writes the parent's workspace in place) or a parallel fan-out of
   **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
   return). The parent parks after launching a delegation and is delivered a
-  parent-scoped completion **steer** containing a structured snapshot equivalent
-  to `inspect_delegation`, including per-subagent final messages,
-  `suggested_next`, and artifact paths. `inspect_delegation` refreshes or
-  recovers that same structured state later/running.
+  parent-scoped completion **daemon observation** containing a structured
+  snapshot equivalent to `inspect_delegation`, including bounded per-subagent
+  final-message previews, `suggested_next`, and artifact paths.
+  `inspect_delegation` refreshes or recovers that same structured state
+  later/running.
   Delegation subagents may emit `subagent.spawned`/`subagent.running` progress
   events, but parent-visible completion is the delegation steer/handoff, not a
   per-child idle event. Reusable patterns are **workflow skills** (`SKILL.md` +

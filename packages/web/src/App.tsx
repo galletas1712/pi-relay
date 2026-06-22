@@ -889,7 +889,7 @@ export function App() {
 				if (loadedSnapshot?.session_id) {
 					// The run board reads the delegation.* surface; the backend emits no
 					// dedicated delegation events, so the subagent lifecycle events (and
-					// the completion steer landing as a normal parent message) are the
+					// the typed completion observation landing in the parent transcript) are the
 					// signal to refresh the board. The 2s poll covers any missed event.
 					void queryClient.invalidateQueries({ queryKey: queryKeys.delegations(loadedSnapshot.session_id) });
 				}
@@ -1583,15 +1583,33 @@ export function App() {
 		(delegation: Delegation) => {
 			const parentSessionId = loadedSnapshot?.session_id;
 			if (!parentSessionId) return;
-			const reRun = reRunParamsForDelegation(delegation, parentSessionId);
-			if (!reRun) {
-				pushNotice("error", "cannot re-run: original prompts are unavailable");
-				return;
-			}
-			const start =
-				reRun.kind === "full" ? api.startFullDelegation(reRun.params) : api.startReadonlyDelegationFanout(reRun.params);
-			void start
-				.then(() => invalidateDelegations())
+			void (async () => {
+				let reRun = reRunParamsForDelegation(delegation, parentSessionId);
+				if (!reRun) {
+					const subagents = await Promise.all(
+						delegation.subagents.map(async (subagent) => {
+							if (typeof subagent.task === "string" && subagent.task.trim()) return subagent;
+							if (!subagent.task_prompt_file) return subagent;
+							const result = await api.readHandoffFile({
+								parentSessionId,
+								delegationId: delegation.delegation_id,
+								subagentId: subagent.id,
+								file: "task_prompt.md",
+							});
+							return { ...subagent, task: result.content };
+						})
+					);
+					reRun = reRunParamsForDelegation({ ...delegation, subagents }, parentSessionId);
+				}
+				if (!reRun) {
+					pushNotice("error", "cannot re-run: original prompts are unavailable");
+					return;
+				}
+				const start =
+					reRun.kind === "full" ? api.startFullDelegation(reRun.params) : api.startReadonlyDelegationFanout(reRun.params);
+				await start;
+				invalidateDelegations();
+			})()
 				.catch((error) => pushNotice("error", errorMessage(error)));
 		},
 		[api, invalidateDelegations, loadedSnapshot?.session_id, pushNotice],
@@ -1784,7 +1802,9 @@ export function App() {
 	);
 
 	const canStop = !!selectedId && loadedSnapshot?.activity === "running";
-	const queuedInputs = loadedSnapshot?.queued_inputs ?? [];
+	const queuedInputs = (loadedSnapshot?.queued_inputs ?? []).filter(
+		(input) => input.content_type !== "daemon_tool_observation" && input.editable !== false,
+	);
 	const handleToggleArchived = useCallback(() => {
 		setShowArchived((show) => !show);
 	}, []);

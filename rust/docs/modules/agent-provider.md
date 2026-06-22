@@ -130,15 +130,22 @@ When replay items exist for an assistant/compaction entry, `transcript_to_messag
 Replay records canonicalize local client-tool names to pi-relay names (e.g. `apply_patch`/`str_replace_based_edit_tool` → `Edit`, `web_search` → `WebSearch`) but keep provider-hosted blocks (`server_tool_use`, `web_search_call`) under their native wire names so a stateless replay is byte-for-byte and the web UI can still pair hosted result blocks.
 
 Daemon-authored observations, such as delegation completion wakeups carrying an
-`inspect_delegation`-equivalent snapshot, are not provider replay. They render
-through the normal `UserMessage` path as user-role text for both providers. This
-is conservative on purpose: OpenAI's Responses input uses `function_call` /
-`function_call_output` (or custom-tool variants) while Anthropic requires
-assistant `tool_use` blocks paired with user `tool_result` blocks, and both APIs
-can reject malformed or non-adjacent tool histories. Pi-relay therefore does not
-blindly fabricate assistant tool calls that the model never generated. A
-provider-specific synthetic tool-pair renderer can be added later only where the
-wire shape is proven safe and gated by tests.
+`inspect_delegation`-equivalent snapshot, are not provider replay and are not
+stored as fake assistant choices. The durable transcript item is
+`daemon_tool_observation`; provider adapters synthesize a tool call/result pair
+only while building a request:
+
+- OpenAI Responses receives adjacent `function_call` and
+  `function_call_output` items using the item's stable local `call_id`. The
+  synthetic call omits provider-generated-looking `id` and `status` fields.
+- Anthropic Messages receives an adjacent assistant `tool_use` message and user
+  `tool_result` message. Non-`toolu_...` internal ids are deterministically
+  adapted to Anthropic-style ids.
+
+Request-shape tests pin the adjacency rules and ensure ordinary assistant tool
+pairs are not split. The model sees an `inspect_delegation` result in the same
+shape as a real tool result, while the transcript/UI semantics remain explicit:
+the daemon authored the observation.
 
 ### Compaction: provider-native vs local summary
 

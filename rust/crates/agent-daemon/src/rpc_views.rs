@@ -1,9 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_store::{
-    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionSnapshot,
-    SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryRecord,
-    TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult, TurnCardRecord,
+    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputContent, QueuedInputRecord,
+    SessionSnapshot, SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult,
+    TranscriptEntryRecord, TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult,
+    TurnCardRecord,
 };
 use serde_json::{json, Value};
 
@@ -99,11 +100,25 @@ pub(crate) fn queue_state(queue: QueueState) -> Value {
 }
 
 fn queued_input(input: QueuedInputRecord) -> Value {
+    let (content, editable, summary, content_type) = match input.content {
+        QueuedInputContent::UserMessage(message) => {
+            (json!(message.content), true, None, "user_message")
+        }
+        QueuedInputContent::DaemonToolObservation(observation) => (
+            json!([]),
+            false,
+            observation.summary,
+            "daemon_tool_observation",
+        ),
+    };
     json!({
         "input_id": input.input_id,
         "priority": input.priority,
         "status": input.status,
-        "content": input.content.content,
+        "content": content,
+        "content_type": content_type,
+        "editable": editable,
+        "summary": summary,
         "client_input_id": input.client_input_id,
         "created_at": input.created_at,
         "updated_at": input.updated_at,
