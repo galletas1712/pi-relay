@@ -183,13 +183,13 @@ stays bounded no matter how large a fan-out or transcript is.
   daemon owns one more directory under the cwd root — the **handoff directory**
   (e.g. `<cwd>/.pi-handoff/`). It is not a workspace: never forked, snapshotted,
   or part of any git repo.
-- On stage completion, for **every** subagent (success or failure), the daemon
+- On delegation completion, for **every** subagent (success or failure), the daemon
   writes per-subagent files; the structured control-flow snapshot comes from
   `inspect_delegation`:
 
   ```text
-  <cwd>/.pi-handoff/<stage_id>/<subagent>/final_message.md
-  <cwd>/.pi-handoff/<stage_id>/<subagent>/transcript.md
+  <cwd>/.pi-handoff/<delegation_id>/<subagent>/final_message.md
+  <cwd>/.pi-handoff/<delegation_id>/<subagent>/transcript.md
   ```
 
   All are rendered from the durable transcript, so they exist even after an RO
@@ -200,11 +200,11 @@ stays bounded no matter how large a fan-out or transcript is.
   the parent branches without parsing prose or reading files first.
 - The daemon then delivers the notification by enqueuing a **short steer** to the
   parent (it appears as a user message in the parent's transcript). It names the
-  stage, says how many succeeded/failed, and embeds the snapshot JSON. It does
-  **not** inline full transcripts:
+  delegation, says how many succeeded/failed, and embeds the snapshot JSON. It
+  does **not** inline full transcripts:
 
   ```text
-  Stage stage_7 (reviewer fan-out) completed: 3 ok, 1 failed.
+  Delegation delegation_... (reviewer fan-out) completed: 3 ok, 1 failed.
   Snapshot JSON (equivalent to inspect_delegation at wakeup time):
   { ... final_message, suggested_next, final_message_path, transcript_path ... }
   ```
@@ -212,7 +212,8 @@ stays bounded no matter how large a fan-out or transcript is.
 - The parent branches on the delivered snapshot first, then reads
   `final_message.md` or opens `transcript.md` only when it needs more detail —
   with its normal file tools.
-  For a full stage, the full subagent's actual edits are already in the workspace.
+  For a full delegation, the full subagent's actual edits are already in the
+  workspace.
 
 The handoff directory is **never cleaned up automatically**; its files double as
 durable run history. There is no `artifacts` table and no structured artifact API
