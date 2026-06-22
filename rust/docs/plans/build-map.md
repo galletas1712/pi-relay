@@ -722,7 +722,7 @@ stage.status).
 **3. Query+poll** (App.tsx, mirror 427-445): stagesQuery with refetchInterval 2_000 while parent running. Add
 queryKeys.stages/stage.
 **4. Event refresh** (sessionEvents.ts + App.tsx): add new stage event names to SESSION_LIST_REFRESH_EVENTS +
-KNOWN_SESSION_EVENTS; in handleSessionEvent invalidate queryKeys.stages. **Completion steer is a normal user message in
+KNOWN_SESSION_EVENTS; in handleSessionEvent invalidate queryKeys.stages. **Completion is a typed daemon observation in
 the parent transcript** — existing transcript pipeline renders it; board just flips the stage row via the query refresh.
 **5. Render+controls** (panels.tsx): RunBoard modeled on SubagentsSection; per subagent row link to child session; cancel
 stage → api.cancelStage; steer full subagent → api.queueFollowUp BUT at STEER priority (new path); re-run → startFull/

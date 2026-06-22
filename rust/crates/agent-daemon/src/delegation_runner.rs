@@ -25,7 +25,7 @@
 use agent_store::{Delegation, DelegationStatus, QueuedInputStatus};
 use agent_vocab::TurnOutcome;
 
-use crate::delegation_snapshot::{build_delegation_snapshot, completion_wakeup_message};
+use crate::delegation_snapshot::{build_delegation_snapshot, completion_wakeup_observation};
 use crate::handoff::subagent_outcome;
 use crate::runtime::SessionDriver;
 use crate::state::AppState;
@@ -127,12 +127,12 @@ async fn publish_completed_delegation(
     let mut completed_delegation = delegation.clone();
     completed_delegation.status = status;
     let snapshot = build_delegation_snapshot(state, &completed_delegation).await?;
-    let message = completion_wakeup_message(&snapshot)?;
+    let observation = completion_wakeup_observation(&snapshot, &completed_delegation)?;
     state
         .repo
-        .enqueue_delegation_steer(
+        .enqueue_delegation_observation(
             &delegation.parent_session_id,
-            &message,
+            &observation,
             &steer_client_input_id,
         )
         .await?;
@@ -163,11 +163,11 @@ async fn completion_steer_needs_drive(
         }))
 }
 
-/// Drive the parent so it picks up the just-queued completion steer. The steer
+/// Drive the parent so it picks up the just-queued completion observation. The observation
 /// is already durable; this is a best-effort prompt so the parent does not wait
 /// for its next external poke. A held-up-the-stack lock is skipped (the parent
 /// is not the firing child, but be defensive) and any drive error is logged, not
-/// propagated — the durable steer is delivered by the parent's normal recovery.
+/// propagated — the durable observation is delivered by the parent's normal recovery.
 ///
 /// Lock ordering note: this acquires the PARENT driver lock while a child driver
 /// lock may be held up the stack (the firing child). `try_acquire` makes that a

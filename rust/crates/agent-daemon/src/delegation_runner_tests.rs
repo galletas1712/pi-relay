@@ -18,8 +18,9 @@ use agent_store::{
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{
-    ActionId, AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
-    ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+    ActionId, AssistantItem, AssistantMessage, CompactionSummary, DaemonToolObservation,
+    ProviderConfig, ProviderKind, ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, TurnId,
+    TurnOutcome, UserMessage,
 };
 use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
@@ -431,14 +432,14 @@ async fn settle_subagent_terminal(env: &TestEnv, session_id: &str, boundary_leaf
         .expect("boundary check"));
 }
 
-/// Completion steer texts that reached the parent. An idle parent accepts the
-/// steer as its next user-message turn, so the steer lands in the parent's
-/// transcript; we collect user messages naming the delegation.
-async fn parent_completion_steer_texts(
+/// Completion observations that reached the parent. An idle parent accepts the
+/// daemon-authored observation as its next model-visible turn, so the typed
+/// observation lands in the parent's transcript.
+async fn parent_completion_observations(
     env: &TestEnv,
     parent_id: &str,
     delegation_id: &str,
-) -> Vec<String> {
+) -> Vec<DaemonToolObservation> {
     let history = env
         .state
         .repo
@@ -449,29 +450,23 @@ async fn parent_completion_steer_texts(
         .entries
         .iter()
         .filter_map(|entry| match &entry.item {
-            TranscriptItem::UserMessage(message) => message.as_text().and_then(|text| {
-                (text.contains(delegation_id) && text.contains("completed"))
-                    .then(|| text.to_string())
-            }),
+            TranscriptItem::DaemonToolObservation(observation)
+                if observation.tool_name == "inspect_delegation"
+                    && observation
+                        .args_json
+                        .contains(&format!("\"delegation_id\":\"{delegation_id}\"")) =>
+            {
+                Some(observation.clone())
+            }
             _ => None,
         })
         .collect()
 }
 
 async fn steers_to_parent(env: &TestEnv, parent_id: &str, delegation_id: &str) -> usize {
-    parent_completion_steer_texts(env, parent_id, delegation_id)
+    parent_completion_observations(env, parent_id, delegation_id)
         .await
         .len()
-}
-
-fn wakeup_snapshot_from_text(text: &str) -> serde_json::Value {
-    let start = text
-        .find("```json\n")
-        .map(|index| index + "```json\n".len())
-        .expect("wakeup has json fence");
-    let rest = &text[start..];
-    let end = rest.find("\n```").expect("wakeup json fence closes");
-    serde_json::from_str(&rest[..end]).expect("wakeup snapshot is valid json")
 }
 
 async fn parent_completion_snapshot(
@@ -479,9 +474,13 @@ async fn parent_completion_snapshot(
     parent_id: &str,
     delegation_id: &str,
 ) -> serde_json::Value {
-    let texts = parent_completion_steer_texts(env, parent_id, delegation_id).await;
-    assert_eq!(texts.len(), 1, "expected exactly one completion wakeup");
-    wakeup_snapshot_from_text(&texts[0])
+    let observations = parent_completion_observations(env, parent_id, delegation_id).await;
+    assert_eq!(
+        observations.len(),
+        1,
+        "expected exactly one completion wakeup"
+    );
+    observations[0].result_json.clone()
 }
 
 async fn inspect_delegation_snapshot(env: &TestEnv, delegation_id: &str) -> serde_json::Value {
@@ -1597,7 +1596,7 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
     assert_eq!(snapshot["status"], "cancelled");
     assert_eq!(subagent["status"], "cancelled");
-    assert_eq!(subagent["final_message"], serde_json::Value::Null);
+    assert_eq!(subagent["final_message_preview"], serde_json::Value::Null);
     assert_eq!(subagent["final_message_path"], serde_json::Value::Null);
     assert_eq!(
         subagent["final_message_relative_path"],
@@ -1888,34 +1887,24 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     let root = handoff_root(&env, &delegation.id);
     assert!(!root.join("index.json").exists());
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
-    let wakeup_texts = parent_completion_steer_texts(&env, "parent", &delegation.id).await;
-    assert_eq!(wakeup_texts.len(), 1);
-    let wakeup_text = &wakeup_texts[0];
-    assert!(
-        wakeup_text.contains("Daemon observation: inspect_delegation"),
-        "persisted completion wakeup should identify itself as a daemon observation"
+    let wakeup_observations = parent_completion_observations(&env, "parent", &delegation.id).await;
+    assert_eq!(wakeup_observations.len(), 1);
+    let wakeup_observation = &wakeup_observations[0];
+    assert_eq!(wakeup_observation.tool_name, "inspect_delegation");
+    assert_eq!(
+        wakeup_observation.args_json,
+        format!("{{\"delegation_id\":\"{}\"}}", delegation.id)
     );
-    assert!(
-        wakeup_text.contains("not by an assistant tool call"),
-        "persisted completion wakeup must not imply the model chose inspect_delegation"
-    );
-    assert!(
-        !wakeup_text.contains("index.json"),
-        "completion wakeup must not instruct the parent to read index.json"
-    );
-    assert!(
-        wakeup_text.contains("Snapshot JSON"),
-        "completion wakeup should include the structured snapshot JSON"
-    );
-    assert!(
-        wakeup_text.contains("Full transcript contents are not inlined"),
-        "completion wakeup should clarify transcripts are artifact paths only"
-    );
-    assert!(
-        !wakeup_text.contains("## User"),
-        "completion wakeup must not inline transcript markdown"
-    );
-    let wakeup_snapshot = wakeup_snapshot_from_text(wakeup_text);
+    assert!(wakeup_observation
+        .summary
+        .as_deref()
+        .unwrap_or_default()
+        .contains("completed with status done_with_failures"));
+    let fallback = wakeup_observation.render_text().expect("fallback renders");
+    assert!(!fallback.contains("index.json"));
+    assert!(!fallback.contains("## User"));
+    assert!(fallback.contains("large prompts/messages are not inlined"));
+    let wakeup_snapshot = wakeup_observation.result_json.clone();
     assert_eq!(wakeup_snapshot, snapshot);
     assert_eq!(snapshot["status"], "done_with_failures");
     assert_eq!(snapshot["kind"], "readonly_fanout");
@@ -1961,7 +1950,10 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     assert_eq!(ok["type"], "read_only");
     assert_eq!(ok["subagent_type"], "read_only");
     assert_eq!(ok["status"], "done");
-    assert_eq!(ok["final_message"], "All good.\n\nsuggested_next: approved");
+    assert_eq!(
+        ok["final_message_preview"],
+        "All good.\n\nsuggested_next: approved"
+    );
     assert_eq!(ok["suggested_next"], "approved");
     let wakeup_ok = wakeup_snapshot["subagents"]
         .as_array()
@@ -1970,7 +1962,7 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
         .find(|subagent| subagent["id"] == "ok_a")
         .expect("ok_a in wakeup snapshot");
     assert_eq!(
-        wakeup_ok["final_message"],
+        wakeup_ok["final_message_preview"],
         "All good.\n\nsuggested_next: approved"
     );
     assert_eq!(wakeup_ok["suggested_next"], "approved");
@@ -2059,7 +2051,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .unwrap();
     assert_eq!(done["status"], "done");
     assert_eq!(
-        done["final_message"],
+        done["final_message_preview"],
         "Found the answer.\n\nsuggested_next: done"
     );
     assert_eq!(done["suggested_next"], "done");
@@ -2082,7 +2074,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .unwrap();
     assert_eq!(running["activity"], "idle");
     assert_eq!(running["status"], "running");
-    assert_eq!(running["final_message"], serde_json::Value::Null);
+    assert_eq!(running["final_message_preview"], serde_json::Value::Null);
     assert_eq!(running["suggested_next"], serde_json::Value::Null);
     assert_eq!(running["final_message_path"], serde_json::Value::Null);
     assert!(root.join("running_child").join("transcript.md").exists());
@@ -2137,7 +2129,7 @@ async fn failed_delegation_does_not_publish_normal_handoff_on_inspect_or_read() 
     let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
     assert_eq!(snapshot["status"], "failed");
     assert_eq!(subagent["status"], "failed");
-    assert_eq!(subagent["final_message"], serde_json::Value::Null);
+    assert_eq!(subagent["final_message_preview"], serde_json::Value::Null);
     assert_eq!(subagent["final_message_path"], serde_json::Value::Null);
     assert_eq!(subagent["transcript_path"], serde_json::Value::Null);
     let root = handoff_root(&env, &delegation.id);
@@ -2591,7 +2583,7 @@ fn payload_texts(value: &serde_json::Value) -> Vec<&str> {
     match value {
         serde_json::Value::String(text) => vec![text.as_str()],
         serde_json::Value::Array(items) => items.iter().flat_map(payload_texts).collect(),
-        serde_json::Value::Object(map) => ["message", "content", "text"]
+        serde_json::Value::Object(map) => ["message", "content", "text", "summary"]
             .into_iter()
             .filter_map(|key| map.get(key))
             .flat_map(payload_texts)
@@ -2762,12 +2754,15 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     assert!(root.join("impl").join("transcript.md").exists());
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["status"], "done");
-    assert_eq!(snapshot["subagents"][0]["final_message"], "implemented");
+    assert_eq!(
+        snapshot["subagents"][0]["final_message_preview"],
+        "implemented"
+    );
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
     let wakeup_snapshot = parent_completion_snapshot(&env, "parent", &delegation.id).await;
     assert_eq!(wakeup_snapshot, snapshot);
     assert_eq!(
-        wakeup_snapshot["subagents"][0]["final_message"],
+        wakeup_snapshot["subagents"][0]["final_message_preview"],
         "implemented"
     );
     assert!(wakeup_snapshot["subagents"][0]["transcript_path"]
@@ -2777,7 +2772,7 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     assert_eq!(
         durable_parent_completion_steers(&env, "parent", &delegation.id).await,
         1,
-        "first repair publishes exactly one durable completion steer"
+        "first repair publishes exactly one durable completion observation"
     );
 
     let repaired_input = env
@@ -2795,7 +2790,7 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     // A second repair sweep must not double-publish or double-drive. The first
     // repair may already have driven the idle parent and consumed the queued
     // input, so assert the deterministic idempotency row rather than requiring
-    // the steer to remain in the active queue.
+    // the completion observation to remain in the active queue.
     sweep_running_delegations_on_boot(&env.state).await;
     let repaired_again = env
         .state
@@ -2812,7 +2807,7 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     assert_eq!(
         durable_parent_completion_steers(&env, "parent", &delegation.id).await,
         1,
-        "second repair must not publish any duplicate durable completion steer"
+        "second repair must not publish any duplicate durable completion observation"
     );
 
     env.cleanup().await;

@@ -1,4 +1,4 @@
-use agent_vocab::{TranscriptItem, UserMessage};
+use agent_vocab::{DaemonToolObservation, TranscriptItem, UserMessage};
 use anyhow::Result;
 use serde_json::{json, Value};
 use sqlx::{postgres::PgRow, Row};
@@ -9,7 +9,8 @@ use super::queue::bump_revisions_tx;
 use super::sql::lock_session_tx;
 use super::PostgresAgentStore;
 use crate::{
-    DelegationKind, DelegationStatus, EventType, InputPriority, SessionActivity, SubagentType,
+    DelegationKind, DelegationStatus, EventType, InputPriority, QueuedInputContent,
+    SessionActivity, SubagentType,
 };
 
 /// A durable delegation row: an ordered unit of work under a parent session that
@@ -329,11 +330,11 @@ impl PostgresAgentStore {
         Ok(updated == 1)
     }
 
-    /// Enqueue the parent's delegation-completion steer with the deterministic
+    /// Enqueue the legacy parent delegation-completion text steer with the deterministic
     /// delegation/attempt key. This is idempotent via the unique
     /// `(session_id, client_input_id)` index, so boot repair or a replay can call
     /// it again without creating a duplicate. The runner calls this only after
-    /// normal handoff files exist, so the parent steer never races ahead of the
+    /// normal handoff files exist, so the parent message never races ahead of the
     /// files it references.
     pub async fn enqueue_delegation_steer(
         &self,
@@ -347,6 +348,27 @@ impl PostgresAgentStore {
             parent_session_id,
             steer_message,
             steer_client_input_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Enqueue a typed daemon-authored observation that wakes the parent in the
+    /// same way as a deterministic completion wakeup, without storing daemon
+    /// facts as human/user message text.
+    pub async fn enqueue_delegation_observation(
+        &self,
+        parent_session_id: &str,
+        observation: &DaemonToolObservation,
+        client_input_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        enqueue_steer_content_tx(
+            &mut tx,
+            parent_session_id,
+            QueuedInputContent::daemon_tool_observation(observation.clone()),
+            client_input_id,
         )
         .await?;
         tx.commit().await?;
@@ -482,7 +504,7 @@ impl PostgresAgentStore {
     }
 }
 
-/// Insert the parent's delegation-completion steer as a durable queued input inside
+/// Insert the parent's delegation-completion text steer as a durable queued input inside
 /// the caller's transaction, idempotent on `(session_id, client_input_id)`. A
 /// re-run with the same key (replay/boot sweep) inserts nothing and emits no
 /// duplicate event. Mirrors the steer branch of `enqueue_user_input`.
@@ -492,8 +514,22 @@ async fn enqueue_steer_tx(
     message: &str,
     client_input_id: &str,
 ) -> Result<()> {
+    enqueue_steer_content_tx(
+        tx,
+        parent_session_id,
+        QueuedInputContent::user_message(UserMessage::text(message)),
+        client_input_id,
+    )
+    .await
+}
+
+async fn enqueue_steer_content_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    parent_session_id: &str,
+    content: QueuedInputContent,
+    client_input_id: &str,
+) -> Result<()> {
     lock_session_tx(tx, parent_session_id).await?;
-    let content = UserMessage::text(message);
     let id = format!("input_{}", Uuid::new_v4());
     let inserted = sqlx::query(
         r#"
@@ -528,7 +564,11 @@ async fn enqueue_steer_tx(
             "input_id": input_id,
             "priority": InputPriority::Steer,
             "client_input_id": client_input_id,
-            "content": content.content.clone(),
+            "content_type": content.as_kind(),
+            "content": match &content {
+                QueuedInputContent::UserMessage(message) => json!(message.content.clone()),
+                QueuedInputContent::DaemonToolObservation(_) => json!([]),
+            },
         }),
     )
     .await?;

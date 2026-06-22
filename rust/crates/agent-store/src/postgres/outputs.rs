@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::{
     ActionKind, ActionStatus, ActionUpdate, EventFrame, EventType, OutputBatch, PersistedAction,
+    QueuedInputContent,
 };
 
 use super::action_records::{action_event_matches_row, action_payload, ActionKey};
@@ -163,7 +164,9 @@ pub(super) async fn persist_outputs_tx(
             .bind(&id)
             .bind(session_id)
             .bind(input.priority.as_str())
-            .bind(serde_json::to_value(&input.content)?)
+            .bind(serde_json::to_value(QueuedInputContent::user_message(
+                input.content.clone(),
+            ))?)
             .bind(client_input_id)
             .fetch_optional(&mut **tx)
             .await
@@ -178,7 +181,8 @@ pub(super) async fn persist_outputs_tx(
             "input_id": input_id,
             "priority": input.priority,
             "client_input_id": input.client_input_id,
-            "content": input.content,
+            "content": input.content.content,
+            "content_type": "user_message",
         }));
     }
 

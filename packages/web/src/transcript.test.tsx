@@ -106,6 +106,43 @@ describe("MessageList compaction display", () => {
 	});
 });
 
+describe("MessageList daemon observations", () => {
+	it("renders typed daemon tool observations as system messages", () => {
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[
+					turnStartedEntry("start", 1, 1),
+					{
+						id: "daemon",
+						parent_id: "start",
+						timestamp_ms: 2,
+						item: {
+							type: "daemon_tool_observation",
+							tool_call_id: "call_inspect_delegation_delegation_1_attempt_1",
+							tool_name: "inspect_delegation",
+							args_json: "{\"delegation_id\":\"delegation_1\"}",
+							result_json: { delegation_id: "delegation_1", status: "done", suggested_next: "approved" },
+							status: "Success",
+							summary: "Delegation delegation_1 completed",
+						},
+					},
+				]}
+				activeLeafId="daemon"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+			/>
+		);
+
+		expect(html).toContain("system-message info");
+		expect(html).toContain("Delegation delegation_1 completed");
+		expect(html).toContain("status done");
+		expect(html).not.toContain("user-message");
+	});
+});
+
 function toolCall(id: string, toolName: string): AssistantItem {
 	return { type: "tool_call", id, tool_name: toolName, args_json: "{}" };
 }

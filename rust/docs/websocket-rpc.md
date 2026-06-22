@@ -1302,10 +1302,15 @@ Result:
       "activity": "idle",
       "status": "done",
       "steerable": false,
-      "final_message": "Looks good.\n\nsuggested_next: approved",
+      "final_message_preview": "Looks good.\n\nsuggested_next: approved",
+      "final_message_bytes": 36,
       "suggested_next": "approved",
       "final_message_path": null,
-      "transcript_path": "/.../.pi-handoff/delegation_.../session_.../transcript.md"
+      "transcript_path": "/.../.pi-handoff/delegation_.../session_.../transcript.md",
+      "task_prompt_file": "session_.../task_prompt.md",
+      "task_prompt_path": "/.../.pi-handoff/delegation_.../session_.../task_prompt.md",
+      "task_prompt_bytes": 123,
+      "task_prompt_sha256": "..."
     }
   ],
   "handoff_dir": "/.../.pi-handoff/delegation_..."
@@ -1363,18 +1368,21 @@ Result:
 
 ### `delegation.read_handoff_file`
 
-Reads a valid delegation handoff file. Normal running/done delegations expose
-per-subagent `transcript.md`; terminal done/done_with_failures delegations also
-expose per-subagent `final_message.md`. Cancelled delegations expose only the
-transcript-only cancellation artifact path reported by `inspect_delegation`, for
-example `cancelled/<subagent_id>.transcript.md`. The structured delegation
-snapshot comes from `delegation.status`/`inspect_delegation`, not from a handoff
-root artifact file. Full transcript bodies are never inlined in delegation snapshots,
-daemon observations, or compaction ledgers; use this RPC to read an artifact
-body explicitly when detail is needed.
+Reads a valid delegation handoff file. Normal running/done/cancelled/failed
+delegations expose per-subagent `task_prompt.md`. Normal running/done
+delegations expose per-subagent `transcript.md`; terminal
+done/done_with_failures delegations also expose per-subagent `final_message.md`.
+Cancelled delegations expose the transcript-only cancellation artifact path
+reported by `inspect_delegation`, for example
+`cancelled/<subagent_id>.transcript.md`. The structured delegation snapshot
+comes from `delegation.status`/`inspect_delegation`, not from a handoff root
+artifact file. Raw task prompts, full final messages, and full transcript bodies
+are never inlined in delegation snapshots, daemon observations, or compaction
+ledgers; use this RPC to read an artifact body explicitly when detail is needed.
 
 Allowed `file` values are exactly:
 
+- `task_prompt.md` with matching `subagent_id`
 - `final_message.md` with matching `subagent_id`
 - `transcript.md` with matching `subagent_id`
 - `cancelled/<subagent_id>.transcript.md` (the `subagent_id` parameter is
@@ -1385,7 +1393,7 @@ Allowed `file` values are exactly:
   "parent_session_id": "parent-session",
   "delegation_id": "delegation_...",
   "subagent_id": "session_...",
-  "file": "final_message.md"
+  "file": "task_prompt.md"
 }
 ```
 
@@ -1415,13 +1423,16 @@ Result:
 When a delegation subagent is spawned or re-driven, the daemon may emit
 parent-scoped `subagent.spawned` and `subagent.running` progress events. These
 are progress hints only. Parent-visible delegation completion is not a per-child
-`subagent.idle`; it is one `InputPriority::Steer` queued to the parent after the
-delegation barrier completes. The steer includes a JSON delegation snapshot
-equivalent to `inspect_delegation`/`delegation.status`, including per-subagent
-final messages, `suggested_next`, and artifact paths. Use
+`subagent.idle`; it is one `InputPriority::Steer` daemon observation queued to
+the parent after the delegation barrier completes. The observation is stored as a
+typed `daemon_tool_observation` transcript item and is inspect-equivalent to
+`inspect_delegation`/`delegation.status`, including bounded per-subagent
+final-message previews, `suggested_next`, and artifact paths. Provider adapters
+render it as an adjacent synthetic `inspect_delegation` tool call/result pair;
+the UI renders it as a daemon/system observation card. Use
 `inspect_delegation`/`delegation.status` to refresh/recover state or inspect
-later/running; use the per-subagent `final_message.md`/`transcript.md` files for
-extra detail.
+later/running; use the per-subagent `task_prompt.md`, `final_message.md`, and
+`transcript.md` files for extra detail.
 
 `subagent.idle` remains an event type for non-delegation subagent compatibility
 (for example, defensive dispatch-failure compensation). When emitted, idle

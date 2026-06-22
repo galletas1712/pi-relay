@@ -22,11 +22,13 @@ use agent_store::{Delegation, DelegationStatus, HistoryTree};
 use agent_vocab::{
     AssistantMessage, ContentBlock, ToolResultStatus, TranscriptItem, TurnOutcome, UserMessage,
 };
+use sha2::{Digest, Sha256};
 
 use crate::state::AppState;
 use crate::types::RpcError;
 
 pub(crate) const HANDOFF_DIR: &str = ".pi-handoff";
+pub(crate) const TASK_PROMPT_FILE: &str = "task_prompt.md";
 
 /// The per-subagent handoff outcome, derived from the subagent's terminal
 /// `TurnOutcome`. Graceful is `done`; an interrupted or crashed turn is
@@ -150,6 +152,12 @@ pub(crate) fn render_transcript_markdown(history: &HistoryTree) -> String {
                     summary.summary.trim()
                 ));
             }
+            TranscriptItem::DaemonToolObservation(observation) => {
+                let text = observation
+                    .render_text()
+                    .unwrap_or_else(|_| "Daemon observation could not be rendered.".to_string());
+                out.push_str(&format!("## Daemon observation\n\n{}\n\n", text.trim()));
+            }
             TranscriptItem::TurnStarted { .. } | TranscriptItem::TurnFinished { .. } => {}
         }
     }
@@ -198,6 +206,9 @@ pub(crate) struct SubagentArtifact {
     pub(crate) suggested_next: Option<String>,
     pub(crate) final_message_path: Option<PathBuf>,
     pub(crate) transcript_path: PathBuf,
+    pub(crate) task_prompt_path: PathBuf,
+    pub(crate) task_prompt_bytes: usize,
+    pub(crate) task_prompt_sha256: String,
 }
 
 impl SubagentArtifact {
@@ -210,6 +221,42 @@ impl SubagentArtifact {
     pub(crate) fn transcript_rel(&self) -> String {
         format!("{}/transcript.md", self.session_id)
     }
+
+    pub(crate) fn task_prompt_rel(&self) -> String {
+        task_prompt_rel(&self.session_id)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TaskPromptArtifact {
+    pub(crate) path: PathBuf,
+    pub(crate) bytes: usize,
+    pub(crate) sha256: String,
+}
+
+pub(crate) fn task_prompt_rel(session_id: &str) -> String {
+    format!("{session_id}/{TASK_PROMPT_FILE}")
+}
+
+pub(crate) async fn refresh_task_prompt_artifact(
+    delegation_dir: &Path,
+    session_id: &str,
+    task: &str,
+) -> std::result::Result<TaskPromptArtifact, RpcError> {
+    let subagent_dir = delegation_dir.join(session_id);
+    tokio::fs::create_dir_all(&subagent_dir)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let path = subagent_dir.join(TASK_PROMPT_FILE);
+    tokio::fs::write(&path, task.as_bytes())
+        .await
+        .map_err(anyhow::Error::from)?;
+    let digest = Sha256::digest(task.as_bytes());
+    Ok(TaskPromptArtifact {
+        path,
+        bytes: task.len(),
+        sha256: format!("{digest:x}"),
+    })
 }
 
 pub(crate) fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
@@ -273,6 +320,12 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         tokio::fs::create_dir_all(&subagent_dir)
             .await
             .map_err(anyhow::Error::from)?;
+        let task_prompt = refresh_task_prompt_artifact(
+            &dir,
+            &subagent.session_id,
+            subagent.task.as_deref().unwrap_or_default(),
+        )
+        .await?;
         let final_message_path = if include_final_messages {
             let path = subagent_dir.join("final_message.md");
             tokio::fs::write(&path, final_message.as_bytes())
@@ -294,6 +347,9 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
             suggested_next: include_final_content.then_some(suggested_next).flatten(),
             final_message_path,
             transcript_path,
+            task_prompt_path: task_prompt.path,
+            task_prompt_bytes: task_prompt.bytes,
+            task_prompt_sha256: task_prompt.sha256,
         });
     }
 

@@ -102,7 +102,7 @@ describe("canReRunDelegation", () => {
 		expect(canReRunDelegation(fullDelegation({ status: "running" }))).toBe(false);
 	});
 
-	it("forbids re-run when any prompt is missing", () => {
+	it("forbids re-run when any prompt source is missing", () => {
 		const delegation = fanoutDelegation({
 			subagents: [
 				{ id: "child-a", status: "idle", role: "explore", subagent_type: "read_only", task: "look here" },
@@ -110,6 +110,31 @@ describe("canReRunDelegation", () => {
 			],
 		});
 		expect(canReRunDelegation(delegation)).toBe(false);
+	});
+
+	it("allows re-run from task prompt handoff files even when prompt text is not inline", () => {
+		const delegation = fanoutDelegation({
+			subagents: [
+				{
+					id: "child-a",
+					status: "idle",
+					role: "explore",
+					subagent_type: "read_only",
+					task: null,
+					task_prompt_file: "child-a/task_prompt.md",
+				},
+				{
+					id: "child-b",
+					status: "idle",
+					role: "explore",
+					subagent_type: "read_only",
+					task: null,
+					task_prompt_file: "child-b/task_prompt.md",
+				},
+			],
+		});
+		expect(canReRunDelegation(delegation)).toBe(true);
+		expect(reRunParamsForDelegation(delegation, "parent")).toBeNull();
 	});
 
 	it("forbids re-run when any role is missing", () => {

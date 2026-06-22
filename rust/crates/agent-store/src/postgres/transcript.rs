@@ -1052,6 +1052,7 @@ fn item_type(item: &TranscriptItem) -> &'static str {
         TranscriptItem::ToolResult(_) => "tool_result",
         TranscriptItem::TurnFinished { .. } => "turn_finished",
         TranscriptItem::CompactionSummary(_) => "compaction_summary",
+        TranscriptItem::DaemonToolObservation(_) => "daemon_tool_observation",
     }
 }
 
@@ -1085,6 +1086,10 @@ fn display_hint(item: &TranscriptItem) -> Option<String> {
             format!("{outcome:?} turn boundary for turn {}", turn_id.0)
         }
         TranscriptItem::CompactionSummary(summary) => summary.summary.clone(),
+        TranscriptItem::DaemonToolObservation(observation) => observation
+            .summary
+            .clone()
+            .unwrap_or_else(|| format!("daemon observation: {}", observation.tool_name)),
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {

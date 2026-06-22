@@ -150,6 +150,25 @@ impl OpenAiCodexSessionState {
     }
 }
 
+fn response_daemon_tool_call_item(observation: &agent_vocab::DaemonToolObservation) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": observation.tool_call_id.as_str(),
+        "name": openai_wire_tool_name(&observation.tool_name),
+        "arguments": observation.args_json,
+    })
+}
+
+fn response_daemon_tool_result_item(
+    observation: &agent_vocab::DaemonToolObservation,
+) -> ProviderResult<Value> {
+    Ok(json!({
+        "type": "function_call_output",
+        "call_id": observation.tool_call_id.as_str(),
+        "output": observation.result_text()?,
+    }))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct OpenAiResponseHeaders {
     upstream_request_id: Option<String>,
@@ -813,6 +832,10 @@ pub(crate) fn transcript_to_response_items(
             TranscriptItem::ToolResult(result) => {
                 responses.push(response_tool_result_item(result));
             }
+            TranscriptItem::DaemonToolObservation(observation) => {
+                responses.push(response_daemon_tool_call_item(observation));
+                responses.push(response_daemon_tool_result_item(observation)?);
+            }
             TranscriptItem::TurnStarted { .. }
             | TranscriptItem::ToolCallStarted { .. }
             | TranscriptItem::TurnFinished { .. } => {}
@@ -1222,7 +1245,7 @@ fn openai_usage(value: &Value) -> Option<ProviderUsage> {
 mod tests {
     use super::*;
     use crate::PromptSections;
-    use agent_vocab::{CompactionSummary, DaemonObservation, ToolCall, ToolResultMessage, TurnId};
+    use agent_vocab::{CompactionSummary, ToolCall, ToolResultMessage, TurnId};
     use reqwest::header::HeaderValue;
 
     fn test_tool(
@@ -2001,8 +2024,9 @@ mod tests {
     }
 
     #[test]
-    fn daemon_observation_renders_as_user_message_not_synthetic_tool_pair() {
-        let observation = DaemonObservation::inspect_delegation(
+    fn daemon_tool_observation_renders_as_openai_synthetic_tool_pair() {
+        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
+            ToolCallId::new("call_delegation_1_attempt_1"),
             "delegation_1",
             Some("Delegation delegation_1 completed with status done: 1 ok, 0 failed.".to_string()),
             json!({
@@ -2013,51 +2037,47 @@ mod tests {
                     "transcript_path": "/tmp/.pi-handoff/delegation_1/child_1/transcript.md",
                 }],
             }),
-        )
-        .into_user_message()
-        .expect("observation renders");
+        );
 
         let items = transcript_to_response_items(
             &crate::PromptSections::default(),
-            &[TranscriptItem::UserMessage(observation).into()],
+            &[TranscriptItem::DaemonToolObservation(observation).into()],
         )
         .expect("transcript should render");
 
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0]["type"], "message");
-        assert_eq!(items[0]["role"], "user");
-        let text = items[0]["content"][0]["text"]
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "call_delegation_1_attempt_1");
+        assert_eq!(items[0]["name"], "inspect_delegation");
+        assert_eq!(
+            items[0]["arguments"],
+            "{\"delegation_id\":\"delegation_1\"}"
+        );
+        assert!(items[0].get("id").is_none());
+        assert!(items[0].get("status").is_none());
+        assert_eq!(items[1]["type"], "function_call_output");
+        assert_eq!(items[1]["call_id"], "call_delegation_1_attempt_1");
+        assert!(items[1].get("id").is_none());
+        assert!(items[1].get("status").is_none());
+        assert!(items[1]["output"]
             .as_str()
-            .expect("observation text");
-        assert!(text.contains("Daemon observation: inspect_delegation"));
-        assert!(text.contains("not by an assistant tool call"));
-        assert!(text.contains("Snapshot JSON follows"));
-        assert!(text.contains("\"delegation_id\": \"delegation_1\""));
-        assert!(!matches!(
-            items[0]["type"].as_str(),
-            Some(
-                "function_call"
-                    | "custom_tool_call"
-                    | "function_call_output"
-                    | "custom_tool_call_output"
-            )
-        ));
+            .expect("json output")
+            .contains("\"delegation_id\": \"delegation_1\""));
     }
 
     #[test]
-    fn daemon_observation_after_tool_result_keeps_openai_tool_pair_adjacent() {
+    fn daemon_tool_observation_after_tool_result_keeps_openai_tool_pairs_adjacent() {
         let tool_call = ToolCall {
             id: ToolCallId::new("call_1"),
             tool_name: "read".to_string(),
             args_json: "{\"path\":\"README.md\"}".to_string(),
         };
-        let observation = DaemonObservation::inspect_delegation(
+        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
+            ToolCallId::new("call_delegation_1_attempt_1"),
             "delegation_1",
             None,
             json!({ "delegation_id": "delegation_1", "status": "done" }),
-        )
-        .into_user_message()
-        .expect("observation renders");
+        );
 
         let items = transcript_to_response_items(
             &crate::PromptSections::default(),
@@ -2072,7 +2092,7 @@ mod tests {
                     "contents",
                 ))
                 .into(),
-                TranscriptItem::UserMessage(observation).into(),
+                TranscriptItem::DaemonToolObservation(observation).into(),
             ],
         )
         .expect("transcript should render");
@@ -2081,12 +2101,10 @@ mod tests {
         assert_eq!(items[0]["call_id"], "call_1");
         assert_eq!(items[1]["type"], "function_call_output");
         assert_eq!(items[1]["call_id"], "call_1");
-        assert_eq!(items[2]["type"], "message");
-        assert_eq!(items[2]["role"], "user");
-        assert!(items[2]["content"][0]["text"]
-            .as_str()
-            .expect("observation text")
-            .contains("Daemon observation: inspect_delegation"));
+        assert_eq!(items[2]["type"], "function_call");
+        assert_eq!(items[2]["call_id"], "call_delegation_1_attempt_1");
+        assert_eq!(items[3]["type"], "function_call_output");
+        assert_eq!(items[3]["call_id"], "call_delegation_1_attempt_1");
     }
 
     #[test]

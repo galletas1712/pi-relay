@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 use crate::codec::from_params;
 use crate::delegation_snapshot::build_delegation_snapshot;
 use crate::handoff::{
-    delegation_dir, handoff_root, refresh_delegation_handoff_artifacts, render_transcript_markdown,
+    delegation_dir, handoff_root, refresh_delegation_handoff_artifacts,
+    refresh_task_prompt_artifact, render_transcript_markdown, task_prompt_rel, TASK_PROMPT_FILE,
 };
 use crate::runtime::{abort_session_tasks, publish_events, SessionDriver};
 use crate::state::AppState;
@@ -578,15 +579,15 @@ impl HandoffFileRequest<'_> {
 }
 
 /// Resolve the closed handoff file vocabulary. Normal files live under
-/// `<subagent_id>/{final_message.md,transcript.md}`. Cancelled delegations expose
-/// only the transcript-only cancellation artifact via
+/// `<subagent_id>/{task_prompt.md,final_message.md,transcript.md}`. Cancelled
+/// delegations expose only the transcript-only cancellation artifact via
 /// `cancelled/<subagent_id>.transcript.md`.
 fn parse_handoff_file_request<'a>(
     subagent_id: Option<&'a str>,
     file: &'a str,
 ) -> std::result::Result<HandoffFileRequest<'a>, RpcError> {
     match file {
-        "final_message.md" | "transcript.md" => {
+        TASK_PROMPT_FILE | "final_message.md" | "transcript.md" => {
             let subagent_id = subagent_id.ok_or_else(|| {
                 RpcError::new("invalid_params", format!("{file} requires a subagent_id"))
             })?;
@@ -610,7 +611,7 @@ fn parse_handoff_file_request<'a>(
             Err(RpcError::new(
                 "invalid_params",
                 format!(
-                    "file must be one of final_message.md | transcript.md | cancelled/<subagent_id>.transcript.md, got {relative}"
+                    "file must be one of task_prompt.md | final_message.md | transcript.md | cancelled/<subagent_id>.transcript.md, got {relative}"
                 ),
             ))
         }
@@ -623,6 +624,10 @@ fn read_allowed_for_status(
 ) -> std::result::Result<bool, RpcError> {
     match status {
         DelegationStatus::Running => match request {
+            HandoffFileRequest::Normal {
+                file: TASK_PROMPT_FILE,
+                ..
+            } => Ok(true),
             HandoffFileRequest::Normal {
                 file: "transcript.md",
                 ..
@@ -642,10 +647,20 @@ fn read_allowed_for_status(
             HandoffFileRequest::CancelledTranscript { .. } => Ok(false),
         },
         DelegationStatus::Cancelled => match request {
+            HandoffFileRequest::Normal {
+                file: TASK_PROMPT_FILE,
+                ..
+            } => Ok(true),
             HandoffFileRequest::CancelledTranscript { .. } => Ok(true),
             HandoffFileRequest::Normal { .. } => Ok(false),
         },
-        DelegationStatus::Failed => Ok(false),
+        DelegationStatus::Failed => match request {
+            HandoffFileRequest::Normal {
+                file: TASK_PROMPT_FILE,
+                ..
+            } => Ok(true),
+            _ => Ok(false),
+        },
     }
 }
 
@@ -763,20 +778,52 @@ pub(crate) async fn read_handoff_file_core(
     validate_member_subagent(request, &members)?;
 
     if read_allowed_for_status(delegation.status, request)? {
-        match delegation.status {
-            DelegationStatus::Running
-            | DelegationStatus::Done
-            | DelegationStatus::DoneWithFailures => {
-                let include_final_messages = matches!(
-                    delegation.status,
-                    DelegationStatus::Done | DelegationStatus::DoneWithFailures
-                );
-                refresh_delegation_handoff_artifacts(state, &delegation, include_final_messages)
-                    .await?;
+        if matches!(
+            request,
+            HandoffFileRequest::Normal {
+                file: TASK_PROMPT_FILE,
+                ..
             }
-            // Cancelled reads are limited to the already-written transcript-only
-            // artifact. Failed delegations have no readable handoff artifacts.
-            DelegationStatus::Cancelled | DelegationStatus::Failed => {}
+        ) {
+            let parent_config = state.repo.load_session_config(parent_session_id).await?;
+            let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+            let subagent_id = request.subagent_id();
+            let member = members
+                .iter()
+                .find(|member| member.session_id == subagent_id)
+                .ok_or_else(|| {
+                    RpcError::new(
+                        "handoff_file_not_found",
+                        "subagent does not belong to this delegation",
+                    )
+                })?;
+            refresh_task_prompt_artifact(
+                &dir,
+                subagent_id,
+                member.task.as_deref().unwrap_or_default(),
+            )
+            .await?;
+        } else {
+            match delegation.status {
+                DelegationStatus::Running
+                | DelegationStatus::Done
+                | DelegationStatus::DoneWithFailures => {
+                    let include_final_messages = matches!(
+                        delegation.status,
+                        DelegationStatus::Done | DelegationStatus::DoneWithFailures
+                    );
+                    refresh_delegation_handoff_artifacts(
+                        state,
+                        &delegation,
+                        include_final_messages,
+                    )
+                    .await?;
+                }
+                // Cancelled reads are limited to the already-written transcript-only
+                // artifact. Failed delegations have no readable handoff artifacts
+                // except task prompts, handled above.
+                DelegationStatus::Cancelled | DelegationStatus::Failed => {}
+            }
         }
     } else {
         return Err(unavailable_handoff_file_error(delegation.status));
@@ -925,39 +972,46 @@ pub(crate) async fn rpc_list(
     let mut views = Vec::with_capacity(delegations.len());
     for delegation in &delegations {
         let delegation_handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
-        let subagents = state
-            .repo
-            .list_delegation_subagents(&delegation.id)
-            .await?
-            .into_iter()
-            .map(|subagent| {
-                let (cancellation_transcript_path, cancellation_transcript_relative_path) =
-                    if delegation.status == DelegationStatus::Cancelled {
-                        let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
-                        let path = delegation_handoff_dir.join(&relative);
-                        if path.exists() {
-                            (Some(path.to_string_lossy().into_owned()), Some(relative))
-                        } else {
-                            (None, None)
-                        }
+        let subagent_rows = state.repo.list_delegation_subagents(&delegation.id).await?;
+        let mut subagents = Vec::with_capacity(subagent_rows.len());
+        for subagent in subagent_rows {
+            let task_prompt = refresh_task_prompt_artifact(
+                &delegation_handoff_dir,
+                &subagent.session_id,
+                subagent.task.as_deref().unwrap_or_default(),
+            )
+            .await?;
+            let task_prompt_relative_path = task_prompt_rel(&subagent.session_id);
+            let (cancellation_transcript_path, cancellation_transcript_relative_path) =
+                if delegation.status == DelegationStatus::Cancelled {
+                    let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
+                    let path = delegation_handoff_dir.join(&relative);
+                    if path.exists() {
+                        (Some(path.to_string_lossy().into_owned()), Some(relative))
                     } else {
                         (None, None)
-                    };
-                json!({
-                    "id": subagent.session_id,
-                    "status": subagent.activity,
-                    "activity": subagent.activity,
-                    "role": subagent.role,
-                    "type": subagent.subagent_type,
-                    "subagent_type": subagent.subagent_type,
-                    "task": subagent.task,
-                    "steerable": delegation.status == DelegationStatus::Running
-                        && subagent.subagent_type == Some(SubagentType::Full),
-                    "cancellation_transcript_path": cancellation_transcript_path,
-                    "cancellation_transcript_relative_path": cancellation_transcript_relative_path,
-                })
-            })
-            .collect::<Vec<_>>();
+                    }
+                } else {
+                    (None, None)
+                };
+            subagents.push(json!({
+                "id": subagent.session_id,
+                "status": subagent.activity,
+                "activity": subagent.activity,
+                "role": subagent.role,
+                "type": subagent.subagent_type,
+                "subagent_type": subagent.subagent_type,
+                "task_prompt_path": task_prompt.path.to_string_lossy().into_owned(),
+                "task_prompt_relative_path": task_prompt_relative_path.clone(),
+                "task_prompt_file": task_prompt_relative_path,
+                "task_prompt_bytes": task_prompt.bytes,
+                "task_prompt_sha256": task_prompt.sha256,
+                "steerable": delegation.status == DelegationStatus::Running
+                    && subagent.subagent_type == Some(SubagentType::Full),
+                "cancellation_transcript_path": cancellation_transcript_path,
+                "cancellation_transcript_relative_path": cancellation_transcript_relative_path,
+            }));
+        }
         views.push(json!({
             "delegation_id": delegation.id,
             "kind": delegation.kind,

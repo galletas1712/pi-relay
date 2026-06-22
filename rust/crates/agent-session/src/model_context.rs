@@ -161,6 +161,7 @@ impl ModelContext {
                     return saw_open_tail.then_some((summary.last_turn_id, index));
                 }
                 TranscriptItem::UserMessage(_)
+                | TranscriptItem::DaemonToolObservation(_)
                 | TranscriptItem::AssistantMessage(_)
                 | TranscriptItem::ToolCallStarted { .. }
                 | TranscriptItem::ToolResult(_) => saw_open_tail = true,
@@ -201,6 +202,7 @@ impl ModelContext {
                 }
                 TranscriptItem::TurnStarted { .. }
                 | TranscriptItem::UserMessage(_)
+                | TranscriptItem::DaemonToolObservation(_)
                 | TranscriptItem::TurnFinished { .. }
                 | TranscriptItem::CompactionSummary(_) => {}
             }
@@ -242,6 +244,7 @@ impl ModelContext {
                 TranscriptItem::ToolResult(result) => tool_results.push(result.clone()),
                 TranscriptItem::TurnStarted { .. }
                 | TranscriptItem::UserMessage(_)
+                | TranscriptItem::DaemonToolObservation(_)
                 | TranscriptItem::ToolCallStarted { .. }
                 | TranscriptItem::TurnFinished { .. }
                 | TranscriptItem::CompactionSummary(_) => {}

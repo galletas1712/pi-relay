@@ -321,7 +321,7 @@ outcomes each subagent reports in `inspect_delegation`.
 - test:      delegate_writing_task({ role:"tester",
     prompt:<how to test>, workflow:"implement_review_test" })
 
-When the completion steer arrives, branch on the delivered snapshot. Read the
+When the completion observation arrives, branch on the delivered snapshot. Read the
 relevant `final_message.md` only if you need more detail, and call
 `inspect_delegation` only to refresh/recover state or inspect later/running.
 Subagents start fresh, so carry the prior stage's findings into the next stage's
@@ -411,7 +411,7 @@ the existing subagent path; RO subagents reject steer/interrupt by type.
 System-prompt rules for the parent (Appendix B): launch at most one stage per
 turn then end your turn; never poll; never start a second stage while one runs;
 never mix full and RO in one stage; while a full subagent runs, supervise and read
-but do not edit; on a completion steer, branch on the delivered snapshot first.
+but do not edit; on a completion observation, branch on the delivered snapshot first.
 
 The `PythonRepl` tool remains a raw escape hatch only; it is no longer the
 orchestration surface.
@@ -464,7 +464,7 @@ blocking dependency; implementation can start immediately.
 
 | Need | Use | Location |
 | --- | --- | --- |
-| Deliver the completion steer to the parent | `enqueue_session_input(state, SessionInputRequest { priority: InputPriority::Steer, .. })` | `agent-daemon/src/main.rs` (~925); already used by `subagents_steer_host` in `repl.rs` |
+| Deliver the completion observation to the parent | enqueue a typed daemon observation at `InputPriority::Steer` | `agent-daemon/src/delegation_runner.rs` / `agent-store/src/postgres/delegations.rs` |
 | Create a child subagent session | `spawn_subagent` / `subagent_spawn_from_active_parent` | `agent-daemon/src/subagents.rs` |
 | Load a role's `SKILL.md` for a subagent | `resolve_skill_role` | `agent-daemon/src/subagents.rs` |
 | Fork workspace dirs (for RO snapshots) | `WorkspaceManager::fork_session_from_parent` (btrfs/reflink/copy under the hood in `instantiate.rs`) | `agent-daemon/src/workspaces/mod.rs` (~150) |

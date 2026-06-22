@@ -153,12 +153,16 @@ runtime intercepts them and dispatches to the delegation engine in
 `delegate_writing_task` launches the single full/writing delegation subagent;
 `delegate_readonly_tasks` launches a homogeneous fan-out of read-only
 subagents; `inspect_delegation` returns the canonical structured state/outcome
-snapshot (with artifact paths, not inline full transcripts);
+snapshot (with task/final/transcript artifact paths, not inline full prompts or
+transcripts);
 `cancel_delegation` cancels an existing delegation; `steer_subagent` queues an
 additional instruction to a running full subagent. Delegation subagents may produce
 `subagent.spawned`/`subagent.running` progress events, but delegation completion
-arrives later as a parent steer containing an `inspect_delegation`-equivalent
-snapshot plus artifact paths, not as a model tool result or per-child idle event.
+arrives later as a daemon-authored parent observation containing an
+`inspect_delegation`-equivalent snapshot plus artifact paths, not as a per-child
+idle event. Provider adapters render that typed observation as a synthetic
+`inspect_delegation` tool call/result pair while keeping the transcript semantics
+daemon-authored.
 
 Their internal delegation types, handoff `delegation_id`, and web/inspector RPC methods
 (`delegation.start_full`, `delegation.start_readonly_fanout`, `delegation.status`,

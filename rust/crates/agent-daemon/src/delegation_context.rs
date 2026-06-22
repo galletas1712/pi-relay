@@ -91,7 +91,7 @@ fn ledger_header() -> String {
         "Point-in-time compaction ledger for this parent session. It lists every delegation row for the parent session, including running, done, done_with_failures, cancelled, and failed statuses. Per-subagent details and final-message snippets are bounded. Full transcript contents are not inlined.\n\n",
     );
     out.push_str(
-        "This section is appended after provider compaction so fresh delegation facts cross the compaction boundary. Distinguish delegations that completed, were cancelled, or failed before compaction from delegations that were still running at compaction time. A running delegation entry is only a point-in-time fact: do not assume it completed; wait for a later completion steer or call `inspect_delegation`.\n",
+        "This section is appended after provider compaction so fresh delegation facts cross the compaction boundary. Distinguish delegations that completed, were cancelled, or failed before compaction from delegations that were still running at compaction time. A running delegation entry is only a point-in-time fact: do not assume it completed; wait for a later completion observation or call `inspect_delegation`.\n",
     );
     out
 }
@@ -105,7 +105,7 @@ fn empty_compaction_delegation_ledger() -> String {
 fn append_compaction_status_note(out: &mut String, status: DelegationStatus) {
     let note = match status {
         DelegationStatus::Running => {
-            "running at compaction time; point-in-time only; await later completion steer or inspect_delegation"
+            "running at compaction time; point-in-time only; await later completion observation or inspect_delegation"
         }
         DelegationStatus::Done => "completed before compaction",
         DelegationStatus::DoneWithFailures => "completed with failures before compaction",

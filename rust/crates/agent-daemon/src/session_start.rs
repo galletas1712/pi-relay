@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_session::AgentSession;
-use agent_store::{InputPriority, SessionActivity, SessionConfig, SubagentType};
+use agent_store::{
+    InputPriority, QueuedInputContent, SessionActivity, SessionConfig, SubagentType,
+};
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -173,7 +175,10 @@ async fn start_prepared_session_with_driver(
 
     let mut session = AgentSession::new();
     session
-        .enqueue_input(agent_input_from_queued_priority(priority, content.clone()))
+        .enqueue_input(agent_input_from_queued_priority(
+            priority,
+            QueuedInputContent::user_message(content.clone()),
+        ))
         .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
     let mut runtime = RuntimeSession { session, config };
     let (entries, events, actions, active_leaf_id) = collect_runtime_outputs(&mut runtime);

@@ -356,14 +356,26 @@ older ledger text by position. Subagent compaction omits parent/sibling
 delegation state entirely, because subagents do not orchestrate the delegation
 tree.
 
-Delegation completion wakeups are daemon-authored observations, not fabricated
-tool calls. The daemon persists a provider-neutral user-role text message that
-clearly says it observed state equivalent to
-`inspect_delegation({ delegation_id })` and embeds the bounded JSON snapshot.
-This avoids violating provider protocols by inventing assistant tool calls that
-the model did not produce. OpenAI and Anthropic have different tool-call/result
-wire shapes and adjacency constraints; synthetic tool-pair rendering is deferred
-until a provider-specific path is proven safe and covered by request-shape tests.
+Delegation completion wakeups are daemon-authored observations, not
+assistant-authored decisions. The durable transcript stores them as a typed
+`daemon_tool_observation` item with an `inspect_delegation` tool name, stable
+local call id, arguments, status, summary, and bounded JSON snapshot. This keeps
+internal transcript semantics honest: the daemon observed delegation state; the
+assistant did not choose a tool call.
+
+Provider adapters render that typed item in the provider-native synthetic
+tool-call/result shape only at request construction time. OpenAI receives an
+adjacent `function_call` plus `function_call_output` pair without
+provider-generated-looking ids/status. Anthropic receives an adjacent assistant
+`tool_use` message plus user `tool_result` message with a deterministic
+`toolu_...` id. The UI renders the same item as a daemon/system observation, not
+as a user bubble and not as a model-selected tool run. Text fallback rendering is
+kept for unsupported contexts and diagnostics.
+
+Delegation snapshots avoid context-heavy payloads: raw subagent task prompts are
+not inlined, final messages are previewed/bounded, and long bodies are referenced
+via handoff files such as `task_prompt.md`, `final_message.md`, and
+`transcript.md`.
 
 Prompt caching works best when the beginning of the prompt is identical across
 requests. That means the long-lived global system prompt, stable tool
