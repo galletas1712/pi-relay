@@ -60,7 +60,7 @@ import {
 	projectTitle,
 	sessionTitle,
 	isArchivedSession,
-	displayActivity,
+	sessionStatusWithDelegations,
 	sortSessionsByLastUserMessage,
 	tallyActivities,
 	type SessionListItem,
@@ -442,6 +442,10 @@ export function App() {
 			(query.state.data?.delegations ?? []).some(isDelegationRunning) ? 2_000 : false,
 	});
 	const delegations = delegationsQuery.data?.delegations ?? [];
+	// `delegating` status for the selected session: the parent reports idle while
+	// its subagents are still in flight. Only known for the selected session,
+	// whose delegations are fetched above.
+	const hasRunningDelegations = delegations.some(isDelegationRunning);
 	const delegationSubagentIds = useMemo(
 		() => delegations.flatMap((delegation) => delegation.subagents.map((subagent) => subagent.id)),
 		[delegations],
@@ -1967,7 +1971,7 @@ export function App() {
 			? projectTitle(selectedProject)
 			: "pi relay";
 	const mobileActivity = selectedChatSession
-		? displayActivity(loadedSnapshot?.activity ?? selectedChatSession.activity)
+		? sessionStatusWithDelegations(loadedSnapshot?.activity ?? selectedChatSession.activity, hasRunningDelegations)
 		: null;
 	const mobileArchived = selectedChatSession ? isArchivedSession(selectedChatSession) : false;
 	const mobileSessionStatus = selectedChatSession ? (mobileArchived ? "archived" : mobileActivity) : null;
@@ -2069,6 +2073,7 @@ export function App() {
 				entries={loadedEntries}
 				turnCards={turnCardViews}
 				transcriptLoading={transcriptLoading}
+				hasRunningDelegations={hasRunningDelegations}
 				modelOptions={MODEL_OPTIONS}
 				modelValue={providerModelKey(activeProvider)}
 				modelLocked={modelLocked}

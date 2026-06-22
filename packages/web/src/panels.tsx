@@ -23,6 +23,7 @@ import {
 	sessionTitle,
 	displayActivity,
 	type SessionDisplayActivity,
+	type SessionStatus,
 	type SessionListItem
 } from "./sessionList.ts";
 import { truncate } from "./text.ts";
@@ -864,7 +865,7 @@ export function SessionRow({
 
 export function LogHeader({
 	archived,
-	activity,
+	status,
 	title,
 	modelOptions,
 	modelValue,
@@ -878,7 +879,7 @@ export function LogHeader({
 	onToggleRight
 }: {
 	archived: boolean;
-	activity: SessionDisplayActivity | null;
+	status: SessionStatus | null;
 	title: string | null;
 	modelOptions: { id: string; label: string }[];
 	modelValue: string;
@@ -894,8 +895,8 @@ export function LogHeader({
 	return (
 		<div className="log-header">
 			{title ? (
-				<span className={`session-state ${archived ? "archived" : activity ?? "idle"}`}>
-					{archived ? "archived" : activity}
+				<span className={`session-state ${archived ? "archived" : status ?? "idle"}`}>
+					{archived ? "archived" : status}
 				</span>
 			) : null}
 			{title ? (

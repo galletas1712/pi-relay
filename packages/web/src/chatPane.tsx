@@ -1,7 +1,7 @@
 import { memo } from "react";
 import { LogHeader } from "./panels.tsx";
 import type { ModelOption } from "./sessionDefaults.ts";
-import { displayActivity, isArchivedSession, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
+import { isArchivedSession, sessionStatusWithDelegations, sessionTitle, type SessionDisplayInfo } from "./sessionList.ts";
 import { MessageList } from "./transcript.tsx";
 import type { TurnCardView } from "./transcript.tsx";
 import type { ReasoningEffort, SessionSnapshot, TranscriptEntry } from "./types.ts";
@@ -12,6 +12,7 @@ export interface ChatPaneProps {
 	entries: TranscriptEntry[];
 	turnCards?: TurnCardView[] | null;
 	transcriptLoading: boolean;
+	hasRunningDelegations: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
 	modelLocked: boolean;
@@ -39,6 +40,7 @@ export const ChatPane = memo(function ChatPane({
 	entries,
 	turnCards,
 	transcriptLoading,
+	hasRunningDelegations,
 	modelOptions,
 	modelValue,
 	modelLocked,
@@ -66,6 +68,7 @@ export const ChatPane = memo(function ChatPane({
 			<ChatHeader
 				session={session}
 				snapshot={snapshot}
+				hasRunningDelegations={hasRunningDelegations}
 				modelOptions={modelOptions}
 				modelValue={modelValue}
 				modelLocked={modelLocked}
@@ -108,6 +111,7 @@ export function activeLeafIdFromEntries(entries: TranscriptEntry[]): string | nu
 interface ChatHeaderProps {
 	session: SessionDisplayInfo | null;
 	snapshot: SessionSnapshot | null;
+	hasRunningDelegations: boolean;
 	modelOptions: ModelOption[];
 	modelValue: string;
 	modelLocked: boolean;
@@ -123,6 +127,7 @@ interface ChatHeaderProps {
 const ChatHeader = memo(function ChatHeader({
 	session,
 	snapshot,
+	hasRunningDelegations,
 	modelOptions,
 	modelValue,
 	modelLocked,
@@ -145,7 +150,7 @@ const ChatHeader = memo(function ChatHeader({
 	return (
 		<LogHeader
 			archived={archived}
-			activity={session ? displayActivity(snapshot?.activity ?? session.activity) : null}
+			status={session ? sessionStatusWithDelegations(snapshot?.activity ?? session.activity, hasRunningDelegations) : null}
 			title={session ? sessionTitle(session) : null}
 			modelOptions={displayedModelOptions}
 			modelValue={modelValue}
