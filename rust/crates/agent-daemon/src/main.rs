@@ -310,6 +310,7 @@ async fn dispatch_request(
         RpcMethod::StageStatus => stage_tools::rpc_status(state, params).await,
         RpcMethod::StageCancel => stage_tools::rpc_cancel(state, params).await,
         RpcMethod::StageList => stage_tools::rpc_list(state, params).await,
+        RpcMethod::StageReadHandoffFile => stage_tools::rpc_read_handoff_file(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }

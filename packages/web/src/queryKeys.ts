@@ -9,6 +9,8 @@ export const queryKeys = {
 	subagents: (parentSessionId: string | null) => ["subagents", parentSessionId] as const,
 	subagentSummaries: (parentSessionId: string | null, childSessionIds: string[]) =>
 		["subagent-summaries", parentSessionId, ...childSessionIds] as const,
+	stages: (parentSessionId: string | null) => ["stages", parentSessionId] as const,
+	stage: (parentSessionId: string | null, stageId: string) => ["stage", parentSessionId, stageId] as const,
 	session: (sessionId: string, scope: EntryScope = "full_tree") => ["session", sessionId, scope] as const,
 	historyTree: (sessionId: string, lastEventId: number) => ["history-tree", sessionId, lastEventId] as const,
 };

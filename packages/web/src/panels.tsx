@@ -3,12 +3,16 @@ import {
 	ArchiveRestore,
 	Bot,
 	Edit3,
+	FileText,
 	Folder,
 	PanelRightOpen,
 	Plus,
+	RotateCcw,
 	Search,
 	Settings,
+	Square,
 	Trash2,
+	Wand2,
 	X
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
@@ -23,7 +27,24 @@ import {
 	type SessionListItem
 } from "./sessionList.ts";
 import { truncate } from "./text.ts";
-import type { Notice, Project, ReasoningEffort, SessionSnapshot, SessionSummary, SubagentListResult, ToolListing } from "./types.ts";
+import {
+	canReRunStage,
+	isStageRunning,
+	stageStatusLabel,
+	steerableSubagentId,
+} from "./runBoard.ts";
+import type {
+	HandoffFileName,
+	Notice,
+	Project,
+	ReasoningEffort,
+	SessionSnapshot,
+	SessionSummary,
+	Stage,
+	StageSubagent,
+	SubagentListResult,
+	ToolListing,
+} from "./types.ts";
 
 function projectWorkspaceSummary(project: Project): string {
 	return project.workspaces
@@ -118,6 +139,213 @@ function SubagentsSection({
 function roleLabel(session: SessionSummary | undefined): string | null {
 	const role = session?.metadata?.role_name;
 	return typeof role === "string" && role.trim() ? role : null;
+}
+
+export interface RunBoardCallbacks {
+	onSelectSession?: (sessionId: string) => void;
+	onCancelStage: (stageId: string) => void;
+	onSteerSubagent: (subagentSessionId: string) => void;
+	onReRunStage: (stage: Stage) => void;
+	readHandoffFile: (stageId: string, subagentId: string | null, file: HandoffFileName) => Promise<string>;
+}
+
+interface RunBoardProps extends RunBoardCallbacks {
+	parentSessionId: string | null;
+	stages: Stage[];
+	taskBySessionId: Map<string, string | null>;
+	loading: boolean;
+	error: string | null;
+}
+
+type OpenHandoffFile = { key: string; content: string } | { key: string; error: string };
+
+function SubagentRow({
+	stage,
+	subagent,
+	open,
+	onOpenFile,
+	onCloseFile,
+	onSelectSession,
+}: {
+	stage: Stage;
+	subagent: StageSubagent;
+	open: OpenHandoffFile | null;
+	onOpenFile: (subagentId: string, file: HandoffFileName) => void;
+	onCloseFile: () => void;
+	onSelectSession?: (sessionId: string) => void;
+}) {
+	const finalKey = `${subagent.id}:final_message.md`;
+	const transcriptKey = `${subagent.id}:transcript.md`;
+	// Handoff files only exist once the stage is terminal (the daemon writes them
+	// inside the barrier). While running, the row links to the live session only.
+	const handoffReady = !isStageRunning(stage);
+	const openFinal = open && open.key === finalKey ? open : null;
+	const openTranscript = open && open.key === transcriptKey ? open : null;
+	return (
+		<div className="run-board-subagent" role="listitem">
+			<div className="run-board-subagent-head">
+				<button
+					className="link-button"
+					type="button"
+					onClick={() => onSelectSession?.(subagent.id)}
+					title={`open ${subagent.id}`}
+				>
+					<Bot size={12} /> {subagent.role ?? subagent.id.slice(0, 13)}
+				</button>
+				<span className={`subagent-activity ${displayActivity(subagent.status)}`}>
+					{displayActivity(subagent.status)}
+				</span>
+			</div>
+			{handoffReady ? (
+				<div className="run-board-handoff-links">
+					<button
+						className="chip-button"
+						type="button"
+						onClick={() => (openFinal ? onCloseFile() : onOpenFile(subagent.id, "final_message.md"))}
+						title="show final_message.md inline"
+					>
+						<FileText size={11} /> final message
+					</button>
+					<button
+						className="chip-button"
+						type="button"
+						onClick={() => (openTranscript ? onCloseFile() : onOpenFile(subagent.id, "transcript.md"))}
+						title="show transcript.md"
+					>
+						<FileText size={11} /> transcript
+					</button>
+				</div>
+			) : null}
+			{openFinal ? <HandoffFileView open={openFinal} /> : null}
+			{openTranscript ? <HandoffFileView open={openTranscript} /> : null}
+		</div>
+	);
+}
+
+function HandoffFileView({ open }: { open: OpenHandoffFile }) {
+	if ("error" in open) return <p className="error-text run-board-file">{open.error}</p>;
+	return <pre className="run-board-file">{open.content}</pre>;
+}
+
+function StageCard({
+	stage,
+	canReRun,
+	steerableId,
+	open,
+	onOpenFile,
+	onCloseFile,
+	onSelectSession,
+	onCancelStage,
+	onSteerSubagent,
+	onReRunStage,
+}: {
+	stage: Stage;
+	canReRun: boolean;
+	steerableId: string | null;
+	open: OpenHandoffFile | null;
+	onOpenFile: (subagentId: string, file: HandoffFileName) => void;
+	onCloseFile: () => void;
+} & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelStage" | "onSteerSubagent" | "onReRunStage">) {
+	const running = isStageRunning(stage);
+	const title = stage.label ?? stage.workflow ?? stage.stage_id.slice(0, 13);
+	return (
+		<div className="run-board-stage">
+			<div className="run-board-stage-head">
+				<span className={`status-rail ${running ? "running" : "idle"}`} />
+				<span className="run-board-stage-title">
+					{title}
+					<span className="run-board-stage-kind">{stage.kind === "full" ? "full" : "fan-out"}</span>
+				</span>
+				<span className={`subagent-activity ${running ? "running" : "idle"}`}>{stageStatusLabel(stage.status)}</span>
+			</div>
+			<div className="run-board-stage-controls">
+				{running ? (
+					<button className="chip-button" type="button" onClick={() => onCancelStage(stage.stage_id)} title="cancel this stage">
+						<Square size={11} /> cancel
+					</button>
+				) : null}
+				{steerableId ? (
+					<button className="chip-button" type="button" onClick={() => onSteerSubagent(steerableId)} title="steer the full subagent">
+						<Wand2 size={11} /> steer
+					</button>
+				) : null}
+				{canReRun ? (
+					<button className="chip-button" type="button" onClick={() => onReRunStage(stage)} title="re-run this stage">
+						<RotateCcw size={11} /> re-run
+					</button>
+				) : null}
+			</div>
+			<div className="run-board-subagents" role="list">
+				{stage.subagents.map((subagent) => (
+					<SubagentRow
+						key={subagent.id}
+						stage={stage}
+						subagent={subagent}
+						open={open}
+						onOpenFile={onOpenFile}
+						onCloseFile={onCloseFile}
+						onSelectSession={onSelectSession}
+					/>
+				))}
+			</div>
+		</div>
+	);
+}
+
+function RunBoard({
+	parentSessionId,
+	stages,
+	taskBySessionId,
+	loading,
+	error,
+	onSelectSession,
+	onCancelStage,
+	onSteerSubagent,
+	onReRunStage,
+	readHandoffFile,
+}: RunBoardProps) {
+	// Which handoff file (if any) is currently expanded. Keyed by
+	// `${subagentId}:${file}` so only one file is open at a time.
+	const [openFile, setOpenFile] = useState<{ stageId: string; open: OpenHandoffFile } | null>(null);
+
+	const openHandoffFile = (stageId: string, subagentId: string, file: HandoffFileName) => {
+		const key = `${subagentId}:${file}`;
+		setOpenFile({ stageId, open: { key, content: "" } });
+		void readHandoffFile(stageId, subagentId, file)
+			.then((content) => setOpenFile({ stageId, open: { key, content } }))
+			.catch((cause: unknown) =>
+				setOpenFile({ stageId, open: { key, error: cause instanceof Error ? cause.message : String(cause) } }),
+			);
+	};
+
+	return (
+		<section className="inspect-section">
+			<h2>Run board</h2>
+			{!parentSessionId ? <p className="muted">No session selected.</p> : null}
+			{loading ? <p className="muted">Loading stages…</p> : null}
+			{error ? <p className="error-text">{error}</p> : null}
+			{parentSessionId && !loading && !error && stages.length === 0 ? <p className="muted">No stages yet.</p> : null}
+			{parentSessionId && stages.length > 0 ? (
+				<div className="run-board">
+					{stages.map((stage) => (
+						<StageCard
+							key={stage.stage_id}
+							stage={stage}
+							canReRun={canReRunStage(stage, taskBySessionId)}
+							steerableId={steerableSubagentId(stage)}
+							open={openFile && openFile.stageId === stage.stage_id ? openFile.open : null}
+							onOpenFile={(subagentId, file) => openHandoffFile(stage.stage_id, subagentId, file)}
+							onCloseFile={() => setOpenFile(null)}
+							onSelectSession={onSelectSession}
+							onCancelStage={onCancelStage}
+							onSteerSubagent={onSteerSubagent}
+							onReRunStage={onReRunStage}
+						/>
+					))}
+				</div>
+			) : null}
+		</section>
+	);
 }
 
 export interface SidebarProps {
@@ -627,6 +855,11 @@ export function Inspector({
 	subagentSummaries,
 	subagentsLoading,
 	subagentsError,
+	stages,
+	stagesLoading,
+	stagesError,
+	stageTaskBySessionId,
+	runBoard,
 	tools,
 	onSelectSession,
 	onClose
@@ -636,6 +869,11 @@ export function Inspector({
 	subagentSummaries: SessionSummary[];
 	subagentsLoading: boolean;
 	subagentsError: string | null;
+	stages: Stage[];
+	stagesLoading: boolean;
+	stagesError: string | null;
+	stageTaskBySessionId: Map<string, string | null>;
+	runBoard: Omit<RunBoardCallbacks, "onSelectSession">;
 	tools: ToolListing[];
 	onSelectSession?: (sessionId: string) => void;
 	onClose?: () => void;
@@ -689,6 +927,18 @@ export function Inspector({
 					<p className="muted">No session selected.</p>
 				)}
 			</section>
+			<RunBoard
+				parentSessionId={snapshot?.session_id ?? null}
+				stages={stages}
+				taskBySessionId={stageTaskBySessionId}
+				loading={stagesLoading}
+				error={stagesError}
+				onSelectSession={onSelectSession}
+				onCancelStage={runBoard.onCancelStage}
+				onSteerSubagent={runBoard.onSteerSubagent}
+				onReRunStage={runBoard.onReRunStage}
+				readHandoffFile={runBoard.readHandoffFile}
+			/>
 			<SubagentsSection
 				parentSessionId={snapshot?.session_id ?? null}
 				subagents={subagents}

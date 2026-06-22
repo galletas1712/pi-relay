@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use agent_store::{Stage, StageKind, StageStatus, SubagentType};
 use agent_vocab::{ToolCall, ToolResultMessage};
@@ -330,6 +330,159 @@ pub(crate) async fn cancel_core(
     Ok(json!({ "cancelled": true }))
 }
 
+#[derive(Debug, Deserialize)]
+struct ReadHandoffFileParams {
+    stage_id: String,
+    subagent_id: Option<String>,
+    file: String,
+}
+
+/// The handoff files a client may read. `index.json` lives at the stage root;
+/// `final_message.md`/`transcript.md` live under a subagent dir. The variant
+/// determines whether a `subagent_id` is required, which is the whole reason a
+/// caller cannot smuggle an arbitrary filename.
+fn handoff_file_is_stage_root(file: &str) -> std::result::Result<bool, RpcError> {
+    match file {
+        "index.json" => Ok(true),
+        "final_message.md" | "transcript.md" => Ok(false),
+        other => Err(RpcError::new(
+            "invalid_params",
+            format!("file must be one of index.json | final_message.md | transcript.md, got {other}"),
+        )),
+    }
+}
+
+/// Reject any path segment that is not a plain file/dir name. A single
+/// `Component::Normal` with no separators, no `.`/`..`, and no NUL is the only
+/// thing that can ever escape the handoff subtree, so we validate the segment
+/// in isolation before it is ever joined onto the trusted base.
+fn safe_path_segment(segment: &str, field: &str) -> std::result::Result<String, RpcError> {
+    let trimmed = segment.trim();
+    let reject = || {
+        RpcError::new(
+            "invalid_params",
+            format!("{field} is not a valid path segment"),
+        )
+    };
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(reject());
+    }
+    let mut components = Path::new(trimmed).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) if name == std::ffi::OsStr::new(trimmed) => {
+            Ok(trimmed.to_string())
+        }
+        _ => Err(reject()),
+    }
+}
+
+/// Resolve a handoff file request to an absolute path strictly under
+/// `<parent_outer_cwd>/.pi-handoff/<stage_id>/`. Every dynamic segment
+/// (`stage_id`, optional `subagent_id`, `file`) is validated as a single safe
+/// path component, so the result can never traverse out of the handoff subtree.
+fn resolve_handoff_file_path(
+    parent_outer_cwd: &str,
+    stage_id: &str,
+    subagent_id: Option<&str>,
+    file: &str,
+) -> std::result::Result<PathBuf, RpcError> {
+    let is_stage_root = handoff_file_is_stage_root(file)?;
+    let stage_segment = safe_path_segment(stage_id, "stage_id")?;
+    let mut path = Path::new(parent_outer_cwd)
+        .join(HANDOFF_DIR)
+        .join(stage_segment);
+    if is_stage_root {
+        if subagent_id.is_some() {
+            return Err(RpcError::new(
+                "invalid_params",
+                "index.json is read without a subagent_id",
+            ));
+        }
+    } else {
+        let subagent_id = subagent_id.ok_or_else(|| {
+            RpcError::new(
+                "invalid_params",
+                format!("{file} requires a subagent_id"),
+            )
+        })?;
+        path.push(safe_path_segment(subagent_id, "subagent_id")?);
+    }
+    // `file` is already constrained to the three known literals above.
+    path.push(file);
+    Ok(path)
+}
+
+/// Read one handoff file for the run board. The web client cannot read host
+/// files directly; this is the only path through which it reaches the handoff
+/// subtree, and it is scoped to the parent (the stage must belong to it, exactly
+/// like `stage.status`) and traversal-safe (every segment is validated).
+pub(crate) async fn read_handoff_file_core(
+    state: &AppState,
+    parent_session_id: &str,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let params: ReadHandoffFileParams = from_params(params)?;
+    let stage = load_stage_for_parent(state, parent_session_id, &params.stage_id).await?;
+    let parent_config = state
+        .repo
+        .load_session_config(parent_session_id)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let path = resolve_handoff_file_path(
+        &parent_config.outer_cwd,
+        &stage.id,
+        params.subagent_id.as_deref(),
+        &params.file,
+    )?;
+    // Defense in depth: confine the symlink-resolved target under the parent's
+    // handoff dir so a symlink planted inside it cannot escape to an arbitrary
+    // host file. Segment validation above already blocks `..`/abs paths.
+    let handoff_root = Path::new(&parent_config.outer_cwd).join(HANDOFF_DIR);
+    let canonical = match tokio::fs::canonicalize(&path).await {
+        Ok(canonical) => canonical,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RpcError::new(
+                "handoff_file_not_found",
+                "handoff file not found; the stage may not have finished yet",
+            ))
+        }
+        Err(error) => return Err(anyhow::Error::from(error).into()),
+    };
+    let canonical_root = tokio::fs::canonicalize(&handoff_root)
+        .await
+        .map_err(anyhow::Error::from)?;
+    if !canonical.starts_with(&canonical_root) {
+        return Err(RpcError::new(
+            "invalid_params",
+            "resolved handoff path escapes the handoff directory",
+        ));
+    }
+    let content = match tokio::fs::read_to_string(&canonical).await {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RpcError::new(
+                "handoff_file_not_found",
+                "handoff file not found; the stage may not have finished yet",
+            ))
+        }
+        Err(error) => return Err(anyhow::Error::from(error).into()),
+    };
+    Ok(json!({
+        "stage_id": stage.id,
+        "subagent_id": params.subagent_id,
+        "file": params.file,
+        "content": content,
+    }))
+}
+
+pub(crate) async fn rpc_read_handoff_file(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let parent_session_id = parent_session_id_from_params(&params)?;
+    read_handoff_file_core(state, &parent_session_id, params).await
+}
+
 fn parent_session_id_from_params(params: &Value) -> std::result::Result<String, RpcError> {
     let parent_session_id = params
         .get("parent_session_id")
@@ -408,6 +561,7 @@ pub(crate) async fn rpc_list(
                     "status": subagent.activity,
                     "role": subagent.role,
                     "subagent_type": subagent.subagent_type,
+                    "task": subagent.task,
                 })
             })
             .collect::<Vec<_>>();
@@ -474,5 +628,73 @@ pub(crate) async fn run_stage_tool(
             &call.tool_name,
             format!("{}: {}", error.code, error.message),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CWD: &str = "/home/u/.local/state/pi-relay/sessions/parent/cwd";
+
+    #[test]
+    fn resolves_index_json_at_stage_root() {
+        let path = resolve_handoff_file_path(CWD, "stage-1", None, "index.json").unwrap();
+        assert_eq!(
+            path,
+            Path::new(CWD).join(".pi-handoff").join("stage-1").join("index.json")
+        );
+    }
+
+    #[test]
+    fn resolves_subagent_file_under_subagent_dir() {
+        let path =
+            resolve_handoff_file_path(CWD, "stage-1", Some("child-9"), "final_message.md").unwrap();
+        assert_eq!(
+            path,
+            Path::new(CWD)
+                .join(".pi-handoff")
+                .join("stage-1")
+                .join("child-9")
+                .join("final_message.md")
+        );
+    }
+
+    #[test]
+    fn rejects_unknown_file_name() {
+        let error = resolve_handoff_file_path(CWD, "stage-1", None, "secrets.env").unwrap_err();
+        assert_eq!(error.code, "invalid_params");
+    }
+
+    #[test]
+    fn rejects_traversal_in_stage_id() {
+        for evil in ["..", "../other", "a/b", "/etc", "stage/../..", "."] {
+            let error =
+                resolve_handoff_file_path(CWD, evil, None, "index.json").unwrap_err();
+            assert_eq!(error.code, "invalid_params", "stage_id {evil} must be rejected");
+        }
+    }
+
+    #[test]
+    fn rejects_traversal_in_subagent_id() {
+        for evil in ["..", "../x", "a/b", "/abs"] {
+            let error =
+                resolve_handoff_file_path(CWD, "stage-1", Some(evil), "transcript.md").unwrap_err();
+            assert_eq!(error.code, "invalid_params", "subagent_id {evil} must be rejected");
+        }
+    }
+
+    #[test]
+    fn requires_subagent_id_for_subagent_files() {
+        let error =
+            resolve_handoff_file_path(CWD, "stage-1", None, "transcript.md").unwrap_err();
+        assert_eq!(error.code, "invalid_params");
+    }
+
+    #[test]
+    fn rejects_subagent_id_for_index_json() {
+        let error =
+            resolve_handoff_file_path(CWD, "stage-1", Some("child-9"), "index.json").unwrap_err();
+        assert_eq!(error.code, "invalid_params");
     }
 }

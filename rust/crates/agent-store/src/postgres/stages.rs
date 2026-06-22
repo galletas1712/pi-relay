@@ -35,6 +35,7 @@ pub struct StageSubagent {
     pub activity: SessionActivity,
     pub subagent_type: Option<SubagentType>,
     pub role: Option<String>,
+    pub task: Option<String>,
 }
 
 impl PostgresAgentStore {
@@ -121,12 +122,20 @@ impl PostgresAgentStore {
                 .get("role_name")
                 .and_then(Value::as_str)
                 .map(str::to_string);
+            // The subagent's task prompt, persisted at spawn — carried in
+            // stage.list so the run board can re-run a stage without the legacy
+            // subagent.list surface.
+            let task = metadata
+                .get("task")
+                .and_then(Value::as_str)
+                .map(str::to_string);
             let activity = self.activity(&session_id).await?;
             subagents.push(StageSubagent {
                 session_id,
                 activity,
                 subagent_type,
                 role,
+                task,
             });
         }
         Ok(subagents)
