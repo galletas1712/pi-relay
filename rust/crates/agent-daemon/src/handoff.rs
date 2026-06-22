@@ -2,11 +2,12 @@
 //!
 //! On the delegation barrier, for every subagent (success or failure) the daemon
 //! renders two files from the durable Postgres transcript — `final_message.md`
-//! and an exhaustive, greppable `transcript.md` — plus a per-delegation
-//! `index.json` manifest, all under
-//! `<parent.outer_cwd>/.pi-handoff/<delegation_id>/`. Everything renders from
-//! `active_branch` (Ui body mode), so it survives an RO subagent's snapshot
-//! being destroyed and a crashed subagent's partial tail.
+//! and an exhaustive, greppable `transcript.md` — under
+//! `<parent.outer_cwd>/.pi-handoff/<delegation_id>/`. `inspect_delegation` is the
+//! structured manifest/control-flow snapshot; the files remain transcript/detail
+//! artifacts only. Everything renders from `active_branch` (Ui body mode), so it
+//! survives an RO subagent's snapshot being destroyed and a crashed subagent's
+//! partial tail.
 //!
 //! The writer is intentionally idempotent, but normal completion only publishes
 //! these files after it wins the DB terminal-status CAS. That ordering prevents
@@ -20,7 +21,6 @@ use agent_store::{Delegation, DelegationKind, DelegationStatus, HistoryTree};
 use agent_vocab::{
     AssistantMessage, ContentBlock, ToolResultStatus, TranscriptItem, TurnOutcome, UserMessage,
 };
-use serde_json::{json, Value};
 
 use crate::state::AppState;
 use crate::types::RpcError;
@@ -50,6 +50,26 @@ pub(crate) fn subagent_outcome(history: &HistoryTree) -> TurnOutcome {
             _ => None,
         })
         .unwrap_or(TurnOutcome::Crashed)
+}
+
+/// Whether the active branch is at a durable turn boundary. This mirrors the
+/// store's terminality predicate for the active branch, but works from the
+/// `HistoryTree` already loaded to render artifacts.
+pub(crate) fn active_branch_is_terminal(history: &HistoryTree) -> bool {
+    let Some(active_leaf_id) = history.active_leaf_id.as_deref() else {
+        return true;
+    };
+    history
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.id == active_leaf_id)
+        .is_some_and(|entry| {
+            matches!(
+                entry.item,
+                TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_)
+            )
+        })
 }
 
 fn user_message_text(message: &UserMessage) -> String {
@@ -169,11 +189,26 @@ pub(crate) fn extract_suggested_next(final_message: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-struct SubagentHandoff {
-    session_id: String,
-    role: Option<String>,
-    status: &'static str,
-    suggested_next: Option<String>,
+#[derive(Debug, Clone)]
+pub(crate) struct SubagentArtifact {
+    pub(crate) session_id: String,
+    pub(crate) terminal_status: Option<&'static str>,
+    pub(crate) final_message: Option<String>,
+    pub(crate) suggested_next: Option<String>,
+    pub(crate) final_message_path: Option<PathBuf>,
+    pub(crate) transcript_path: PathBuf,
+}
+
+impl SubagentArtifact {
+    pub(crate) fn final_message_rel(&self) -> Option<String> {
+        self.final_message_path
+            .as_ref()
+            .map(|_| format!("{}/final_message.md", self.session_id))
+    }
+
+    pub(crate) fn transcript_rel(&self) -> String {
+        format!("{}/transcript.md", self.session_id)
+    }
 }
 
 pub(crate) fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
@@ -182,98 +217,103 @@ pub(crate) fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> Pat
         .join(delegation_id)
 }
 
-/// Render and write the whole handoff directory for a completed delegation.
-/// This is a pure function of durable transcripts and delegation metadata and
-/// is safe to replay, but it must not be used as the single-flight. The normal
-/// barrier calls it only after winning the `finish_delegation` CAS; otherwise a
-/// cancellation that wins the same race could be left with completed handoff
-/// artifacts. `delegation_status` is the terminal status the caller committed
-/// (`done` vs `done_with_failures`).
-pub(crate) async fn write_delegation_handoff(
+/// Refresh per-subagent handoff artifacts from durable Postgres transcripts.
+///
+/// This writes each subagent's exhaustive `transcript.md` on every call. When
+/// `include_final_messages` is true, it also writes `final_message.md`. Returned
+/// metadata may still include final-message/suggested-next text for terminal
+/// subagents in a running delegation, but normal final-message files are only
+/// published for completed delegations. Running inspections pass `false`: their
+/// transcript files are kept current, but no normal final-message artifact is
+/// published before the completion CAS wins. Cancelled and failed delegations do
+/// not publish normal per-subagent handoff artifacts; cancellation has its own
+/// transcript-only artifact path.
+pub(crate) async fn refresh_delegation_handoff_artifacts(
     state: &AppState,
     delegation: &Delegation,
-    delegation_status: DelegationStatus,
-) -> std::result::Result<PathBuf, RpcError> {
+    include_final_messages: bool,
+) -> std::result::Result<(PathBuf, Vec<SubagentArtifact>), RpcError> {
     let parent_config = state
         .repo
         .load_session_config(&delegation.parent_session_id)
         .await?;
     let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
 
+    if matches!(
+        delegation.status,
+        DelegationStatus::Cancelled | DelegationStatus::Failed
+    ) {
+        return Ok((dir, Vec::new()));
+    }
+
     let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
 
-    let mut manifest = Vec::with_capacity(subagents.len());
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(anyhow::Error::from)?;
+
+    let mut artifacts = Vec::with_capacity(subagents.len());
     for subagent in &subagents {
         let history = state.repo.active_branch(&subagent.session_id).await?;
+        let is_terminal = active_branch_is_terminal(&history);
         let final_message = extract_final_message(&history);
         let transcript = render_transcript_markdown(&history);
         let status = subagent_status(subagent_outcome(&history));
         let suggested_next = extract_suggested_next(&final_message);
+        let include_final_content = match delegation.status {
+            DelegationStatus::Running => is_terminal,
+            DelegationStatus::Done | DelegationStatus::DoneWithFailures => true,
+            DelegationStatus::Cancelled | DelegationStatus::Failed => false,
+        };
 
         let subagent_dir = dir.join(&subagent.session_id);
         tokio::fs::create_dir_all(&subagent_dir)
             .await
             .map_err(anyhow::Error::from)?;
-        tokio::fs::write(
-            subagent_dir.join("final_message.md"),
-            final_message.as_bytes(),
-        )
-        .await
-        .map_err(anyhow::Error::from)?;
-        tokio::fs::write(subagent_dir.join("transcript.md"), transcript.as_bytes())
+        let final_message_path = if include_final_messages {
+            let path = subagent_dir.join("final_message.md");
+            tokio::fs::write(&path, final_message.as_bytes())
+                .await
+                .map_err(anyhow::Error::from)?;
+            Some(path)
+        } else {
+            None
+        };
+        let transcript_path = subagent_dir.join("transcript.md");
+        tokio::fs::write(&transcript_path, transcript.as_bytes())
             .await
             .map_err(anyhow::Error::from)?;
 
-        manifest.push(SubagentHandoff {
+        artifacts.push(SubagentArtifact {
             session_id: subagent.session_id.clone(),
-            role: subagent.role.clone(),
-            status,
-            suggested_next,
+            terminal_status: is_terminal.then_some(status),
+            final_message: include_final_content.then_some(final_message),
+            suggested_next: include_final_content.then_some(suggested_next).flatten(),
+            final_message_path,
+            transcript_path,
         });
     }
 
-    let index = index_json(delegation, delegation_status, &manifest);
-    tokio::fs::write(
-        dir.join("index.json"),
-        serde_json::to_vec_pretty(&index).map_err(anyhow::Error::from)?,
-    )
-    .await
-    .map_err(anyhow::Error::from)?;
+    Ok((dir, artifacts))
+}
 
+/// Render and write the completed delegation's per-subagent handoff files.
+/// This is a pure function of durable transcripts and delegation metadata and
+/// is safe to replay, but it must not be used as the single-flight. The normal
+/// barrier calls it only after winning the `finish_delegation` CAS; otherwise a
+/// cancellation that wins the same race could be left with completed handoff
+/// artifacts.
+pub(crate) async fn write_delegation_handoff(
+    state: &AppState,
+    delegation: &Delegation,
+) -> std::result::Result<PathBuf, RpcError> {
+    let (dir, _) = refresh_delegation_handoff_artifacts(state, delegation, true).await?;
     Ok(dir)
 }
 
-/// The per-delegation `index.json` manifest: the parent's entry point. Paths
-/// are relative to the delegation dir, so the parent navigates without scanning.
-fn index_json(
-    delegation: &Delegation,
-    delegation_status: DelegationStatus,
-    subagents: &[SubagentHandoff],
-) -> Value {
-    let subagents = subagents
-        .iter()
-        .map(|subagent| {
-            json!({
-                "id": subagent.session_id,
-                "role": subagent.role,
-                "status": subagent.status,
-                "suggested_next": subagent.suggested_next,
-                "final_message": format!("{}/final_message.md", subagent.session_id),
-                "transcript": format!("{}/transcript.md", subagent.session_id),
-            })
-        })
-        .collect::<Vec<_>>();
-    json!({
-        "delegation_id": delegation.id,
-        "kind": delegation.kind.as_str(),
-        "workflow": delegation.workflow,
-        "status": delegation_status.as_str(),
-        "subagents": subagents,
-    })
-}
-
 /// The short completion steer delivered to the parent. It names the delegation,
-/// the ok/failed counts, and points at `index.json` — it never inlines messages.
+/// the ok/failed counts, and points at the handoff directory — it never inlines
+/// full transcripts.
 pub(crate) fn steer_message(
     delegation: &Delegation,
     handoff_dir: &Path,
@@ -290,12 +330,12 @@ pub(crate) fn steer_message(
         .as_deref()
         .map(|label| format!(" ({label})"))
         .unwrap_or_default();
-    let index = handoff_dir.join("index.json");
     let mut message = format!(
         "Delegation {} ({kind}){label} finished: {ok} ok, {failed} failed. \
-         Read {}, then the per-subagent final_message.md files.",
+         Use inspect_delegation for the structured snapshot; transcript details \
+         are in {}.",
         delegation.id,
-        index.display(),
+        handoff_dir.display(),
     );
     if !failed_ids.is_empty() {
         message.push_str(&format!(" Failed: {}.", failed_ids.join(", ")));

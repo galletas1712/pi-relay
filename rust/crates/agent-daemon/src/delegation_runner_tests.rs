@@ -62,7 +62,9 @@ use super::{
     complete_delegation_if_ready, sweep_running_delegations_on_boot,
     try_claim_and_publish_completed_delegation,
 };
-use crate::delegation_tools::{cancel_core, run_delegation_tool, steer_subagent_core};
+use crate::delegation_tools::{
+    cancel_core, read_handoff_file_core, run_delegation_tool, status_core, steer_subagent_core,
+};
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(90_000);
 
@@ -445,15 +447,18 @@ async fn steers_to_parent(env: &TestEnv, parent_id: &str, delegation_id: &str) -
         .count()
 }
 
-fn read_index(env: &TestEnv, delegation_id: &str) -> serde_json::Value {
-    let path = env
-        .cwd
-        .path()
-        .join(".pi-handoff")
-        .join(delegation_id)
-        .join("index.json");
-    let raw = std::fs::read_to_string(path).expect("index.json exists");
-    serde_json::from_str(&raw).expect("index.json parses")
+async fn inspect_delegation_snapshot(env: &TestEnv, delegation_id: &str) -> serde_json::Value {
+    status_core(
+        &env.state,
+        "parent",
+        json!({ "delegation_id": delegation_id }),
+    )
+    .await
+    .expect("inspect delegation")
+}
+
+fn handoff_root(env: &TestEnv, delegation_id: &str) -> PathBuf {
+    env.cwd.path().join(".pi-handoff").join(delegation_id)
 }
 
 #[tokio::test]
@@ -808,11 +813,30 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     assert!(transcript.contains("keep working"));
     assert!(transcript.contains("## Assistant"));
     assert!(transcript.contains("working..."));
-    assert!(!env
-        .cwd
-        .path()
-        .join(".pi-handoff")
-        .join(&delegation.id)
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
+    assert_eq!(snapshot["status"], "cancelled");
+    assert_eq!(subagent["status"], "cancelled");
+    assert_eq!(subagent["final_message"], serde_json::Value::Null);
+    assert_eq!(subagent["final_message_path"], serde_json::Value::Null);
+    assert_eq!(
+        subagent["final_message_relative_path"],
+        serde_json::Value::Null
+    );
+    assert_eq!(subagent["final_message_file"], serde_json::Value::Null);
+    assert_eq!(subagent["transcript_path"], serde_json::Value::Null);
+    assert_eq!(
+        subagent["transcript_relative_path"],
+        serde_json::Value::Null
+    );
+    assert_eq!(subagent["transcript_file"], serde_json::Value::Null);
+    assert_eq!(subagent["cancellation_transcript_path"], transcript_path);
+    assert_eq!(
+        subagent["cancellation_transcript_relative_path"],
+        format!("cancelled/{}.transcript.md", "impl_to_cancel")
+    );
+    assert_eq!(snapshot["progress"]["running"], 0);
+    assert!(!handoff_root(&env, &delegation.id)
         .join("index.json")
         .exists());
     assert!(!env
@@ -823,6 +847,53 @@ async fn cancel_delegation_returns_transcript_only_paths() {
         .join("impl_to_cancel")
         .join("final_message.md")
         .exists());
+    assert!(!env
+        .cwd
+        .path()
+        .join(".pi-handoff")
+        .join(&delegation.id)
+        .join("impl_to_cancel")
+        .join("transcript.md")
+        .exists());
+    let normal_read = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "subagent_id": "impl_to_cancel",
+            "file": "transcript.md",
+        }),
+    )
+    .await
+    .expect_err("normal transcript read rejected for cancellation");
+    assert_eq!(normal_read.code, "handoff_file_not_found");
+    assert!(!env
+        .cwd
+        .path()
+        .join(".pi-handoff")
+        .join(&delegation.id)
+        .join("impl_to_cancel")
+        .join("transcript.md")
+        .exists());
+    let cancellation_read = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "file": "cancelled/impl_to_cancel.transcript.md",
+        }),
+    )
+    .await
+    .expect("cancelled transcript readable");
+    assert_eq!(cancellation_read["subagent_id"], "impl_to_cancel");
+    assert_eq!(
+        cancellation_read["file"],
+        "cancelled/impl_to_cancel.transcript.md"
+    );
+    assert!(cancellation_read["content"]
+        .as_str()
+        .expect("cancelled transcript content")
+        .contains("working..."));
     assert_eq!(
         env.state
             .repo
@@ -909,7 +980,7 @@ async fn cancel_delegation_does_not_clobber_completed_delegation_or_write_artifa
             .status,
         DelegationStatus::DoneWithFailures
     );
-    let handoff_root = env.cwd.path().join(".pi-handoff").join(&delegation.id);
+    let handoff_root = handoff_root(&env, &delegation.id);
     assert!(
         !handoff_root.join("cancelled").exists(),
         "cancel-loser must not write transcript-only artifacts"
@@ -1017,12 +1088,23 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     sweep_running_delegations_on_boot(&env.state).await;
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
 
-    // Handoff: index.json + per-subagent files for EVERY subagent (incl. failed).
-    let index = read_index(&env, &delegation.id);
-    assert_eq!(index["status"], "done_with_failures");
-    assert_eq!(index["kind"], "readonly_fanout");
-    assert_eq!(index["workflow"], "implement_review_test");
-    let subagents = index["subagents"].as_array().expect("subagents array");
+    // Handoff: inspect_delegation is the manifest-equivalent snapshot; the
+    // handoff dir contains per-subagent files for EVERY subagent (incl. failed)
+    // but no delegation-root index.json.
+    let root = handoff_root(&env, &delegation.id);
+    assert!(!root.join("index.json").exists());
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    assert_eq!(snapshot["status"], "done_with_failures");
+    assert_eq!(snapshot["kind"], "readonly_fanout");
+    assert_eq!(snapshot["workflow"], "implement_review_test");
+    assert_eq!(snapshot["label"], "review");
+    assert_eq!(snapshot["handoff_dir"], root.to_string_lossy().as_ref());
+    assert_eq!(snapshot["progress"]["expected"], 2);
+    assert_eq!(snapshot["progress"]["spawned"], 2);
+    assert_eq!(snapshot["progress"]["terminal"], 2);
+    assert_eq!(snapshot["progress"]["running"], 0);
+    assert_eq!(snapshot["progress"]["failed"], 1);
+    let subagents = snapshot["subagents"].as_array().expect("subagents array");
     assert_eq!(subagents.len(), 2);
     for subagent in subagents {
         let id = subagent["id"].as_str().unwrap();
@@ -1037,16 +1119,210 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
             "final_message for {id}"
         );
         assert!(base.join("transcript.md").exists(), "transcript for {id}");
+        assert_eq!(
+            subagent["final_message_path"],
+            base.join("final_message.md").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            subagent["transcript_path"],
+            base.join("transcript.md").to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            subagent["final_message_file"],
+            format!("{id}/final_message.md")
+        );
+        assert_eq!(subagent["transcript_file"], format!("{id}/transcript.md"));
     }
     let ok = subagents.iter().find(|s| s["id"] == "ok_a").unwrap();
+    assert_eq!(ok["role"], "reviewer");
+    assert_eq!(ok["type"], "read_only");
+    assert_eq!(ok["subagent_type"], "read_only");
     assert_eq!(ok["status"], "done");
+    assert_eq!(ok["final_message"], "All good.\n\nsuggested_next: approved");
     assert_eq!(ok["suggested_next"], "approved");
+    assert_eq!(ok["steerable"], false);
     let failed = subagents
         .iter()
         .find(|s| s["id"] == "still_running")
         .unwrap();
     assert_eq!(failed["status"], "failed");
     assert_eq!(failed["suggested_next"], serde_json::Value::Null);
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn inspect_delegation_refreshes_artifacts_from_postgres() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "inspect refresh test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            Some("explore"),
+            None,
+            2,
+        )
+        .await
+        .expect("create delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "done_child",
+        "explorer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "Found the answer.\n\nsuggested_next: done",
+    )
+    .await;
+    create_running_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "running_child",
+        "explorer",
+        TurnOutcome::Graceful,
+    )
+    .await;
+
+    let root = handoff_root(&env, &delegation.id);
+    assert!(
+        !root.exists(),
+        "inspection should be the first artifact writer in this test"
+    );
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    assert_eq!(snapshot["status"], "running");
+    assert_eq!(snapshot["progress"]["expected"], 2);
+    assert_eq!(snapshot["progress"]["spawned"], 2);
+    assert_eq!(snapshot["progress"]["terminal"], 1);
+    assert_eq!(snapshot["progress"]["running"], 1);
+    assert_eq!(snapshot["progress"]["failed"], 0);
+    assert!(!root.join("index.json").exists());
+
+    let done = snapshot["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subagent| subagent["id"] == "done_child")
+        .unwrap();
+    assert_eq!(done["status"], "done");
+    assert_eq!(
+        done["final_message"],
+        "Found the answer.\n\nsuggested_next: done"
+    );
+    assert_eq!(done["suggested_next"], "done");
+    assert_eq!(done["final_message_path"], serde_json::Value::Null);
+    assert!(
+        !root.join("done_child").join("final_message.md").exists(),
+        "normal final_message artifact waits for delegation completion"
+    );
+    assert!(
+        std::fs::read_to_string(root.join("done_child").join("transcript.md"))
+            .expect("terminal transcript artifact")
+            .contains("Found the answer.")
+    );
+
+    let running = snapshot["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subagent| subagent["id"] == "running_child")
+        .unwrap();
+    assert_eq!(running["activity"], "idle");
+    assert_eq!(running["status"], "running");
+    assert_eq!(running["final_message"], serde_json::Value::Null);
+    assert_eq!(running["suggested_next"], serde_json::Value::Null);
+    assert_eq!(running["final_message_path"], serde_json::Value::Null);
+    assert!(root.join("running_child").join("transcript.md").exists());
+    assert!(
+        !root.join("running_child").join("final_message.md").exists(),
+        "mid-turn child should not get a premature final_message artifact"
+    );
+
+    // Mutate the stale artifact on disk; a later inspect must refresh it from
+    // the durable Postgres transcript before returning the file path.
+    std::fs::write(
+        root.join("done_child").join("transcript.md"),
+        "stale local artifact",
+    )
+    .expect("overwrite transcript artifact");
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    assert_eq!(snapshot["progress"]["terminal"], 1);
+    let refreshed = std::fs::read_to_string(root.join("done_child").join("transcript.md")).unwrap();
+    assert!(refreshed.contains("Found the answer."));
+    assert!(!refreshed.contains("stale local artifact"));
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn failed_delegation_does_not_publish_normal_handoff_on_inspect_or_read() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "failed inspect test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_failed").await;
+    env.state
+        .repo
+        .set_delegation_status(&delegation.id, DelegationStatus::Failed)
+        .await
+        .expect("mark failed");
+
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
+    assert_eq!(snapshot["status"], "failed");
+    assert_eq!(subagent["status"], "failed");
+    assert_eq!(subagent["final_message"], serde_json::Value::Null);
+    assert_eq!(subagent["final_message_path"], serde_json::Value::Null);
+    assert_eq!(subagent["transcript_path"], serde_json::Value::Null);
+    let root = handoff_root(&env, &delegation.id);
+    assert!(
+        !root.join("impl_failed").join("transcript.md").exists(),
+        "failed inspection must not create normal transcript artifacts"
+    );
+    let error = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "subagent_id": "impl_failed",
+            "file": "transcript.md",
+        }),
+    )
+    .await
+    .expect_err("failed delegation normal read rejected");
+    assert_eq!(error.code, "handoff_file_not_found");
+    assert!(
+        !root.join("impl_failed").join("transcript.md").exists(),
+        "failed read must not create normal transcript artifacts"
+    );
 
     env.cleanup().await;
 }
@@ -1114,7 +1390,7 @@ async fn completion_loser_after_cancellation_does_not_write_normal_handoff() {
             .status,
         DelegationStatus::Cancelled
     );
-    let handoff_root = env.cwd.path().join(".pi-handoff").join(&delegation.id);
+    let handoff_root = handoff_root(&env, &delegation.id);
     assert!(!handoff_root.join("index.json").exists());
     assert!(!handoff_root.join("impl_cancel_wins").exists());
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
@@ -1157,10 +1433,10 @@ async fn out_of_set_suggested_next_is_recorded_verbatim() {
     complete_delegation_if_ready(&env.state, &delegation.id)
         .await
         .expect("barrier");
-    let index = read_index(&env, &delegation.id);
-    assert_eq!(index["status"], "done");
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    assert_eq!(snapshot["status"], "done");
     assert_eq!(
-        index["subagents"][0]["suggested_next"],
+        snapshot["subagents"][0]["suggested_next"],
         "ship_it_immediately"
     );
 
@@ -1632,11 +1908,7 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
         .await
         .expect("find steer")
         .is_none());
-    assert!(!env
-        .cwd
-        .path()
-        .join(".pi-handoff")
-        .join(&delegation.id)
+    assert!(!handoff_root(&env, &delegation.id)
         .join("index.json")
         .exists());
     assert_eq!(
@@ -1652,8 +1924,13 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
         .await
         .expect("find repaired steer")
         .is_some());
-    let index = read_index(&env, &delegation.id);
-    assert_eq!(index["status"], "done");
+    let root = handoff_root(&env, &delegation.id);
+    assert!(!root.join("index.json").exists());
+    assert!(root.join("impl").join("final_message.md").exists());
+    assert!(root.join("impl").join("transcript.md").exists());
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    assert_eq!(snapshot["status"], "done");
+    assert_eq!(snapshot["subagents"][0]["final_message"], "implemented");
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
     assert_eq!(
         durable_parent_completion_steers(&env, "parent", &delegation.id).await,

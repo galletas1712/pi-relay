@@ -114,6 +114,9 @@ function SubagentRow({
 	const handoffReady = delegationHasHandoff(delegation);
 	const openFinal = open && open.key === finalKey ? open : null;
 	const openTranscript = open && open.key === transcriptKey ? open : null;
+	const liveActivity =
+		subagent.activity ??
+		(subagent.status === "idle" || subagent.status === "queued" || subagent.status === "running" ? subagent.status : "idle");
 	return (
 		<div className="run-board-subagent" role="listitem">
 			<div className="run-board-subagent-head">
@@ -125,8 +128,8 @@ function SubagentRow({
 				>
 					<Bot size={12} /> {subagent.role ?? subagent.id.slice(0, 13)}
 				</button>
-				<span className={`subagent-activity ${displayActivity(subagent.status)}`}>
-					{displayActivity(subagent.status)}
+				<span className={`subagent-activity ${displayActivity(liveActivity)}`}>
+					{displayActivity(liveActivity)}
 				</span>
 			</div>
 			{handoffReady ? (
@@ -181,8 +184,6 @@ function DelegationCard({
 } & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onSteerSubagent" | "onReRunDelegation">) {
 	const running = isDelegationRunning(delegation);
 	const title = delegation.label ?? delegation.workflow ?? delegation.delegation_id.slice(0, 13);
-	const indexKey = `delegation:index.json`;
-	const openIndex = open && open.key === indexKey ? open : null;
 	const handoffReady = delegationHasHandoff(delegation);
 	return (
 		<div className="run-board-delegation">
@@ -215,18 +216,7 @@ function DelegationCard({
 						<RotateCcw size={11} /> re-run
 					</button>
 				) : null}
-				{handoffReady ? (
-					<button
-						className="chip-button"
-						type="button"
-						onClick={() => (openIndex ? onCloseFile() : onOpenFile(null, "index.json"))}
-						title="show delegation handoff index.json"
-					>
-						<FileText size={11} /> index.json
-					</button>
-				) : null}
 			</div>
-			{openIndex ? <HandoffFileView open={openIndex} /> : null}
 			<div className="run-board-subagents" role="list">
 				{delegation.subagents.map((subagent) => (
 					<SubagentRow

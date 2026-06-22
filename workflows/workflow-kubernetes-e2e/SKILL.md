@@ -14,7 +14,7 @@ result. You decide what to do with that result.
   workspace and reports their paths). The generic `tester` role carries the
   kubernetes specifics in its delegation prompt.
 
-## Outcomes (suggested_next, in index.json)
+## Outcomes (suggested_next, in inspect_delegation)
 - tester: pass | product_failure | environment_retry | human_needed
 
 ## Control flow

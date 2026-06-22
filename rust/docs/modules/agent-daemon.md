@@ -46,7 +46,7 @@ delegation_tools.rs     delegation tool surface (delegate_writing_task /
 delegation_runner.rs    delegation barrier: all-terminal detect, attempt-fenced finish CAS,
                    idempotent handoff write, one steer to the parent; boot
                    crash sweep
-handoff.rs         renders index.json + per-subagent final_message.md / transcript.md
+handoff.rs         renders per-subagent final_message.md / transcript.md
                    from the durable transcript
 ```
 

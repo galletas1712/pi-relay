@@ -1265,7 +1265,11 @@ Result:
 
 ### `delegation.status`
 
-Returns one in-scope delegation and its current subagent statuses.
+Returns one in-scope delegation as the canonical structured snapshot. The
+snapshot includes delegation metadata, progress counts, subagent roles/types,
+activity/status, steerability, terminal final-message text/suggested_next (when
+available), and handoff artifact paths. It does not inline full transcript
+contents; read the `transcript.md` file when detail is needed.
 
 ```json
 {
@@ -1281,8 +1285,23 @@ Result:
   "delegation_id": "delegation_...",
   "kind": "readonly_fanout",
   "status": "running",
+  "workflow": "implement_review",
+  "label": "review",
+  "progress": { "expected": 2, "spawned": 2, "terminal": 1, "running": 1, "failed": 0 },
   "subagents": [
-    { "id": "session_...", "status": "running" }
+    {
+      "id": "session_...",
+      "role": "reviewer",
+      "type": "read_only",
+      "subagent_type": "read_only",
+      "activity": "idle",
+      "status": "done",
+      "steerable": false,
+      "final_message": "Looks good.\n\nsuggested_next: approved",
+      "suggested_next": "approved",
+      "final_message_path": null,
+      "transcript_path": "/.../.pi-handoff/delegation_.../session_.../transcript.md"
+    }
   ],
   "handoff_dir": "/.../.pi-handoff/delegation_..."
 }
@@ -1339,9 +1358,13 @@ Result:
 
 ### `delegation.read_handoff_file`
 
-Reads `index.json` from the delegation root, or `final_message.md` /
-`transcript.md` from a delegation subagent directory. `index.json` is read
-without `subagent_id`; subagent files require it.
+Reads a valid delegation handoff file. Normal running/done delegations expose
+per-subagent `transcript.md`; terminal done/done_with_failures delegations also
+expose per-subagent `final_message.md`. Cancelled delegations expose only the
+transcript-only cancellation artifact path reported by `inspect_delegation`, for
+example `cancelled/<subagent_id>.transcript.md`. The structured delegation
+snapshot comes from `delegation.status`/`inspect_delegation`, not from a handoff
+manifest file.
 
 ```json
 {
@@ -1369,8 +1392,9 @@ When a delegation subagent is spawned or re-driven, the daemon may emit
 parent-scoped `subagent.spawned` and `subagent.running` progress events. These
 are progress hints only. Parent-visible delegation completion is not a per-child
 `subagent.idle`; it is one `InputPriority::Steer` queued to the parent after the
-delegation barrier completes, pointing at the handoff directory (`index.json` plus
-per-subagent `final_message.md`/`transcript.md`).
+delegation barrier completes, pointing at the handoff directory. Use
+`inspect_delegation`/`delegation.status` for structured state and the
+per-subagent `final_message.md`/`transcript.md` files for details.
 
 `subagent.idle` remains an event type for non-delegation subagent compatibility
 (for example, defensive dispatch-failure compensation). When emitted, idle

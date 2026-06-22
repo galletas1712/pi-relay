@@ -152,9 +152,10 @@ runtime intercepts them and dispatches to the delegation engine in
 `delegation_tools.rs`.
 `delegate_writing_task` launches the single full/writing delegation subagent;
 `delegate_readonly_tasks` launches a homogeneous fan-out of read-only
-subagents; `inspect_delegation` and `cancel_delegation` inspect or cancel an
-existing delegation; `steer_subagent` queues an additional instruction to a
-running full subagent. Delegation subagents may produce
+subagents; `inspect_delegation` returns the canonical structured state/outcome
+snapshot (with artifact paths, not inline full transcripts);
+`cancel_delegation` cancels an existing delegation; `steer_subagent` queues an
+additional instruction to a running full subagent. Delegation subagents may produce
 `subagent.spawned`/`subagent.running` progress events, but delegation completion
 arrives later as a parent steer pointing at the handoff directory, not as a
 model tool result or per-child idle event.

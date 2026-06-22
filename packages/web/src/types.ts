@@ -120,17 +120,32 @@ export interface EventFrame {
 
 export type DelegationKind = "full" | "readonly_fanout";
 export type DelegationStatus = "running" | "done" | "done_with_failures" | "cancelled" | "failed";
+export type DelegationSubagentStatus = DelegationStatus | "idle" | "queued" | "done";
 export type SubagentType = "full" | "read_only";
 
-/** A subagent row inside a delegation. `status` is the live session activity
- * (idle/running), not the delegation-level status; the durable per-subagent
- * outcome lives in the handoff index.json. */
+/** A subagent row inside a delegation. List responses keep `status` as live
+ * session activity for board compatibility; rich `delegation.status` /
+ * `inspect_delegation` responses may also carry terminal outcome fields and
+ * artifact paths. */
 export interface DelegationSubagent {
 	id: string;
-	status: Activity;
+	status: Activity | DelegationSubagentStatus;
+	activity?: Activity;
 	role?: string | null;
+	type?: SubagentType | null;
 	subagent_type?: SubagentType | null;
 	task?: string | null;
+	steerable?: boolean;
+	final_message?: string | null;
+	suggested_next?: string | null;
+	final_message_path?: string | null;
+	final_message_relative_path?: string | null;
+	final_message_file?: string | null;
+	transcript_path?: string | null;
+	transcript_relative_path?: string | null;
+	transcript_file?: string | null;
+	cancellation_transcript_path?: string | null;
+	cancellation_transcript_relative_path?: string | null;
 }
 
 export interface Delegation {
@@ -148,7 +163,7 @@ export interface DelegationListResult {
 	delegations: Delegation[];
 }
 
-export type HandoffFileName = "index.json" | "final_message.md" | "transcript.md";
+export type HandoffFileName = "final_message.md" | "transcript.md";
 
 export interface ReadHandoffFileResult {
 	delegation_id: string;

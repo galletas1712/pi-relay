@@ -7,10 +7,10 @@ export function isDelegationRunning(delegation: Delegation): boolean {
 	return delegation.status === "running";
 }
 
-/** The daemon only writes handoff files from the delegation barrier, which
- * completes delegations as `done` or `done_with_failures`. Other terminal
- * states are real, but do not have an index.json or per-subagent handoff files
- * behind them. */
+/** The daemon writes normal per-subagent handoff files from the delegation
+ * barrier, which completes delegations as `done` or `done_with_failures`.
+ * Other terminal states are real, but only completed delegations expose the
+ * normal final_message/transcript artifact links in the board. */
 export function delegationHasHandoff(delegation: Delegation): boolean {
 	return delegation.status === "done" || delegation.status === "done_with_failures";
 }
