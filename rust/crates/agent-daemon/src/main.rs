@@ -83,8 +83,8 @@ async fn main() -> Result<()> {
     };
 
     // Complete any delegation that crashed mid-barrier: a `running` delegation whose
-    // subagents are all terminal is finished (handoff + steer) exactly once via
-    // the same attempt-fenced CAS the live barrier uses.
+    // subagents are all terminal is finished (handoff + wakeup observation)
+    // exactly once via the same attempt-fenced CAS the live barrier uses.
     //
     // This runs AFTER the global stale-mark above, but that ordering is safe:
     // delegation terminality is transcript-boundary based, independent of action
@@ -848,7 +848,8 @@ pub(crate) async fn input_user(
     // Server-side guard: a read-only subagent must never be steered. The legacy
     // client-only check is not authoritative, so reject a Steer-priority input
     // targeting a read_only subagent here. Follow-up inputs (and the barrier's
-    // top-level parent steer, which is never read_only) are unaffected.
+    // top-level parent wakeup observation, which targets a parent session) are
+    // unaffected.
     if priority == InputPriority::Steer
         && state.repo.session_subagent_type(&session_id).await? == Some(SubagentType::ReadOnly)
     {

@@ -306,14 +306,15 @@ impl PostgresAgentStore {
     /// This is an attempt-fenced `running -> done|done_with_failures` CAS. The
     /// CAS must run before normal handoff publishing so a concurrent
     /// `delegation.cancel` cannot win and then receive a normal completed
-    /// handoff. The parent steer is intentionally NOT enqueued here: the runner
-    /// publishes handoff files first, then enqueues the deterministic steer, so
-    /// the parent is never pointed at missing files during normal operation.
+    /// handoff. The parent wakeup is intentionally NOT enqueued here: the runner
+    /// publishes handoff files first, then enqueues the deterministic typed
+    /// wakeup observation, so the parent is never pointed at missing files
+    /// during normal operation.
     ///
-    /// A crash after this CAS but before file/steer publication leaves a
-    /// terminal delegation with no steer. The daemon boot sweep repairs that by
-    /// re-rendering terminal handoffs and idempotently enqueueing any missing
-    /// deterministic steer for completed delegations.
+    /// A crash after this CAS but before file/wakeup publication leaves a
+    /// terminal delegation with no wakeup observation. The daemon boot sweep
+    /// repairs that by re-rendering terminal handoffs and idempotently
+    /// enqueueing any missing deterministic wakeup for completed delegations.
     pub async fn finish_delegation(
         &self,
         delegation_id: &str,
@@ -332,12 +333,12 @@ impl PostgresAgentStore {
         Ok(updated == 1)
     }
 
-    /// Enqueue the legacy parent delegation-completion text steer with the deterministic
-    /// delegation/attempt key. This is idempotent via the unique
-    /// `(session_id, client_input_id)` index, so boot repair or a replay can call
-    /// it again without creating a duplicate. The runner calls this only after
-    /// normal handoff files exist, so the parent message never races ahead of the
-    /// files it references.
+    /// Enqueue a parent wakeup with the deterministic delegation/attempt key.
+    /// This legacy text-steer compatibility path remains idempotent via the
+    /// unique `(session_id, client_input_id)` index, so boot repair or a replay
+    /// can call it again without creating a duplicate. Current delegation
+    /// completion delivery uses `enqueue_delegation_observation` so daemon facts
+    /// are stored as a typed observation rather than human/user message text.
     pub async fn enqueue_delegation_steer(
         &self,
         parent_session_id: &str,
@@ -488,9 +489,9 @@ impl PostgresAgentStore {
 
     /// Completed delegations that may need boot-time publication repair. The
     /// normal barrier claims the terminal status before writing files/enqueueing
-    /// the parent steer; if the daemon crashes in that narrow gap, these rows
-    /// are no longer `running` and therefore are not covered by the ordinary
-    /// running-delegation sweep.
+    /// the parent wakeup observation; if the daemon crashes in that narrow gap,
+    /// these rows are no longer `running` and therefore are not covered by the
+    /// ordinary running-delegation sweep.
     pub async fn list_completed_delegations_for_repair(&self) -> Result<Vec<Delegation>> {
         let rows = sqlx::query(
             r#"
@@ -506,10 +507,10 @@ impl PostgresAgentStore {
     }
 }
 
-/// Insert the parent's delegation-completion text steer as a durable queued input inside
-/// the caller's transaction, idempotent on `(session_id, client_input_id)`. A
-/// re-run with the same key (replay/boot sweep) inserts nothing and emits no
-/// duplicate event. Mirrors the steer branch of `enqueue_user_input`.
+/// Insert a text steer as a durable queued input inside the caller's
+/// transaction, idempotent on `(session_id, client_input_id)`. A re-run with
+/// the same key inserts nothing and emits no duplicate event. Mirrors the steer
+/// branch of `enqueue_user_input`.
 async fn enqueue_steer_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     parent_session_id: &str,

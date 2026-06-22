@@ -42,8 +42,9 @@ See [agent-tools](../modules/agent-tools.md) for the full registry. In brief:
 - **LoadSkill** activates a named skill.
 - **Delegation tools** (`delegate_writing_task`, `delegate_readonly_tasks`,
   `inspect_delegation`, `cancel_delegation`) are uniform JSON tools handled by
-  the stage runtime; stage completion is reported later via a steer containing
-  an `inspect_delegation`-equivalent snapshot and handoff artifact paths.
+  the stage runtime; stage completion is reported later via a daemon-authored
+  wakeup observation containing an `inspect_delegation`-equivalent bounded
+  snapshot and handoff artifact paths.
 
 Tools are registered through `ToolDescriptor` / `ProviderTool` in
 `agent-tools/src/registry.rs`, which already separates the model-visible

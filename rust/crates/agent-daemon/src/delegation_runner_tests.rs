@@ -1,4 +1,4 @@
-//! Deterministic delegation barrier / handoff / steer tests against a real Postgres.
+//! Deterministic delegation barrier / handoff / wakeup-observation tests against a real Postgres.
 //!
 //! These drive the barrier directly (the live lifecycle hook and the boot
 //! sweep both funnel through `complete_delegation_if_ready`), with subagents placed
@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 use agent_provider::ModelTranscriptEntry;
 use agent_session::{AgentSession, ModelContext, SessionAction, TranscriptStorageNode};
 use agent_store::{
-    DelegationKind, DelegationStatus, EventType, InputPriority, PostgresAgentStore,
+    Delegation, DelegationKind, DelegationStatus, EventType, InputPriority, PostgresAgentStore,
     QueuedInputStatus, SessionConfig, SubagentType,
 };
 use agent_tools::ToolRegistry;
@@ -176,7 +176,8 @@ fn session_config(env: &TestEnv, project_id: Uuid, metadata: serde_json::Value) 
 }
 
 /// A parent session that opts into the harness, so any model dispatch the
-/// barrier's steer triggers stops at `pending` instead of calling a provider.
+/// barrier's wakeup observation triggers stops at `pending` instead of calling
+/// a provider.
 async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
     env.state
         .repo
@@ -463,7 +464,11 @@ async fn parent_completion_observations(
         .collect()
 }
 
-async fn steers_to_parent(env: &TestEnv, parent_id: &str, delegation_id: &str) -> usize {
+async fn wakeup_observations_to_parent(
+    env: &TestEnv,
+    parent_id: &str,
+    delegation_id: &str,
+) -> usize {
     parent_completion_observations(env, parent_id, delegation_id)
         .await
         .len()
@@ -947,7 +952,7 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
     assert!(ledger.contains("status: failed"));
     assert!(ledger.contains("failed before compaction"));
     assert!(ledger.contains("transcript_file: null"));
-    assert!(ledger.contains("Full transcript contents are not inlined"));
+    assert!(ledger.contains("Full transcript and final-message contents are not inlined"));
     assert!(!ledger.contains("## User"));
     assert!(!ledger.contains("## Assistant"));
     assert!(!ledger.contains("transcript body"));
@@ -1783,7 +1788,7 @@ async fn cancel_delegation_does_not_clobber_completed_delegation_or_write_artifa
 }
 
 #[tokio::test]
-async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent() {
+async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_subagent() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -1847,14 +1852,18 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
             .status,
         DelegationStatus::Running
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        0
+    );
 
     // Settle the second subagent terminal at a Crashed boundary — the barrier
     // classifies a non-graceful TurnFinished as a failure, exactly as a child
     // that died mid-task and was recovered to a boundary would appear.
     settle_subagent_terminal(&env, "still_running", &boundary_leaf).await;
 
-    // Now all terminal -> exactly one steer, done_with_failures, handoff for all.
+    // Now all terminal -> exactly one wakeup observation, done_with_failures,
+    // handoff for all.
     complete_delegation_if_ready(&env.state, &delegation.id)
         .await
         .expect("barrier (complete)");
@@ -1868,14 +1877,21 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
             .status,
         DelegationStatus::DoneWithFailures
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
-    // Re-delivered events must not double-steer (idempotent via the CAS).
+    // Re-delivered events must not double-publish a wakeup (idempotent via the
+    // CAS).
     complete_delegation_if_ready(&env.state, &delegation.id)
         .await
         .expect("barrier (replay)");
     sweep_running_delegations_on_boot(&env.state).await;
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
     // Handoff: inspect_delegation is the control-flow snapshot; the
     // handoff dir contains per-subagent files for EVERY subagent (incl. failed)
@@ -2194,7 +2210,10 @@ async fn completion_loser_after_cancellation_does_not_write_normal_handoff() {
     let handoff_root = handoff_root(&env, &delegation.id);
     assert!(!handoff_root.join("index.json").exists());
     assert!(!handoff_root.join("impl_cancel_wins").exists());
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        0
+    );
 
     env.cleanup().await;
 }
@@ -2475,11 +2494,17 @@ async fn boot_sweep_completes_a_crash_mid_barrier_delegation_exactly_once() {
             .status,
         DelegationStatus::Done
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
-    // A second sweep (another restart) must not double-steer.
+    // A second sweep (another restart) must not double-publish a wakeup.
     sweep_running_delegations_on_boot(&env.state).await;
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
     env.cleanup().await;
 }
@@ -2633,18 +2658,25 @@ async fn parent_idle_rows(env: &TestEnv, parent_id: &str) -> usize {
         .count()
 }
 
-/// Count durable parent `input.queued` completion-steer events for a delegation.
+fn delegation_wakeup_client_input_id(delegation: &Delegation) -> String {
+    format!(
+        "delegation-steer:{}:{}",
+        delegation.id, delegation.attempt_id
+    )
+}
+
+/// Durable parent `input.queued` wakeup-observation events for a delegation.
 ///
 /// This is intentionally based on the persistent event log rather than the
-/// queue row or parent transcript: if replay accidentally publishes a second
-/// steer with a fresh/non-deterministic client id, the row and transcript checks
-/// can miss it after the first steer is already consumed, but the event log keeps
-/// both publishes.
-async fn durable_parent_completion_steers(
+/// active queue: after the parent consumes the deterministic wakeup, the queue
+/// row may no longer be active, but the event log still records whether that
+/// client-input key was published exactly once.
+async fn durable_parent_wakeup_observation_events(
     env: &TestEnv,
     parent_id: &str,
-    delegation_id: &str,
-) -> usize {
+    delegation: &Delegation,
+) -> Vec<serde_json::Value> {
+    let client_input_id = delegation_wakeup_client_input_id(delegation);
     env.state
         .repo
         .events_after(parent_id, None)
@@ -2658,32 +2690,71 @@ async fn durable_parent_completion_steers(
                     .get("priority")
                     .and_then(serde_json::Value::as_str)
                     == Some(InputPriority::Steer.as_str())
-                && event_payload_text_mentions(&event.data, delegation_id, "completed")
+                && event
+                    .data
+                    .get("client_input_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(client_input_id.as_str())
         })
-        .count()
+        .map(|event| event.data)
+        .collect()
 }
 
-fn event_payload_text_mentions(
-    payload: &serde_json::Value,
-    delegation_id: &str,
-    other_needle: &str,
-) -> bool {
-    payload_texts(payload)
-        .iter()
-        .any(|text| text.contains(delegation_id) && text.contains(other_needle))
-}
+fn assert_minimal_wakeup_event_payload(payload: &serde_json::Value, client_input_id: &str) {
+    assert_eq!(
+        payload.get("priority").and_then(serde_json::Value::as_str),
+        Some(InputPriority::Steer.as_str())
+    );
+    assert_eq!(
+        payload.get("status").and_then(serde_json::Value::as_str),
+        Some(QueuedInputStatus::Queued.as_str())
+    );
+    assert_eq!(
+        payload
+            .get("client_input_id")
+            .and_then(serde_json::Value::as_str),
+        Some(client_input_id)
+    );
 
-fn payload_texts(value: &serde_json::Value) -> Vec<&str> {
-    match value {
-        serde_json::Value::String(text) => vec![text.as_str()],
-        serde_json::Value::Array(items) => items.iter().flat_map(payload_texts).collect(),
-        serde_json::Value::Object(map) => ["message", "content", "text", "summary"]
-            .into_iter()
-            .filter_map(|key| map.get(key))
-            .flat_map(payload_texts)
-            .collect(),
-        _ => Vec::new(),
+    for field in [
+        "content_type",
+        "content",
+        "editable",
+        "summary",
+        "tool_name",
+        "delegation_id",
+        "result_json",
+        "result",
+    ] {
+        assert!(
+            payload.get(field).is_none(),
+            "typed daemon wakeup input.queued payload should not inline {field}: {payload}"
+        );
     }
+
+    let queued = payload["queued_inputs"]
+        .as_array()
+        .expect("queued inputs")
+        .iter()
+        .find(|input| {
+            input
+                .get("client_input_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(client_input_id)
+        })
+        .expect("wakeup queue projection");
+    assert_eq!(queued["content_type"], "daemon_tool_observation");
+    assert_eq!(queued["content"], json!([]));
+    assert_eq!(queued["editable"], false);
+    assert!(queued.get("summary").is_none());
+    assert!(queued.get("tool_name").is_none());
+    assert!(queued.get("result_json").is_none());
+
+    let payload_text = payload.to_string();
+    assert!(!payload_text.contains("completed"));
+    assert!(!payload_text.contains("implemented"));
+    assert!(!payload_text.contains("inspect_delegation"));
+    assert!(!payload_text.contains("subagents"));
 }
 
 /// FIX A: a fan-out whose subagent #1 is terminal while #2 has not yet been
@@ -2736,9 +2807,13 @@ async fn partial_spawn_does_not_complete_delegation() {
             .status,
         DelegationStatus::Running
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        0
+    );
 
-    // The sibling arrives terminal too; now the full set exists -> one steer.
+    // The sibling arrives terminal too; now the full set exists -> one wakeup
+    // observation.
     create_terminal_subagent(
         &env,
         project_id,
@@ -2764,16 +2839,20 @@ async fn partial_spawn_does_not_complete_delegation() {
             .status,
         DelegationStatus::Done
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
     env.cleanup().await;
 }
 
 /// Simulate a crash after the finish_delegation status claim but before handoff
-/// files / steer publication. Boot repair must publish the files, enqueue the
-/// deterministic steer, and remain idempotent on later restarts.
+/// files / wakeup-observation publication. Boot repair must publish the files,
+/// enqueue the deterministic daemon-authored observation, and remain idempotent
+/// on later restarts.
 #[tokio::test]
-async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
+async fn boot_repair_publishes_handoff_and_wakeup_observation_after_finish_claim_crash() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -2805,10 +2884,7 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     .await;
 
     // Claim only the terminal status, then "crash" before normal publication.
-    let key = format!(
-        "delegation-steer:{}:{}",
-        delegation.id, delegation.attempt_id
-    );
+    let key = delegation_wakeup_client_input_id(&delegation);
     assert!(env
         .state
         .repo
@@ -2824,13 +2900,15 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
         .repo
         .find_client_input("parent", &key)
         .await
-        .expect("find steer")
+        .expect("find wakeup")
         .is_none());
     assert!(!handoff_root(&env, &delegation.id)
         .join("index.json")
         .exists());
     assert_eq!(
-        durable_parent_completion_steers(&env, "parent", &delegation.id).await,
+        durable_parent_wakeup_observation_events(&env, "parent", &delegation)
+            .await
+            .len(),
         0
     );
 
@@ -2840,7 +2918,7 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
         .repo
         .find_client_input("parent", &key)
         .await
-        .expect("find repaired steer")
+        .expect("find repaired wakeup")
         .is_some());
     let root = handoff_root(&env, &delegation.id);
     assert!(!root.join("index.json").exists());
@@ -2848,26 +2926,31 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     assert!(root.join("impl").join("transcript.md").exists());
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["status"], "done");
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
     let wakeup_snapshot = parent_completion_snapshot(&env, "parent", &delegation.id).await;
     assert_eq!(wakeup_snapshot, snapshot);
     assert_eq!(
         wakeup_snapshot["subagents"][0]["transcript_file"],
         "impl/transcript.md"
     );
+    let wakeup_events = durable_parent_wakeup_observation_events(&env, "parent", &delegation).await;
     assert_eq!(
-        durable_parent_completion_steers(&env, "parent", &delegation.id).await,
+        wakeup_events.len(),
         1,
         "first repair publishes exactly one durable completion observation"
     );
+    assert_minimal_wakeup_event_payload(&wakeup_events[0], &key);
 
     let repaired_input = env
         .state
         .repo
         .find_client_input("parent", &key)
         .await
-        .expect("find repaired steer")
-        .expect("repaired steer exists");
+        .expect("find repaired wakeup")
+        .expect("repaired wakeup exists");
     assert!(matches!(
         repaired_input.status,
         QueuedInputStatus::Queued | QueuedInputStatus::Consuming | QueuedInputStatus::Consumed
@@ -2883,15 +2966,20 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
         .repo
         .find_client_input("parent", &key)
         .await
-        .expect("find repaired steer after replay")
-        .expect("repaired steer still exists");
+        .expect("find repaired wakeup after replay")
+        .expect("repaired wakeup still exists");
     assert_eq!(
         repaired_again.input_id, repaired_input.input_id,
-        "deterministic steer client id reuses the original row"
+        "deterministic wakeup client id reuses the original row"
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
     assert_eq!(
-        durable_parent_completion_steers(&env, "parent", &delegation.id).await,
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
+    assert_eq!(
+        durable_parent_wakeup_observation_events(&env, "parent", &delegation)
+            .await
+            .len(),
         1,
         "second repair must not publish any duplicate durable completion observation"
     );
@@ -2901,7 +2989,7 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
 
 /// FIX C: a delegation subagent at a NON-boundary leaf (mid-turn) with its action
 /// stale-marked (as the boot stale-mark does) and no queued input must NOT cause
-/// the boot sweep to complete/steer the delegation.
+/// the boot sweep to complete/wake the delegation.
 #[tokio::test]
 async fn boot_sweep_does_not_complete_mid_turn_subagent() {
     let Some(env) = test_env().await else {
@@ -2954,13 +3042,17 @@ async fn boot_sweep_does_not_complete_mid_turn_subagent() {
             .status,
         DelegationStatus::Running
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        0
+    );
 
     env.cleanup().await;
 }
 
 /// FIX D: a terminal delegation member produces ZERO parent-visible `subagent.idle`
-/// rows, yet the single delegation steer is still delivered (and the once-gate fired).
+/// rows, yet the single delegation wakeup observation is still delivered (and
+/// the once-gate fired).
 /// Driven through the LIVE seam (`handle_subagent_terminal_for_parent_if_needed`), which
 /// is FIX F's live-seam coverage for the suppression path.
 #[tokio::test]
@@ -3001,7 +3093,8 @@ async fn terminal_delegation_member_yields_zero_parent_idle_rows() {
 
     // Zero per-child idle surfaced to the parent...
     assert_eq!(parent_idle_rows(&env, "parent").await, 0);
-    // ...yet the delegation completed and the single steer was delivered.
+    // ...yet the delegation completed and the single wakeup observation was
+    // delivered.
     assert_eq!(
         env.state
             .repo
@@ -3012,7 +3105,10 @@ async fn terminal_delegation_member_yields_zero_parent_idle_rows() {
             .status,
         DelegationStatus::Done
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
     env.cleanup().await;
 }
@@ -3170,11 +3266,11 @@ async fn dispatch_failure_for_delegation_member_emits_no_parent_idle() {
     env.cleanup().await;
 }
 
-/// FIX F: two sibling delegation members reaching idle through the LIVE seam — one
-/// triggering recovery of the other — steer the parent EXACTLY once, and neither
-/// surfaces a per-child idle.
+/// FIX F: two sibling delegation members reaching idle through the LIVE seam —
+/// one triggering recovery of the other — wake the parent EXACTLY once, and
+/// neither surfaces a per-child idle.
 #[tokio::test]
-async fn two_siblings_steer_parent_exactly_once_via_live_seam() {
+async fn two_siblings_wake_parent_exactly_once_via_live_seam() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -3241,7 +3337,10 @@ async fn two_siblings_steer_parent_exactly_once_via_live_seam() {
             .status,
         DelegationStatus::Done
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
     env.cleanup().await;
 }
