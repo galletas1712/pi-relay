@@ -5,7 +5,6 @@ import {
 	reRunParamsForDelegation,
 	delegationHasHandoff,
 	delegationStatusLabel,
-	steerableSubagentId,
 } from "./delegationBoard.ts";
 import type { Delegation } from "./types.ts";
 
@@ -79,17 +78,6 @@ describe("delegationHasHandoff", () => {
 		expect(delegationHasHandoff(fullDelegation({ status: "running" }))).toBe(false);
 		expect(delegationHasHandoff(fullDelegation({ status: "cancelled" }))).toBe(false);
 		expect(delegationHasHandoff(fullDelegation({ status: "failed" }))).toBe(false);
-	});
-});
-
-describe("steerableSubagentId", () => {
-	it("returns the full subagent only while the delegation is running", () => {
-		expect(steerableSubagentId(fullDelegation({ status: "running" }))).toBe("child-1");
-		expect(steerableSubagentId(fullDelegation({ status: "done" }))).toBeNull();
-	});
-
-	it("never returns a read-only fan-out member", () => {
-		expect(steerableSubagentId(fanoutDelegation({ status: "running" }))).toBeNull();
 	});
 });
 

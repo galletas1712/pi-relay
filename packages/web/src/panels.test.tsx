@@ -186,12 +186,12 @@ describe("Inspector run board handoff details", () => {
 		});
 
 		expect(html).toContain("handoff /workspace/.pi-handoff/delegation-1");
-		expect(html).toContain("task_prompt.md");
 		expect(html).toContain("final_message.md");
 		expect(html).toContain("transcript.md");
-		expect(html).toContain("task prompt");
 		expect(html).toContain("final message");
 		expect(html).toContain("transcript");
+		expect(html).not.toContain("task_prompt.md");
+		expect(html).not.toContain("task prompt");
 		expect(html).not.toContain("index.json");
 	});
 
