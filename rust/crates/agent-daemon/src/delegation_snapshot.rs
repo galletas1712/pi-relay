@@ -1,14 +1,72 @@
-use agent_store::{Delegation, DelegationStatus, SubagentType};
+use agent_store::{Delegation, DelegationProgress, DelegationStatus, SubagentType};
 use agent_vocab::{DaemonToolObservation, ToolCallId};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::handoff::{
-    delegation_dir, refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
-    safe_handoff_path_segment, task_prompt_rel, SubagentArtifact,
+    active_branch_is_terminal, delegation_dir, extract_final_message, extract_suggested_next,
+    refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
+    safe_handoff_path_segment, subagent_outcome, task_prompt_rel, SubagentArtifact,
 };
 use crate::state::AppState;
 use crate::types::RpcError;
+
+pub(crate) struct ListSubagentState {
+    pub(crate) status: String,
+    pub(crate) suggested_next: Option<String>,
+}
+
+pub(crate) fn progress_view(progress: DelegationProgress) -> Value {
+    json!({
+        "expected": progress.expected,
+        "spawned": progress.spawned,
+        "terminal": progress.terminal,
+        "running": progress.running,
+        "failed": progress.failed,
+    })
+}
+
+fn terminal_outcome_status(history: &agent_store::HistoryTree) -> Option<&'static str> {
+    active_branch_is_terminal(history).then(|| match subagent_outcome(history) {
+        agent_vocab::TurnOutcome::Graceful => "done",
+        agent_vocab::TurnOutcome::Interrupted | agent_vocab::TurnOutcome::Crashed => "failed",
+    })
+}
+
+pub(crate) async fn list_subagent_state(
+    state: &AppState,
+    delegation_status: DelegationStatus,
+    subagent_id: &str,
+) -> std::result::Result<ListSubagentState, RpcError> {
+    match delegation_status {
+        DelegationStatus::Running => {
+            let history = state.repo.active_branch(subagent_id).await?;
+            let terminal_status = terminal_outcome_status(&history);
+            let suggested_next = terminal_status
+                .and_then(|_| extract_suggested_next(&extract_final_message(&history)));
+            Ok(ListSubagentState {
+                status: terminal_status.unwrap_or("running").to_string(),
+                suggested_next,
+            })
+        }
+        DelegationStatus::Done | DelegationStatus::DoneWithFailures => {
+            let history = state.repo.active_branch(subagent_id).await?;
+            let terminal_status = terminal_outcome_status(&history);
+            let suggested_next = terminal_status
+                .and_then(|_| extract_suggested_next(&extract_final_message(&history)));
+            Ok(ListSubagentState {
+                status: terminal_status
+                    .unwrap_or_else(|| delegation_status.as_str())
+                    .to_string(),
+                suggested_next,
+            })
+        }
+        DelegationStatus::Cancelled | DelegationStatus::Failed => Ok(ListSubagentState {
+            status: delegation_status.as_str().to_string(),
+            suggested_next: None,
+        }),
+    }
+}
 
 fn count_failed_subagent_artifacts(artifacts: &[SubagentArtifact]) -> usize {
     artifacts

@@ -133,13 +133,13 @@ export interface DelegationProgress {
 	failed: number;
 }
 
-/** A subagent row inside a delegation. List responses keep `status` as live
- * session activity for board compatibility; rich `delegation.status` /
- * `inspect_delegation` responses may also carry terminal outcome fields and
- * artifact refs. The daemon intentionally does not inline raw task prompts,
- * final-message prose, or transcript bodies; use `task_prompt_file`,
- * `final_message_file`, and `transcript_file` with
- * `delegation.read_handoff_file` when detail is needed. */
+/** A subagent row inside a delegation. `status` is the meaningful delegation
+ * member status (`done`/`failed` for terminal subagents, `running` for in-flight
+ * members, or the parent delegation's terminal status for cancelled/failed
+ * delegations); `activity` preserves the live session activity separately. The
+ * daemon intentionally does not inline raw task prompts, final-message prose,
+ * or transcript bodies; use `task_prompt_file`, `final_message_file`, and
+ * `transcript_file` with `delegation.read_handoff_file` when detail is needed. */
 export interface DelegationSubagent {
 	id: string;
 	status: Activity | DelegationSubagentStatus;

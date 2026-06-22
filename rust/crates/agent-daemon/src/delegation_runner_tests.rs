@@ -498,6 +498,28 @@ async fn inspect_delegation_snapshot(env: &TestEnv, delegation_id: &str) -> serd
     .expect("inspect delegation")
 }
 
+fn assert_list_subagent_has_only_compact_fields(subagent: &serde_json::Value) {
+    let object = subagent.as_object().expect("subagent object");
+    for key in object.keys() {
+        assert!(
+            matches!(
+                key.as_str(),
+                "id" | "status"
+                    | "activity"
+                    | "role"
+                    | "type"
+                    | "subagent_type"
+                    | "task_prompt_file"
+                    | "steerable"
+                    | "suggested_next"
+                    | "final_message_file"
+                    | "transcript_file"
+            ),
+            "unexpected list subagent field: {key}"
+        );
+    }
+}
+
 fn handoff_root(env: &TestEnv, delegation_id: &str) -> PathBuf {
     env.cwd.path().join(".pi-handoff").join(delegation_id)
 }
@@ -2074,6 +2096,47 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         !root.join("running_child").join("final_message.md").exists(),
         "mid-turn child should not get a premature final_message artifact"
     );
+
+    let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
+        .await
+        .expect("list delegations");
+    let listed = list["delegations"]
+        .as_array()
+        .expect("delegations array")
+        .iter()
+        .find(|row| row["delegation_id"] == delegation.id)
+        .expect("listed delegation");
+    assert_eq!(listed["progress"]["expected"], 2);
+    assert_eq!(listed["progress"]["spawned"], 2);
+    assert_eq!(listed["progress"]["terminal"], 1);
+    assert_eq!(listed["progress"]["running"], 1);
+    assert_eq!(listed["progress"]["failed"], 0);
+    let listed_done = listed["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subagent| subagent["id"] == "done_child")
+        .unwrap();
+    assert_eq!(listed_done["status"], "done");
+    assert_eq!(listed_done["activity"], "idle");
+    assert_eq!(listed_done["suggested_next"], "done");
+    assert_eq!(listed_done["final_message_file"], serde_json::Value::Null);
+    assert_eq!(listed_done["transcript_file"], "done_child/transcript.md");
+    assert_list_subagent_has_only_compact_fields(listed_done);
+    let listed_running = listed["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subagent| subagent["id"] == "running_child")
+        .unwrap();
+    assert_eq!(listed_running["status"], "running");
+    assert_eq!(listed_running["activity"], "idle");
+    assert_eq!(listed_running["suggested_next"], serde_json::Value::Null);
+    assert_eq!(
+        listed_running["transcript_file"],
+        "running_child/transcript.md"
+    );
+    assert_list_subagent_has_only_compact_fields(listed_running);
 
     // Mutate the stale artifact on disk; a later inspect must refresh it from
     // the durable Postgres transcript before returning the file path.

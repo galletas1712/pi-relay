@@ -10,11 +10,13 @@ function delegation(overrides: Partial<Delegation> = {}): Delegation {
 		status: "done",
 		workflow: null,
 		label: "review",
+		progress: { expected: 1, spawned: 1, terminal: 1, running: 0, failed: 0 },
 		handoff_dir: "/workspace/.pi-handoff/delegation-1",
 		subagents: [
 			{
 				id: "child-1",
 				status: "done",
+				activity: "idle",
 				role: "reviewer",
 				subagent_type: "read_only",
 				task_prompt_file: "child-1/task_prompt.md",
@@ -101,6 +103,7 @@ describe("Inspector run board delegation list", () => {
 					{
 						id: `child-${index + 1}`,
 						status: "done",
+						activity: "idle",
 						role: "reviewer",
 						subagent_type: "read_only",
 						task_prompt_file: `child-${index + 1}/task_prompt.md`,
@@ -153,6 +156,7 @@ describe("Inspector run board handoff details", () => {
 					{
 						id: "child-1",
 						status: "done",
+						activity: "idle",
 						role: "reviewer",
 						subagent_type: "read_only",
 						task_prompt_file: "child-1/task_prompt.md",
@@ -197,7 +201,8 @@ describe("Inspector run board handoff details", () => {
 			subagents: [
 				{
 					id: "child-1",
-					status: "idle",
+					status: "cancelled",
+					activity: "idle",
 					role: "reviewer",
 					subagent_type: "read_only",
 					task_prompt_file: "child-1/task_prompt.md",
@@ -239,8 +244,8 @@ describe("Inspector run board handoff details", () => {
 							role: "explorer",
 							subagent_type: "read_only",
 							task_prompt_file: "done-child/task_prompt.md",
-							transcript_file: "done-child/transcript.md",
-							final_message_file: "done-child/final_message.md",
+							transcript_file: null,
+							final_message_file: null,
 							suggested_next: "done",
 						},
 						{
@@ -250,7 +255,7 @@ describe("Inspector run board handoff details", () => {
 							role: "explorer",
 							subagent_type: "read_only",
 							task_prompt_file: "running-child/task_prompt.md",
-							transcript_file: "running-child/transcript.md",
+							transcript_file: null,
 							suggested_next: null,
 						},
 					],
@@ -260,6 +265,8 @@ describe("Inspector run board handoff details", () => {
 
 		expect(html).toContain("fan-out");
 		expect(html).toContain("1/2 terminal, 1 running, 0 failed");
+		expect(html).toContain("done</span>");
+		expect(html).toContain("idle</span>");
 		expect(html).toContain("suggested next");
 		expect(html).toContain("done");
 		expect(html).not.toContain("Found the answer");
