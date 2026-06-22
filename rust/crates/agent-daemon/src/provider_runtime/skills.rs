@@ -12,27 +12,30 @@ use super::prompt::{
 };
 
 pub(crate) fn load_skill_result(
+    prompt_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
 ) -> ToolResultMessage {
-    match load_skill_output(outer_cwd, workspaces, loaded_skills, call) {
+    match load_skill_output(prompt_root, outer_cwd, workspaces, loaded_skills, call) {
         Ok(output) => ToolResultMessage::success(call.id.clone(), "LoadSkill", output),
         Err(error) => ToolResultMessage::error(call.id.clone(), "LoadSkill", error.to_string()),
     }
 }
 
 fn load_skill_output(
+    prompt_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
 ) -> Result<String> {
-    load_skill_output_with_home(outer_cwd, workspaces, loaded_skills, call, None)
+    load_skill_output_with_home(prompt_root, outer_cwd, workspaces, loaded_skills, call, None)
 }
 
 fn load_skill_output_with_home(
+    prompt_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
@@ -53,12 +56,15 @@ fn load_skill_output_with_home(
     if loaded_skills.contains(&skill_id) {
         return Ok("skill already loaded".to_string());
     }
-    let skills = match home {
+    let mut skills = match home {
         Some(home) => {
             load_skills_for_session_workspaces_with_home(outer_cwd, workspaces, Some(home))
         }
         None => load_skills_for_session_workspaces(outer_cwd, workspaces),
     };
+    if workspace.is_none() {
+        skills.extend(load_global_skills_from_dir(&prompt_root.join("workflows")));
+    }
     let Some(skill) = skills
         .into_iter()
         .find(|skill| skill.name == name && skill.workspace.as_deref() == workspace)
@@ -151,7 +157,9 @@ pub(crate) fn resolve_skill_role(
 }
 
 fn load_packaged_role_skills(prompt_root: &Path) -> Vec<Skill> {
-    load_global_skills_from_dir(&prompt_root.join("subagent-roles"))
+    let mut skills = load_global_skills_from_dir(&prompt_root.join("subagent-roles"));
+    skills.extend(load_global_skills_from_dir(&prompt_root.join("workflows")));
+    skills
 }
 
 fn packaged_role(prompt_root: &Path, name: &str) -> Option<Skill> {
@@ -208,7 +216,7 @@ mod tests {
         let mut loaded = std::collections::BTreeSet::new();
         let workspaces = vec![SessionWorkspace::local("repo", "")];
 
-        let first = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
+        let first = load_skill_result(&outer_cwd, &outer_cwd, &workspaces, &loaded, &call);
         assert_eq!(first.status, agent_vocab::ToolResultStatus::Success);
         assert!(first.output.contains("<name>rust-refactor</name>"));
         assert!(first.output.contains("<workspace>repo</workspace>"));
@@ -216,11 +224,40 @@ mod tests {
         assert!(first.output.contains("Prefer small, tested changes."));
 
         loaded.insert(skill_identifier(Some("repo"), "rust-refactor"));
-        let second = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
+        let second = load_skill_result(&outer_cwd, &outer_cwd, &workspaces, &loaded, &call);
         assert_eq!(second.status, agent_vocab::ToolResultStatus::Success);
         assert_eq!(second.output, "skill already loaded");
 
         std::fs::remove_dir_all(outer_cwd).ok();
+    }
+
+    #[test]
+    fn load_skill_result_loads_installed_workflow_skill() {
+        let prompt_root = make_temp_dir("load-workflow-skill");
+        let outer_cwd = prompt_root.join("outer");
+        std::fs::create_dir_all(&outer_cwd).expect("outer cwd");
+        let skill_dir = prompt_root.join("workflows/workflow-explore");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: workflow-explore\ndescription: Parallel read-only exploration.\n---\n\nUse stage_start_readonly_fanout to fan out.\n",
+        )
+        .expect("skill file");
+
+        let call = ToolCall {
+            id: ToolCallId::from_u64(1),
+            tool_name: "LoadSkill".to_string(),
+            args_json: r#"{"name":"workflow-explore"}"#.to_string(),
+        };
+        let loaded = std::collections::BTreeSet::new();
+
+        let result = load_skill_result(&prompt_root, &outer_cwd, &[], &loaded, &call);
+        assert_eq!(result.status, agent_vocab::ToolResultStatus::Success);
+        assert!(result.output.contains("<name>workflow-explore</name>"));
+        assert!(!result.output.contains("<workspace>"));
+        assert!(result.output.contains("stage_start_readonly_fanout"));
+
+        std::fs::remove_dir_all(prompt_root).ok();
     }
 
     #[test]
@@ -380,8 +417,9 @@ mod tests {
         };
         let loaded = std::collections::BTreeSet::new();
 
-        let result = load_skill_output_with_home(&outer_cwd, &[], &loaded, &call, Some(&home))
-            .expect("loads global skill");
+        let result =
+            load_skill_output_with_home(&outer_cwd, &outer_cwd, &[], &loaded, &call, Some(&home))
+                .expect("loads global skill");
         let result = ToolResultMessage::success(call.id.clone(), "LoadSkill", result);
         assert_eq!(result.status, agent_vocab::ToolResultStatus::Success);
         assert!(result.output.contains("<name>global</name>"));
