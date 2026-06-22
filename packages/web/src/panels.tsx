@@ -142,16 +142,13 @@ function SubagentRow({
 }) {
 	const finalKey = `${subagent.id}:final_message.md`;
 	const transcriptKey = `${subagent.id}:transcript.md`;
-	const taskPromptKey = `${subagent.id}:task_prompt.md`;
 	const cancellationFile = cancellationTranscriptFile(delegation, subagent);
 	const cancellationKey = cancellationFile ? `${subagent.id}:${cancellationFile}` : null;
 	const openFinal = open && open.key === finalKey ? open : null;
 	const openTranscript = open && open.key === transcriptKey ? open : null;
-	const openTaskPrompt = open && open.key === taskPromptKey ? open : null;
 	const openCancellation = open && cancellationKey && open.key === cancellationKey ? open : null;
 	const finalMessageFile = compactText(subagent.final_message_file);
 	const transcriptFile = compactText(subagent.transcript_file);
-	const taskPromptFile = compactText(subagent.task_prompt_file);
 	const suggestedNext = compactText(subagent.suggested_next);
 	const liveActivity =
 		subagent.activity ??
@@ -185,12 +182,6 @@ function SubagentRow({
 						<span>session</span>
 						<code>{subagent.id}</code>
 					</div>
-					{taskPromptFile ? (
-						<div className="run-board-debug-row">
-							<span>task prompt</span>
-							<code>{taskPromptFile}</code>
-						</div>
-					) : null}
 					{finalMessageFile ? (
 						<div className="run-board-debug-row">
 							<span>final message</span>
@@ -213,16 +204,6 @@ function SubagentRow({
 			) : null}
 			{detailsOpen ? (
 				<div className="run-board-handoff-links">
-					{taskPromptFile ? (
-						<button
-							className="chip-button"
-							type="button"
-							onClick={() => (openTaskPrompt ? onCloseFile() : onOpenFile(subagent.id, "task_prompt.md"))}
-							title="show task_prompt.md"
-						>
-							<FileText size={11} /> task prompt
-						</button>
-					) : null}
 					{finalMessageFile ? (
 						<button
 							className="chip-button"
@@ -257,7 +238,6 @@ function SubagentRow({
 			) : null}
 			{openFinal ? <HandoffFileView open={openFinal} /> : null}
 			{openTranscript ? <HandoffFileView open={openTranscript} /> : null}
-			{openTaskPrompt ? <HandoffFileView open={openTaskPrompt} /> : null}
 			{openCancellation ? <HandoffFileView open={openCancellation} /> : null}
 		</div>
 	);
