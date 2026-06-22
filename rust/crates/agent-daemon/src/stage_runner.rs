@@ -42,12 +42,7 @@ pub(crate) async fn complete_stage_if_ready(
     state: &AppState,
     stage_id: &str,
 ) -> std::result::Result<(), RpcError> {
-    let Some(stage) = state
-        .repo
-        .get_stage(stage_id)
-        .await
-        .map_err(anyhow::Error::from)?
-    else {
+    let Some(stage) = state.repo.get_stage(stage_id).await? else {
         return Ok(());
     };
     if stage.status != StageStatus::Running {
@@ -63,12 +58,7 @@ pub(crate) async fn complete_stage_if_ready(
     // the workflow re-runs; a resumable mid-turn subagent keeps the stage running.
     recover_subagent_tails(state, &stage).await;
 
-    if !state
-        .repo
-        .stage_subagents_all_terminal(stage_id)
-        .await
-        .map_err(anyhow::Error::from)?
-    {
+    if !state.repo.stage_subagents_all_terminal(stage_id).await? {
         return Ok(());
     }
 
@@ -92,8 +82,7 @@ pub(crate) async fn complete_stage_if_ready(
             &message,
             &steer_client_input_id,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     if !won {
         // Another terminal child or the boot sweep already won the CAS; that
         // winner enqueued the single steer in its own tx. Nothing more to do.
@@ -146,7 +135,10 @@ async fn recover_subagent_tails(state: &AppState, stage: &Stage) {
     let subagents = match state.repo.list_stage_subagents(&stage.id).await {
         Ok(subagents) => subagents,
         Err(error) => {
-            eprintln!("stage barrier could not list subagents of {}: {error:#}", stage.id);
+            eprintln!(
+                "stage barrier could not list subagents of {}: {error:#}",
+                stage.id
+            );
             return;
         }
     };
@@ -170,19 +162,11 @@ async fn classify_subagents(
     state: &AppState,
     stage: &Stage,
 ) -> std::result::Result<(StageStatus, usize, usize, Vec<String>), RpcError> {
-    let subagents = state
-        .repo
-        .list_stage_subagents(&stage.id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let subagents = state.repo.list_stage_subagents(&stage.id).await?;
     let mut ok = 0usize;
     let mut failed_ids = Vec::new();
     for subagent in &subagents {
-        let history = state
-            .repo
-            .active_branch(&subagent.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let history = state.repo.active_branch(&subagent.session_id).await?;
         match subagent_outcome(&history) {
             TurnOutcome::Graceful => ok += 1,
             TurnOutcome::Interrupted | TurnOutcome::Crashed => {

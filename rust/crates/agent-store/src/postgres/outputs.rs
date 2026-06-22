@@ -327,7 +327,7 @@ async fn complete_action_tx(
                 and attempt_id=$3::text
                 and status in ('pending','running')
             "#;
-    if let Some(row) = sqlx::query(&select_query)
+    if let Some(row) = sqlx::query(select_query)
         .bind(session_id)
         .bind(&update.row_id)
         .bind(&update.attempt_id)
@@ -368,7 +368,7 @@ async fn complete_action_tx(
                 and attempt_id=$3::text
                 and status in ('pending','running')
             "#;
-    let updated = sqlx::query(&update_query)
+    let updated = sqlx::query(update_query)
         .bind(session_id)
         .bind(&update.row_id)
         .bind(&update.attempt_id)

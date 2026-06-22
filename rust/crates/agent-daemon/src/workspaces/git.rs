@@ -111,10 +111,7 @@ pub(crate) async fn validate_remote_branch(remote_url: &str, remote_branch: &str
 /// Run `git` in `cwd` (optionally against an alternate index) and return trimmed
 /// stdout. The typed wrappers below choose the arg shape and whether stdout is
 /// used; this is the single place that spawns git and maps failure to an error.
-async fn git(
-    cwd: &Path,
-    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
-) -> Result<String> {
+async fn git(cwd: &Path, args: impl IntoIterator<Item = impl AsRef<OsStr>>) -> Result<String> {
     let output = git_command()
         .args(args)
         .current_dir(cwd)

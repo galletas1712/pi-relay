@@ -149,8 +149,7 @@ async fn delete_btrfs_subvolumes_depth_first(root: &Path) -> Result<()> {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("read workspace tree {}", dir.display()))
+                return Err(error).with_context(|| format!("read workspace tree {}", dir.display()))
             }
         };
         while let Some(entry) = entries

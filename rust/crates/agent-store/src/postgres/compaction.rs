@@ -30,6 +30,8 @@ impl PostgresAgentStore {
     /// or Running post-dispatch) to Blocked and create a sibling Compaction
     /// action. Callers pick the status based on whether the gate fired before
     /// or after the model call started.
+    // Persistence entry point: each argument is a distinct DB column / gate input.
+    #[allow(clippy::too_many_arguments)]
     pub async fn block_model_action_for_compaction(
         &self,
         session_id: &str,

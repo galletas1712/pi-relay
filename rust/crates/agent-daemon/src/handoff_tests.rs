@@ -105,7 +105,11 @@ fn render_includes_failed_tool_results_and_compaction() {
         entry(
             "cs",
             TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
-                "child", "leaf", "summarized history", None, TurnId(1),
+                "child",
+                "leaf",
+                "summarized history",
+                None,
+                TurnId(1),
             )),
         ),
     ]);

@@ -62,7 +62,7 @@ impl SessionDriver {
                 if provider_error.is_some_and(agent_provider::ProviderError::is_context_overflow) {
                     limit
                 } else {
-                    return Err(anyhow::Error::from(error).into());
+                    return Err(error.into());
                 }
             }
         };
@@ -172,8 +172,7 @@ async fn block_and_spawn_auto_compaction(
             tokens_before,
             limit,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     publish_events(state, created.events);
     if matches!(created.job.scope, CompactionScope::Boundary { .. }) {
         state.active.lock().await.remove(session_id);
@@ -242,8 +241,7 @@ async fn run_compaction_job(
             let result = state
                 .repo
                 .complete_compaction_action(&job, completion)
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
             if result.new_root_id.is_some() {
                 state
                     .repo
@@ -252,8 +250,7 @@ async fn run_compaction_job(
                         result.new_root_id.as_deref(),
                         matches!(job.trigger, CompactionTrigger::Manual),
                     )
-                    .await
-                    .map_err(anyhow::Error::from)?;
+                    .await?;
                 state
                     .provider_connections
                     .mark_compacted(&session_id, config.provider.kind, job.last_turn_id.0)
@@ -283,18 +280,10 @@ async fn run_compaction_job(
                         &job.source_leaf_id,
                         &error,
                     )
-                    .await
-                    .map_err(anyhow::Error::from)?;
+                    .await?;
             }
             fail_blocked_model_for_compaction_error(&state, &session_id, &job, &error).await?;
-            (
-                state
-                    .repo
-                    .fail_compaction_action(&job, error)
-                    .await
-                    .map_err(anyhow::Error::from)?,
-                None,
-            )
+            (state.repo.fail_compaction_action(&job, error).await?, None)
         }
     };
     publish_events(&state, events);
@@ -310,8 +299,7 @@ async fn run_compaction_job(
         if state
             .repo
             .claim_pending_model_action(&session_id, &dispatch.row_id, &dispatch.attempt_id)
-            .await
-            .map_err(anyhow::Error::from)?
+            .await?
         {
             spawn_model_dispatch(state.clone(), session_id.clone(), dispatch, true);
         }
@@ -346,11 +334,7 @@ async fn install_runtime_compaction_checkpoint(
     let Some(active) = state.active.lock().await.get(session_id).cloned() else {
         return Ok(());
     };
-    let stored = state
-        .repo
-        .load_stored_session(session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let stored = state.repo.load_stored_session(session_id).await?;
     let session = AgentSession::from_stored_session_preserving_open_turn(stored)
         .map_err(history_error_to_rpc)?;
     let mut runtime = active.lock().await;
@@ -403,8 +387,7 @@ async fn fail_blocked_model_for_compaction_error(
             blocked_model_attempt_id,
             &model_error,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     publish_events(state, events);
     let Some(active) = state.active.lock().await.get(session_id).cloned() else {
         return Ok(());

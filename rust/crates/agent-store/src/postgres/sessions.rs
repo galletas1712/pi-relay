@@ -201,6 +201,8 @@ impl PostgresAgentStore {
         )
     }
 
+    // Persistence entry point: each argument is a distinct session/transcript column.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_session_outputs(
         &self,
         session_id: &str,
@@ -230,6 +232,8 @@ impl PostgresAgentStore {
         .await
     }
 
+    // Persistence entry point: each argument is a distinct session/transcript column.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_session_outputs_with_parent(
         &self,
         session_id: &str,
@@ -543,11 +547,13 @@ impl PostgresAgentStore {
     }
 
     pub async fn session_stage_id(&self, session_id: &str) -> Result<Option<String>> {
-        Ok(sqlx::query_scalar("select stage_id from sessions where id=$1")
-            .bind(session_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .flatten())
+        Ok(
+            sqlx::query_scalar("select stage_id from sessions where id=$1")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
     }
 
     pub async fn activity(&self, session_id: &str) -> Result<SessionActivity> {

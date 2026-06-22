@@ -422,6 +422,35 @@ fn error_source_chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> 
     chain
 }
 
+pub type ProviderResult<T> = Result<T, ProviderError>;
+
+#[async_trait]
+pub trait ModelProvider: Send + Sync {
+    async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse>;
+
+    fn supports_remote_compaction(&self) -> bool {
+        false
+    }
+
+    async fn compact(
+        &self,
+        _request: ProviderCompactionRequest,
+    ) -> ProviderResult<ProviderCompactionResponse> {
+        Err(ProviderError::Provider(
+            "provider does not support remote compaction".to_string(),
+        ))
+    }
+
+    async fn count_tokens(
+        &self,
+        _request: ProviderTokenCountRequest,
+    ) -> ProviderResult<ProviderTokenCountResponse> {
+        Err(ProviderError::Provider(
+            "provider does not support token counting".to_string(),
+        ))
+    }
+}
+
 #[cfg(test)]
 mod provider_error_tests {
     use super::*;
@@ -565,34 +594,5 @@ mod provider_error_tests {
             .raw_value()
             .unwrap();
         assert_eq!(hosted["name"], "web_fetch");
-    }
-}
-
-pub type ProviderResult<T> = Result<T, ProviderError>;
-
-#[async_trait]
-pub trait ModelProvider: Send + Sync {
-    async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse>;
-
-    fn supports_remote_compaction(&self) -> bool {
-        false
-    }
-
-    async fn compact(
-        &self,
-        _request: ProviderCompactionRequest,
-    ) -> ProviderResult<ProviderCompactionResponse> {
-        Err(ProviderError::Provider(
-            "provider does not support remote compaction".to_string(),
-        ))
-    }
-
-    async fn count_tokens(
-        &self,
-        _request: ProviderTokenCountRequest,
-    ) -> ProviderResult<ProviderTokenCountResponse> {
-        Err(ProviderError::Provider(
-            "provider does not support token counting".to_string(),
-        ))
     }
 }
