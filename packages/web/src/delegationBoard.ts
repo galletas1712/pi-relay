@@ -27,15 +27,6 @@ export function delegationStatusLabel(status: DelegationStatus): string {
 	return DELEGATION_STATUS_LABELS[status] ?? status;
 }
 
-/** Only a full delegation's single full subagent can be steered; read-only fan-out
- * members are fire-and-forget and the daemon rejects steering them. Returns the
- * steerable subagent id, or null when nothing in the delegation is steerable. */
-export function steerableSubagentId(delegation: Delegation): string | null {
-	if (!isDelegationRunning(delegation)) return null;
-	const full = delegation.subagents.find((subagent) => subagent.subagent_type === "full");
-	return full ? full.id : null;
-}
-
 /** Whether a delegation can be re-run from the board. Keep this predicate in lockstep
  * with the actual reconstruction path so the UI never offers a re-run that the
  * click handler will reject. */

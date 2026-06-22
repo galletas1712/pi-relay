@@ -1328,7 +1328,11 @@ cancelled. Terminal delegations are left unchanged and return
 ### `delegation.list`
 
 Lists all delegations for a parent session, newest first. This is the run-board
-feed used by the web UI.
+feed used by the web UI. Subagent rows include the same inline
+`final_message`/`suggested_next` summary fields as `delegation.status` when a
+subagent is terminal, including terminal subagents in a still-running fan-out.
+Normal `final_message.md` files are still only published for completed
+delegations.
 
 ```json
 { "parent_session_id": "parent-session" }
@@ -1349,10 +1353,15 @@ Result:
       "subagents": [
         {
           "id": "session_...",
-          "status": "idle",
+          "status": "done",
+          "activity": "idle",
           "role": "implementer",
           "subagent_type": "full",
-          "task": "Implement the requested change."
+          "task": "Implement the requested change.",
+          "final_message": "Implemented.\n\nsuggested_next: pass",
+          "suggested_next": "pass",
+          "final_message_path": "/.../.pi-handoff/delegation_.../session_.../final_message.md",
+          "transcript_path": "/.../.pi-handoff/delegation_.../session_.../transcript.md"
         }
       ],
       "handoff_dir": "/.../.pi-handoff/delegation_..."

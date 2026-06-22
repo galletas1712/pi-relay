@@ -2975,6 +2975,16 @@ pre {
 	gap: 6px;
 }
 
+.run-board-debug {
+	display: flex;
+	flex-direction: column;
+	gap: 6px;
+	border: 1px dashed var(--border);
+	border-radius: 6px;
+	padding: 6px 8px;
+	background: color-mix(in oklch, var(--muted, transparent) 45%, transparent);
+}
+
 .chip-button {
 	display: inline-flex;
 	align-items: center;
@@ -3020,6 +3030,36 @@ pre {
 	display: inline-flex;
 	align-items: center;
 	gap: 4px;
+}
+
+.run-board-result {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	border-radius: 6px;
+	background: color-mix(in oklch, var(--muted, transparent) 55%, transparent);
+	padding: 6px 8px;
+	font-size: var(--text-xs);
+}
+
+.run-board-result p {
+	margin: 0;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.run-board-result-label,
+.run-board-suggested-next span {
+	color: var(--muted-foreground);
+	font-size: var(--text-2xs);
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+
+.run-board-more-button {
+	align-self: flex-start;
+	font-size: var(--text-xs);
 }
 
 .run-board-file {

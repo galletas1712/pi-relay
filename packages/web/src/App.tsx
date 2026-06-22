@@ -1560,25 +1560,6 @@ export function App() {
 		[api, invalidateDelegations, loadedSnapshot?.session_id, pushNotice],
 	);
 
-	// Steer the full subagent: a steer-priority message into the subagent's own
-	// session (the composer only ever sends follow_up). The daemon rejects
-	// steering a read-only subagent, so the board only offers this for the full.
-	const steerSubagent = useCallback(
-		(subagentSessionId: string) => {
-			const text = window.prompt("Steer the full subagent with:");
-			if (!text || !text.trim()) return;
-			void api
-				.steerSubagent({
-					subagentSessionId,
-					clientInputId: randomId("web_steer"),
-					content: [{ type: "text", text: text.trim() }],
-				})
-				.then(() => pushNotice("success", "steered the subagent"))
-				.catch((error) => pushNotice("error", errorMessage(error)));
-		},
-		[api, pushNotice],
-	);
-
 	const reRunDelegation = useCallback(
 		(delegation: Delegation) => {
 			const parentSessionId = loadedSnapshot?.session_id;
@@ -2117,7 +2098,6 @@ export function App() {
 					delegationsError={errorMessageOrNull(delegationsQuery.error)}
 					runBoard={{
 						onCancelDelegation: cancelDelegation,
-						onSteerSubagent: steerSubagent,
 						onReRunDelegation: reRunDelegation,
 						readHandoffFile,
 					}}

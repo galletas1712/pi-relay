@@ -12,6 +12,7 @@ use crate::codec::from_params;
 use crate::delegation_snapshot::build_delegation_snapshot;
 use crate::handoff::{
     delegation_dir, handoff_root, refresh_delegation_handoff_artifacts, render_transcript_markdown,
+    SubagentArtifact,
 };
 use crate::runtime::{abort_session_tasks, publish_events, SessionDriver};
 use crate::state::AppState;
@@ -909,9 +910,14 @@ pub(crate) async fn rpc_cancel(
     cancel_core(state, &parent_session_id, params).await
 }
 
-/// Per-parent delegation list for the run board: each delegation with its
-/// kind/status and its subagents' ids/status. (The model-facing tool surface
-/// has no list.)
+/// Per-parent delegation list for the run board. The model-facing tool surface
+/// has no list.
+///
+/// The list view intentionally shares the same derived artifact metadata as
+/// `inspect_delegation`: terminal subagents in a still-running fan-out may have
+/// inline `final_message` / `suggested_next` text, but normal
+/// `final_message.md` files are only published once the whole delegation has
+/// completed.
 pub(crate) async fn rpc_list(
     state: &AppState,
     params: Value,
@@ -925,12 +931,52 @@ pub(crate) async fn rpc_list(
     let mut views = Vec::with_capacity(delegations.len());
     for delegation in &delegations {
         let delegation_handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+        let include_final_messages = matches!(
+            delegation.status,
+            DelegationStatus::Done | DelegationStatus::DoneWithFailures
+        );
+        let artifacts = match delegation.status {
+            DelegationStatus::Running
+            | DelegationStatus::Done
+            | DelegationStatus::DoneWithFailures => {
+                let (_dir, artifacts) =
+                    refresh_delegation_handoff_artifacts(state, delegation, include_final_messages)
+                        .await?;
+                artifacts
+            }
+            DelegationStatus::Cancelled | DelegationStatus::Failed => Vec::new(),
+        };
         let subagents = state
             .repo
             .list_delegation_subagents(&delegation.id)
             .await?
             .into_iter()
             .map(|subagent| {
+                let artifact = artifacts
+                    .iter()
+                    .find(|artifact| artifact.session_id == subagent.session_id);
+                let terminal_status = artifact.and_then(|artifact| artifact.terminal_status);
+                let final_message = artifact.and_then(|artifact| artifact.final_message.clone());
+                let suggested_next = artifact.and_then(|artifact| artifact.suggested_next.clone());
+                let final_message_path = artifact
+                    .and_then(|artifact| artifact.final_message_path.as_deref())
+                    .map(|path| path.to_string_lossy().into_owned());
+                let final_message_relative_path =
+                    artifact.and_then(SubagentArtifact::final_message_rel);
+                let transcript_path = artifact
+                    .map(|artifact| artifact.transcript_path.to_string_lossy().into_owned());
+                let transcript_relative_path = artifact.map(SubagentArtifact::transcript_rel);
+                let status = match delegation.status {
+                    DelegationStatus::Running => terminal_status
+                        .map(str::to_string)
+                        .unwrap_or_else(|| subagent.activity.as_str().to_string()),
+                    DelegationStatus::Done | DelegationStatus::DoneWithFailures => terminal_status
+                        .map(str::to_string)
+                        .unwrap_or_else(|| delegation.status.as_str().to_string()),
+                    DelegationStatus::Cancelled | DelegationStatus::Failed => {
+                        delegation.status.as_str().to_string()
+                    }
+                };
                 let (cancellation_transcript_path, cancellation_transcript_relative_path) =
                     if delegation.status == DelegationStatus::Cancelled {
                         let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
@@ -945,7 +991,7 @@ pub(crate) async fn rpc_list(
                     };
                 json!({
                     "id": subagent.session_id,
-                    "status": subagent.activity,
+                    "status": status,
                     "activity": subagent.activity,
                     "role": subagent.role,
                     "type": subagent.subagent_type,
@@ -953,6 +999,14 @@ pub(crate) async fn rpc_list(
                     "task": subagent.task,
                     "steerable": delegation.status == DelegationStatus::Running
                         && subagent.subagent_type == Some(SubagentType::Full),
+                    "final_message": final_message,
+                    "suggested_next": suggested_next,
+                    "final_message_path": final_message_path,
+                    "final_message_relative_path": final_message_relative_path.clone(),
+                    "final_message_file": final_message_relative_path,
+                    "transcript_path": transcript_path,
+                    "transcript_relative_path": transcript_relative_path.clone(),
+                    "transcript_file": transcript_relative_path,
                     "cancellation_transcript_path": cancellation_transcript_path,
                     "cancellation_transcript_relative_path": cancellation_transcript_relative_path,
                 })

@@ -2091,6 +2091,41 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         "mid-turn child should not get a premature final_message artifact"
     );
 
+    let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
+        .await
+        .expect("list delegations");
+    let listed_delegation = list["delegations"].as_array().unwrap()[0].clone();
+    assert_eq!(listed_delegation["status"], "running");
+    let listed_done = listed_delegation["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subagent| subagent["id"] == "done_child")
+        .unwrap();
+    assert_eq!(listed_done["status"], "done");
+    assert_eq!(
+        listed_done["final_message"],
+        "Found the answer.\n\nsuggested_next: done"
+    );
+    assert_eq!(listed_done["suggested_next"], "done");
+    assert_eq!(listed_done["final_message_path"], serde_json::Value::Null);
+    assert_eq!(
+        listed_done["final_message_relative_path"],
+        serde_json::Value::Null
+    );
+    let listed_running = listed_delegation["subagents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|subagent| subagent["id"] == "running_child")
+        .unwrap();
+    assert_eq!(listed_running["status"], "idle");
+    assert_eq!(listed_running["final_message"], serde_json::Value::Null);
+    assert!(
+        !root.join("done_child").join("final_message.md").exists(),
+        "list should not publish normal final_message artifacts early"
+    );
+
     // Mutate the stale artifact on disk; a later inspect must refresh it from
     // the durable Postgres transcript before returning the file path.
     std::fs::write(

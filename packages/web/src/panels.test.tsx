@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { Inspector, type RunBoardCallbacks } from "./panels.tsx";
+import { Inspector, RunBoardDelegationList, type RunBoardCallbacks } from "./panels.tsx";
 import type { HandoffFileName, SessionSnapshot, Delegation, ToolListing } from "./types.ts";
 
 function delegation(overrides: Partial<Delegation> = {}): Delegation {
@@ -44,7 +44,6 @@ function snapshot(): SessionSnapshot {
 function callbacks(): Omit<RunBoardCallbacks, "onSelectSession"> {
 	return {
 		onCancelDelegation: () => {},
-		onSteerSubagent: () => {},
 		onReRunDelegation: () => {},
 		readHandoffFile: (_delegationId: string, _subagentId: string | null, _file: HandoffFileName) => Promise.resolve(""),
 	};
@@ -63,55 +62,219 @@ function renderInspector(delegations: Delegation[]): string {
 	);
 }
 
-describe("Inspector run board handoff links", () => {
-	it("shows handoff path and file buttons for completed delegations", () => {
-		const html = renderInspector([delegation({ status: "done_with_failures" })]);
+function renderRunBoardList({
+	delegations,
+	showAllDelegations = false,
+	openDebugDelegationIds = new Set<string>(),
+}: {
+	delegations: Delegation[];
+	showAllDelegations?: boolean;
+	openDebugDelegationIds?: ReadonlySet<string>;
+}): string {
+	return renderToStaticMarkup(
+		<RunBoardDelegationList
+			delegations={delegations}
+			showAllDelegations={showAllDelegations}
+			openDebugDelegationIds={openDebugDelegationIds}
+			openFile={null}
+			onToggleShowAllDelegations={() => {}}
+			onToggleDelegationDebug={() => {}}
+			onOpenFile={() => {}}
+			onCloseFile={() => {}}
+			onCancelDelegation={() => {}}
+			onReRunDelegation={() => {}}
+		/>,
+	);
+}
 
-		expect(html).toContain("handoff /workspace/.pi-handoff/delegation-1");
-		expect(html).not.toContain("index.json");
-		expect(html).toContain("final message");
-		expect(html).toContain("transcript");
+describe("Inspector run board delegation list", () => {
+	it("shows only the first three delegations by default and all delegations in expanded mode", () => {
+		const delegations = Array.from({ length: 5 }, (_, index) =>
+			delegation({
+				delegation_id: `delegation-${index + 1}`,
+				label: `task ${index + 1}`,
+				handoff_dir: `/workspace/.pi-handoff/delegation-${index + 1}`,
+			}),
+		);
+
+		const collapsed = renderRunBoardList({ delegations });
+		expect(collapsed).toContain("task 1");
+		expect(collapsed).toContain("task 2");
+		expect(collapsed).toContain("task 3");
+		expect(collapsed).not.toContain("task 4");
+		expect(collapsed).not.toContain("task 5");
+		expect(collapsed).toContain("see more (2)");
+		expect(collapsed).not.toContain("show fewer");
+
+		const expanded = renderRunBoardList({ delegations, showAllDelegations: true });
+		expect(expanded).toContain("task 1");
+		expect(expanded).toContain("task 2");
+		expect(expanded).toContain("task 3");
+		expect(expanded).toContain("task 4");
+		expect(expanded).toContain("task 5");
+		expect(expanded).toContain("show fewer");
+		expect(expanded).not.toContain("see more");
 	});
 
-	it("shows cancellation transcript links for cancelled delegations when the artifact is reported", () => {
+	it("does not show an expansion control when there are three or fewer delegations", () => {
+		const html = renderRunBoardList({
+			delegations: [1, 2, 3].map((index) => delegation({ delegation_id: `delegation-${index}`, label: `task ${index}` })),
+		});
+
+		expect(html).toContain("task 1");
+		expect(html).toContain("task 2");
+		expect(html).toContain("task 3");
+		expect(html).not.toContain("see more");
+		expect(html).not.toContain("show fewer");
+	});
+});
+
+describe("Inspector run board handoff details", () => {
+	it("hides handoff paths and artifact file names in the default completed-delegation render", () => {
 		const html = renderInspector([
 			delegation({
-				status: "cancelled",
+				status: "done_with_failures",
 				subagents: [
 					{
 						id: "child-1",
-						status: "idle",
+						status: "done",
 						role: "reviewer",
 						subagent_type: "read_only",
 						task: "review the change",
-						cancellation_transcript_relative_path: "cancelled/child-1.transcript.md",
+						final_message: "Reviewed the patch.",
+						suggested_next: "ship it",
 					},
 				],
 			}),
 		]);
 
+		expect(html).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
+		expect(html).not.toContain("/workspace/.pi-handoff/delegation-1");
+		expect(html).not.toContain("final_message.md");
+		expect(html).not.toContain("transcript.md");
+		expect(html).not.toContain("index.json");
+		expect(html).toContain("Reviewed the patch.");
+		expect(html).toContain("suggested next");
+		expect(html).toContain("ship it");
+	});
+
+	it("reveals artifact actions and handoff path only in debug details", () => {
+		const html = renderRunBoardList({
+			delegations: [delegation({ status: "done_with_failures" })],
+			openDebugDelegationIds: new Set(["delegation-1"]),
+		});
+
 		expect(html).toContain("handoff /workspace/.pi-handoff/delegation-1");
+		expect(html).toContain("final_message.md");
+		expect(html).toContain("transcript.md");
 		expect(html).not.toContain("index.json");
-		expect(html).not.toContain("final message");
-		expect(html).toContain("cancellation transcript");
 	});
 
-	it("does not show file buttons for cancelled delegations without a cancellation transcript artifact", () => {
-		const html = renderInspector([delegation({ status: "cancelled" })]);
+	it("keeps cancellation transcript debug-only", () => {
+		const cancelled = delegation({
+			status: "cancelled",
+			subagents: [
+				{
+					id: "child-1",
+					status: "idle",
+					role: "reviewer",
+					subagent_type: "read_only",
+					task: "review the change",
+					cancellation_transcript_relative_path: "cancelled/child-1.transcript.md",
+				},
+			],
+		});
 
-		expect(html).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
-		expect(html).not.toContain("index.json");
-		expect(html).not.toContain("final message");
-		expect(html).not.toContain("cancellation transcript");
-		expect(html).not.toContain("transcript");
+		const initial = renderRunBoardList({ delegations: [cancelled] });
+		expect(initial).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
+		expect(initial).not.toContain("cancellation transcript");
+		expect(initial).not.toContain("cancelled/child-1.transcript.md");
+		expect(initial).not.toContain("index.json");
+
+		const debug = renderRunBoardList({
+			delegations: [cancelled],
+			openDebugDelegationIds: new Set(["delegation-1"]),
+		});
+		expect(debug).toContain("handoff /workspace/.pi-handoff/delegation-1");
+		expect(debug).toContain("cancellation transcript");
+		expect(debug).toContain("cancelled/child-1.transcript.md");
+		expect(debug).not.toContain("index.json");
 	});
 
-	it("does not show handoff path or file buttons for failed delegations", () => {
-		const html = renderInspector([delegation({ status: "failed" })]);
+	it("renders a terminal subagent summary in a still-running fan-out", () => {
+		const html = renderRunBoardList({
+			delegations: [
+				delegation({
+					status: "running",
+					kind: "readonly_fanout",
+					label: "fan-out",
+					subagents: [
+						{
+							id: "done-child",
+							status: "done",
+							activity: "idle",
+							role: "explorer",
+							subagent_type: "read_only",
+							task: "explore one angle",
+							final_message: "Found the answer.\n\nsuggested_next: done",
+							suggested_next: "done",
+						},
+						{
+							id: "running-child",
+							status: "running",
+							activity: "running",
+							role: "explorer",
+							subagent_type: "read_only",
+							task: "explore another angle",
+							final_message: "This should stay hidden while running.",
+							suggested_next: "done",
+						},
+					],
+				}),
+			],
+		});
 
-		expect(html).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
-		expect(html).not.toContain("index.json");
-		expect(html).not.toContain("final message");
-		expect(html).not.toContain("transcript");
+		expect(html).toContain("fan-out");
+		expect(html).toContain("Found the answer.");
+		expect(html).toContain("suggested next");
+		expect(html).toContain("done");
+		expect(html).not.toContain("This should stay hidden while running.");
+		expect(html).not.toContain("final_message.md");
+		expect(html).not.toContain("transcript.md");
+	});
+});
+
+describe("Inspector run board primary controls", () => {
+	it("does not offer steer from the run board while keeping cancel and subagent open controls", () => {
+		const html = renderInspector([
+			delegation({
+				kind: "full",
+				status: "running",
+				label: "implement",
+				subagents: [
+					{
+						id: "child-full-1",
+						status: "running",
+						activity: "running",
+						role: "implementer",
+						subagent_type: "full",
+						steerable: true,
+						task: "implement the change",
+					},
+				],
+			}),
+		]);
+
+		expect(html).toContain("implement");
+		expect(html).toContain("cancel");
+		expect(html).toContain("open child-full-1");
+		expect(html).not.toContain("steer");
+	});
+
+	it("keeps the re-run control for terminal re-runnable delegations", () => {
+		const html = renderInspector([delegation({ status: "done" })]);
+
+		expect(html).toContain("re-run");
+		expect(html).not.toContain("steer");
 	});
 });

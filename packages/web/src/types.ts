@@ -123,10 +123,11 @@ export type DelegationStatus = "running" | "done" | "done_with_failures" | "canc
 export type DelegationSubagentStatus = DelegationStatus | "idle" | "queued" | "done";
 export type SubagentType = "full" | "read_only";
 
-/** A subagent row inside a delegation. List responses keep `status` as live
- * session activity for board compatibility; rich `delegation.status` /
- * `inspect_delegation` responses may also carry terminal outcome fields and
- * artifact paths. */
+/** A subagent row inside a delegation. Running list rows may report live session
+ * activity (`idle` / `queued` / `running`) for in-flight subagents and terminal
+ * outcome (`done` / `failed`) for completed subagents; rich
+ * `delegation.status` / `inspect_delegation` responses may also carry artifact
+ * paths. */
 export interface DelegationSubagent {
 	id: string;
 	status: Activity | DelegationSubagentStatus;
