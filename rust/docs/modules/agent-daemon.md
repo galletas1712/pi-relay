@@ -46,8 +46,8 @@ delegation_tools.rs     delegation tool surface (delegate_writing_task /
 delegation_runner.rs    delegation barrier: all-terminal detect, attempt-fenced finish CAS,
                    idempotent handoff write, one steer to the parent; boot
                    crash sweep
-handoff.rs         renders per-subagent final_message.md / transcript.md
-                   from the durable transcript
+handoff.rs         renders per-subagent task_prompt.md / final_message.md /
+                   transcript.md from durable delegation/session state
 ```
 
 Subagent work runs as **delegations** (`delegate_writing_task` /
@@ -58,29 +58,33 @@ snapshot destroyed on return. Delegation subagents may emit
 `subagent.spawned`/`subagent.running` progress events; their terminal hook fires
 a single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
 terminal. After the DB finish CAS wins, the runner writes the handoff directory
-and then enqueues one `InputPriority::Steer` notification to the parent. That
-notification includes the same structured snapshot shape as `inspect_delegation`,
-with final messages, `suggested_next`, and artifact paths.
-Completion is that steer/handoff, not a parent-visible per-child idle event. The
+and then enqueues one `InputPriority::Steer` daemon observation to the parent.
+That observation includes the same structured snapshot shape as
+`inspect_delegation`, with `suggested_next` and compact handoff file
+references.
+Completion is that typed wakeup observation/handoff, not a parent-visible per-child idle event. The
 runner never decides the next delegation — the parent does, guided by workflow
 skills. Cancellation is terminal and exports transcript-only files for the
 cancelled subagents instead of running the normal completion handoff.
 
 Delegation completion wakeups are rendered as provider-neutral daemon
-observations. The durable transcript entry is an ordinary user-role text message
-with an explicit heading (`Daemon observation: inspect_delegation`), a note that
-the daemon authored it rather than the assistant choosing a tool call, a statement
-that it is equivalent to `inspect_delegation({ delegation_id })` at observation
-time, and the inspect snapshot JSON. It never inlines transcript bodies. The
-daemon deliberately does **not** fabricate assistant tool-call + tool-result
-pairs for wakeups: OpenAI Responses and Anthropic Messages each have strict,
-provider-specific tool-call/result shapes and adjacency expectations, and
-pi-relay only stores model-generated provider replay sidecars. A synthetic tool
-pair path should be added only behind provider-specific support/proof and tests.
+observations. The durable transcript entry is a typed
+`daemon_tool_observation`, not an ordinary user message and not a fake assistant
+tool choice. It records the daemon-authored `inspect_delegation` observation
+with a stable local tool-call id, arguments, status, concise summary, and bounded
+snapshot JSON. Provider adapters translate this typed item into adjacent
+synthetic tool call/result pairs for OpenAI and Anthropic request bodies; the UI
+renders it as a daemon/system observation card. A text fallback renderer remains
+available for diagnostics and unsupported contexts.
+
+The snapshot never inlines full transcript bodies or raw subagent task prompts.
+Task prompts are materialized as per-subagent `task_prompt.md` handoff files,
+final messages are exposed through `final_message.md` file references, and
+`suggested_next` stays inline because workflows branch on it.
 
 Normal top-level parent model requests do not receive a daemon-generated
 delegation dashboard. They are transcript-driven: durable delegate tool results
-and wakeup steers already live in history, so the provider input stays as stable
+and typed wakeup observations already live in history, so the provider input stays as stable
 PI/system prompt plus transcript history.
 
 Compaction is the special case, but the live ledger is not a provider input. For
@@ -90,10 +94,10 @@ text). After the provider returns, the daemon appends a fresh
 `## Delegation state at compaction time` section to the stored compaction
 summary. The ledger lists every delegation row for that parent session across
 all statuses (`running`, `done`, `done_with_failures`, `cancelled`, `failed`),
-with bounded subagent/progress details, cheap final-message snippets when
+with bounded subagent/progress details, `suggested_next` control data when
 available, and artifact paths. It does not refresh artifacts or inline
-transcript bodies. A `running` entry is a point-in-time compaction fact, not a
-final outcome; later completion steers or `inspect_delegation` provide fresh
+transcript or final-message bodies. A `running` entry is a point-in-time compaction fact, not a
+final outcome; later completion observations or `inspect_delegation` provide fresh
 state. If older ledger text remains in prior summaries, the newly appended
 ledger supersedes it by being the latest section. Subagent compactions do not
 receive or append the parent ledger, sibling subagent state, or `## Current

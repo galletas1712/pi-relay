@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::PathBuf;
 
 use agent_core::AgentInput;
 use agent_store::{
@@ -11,7 +11,9 @@ use serde_json::{json, Value};
 use crate::codec::from_params;
 use crate::delegation_snapshot::build_delegation_snapshot;
 use crate::handoff::{
-    delegation_dir, handoff_root, refresh_delegation_handoff_artifacts, render_transcript_markdown,
+    delegation_dir, extract_suggested_next, handoff_root, refresh_delegation_handoff_artifacts,
+    refresh_task_prompt_artifact_if_present, render_transcript_markdown, safe_handoff_path_segment,
+    task_prompt_rel, TASK_PROMPT_FILE,
 };
 use crate::runtime::{abort_session_tasks, publish_events, SessionDriver};
 use crate::state::AppState;
@@ -489,10 +491,12 @@ pub(crate) async fn cancel_core(
         return Ok(json!({ "cancelled": false }));
     }
     cancel_delegation_subagents_without_reactivation(state, &delegation.id).await;
-    let transcript_paths = write_cancelled_subagent_transcripts(state, &delegation).await?;
+    let (handoff_dir, subagents) = write_cancelled_subagent_transcripts(state, &delegation).await?;
     Ok(json!({
         "cancelled": true,
-        "transcripts": transcript_paths,
+        "delegation_id": delegation.id,
+        "handoff_dir": handoff_dir,
+        "subagents": subagents,
     }))
 }
 
@@ -525,30 +529,34 @@ async fn cancel_delegation_subagents_without_reactivation(state: &AppState, dele
 async fn write_cancelled_subagent_transcripts(
     state: &AppState,
     delegation: &Delegation,
-) -> std::result::Result<Vec<Value>, RpcError> {
+) -> std::result::Result<(String, Vec<Value>), RpcError> {
     let parent_config = state
         .repo
         .load_session_config(&delegation.parent_session_id)
         .await?;
-    let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id).join("cancelled");
+    let delegation_segment = safe_path_segment(&delegation.id, "delegation_id")?;
+    let handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation_segment);
+    let dir = handoff_dir.join("cancelled");
     let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
-    let mut transcripts = Vec::with_capacity(subagents.len());
+    let mut transcript_refs = Vec::with_capacity(subagents.len());
     for subagent in &subagents {
+        let subagent_segment = safe_path_segment(&subagent.session_id, "subagent_id")?;
         let history = state.repo.active_branch(&subagent.session_id).await?;
         let transcript = render_transcript_markdown(&history);
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(anyhow::Error::from)?;
-        let path = dir.join(format!("{}.transcript.md", subagent.session_id));
+        let transcript_file = format!("cancelled/{subagent_segment}.transcript.md");
+        let path = dir.join(format!("{subagent_segment}.transcript.md"));
         tokio::fs::write(&path, transcript.as_bytes())
             .await
             .map_err(anyhow::Error::from)?;
-        transcripts.push(json!({
+        transcript_refs.push(json!({
             "subagent_id": subagent.session_id,
-            "transcript": path.to_string_lossy(),
+            "transcript_file": transcript_file,
         }));
     }
-    Ok(transcripts)
+    Ok((handoff_dir.to_string_lossy().into_owned(), transcript_refs))
 }
 
 #[derive(Debug, Deserialize)]
@@ -578,15 +586,15 @@ impl HandoffFileRequest<'_> {
 }
 
 /// Resolve the closed handoff file vocabulary. Normal files live under
-/// `<subagent_id>/{final_message.md,transcript.md}`. Cancelled delegations expose
-/// only the transcript-only cancellation artifact via
+/// `<subagent_id>/{task_prompt.md,final_message.md,transcript.md}`. Cancelled
+/// delegations expose only the transcript-only cancellation artifact via
 /// `cancelled/<subagent_id>.transcript.md`.
 fn parse_handoff_file_request<'a>(
     subagent_id: Option<&'a str>,
     file: &'a str,
 ) -> std::result::Result<HandoffFileRequest<'a>, RpcError> {
     match file {
-        "final_message.md" | "transcript.md" => {
+        TASK_PROMPT_FILE | "final_message.md" | "transcript.md" => {
             let subagent_id = subagent_id.ok_or_else(|| {
                 RpcError::new("invalid_params", format!("{file} requires a subagent_id"))
             })?;
@@ -610,7 +618,7 @@ fn parse_handoff_file_request<'a>(
             Err(RpcError::new(
                 "invalid_params",
                 format!(
-                    "file must be one of final_message.md | transcript.md | cancelled/<subagent_id>.transcript.md, got {relative}"
+                    "file must be one of task_prompt.md | final_message.md | transcript.md | cancelled/<subagent_id>.transcript.md, got {relative}"
                 ),
             ))
         }
@@ -623,6 +631,10 @@ fn read_allowed_for_status(
 ) -> std::result::Result<bool, RpcError> {
     match status {
         DelegationStatus::Running => match request {
+            HandoffFileRequest::Normal {
+                file: TASK_PROMPT_FILE,
+                ..
+            } => Ok(true),
             HandoffFileRequest::Normal {
                 file: "transcript.md",
                 ..
@@ -642,10 +654,20 @@ fn read_allowed_for_status(
             HandoffFileRequest::CancelledTranscript { .. } => Ok(false),
         },
         DelegationStatus::Cancelled => match request {
+            HandoffFileRequest::Normal {
+                file: TASK_PROMPT_FILE,
+                ..
+            } => Ok(true),
             HandoffFileRequest::CancelledTranscript { .. } => Ok(true),
             HandoffFileRequest::Normal { .. } => Ok(false),
         },
-        DelegationStatus::Failed => Ok(false),
+        DelegationStatus::Failed => match request {
+            HandoffFileRequest::Normal {
+                file: TASK_PROMPT_FILE,
+                ..
+            } => Ok(true),
+            _ => Ok(false),
+        },
     }
 }
 
@@ -695,23 +717,7 @@ fn validate_member_subagent(
 /// thing that can ever escape the handoff subtree, so we validate the segment
 /// in isolation before it is ever joined onto the trusted base.
 fn safe_path_segment(segment: &str, field: &str) -> std::result::Result<String, RpcError> {
-    let trimmed = segment.trim();
-    let reject = || {
-        RpcError::new(
-            "invalid_params",
-            format!("{field} is not a valid path segment"),
-        )
-    };
-    if trimmed.is_empty() || trimmed.contains('\0') {
-        return Err(reject());
-    }
-    let mut components = Path::new(trimmed).components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(name)), None) if name == std::ffi::OsStr::new(trimmed) => {
-            Ok(trimmed.to_string())
-        }
-        _ => Err(reject()),
-    }
+    safe_handoff_path_segment(segment, field)
 }
 
 /// Resolve a handoff file request to an absolute path strictly under
@@ -757,26 +763,63 @@ pub(crate) async fn read_handoff_file_core(
     let delegation =
         load_delegation_for_parent(state, parent_session_id, &params.delegation_id).await?;
     let request = parse_handoff_file_request(params.subagent_id.as_deref(), &params.file)?;
+    safe_path_segment(&delegation.id, "delegation_id")?;
+    safe_path_segment(request.subagent_id(), "subagent_id")?;
     // A read may only target a subagent that belongs to this delegation;
     // otherwise a caller could probe arbitrary `<delegation>/<segment>/` paths.
     let members = state.repo.list_delegation_subagents(&delegation.id).await?;
     validate_member_subagent(request, &members)?;
 
     if read_allowed_for_status(delegation.status, request)? {
-        match delegation.status {
-            DelegationStatus::Running
-            | DelegationStatus::Done
-            | DelegationStatus::DoneWithFailures => {
-                let include_final_messages = matches!(
-                    delegation.status,
-                    DelegationStatus::Done | DelegationStatus::DoneWithFailures
-                );
-                refresh_delegation_handoff_artifacts(state, &delegation, include_final_messages)
-                    .await?;
+        if matches!(
+            request,
+            HandoffFileRequest::Normal {
+                file: TASK_PROMPT_FILE,
+                ..
             }
-            // Cancelled reads are limited to the already-written transcript-only
-            // artifact. Failed delegations have no readable handoff artifacts.
-            DelegationStatus::Cancelled | DelegationStatus::Failed => {}
+        ) {
+            let parent_config = state.repo.load_session_config(parent_session_id).await?;
+            let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
+            let subagent_id = request.subagent_id();
+            let member = members
+                .iter()
+                .find(|member| member.session_id == subagent_id)
+                .ok_or_else(|| {
+                    RpcError::new(
+                        "handoff_file_not_found",
+                        "subagent does not belong to this delegation",
+                    )
+                })?;
+            let task_prompt =
+                refresh_task_prompt_artifact_if_present(&dir, subagent_id, member.task.as_deref())
+                    .await?;
+            if task_prompt.is_none() {
+                return Err(RpcError::new(
+                    "handoff_file_not_found",
+                    "task prompt is unavailable for this subagent",
+                ));
+            }
+        } else {
+            match delegation.status {
+                DelegationStatus::Running
+                | DelegationStatus::Done
+                | DelegationStatus::DoneWithFailures => {
+                    let include_final_messages = matches!(
+                        delegation.status,
+                        DelegationStatus::Done | DelegationStatus::DoneWithFailures
+                    );
+                    refresh_delegation_handoff_artifacts(
+                        state,
+                        &delegation,
+                        include_final_messages,
+                    )
+                    .await?;
+                }
+                // Cancelled reads are limited to the already-written transcript-only
+                // artifact. Failed delegations have no readable handoff artifacts
+                // except task prompts, handled above.
+                DelegationStatus::Cancelled | DelegationStatus::Failed => {}
+            }
         }
     } else {
         return Err(unavailable_handoff_file_error(delegation.status));
@@ -925,39 +968,68 @@ pub(crate) async fn rpc_list(
     let mut views = Vec::with_capacity(delegations.len());
     for delegation in &delegations {
         let delegation_handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
-        let subagents = state
-            .repo
-            .list_delegation_subagents(&delegation.id)
-            .await?
-            .into_iter()
-            .map(|subagent| {
-                let (cancellation_transcript_path, cancellation_transcript_relative_path) =
-                    if delegation.status == DelegationStatus::Cancelled {
-                        let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
-                        let path = delegation_handoff_dir.join(&relative);
-                        if path.exists() {
-                            (Some(path.to_string_lossy().into_owned()), Some(relative))
-                        } else {
-                            (None, None)
-                        }
-                    } else {
-                        (None, None)
-                    };
-                json!({
-                    "id": subagent.session_id,
-                    "status": subagent.activity,
-                    "activity": subagent.activity,
-                    "role": subagent.role,
-                    "type": subagent.subagent_type,
-                    "subagent_type": subagent.subagent_type,
-                    "task": subagent.task,
-                    "steerable": delegation.status == DelegationStatus::Running
-                        && subagent.subagent_type == Some(SubagentType::Full),
-                    "cancellation_transcript_path": cancellation_transcript_path,
-                    "cancellation_transcript_relative_path": cancellation_transcript_relative_path,
-                })
-            })
-            .collect::<Vec<_>>();
+        let subagent_rows = state.repo.list_delegation_subagents(&delegation.id).await?;
+        let mut subagents = Vec::with_capacity(subagent_rows.len());
+        for subagent in subagent_rows {
+            let task_prompt = refresh_task_prompt_artifact_if_present(
+                &delegation_handoff_dir,
+                &subagent.session_id,
+                subagent.task.as_deref(),
+            )
+            .await?;
+            let task_prompt_file = task_prompt
+                .as_ref()
+                .map(|_| task_prompt_rel(&subagent.session_id));
+            let (final_message_file, suggested_next) = if matches!(
+                delegation.status,
+                DelegationStatus::Done | DelegationStatus::DoneWithFailures
+            ) {
+                let relative = format!("{}/final_message.md", subagent.session_id);
+                let path = delegation_handoff_dir.join(&relative);
+                if path.exists() {
+                    let suggested_next = tokio::fs::read_to_string(&path)
+                        .await
+                        .ok()
+                        .as_deref()
+                        .and_then(extract_suggested_next);
+                    (Some(relative), suggested_next)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+            let transcript_file = match delegation.status {
+                DelegationStatus::Cancelled => {
+                    let subagent_segment = safe_path_segment(&subagent.session_id, "subagent_id")?;
+                    let relative = format!("cancelled/{subagent_segment}.transcript.md");
+                    let path = delegation_handoff_dir.join(&relative);
+                    path.exists().then_some(relative)
+                }
+                DelegationStatus::Running
+                | DelegationStatus::Done
+                | DelegationStatus::DoneWithFailures => {
+                    let relative = format!("{}/transcript.md", subagent.session_id);
+                    let path = delegation_handoff_dir.join(&relative);
+                    path.exists().then_some(relative)
+                }
+                DelegationStatus::Failed => None,
+            };
+            subagents.push(json!({
+                "id": subagent.session_id,
+                "status": subagent.activity,
+                "activity": subagent.activity,
+                "role": subagent.role,
+                "type": subagent.subagent_type,
+                "subagent_type": subagent.subagent_type,
+                "task_prompt_file": task_prompt_file,
+                "steerable": delegation.status == DelegationStatus::Running
+                    && subagent.subagent_type == Some(SubagentType::Full),
+                "suggested_next": suggested_next,
+                "final_message_file": final_message_file,
+                "transcript_file": transcript_file,
+            }));
+        }
         views.push(json!({
             "delegation_id": delegation.id,
             "kind": delegation.kind,
@@ -1031,6 +1103,8 @@ pub(crate) async fn run_delegation_tool(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     const CWD: &str = "/home/u/.local/state/pi-relay/sessions/parent/cwd";

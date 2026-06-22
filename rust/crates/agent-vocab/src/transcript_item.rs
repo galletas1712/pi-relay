@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::daemon_observation::DaemonToolObservation;
 use crate::ids::TurnId;
 use crate::message::{AssistantMessage, ToolCall, ToolResultMessage, UserMessage};
 
@@ -28,6 +29,7 @@ pub enum TranscriptItem {
         outcome: TurnOutcome,
     },
     CompactionSummary(CompactionSummary),
+    DaemonToolObservation(DaemonToolObservation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,7 +76,36 @@ impl TranscriptItem {
             TranscriptItem::CompactionSummary(summary) => Some(summary.last_turn_id),
             TranscriptItem::UserMessage(_)
             | TranscriptItem::AssistantMessage(_)
-            | TranscriptItem::ToolResult(_) => None,
+            | TranscriptItem::ToolResult(_)
+            | TranscriptItem::DaemonToolObservation(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ids::ToolCallId;
+    use crate::message::ToolResultStatus;
+    use serde_json::json;
+
+    #[test]
+    fn daemon_tool_observation_transcript_item_round_trips_with_type_tag() {
+        let item = TranscriptItem::DaemonToolObservation(DaemonToolObservation {
+            tool_call_id: ToolCallId::new("call_delegation_1_attempt_1"),
+            tool_name: "inspect_delegation".to_string(),
+            args_json: "{\"delegation_id\":\"delegation_1\"}".to_string(),
+            result_json: json!({ "delegation_id": "delegation_1", "status": "done" }),
+            status: ToolResultStatus::Success,
+            summary: Some("done".to_string()),
+        });
+
+        let value = serde_json::to_value(&item).expect("serialize");
+        assert_eq!(value["type"], "daemon_tool_observation");
+        assert_eq!(value["tool_name"], "inspect_delegation");
+
+        let round_trip: TranscriptItem = serde_json::from_value(value).expect("deserialize");
+        assert_eq!(round_trip, item);
+        assert_eq!(round_trip.turn_id(), None);
     }
 }

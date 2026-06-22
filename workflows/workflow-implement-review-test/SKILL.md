@@ -43,11 +43,11 @@ snapshot.
 Notes:
 - The tester is a full delegation because building/running tests writes the workspace
   (build outputs); it edits in place like the implementer.
-- After launching a delegation, end your turn; you will be steered when it
+- After launching a delegation, end your turn; you will receive a completion observation when it
   completes with an `inspect_delegation`-equivalent snapshot.
-- Subagents start fresh — carry the prior delegation's findings from the
-  delivered snapshot/final messages into the next delegation's prompt. Read
-  transcript/final-message files only when more detail is needed.
+- Subagents start fresh — carry prior control-flow facts from the delivered
+  snapshot into the next delegation's prompt. Read transcript/final-message
+  files only when more detail is needed.
 - In each subagent's prompt, REQUIRE it to end its final message with a line
   `suggested_next: <one of the outcomes above>` — that line is what
   the delivered snapshot records and you branch on; without it the recorded

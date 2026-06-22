@@ -18,10 +18,10 @@ synthesize the findings yourself. Nothing is changed in the workspace.
 1. Decide the angles (e.g. "current behavior", "prior art in the repo",
    "failure modes", "simplest option"). One explorer per angle.
 2. Run a single read-only fan-out with all explorers.
-3. When the completion steer arrives, branch on the delivered delegation
-   snapshot. Carry findings from that snapshot/final messages into your
-   synthesis; read an explorer's final_message.md or transcript only when you
-   need more detail. Call `inspect_delegation` only to refresh/recover state or
+3. When the completion observation arrives, branch on the delivered delegation
+   snapshot. Carry control-flow facts from that snapshot into your synthesis;
+   read an explorer's final_message.md or transcript only when you need more
+   detail. Call `inspect_delegation` only to refresh/recover state or
    inspect later.
    Synthesize the answer yourself (you are the reducer — there is no reducer
    subagent).
@@ -40,7 +40,10 @@ synthesize the findings yourself. Nothing is changed in the workspace.
 Notes:
 - Explorers start with fresh context: put the question and any pointers (files,
   prior handoff paths) in each prompt.
-- Explorers return only their final message in the delegation snapshot, so
-  instruct each to summarize findings and quote key evidence inline, and to end
-  with a line `suggested_next: done` or `suggested_next: inconclusive`.
+- Explorers write detailed findings in their final message artifact. The
+  delivered/refreshed delegation snapshot carries control-flow facts such as
+  `suggested_next`, status/progress, and artifact refs; read `final_message.md`
+  or `transcript.md` via those refs when more detail is needed. Instruct each
+  explorer to end with a line `suggested_next: done` or
+  `suggested_next: inconclusive`.
 - This workflow never edits the workspace; do not use a full delegation here.

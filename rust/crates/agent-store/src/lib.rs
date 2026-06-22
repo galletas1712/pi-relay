@@ -6,8 +6,8 @@ use std::fmt;
 
 use agent_session::{ModelContext, SessionAction, SessionEvent, TranscriptStorageNode};
 use agent_vocab::{
-    text_enum, ActionId, ProviderConfig, ProviderKind, ProviderReplayItem, TranscriptItem, TurnId,
-    TurnOutcome, UserMessage,
+    text_enum, ActionId, DaemonToolObservation, ProviderConfig, ProviderKind, ProviderReplayItem,
+    TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 pub use postgres::{Delegation, DelegationProgress, DelegationSubagent, PostgresAgentStore};
 use serde::{Deserialize, Serialize};
@@ -426,7 +426,7 @@ pub struct QueuedInputRecord {
     pub input_id: String,
     pub priority: InputPriority,
     pub status: QueuedInputStatus,
-    pub content: UserMessage,
+    pub content: QueuedInputContent,
     pub client_input_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -528,6 +528,7 @@ pub struct TurnCardRecord {
     pub start_timestamp_ms: u64,
     pub timestamp_ms: u64,
     pub user_messages: Vec<TranscriptEntryRecord>,
+    pub daemon_observations: Vec<TranscriptEntryRecord>,
     pub assistant_message: Option<TranscriptEntryRecord>,
     pub summary: Option<String>,
     pub can_resume: bool,
@@ -648,10 +649,45 @@ pub struct AcceptedInput {
 pub struct QueuedInput {
     pub id: String,
     pub priority: InputPriority,
-    pub content: UserMessage,
+    pub content: QueuedInputContent,
     pub client_input_id: Option<String>,
     pub claim_id: String,
     pub row_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "content", rename_all = "snake_case")]
+pub enum QueuedInputContent {
+    UserMessage(UserMessage),
+    DaemonToolObservation(DaemonToolObservation),
+}
+
+impl QueuedInputContent {
+    pub fn user_message(message: UserMessage) -> Self {
+        Self::UserMessage(message)
+    }
+
+    pub fn daemon_tool_observation(observation: DaemonToolObservation) -> Self {
+        Self::DaemonToolObservation(observation)
+    }
+
+    pub fn editable_user_message(&self) -> Option<&UserMessage> {
+        match self {
+            Self::UserMessage(message) => Some(message),
+            Self::DaemonToolObservation(_) => None,
+        }
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        self.editable_user_message().and_then(UserMessage::as_text)
+    }
+
+    pub fn as_kind(&self) -> &'static str {
+        match self {
+            Self::UserMessage(_) => "user_message",
+            Self::DaemonToolObservation(_) => "daemon_tool_observation",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

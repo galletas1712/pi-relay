@@ -88,7 +88,7 @@ async fn active_branch_turn_card_rows_tx(
                      end
                    ) over (order by sequence rows between unbounded preceding and current row) as card_ordinal
             from branch
-            where item->>'type' in ('turn_started', 'user_message', 'assistant_message', 'tool_call_started', 'tool_result', 'turn_finished', 'compaction_summary')
+            where item->>'type' in ('turn_started', 'user_message', 'assistant_message', 'tool_call_started', 'tool_result', 'turn_finished', 'compaction_summary', 'daemon_tool_observation')
         ),
         terminal_assistant as (
             select card_ordinal, max(sequence) as sequence
@@ -101,7 +101,7 @@ async fn active_branch_turn_card_rows_tx(
                card_rows.timestamp_ms,
                card_rows.sequence,
                case
-                 when card_rows.item->>'type' = 'user_message'
+                 when card_rows.item->>'type' in ('user_message', 'daemon_tool_observation')
                       or terminal_assistant.sequence = card_rows.sequence then card_rows.item
                  else null
                end as body_item,
@@ -146,16 +146,23 @@ fn turn_card_row(row: &sqlx::postgres::PgRow) -> Result<TurnCardRow> {
         .map(serde_json::from_value)
         .transpose()?;
     let entry = match (item_type.as_str(), body_item) {
-        ("user_message" | "assistant_message", Some(item)) => Some(TranscriptEntryRecord {
-            id: row.get("id"),
-            parent_id: row.get("parent_id"),
-            timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
-            sequence: row.get("sequence"),
-            item,
-            provider_replay: Vec::new(),
-        }),
+        ("user_message" | "assistant_message" | "daemon_tool_observation", Some(item)) => {
+            Some(TranscriptEntryRecord {
+                id: row.get("id"),
+                parent_id: row.get("parent_id"),
+                timestamp_ms: row.get::<i64, _>("timestamp_ms") as u64,
+                sequence: row.get("sequence"),
+                item,
+                provider_replay: Vec::new(),
+            })
+        }
         ("user_message", None) => {
             return Err(anyhow!("turn-card row missing body item for user_message"));
+        }
+        ("daemon_tool_observation", None) => {
+            return Err(anyhow!(
+                "turn-card row missing body item for daemon_tool_observation"
+            ));
         }
         ("assistant_message", None) => None,
         _ => None,
@@ -229,6 +236,7 @@ struct MutableTurnCard {
     start_timestamp_ms: u64,
     timestamp_ms: u64,
     user_messages: Vec<TranscriptEntryRecord>,
+    daemon_observations: Vec<TranscriptEntryRecord>,
     assistant_message: Option<TranscriptEntryRecord>,
     summary: Option<String>,
     status: TurnCardStatus,
@@ -274,6 +282,7 @@ fn turn_cards_from_rows(rows: &[TurnCardRow]) -> Vec<TurnCardRecord> {
                 start_timestamp_ms: row.timestamp_ms,
                 timestamp_ms: row.timestamp_ms,
                 user_messages: Vec::new(),
+                daemon_observations: Vec::new(),
                 assistant_message: None,
                 summary: None,
                 status: TurnCardStatus::Open,
@@ -297,6 +306,7 @@ fn turn_cards_from_rows(rows: &[TurnCardRow]) -> Vec<TurnCardRecord> {
                 .unwrap_or(row.timestamp_ms),
             timestamp_ms: row.timestamp_ms,
             user_messages: Vec::new(),
+            daemon_observations: Vec::new(),
             assistant_message: None,
             summary: None,
             status: TurnCardStatus::Open,
@@ -328,6 +338,11 @@ fn append_entry_to_turn_card(card: &mut MutableTurnCard, row: &TurnCardRow) {
         "assistant_message" => {
             if let Some(entry) = row.entry_record() {
                 card.assistant_message = Some(entry);
+            }
+        }
+        "daemon_tool_observation" => {
+            if let Some(entry) = row.entry_record() {
+                card.daemon_observations.push(entry);
             }
         }
         "turn_finished" => {
@@ -386,6 +401,7 @@ fn finalize_turn_card(card: MutableTurnCard) -> TurnCardRecord {
         start_timestamp_ms: card.start_timestamp_ms,
         timestamp_ms: card.timestamp_ms,
         user_messages: card.user_messages,
+        daemon_observations: card.daemon_observations,
         assistant_message: card.assistant_message,
         summary: card.summary,
         can_resume,

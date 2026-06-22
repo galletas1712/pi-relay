@@ -16,7 +16,7 @@
 //! repair may re-render the same files for already-completed delegations if the
 //! daemon crashed after the status CAS but before publication.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use agent_store::{Delegation, DelegationStatus, HistoryTree};
 use agent_vocab::{
@@ -27,6 +27,7 @@ use crate::state::AppState;
 use crate::types::RpcError;
 
 pub(crate) const HANDOFF_DIR: &str = ".pi-handoff";
+pub(crate) const TASK_PROMPT_FILE: &str = "task_prompt.md";
 
 /// The per-subagent handoff outcome, derived from the subagent's terminal
 /// `TurnOutcome`. Graceful is `done`; an interrupted or crashed turn is
@@ -150,6 +151,12 @@ pub(crate) fn render_transcript_markdown(history: &HistoryTree) -> String {
                     summary.summary.trim()
                 ));
             }
+            TranscriptItem::DaemonToolObservation(observation) => {
+                let text = observation
+                    .render_text()
+                    .unwrap_or_else(|_| "Daemon observation could not be rendered.".to_string());
+                out.push_str(&format!("## Daemon observation\n\n{}\n\n", text.trim()));
+            }
             TranscriptItem::TurnStarted { .. } | TranscriptItem::TurnFinished { .. } => {}
         }
     }
@@ -194,10 +201,9 @@ pub(crate) fn extract_suggested_next(final_message: &str) -> Option<String> {
 pub(crate) struct SubagentArtifact {
     pub(crate) session_id: String,
     pub(crate) terminal_status: Option<&'static str>,
-    pub(crate) final_message: Option<String>,
     pub(crate) suggested_next: Option<String>,
     pub(crate) final_message_path: Option<PathBuf>,
-    pub(crate) transcript_path: PathBuf,
+    pub(crate) task_prompt_path: Option<PathBuf>,
 }
 
 impl SubagentArtifact {
@@ -210,6 +216,81 @@ impl SubagentArtifact {
     pub(crate) fn transcript_rel(&self) -> String {
         format!("{}/transcript.md", self.session_id)
     }
+
+    pub(crate) fn task_prompt_rel(&self) -> Option<String> {
+        self.task_prompt_path
+            .as_ref()
+            .map(|_| task_prompt_rel(&self.session_id))
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TaskPromptArtifact {
+    pub(crate) path: PathBuf,
+}
+
+pub(crate) fn task_prompt_rel(session_id: &str) -> String {
+    format!("{session_id}/{TASK_PROMPT_FILE}")
+}
+
+/// Reject any dynamic path segment that is not a plain file/dir name. Every
+/// handoff writer should validate public ids before joining them onto the
+/// trusted handoff root.
+pub(crate) fn safe_handoff_path_segment(
+    segment: &str,
+    field: &str,
+) -> std::result::Result<String, RpcError> {
+    let trimmed = segment.trim();
+    let reject = || {
+        RpcError::new(
+            "invalid_params",
+            format!("{field} is not a valid path segment"),
+        )
+    };
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(reject());
+    }
+    let mut components = Path::new(trimmed).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) if name == std::ffi::OsStr::new(trimmed) => {
+            Ok(trimmed.to_string())
+        }
+        _ => Err(reject()),
+    }
+}
+
+pub(crate) async fn refresh_task_prompt_artifact(
+    delegation_dir: &Path,
+    session_id: &str,
+    task: &str,
+) -> std::result::Result<TaskPromptArtifact, RpcError> {
+    let session_segment = safe_handoff_path_segment(session_id, "subagent_id")?;
+    let subagent_dir = delegation_dir.join(session_segment);
+    tokio::fs::create_dir_all(&subagent_dir)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let path = subagent_dir.join(TASK_PROMPT_FILE);
+    tokio::fs::write(&path, task.as_bytes())
+        .await
+        .map_err(anyhow::Error::from)?;
+    Ok(TaskPromptArtifact { path })
+}
+
+pub(crate) async fn refresh_task_prompt_artifact_if_present(
+    delegation_dir: &Path,
+    session_id: &str,
+    task: Option<&str>,
+) -> std::result::Result<Option<TaskPromptArtifact>, RpcError> {
+    safe_handoff_path_segment(session_id, "subagent_id")?;
+    let Some(task) = task else {
+        return Ok(None);
+    };
+    if task.trim().is_empty() {
+        return Ok(None);
+    }
+    refresh_task_prompt_artifact(delegation_dir, session_id, task)
+        .await
+        .map(Some)
 }
 
 pub(crate) fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
@@ -224,13 +305,12 @@ pub(crate) fn handoff_root(parent_outer_cwd: &str) -> PathBuf {
 ///
 /// This writes each subagent's exhaustive `transcript.md` on every call. When
 /// `include_final_messages` is true, it also writes `final_message.md`. Returned
-/// metadata may still include final-message/suggested-next text for terminal
-/// subagents in a running delegation, but normal final-message files are only
-/// published for completed delegations. Running inspections pass `false`: their
-/// transcript files are kept current, but no normal final-message artifact is
-/// published before the completion CAS wins. Cancelled and failed delegations do
-/// not publish normal per-subagent handoff artifacts; cancellation has its own
-/// transcript-only artifact path.
+/// metadata may still include `suggested_next` for terminal subagents in a
+/// running delegation, but final-message prose is not returned to snapshots.
+/// Running inspections pass `false`: their transcript files are kept current,
+/// but no normal final-message artifact is published before the completion CAS
+/// wins. Cancelled and failed delegations do not publish normal per-subagent
+/// handoff artifacts; cancellation has its own transcript-only artifact path.
 pub(crate) async fn refresh_delegation_handoff_artifacts(
     state: &AppState,
     delegation: &Delegation,
@@ -273,6 +353,12 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         tokio::fs::create_dir_all(&subagent_dir)
             .await
             .map_err(anyhow::Error::from)?;
+        let task_prompt = refresh_task_prompt_artifact_if_present(
+            &dir,
+            &subagent.session_id,
+            subagent.task.as_deref(),
+        )
+        .await?;
         let final_message_path = if include_final_messages {
             let path = subagent_dir.join("final_message.md");
             tokio::fs::write(&path, final_message.as_bytes())
@@ -290,10 +376,9 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         artifacts.push(SubagentArtifact {
             session_id: subagent.session_id.clone(),
             terminal_status: is_terminal.then_some(status),
-            final_message: include_final_content.then_some(final_message),
             suggested_next: include_final_content.then_some(suggested_next).flatten(),
             final_message_path,
-            transcript_path,
+            task_prompt_path: task_prompt.as_ref().map(|artifact| artifact.path.clone()),
         });
     }
 

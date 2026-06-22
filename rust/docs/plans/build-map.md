@@ -60,7 +60,7 @@ or `stage_id` column.
 | rust/crates/agent-store/src/postgres/session_links.rs | session_parent_id / list_child_session_ids / set_session_parent | 10-53 | Parent/child linkage queries. |
 | rust/crates/agent-daemon/src/workspaces/mod.rs | fork_session_from_parent | 150-217 | Snapshot mechanism RO keeps, full skips. |
 | rust/crates/agent-daemon/src/workspaces/mod.rs | remove_session_dir | 260-266 | remove_dir_all; does NOT reclaim btrfs subvolumes (#2). |
-| rust/crates/agent-daemon/src/main.rs | enqueue_session_input / interrupt_session | 924, 1240 | Steer delivery + interrupt primitives reused by control RPCs + barrier→steer. |
+| rust/crates/agent-daemon/src/main.rs | enqueue_session_input / interrupt_session | 924, 1240 | Steer delivery + interrupt primitives reused by control RPCs; delegation completion now uses barrier→typed daemon wakeup observation. |
 
 ### build_seams
 **Net-new #1 — skip the fork for full.** Single fork call site `subagents.rs:264-273`; returned `(outer_cwd, workspaces)`
@@ -436,7 +436,7 @@ Appendix A schemas (workflow-orchestration.md:630-653):
 `} else if is_stage_tool_name(&tool_call.tool_name) { run_stage_tool(&state, &session_id, &dispatch.config, &tool_call).await }`.
 Add module exporting `is_stage_tool_name`/`run_stage_tool -> ToolResultMessage`, mirroring repl_tools.rs (14-60). Handler
 parses args_json, runs guards, calls engine, returns ToolResultMessage::success/error. session_id IS the parent.
-**Handler must NOT block** — return stage_id immediately; completion arrives via barrier→steer.
+**Handler must NOT block** — return stage_id immediately; completion arrives via barrier→typed daemon wakeup observation.
 
 **Reuse spawn engine:** run_stage_tool builds the params subagent_spawn_from_active_parent consumes, calls spawn_subagent
 per subagent, tagging stage_id + subagent_type. For full, skip fork (#1). Drop legacy sources/initial_context.
@@ -712,7 +712,7 @@ the per-session inspector.
 Add the run board as a section inside Inspector (panels.tsx:624) or a new sibling, reusing subagent data-flow.
 **1. Types** (types.ts after 125): StageKind=`"full"|"readonly_fanout"`, StageStatus=`"running"|"done"|
 "done_with_failures"|"cancelled"|"failed"`, SubagentType=`"full"|"read_only"`, StageSubagent
-{id,role?,status,suggested_next?,final_message_path?,transcript_path?,activity?}, Stage
+{id,role?,status,suggested_next?,final_message_file?,transcript_file?,activity?}, Stage
 {stage_id,parent_session_id,workflow?,label?,kind,status,handoff_dir?,subagents[],created_at?,updated_at?},
 StageListResult{parent_session_id,stages[]}. Extend SessionSummary/Snapshot with stage_id?, subagent_type?.
 **2. Facade** (agentApi.ts): listStages/getStage("stage.status")/startFullStage/startReadonlyFanout/cancelStage. The
@@ -722,7 +722,7 @@ stage.status).
 **3. Query+poll** (App.tsx, mirror 427-445): stagesQuery with refetchInterval 2_000 while parent running. Add
 queryKeys.stages/stage.
 **4. Event refresh** (sessionEvents.ts + App.tsx): add new stage event names to SESSION_LIST_REFRESH_EVENTS +
-KNOWN_SESSION_EVENTS; in handleSessionEvent invalidate queryKeys.stages. **Completion steer is a normal user message in
+KNOWN_SESSION_EVENTS; in handleSessionEvent invalidate queryKeys.stages. **Completion is a typed daemon observation in
 the parent transcript** — existing transcript pipeline renders it; board just flips the stage row via the query refresh.
 **5. Render+controls** (panels.tsx): RunBoard modeled on SubagentsSection; per subagent row link to child session; cancel
 stage → api.cancelStage; steer full subagent → api.queueFollowUp BUT at STEER priority (new path); re-run → startFull/
@@ -738,7 +738,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 - NO stage.* RPC registered yet — coordinate exact param/result JSON with Phase 2 builder.
 - **Handoff files live on the daemon host filesystem; NO RPC reads arbitrary files from the web client today.** "Links to
   handoff files" cannot be live links unless the builder adds a file-read RPC; else show paths as text. BACKEND DEPENDENCY.
-- Completion notification is a STEER into the parent transcript, not a special event — don't build a separate renderer.
+- Completion notification is a typed daemon-authored wakeup observation in the parent transcript, not a special UI event — don't build a separate renderer.
 - Keep the 2s poll fallback while parent running (survive missed events).
 - transcript.tsx has zero subagent/stage awareness — run board is purely Inspector/panels.
 - New stage event names MUST go in KNOWN_SESSION_EVENTS or they force redundant active-branch syncs.
@@ -758,7 +758,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 | **#3** | Durable `stages` table + `sessions.stage_id`/`subagent_type` columns + stages repo | `schema.rs:20-128` SCHEMA_SQL (create stages BEFORE alters), text_enums in `lib.rs:58-92`, new `postgres/stages.rs` (register `mod stages;` mod.rs:1-16): create_stage, list_stage_subagents, finish_stage CAS, sweep_running_stages. Set values via start_session_outputs_with_parent (sessions.rs:252) or a setter mirroring set_session_parent. Update 3 explicit reads (list_sessions:428, load_session_config:500, session_snapshot snapshots.rs:24) only if surfaced. |
 | **#4** | Delegation model-facing tools + dispatch + 3 guards | Declare in `agent-tools/src/registry.rs:335-376` (register_runtime_tool, 4 `*_definition()` fns). Intercept by name in `runtime/tool.rs:58-90` (is_stage_tool_name/run_stage_tool). Engine reuses spawn_subagent (subagents.rs:191). Guards in run_stage_tool: homogeneity/single-full (structural), one-stage-per-parent (`parent_has_running_stage`), reject RO steer/interrupt (subagent_type). Update broken registry tests (476,516). Optionally register stage.* web RPCs in RpcMethod (types.rs:82-121) for UI/tests. |
 | **#5** | Handoff writer (transcript.md + final_message.md; inspect_delegation snapshot) | New module (e.g. `agent-daemon/src/handoff.rs`): `render_transcript_markdown(&HistoryTree)` + `extract_final_message(&HistoryTree)`, reading `active_branch(child)` (transcript.rs:328, Ui mode). Path `<parent.outer_cwd>/.pi-handoff/<stage_id>/<subagent>/` via load_session_config(parent).outer_cwd. Run inside the barrier (Section #6). `inspect_delegation` carries role/status/suggested_next/paths per subagent. |
-| **#6** | Barrier → steer hook in subagent-lifecycle path | Stage runner `on_subagent_terminal`/`try_stage_barrier` on SessionDriver, called at the three try_subagent_parent_idle_event call sites (`runtime/mod.rs:211,359,420`). Barrier: lock stage row (stages.rs CAS, FOR UPDATE) → all-subagents-terminal predicate → finish_stage CAS (running→done|done_with_failures from TurnOutcome) → render handoff (#5) → ONE `enqueue_session_input(&self.state, Steer)` to parent (main.rs:924). SUPPRESS per-child idle notification for stage members. Wire stage_runner into AppState (state.rs:30). |
+| **#6** | Barrier → typed daemon wakeup hook in subagent-lifecycle path | Stage runner `on_subagent_terminal`/`try_stage_barrier` on SessionDriver, called at the three try_subagent_parent_idle_event call sites (`runtime/mod.rs:211,359,420`). Barrier: lock stage row (stages.rs CAS, FOR UPDATE) → all-subagents-terminal predicate → finish_stage CAS (running→done|done_with_failures from TurnOutcome) → render handoff (#5) → ONE typed daemon observation queued at `InputPriority::Steer` to parent. SUPPRESS per-child idle notification for stage members. Wire stage_runner into AppState (state.rs:30). |
 | **#7** | Workflow skills installed + discoverable + PI.md rewrite | Copy 4 drafts to `/home/schwinns/pi-relay-wf/workflows/<name>/SKILL.md`. THREE loader edits: load_packaged_role_skills (skills.rs:153, role fallback), load_prompt_skills (prompt.rs:81, index — thread prompt_root), load_skill_output_with_home (skills.rs:62, LoadSkill — thread prompt_root). Rewrite PI.md:40-64 with Appendix B (AFTER Phases 1-3). |
 
 ---
@@ -786,7 +786,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 - Optionally `agent-daemon/src/types.rs` + `main.rs:255-293` — RpcMethod::Stage* for UI/tests.
 - `agent-daemon/src/repl.rs` — reject RO steer/interrupt (682-712).
 
-**Phase 3 — barrier → steer + handoff writer**
+**Phase 3 — barrier → typed daemon wakeup observation + handoff writer**
 - `agent-daemon/src/state.rs` — stage_runner handle in AppState.
 - `agent-daemon/src/runtime/mod.rs` — try_stage_barrier at 211/359/420; suppress per-child idle for stage members.
 - `agent-daemon/src/handoff.rs` (new) — render_transcript_markdown, extract_final_message; structured snapshot via inspect_delegation.

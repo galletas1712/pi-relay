@@ -45,11 +45,12 @@ Subagent orchestration with the smallest possible runtime:
 - Work happens in **stages**: either *one full subagent* or *a parallel fan-out of
   RO subagents* — never both, and never multiple full (writing) subagents.
 - Results propagate through a canonical structured delegation snapshot plus a
-  **handoff directory** of per-subagent files (final message + full transcript),
-  not through model context. The parent **does not busy-wait**: after launching
-  a stage it parks, and the daemon delivers a short **steer** containing an
-  `inspect_delegation`-equivalent snapshot when the stage completes. The parent
-  stays responsive to the user the whole time.
+  **handoff directory** of per-subagent files (`final_message.md`,
+  `transcript.md`, and `task_prompt.md` when available), not through model
+  context. The parent **does not busy-wait**: after launching a stage it parks,
+  and the daemon delivers a typed daemon-authored **wakeup observation**
+  containing an `inspect_delegation`-equivalent bounded snapshot when the stage
+  completes. The parent stays responsive to the user the whole time.
 - A **workflow** is a **skill** (`SKILL.md`) describing a possibly-cyclic state
   machine of stages. The parent loads it with `LoadSkill` and drives it with
   discretion, branching on subagents' typed outcomes. There is no workflow tool
@@ -89,14 +90,14 @@ tool behavior elsewhere).
 2. **The parent never busy-waits, but it is not frozen.** After launching a stage
    the parent parks (goes idle; it does not spin or poll). It stays a normal
    interactive session: user input drives it to make progress while the stage
-   runs. Stage completion is delivered as a high-priority **steer** (seen
-   promptly, even mid-turn), not a follow-up. During a full stage the parent
-   defers workspace edits to the full subagent (soft rule).
+   runs. Stage completion is delivered as a high-priority typed daemon wakeup
+   observation (seen promptly, even mid-turn), not a follow-up. During a full
+   stage the parent defers workspace edits to the full subagent (soft rule).
 3. **Workflows are skills the parent interprets, not a daemon DSL.** A workflow is
    a `SKILL.md` describing a (possibly cyclic) state machine of stages; the parent
    follows it with discretion, branching on typed subagent outcomes. The daemon
-   supplies mechanism (typed subagents, snapshots, the handoff dir, steer
-   notifications, durable stage records); the parent supplies policy.
+   supplies mechanism (typed subagents, snapshots, the handoff dir, wakeup
+   observations, durable stage records); the parent supplies policy.
 
 ## Relationship to the stated architecture
 
@@ -113,7 +114,7 @@ into a void.** It changes three things the architecture currently describes, and
 those doc updates ship with the implementation:
 
 - **Control surface:** Python REPL `subagents.*` (busy-wait) → provider-visible
-  delegation tool calls + daemon steer notifications (no busy-wait).
+  delegation tool calls + daemon wakeup observations (no busy-wait).
 - **Workspace handoff:** forked-context snapshots and git source-refs between
   subagents → one durable workspace (full writes in place; RO disposable
   snapshots) with file-based handoff; no merge, no source-refs.
@@ -195,18 +196,24 @@ stays bounded no matter how large a fan-out or transcript is.
   All are rendered from the durable transcript, so they exist even after an RO
   snapshot is gone and even when the subagent crashed.
 - The parent receives the same compact structured snapshot in the completion
-  steer and can refresh it later with **`inspect_delegation`**. It includes
-  per-subagent status, final_message, suggested_next, and handoff file paths so
-  the parent branches without parsing prose or reading files first.
-- The daemon then delivers the notification by enqueuing a **short steer** to the
-  parent (it appears as a user message in the parent's transcript). It names the
-  delegation, says how many succeeded/failed, and embeds the snapshot JSON. It
-  does **not** inline full transcripts:
+  wakeup observation and can refresh it later with **`inspect_delegation`**. It
+  includes per-subagent status, `suggested_next`, and compact handoff file
+  references so the parent branches without parsing prose or reading files
+  first.
+- The daemon then delivers the notification by enqueuing a typed
+  `daemon_tool_observation` for the parent. It names the delegation, says how
+  many succeeded/failed, and carries the bounded snapshot JSON. It does **not**
+  inline full transcripts or full final-message bodies:
 
   ```text
   Delegation delegation_... (reviewer fan-out) completed: 3 ok, 1 failed.
   Snapshot JSON (equivalent to inspect_delegation at wakeup time):
-  { ... final_message, suggested_next, final_message_path, transcript_path ... }
+  {
+    ...
+    "final_message_file": "child/final_message.md",
+    "suggested_next": "approved",
+    "transcript_file": "child/transcript.md"
+  }
   ```
 
 - The parent branches on the delivered snapshot first, then reads
@@ -233,8 +240,8 @@ parent calls delegate_writing_task / delegate_readonly_tasks
   -> subagents run; as each RO subagent returns, destroy its snapshot
   -> the daemon BLOCKS until every subagent is terminal (one barrier)
   -> the daemon writes final_message.md + transcript.md for every subagent,
-     then enqueues ONE short steer to the parent with the structured snapshot
-  -> parent (woken by the steer) branches on the snapshot and decides the next
+     then enqueues ONE typed wakeup observation to the parent with the structured snapshot
+  -> parent (woken by the observation) branches on the snapshot and decides the next
      stage, a re-run, done, or whether to read artifact files for more detail
 ```
 
@@ -321,7 +328,7 @@ outcomes each subagent reports in `inspect_delegation`.
 - test:      delegate_writing_task({ role:"tester",
     prompt:<how to test>, workflow:"implement_review_test" })
 
-When the completion steer arrives, branch on the delivered snapshot. Read the
+When the completion observation arrives, branch on the delivered snapshot. Read the
 relevant `final_message.md` only if you need more detail, and call
 `inspect_delegation` only to refresh/recover state or inspect later/running.
 Subagents start fresh, so carry the prior stage's findings into the next stage's
@@ -373,8 +380,9 @@ is just a parent session and its ordered stages.
 
 ## Stage runner
 
-Single-purpose: **detect the stage barrier, write the handoff files, and steer the
-parent exactly once**, with the same rigor `agent-store` applies to sessions.
+Single-purpose: **detect the stage barrier, write the handoff files, and publish
+one parent wakeup observation**, with the same rigor `agent-store` applies to
+sessions.
 
 ```text
 on a subagent of stage S reaching a terminal lifecycle state:
@@ -383,13 +391,13 @@ on a subagent of stage S reaching a terminal lifecycle state:
   if any subagent of S not terminal: return     # barrier not met
   set S.status = done|done_with_failures         # CAS on attempt_id
   render handoff files for every subagent of S   # per-subagent md
-  enqueue a steer to S.parent_session_id containing the structured snapshot
+  enqueue a typed daemon observation to S.parent_session_id containing the structured snapshot
   commit; then drive the parent
 ```
 
 Properties (reusing existing patterns): single-flight per stage via the stage row
-lock; idempotent (a non-`running` stage short-circuits, so the parent is steered
-once); attempt-fenced; crash-safe via a startup sweep over `running` stages whose
+lock; idempotent (a non-`running` stage short-circuits, so the parent wakeup is
+published once); attempt-fenced; crash-safe via a startup sweep over `running` stages whose
 subagents are all terminal. RO snapshots are reclaimed per subagent as each
 returns (independent of the barrier); handoff files render from the durable
 transcript, so they never depend on a snapshot. The runner never decides the next
@@ -411,7 +419,7 @@ the existing subagent path; RO subagents reject steer/interrupt by type.
 System-prompt rules for the parent (Appendix B): launch at most one stage per
 turn then end your turn; never poll; never start a second stage while one runs;
 never mix full and RO in one stage; while a full subagent runs, supervise and read
-but do not edit; on a completion steer, branch on the delivered snapshot first.
+but do not edit; on a completion observation, branch on the delivered snapshot first.
 
 The `PythonRepl` tool remains a raw escape hatch only; it is no longer the
 orchestration surface.
@@ -422,7 +430,7 @@ The parent session is the user's session and stays responsive: the user can stee
 the parent while a stage runs, and the parent asks the user directly when it needs
 a decision. A full subagent that needs the human ends with
 `suggested_next = human_needed`, which appears in its handoff `final_message.md`
-and the steer; the parent relays it. To intervene in a running stage the user
+and the wakeup observation; the parent relays it. To intervene in a running stage the user
 cancels it or steers the full subagent. No blocked-run table, no signal artifact.
 
 ## Migration off the Python REPL
@@ -432,7 +440,7 @@ delegation tool calls.** Today `PI.md` teaches orchestration via the
 `PythonRepl` tool's `subagents.*` host functions, which busy-wait in a
 long-lived Python process. The stage model replaces that with ordinary tool
 calls (`delegate_writing_task`, `delegate_readonly_tasks`,
-`inspect_delegation`, `cancel_delegation`) plus daemon-driven steers.
+`inspect_delegation`, `cancel_delegation`) plus daemon-driven wakeup observations.
 
 | Surface | Today | Steady state |
 | --- | --- | --- |
@@ -441,7 +449,7 @@ calls (`delegate_writing_task`, `delegate_readonly_tasks`,
 | Python REPL `subagents.*` (busy-wait) | current primary path in `PI.md` | raw escape hatch only; removed from `PI.md` |
 | `subagent.spawn` / `subagent.list` RPCs | low-level, REPL-backed | reused by / folded into the stage engine |
 
-Sequence: ship delegation tools + stages + handoff/steer (Phases 0–3); rewrite
+Sequence: ship delegation tools + stages + handoff/wakeup observation (Phases 0–3); rewrite
 the `PI.md` "Subagent delegation" section to teach delegation tools, workflow
 skills, the handoff dir, fresh-context prompts, and park-but-stay-responsive,
 deleting the `subagents.spawn/wait/...` guidance. Fully retiring the REPL
@@ -464,7 +472,7 @@ blocking dependency; implementation can start immediately.
 
 | Need | Use | Location |
 | --- | --- | --- |
-| Deliver the completion steer to the parent | `enqueue_session_input(state, SessionInputRequest { priority: InputPriority::Steer, .. })` | `agent-daemon/src/main.rs` (~925); already used by `subagents_steer_host` in `repl.rs` |
+| Deliver the completion observation to the parent | enqueue a typed daemon observation at `InputPriority::Steer` | `agent-daemon/src/delegation_runner.rs` / `agent-store/src/postgres/delegations.rs` |
 | Create a child subagent session | `spawn_subagent` / `subagent_spawn_from_active_parent` | `agent-daemon/src/subagents.rs` |
 | Load a role's `SKILL.md` for a subagent | `resolve_skill_role` | `agent-daemon/src/subagents.rs` |
 | Fork workspace dirs (for RO snapshots) | `WorkspaceManager::fork_session_from_parent` (btrfs/reflink/copy under the hood in `instantiate.rs`) | `agent-daemon/src/workspaces/mod.rs` (~150) |
@@ -491,7 +499,7 @@ blocking dependency; implementation can start immediately.
 4. **Delegation tools** (Appendix A) + homogeneity/single-stage guards.
 5. **The handoff writer** (per-subagent `final_message.md` /
    `transcript.md`) under `<outer_cwd>/.pi-handoff/<stage_id>/`.
-6. **The barrier→steer hook** in the subagent-lifecycle path (the runner above).
+6. **The barrier→wakeup-observation hook** in the subagent-lifecycle path (the runner above).
 7. **Workflow skills** as `SKILL.md` files (data, no daemon change) and the
    rewritten `PI.md` block.
 
@@ -547,11 +555,11 @@ busy-wait/poll loop.
   `cancel_delegation`; enforce homogeneity, a single full subagent, and
   one-stage-at-a-time per parent.
 
-### Phase 3 — handoff + barrier + steer
+### Phase 3 — handoff + barrier + wakeup observation
 
 - Handoff writer (per-subagent files from the durable transcript).
-- Stage runner: barrier, single-flight completion, one steer to the parent,
-  attempt fencing, crash-recovery sweep.
+- Stage runner: barrier, single-flight completion, one typed daemon wakeup
+  observation to the parent, attempt fencing, crash-recovery sweep.
 - `PI.md` park-but-stay-responsive rules; deterministic idempotency tests.
 
 ### Phase 4 — workflow skills
@@ -576,13 +584,14 @@ busy-wait/poll loop.
 Reuse the dev harness that resolves model actions deterministically
 (`harness.model.complete` / `harness.model.fail`).
 
-- **Barrier + handoff + steer (real Postgres):** drive subagents to terminal
-  states; assert one steer only after all are terminal; assert
+- **Barrier + handoff + wakeup observation (real Postgres):** drive subagents to terminal
+  states; assert one typed wakeup observation only after all are terminal; assert
   `final_message.md`/`transcript.md` exist for every subagent
   including failed ones; assert re-delivered events and restart sweeps do not
-  double-steer; assert a stale `attempt_id` cannot re-fire.
-- **Steer, not follow-up:** delivered at steer priority, seen promptly (mid-turn
-  after a tool batch if the parent is running).
+  double-publish; assert a stale `attempt_id` cannot re-fire.
+- **High priority, not follow-up:** delivered through the steer-priority queue
+  lane as a daemon observation, seen promptly (mid-turn after a tool batch if
+  the parent is running).
 - **In-place full writes:** a full subagent's edits are visible in the parent's
   workspace after the stage; full subagents do not fork.
 - **RO isolation + GC:** an RO subagent's writes never reach the durable
@@ -602,8 +611,8 @@ Reuse the dev harness that resolves model actions deterministically
 3. RO subagents run in disposable snapshots, may build/test in them, and are GC'd
    on return; they return no files.
 4. A stage is homogeneous: one full, or many RO. Never parallel writers.
-5. The parent parks (no spin) but stays responsive; completion arrives as a steer
-   containing the structured snapshot.
+5. The parent parks (no spin) but stays responsive; completion arrives as a
+   typed daemon wakeup observation containing the structured snapshot.
 6. Subagents cannot spawn subagents; subagent context is fresh.
 7. Results propagate through the delivered snapshot plus the handoff directory
    (final message + transcript) and, for full stages, the durable workspace. No
@@ -648,8 +657,9 @@ method names.
 
 Daemon-enforced errors: starting a second stage while one is running; mixing full
 and RO in one stage; more than one full subagent; steering an RO subagent.
-Completion is **not** a tool result — it arrives later as a steer containing an
-`inspect_delegation`-equivalent snapshot with handoff artifact paths. The
+Completion is **not** a tool result — it arrives later as a daemon-authored
+wakeup observation containing an `inspect_delegation`-equivalent bounded snapshot
+with handoff artifact paths. The
 `workflow` field is an optional grouping label only.
 
 ## Appendix B: draft `PI.md` "Subagent delegation" block

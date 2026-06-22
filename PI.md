@@ -55,13 +55,14 @@ Rules:
 
 - Launch at most one delegation per turn, then end your turn. Do not poll or loop —
   you will be notified.
-- When a delegation finishes you receive a daemon-authored wakeup steer with a
-  structured snapshot equivalent to `inspect_delegation`. Branch on the delivered
-  `suggested_next`/status fields; call `inspect_delegation` only to refresh or
-  recover state, or to inspect a delegation later/running. Read artifact paths
-  (`final_message.md`/`transcript.md`) only if you need more detail.
+- When a delegation finishes you receive a daemon-authored wakeup observation
+  with a structured snapshot equivalent to `inspect_delegation`. Branch on the
+  delivered `suggested_next`/status fields; call `inspect_delegation` only to
+  refresh or recover state, or to inspect a delegation later/running. Snapshot
+  payloads are bounded: read handoff artifact paths (`task_prompt.md`,
+  `final_message.md`, `transcript.md`) only if you need more detail.
 - Normal turns are transcript-driven: rely on durable tool results and wakeup
-  steers already present in the transcript. The daemon does not inject a
+  observations already present in the transcript. The daemon does not inject a
   separate current-delegation dashboard into ordinary model turns. Compaction
   provider inputs should also ignore/refrain from reconstructing live delegation
   state: after parent-session compaction returns, the daemon appends a fresh

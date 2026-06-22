@@ -7,6 +7,15 @@ export function isDelegationRunning(delegation: Delegation): boolean {
 	return delegation.status === "running";
 }
 
+function subagentHasPromptSource(subagent: DelegationSubagent, allowPromptFiles: boolean): boolean {
+	if (typeof subagent.task === "string" && subagent.task.trim()) return true;
+	return allowPromptFiles && subagentHasNonEmptyPromptFile(subagent);
+}
+
+export function subagentHasNonEmptyPromptFile(subagent: DelegationSubagent): boolean {
+	return typeof subagent.task_prompt_file === "string" && !!subagent.task_prompt_file.trim();
+}
+
 /** The daemon writes normal per-subagent handoff files from the delegation
  * barrier, which completes delegations as `done` or `done_with_failures`.
  * Other terminal states are real, but only completed delegations expose the
@@ -40,7 +49,7 @@ export function steerableSubagentId(delegation: Delegation): string | null {
  * with the actual reconstruction path so the UI never offers a re-run that the
  * click handler will reject. */
 export function canReRunDelegation(delegation: Delegation): boolean {
-	return reRunTaskPlan(delegation) !== null;
+	return reRunTaskPlan(delegation, { allowPromptFiles: true }) !== null;
 }
 
 function isReRunnableDelegationStatus(status: DelegationStatus): boolean {
@@ -68,12 +77,27 @@ type ReRunTaskPlan =
 	| { kind: "full"; task: ReRunTask }
 	| { kind: "readonly_fanout"; tasks: ReRunTask[] };
 
-function reRunTaskPlan(delegation: Delegation): ReRunTaskPlan | null {
+function reRunTaskPlan(delegation: Delegation, options: { allowPromptFiles: boolean } = { allowPromptFiles: false }): ReRunTaskPlan | null {
 	if (!isReRunnableDelegationStatus(delegation.status)) return null;
 	if (delegation.subagents.length === 0) return null;
-	const tasks = delegation.subagents.map((subagent) => subagentTask(subagent));
-	if (tasks.some((task) => task === null)) return null;
-	const resolved = tasks as ReRunTask[];
+	const roles = delegation.subagents.map((subagent) => subagent.role);
+	if (roles.some((role) => typeof role !== "string" || !role.trim())) return null;
+	if (options.allowPromptFiles) {
+		if (delegation.subagents.some((subagent) => !subagentHasPromptSource(subagent, true))) return null;
+	} else {
+		const tasks = delegation.subagents.map((subagent) => subagentTask(subagent));
+		if (tasks.some((task) => task === null)) return null;
+		const resolved = tasks as ReRunTask[];
+		return planForResolvedTasks(delegation, resolved);
+	}
+	const resolved = delegation.subagents.map((subagent) => ({
+		role: subagent.role!.trim(),
+		prompt: typeof subagent.task === "string" ? subagent.task : "",
+	}));
+	return planForResolvedTasks(delegation, resolved);
+}
+
+function planForResolvedTasks(delegation: Delegation, resolved: ReRunTask[]): ReRunTaskPlan | null {
 	const kind = delegation.kind as string;
 	if (kind === "full") {
 		const only = resolved[0];
@@ -86,9 +110,9 @@ function reRunTaskPlan(delegation: Delegation): ReRunTaskPlan | null {
 	return null;
 }
 
-/** Reconstruct the `delegation.start_*` params to re-run a finished delegation. The board
- * receives the original prompts as `DelegationSubagent.task`. Returns the kind-tagged
- * params, or null when any prompt/role is missing (re-run is then disabled). */
+/** Reconstruct the `delegation.start_*` params to re-run a finished delegation after
+ * prompt text has been loaded inline (possibly from `task_prompt.md`). Returns the
+ * kind-tagged params, or null when any prompt/role is missing. */
 export function reRunParamsForDelegation(
 	delegation: Delegation,
 	parentSessionId: string,

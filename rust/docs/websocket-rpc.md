@@ -210,7 +210,9 @@ compaction branches without being duplicated in action payloads.
 
 ### `queued_inputs`
 
-Durable user input queue:
+Durable input queue. Most rows are user follow-ups; daemon-authored wakeup
+observations can also be queued at steer priority so parent sessions resume
+promptly without treating the notification as a user message.
 
 ```text
 id text primary key
@@ -326,7 +328,9 @@ updated_at timestamptz not null default now()
 Child sessions link back through `sessions.delegation_id`. The
 `delegations_parent_created_idx` index supports the per-parent run-board feed.
 The completion runner uses `attempt_id` as an idempotency fence and queues a
-deterministic parent steer keyed as `delegation-steer:<delegation_id>:<attempt_id>`.
+deterministic parent daemon wakeup observation keyed as
+`delegation-steer:<delegation_id>:<attempt_id>` (the key name is retained for
+idempotency compatibility).
 
 ### `events`
 
@@ -556,10 +560,14 @@ Result shape:
 }
 ```
 
-`queued_inputs` contains live queued or consuming user inputs with `input_id`,
+`queued_inputs` contains live queued or consuming input rows with `input_id`,
 `priority`, `status`, `content`, `client_input_id`, `created_at`, `updated_at`,
-optional `promoted_at`, and optional `follow_up_position`. The web UI uses it
-for the composer-adjacent queue pane. `session_revision`,
+optional `promoted_at`, and optional `follow_up_position`. User-message rows
+carry their message content. Daemon wakeup observation rows are non-editable
+signals (`content_type = "daemon_tool_observation"`, `content = []`,
+`editable = false`); their typed transcript entry/result JSON and handoff files
+are the source of truth, not queue-event prose. The web UI uses editable
+user-message rows for the composer-adjacent queue pane. `session_revision`,
 `queue_revision`, and `transcript_revision` are monotonically increasing
 per-session counters for replacing stale cached views instead of inferring
 patches from partial events. `transcript_revision` changes when transcript rows
@@ -1272,9 +1280,9 @@ Result:
 
 Returns one in-scope delegation as the canonical structured snapshot. The
 snapshot includes delegation metadata, progress counts, subagent roles/types,
-activity/status, steerability, terminal final-message text/suggested_next (when
-available), and handoff artifact paths. It does not inline full transcript
-contents; read the `transcript.md` file when detail is needed.
+activity/status, steerability, `suggested_next` (when available), and compact
+handoff file references. It does not inline full transcript, task prompt, or
+final-message bodies; read handoff files when detail is needed.
 
 ```json
 {
@@ -1302,10 +1310,10 @@ Result:
       "activity": "idle",
       "status": "done",
       "steerable": false,
-      "final_message": "Looks good.\n\nsuggested_next: approved",
       "suggested_next": "approved",
-      "final_message_path": null,
-      "transcript_path": "/.../.pi-handoff/delegation_.../session_.../transcript.md"
+      "final_message_file": null,
+      "transcript_file": "session_.../transcript.md",
+      "task_prompt_file": "session_.../task_prompt.md"
     }
   ],
   "handoff_dir": "/.../.pi-handoff/delegation_..."
@@ -1316,12 +1324,29 @@ Result:
 
 Interrupts all running subagents in a delegation and marks the delegation
 cancelled. Terminal delegations are left unchanged and return
-`{ "cancelled": false }`.
+`{ "cancelled": false }`. A successful cancellation returns compact
+per-subagent transcript file references relative to `handoff_dir`.
 
 ```json
 {
   "parent_session_id": "parent-session",
   "delegation_id": "delegation_..."
+}
+```
+
+Successful result:
+
+```json
+{
+  "cancelled": true,
+  "delegation_id": "delegation_...",
+  "handoff_dir": "/.../.pi-handoff/delegation_...",
+  "subagents": [
+    {
+      "subagent_id": "session_...",
+      "transcript_file": "cancelled/session_abc.transcript.md"
+    }
+  ]
 }
 ```
 
@@ -1352,7 +1377,10 @@ Result:
           "status": "idle",
           "role": "implementer",
           "subagent_type": "full",
-          "task": "Implement the requested change."
+          "task_prompt_file": "session_.../task_prompt.md",
+          "transcript_file": "session_.../transcript.md",
+          "final_message_file": "session_.../final_message.md",
+          "suggested_next": "ready_for_review"
         }
       ],
       "handoff_dir": "/.../.pi-handoff/delegation_..."
@@ -1363,18 +1391,21 @@ Result:
 
 ### `delegation.read_handoff_file`
 
-Reads a valid delegation handoff file. Normal running/done delegations expose
-per-subagent `transcript.md`; terminal done/done_with_failures delegations also
-expose per-subagent `final_message.md`. Cancelled delegations expose only the
-transcript-only cancellation artifact path reported by `inspect_delegation`, for
-example `cancelled/<subagent_id>.transcript.md`. The structured delegation
-snapshot comes from `delegation.status`/`inspect_delegation`, not from a handoff
-root artifact file. Full transcript bodies are never inlined in delegation snapshots,
-daemon observations, or compaction ledgers; use this RPC to read an artifact
-body explicitly when detail is needed.
+Reads a valid delegation handoff file. Normal running/done/cancelled/failed
+delegations expose per-subagent `task_prompt.md`. Normal running/done
+delegations expose per-subagent `transcript.md`; terminal
+done/done_with_failures delegations also expose per-subagent `final_message.md`.
+Cancelled delegations expose the transcript-only cancellation artifact path
+reported by `inspect_delegation`, for example
+`cancelled/<subagent_id>.transcript.md`. The structured delegation snapshot
+comes from `delegation.status`/`inspect_delegation`, not from a handoff root
+artifact file. Raw task prompts, full final messages, and full transcript bodies
+are never inlined in delegation snapshots, daemon observations, or compaction
+ledgers; use this RPC to read an artifact body explicitly when detail is needed.
 
 Allowed `file` values are exactly:
 
+- `task_prompt.md` with matching `subagent_id`
 - `final_message.md` with matching `subagent_id`
 - `transcript.md` with matching `subagent_id`
 - `cancelled/<subagent_id>.transcript.md` (the `subagent_id` parameter is
@@ -1385,7 +1416,7 @@ Allowed `file` values are exactly:
   "parent_session_id": "parent-session",
   "delegation_id": "delegation_...",
   "subagent_id": "session_...",
-  "file": "final_message.md"
+  "file": "task_prompt.md"
 }
 ```
 
@@ -1415,13 +1446,16 @@ Result:
 When a delegation subagent is spawned or re-driven, the daemon may emit
 parent-scoped `subagent.spawned` and `subagent.running` progress events. These
 are progress hints only. Parent-visible delegation completion is not a per-child
-`subagent.idle`; it is one `InputPriority::Steer` queued to the parent after the
-delegation barrier completes. The steer includes a JSON delegation snapshot
-equivalent to `inspect_delegation`/`delegation.status`, including per-subagent
-final messages, `suggested_next`, and artifact paths. Use
+`subagent.idle`; it is one `InputPriority::Steer` daemon observation queued to
+the parent after the delegation barrier completes. The observation is stored as a
+typed `daemon_tool_observation` transcript item and is inspect-equivalent to
+`inspect_delegation`/`delegation.status`, including per-subagent
+`suggested_next` and artifact paths. Provider adapters
+render it as an adjacent synthetic `inspect_delegation` tool call/result pair;
+the UI renders it as a daemon/system observation card. Use
 `inspect_delegation`/`delegation.status` to refresh/recover state or inspect
-later/running; use the per-subagent `final_message.md`/`transcript.md` files for
-extra detail.
+later/running; use the per-subagent `task_prompt.md`, `final_message.md`, and
+`transcript.md` files for extra detail.
 
 `subagent.idle` remains an event type for non-delegation subagent compatibility
 (for example, defensive dispatch-failure compensation). When emitted, idle
@@ -1539,7 +1573,7 @@ subagent.idle
 ```
 
 `subagent.idle` is listed for compatibility; delegation-member completion is
-reported by the delegation steer/handoff described above.
+reported by the delegation wakeup observation/handoff described above.
 
 No approval or awaiting-approval events are emitted.
 
@@ -1560,7 +1594,9 @@ queue projection:
 
 Clients should replace cached queue state when an event carries a newer
 `queue_revision`. They should refetch rather than trying to infer ordering from
-partial event payloads.
+partial event payloads. Event payloads are notification/invalidation signals,
+not content storage: daemon wakeup observation `input.queued` events do not
+inline prose summaries, full result JSON, final messages, or task prompts.
 
 `transcript.appended` carries the appended entry body when available, plus its
 compact `tree_node`, `active_leaf_id`, and revision counters:

@@ -37,7 +37,7 @@ result. You decide what to do with that result.
 The `tester` role is generic; put all kubernetes-specific guidance below in the
 delegation prompt, and REQUIRE the tester to end its final message with a line
 `suggested_next: pass | product_failure | environment_retry | human_needed`.
-When the completion steer arrives, branch on the delivered snapshot; call
+When the completion observation arrives, branch on the delivered snapshot; call
 `inspect_delegation` only to refresh/recover state or inspect later/running.
 
 Cluster-safety rules to put in the tester's prompt:

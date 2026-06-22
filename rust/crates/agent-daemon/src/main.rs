@@ -40,8 +40,9 @@ use agent_core::AgentInput;
 use agent_session::SessionInput;
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
-    EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputStatus,
-    SessionConfig, SubagentType, TranscriptEntryBodyMode, TranscriptEntryScope, WorkspaceKind,
+    EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputContent,
+    QueuedInputStatus, SessionConfig, SubagentType, TranscriptEntryBodyMode, TranscriptEntryScope,
+    WorkspaceKind,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -82,8 +83,8 @@ async fn main() -> Result<()> {
     };
 
     // Complete any delegation that crashed mid-barrier: a `running` delegation whose
-    // subagents are all terminal is finished (handoff + steer) exactly once via
-    // the same attempt-fenced CAS the live barrier uses.
+    // subagents are all terminal is finished (handoff + wakeup observation)
+    // exactly once via the same attempt-fenced CAS the live barrier uses.
     //
     // This runs AFTER the global stale-mark above, but that ordering is safe:
     // delegation terminality is transcript-boundary based, independent of action
@@ -847,7 +848,8 @@ pub(crate) async fn input_user(
     // Server-side guard: a read-only subagent must never be steered. The legacy
     // client-only check is not authoritative, so reject a Steer-priority input
     // targeting a read_only subagent here. Follow-up inputs (and the barrier's
-    // top-level parent steer, which is never read_only) are unaffected.
+    // top-level parent wakeup observation, which targets a parent session) are
+    // unaffected.
     if priority == InputPriority::Steer
         && state.repo.session_subagent_type(&session_id).await? == Some(SubagentType::ReadOnly)
     {
@@ -992,7 +994,10 @@ pub(crate) async fn enqueue_session_input(
                 let mut runtime = active.lock().await;
                 runtime
                     .session
-                    .enqueue_input(agent_input_from_queued_priority(priority, content.clone()))
+                    .enqueue_input(agent_input_from_queued_priority(
+                        priority,
+                        QueuedInputContent::user_message(content.clone()),
+                    ))
                     .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
             }
             let dispatches = driver

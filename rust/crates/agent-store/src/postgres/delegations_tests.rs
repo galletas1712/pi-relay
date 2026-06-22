@@ -2,10 +2,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_session::TranscriptStorageNode;
 use agent_vocab::{
-    AssistantMessage, ProviderConfig, ProviderKind, ReasoningEffort, TranscriptItem, TurnId,
-    TurnOutcome, UserMessage,
+    AssistantMessage, DaemonToolObservation, ProviderConfig, ProviderKind, ReasoningEffort,
+    ToolCallId, TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
-use serde_json::json;
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{DelegationKind, DelegationStatus, SessionConfig, SubagentType};
@@ -671,7 +671,7 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
         .await
         .expect("replay is a no-op"));
 
-    // The status CAS no longer enqueues the steer. Publication happens after
+    // The status CAS no longer enqueues the wakeup. Publication happens after
     // the handoff files exist, but the deterministic client_input_id still
     // makes the enqueue idempotent.
     let key = format!(
@@ -922,6 +922,71 @@ async fn all_terminal_predicate_and_boot_sweep() {
         .await
         .expect("sweep")
         .is_empty());
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn enqueue_delegation_observation_event_uses_minimal_payload_and_queue_projection() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegations test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    let observation = DaemonToolObservation::inspect_delegation(
+        ToolCallId::new("call_delegation_1_attempt_1"),
+        "delegation_1",
+        Some("Delegation delegation_1 completed with status done".to_string()),
+        json!({
+            "delegation_id": "delegation_1",
+            "status": "done",
+            "subagents": [{
+                "id": "child",
+                "suggested_next": "approved",
+                "final_message_file": "child/final_message.md",
+                "transcript_file": "child/transcript.md",
+            }],
+        }),
+    );
+
+    db.store
+        .enqueue_delegation_observation("parent", &observation, "typed-wakeup")
+        .await
+        .expect("enqueue observation");
+
+    let payload: Value = sqlx::query_scalar(
+        "select payload from events where session_id=$1 and type='input.queued' order by id desc limit 1",
+    )
+    .bind("parent")
+    .fetch_one(&db.store.pool)
+    .await
+    .expect("load input queued event");
+
+    assert!(payload.get("content_type").is_none());
+    assert!(payload.get("content").is_none());
+    assert!(payload.get("editable").is_none());
+    assert!(payload.get("summary").is_none());
+    assert!(payload.get("tool_name").is_none());
+    assert!(payload.get("delegation_id").is_none());
+    assert_eq!(payload["status"], "queued");
+    assert_eq!(payload["client_input_id"], "typed-wakeup");
+    let queued = payload["queued_inputs"]
+        .as_array()
+        .expect("queued inputs")
+        .first()
+        .expect("queued input");
+    assert_eq!(queued["content_type"], "daemon_tool_observation");
+    assert_eq!(queued["content"], json!([]));
+    assert_eq!(queued["editable"], false);
+    assert!(queued.get("summary").is_none());
+    let payload_text = payload.to_string();
+    assert!(!payload_text.contains("Delegation delegation_1 completed with status done"));
+    assert!(!payload_text.contains("subagents"));
 
     db.cleanup().await;
 }

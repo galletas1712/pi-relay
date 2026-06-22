@@ -1,16 +1,13 @@
-use std::path::Path;
-
 use agent_store::{Delegation, DelegationStatus, SubagentType};
-use agent_vocab::DaemonObservation;
+use agent_vocab::{DaemonToolObservation, ToolCallId};
 use serde_json::{json, Value};
 
-use crate::handoff::{delegation_dir, refresh_delegation_handoff_artifacts, SubagentArtifact};
+use crate::handoff::{
+    delegation_dir, refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
+    safe_handoff_path_segment, task_prompt_rel, SubagentArtifact,
+};
 use crate::state::AppState;
 use crate::types::RpcError;
-
-fn path_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
 
 fn count_failed_subagent_artifacts(artifacts: &[SubagentArtifact]) -> usize {
     artifacts
@@ -84,8 +81,9 @@ async fn subagent_has_active_runtime(state: &AppState, subagent_id: &str) -> boo
 ///
 /// This is also the canonical payload for terminal parent wakeups. It refreshes
 /// artifact files that are valid for the delegation's current status, includes
-/// per-subagent final messages / `suggested_next` values when available, and
-/// reports artifact paths without inlining full transcript contents.
+/// per-subagent `suggested_next` values when available, and reports compact
+/// handoff file references without inlining transcript, task-prompt, or
+/// final-message prose.
 pub(crate) async fn build_delegation_snapshot(
     state: &AppState,
     delegation: &Delegation,
@@ -115,26 +113,34 @@ pub(crate) async fn build_delegation_snapshot(
         } else if delegation.status == DelegationStatus::Running {
             running_count += 1;
         }
-        let final_message = artifact.and_then(|artifact| artifact.final_message.clone());
         let suggested_next = artifact.and_then(|artifact| artifact.suggested_next.clone());
-        let final_message_path = artifact
-            .and_then(|artifact| artifact.final_message_path.as_deref())
-            .map(path_string);
-        let final_message_relative_path = artifact.and_then(SubagentArtifact::final_message_rel);
-        let transcript_path = artifact.map(|artifact| path_string(&artifact.transcript_path));
-        let transcript_relative_path = artifact.map(SubagentArtifact::transcript_rel);
-        let (cancellation_transcript_path, cancellation_transcript_relative_path) =
-            if delegation.status == DelegationStatus::Cancelled {
-                let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
-                let path = handoff_dir_path.join(&relative);
-                if path.exists() {
-                    (Some(path_string(&path)), Some(relative))
-                } else {
-                    (None, None)
-                }
+        let final_message_file = artifact.and_then(SubagentArtifact::final_message_rel);
+        let normal_transcript_file = artifact.map(SubagentArtifact::transcript_rel);
+        let task_prompt_file = if let Some(artifact) = artifact {
+            artifact.task_prompt_rel()
+        } else {
+            let task_prompt = refresh_task_prompt_artifact_if_present(
+                &handoff_dir_path,
+                &subagent.session_id,
+                subagent.task.as_deref(),
+            )
+            .await?;
+            task_prompt
+                .as_ref()
+                .map(|_| task_prompt_rel(&subagent.session_id))
+        };
+        let transcript_file = if delegation.status == DelegationStatus::Cancelled {
+            let subagent_segment = safe_handoff_path_segment(&subagent.session_id, "subagent_id")?;
+            let relative = format!("cancelled/{subagent_segment}.transcript.md");
+            let path = handoff_dir_path.join(&relative);
+            if path.exists() {
+                Some(relative)
             } else {
-                (None, None)
-            };
+                None
+            }
+        } else {
+            normal_transcript_file
+        };
         let status = match delegation.status {
             DelegationStatus::Running => terminal_status
                 .map(str::to_string)
@@ -171,17 +177,10 @@ pub(crate) async fn build_delegation_snapshot(
             "activity": subagent.activity,
             "status": status,
             "steerable": steerable,
-            "final_message": final_message,
             "suggested_next": suggested_next,
-            "final_message_path": final_message_path,
-            "final_message_relative_path": final_message_relative_path.clone(),
-            "final_message_file": final_message_relative_path,
-            "transcript_path": transcript_path,
-            "transcript_relative_path": transcript_relative_path.clone(),
-            "transcript_file": transcript_relative_path,
-            "cancellation_transcript_path": cancellation_transcript_path,
-            "cancellation_transcript_relative_path": cancellation_transcript_relative_path,
-            "task": subagent.task,
+            "final_message_file": final_message_file,
+            "transcript_file": transcript_file,
+            "task_prompt_file": task_prompt_file,
         }));
     }
     let expected_count = delegation.expected_subagents.max(0) as usize;
@@ -191,7 +190,7 @@ pub(crate) async fn build_delegation_snapshot(
     Ok(delegation_view(
         delegation,
         json!(subagent_views),
-        path_string(&handoff_dir_path),
+        handoff_dir_path.to_string_lossy().into_owned(),
         terminal_count,
         running_count,
         failed_count,
@@ -213,15 +212,18 @@ fn snapshot_progress_count(snapshot: &Value, key: &str) -> usize {
         .unwrap_or_default() as usize
 }
 
-/// Render the terminal wakeup delivered to the parent after a delegation
-/// completes.
+/// Build the terminal daemon observation delivered to the parent after a
+/// delegation completes.
 ///
 /// This is represented as a daemon-authored observation rather than a
-/// fabricated assistant tool call. The message deliberately carries the same
+/// fabricated assistant tool call. The observation deliberately carries the same
 /// JSON snapshot as `inspect_delegation`, instead of directing the parent to a
-/// root artifact file. Transcript artifact paths are present in the snapshot;
-/// transcript contents are not inlined.
-pub(crate) fn completion_wakeup_message(snapshot: &Value) -> std::result::Result<String, RpcError> {
+/// root artifact file. Compact handoff file references are present in the
+/// snapshot; transcript contents are not inlined.
+pub(crate) fn completion_wakeup_observation(
+    snapshot: &Value,
+    delegation: &Delegation,
+) -> std::result::Result<DaemonToolObservation, RpcError> {
     let delegation_id =
         snapshot_string(snapshot, "delegation_id").unwrap_or_else(|| "<unknown>".to_string());
     let kind = match snapshot.get("kind").and_then(Value::as_str) {
@@ -240,27 +242,29 @@ pub(crate) fn completion_wakeup_message(snapshot: &Value) -> std::result::Result
     let summary = format!(
         "Delegation {delegation_id} ({kind}){label} completed with status {status}: {ok} ok, {failed} failed."
     );
-    DaemonObservation::inspect_delegation(delegation_id, Some(summary), snapshot.clone())
-        .render_text()
-        .map_err(|error| RpcError::new("observation_render_failed", error.to_string()))
+    let tool_call_id = ToolCallId::new(format!(
+        "call_inspect_delegation_{}_{}",
+        delegation
+            .id
+            .replace(|ch: char| !ch.is_ascii_alphanumeric(), "_"),
+        delegation
+            .attempt_id
+            .replace(|ch: char| !ch.is_ascii_alphanumeric(), "_")
+    ));
+    Ok(DaemonToolObservation::inspect_delegation(
+        tool_call_id,
+        delegation_id,
+        Some(summary),
+        snapshot.clone(),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn embedded_snapshot(message: &str) -> Value {
-        let start = message
-            .find("```json\n")
-            .map(|index| index + "```json\n".len())
-            .expect("json fence");
-        let rest = &message[start..];
-        let end = rest.find("\n```").expect("json fence end");
-        serde_json::from_str(&rest[..end]).expect("valid snapshot json")
-    }
-
     #[test]
-    fn completion_wakeup_embeds_snapshot_paths_without_transcript_body() {
+    fn completion_wakeup_observation_carries_bounded_snapshot_and_summary() {
         let snapshot = json!({
             "delegation_id": "delegation_1",
             "kind": "readonly_fanout",
@@ -276,26 +280,45 @@ mod tests {
             "subagents": [{
                 "id": "child_1",
                 "status": "done",
-                "final_message": "Looks good.\n\nsuggested_next: approved",
+                "final_message_file": "child_1/final_message.md",
                 "suggested_next": "approved",
-                "final_message_path": "/tmp/.pi-handoff/delegation_1/child_1/final_message.md",
-                "transcript_path": "/tmp/.pi-handoff/delegation_1/child_1/transcript.md",
+                "task_prompt_file": "child_1/task_prompt.md",
+                "transcript_file": "child_1/transcript.md",
             }],
             "handoff_dir": "/tmp/.pi-handoff/delegation_1",
         });
+        let delegation = Delegation {
+            id: "delegation_1".to_string(),
+            parent_session_id: "parent".to_string(),
+            workflow: None,
+            label: Some("review".to_string()),
+            kind: agent_store::DelegationKind::ReadonlyFanout,
+            status: DelegationStatus::Done,
+            attempt_id: "attempt-1".to_string(),
+            expected_subagents: 1,
+        };
 
-        let message = completion_wakeup_message(&snapshot).expect("wakeup");
+        let observation =
+            completion_wakeup_observation(&snapshot, &delegation).expect("observation");
 
-        assert!(message.contains("completed with status done"));
-        assert!(message.contains("Daemon observation: inspect_delegation"));
-        assert!(message.contains("not by an assistant tool call"));
-        assert!(message.contains(
-            "equivalent to `inspect_delegation({ \"delegation_id\": \"delegation_1\" })`"
-        ));
-        assert!(message.contains("Snapshot JSON follows"));
-        assert!(message.contains("Full transcript contents are not inlined"));
-        assert!(!message.contains("index.json"));
-        assert!(!message.contains("## User"));
-        assert_eq!(embedded_snapshot(&message), snapshot);
+        assert_eq!(observation.tool_name, "inspect_delegation");
+        assert_eq!(
+            observation.tool_call_id.as_str(),
+            "call_inspect_delegation_delegation_1_attempt_1"
+        );
+        assert_eq!(
+            observation.args_json,
+            "{\"delegation_id\":\"delegation_1\"}"
+        );
+        assert_eq!(observation.result_json, snapshot);
+        assert!(observation
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("completed with status done"));
+        assert!(observation
+            .render_text()
+            .unwrap()
+            .contains("large prompts/messages are not inlined"));
     }
 }

@@ -136,18 +136,18 @@ The prompt is rendered exactly once, at `session.start`, after project workspace
 
 ## Stable prefix vs dynamic context
 
-The rendered `PI.md` is the **stable prefix** of [agent-provider](./agent-provider.md)'s `PromptSections`. The daemon's `assemble_agent_prompt` wraps the stored `system_prompt` as the stable prefix for ordinary model turns. It does not inject `## Current delegations` or any other delegation dashboard into normal parent turns; those requests are driven by stable prompt + transcript history, where durable delegation tool results and wakeup steers already live.
+The rendered `PI.md` is the **stable prefix** of [agent-provider](./agent-provider.md)'s `PromptSections`. The daemon's `assemble_agent_prompt` wraps the stored `system_prompt` as the stable prefix for ordinary model turns. It does not inject `## Current delegations` or any other delegation dashboard into normal parent turns; those requests are driven by stable prompt + transcript history, where durable delegation tool results and typed wakeup observations already live.
 
 Compaction is the exception, but the ledger is appended after the provider
 returns rather than sent as compaction input. For top-level parent sessions, the
 daemon stores the provider summary plus a fresh
 `## Delegation state at compaction time` section. That ledger lists every
 delegation row for the parent session (running, done, done_with_failures,
-cancelled, failed) with bounded progress/subagent fields, cheap final-message
-snippets when available, and artifact paths. It deliberately does not inline
-full transcripts or refresh handoff artifacts. Running entries are
+cancelled, failed) with bounded progress/subagent fields, `suggested_next`
+control data when available, and artifact paths. It deliberately does not inline
+full transcripts or final-message prose, or refresh handoff artifacts. Running entries are
 point-in-time facts; summaries must not assume they completed before a later
-completion steer or refreshed `inspect_delegation`. Future compactions summarize
+completion observation or refreshed `inspect_delegation`. Future compactions summarize
 prior summary text normally, including any older point-in-time ledgers, then
 append a fresh ledger again. The latest appended ledger supersedes older ledger
 text by position.

@@ -58,6 +58,8 @@ export interface QueuedInput {
 	priority: InputPriority;
 	status: QueuedInputStatus;
 	content: ContentBlock[];
+	content_type?: "user_message" | "daemon_tool_observation";
+	editable?: boolean;
 	client_input_id?: string | null;
 	created_at: string;
 	updated_at?: string;
@@ -136,16 +138,10 @@ export interface DelegationSubagent {
 	subagent_type?: SubagentType | null;
 	task?: string | null;
 	steerable?: boolean;
-	final_message?: string | null;
 	suggested_next?: string | null;
-	final_message_path?: string | null;
-	final_message_relative_path?: string | null;
 	final_message_file?: string | null;
-	transcript_path?: string | null;
-	transcript_relative_path?: string | null;
 	transcript_file?: string | null;
-	cancellation_transcript_path?: string | null;
-	cancellation_transcript_relative_path?: string | null;
+	task_prompt_file?: string | null;
 }
 
 export interface Delegation {
@@ -164,7 +160,7 @@ export interface DelegationListResult {
 }
 
 export type CancellationTranscriptFileName = `cancelled/${string}.transcript.md`;
-export type HandoffFileName = "final_message.md" | "transcript.md" | CancellationTranscriptFileName;
+export type HandoffFileName = "task_prompt.md" | "final_message.md" | "transcript.md" | CancellationTranscriptFileName;
 
 export interface ReadHandoffFileResult {
 	delegation_id: string;
@@ -220,6 +216,15 @@ export interface ToolResultMessage {
 	status: ToolResultStatus;
 }
 
+export interface DaemonToolObservation {
+	tool_call_id: string;
+	tool_name: string;
+	args_json: string;
+	result_json: unknown;
+	status: ToolResultStatus;
+	summary?: string | null;
+}
+
 export type TranscriptItem =
 	| { type: "turn_started"; turn_id: number }
 	| { type: "user_message"; content: ContentBlock[] }
@@ -227,6 +232,7 @@ export type TranscriptItem =
 	| { type: "tool_call_started"; turn_id: number; tool_call: ToolCall }
 	| { type: "tool_result"; tool_call_id: string; tool_name: string; output: string; status: ToolResultStatus }
 	| { type: "turn_finished"; turn_id: number; outcome: TurnOutcome }
+	| ({ type: "daemon_tool_observation" } & DaemonToolObservation)
 	| {
 			type: "compaction_summary";
 			source_session_id: string;
@@ -292,6 +298,7 @@ export interface TurnCard {
 	start_timestamp_ms: number;
 	timestamp_ms: number;
 	user_messages: TranscriptEntry[];
+	daemon_observations?: TranscriptEntry[];
 	assistant_message?: TranscriptEntry | null;
 	summary?: string | null;
 	can_resume: boolean;

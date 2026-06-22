@@ -320,7 +320,8 @@ Run after each major step; all must pass and the new surface must be unaffected:
       written (per-subagent `final_message.md`/`transcript.md`; structured state via
       `inspect_delegation`), `delegation.read_handoff_file` reads them,
       `delegation.cancel` cancels a running delegation, and
-      the completion steer lands as a parent message. The real-model e2e (Task #8)
+      the completion wakeup lands as a typed daemon observation in the parent
+      transcript. The real-model e2e (Task #8)
       remains the gold check.
 - [ ] grep guard: `grep -rn "subagents\.\(spawn\|wait\|call\|list\|steer\|interrupt\)\|fork_context\|subagent\.list\|import_source_refs\|SourceRefSpec" rust packages/web/src`
       returns only historical planning docs.

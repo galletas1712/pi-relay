@@ -1,4 +1,4 @@
-//! Deterministic delegation barrier / handoff / steer tests against a real Postgres.
+//! Deterministic delegation barrier / handoff / wakeup-observation tests against a real Postgres.
 //!
 //! These drive the barrier directly (the live lifecycle hook and the boot
 //! sweep both funnel through `complete_delegation_if_ready`), with subagents placed
@@ -13,13 +13,14 @@ use std::sync::{Arc, Mutex as StdMutex};
 use agent_provider::ModelTranscriptEntry;
 use agent_session::{AgentSession, ModelContext, SessionAction, TranscriptStorageNode};
 use agent_store::{
-    DelegationKind, DelegationStatus, EventType, InputPriority, PostgresAgentStore,
+    Delegation, DelegationKind, DelegationStatus, EventType, InputPriority, PostgresAgentStore,
     QueuedInputStatus, SessionConfig, SubagentType,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{
-    ActionId, AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
-    ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+    ActionId, AssistantItem, AssistantMessage, CompactionSummary, DaemonToolObservation,
+    ProviderConfig, ProviderKind, ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, TurnId,
+    TurnOutcome, UserMessage,
 };
 use serde_json::json;
 use tokio::sync::{broadcast, Mutex};
@@ -175,7 +176,8 @@ fn session_config(env: &TestEnv, project_id: Uuid, metadata: serde_json::Value) 
 }
 
 /// A parent session that opts into the harness, so any model dispatch the
-/// barrier's steer triggers stops at `pending` instead of calling a provider.
+/// barrier's wakeup observation triggers stops at `pending` instead of calling
+/// a provider.
 async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
     env.state
         .repo
@@ -431,14 +433,14 @@ async fn settle_subagent_terminal(env: &TestEnv, session_id: &str, boundary_leaf
         .expect("boundary check"));
 }
 
-/// Completion steer texts that reached the parent. An idle parent accepts the
-/// steer as its next user-message turn, so the steer lands in the parent's
-/// transcript; we collect user messages naming the delegation.
-async fn parent_completion_steer_texts(
+/// Completion observations that reached the parent. An idle parent accepts the
+/// daemon-authored observation as its next model-visible turn, so the typed
+/// observation lands in the parent's transcript.
+async fn parent_completion_observations(
     env: &TestEnv,
     parent_id: &str,
     delegation_id: &str,
-) -> Vec<String> {
+) -> Vec<DaemonToolObservation> {
     let history = env
         .state
         .repo
@@ -449,29 +451,27 @@ async fn parent_completion_steer_texts(
         .entries
         .iter()
         .filter_map(|entry| match &entry.item {
-            TranscriptItem::UserMessage(message) => message.as_text().and_then(|text| {
-                (text.contains(delegation_id) && text.contains("completed"))
-                    .then(|| text.to_string())
-            }),
+            TranscriptItem::DaemonToolObservation(observation)
+                if observation.tool_name == "inspect_delegation"
+                    && observation
+                        .args_json
+                        .contains(&format!("\"delegation_id\":\"{delegation_id}\"")) =>
+            {
+                Some(observation.clone())
+            }
             _ => None,
         })
         .collect()
 }
 
-async fn steers_to_parent(env: &TestEnv, parent_id: &str, delegation_id: &str) -> usize {
-    parent_completion_steer_texts(env, parent_id, delegation_id)
+async fn wakeup_observations_to_parent(
+    env: &TestEnv,
+    parent_id: &str,
+    delegation_id: &str,
+) -> usize {
+    parent_completion_observations(env, parent_id, delegation_id)
         .await
         .len()
-}
-
-fn wakeup_snapshot_from_text(text: &str) -> serde_json::Value {
-    let start = text
-        .find("```json\n")
-        .map(|index| index + "```json\n".len())
-        .expect("wakeup has json fence");
-    let rest = &text[start..];
-    let end = rest.find("\n```").expect("wakeup json fence closes");
-    serde_json::from_str(&rest[..end]).expect("wakeup snapshot is valid json")
 }
 
 async fn parent_completion_snapshot(
@@ -479,9 +479,13 @@ async fn parent_completion_snapshot(
     parent_id: &str,
     delegation_id: &str,
 ) -> serde_json::Value {
-    let texts = parent_completion_steer_texts(env, parent_id, delegation_id).await;
-    assert_eq!(texts.len(), 1, "expected exactly one completion wakeup");
-    wakeup_snapshot_from_text(&texts[0])
+    let observations = parent_completion_observations(env, parent_id, delegation_id).await;
+    assert_eq!(
+        observations.len(),
+        1,
+        "expected exactly one completion wakeup"
+    );
+    observations[0].result_json.clone()
 }
 
 async fn inspect_delegation_snapshot(env: &TestEnv, delegation_id: &str) -> serde_json::Value {
@@ -935,7 +939,8 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
     assert!(ledger.contains("status: done"));
     assert!(ledger.contains("completed before compaction"));
     assert!(ledger.contains("final_message_file: `review_done/final_message.md`"));
-    assert!(ledger.contains("\"Looks good.\\n\\nsuggested_next: approved\""));
+    assert!(ledger.contains("suggested_next: \"approved\""));
+    assert!(!ledger.contains("\"Looks good.\\n\\nsuggested_next: approved\""));
     assert!(ledger.contains(&format!("delegation_id: `{}`", done_with_failures.id)));
     assert!(ledger.contains("status: done_with_failures"));
     assert!(ledger.contains("completed with failures before compaction"));
@@ -947,7 +952,7 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
     assert!(ledger.contains("status: failed"));
     assert!(ledger.contains("failed before compaction"));
     assert!(ledger.contains("transcript_file: null"));
-    assert!(ledger.contains("Full transcript contents are not inlined"));
+    assert!(ledger.contains("Full transcript and final-message contents are not inlined"));
     assert!(!ledger.contains("## User"));
     assert!(!ledger.contains("## Assistant"));
     assert!(!ledger.contains("transcript body"));
@@ -1575,19 +1580,25 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     .await
     .expect("cancel delegation");
     assert_eq!(result["cancelled"], true);
-    let transcripts = result["transcripts"].as_array().expect("transcripts array");
-    assert_eq!(transcripts.len(), 1);
-    assert_eq!(transcripts[0]["subagent_id"], "impl_to_cancel");
-    let transcript_path = transcripts[0]["transcript"]
-        .as_str()
-        .expect("transcript path");
-    assert!(
-        transcript_path.ends_with(&format!(
-            ".pi-handoff/{}/cancelled/impl_to_cancel.transcript.md",
-            delegation.id
-        )),
-        "unexpected transcript path: {transcript_path}"
+    assert_eq!(result["delegation_id"], delegation.id);
+    let expected_handoff_dir = handoff_root(&env, &delegation.id)
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        result["handoff_dir"].as_str(),
+        Some(expected_handoff_dir.as_str())
     );
+    let result_subagents = result["subagents"].as_array().expect("subagents array");
+    assert_eq!(result_subagents.len(), 1);
+    assert_eq!(result_subagents[0]["subagent_id"], "impl_to_cancel");
+    assert_eq!(
+        result_subagents[0]["transcript_file"],
+        "cancelled/impl_to_cancel.transcript.md"
+    );
+    assert!(result_subagents[0].get("transcript").is_none());
+    let transcript_path = handoff_root(&env, &delegation.id)
+        .join("cancelled")
+        .join("impl_to_cancel.transcript.md");
     let transcript = std::fs::read_to_string(transcript_path).expect("transcript readable");
     assert!(transcript.contains("## User"));
     assert!(transcript.contains("keep working"));
@@ -1597,24 +1608,14 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
     assert_eq!(snapshot["status"], "cancelled");
     assert_eq!(subagent["status"], "cancelled");
-    assert_eq!(subagent["final_message"], serde_json::Value::Null);
-    assert_eq!(subagent["final_message_path"], serde_json::Value::Null);
-    assert_eq!(
-        subagent["final_message_relative_path"],
-        serde_json::Value::Null
-    );
     assert_eq!(subagent["final_message_file"], serde_json::Value::Null);
-    assert_eq!(subagent["transcript_path"], serde_json::Value::Null);
     assert_eq!(
-        subagent["transcript_relative_path"],
-        serde_json::Value::Null
-    );
-    assert_eq!(subagent["transcript_file"], serde_json::Value::Null);
-    assert_eq!(subagent["cancellation_transcript_path"], transcript_path);
-    assert_eq!(
-        subagent["cancellation_transcript_relative_path"],
+        subagent["transcript_file"],
         format!("cancelled/{}.transcript.md", "impl_to_cancel")
     );
+    assert!(subagent.get("final_message_path").is_none());
+    assert!(subagent.get("transcript_path").is_none());
+    assert!(subagent.get("cancellation_transcript_path").is_none());
     let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
         .await
         .expect("list delegations");
@@ -1622,13 +1623,12 @@ async fn cancel_delegation_returns_transcript_only_paths() {
         .as_array()
         .unwrap()[0];
     assert_eq!(
-        listed_subagent["cancellation_transcript_path"],
-        transcript_path
-    );
-    assert_eq!(
-        listed_subagent["cancellation_transcript_relative_path"],
+        listed_subagent["transcript_file"],
         "cancelled/impl_to_cancel.transcript.md"
     );
+    assert!(listed_subagent
+        .get("cancellation_transcript_path")
+        .is_none());
     assert_eq!(snapshot["progress"]["running"], 0);
     assert!(!handoff_root(&env, &delegation.id)
         .join("index.json")
@@ -1788,7 +1788,7 @@ async fn cancel_delegation_does_not_clobber_completed_delegation_or_write_artifa
 }
 
 #[tokio::test]
-async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent() {
+async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_subagent() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -1852,14 +1852,18 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
             .status,
         DelegationStatus::Running
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        0
+    );
 
     // Settle the second subagent terminal at a Crashed boundary — the barrier
     // classifies a non-graceful TurnFinished as a failure, exactly as a child
     // that died mid-task and was recovered to a boundary would appear.
     settle_subagent_terminal(&env, "still_running", &boundary_leaf).await;
 
-    // Now all terminal -> exactly one steer, done_with_failures, handoff for all.
+    // Now all terminal -> exactly one wakeup observation, done_with_failures,
+    // handoff for all.
     complete_delegation_if_ready(&env.state, &delegation.id)
         .await
         .expect("barrier (complete)");
@@ -1873,14 +1877,21 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
             .status,
         DelegationStatus::DoneWithFailures
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
-    // Re-delivered events must not double-steer (idempotent via the CAS).
+    // Re-delivered events must not double-publish a wakeup (idempotent via the
+    // CAS).
     complete_delegation_if_ready(&env.state, &delegation.id)
         .await
         .expect("barrier (replay)");
     sweep_running_delegations_on_boot(&env.state).await;
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
     // Handoff: inspect_delegation is the control-flow snapshot; the
     // handoff dir contains per-subagent files for EVERY subagent (incl. failed)
@@ -1888,34 +1899,24 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     let root = handoff_root(&env, &delegation.id);
     assert!(!root.join("index.json").exists());
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
-    let wakeup_texts = parent_completion_steer_texts(&env, "parent", &delegation.id).await;
-    assert_eq!(wakeup_texts.len(), 1);
-    let wakeup_text = &wakeup_texts[0];
-    assert!(
-        wakeup_text.contains("Daemon observation: inspect_delegation"),
-        "persisted completion wakeup should identify itself as a daemon observation"
+    let wakeup_observations = parent_completion_observations(&env, "parent", &delegation.id).await;
+    assert_eq!(wakeup_observations.len(), 1);
+    let wakeup_observation = &wakeup_observations[0];
+    assert_eq!(wakeup_observation.tool_name, "inspect_delegation");
+    assert_eq!(
+        wakeup_observation.args_json,
+        format!("{{\"delegation_id\":\"{}\"}}", delegation.id)
     );
-    assert!(
-        wakeup_text.contains("not by an assistant tool call"),
-        "persisted completion wakeup must not imply the model chose inspect_delegation"
-    );
-    assert!(
-        !wakeup_text.contains("index.json"),
-        "completion wakeup must not instruct the parent to read index.json"
-    );
-    assert!(
-        wakeup_text.contains("Snapshot JSON"),
-        "completion wakeup should include the structured snapshot JSON"
-    );
-    assert!(
-        wakeup_text.contains("Full transcript contents are not inlined"),
-        "completion wakeup should clarify transcripts are artifact paths only"
-    );
-    assert!(
-        !wakeup_text.contains("## User"),
-        "completion wakeup must not inline transcript markdown"
-    );
-    let wakeup_snapshot = wakeup_snapshot_from_text(wakeup_text);
+    assert!(wakeup_observation
+        .summary
+        .as_deref()
+        .unwrap_or_default()
+        .contains("completed with status done_with_failures"));
+    let fallback = wakeup_observation.render_text().expect("fallback renders");
+    assert!(!fallback.contains("index.json"));
+    assert!(!fallback.contains("## User"));
+    assert!(fallback.contains("large prompts/messages are not inlined"));
+    let wakeup_snapshot = wakeup_observation.result_json.clone();
     assert_eq!(wakeup_snapshot, snapshot);
     assert_eq!(snapshot["status"], "done_with_failures");
     assert_eq!(snapshot["kind"], "readonly_fanout");
@@ -1943,25 +1944,18 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
         );
         assert!(base.join("transcript.md").exists(), "transcript for {id}");
         assert_eq!(
-            subagent["final_message_path"],
-            base.join("final_message.md").to_string_lossy().as_ref()
-        );
-        assert_eq!(
-            subagent["transcript_path"],
-            base.join("transcript.md").to_string_lossy().as_ref()
-        );
-        assert_eq!(
             subagent["final_message_file"],
             format!("{id}/final_message.md")
         );
         assert_eq!(subagent["transcript_file"], format!("{id}/transcript.md"));
+        assert!(subagent.get("final_message_path").is_none());
+        assert!(subagent.get("transcript_path").is_none());
     }
     let ok = subagents.iter().find(|s| s["id"] == "ok_a").unwrap();
     assert_eq!(ok["role"], "reviewer");
     assert_eq!(ok["type"], "read_only");
     assert_eq!(ok["subagent_type"], "read_only");
     assert_eq!(ok["status"], "done");
-    assert_eq!(ok["final_message"], "All good.\n\nsuggested_next: approved");
     assert_eq!(ok["suggested_next"], "approved");
     let wakeup_ok = wakeup_snapshot["subagents"]
         .as_array()
@@ -1969,15 +1963,8 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
         .iter()
         .find(|subagent| subagent["id"] == "ok_a")
         .expect("ok_a in wakeup snapshot");
-    assert_eq!(
-        wakeup_ok["final_message"],
-        "All good.\n\nsuggested_next: approved"
-    );
     assert_eq!(wakeup_ok["suggested_next"], "approved");
-    assert!(wakeup_ok["transcript_path"]
-        .as_str()
-        .expect("transcript path in wakeup snapshot")
-        .ends_with("ok_a/transcript.md"));
+    assert_eq!(wakeup_ok["transcript_file"], "ok_a/transcript.md");
     assert_eq!(ok["steerable"], false);
     let failed = subagents
         .iter()
@@ -2058,12 +2045,9 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .find(|subagent| subagent["id"] == "done_child")
         .unwrap();
     assert_eq!(done["status"], "done");
-    assert_eq!(
-        done["final_message"],
-        "Found the answer.\n\nsuggested_next: done"
-    );
     assert_eq!(done["suggested_next"], "done");
-    assert_eq!(done["final_message_path"], serde_json::Value::Null);
+    assert_eq!(done["final_message_file"], serde_json::Value::Null);
+    assert!(done.get("final_message_path").is_none());
     assert!(
         !root.join("done_child").join("final_message.md").exists(),
         "normal final_message artifact waits for delegation completion"
@@ -2082,9 +2066,9 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .unwrap();
     assert_eq!(running["activity"], "idle");
     assert_eq!(running["status"], "running");
-    assert_eq!(running["final_message"], serde_json::Value::Null);
     assert_eq!(running["suggested_next"], serde_json::Value::Null);
-    assert_eq!(running["final_message_path"], serde_json::Value::Null);
+    assert_eq!(running["final_message_file"], serde_json::Value::Null);
+    assert!(running.get("final_message_path").is_none());
     assert!(root.join("running_child").join("transcript.md").exists());
     assert!(
         !root.join("running_child").join("final_message.md").exists(),
@@ -2137,9 +2121,10 @@ async fn failed_delegation_does_not_publish_normal_handoff_on_inspect_or_read() 
     let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
     assert_eq!(snapshot["status"], "failed");
     assert_eq!(subagent["status"], "failed");
-    assert_eq!(subagent["final_message"], serde_json::Value::Null);
-    assert_eq!(subagent["final_message_path"], serde_json::Value::Null);
-    assert_eq!(subagent["transcript_path"], serde_json::Value::Null);
+    assert_eq!(subagent["final_message_file"], serde_json::Value::Null);
+    assert_eq!(subagent["transcript_file"], serde_json::Value::Null);
+    assert!(subagent.get("final_message_path").is_none());
+    assert!(subagent.get("transcript_path").is_none());
     let root = handoff_root(&env, &delegation.id);
     assert!(
         !root.join("impl_failed").join("transcript.md").exists(),
@@ -2225,7 +2210,127 @@ async fn completion_loser_after_cancellation_does_not_write_normal_handoff() {
     let handoff_root = handoff_root(&env, &delegation.id);
     assert!(!handoff_root.join("index.json").exists());
     assert!(!handoff_root.join("impl_cancel_wins").exists());
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        0
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn missing_task_metadata_omits_task_prompt_artifacts_and_rerun_metadata() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "missing task prompt test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("legacy"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_legacy").await;
+
+    let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
+        .await
+        .expect("list delegations");
+    let listed_subagent = &list["delegations"].as_array().unwrap()[0]["subagents"]
+        .as_array()
+        .unwrap()[0];
+    assert_eq!(listed_subagent["task_prompt_file"], serde_json::Value::Null);
+    assert!(listed_subagent.get("task_prompt_path").is_none());
+
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let subagent = &snapshot["subagents"].as_array().unwrap()[0];
+    assert_eq!(subagent["task_prompt_file"], serde_json::Value::Null);
+    assert!(subagent.get("task_prompt_path").is_none());
+    assert!(
+        !handoff_root(&env, &delegation.id)
+            .join("impl_legacy")
+            .join("task_prompt.md")
+            .exists(),
+        "missing task metadata must not create an empty task_prompt.md"
+    );
+
+    let error = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "subagent_id": "impl_legacy",
+            "file": "task_prompt.md",
+        }),
+    )
+    .await
+    .expect_err("missing task prompt read rejected");
+    assert_eq!(error.code, "handoff_file_not_found");
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn read_task_prompt_validates_subagent_segment_before_refreshing_artifact() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "task prompt path validation test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl").await;
+    let metadata_with_task = json!({
+        "created_by": "test",
+        "role_name": "implementer",
+        "task": "write the follow-up fix",
+    });
+    env.state
+        .repo
+        .update_session_metadata("impl", &metadata_with_task)
+        .await
+        .expect("store task metadata");
+
+    let error = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "subagent_id": "../impl",
+            "file": "task_prompt.md",
+        }),
+    )
+    .await
+    .expect_err("invalid path segment rejected before artifact refresh");
+    assert_eq!(error.code, "invalid_params");
+    assert!(
+        !handoff_root(&env, &delegation.id)
+            .join("impl")
+            .join("task_prompt.md")
+            .exists(),
+        "invalid subagent_id must not refresh task_prompt.md"
+    );
 
     env.cleanup().await;
 }
@@ -2389,11 +2494,17 @@ async fn boot_sweep_completes_a_crash_mid_barrier_delegation_exactly_once() {
             .status,
         DelegationStatus::Done
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
-    // A second sweep (another restart) must not double-steer.
+    // A second sweep (another restart) must not double-publish a wakeup.
     sweep_running_delegations_on_boot(&env.state).await;
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
     env.cleanup().await;
 }
@@ -2547,18 +2658,25 @@ async fn parent_idle_rows(env: &TestEnv, parent_id: &str) -> usize {
         .count()
 }
 
-/// Count durable parent `input.queued` completion-steer events for a delegation.
+fn delegation_wakeup_client_input_id(delegation: &Delegation) -> String {
+    format!(
+        "delegation-steer:{}:{}",
+        delegation.id, delegation.attempt_id
+    )
+}
+
+/// Durable parent `input.queued` wakeup-observation events for a delegation.
 ///
 /// This is intentionally based on the persistent event log rather than the
-/// queue row or parent transcript: if replay accidentally publishes a second
-/// steer with a fresh/non-deterministic client id, the row and transcript checks
-/// can miss it after the first steer is already consumed, but the event log keeps
-/// both publishes.
-async fn durable_parent_completion_steers(
+/// active queue: after the parent consumes the deterministic wakeup, the queue
+/// row may no longer be active, but the event log still records whether that
+/// client-input key was published exactly once.
+async fn durable_parent_wakeup_observation_events(
     env: &TestEnv,
     parent_id: &str,
-    delegation_id: &str,
-) -> usize {
+    delegation: &Delegation,
+) -> Vec<serde_json::Value> {
+    let client_input_id = delegation_wakeup_client_input_id(delegation);
     env.state
         .repo
         .events_after(parent_id, None)
@@ -2572,32 +2690,71 @@ async fn durable_parent_completion_steers(
                     .get("priority")
                     .and_then(serde_json::Value::as_str)
                     == Some(InputPriority::Steer.as_str())
-                && event_payload_text_mentions(&event.data, delegation_id, "completed")
+                && event
+                    .data
+                    .get("client_input_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(client_input_id.as_str())
         })
-        .count()
+        .map(|event| event.data)
+        .collect()
 }
 
-fn event_payload_text_mentions(
-    payload: &serde_json::Value,
-    delegation_id: &str,
-    other_needle: &str,
-) -> bool {
-    payload_texts(payload)
-        .iter()
-        .any(|text| text.contains(delegation_id) && text.contains(other_needle))
-}
+fn assert_minimal_wakeup_event_payload(payload: &serde_json::Value, client_input_id: &str) {
+    assert_eq!(
+        payload.get("priority").and_then(serde_json::Value::as_str),
+        Some(InputPriority::Steer.as_str())
+    );
+    assert_eq!(
+        payload.get("status").and_then(serde_json::Value::as_str),
+        Some(QueuedInputStatus::Queued.as_str())
+    );
+    assert_eq!(
+        payload
+            .get("client_input_id")
+            .and_then(serde_json::Value::as_str),
+        Some(client_input_id)
+    );
 
-fn payload_texts(value: &serde_json::Value) -> Vec<&str> {
-    match value {
-        serde_json::Value::String(text) => vec![text.as_str()],
-        serde_json::Value::Array(items) => items.iter().flat_map(payload_texts).collect(),
-        serde_json::Value::Object(map) => ["message", "content", "text"]
-            .into_iter()
-            .filter_map(|key| map.get(key))
-            .flat_map(payload_texts)
-            .collect(),
-        _ => Vec::new(),
+    for field in [
+        "content_type",
+        "content",
+        "editable",
+        "summary",
+        "tool_name",
+        "delegation_id",
+        "result_json",
+        "result",
+    ] {
+        assert!(
+            payload.get(field).is_none(),
+            "typed daemon wakeup input.queued payload should not inline {field}: {payload}"
+        );
     }
+
+    let queued = payload["queued_inputs"]
+        .as_array()
+        .expect("queued inputs")
+        .iter()
+        .find(|input| {
+            input
+                .get("client_input_id")
+                .and_then(serde_json::Value::as_str)
+                == Some(client_input_id)
+        })
+        .expect("wakeup queue projection");
+    assert_eq!(queued["content_type"], "daemon_tool_observation");
+    assert_eq!(queued["content"], json!([]));
+    assert_eq!(queued["editable"], false);
+    assert!(queued.get("summary").is_none());
+    assert!(queued.get("tool_name").is_none());
+    assert!(queued.get("result_json").is_none());
+
+    let payload_text = payload.to_string();
+    assert!(!payload_text.contains("completed"));
+    assert!(!payload_text.contains("implemented"));
+    assert!(!payload_text.contains("inspect_delegation"));
+    assert!(!payload_text.contains("subagents"));
 }
 
 /// FIX A: a fan-out whose subagent #1 is terminal while #2 has not yet been
@@ -2650,9 +2807,13 @@ async fn partial_spawn_does_not_complete_delegation() {
             .status,
         DelegationStatus::Running
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        0
+    );
 
-    // The sibling arrives terminal too; now the full set exists -> one steer.
+    // The sibling arrives terminal too; now the full set exists -> one wakeup
+    // observation.
     create_terminal_subagent(
         &env,
         project_id,
@@ -2678,16 +2839,20 @@ async fn partial_spawn_does_not_complete_delegation() {
             .status,
         DelegationStatus::Done
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
     env.cleanup().await;
 }
 
 /// Simulate a crash after the finish_delegation status claim but before handoff
-/// files / steer publication. Boot repair must publish the files, enqueue the
-/// deterministic steer, and remain idempotent on later restarts.
+/// files / wakeup-observation publication. Boot repair must publish the files,
+/// enqueue the deterministic daemon-authored observation, and remain idempotent
+/// on later restarts.
 #[tokio::test]
-async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
+async fn boot_repair_publishes_handoff_and_wakeup_observation_after_finish_claim_crash() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -2719,10 +2884,7 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     .await;
 
     // Claim only the terminal status, then "crash" before normal publication.
-    let key = format!(
-        "delegation-steer:{}:{}",
-        delegation.id, delegation.attempt_id
-    );
+    let key = delegation_wakeup_client_input_id(&delegation);
     assert!(env
         .state
         .repo
@@ -2738,13 +2900,15 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
         .repo
         .find_client_input("parent", &key)
         .await
-        .expect("find steer")
+        .expect("find wakeup")
         .is_none());
     assert!(!handoff_root(&env, &delegation.id)
         .join("index.json")
         .exists());
     assert_eq!(
-        durable_parent_completion_steers(&env, "parent", &delegation.id).await,
+        durable_parent_wakeup_observation_events(&env, "parent", &delegation)
+            .await
+            .len(),
         0
     );
 
@@ -2754,7 +2918,7 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
         .repo
         .find_client_input("parent", &key)
         .await
-        .expect("find repaired steer")
+        .expect("find repaired wakeup")
         .is_some());
     let root = handoff_root(&env, &delegation.id);
     assert!(!root.join("index.json").exists());
@@ -2762,31 +2926,31 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     assert!(root.join("impl").join("transcript.md").exists());
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["status"], "done");
-    assert_eq!(snapshot["subagents"][0]["final_message"], "implemented");
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
     let wakeup_snapshot = parent_completion_snapshot(&env, "parent", &delegation.id).await;
     assert_eq!(wakeup_snapshot, snapshot);
     assert_eq!(
-        wakeup_snapshot["subagents"][0]["final_message"],
-        "implemented"
+        wakeup_snapshot["subagents"][0]["transcript_file"],
+        "impl/transcript.md"
     );
-    assert!(wakeup_snapshot["subagents"][0]["transcript_path"]
-        .as_str()
-        .expect("transcript path in repaired wakeup")
-        .ends_with("impl/transcript.md"));
+    let wakeup_events = durable_parent_wakeup_observation_events(&env, "parent", &delegation).await;
     assert_eq!(
-        durable_parent_completion_steers(&env, "parent", &delegation.id).await,
+        wakeup_events.len(),
         1,
-        "first repair publishes exactly one durable completion steer"
+        "first repair publishes exactly one durable completion observation"
     );
+    assert_minimal_wakeup_event_payload(&wakeup_events[0], &key);
 
     let repaired_input = env
         .state
         .repo
         .find_client_input("parent", &key)
         .await
-        .expect("find repaired steer")
-        .expect("repaired steer exists");
+        .expect("find repaired wakeup")
+        .expect("repaired wakeup exists");
     assert!(matches!(
         repaired_input.status,
         QueuedInputStatus::Queued | QueuedInputStatus::Consuming | QueuedInputStatus::Consumed
@@ -2795,24 +2959,29 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     // A second repair sweep must not double-publish or double-drive. The first
     // repair may already have driven the idle parent and consumed the queued
     // input, so assert the deterministic idempotency row rather than requiring
-    // the steer to remain in the active queue.
+    // the completion observation to remain in the active queue.
     sweep_running_delegations_on_boot(&env.state).await;
     let repaired_again = env
         .state
         .repo
         .find_client_input("parent", &key)
         .await
-        .expect("find repaired steer after replay")
-        .expect("repaired steer still exists");
+        .expect("find repaired wakeup after replay")
+        .expect("repaired wakeup still exists");
     assert_eq!(
         repaired_again.input_id, repaired_input.input_id,
-        "deterministic steer client id reuses the original row"
+        "deterministic wakeup client id reuses the original row"
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
     assert_eq!(
-        durable_parent_completion_steers(&env, "parent", &delegation.id).await,
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
+    assert_eq!(
+        durable_parent_wakeup_observation_events(&env, "parent", &delegation)
+            .await
+            .len(),
         1,
-        "second repair must not publish any duplicate durable completion steer"
+        "second repair must not publish any duplicate durable completion observation"
     );
 
     env.cleanup().await;
@@ -2820,7 +2989,7 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
 
 /// FIX C: a delegation subagent at a NON-boundary leaf (mid-turn) with its action
 /// stale-marked (as the boot stale-mark does) and no queued input must NOT cause
-/// the boot sweep to complete/steer the delegation.
+/// the boot sweep to complete/wake the delegation.
 #[tokio::test]
 async fn boot_sweep_does_not_complete_mid_turn_subagent() {
     let Some(env) = test_env().await else {
@@ -2873,13 +3042,17 @@ async fn boot_sweep_does_not_complete_mid_turn_subagent() {
             .status,
         DelegationStatus::Running
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        0
+    );
 
     env.cleanup().await;
 }
 
 /// FIX D: a terminal delegation member produces ZERO parent-visible `subagent.idle`
-/// rows, yet the single delegation steer is still delivered (and the once-gate fired).
+/// rows, yet the single delegation wakeup observation is still delivered (and
+/// the once-gate fired).
 /// Driven through the LIVE seam (`handle_subagent_terminal_for_parent_if_needed`), which
 /// is FIX F's live-seam coverage for the suppression path.
 #[tokio::test]
@@ -2920,7 +3093,8 @@ async fn terminal_delegation_member_yields_zero_parent_idle_rows() {
 
     // Zero per-child idle surfaced to the parent...
     assert_eq!(parent_idle_rows(&env, "parent").await, 0);
-    // ...yet the delegation completed and the single steer was delivered.
+    // ...yet the delegation completed and the single wakeup observation was
+    // delivered.
     assert_eq!(
         env.state
             .repo
@@ -2931,7 +3105,10 @@ async fn terminal_delegation_member_yields_zero_parent_idle_rows() {
             .status,
         DelegationStatus::Done
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
     env.cleanup().await;
 }
@@ -3089,11 +3266,11 @@ async fn dispatch_failure_for_delegation_member_emits_no_parent_idle() {
     env.cleanup().await;
 }
 
-/// FIX F: two sibling delegation members reaching idle through the LIVE seam — one
-/// triggering recovery of the other — steer the parent EXACTLY once, and neither
-/// surfaces a per-child idle.
+/// FIX F: two sibling delegation members reaching idle through the LIVE seam —
+/// one triggering recovery of the other — wake the parent EXACTLY once, and
+/// neither surfaces a per-child idle.
 #[tokio::test]
-async fn two_siblings_steer_parent_exactly_once_via_live_seam() {
+async fn two_siblings_wake_parent_exactly_once_via_live_seam() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -3160,7 +3337,10 @@ async fn two_siblings_steer_parent_exactly_once_via_live_seam() {
             .status,
         DelegationStatus::Done
     );
-    assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &delegation.id).await,
+        1
+    );
 
     env.cleanup().await;
 }

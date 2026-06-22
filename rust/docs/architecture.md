@@ -25,8 +25,9 @@ in-flight future work lives under [`plans/`](plans/).
    without changing the FSM.
 6. Support bounded parent/child subagent delegation as **delegations**: the parent
    runs one full (writing) subagent or a parallel fan-out of read-only
-   subagents, parks, and is steered with a completion notification. No generic
-   injected-message routing layer or event bus between arbitrary sessions.
+   subagents, parks, and is resumed with a daemon-authored wakeup observation.
+   No generic injected-message routing layer or event bus between arbitrary
+   sessions.
 
 ## Crate Stack
 
@@ -126,13 +127,14 @@ Implemented user-facing behavior:
   (writes the parent's workspace in place) or a parallel fan-out of
   **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
   return). The parent parks after launching a delegation and is delivered a
-  parent-scoped completion **steer** containing a structured snapshot equivalent
-  to `inspect_delegation`, including per-subagent final messages,
-  `suggested_next`, and artifact paths. `inspect_delegation` refreshes or
-  recovers that same structured state later/running.
+  parent-scoped completion **daemon observation** containing a structured
+  snapshot equivalent to `inspect_delegation`, including per-subagent
+  `suggested_next` and compact handoff file references.
+  `inspect_delegation` refreshes or recovers that same structured state
+  later/running.
   Delegation subagents may emit `subagent.spawned`/`subagent.running` progress
-  events, but parent-visible completion is the delegation steer/handoff, not a
-  per-child idle event. Reusable patterns are **workflow skills** (`SKILL.md` +
+  events, but parent-visible completion is the delegation wakeup observation and
+  handoff, not a per-child idle event. Reusable patterns are **workflow skills** (`SKILL.md` +
   `LoadSkill`), not a DSL. Web/inspector RPCs use the canonical
   `delegation.*` client API. See
   [agent-daemon](modules/agent-daemon.md).
