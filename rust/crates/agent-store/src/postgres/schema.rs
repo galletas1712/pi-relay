@@ -49,6 +49,8 @@ alter table sessions add column if not exists system_prompt text not null defaul
 
 alter table sessions add column if not exists parent_session_id text null references sessions(id) on delete set null;
 
+alter table sessions add column if not exists subagent_type text null;
+
 create index if not exists sessions_project_created_idx
     on sessions(project_id, created_at desc, id desc);
 

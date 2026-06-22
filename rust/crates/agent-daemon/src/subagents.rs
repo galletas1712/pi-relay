@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use agent_store::{EventFrame, EventType, InputPriority, SessionConfig};
+use agent_store::{EventFrame, EventType, InputPriority, SessionConfig, SubagentType};
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -101,6 +101,7 @@ struct SubagentSpawnRequest {
     display_name: Option<String>,
     provider: Option<ProviderConfig>,
     metadata: Value,
+    subagent_type: SubagentType,
 }
 
 impl SubagentSpawnRequest {
@@ -165,6 +166,7 @@ impl SubagentSpawnRequest {
             display_name: params.display_name,
             provider: params.provider,
             metadata: params.metadata.unwrap_or_else(|| json!({})),
+            subagent_type: params.subagent_type.unwrap_or(SubagentType::ReadOnly),
         })
     }
 }
@@ -181,6 +183,7 @@ struct SubagentSpawnParams {
     display_name: Option<String>,
     provider: Option<ProviderConfig>,
     metadata: Option<Value>,
+    subagent_type: Option<SubagentType>,
 }
 
 struct SpawnedSubagent {
@@ -257,20 +260,25 @@ async fn spawn_subagent(
         request.role_workspace.as_deref(),
     )
     .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
-    let source_configs = load_source_configs(state, &request.parent_session_id, &request.sources)
-        .await?
-        .into_iter()
-        .collect::<Vec<_>>();
-    let (outer_cwd, workspaces) = state
-        .workspaces
-        .fork_session_from_parent(
-            &request.parent_session_id,
-            &parent_config.outer_cwd,
-            &parent_config.workspaces,
-            &child_session_id,
-        )
-        .await
-        .map_err(anyhow::Error::from)?;
+    // A full subagent is the durable workspace's single writer for its stage:
+    // it runs against the parent's dirs in place (no fork). A read-only subagent
+    // forks the parent into its own disposable snapshot.
+    let (outer_cwd, workspaces) = match request.subagent_type {
+        SubagentType::Full => (
+            parent_config.outer_cwd.clone(),
+            parent_config.workspaces.clone(),
+        ),
+        SubagentType::ReadOnly => state
+            .workspaces
+            .fork_session_from_parent(
+                &request.parent_session_id,
+                &parent_config.outer_cwd,
+                &parent_config.workspaces,
+                &child_session_id,
+            )
+            .await
+            .map_err(anyhow::Error::from)?,
+    };
 
     let child_metadata = subagent_metadata(
         request.metadata,
@@ -300,15 +308,29 @@ async fn spawn_subagent(
             parent_session_id: &request.parent_session_id,
         },
     )?;
-    let source_refs = match state
-        .workspaces
-        .import_source_refs(&outer_cwd, &child_config.workspaces, &source_configs)
-        .await
-    {
-        Ok(source_refs) => source_refs,
-        Err(error) => {
-            let _ = state.workspaces.remove_session_dir(&child_session_id).await;
-            return Err(anyhow::Error::from(error).into());
+    // Source refs are only meaningful for a forked (read-only) child with its
+    // own private dirs; a full subagent writes the parent's dirs in place and
+    // carries no sources. Skip the import (and its teardown, which would delete
+    // the shared parent workspace) entirely for full.
+    let source_refs = match request.subagent_type {
+        SubagentType::Full => Vec::new(),
+        SubagentType::ReadOnly => {
+            let source_configs =
+                load_source_configs(state, &request.parent_session_id, &request.sources)
+                    .await?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            match state
+                .workspaces
+                .import_source_refs(&outer_cwd, &child_config.workspaces, &source_configs)
+                .await
+            {
+                Ok(source_refs) => source_refs,
+                Err(error) => {
+                    let _ = state.workspaces.remove_session_dir(&child_session_id).await;
+                    return Err(anyhow::Error::from(error).into());
+                }
+            }
         }
     };
 
@@ -319,6 +341,7 @@ async fn spawn_subagent(
         request.initial_context.as_deref(),
         &source_refs,
     );
+    let subagent_type = request.subagent_type;
     let started = start_prepared_session(
         state,
         PreparedSessionStart {
@@ -328,6 +351,7 @@ async fn spawn_subagent(
             content: UserMessage::text(initial_task),
             client_input_id: None,
             parent_session_id: Some(request.parent_session_id.clone()),
+            subagent_type: Some(subagent_type),
             dispatch_mode: PreparedSessionDispatchMode::Deferred,
         },
     )
@@ -346,8 +370,13 @@ async fn spawn_subagent(
     {
         Ok(parent_events) => parent_events,
         Err(error) => {
-            cleanup_failed_spawn(state, &started.session_id, "parent lifecycle event failure")
-                .await;
+            cleanup_failed_spawn(
+                state,
+                &started.session_id,
+                subagent_type,
+                "parent lifecycle event failure",
+            )
+            .await;
             return Err(error);
         }
     };
@@ -365,7 +394,13 @@ async fn spawn_subagent(
             &error,
         )
         .await;
-        cleanup_failed_spawn(state, &started.session_id, "initial dispatch failure").await;
+        cleanup_failed_spawn(
+            state,
+            &started.session_id,
+            subagent_type,
+            "initial dispatch failure",
+        )
+        .await;
         return Err(error);
     }
 
@@ -558,17 +593,33 @@ pub(crate) async fn require_known_subagent(
     Ok(())
 }
 
-async fn cleanup_failed_spawn(state: &AppState, child_session_id: &str, reason: &str) {
+async fn cleanup_failed_spawn(
+    state: &AppState,
+    child_session_id: &str,
+    subagent_type: SubagentType,
+    reason: &str,
+) {
     state.active.lock().await.remove(child_session_id);
     if let Err(delete_error) = state.repo.delete_session(child_session_id).await {
         eprintln!(
             "failed to clean up child session {child_session_id} after {reason}: {delete_error:#}"
         );
     }
-    if let Err(workspace_error) = state.workspaces.remove_session_dir(child_session_id).await {
-        eprintln!(
-            "failed to clean up child workspace {child_session_id} after {reason}: {workspace_error:#}"
-        );
+    // A full subagent shares the parent's session root/cwd in place; its
+    // session dir was never created, so tearing it down would delete the
+    // parent's durable workspace. Only a forked read-only child owns a private
+    // dir that is safe to reclaim.
+    match subagent_type {
+        SubagentType::Full => {}
+        SubagentType::ReadOnly => {
+            if let Err(workspace_error) =
+                state.workspaces.destroy_session_workspaces(child_session_id).await
+            {
+                eprintln!(
+                    "failed to clean up child workspace {child_session_id} after {reason}: {workspace_error:#}"
+                );
+            }
+        }
     }
     state
         .provider_connections

@@ -13,7 +13,7 @@ use agent_core::AgentInput;
 use agent_session::{AgentSession, SessionAction, SessionInput};
 use agent_store::{
     AcceptedInput, ActionUpdate, EventFrame, EventType, OutputBatch, QueuedInput, SessionActivity,
-    SessionConfig,
+    SessionConfig, SubagentType,
 };
 use agent_vocab::{ProviderReplayItem, TranscriptItem, TurnOutcome};
 use anyhow::Context;
@@ -394,6 +394,34 @@ impl SessionDriver {
         }
     }
 
+    async fn destroy_read_only_subagent_workspaces(&self) {
+        match self
+            .state
+            .repo
+            .session_subagent_type(&self.session_id)
+            .await
+        {
+            Ok(Some(SubagentType::ReadOnly)) => {
+                if let Err(error) = self
+                    .state
+                    .workspaces
+                    .destroy_session_workspaces(&self.session_id)
+                    .await
+                {
+                    eprintln!(
+                        "failed to destroy read-only subagent workspace {}: {error:#}",
+                        self.session_id
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "failed to load subagent type for workspace teardown {}: {error:#}",
+                self.session_id
+            ),
+        }
+    }
+
     async fn reconcile_abandoned_boundary_session(&self) -> std::result::Result<(), RpcError> {
         let activity = self
             .state
@@ -424,7 +452,18 @@ impl SessionDriver {
 
     async fn try_subagent_parent_idle_event(&self) -> Option<EventFrame> {
         match self.subagent_parent_idle_event().await {
-            Ok(event) => event,
+            Ok(event) => {
+                if event.is_some() {
+                    // The idle event is produced exactly once per terminal child,
+                    // by whichever terminal path wins the once-only gate (the
+                    // drive loop, recovery, or the notify wrapper). A read-only
+                    // subagent's fork is a disposable snapshot, so reclaim it on
+                    // that single firing — its handoff renders from the durable
+                    // transcript, not the snapshot.
+                    self.destroy_read_only_subagent_workspaces().await;
+                }
+                event
+            }
             Err(error) => {
                 eprintln!(
                     "failed to publish parent subagent idle event child={}: {}: {}",

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_session::AgentSession;
-use agent_store::{InputPriority, SessionActivity, SessionConfig};
+use agent_store::{InputPriority, SessionActivity, SessionConfig, SubagentType};
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -101,6 +101,7 @@ pub(crate) async fn session_start(
             content,
             client_input_id: params.client_input_id,
             parent_session_id: None,
+            subagent_type: None,
             dispatch_mode: PreparedSessionDispatchMode::Auto,
         },
     )
@@ -120,6 +121,7 @@ pub(crate) struct PreparedSessionStart {
     pub(crate) content: UserMessage,
     pub(crate) client_input_id: Option<String>,
     pub(crate) parent_session_id: Option<String>,
+    pub(crate) subagent_type: Option<SubagentType>,
     pub(crate) dispatch_mode: PreparedSessionDispatchMode,
 }
 
@@ -156,6 +158,7 @@ async fn start_prepared_session_with_driver(
         content,
         client_input_id,
         parent_session_id,
+        subagent_type,
         dispatch_mode,
     } = request;
     let project_id = config.project_id;
@@ -215,6 +218,7 @@ async fn start_prepared_session_with_driver(
             &content,
             client_input_id.as_deref(),
             parent_session_id.as_deref(),
+            subagent_type,
         )
         .await
         .map_err(anyhow::Error::from)?;

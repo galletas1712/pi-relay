@@ -49,6 +49,11 @@ text_enum! {
         Running => "running",
     }
 
+    pub enum SubagentType {
+        Full => "full",
+        ReadOnly => "read_only",
+    }
+
     pub enum ActiveBranchSyncStatus {
         Unchanged => "unchanged",
         Extended => "extended",

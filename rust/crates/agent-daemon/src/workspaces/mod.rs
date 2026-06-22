@@ -28,11 +28,17 @@ use self::git::{
     run_git, snapshot_worktree_commit,
 };
 use self::instantiate::{
-    create_workspace_dir, instantiate_workspace_from_base, materialize_tree_from_source_exact,
+    create_workspace_dir, destroy_workspace_tree, instantiate_workspace_from_base,
+    materialize_tree_from_source_exact,
 };
 use self::local::refresh_local_workspace_base;
 use self::selection::SelectedWorkspace;
 pub(crate) use self::selection::{RequestedWorkspace, WorkspaceSelection};
+
+/// Sibling of the workspace dirs under the cwd root. Owned by the daemon for
+/// stage handoff files; it is never a workspace, never snapshotted into an RO
+/// fork.
+const HANDOFF_DIR: &str = ".pi-handoff";
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceManager {
@@ -121,16 +127,15 @@ impl WorkspaceManager {
         if workspaces.is_empty() {
             return Ok(());
         }
-        let cwd = self.session_root(session_id).join("cwd");
-        let configured = PathBuf::from(outer_cwd);
-        if configured != cwd {
-            bail!(
-                "session outer_cwd does not match workspace state root: expected {}, got {}",
-                cwd.display(),
-                configured.display()
-            );
+        let own_cwd = self.session_root(session_id).join("cwd");
+        let cwd = PathBuf::from(outer_cwd);
+        // A `full` subagent runs against its parent's workspace dirs in place, so
+        // its configured outer_cwd lives under the parent's session root, not its
+        // own. Those dirs already exist; only materialize the tree for a session
+        // that owns its cwd. The workspaces below are validated either way.
+        if cwd == own_cwd {
+            tokio::fs::create_dir_all(&cwd).await?;
         }
-        tokio::fs::create_dir_all(&cwd).await?;
         for workspace in workspaces {
             validate_workspace_dir(&workspace.workspace_dir)?;
             let target = cwd.join(&workspace.workspace_dir);
@@ -193,6 +198,16 @@ impl WorkspaceManager {
                     child_cwd.display()
                 )
             })?;
+
+        // The durable handoff directory lives under the parent cwd and must
+        // never be carried into a disposable RO fork (the durable copy stays
+        // under the parent). The fork copies the whole cwd, so drop it here.
+        let child_handoff = child_cwd.join(HANDOFF_DIR);
+        if child_handoff.exists() {
+            destroy_workspace_tree(&child_handoff).await.with_context(|| {
+                format!("exclude handoff dir from fork {}", child_handoff.display())
+            })?;
+        }
 
         let mut child_workspaces = Vec::with_capacity(parent_workspaces.len());
         for workspace in parent_workspaces {
@@ -257,12 +272,20 @@ impl WorkspaceManager {
         Ok(refs)
     }
 
-    pub(crate) async fn remove_session_dir(&self, session_id: &str) -> Result<()> {
+    /// Reclaim a session's entire workspace tree, including any btrfs
+    /// subvolumes created while instantiating or forking it. This is the single
+    /// teardown primitive; callers that only want directory removal still route
+    /// through it so subvolume metadata is never leaked.
+    pub(crate) async fn destroy_session_workspaces(&self, session_id: &str) -> Result<()> {
         let root = self.session_root(session_id);
         if root.exists() {
-            tokio::fs::remove_dir_all(root).await?;
+            destroy_workspace_tree(&root).await?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn remove_session_dir(&self, session_id: &str) -> Result<()> {
+        self.destroy_session_workspaces(session_id).await
     }
 
     pub(crate) async fn reconcile_project_bases(
