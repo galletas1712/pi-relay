@@ -354,6 +354,54 @@ async fn create_running_subagent(
     boundary
 }
 
+/// A spawned delegation child whose session row exists but whose transcript has
+/// not started yet (`active_leaf_id == None`). This is terminal/non-failed by
+/// the store's progress convention.
+async fn create_empty_subagent(
+    env: &TestEnv,
+    project_id: Uuid,
+    parent_id: &str,
+    delegation_id: &str,
+    session_id: &str,
+    role: &str,
+    subagent_type: SubagentType,
+) {
+    env.state
+        .repo
+        .start_session_outputs_with_parent(
+            session_id,
+            &session_config(
+                env,
+                project_id,
+                json!({ "created_by": "test", "role_name": role }),
+            ),
+            &[],
+            None,
+            &[],
+            &[],
+            InputPriority::FollowUp,
+            &UserMessage::text("spawned but not started"),
+            None,
+            Some(parent_id),
+            Some(subagent_type),
+            Some(delegation_id),
+        )
+        .await
+        .expect("create empty delegation subagent");
+    assert_eq!(
+        env.state.repo.activity(session_id).await.expect("activity"),
+        agent_store::SessionActivity::Idle
+    );
+    let history = env
+        .state
+        .repo
+        .active_branch(session_id)
+        .await
+        .expect("empty active branch");
+    assert_eq!(history.active_leaf_id, None);
+    assert!(history.entries.is_empty());
+}
+
 /// A full subagent with an active, unfinished model action. This keeps the
 /// session genuinely busy so a steer-priority input should be queued rather
 /// than immediately consumed into a new turn.
@@ -2150,6 +2198,101 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
     let refreshed = std::fs::read_to_string(root.join("done_child").join("transcript.md")).unwrap();
     assert!(refreshed.contains("Found the answer."));
     assert!(!refreshed.contains("stale local artifact"));
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn delegation_list_treats_empty_active_branch_as_terminal_non_failed() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "delegation empty child list test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            Some("empty"),
+            2,
+        )
+        .await
+        .expect("create delegation");
+
+    create_empty_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "empty_child",
+        "reviewer",
+        SubagentType::ReadOnly,
+    )
+    .await;
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "failed_child",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Crashed,
+        "Failed with durable evidence.",
+    )
+    .await;
+
+    let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
+        .await
+        .expect("list delegations");
+    let listed = list["delegations"]
+        .as_array()
+        .expect("delegations array")
+        .iter()
+        .find(|row| row["delegation_id"] == delegation.id)
+        .expect("listed delegation");
+    assert_eq!(listed["progress"]["expected"], 2);
+    assert_eq!(listed["progress"]["spawned"], 2);
+    assert_eq!(listed["progress"]["terminal"], 2);
+    assert_eq!(listed["progress"]["running"], 0);
+    assert_eq!(listed["progress"]["failed"], 1);
+
+    let empty = listed["subagents"]
+        .as_array()
+        .expect("subagents")
+        .iter()
+        .find(|subagent| subagent["id"] == "empty_child")
+        .expect("empty child");
+    assert_eq!(empty["status"], "done");
+    assert_eq!(empty["activity"], "idle");
+    assert_eq!(empty["suggested_next"], serde_json::Value::Null);
+    assert_eq!(empty["final_message_file"], serde_json::Value::Null);
+    assert_eq!(empty["transcript_file"], serde_json::Value::Null);
+    assert_list_subagent_has_only_compact_fields(empty);
+
+    let failed = listed["subagents"]
+        .as_array()
+        .expect("subagents")
+        .iter()
+        .find(|subagent| subagent["id"] == "failed_child")
+        .expect("failed child");
+    assert_eq!(failed["status"], "failed");
+    assert_eq!(failed["activity"], "idle");
+    assert_list_subagent_has_only_compact_fields(failed);
 
     env.cleanup().await;
 }

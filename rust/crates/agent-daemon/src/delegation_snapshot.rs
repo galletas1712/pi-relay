@@ -4,9 +4,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::handoff::{
-    active_branch_is_terminal, delegation_dir, extract_final_message, extract_suggested_next,
+    delegation_dir, extract_final_message, extract_suggested_next,
     refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
-    safe_handoff_path_segment, subagent_outcome, task_prompt_rel, SubagentArtifact,
+    safe_handoff_path_segment, task_prompt_rel, terminal_subagent_status, SubagentArtifact,
 };
 use crate::state::AppState;
 use crate::types::RpcError;
@@ -26,13 +26,6 @@ pub(crate) fn progress_view(progress: DelegationProgress) -> Value {
     })
 }
 
-fn terminal_outcome_status(history: &agent_store::HistoryTree) -> Option<&'static str> {
-    active_branch_is_terminal(history).then(|| match subagent_outcome(history) {
-        agent_vocab::TurnOutcome::Graceful => "done",
-        agent_vocab::TurnOutcome::Interrupted | agent_vocab::TurnOutcome::Crashed => "failed",
-    })
-}
-
 pub(crate) async fn list_subagent_state(
     state: &AppState,
     delegation_status: DelegationStatus,
@@ -41,7 +34,7 @@ pub(crate) async fn list_subagent_state(
     match delegation_status {
         DelegationStatus::Running => {
             let history = state.repo.active_branch(subagent_id).await?;
-            let terminal_status = terminal_outcome_status(&history);
+            let terminal_status = terminal_subagent_status(&history);
             let suggested_next = terminal_status
                 .and_then(|_| extract_suggested_next(&extract_final_message(&history)));
             Ok(ListSubagentState {
@@ -51,7 +44,7 @@ pub(crate) async fn list_subagent_state(
         }
         DelegationStatus::Done | DelegationStatus::DoneWithFailures => {
             let history = state.repo.active_branch(subagent_id).await?;
-            let terminal_status = terminal_outcome_status(&history);
+            let terminal_status = terminal_subagent_status(&history);
             let suggested_next = terminal_status
                 .and_then(|_| extract_suggested_next(&extract_final_message(&history)));
             Ok(ListSubagentState {

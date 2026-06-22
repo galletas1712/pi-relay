@@ -54,6 +54,28 @@ pub(crate) fn subagent_outcome(history: &HistoryTree) -> TurnOutcome {
         .unwrap_or(TurnOutcome::Crashed)
 }
 
+/// The compact terminal status for a subagent active branch.
+///
+/// This mirrors the store's delegation progress convention: an empty active
+/// branch (`active_leaf_id == None`) and a compaction-summary leaf are terminal
+/// non-failures. Only a durable `TurnFinished` outcome can mark a terminal
+/// subagent as failed.
+pub(crate) fn terminal_subagent_status(history: &HistoryTree) -> Option<&'static str> {
+    let Some(active_leaf_id) = history.active_leaf_id.as_deref() else {
+        return Some("done");
+    };
+    let leaf = history
+        .entries
+        .iter()
+        .rev()
+        .find(|entry| entry.id == active_leaf_id)?;
+    match &leaf.item {
+        TranscriptItem::TurnFinished { outcome, .. } => Some(subagent_status(*outcome)),
+        TranscriptItem::CompactionSummary(_) => Some("done"),
+        _ => None,
+    }
+}
+
 /// Whether the active branch is at a durable turn boundary. This mirrors the
 /// store's terminality predicate for the active branch, but works from the
 /// `HistoryTree` already loaded to render artifacts.
@@ -341,7 +363,7 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         let is_terminal = active_branch_is_terminal(&history);
         let final_message = extract_final_message(&history);
         let transcript = render_transcript_markdown(&history);
-        let status = subagent_status(subagent_outcome(&history));
+        let status = terminal_subagent_status(&history);
         let suggested_next = extract_suggested_next(&final_message);
         let include_final_content = match delegation.status {
             DelegationStatus::Running => is_terminal,
@@ -375,7 +397,7 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
 
         artifacts.push(SubagentArtifact {
             session_id: subagent.session_id.clone(),
-            terminal_status: is_terminal.then_some(status),
+            terminal_status: is_terminal.then_some(status).flatten(),
             suggested_next: include_final_content.then_some(suggested_next).flatten(),
             final_message_path,
             task_prompt_path: task_prompt.as_ref().map(|artifact| artifact.path.clone()),

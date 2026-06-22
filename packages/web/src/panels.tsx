@@ -414,15 +414,30 @@ function RunBoard({
 	const [openFile, setOpenFile] = useState<{ delegationId: string; open: OpenHandoffFile } | null>(null);
 	const [showAllDelegations, setShowAllDelegations] = useState(false);
 	const [openDebugDelegationIds, setOpenDebugDelegationIds] = useState<Set<string>>(() => new Set());
+	const parentSessionIdRef = useRef(parentSessionId);
+	parentSessionIdRef.current = parentSessionId;
+
+	useEffect(() => {
+		setOpenFile(null);
+		setShowAllDelegations(false);
+		setOpenDebugDelegationIds(new Set());
+	}, [parentSessionId]);
 
 	const openHandoffFile = (delegationId: string, subagentId: string | null, file: HandoffFileName) => {
 		const key = `${subagentId ?? "delegation"}:${file}`;
+		const sessionAtOpen = parentSessionIdRef.current;
 		setOpenFile({ delegationId, open: { key, content: "" } });
 		void readHandoffFile(delegationId, subagentId, file)
-			.then((content) => setOpenFile({ delegationId, open: { key, content } }))
-			.catch((cause: unknown) =>
-				setOpenFile({ delegationId, open: { key, error: cause instanceof Error ? cause.message : String(cause) } }),
-			);
+			.then((content) => {
+				if (parentSessionIdRef.current === sessionAtOpen) {
+					setOpenFile({ delegationId, open: { key, content } });
+				}
+			})
+			.catch((cause: unknown) => {
+				if (parentSessionIdRef.current === sessionAtOpen) {
+					setOpenFile({ delegationId, open: { key, error: cause instanceof Error ? cause.message : String(cause) } });
+				}
+			});
 	};
 	const toggleDelegationDebug = (delegationId: string) => {
 		const closing = openDebugDelegationIds.has(delegationId);
