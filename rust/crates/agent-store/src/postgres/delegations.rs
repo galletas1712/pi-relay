@@ -201,61 +201,85 @@ impl PostgresAgentStore {
         Ok(())
     }
 
-    /// The delegation barrier's completion CAS, atomic with the parent steer.
+    /// Attempt-fenced cancellation CAS. This is the only path
+    /// `delegation.cancel` uses to move an in-flight delegation to `cancelled`:
+    /// it updates exactly one row iff the caller observed the current attempt
+    /// and the delegation is still `running`. If completion, another cancel, or
+    /// spawn-failure termination wins first, this returns `false` and the caller
+    /// must not interrupt subagents or publish cancellation transcripts.
+    pub async fn cancel_running_delegation(
+        &self,
+        delegation_id: &str,
+        attempt_id: &str,
+    ) -> Result<bool> {
+        let updated = sqlx::query(
+            r#"
+            update delegations
+            set status='cancelled', updated_at=now()
+            where id=$1 and attempt_id=$2 and status='running'
+            "#,
+        )
+        .bind(delegation_id)
+        .bind(attempt_id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    /// Claim the delegation barrier's terminal status transition.
     ///
-    /// Single-flight via the delegation row's `for update` lock; idempotent via the
-    /// `status='running'` + `attempt_id` fence. When the CAS wins, the SAME
-    /// transaction inserts the parent's steer as a durable `queued_input`
-    /// (`InputPriority::Steer`) keyed by a deterministic `client_input_id`
-    /// derived from `delegation_id`+`attempt_id`. So a commit means the steer is
-    /// durably queued: a crash in the old gap between the CAS commit and a
-    /// separate enqueue can no longer strand the parent, and a replay/sweep
-    /// re-running this with the same key cannot double-enqueue (the unique
-    /// `(session_id, client_input_id)` index makes the insert a no-op).
+    /// This is an attempt-fenced `running -> done|done_with_failures` CAS. The
+    /// CAS must run before normal handoff publishing so a concurrent
+    /// `delegation.cancel` cannot win and then receive a normal completed
+    /// handoff. The parent steer is intentionally NOT enqueued here: the runner
+    /// publishes handoff files first, then enqueues the deterministic steer, so
+    /// the parent is never pointed at missing files during normal operation.
     ///
-    /// Returns whether this call won the transition (`rows_affected()==1`), so
-    /// exactly one caller drives the parent after the steer is queued. Handoff
-    /// rendering happens outside this transaction and is intentionally
-    /// idempotent. A missing delegation is a benign no-op (a late lifecycle event
-    /// for a deleted delegation).
+    /// A crash after this CAS but before file/steer publication leaves a
+    /// terminal delegation with no steer. The daemon boot sweep repairs that by
+    /// re-rendering terminal handoffs and idempotently enqueueing any missing
+    /// deterministic steer for completed delegations.
     pub async fn finish_delegation(
         &self,
         delegation_id: &str,
         attempt_id: &str,
         status: DelegationStatus,
-        parent_session_id: &str,
-        steer_message: &str,
-        steer_client_input_id: &str,
     ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let locked = sqlx::query("select id from delegations where id=$1 for update")
-            .bind(delegation_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        if locked.is_none() {
-            tx.commit().await?;
-            return Ok(false);
-        }
         let updated = sqlx::query(
             "update delegations set status=$3, updated_at=now() where id=$1 and attempt_id=$2 and status='running'",
         )
         .bind(delegation_id)
         .bind(attempt_id)
         .bind(status.as_str())
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await?
         .rows_affected();
-        if updated == 1 {
-            enqueue_steer_tx(
-                &mut tx,
-                parent_session_id,
-                steer_message,
-                steer_client_input_id,
-            )
-            .await?;
-        }
-        tx.commit().await?;
         Ok(updated == 1)
+    }
+
+    /// Enqueue the parent's delegation-completion steer with the deterministic
+    /// delegation/attempt key. This is idempotent via the unique
+    /// `(session_id, client_input_id)` index, so boot repair or a replay can call
+    /// it again without creating a duplicate. The runner calls this only after
+    /// normal handoff files exist, so the parent steer never races ahead of the
+    /// files it references.
+    pub async fn enqueue_delegation_steer(
+        &self,
+        parent_session_id: &str,
+        steer_message: &str,
+        steer_client_input_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        enqueue_steer_tx(
+            &mut tx,
+            parent_session_id,
+            steer_message,
+            steer_client_input_id,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Whether every subagent of a delegation is terminal. Two fences guard
@@ -325,6 +349,25 @@ impl PostgresAgentStore {
             from delegations
             where status='running'
             order by created_at, id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_delegation).collect()
+    }
+
+    /// Completed delegations that may need boot-time publication repair. The
+    /// normal barrier claims the terminal status before writing files/enqueueing
+    /// the parent steer; if the daemon crashes in that narrow gap, these rows
+    /// are no longer `running` and therefore are not covered by the ordinary
+    /// running-delegation sweep.
+    pub async fn list_completed_delegations_for_repair(&self) -> Result<Vec<Delegation>> {
+        let rows = sqlx::query(
+            r#"
+            select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
+            from delegations
+            where status in ('done', 'done_with_failures')
+            order by updated_at, id
             "#,
         )
         .fetch_all(&self.pool)

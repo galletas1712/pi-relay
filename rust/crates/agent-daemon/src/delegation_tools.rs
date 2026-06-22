@@ -1,12 +1,14 @@
 use std::path::{Component, Path, PathBuf};
 
-use agent_store::{Delegation, DelegationKind, DelegationStatus, SubagentType};
-use agent_vocab::{ToolCall, ToolResultMessage};
+use agent_core::AgentInput;
+use agent_store::{Delegation, DelegationKind, DelegationStatus, InputPriority, SubagentType};
+use agent_vocab::{ToolCall, ToolResultMessage, UserMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::codec::from_params;
-use crate::interrupt_session;
+use crate::handoff::render_transcript_markdown;
+use crate::runtime::{abort_session_tasks, publish_events, SessionDriver};
 use crate::state::AppState;
 use crate::subagents::{spawn_subagent, DelegationSubagentSpawn};
 use crate::types::RpcError;
@@ -26,6 +28,125 @@ struct StartFullParams {
     prompt: String,
     workflow: Option<String>,
     label: Option<String>,
+}
+
+async fn subagent_delegation_for_parent(
+    state: &AppState,
+    parent_session_id: &str,
+    subagent_id: &str,
+) -> std::result::Result<Delegation, RpcError> {
+    let parent = state
+        .repo
+        .session_parent_id(subagent_id)
+        .await
+        .map_err(|error| {
+            eprintln!("failed to load parent for subagent {subagent_id}: {error:#}");
+            RpcError::new("subagent_not_found", "subagent not found")
+        })?;
+    if parent.as_deref() != Some(parent_session_id) {
+        return Err(RpcError::new(
+            "subagent_not_found",
+            "subagent is not in scope",
+        ));
+    }
+    let delegation_id = state
+        .repo
+        .session_delegation_id(subagent_id)
+        .await
+        .map_err(|error| {
+            eprintln!("failed to load delegation for subagent {subagent_id}: {error:#}");
+            RpcError::new("subagent_not_found", "subagent is not in scope")
+        })?
+        .ok_or_else(|| RpcError::new("subagent_not_found", "subagent is not in scope"))?;
+    load_delegation_for_parent(state, parent_session_id, &delegation_id).await
+}
+
+pub(crate) async fn steer_subagent_core(
+    state: &AppState,
+    parent_session_id: &str,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let params: SteerSubagentParams = from_params(params)?;
+    let subagent_id = trim_required(&params.subagent_id, "subagent_id")?;
+    let message = trim_required(&params.message, "message")?;
+    let delegation = subagent_delegation_for_parent(state, parent_session_id, &subagent_id).await?;
+    if delegation.status != DelegationStatus::Running {
+        return Err(RpcError::new(
+            "delegation_not_running",
+            "cannot steer a subagent whose delegation is terminal",
+        ));
+    }
+    match state.repo.session_subagent_type(&subagent_id).await? {
+        Some(SubagentType::Full) => {}
+        Some(SubagentType::ReadOnly) => {
+            return Err(RpcError::new(
+                "cannot_steer_read_only_subagent",
+                "a read-only subagent cannot be steered",
+            ))
+        }
+        None => {
+            return Err(RpcError::new(
+                "subagent_not_found",
+                "subagent is not in scope",
+            ))
+        }
+    }
+    // A running delegation row can briefly race a subagent reaching its terminal
+    // transcript boundary before the barrier wins the delegation CAS. Do not
+    // enqueue a steer in that terminal window: doing so would start a new turn
+    // and reactivate a subagent that has already finished.
+    if state
+        .repo
+        .active_leaf_is_turn_boundary(&subagent_id)
+        .await?
+    {
+        return Err(RpcError::new(
+            "subagent_terminal",
+            "cannot steer a subagent that is already terminal",
+        ));
+    }
+    let has_unfinished_actions = state.repo.has_unfinished_actions(&subagent_id).await?;
+    let has_queued_inputs = state.repo.has_queued_inputs(&subagent_id).await?;
+    let has_active_runtime = subagent_has_active_runtime(state, &subagent_id).await;
+    if !has_unfinished_actions && !has_queued_inputs && !has_active_runtime {
+        return Err(RpcError::new(
+            "subagent_not_running",
+            "cannot steer a subagent without active work or queued input",
+        ));
+    }
+
+    let client_input_id = format!("subagent-steer:{}:{}", delegation.id, uuid::Uuid::new_v4());
+    let queued = state
+        .repo
+        .enqueue_user_input(
+            &subagent_id,
+            InputPriority::Steer,
+            &UserMessage::text(message),
+            Some(&client_input_id),
+        )
+        .await?;
+    if let Some(event) = queued.event {
+        publish_events(state, vec![event]);
+    }
+    if !has_unfinished_actions {
+        let driver = SessionDriver::acquire(state, &subagent_id).await;
+        driver.drive_until_blocked().await?;
+    }
+    Ok(json!({
+        "subagent_id": subagent_id,
+        "queued": true,
+        "input_id": queued.input_id,
+    }))
+}
+
+async fn subagent_has_active_runtime(state: &AppState, subagent_id: &str) -> bool {
+    state.active.lock().await.contains_key(subagent_id)
+}
+
+fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
+    Path::new(parent_outer_cwd)
+        .join(HANDOFF_DIR)
+        .join(delegation_id)
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +176,13 @@ struct DelegationIdParams {
     #[serde(rename = "parent_session_id")]
     _parent_session_id: Option<String>,
     delegation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SteerSubagentParams {
+    subagent_id: String,
+    message: String,
 }
 
 fn trim_required(value: &str, field: &str) -> std::result::Result<String, RpcError> {
@@ -108,19 +236,33 @@ async fn reject_if_subagent(
     Ok(())
 }
 
-/// Move a delegation to a terminal status, interrupting any subagents already
-/// spawned for it. Shared by cancel and by the spawn-failure compensation path,
-/// so a half-started delegation never strands the parent behind the
-/// one-delegation-per-parent guard. Uses the low-level interrupt (the read-only
-/// steer/interrupt guard only blocks the model/parent from poking an individual
-/// RO subagent; tearing the whole delegation down is allowed).
+/// Spawn-failure compensation: move a half-created delegation to a terminal
+/// status and interrupt any subagents already spawned for it so the parent is
+/// not stranded behind the one-delegation-per-parent guard. This is deliberately
+/// unconditional because spawn failure owns the just-created delegation row.
+/// User-visible cancellation does NOT use this helper; it uses
+/// `cancel_running_delegation` so it cannot clobber a concurrent normal
+/// completion.
 async fn terminate_delegation(state: &AppState, delegation_id: &str, status: DelegationStatus) {
+    if let Err(error) = state
+        .repo
+        .set_delegation_status(delegation_id, status)
+        .await
+    {
+        eprintln!("failed to set delegation {delegation_id} to a terminal status: {error:#}");
+    }
     match state.repo.list_delegation_subagents(delegation_id).await {
         Ok(subagents) => {
             for subagent in &subagents {
-                if let Err(error) = interrupt_session(state, &subagent.session_id).await {
+                if let Err(error) = cancel_subagent_without_reactivation(
+                    state,
+                    &subagent.session_id,
+                    subagent.subagent_type,
+                )
+                .await
+                {
                     eprintln!(
-                        "failed to interrupt subagent {} while terminating delegation {}: {}: {}",
+                        "failed to cancel subagent {} while terminating delegation {}: {}: {}",
                         subagent.session_id, delegation_id, error.code, error.message
                     );
                 }
@@ -132,13 +274,42 @@ async fn terminate_delegation(state: &AppState, delegation_id: &str, status: Del
             )
         }
     }
-    if let Err(error) = state
-        .repo
-        .set_delegation_status(delegation_id, status)
-        .await
-    {
-        eprintln!("failed to set delegation {delegation_id} to a terminal status: {error:#}");
+}
+
+async fn cancel_subagent_without_reactivation(
+    state: &AppState,
+    session_id: &str,
+    subagent_type: Option<SubagentType>,
+) -> std::result::Result<(), RpcError> {
+    abort_session_tasks(state, session_id);
+    let driver = SessionDriver::acquire(state, session_id).await;
+    if let Some(active) = driver.active_session().await {
+        // Persist an interrupted turn boundary if the subagent has live runtime
+        // state, but deliberately do not drive afterwards: queued inputs for a
+        // cancelled delegation must not reactivate the subagent.
+        let _dispatches = driver
+            .apply_agent_input(active, AgentInput::Interrupt, None)
+            .await?;
+    } else {
+        let events = state
+            .repo
+            .cancel_unfinished_session_work(session_id, "delegation cancelled")
+            .await?;
+        if !events.is_empty() {
+            publish_events(state, events);
+        }
     }
+    state.active.lock().await.remove(session_id);
+    if subagent_type == Some(SubagentType::ReadOnly) {
+        if let Err(error) = state
+            .workspaces
+            .destroy_session_workspaces(session_id)
+            .await
+        {
+            eprintln!("failed to destroy read-only subagent workspace {session_id}: {error:#}");
+        }
+    }
+    Ok(())
 }
 
 /// Start the single full (writing) subagent of a delegation. Homogeneity and the
@@ -325,11 +496,13 @@ pub(crate) async fn status_core(
     ))
 }
 
-/// Cancel an in-flight delegation: interrupt each of its subagents and mark the
-/// delegation cancelled. Interrupting a read-only subagent is allowed here
-/// because the whole delegation is being torn down (the per-subagent guard only
-/// blocks the model/parent from steering or interrupting an individual RO
-/// subagent).
+/// Cancel an in-flight delegation. Cancellation first wins an attempt-fenced
+/// `running -> cancelled` CAS; only the CAS winner interrupts subagents and
+/// writes transcript-only artifacts. If completion or another cancellation wins
+/// first, this returns `{ "cancelled": false }` and leaves existing artifacts
+/// untouched. Interrupting a read-only subagent is allowed here because the
+/// whole delegation is being torn down (the per-subagent guard only blocks the
+/// model/parent from steering or interrupting an individual RO subagent).
 pub(crate) async fn cancel_core(
     state: &AppState,
     parent_session_id: &str,
@@ -344,8 +517,74 @@ pub(crate) async fn cancel_core(
     if delegation.status != DelegationStatus::Running {
         return Ok(json!({ "cancelled": false }));
     }
-    terminate_delegation(state, &delegation.id, DelegationStatus::Cancelled).await;
-    Ok(json!({ "cancelled": true }))
+    let won_cancel = state
+        .repo
+        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
+        .await?;
+    if !won_cancel {
+        return Ok(json!({ "cancelled": false }));
+    }
+    cancel_delegation_subagents_without_reactivation(state, &delegation.id).await;
+    let transcript_paths = write_cancelled_subagent_transcripts(state, &delegation).await?;
+    Ok(json!({
+        "cancelled": true,
+        "transcripts": transcript_paths,
+    }))
+}
+
+async fn cancel_delegation_subagents_without_reactivation(state: &AppState, delegation_id: &str) {
+    match state.repo.list_delegation_subagents(delegation_id).await {
+        Ok(subagents) => {
+            for subagent in &subagents {
+                if let Err(error) = cancel_subagent_without_reactivation(
+                    state,
+                    &subagent.session_id,
+                    subagent.subagent_type,
+                )
+                .await
+                {
+                    eprintln!(
+                        "failed to cancel subagent {} while cancelling delegation {}: {}: {}",
+                        subagent.session_id, delegation_id, error.code, error.message
+                    );
+                }
+            }
+        }
+        Err(error) => {
+            eprintln!(
+                "failed to list subagents while cancelling delegation {delegation_id}: {error:#}"
+            )
+        }
+    }
+}
+
+async fn write_cancelled_subagent_transcripts(
+    state: &AppState,
+    delegation: &Delegation,
+) -> std::result::Result<Vec<Value>, RpcError> {
+    let parent_config = state
+        .repo
+        .load_session_config(&delegation.parent_session_id)
+        .await?;
+    let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id).join("cancelled");
+    let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
+    let mut transcripts = Vec::with_capacity(subagents.len());
+    for subagent in &subagents {
+        let history = state.repo.active_branch(&subagent.session_id).await?;
+        let transcript = render_transcript_markdown(&history);
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .map_err(anyhow::Error::from)?;
+        let path = dir.join(format!("{}.transcript.md", subagent.session_id));
+        tokio::fs::write(&path, transcript.as_bytes())
+            .await
+            .map_err(anyhow::Error::from)?;
+        transcripts.push(json!({
+            "subagent_id": subagent.session_id,
+            "transcript": path.to_string_lossy(),
+        }));
+    }
+    Ok(transcripts)
 }
 
 #[derive(Debug, Deserialize)]
@@ -646,6 +885,7 @@ pub(crate) fn is_delegation_tool_name(name: &str) -> bool {
             | "delegate_readonly_tasks"
             | "inspect_delegation"
             | "cancel_delegation"
+            | "steer_subagent"
     )
 }
 
@@ -673,6 +913,7 @@ pub(crate) async fn run_delegation_tool(
         }
         "inspect_delegation" => status_core(state, parent_session_id, params).await,
         "cancel_delegation" => cancel_core(state, parent_session_id, params).await,
+        "steer_subagent" => steer_subagent_core(state, parent_session_id, params).await,
         other => Err(RpcError::new(
             "unknown_tool",
             format!("unknown delegation tool: {other}"),
@@ -705,6 +946,7 @@ mod tests {
             "delegate_readonly_tasks",
             "inspect_delegation",
             "cancel_delegation",
+            "steer_subagent",
         ] {
             assert!(
                 is_delegation_tool_name(name),

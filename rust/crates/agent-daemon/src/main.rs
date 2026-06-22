@@ -922,6 +922,15 @@ pub(crate) async fn enqueue_session_input(
     let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
     let recovered_ms = started_at.elapsed().as_millis();
+    if priority == InputPriority::Steer
+        && state.repo.session_parent_id(&session_id).await?.is_some()
+        && state.repo.active_leaf_is_turn_boundary(&session_id).await?
+    {
+        return Err(RpcError::new(
+            "subagent_terminal",
+            "cannot steer a subagent that is already terminal",
+        ));
+    }
     let mut expected_params = json!({});
     if let Some(expected_active_leaf_id) = expected_active_leaf_id {
         expected_params["expected_active_leaf_id"] = expected_active_leaf_id;

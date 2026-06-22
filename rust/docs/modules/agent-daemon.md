@@ -40,7 +40,7 @@ subagents.rs       delegation subagent spawn core: role resolution, full vs
                    read-only workspace handling, child prompt + lifecycle events
 delegation_tools.rs     delegation tool surface (delegate_writing_task /
                    delegate_readonly_tasks / inspect_delegation /
-                   cancel_delegation) plus delegation.* web RPCs
+                   cancel_delegation / steer_subagent) plus delegation.* web RPCs
                    (start_full / start_readonly_fanout / status / cancel /
                    list) + homogeneity/one-delegation-per-parent guards
 delegation_runner.rs    delegation barrier: all-terminal detect, attempt-fenced finish CAS,
@@ -51,16 +51,18 @@ handoff.rs         renders index.json + per-subagent final_message.md / transcri
 ```
 
 Subagent work runs as **delegations** (`delegate_writing_task` /
-`delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation`). Full subagents
+`delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation` /
+`steer_subagent`). Full subagents
 reuse the parent's workspace dirs in place; read-only subagents get a forked
 snapshot destroyed on return. Delegation subagents may emit
 `subagent.spawned`/`subagent.running` progress events; their terminal hook fires
 a single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
-terminal. The runner writes the handoff directory idempotently and the DB
-finish CAS enqueues one `InputPriority::Steer` notification to the parent.
+terminal. After the DB finish CAS wins, the runner writes the handoff directory
+and then enqueues one `InputPriority::Steer` notification to the parent.
 Completion is that steer/handoff, not a parent-visible per-child idle event. The
 runner never decides the next delegation — the parent does, guided by workflow
-skills.
+skills. Cancellation is terminal and exports transcript-only files for the
+cancelled subagents instead of running the normal completion handoff.
 
 The web/inspector RPC surface remains `delegation.start_full`,
 `delegation.start_readonly_fanout`, `delegation.status`, `delegation.cancel`, and `delegation.list`;

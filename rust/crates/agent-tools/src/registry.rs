@@ -410,6 +410,28 @@ fn cancel_delegation_definition() -> ToolDefinition {
     )
 }
 
+fn steer_subagent_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "steer_subagent",
+        "Send an additional instruction or correction to a running full subagent without cancelling and restarting it. The subagent id is the subagent session id shown by inspect_delegation.",
+        json!({
+            "type": "object",
+            "properties": {
+                "subagent_id": {
+                    "type": "string",
+                    "description": "The target subagent session id shown in delegation inspection."
+                },
+                "message": {
+                    "type": "string",
+                    "description": "The additional instruction, correction, or context to send to the running subagent."
+                }
+            },
+            "required": ["subagent_id", "message"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 pub struct FirstPartyToolExtension;
 
 impl ToolExtension for FirstPartyToolExtension {
@@ -447,6 +469,12 @@ impl ToolExtension for FirstPartyToolExtension {
             "cancel_delegation",
             "delegation",
             cancel_delegation_definition(),
+        );
+        register_runtime_tool(
+            registry,
+            "steer_subagent",
+            "delegation",
+            steer_subagent_definition(),
         );
         register_edit(registry);
         register_uniform(registry, "Bash", "shell", BashTool);
@@ -600,6 +628,7 @@ mod tests {
                 "Grep",
                 "inspect_delegation",
                 "LoadSkill",
+                "steer_subagent",
                 "WebFetch",
                 "WebSearch"
             ]
@@ -614,6 +643,7 @@ mod tests {
                 "Grep",
                 "inspect_delegation",
                 "LoadSkill",
+                "steer_subagent",
                 "Edit",
                 "WebFetch",
                 "WebSearch"
@@ -646,6 +676,7 @@ mod tests {
                 "Grep",
                 "inspect_delegation",
                 "LoadSkill",
+                "steer_subagent",
                 "web_fetch",
                 "web_search"
             ]
@@ -660,10 +691,36 @@ mod tests {
                 "Grep",
                 "inspect_delegation",
                 "LoadSkill",
+                "steer_subagent",
                 "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search"
             ]
+        );
+    }
+
+    #[test]
+    fn steer_subagent_tool_schema_is_model_facing() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let tool = registry
+            .provider_tools_for_provider(ProviderKind::OpenAi)
+            .into_iter()
+            .find(|tool| tool.name == "steer_subagent")
+            .expect("steer_subagent tool");
+
+        assert_eq!(tool.canonical_name, "steer_subagent");
+        assert_eq!(tool.execution, ToolExecution::LocalJson);
+        assert_eq!(tool.input_schema["type"], "object");
+        assert_eq!(
+            tool.input_schema["required"],
+            json!(["subagent_id", "message"])
+        );
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert!(
+            tool.input_schema["properties"]["subagent_id"]["description"]
+                .as_str()
+                .expect("subagent_id description")
+                .contains("subagent session id")
         );
     }
 
@@ -764,6 +821,7 @@ mod tests {
             "delegate_readonly_tasks",
             "inspect_delegation",
             "cancel_delegation",
+            "steer_subagent",
         ] {
             assert!(
                 names.contains(&expected.to_string()),

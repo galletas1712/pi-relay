@@ -1363,6 +1363,7 @@ mod tests {
                 "Grep",
                 "inspect_delegation",
                 "LoadSkill",
+                "steer_subagent",
                 "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search"
@@ -1408,15 +1409,17 @@ mod tests {
         assert!(body["tools"][5].get("type").is_none());
         assert_eq!(body["tools"][6]["name"], "LoadSkill");
         assert!(body["tools"][6].get("type").is_none());
-        assert_eq!(body["tools"][7]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][7]["name"], "str_replace_based_edit_tool");
-        assert_eq!(body["tools"][8]["name"], "web_fetch");
-        assert!(body["tools"][8].get("type").is_none());
-        assert_eq!(body["tools"][9]["name"], "web_search");
+        assert_eq!(body["tools"][7]["name"], "steer_subagent");
+        assert!(body["tools"][7].get("type").is_none());
+        assert_eq!(body["tools"][8]["type"], "text_editor_20250728");
+        assert_eq!(body["tools"][8]["name"], "str_replace_based_edit_tool");
+        assert_eq!(body["tools"][9]["name"], "web_fetch");
         assert!(body["tools"][9].get("type").is_none());
+        assert_eq!(body["tools"][10]["name"], "web_search");
+        assert!(body["tools"][10].get("type").is_none());
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
-        for index in 0..10 {
+        for index in 0..11 {
             assert!(
                 body["tools"][index].get("cache_control").is_none(),
                 "tool {index} should not carry cache_control"
