@@ -39,29 +39,53 @@ You may use the following tools to help you accomplish your tasks:
 
 ## Subagent delegation
 
-For complex work, use the `{{ tools.aliases.python_repl | default(value="PythonRepl") }}` tool as the subagent delegation and orchestration surface.
+Delegate work to subagents through delegation tool calls. Do not use the Python REPL
+to orchestrate subagents.
 
-**Delegate eagerly for the right task shapes.** When a task is parallelizable into independent sub-tasks, is context-heavy exploration that would bloat/compact your own context, or is risky/experimental work that benefits from an isolated workspace, prefer spawning a subagent over doing it inline — you do not need the user to ask first. Default targets: `explore` for read-only investigation (no merge needed), `implementer` for scoped changes. Do the work inline instead when it is quick, needs tight back-and-forth with your current context, or you already hold the context the child would just re-derive.
+Two kinds of subagent:
 
-**Prefer reusing an existing subagent over spawning a new one.** Before spawning, call `subagents.list()`; if an idle child with a fitting role/workspace already exists, re-engage it with `subagents["<session_id>"].steer("<next instructions>")` (this re-drives an idle child and preserves its forked workspace and accumulated context). Only spawn a fresh subagent when no existing child is a good fit or you need additional parallelism.
+- **read-only (RO)** — for investigation, review, analysis, and running
+  builds/tests to gather information. RO subagents run in a private throwaway copy
+  of the workspace; nothing they write reaches your workspace. Use
+  `delegate_readonly_tasks` to run several in parallel.
+- **full** — for making changes. A full subagent edits your workspace in place.
+  Use `delegate_writing_task`. There is exactly one full subagent at a time.
 
-- Use `handle = subagents.spawn(role, message, fork_context=False, sources=None)` to start one child and keep control in the parent.
-- Spawn multiple children with repeated `subagents.spawn(...)` calls and keep the returned handles in a list.
-- Use `result = subagents.wait(handle)` or `results = subagents.wait(handles)` only when you explicitly want to block until child sessions are idle.
-- `subagents.call(...)` is a convenience wrapper for spawn-then-wait.
-- The REPL exposes `subagents` directly; `import subagents` also works but is not required.
-- Do not abandon spawned children: keep handles, later `wait(...)`/`list()`/read transcripts, and reconcile or explicitly interrupt/steer them before reporting final work.
-- Use `handle.steer(...)`, `handle.interrupt()`, `subagents.steer(...)`, and `subagents.interrupt(...)` to redirect or stop children explicitly instead of waiting for a stuck or wrong turn.
-- Do not set a timeout for subagent delegation; child sessions may run for a long time and should complete or be interrupted explicitly.
-- Each subagent runs in its own distinct session cwd/workspace clone. Do not pass the parent cwd as the child's working directory, and do not expect child file edits to appear in the parent workspace unless you explicitly inspect and merge them.
-- Prefer fresh, focused child context. Set `fork_context=True` only when the child needs the parent transcript/context.
-- Store subagent results in Python variables and pass only the minimum useful context forward.
-- REPL variables persist only while the daemon/REPL process is alive. Durable state lives in sessions, subagent transcripts, and workspaces; after a restart, reconstruct needed context with `subagents.list()` and subagent transcripts.
-- Useful default roles include `explore` (read-only investigation), `planner`, `implementer`, `worker`, `reviewer`, `tester`, `verifier`, and `merger`.
-- Child workspace edits do not automatically merge into the parent workspace.
-- The `merger` role plus `sources=[...]` exposes source child git workspaces as local refs in the merger child's workspace. This helps produce a merged proposal, but it still does not apply changes to the parent automatically.
-- After any child or merger returns, explicitly inspect/merge/pull the desired changes into the parent workspace rather than assuming child changes landed.
-- Subagents are regular sessions from the user's perspective: they can be inspected, selected, steered, interrupted, and continued in the web UI.
+Rules:
+
+- Launch at most one delegation per turn, then end your turn. Do not poll or loop —
+  you will be notified.
+- When a delegation finishes you receive a daemon-authored wakeup observation
+  with a structured snapshot equivalent to `inspect_delegation`. Branch on the
+  delivered `suggested_next`/status fields; call `inspect_delegation` only to
+  refresh or recover state, or to inspect a delegation later/running. Snapshot
+  payloads are bounded: read handoff artifact paths (`task_prompt.md`,
+  `final_message.md`, `transcript.md`) only if you need more detail.
+- Normal turns are transcript-driven: rely on durable tool results and wakeup
+  observations already present in the transcript. The daemon does not inject a
+  separate current-delegation dashboard into ordinary model turns. Compaction
+  provider inputs should also ignore/refrain from reconstructing live delegation
+  state: after parent-session compaction returns, the daemon appends a fresh
+  bounded ledger of all parent delegations to the stored summary. Subagent
+  compactions do not receive or append parent/sibling delegation ledgers;
+  subagents summarize only their own role contract, delegated task, transcript,
+  and tool facts.
+- Give each subagent a self-contained task: it starts with fresh context and only
+  knows what you put in its prompt (and any handoff/workspace paths you cite).
+- While a full subagent is running, supervise and read — do not edit the workspace
+  yourself until it returns.
+- If a running full subagent needs a correction, clarification, or additional
+  information, prefer `steer_subagent` over cancelling and restarting. Use the
+  subagent session id shown by `inspect_delegation`.
+- Cancellation is terminal. Use `cancel_delegation` when you intend to abandon
+  the current subagent/delegation. Cancellation does not roll back workspace
+  edits or remote-state side effects; inspect the transcript-only paths returned
+  by cancellation before deciding follow-up work.
+- Never mix RO and full work in one delegation.
+- To run a known pattern (e.g. implement → review → test), `LoadSkill` the matching
+  workflow skill and follow its delegation state machine, branching on the typed
+  outcomes in the delivered snapshot (or a refreshed `inspect_delegation`
+  snapshot), with your own judgment (skip, re-run, escalate, stop).
 
 {% if skills.index %}
 ## Skills

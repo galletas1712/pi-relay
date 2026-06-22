@@ -2,13 +2,20 @@ use std::collections::VecDeque;
 
 use crate::event::{AgentEvent, AgentInput, TurnInput};
 use crate::state::AgentState;
-use agent_vocab::TurnId;
+use agent_vocab::{DaemonToolObservation, TurnId};
 
 /// A queued turn input.
 ///
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct UserInputEntry {
     pub(crate) content: TurnInput,
+}
+
+/// A queued daemon-authored observation. Kept distinct from user input so the
+/// transcript can preserve authorship semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonObservationEntry {
+    pub(crate) observation: DaemonToolObservation,
 }
 
 /// Volatile prioritized queues feeding the live agent FSM.
@@ -20,6 +27,7 @@ pub struct Mailbox {
     notifications: VecDeque<AgentEvent>,
     steer: VecDeque<UserInputEntry>,
     follow_up: VecDeque<UserInputEntry>,
+    daemon_observations: VecDeque<DaemonObservationEntry>,
     interrupt_requested: bool,
 }
 
@@ -32,6 +40,10 @@ impl Mailbox {
             }
             AgentInput::FollowUp { content } => {
                 self.follow_up.push_back(UserInputEntry { content });
+            }
+            AgentInput::DaemonObservation { observation } => {
+                self.daemon_observations
+                    .push_back(DaemonObservationEntry { observation });
             }
             AgentInput::ModelCompleted {
                 action_id,
@@ -109,12 +121,17 @@ impl Mailbox {
             .or_else(|| self.follow_up.pop_front())
     }
 
+    fn pop_daemon_observation_entry(&mut self) -> Option<DaemonObservationEntry> {
+        self.daemon_observations.pop_front()
+    }
+
     fn pop_steer_input_entry(&mut self) -> Option<UserInputEntry> {
         self.steer.pop_front()
     }
 
-    /// Drain every queued user input as reconstructed `AgentInput` values,
-    /// preserving priority order (steer before follow-up).
+    /// Drain every queued turn-starting input as reconstructed `AgentInput`
+    /// values, preserving dispatch order (steer, follow-up, then daemon
+    /// observations).
     ///
     /// Notifications and interrupt state are left untouched.
     pub(crate) fn drain_pending_inputs(&mut self) -> Vec<AgentInput> {
@@ -124,6 +141,11 @@ impl Mailbox {
         }));
         drained.extend(self.follow_up.drain(..).map(|entry| AgentInput::FollowUp {
             content: entry.content,
+        }));
+        drained.extend(self.daemon_observations.drain(..).map(|entry| {
+            AgentInput::DaemonObservation {
+                observation: entry.observation,
+            }
         }));
         drained
     }
@@ -155,12 +177,26 @@ impl Mailbox {
                 .map(|entry| AgentEvent::Steer {
                     input: entry.content,
                 })
+                .or_else(|| {
+                    self.pop_daemon_observation_entry()
+                        .map(|entry| AgentEvent::DaemonObservation {
+                            observation: entry.observation,
+                        })
+                })
                 .or(Some(AgentEvent::ContinueModel)),
             AgentState::Idle => self
                 .pop_user_input_entry()
                 .map(|entry| AgentEvent::StartTurn {
                     turn_id: next_turn_id,
                     input: entry.content,
+                })
+                .or_else(|| {
+                    self.pop_daemon_observation_entry().map(|entry| {
+                        AgentEvent::StartDaemonObservationTurn {
+                            turn_id: next_turn_id,
+                            observation: entry.observation,
+                        }
+                    })
                 }),
             AgentState::RunningModel { .. } | AgentState::RunningTools { .. } => None,
         }

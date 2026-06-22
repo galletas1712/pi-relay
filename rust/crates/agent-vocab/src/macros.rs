@@ -5,14 +5,14 @@ macro_rules! text_enum {
     ($(
         $(#[$meta:meta])*
         pub enum $name:ident {
-            $($variant:ident => $wire:literal),+ $(,)?
+            $($(#[$variant_meta:meta])* $variant:ident => $wire:literal),+ $(,)?
         }
     )+) => {
         $(
             $(#[$meta])*
             #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
             pub enum $name {
-                $($variant),+
+                $($(#[$variant_meta])* $variant),+
             }
 
             impl $name {

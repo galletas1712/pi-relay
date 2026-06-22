@@ -3,9 +3,13 @@
 mod auth;
 mod codec;
 mod config;
+mod delegation_context;
+mod delegation_runner;
+mod delegation_snapshot;
+mod delegation_tools;
+mod handoff;
 mod model_metadata;
 mod provider_runtime;
-mod repl;
 mod rpc_views;
 mod runtime;
 mod session_start;
@@ -36,8 +40,9 @@ use agent_core::AgentInput;
 use agent_session::SessionInput;
 use agent_store::{
     AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
-    EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputStatus,
-    SessionConfig, TranscriptEntryBodyMode, TranscriptEntryScope, WorkspaceKind,
+    EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputContent,
+    QueuedInputStatus, SessionConfig, SubagentType, TranscriptEntryBodyMode, TranscriptEntryScope,
+    WorkspaceKind,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -73,10 +78,21 @@ async fn main() -> Result<()> {
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
-        repls: repl::ReplRegistry::default(),
         workspaces,
         prompt_root,
     };
+
+    // Complete any delegation that crashed mid-barrier: a `running` delegation whose
+    // subagents are all terminal is finished (handoff + wakeup observation)
+    // exactly once via the same attempt-fenced CAS the live barrier uses.
+    //
+    // This runs AFTER the global stale-mark above, but that ordering is safe:
+    // delegation terminality is transcript-boundary based, independent of action
+    // status, so a subagent stale-marked mid-turn is still NON-terminal. The
+    // sweep recovers each subagent to a boundary first, so a resumable mid-turn
+    // child re-establishes live work (delegation stays running) instead of being
+    // abandoned as a failure.
+    delegation_runner::sweep_running_delegations_on_boot(&state).await;
 
     let listener = TcpListener::bind(&config.bind).await?;
     println!("pi-agentd listening on ws://{}", config.bind);
@@ -99,7 +115,6 @@ async fn main() -> Result<()> {
     }
 
     drain_dispatch_tasks(&state).await;
-    state.repls.kill_all().await;
     state.repo.close().await;
     Ok(())
 }
@@ -286,8 +301,16 @@ async fn dispatch_request(
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
-        RpcMethod::ReplExec => repl::repl_exec(state, params).await,
-        RpcMethod::SubagentList => subagents::subagent_list(state, params).await,
+        RpcMethod::DelegationStartFull => delegation_tools::rpc_start_full(state, params).await,
+        RpcMethod::DelegationStartReadonlyFanout => {
+            delegation_tools::rpc_start_readonly_fanout(state, params).await
+        }
+        RpcMethod::DelegationStatus => delegation_tools::rpc_status(state, params).await,
+        RpcMethod::DelegationCancel => delegation_tools::rpc_cancel(state, params).await,
+        RpcMethod::DelegationList => delegation_tools::rpc_list(state, params).await,
+        RpcMethod::DelegationReadHandoffFile => {
+            delegation_tools::rpc_read_handoff_file(state, params).await
+        }
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }
@@ -334,11 +357,7 @@ async fn session_list(state: &AppState, params: Value) -> std::result::Result<Va
             })
         })
         .transpose()?;
-    let sessions = state
-        .repo
-        .list_sessions(project_id, limit)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let sessions = state.repo.list_sessions(project_id, limit).await?;
     Ok(json!({
         "sessions": sessions
             .into_iter()
@@ -368,11 +387,7 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
     let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
     let recovered_ms = started_at.elapsed().as_millis();
-    let snapshot = state
-        .repo
-        .session_snapshot(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let snapshot = state.repo.session_snapshot(&session_id).await?;
     let snapshot_ms = started_at.elapsed().as_millis();
     let entries = if include_entries {
         let scope = if entries_scope == "active_branch" {
@@ -384,8 +399,7 @@ async fn session_get(state: &AppState, params: Value) -> std::result::Result<Val
             state
                 .repo
                 .transcript_entries_for_scope(&session_id, scope, TranscriptEntryBodyMode::Ui)
-                .await
-                .map_err(anyhow::Error::from)?,
+                .await?,
         )
     } else {
         None
@@ -420,14 +434,9 @@ async fn session_sync_active_branch(
     let sync = state
         .repo
         .sync_active_branch(&session_id, base_leaf_id, TranscriptEntryBodyMode::Ui)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     let sync_ms = started_at.elapsed().as_millis();
-    let overview = state
-        .repo
-        .session_snapshot(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let overview = state.repo.session_snapshot(&session_id).await?;
     let snapshot_ms = started_at.elapsed().as_millis();
     let entry_count = sync.entries.len();
     let status = sync.status;
@@ -455,13 +464,8 @@ async fn session_rename(state: &AppState, params: Value) -> std::result::Result<
     let events = state
         .repo
         .rename_session_manually(&session_id, &title)
-        .await
-        .map_err(anyhow::Error::from)?;
-    let config = state
-        .repo
-        .load_session_config(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
+    let config = state.repo.load_session_config(&session_id).await?;
     replace_active_session_config(state, &session_id, config.clone()).await;
     publish_events(state, events);
     clear_event_buffer_if_idle(state, &session_id).await?;
@@ -469,18 +473,13 @@ async fn session_rename(state: &AppState, params: Value) -> std::result::Result<
         "session_id": session_id,
         "title": title,
         "metadata": config.metadata,
-        "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?
+        "activity": state.repo.activity(&session_id).await?
     }))
 }
 
 async fn session_delete(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
-    if !state
-        .repo
-        .session_exists(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?
-    {
+    if !state.repo.session_exists(&session_id).await? {
         return Err(RpcError::new("session_not_found", "session not found"));
     }
 
@@ -492,11 +491,7 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
     delete_order.push(session_id.clone());
     for candidate_session_id in &delete_order {
         state.active.lock().await.remove(candidate_session_id);
-        let deleted = state
-            .repo
-            .delete_session(candidate_session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let deleted = state.repo.delete_session(candidate_session_id).await?;
         if !deleted && candidate_session_id == &session_id {
             return Err(RpcError::new("session_not_found", "session not found"));
         }
@@ -537,8 +532,7 @@ async fn lock_hidden_subagent_delete_tree(
         let child_session_ids_for_parent = state
             .repo
             .list_child_session_ids(&parent_session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         for child_session_id in child_session_ids_for_parent {
             if !seen.insert(child_session_id.clone()) {
                 continue;
@@ -557,11 +551,7 @@ async fn session_configure(
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let driver = SessionDriver::acquire(state, &session_id).await;
-    let current = state
-        .repo
-        .load_session_config(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let current = state.repo.load_session_config(&session_id).await?;
     let provider = params
         .get("provider")
         .cloned()
@@ -581,12 +571,7 @@ async fn session_configure(
     let metadata_changed = metadata != current.metadata;
     if model_changed {
         driver.ensure_idle_for_source_mutation().await?;
-        if state
-            .repo
-            .has_transcript_entries(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?
-        {
+        if state.repo.has_transcript_entries(&session_id).await? {
             return Err(RpcError::new(
                 "provider_locked",
                 "session model cannot be changed after the first transcript entry",
@@ -603,11 +588,7 @@ async fn session_configure(
         provider,
         metadata,
     };
-    let events = state
-        .repo
-        .configure_session(&session_id, &config)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let events = state.repo.configure_session(&session_id, &config).await?;
     if let Some(active) = driver.active_session().await {
         active.lock().await.config = config.clone();
     }
@@ -617,7 +598,7 @@ async fn session_configure(
         "session_id": session_id,
         "provider": config.provider,
         "metadata": config.metadata,
-        "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?
+        "activity": state.repo.activity(&session_id).await?
     }))
 }
 
@@ -643,11 +624,7 @@ fn ensure_metadata_object(metadata: &mut Value) -> &mut serde_json::Map<String, 
 }
 
 async fn project_list(state: &AppState) -> std::result::Result<Value, RpcError> {
-    let projects = state
-        .repo
-        .list_projects()
-        .await
-        .map_err(anyhow::Error::from)?;
+    let projects = state.repo.list_projects().await?;
     Ok(json!({
         "projects": projects
             .into_iter()
@@ -658,7 +635,7 @@ async fn project_list(state: &AppState) -> std::result::Result<Value, RpcError> 
 
 async fn project_create(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let params: ProjectWriteParams = from_params(params)?;
-    let project_id = params.project_id.unwrap_or_else(|| Uuid::new_v4());
+    let project_id = params.project_id.unwrap_or_else(Uuid::new_v4);
     let name = params.name.trim();
     if name.is_empty() {
         return Err(RpcError::new("invalid_params", "project name is required"));
@@ -672,18 +649,13 @@ async fn project_create(state: &AppState, params: Value) -> std::result::Result<
             &workspaces,
             params.metadata.unwrap_or_else(|| json!({})),
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     Ok(rpc_views::project(project))
 }
 
 async fn project_update(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let project_id = required_uuid(&params, "project_id")?;
-    let current = state
-        .repo
-        .get_project(project_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let current = state.repo.get_project(project_id).await?;
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -707,8 +679,7 @@ async fn project_update(state: &AppState, params: Value) -> std::result::Result<
     let project = state
         .repo
         .update_project(project_id, name, &workspaces)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     if let Err(error) = state
         .workspaces
         .reconcile_project_bases(project_id, &project.workspaces)
@@ -721,11 +692,7 @@ async fn project_update(state: &AppState, params: Value) -> std::result::Result<
 
 async fn project_delete(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let project_id = required_uuid(&params, "project_id")?;
-    let deleted = state
-        .repo
-        .delete_empty_project(project_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let deleted = state.repo.delete_empty_project(project_id).await?;
     if !deleted {
         return Err(RpcError::new(
             "project_not_empty",
@@ -814,18 +781,13 @@ async fn system_prompt(state: &AppState, params: Value) -> std::result::Result<V
         .get("session_id")
         .and_then(Value::as_str)
         .ok_or_else(|| RpcError::new("session_required", "system.prompt requires session_id"))?;
-    let config = state
-        .repo
-        .load_session_config(session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let config = state.repo.load_session_config(session_id).await?;
     state
         .workspaces
         .ensure_session(session_id, &config.outer_cwd, &config.workspaces)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     Ok(json!({
-        "template": current_pi_template(state).map_err(anyhow::Error::from)?,
+        "template": current_pi_template(state)?,
         "rendered": config.system_prompt,
     }))
 }
@@ -842,11 +804,7 @@ async fn events_subscribe(
     let after_event_id = params.get("after_event_id").and_then(Value::as_i64);
     subscriptions.insert(session_id.clone());
     let Some(after_event_id) = after_event_id else {
-        let current = state
-            .repo
-            .last_event_id(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let current = state.repo.last_event_id(&session_id).await?;
         event_high_water.insert(session_id, current);
         return Ok(json!({ "replayed": [] }));
     };
@@ -854,8 +812,7 @@ async fn events_subscribe(
     let events = state
         .repo
         .events_after(&session_id, Some(after_event_id))
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     let replayed_max = events
         .iter()
         .map(|event| event.event_id)
@@ -876,7 +833,10 @@ fn events_unsubscribe(
     Ok(json!({ "session_id": session_id }))
 }
 
-async fn input_user(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+pub(crate) async fn input_user(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
     let priority = params
         .get("priority")
@@ -885,6 +845,19 @@ async fn input_user(state: &AppState, params: Value) -> std::result::Result<Valu
         .transpose()
         .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
         .unwrap_or(InputPriority::FollowUp);
+    // Server-side guard: a read-only subagent must never be steered. The legacy
+    // client-only check is not authoritative, so reject a Steer-priority input
+    // targeting a read_only subagent here. Follow-up inputs (and the barrier's
+    // top-level parent wakeup observation, which targets a parent session) are
+    // unaffected.
+    if priority == InputPriority::Steer
+        && state.repo.session_subagent_type(&session_id).await? == Some(SubagentType::ReadOnly)
+    {
+        return Err(RpcError::new(
+            "cannot_steer_read_only_subagent",
+            "a read-only subagent cannot be steered",
+        ));
+    }
     let client_input_id = params
         .get("client_input_id")
         .and_then(Value::as_str)
@@ -953,6 +926,15 @@ pub(crate) async fn enqueue_session_input(
     let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
     let recovered_ms = started_at.elapsed().as_millis();
+    if priority == InputPriority::Steer
+        && state.repo.session_parent_id(&session_id).await?.is_some()
+        && state.repo.active_leaf_is_turn_boundary(&session_id).await?
+    {
+        return Err(RpcError::new(
+            "subagent_terminal",
+            "cannot steer a subagent that is already terminal",
+        ));
+    }
     let mut expected_params = json!({});
     if let Some(expected_active_leaf_id) = expected_active_leaf_id {
         expected_params["expected_active_leaf_id"] = expected_active_leaf_id;
@@ -962,15 +944,13 @@ pub(crate) async fn enqueue_session_input(
             if let Some(record) = state
                 .repo
                 .find_client_input(&session_id, client_input_id)
-                .await
-                .map_err(anyhow::Error::from)?
+                .await?
             {
                 let queue = state
                     .repo
                     .queue_state(&session_id)
                     .await
-                    .map(rpc_views::queue_state)
-                    .map_err(anyhow::Error::from)?;
+                    .map(rpc_views::queue_state)?;
                 if perf_logging_enabled() {
                     let total_ms = started_at.elapsed().as_millis();
                     eprintln!(
@@ -990,22 +970,13 @@ pub(crate) async fn enqueue_session_input(
                 }));
             }
         }
-        let has_running = state
-            .repo
-            .has_unfinished_actions(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
-        let has_queued = state
-            .repo
-            .has_queued_inputs(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let has_running = state.repo.has_unfinished_actions(&session_id).await?;
+        let has_queued = state.repo.has_queued_inputs(&session_id).await?;
         if has_running || has_queued {
             let queued = state
                 .repo
                 .enqueue_user_input(&session_id, priority, &content, client_input_id.as_deref())
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
             InputOutcome::Queued {
                 input_id: queued.input_id,
                 event: queued.event,
@@ -1023,7 +994,10 @@ pub(crate) async fn enqueue_session_input(
                 let mut runtime = active.lock().await;
                 runtime
                     .session
-                    .enqueue_input(agent_input_from_queued_priority(priority, content.clone()))
+                    .enqueue_input(agent_input_from_queued_priority(
+                        priority,
+                        QueuedInputContent::user_message(content.clone()),
+                    ))
                     .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
             }
             let dispatches = driver
@@ -1046,13 +1020,8 @@ pub(crate) async fn enqueue_session_input(
                     base_leaf_id.as_deref(),
                     TranscriptEntryBodyMode::Ui,
                 )
-                .await
-                .map_err(anyhow::Error::from)?;
-            let snapshot = state
-                .repo
-                .session_snapshot(&session_id)
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
+            let snapshot = state.repo.session_snapshot(&session_id).await?;
             InputOutcome::Accepted {
                 dispatches,
                 active_branch_sync: rpc_views::active_branch_sync(sync, snapshot),
@@ -1248,8 +1217,7 @@ pub(crate) async fn interrupt_session(
         let events = state
             .repo
             .cancel_unfinished_session_work(session_id, "session interrupted")
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         if !events.is_empty() {
             let aborted_tasks = abort_session_tasks(state, session_id);
             publish_events(state, events);
@@ -1259,12 +1227,11 @@ pub(crate) async fn interrupt_session(
         let event = state
             .repo
             .insert_event(
-                &session_id,
+                session_id,
                 EventType::InputIgnored,
                 json!({ "kind": "interrupt" }),
             )
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         publish_events(state, vec![event]);
         clear_event_buffer_if_idle(state, session_id).await?;
         return Ok(json!({ "ignored": true }));
@@ -1290,8 +1257,7 @@ async fn transcript_index(state: &AppState, params: Value) -> std::result::Resul
     let index = state
         .repo
         .transcript_tree_index(&session_id, after_sequence, limit)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     let load_ms = started_at.elapsed().as_millis();
     let node_count = index.nodes.len();
     let complete = index.complete;
@@ -1319,8 +1285,7 @@ async fn transcript_entries(
     let result = state
         .repo
         .transcript_entries_by_id(&session_id, &entry_ids, TranscriptEntryBodyMode::Ui)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     Ok(rpc_views::transcript_entries(result))
 }
 
@@ -1336,8 +1301,7 @@ async fn transcript_turns(state: &AppState, params: Value) -> std::result::Resul
     let result = state
         .repo
         .transcript_turns(&session_id, before_entry_id, limit)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     let loaded_ms = started_at.elapsed().as_millis();
     let card_count = result.cards.len();
     let value = rpc_views::transcript_turns(result);
@@ -1374,8 +1338,7 @@ async fn transcript_turn_detail(
             end_sequence,
             TranscriptEntryBodyMode::Ui,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     Ok(rpc_views::transcript_turn_detail(result))
 }
 
@@ -1386,11 +1349,7 @@ async fn history_tree(state: &AppState, params: Value) -> std::result::Result<Va
     let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
     let recovered_ms = started_at.elapsed().as_millis();
-    let tree = state
-        .repo
-        .history_tree(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let tree = state.repo.history_tree(&session_id).await?;
     let loaded_ms = started_at.elapsed().as_millis();
     let entry_count = tree.entries.len();
     let value = rpc_views::history_tree(tree);
@@ -1415,11 +1374,7 @@ async fn history_context(state: &AppState, params: Value) -> std::result::Result
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.recover_if_needed().await?;
     let leaf_id = params.get("leaf_id").and_then(Value::as_str);
-    let stored = state
-        .repo
-        .load_stored_session(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let stored = state.repo.load_stored_session(&session_id).await?;
     let store = transcript_store_from_stored(&stored)?;
     let items = leaf_id
         .map(|leaf_id| {
@@ -1441,18 +1396,13 @@ async fn history_switch(state: &AppState, params: Value) -> std::result::Result<
     driver.ensure_idle_for_source_mutation().await?;
     let idle_ms = started_at.elapsed().as_millis();
     let leaf_id = params.get("leaf_id").and_then(Value::as_str);
-    let active_leaf_id = state
-        .repo
-        .active_leaf_id(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let active_leaf_id = state.repo.active_leaf_id(&session_id).await?;
     ensure_expected_active_leaf_matches(&active_leaf_id, &params)?;
     let expected_ms = started_at.elapsed().as_millis();
     if !state
         .repo
         .transcript_leaf_is_turn_boundary(&session_id, leaf_id)
-        .await
-        .map_err(anyhow::Error::from)?
+        .await?
     {
         return Err(RpcError::new(
             "not_turn_boundary",
@@ -1556,11 +1506,7 @@ async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Val
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.ensure_idle_for_source_mutation().await?;
 
-    let stored = state
-        .repo
-        .load_stored_session(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let stored = state.repo.load_stored_session(&session_id).await?;
     ensure_expected_active_leaf_matches(&stored.active_leaf_id, &params)?;
     let leaf_id = params
         .get("leaf_id")
@@ -1603,8 +1549,7 @@ async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Val
     let action = state
         .repo
         .find_resumable_model_action(&session_id, turn_id)
-        .await
-        .map_err(anyhow::Error::from)?
+        .await?
         .ok_or_else(|| {
             RpcError::new(
                 "not_resumable",
@@ -1638,21 +1583,15 @@ async fn compaction_request(
     let session_id = required_string(&params, "session_id")?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.ensure_idle_for_source_mutation().await?;
-    let config = state
-        .repo
-        .load_session_config(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let config = state.repo.load_session_config(&session_id).await?;
     state
         .workspaces
         .ensure_session(&session_id, &config.outer_cwd, &config.workspaces)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     let created = state
         .repo
         .create_compaction_action(&session_id, CompactionTrigger::Manual)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     publish_events(state, created.events);
     let action_row_id = created.job.action_row_id.clone();
     spawn_compaction(state, session_id, created.job, config);
@@ -1685,8 +1624,7 @@ async fn harness_model_complete(
     state
         .repo
         .claim_pending_model_action(&session_id, &action_row_id, &action.attempt_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     let active = driver
         .require_active_session("stale_action", "session is not active")
@@ -1732,8 +1670,7 @@ async fn harness_model_fail(
     state
         .repo
         .claim_pending_model_action(&session_id, &action_row_id, &action.attempt_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     let active = driver
         .require_active_session("stale_action", "session is not active")

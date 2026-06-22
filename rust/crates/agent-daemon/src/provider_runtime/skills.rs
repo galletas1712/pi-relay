@@ -13,27 +13,37 @@ use super::prompt::{
 };
 
 pub(crate) fn load_skill_result(
+    prompt_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
 ) -> ToolResultMessage {
-    match load_skill_output(outer_cwd, workspaces, loaded_skills, call) {
+    match load_skill_output(prompt_root, outer_cwd, workspaces, loaded_skills, call) {
         Ok(output) => ToolResultMessage::success(call.id.clone(), "LoadSkill", output),
         Err(error) => ToolResultMessage::error(call.id.clone(), "LoadSkill", error.to_string()),
     }
 }
 
 fn load_skill_output(
+    prompt_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
     call: &ToolCall,
 ) -> Result<String> {
-    load_skill_output_with_home(outer_cwd, workspaces, loaded_skills, call, None)
+    load_skill_output_with_home(
+        prompt_root,
+        outer_cwd,
+        workspaces,
+        loaded_skills,
+        call,
+        None,
+    )
 }
 
 fn load_skill_output_with_home(
+    prompt_root: &Path,
     outer_cwd: &Path,
     workspaces: &[SessionWorkspace],
     loaded_skills: &std::collections::BTreeSet<String>,
@@ -45,12 +55,13 @@ fn load_skill_output_with_home(
     if name.is_empty() {
         return Err(anyhow!("skill name cannot be empty"));
     }
-    let skills = match home {
+    let mut skills = match home {
         Some(home) => {
             load_skills_for_session_workspaces_with_home(outer_cwd, workspaces, Some(home))
         }
         None => load_skills_for_session_workspaces(outer_cwd, workspaces),
     };
+    skills.extend(load_global_skills_from_dir(&prompt_root.join("workflows")));
     let skill = resolve_load_skill(&skills, name)?;
     let skill_id = skill_identifier(skill.workspace.as_deref(), &skill.name);
     if loaded_skills.contains(&skill_id) {
@@ -193,7 +204,7 @@ mod tests {
         let mut loaded = std::collections::BTreeSet::new();
         let workspaces = vec![SessionWorkspace::local("repo", "")];
 
-        let first = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
+        let first = load_skill_result(&outer_cwd, &outer_cwd, &workspaces, &loaded, &call);
         assert_eq!(first.status, agent_vocab::ToolResultStatus::Success);
         let first_json: Value = serde_json::from_str(&first.output).expect("json output");
         assert_eq!(first_json["status"], "loaded");
@@ -204,7 +215,7 @@ mod tests {
         assert!(first.output.contains("Prefer small, tested changes."));
 
         loaded.insert(skill_identifier(Some("repo"), "rust-refactor"));
-        let second = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
+        let second = load_skill_result(&outer_cwd, &outer_cwd, &workspaces, &loaded, &call);
         assert_eq!(second.status, agent_vocab::ToolResultStatus::Success);
         let second_json: Value = serde_json::from_str(&second.output).expect("json output");
         assert_eq!(second_json["status"], "already_loaded");
@@ -234,7 +245,7 @@ mod tests {
         let loaded = std::collections::BTreeSet::new();
         let workspaces = vec![SessionWorkspace::local("repo", "")];
 
-        let result = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
+        let result = load_skill_result(&outer_cwd, &outer_cwd, &workspaces, &loaded, &call);
         assert_eq!(result.status, agent_vocab::ToolResultStatus::Error);
         assert!(result.output.contains("unknown field `workspace`"));
 
@@ -261,11 +272,51 @@ mod tests {
         let loaded = std::collections::BTreeSet::new();
         let workspaces = vec![SessionWorkspace::local("repo", "")];
 
-        let result = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
+        let result = load_skill_result(&outer_cwd, &outer_cwd, &workspaces, &loaded, &call);
         assert_eq!(result.status, agent_vocab::ToolResultStatus::Error);
         assert!(result.output.contains("skill not found: rust-refactor"));
 
         std::fs::remove_dir_all(outer_cwd).ok();
+    }
+
+    #[test]
+    fn workflow_skills_load_but_do_not_resolve_as_packaged_roles() {
+        let prompt_root = make_temp_dir("load-workflow-skill");
+        let outer_cwd = prompt_root.join("outer");
+        std::fs::create_dir_all(&outer_cwd).expect("outer cwd");
+        let skill_dir = prompt_root.join("workflows/workflow-only-test-role");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: workflow-only-test-role\ndescription: Test workflow skill.\n---\n\nUse delegate_readonly_tasks to fan out.\n",
+        )
+        .expect("skill file");
+
+        let call = ToolCall {
+            id: ToolCallId::from_u64(1),
+            tool_name: "LoadSkill".to_string(),
+            args_json: r#"{"name":"workflow-only-test-role"}"#.to_string(),
+        };
+        let loaded = std::collections::BTreeSet::new();
+
+        let result = load_skill_result(&prompt_root, &outer_cwd, &[], &loaded, &call);
+        assert_eq!(result.status, agent_vocab::ToolResultStatus::Success);
+        let output: Value = serde_json::from_str(&result.output).expect("json output");
+        assert_eq!(output["name"], "workflow-only-test-role");
+        assert_eq!(output["skill_name"], "workflow-only-test-role");
+        assert!(output.get("workspace").is_none());
+        assert!(output["content"]
+            .as_str()
+            .expect("content string")
+            .contains("delegate_readonly_tasks"));
+
+        let error = resolve_skill_role(&prompt_root, &outer_cwd, &[], "workflow-only-test-role")
+            .expect_err("workflow skills are not packaged subagent roles");
+        assert!(error
+            .to_string()
+            .contains("role skill not found: workflow-only-test-role"));
+
+        std::fs::remove_dir_all(prompt_root).ok();
     }
 
     #[test]
@@ -455,8 +506,9 @@ mod tests {
         };
         let loaded = std::collections::BTreeSet::new();
 
-        let result = load_skill_output_with_home(&outer_cwd, &[], &loaded, &call, Some(&home))
-            .expect("loads global skill");
+        let result =
+            load_skill_output_with_home(&outer_cwd, &outer_cwd, &[], &loaded, &call, Some(&home))
+                .expect("loads global skill");
         let result = ToolResultMessage::success(call.id.clone(), "LoadSkill", result);
         assert_eq!(result.status, agent_vocab::ToolResultStatus::Success);
         let output: Value = serde_json::from_str(&result.output).expect("json output");

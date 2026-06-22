@@ -73,8 +73,12 @@ pub(crate) enum RpcMethod {
     TurnResume,
     ToolsList,
     CompactionRequest,
-    ReplExec,
-    SubagentList,
+    DelegationStartFull,
+    DelegationStartReadonlyFanout,
+    DelegationStatus,
+    DelegationCancel,
+    DelegationList,
+    DelegationReadHandoffFile,
     HarnessModelComplete,
     HarnessModelFail,
 }
@@ -112,8 +116,12 @@ impl RpcMethod {
             "turn.resume" => Some(Self::TurnResume),
             "tools.list" => Some(Self::ToolsList),
             "compaction.request" => Some(Self::CompactionRequest),
-            "repl.exec" => Some(Self::ReplExec),
-            "subagent.list" => Some(Self::SubagentList),
+            "delegation.start_full" => Some(Self::DelegationStartFull),
+            "delegation.start_readonly_fanout" => Some(Self::DelegationStartReadonlyFanout),
+            "delegation.status" => Some(Self::DelegationStatus),
+            "delegation.cancel" => Some(Self::DelegationCancel),
+            "delegation.list" => Some(Self::DelegationList),
+            "delegation.read_handoff_file" => Some(Self::DelegationReadHandoffFile),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
             _ => None,
@@ -189,11 +197,40 @@ mod tests {
             Some(RpcMethod::TranscriptTurnDetail)
         );
         assert_eq!(RpcMethod::parse("turn.resume"), Some(RpcMethod::TurnResume));
-        assert_eq!(RpcMethod::parse("repl.exec"), Some(RpcMethod::ReplExec));
         assert_eq!(
-            RpcMethod::parse("subagent.list"),
-            Some(RpcMethod::SubagentList)
+            RpcMethod::parse("delegation.start_full"),
+            Some(RpcMethod::DelegationStartFull)
         );
+        assert_eq!(
+            RpcMethod::parse("delegation.start_readonly_fanout"),
+            Some(RpcMethod::DelegationStartReadonlyFanout)
+        );
+        assert_eq!(
+            RpcMethod::parse("delegation.status"),
+            Some(RpcMethod::DelegationStatus)
+        );
+        assert_eq!(
+            RpcMethod::parse("delegation.cancel"),
+            Some(RpcMethod::DelegationCancel)
+        );
+        assert_eq!(
+            RpcMethod::parse("delegation.list"),
+            Some(RpcMethod::DelegationList)
+        );
+        assert_eq!(
+            RpcMethod::parse("delegation.read_handoff_file"),
+            Some(RpcMethod::DelegationReadHandoffFile)
+        );
+        for old in [
+            "stage.start_full",
+            "stage.start_readonly_fanout",
+            "stage.status",
+            "stage.cancel",
+            "stage.list",
+            "stage.read_handoff_file",
+        ] {
+            assert_eq!(RpcMethod::parse(old), None, "{old} must not parse");
+        }
         assert_eq!(
             RpcMethod::parse("history.switch"),
             Some(RpcMethod::HistorySwitch)

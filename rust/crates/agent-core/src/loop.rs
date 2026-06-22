@@ -149,7 +149,8 @@ fn started_turn_id(items: &[TranscriptItem]) -> Option<TurnId> {
         | TranscriptItem::ToolCallStarted { .. }
         | TranscriptItem::ToolResult(_)
         | TranscriptItem::TurnFinished { .. }
-        | TranscriptItem::CompactionSummary(_) => None,
+        | TranscriptItem::CompactionSummary(_)
+        | TranscriptItem::DaemonToolObservation(_) => None,
     })
 }
 

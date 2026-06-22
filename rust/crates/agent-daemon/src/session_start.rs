@@ -2,7 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use agent_session::AgentSession;
-use agent_store::{InputPriority, SessionActivity, SessionConfig};
+use agent_store::{
+    InputPriority, QueuedInputContent, SessionActivity, SessionConfig, SubagentType,
+};
 use agent_vocab::{ProviderConfig, UserMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -32,36 +34,22 @@ pub(crate) async fn session_start(
     let content = parse_user_message(params.content)?;
 
     let driver = SessionDriver::acquire(state, &session_id).await;
-    if state
-        .repo
-        .session_exists(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?
-    {
-        let current = state
-            .repo
-            .load_session_config(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+    if state.repo.session_exists(&session_id).await? {
+        let current = state.repo.load_session_config(&session_id).await?;
         state
             .workspaces
             .ensure_session(&session_id, &current.outer_cwd, &current.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         return Ok(json!({
             "session_id": session_id,
             "project_id": current.project_id,
-            "activity": state.repo.activity(&session_id).await.map_err(anyhow::Error::from)?,
+            "activity": state.repo.activity(&session_id).await?,
             "replayed": true,
         }));
     }
 
     let (outer_cwd, workspaces) = if let Some(project_id) = project_id {
-        let project = state
-            .repo
-            .get_project(project_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let project = state.repo.get_project(project_id).await?;
         let selection = WorkspaceSelection::from_requested(
             params
                 .workspaces
@@ -73,8 +61,7 @@ pub(crate) async fn session_start(
         state
             .workspaces
             .materialize_session(project_id, &session_id, &project.workspaces, &selected)
-            .await
-            .map_err(anyhow::Error::from)?
+            .await?
     } else {
         let cwd = home_dir_for_ephemeral_session()?
             .to_string_lossy()
@@ -89,7 +76,7 @@ pub(crate) async fn session_start(
         provider: params.provider,
         metadata: params.metadata.unwrap_or_else(|| json!({})),
     };
-    config.system_prompt = render_pi_prompt(state, &config).map_err(anyhow::Error::from)?;
+    config.system_prompt = render_pi_prompt(state, &config)?;
 
     let started = start_prepared_session_with_driver(
         state,
@@ -101,6 +88,8 @@ pub(crate) async fn session_start(
             content,
             client_input_id: params.client_input_id,
             parent_session_id: None,
+            subagent_type: None,
+            delegation_id: None,
             dispatch_mode: PreparedSessionDispatchMode::Auto,
         },
     )
@@ -120,6 +109,8 @@ pub(crate) struct PreparedSessionStart {
     pub(crate) content: UserMessage,
     pub(crate) client_input_id: Option<String>,
     pub(crate) parent_session_id: Option<String>,
+    pub(crate) subagent_type: Option<SubagentType>,
+    pub(crate) delegation_id: Option<String>,
     pub(crate) dispatch_mode: PreparedSessionDispatchMode,
 }
 
@@ -156,34 +147,22 @@ async fn start_prepared_session_with_driver(
         content,
         client_input_id,
         parent_session_id,
+        subagent_type,
+        delegation_id,
         dispatch_mode,
     } = request;
     let project_id = config.project_id;
 
-    if state
-        .repo
-        .session_exists(&session_id)
-        .await
-        .map_err(anyhow::Error::from)?
-    {
-        let current = state
-            .repo
-            .load_session_config(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+    if state.repo.session_exists(&session_id).await? {
+        let current = state.repo.load_session_config(&session_id).await?;
         state
             .workspaces
             .ensure_session(&session_id, &current.outer_cwd, &current.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         return Ok(StartedSession {
             session_id: session_id.clone(),
             project_id: current.project_id,
-            activity: state
-                .repo
-                .activity(&session_id)
-                .await
-                .map_err(anyhow::Error::from)?,
+            activity: state.repo.activity(&session_id).await?,
             replayed: true,
             dispatches: Vec::new(),
         });
@@ -192,12 +171,14 @@ async fn start_prepared_session_with_driver(
     state
         .workspaces
         .ensure_session(&session_id, &config.outer_cwd, &config.workspaces)
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
 
     let mut session = AgentSession::new();
     session
-        .enqueue_input(agent_input_from_queued_priority(priority, content.clone()))
+        .enqueue_input(agent_input_from_queued_priority(
+            priority,
+            QueuedInputContent::user_message(content.clone()),
+        ))
         .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
     let mut runtime = RuntimeSession { session, config };
     let (entries, events, actions, active_leaf_id) = collect_runtime_outputs(&mut runtime);
@@ -215,19 +196,16 @@ async fn start_prepared_session_with_driver(
             &content,
             client_input_id.as_deref(),
             parent_session_id.as_deref(),
+            subagent_type,
+            delegation_id.as_deref(),
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
 
     if frames.is_empty() {
         return Ok(StartedSession {
             session_id: session_id.clone(),
             project_id,
-            activity: state
-                .repo
-                .activity(&session_id)
-                .await
-                .map_err(anyhow::Error::from)?,
+            activity: state.repo.activity(&session_id).await?,
             replayed: true,
             dispatches: Vec::new(),
         });
@@ -248,11 +226,7 @@ async fn start_prepared_session_with_driver(
     Ok(StartedSession {
         session_id: session_id.clone(),
         project_id,
-        activity: state
-            .repo
-            .activity(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?,
+        activity: state.repo.activity(&session_id).await?,
         replayed: false,
         dispatches,
     })

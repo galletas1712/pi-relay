@@ -13,9 +13,9 @@ use agent_core::AgentInput;
 use agent_session::{AgentSession, SessionAction, SessionInput};
 use agent_store::{
     AcceptedInput, ActionUpdate, EventFrame, EventType, OutputBatch, QueuedInput, SessionActivity,
-    SessionConfig,
+    SessionConfig, SubagentType,
 };
-use agent_vocab::{ProviderReplayItem, TranscriptItem, TurnOutcome};
+use agent_vocab::ProviderReplayItem;
 use anyhow::Context;
 use serde_json::{json, Value};
 use tokio::sync::{Mutex, OwnedMutexGuard};
@@ -42,11 +42,7 @@ pub(crate) async fn ensure_expected_active_leaf(
     if params.get("expected_active_leaf_id").is_none() {
         return Ok(());
     }
-    let active_leaf_id = state
-        .repo
-        .active_leaf_id(session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let active_leaf_id = state.repo.active_leaf_id(session_id).await?;
     ensure_expected_active_leaf_matches(&active_leaf_id, params)
 }
 
@@ -103,6 +99,25 @@ impl SessionDriver {
         }
     }
 
+    /// Acquire only if the session's driver lock is free. Returns `None` if it
+    /// is already held (the session is being driven or recovered elsewhere on
+    /// the stack), letting the delegation barrier recover sibling tails without
+    /// blocking on — or deadlocking against — a lock held further up the call
+    /// chain (e.g. the firing child whose terminal idle triggered the barrier).
+    pub(crate) async fn try_acquire(
+        state: &AppState,
+        session_id: impl Into<String>,
+    ) -> Option<Self> {
+        let session_id = session_id.into();
+        let lock = session_driver_lock(state, &session_id).await;
+        let guard = lock.try_lock_owned().ok()?;
+        Some(Self {
+            state: state.clone(),
+            session_id,
+            _guard: guard,
+        })
+    }
+
     pub(crate) async fn ensure_idle_for_source_mutation(
         &self,
     ) -> std::result::Result<(), RpcError> {
@@ -127,14 +142,8 @@ impl SessionDriver {
                 .state
                 .repo
                 .has_unfinished_actions(&self.session_id)
-                .await
-                .map_err(anyhow::Error::from)?
-            || self
-                .state
-                .repo
-                .has_queued_inputs(&self.session_id)
-                .await
-                .map_err(anyhow::Error::from)?
+                .await?
+            || self.state.repo.has_queued_inputs(&self.session_id).await?
         {
             return Err(RpcError::new(
                 "session_busy",
@@ -157,14 +166,12 @@ impl SessionDriver {
         self.state
             .repo
             .reset_abandoned_consuming_inputs(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         if self
             .state
             .repo
             .active_leaf_is_turn_boundary(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?
+            .await?
         {
             self.reconcile_abandoned_boundary_session().await?;
             return Ok(());
@@ -173,8 +180,7 @@ impl SessionDriver {
             .state
             .repo
             .load_stored_session(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let store = transcript_store_from_stored(&stored)?;
         if store.is_turn_boundary() {
             self.reconcile_abandoned_boundary_session().await?;
@@ -198,17 +204,11 @@ impl SessionDriver {
                 &new_entries,
                 recovered_stored.active_leaf_id.as_deref(),
             )
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let mut events = events;
-        let activity = self
-            .state
-            .repo
-            .activity(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let activity = self.state.repo.activity(&self.session_id).await?;
         if !should_continue && activity == SessionActivity::Idle {
-            if let Some(event) = self.try_subagent_parent_idle_event().await {
+            if let Some(event) = self.try_handle_subagent_terminal_for_parent().await {
                 events.push(event);
             }
         }
@@ -234,19 +234,16 @@ impl SessionDriver {
             .state
             .repo
             .load_session_config(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         self.state
             .workspaces
             .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let stored = self
             .state
             .repo
             .load_stored_session(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let session = AgentSession::from_stored_session(stored)
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         self.state.active.lock().await.insert(
@@ -306,8 +303,7 @@ impl SessionDriver {
                 .state
                 .repo
                 .has_unfinished_actions(&self.session_id)
-                .await
-                .map_err(anyhow::Error::from)?
+                .await?
             {
                 break;
             }
@@ -316,8 +312,7 @@ impl SessionDriver {
                 .state
                 .repo
                 .take_next_queued_input(&self.session_id)
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
             if let Some(queued) = maybe_input {
                 let agent_input =
                     agent_input_from_queued_priority(queued.priority, queued.content.clone());
@@ -331,8 +326,7 @@ impl SessionDriver {
                         self.state
                             .repo
                             .reset_consuming_input(&self.session_id, &queued.id, &queued.claim_id)
-                            .await
-                            .map_err(anyhow::Error::from)?;
+                            .await?;
                         return Err(RpcError::new("invalid_input", error.to_string()));
                     }
                     let dispatched = self
@@ -353,10 +347,9 @@ impl SessionDriver {
                 .state
                 .repo
                 .insert_event(&self.session_id, EventType::SessionIdle, json!({}))
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
             let mut events = vec![event];
-            if let Some(event) = self.try_subagent_parent_idle_event().await {
+            if let Some(event) = self.try_handle_subagent_terminal_for_parent().await {
                 events.push(event);
             }
             publish_events(&self.state, events);
@@ -388,83 +381,163 @@ impl SessionDriver {
         Ok(false)
     }
 
-    pub(crate) async fn notify_subagent_parent_idle_if_needed(&self) {
-        if let Some(event) = self.try_subagent_parent_idle_event().await {
+    pub(crate) async fn handle_subagent_terminal_for_parent_if_needed(&self) {
+        if let Some(event) = self.try_handle_subagent_terminal_for_parent().await {
             publish_events(&self.state, vec![event]);
         }
     }
 
-    async fn reconcile_abandoned_boundary_session(&self) -> std::result::Result<(), RpcError> {
-        let activity = self
+    async fn destroy_read_only_subagent_workspaces(&self) {
+        match self
             .state
             .repo
-            .activity(&self.session_id)
+            .session_subagent_type(&self.session_id)
             .await
-            .map_err(anyhow::Error::from)?;
+        {
+            Ok(Some(SubagentType::ReadOnly)) => {
+                if let Err(error) = self
+                    .state
+                    .workspaces
+                    .destroy_session_workspaces(&self.session_id)
+                    .await
+                {
+                    eprintln!(
+                        "failed to destroy read-only subagent workspace {}: {error:#}",
+                        self.session_id
+                    );
+                }
+            }
+            Ok(_) => {}
+            Err(error) => eprintln!(
+                "failed to load subagent type for workspace teardown {}: {error:#}",
+                self.session_id
+            ),
+        }
+    }
+
+    async fn reconcile_abandoned_boundary_session(&self) -> std::result::Result<(), RpcError> {
+        let activity = self.state.repo.activity(&self.session_id).await?;
         if activity == SessionActivity::Running
             && !session_has_live_tasks(&self.state, &self.session_id)
         {
             self.state
                 .repo
                 .mark_unfinished_actions_stale(&self.session_id)
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
         }
-        let activity = self
-            .state
-            .repo
-            .activity(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        let activity = self.state.repo.activity(&self.session_id).await?;
         if activity == SessionActivity::Idle {
-            self.notify_subagent_parent_idle_if_needed().await;
+            self.handle_subagent_terminal_for_parent_if_needed().await;
         }
         Ok(())
     }
 
-    async fn try_subagent_parent_idle_event(&self) -> Option<EventFrame> {
-        match self.subagent_parent_idle_event().await {
-            Ok(event) => event,
+    async fn try_handle_subagent_terminal_for_parent(&self) -> Option<EventFrame> {
+        let notification_key = match self.subagent_idle_notification_key().await {
+            Ok(Some(notification_key)) => notification_key,
+            Ok(None) => return None,
             Err(error) => {
                 eprintln!(
-                    "failed to publish parent subagent idle event child={}: {}: {}",
+                    "failed to build subagent terminal notification key child={}: {}: {}",
                     self.session_id, error.code, error.message
                 );
-                None
+                return None;
             }
+        };
+
+        // Every parentful subagent is a delegation member (the only spawn path
+        // sets a delegation_id). A delegation member's completion is delivered as
+        // ONE typed delegation wakeup observation,
+        // NOT a per-child idle. Fire the once-gate WITHOUT writing a
+        // parent-visible SubagentIdle row (so events_after / the run board never
+        // surface per-child idle), then — on that single firing — destroy the RO
+        // snapshot and run the barrier. The barrier is single-flighted by the DB
+        // delegation-row CAS, so concurrent terminal children wake the parent exactly
+        // once. Return None: the per-child idle is suppressed for the parent.
+        let delegation_id = match self
+            .state
+            .repo
+            .session_delegation_id(&self.session_id)
+            .await
+        {
+            Ok(Some(delegation_id)) => delegation_id,
+            Ok(None) => return None,
+            Err(error) => {
+                eprintln!(
+                    "failed to load delegation id for subagent {}: {error:#}",
+                    self.session_id
+                );
+                return None;
+            }
+        };
+        let first_fire = match self
+            .state
+            .repo
+            .claim_subagent_idle_once(&self.session_id, &notification_key)
+            .await
+        {
+            Ok(first_fire) => first_fire,
+            Err(error) => {
+                eprintln!(
+                    "failed to claim delegation-member idle once-gate child={}: {error:#}",
+                    self.session_id
+                );
+                return None;
+            }
+        };
+        if first_fire {
+            self.destroy_read_only_subagent_workspaces().await;
+        }
+        self.try_delegation_barrier(&delegation_id).await;
+        None
+    }
+
+    /// The delegation barrier: when a subagent of a delegation reaches its
+    /// once-only terminal idle, complete the delegation iff every subagent is
+    /// terminal. The `finish_delegation` CAS (`status='running'` +
+    /// `attempt_id` fence) is the single-flight for terminal delegation status;
+    /// only its winner publishes normal handoff files and then enqueues the
+    /// deterministic parent wakeup observation. A cancellation winner therefore
+    /// remains transcript-only.
+    async fn try_delegation_barrier(&self, delegation_id: &str) {
+        // `recover_if_needed` -> terminal idle -> barrier -> sibling
+        // `recover_if_needed` is a recursive async cycle; box it to break the
+        // infinitely-sized future. The cycle terminates because each sibling's
+        // barrier short-circuits once the delegation is no longer `running`.
+        let future = Box::pin(crate::delegation_runner::complete_delegation_if_ready(
+            &self.state,
+            delegation_id,
+        ));
+        if let Err(error) = future.await {
+            eprintln!(
+                "delegation barrier failed for delegation {delegation_id} (child {}): {}: {}",
+                self.session_id, error.code, error.message
+            );
         }
     }
 
-    async fn subagent_parent_idle_event(
+    /// The once-gate dedup key (the terminal active leaf) for this child's
+    /// parent-visible idle. `None` when this session has no parent (a top-level
+    /// session). The caller only needs the key: a delegation member's completion
+    /// is delivered as a single delegation wakeup observation, not a per-child
+    /// idle payload.
+    async fn subagent_idle_notification_key(
         &self,
-    ) -> std::result::Result<Option<EventFrame>, RpcError> {
-        let Some(parent_session_id) = self
+    ) -> std::result::Result<Option<String>, RpcError> {
+        if self
             .state
             .repo
             .session_parent_id(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?
-        else {
+            .await?
+            .is_none()
+        {
             return Ok(None);
-        };
-        let config = self
-            .state
-            .repo
-            .load_session_config(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        }
         let turns = self
             .state
             .repo
             .transcript_turns(&self.session_id, None, Some(20))
-            .await
-            .map_err(anyhow::Error::from)?;
-        let outcome = turns
-            .cards
-            .iter()
-            .rev()
-            .find_map(|card| card.outcome)
-            .unwrap_or(TurnOutcome::Graceful);
+            .await?;
         let notification_key = turns
             .cards
             .iter()
@@ -478,39 +551,7 @@ impl SessionDriver {
                     .map(|active_leaf_id| format!("active_leaf:{active_leaf_id}"))
             })
             .unwrap_or_else(|| "empty".to_string());
-        let text = turns
-            .cards
-            .iter()
-            .rev()
-            .filter_map(|card| card.assistant_message.as_ref())
-            .find_map(|entry| match &entry.item {
-                TranscriptItem::AssistantMessage(message) => Some(message.text()),
-                _ => None,
-            })
-            .unwrap_or_default();
-        let summary_preview = if text.chars().count() > 500 {
-            format!("{}…", text.chars().take(500).collect::<String>())
-        } else {
-            text
-        };
-        let event = self
-            .state
-            .repo
-            .insert_subagent_idle_event_once(
-                &parent_session_id,
-                &self.session_id,
-                &notification_key,
-                json!({
-                    "child_session_id": self.session_id,
-                    "role": config.metadata.get("role_name").and_then(Value::as_str),
-                    "display_name": config.metadata.get("display_name").and_then(Value::as_str),
-                    "outcome": outcome,
-                    "summary_preview": summary_preview,
-                }),
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        Ok(event)
+        Ok(Some(notification_key))
     }
 
     async fn consume_ready_steer(
@@ -529,8 +570,7 @@ impl SessionDriver {
             .state
             .repo
             .take_next_queued_steer_input(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?
+            .await?
         else {
             return Ok(None);
         };
@@ -544,8 +584,7 @@ impl SessionDriver {
             self.state
                 .repo
                 .reset_consuming_input(&self.session_id, &queued.id, &queued.claim_id)
-                .await
-                .map_err(anyhow::Error::from)?;
+                .await?;
             return Err(RpcError::new("invalid_input", error.to_string()));
         }
 
@@ -602,7 +641,6 @@ impl SessionDriver {
                 .repo
                 .action_can_complete(&self.session_id, &update.row_id, &update.attempt_id)
                 .await
-                .map_err(anyhow::Error::from)
                 .context("check action can complete")?
             {
                 return Err(RpcError::new(
@@ -624,19 +662,16 @@ impl SessionDriver {
             .state
             .repo
             .load_session_config(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         self.state
             .workspaces
             .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let stored = self
             .state
             .repo
             .load_stored_session(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let mut session = AgentSession::from_stored_session(stored)
             .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
         session
@@ -688,7 +723,7 @@ impl SessionDriver {
             Ok(persisted) => persisted,
             Err(error) => {
                 self.state.active.lock().await.remove(&self.session_id);
-                return Err(anyhow::Error::from(error).into());
+                return Err(error.into());
             }
         };
         publish_events(&self.state, frames);
@@ -709,19 +744,16 @@ impl SessionDriver {
             .state
             .repo
             .pending_actions_for_dispatch(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let config = self
             .state
             .repo
             .load_session_config(&self.session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         self.state
             .workspaces
             .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
-            .await
-            .map_err(anyhow::Error::from)?;
+            .await?;
         let resolved = pending
             .into_iter()
             .map(|action| DispatchAction {

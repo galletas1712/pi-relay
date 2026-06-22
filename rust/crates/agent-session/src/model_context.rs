@@ -78,14 +78,13 @@ impl ModelContext {
     }
 
     pub fn is_turn_boundary(&self) -> bool {
-        for item in self.items.iter().rev() {
-            match item {
-                TranscriptItem::TurnFinished { .. } => return true,
-                TranscriptItem::CompactionSummary(_) => return true,
-                _ => return false,
+        match self.items.last() {
+            Some(TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_)) => {
+                true
             }
+            Some(_) => false,
+            None => true,
         }
-        true
     }
 
     pub fn last_turn_id(&self) -> TurnId {
@@ -97,9 +96,7 @@ impl ModelContext {
     }
 
     pub fn split_before_open_turn(&self) -> Option<(Self, Vec<ModelContextEntry>)> {
-        let Some((_, turn_start)) = Self::open_turn_start(&self.items) else {
-            return None;
-        };
+        let (_, turn_start) = Self::open_turn_start(&self.items)?;
         let prefix = Self {
             items: self.items[..turn_start].to_vec(),
             provider_replay: self.provider_replay[..turn_start].to_vec(),
@@ -164,6 +161,7 @@ impl ModelContext {
                     return saw_open_tail.then_some((summary.last_turn_id, index));
                 }
                 TranscriptItem::UserMessage(_)
+                | TranscriptItem::DaemonToolObservation(_)
                 | TranscriptItem::AssistantMessage(_)
                 | TranscriptItem::ToolCallStarted { .. }
                 | TranscriptItem::ToolResult(_) => saw_open_tail = true,
@@ -173,15 +171,13 @@ impl ModelContext {
     }
 
     fn is_turn_boundary_items(items: &[TranscriptItem]) -> bool {
-        for item in items.iter().rev() {
-            match item {
-                TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_) => {
-                    return true;
-                }
-                _ => return false,
+        match items.last() {
+            Some(TranscriptItem::TurnFinished { .. } | TranscriptItem::CompactionSummary(_)) => {
+                true
             }
+            Some(_) => false,
+            None => true,
         }
-        true
     }
 
     fn complete_open_tool_calls(
@@ -206,6 +202,7 @@ impl ModelContext {
                 }
                 TranscriptItem::TurnStarted { .. }
                 | TranscriptItem::UserMessage(_)
+                | TranscriptItem::DaemonToolObservation(_)
                 | TranscriptItem::TurnFinished { .. }
                 | TranscriptItem::CompactionSummary(_) => {}
             }
@@ -247,6 +244,7 @@ impl ModelContext {
                 TranscriptItem::ToolResult(result) => tool_results.push(result.clone()),
                 TranscriptItem::TurnStarted { .. }
                 | TranscriptItem::UserMessage(_)
+                | TranscriptItem::DaemonToolObservation(_)
                 | TranscriptItem::ToolCallStarted { .. }
                 | TranscriptItem::TurnFinished { .. }
                 | TranscriptItem::CompactionSummary(_) => {}
