@@ -372,10 +372,11 @@ provider-generated-looking ids/status. Anthropic receives an adjacent assistant
 as a user bubble and not as a model-selected tool run. Text fallback rendering is
 kept for unsupported contexts and diagnostics.
 
-Delegation snapshots avoid context-heavy payloads: raw subagent task prompts are
-not inlined, final messages are previewed/bounded, and long bodies are referenced
-via handoff files such as `task_prompt.md`, `final_message.md`, and
-`transcript.md`.
+Delegation snapshots avoid context-heavy payloads: raw subagent task prompts,
+final-message prose, and transcript bodies are not inlined. Long bodies are
+referenced via handoff files such as `task_prompt.md`, `final_message.md`, and
+`transcript.md`; only workflow control facts such as `suggested_next` remain
+inline.
 
 Prompt caching works best when the beginning of the prompt is identical across
 requests. That means the long-lived global system prompt, stable tool

@@ -138,13 +138,10 @@ export interface DelegationSubagent {
 	subagent_type?: SubagentType | null;
 	task?: string | null;
 	steerable?: boolean;
-	final_message?: string | null;
-	final_message_preview?: string | null;
 	suggested_next?: string | null;
 	final_message_file?: string | null;
 	transcript_file?: string | null;
 	task_prompt_file?: string | null;
-	cancellation_transcript_file?: string | null;
 }
 
 export interface Delegation {

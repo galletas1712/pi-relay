@@ -4,25 +4,10 @@ use serde_json::{json, Value};
 
 use crate::handoff::{
     delegation_dir, refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
-    task_prompt_rel, SubagentArtifact,
+    safe_handoff_path_segment, task_prompt_rel, SubagentArtifact,
 };
 use crate::state::AppState;
 use crate::types::RpcError;
-
-fn bounded_preview(text: Option<String>) -> Option<String> {
-    const MAX_CHARS: usize = 1200;
-    let text = text?;
-    if text.trim().is_empty() {
-        return None;
-    }
-    let mut chars = text.chars();
-    let preview = chars.by_ref().take(MAX_CHARS).collect::<String>();
-    if chars.next().is_some() {
-        Some(format!("{preview}…"))
-    } else {
-        Some(preview)
-    }
-}
 
 fn count_failed_subagent_artifacts(artifacts: &[SubagentArtifact]) -> usize {
     artifacts
@@ -96,9 +81,9 @@ async fn subagent_has_active_runtime(state: &AppState, subagent_id: &str) -> boo
 ///
 /// This is also the canonical payload for terminal parent wakeups. It refreshes
 /// artifact files that are valid for the delegation's current status, includes
-/// per-subagent final-message previews / `suggested_next` values when available,
-/// and reports compact handoff file references without inlining full transcript
-/// contents.
+/// per-subagent `suggested_next` values when available, and reports compact
+/// handoff file references without inlining transcript, task-prompt, or
+/// final-message prose.
 pub(crate) async fn build_delegation_snapshot(
     state: &AppState,
     delegation: &Delegation,
@@ -128,11 +113,9 @@ pub(crate) async fn build_delegation_snapshot(
         } else if delegation.status == DelegationStatus::Running {
             running_count += 1;
         }
-        let final_message = artifact.and_then(|artifact| artifact.final_message.clone());
-        let final_message_preview = bounded_preview(final_message.clone());
         let suggested_next = artifact.and_then(|artifact| artifact.suggested_next.clone());
         let final_message_file = artifact.and_then(SubagentArtifact::final_message_rel);
-        let transcript_file = artifact.map(SubagentArtifact::transcript_rel);
+        let normal_transcript_file = artifact.map(SubagentArtifact::transcript_rel);
         let task_prompt_file = if let Some(artifact) = artifact {
             artifact.task_prompt_rel()
         } else {
@@ -146,8 +129,9 @@ pub(crate) async fn build_delegation_snapshot(
                 .as_ref()
                 .map(|_| task_prompt_rel(&subagent.session_id))
         };
-        let cancellation_transcript_file = if delegation.status == DelegationStatus::Cancelled {
-            let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
+        let transcript_file = if delegation.status == DelegationStatus::Cancelled {
+            let subagent_segment = safe_handoff_path_segment(&subagent.session_id, "subagent_id")?;
+            let relative = format!("cancelled/{subagent_segment}.transcript.md");
             let path = handoff_dir_path.join(&relative);
             if path.exists() {
                 Some(relative)
@@ -155,7 +139,7 @@ pub(crate) async fn build_delegation_snapshot(
                 None
             }
         } else {
-            None
+            normal_transcript_file
         };
         let status = match delegation.status {
             DelegationStatus::Running => terminal_status
@@ -193,12 +177,10 @@ pub(crate) async fn build_delegation_snapshot(
             "activity": subagent.activity,
             "status": status,
             "steerable": steerable,
-            "final_message_preview": final_message_preview,
             "suggested_next": suggested_next,
             "final_message_file": final_message_file,
             "transcript_file": transcript_file,
             "task_prompt_file": task_prompt_file,
-            "cancellation_transcript_file": cancellation_transcript_file,
         }));
     }
     let expected_count = delegation.expected_subagents.max(0) as usize;
@@ -298,7 +280,6 @@ mod tests {
             "subagents": [{
                 "id": "child_1",
                 "status": "done",
-                "final_message_preview": "Looks good.\n\nsuggested_next: approved",
                 "final_message_file": "child_1/final_message.md",
                 "suggested_next": "approved",
                 "task_prompt_file": "child_1/task_prompt.md",

@@ -945,7 +945,12 @@ async fn enqueue_delegation_observation_event_uses_minimal_payload_and_queue_pro
         json!({
             "delegation_id": "delegation_1",
             "status": "done",
-            "subagents": [{"id": "child", "final_message_preview": "ok"}],
+            "subagents": [{
+                "id": "child",
+                "suggested_next": "approved",
+                "final_message_file": "child/final_message.md",
+                "transcript_file": "child/transcript.md",
+            }],
         }),
     );
 
@@ -981,7 +986,6 @@ async fn enqueue_delegation_observation_event_uses_minimal_payload_and_queue_pro
     assert!(queued.get("summary").is_none());
     let payload_text = payload.to_string();
     assert!(!payload_text.contains("Delegation delegation_1 completed with status done"));
-    assert!(!payload_text.contains("final_message_preview"));
     assert!(!payload_text.contains("subagents"));
 
     db.cleanup().await;

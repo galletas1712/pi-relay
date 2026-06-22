@@ -45,8 +45,8 @@ Subagent orchestration with the smallest possible runtime:
 - Work happens in **stages**: either *one full subagent* or *a parallel fan-out of
   RO subagents* — never both, and never multiple full (writing) subagents.
 - Results propagate through a canonical structured delegation snapshot plus a
-  **handoff directory** of per-subagent files (final-message preview + full
-  transcript, with full final messages available via files), not through model
+  **handoff directory** of per-subagent files (`final_message.md`,
+  `transcript.md`, and `task_prompt.md` when available), not through model
   context. The parent **does not busy-wait**: after launching a stage it parks,
   and the daemon delivers a typed daemon-authored **wakeup observation**
   containing an `inspect_delegation`-equivalent bounded snapshot when the stage
@@ -197,9 +197,9 @@ stays bounded no matter how large a fan-out or transcript is.
   snapshot is gone and even when the subagent crashed.
 - The parent receives the same compact structured snapshot in the completion
   wakeup observation and can refresh it later with **`inspect_delegation`**. It
-  includes per-subagent status, `final_message_preview`,
-  `suggested_next`, and compact handoff file references so the parent branches
-  without parsing prose or reading files first.
+  includes per-subagent status, `suggested_next`, and compact handoff file
+  references so the parent branches without parsing prose or reading files
+  first.
 - The daemon then delivers the notification by enqueuing a typed
   `daemon_tool_observation` for the parent. It names the delegation, says how
   many succeeded/failed, and carries the bounded snapshot JSON. It does **not**
@@ -210,7 +210,6 @@ stays bounded no matter how large a fan-out or transcript is.
   Snapshot JSON (equivalent to inspect_delegation at wakeup time):
   {
     ...
-    "final_message_preview": "...",
     "final_message_file": "child/final_message.md",
     "suggested_next": "approved",
     "transcript_file": "child/transcript.md"

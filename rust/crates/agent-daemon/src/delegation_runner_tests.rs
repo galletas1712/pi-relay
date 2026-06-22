@@ -934,7 +934,8 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
     assert!(ledger.contains("status: done"));
     assert!(ledger.contains("completed before compaction"));
     assert!(ledger.contains("final_message_file: `review_done/final_message.md`"));
-    assert!(ledger.contains("\"Looks good.\\n\\nsuggested_next: approved\""));
+    assert!(ledger.contains("suggested_next: \"approved\""));
+    assert!(!ledger.contains("\"Looks good.\\n\\nsuggested_next: approved\""));
     assert!(ledger.contains(&format!("delegation_id: `{}`", done_with_failures.id)));
     assert!(ledger.contains("status: done_with_failures"));
     assert!(ledger.contains("completed with failures before compaction"));
@@ -1574,19 +1575,25 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     .await
     .expect("cancel delegation");
     assert_eq!(result["cancelled"], true);
-    let transcripts = result["transcripts"].as_array().expect("transcripts array");
-    assert_eq!(transcripts.len(), 1);
-    assert_eq!(transcripts[0]["subagent_id"], "impl_to_cancel");
-    let transcript_path = transcripts[0]["transcript"]
-        .as_str()
-        .expect("transcript path");
-    assert!(
-        transcript_path.ends_with(&format!(
-            ".pi-handoff/{}/cancelled/impl_to_cancel.transcript.md",
-            delegation.id
-        )),
-        "unexpected transcript path: {transcript_path}"
+    assert_eq!(result["delegation_id"], delegation.id);
+    let expected_handoff_dir = handoff_root(&env, &delegation.id)
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        result["handoff_dir"].as_str(),
+        Some(expected_handoff_dir.as_str())
     );
+    let result_subagents = result["subagents"].as_array().expect("subagents array");
+    assert_eq!(result_subagents.len(), 1);
+    assert_eq!(result_subagents[0]["subagent_id"], "impl_to_cancel");
+    assert_eq!(
+        result_subagents[0]["transcript_file"],
+        "cancelled/impl_to_cancel.transcript.md"
+    );
+    assert!(result_subagents[0].get("transcript").is_none());
+    let transcript_path = handoff_root(&env, &delegation.id)
+        .join("cancelled")
+        .join("impl_to_cancel.transcript.md");
     let transcript = std::fs::read_to_string(transcript_path).expect("transcript readable");
     assert!(transcript.contains("## User"));
     assert!(transcript.contains("keep working"));
@@ -1596,11 +1603,9 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
     assert_eq!(snapshot["status"], "cancelled");
     assert_eq!(subagent["status"], "cancelled");
-    assert_eq!(subagent["final_message_preview"], serde_json::Value::Null);
     assert_eq!(subagent["final_message_file"], serde_json::Value::Null);
-    assert_eq!(subagent["transcript_file"], serde_json::Value::Null);
     assert_eq!(
-        subagent["cancellation_transcript_file"],
+        subagent["transcript_file"],
         format!("cancelled/{}.transcript.md", "impl_to_cancel")
     );
     assert!(subagent.get("final_message_path").is_none());
@@ -1613,7 +1618,7 @@ async fn cancel_delegation_returns_transcript_only_paths() {
         .as_array()
         .unwrap()[0];
     assert_eq!(
-        listed_subagent["cancellation_transcript_file"],
+        listed_subagent["transcript_file"],
         "cancelled/impl_to_cancel.transcript.md"
     );
     assert!(listed_subagent
@@ -1935,10 +1940,6 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     assert_eq!(ok["type"], "read_only");
     assert_eq!(ok["subagent_type"], "read_only");
     assert_eq!(ok["status"], "done");
-    assert_eq!(
-        ok["final_message_preview"],
-        "All good.\n\nsuggested_next: approved"
-    );
     assert_eq!(ok["suggested_next"], "approved");
     let wakeup_ok = wakeup_snapshot["subagents"]
         .as_array()
@@ -1946,10 +1947,6 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
         .iter()
         .find(|subagent| subagent["id"] == "ok_a")
         .expect("ok_a in wakeup snapshot");
-    assert_eq!(
-        wakeup_ok["final_message_preview"],
-        "All good.\n\nsuggested_next: approved"
-    );
     assert_eq!(wakeup_ok["suggested_next"], "approved");
     assert_eq!(wakeup_ok["transcript_file"], "ok_a/transcript.md");
     assert_eq!(ok["steerable"], false);
@@ -2032,10 +2029,6 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .find(|subagent| subagent["id"] == "done_child")
         .unwrap();
     assert_eq!(done["status"], "done");
-    assert_eq!(
-        done["final_message_preview"],
-        "Found the answer.\n\nsuggested_next: done"
-    );
     assert_eq!(done["suggested_next"], "done");
     assert_eq!(done["final_message_file"], serde_json::Value::Null);
     assert!(done.get("final_message_path").is_none());
@@ -2057,7 +2050,6 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .unwrap();
     assert_eq!(running["activity"], "idle");
     assert_eq!(running["status"], "running");
-    assert_eq!(running["final_message_preview"], serde_json::Value::Null);
     assert_eq!(running["suggested_next"], serde_json::Value::Null);
     assert_eq!(running["final_message_file"], serde_json::Value::Null);
     assert!(running.get("final_message_path").is_none());
@@ -2113,7 +2105,6 @@ async fn failed_delegation_does_not_publish_normal_handoff_on_inspect_or_read() 
     let subagent = snapshot["subagents"].as_array().unwrap()[0].clone();
     assert_eq!(snapshot["status"], "failed");
     assert_eq!(subagent["status"], "failed");
-    assert_eq!(subagent["final_message_preview"], serde_json::Value::Null);
     assert_eq!(subagent["final_message_file"], serde_json::Value::Null);
     assert_eq!(subagent["transcript_file"], serde_json::Value::Null);
     assert!(subagent.get("final_message_path").is_none());
@@ -2857,17 +2848,9 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     assert!(root.join("impl").join("transcript.md").exists());
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["status"], "done");
-    assert_eq!(
-        snapshot["subagents"][0]["final_message_preview"],
-        "implemented"
-    );
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
     let wakeup_snapshot = parent_completion_snapshot(&env, "parent", &delegation.id).await;
     assert_eq!(wakeup_snapshot, snapshot);
-    assert_eq!(
-        wakeup_snapshot["subagents"][0]["final_message_preview"],
-        "implemented"
-    );
     assert_eq!(
         wakeup_snapshot["subagents"][0]["transcript_file"],
         "impl/transcript.md"

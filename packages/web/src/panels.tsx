@@ -94,8 +94,9 @@ interface RunBoardProps extends RunBoardCallbacks {
 
 type OpenHandoffFile = { key: string; content: string } | { key: string; error: string };
 
-function cancellationTranscriptFile(subagent: DelegationSubagent): HandoffFileName | null {
-	const file = subagent.cancellation_transcript_file;
+function cancellationTranscriptFile(delegation: Delegation, subagent: DelegationSubagent): HandoffFileName | null {
+	if (delegation.status !== "cancelled") return null;
+	const file = subagent.transcript_file;
 	if (typeof file !== "string") return null;
 	if (!/^cancelled\/[^/]+\.transcript\.md$/.test(file)) return null;
 	return file as HandoffFileName;
@@ -119,7 +120,7 @@ function SubagentRow({
 	const finalKey = `${subagent.id}:final_message.md`;
 	const transcriptKey = `${subagent.id}:transcript.md`;
 	const taskPromptKey = `${subagent.id}:task_prompt.md`;
-	const cancellationFile = cancellationTranscriptFile(subagent);
+	const cancellationFile = cancellationTranscriptFile(delegation, subagent);
 	const cancellationKey = cancellationFile ? `${subagent.id}:${cancellationFile}` : null;
 	const handoffReady = delegationHasHandoff(delegation);
 	const openFinal = open && open.key === finalKey ? open : null;
@@ -223,7 +224,7 @@ function DelegationCard({
 	const running = isDelegationRunning(delegation);
 	const title = delegation.label ?? delegation.workflow ?? delegation.delegation_id.slice(0, 13);
 	const handoffReady = delegationHasHandoff(delegation);
-	const hasCancellationTranscript = delegation.status === "cancelled" && delegation.subagents.some(cancellationTranscriptFile);
+	const hasCancellationTranscript = delegation.subagents.some((subagent) => cancellationTranscriptFile(delegation, subagent));
 	return (
 		<div className="run-board-delegation">
 			<div className="run-board-delegation-head">
