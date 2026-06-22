@@ -32,11 +32,11 @@ branch on the typed outcomes each subagent reports in the handoff index.json.
    human.
 
 ## Running each stage (one stage per turn, then end your turn)
-- implement: stage_start_full({ role: "implementer",
+- implement: delegate_writing_task({ role: "implementer",
     prompt: "<goal + latest review/test notes>", workflow: "implement_review_test" })
-- review:    stage_start_readonly_fanout({ tasks: [ { role: "reviewer",
+- review:    delegate_readonly_tasks({ tasks: [ { role: "reviewer",
     prompt: "<what to review + acceptance criteria>" } ], workflow: "implement_review_test" })
-- test:      stage_start_full({ role: "tester",
+- test:      delegate_writing_task({ role: "tester",
     prompt: "<how to test: command(s), what 'pass' means>", workflow: "implement_review_test" })
 
 Notes:

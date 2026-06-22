@@ -66,9 +66,9 @@ flow into child `SessionConfig` at 284-291. Add `subagent_type` enum `{ Full, Re
 
 **Persisting the type:** cleanest = new `subagent_type` column threaded through `start_prepared_session` →
 `start_session_outputs_with_parent` (sessions.rs:231-268), add `subagent_type text null` to INSERT + a `.bind`.
-Interim it can also stamp into `metadata` via `subagent_metadata`, but spec wants a column for `stage.*` querying.
+Interim it can also stamp into `metadata` via `subagent_metadata`, but spec wants a column for stage querying.
 
-**Control RPCs:** stage.* must promote steer/interrupt to real RPCs reusing `enqueue_session_input(InputPriority::Steer)`
+**Control RPCs:** the stage client APIs must promote steer/interrupt to real RPCs reusing `enqueue_session_input(InputPriority::Steer)`
 (main.rs:924) + `interrupt_session` (main.rs:1240). RO subagents reject steer/interrupt by `subagent_type`.
 
 ### gotchas
@@ -386,38 +386,42 @@ separate `ToolRegistry` built by `FirstPartyToolExtension::register` (registry.r
 WebFetch, LoadSkill, PythonRepl. The model reaches `subagent.spawn` ONLY by writing Python in PythonRepl → host fns in
 repl.rs → subagent_spawn_from_active_parent (repl.rs:452). `run_tool_turn` (runtime/tool.rs) special-cases LoadSkill/web
 tools/PythonRepl BY NAME before `ToolRegistry::execute`. LoadSkill/PythonRepl are "runtime tools" — declaration, NO
-executor (`register_runtime_tool`). **This is the exact seam for `stage.*`: runtime tools intercepted by name.**
+executor (`register_runtime_tool`). **This is the exact seam for delegation
+tools (`delegate_writing_task`, `delegate_readonly_tasks`,
+`inspect_delegation`, `cancel_delegation`): runtime tools intercepted by name.**
 
 ### key_locations
 | path | symbol | lines | role |
 |---|---|---|---|
 | rust/crates/agent-daemon/src/types.rs | RpcMethod + parse | 44-122 | Client RPC registry. subagent.list at 116; NO subagent.spawn. Add Stage* if exposing as client RPCs (recommended for UI/tests). |
 | rust/crates/agent-daemon/src/main.rs | dispatch match | 255-293 | RpcMethod→handler. SubagentList→subagent_list at 290. |
-| rust/crates/agent-daemon/src/main.rs | tools_list | 296-321 | tools.list RPC; stage.* appear automatically once registered. |
-| rust/crates/agent-tools/src/registry.rs | FirstPartyToolExtension::register / register_runtime_tool | 335-376 | DECLARE model-facing stage.* here. register_runtime_tool adds declaration, no executor, both providers. |
-| rust/crates/agent-tools/src/registry.rs | ToolRegistry::execute / canonical_tool_name_for_provider | 248-268 | Fallthrough for tools WITH executors. stage.* (no executor) must be intercepted before here. |
+| rust/crates/agent-daemon/src/main.rs | tools_list | 296-321 | tools.list RPC; delegation tools appear automatically once registered. |
+| rust/crates/agent-tools/src/registry.rs | FirstPartyToolExtension::register / register_runtime_tool | 335-376 | DECLARE model-facing delegation tools here. register_runtime_tool adds declaration, no executor, both providers. |
+| rust/crates/agent-tools/src/registry.rs | ToolRegistry::execute / canonical_tool_name_for_provider | 248-268 | Fallthrough for tools WITH executors. Delegation tools (no executor) must be intercepted before here. |
 | rust/crates/agent-daemon/src/runtime/tool.rs | run_tool_turn | 58-90 | THE dispatch seam. if/else by name: LoadSkill(58), web(66), PythonRepl(75) before state.tools.execute(78). Add stage arm. |
-| rust/crates/agent-daemon/src/provider_runtime/prompt.rs | tool_specs / prompt_context | 59-79 | ProviderTool→ToolSpec for prompt+wire. stage.* flow automatically. |
-| rust/crates/agent-daemon/src/subagents.rs | spawn_subagent / subagent_spawn_from_active_parent / SubagentSpawnRequest | 69-376 | The engine stage.start_* reuses. Fork at 264-273 (skip for full). sources/initial_context/fork_context (147-167,625-668) = legacy spec drops. |
-| rust/crates/agent-daemon/src/subagents.rs | subagent_list / require_known_subagent | 20-67, 541-559 | Pattern for stage.status listing + per-parent ownership guard. |
+| rust/crates/agent-daemon/src/provider_runtime/prompt.rs | tool_specs / prompt_context | 59-79 | ProviderTool→ToolSpec for prompt+wire. Delegation tool names flow automatically. |
+| rust/crates/agent-daemon/src/subagents.rs | spawn_subagent / subagent_spawn_from_active_parent / SubagentSpawnRequest | 69-376 | The delegation start tools reuse this engine. Fork at 264-273 (skip for full). sources/initial_context/fork_context (147-167,625-668) = legacy spec drops. |
+| rust/crates/agent-daemon/src/subagents.rs | subagent_list / require_known_subagent | 20-67, 541-559 | Pattern for stage inspection/listing + per-parent ownership guard. |
 | rust/crates/agent-daemon/src/repl.rs | subagents_steer_host / spawn host wrapper | 434-462, 682-712 | Steer path + spawn params. RO steer/interrupt must be REJECTED by subagent_type. |
-| rust/crates/agent-store/src/postgres/session_links.rs | session_parent_id / list_child_session_ids | 35-44 | one-stage-per-parent guard + stage.status enumeration. |
+| rust/crates/agent-store/src/postgres/session_links.rs | session_parent_id / list_child_session_ids | 35-44 | one-stage-per-parent guard + stage inspection enumeration. |
 | rust/crates/agent-store/src/postgres/sessions.rs | activity | 528 | SessionActivity (Running/Idle) for terminal detection. |
 
 ### build_seams
-**Make stage.* model-facing** (runtime-tool pattern): add four `*_definition()` fns mirroring `python_repl_definition`
-(registry.rs:306-326) with Appendix A schemas, register via register_runtime_tool in FirstPartyToolExtension::register:
+**Make delegation tools model-facing** (runtime-tool pattern): add four
+`*_definition()` fns mirroring `python_repl_definition` (registry.rs:306-326)
+with Appendix A schemas, register via register_runtime_tool in
+FirstPartyToolExtension::register:
 ```rust
-register_runtime_tool(registry, "stage.start_full", "stage", stage_start_full_definition());
-register_runtime_tool(registry, "stage.start_readonly_fanout", "stage", stage_start_readonly_fanout_definition());
-register_runtime_tool(registry, "stage.status", "stage", stage_status_definition());
-register_runtime_tool(registry, "stage.cancel", "stage", stage_cancel_definition());
+register_runtime_tool(registry, "delegate_writing_task", "stage", delegate_writing_task_definition());
+register_runtime_tool(registry, "delegate_readonly_tasks", "stage", delegate_readonly_tasks_definition());
+register_runtime_tool(registry, "inspect_delegation", "stage", inspect_delegation_definition());
+register_runtime_tool(registry, "cancel_delegation", "stage", cancel_delegation_definition());
 ```
 Appendix A schemas (workflow-orchestration.md:630-653):
-- start_full: in `{role,prompt,workflow?,label?}` req `[role,prompt]`; out `{stage_id, subagent_session_id}`
-- start_readonly_fanout: in `{tasks:[{role,prompt}],workflow?,label?}` req `[tasks]`; out `{stage_id, subagent_session_ids:[]}`
-- status: in `{stage_id}`; out `{stage_id, kind, status, subagents:[{id,status}], handoff_dir}`
-- cancel: in `{stage_id}`; out `{cancelled:bool}`
+- delegate_writing_task: in `{role,prompt,workflow?,label?}` req `[role,prompt]`; out `{stage_id, subagent_session_id}`
+- delegate_readonly_tasks: in `{tasks:[{role,prompt}],workflow?,label?}` req `[tasks]`; out `{stage_id, subagent_session_ids:[]}`
+- inspect_delegation: in `{stage_id}`; out `{stage_id, kind, status, subagents:[{id,status}], handoff_dir}`
+- cancel_delegation: in `{stage_id}`; out `{cancelled:bool}`
 
 **Dispatch:** extend run_tool_turn (tool.rs:58-90) BEFORE state.tools.execute:
 `} else if is_stage_tool_name(&tool_call.tool_name) { run_stage_tool(&state, &session_id, &dispatch.config, &tool_call).await }`.
@@ -439,16 +443,18 @@ per subagent, tagging stage_id + subagent_type. For full, skip fork (#1). Drop l
 (types.rs:131-139). Recommend core logic returns Result<Value,RpcError>, run_stage_tool adapts → ToolResultMessage::error.
 
 ### gotchas
-- subagent.spawn is NOT in RpcMethod and NOT a model-facing tool — reached ONLY via PythonRepl. Build stage.* as
+- subagent.spawn is NOT in RpcMethod and NOT a model-facing tool — reached ONLY via PythonRepl. Build delegation tools as
   ToolRegistry runtime tools (LoadSkill/PythonRepl pattern), not only as RpcMethod.
-- Two parallel surfaces; tools.list reflects only ToolRegistry. Decide deliberately if stage.* also needs client RPC
+- Two parallel surfaces; tools.list reflects only ToolRegistry. Decide deliberately if delegation also needs client RPC
   entries (likely yes for UI run board + deterministic tests).
 - register_runtime_tool gives NO executor; ToolRegistry::execute returns UnknownTool if reached — MUST intercept in
   run_tool_turn first.
-- Interception matches the WIRE name (tool_call.tool_name); for stage.* wire==canonical (no alias), dots are fine.
+- Interception matches the WIRE name (tool_call.tool_name); for delegation
+  tools, wire==canonical (no alias).
 - Registry sorts by name (registry.rs:274); tests `provider_tools_use_provider_facing_names` (516) and
   `definitions_for_provider_expose_only_that_provider` (476) assert EXACT tool-name lists and WILL break — update them.
-- Completion result is NOT the tool result — stage.start_* returns immediately; outcome arrives async as a Steer.
+- Completion result is NOT the tool result — the start-delegation tools return
+  immediately; outcome arrives async as a Steer.
 - spawn_subagent unconditionally forks (264-273); full must skip — in subagents.rs, but tool must pass subagent_type.
 
 ### spec-drift
@@ -590,7 +596,8 @@ test follows load_skill_result_loads_content_once (skills.rs:191).
 - `workflow-` prefix avoids shadowing role skills (explore vs workflow-explore). Keep the prefix.
 - load_global_skills_from_dir scans one level: <dir>/<child>/SKILL.md. Flat workflows/SKILL.md ignored.
 - Workflow skills render as GLOBAL (untagged) skills.
-- Appendix B references stage.* tools — do NOT apply PI.md rewrite before Phases 1-3 land (spec line 662).
+- Appendix B references delegation tools — do NOT apply PI.md rewrite before
+  Phases 1-3 land (spec line 662).
 
 ### spec-drift
 - Spec line 477 locates resolve_skill_role in agent-daemon/src/subagents.rs — it's actually in
@@ -636,9 +643,11 @@ gpt-5.2-codex, gpt-5.3-codex`. Claude `claude-opus-4-8` (1M), `claude-opus-4-7` 
 ### build_seams
 **Deterministic harness tests:** session.start with `metadata:{"harness":true}` → runtime stops at spawn_model_dispatch:34
 leaving action pending → discover action_row_id via events/transcript/actions → `harness.model.complete` with an
-`assistant` carrying a tool-call for `stage.start_full`/`subagent.spawn` (parsed by parse_assistant_message, main.rs:1668)
-→ scripting a sequence drives the barrier/handoff/steer state machine deterministically. Phase 2 stage.* tools must be
-dispatchable from a harness-supplied assistant tool-call the same way subagent.spawn is.
+`assistant` carrying a tool-call for `delegate_writing_task`/`subagent.spawn`
+(parsed by parse_assistant_message, main.rs:1668) → scripting a sequence drives
+the barrier/handoff/steer state machine deterministically. Phase 2 delegation
+tools must be dispatchable from a harness-supplied assistant tool-call the same
+way subagent.spawn is.
 
 **Integration scaffolding:** reuse test_store() (sessions_tests.rs:34-63): gate PI_RELAY_TEST_DATABASE_URL,
 create db, migrate, drop. New `stages` table in schema::migrate is picked up automatically. Run: `cargo test` (workspace
@@ -679,7 +688,7 @@ the per-session inspector.
 | packages/web/src/agentApi.ts | AgentApi interface + AgentApiClient | 31-68,310-314,419-421 | Add stageStart*/stageStatus/stageCancel mirroring listSubagents(310) + interrupt(419). |
 | packages/web/src/types.ts | SubagentListItem / Result / EventFrame / SessionSummary | 110-125,31-45 | Wire types. Add Stage/StageSubagent/StageStatus + stage_id/subagent_type fields. EventFrame.data is Record so payloads need no schema change. |
 | packages/web/src/panels.tsx | SubagentsSection + Inspector | 60-116,624-734 | Existing subagent rendering. RunBoard replaces/extends SubagentsSection or sibling section grouped by stage. |
-| packages/web/src/App.tsx | subagentsQuery / subagentIds / subagentSummariesQuery | 427-445 | Data fetch + 2s poll. Clone for stage.status. |
+| packages/web/src/App.tsx | subagentsQuery / subagentIds / subagentSummariesQuery | 427-445 | Data fetch + 2s poll. Clone for stage data. |
 | packages/web/src/App.tsx | handleSessionEvent | 884-907 | subagent.* handling; refreshList invalidates subagents query(887). Wire stage.* here. |
 | packages/web/src/App.tsx | event subscription effect (desiredSessionIds) | 1055-1100 | Subscribes parent + each child. Board's subagent ids must feed this set. |
 | packages/web/src/App.tsx | Inspector render site | 2040-2054 | Where subagents/summaries pass into Inspector. Thread run board props here. |
@@ -697,9 +706,10 @@ Add the run board as a section inside Inspector (panels.tsx:624) or a new siblin
 {id,role?,status,suggested_next?,final_message_path?,transcript_path?,activity?}, Stage
 {stage_id,parent_session_id,workflow?,label?,kind,status,handoff_dir?,subagents[],created_at?,updated_at?},
 StageListResult{parent_session_id,stages[]}. Extend SessionSummary/Snapshot with stage_id?, subagent_type?.
-**2. Facade** (agentApi.ts): listStages/getStage("stage.status")/startFullStage/startReadonlyFanout/cancelStage. Spec
-names exactly stage.start_full/start_readonly_fanout/status/cancel; **there is NO stage.list — recommend backend add a
-per-parent listing for the board** (spec mandates only per-id stage.status).
+**2. Facade** (agentApi.ts): listStages/getStage("stage.status")/startFullStage/startReadonlyFanout/cancelStage. The
+web/client RPC names stay `stage.start_full`/`stage.start_readonly_fanout`/`stage.status`/`stage.cancel`; **there is NO
+stage.list in the original spec — recommend backend add a per-parent listing for the board** (spec mandates only per-id
+stage.status).
 **3. Query+poll** (App.tsx, mirror 427-445): stagesQuery with refetchInterval 2_000 while parent running. Add
 queryKeys.stages/stage.
 **4. Event refresh** (sessionEvents.ts + App.tsx): add new stage event names to SESSION_LIST_REFRESH_EVENTS +
@@ -707,7 +717,7 @@ KNOWN_SESSION_EVENTS; in handleSessionEvent invalidate queryKeys.stages. **Compl
 the parent transcript** — existing transcript pipeline renders it; board just flips the stage row via the query refresh.
 **5. Render+controls** (panels.tsx): RunBoard modeled on SubagentsSection; per subagent row link to child session; cancel
 stage → api.cancelStage; steer full subagent → api.queueFollowUp BUT at STEER priority (new path); re-run → startFull/
-fanout (confirm with backend whether re-run is fresh stage.start_* or turn.resume).
+fanout (confirm with backend whether re-run is a fresh stage-start RPC or turn.resume).
 **6. Inspector wiring** (App.tsx:2040-2054 + panels.tsx:624): thread stages + callbacks; board subagent session_ids must
 feed desiredSessionIds (App.tsx:1062-1064).
 
@@ -715,7 +725,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 - Composer ALWAYS submits follow_up priority (submitComposer→queueFollowUp, only 'follow_up' literal at App.tsx:1382).
   "Steer the full subagent" needs a NEW steer-priority path — does not exist today.
 - subagent.list returns ONLY {child_session_id, activity}; role/title/model fetched per-child. Prefer embedding in
-  stage.status to avoid N round-trips per fan-out.
+  stage status/list responses to avoid N round-trips per fan-out.
 - NO stage.* RPC registered yet — coordinate exact param/result JSON with Phase 2 builder.
 - **Handoff files live on the daemon host filesystem; NO RPC reads arbitrary files from the web client today.** "Links to
   handoff files" cannot be live links unless the builder adds a file-read RPC; else show paths as text. BACKEND DEPENDENCY.
@@ -725,7 +735,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 - New stage event names MUST go in KNOWN_SESSION_EVENTS or they force redundant active-branch syncs.
 
 ### spec-drift
-- Spec's stage.status is per-id only — a per-parent stage list (to populate the board) is unspecified; Phase 2 backend
+- The original spec only defined per-id stage status — a per-parent stage list (to populate the board) is unspecified; Phase 2 backend
   should add it.
 
 ---
@@ -737,7 +747,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 | **#1** | Skip the workspace fork for `full` subagents | `subagents.rs:264-273` (the ONLY fork call) — branch on new `subagent_type`: ReadOnly keeps `fork_session_from_parent`, Full reuses `parent_config.outer_cwd/workspaces`. Add `subagent_type` enum to `SubagentSpawnRequest`/`Params` (subagents.rs:92-184). VERIFY `ensure_session` (session_start.rs:192) is no-op against parent cwd. Full teardown must NOT delete parent workspace (cleanup_failed_spawn:561, remove_session_dir:260). |
 | **#2** | Subvolume-aware destroy path | New `destroy_workspace_tree(root)` in `workspaces/instantiate.rs` (next to try_btrfs_subvolume_create:107, depth-first + remove_dir_all fallback) + public `destroy_session_workspaces(session_id)` on WorkspaceManager (`workspaces/mod.rs`, next to remove_session_dir:260). Redirect remove_session_dir to delegate. Call at RO terminal lifecycle. Exclude `.pi-handoff` from the fork (materialize_tree_from_source_exact:29). |
 | **#3** | Durable `stages` table + `sessions.stage_id`/`subagent_type` columns + stages repo | `schema.rs:20-128` SCHEMA_SQL (create stages BEFORE alters), text_enums in `lib.rs:58-92`, new `postgres/stages.rs` (register `mod stages;` mod.rs:1-16): create_stage, list_stage_subagents, finish_stage CAS, sweep_running_stages. Set values via start_session_outputs_with_parent (sessions.rs:252) or a setter mirroring set_session_parent. Update 3 explicit reads (list_sessions:428, load_session_config:500, session_snapshot snapshots.rs:24) only if surfaced. |
-| **#4** | `stage.*` model-facing tools + dispatch + 3 guards | Declare in `agent-tools/src/registry.rs:335-376` (register_runtime_tool, 4 `*_definition()` fns). Intercept by name in `runtime/tool.rs:58-90` (is_stage_tool_name/run_stage_tool). Engine reuses spawn_subagent (subagents.rs:191). Guards in run_stage_tool: homogeneity/single-full (structural), one-stage-per-parent (`parent_has_running_stage`), reject RO steer/interrupt (subagent_type). Update broken registry tests (476,516). Optionally register in RpcMethod (types.rs:82-121) for UI/tests. |
+| **#4** | Delegation model-facing tools + dispatch + 3 guards | Declare in `agent-tools/src/registry.rs:335-376` (register_runtime_tool, 4 `*_definition()` fns). Intercept by name in `runtime/tool.rs:58-90` (is_stage_tool_name/run_stage_tool). Engine reuses spawn_subagent (subagents.rs:191). Guards in run_stage_tool: homogeneity/single-full (structural), one-stage-per-parent (`parent_has_running_stage`), reject RO steer/interrupt (subagent_type). Update broken registry tests (476,516). Optionally register stage.* web RPCs in RpcMethod (types.rs:82-121) for UI/tests. |
 | **#5** | Handoff writer (transcript.md + final_message.md + index.json) | New module (e.g. `agent-daemon/src/handoff.rs`): `render_transcript_markdown(&HistoryTree)` + `extract_final_message(&HistoryTree)`, reading `active_branch(child)` (transcript.rs:328, Ui mode). Path `<parent.outer_cwd>/.pi-handoff/<stage_id>/<subagent>/` via load_session_config(parent).outer_cwd. Run inside the barrier (Section #6). index.json carries role/status/suggested_next/paths per subagent. |
 | **#6** | Barrier → steer hook in subagent-lifecycle path | Stage runner `on_subagent_terminal`/`try_stage_barrier` on SessionDriver, called at the three try_subagent_parent_idle_event call sites (`runtime/mod.rs:211,359,420`). Barrier: lock stage row (stages.rs CAS, FOR UPDATE) → all-subagents-terminal predicate → finish_stage CAS (running→done|done_with_failures from TurnOutcome) → render handoff (#5) → ONE `enqueue_session_input(&self.state, Steer)` to parent (main.rs:924). SUPPRESS per-child idle notification for stage members. Wire stage_runner into AppState (state.rs:30). |
 | **#7** | Workflow skills installed + discoverable + PI.md rewrite | Copy 4 drafts to `/home/schwinns/pi-relay-wf/workflows/<name>/SKILL.md`. THREE loader edits: load_packaged_role_skills (skills.rs:153, role fallback), load_prompt_skills (prompt.rs:81, index — thread prompt_root), load_skill_output_with_home (skills.rs:62, LoadSkill — thread prompt_root). Rewrite PI.md:40-64 with Appendix B (AFTER Phases 1-3). |
@@ -756,7 +766,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 - `agent-daemon/src/workspaces/mod.rs` — `destroy_session_workspaces`; redirect remove_session_dir; exclude `.pi-handoff` from fork (mod.rs:187 / materialize path).
 - Tests: per-test fresh DB (sessions_tests.rs pattern).
 
-**Phase 2 — stages table + repo + stage.* tools**
+**Phase 2 — stages table + repo + delegation tools**
 - `agent-store/src/postgres/schema.rs` — stages table + stages_parent_created_idx + `alter ... stage_id` (after stages).
 - `agent-store/src/lib.rs` — StageKind, StageStatus text_enums.
 - `agent-store/src/postgres/mod.rs` — `mod stages;`.
@@ -840,11 +850,12 @@ CREATE/DROP DATABASE) — confirm it is exported or the workflow tests pass whil
 - **[#5, should verify]** Whether the child's tail is already recovered to a turn boundary when the barrier runs (it runs
   after terminal, but a crashed tail could miss its final assistant message). parent_context_block does acquire+recover
   first; confirm the barrier path does too or add a recover.
-- **[#4 / web]** Exact stage.* param/result JSON shapes must be agreed between the Phase 2 backend builder and the web
-  builder. Spec Appendix A is the contract.
+- **[#4 / web]** Exact delegation-tool and web RPC param/result JSON shapes must
+  be agreed between the Phase 2 backend builder and the web builder. Spec
+  Appendix A is the model-facing contract; web keeps the `stage.*` client RPCs.
 - **[web]** NO RPC reads arbitrary host files from the web client. Handoff-file links require a NEW backend file-read RPC,
   or the board shows absolute paths as text. Unowned backend dependency.
-- **[web]** Spec defines stage.status per-id only; a per-parent `stage.list` (needed to populate the board) is
+- **[web]** Spec defines stage status per-id only; a per-parent `stage.list` (needed to populate the board) is
   unspecified — Phase 2 backend should add it.
 - **[creds, CI]** The real-model e2e depends on the daemon's HOME/env having live Codex + Anthropic creds; on a fresh CI
   machine these are absent. Confirm `codex login` has run (or CODEX_ACCESS_TOKEN/CODEX_REFRESH_TOKEN set) and

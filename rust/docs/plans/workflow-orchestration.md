@@ -11,7 +11,7 @@ Everything a builder needs is under `rust/docs/plans/`:
 | File | What it is | Status |
 | --- | --- | --- |
 | `workflow-orchestration.md` (this file) | The canonical spec + build brief (Implementation guide, Appendices A/B). | authoritative |
-| `phase-0-doc-edits.md` | Exact `architecture.md` / `agent-daemon.md` edits, staged to apply **with** the `stage.*` landing. | apply in Phase 0 |
+| `phase-0-doc-edits.md` | Exact `architecture.md` / `agent-daemon.md` edits, staged to apply **with** the delegation-tool landing. | apply in Phase 0 |
 | `workflow-skills/README.md` | How to install workflow skills (one loader line + copy files). | apply in Phase 4 |
 | `workflow-skills/workflow-*/SKILL.md` | The four bundled workflow-pattern skills, as inert drafts. | install in Phase 4 |
 
@@ -105,8 +105,8 @@ So this plan **evolves documented behavior; it does not introduce orchestration
 into a void.** It changes three things the architecture currently describes, and
 those doc updates ship with the implementation:
 
-- **Control surface:** Python REPL `subagents.*` (busy-wait) → regular `stage.*`
-  tool calls + daemon steer notifications (no busy-wait).
+- **Control surface:** Python REPL `subagents.*` (busy-wait) → provider-visible
+  delegation tool calls + daemon steer notifications (no busy-wait).
 - **Workspace handoff:** forked-context snapshots and git source-refs between
   subagents → one durable workspace (full writes in place; RO disposable
   snapshots) with file-based handoff; no merge, no source-refs.
@@ -237,7 +237,7 @@ A **stage** is `kind = full` (one full subagent) or `kind = readonly_fanout` (on
 or more RO subagents). Lifecycle:
 
 ```text
-parent calls stage.start_full / stage.start_readonly_fanout
+parent calls delegate_writing_task / delegate_readonly_tasks
   -> full stage: start one subagent in the parent's workspace dirs (in place)
      RO stage: snapshot the workspace dirs per subagent; start each in its snapshot
   -> parent parks (idle) but stays responsive to the user
@@ -284,8 +284,8 @@ twice, is brittle against messy real conditions, and contradicts invariant 3.
 A workflow is a **skill** (`SKILL.md`) discovered in the skills index and loaded
 with `LoadSkill` (the subagent roles are already skills). It documents a
 graph-shaped state machine the parent follows with judgment, driving it with
-`stage.*` calls. There is **no `workflow.*` tool surface**; stages carry an
-optional `workflow` label only so the run board can group them.
+delegation tool calls. There is **no `workflow.*` tool surface**; stages carry
+an optional `workflow` label only so the run board can group them.
 
 **Soft control flow, hard signals.** The skill reads like a state machine, but it
 is parent-interpreted. What keeps it crisp is the **typed `suggested_next`
@@ -325,11 +325,11 @@ outcomes each subagent reports in the handoff index.json.
    human.
 
 ## Running each stage (one stage per turn, then end your turn)
-- implement: stage.start_full({ role:"implementer",
+- implement: delegate_writing_task({ role:"implementer",
     prompt:<goal + latest review/test notes>, workflow:"implement_review_test" })
-- review:    stage.start_readonly_fanout({ tasks:[{role:"reviewer",
+- review:    delegate_readonly_tasks({ tasks:[{role:"reviewer",
     prompt:<what to review + acceptance criteria>}], workflow:"implement_review_test" })
-- test:      stage.start_full({ role:"tester",
+- test:      delegate_writing_task({ role:"tester",
     prompt:<how to test>, workflow:"implement_review_test" })
 
 When the handoff steer arrives, read index.json then the relevant
@@ -407,10 +407,10 @@ stage — that is the parent's job.
 ## Tools
 
 ```text
-stage.start_full            -> { role, prompt, workflow?, label? }   ; one full subagent (in place)
-stage.start_readonly_fanout -> { tasks:[{role,prompt}], workflow?, label? } ; N RO subagents (snapshots)
-stage.status                -> inspect a stage and its subagents
-stage.cancel                -> cancel an in-flight stage
+delegate_writing_task            -> { role, prompt, workflow?, label? }   ; one full subagent (in place)
+delegate_readonly_tasks -> { tasks:[{role,prompt}], workflow?, label? } ; N RO subagents (snapshots)
+inspect_delegation                -> inspect a stage and its subagents
+cancel_delegation                -> cancel an in-flight stage
 ```
 
 Full schemas in Appendix A. Workflows have **no tools**: they are skills loaded
@@ -436,24 +436,25 @@ cancels it or steers the full subagent. No blocked-run table, no signal artifact
 
 ## Migration off the Python REPL
 
-This plan **moves subagent invocation off the Python REPL onto regular daemon RPC
-tool calls.** Today `PI.md` teaches orchestration via the `PythonRepl` tool's
-`subagents.*` host functions, which busy-wait in a long-lived Python process. The
-stage model replaces that with ordinary tool calls (`stage.*`) — the same kind of
-RPC the existing `subagent.spawn` already is — plus daemon-driven steers.
+This plan **moves subagent invocation off the Python REPL onto provider-visible
+delegation tool calls.** Today `PI.md` teaches orchestration via the
+`PythonRepl` tool's `subagents.*` host functions, which busy-wait in a
+long-lived Python process. The stage model replaces that with ordinary tool
+calls (`delegate_writing_task`, `delegate_readonly_tasks`,
+`inspect_delegation`, `cancel_delegation`) plus daemon-driven steers.
 
 | Surface | Today | Steady state |
 | --- | --- | --- |
-| `stage.*` (regular tool calls) | none yet | the way to run staged and parallel-RO work |
+| delegation tools | none yet | the way to run staged and parallel-RO work |
 | workflow skills (`SKILL.md` + `LoadSkill`) | roles exist as skills | named, possibly-cyclic stage playbooks |
 | Python REPL `subagents.*` (busy-wait) | current primary path in `PI.md` | raw escape hatch only; removed from `PI.md` |
-| `subagent.spawn` / `subagent.list` RPCs | low-level, REPL-backed | reused by / folded into `stage.*` |
+| `subagent.spawn` / `subagent.list` RPCs | low-level, REPL-backed | reused by / folded into the stage engine |
 
-Sequence: ship `stage.*` + stages + handoff/steer (Phases 0–3); rewrite the
-`PI.md` "Subagent delegation" section to teach `stage.*`, workflow skills, the
-handoff dir, fresh-context prompts, and park-but-stay-responsive, deleting the
-`subagents.spawn/wait/...` guidance. Fully retiring the REPL `subagents.*` host
-functions is a later cleanup.
+Sequence: ship delegation tools + stages + handoff/steer (Phases 0–3); rewrite
+the `PI.md` "Subagent delegation" section to teach delegation tools, workflow
+skills, the handoff dir, fresh-context prompts, and park-but-stay-responsive,
+deleting the `subagents.spawn/wait/...` guidance. Fully retiring the REPL
+`subagents.*` host functions is a later cleanup.
 
 ## Implementation guide
 
@@ -496,7 +497,7 @@ blocking dependency; implementation can start immediately.
    subvolumes and call it when an RO subagent reaches a terminal lifecycle state.
 3. **`stages` table + repo methods** (create/lock/finish, list by parent, sweep
    `running`).
-4. **`stage.*` RPC tools** (Appendix A) + homogeneity/single-stage guards.
+4. **Delegation tools** (Appendix A) + homogeneity/single-stage guards.
 5. **The handoff writer** (`index.json` + per-subagent `final_message.md` /
    `transcript.md`) under `<outer_cwd>/.pi-handoff/<stage_id>/`.
 6. **The barrier→steer hook** in the subagent-lifecycle path (the runner above).
@@ -538,8 +539,8 @@ busy-wait/poll loop.
 - PR #150 (lifecycle events) is already on `main`; no code prerequisite remains.
 - Apply the staged doc edits in `phase-0-doc-edits.md` (architecture.md goals +
   subagent-delegation bullet + not-implemented list; agent-daemon.md runtime
-  summary) **in the same change that lands `stage.*`**, so the docs never describe
-  unbuilt behavior.
+  summary) **in the same change that lands delegation tools**, so the docs never
+  describe unbuilt behavior.
 
 ### Phase 1 — typed subagents
 
@@ -551,8 +552,8 @@ busy-wait/poll loop.
 ### Phase 2 — stages
 
 - Add the `stages` table + repo methods + `stage_id` on sessions.
-- Add `stage.start_full`, `stage.start_readonly_fanout`, `stage.status`,
-  `stage.cancel`; enforce homogeneity, a single full subagent, and
+- Add `delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`,
+  `cancel_delegation`; enforce homogeneity, a single full subagent, and
   one-stage-at-a-time per parent.
 
 ### Phase 3 — handoff + barrier + steer
@@ -595,8 +596,8 @@ Reuse the dev harness that resolves model actions deterministically
   workspace after the stage; full subagents do not fork.
 - **RO isolation + GC:** an RO subagent's writes never reach the durable
   workspace; its snapshot is destroyed after return; its handoff files survive.
-- **Homogeneity / single-flight:** `stage.start_*` rejects mixed stages, more than
-  one full subagent, and a second concurrent stage.
+- **Homogeneity / single-flight:** the start-delegation tools reject mixed
+  stages, more than one full subagent, and a second concurrent stage.
 - **Continue-where-left-off:** a crashed/interrupted subagent resumes its session
   from the recovered turn boundary; no git, no rollback.
 - **Typed outcomes:** a `suggested_next` outside a workflow skill's set is recorded
@@ -622,34 +623,35 @@ Reuse the dev harness that resolves model actions deterministically
 10. The daemon owns mechanism; the model owns policy (which stage next, re-run,
     stop).
 
-## Appendix A: `stage.*` tool schemas (regular RPC tools)
+## Appendix A: delegation tool schemas
 
-Ordinary daemon RPC tools (the kind `subagent.spawn` already is), surfaced to the
-model as function tools — not REPL host functions.
+Provider-visible function tools intercepted by the daemon runtime — not REPL
+host functions. The separate web/inspector client RPCs keep their `stage.*`
+method names.
 
 ```jsonc
 // Launch the single full (writing) subagent. End your turn after calling.
-{ "name": "stage.start_full",
+{ "name": "delegate_writing_task",
   "input": { "role": "implementer", "prompt": "Implement X in place. ...",
              "workflow": "implement_review_test", "label": "implement X" },
   "result": { "stage_id": "stage_8", "subagent_session_id": "session_..." } }
 
 // Launch N RO subagents in parallel, each in its own disposable snapshot.
 // End your turn after calling.
-{ "name": "stage.start_readonly_fanout",
+{ "name": "delegate_readonly_tasks",
   "input": { "tasks": [ { "role": "reviewer", "prompt": "Review for correctness. ..." },
                          { "role": "reviewer", "prompt": "Review for security. ..." } ],
              "workflow": "implement_review_test", "label": "review fan-out" },
   "result": { "stage_id": "stage_9", "subagent_session_ids": ["session_...", "session_..."] } }
 
 // Inspect a stage (also readable via index.json once complete).
-{ "name": "stage.status", "input": { "stage_id": "stage_9" },
+{ "name": "inspect_delegation", "input": { "stage_id": "stage_9" },
   "result": { "stage_id": "stage_9", "kind": "readonly_fanout", "status": "running",
               "subagents": [ { "id": "...", "status": "running" } ],
               "handoff_dir": "<cwd>/.pi-handoff/stage_9" } }
 
 // Cancel an in-flight stage (all its subagents).
-{ "name": "stage.cancel", "input": { "stage_id": "stage_9" }, "result": { "cancelled": true } }
+{ "name": "cancel_delegation", "input": { "stage_id": "stage_9" }, "result": { "cancelled": true } }
 ```
 
 Daemon-enforced errors: starting a second stage while one is running; mixing full
@@ -673,9 +675,9 @@ Two kinds of subagent:
 - **read-only (RO)** — for investigation, review, analysis, and running
   builds/tests to gather information. RO subagents run in a private throwaway copy
   of the workspace; nothing they write reaches your workspace. Use
-  `stage.start_readonly_fanout` to run several in parallel.
+  `delegate_readonly_tasks` to run several in parallel.
 - **full** — for making changes. A full subagent edits your workspace in place.
-  Use `stage.start_full`. There is exactly one full subagent at a time.
+  Use `delegate_writing_task`. There is exactly one full subagent at a time.
 
 Rules:
 

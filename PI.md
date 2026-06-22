@@ -47,9 +47,9 @@ Two kinds of subagent:
 - **read-only (RO)** — for investigation, review, analysis, and running
   builds/tests to gather information. RO subagents run in a private throwaway copy
   of the workspace; nothing they write reaches your workspace. Use
-  `stage_start_readonly_fanout` to run several in parallel.
+  `delegate_readonly_tasks` to run several in parallel.
 - **full** — for making changes. A full subagent edits your workspace in place.
-  Use `stage_start_full`. There is exactly one full subagent at a time.
+  Use `delegate_writing_task`. There is exactly one full subagent at a time.
 
 Rules:
 

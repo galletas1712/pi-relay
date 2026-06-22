@@ -303,10 +303,10 @@ fn load_skill_definition() -> ToolDefinition {
     )
 }
 
-fn stage_start_full_definition() -> ToolDefinition {
+fn delegate_writing_task_definition() -> ToolDefinition {
     ToolDefinition::new(
-        "stage_start_full",
-        "Launch the single full (writing) subagent for a stage. It edits the workspace in place; there is exactly one full subagent at a time. End your turn after calling; completion arrives later as a steer pointing at the stage handoff directory.",
+        "delegate_writing_task",
+        "Launch the single full (writing) subagent for a delegation stage. It edits the workspace in place; there is exactly one full subagent at a time. End your turn after calling; completion arrives later as a steer pointing at the stage handoff directory.",
         json!({
             "type": "object",
             "properties": {
@@ -333,9 +333,9 @@ fn stage_start_full_definition() -> ToolDefinition {
     )
 }
 
-fn stage_start_readonly_fanout_definition() -> ToolDefinition {
+fn delegate_readonly_tasks_definition() -> ToolDefinition {
     ToolDefinition::new(
-        "stage_start_readonly_fanout",
+        "delegate_readonly_tasks",
         "Launch N read-only subagents in parallel, each in its own disposable snapshot of the workspace. Use for investigation, review, or running builds/tests; nothing they write reaches your workspace. End your turn after calling; completion arrives later as a steer.",
         json!({
             "type": "object",
@@ -374,16 +374,16 @@ fn stage_start_readonly_fanout_definition() -> ToolDefinition {
     )
 }
 
-fn stage_status_definition() -> ToolDefinition {
+fn inspect_delegation_definition() -> ToolDefinition {
     ToolDefinition::new(
-        "stage_status",
+        "inspect_delegation",
         "Inspect a stage and its subagents (also readable via the handoff index.json once complete).",
         json!({
             "type": "object",
             "properties": {
                 "stage_id": {
                     "type": "string",
-                    "description": "The stage id returned by stage_start_full / stage_start_readonly_fanout."
+                    "description": "The stage id returned by delegate_writing_task / delegate_readonly_tasks."
                 }
             },
             "required": ["stage_id"],
@@ -392,9 +392,9 @@ fn stage_status_definition() -> ToolDefinition {
     )
 }
 
-fn stage_cancel_definition() -> ToolDefinition {
+fn cancel_delegation_definition() -> ToolDefinition {
     ToolDefinition::new(
-        "stage_cancel",
+        "cancel_delegation",
         "Cancel an in-flight stage and all of its subagents.",
         json!({
             "type": "object",
@@ -426,18 +426,28 @@ impl ToolExtension for FirstPartyToolExtension {
         );
         register_runtime_tool(
             registry,
-            "stage_start_full",
+            "delegate_writing_task",
             "stage",
-            stage_start_full_definition(),
+            delegate_writing_task_definition(),
         );
         register_runtime_tool(
             registry,
-            "stage_start_readonly_fanout",
+            "delegate_readonly_tasks",
             "stage",
-            stage_start_readonly_fanout_definition(),
+            delegate_readonly_tasks_definition(),
         );
-        register_runtime_tool(registry, "stage_status", "stage", stage_status_definition());
-        register_runtime_tool(registry, "stage_cancel", "stage", stage_cancel_definition());
+        register_runtime_tool(
+            registry,
+            "inspect_delegation",
+            "stage",
+            inspect_delegation_definition(),
+        );
+        register_runtime_tool(
+            registry,
+            "cancel_delegation",
+            "stage",
+            cancel_delegation_definition(),
+        );
         register_edit(registry);
         register_uniform(registry, "Bash", "shell", BashTool);
         register_uniform(registry, "Grep", "workspace_search", GrepTool);
@@ -584,12 +594,12 @@ mod tests {
             [
                 "Edit",
                 "Bash",
+                "cancel_delegation",
+                "delegate_readonly_tasks",
+                "delegate_writing_task",
                 "Grep",
+                "inspect_delegation",
                 "LoadSkill",
-                "stage_cancel",
-                "stage_start_full",
-                "stage_start_readonly_fanout",
-                "stage_status",
                 "WebFetch",
                 "WebSearch"
             ]
@@ -598,12 +608,12 @@ mod tests {
             claude,
             [
                 "Bash",
+                "cancel_delegation",
+                "delegate_readonly_tasks",
+                "delegate_writing_task",
                 "Grep",
+                "inspect_delegation",
                 "LoadSkill",
-                "stage_cancel",
-                "stage_start_full",
-                "stage_start_readonly_fanout",
-                "stage_status",
                 "Edit",
                 "WebFetch",
                 "WebSearch"
@@ -630,12 +640,12 @@ mod tests {
             [
                 "apply_patch",
                 "Bash",
+                "cancel_delegation",
+                "delegate_readonly_tasks",
+                "delegate_writing_task",
                 "Grep",
+                "inspect_delegation",
                 "LoadSkill",
-                "stage_cancel",
-                "stage_start_full",
-                "stage_start_readonly_fanout",
-                "stage_status",
                 "web_fetch",
                 "web_search"
             ]
@@ -644,12 +654,12 @@ mod tests {
             claude,
             [
                 "Bash",
+                "cancel_delegation",
+                "delegate_readonly_tasks",
+                "delegate_writing_task",
                 "Grep",
+                "inspect_delegation",
                 "LoadSkill",
-                "stage_cancel",
-                "stage_start_full",
-                "stage_start_readonly_fanout",
-                "stage_status",
                 "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search"
@@ -738,6 +748,39 @@ mod tests {
             claude_edit.declaration["name"],
             "str_replace_based_edit_tool"
         );
+    }
+
+    #[test]
+    fn delegation_registry_exposes_only_new_model_facing_names() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let names = registry
+            .provider_tools_for_provider(ProviderKind::OpenAi)
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect::<Vec<_>>();
+
+        for expected in [
+            "delegate_writing_task",
+            "delegate_readonly_tasks",
+            "inspect_delegation",
+            "cancel_delegation",
+        ] {
+            assert!(
+                names.contains(&expected.to_string()),
+                "{expected} should be exposed"
+            );
+        }
+        for old in [
+            "stage_start_full",
+            "stage_start_readonly_fanout",
+            "stage_status",
+            "stage_cancel",
+        ] {
+            assert!(
+                !names.contains(&old.to_string()),
+                "{old} must not remain provider-visible"
+            );
+        }
     }
 
     #[test]

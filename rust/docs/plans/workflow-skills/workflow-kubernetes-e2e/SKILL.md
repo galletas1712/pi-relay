@@ -29,7 +29,7 @@ result. You decide what to do with that result.
                          decision: relay to the human and wait.
 
 ## Running the stage (one stage per turn, then end your turn)
-- test: stage.start_full({ role: "kubernetes-tester",
+- test: delegate_writing_task({ role: "kubernetes-tester",
     prompt: "<context, namespace, what to deploy/test, what 'pass' means>",
     workflow: "kubernetes_e2e" })
 

@@ -598,7 +598,17 @@ pub(crate) async fn rpc_list(
 pub(crate) fn is_stage_tool_name(name: &str) -> bool {
     matches!(
         name,
-        "stage_start_full" | "stage_start_readonly_fanout" | "stage_status" | "stage_cancel"
+        "delegate_writing_task"
+            | "delegate_readonly_tasks"
+            | "inspect_delegation"
+            | "cancel_delegation"
+            // Hidden short-term compatibility aliases. These are accepted by
+            // dispatch only; agent-tools does not expose them in the provider
+            // registry/tool list.
+            | "stage_start_full"
+            | "stage_start_readonly_fanout"
+            | "stage_status"
+            | "stage_cancel"
     )
 }
 
@@ -620,12 +630,16 @@ pub(crate) async fn run_stage_tool(
         }
     };
     let result = match call.tool_name.as_str() {
-        "stage_start_full" => start_full_core(state, parent_session_id, params).await,
-        "stage_start_readonly_fanout" => {
+        "delegate_writing_task" | "stage_start_full" => {
+            start_full_core(state, parent_session_id, params).await
+        }
+        "delegate_readonly_tasks" | "stage_start_readonly_fanout" => {
             start_readonly_fanout_core(state, parent_session_id, params).await
         }
-        "stage_status" => status_core(state, parent_session_id, params).await,
-        "stage_cancel" => cancel_core(state, parent_session_id, params).await,
+        "inspect_delegation" | "stage_status" => {
+            status_core(state, parent_session_id, params).await
+        }
+        "cancel_delegation" | "stage_cancel" => cancel_core(state, parent_session_id, params).await,
         other => Err(RpcError::new(
             "unknown_tool",
             format!("unknown stage tool: {other}"),
@@ -650,6 +664,25 @@ mod tests {
     use super::*;
 
     const CWD: &str = "/home/u/.local/state/pi-relay/sessions/parent/cwd";
+
+    #[test]
+    fn stage_tool_interception_accepts_new_names_and_hidden_aliases() {
+        for name in [
+            "delegate_writing_task",
+            "delegate_readonly_tasks",
+            "inspect_delegation",
+            "cancel_delegation",
+            // Hidden daemon-only aliases; not registered provider tools.
+            "stage_start_full",
+            "stage_start_readonly_fanout",
+            "stage_status",
+            "stage_cancel",
+        ] {
+            assert!(is_stage_tool_name(name), "{name} should be intercepted");
+        }
+        assert!(!is_stage_tool_name("stage.list"));
+        assert!(!is_stage_tool_name("stage.start_full"));
+    }
 
     #[test]
     fn resolves_index_json_at_stage_root() {
