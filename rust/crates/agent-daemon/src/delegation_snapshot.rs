@@ -1,6 +1,7 @@
 use agent_store::{Delegation, DelegationStatus, SubagentType};
 use agent_vocab::{DaemonToolObservation, ToolCallId};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::handoff::{
     delegation_dir, refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
@@ -212,6 +213,25 @@ fn snapshot_progress_count(snapshot: &Value, key: &str) -> usize {
         .unwrap_or_default() as usize
 }
 
+fn short_delegation_observation_call_id(delegation: &Delegation) -> ToolCallId {
+    // OpenAI Responses rejects `call_id` values longer than 64 characters.
+    // Delegation ids and attempt ids are both UUID-bearing strings, so spelling
+    // both out (`call_inspect_delegation_<delegation>_<attempt>`) can exceed
+    // that limit. Keep a human-recognizable prefix and a deterministic digest
+    // of both durable ids; the full delegation id remains in args_json/result.
+    let mut hasher = Sha256::new();
+    hasher.update(delegation.id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(delegation.attempt_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut suffix = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut suffix, "{byte:02x}");
+    }
+    ToolCallId::new(format!("call_inspect_delegation_{suffix}"))
+}
+
 /// Build the terminal daemon observation delivered to the parent after a
 /// delegation completes.
 ///
@@ -242,15 +262,7 @@ pub(crate) fn completion_wakeup_observation(
     let summary = format!(
         "Delegation {delegation_id} ({kind}){label} completed with status {status}: {ok} ok, {failed} failed."
     );
-    let tool_call_id = ToolCallId::new(format!(
-        "call_inspect_delegation_{}_{}",
-        delegation
-            .id
-            .replace(|ch: char| !ch.is_ascii_alphanumeric(), "_"),
-        delegation
-            .attempt_id
-            .replace(|ch: char| !ch.is_ascii_alphanumeric(), "_")
-    ));
+    let tool_call_id = short_delegation_observation_call_id(delegation);
     Ok(DaemonToolObservation::inspect_delegation(
         tool_call_id,
         delegation_id,
@@ -302,10 +314,11 @@ mod tests {
             completion_wakeup_observation(&snapshot, &delegation).expect("observation");
 
         assert_eq!(observation.tool_name, "inspect_delegation");
-        assert_eq!(
-            observation.tool_call_id.as_str(),
-            "call_inspect_delegation_delegation_1_attempt_1"
-        );
+        assert!(observation
+            .tool_call_id
+            .as_str()
+            .starts_with("call_inspect_delegation_"));
+        assert!(observation.tool_call_id.as_str().len() <= 64);
         assert_eq!(
             observation.args_json,
             "{\"delegation_id\":\"delegation_1\"}"
@@ -320,5 +333,45 @@ mod tests {
             .render_text()
             .unwrap()
             .contains("large prompts/messages are not inlined"));
+    }
+
+    #[test]
+    fn completion_wakeup_observation_call_id_stays_under_provider_limit_for_uuid_ids() {
+        let snapshot = json!({
+            "delegation_id": "delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
+            "kind": "readonly_fanout",
+            "status": "done",
+            "progress": {
+                "terminal": 4,
+                "failed": 0,
+            },
+            "subagents": [],
+            "handoff_dir": "/tmp/.pi-handoff/delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
+        });
+        let delegation = Delegation {
+            id: "delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52".to_string(),
+            parent_session_id: "parent".to_string(),
+            workflow: None,
+            label: None,
+            kind: agent_store::DelegationKind::ReadonlyFanout,
+            status: DelegationStatus::Done,
+            attempt_id: "62847e1a-b705-48ee-899b-b062ccdf38f6".to_string(),
+            expected_subagents: 4,
+        };
+
+        let first = completion_wakeup_observation(&snapshot, &delegation)
+            .expect("observation")
+            .tool_call_id;
+        let second = completion_wakeup_observation(&snapshot, &delegation)
+            .expect("observation")
+            .tool_call_id;
+
+        assert_eq!(first, second);
+        assert!(first.as_str().starts_with("call_inspect_delegation_"));
+        assert!(first.as_str().len() <= 64);
+        assert_ne!(
+            first.as_str(),
+            "call_inspect_delegation_delegation_6d17ff90_6e46_4c3f_88ad_d92d77350d52_62847e1a_b705_48ee_899b_b062ccdf38f6"
+        );
     }
 }
