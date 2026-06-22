@@ -11,14 +11,12 @@ use serde_json::{json, Value};
 use crate::codec::from_params;
 use crate::delegation_snapshot::build_delegation_snapshot;
 use crate::handoff::{
-    delegation_dir, refresh_delegation_handoff_artifacts, render_transcript_markdown,
+    delegation_dir, handoff_root, refresh_delegation_handoff_artifacts, render_transcript_markdown,
 };
 use crate::runtime::{abort_session_tasks, publish_events, SessionDriver};
 use crate::state::AppState;
 use crate::subagents::{spawn_subagent, DelegationSubagentSpawn};
 use crate::types::RpcError;
-
-const HANDOFF_DIR: &str = ".pi-handoff";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -432,14 +430,6 @@ pub(crate) async fn start_readonly_fanout_core(
     }))
 }
 
-fn handoff_dir(parent_outer_cwd: &str, delegation_id: &str) -> String {
-    Path::new(parent_outer_cwd)
-        .join(HANDOFF_DIR)
-        .join(delegation_id)
-        .to_string_lossy()
-        .into_owned()
-}
-
 async fn load_delegation_for_parent(
     state: &AppState,
     parent_session_id: &str,
@@ -735,9 +725,7 @@ fn resolve_handoff_file_path(
     request: HandoffFileRequest<'_>,
 ) -> std::result::Result<PathBuf, RpcError> {
     let delegation_segment = safe_path_segment(delegation_id, "delegation_id")?;
-    let mut path = Path::new(parent_outer_cwd)
-        .join(HANDOFF_DIR)
-        .join(delegation_segment);
+    let mut path = delegation_dir(parent_outer_cwd, &delegation_segment);
     match request {
         HandoffFileRequest::Normal { subagent_id, file } => {
             path.push(safe_path_segment(subagent_id, "subagent_id")?);
@@ -798,7 +786,7 @@ pub(crate) async fn read_handoff_file_core(
     // Defense in depth: confine the symlink-resolved target under the parent's
     // handoff dir so a symlink planted inside it cannot escape to an arbitrary
     // host file. Segment validation above already blocks `..`/abs paths.
-    let handoff_root = Path::new(&parent_config.outer_cwd).join(HANDOFF_DIR);
+    let handoff_root_path = handoff_root(&parent_config.outer_cwd);
     let canonical = match tokio::fs::canonicalize(&path).await {
         Ok(canonical) => canonical,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -819,12 +807,12 @@ pub(crate) async fn read_handoff_file_core(
             ));
         }
     };
-    let canonical_root = match tokio::fs::canonicalize(&handoff_root).await {
+    let canonical_root = match tokio::fs::canonicalize(&handoff_root_path).await {
         Ok(root) => root,
         Err(error) => {
             eprintln!(
                 "failed to resolve handoff root {}: {error:#}",
-                handoff_root.display()
+                handoff_root_path.display()
             );
             return Err(RpcError::new(
                 "handoff_file_read_failed",
@@ -936,12 +924,25 @@ pub(crate) async fn rpc_list(
         .await?;
     let mut views = Vec::with_capacity(delegations.len());
     for delegation in &delegations {
+        let delegation_handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
         let subagents = state
             .repo
             .list_delegation_subagents(&delegation.id)
             .await?
             .into_iter()
             .map(|subagent| {
+                let (cancellation_transcript_path, cancellation_transcript_relative_path) =
+                    if delegation.status == DelegationStatus::Cancelled {
+                        let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
+                        let path = delegation_handoff_dir.join(&relative);
+                        if path.exists() {
+                            (Some(path.to_string_lossy().into_owned()), Some(relative))
+                        } else {
+                            (None, None)
+                        }
+                    } else {
+                        (None, None)
+                    };
                 json!({
                     "id": subagent.session_id,
                     "status": subagent.activity,
@@ -952,6 +953,8 @@ pub(crate) async fn rpc_list(
                     "task": subagent.task,
                     "steerable": delegation.status == DelegationStatus::Running
                         && subagent.subagent_type == Some(SubagentType::Full),
+                    "cancellation_transcript_path": cancellation_transcript_path,
+                    "cancellation_transcript_relative_path": cancellation_transcript_relative_path,
                 })
             })
             .collect::<Vec<_>>();
@@ -962,7 +965,7 @@ pub(crate) async fn rpc_list(
             "workflow": delegation.workflow,
             "label": delegation.label,
             "subagents": subagents,
-            "handoff_dir": handoff_dir(&parent_config.outer_cwd, &delegation.id),
+            "handoff_dir": delegation_handoff_dir.to_string_lossy().into_owned(),
         }));
     }
     Ok(json!({
@@ -1062,7 +1065,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_stage_id_parameter_is_rejected() {
+    fn stale_stage_id_parameter_is_rejected_as_hard_rename_regression_guard() {
         let error: RpcError = from_params::<DelegationIdParams>(json!({
             "stage_id": "delegation-1",
         }))
@@ -1120,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_index_json_because_inspect_delegation_is_the_manifest() {
+    fn rejects_index_json_because_snapshots_replaced_root_manifests() {
         let error = parse_handoff_file_request(None, "index.json").unwrap_err();
         assert_eq!(error.code, "invalid_params");
     }

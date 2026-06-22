@@ -219,7 +219,7 @@ fn snapshot_progress_count(snapshot: &Value, key: &str) -> usize {
 /// This is represented as a daemon-authored observation rather than a
 /// fabricated assistant tool call. The message deliberately carries the same
 /// JSON snapshot as `inspect_delegation`, instead of directing the parent to a
-/// manifest file. Transcript artifact paths are present in the snapshot;
+/// root artifact file. Transcript artifact paths are present in the snapshot;
 /// transcript contents are not inlined.
 pub(crate) fn completion_wakeup_message(snapshot: &Value) -> std::result::Result<String, RpcError> {
     let delegation_id =

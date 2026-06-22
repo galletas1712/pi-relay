@@ -4,6 +4,7 @@ use sqlx::Row;
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
+    #[cfg(test)]
     pub async fn set_session_parent(
         &self,
         child_session_id: &str,

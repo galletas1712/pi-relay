@@ -138,6 +138,18 @@ create table if not exists delegations (
 
 create index if not exists delegations_parent_created_idx on delegations(parent_session_id, created_at, id);
 
+create index if not exists delegations_parent_running_idx
+    on delegations(parent_session_id)
+    where status='running';
+
+create index if not exists delegations_running_created_idx
+    on delegations(created_at, id)
+    where status='running';
+
+create index if not exists delegations_completed_repair_idx
+    on delegations(updated_at, id)
+    where status in ('done','done_with_failures');
+
 -- The number of subagents the delegation will eventually spawn. The barrier
 -- requires the full set to exist (and be terminal) before completing, so a
 -- partial spawn (subagent #1 terminal while #2 is not yet inserted) cannot

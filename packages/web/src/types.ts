@@ -163,7 +163,8 @@ export interface DelegationListResult {
 	delegations: Delegation[];
 }
 
-export type HandoffFileName = "final_message.md" | "transcript.md";
+export type CancellationTranscriptFileName = `cancelled/${string}.transcript.md`;
+export type HandoffFileName = "final_message.md" | "transcript.md" | CancellationTranscriptFileName;
 
 export interface ReadHandoffFileResult {
 	delegation_id: string;

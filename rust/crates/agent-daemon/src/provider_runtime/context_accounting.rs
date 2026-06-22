@@ -1,4 +1,4 @@
-use agent_provider::{PromptSections, ProviderTokenCountRequest, ProviderToolProfile};
+use agent_provider::{ProviderTokenCountRequest, ProviderToolProfile};
 use agent_session::{ModelContext, ModelContextEntry, TranscriptStorageNode};
 use agent_store::SessionConfig;
 use agent_vocab::{ProviderKind, TranscriptItem};
@@ -106,21 +106,14 @@ async fn estimate_codex_model_input_tokens_from_usage_anchor(
             );
             let suffix_transcript = provider_transcript(suffix_context);
             // The usage anchor already accounts for the prompt that was sent
-            // with that older model action. Include any current daemon-owned
-            // dynamic tail context as a suffix adjustment; normal model turns
-            // currently have none, but this keeps the estimator correct if a
-            // future bounded dynamic section is enabled.
-            let prompt = assemble_agent_prompt(state, config, session_id).await?;
-            let dynamic_prompt_tokens = agent_provider::estimate_model_input_tokens(
-                &PromptSections::new(None, prompt.dynamic_context.clone()),
-                &[],
-            );
+            // with that older model action. Normal daemon requests no longer
+            // append daemon-owned dynamic context, so only estimate the local
+            // transcript suffix added after the anchor.
             let suffix_tokens = agent_provider::estimate_transcript_tokens(
-                &PromptSections::default(),
+                &agent_provider::PromptSections::default(),
                 &suffix_transcript,
             )
-            .tokens
-            .saturating_add(dynamic_prompt_tokens);
+            .tokens;
             return Ok(usage
                 .with_estimated_suffix_tokens(suffix_tokens)
                 .total_tokens);

@@ -76,7 +76,7 @@ pub(crate) async fn complete_delegation_if_ready(
         return Ok(());
     }
 
-    let (won_status, _, _, _) = classify_subagents(state, &delegation).await?;
+    let won_status = classify_subagents(state, &delegation).await?;
 
     let won = try_claim_and_publish_completed_delegation(state, &delegation, won_status).await?;
     if !won {
@@ -222,32 +222,24 @@ async fn recover_subagent_tails(state: &AppState, delegation: &Delegation) {
     }
 }
 
-/// Read every subagent's terminal outcome from its durable transcript and fold
-/// it into the delegation's won status (`done` vs `done_with_failures`), plus the
-/// ok/failed counts and the failed ids for the steer.
+/// Read every subagent's terminal outcome from its durable Postgres transcript
+/// and fold it into the delegation's won status (`done` vs
+/// `done_with_failures`).
 async fn classify_subagents(
     state: &AppState,
     delegation: &Delegation,
-) -> std::result::Result<(DelegationStatus, usize, usize, Vec<String>), RpcError> {
+) -> std::result::Result<DelegationStatus, RpcError> {
     let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
-    let mut ok = 0usize;
-    let mut failed_ids = Vec::new();
     for subagent in &subagents {
         let history = state.repo.active_branch(&subagent.session_id).await?;
         match subagent_outcome(&history) {
-            TurnOutcome::Graceful => ok += 1,
+            TurnOutcome::Graceful => {}
             TurnOutcome::Interrupted | TurnOutcome::Crashed => {
-                failed_ids.push(subagent.session_id.clone())
+                return Ok(DelegationStatus::DoneWithFailures);
             }
         }
     }
-    let failed = failed_ids.len();
-    let status = if failed == 0 {
-        DelegationStatus::Done
-    } else {
-        DelegationStatus::DoneWithFailures
-    };
-    Ok((status, ok, failed, failed_ids))
+    Ok(DelegationStatus::Done)
 }
 
 /// Boot crash sweep:
@@ -325,14 +317,14 @@ async fn repair_completed_delegation_publication(
     ) {
         return Ok(());
     }
-    let (classified_status, _, _, _) = classify_subagents(state, delegation).await?;
+    let classified_status = classify_subagents(state, delegation).await?;
     let status = if classified_status == status {
         status
     } else {
         // The committed DB status is authoritative after the CAS. This mismatch
         // should not happen unless transcripts were manually edited, but repair
-        // still publishes a manifest that matches the terminal row the parent
-        // will observe.
+        // still publishes an observation payload that matches the terminal row
+        // the parent will observe.
         eprintln!(
             "completed delegation {} repair classified {:?} but row is {:?}; using row status",
             delegation.id, classified_status, status
