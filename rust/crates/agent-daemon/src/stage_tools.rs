@@ -423,6 +423,24 @@ pub(crate) async fn read_handoff_file_core(
 ) -> std::result::Result<Value, RpcError> {
     let params: ReadHandoffFileParams = from_params(params)?;
     let stage = load_stage_for_parent(state, parent_session_id, &params.stage_id).await?;
+    // A subagent-scoped read may only target a subagent that belongs to this
+    // stage; otherwise a caller could probe arbitrary `<stage>/<segment>/` paths.
+    if let Some(subagent_id) = params.subagent_id.as_deref() {
+        let members = state
+            .repo
+            .list_stage_subagents(&stage.id)
+            .await
+            .map_err(anyhow::Error::from)?;
+        if !members
+            .iter()
+            .any(|member| member.session_id == subagent_id)
+        {
+            return Err(RpcError::new(
+                "handoff_file_not_found",
+                "subagent does not belong to this stage",
+            ));
+        }
+    }
     let parent_config = state
         .repo
         .load_session_config(parent_session_id)
@@ -446,11 +464,28 @@ pub(crate) async fn read_handoff_file_core(
                 "handoff file not found; the stage may not have finished yet",
             ))
         }
-        Err(error) => return Err(anyhow::Error::from(error).into()),
+        Err(error) => {
+            // Never leak the absolute host handoff path to the client.
+            eprintln!("failed to resolve handoff file {}: {error:#}", path.display());
+            return Err(RpcError::new(
+                "handoff_file_read_failed",
+                "failed to read handoff file",
+            ));
+        }
     };
-    let canonical_root = tokio::fs::canonicalize(&handoff_root)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let canonical_root = match tokio::fs::canonicalize(&handoff_root).await {
+        Ok(root) => root,
+        Err(error) => {
+            eprintln!(
+                "failed to resolve handoff root {}: {error:#}",
+                handoff_root.display()
+            );
+            return Err(RpcError::new(
+                "handoff_file_read_failed",
+                "failed to read handoff file",
+            ));
+        }
+    };
     if !canonical.starts_with(&canonical_root) {
         return Err(RpcError::new(
             "invalid_params",
@@ -465,7 +500,14 @@ pub(crate) async fn read_handoff_file_core(
                 "handoff file not found; the stage may not have finished yet",
             ))
         }
-        Err(error) => return Err(anyhow::Error::from(error).into()),
+        Err(error) => {
+            // Never leak the absolute host handoff path to the client.
+            eprintln!("failed to read handoff file {}: {error:#}", canonical.display());
+            return Err(RpcError::new(
+                "handoff_file_read_failed",
+                "failed to read handoff file",
+            ));
+        }
     };
     Ok(json!({
         "stage_id": stage.id,
