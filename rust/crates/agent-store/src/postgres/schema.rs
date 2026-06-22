@@ -17,6 +17,7 @@ use sqlx::PgPool;
 ///   Idempotency is keyed by `(session_id, client_input_id)`.
 /// - `actions`: durable model/tool/compaction/cancel work records.
 /// - `events`: ordered observable event stream for websocket replay.
+/// - `delegations`: bounded parent/child subagent delegation units.
 const SCHEMA_SQL: &str = r#"
 create table if not exists projects (
     id uuid primary key,
@@ -123,7 +124,7 @@ create table if not exists events (
 
 create index if not exists events_session_id_idx on events(session_id, id);
 
-create table if not exists stages (
+create table if not exists delegations (
     id text primary key,
     parent_session_id text not null references sessions(id) on delete cascade,
     workflow text null,
@@ -135,14 +136,15 @@ create table if not exists stages (
     updated_at timestamptz not null default now()
 );
 
-create index if not exists stages_parent_created_idx on stages(parent_session_id, created_at, id);
+create index if not exists delegations_parent_created_idx on delegations(parent_session_id, created_at, id);
 
--- The number of subagents the stage will eventually spawn. The barrier requires
--- the full set to exist (and be terminal) before completing, so a partial spawn
--- (subagent #1 terminal while #2 is not yet inserted) cannot complete the stage.
-alter table stages add column if not exists expected_subagents integer not null default 1;
+-- The number of subagents the delegation will eventually spawn. The barrier
+-- requires the full set to exist (and be terminal) before completing, so a
+-- partial spawn (subagent #1 terminal while #2 is not yet inserted) cannot
+-- complete the delegation.
+alter table delegations add column if not exists expected_subagents integer not null default 1;
 
-alter table sessions add column if not exists stage_id text null references stages(id);
+alter table sessions add column if not exists delegation_id text null references delegations(id);
 "#;
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {

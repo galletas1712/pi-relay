@@ -36,34 +36,34 @@ workspaces/        workspace base refresh, local/git source handling, sanitizati
 rpc_views.rs       response shaping (snapshots, queue state, transcript views, server_time_ms)
 model_metadata.rs  per-model context windows + 85% auto-compaction default limit
 provider_runtime/  provider selection, model/web-tool execution, compaction, token accounting
-subagents.rs       stage subagent spawn core: role resolution, full vs
+subagents.rs       delegation subagent spawn core: role resolution, full vs
                    read-only workspace handling, child prompt + lifecycle events
-stage_tools.rs     delegation tool surface (delegate_writing_task /
+delegation_tools.rs     delegation tool surface (delegate_writing_task /
                    delegate_readonly_tasks / inspect_delegation /
-                   cancel_delegation) plus unchanged stage.* web RPCs
+                   cancel_delegation) plus delegation.* web RPCs
                    (start_full / start_readonly_fanout / status / cancel /
-                   list) + homogeneity/one-stage-per-parent guards
-stage_runner.rs    stage barrier: all-terminal detect, attempt-fenced finish CAS,
+                   list) + homogeneity/one-delegation-per-parent guards
+delegation_runner.rs    delegation barrier: all-terminal detect, attempt-fenced finish CAS,
                    idempotent handoff write, one steer to the parent; boot
                    crash sweep
 handoff.rs         renders index.json + per-subagent final_message.md / transcript.md
                    from the durable transcript
 ```
 
-Subagent work runs as **stages** (`delegate_writing_task` /
+Subagent work runs as **delegations** (`delegate_writing_task` /
 `delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation`). Full subagents
 reuse the parent's workspace dirs in place; read-only subagents get a forked
-snapshot destroyed on return. Stage subagents may emit
+snapshot destroyed on return. Delegation subagents may emit
 `subagent.spawned`/`subagent.running` progress events; their terminal hook fires
-a single-flight, `attempt_id`-fenced barrier when all subagents of a stage are
+a single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
 terminal. The runner writes the handoff directory idempotently and the DB
 finish CAS enqueues one `InputPriority::Steer` notification to the parent.
 Completion is that steer/handoff, not a parent-visible per-child idle event. The
-runner never decides the next stage — the parent does, guided by workflow
+runner never decides the next delegation — the parent does, guided by workflow
 skills.
 
-The web/inspector RPC surface remains `stage.start_full`,
-`stage.start_readonly_fanout`, `stage.status`, `stage.cancel`, and `stage.list`;
+The web/inspector RPC surface remains `delegation.start_full`,
+`delegation.start_readonly_fanout`, `delegation.status`, `delegation.cancel`, and `delegation.list`;
 those names are client APIs, not the provider-visible model tool names.
 
 `runtime/` keeps ordering-sensitive behavior in named phases instead of a generic

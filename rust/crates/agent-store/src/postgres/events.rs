@@ -57,8 +57,8 @@ impl PostgresAgentStore {
         Ok(frames)
     }
 
-    /// Legacy/non-stage compatibility writer for parent-visible
-    /// `subagent.idle`. Stage members do not call this on terminal completion;
+    /// Parent-visible
+    /// `subagent.idle`. Delegation members do not call this on terminal completion;
     /// they use `claim_subagent_idle_once` below to fire cleanup/barrier work
     /// without surfacing a per-child idle event to the parent.
     pub async fn insert_subagent_idle_event_once(
@@ -105,7 +105,7 @@ impl PostgresAgentStore {
     /// Claim the once-only terminal-idle gate for a child WITHOUT writing a
     /// parent-visible `SubagentIdle` row. Returns `true` exactly once per
     /// `notification_key` (the same dedup `insert_subagent_idle_event_once`
-    /// uses), so a stage member's barrier + RO-snapshot destroy still fire
+    /// uses), so a delegation member's barrier + RO-snapshot destroy still fire
     /// exactly once while no per-child idle ever surfaces to the parent.
     pub async fn claim_subagent_idle_once(
         &self,

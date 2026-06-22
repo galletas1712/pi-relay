@@ -7,8 +7,8 @@ use agent_tools::ToolContext;
 use agent_vocab::{ToolResultMessage, ToolResultStatus, TranscriptItem};
 use serde_json::json;
 
+use crate::delegation_tools::{is_delegation_tool_name, run_delegation_tool};
 use crate::provider_runtime::{is_web_tool_name, load_skill_result, run_web_tool};
-use crate::stage_tools::{is_stage_tool_name, run_stage_tool};
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError};
 
@@ -70,8 +70,8 @@ pub(super) async fn run_tool_turn(
             &tool_context,
         )
         .await
-    } else if is_stage_tool_name(&tool_call.tool_name) {
-        run_stage_tool(&state, &session_id, &tool_call).await
+    } else if is_delegation_tool_name(&tool_call.tool_name) {
+        run_delegation_tool(&state, &session_id, &tool_call).await
     } else {
         match state
             .tools

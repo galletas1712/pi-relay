@@ -14,7 +14,7 @@ import { randomId } from "./ids.ts";
 import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
-import { isStageRunning, reRunParamsForStage } from "./runBoard.ts";
+import { isDelegationRunning, reRunParamsForDelegation } from "./delegationBoard.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
@@ -87,7 +87,7 @@ import type {
 	ReasoningEffort,
 	SessionSnapshot,
 	SessionSummary,
-	Stage,
+	Delegation,
 	HandoffFileName,
 	ToolListing,
 	TranscriptEntry,
@@ -427,23 +427,24 @@ export function App() {
 		enabled: connection === "open",
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
-	const stagesQuery = useQuery({
-		queryKey: queryKeys.stages(loadedSnapshot?.session_id ?? null),
+	const delegationsQuery = useQuery({
+		queryKey: queryKeys.delegations(loadedSnapshot?.session_id ?? null),
 		queryFn: () => {
 			if (!loadedSnapshot) throw new Error("select a session first");
-			return api.listStages(loadedSnapshot.session_id);
+			return api.listDelegations(loadedSnapshot.session_id);
 		},
 		enabled: connection === "open" && !!loadedSnapshot,
-		// The parent PARKS (goes idle) while a stage runs, so gate the poll on
-		// whether any stage is actually running — not on the parent's activity —
-		// or the missed-event safety net would be off exactly when it's needed.
+		// The parent PARKS (goes idle) while a delegation runs, so gate the poll
+		// on whether any delegation is actually running — not on the parent's
+		// activity — or the missed-event safety net would be off exactly when
+		// it's needed.
 		refetchInterval: (query) =>
-			(query.state.data?.stages ?? []).some(isStageRunning) ? 2_000 : false,
+			(query.state.data?.delegations ?? []).some(isDelegationRunning) ? 2_000 : false,
 	});
-	const stages = stagesQuery.data?.stages ?? [];
-	const stageSubagentIds = useMemo(
-		() => stages.flatMap((stage) => stage.subagents.map((subagent) => subagent.id)),
-		[stages],
+	const delegations = delegationsQuery.data?.delegations ?? [];
+	const delegationSubagentIds = useMemo(
+		() => delegations.flatMap((delegation) => delegation.subagents.map((subagent) => subagent.id)),
+		[delegations],
 	);
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
 	const hasTranscriptEntries =
@@ -886,11 +887,11 @@ export function App() {
 			if (refreshPlan.refreshList) {
 				scheduleSessionListRefresh();
 				if (loadedSnapshot?.session_id) {
-					// The run board reads the stage.* surface; the backend emits no
-					// dedicated stage events, so the subagent lifecycle events (and the
-					// completion steer landing as a normal parent message) are the signal
-					// to refresh the board. The 2s poll covers any missed event.
-					void queryClient.invalidateQueries({ queryKey: queryKeys.stages(loadedSnapshot.session_id) });
+					// The run board reads the delegation.* surface; the backend emits no
+					// dedicated delegation events, so the subagent lifecycle events (and
+					// the completion steer landing as a normal parent message) are the
+					// signal to refresh the board. The 2s poll covers any missed event.
+					void queryClient.invalidateQueries({ queryKey: queryKeys.delegations(loadedSnapshot.session_id) });
 				}
 			}
 
@@ -1065,8 +1066,8 @@ export function App() {
 		for (const session of sessions) {
 			desiredSessionIds.add(session.session_id);
 		}
-		for (const stageSubagentId of stageSubagentIds) {
-			desiredSessionIds.add(stageSubagentId);
+		for (const delegationSubagentId of delegationSubagentIds) {
+			desiredSessionIds.add(delegationSubagentId);
 		}
 		if (selectedId && selectedHasEventCursor) desiredSessionIds.add(selectedId);
 		for (const sessionId of Array.from(subscribedEventSessionIds.current)) {
@@ -1102,7 +1103,7 @@ export function App() {
 		pushNotice,
 		selectedId,
 		sessions,
-		stageSubagentIds,
+		delegationSubagentIds,
 	]);
 
 	const configureProvider = useCallback(
@@ -1541,22 +1542,22 @@ export function App() {
 		}
 	}, [api, pushNotice, queryClient, requireSelected, syncActiveBranchNow]);
 
-	const invalidateStages = useCallback(() => {
+	const invalidateDelegations = useCallback(() => {
 		if (loadedSnapshot?.session_id) {
-			void queryClient.invalidateQueries({ queryKey: queryKeys.stages(loadedSnapshot.session_id) });
+			void queryClient.invalidateQueries({ queryKey: queryKeys.delegations(loadedSnapshot.session_id) });
 		}
 	}, [loadedSnapshot?.session_id, queryClient]);
 
-	const cancelStage = useCallback(
-		(stageId: string) => {
+	const cancelDelegation = useCallback(
+		(delegationId: string) => {
 			const parentSessionId = loadedSnapshot?.session_id;
 			if (!parentSessionId) return;
 			void api
-				.cancelStage(parentSessionId, stageId)
-				.then(() => invalidateStages())
+				.cancelDelegation(parentSessionId, delegationId)
+				.then(() => invalidateDelegations())
 				.catch((error) => pushNotice("error", errorMessage(error)));
 		},
-		[api, invalidateStages, loadedSnapshot?.session_id, pushNotice],
+		[api, invalidateDelegations, loadedSnapshot?.session_id, pushNotice],
 	);
 
 	// Steer the full subagent: a steer-priority message into the subagent's own
@@ -1578,29 +1579,29 @@ export function App() {
 		[api, pushNotice],
 	);
 
-	const reRunStage = useCallback(
-		(stage: Stage) => {
+	const reRunDelegation = useCallback(
+		(delegation: Delegation) => {
 			const parentSessionId = loadedSnapshot?.session_id;
 			if (!parentSessionId) return;
-			const reRun = reRunParamsForStage(stage, parentSessionId);
+			const reRun = reRunParamsForDelegation(delegation, parentSessionId);
 			if (!reRun) {
 				pushNotice("error", "cannot re-run: original prompts are unavailable");
 				return;
 			}
 			const start =
-				reRun.kind === "full" ? api.startFullStage(reRun.params) : api.startReadonlyFanout(reRun.params);
+				reRun.kind === "full" ? api.startFullDelegation(reRun.params) : api.startReadonlyDelegationFanout(reRun.params);
 			void start
-				.then(() => invalidateStages())
+				.then(() => invalidateDelegations())
 				.catch((error) => pushNotice("error", errorMessage(error)));
 		},
-		[api, invalidateStages, loadedSnapshot?.session_id, pushNotice],
+		[api, invalidateDelegations, loadedSnapshot?.session_id, pushNotice],
 	);
 
 	const readHandoffFile = useCallback(
-		async (stageId: string, subagentId: string | null, file: HandoffFileName): Promise<string> => {
+		async (delegationId: string, subagentId: string | null, file: HandoffFileName): Promise<string> => {
 			const parentSessionId = loadedSnapshot?.session_id;
 			if (!parentSessionId) throw new Error("select a session first");
-			const result = await api.readHandoffFile({ parentSessionId, stageId, subagentId, file });
+			const result = await api.readHandoffFile({ parentSessionId, delegationId, subagentId, file });
 			return result.content;
 		},
 		[api, loadedSnapshot?.session_id],
@@ -2111,13 +2112,13 @@ export function App() {
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
 				<Inspector
 					snapshot={loadedSnapshot}
-					stages={stages}
-					stagesLoading={stagesQuery.isLoading}
-					stagesError={errorMessageOrNull(stagesQuery.error)}
+					delegations={delegations}
+					delegationsLoading={delegationsQuery.isLoading}
+					delegationsError={errorMessageOrNull(delegationsQuery.error)}
 					runBoard={{
-						onCancelStage: cancelStage,
+						onCancelDelegation: cancelDelegation,
 						onSteerSubagent: steerSubagent,
-						onReRunStage: reRunStage,
+						onReRunDelegation: reRunDelegation,
 						readHandoffFile,
 					}}
 					tools={tools}
