@@ -190,6 +190,33 @@ async fn loaded_skills_for_session(state: &AppState, session_id: &str) -> BTreeS
 }
 
 fn loaded_skill_identifier(output: &str) -> Option<String> {
+    if let Some(identifier) = loaded_skill_identifier_json(output) {
+        return Some(identifier);
+    }
+    loaded_skill_identifier_xml(output)
+}
+
+fn loaded_skill_identifier_json(output: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    let name = value.get("skill_name").and_then(serde_json::Value::as_str);
+    let exposed_name = value.get("name").and_then(serde_json::Value::as_str);
+    let workspace = value
+        .get("workspace")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty());
+    let name = name.or_else(|| {
+        let exposed_name = exposed_name?;
+        if workspace.is_some() {
+            exposed_name.rsplit_once('/').map(|(_, name)| name)
+        } else {
+            Some(exposed_name)
+        }
+    })?;
+    Some(crate::provider_runtime::skill_identifier(workspace, name))
+}
+
+fn loaded_skill_identifier_xml(output: &str) -> Option<String> {
     let rest = output.strip_prefix("<loaded_skill>\n<name>")?;
     let end = rest.find("</name>")?;
     let name = xml_unescape(&rest[..end]);
@@ -213,4 +240,42 @@ fn xml_unescape(input: &str) -> String {
         .replace("&gt;", ">")
         .replace("&lt;", "<")
         .replace("&amp;", "&")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loaded_skill_identifier_accepts_json_output() {
+        let output = serde_json::json!({
+            "status": "loaded",
+            "name": "repo/rust-refactor",
+            "skill_name": "rust-refactor",
+            "workspace": "repo",
+            "content": "Prefer small, tested changes."
+        })
+        .to_string();
+
+        assert_eq!(
+            loaded_skill_identifier(&output),
+            Some(crate::provider_runtime::skill_identifier(
+                Some("repo"),
+                "rust-refactor"
+            ))
+        );
+    }
+
+    #[test]
+    fn loaded_skill_identifier_still_accepts_legacy_xml_output() {
+        let output = "<loaded_skill>\n<name>rust-refactor</name>\n<workspace>repo</workspace>\n<content>\nPrefer small, tested changes.\n</content>\n</loaded_skill>";
+
+        assert_eq!(
+            loaded_skill_identifier(output),
+            Some(crate::provider_runtime::skill_identifier(
+                Some("repo"),
+                "rust-refactor"
+            ))
+        );
+    }
 }

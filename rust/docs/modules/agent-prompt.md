@@ -43,7 +43,7 @@ Input types the caller fills in:
 | `session.workspaces_markdown` | string | Human-readable bullet list of workspaces (see below). Falls back to a "No project workspaces" sentence when empty. |
 | `tools.specs` | string | Markdown for every tool (`### name`, description, `Parameters:` JSON block), sorted by name. Falls back to "No tools are currently available." when empty. |
 | `tools.aliases` | object | Map of `prompt_alias -> tool name`, used to reference tools by role. |
-| `skills.index` | string | `<available_skills>` XML block, or empty string when there are no skills. |
+| `skills.index` | string | Pretty JSON object with an `available_skills` array, or empty string when there are no skills. |
 
 `tools.aliases` lets the template name a tool by its role rather than its concrete name, which differs per provider. The template uses minijinja `default(...)` so it still renders when an alias is absent, e.g.:
 
@@ -88,25 +88,30 @@ Git and local workspaces render differently so the model knows the publish postu
 
 ### Skills index
 
-`skills.index` emits one `<skill>` per discovered skill, sorted by workspace then name:
+`skills.index` emits pretty JSON for discovered skills, sorted by the model-facing `name`:
 
-```xml
-<available_skills>
-  <skill>
-    <name>rust-refactor</name>
-    <description>Use for Rust refactors.</description>
-  </skill>
-  <skill>
-    <workspace>repo</workspace>
-    <name>repo-build</name>
-    <description>Use for repo build issues.</description>
-  </skill>
-</available_skills>
+```json
+{
+  "available_skills": [
+    {
+      "name": "repo/repo-build",
+      "description": "Use for repo build issues."
+    },
+    {
+      "name": "rust-refactor",
+      "description": "Use for Rust refactors."
+    }
+  ]
+}
 ```
 
-A `<workspace>` tag marks a skill as scoped to that workspace subdirectory; skills without it are global. All text fields are XML-escaped. With no skills the variable is the empty string, and `PI.md` drops the entire Skills section via `{% if skills.index %}`.
+Workspace-scoped skills are exposed to the model with their workspace directory
+as a prefix (`workspace/name`); skills without a slash prefix are global.
+`LoadSkill` should be called with the exact `name` from this JSON. JSON escaping
+is handled by `serde_json`. With no skills the variable is the empty string, and
+`PI.md` drops the entire Skills section via `{% if skills.index %}`.
 
-Skill *discovery* (scanning `~/.agents/skills` and `<workspace>/.agents/skills`, parsing SKILL.md frontmatter) lives in the daemon's `provider_runtime`, not this crate. The crate only formats the `Skill` list it is handed.
+Skill *discovery* (scanning `~/.agents/skills` and each workspace root's `.agents/skills`, parsing SKILL.md frontmatter) lives in the daemon's `provider_runtime`, not this crate. The crate only formats the `Skill` list it is handed.
 
 ### Render and cleanup
 

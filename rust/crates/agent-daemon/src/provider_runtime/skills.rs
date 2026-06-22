@@ -5,6 +5,7 @@ use agent_store::SessionWorkspace;
 use agent_vocab::{ToolCall, ToolResultMessage};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use serde_json::{json, Value};
 
 use super::prompt::{
     load_global_skills_from_dir, load_parsed_skill_file, load_skills_for_session_workspaces,
@@ -44,42 +45,68 @@ fn load_skill_output_with_home(
     if name.is_empty() {
         return Err(anyhow!("skill name cannot be empty"));
     }
-    let workspace = args
+    let legacy_workspace = args
         .workspace
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let skill_id = skill_identifier(workspace, name);
-    if loaded_skills.contains(&skill_id) {
-        return Ok("skill already loaded".to_string());
-    }
     let skills = match home {
         Some(home) => {
             load_skills_for_session_workspaces_with_home(outer_cwd, workspaces, Some(home))
         }
         None => load_skills_for_session_workspaces(outer_cwd, workspaces),
     };
-    let Some(skill) = skills
-        .into_iter()
-        .find(|skill| skill.name == name && skill.workspace.as_deref() == workspace)
-    else {
-        return Err(match workspace {
-            Some(workspace) => anyhow!("skill not found: {workspace}/{name}"),
-            None => anyhow!("skill not found: {name}"),
-        });
-    };
+    let skill = resolve_load_skill(&skills, name, legacy_workspace)?;
+    let skill_id = skill_identifier(skill.workspace.as_deref(), &skill.name);
+    if loaded_skills.contains(&skill_id) {
+        return loaded_skill_json("already_loaded", skill, None);
+    }
     let content = std::fs::read_to_string(&skill.file_path)?;
-    let workspace_xml = skill
-        .workspace
-        .as_deref()
-        .map(|workspace| format!("\n<workspace>{}</workspace>", xml_escape(workspace)))
-        .unwrap_or_default();
-    Ok(format!(
-        "<loaded_skill>\n<name>{}</name>{}\n<content>\n{}\n</content>\n</loaded_skill>",
-        xml_escape(&skill.name),
-        workspace_xml,
-        content.trim()
-    ))
+    loaded_skill_json("loaded", skill, Some(content.trim()))
+}
+
+fn resolve_load_skill<'a>(
+    skills: &'a [Skill],
+    requested_name: &str,
+    legacy_workspace: Option<&str>,
+) -> Result<&'a Skill> {
+    if let Some(workspace) = legacy_workspace {
+        let Some(skill) = skills.iter().find(|skill| {
+            skill.workspace.as_deref() == Some(workspace)
+                && (skill.name == requested_name || skill.exposed_name() == requested_name)
+        }) else {
+            return Err(anyhow!("skill not found: {workspace}/{requested_name}"));
+        };
+        return Ok(skill);
+    }
+
+    let mut matches = skills
+        .iter()
+        .filter(|skill| skill.exposed_name() == requested_name)
+        .collect::<Vec<_>>();
+    match matches.len() {
+        1 => Ok(matches.remove(0)),
+        0 => Err(anyhow!(
+            "skill not found: {requested_name}. Use the exact name from the available skills JSON; workspace skills are prefixed as workspace/name."
+        )),
+        _ => Err(anyhow!(
+            "skill name is ambiguous: {requested_name}. Use the exact name from the available skills JSON."
+        )),
+    }
+}
+
+fn loaded_skill_json(status: &str, skill: &Skill, content: Option<&str>) -> Result<String> {
+    let mut object = serde_json::Map::new();
+    object.insert("status".to_string(), json!(status));
+    object.insert("name".to_string(), json!(skill.exposed_name()));
+    object.insert("skill_name".to_string(), json!(skill.name));
+    if let Some(workspace) = &skill.workspace {
+        object.insert("workspace".to_string(), json!(workspace));
+    }
+    if let Some(content) = content {
+        object.insert("content".to_string(), json!(content));
+    }
+    Ok(serde_json::to_string_pretty(&Value::Object(object))?)
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,13 +145,28 @@ pub(crate) fn resolve_skill_role(
     let workspace = workspace.map(str::trim).filter(|value| !value.is_empty());
     let skills = load_skills_for_session_workspaces(outer_cwd, workspaces);
     if let Some(workspace) = workspace {
-        let Some(skill) = skills
-            .into_iter()
-            .find(|skill| skill.name == name && skill.workspace.as_deref() == Some(workspace))
-        else {
+        let Some(skill) = skills.into_iter().find(|skill| {
+            skill.workspace.as_deref() == Some(workspace)
+                && (skill.name == name || skill.exposed_name() == name)
+        }) else {
             return Err(anyhow!("role skill not found: {workspace}/{name}"));
         };
         return role_from_skill(skill);
+    }
+
+    let mut exposed_matches = skills
+        .iter()
+        .filter(|skill| skill.exposed_name() == name)
+        .cloned()
+        .collect::<Vec<_>>();
+    match exposed_matches.len() {
+        1 => return role_from_skill(exposed_matches.remove(0)),
+        0 => {}
+        _ => {
+            return Err(anyhow!(
+                "role skill is ambiguous: {name}; use a unique prefixed role name"
+            ))
+        }
     }
 
     let mut matches = skills
@@ -137,14 +179,14 @@ pub(crate) fn resolve_skill_role(
             .ok_or_else(|| anyhow!("role skill not found: {name}"))
             .and_then(role_from_skill),
         _ => {
-            let mut scopes = matches
+            let mut candidates = matches
                 .iter()
-                .map(|skill| skill.workspace.as_deref().unwrap_or("global"))
+                .map(|skill| skill.exposed_name())
                 .collect::<Vec<_>>();
-            scopes.sort_unstable();
+            candidates.sort_unstable();
             Err(anyhow!(
-                "role skill is ambiguous: {name} exists in {}; pass role_workspace",
-                scopes.join(", ")
+                "role skill is ambiguous: {name} exists as {}; use one of these prefixed role names or pass role_workspace",
+                candidates.join(", ")
             ))
         }
     }
@@ -172,15 +214,6 @@ fn role_from_skill(skill: Skill) -> Result<ResolvedSkillRole> {
     })
 }
 
-fn xml_escape(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,22 +236,56 @@ mod tests {
         let call = ToolCall {
             id: ToolCallId::from_u64(1),
             tool_name: "LoadSkill".to_string(),
-            args_json: r#"{"workspace":"repo","name":"rust-refactor"}"#.to_string(),
+            args_json: r#"{"name":"repo/rust-refactor"}"#.to_string(),
         };
         let mut loaded = std::collections::BTreeSet::new();
         let workspaces = vec![SessionWorkspace::local("repo", "")];
 
         let first = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
         assert_eq!(first.status, agent_vocab::ToolResultStatus::Success);
-        assert!(first.output.contains("<name>rust-refactor</name>"));
-        assert!(first.output.contains("<workspace>repo</workspace>"));
+        let first_json: Value = serde_json::from_str(&first.output).expect("json output");
+        assert_eq!(first_json["status"], "loaded");
+        assert_eq!(first_json["name"], "repo/rust-refactor");
+        assert_eq!(first_json["skill_name"], "rust-refactor");
+        assert_eq!(first_json["workspace"], "repo");
         assert!(!first.output.contains("<base_dir>"));
         assert!(first.output.contains("Prefer small, tested changes."));
 
         loaded.insert(skill_identifier(Some("repo"), "rust-refactor"));
         let second = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
         assert_eq!(second.status, agent_vocab::ToolResultStatus::Success);
-        assert_eq!(second.output, "skill already loaded");
+        let second_json: Value = serde_json::from_str(&second.output).expect("json output");
+        assert_eq!(second_json["status"], "already_loaded");
+        assert_eq!(second_json["name"], "repo/rust-refactor");
+        assert!(second_json.get("content").is_none());
+
+        std::fs::remove_dir_all(outer_cwd).ok();
+    }
+
+    #[test]
+    fn load_skill_result_accepts_legacy_workspace_argument() {
+        let outer_cwd = make_temp_dir("load-skill-legacy-workspace");
+        let workspace = outer_cwd.join("repo");
+        let skill_dir = workspace.join(".agents/skills/rust-refactor");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: rust-refactor\ndescription: Use for Rust refactors.\n---\n\nPrefer small, tested changes.\n",
+        )
+        .expect("skill file");
+
+        let call = ToolCall {
+            id: ToolCallId::from_u64(1),
+            tool_name: "LoadSkill".to_string(),
+            args_json: r#"{"workspace":"repo","name":"rust-refactor"}"#.to_string(),
+        };
+        let loaded = std::collections::BTreeSet::new();
+        let workspaces = vec![SessionWorkspace::local("repo", "")];
+
+        let first = load_skill_result(&outer_cwd, &workspaces, &loaded, &call);
+        assert_eq!(first.status, agent_vocab::ToolResultStatus::Success);
+        let first_json: Value = serde_json::from_str(&first.output).expect("json output");
+        assert_eq!(first_json["name"], "repo/rust-refactor");
 
         std::fs::remove_dir_all(outer_cwd).ok();
     }
@@ -303,7 +370,33 @@ mod tests {
             None,
         )
         .expect_err("ambiguous role rejected");
-        assert!(error.to_string().contains("pass role_workspace"));
+        assert!(error.to_string().contains("repo-a/context-inspector"));
+
+        std::fs::remove_dir_all(outer_cwd).ok();
+    }
+
+    #[test]
+    fn resolves_workspace_role_with_prefixed_name() {
+        let outer_cwd = make_temp_dir("resolve-prefixed-workspace-role");
+        let workspace = outer_cwd.join("repo");
+        let skill_dir = workspace.join(".agents/skills/context-inspector");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: context-inspector\ndescription: Inspect context.\n---\n\nInspect carefully.\n",
+        )
+        .expect("skill file");
+
+        let role = resolve_skill_role(
+            &outer_cwd,
+            &outer_cwd,
+            &[SessionWorkspace::local("repo", "")],
+            "repo/context-inspector",
+            None,
+        )
+        .expect("role resolves");
+        assert_eq!(role.name, "context-inspector");
+        assert_eq!(role.workspace.as_deref(), Some("repo"));
 
         std::fs::remove_dir_all(outer_cwd).ok();
     }
@@ -384,8 +477,10 @@ mod tests {
             .expect("loads global skill");
         let result = ToolResultMessage::success(call.id.clone(), "LoadSkill", result);
         assert_eq!(result.status, agent_vocab::ToolResultStatus::Success);
-        assert!(result.output.contains("<name>global</name>"));
-        assert!(!result.output.contains("<workspace>"));
+        let output: Value = serde_json::from_str(&result.output).expect("json output");
+        assert_eq!(output["name"], "global");
+        assert_eq!(output["skill_name"], "global");
+        assert!(output.get("workspace").is_none());
         assert!(!result.output.contains("<base_dir>"));
 
         std::fs::remove_dir_all(outer_cwd).ok();

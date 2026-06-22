@@ -75,6 +75,13 @@ impl Skill {
             file_path: file_path.into(),
         }
     }
+
+    pub fn exposed_name(&self) -> String {
+        match self.workspace.as_deref() {
+            Some(workspace) => format!("{workspace}/{}", self.name),
+            None => self.name.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,7 +155,7 @@ fn template_context(ctx: &PromptContext) -> Value {
             "aliases": tools_aliases_json(&ctx.tools),
         },
         "skills": {
-            "index": skills_index_xml(&ctx.skills),
+            "index": skills_index_json(&ctx.skills),
         },
     })
 }
@@ -233,34 +240,29 @@ fn tools_aliases_json(tools: &[ToolSpec]) -> Value {
     Value::Object(map)
 }
 
-fn skills_index_xml(skills: &[Skill]) -> String {
+fn skills_index_json(skills: &[Skill]) -> String {
     if skills.is_empty() {
         return String::new();
     }
     let mut skills = skills.iter().collect::<Vec<_>>();
     skills.sort_by(|left, right| {
-        left.workspace
-            .cmp(&right.workspace)
+        left.exposed_name()
+            .cmp(&right.exposed_name())
             .then_with(|| left.name.cmp(&right.name))
     });
-    let mut lines = vec!["<available_skills>".to_string()];
-    for skill in skills {
-        lines.push("  <skill>".to_string());
-        if let Some(workspace) = &skill.workspace {
-            lines.push(format!(
-                "    <workspace>{}</workspace>",
-                escape_xml(workspace)
-            ));
-        }
-        lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-        lines.push(format!(
-            "    <description>{}</description>",
-            escape_xml(&skill.description)
-        ));
-        lines.push("  </skill>".to_string());
-    }
-    lines.push("</available_skills>".to_string());
-    lines.join("\n")
+    let skills = skills
+        .into_iter()
+        .map(|skill| {
+            json!({
+                "name": skill.exposed_name(),
+                "description": skill.description,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&json!({
+        "available_skills": skills,
+    }))
+    .expect("available skills JSON must serialize")
 }
 
 fn agents_md_for_workspaces(cwd: &Path, workspaces: &[PromptWorkspace]) -> String {
@@ -280,15 +282,6 @@ fn agents_md_for_workspaces(cwd: &Path, workspaces: &[PromptWorkspace]) -> Strin
         })
         .collect::<Vec<_>>()
         .join("\n\n")
-}
-
-fn escape_xml(value: &str) -> String {
-    value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
 }
 
 fn path_display(path: &Path) -> String {
@@ -377,11 +370,25 @@ mod tests {
             TEST_PI_MD,
             &ctx(vec!["Bash"], vec![global_skill, workspace_skill]),
         );
-        assert!(rendered.contains("<available_skills>"));
+        assert!(rendered.contains("\"available_skills\""));
         assert!(rendered.contains("rust-refactor"));
-        assert!(rendered.contains("<workspace>repo</workspace>"));
+        assert!(rendered.contains("repo/rust-refactor"));
+        assert!(!rendered.contains("<workspace>repo</workspace>"));
         assert!(!rendered.contains("<base_dir>"));
         assert!(!rendered.contains("<location>"));
+    }
+
+    #[test]
+    fn skills_index_uses_json_and_serde_escaping() {
+        let skill = Skill::new(
+            "quote-skill",
+            "Use for <xml> & \"quotes\".",
+            "/tmp/project/.agents/skills/quote-skill/SKILL.md",
+        );
+        let rendered = render_prompt(TEST_PI_MD, &ctx(vec!["Bash"], vec![skill]));
+        assert!(rendered.contains("\"name\": \"quote-skill\""));
+        assert!(rendered.contains("\"description\": \"Use for <xml> & \\\"quotes\\\".\""));
+        assert!(!rendered.contains("&lt;xml&gt;"));
     }
 
     #[test]

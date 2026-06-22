@@ -68,12 +68,11 @@ For complex work, use the `{{ tools.aliases.python_repl | default(value="PythonR
 
 Here is the full list of skills available to you:
 
-```
+```json
 {{ skills.index }}
 ```
 
 When a task surfaces that matches one (or more) of the available skills, call `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` for each skill you want to gain.
 Each invocation of `{{ tools.aliases.skill_loader | default(value="LoadSkill") }}` will insert useful context about the chosen domain in your context before acting, which makes you more knowledgeable!
-The `<workspace>` tag means the skill is specific to the specified workspace subdirectory and should only be invoked if it is relevant and you read/write to that workspace subdirectory.
-Skills without the `<workspace>` tag are globally available.
+Use the exact skill `name` from the JSON list. Workspace skill names include their workspace prefix (for example `repo/repo-build`); names without a prefix are globally available.
 {% endif %}

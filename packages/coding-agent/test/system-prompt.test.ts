@@ -182,7 +182,7 @@ describe("PromptAssembly", () => {
 		const assembly = new PromptAssembly([new SkillsSource([skill])]);
 
 		const withRead = assembly.assemble(makeCtx({ toolNames: ["read"] })).text;
-		expect(withRead).toContain("<available_skills>");
+		expect(withRead).toContain('"available_skills"');
 		expect(withRead).toContain("shell");
 
 		const withoutRead = assembly.assemble(makeCtx({ toolNames: ["bash"] })).text;

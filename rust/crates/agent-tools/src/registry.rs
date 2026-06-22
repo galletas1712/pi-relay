@@ -288,13 +288,9 @@ fn load_skill_definition() -> ToolDefinition {
         json!({
             "type": "object",
             "properties": {
-                "workspace": {
-                    "type": "string",
-                    "description": "For workspace skills, the exact workspace directory shown for the skill in the system prompt. Omit this for global skills."
-                },
                 "name": {
                     "type": "string",
-                    "description": "The exact skill name from the available skills listed in the system prompt."
+                    "description": "The exact skill name from the available skills JSON. Workspace skill names include their workspace prefix, for example repo/repo-build."
                 }
             },
             "required": ["name"],
@@ -550,6 +546,21 @@ mod tests {
                 "web_search"
             ]
         );
+    }
+
+    #[test]
+    fn load_skill_schema_uses_prefixed_name_only() {
+        let definition = load_skill_definition();
+        assert!(definition.input_schema["properties"].get("name").is_some());
+        assert!(definition.input_schema["properties"]
+            .get("workspace")
+            .is_none());
+        assert_eq!(definition.input_schema["required"], json!(["name"]));
+        assert_eq!(definition.input_schema["additionalProperties"], false);
+        assert!(definition.input_schema["properties"]["name"]["description"]
+            .as_str()
+            .expect("name description")
+            .contains("repo/repo-build"));
     }
 
     #[test]

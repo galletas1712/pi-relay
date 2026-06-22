@@ -2,7 +2,7 @@ import { formatSkillsForPrompt, type Skill } from "../../skills.js";
 import type { PromptContext, PromptFragment, PromptSource } from "../types.js";
 
 /**
- * Emits the `<available_skills>` XML block. Skills are only usable if the `read`
+ * Emits the `available_skills` JSON block. Skills are only usable if the `read`
  * tool is active (the agent loads a skill by reading its SKILL.md), so when the
  * read tool is absent we contribute nothing.
  *

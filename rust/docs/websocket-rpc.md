@@ -1296,11 +1296,13 @@ running/idle cycle for its next piece of work. Parent sessions can subscribe to
 their normal event stream instead of polling `subagents.list()` to discover child
 completion.
 
-`role` can be a built-in role (`explore`, `worker`, `reviewer`, `tester`) or the name of an
-available skill. A unique workspace-scoped skill can be addressed by name alone;
-if multiple workspace skills share a role name, pass `role_workspace` to
-disambiguate. `fork_context=False` sends only the delegated task plus the normal
-session prompt, workspace/project context, and role instructions. `fork_context=True`
+`role` can be a built-in role (`explore`, `worker`, `reviewer`, `tester`) or the
+name of an available skill. Workspace-scoped skills can be addressed with the
+same prefixed names shown in the prompt JSON, for example `repo/reviewer`.
+Unprefixed unique workspace skills and the legacy `role_workspace` field remain
+accepted for compatibility. `fork_context=False` sends only the delegated task
+plus the normal session prompt, workspace/project context, and role instructions.
+`fork_context=True`
 also appends a bounded textual snapshot of the parent session's active branch to
 the child initial message.
 
