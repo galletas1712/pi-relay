@@ -98,6 +98,47 @@ impl PostgresAgentStore {
         Ok(Some(event))
     }
 
+    /// Claim the once-only terminal-idle gate for a child WITHOUT writing a
+    /// parent-visible `SubagentIdle` row. Returns `true` exactly once per
+    /// `notification_key` (the same dedup `insert_subagent_idle_event_once`
+    /// uses), so a stage member's barrier + RO-snapshot destroy still fire
+    /// exactly once while no per-child idle ever surfaces to the parent.
+    pub async fn claim_subagent_idle_once(
+        &self,
+        child_session_id: &str,
+        notification_key: &str,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("select metadata from sessions where id=$1 for update")
+            .bind(child_session_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let mut metadata: Value = row.get("metadata");
+        if metadata
+            .get("subagent_parent_idle_notification_key")
+            .and_then(Value::as_str)
+            == Some(notification_key)
+        {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        ensure_payload_object(&mut metadata).insert(
+            "subagent_parent_idle_notification_key".to_string(),
+            Value::String(notification_key.to_string()),
+        );
+        sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
+            .bind(child_session_id)
+            .bind(&metadata)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn events_after(
         &self,
         session_id: &str,

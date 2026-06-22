@@ -543,6 +543,17 @@ async fn publish_subagent_parent_dispatch_failed_event(
     display_name: Option<&str>,
     error: &RpcError,
 ) {
+    // A stage member's failure is owned by the stage (FIX E): the stage_tools
+    // spawn-failure compensation fails the stage and the tool returns Err
+    // synchronously. Suppress the per-child idle so the parent never sees a
+    // per-child notification for a stage member (matching the live idle gate).
+    match state.repo.session_stage_id(child_session_id).await {
+        Ok(Some(_)) => return,
+        Ok(None) => {}
+        Err(stage_error) => eprintln!(
+            "failed to load stage id for dispatch-failed child={child_session_id}: {stage_error:#}"
+        ),
+    }
     let summary_preview = format!("initial dispatch failed: {}: {}", error.code, error.message);
     match state
         .repo
@@ -567,6 +578,25 @@ async fn publish_subagent_parent_dispatch_failed_event(
             "failed to publish parent subagent dispatch-failed event parent={parent_session_id} child={child_session_id}: {event_error:#}"
         ),
     }
+}
+
+#[cfg(test)]
+pub(crate) async fn publish_subagent_parent_dispatch_failed_event_for_test(
+    state: &AppState,
+    parent_session_id: &str,
+    child_session_id: &str,
+    role: &str,
+) {
+    publish_subagent_parent_dispatch_failed_event(
+        state,
+        parent_session_id,
+        child_session_id,
+        role,
+        None,
+        None,
+        &RpcError::new("provider_error", "simulated initial dispatch failure"),
+    )
+    .await;
 }
 
 fn source_session_id(value: Value) -> Option<String> {

@@ -103,6 +103,25 @@ impl SessionDriver {
         }
     }
 
+    /// Acquire only if the session's driver lock is free. Returns `None` if it
+    /// is already held (the session is being driven or recovered elsewhere on
+    /// the stack), letting the stage barrier recover sibling tails without
+    /// blocking on — or deadlocking against — a lock held further up the call
+    /// chain (e.g. the firing child whose terminal idle triggered the barrier).
+    pub(crate) async fn try_acquire(
+        state: &AppState,
+        session_id: impl Into<String>,
+    ) -> Option<Self> {
+        let session_id = session_id.into();
+        let lock = session_driver_lock(state, &session_id).await;
+        let guard = lock.try_lock_owned().ok()?;
+        Some(Self {
+            state: state.clone(),
+            session_id,
+            _guard: guard,
+        })
+    }
+
     pub(crate) async fn ensure_idle_for_source_mutation(
         &self,
     ) -> std::result::Result<(), RpcError> {
@@ -451,32 +470,122 @@ impl SessionDriver {
     }
 
     async fn try_subagent_parent_idle_event(&self) -> Option<EventFrame> {
-        match self.subagent_parent_idle_event().await {
+        let notification = match self.subagent_idle_notification().await {
+            Ok(Some(notification)) => notification,
+            Ok(None) => return None,
+            Err(error) => {
+                eprintln!(
+                    "failed to build parent subagent idle event child={}: {}: {}",
+                    self.session_id, error.code, error.message
+                );
+                return None;
+            }
+        };
+        let (parent_session_id, notification_key, payload) = notification;
+
+        // A stage member's completion is delivered as ONE stage steer, NOT a
+        // per-child idle (FIX D). Fire the once-gate WITHOUT writing a
+        // parent-visible SubagentIdle row (so events_after / the run board never
+        // surface per-child idle for stage members), then — on that single firing
+        // — destroy the RO snapshot and run the barrier. The barrier is
+        // single-flighted by the DB stage-row CAS, so concurrent terminal children
+        // steer the parent exactly once. Return None: the per-child idle is
+        // suppressed for the parent in every case.
+        let stage_id = match self.state.repo.session_stage_id(&self.session_id).await {
+            Ok(stage_id) => stage_id,
+            Err(error) => {
+                // Conservative on a lookup error: emit nothing rather than a
+                // possibly-wrong per-child idle for what may be a stage member.
+                eprintln!(
+                    "failed to load stage id for subagent {}: {error:#}",
+                    self.session_id
+                );
+                return None;
+            }
+        };
+        if let Some(stage_id) = stage_id {
+            let first_fire = match self
+                .state
+                .repo
+                .claim_subagent_idle_once(&self.session_id, &notification_key)
+                .await
+            {
+                Ok(first_fire) => first_fire,
+                Err(error) => {
+                    eprintln!(
+                        "failed to claim stage-member idle once-gate child={}: {error:#}",
+                        self.session_id
+                    );
+                    return None;
+                }
+            };
+            if first_fire {
+                self.destroy_read_only_subagent_workspaces().await;
+            }
+            self.try_stage_barrier(&stage_id).await;
+            return None;
+        }
+
+        // Non-stage subagent: the per-child idle IS the parent's signal. Insert it
+        // once (the same once-gate dedup), and on that single firing reclaim a
+        // read-only subagent's disposable snapshot — its handoff/transcript is
+        // durable in Postgres, so the snapshot is safe to destroy.
+        match self
+            .state
+            .repo
+            .insert_subagent_idle_event_once(
+                &parent_session_id,
+                &self.session_id,
+                &notification_key,
+                payload,
+            )
+            .await
+        {
             Ok(event) => {
                 if event.is_some() {
-                    // The idle event is produced exactly once per terminal child,
-                    // by whichever terminal path wins the once-only gate (the
-                    // drive loop, recovery, or the notify wrapper). A read-only
-                    // subagent's fork is a disposable snapshot, so reclaim it on
-                    // that single firing — its handoff renders from the durable
-                    // transcript, not the snapshot.
                     self.destroy_read_only_subagent_workspaces().await;
                 }
                 event
             }
             Err(error) => {
                 eprintln!(
-                    "failed to publish parent subagent idle event child={}: {}: {}",
-                    self.session_id, error.code, error.message
+                    "failed to publish parent subagent idle event child={}: {error:#}",
+                    self.session_id
                 );
                 None
             }
         }
     }
 
-    async fn subagent_parent_idle_event(
+    /// The stage barrier: when a subagent of a stage reaches its once-only
+    /// terminal idle, complete the stage iff every subagent is terminal. The
+    /// `finish_stage` CAS (stage-row `for update` lock + `status='running'`
+    /// fence) is the single-flight; whichever caller wins it (a concurrent
+    /// terminal child or the boot sweep) renders the handoff and steers the
+    /// parent exactly once.
+    async fn try_stage_barrier(&self, stage_id: &str) {
+        // `recover_if_needed` -> terminal idle -> barrier -> sibling
+        // `recover_if_needed` is a recursive async cycle; box it to break the
+        // infinitely-sized future. The cycle terminates because each sibling's
+        // barrier short-circuits once the stage is no longer `running`.
+        let future = Box::pin(crate::stage_runner::complete_stage_if_ready(
+            &self.state,
+            stage_id,
+        ));
+        if let Err(error) = future.await {
+            eprintln!(
+                "stage barrier failed for stage {stage_id} (child {}): {}: {}",
+                self.session_id, error.code, error.message
+            );
+        }
+    }
+
+    /// The parent-visible idle notification for this child: its parent id, the
+    /// once-gate dedup key (the terminal active leaf), and the event payload.
+    /// `None` when this session has no parent (a top-level session).
+    async fn subagent_idle_notification(
         &self,
-    ) -> std::result::Result<Option<EventFrame>, RpcError> {
+    ) -> std::result::Result<Option<(String, String, Value)>, RpcError> {
         let Some(parent_session_id) = self
             .state
             .repo
@@ -498,12 +607,16 @@ impl SessionDriver {
             .transcript_turns(&self.session_id, None, Some(20))
             .await
             .map_err(anyhow::Error::from)?;
+        // A subagent with no finished turn defaults to Crashed, consistent with
+        // the durable handoff classification (`handoff::subagent_outcome`): a
+        // session that reached idle without any TurnFinished did not finish
+        // gracefully.
         let outcome = turns
             .cards
             .iter()
             .rev()
             .find_map(|card| card.outcome)
-            .unwrap_or(TurnOutcome::Graceful);
+            .unwrap_or(TurnOutcome::Crashed);
         let notification_key = turns
             .cards
             .iter()
@@ -532,25 +645,15 @@ impl SessionDriver {
         } else {
             text
         };
-        let event = self
-            .state
-            .repo
-            .insert_subagent_idle_event_once(
-                &parent_session_id,
-                &self.session_id,
-                &notification_key,
-                json!({
-                    "child_session_id": self.session_id,
-                    "role": config.metadata.get("role_name").and_then(Value::as_str),
-                    "role_workspace": config.metadata.get("role_workspace").and_then(Value::as_str),
-                    "display_name": config.metadata.get("display_name").and_then(Value::as_str),
-                    "outcome": outcome,
-                    "summary_preview": summary_preview,
-                }),
-            )
-            .await
-            .map_err(anyhow::Error::from)?;
-        Ok(event)
+        let payload = json!({
+            "child_session_id": self.session_id,
+            "role": config.metadata.get("role_name").and_then(Value::as_str),
+            "role_workspace": config.metadata.get("role_workspace").and_then(Value::as_str),
+            "display_name": config.metadata.get("display_name").and_then(Value::as_str),
+            "outcome": outcome,
+            "summary_preview": summary_preview,
+        });
+        Ok(Some((parent_session_id, notification_key, payload)))
     }
 
     async fn consume_ready_steer(
