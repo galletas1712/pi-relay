@@ -137,8 +137,11 @@ table.
 
 ### LoadSkill
 
-`LoadSkill` activates an available skill by name (optionally scoped to a
-workspace dir) so its instructions are injected into model context. It is
+`LoadSkill` activates an available skill by exact model-facing name so its
+instructions are injected into model context. Workspace skills are exposed in
+the prompt JSON with a workspace prefix such as `repo/repo-build`; global skills
+use their plain name. The tool schema accepts only a `name` argument, so callers
+must pass the exact JSON name shown in the available-skills prompt. It is
 registered as a provider tool for declaration/replay, but has no registry
 executor — the daemon runtime intercepts `tool_name == "LoadSkill"` and resolves
 it against the session's loaded-skill set and workspace skills.

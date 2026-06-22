@@ -29,7 +29,6 @@ impl From<DelegationSubagentSpawn> for SubagentSpawnRequest {
         Self {
             parent_session_id: spawn.parent_session_id,
             role: spawn.role,
-            role_workspace: None,
             task: spawn.task,
             provider: None,
             metadata: json!({}),
@@ -43,7 +42,6 @@ impl From<DelegationSubagentSpawn> for SubagentSpawnRequest {
 pub(crate) struct SubagentSpawnRequest {
     parent_session_id: String,
     role: String,
-    role_workspace: Option<String>,
     task: String,
     provider: Option<ProviderConfig>,
     metadata: Value,
@@ -80,9 +78,10 @@ pub(crate) async fn spawn_subagent(
         &PathBuf::from(&parent_config.outer_cwd),
         &parent_config.workspaces,
         &request.role,
-        request.role_workspace.as_deref(),
     )
     .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
+    let resolved_role_name = resolved_role_name(&role.name, role.workspace.as_deref());
+
     // A full subagent is the durable workspace's single writer for its
     // delegation: it runs against the parent's dirs in place (no fork). A
     // read-only subagent forks the parent into its own disposable snapshot.
@@ -106,8 +105,7 @@ pub(crate) async fn spawn_subagent(
 
     let child_metadata = subagent_metadata(
         request.metadata,
-        &role.name,
-        role.workspace.as_deref(),
+        &resolved_role_name,
         &request.task,
         &role.file_path,
         &parent_config.metadata,
@@ -124,7 +122,7 @@ pub(crate) async fn spawn_subagent(
         state,
         &child_config,
         ChildPromptRole {
-            name: &role.name,
+            name: &resolved_role_name,
             workspace: role.workspace.as_deref(),
             description: &role.description,
             content: &role.content,
@@ -155,8 +153,7 @@ pub(crate) async fn spawn_subagent(
         state,
         &request.parent_session_id,
         &started.session_id,
-        &role.name,
-        role.workspace.as_deref(),
+        &resolved_role_name,
     )
     .await
     {
@@ -180,8 +177,7 @@ pub(crate) async fn spawn_subagent(
             state,
             &request.parent_session_id,
             &started.session_id,
-            &role.name,
-            role.workspace.as_deref(),
+            &resolved_role_name,
             &error,
         )
         .await;
@@ -203,7 +199,6 @@ async fn subagent_parent_spawn_events(
     parent_session_id: &str,
     child_session_id: &str,
     role: &str,
-    role_workspace: Option<&str>,
 ) -> std::result::Result<Vec<EventFrame>, RpcError> {
     state
         .repo
@@ -215,7 +210,6 @@ async fn subagent_parent_spawn_events(
                     json!({
                         "child_session_id": child_session_id,
                         "role": role,
-                        "role_workspace": role_workspace,
                     }),
                 ),
                 (
@@ -223,7 +217,6 @@ async fn subagent_parent_spawn_events(
                     json!({
                         "child_session_id": child_session_id,
                         "role": role,
-                        "role_workspace": role_workspace,
                     }),
                 ),
             ],
@@ -240,7 +233,6 @@ pub(crate) async fn subagent_lifecycle_payload(
     Ok(json!({
         "child_session_id": child_session_id,
         "role": config.metadata.get("role_name").and_then(Value::as_str),
-        "role_workspace": config.metadata.get("role_workspace").and_then(Value::as_str),
     }))
 }
 
@@ -285,7 +277,6 @@ async fn publish_subagent_parent_dispatch_failed_event(
     parent_session_id: &str,
     child_session_id: &str,
     role: &str,
-    role_workspace: Option<&str>,
     error: &RpcError,
 ) {
     // A delegation member's failure is owned by the delegation:
@@ -310,7 +301,6 @@ async fn publish_subagent_parent_dispatch_failed_event(
             json!({
                 "child_session_id": child_session_id,
                 "role": role,
-                "role_workspace": role_workspace,
                 "outcome": "Crashed",
                 "summary_preview": summary_preview,
             }),
@@ -337,7 +327,6 @@ pub(crate) async fn publish_subagent_parent_dispatch_failed_event_for_test(
         parent_session_id,
         child_session_id,
         role,
-        None,
         &RpcError::new("provider_error", "simulated initial dispatch failure"),
     )
     .await;
@@ -401,7 +390,6 @@ async fn cleanup_failed_spawn(
 fn subagent_metadata(
     metadata: Value,
     role_name: &str,
-    role_workspace: Option<&str>,
     task: &str,
     role_file_path: &PathBuf,
     parent_metadata: &Value,
@@ -432,12 +420,16 @@ fn subagent_metadata(
     map.insert("hidden".to_string(), json!(true));
     map.insert("subagent".to_string(), json!(true));
     map.insert("role_name".to_string(), json!(role_name));
-    if let Some(role_workspace) = role_workspace {
-        map.insert("role_workspace".to_string(), json!(role_workspace));
-    }
     map.insert("task".to_string(), json!(task));
     map.insert("role_file_path".to_string(), json!(role_file_path));
     metadata
+}
+
+fn resolved_role_name(name: &str, workspace: Option<&str>) -> String {
+    match workspace {
+        Some(workspace) => format!("{workspace}/{name}"),
+        None => name.to_string(),
+    }
 }
 
 fn child_initial_task_message(parent_session_id: &str, task: &str) -> String {
@@ -492,8 +484,7 @@ mod tests {
     fn subagent_metadata_marks_session_hidden() {
         let metadata = subagent_metadata(
             json!({ "custom": true }),
-            "reviewer",
-            Some("repo"),
+            "repo/reviewer",
             "Review this",
             &PathBuf::from("/tmp/reviewer/SKILL.md"),
             &json!({ "harness": true, "auto_title_disabled": true }),
@@ -506,12 +497,20 @@ mod tests {
                 "auto_title_disabled": true,
                 "hidden": true,
                 "subagent": true,
-                "role_name": "reviewer",
-                "role_workspace": "repo",
+                "role_name": "repo/reviewer",
                 "task": "Review this",
                 "role_file_path": "/tmp/reviewer/SKILL.md",
             })
         );
+    }
+
+    #[test]
+    fn resolved_role_name_prefixes_workspace_roles() {
+        assert_eq!(
+            resolved_role_name("reviewer", Some("repo")),
+            "repo/reviewer"
+        );
+        assert_eq!(resolved_role_name("reviewer", None), "reviewer");
     }
 
     #[test]

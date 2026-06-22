@@ -181,27 +181,63 @@ async fn loaded_skills_for_session(state: &AppState, session_id: &str) -> BTreeS
 }
 
 fn loaded_skill_identifier(output: &str) -> Option<String> {
-    let rest = output.strip_prefix("<loaded_skill>\n<name>")?;
-    let end = rest.find("</name>")?;
-    let name = xml_unescape(&rest[..end]);
-    let after_name = &rest[end + "</name>".len()..];
-    let workspace = if let Some(workspace_rest) = after_name.strip_prefix("\n<workspace>") {
-        let workspace_end = workspace_rest.find("</workspace>")?;
-        Some(xml_unescape(&workspace_rest[..workspace_end]))
-    } else {
-        None
-    };
-    Some(crate::provider_runtime::skill_identifier(
-        workspace.as_deref(),
-        &name,
-    ))
+    loaded_skill_identifier_json(output)
 }
 
-fn xml_unescape(input: &str) -> String {
-    input
-        .replace("&apos;", "'")
-        .replace("&quot;", "\"")
-        .replace("&gt;", ">")
-        .replace("&lt;", "<")
-        .replace("&amp;", "&")
+fn loaded_skill_identifier_json(output: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    let name = value
+        .get("skill_name")
+        .and_then(serde_json::Value::as_str)?;
+    let workspace = value
+        .get("workspace")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|workspace| !workspace.is_empty());
+    Some(crate::provider_runtime::skill_identifier(workspace, name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn loaded_skill_identifier_accepts_json_output() {
+        let output = serde_json::json!({
+            "status": "loaded",
+            "name": "repo/rust-refactor",
+            "skill_name": "rust-refactor",
+            "workspace": "repo",
+            "content": "Prefer small, tested changes."
+        })
+        .to_string();
+
+        assert_eq!(
+            loaded_skill_identifier(&output),
+            Some(crate::provider_runtime::skill_identifier(
+                Some("repo"),
+                "rust-refactor"
+            ))
+        );
+    }
+
+    #[test]
+    fn loaded_skill_identifier_rejects_non_json_output() {
+        let output = "not json";
+
+        assert_eq!(loaded_skill_identifier(output), None);
+    }
+
+    #[test]
+    fn loaded_skill_identifier_requires_current_json_shape() {
+        let output = serde_json::json!({
+            "status": "loaded",
+            "name": "repo/rust-refactor",
+            "workspace": "repo",
+            "content": "Prefer small, tested changes."
+        })
+        .to_string();
+
+        assert_eq!(loaded_skill_identifier(&output), None);
+    }
 }

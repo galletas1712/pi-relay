@@ -227,7 +227,7 @@ describe("skills", () => {
 			expect(result).toBe("");
 		});
 
-		it("should format skills as XML", () => {
+		it("should format skills as JSON", () => {
 			const skills: Skill[] = [
 				createTestSkill({
 					name: "test-skill",
@@ -238,16 +238,20 @@ describe("skills", () => {
 			];
 
 			const result = formatSkillsForPrompt(skills);
+			const json = JSON.parse(result.substring(result.indexOf("{")));
 
-			expect(result).toContain("<available_skills>");
-			expect(result).toContain("</available_skills>");
-			expect(result).toContain("<skill>");
-			expect(result).toContain("<name>test-skill</name>");
-			expect(result).toContain("<description>A test skill.</description>");
-			expect(result).toContain("<location>/path/to/skill/SKILL.md</location>");
+			expect(json).toEqual({
+				available_skills: [
+					{
+						name: "test-skill",
+						description: "A test skill.",
+						location: "/path/to/skill/SKILL.md",
+					},
+				],
+			});
 		});
 
-		it("should include intro text before XML", () => {
+		it("should include intro text before JSON", () => {
 			const skills: Skill[] = [
 				createTestSkill({
 					name: "test-skill",
@@ -258,14 +262,14 @@ describe("skills", () => {
 			];
 
 			const result = formatSkillsForPrompt(skills);
-			const xmlStart = result.indexOf("<available_skills>");
-			const introText = result.substring(0, xmlStart);
+			const jsonStart = result.indexOf("{");
+			const introText = result.substring(0, jsonStart);
 
 			expect(introText).toContain("The following skills provide specialized instructions");
 			expect(introText).toContain("Use the read tool to load a skill's file");
 		});
 
-		it("should escape XML special characters", () => {
+		it("should JSON-escape special characters", () => {
 			const skills: Skill[] = [
 				createTestSkill({
 					name: "test-skill",
@@ -276,10 +280,13 @@ describe("skills", () => {
 			];
 
 			const result = formatSkillsForPrompt(skills);
+			const json = JSON.parse(result.substring(result.indexOf("{")));
 
-			expect(result).toContain("&lt;special&gt;");
-			expect(result).toContain("&amp;");
-			expect(result).toContain("&quot;characters&quot;");
+			expect(json.available_skills[0].description).toBe(
+				'A skill with <special> & "characters".',
+			);
+			expect(result).toContain('\\"characters\\"');
+			expect(result).not.toContain("&lt;special&gt;");
 		});
 
 		it("should format multiple skills", () => {
@@ -299,10 +306,12 @@ describe("skills", () => {
 			];
 
 			const result = formatSkillsForPrompt(skills);
+			const json = JSON.parse(result.substring(result.indexOf("{")));
 
-			expect(result).toContain("<name>skill-one</name>");
-			expect(result).toContain("<name>skill-two</name>");
-			expect((result.match(/<skill>/g) || []).length).toBe(2);
+			expect(json.available_skills.map((skill: { name: string }) => skill.name)).toEqual([
+				"skill-one",
+				"skill-two",
+			]);
 		});
 
 		it("should exclude skills with disableModelInvocation from prompt", () => {
@@ -323,10 +332,11 @@ describe("skills", () => {
 			];
 
 			const result = formatSkillsForPrompt(skills);
+			const json = JSON.parse(result.substring(result.indexOf("{")));
 
-			expect(result).toContain("<name>visible-skill</name>");
-			expect(result).not.toContain("<name>hidden-skill</name>");
-			expect((result.match(/<skill>/g) || []).length).toBe(1);
+			expect(json.available_skills.map((skill: { name: string }) => skill.name)).toEqual([
+				"visible-skill",
+			]);
 		});
 
 		it("should return empty string when all skills have disableModelInvocation", () => {

@@ -288,13 +288,9 @@ fn load_skill_definition() -> ToolDefinition {
         json!({
             "type": "object",
             "properties": {
-                "workspace": {
-                    "type": "string",
-                    "description": "For workspace skills, the exact workspace directory shown for the skill in the system prompt. Omit this for global skills."
-                },
                 "name": {
                     "type": "string",
-                    "description": "The exact skill name from the available skills listed in the system prompt."
+                    "description": "The exact skill name from the available skills JSON. Workspace skill names include their workspace prefix, for example repo/repo-build."
                 }
             },
             "required": ["name"],
@@ -312,7 +308,7 @@ fn delegate_writing_task_definition() -> ToolDefinition {
             "properties": {
                 "role": {
                     "type": "string",
-                    "description": "The subagent role (a skill name), e.g. \"implementer\"."
+                    "description": "The subagent role skill name. Use prefixed workspace role names like \"repo/reviewer\" for workspace-scoped skills; unprefixed names resolve packaged/global roles such as \"implementer\"."
                 },
                 "prompt": {
                     "type": "string",
@@ -348,7 +344,7 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
                         "properties": {
                             "role": {
                                 "type": "string",
-                                "description": "The subagent role (a skill name), e.g. \"reviewer\"."
+                                "description": "The subagent role skill name. Use prefixed workspace role names like \"repo/reviewer\" for workspace-scoped skills; unprefixed names resolve packaged/global roles such as \"reviewer\"."
                             },
                             "prompt": {
                                 "type": "string",
@@ -697,6 +693,21 @@ mod tests {
                 "web_search"
             ]
         );
+    }
+
+    #[test]
+    fn load_skill_schema_uses_prefixed_name_only() {
+        let definition = load_skill_definition();
+        assert!(definition.input_schema["properties"].get("name").is_some());
+        assert!(definition.input_schema["properties"]
+            .get("workspace")
+            .is_none());
+        assert_eq!(definition.input_schema["required"], json!(["name"]));
+        assert_eq!(definition.input_schema["additionalProperties"], false);
+        assert!(definition.input_schema["properties"]["name"]["description"]
+            .as_str()
+            .expect("name description")
+            .contains("repo/repo-build"));
     }
 
     #[test]

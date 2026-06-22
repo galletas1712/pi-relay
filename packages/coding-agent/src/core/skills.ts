@@ -330,8 +330,8 @@ function loadSkillFromFile(
 
 /**
  * Format skills for inclusion in a system prompt.
- * Uses XML format per Agent Skills standard.
- * See: https://agentskills.io/integrate-skills
+ * Uses readable JSON so model-facing prompts and Rust daemon prompts share the
+ * same shape.
  *
  * Skills with disableModelInvocation=true are excluded from the prompt
  * (they can only be invoked explicitly via /skill:name commands).
@@ -348,29 +348,20 @@ export function formatSkillsForPrompt(skills: Skill[]): string {
 		"Use the read tool to load a skill's file when the task matches its description.",
 		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
 		"",
-		"<available_skills>",
+		JSON.stringify(
+			{
+				available_skills: visibleSkills.map((skill) => ({
+					name: skill.name,
+					description: skill.description,
+					location: skill.filePath,
+				})),
+			},
+			null,
+			2,
+		),
 	];
 
-	for (const skill of visibleSkills) {
-		lines.push("  <skill>");
-		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
-		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
-		lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
-		lines.push("  </skill>");
-	}
-
-	lines.push("</available_skills>");
-
 	return lines.join("\n");
-}
-
-function escapeXml(str: string): string {
-	return str
-		.replace(/&/g, "&amp;")
-		.replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;")
-		.replace(/"/g, "&quot;")
-		.replace(/'/g, "&apos;");
 }
 
 export interface LoadSkillsOptions {
