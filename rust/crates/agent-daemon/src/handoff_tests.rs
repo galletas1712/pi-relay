@@ -203,3 +203,52 @@ fn active_branch_terminality_uses_the_active_leaf_boundary() {
     mid_turn.active_leaf_id = Some("tf".to_string());
     assert!(active_branch_is_terminal(&mid_turn));
 }
+
+#[test]
+fn terminal_subagent_status_matches_progress_empty_branch_convention() {
+    let empty = HistoryTree {
+        session_id: "child".to_string(),
+        active_leaf_id: None,
+        entries: Vec::new(),
+    };
+    assert_eq!(terminal_subagent_status(&empty), Some("done"));
+
+    let mut mid_turn = history(vec![entry(
+        "a",
+        TranscriptItem::AssistantMessage(AssistantMessage {
+            items: vec![AssistantItem::Text("still working".to_string())],
+        }),
+    )]);
+    mid_turn.active_leaf_id = Some("a".to_string());
+    assert_eq!(terminal_subagent_status(&mid_turn), None);
+
+    let graceful = history(vec![entry(
+        "tf",
+        TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Graceful,
+        },
+    )]);
+    assert_eq!(terminal_subagent_status(&graceful), Some("done"));
+
+    let crashed = history(vec![entry(
+        "tf",
+        TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Crashed,
+        },
+    )]);
+    assert_eq!(terminal_subagent_status(&crashed), Some("failed"));
+
+    let compacted = history(vec![entry(
+        "cs",
+        TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+            "child",
+            "leaf",
+            "summary",
+            None,
+            TurnId(1),
+        )),
+    )]);
+    assert_eq!(terminal_subagent_status(&compacted), Some("done"));
+}

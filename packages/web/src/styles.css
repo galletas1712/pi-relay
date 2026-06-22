@@ -2968,6 +2968,20 @@ pre {
 	font-size: var(--text-2xs);
 }
 
+.run-board-progress,
+.run-board-subagent-summary {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 6px;
+	color: var(--muted-foreground);
+	font-size: var(--text-2xs);
+}
+
+.run-board-subagent-summary strong {
+	color: var(--foreground);
+	font-weight: 500;
+}
+
 .run-board-delegation-controls,
 .run-board-handoff-links {
 	display: flex;
@@ -2995,6 +3009,16 @@ pre {
 	outline: none;
 }
 
+.chip-button.pressed {
+	border-color: color-mix(in oklch, var(--primary) 48%, var(--border));
+	background: color-mix(in oklch, var(--primary) 9%, transparent);
+	color: var(--primary);
+}
+
+.run-board-toggle {
+	align-self: flex-start;
+}
+
 .run-board-subagents {
 	display: flex;
 	flex-direction: column;
@@ -3020,6 +3044,36 @@ pre {
 	display: inline-flex;
 	align-items: center;
 	gap: 4px;
+}
+
+.run-board-debug {
+	display: flex;
+	flex-direction: column;
+	gap: 3px;
+	border: 1px solid var(--border);
+	border-radius: 6px;
+	padding: 6px;
+	background: color-mix(in oklch, var(--muted) 60%, transparent);
+}
+
+.run-board-debug-row {
+	display: grid;
+	grid-template-columns: minmax(72px, max-content) minmax(0, 1fr);
+	gap: 8px;
+	align-items: baseline;
+	font-size: var(--text-2xs);
+}
+
+.run-board-debug-row span {
+	color: var(--muted-foreground);
+}
+
+.run-board-debug-row code {
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	font-family: var(--font-mono);
 }
 
 .run-board-file {

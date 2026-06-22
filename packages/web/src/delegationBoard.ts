@@ -7,11 +7,6 @@ export function isDelegationRunning(delegation: Delegation): boolean {
 	return delegation.status === "running";
 }
 
-function subagentHasPromptSource(subagent: DelegationSubagent, allowPromptFiles: boolean): boolean {
-	if (typeof subagent.task === "string" && subagent.task.trim()) return true;
-	return allowPromptFiles && subagentHasNonEmptyPromptFile(subagent);
-}
-
 export function subagentHasNonEmptyPromptFile(subagent: DelegationSubagent): boolean {
 	return typeof subagent.task_prompt_file === "string" && !!subagent.task_prompt_file.trim();
 }
@@ -49,7 +44,7 @@ export function steerableSubagentId(delegation: Delegation): string | null {
  * with the actual reconstruction path so the UI never offers a re-run that the
  * click handler will reject. */
 export function canReRunDelegation(delegation: Delegation): boolean {
-	return reRunTaskPlan(delegation, { allowPromptFiles: true }) !== null;
+	return reRunTaskPlan(delegation, new Map(), { allowPromptFiles: true }) !== null;
 }
 
 function isReRunnableDelegationStatus(status: DelegationStatus): boolean {
@@ -64,12 +59,12 @@ function isReRunnableDelegationStatus(status: DelegationStatus): boolean {
 	}
 }
 
-function subagentTask(subagent: DelegationSubagent): { role: string; prompt: string } | null {
-	const prompt = subagent.task;
+function subagentTask(subagent: DelegationSubagent, resolvedPrompts: ReadonlyMap<string, string>): { role: string; prompt: string } | null {
+	const prompt = resolvedPrompts.get(subagent.id);
 	const role = subagent.role;
 	if (typeof prompt !== "string" || !prompt.trim()) return null;
 	if (typeof role !== "string" || !role.trim()) return null;
-	return { role, prompt };
+	return { role: role.trim(), prompt };
 }
 
 type ReRunTask = { role: string; prompt: string };
@@ -77,24 +72,28 @@ type ReRunTaskPlan =
 	| { kind: "full"; task: ReRunTask }
 	| { kind: "readonly_fanout"; tasks: ReRunTask[] };
 
-function reRunTaskPlan(delegation: Delegation, options: { allowPromptFiles: boolean } = { allowPromptFiles: false }): ReRunTaskPlan | null {
+function reRunTaskPlan(
+	delegation: Delegation,
+	resolvedPrompts: ReadonlyMap<string, string>,
+	options: { allowPromptFiles: boolean } = { allowPromptFiles: false },
+): ReRunTaskPlan | null {
 	if (!isReRunnableDelegationStatus(delegation.status)) return null;
 	if (delegation.subagents.length === 0) return null;
 	const roles = delegation.subagents.map((subagent) => subagent.role);
 	if (roles.some((role) => typeof role !== "string" || !role.trim())) return null;
 	if (options.allowPromptFiles) {
-		if (delegation.subagents.some((subagent) => !subagentHasPromptSource(subagent, true))) return null;
+		if (delegation.subagents.some((subagent) => !subagentHasNonEmptyPromptFile(subagent))) return null;
+		const resolved = delegation.subagents.map((subagent) => ({
+			role: subagent.role!.trim(),
+			prompt: resolvedPrompts.get(subagent.id) ?? "",
+		}));
+		return planForResolvedTasks(delegation, resolved);
 	} else {
-		const tasks = delegation.subagents.map((subagent) => subagentTask(subagent));
+		const tasks = delegation.subagents.map((subagent) => subagentTask(subagent, resolvedPrompts));
 		if (tasks.some((task) => task === null)) return null;
 		const resolved = tasks as ReRunTask[];
 		return planForResolvedTasks(delegation, resolved);
 	}
-	const resolved = delegation.subagents.map((subagent) => ({
-		role: subagent.role!.trim(),
-		prompt: typeof subagent.task === "string" ? subagent.task : "",
-	}));
-	return planForResolvedTasks(delegation, resolved);
 }
 
 function planForResolvedTasks(delegation: Delegation, resolved: ReRunTask[]): ReRunTaskPlan | null {
@@ -111,16 +110,18 @@ function planForResolvedTasks(delegation: Delegation, resolved: ReRunTask[]): Re
 }
 
 /** Reconstruct the `delegation.start_*` params to re-run a finished delegation after
- * prompt text has been loaded inline (possibly from `task_prompt.md`). Returns the
- * kind-tagged params, or null when any prompt/role is missing. */
+ * prompt text has been explicitly loaded from `task_prompt.md`. The normal
+ * delegation snapshot intentionally carries only file refs, not raw task prompt
+ * text. Returns the kind-tagged params, or null when any prompt/role is missing. */
 export function reRunParamsForDelegation(
 	delegation: Delegation,
 	parentSessionId: string,
+	resolvedPrompts: ReadonlyMap<string, string> = new Map(),
 ):
 	| { kind: "full"; params: StartFullDelegationParams }
 	| { kind: "readonly_fanout"; params: StartReadonlyDelegationFanoutParams }
 	| null {
-	const plan = reRunTaskPlan(delegation);
+	const plan = reRunTaskPlan(delegation, resolvedPrompts);
 	if (!plan) return null;
 	if (plan.kind === "full") {
 		return {

@@ -24,10 +24,9 @@
 //! once.
 
 use agent_store::{Delegation, DelegationStatus, QueuedInputStatus};
-use agent_vocab::TurnOutcome;
 
 use crate::delegation_snapshot::{build_delegation_snapshot, completion_wakeup_observation};
-use crate::handoff::subagent_outcome;
+use crate::handoff::terminal_subagent_status;
 use crate::runtime::SessionDriver;
 use crate::state::AppState;
 use crate::types::RpcError;
@@ -224,7 +223,7 @@ async fn recover_subagent_tails(state: &AppState, delegation: &Delegation) {
     }
 }
 
-/// Read every subagent's terminal outcome from its durable Postgres transcript
+/// Read every subagent's terminal status from its durable Postgres transcript
 /// and fold it into the delegation's won status (`done` vs
 /// `done_with_failures`).
 async fn classify_subagents(
@@ -234,11 +233,8 @@ async fn classify_subagents(
     let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
     for subagent in &subagents {
         let history = state.repo.active_branch(&subagent.session_id).await?;
-        match subagent_outcome(&history) {
-            TurnOutcome::Graceful => {}
-            TurnOutcome::Interrupted | TurnOutcome::Crashed => {
-                return Ok(DelegationStatus::DoneWithFailures);
-            }
+        if terminal_subagent_status(&history) == Some("failed") {
+            return Ok(DelegationStatus::DoneWithFailures);
         }
     }
     Ok(DelegationStatus::Done)

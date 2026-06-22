@@ -22,7 +22,7 @@ function fullDelegation(overrides: Partial<Delegation> = {}): Delegation {
 				status: "idle",
 				role: "implement",
 				subagent_type: "full",
-				task: "implement the feature",
+				task_prompt_file: "child-1/task_prompt.md",
 			},
 		],
 		...overrides,
@@ -42,14 +42,14 @@ function fanoutDelegation(overrides: Partial<Delegation> = {}): Delegation {
 				status: "idle",
 				role: "explore",
 				subagent_type: "read_only",
-				task: "explore module a",
+				task_prompt_file: "child-a/task_prompt.md",
 			},
 			{
 				id: "child-b",
 				status: "idle",
 				role: "explore",
 				subagent_type: "read_only",
-				task: "explore module b",
+				task_prompt_file: "child-b/task_prompt.md",
 			},
 		],
 		...overrides,
@@ -94,7 +94,7 @@ describe("steerableSubagentId", () => {
 });
 
 describe("canReRunDelegation", () => {
-	it("allows re-run of a finished delegation when every prompt and role is present", () => {
+	it("allows re-run of a finished delegation when every prompt file ref and role is present", () => {
 		expect(canReRunDelegation(fullDelegation({ status: "done" }))).toBe(true);
 	});
 
@@ -102,17 +102,7 @@ describe("canReRunDelegation", () => {
 		expect(canReRunDelegation(fullDelegation({ status: "running" }))).toBe(false);
 	});
 
-	it("forbids re-run when any prompt source is missing", () => {
-		const delegation = fanoutDelegation({
-			subagents: [
-				{ id: "child-a", status: "idle", role: "explore", subagent_type: "read_only", task: "look here" },
-				{ id: "child-b", status: "idle", role: "explore", subagent_type: "read_only", task: null },
-			],
-		});
-		expect(canReRunDelegation(delegation)).toBe(false);
-	});
-
-	it("allows re-run from task prompt handoff files even when prompt text is not inline", () => {
+	it("forbids re-run when any prompt file ref is missing", () => {
 		const delegation = fanoutDelegation({
 			subagents: [
 				{
@@ -120,7 +110,22 @@ describe("canReRunDelegation", () => {
 					status: "idle",
 					role: "explore",
 					subagent_type: "read_only",
-					task: null,
+					task_prompt_file: "child-a/task_prompt.md",
+				},
+				{ id: "child-b", status: "idle", role: "explore", subagent_type: "read_only", task_prompt_file: null },
+			],
+		});
+		expect(canReRunDelegation(delegation)).toBe(false);
+	});
+
+	it("allows re-run from task prompt handoff file references before prompt text is loaded", () => {
+		const delegation = fanoutDelegation({
+			subagents: [
+				{
+					id: "child-a",
+					status: "idle",
+					role: "explore",
+					subagent_type: "read_only",
 					task_prompt_file: "child-a/task_prompt.md",
 				},
 				{
@@ -128,7 +133,6 @@ describe("canReRunDelegation", () => {
 					status: "idle",
 					role: "explore",
 					subagent_type: "read_only",
-					task: null,
 					task_prompt_file: "child-b/task_prompt.md",
 				},
 			],
@@ -145,7 +149,6 @@ describe("canReRunDelegation", () => {
 					status: "idle",
 					role: "explore",
 					subagent_type: "read_only",
-					task: null,
 					task_prompt_file: "",
 				},
 				{
@@ -153,7 +156,6 @@ describe("canReRunDelegation", () => {
 					status: "idle",
 					role: "explore",
 					subagent_type: "read_only",
-					task: null,
 					task_prompt_file: null,
 				},
 			],
@@ -169,7 +171,7 @@ describe("canReRunDelegation", () => {
 					status: "idle",
 					role: null,
 					subagent_type: "full",
-					task: "implement the feature",
+					task_prompt_file: "child-1/task_prompt.md",
 				},
 			],
 		});
@@ -189,7 +191,11 @@ describe("canReRunDelegation", () => {
 
 describe("reRunParamsForDelegation", () => {
 	it("reconstructs a full delegation start with the subagent task", () => {
-		const result = reRunParamsForDelegation(fullDelegation({ status: "done" }), "parent");
+		const result = reRunParamsForDelegation(
+			fullDelegation({ status: "done" }),
+			"parent",
+			new Map([["child-1", "implement the feature"]]),
+		);
 		expect(result).toEqual({
 			kind: "full",
 			params: {
@@ -203,7 +209,14 @@ describe("reRunParamsForDelegation", () => {
 	});
 
 	it("reconstructs a fan-out with one task per subagent", () => {
-		const result = reRunParamsForDelegation(fanoutDelegation(), "parent");
+		const result = reRunParamsForDelegation(
+			fanoutDelegation(),
+			"parent",
+			new Map([
+				["child-a", "explore module a"],
+				["child-b", "explore module b"],
+			]),
+		);
 		expect(result).toEqual({
 			kind: "readonly_fanout",
 			params: {
@@ -219,9 +232,7 @@ describe("reRunParamsForDelegation", () => {
 	});
 
 	it("returns null when a prompt cannot be recovered", () => {
-		const delegation = fullDelegation({
-			subagents: [{ id: "child-1", status: "idle", role: "implement", subagent_type: "full", task: null }],
-		});
+		const delegation = fullDelegation();
 		expect(reRunParamsForDelegation(delegation, "parent")).toBeNull();
 	});
 
@@ -233,11 +244,11 @@ describe("reRunParamsForDelegation", () => {
 					status: "idle",
 					role: undefined,
 					subagent_type: "full",
-					task: "implement the feature",
+					task_prompt_file: "child-1/task_prompt.md",
 				},
 			],
 		});
-		expect(reRunParamsForDelegation(delegation, "parent")).toBeNull();
+		expect(reRunParamsForDelegation(delegation, "parent", new Map([["child-1", "implement the feature"]]))).toBeNull();
 	});
 
 	it("returns null while running or when a delegation has no subagents", () => {

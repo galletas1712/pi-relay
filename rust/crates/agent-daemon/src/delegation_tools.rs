@@ -9,9 +9,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::codec::from_params;
-use crate::delegation_snapshot::build_delegation_snapshot;
+use crate::delegation_snapshot::{build_delegation_snapshot, list_subagent_state, progress_view};
 use crate::handoff::{
-    delegation_dir, extract_suggested_next, handoff_root, refresh_delegation_handoff_artifacts,
+    delegation_dir, handoff_root, refresh_delegation_handoff_artifacts,
     refresh_task_prompt_artifact_if_present, render_transcript_markdown, safe_handoff_path_segment,
     task_prompt_rel, TASK_PROMPT_FILE,
 };
@@ -969,6 +969,7 @@ pub(crate) async fn rpc_list(
     for delegation in &delegations {
         let delegation_handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
         let subagent_rows = state.repo.list_delegation_subagents(&delegation.id).await?;
+        let progress = state.repo.delegation_progress(delegation).await?;
         let mut subagents = Vec::with_capacity(subagent_rows.len());
         for subagent in subagent_rows {
             let task_prompt = refresh_task_prompt_artifact_if_present(
@@ -980,24 +981,19 @@ pub(crate) async fn rpc_list(
             let task_prompt_file = task_prompt
                 .as_ref()
                 .map(|_| task_prompt_rel(&subagent.session_id));
-            let (final_message_file, suggested_next) = if matches!(
+            let final_message_file = if matches!(
                 delegation.status,
                 DelegationStatus::Done | DelegationStatus::DoneWithFailures
             ) {
                 let relative = format!("{}/final_message.md", subagent.session_id);
                 let path = delegation_handoff_dir.join(&relative);
                 if path.exists() {
-                    let suggested_next = tokio::fs::read_to_string(&path)
-                        .await
-                        .ok()
-                        .as_deref()
-                        .and_then(extract_suggested_next);
-                    (Some(relative), suggested_next)
+                    Some(relative)
                 } else {
-                    (None, None)
+                    None
                 }
             } else {
-                (None, None)
+                None
             };
             let transcript_file = match delegation.status {
                 DelegationStatus::Cancelled => {
@@ -1015,9 +1011,11 @@ pub(crate) async fn rpc_list(
                 }
                 DelegationStatus::Failed => None,
             };
+            let state_for_row =
+                list_subagent_state(state, delegation.status, &subagent.session_id).await?;
             subagents.push(json!({
                 "id": subagent.session_id,
-                "status": subagent.activity,
+                "status": state_for_row.status,
                 "activity": subagent.activity,
                 "role": subagent.role,
                 "type": subagent.subagent_type,
@@ -1025,7 +1023,7 @@ pub(crate) async fn rpc_list(
                 "task_prompt_file": task_prompt_file,
                 "steerable": delegation.status == DelegationStatus::Running
                     && subagent.subagent_type == Some(SubagentType::Full),
-                "suggested_next": suggested_next,
+                "suggested_next": state_for_row.suggested_next,
                 "final_message_file": final_message_file,
                 "transcript_file": transcript_file,
             }));
@@ -1036,6 +1034,7 @@ pub(crate) async fn rpc_list(
             "status": delegation.status,
             "workflow": delegation.workflow,
             "label": delegation.label,
+            "progress": progress_view(progress),
             "subagents": subagents,
             "handoff_dir": delegation_handoff_dir.to_string_lossy().into_owned(),
         }));
