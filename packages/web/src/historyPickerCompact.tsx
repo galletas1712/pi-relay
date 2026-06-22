@@ -148,7 +148,7 @@ function historyPickerContent({
 		return (
 			<div className="history-loading">
 				<Loader2 className="spin" size={16} />
-				<span>Loading history index...</span>
+				<span>Loading history index…</span>
 			</div>
 		);
 	}
@@ -207,7 +207,7 @@ function historyPickerContent({
 			{loading ? (
 				<div className="history-loading">
 					<Loader2 className="spin" size={16} />
-					<span>Loading more history...</span>
+					<span>Loading more history…</span>
 				</div>
 			) : null}
 		</>
