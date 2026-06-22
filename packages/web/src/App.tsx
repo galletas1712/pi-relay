@@ -427,25 +427,6 @@ export function App() {
 		enabled: connection === "open",
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
-	const subagentsQuery = useQuery({
-		queryKey: queryKeys.subagents(loadedSnapshot?.session_id ?? null),
-		queryFn: () => {
-			if (!loadedSnapshot) throw new Error("select a session first");
-			return api.listSubagents(loadedSnapshot.session_id);
-		},
-		enabled: connection === "open" && !!loadedSnapshot,
-		refetchInterval: loadedSnapshot?.activity === "running" ? 2_000 : false,
-	});
-	const subagentIds = useMemo(
-		() => subagentsQuery.data?.subagents.map((subagent) => subagent.child_session_id) ?? [],
-		[subagentsQuery.data],
-	);
-	const subagentSummariesQuery = useQuery({
-		queryKey: queryKeys.subagentSummaries(loadedSnapshot?.session_id ?? null, subagentIds),
-		queryFn: async () => Promise.all(subagentIds.map(async (sessionId) => snapshotToSummary(await api.getSession(sessionId)))),
-		enabled: connection === "open" && subagentIds.length > 0,
-	});
-	const subagentSummaries = subagentSummariesQuery.data ?? [];
 	const stagesQuery = useQuery({
 		queryKey: queryKeys.stages(loadedSnapshot?.session_id ?? null),
 		queryFn: () => {
@@ -465,8 +446,7 @@ export function App() {
 		[stages],
 	);
 	// Re-run needs the original prompts; stage.list carries each subagent's
-	// persisted task, so recover them from the stage data itself — no dependency
-	// on the legacy subagent.list surface (which Phase 6 retires).
+	// persisted task, so recover them from the stage data itself.
 	const stageTaskBySessionId = useMemo(() => {
 		const map = new Map<string, string | null>();
 		for (const stage of stages) {
@@ -917,7 +897,6 @@ export function App() {
 			if (refreshPlan.refreshList) {
 				scheduleSessionListRefresh();
 				if (loadedSnapshot?.session_id) {
-					void queryClient.invalidateQueries({ queryKey: queryKeys.subagents(loadedSnapshot.session_id) });
 					// The run board reads the stage.* surface; the backend emits no
 					// dedicated stage events, so the subagent lifecycle events (and the
 					// completion steer landing as a normal parent message) are the signal
@@ -1097,9 +1076,6 @@ export function App() {
 		for (const session of sessions) {
 			desiredSessionIds.add(session.session_id);
 		}
-		for (const subagentId of subagentIds) {
-			desiredSessionIds.add(subagentId);
-		}
 		for (const stageSubagentId of stageSubagentIds) {
 			desiredSessionIds.add(stageSubagentId);
 		}
@@ -1137,7 +1113,6 @@ export function App() {
 		pushNotice,
 		selectedId,
 		sessions,
-		subagentIds,
 		stageSubagentIds,
 	]);
 
@@ -2147,10 +2122,6 @@ export function App() {
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
 				<Inspector
 					snapshot={loadedSnapshot}
-					subagents={subagentsQuery.data ?? null}
-					subagentSummaries={subagentSummaries}
-					subagentsLoading={subagentsQuery.isLoading || subagentSummariesQuery.isLoading}
-					subagentsError={errorMessageOrNull(subagentsQuery.error ?? subagentSummariesQuery.error)}
 					stages={stages}
 					stagesLoading={stagesQuery.isLoading}
 					stagesError={errorMessageOrNull(stagesQuery.error)}
@@ -2233,24 +2204,6 @@ export function App() {
 
 function titleFromText(text: string): string {
 	return truncate(firstLine(text).trim() || "New session", 64);
-}
-
-function snapshotToSummary(snapshot: SessionSnapshot): SessionSummary {
-	return {
-		session_id: snapshot.session_id,
-		project_id: snapshot.project_id,
-		parent_session_id: snapshot.parent_session_id,
-		outer_cwd: snapshot.outer_cwd,
-		workspaces: snapshot.workspaces,
-		activity: snapshot.activity,
-		active_leaf_id: snapshot.active_leaf_id,
-		provider: snapshot.provider,
-		metadata: snapshot.metadata,
-		created_at: "",
-		updated_at: "",
-		last_user_message_timestamp_ms: snapshot.last_user_message_timestamp_ms,
-		has_transcript_entries: snapshot.has_transcript_entries,
-	};
 }
 
 function errorMessageOrNull(error: unknown): string | null {

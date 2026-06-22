@@ -123,8 +123,8 @@ impl PostgresAgentStore {
                 .and_then(Value::as_str)
                 .map(str::to_string);
             // The subagent's task prompt, persisted at spawn — carried in
-            // stage.list so the run board can re-run a stage without the legacy
-            // subagent.list surface.
+            // stage.list so the run board can re-run a stage from the stage data
+            // itself.
             let task = metadata
                 .get("task")
                 .and_then(Value::as_str)

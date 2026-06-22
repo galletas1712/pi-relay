@@ -74,7 +74,6 @@ pub(crate) enum RpcMethod {
     ToolsList,
     CompactionRequest,
     ReplExec,
-    SubagentList,
     StageStartFull,
     StageStartReadonlyFanout,
     StageStatus,
@@ -119,7 +118,6 @@ impl RpcMethod {
             "tools.list" => Some(Self::ToolsList),
             "compaction.request" => Some(Self::CompactionRequest),
             "repl.exec" => Some(Self::ReplExec),
-            "subagent.list" => Some(Self::SubagentList),
             "stage.start_full" => Some(Self::StageStartFull),
             "stage.start_readonly_fanout" => Some(Self::StageStartReadonlyFanout),
             "stage.status" => Some(Self::StageStatus),
@@ -202,10 +200,6 @@ mod tests {
         );
         assert_eq!(RpcMethod::parse("turn.resume"), Some(RpcMethod::TurnResume));
         assert_eq!(RpcMethod::parse("repl.exec"), Some(RpcMethod::ReplExec));
-        assert_eq!(
-            RpcMethod::parse("subagent.list"),
-            Some(RpcMethod::SubagentList)
-        );
         assert_eq!(
             RpcMethod::parse("stage.start_full"),
             Some(RpcMethod::StageStartFull)

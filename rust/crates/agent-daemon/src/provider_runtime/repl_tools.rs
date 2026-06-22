@@ -40,7 +40,7 @@ pub(crate) async fn run_repl_tool(
 
     match state
         .repls
-        .execute(state, session_id, args.code, args.timeout_ms)
+        .execute(session_id, args.code, args.timeout_ms)
         .await
     {
         Ok(result) => {
