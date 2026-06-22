@@ -17,7 +17,7 @@
 
 use std::path::{Path, PathBuf};
 
-use agent_store::{Delegation, DelegationKind, DelegationStatus, HistoryTree};
+use agent_store::{Delegation, DelegationStatus, HistoryTree};
 use agent_vocab::{
     AssistantMessage, ContentBlock, ToolResultStatus, TranscriptItem, TurnOutcome, UserMessage,
 };
@@ -295,52 +295,6 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
     }
 
     Ok((dir, artifacts))
-}
-
-/// Render and write the completed delegation's per-subagent handoff files.
-/// This is a pure function of durable transcripts and delegation metadata and
-/// is safe to replay, but it must not be used as the single-flight. The normal
-/// barrier calls it only after winning the `finish_delegation` CAS; otherwise a
-/// cancellation that wins the same race could be left with completed handoff
-/// artifacts.
-pub(crate) async fn write_delegation_handoff(
-    state: &AppState,
-    delegation: &Delegation,
-) -> std::result::Result<PathBuf, RpcError> {
-    let (dir, _) = refresh_delegation_handoff_artifacts(state, delegation, true).await?;
-    Ok(dir)
-}
-
-/// The short completion steer delivered to the parent. It names the delegation,
-/// the ok/failed counts, and points at the handoff directory — it never inlines
-/// full transcripts.
-pub(crate) fn steer_message(
-    delegation: &Delegation,
-    handoff_dir: &Path,
-    ok: usize,
-    failed: usize,
-    failed_ids: &[String],
-) -> String {
-    let kind = match delegation.kind {
-        DelegationKind::Full => "full subagent",
-        DelegationKind::ReadonlyFanout => "read-only fan-out",
-    };
-    let label = delegation
-        .label
-        .as_deref()
-        .map(|label| format!(" ({label})"))
-        .unwrap_or_default();
-    let mut message = format!(
-        "Delegation {} ({kind}){label} finished: {ok} ok, {failed} failed. \
-         Use inspect_delegation for the structured snapshot; transcript details \
-         are in {}.",
-        delegation.id,
-        handoff_dir.display(),
-    );
-    if !failed_ids.is_empty() {
-        message.push_str(&format!(" Failed: {}.", failed_ids.join(", ")));
-    }
-    message
 }
 
 #[cfg(test)]

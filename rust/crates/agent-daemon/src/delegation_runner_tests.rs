@@ -425,10 +425,14 @@ async fn settle_subagent_terminal(env: &TestEnv, session_id: &str, boundary_leaf
         .expect("boundary check"));
 }
 
-/// Count completion steers that reached the parent. An idle parent accepts the
+/// Completion steer texts that reached the parent. An idle parent accepts the
 /// steer as its next user-message turn, so the steer lands in the parent's
-/// transcript; we count user messages naming the delegation.
-async fn steers_to_parent(env: &TestEnv, parent_id: &str, delegation_id: &str) -> usize {
+/// transcript; we collect user messages naming the delegation.
+async fn parent_completion_steer_texts(
+    env: &TestEnv,
+    parent_id: &str,
+    delegation_id: &str,
+) -> Vec<String> {
     let history = env
         .state
         .repo
@@ -438,13 +442,40 @@ async fn steers_to_parent(env: &TestEnv, parent_id: &str, delegation_id: &str) -
     history
         .entries
         .iter()
-        .filter(|entry| match &entry.item {
-            TranscriptItem::UserMessage(message) => message
-                .as_text()
-                .is_some_and(|text| text.contains(delegation_id) && text.contains("finished")),
-            _ => false,
+        .filter_map(|entry| match &entry.item {
+            TranscriptItem::UserMessage(message) => message.as_text().and_then(|text| {
+                (text.contains(delegation_id) && text.contains("completed"))
+                    .then(|| text.to_string())
+            }),
+            _ => None,
         })
-        .count()
+        .collect()
+}
+
+async fn steers_to_parent(env: &TestEnv, parent_id: &str, delegation_id: &str) -> usize {
+    parent_completion_steer_texts(env, parent_id, delegation_id)
+        .await
+        .len()
+}
+
+fn wakeup_snapshot_from_text(text: &str) -> serde_json::Value {
+    let start = text
+        .find("```json\n")
+        .map(|index| index + "```json\n".len())
+        .expect("wakeup has json fence");
+    let rest = &text[start..];
+    let end = rest.find("\n```").expect("wakeup json fence closes");
+    serde_json::from_str(&rest[..end]).expect("wakeup snapshot is valid json")
+}
+
+async fn parent_completion_snapshot(
+    env: &TestEnv,
+    parent_id: &str,
+    delegation_id: &str,
+) -> serde_json::Value {
+    let texts = parent_completion_steer_texts(env, parent_id, delegation_id).await;
+    assert_eq!(texts.len(), 1, "expected exactly one completion wakeup");
+    wakeup_snapshot_from_text(&texts[0])
 }
 
 async fn inspect_delegation_snapshot(env: &TestEnv, delegation_id: &str) -> serde_json::Value {
@@ -1094,6 +1125,27 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     let root = handoff_root(&env, &delegation.id);
     assert!(!root.join("index.json").exists());
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let wakeup_texts = parent_completion_steer_texts(&env, "parent", &delegation.id).await;
+    assert_eq!(wakeup_texts.len(), 1);
+    let wakeup_text = &wakeup_texts[0];
+    assert!(
+        !wakeup_text.contains("index.json"),
+        "completion wakeup must not instruct the parent to read index.json"
+    );
+    assert!(
+        wakeup_text.contains("Snapshot JSON"),
+        "completion wakeup should include the structured snapshot JSON"
+    );
+    assert!(
+        wakeup_text.contains("Full transcript contents are not inlined"),
+        "completion wakeup should clarify transcripts are artifact paths only"
+    );
+    assert!(
+        !wakeup_text.contains("## User"),
+        "completion wakeup must not inline transcript markdown"
+    );
+    let wakeup_snapshot = wakeup_snapshot_from_text(wakeup_text);
+    assert_eq!(wakeup_snapshot, snapshot);
     assert_eq!(snapshot["status"], "done_with_failures");
     assert_eq!(snapshot["kind"], "readonly_fanout");
     assert_eq!(snapshot["workflow"], "implement_review_test");
@@ -1140,6 +1192,21 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     assert_eq!(ok["status"], "done");
     assert_eq!(ok["final_message"], "All good.\n\nsuggested_next: approved");
     assert_eq!(ok["suggested_next"], "approved");
+    let wakeup_ok = wakeup_snapshot["subagents"]
+        .as_array()
+        .expect("wakeup subagents array")
+        .iter()
+        .find(|subagent| subagent["id"] == "ok_a")
+        .expect("ok_a in wakeup snapshot");
+    assert_eq!(
+        wakeup_ok["final_message"],
+        "All good.\n\nsuggested_next: approved"
+    );
+    assert_eq!(wakeup_ok["suggested_next"], "approved");
+    assert!(wakeup_ok["transcript_path"]
+        .as_str()
+        .expect("transcript path in wakeup snapshot")
+        .ends_with("ok_a/transcript.md"));
     assert_eq!(ok["steerable"], false);
     let failed = subagents
         .iter()
@@ -1369,16 +1436,10 @@ async fn completion_loser_after_cancellation_does_not_write_normal_handoff() {
         .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
         .await
         .expect("cancellation wins"));
-    let won_completion = try_claim_and_publish_completed_delegation(
-        &env.state,
-        &delegation,
-        DelegationStatus::Done,
-        1,
-        0,
-        &[],
-    )
-    .await
-    .expect("completion loser returns cleanly");
+    let won_completion =
+        try_claim_and_publish_completed_delegation(&env.state, &delegation, DelegationStatus::Done)
+            .await
+            .expect("completion loser returns cleanly");
     assert!(!won_completion);
     assert_eq!(
         env.state
@@ -1740,7 +1801,7 @@ async fn durable_parent_completion_steers(
                     .get("priority")
                     .and_then(serde_json::Value::as_str)
                     == Some(InputPriority::Steer.as_str())
-                && event_payload_text_mentions(&event.data, delegation_id, "finished")
+                && event_payload_text_mentions(&event.data, delegation_id, "completed")
         })
         .count()
 }
@@ -1932,6 +1993,16 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
     assert_eq!(snapshot["status"], "done");
     assert_eq!(snapshot["subagents"][0]["final_message"], "implemented");
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 1);
+    let wakeup_snapshot = parent_completion_snapshot(&env, "parent", &delegation.id).await;
+    assert_eq!(wakeup_snapshot, snapshot);
+    assert_eq!(
+        wakeup_snapshot["subagents"][0]["final_message"],
+        "implemented"
+    );
+    assert!(wakeup_snapshot["subagents"][0]["transcript_path"]
+        .as_str()
+        .expect("transcript path in repaired wakeup")
+        .ends_with("impl/transcript.md"));
     assert_eq!(
         durable_parent_completion_steers(&env, "parent", &delegation.id).await,
         1,

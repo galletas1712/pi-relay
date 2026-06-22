@@ -58,7 +58,9 @@ snapshot destroyed on return. Delegation subagents may emit
 `subagent.spawned`/`subagent.running` progress events; their terminal hook fires
 a single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
 terminal. After the DB finish CAS wins, the runner writes the handoff directory
-and then enqueues one `InputPriority::Steer` notification to the parent.
+and then enqueues one `InputPriority::Steer` notification to the parent. That
+notification includes the same structured snapshot shape as `inspect_delegation`,
+with final messages, `suggested_next`, and artifact paths.
 Completion is that steer/handoff, not a parent-visible per-child idle event. The
 runner never decides the next delegation — the parent does, guided by workflow
 skills. Cancellation is terminal and exports transcript-only files for the

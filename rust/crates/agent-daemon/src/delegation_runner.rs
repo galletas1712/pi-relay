@@ -25,7 +25,8 @@
 use agent_store::{Delegation, DelegationStatus, QueuedInputStatus};
 use agent_vocab::TurnOutcome;
 
-use crate::handoff::{delegation_dir, steer_message, subagent_outcome, write_delegation_handoff};
+use crate::delegation_snapshot::{build_delegation_snapshot, completion_wakeup_message};
+use crate::handoff::subagent_outcome;
 use crate::runtime::SessionDriver;
 use crate::state::AppState;
 use crate::types::RpcError;
@@ -75,17 +76,9 @@ pub(crate) async fn complete_delegation_if_ready(
         return Ok(());
     }
 
-    let (won_status, ok, failed, failed_ids) = classify_subagents(state, &delegation).await?;
+    let (won_status, _, _, _) = classify_subagents(state, &delegation).await?;
 
-    let won = try_claim_and_publish_completed_delegation(
-        state,
-        &delegation,
-        won_status,
-        ok,
-        failed,
-        &failed_ids,
-    )
-    .await?;
+    let won = try_claim_and_publish_completed_delegation(state, &delegation, won_status).await?;
     if !won {
         // Another terminal child, the boot sweep, or cancellation already won
         // the status CAS. Only the winner may publish normal handoff files; a
@@ -104,9 +97,6 @@ pub(crate) async fn try_claim_and_publish_completed_delegation(
     state: &AppState,
     delegation: &Delegation,
     status: DelegationStatus,
-    ok: usize,
-    failed: usize,
-    failed_ids: &[String],
 ) -> std::result::Result<bool, RpcError> {
     let won = state
         .repo
@@ -119,31 +109,25 @@ pub(crate) async fn try_claim_and_publish_completed_delegation(
     // keeps a cancelled delegation from getting completed artifacts. If the
     // daemon crashes in this gap, boot repair re-renders completed delegations
     // and enqueues the same deterministic steer.
-    publish_completed_delegation(state, delegation, status, ok, failed, failed_ids).await?;
+    publish_completed_delegation(state, delegation, status).await?;
     Ok(true)
 }
 
 /// Render a completed delegation's normal handoff files and then enqueue the
 /// deterministic parent steer. This helper is intentionally replayable:
-/// `write_delegation_handoff` rewrites the same content from durable
-/// transcripts, and `enqueue_delegation_steer` is keyed by
+/// `build_delegation_snapshot` refreshes the same handoff artifacts from
+/// durable transcripts, and `enqueue_delegation_steer` is keyed by
 /// delegation-id+attempt-id so repair cannot double-enqueue.
 async fn publish_completed_delegation(
     state: &AppState,
     delegation: &Delegation,
-    _status: DelegationStatus,
-    ok: usize,
-    failed: usize,
-    failed_ids: &[String],
+    status: DelegationStatus,
 ) -> std::result::Result<(), RpcError> {
-    let parent_config = state
-        .repo
-        .load_session_config(&delegation.parent_session_id)
-        .await?;
-    let handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
-    let message = steer_message(delegation, &handoff_dir, ok, failed, failed_ids);
     let steer_client_input_id = delegation_steer_client_input_id(delegation);
-    write_delegation_handoff(state, delegation).await?;
+    let mut completed_delegation = delegation.clone();
+    completed_delegation.status = status;
+    let snapshot = build_delegation_snapshot(state, &completed_delegation).await?;
+    let message = completion_wakeup_message(&snapshot)?;
     state
         .repo
         .enqueue_delegation_steer(
@@ -341,7 +325,7 @@ async fn repair_completed_delegation_publication(
     ) {
         return Ok(());
     }
-    let (classified_status, ok, failed, failed_ids) = classify_subagents(state, delegation).await?;
+    let (classified_status, _, _, _) = classify_subagents(state, delegation).await?;
     let status = if classified_status == status {
         status
     } else {
@@ -355,7 +339,7 @@ async fn repair_completed_delegation_publication(
         );
         status
     };
-    publish_completed_delegation(state, delegation, status, ok, failed, &failed_ids).await?;
+    publish_completed_delegation(state, delegation, status).await?;
     if completion_steer_needs_drive(state, delegation).await? {
         drive_parent_after_steer(state, &delegation.parent_session_id).await;
     }
