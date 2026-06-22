@@ -445,17 +445,6 @@ export function App() {
 		() => stages.flatMap((stage) => stage.subagents.map((subagent) => subagent.id)),
 		[stages],
 	);
-	// Re-run needs the original prompts; stage.list carries each subagent's
-	// persisted task, so recover them from the stage data itself.
-	const stageTaskBySessionId = useMemo(() => {
-		const map = new Map<string, string | null>();
-		for (const stage of stages) {
-			for (const subagent of stage.subagents) {
-				map.set(subagent.id, subagent.task ?? null);
-			}
-		}
-		return map;
-	}, [stages]);
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
 	const hasTranscriptEntries =
 		loadedSnapshot?.has_transcript_entries ??
@@ -1593,7 +1582,7 @@ export function App() {
 		(stage: Stage) => {
 			const parentSessionId = loadedSnapshot?.session_id;
 			if (!parentSessionId) return;
-			const reRun = reRunParamsForStage(stage, parentSessionId, stageTaskBySessionId);
+			const reRun = reRunParamsForStage(stage, parentSessionId);
 			if (!reRun) {
 				pushNotice("error", "cannot re-run: original prompts are unavailable");
 				return;
@@ -1604,7 +1593,7 @@ export function App() {
 				.then(() => invalidateStages())
 				.catch((error) => pushNotice("error", errorMessage(error)));
 		},
-		[api, invalidateStages, loadedSnapshot?.session_id, pushNotice, stageTaskBySessionId],
+		[api, invalidateStages, loadedSnapshot?.session_id, pushNotice],
 	);
 
 	const readHandoffFile = useCallback(
@@ -2125,7 +2114,6 @@ export function App() {
 					stages={stages}
 					stagesLoading={stagesQuery.isLoading}
 					stagesError={errorMessageOrNull(stagesQuery.error)}
-					stageTaskBySessionId={stageTaskBySessionId}
 					runBoard={{
 						onCancelStage: cancelStage,
 						onSteerSubagent: steerSubagent,

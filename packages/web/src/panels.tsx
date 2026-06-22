@@ -30,6 +30,7 @@ import { truncate } from "./text.ts";
 import {
 	canReRunStage,
 	isStageRunning,
+	stageHasHandoff,
 	stageStatusLabel,
 	steerableSubagentId,
 } from "./runBoard.ts";
@@ -87,7 +88,6 @@ export interface RunBoardCallbacks {
 interface RunBoardProps extends RunBoardCallbacks {
 	parentSessionId: string | null;
 	stages: Stage[];
-	taskBySessionId: Map<string, string | null>;
 	loading: boolean;
 	error: string | null;
 }
@@ -111,9 +111,7 @@ function SubagentRow({
 }) {
 	const finalKey = `${subagent.id}:final_message.md`;
 	const transcriptKey = `${subagent.id}:transcript.md`;
-	// Handoff files only exist once the stage is terminal (the daemon writes them
-	// inside the barrier). While running, the row links to the live session only.
-	const handoffReady = !isStageRunning(stage);
+	const handoffReady = stageHasHandoff(stage);
 	const openFinal = open && open.key === finalKey ? open : null;
 	const openTranscript = open && open.key === transcriptKey ? open : null;
 	return (
@@ -178,11 +176,14 @@ function StageCard({
 	canReRun: boolean;
 	steerableId: string | null;
 	open: OpenHandoffFile | null;
-	onOpenFile: (subagentId: string, file: HandoffFileName) => void;
+	onOpenFile: (subagentId: string | null, file: HandoffFileName) => void;
 	onCloseFile: () => void;
 } & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelStage" | "onSteerSubagent" | "onReRunStage">) {
 	const running = isStageRunning(stage);
 	const title = stage.label ?? stage.workflow ?? stage.stage_id.slice(0, 13);
+	const indexKey = `stage:index.json`;
+	const openIndex = open && open.key === indexKey ? open : null;
+	const handoffReady = stageHasHandoff(stage);
 	return (
 		<div className="run-board-stage">
 			<div className="run-board-stage-head">
@@ -193,6 +194,11 @@ function StageCard({
 				</span>
 				<span className={`subagent-activity ${running ? "running" : "idle"}`}>{stageStatusLabel(stage.status)}</span>
 			</div>
+			{handoffReady && stage.handoff_dir ? (
+				<div className="run-board-handoff-path" title={stage.handoff_dir}>
+					handoff {stage.handoff_dir}
+				</div>
+			) : null}
 			<div className="run-board-stage-controls">
 				{running ? (
 					<button className="chip-button" type="button" onClick={() => onCancelStage(stage.stage_id)} title="cancel this stage">
@@ -209,7 +215,18 @@ function StageCard({
 						<RotateCcw size={11} /> re-run
 					</button>
 				) : null}
+				{handoffReady ? (
+					<button
+						className="chip-button"
+						type="button"
+						onClick={() => (openIndex ? onCloseFile() : onOpenFile(null, "index.json"))}
+						title="show stage handoff index.json"
+					>
+						<FileText size={11} /> index.json
+					</button>
+				) : null}
 			</div>
+			{openIndex ? <HandoffFileView open={openIndex} /> : null}
 			<div className="run-board-subagents" role="list">
 				{stage.subagents.map((subagent) => (
 					<SubagentRow
@@ -230,7 +247,6 @@ function StageCard({
 function RunBoard({
 	parentSessionId,
 	stages,
-	taskBySessionId,
 	loading,
 	error,
 	onSelectSession,
@@ -240,11 +256,11 @@ function RunBoard({
 	readHandoffFile,
 }: RunBoardProps) {
 	// Which handoff file (if any) is currently expanded. Keyed by
-	// `${subagentId}:${file}` so only one file is open at a time.
+	// `${subagentId ?? "stage"}:${file}` so only one file is open at a time.
 	const [openFile, setOpenFile] = useState<{ stageId: string; open: OpenHandoffFile } | null>(null);
 
-	const openHandoffFile = (stageId: string, subagentId: string, file: HandoffFileName) => {
-		const key = `${subagentId}:${file}`;
+	const openHandoffFile = (stageId: string, subagentId: string | null, file: HandoffFileName) => {
+		const key = `${subagentId ?? "stage"}:${file}`;
 		setOpenFile({ stageId, open: { key, content: "" } });
 		void readHandoffFile(stageId, subagentId, file)
 			.then((content) => setOpenFile({ stageId, open: { key, content } }))
@@ -266,7 +282,7 @@ function RunBoard({
 						<StageCard
 							key={stage.stage_id}
 							stage={stage}
-							canReRun={canReRunStage(stage, taskBySessionId)}
+							canReRun={canReRunStage(stage)}
 							steerableId={steerableSubagentId(stage)}
 							open={openFile && openFile.stageId === stage.stage_id ? openFile.open : null}
 							onOpenFile={(subagentId, file) => openHandoffFile(stage.stage_id, subagentId, file)}
@@ -789,7 +805,6 @@ export function Inspector({
 	stages,
 	stagesLoading,
 	stagesError,
-	stageTaskBySessionId,
 	runBoard,
 	tools,
 	onSelectSession,
@@ -799,7 +814,6 @@ export function Inspector({
 	stages: Stage[];
 	stagesLoading: boolean;
 	stagesError: string | null;
-	stageTaskBySessionId: Map<string, string | null>;
 	runBoard: Omit<RunBoardCallbacks, "onSelectSession">;
 	tools: ToolListing[];
 	onSelectSession?: (sessionId: string) => void;
@@ -857,7 +871,6 @@ export function Inspector({
 			<RunBoard
 				parentSessionId={snapshot?.session_id ?? null}
 				stages={stages}
-				taskBySessionId={stageTaskBySessionId}
 				loading={stagesLoading}
 				error={stagesError}
 				onSelectSession={onSelectSession}
