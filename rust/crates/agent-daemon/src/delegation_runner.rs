@@ -8,18 +8,19 @@
 //!   finish_delegation CAS (running -> done|done_with_failures)    # single-flight status claim
 //!   if the CAS won:
 //!     render/refresh handoff dir (per-subagent md)
-//!     enqueue deterministic parent steer
-//!     drive parent to consume the queued steer
+//!     enqueue deterministic parent wakeup observation
+//!     drive parent to consume the queued wakeup
 //! ```
 //!
 //! The terminal-status CAS runs before normal handoff rendering so a concurrent
 //! cancellation cannot win and then be left with normal completed handoff
-//! artifacts. The steer is enqueued only after the files exist; if the daemon
-//! crashes after the status CAS but before publishing files/steer, the boot
-//! sweep repairs already-completed delegations by re-rendering the handoff and
-//! idempotently enqueueing the deterministic steer. The single-flight is the DB
+//! artifacts. The wakeup observation is enqueued only after the files exist; if
+//! the daemon crashes after the status CAS but before publishing
+//! files/observation, the boot sweep repairs already-completed delegations by
+//! re-rendering the handoff and idempotently enqueueing the deterministic
+//! wakeup. The single-flight is the DB
 //! `finish_delegation` CAS, NOT the in-process `SessionDriver` mutex — so
-//! concurrent terminal children and restart repair steer the parent exactly
+//! concurrent terminal children and restart repair wake the parent exactly
 //! once.
 
 use agent_store::{Delegation, DelegationStatus, QueuedInputStatus};
@@ -42,9 +43,9 @@ use crate::types::RpcError;
 ///   if not all terminal: return                 # barrier not met
 ///   finish_delegation CAS                       # claim terminal status before
 ///                                                # any normal handoff files
-///   if won: write handoff files                 # parent steer is not queued
+///   if won: write handoff files                 # parent wakeup is not queued
 ///                                                # until these exist
-///   enqueue deterministic steer                 # idempotent; boot repair
+///   enqueue deterministic wakeup observation     # idempotent; boot repair
 ///                                                # retries after CAS/file gaps
 ///   drive the parent
 pub(crate) async fn complete_delegation_if_ready(
@@ -86,10 +87,10 @@ pub(crate) async fn complete_delegation_if_ready(
         return Ok(());
     }
 
-    // The steer is durably queued. Drive the parent so it consumes the steer
-    // promptly; driving is idempotent and replayable, and the durable
-    // queued_input is the crash backstop if this drive never runs.
-    drive_parent_after_steer(state, &delegation.parent_session_id).await;
+    // The wakeup observation is durably queued. Drive the parent so it consumes
+    // the wakeup promptly; driving is idempotent and replayable, and the
+    // durable queued_input is the crash backstop if this drive never runs.
+    drive_parent_after_wakeup(state, &delegation.parent_session_id).await;
     Ok(())
 }
 
@@ -108,22 +109,23 @@ pub(crate) async fn try_claim_and_publish_completed_delegation(
     // Publish normal handoff only after winning the terminal status claim; this
     // keeps a cancelled delegation from getting completed artifacts. If the
     // daemon crashes in this gap, boot repair re-renders completed delegations
-    // and enqueues the same deterministic steer.
+    // and enqueues the same deterministic wakeup observation.
     publish_completed_delegation(state, delegation, status).await?;
     Ok(true)
 }
 
 /// Render a completed delegation's normal handoff files and then enqueue the
-/// deterministic parent steer. This helper is intentionally replayable:
+/// deterministic typed parent wakeup observation. This helper is intentionally
+/// replayable:
 /// `build_delegation_snapshot` refreshes the same handoff artifacts from
-/// durable transcripts, and `enqueue_delegation_steer` is keyed by
+/// durable transcripts, and the queued-input client id is keyed by
 /// delegation-id+attempt-id so repair cannot double-enqueue.
 async fn publish_completed_delegation(
     state: &AppState,
     delegation: &Delegation,
     status: DelegationStatus,
 ) -> std::result::Result<(), RpcError> {
-    let steer_client_input_id = delegation_steer_client_input_id(delegation);
+    let wakeup_client_input_id = delegation_wakeup_client_input_id(delegation);
     let mut completed_delegation = delegation.clone();
     completed_delegation.status = status;
     let snapshot = build_delegation_snapshot(state, &completed_delegation).await?;
@@ -133,24 +135,24 @@ async fn publish_completed_delegation(
         .enqueue_delegation_observation(
             &delegation.parent_session_id,
             &observation,
-            &steer_client_input_id,
+            &wakeup_client_input_id,
         )
         .await?;
     Ok(())
 }
 
-fn delegation_steer_client_input_id(delegation: &Delegation) -> String {
+fn delegation_wakeup_client_input_id(delegation: &Delegation) -> String {
     format!(
         "delegation-steer:{}:{}",
         delegation.id, delegation.attempt_id
     )
 }
 
-async fn completion_steer_needs_drive(
+async fn completion_wakeup_needs_drive(
     state: &AppState,
     delegation: &Delegation,
 ) -> std::result::Result<bool, RpcError> {
-    let key = delegation_steer_client_input_id(delegation);
+    let key = delegation_wakeup_client_input_id(delegation);
     Ok(state
         .repo
         .find_client_input(&delegation.parent_session_id, &key)
@@ -173,22 +175,22 @@ async fn completion_steer_needs_drive(
 /// lock may be held up the stack (the firing child). `try_acquire` makes that a
 /// skip rather than a blocking acquire, so the child->parent ordering here cannot
 /// deadlock against the parent->child ordering of a spawn.
-async fn drive_parent_after_steer(state: &AppState, parent_session_id: &str) {
+async fn drive_parent_after_wakeup(state: &AppState, parent_session_id: &str) {
     let Some(driver) = SessionDriver::try_acquire(state, parent_session_id).await else {
         return;
     };
     if let Err(error) = driver.recover_if_needed().await {
         eprintln!(
-            "delegation barrier could not recover parent {parent_session_id} after steer: {}: {}",
+            "delegation barrier could not recover parent {parent_session_id} after wakeup: {}: {}",
             error.code, error.message
         );
         return;
     }
     // recover_if_needed only drives a parent that should_continue; an idle parent
-    // with the freshly queued steer needs an explicit drive to consume it.
+    // with the freshly queued wakeup needs an explicit drive to consume it.
     if let Err(error) = driver.drive_until_blocked().await {
         eprintln!(
-            "delegation barrier could not drive parent {parent_session_id} after steer: {}: {}",
+            "delegation barrier could not drive parent {parent_session_id} after wakeup: {}: {}",
             error.code, error.message
         );
     }
@@ -248,8 +250,8 @@ async fn classify_subagents(
 ///    crash before the terminal-status claim leaves such a delegation `running`
 ///    with every subagent idle; the ordinary barrier path handles it.
 /// 2. Repair already-completed delegations that may have crashed after the
-///    status CAS but before normal handoff files and the parent steer were
-///    published. This repair is idempotent and only covers `done` /
+///    status CAS but before normal handoff files and the parent wakeup
+///    observation were published. This repair is idempotent and only covers `done` /
 ///    `done_with_failures`; cancelled delegations remain transcript-only and
 ///    are never reactivated.
 pub(crate) async fn sweep_running_delegations_on_boot(state: &AppState) {
@@ -332,8 +334,8 @@ async fn repair_completed_delegation_publication(
         status
     };
     publish_completed_delegation(state, delegation, status).await?;
-    if completion_steer_needs_drive(state, delegation).await? {
-        drive_parent_after_steer(state, &delegation.parent_session_id).await;
+    if completion_wakeup_needs_drive(state, delegation).await? {
+        drive_parent_after_wakeup(state, &delegation.parent_session_id).await;
     }
     Ok(())
 }

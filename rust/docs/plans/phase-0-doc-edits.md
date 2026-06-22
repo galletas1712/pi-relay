@@ -50,8 +50,8 @@ with:
 >   A stage is one **full** subagent (writes the parent's workspace in place) or a
 >   parallel fan-out of **read-only** subagents (each in a disposable btrfs
 >   snapshot, destroyed on return). The parent parks after launching a stage and
->   is delivered a parent-scoped completion **steer** pointing at a handoff
->   directory (per-subagent final message and transcript; structured state via `inspect_delegation`).
+>   is delivered a parent-scoped daemon-authored wakeup observation containing an
+>   `inspect_delegation`-equivalent bounded snapshot and handoff artifact refs.
 >   `subagent.{spawned,running,idle}` lifecycle events drive the stage barrier.
 >   Reusable patterns are **workflow skills** (`SKILL.md` + `LoadSkill`), not a
 >   DSL. The Python REPL `subagents` module remains only as a raw escape hatch.

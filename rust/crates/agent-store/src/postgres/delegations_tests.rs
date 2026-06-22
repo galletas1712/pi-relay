@@ -671,7 +671,7 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
         .await
         .expect("replay is a no-op"));
 
-    // The status CAS no longer enqueues the steer. Publication happens after
+    // The status CAS no longer enqueues the wakeup. Publication happens after
     // the handoff files exist, but the deterministic client_input_id still
     // makes the enqueue idempotent.
     let key = format!(

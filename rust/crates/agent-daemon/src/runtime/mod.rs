@@ -447,12 +447,12 @@ impl SessionDriver {
 
         // Every parentful subagent is a delegation member (the only spawn path
         // sets a delegation_id). A delegation member's completion is delivered as
-        // ONE delegation steer,
+        // ONE typed delegation wakeup observation,
         // NOT a per-child idle. Fire the once-gate WITHOUT writing a
         // parent-visible SubagentIdle row (so events_after / the run board never
         // surface per-child idle), then — on that single firing — destroy the RO
         // snapshot and run the barrier. The barrier is single-flighted by the DB
-        // delegation-row CAS, so concurrent terminal children steer the parent exactly
+        // delegation-row CAS, so concurrent terminal children wake the parent exactly
         // once. Return None: the per-child idle is suppressed for the parent.
         let delegation_id = match self
             .state
@@ -497,8 +497,8 @@ impl SessionDriver {
     /// terminal. The `finish_delegation` CAS (`status='running'` +
     /// `attempt_id` fence) is the single-flight for terminal delegation status;
     /// only its winner publishes normal handoff files and then enqueues the
-    /// deterministic parent steer. A cancellation winner therefore remains
-    /// transcript-only.
+    /// deterministic parent wakeup observation. A cancellation winner therefore
+    /// remains transcript-only.
     async fn try_delegation_barrier(&self, delegation_id: &str) {
         // `recover_if_needed` -> terminal idle -> barrier -> sibling
         // `recover_if_needed` is a recursive async cycle; box it to break the
@@ -519,7 +519,8 @@ impl SessionDriver {
     /// The once-gate dedup key (the terminal active leaf) for this child's
     /// parent-visible idle. `None` when this session has no parent (a top-level
     /// session). The caller only needs the key: a delegation member's completion
-    /// is delivered as a single delegation steer, not a per-child idle payload.
+    /// is delivered as a single delegation wakeup observation, not a per-child
+    /// idle payload.
     async fn subagent_idle_notification_key(
         &self,
     ) -> std::result::Result<Option<String>, RpcError> {
