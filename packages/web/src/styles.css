@@ -957,8 +957,33 @@ pre {
 .empty-state {
 	flex: 1;
 	flex-direction: column;
-	gap: 12px;
+	gap: var(--space-2);
+	padding: var(--space-5);
+	text-align: center;
 	font-weight: 500;
+}
+
+.empty-state-title {
+	font-size: var(--text-2xl);
+	font-weight: 600;
+	color: var(--foreground);
+}
+
+.empty-state-sub {
+	max-width: 34ch;
+	font-size: var(--text-sm);
+	font-weight: 400;
+	color: var(--muted-foreground);
+}
+
+/* The empty-state CTA reuses .primary-button, but that base style is built for
+ * the sidebar toolbar where it stretches (flex: 1) and left-aligns its label.
+ * Here it is a standalone action, so size it to its content and center it. */
+.empty-state-cta {
+	flex: 0 0 auto;
+	justify-content: center;
+	margin-top: var(--space-2);
+	padding: 0 var(--space-4);
 }
 
 .message-row {
@@ -981,8 +1006,39 @@ pre {
 	display: block;
 }
 
-.turn-summary.current .assistant-block {
-	border-color: color-mix(in oklch, var(--primary) 36%, var(--border));
+/* Running-turn rail. The transcript's running turn (.turn-summary.current is
+ * only applied while the session is actually running) carries the same primary
+ * rail idiom used by the sidebar (.status-rail.running) and the mockup's
+ * .turn.running::before. The 3px bar is absolutely positioned so it never
+ * shifts the turn's content, and it is aligned to the left edge of the centered
+ * 900px content column (max(0px, calc(50% - 450px))) so it reads as attached to
+ * the running turn rather than floating at the pane edge. The previous rule here
+ * set border-color on .assistant-block, which has no border, so it painted
+ * nothing — it has been replaced by this real rail. */
+.turn-summary.current {
+	position: relative;
+}
+
+.turn-summary.current::before {
+	content: "";
+	position: absolute;
+	top: var(--space-1);
+	bottom: var(--space-1);
+	left: max(0px, calc(50% - 450px));
+	width: 3px;
+	border-radius: 999px;
+	background: var(--primary);
+	animation: turn-rail-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes turn-rail-pulse {
+	0%,
+	100% {
+		opacity: 0.45;
+	}
+	50% {
+		opacity: 1;
+	}
 }
 
 .turn-detail-toggle-row {
@@ -1409,6 +1465,61 @@ pre {
 .system-message-action:disabled {
 	cursor: default;
 	opacity: 0.65;
+}
+
+/* "Working…" signature strip. Unlike the generic .system-message line, the
+ * running-turn clock is the defining "the agent is working" moment, so it gets
+ * a distinct primary-tinted, lifted strip: a leading primary dot, the label in
+ * --primary, and a tabular-nums monospace elapsed clock that never jitters as
+ * it ticks. Its outer box shares the same centered 900px column as transcript
+ * rows; as a bordered card it carries its own token-based inner padding. The
+ * dot pulse is auto-gated by the global prefers-reduced-motion block. */
+.working-indicator {
+	display: flex;
+	align-items: center;
+	gap: var(--space-2);
+	width: min(100%, 900px);
+	margin: var(--space-2) auto;
+	padding: var(--space-2) var(--space-4);
+	border: 1px solid color-mix(in oklch, var(--primary) 35%, var(--border));
+	border-radius: var(--radius);
+	background: color-mix(in oklch, var(--primary) 12%, var(--card));
+	box-shadow: var(--elev-pop);
+}
+
+.working-indicator-dot {
+	flex: 0 0 auto;
+	width: 8px;
+	height: 8px;
+	border-radius: 999px;
+	background: var(--primary);
+	animation: working-indicator-pulse 1.6s ease-out infinite;
+}
+
+.working-indicator-label {
+	font-size: var(--text-sm);
+	font-weight: 600;
+	color: var(--primary);
+}
+
+.working-indicator-elapsed {
+	margin-left: auto;
+	font-family: var(--font-mono);
+	font-size: var(--text-md);
+	font-variant-numeric: tabular-nums;
+	color: var(--primary);
+}
+
+@keyframes working-indicator-pulse {
+	0% {
+		box-shadow: 0 0 0 0 color-mix(in oklch, var(--primary) 70%, transparent);
+	}
+	70% {
+		box-shadow: 0 0 0 9px color-mix(in oklch, var(--primary) 0%, transparent);
+	}
+	100% {
+		box-shadow: 0 0 0 0 transparent;
+	}
 }
 
 .notice-stack {
