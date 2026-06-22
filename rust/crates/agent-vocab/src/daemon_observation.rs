@@ -213,7 +213,7 @@ mod tests {
                 "status": "done",
                 "subagents": [{
                     "id": "child_1",
-                    "transcript_path": "/tmp/.pi-handoff/delegation_1/child_1/transcript.md",
+                    "transcript_file": "child_1/transcript.md",
                 }],
             }),
         );
@@ -227,7 +227,7 @@ mod tests {
         assert!(text.contains("large prompts/messages are not inlined"));
         assert!(text.contains("Snapshot JSON follows"));
         assert!(text.contains("\"delegation_id\": \"delegation_1\""));
-        assert!(text.contains("\"transcript_path\""));
+        assert!(text.contains("\"transcript_file\""));
     }
 
     #[test]

@@ -84,7 +84,7 @@ describe("Inspector run board handoff links", () => {
 						role: "reviewer",
 						subagent_type: "read_only",
 						task: "review the change",
-						cancellation_transcript_relative_path: "cancelled/child-1.transcript.md",
+						cancellation_transcript_file: "cancelled/child-1.transcript.md",
 					},
 				],
 			}),

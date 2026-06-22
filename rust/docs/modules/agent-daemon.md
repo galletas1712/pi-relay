@@ -60,9 +60,9 @@ a single-flight, `attempt_id`-fenced barrier when all subagents of a delegation 
 terminal. After the DB finish CAS wins, the runner writes the handoff directory
 and then enqueues one `InputPriority::Steer` daemon observation to the parent.
 That observation includes the same structured snapshot shape as
-`inspect_delegation`, with bounded final-message previews, `suggested_next`, and
-artifact paths.
-Completion is that steer/handoff, not a parent-visible per-child idle event. The
+`inspect_delegation`, with bounded final-message previews, `suggested_next`,
+and compact handoff file references.
+Completion is that typed wakeup observation/handoff, not a parent-visible per-child idle event. The
 runner never decides the next delegation — the parent does, guided by workflow
 skills. Cancellation is terminal and exports transcript-only files for the
 cancelled subagents instead of running the normal completion handoff.

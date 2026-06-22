@@ -731,13 +731,7 @@ const TranscriptDisplayNodeView = memo(function TranscriptDisplayNodeView({
 		return <ToolResultCard item={item} entryId={node.entry.id} />;
 	}
 	if (node.type === "daemon_tool_observation") {
-		const item = node.entry.item;
-		const delegationId = delegationIdFromDaemonObservation(item);
-		const status = delegationStatusFromDaemonObservation(item);
-		const parts = [item.summary?.trim() || `Daemon observed ${item.tool_name}`];
-		if (delegationId && !parts[0].includes(delegationId)) parts.push(`delegation ${delegationId}`);
-		if (status) parts.push(`status ${status}`);
-		return <SystemMessage tone="info" text={parts.join(" · ")} entryId={node.entry.id} />;
+		return <DaemonObservationSystemMessage entry={node.entry} />;
 	}
 	if (node.type === "compaction_summary") {
 		const item = node.entry.item;
@@ -786,6 +780,23 @@ function delegationStatusFromDaemonObservation(item: Extract<TranscriptItem, { t
 	return null;
 }
 
+function daemonObservationSystemText(item: Extract<TranscriptItem, { type: "daemon_tool_observation" }>): string {
+	const delegationId = delegationIdFromDaemonObservation(item);
+	const status = delegationStatusFromDaemonObservation(item);
+	const parts = [item.summary?.trim() || `Daemon observed ${item.tool_name}`];
+	if (delegationId && !parts[0].includes(delegationId)) parts.push(`delegation ${delegationId}`);
+	if (status) parts.push(`status ${status}`);
+	return parts.join(" · ");
+}
+
+function DaemonObservationSystemMessage({
+	entry,
+}: {
+	entry: TranscriptEntry & { item: Extract<TranscriptItem, { type: "daemon_tool_observation" }> };
+}) {
+	return <SystemMessage tone="info" text={daemonObservationSystemText(entry.item)} entryId={entry.id} />;
+}
+
 const TurnCardRow = memo(function TurnCardRow({
 	turn,
 	pendingActions,
@@ -824,6 +835,7 @@ const TurnCardRow = memo(function TurnCardRow({
 		else onExpandTurn?.(card.id);
 	};
 	const summaryUserMessages = isExpanded ? [] : card.user_messages;
+	const summaryDaemonObservations = isExpanded ? [] : card.daemon_observations ?? [];
 	let detailRows: ReactNode = null;
 	if (detailEntries) {
 		const toolIndex = indexToolEntries(detailEntries);
@@ -858,6 +870,14 @@ const TurnCardRow = memo(function TurnCardRow({
 						entryId={entry.id}
 						item={entry.item}
 						turnJumpTargetId={entry.id === firstUserMessageId ? turnJumpTargetId : undefined}
+					/>
+				) : null,
+			)}
+			{summaryDaemonObservations.map((entry) =>
+				entry.item.type === "daemon_tool_observation" ? (
+					<DaemonObservationSystemMessage
+						key={entry.id}
+						entry={entry as TranscriptEntry & { item: Extract<TranscriptItem, { type: "daemon_tool_observation" }> }}
 					/>
 				) : null,
 			)}

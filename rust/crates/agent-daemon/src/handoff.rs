@@ -16,13 +16,12 @@
 //! repair may re-render the same files for already-completed delegations if the
 //! daemon crashed after the status CAS but before publication.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use agent_store::{Delegation, DelegationStatus, HistoryTree};
 use agent_vocab::{
     AssistantMessage, ContentBlock, ToolResultStatus, TranscriptItem, TurnOutcome, UserMessage,
 };
-use sha2::{Digest, Sha256};
 
 use crate::state::AppState;
 use crate::types::RpcError;
@@ -205,10 +204,7 @@ pub(crate) struct SubagentArtifact {
     pub(crate) final_message: Option<String>,
     pub(crate) suggested_next: Option<String>,
     pub(crate) final_message_path: Option<PathBuf>,
-    pub(crate) transcript_path: PathBuf,
-    pub(crate) task_prompt_path: PathBuf,
-    pub(crate) task_prompt_bytes: usize,
-    pub(crate) task_prompt_sha256: String,
+    pub(crate) task_prompt_path: Option<PathBuf>,
 }
 
 impl SubagentArtifact {
@@ -222,20 +218,46 @@ impl SubagentArtifact {
         format!("{}/transcript.md", self.session_id)
     }
 
-    pub(crate) fn task_prompt_rel(&self) -> String {
-        task_prompt_rel(&self.session_id)
+    pub(crate) fn task_prompt_rel(&self) -> Option<String> {
+        self.task_prompt_path
+            .as_ref()
+            .map(|_| task_prompt_rel(&self.session_id))
     }
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct TaskPromptArtifact {
     pub(crate) path: PathBuf,
-    pub(crate) bytes: usize,
-    pub(crate) sha256: String,
 }
 
 pub(crate) fn task_prompt_rel(session_id: &str) -> String {
     format!("{session_id}/{TASK_PROMPT_FILE}")
+}
+
+/// Reject any dynamic path segment that is not a plain file/dir name. Every
+/// handoff writer should validate public ids before joining them onto the
+/// trusted handoff root.
+pub(crate) fn safe_handoff_path_segment(
+    segment: &str,
+    field: &str,
+) -> std::result::Result<String, RpcError> {
+    let trimmed = segment.trim();
+    let reject = || {
+        RpcError::new(
+            "invalid_params",
+            format!("{field} is not a valid path segment"),
+        )
+    };
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(reject());
+    }
+    let mut components = Path::new(trimmed).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(name)), None) if name == std::ffi::OsStr::new(trimmed) => {
+            Ok(trimmed.to_string())
+        }
+        _ => Err(reject()),
+    }
 }
 
 pub(crate) async fn refresh_task_prompt_artifact(
@@ -243,7 +265,8 @@ pub(crate) async fn refresh_task_prompt_artifact(
     session_id: &str,
     task: &str,
 ) -> std::result::Result<TaskPromptArtifact, RpcError> {
-    let subagent_dir = delegation_dir.join(session_id);
+    let session_segment = safe_handoff_path_segment(session_id, "subagent_id")?;
+    let subagent_dir = delegation_dir.join(session_segment);
     tokio::fs::create_dir_all(&subagent_dir)
         .await
         .map_err(anyhow::Error::from)?;
@@ -251,12 +274,24 @@ pub(crate) async fn refresh_task_prompt_artifact(
     tokio::fs::write(&path, task.as_bytes())
         .await
         .map_err(anyhow::Error::from)?;
-    let digest = Sha256::digest(task.as_bytes());
-    Ok(TaskPromptArtifact {
-        path,
-        bytes: task.len(),
-        sha256: format!("{digest:x}"),
-    })
+    Ok(TaskPromptArtifact { path })
+}
+
+pub(crate) async fn refresh_task_prompt_artifact_if_present(
+    delegation_dir: &Path,
+    session_id: &str,
+    task: Option<&str>,
+) -> std::result::Result<Option<TaskPromptArtifact>, RpcError> {
+    safe_handoff_path_segment(session_id, "subagent_id")?;
+    let Some(task) = task else {
+        return Ok(None);
+    };
+    if task.trim().is_empty() {
+        return Ok(None);
+    }
+    refresh_task_prompt_artifact(delegation_dir, session_id, task)
+        .await
+        .map(Some)
 }
 
 pub(crate) fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
@@ -320,10 +355,10 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         tokio::fs::create_dir_all(&subagent_dir)
             .await
             .map_err(anyhow::Error::from)?;
-        let task_prompt = refresh_task_prompt_artifact(
+        let task_prompt = refresh_task_prompt_artifact_if_present(
             &dir,
             &subagent.session_id,
-            subagent.task.as_deref().unwrap_or_default(),
+            subagent.task.as_deref(),
         )
         .await?;
         let final_message_path = if include_final_messages {
@@ -346,10 +381,7 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
             final_message: include_final_content.then_some(final_message),
             suggested_next: include_final_content.then_some(suggested_next).flatten(),
             final_message_path,
-            transcript_path,
-            task_prompt_path: task_prompt.path,
-            task_prompt_bytes: task_prompt.bytes,
-            task_prompt_sha256: task_prompt.sha256,
+            task_prompt_path: task_prompt.as_ref().map(|artifact| artifact.path.clone()),
         });
     }
 

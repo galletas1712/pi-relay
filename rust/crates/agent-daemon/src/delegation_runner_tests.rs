@@ -1597,23 +1597,15 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     assert_eq!(snapshot["status"], "cancelled");
     assert_eq!(subagent["status"], "cancelled");
     assert_eq!(subagent["final_message_preview"], serde_json::Value::Null);
-    assert_eq!(subagent["final_message_path"], serde_json::Value::Null);
-    assert_eq!(
-        subagent["final_message_relative_path"],
-        serde_json::Value::Null
-    );
     assert_eq!(subagent["final_message_file"], serde_json::Value::Null);
-    assert_eq!(subagent["transcript_path"], serde_json::Value::Null);
-    assert_eq!(
-        subagent["transcript_relative_path"],
-        serde_json::Value::Null
-    );
     assert_eq!(subagent["transcript_file"], serde_json::Value::Null);
-    assert_eq!(subagent["cancellation_transcript_path"], transcript_path);
     assert_eq!(
-        subagent["cancellation_transcript_relative_path"],
+        subagent["cancellation_transcript_file"],
         format!("cancelled/{}.transcript.md", "impl_to_cancel")
     );
+    assert!(subagent.get("final_message_path").is_none());
+    assert!(subagent.get("transcript_path").is_none());
+    assert!(subagent.get("cancellation_transcript_path").is_none());
     let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
         .await
         .expect("list delegations");
@@ -1621,13 +1613,12 @@ async fn cancel_delegation_returns_transcript_only_paths() {
         .as_array()
         .unwrap()[0];
     assert_eq!(
-        listed_subagent["cancellation_transcript_path"],
-        transcript_path
-    );
-    assert_eq!(
-        listed_subagent["cancellation_transcript_relative_path"],
+        listed_subagent["cancellation_transcript_file"],
         "cancelled/impl_to_cancel.transcript.md"
     );
+    assert!(listed_subagent
+        .get("cancellation_transcript_path")
+        .is_none());
     assert_eq!(snapshot["progress"]["running"], 0);
     assert!(!handoff_root(&env, &delegation.id)
         .join("index.json")
@@ -1932,18 +1923,12 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
         );
         assert!(base.join("transcript.md").exists(), "transcript for {id}");
         assert_eq!(
-            subagent["final_message_path"],
-            base.join("final_message.md").to_string_lossy().as_ref()
-        );
-        assert_eq!(
-            subagent["transcript_path"],
-            base.join("transcript.md").to_string_lossy().as_ref()
-        );
-        assert_eq!(
             subagent["final_message_file"],
             format!("{id}/final_message.md")
         );
         assert_eq!(subagent["transcript_file"], format!("{id}/transcript.md"));
+        assert!(subagent.get("final_message_path").is_none());
+        assert!(subagent.get("transcript_path").is_none());
     }
     let ok = subagents.iter().find(|s| s["id"] == "ok_a").unwrap();
     assert_eq!(ok["role"], "reviewer");
@@ -1966,10 +1951,7 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
         "All good.\n\nsuggested_next: approved"
     );
     assert_eq!(wakeup_ok["suggested_next"], "approved");
-    assert!(wakeup_ok["transcript_path"]
-        .as_str()
-        .expect("transcript path in wakeup snapshot")
-        .ends_with("ok_a/transcript.md"));
+    assert_eq!(wakeup_ok["transcript_file"], "ok_a/transcript.md");
     assert_eq!(ok["steerable"], false);
     let failed = subagents
         .iter()
@@ -2055,7 +2037,8 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         "Found the answer.\n\nsuggested_next: done"
     );
     assert_eq!(done["suggested_next"], "done");
-    assert_eq!(done["final_message_path"], serde_json::Value::Null);
+    assert_eq!(done["final_message_file"], serde_json::Value::Null);
+    assert!(done.get("final_message_path").is_none());
     assert!(
         !root.join("done_child").join("final_message.md").exists(),
         "normal final_message artifact waits for delegation completion"
@@ -2076,7 +2059,8 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
     assert_eq!(running["status"], "running");
     assert_eq!(running["final_message_preview"], serde_json::Value::Null);
     assert_eq!(running["suggested_next"], serde_json::Value::Null);
-    assert_eq!(running["final_message_path"], serde_json::Value::Null);
+    assert_eq!(running["final_message_file"], serde_json::Value::Null);
+    assert!(running.get("final_message_path").is_none());
     assert!(root.join("running_child").join("transcript.md").exists());
     assert!(
         !root.join("running_child").join("final_message.md").exists(),
@@ -2130,8 +2114,10 @@ async fn failed_delegation_does_not_publish_normal_handoff_on_inspect_or_read() 
     assert_eq!(snapshot["status"], "failed");
     assert_eq!(subagent["status"], "failed");
     assert_eq!(subagent["final_message_preview"], serde_json::Value::Null);
-    assert_eq!(subagent["final_message_path"], serde_json::Value::Null);
-    assert_eq!(subagent["transcript_path"], serde_json::Value::Null);
+    assert_eq!(subagent["final_message_file"], serde_json::Value::Null);
+    assert_eq!(subagent["transcript_file"], serde_json::Value::Null);
+    assert!(subagent.get("final_message_path").is_none());
+    assert!(subagent.get("transcript_path").is_none());
     let root = handoff_root(&env, &delegation.id);
     assert!(
         !root.join("impl_failed").join("transcript.md").exists(),
@@ -2218,6 +2204,123 @@ async fn completion_loser_after_cancellation_does_not_write_normal_handoff() {
     assert!(!handoff_root.join("index.json").exists());
     assert!(!handoff_root.join("impl_cancel_wins").exists());
     assert_eq!(steers_to_parent(&env, "parent", &delegation.id).await, 0);
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn missing_task_metadata_omits_task_prompt_artifacts_and_rerun_metadata() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "missing task prompt test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("legacy"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_legacy").await;
+
+    let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
+        .await
+        .expect("list delegations");
+    let listed_subagent = &list["delegations"].as_array().unwrap()[0]["subagents"]
+        .as_array()
+        .unwrap()[0];
+    assert_eq!(listed_subagent["task_prompt_file"], serde_json::Value::Null);
+    assert!(listed_subagent.get("task_prompt_path").is_none());
+
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let subagent = &snapshot["subagents"].as_array().unwrap()[0];
+    assert_eq!(subagent["task_prompt_file"], serde_json::Value::Null);
+    assert!(subagent.get("task_prompt_path").is_none());
+    assert!(
+        !handoff_root(&env, &delegation.id)
+            .join("impl_legacy")
+            .join("task_prompt.md")
+            .exists(),
+        "missing task metadata must not create an empty task_prompt.md"
+    );
+
+    let error = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "subagent_id": "impl_legacy",
+            "file": "task_prompt.md",
+        }),
+    )
+    .await
+    .expect_err("missing task prompt read rejected");
+    assert_eq!(error.code, "handoff_file_not_found");
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn read_task_prompt_validates_subagent_segment_before_refreshing_artifact() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "task prompt path validation test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl").await;
+    let metadata_with_task = json!({
+        "created_by": "test",
+        "role_name": "implementer",
+        "task": "write the follow-up fix",
+    });
+    env.state
+        .repo
+        .update_session_metadata("impl", &metadata_with_task)
+        .await
+        .expect("store task metadata");
+
+    let error = read_handoff_file_core(
+        &env.state,
+        "parent",
+        json!({
+            "delegation_id": delegation.id,
+            "subagent_id": "../impl",
+            "file": "task_prompt.md",
+        }),
+    )
+    .await
+    .expect_err("invalid path segment rejected before artifact refresh");
+    assert_eq!(error.code, "invalid_params");
+    assert!(
+        !handoff_root(&env, &delegation.id)
+            .join("impl")
+            .join("task_prompt.md")
+            .exists(),
+        "invalid subagent_id must not refresh task_prompt.md"
+    );
 
     env.cleanup().await;
 }
@@ -2765,10 +2868,10 @@ async fn boot_repair_publishes_handoff_and_steer_after_finish_claim_crash() {
         wakeup_snapshot["subagents"][0]["final_message_preview"],
         "implemented"
     );
-    assert!(wakeup_snapshot["subagents"][0]["transcript_path"]
-        .as_str()
-        .expect("transcript path in repaired wakeup")
-        .ends_with("impl/transcript.md"));
+    assert_eq!(
+        wakeup_snapshot["subagents"][0]["transcript_file"],
+        "impl/transcript.md"
+    );
     assert_eq!(
         durable_parent_completion_steers(&env, "parent", &delegation.id).await,
         1,

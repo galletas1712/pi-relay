@@ -31,8 +31,9 @@ with:
 
 > 6. Support bounded parent/child subagent delegation as **stages**: the parent
 >    runs one full (writing) subagent or a parallel fan-out of read-only
->    subagents, parks, and is steered with a completion notification. No generic
->    injected-message routing layer or event bus between arbitrary sessions.
+>    subagents, parks, and is resumed with a daemon-authored wakeup observation.
+>    No generic injected-message routing layer or event bus between arbitrary
+>    sessions.
 
 ## Edit 2 — `rust/docs/architecture.md`, "Subagent delegation" feature bullet
 

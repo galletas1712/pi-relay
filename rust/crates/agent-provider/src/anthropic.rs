@@ -1797,7 +1797,7 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
                 "status": "done",
                 "subagents": [{
                     "id": "child_1",
-                    "transcript_path": "/tmp/.pi-handoff/delegation_1/child_1/transcript.md",
+                    "transcript_file": "child_1/transcript.md",
                 }],
             }),
         );

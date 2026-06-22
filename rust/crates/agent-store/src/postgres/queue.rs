@@ -784,11 +784,9 @@ pub(super) async fn bump_revisions_tx(
 }
 
 pub(super) fn queued_input_value(input: &QueuedInputRecord) -> Value {
-    let (content, editable, summary) = match &input.content {
-        QueuedInputContent::UserMessage(message) => (json!(message.content.clone()), true, None),
-        QueuedInputContent::DaemonToolObservation(observation) => {
-            (json!([]), false, observation.summary.clone())
-        }
+    let (content, editable) = match &input.content {
+        QueuedInputContent::UserMessage(message) => (json!(message.content.clone()), true),
+        QueuedInputContent::DaemonToolObservation(_) => (json!([]), false),
     };
     json!({
         "input_id": input.input_id,
@@ -797,7 +795,6 @@ pub(super) fn queued_input_value(input: &QueuedInputRecord) -> Value {
         "content": content,
         "content_type": input.content.as_kind(),
         "editable": editable,
-        "summary": summary,
         "client_input_id": input.client_input_id,
         "created_at": input.created_at,
         "updated_at": input.updated_at,
@@ -816,7 +813,10 @@ pub(super) fn queued_input_content_from_value(value: Value) -> Result<QueuedInpu
     }
 }
 
-fn append_queued_content_event_fields(payload: &mut Value, content: &QueuedInputContent) {
+pub(super) fn append_queued_content_event_fields(
+    payload: &mut Value,
+    content: &QueuedInputContent,
+) {
     let Some(object) = payload.as_object_mut() else {
         return;
     };
@@ -829,12 +829,9 @@ fn append_queued_content_event_fields(payload: &mut Value, content: &QueuedInput
             object.insert("content".to_string(), json!(message.content.clone()));
             object.insert("editable".to_string(), Value::Bool(true));
         }
-        QueuedInputContent::DaemonToolObservation(observation) => {
+        QueuedInputContent::DaemonToolObservation(_) => {
             object.insert("content".to_string(), json!([]));
             object.insert("editable".to_string(), Value::Bool(false));
-            if let Some(summary) = &observation.summary {
-                object.insert("summary".to_string(), Value::String(summary.clone()));
-            }
         }
     }
 }

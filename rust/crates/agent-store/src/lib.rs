@@ -528,6 +528,7 @@ pub struct TurnCardRecord {
     pub start_timestamp_ms: u64,
     pub timestamp_ms: u64,
     pub user_messages: Vec<TranscriptEntryRecord>,
+    pub daemon_observations: Vec<TranscriptEntryRecord>,
     pub assistant_message: Option<TranscriptEntryRecord>,
     pub summary: Option<String>,
     pub can_resume: bool,

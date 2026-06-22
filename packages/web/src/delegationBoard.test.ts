@@ -137,6 +137,30 @@ describe("canReRunDelegation", () => {
 		expect(reRunParamsForDelegation(delegation, "parent")).toBeNull();
 	});
 
+	it("forbids re-run when task prompt file references are missing or empty", () => {
+		const delegation = fanoutDelegation({
+			subagents: [
+				{
+					id: "child-a",
+					status: "idle",
+					role: "explore",
+					subagent_type: "read_only",
+					task: null,
+					task_prompt_file: "",
+				},
+				{
+					id: "child-b",
+					status: "idle",
+					role: "explore",
+					subagent_type: "read_only",
+					task: null,
+					task_prompt_file: null,
+				},
+			],
+		});
+		expect(canReRunDelegation(delegation)).toBe(false);
+	});
+
 	it("forbids re-run when any role is missing", () => {
 		const delegation = fullDelegation({
 			subagents: [

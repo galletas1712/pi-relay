@@ -1,19 +1,13 @@
-use std::path::Path;
-
 use agent_store::{Delegation, DelegationStatus, SubagentType};
 use agent_vocab::{DaemonToolObservation, ToolCallId};
 use serde_json::{json, Value};
 
 use crate::handoff::{
-    delegation_dir, refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact,
+    delegation_dir, refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
     task_prompt_rel, SubagentArtifact,
 };
 use crate::state::AppState;
 use crate::types::RpcError;
-
-fn path_string(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
 
 fn bounded_preview(text: Option<String>) -> Option<String> {
     const MAX_CHARS: usize = 1200;
@@ -102,8 +96,9 @@ async fn subagent_has_active_runtime(state: &AppState, subagent_id: &str) -> boo
 ///
 /// This is also the canonical payload for terminal parent wakeups. It refreshes
 /// artifact files that are valid for the delegation's current status, includes
-/// per-subagent final messages / `suggested_next` values when available, and
-/// reports artifact paths without inlining full transcript contents.
+/// per-subagent final-message previews / `suggested_next` values when available,
+/// and reports compact handoff file references without inlining full transcript
+/// contents.
 pub(crate) async fn build_delegation_snapshot(
     state: &AppState,
     delegation: &Delegation,
@@ -135,49 +130,33 @@ pub(crate) async fn build_delegation_snapshot(
         }
         let final_message = artifact.and_then(|artifact| artifact.final_message.clone());
         let final_message_preview = bounded_preview(final_message.clone());
-        let final_message_bytes = final_message.as_ref().map(|message| message.len());
         let suggested_next = artifact.and_then(|artifact| artifact.suggested_next.clone());
-        let final_message_path = artifact
-            .and_then(|artifact| artifact.final_message_path.as_deref())
-            .map(path_string);
-        let final_message_relative_path = artifact.and_then(SubagentArtifact::final_message_rel);
-        let transcript_path = artifact.map(|artifact| path_string(&artifact.transcript_path));
-        let transcript_relative_path = artifact.map(SubagentArtifact::transcript_rel);
-        let task_prompt_metadata = if let Some(artifact) = artifact {
-            (
-                path_string(&artifact.task_prompt_path),
-                artifact.task_prompt_rel(),
-                artifact.task_prompt_bytes,
-                artifact.task_prompt_sha256.clone(),
-            )
+        let final_message_file = artifact.and_then(SubagentArtifact::final_message_rel);
+        let transcript_file = artifact.map(SubagentArtifact::transcript_rel);
+        let task_prompt_file = if let Some(artifact) = artifact {
+            artifact.task_prompt_rel()
         } else {
-            let task_prompt = refresh_task_prompt_artifact(
+            let task_prompt = refresh_task_prompt_artifact_if_present(
                 &handoff_dir_path,
                 &subagent.session_id,
-                subagent.task.as_deref().unwrap_or_default(),
+                subagent.task.as_deref(),
             )
             .await?;
-            (
-                path_string(&task_prompt.path),
-                task_prompt_rel(&subagent.session_id),
-                task_prompt.bytes,
-                task_prompt.sha256,
-            )
+            task_prompt
+                .as_ref()
+                .map(|_| task_prompt_rel(&subagent.session_id))
         };
-        let (task_prompt_path, task_prompt_relative_path, task_prompt_bytes, task_prompt_sha256) =
-            task_prompt_metadata;
-        let (cancellation_transcript_path, cancellation_transcript_relative_path) =
-            if delegation.status == DelegationStatus::Cancelled {
-                let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
-                let path = handoff_dir_path.join(&relative);
-                if path.exists() {
-                    (Some(path_string(&path)), Some(relative))
-                } else {
-                    (None, None)
-                }
+        let cancellation_transcript_file = if delegation.status == DelegationStatus::Cancelled {
+            let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
+            let path = handoff_dir_path.join(&relative);
+            if path.exists() {
+                Some(relative)
             } else {
-                (None, None)
-            };
+                None
+            }
+        } else {
+            None
+        };
         let status = match delegation.status {
             DelegationStatus::Running => terminal_status
                 .map(str::to_string)
@@ -215,21 +194,11 @@ pub(crate) async fn build_delegation_snapshot(
             "status": status,
             "steerable": steerable,
             "final_message_preview": final_message_preview,
-            "final_message_bytes": final_message_bytes,
             "suggested_next": suggested_next,
-            "final_message_path": final_message_path,
-            "final_message_relative_path": final_message_relative_path.clone(),
-            "final_message_file": final_message_relative_path,
-            "transcript_path": transcript_path,
-            "transcript_relative_path": transcript_relative_path.clone(),
-            "transcript_file": transcript_relative_path,
-            "task_prompt_path": task_prompt_path,
-            "task_prompt_relative_path": task_prompt_relative_path.clone(),
-            "task_prompt_file": task_prompt_relative_path,
-            "task_prompt_bytes": task_prompt_bytes,
-            "task_prompt_sha256": task_prompt_sha256,
-            "cancellation_transcript_path": cancellation_transcript_path,
-            "cancellation_transcript_relative_path": cancellation_transcript_relative_path,
+            "final_message_file": final_message_file,
+            "transcript_file": transcript_file,
+            "task_prompt_file": task_prompt_file,
+            "cancellation_transcript_file": cancellation_transcript_file,
         }));
     }
     let expected_count = delegation.expected_subagents.max(0) as usize;
@@ -239,7 +208,7 @@ pub(crate) async fn build_delegation_snapshot(
     Ok(delegation_view(
         delegation,
         json!(subagent_views),
-        path_string(&handoff_dir_path),
+        handoff_dir_path.to_string_lossy().into_owned(),
         terminal_count,
         running_count,
         failed_count,
@@ -267,8 +236,8 @@ fn snapshot_progress_count(snapshot: &Value, key: &str) -> usize {
 /// This is represented as a daemon-authored observation rather than a
 /// fabricated assistant tool call. The observation deliberately carries the same
 /// JSON snapshot as `inspect_delegation`, instead of directing the parent to a
-/// root artifact file. Transcript artifact paths are present in the snapshot;
-/// transcript contents are not inlined.
+/// root artifact file. Compact handoff file references are present in the
+/// snapshot; transcript contents are not inlined.
 pub(crate) fn completion_wakeup_observation(
     snapshot: &Value,
     delegation: &Delegation,
@@ -333,8 +302,7 @@ mod tests {
                 "final_message_file": "child_1/final_message.md",
                 "suggested_next": "approved",
                 "task_prompt_file": "child_1/task_prompt.md",
-                "final_message_path": "/tmp/.pi-handoff/delegation_1/child_1/final_message.md",
-                "transcript_path": "/tmp/.pi-handoff/delegation_1/child_1/transcript.md",
+                "transcript_file": "child_1/transcript.md",
             }],
             "handoff_dir": "/tmp/.pi-handoff/delegation_1",
         });
