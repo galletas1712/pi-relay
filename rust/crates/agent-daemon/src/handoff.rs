@@ -4,10 +4,11 @@
 //! renders two files from the durable Postgres transcript — `final_message.md`
 //! and an exhaustive, greppable `transcript.md` — under
 //! `<parent.outer_cwd>/.pi-handoff/<delegation_id>/`. `inspect_delegation` is the
-//! structured manifest/control-flow snapshot; the files remain transcript/detail
-//! artifacts only. Everything renders from `active_branch` (Ui body mode), so it
-//! survives an RO subagent's snapshot being destroyed and a crashed subagent's
-//! partial tail.
+//! structured control-flow snapshot; the files remain transcript/detail
+//! artifacts only. Postgres transcript history is the durable source of truth:
+//! these artifact files are derived from `active_branch` (Ui body mode) and can
+//! be re-rendered after an RO subagent's filesystem snapshot is destroyed or a
+//! daemon crash leaves publication incomplete.
 //!
 //! The writer is intentionally idempotent, but normal completion only publishes
 //! these files after it wins the DB terminal-status CAS. That ordering prevents
@@ -25,7 +26,7 @@ use agent_vocab::{
 use crate::state::AppState;
 use crate::types::RpcError;
 
-const HANDOFF_DIR: &str = ".pi-handoff";
+pub(crate) const HANDOFF_DIR: &str = ".pi-handoff";
 
 /// The per-subagent handoff outcome, derived from the subagent's terminal
 /// `TurnOutcome`. Graceful is `done`; an interrupted or crashed turn is
@@ -212,9 +213,11 @@ impl SubagentArtifact {
 }
 
 pub(crate) fn delegation_dir(parent_outer_cwd: &str, delegation_id: &str) -> PathBuf {
-    Path::new(parent_outer_cwd)
-        .join(HANDOFF_DIR)
-        .join(delegation_id)
+    handoff_root(parent_outer_cwd).join(delegation_id)
+}
+
+pub(crate) fn handoff_root(parent_outer_cwd: &str) -> PathBuf {
+    Path::new(parent_outer_cwd).join(HANDOFF_DIR)
 }
 
 /// Refresh per-subagent handoff artifacts from durable Postgres transcripts.

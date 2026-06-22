@@ -184,8 +184,8 @@ stays bounded no matter how large a fan-out or transcript is.
   (e.g. `<cwd>/.pi-handoff/`). It is not a workspace: never forked, snapshotted,
   or part of any git repo.
 - On stage completion, for **every** subagent (success or failure), the daemon
-  writes per-subagent files; the structured manifest/control-flow view comes
-  from `inspect_delegation`:
+  writes per-subagent files; the structured control-flow snapshot comes from
+  `inspect_delegation`:
 
   ```text
   <cwd>/.pi-handoff/<stage_id>/<subagent>/final_message.md
@@ -606,7 +606,7 @@ Reuse the dev harness that resolves model actions deterministically
 6. Subagents cannot spawn subagents; subagent context is fresh.
 7. Results propagate through the delivered snapshot plus the handoff directory
    (final message + transcript) and, for full stages, the durable workspace. No
-   root index manifest, no artifact store, no variable store, no context dump.
+   root `index.json`, no artifact store, no variable store, no context dump.
 8. Recovery is "continue where we left off" — no git recovery, no rollback in v1.
 9. Workflows are skills (`SKILL.md` + `LoadSkill`) describing a parent-interpreted,
    possibly-cyclic stage state machine. No DSL, no daemon graph, no `workflow.*`

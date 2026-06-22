@@ -2,7 +2,7 @@ use std::path::Path;
 
 use agent_store::{Delegation, DelegationStatus, SessionActivity, SubagentType};
 
-use crate::handoff::delegation_dir;
+use crate::handoff::{delegation_dir, extract_suggested_next};
 use crate::state::AppState;
 
 const MAX_SUBAGENTS_PER_DELEGATION: usize = 8;
@@ -239,7 +239,7 @@ async fn read_bounded_final_message(path: &Path) -> Option<(String, Option<Strin
     if trimmed.is_empty() {
         return None;
     }
-    let suggested_next = extract_suggested_next(trimmed);
+    let suggested_next = bounded_suggested_next(trimmed);
     Some((
         truncate_chars(trimmed, MAX_FINAL_MESSAGE_CHARS),
         suggested_next,
@@ -256,20 +256,8 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn extract_suggested_next(final_message: &str) -> Option<String> {
-    final_message
-        .lines()
-        .rev()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .and_then(|line| line.strip_prefix("suggested_next:"))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(truncate_suggested_next)
-}
-
-fn truncate_suggested_next(value: &str) -> String {
-    truncate_chars(value, 120)
+fn bounded_suggested_next(final_message: &str) -> Option<String> {
+    extract_suggested_next(final_message).map(|value| truncate_chars(&value, 120))
 }
 
 fn optional_inline_code(value: Option<&str>) -> String {
@@ -350,7 +338,7 @@ pub(crate) fn test_ledger_from_snapshots(
                 if let Some(final_message) = subagent.final_message.as_deref() {
                     let trimmed_final_message = final_message.trim();
                     if !trimmed_final_message.is_empty() {
-                        let suggested_next = extract_suggested_next(trimmed_final_message);
+                        let suggested_next = bounded_suggested_next(trimmed_final_message);
                         let final_message =
                             truncate_chars(trimmed_final_message, MAX_FINAL_MESSAGE_CHARS);
                         out.push_str(&format!(

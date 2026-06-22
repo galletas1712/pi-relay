@@ -32,10 +32,11 @@ use self::local::refresh_local_workspace_base;
 use self::selection::SelectedWorkspace;
 pub(crate) use self::selection::{RequestedWorkspace, WorkspaceSelection};
 
-/// Sibling of the workspace dirs under the cwd root. Owned by the daemon for
-/// delegation handoff files; it is never a workspace, never snapshotted into an
-/// RO fork.
-const HANDOFF_DIR: &str = ".pi-handoff";
+use crate::handoff::HANDOFF_DIR;
+
+// `.pi-handoff` is a sibling of the workspace dirs under the cwd root. It is
+// owned by the daemon for delegation artifact files; it is never a workspace,
+// never snapshotted into an RO fork.
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceManager {

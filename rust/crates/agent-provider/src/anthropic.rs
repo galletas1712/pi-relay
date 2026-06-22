@@ -497,8 +497,10 @@ fn attribution_header(
 /// Deriving from `stable_prefix` instead means every pi-relay session with the
 /// same stable system prompt produces the same fingerprint and therefore the
 /// same cached prefix, enabling true cross-session reuse of the stable-system
-/// cache. We fall back to a digest of the first user text only when no stable
-/// prefix is configured (e.g. compaction calls), so the header is never empty.
+/// cache. We fall back to a digest of the first user text only when a caller
+/// truly supplies no stable prefix; normal daemon requests and local
+/// compaction prompts are stable, and Anthropic remote compaction is not
+/// supported.
 fn attribution_fingerprint(
     prompt: &crate::PromptSections,
     transcript: &[ModelTranscriptEntry],

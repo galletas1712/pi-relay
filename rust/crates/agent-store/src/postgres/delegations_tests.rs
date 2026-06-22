@@ -232,7 +232,10 @@ async fn migration_creates_delegation_ledger_query_indexes() {
         where schemaname='public'
           and indexname in (
               'sessions_delegation_created_idx',
-              'delegations_parent_created_idx'
+              'delegations_parent_created_idx',
+              'delegations_parent_running_idx',
+              'delegations_running_created_idx',
+              'delegations_completed_repair_idx'
           )
         order by indexname
         "#,
@@ -244,7 +247,10 @@ async fn migration_creates_delegation_ledger_query_indexes() {
     assert_eq!(
         index_names,
         vec![
+            "delegations_completed_repair_idx".to_string(),
             "delegations_parent_created_idx".to_string(),
+            "delegations_parent_running_idx".to_string(),
+            "delegations_running_created_idx".to_string(),
             "sessions_delegation_created_idx".to_string(),
         ]
     );

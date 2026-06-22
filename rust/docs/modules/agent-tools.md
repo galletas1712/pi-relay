@@ -162,7 +162,7 @@ snapshot plus artifact paths, not as a model tool result or per-child idle event
 
 Their internal delegation types, handoff `delegation_id`, and web/inspector RPC methods
 (`delegation.start_full`, `delegation.start_readonly_fanout`, `delegation.status`,
-`delegation.cancel`, `delegation.list`) are client JSON-RPC APIs for the
+`delegation.cancel`, `delegation.list`, `delegation.read_handoff_file`) are client JSON-RPC APIs for the
 web/inspector surface, not provider-visible tool names.
 
 ## How it works

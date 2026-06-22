@@ -661,8 +661,8 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
     //      `~/codex/codex-rs/core/src/client.rs`). One bucket per pi-relay
     //      session keeps us well under OpenAI's ~15 RPM-per-shard ceiling
     //      while still maximising in-session prefix reuse.
-    //   3. Deterministic config-hash fallback for tests that don't
-    //      supply a session id.
+    //   3. Fresh UUID/test fallback supplied by `openai_session_id` when
+    //      neither the request nor provider session state has an id.
     let prompt_cache_key = request
         .prompt_cache_key
         .unwrap_or_else(|| session_id.to_string());
