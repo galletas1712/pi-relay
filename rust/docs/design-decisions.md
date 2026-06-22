@@ -355,6 +355,15 @@ older ledger text by position. Subagent compaction omits parent/sibling
 delegation state entirely, because subagents do not orchestrate the delegation
 tree.
 
+Delegation completion wakeups are daemon-authored observations, not fabricated
+tool calls. The daemon persists a provider-neutral user-role text message that
+clearly says it observed state equivalent to
+`inspect_delegation({ delegation_id })` and embeds the bounded JSON snapshot.
+This avoids violating provider protocols by inventing assistant tool calls that
+the model did not produce. OpenAI and Anthropic have different tool-call/result
+wire shapes and adjacency constraints; synthetic tool-pair rendering is deferred
+until a provider-specific path is proven safe and covered by request-shape tests.
+
 Prompt caching works best when the beginning of the prompt is identical across
 requests. That means the long-lived global system prompt, stable tool
 definitions, transcript prefix, and any reusable static project instructions
