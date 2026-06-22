@@ -1560,47 +1560,28 @@ export function App() {
 		[api, invalidateDelegations, loadedSnapshot?.session_id, pushNotice],
 	);
 
-	// Steer the full subagent: a steer-priority message into the subagent's own
-	// session (the composer only ever sends follow_up). The daemon rejects
-	// steering a read-only subagent, so the board only offers this for the full.
-	const steerSubagent = useCallback(
-		(subagentSessionId: string) => {
-			const text = window.prompt("Steer the full subagent with:");
-			if (!text || !text.trim()) return;
-			void api
-				.steerSubagent({
-					subagentSessionId,
-					clientInputId: randomId("web_steer"),
-					content: [{ type: "text", text: text.trim() }],
-				})
-				.then(() => pushNotice("success", "steered the subagent"))
-				.catch((error) => pushNotice("error", errorMessage(error)));
-		},
-		[api, pushNotice],
-	);
-
 	const reRunDelegation = useCallback(
 		(delegation: Delegation) => {
 			const parentSessionId = loadedSnapshot?.session_id;
 			if (!parentSessionId) return;
 			void (async () => {
-				let reRun = reRunParamsForDelegation(delegation, parentSessionId);
-				if (!reRun) {
-					const subagents = await Promise.all(
-						delegation.subagents.map(async (subagent) => {
-							if (typeof subagent.task === "string" && subagent.task.trim()) return subagent;
-							if (!subagentHasNonEmptyPromptFile(subagent)) return subagent;
-							const result = await api.readHandoffFile({
-								parentSessionId,
-								delegationId: delegation.delegation_id,
-								subagentId: subagent.id,
-								file: "task_prompt.md",
-							});
-							return { ...subagent, task: result.content };
-						})
-					);
-					reRun = reRunParamsForDelegation({ ...delegation, subagents }, parentSessionId);
+				const promptPairs = await Promise.all(
+					delegation.subagents.map(async (subagent): Promise<[string, string | null]> => {
+						if (!subagentHasNonEmptyPromptFile(subagent)) return [subagent.id, null];
+						const result = await api.readHandoffFile({
+							parentSessionId,
+							delegationId: delegation.delegation_id,
+							subagentId: subagent.id,
+							file: "task_prompt.md",
+						});
+						return [subagent.id, result.content];
+					}),
+				);
+				const resolvedPrompts = new Map<string, string>();
+				for (const [subagentId, prompt] of promptPairs) {
+					if (typeof prompt === "string") resolvedPrompts.set(subagentId, prompt);
 				}
+				const reRun = reRunParamsForDelegation(delegation, parentSessionId, resolvedPrompts);
 				if (!reRun) {
 					pushNotice("error", "cannot re-run: original prompts are unavailable");
 					return;
@@ -2137,7 +2118,6 @@ export function App() {
 					delegationsError={errorMessageOrNull(delegationsQuery.error)}
 					runBoard={{
 						onCancelDelegation: cancelDelegation,
-						onSteerSubagent: steerSubagent,
 						onReRunDelegation: reRunDelegation,
 						readHandoffFile,
 					}}

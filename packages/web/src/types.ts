@@ -125,10 +125,21 @@ export type DelegationStatus = "running" | "done" | "done_with_failures" | "canc
 export type DelegationSubagentStatus = DelegationStatus | "idle" | "queued" | "done";
 export type SubagentType = "full" | "read_only";
 
+export interface DelegationProgress {
+	expected: number;
+	spawned: number;
+	terminal: number;
+	running: number;
+	failed: number;
+}
+
 /** A subagent row inside a delegation. List responses keep `status` as live
  * session activity for board compatibility; rich `delegation.status` /
  * `inspect_delegation` responses may also carry terminal outcome fields and
- * artifact paths. */
+ * artifact refs. The daemon intentionally does not inline raw task prompts,
+ * final-message prose, or transcript bodies; use `task_prompt_file`,
+ * `final_message_file`, and `transcript_file` with
+ * `delegation.read_handoff_file` when detail is needed. */
 export interface DelegationSubagent {
 	id: string;
 	status: Activity | DelegationSubagentStatus;
@@ -136,7 +147,6 @@ export interface DelegationSubagent {
 	role?: string | null;
 	type?: SubagentType | null;
 	subagent_type?: SubagentType | null;
-	task?: string | null;
 	steerable?: boolean;
 	suggested_next?: string | null;
 	final_message_file?: string | null;
@@ -150,6 +160,7 @@ export interface Delegation {
 	status: DelegationStatus;
 	workflow?: string | null;
 	label?: string | null;
+	progress?: DelegationProgress | null;
 	handoff_dir?: string;
 	subagents: DelegationSubagent[];
 }

@@ -12,7 +12,6 @@ import {
 	Settings,
 	Square,
 	Trash2,
-	Wand2,
 	X
 } from "lucide-react";
 import { memo, useEffect, useRef, useState } from "react";
@@ -30,9 +29,7 @@ import { truncate } from "./text.ts";
 import {
 	canReRunDelegation,
 	isDelegationRunning,
-	delegationHasHandoff,
 	delegationStatusLabel,
-	steerableSubagentId,
 } from "./delegationBoard.ts";
 import type {
 	HandoffFileName,
@@ -80,7 +77,6 @@ export function SidebarHeader({
 export interface RunBoardCallbacks {
 	onSelectSession?: (sessionId: string) => void;
 	onCancelDelegation: (delegationId: string) => void;
-	onSteerSubagent: (subagentSessionId: string) => void;
 	onReRunDelegation: (delegation: Delegation) => void;
 	readHandoffFile: (delegationId: string, subagentId: string | null, file: HandoffFileName) => Promise<string>;
 }
@@ -92,6 +88,8 @@ interface RunBoardProps extends RunBoardCallbacks {
 	error: string | null;
 }
 
+const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
+
 type OpenHandoffFile = { key: string; content: string } | { key: string; error: string };
 
 function cancellationTranscriptFile(delegation: Delegation, subagent: DelegationSubagent): HandoffFileName | null {
@@ -102,9 +100,33 @@ function cancellationTranscriptFile(delegation: Delegation, subagent: Delegation
 	return file as HandoffFileName;
 }
 
+function compactText(value: string | null | undefined): string | null {
+	if (typeof value !== "string") return null;
+	const trimmed = value.trim();
+	return trimmed.length > 0 ? trimmed : null;
+}
+
+function progressSummary(delegation: Delegation): string | null {
+	const progress = delegation.progress;
+	if (!progress) return null;
+	const parts = [
+		`${progress.terminal}/${progress.expected} terminal`,
+		`${progress.running} running`,
+		`${progress.failed} failed`,
+	];
+	return parts.join(", ");
+}
+
+function subagentStatusLabel(subagent: DelegationSubagent): string {
+	const status = typeof subagent.status === "string" ? subagent.status : "idle";
+	if (status === "done_with_failures") return "done with failures";
+	return status.replaceAll("_", " ");
+}
+
 function SubagentRow({
 	delegation,
 	subagent,
+	detailsOpen,
 	open,
 	onOpenFile,
 	onCloseFile,
@@ -112,6 +134,7 @@ function SubagentRow({
 }: {
 	delegation: Delegation;
 	subagent: DelegationSubagent;
+	detailsOpen: boolean;
 	open: OpenHandoffFile | null;
 	onOpenFile: (subagentId: string, file: HandoffFileName) => void;
 	onCloseFile: () => void;
@@ -122,11 +145,14 @@ function SubagentRow({
 	const taskPromptKey = `${subagent.id}:task_prompt.md`;
 	const cancellationFile = cancellationTranscriptFile(delegation, subagent);
 	const cancellationKey = cancellationFile ? `${subagent.id}:${cancellationFile}` : null;
-	const handoffReady = delegationHasHandoff(delegation);
 	const openFinal = open && open.key === finalKey ? open : null;
 	const openTranscript = open && open.key === transcriptKey ? open : null;
 	const openTaskPrompt = open && open.key === taskPromptKey ? open : null;
 	const openCancellation = open && cancellationKey && open.key === cancellationKey ? open : null;
+	const finalMessageFile = compactText(subagent.final_message_file);
+	const transcriptFile = compactText(subagent.transcript_file);
+	const taskPromptFile = compactText(subagent.task_prompt_file);
+	const suggestedNext = compactText(subagent.suggested_next);
 	const liveActivity =
 		subagent.activity ??
 		(subagent.status === "idle" || subagent.status === "queued" || subagent.status === "running" ? subagent.status : "idle");
@@ -145,48 +171,88 @@ function SubagentRow({
 					{displayActivity(liveActivity)}
 				</span>
 			</div>
-			{subagent.task_prompt_file ? (
-				<div className="run-board-handoff-links">
-					<button
-						className="chip-button"
-						type="button"
-						onClick={() => (openTaskPrompt ? onCloseFile() : onOpenFile(subagent.id, "task_prompt.md"))}
-						title="show task_prompt.md"
-					>
-						<FileText size={11} /> task prompt
-					</button>
+			<div className="run-board-subagent-summary">
+				<span>{subagentStatusLabel(subagent)}</span>
+				{suggestedNext ? (
+					<span title={`suggested_next: ${suggestedNext}`}>
+						suggested next <strong>{suggestedNext}</strong>
+					</span>
+				) : null}
+			</div>
+			{detailsOpen ? (
+				<div className="run-board-debug">
+					<div className="run-board-debug-row">
+						<span>session</span>
+						<code>{subagent.id}</code>
+					</div>
+					{taskPromptFile ? (
+						<div className="run-board-debug-row">
+							<span>task prompt</span>
+							<code>{taskPromptFile}</code>
+						</div>
+					) : null}
+					{finalMessageFile ? (
+						<div className="run-board-debug-row">
+							<span>final message</span>
+							<code>{finalMessageFile}</code>
+						</div>
+					) : null}
+					{transcriptFile && !cancellationFile ? (
+						<div className="run-board-debug-row">
+							<span>transcript</span>
+							<code>{transcriptFile}</code>
+						</div>
+					) : null}
+					{cancellationFile ? (
+						<div className="run-board-debug-row">
+							<span>cancellation transcript</span>
+							<code>{cancellationFile}</code>
+						</div>
+					) : null}
 				</div>
 			) : null}
-			{handoffReady ? (
+			{detailsOpen ? (
 				<div className="run-board-handoff-links">
-					<button
-						className="chip-button"
-						type="button"
-						onClick={() => (openFinal ? onCloseFile() : onOpenFile(subagent.id, "final_message.md"))}
-						title="show final_message.md inline"
-					>
-						<FileText size={11} /> final message
-					</button>
-					<button
-						className="chip-button"
-						type="button"
-						onClick={() => (openTranscript ? onCloseFile() : onOpenFile(subagent.id, "transcript.md"))}
-						title="show transcript.md"
-					>
-						<FileText size={11} /> transcript
-					</button>
-				</div>
-			) : null}
-			{cancellationFile ? (
-				<div className="run-board-handoff-links">
-					<button
-						className="chip-button"
-						type="button"
-						onClick={() => (openCancellation ? onCloseFile() : onOpenFile(subagent.id, cancellationFile))}
-						title="show cancellation transcript artifact"
-					>
-						<FileText size={11} /> cancellation transcript
-					</button>
+					{taskPromptFile ? (
+						<button
+							className="chip-button"
+							type="button"
+							onClick={() => (openTaskPrompt ? onCloseFile() : onOpenFile(subagent.id, "task_prompt.md"))}
+							title="show task_prompt.md"
+						>
+							<FileText size={11} /> task prompt
+						</button>
+					) : null}
+					{finalMessageFile ? (
+						<button
+							className="chip-button"
+							type="button"
+							onClick={() => (openFinal ? onCloseFile() : onOpenFile(subagent.id, "final_message.md"))}
+							title="show final_message.md"
+						>
+							<FileText size={11} /> final message
+						</button>
+					) : null}
+					{transcriptFile && !cancellationFile ? (
+						<button
+							className="chip-button"
+							type="button"
+							onClick={() => (openTranscript ? onCloseFile() : onOpenFile(subagent.id, "transcript.md"))}
+							title="show transcript.md"
+						>
+							<FileText size={11} /> transcript
+						</button>
+					) : null}
+					{cancellationFile ? (
+						<button
+							className="chip-button"
+							type="button"
+							onClick={() => (openCancellation ? onCloseFile() : onOpenFile(subagent.id, cancellationFile))}
+							title="show cancellation transcript artifact"
+						>
+							<FileText size={11} /> cancellation transcript
+						</button>
+					) : null}
 				</div>
 			) : null}
 			{openFinal ? <HandoffFileView open={openFinal} /> : null}
@@ -205,26 +271,26 @@ function HandoffFileView({ open }: { open: OpenHandoffFile }) {
 function DelegationCard({
 	delegation,
 	canReRun,
-	steerableId,
+	detailsOpen,
 	open,
+	onToggleDetails,
 	onOpenFile,
 	onCloseFile,
 	onSelectSession,
 	onCancelDelegation,
-	onSteerSubagent,
 	onReRunDelegation,
 }: {
 	delegation: Delegation;
 	canReRun: boolean;
-	steerableId: string | null;
+	detailsOpen: boolean;
 	open: OpenHandoffFile | null;
+	onToggleDetails: () => void;
 	onOpenFile: (subagentId: string | null, file: HandoffFileName) => void;
 	onCloseFile: () => void;
-} & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onSteerSubagent" | "onReRunDelegation">) {
+} & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onReRunDelegation">) {
 	const running = isDelegationRunning(delegation);
 	const title = delegation.label ?? delegation.workflow ?? delegation.delegation_id.slice(0, 13);
-	const handoffReady = delegationHasHandoff(delegation);
-	const hasCancellationTranscript = delegation.subagents.some((subagent) => cancellationTranscriptFile(delegation, subagent));
+	const progress = progressSummary(delegation);
 	return (
 		<div className="run-board-delegation">
 			<div className="run-board-delegation-head">
@@ -235,7 +301,8 @@ function DelegationCard({
 				</span>
 				<span className={`subagent-activity ${running ? "running" : "idle"}`}>{delegationStatusLabel(delegation.status)}</span>
 			</div>
-			{(handoffReady || hasCancellationTranscript) && delegation.handoff_dir ? (
+			{progress ? <div className="run-board-progress">{progress}</div> : null}
+			{detailsOpen && delegation.handoff_dir ? (
 				<div className="run-board-handoff-path" title={delegation.handoff_dir}>
 					handoff {delegation.handoff_dir}
 				</div>
@@ -246,16 +313,20 @@ function DelegationCard({
 						<Square size={11} /> cancel
 					</button>
 				) : null}
-				{steerableId ? (
-					<button className="chip-button" type="button" onClick={() => onSteerSubagent(steerableId)} title="steer the full subagent">
-						<Wand2 size={11} /> steer
-					</button>
-				) : null}
 				{canReRun ? (
 					<button className="chip-button" type="button" onClick={() => onReRunDelegation(delegation)} title="re-run this delegation">
 						<RotateCcw size={11} /> re-run
 					</button>
 				) : null}
+				<button
+					className={`chip-button ${detailsOpen ? "pressed" : ""}`}
+					type="button"
+					onClick={onToggleDetails}
+					aria-expanded={detailsOpen}
+					title={detailsOpen ? "hide delegation artifact details" : "show delegation artifact details"}
+				>
+					<FileText size={11} /> {detailsOpen ? "hide details" : "details"}
+				</button>
 			</div>
 			<div className="run-board-subagents" role="list">
 				{delegation.subagents.map((subagent) => (
@@ -263,6 +334,7 @@ function DelegationCard({
 						key={subagent.id}
 						delegation={delegation}
 						subagent={subagent}
+						detailsOpen={detailsOpen}
 						open={open}
 						onOpenFile={onOpenFile}
 						onCloseFile={onCloseFile}
@@ -274,6 +346,59 @@ function DelegationCard({
 	);
 }
 
+export function RunBoardDelegationList({
+	delegations,
+	showAllDelegations,
+	openDebugDelegationIds,
+	openFile,
+	onToggleShowAllDelegations,
+	onToggleDelegationDebug,
+	onOpenFile,
+	onCloseFile,
+	onSelectSession,
+	onCancelDelegation,
+	onReRunDelegation,
+}: {
+	delegations: Delegation[];
+	showAllDelegations: boolean;
+	openDebugDelegationIds: ReadonlySet<string>;
+	openFile: { delegationId: string; open: OpenHandoffFile } | null;
+	onToggleShowAllDelegations: () => void;
+	onToggleDelegationDebug: (delegationId: string) => void;
+	onOpenFile: (delegationId: string, subagentId: string | null, file: HandoffFileName) => void;
+	onCloseFile: () => void;
+} & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onReRunDelegation">) {
+	const hiddenDelegationCount = Math.max(0, delegations.length - RUN_BOARD_DEFAULT_DELEGATION_COUNT);
+	const visibleDelegations =
+		showAllDelegations || hiddenDelegationCount === 0
+			? delegations
+			: delegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT);
+	return (
+		<div className="run-board">
+			{visibleDelegations.map((delegation) => (
+				<DelegationCard
+					key={delegation.delegation_id}
+					delegation={delegation}
+					canReRun={canReRunDelegation(delegation)}
+					detailsOpen={openDebugDelegationIds.has(delegation.delegation_id)}
+					open={openFile && openFile.delegationId === delegation.delegation_id ? openFile.open : null}
+					onToggleDetails={() => onToggleDelegationDebug(delegation.delegation_id)}
+					onOpenFile={(subagentId, file) => onOpenFile(delegation.delegation_id, subagentId, file)}
+					onCloseFile={onCloseFile}
+					onSelectSession={onSelectSession}
+					onCancelDelegation={onCancelDelegation}
+					onReRunDelegation={onReRunDelegation}
+				/>
+			))}
+			{hiddenDelegationCount > 0 ? (
+				<button className="chip-button run-board-toggle" type="button" onClick={onToggleShowAllDelegations}>
+					{showAllDelegations ? "show fewer" : `see more (${hiddenDelegationCount})`}
+				</button>
+			) : null}
+		</div>
+	);
+}
+
 function RunBoard({
 	parentSessionId,
 	delegations,
@@ -281,13 +406,14 @@ function RunBoard({
 	error,
 	onSelectSession,
 	onCancelDelegation,
-	onSteerSubagent,
 	onReRunDelegation,
 	readHandoffFile,
 }: RunBoardProps) {
 	// Which handoff file (if any) is currently expanded. Keyed by
 	// `${subagentId ?? "delegation"}:${file}` so only one file is open at a time.
 	const [openFile, setOpenFile] = useState<{ delegationId: string; open: OpenHandoffFile } | null>(null);
+	const [showAllDelegations, setShowAllDelegations] = useState(false);
+	const [openDebugDelegationIds, setOpenDebugDelegationIds] = useState<Set<string>>(() => new Set());
 
 	const openHandoffFile = (delegationId: string, subagentId: string | null, file: HandoffFileName) => {
 		const key = `${subagentId ?? "delegation"}:${file}`;
@@ -298,6 +424,19 @@ function RunBoard({
 				setOpenFile({ delegationId, open: { key, error: cause instanceof Error ? cause.message : String(cause) } }),
 			);
 	};
+	const toggleDelegationDebug = (delegationId: string) => {
+		const closing = openDebugDelegationIds.has(delegationId);
+		setOpenDebugDelegationIds((current) => {
+			const next = new Set(current);
+			if (next.has(delegationId)) {
+				next.delete(delegationId);
+			} else {
+				next.add(delegationId);
+			}
+			return next;
+		});
+		if (closing && openFile?.delegationId === delegationId) setOpenFile(null);
+	};
 
 	return (
 		<section className="inspect-section">
@@ -307,23 +446,19 @@ function RunBoard({
 			{error ? <p className="error-text">{error}</p> : null}
 			{parentSessionId && !loading && !error && delegations.length === 0 ? <p className="muted">No delegations yet.</p> : null}
 			{parentSessionId && delegations.length > 0 ? (
-				<div className="run-board">
-					{delegations.map((delegation) => (
-						<DelegationCard
-							key={delegation.delegation_id}
-							delegation={delegation}
-							canReRun={canReRunDelegation(delegation)}
-							steerableId={steerableSubagentId(delegation)}
-							open={openFile && openFile.delegationId === delegation.delegation_id ? openFile.open : null}
-							onOpenFile={(subagentId, file) => openHandoffFile(delegation.delegation_id, subagentId, file)}
-							onCloseFile={() => setOpenFile(null)}
-							onSelectSession={onSelectSession}
-							onCancelDelegation={onCancelDelegation}
-							onSteerSubagent={onSteerSubagent}
-							onReRunDelegation={onReRunDelegation}
-						/>
-					))}
-				</div>
+				<RunBoardDelegationList
+					delegations={delegations}
+					showAllDelegations={showAllDelegations}
+					openDebugDelegationIds={openDebugDelegationIds}
+					openFile={openFile}
+					onToggleShowAllDelegations={() => setShowAllDelegations((current) => !current)}
+					onToggleDelegationDebug={toggleDelegationDebug}
+					onOpenFile={openHandoffFile}
+					onCloseFile={() => setOpenFile(null)}
+					onSelectSession={onSelectSession}
+					onCancelDelegation={onCancelDelegation}
+					onReRunDelegation={onReRunDelegation}
+				/>
 			) : null}
 		</section>
 	);
@@ -905,7 +1040,6 @@ export function Inspector({
 				error={delegationsError}
 				onSelectSession={onSelectSession}
 				onCancelDelegation={runBoard.onCancelDelegation}
-				onSteerSubagent={runBoard.onSteerSubagent}
 				onReRunDelegation={runBoard.onReRunDelegation}
 				readHandoffFile={runBoard.readHandoffFile}
 			/>
