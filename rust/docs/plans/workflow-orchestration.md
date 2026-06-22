@@ -1,8 +1,15 @@
 # Subagent stages & workflows — implementation plan
 
-Status: **design settled; ready to implement.** The former gating prerequisite —
+> **Historical/superseded.** The stage/delegation implementation has landed and
+> the live docs now describe current behavior. Treat this file as design history,
+> not as an authoritative spec. Current workflow skills live in the top-level
+> `workflows/` directory, and current subagent roles live in `subagent-roles/`.
+> The draft `rust/docs/plans/workflow-skills/` copies referenced below have been
+> removed after installation.
+
+Status: **historical implementation plan.** The former gating prerequisite —
 parent-visible child lifecycle events (PR #150) — has landed on `main`, so there
-is no longer a blocking dependency. This document is the canonical spec.
+is no longer a blocking dependency.
 
 ## Handoff package
 
@@ -10,10 +17,9 @@ Everything a builder needs is under `rust/docs/plans/`:
 
 | File | What it is | Status |
 | --- | --- | --- |
-| `workflow-orchestration.md` (this file) | The canonical spec + build brief (Implementation guide, Appendices A/B). | authoritative |
-| `phase-0-doc-edits.md` | Exact `architecture.md` / `agent-daemon.md` edits, staged to apply **with** the delegation-tool landing. | apply in Phase 0 |
-| `workflow-skills/README.md` | How to install workflow skills (one loader line + copy files). | apply in Phase 4 |
-| `workflow-skills/workflow-*/SKILL.md` | The four bundled workflow-pattern skills, as inert drafts. | install in Phase 4 |
+| `workflow-orchestration.md` (this file) | Historical spec + build brief (Implementation guide, Appendices A/B). | superseded |
+| `phase-0-doc-edits.md` | Exact `architecture.md` / `agent-daemon.md` edits, staged to apply **with** the delegation-tool landing. | superseded |
+| top-level `workflows/workflow-*/SKILL.md` | The installed workflow-pattern skills. Historical references below to `workflow-skills/` were draft copies. | current location |
 
 Build in phase order (below). The design is settled and the open questions are
 all decided ("Decided defaults"); do not reopen them or the "Rejected options".

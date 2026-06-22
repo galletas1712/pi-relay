@@ -44,7 +44,8 @@ stage_tools.rs     delegation tool surface (delegate_writing_task /
                    (start_full / start_readonly_fanout / status / cancel /
                    list) + homogeneity/one-stage-per-parent guards
 stage_runner.rs    stage barrier: all-terminal detect, attempt-fenced finish CAS,
-                   handoff write, one steer to the parent; boot crash sweep
+                   idempotent handoff write, one steer to the parent; boot
+                   crash sweep
 handoff.rs         renders index.json + per-subagent final_message.md / transcript.md
                    from the durable transcript
 ```
@@ -52,12 +53,14 @@ handoff.rs         renders index.json + per-subagent final_message.md / transcri
 Subagent work runs as **stages** (`delegate_writing_task` /
 `delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation`). Full subagents
 reuse the parent's workspace dirs in place; read-only subagents get a forked
-snapshot destroyed on return. The stage runner watches
-`subagent.{spawned,running,idle}` events, applies a single-flight,
-`attempt_id`-fenced barrier when all subagents of a stage are terminal, writes
-the handoff directory, and enqueues one `InputPriority::Steer` notification to
-the parent. The runner never decides the next stage — the parent does, guided by
-workflow skills.
+snapshot destroyed on return. Stage subagents may emit
+`subagent.spawned`/`subagent.running` progress events; their terminal hook fires
+a single-flight, `attempt_id`-fenced barrier when all subagents of a stage are
+terminal. The runner writes the handoff directory idempotently and the DB
+finish CAS enqueues one `InputPriority::Steer` notification to the parent.
+Completion is that steer/handoff, not a parent-visible per-child idle event. The
+runner never decides the next stage — the parent does, guided by workflow
+skills.
 
 The web/inspector RPC surface remains `stage.start_full`,
 `stage.start_readonly_fanout`, `stage.status`, `stage.cancel`, and `stage.list`;
@@ -109,7 +112,7 @@ Every handler that touches session state calls `SessionDriver::acquire`, which f
 
 ### Automatic tool dispatch
 
-Tool actions are dispatched immediately. `spawn_claimed_dispatch` runs `run_tool_turn` in a registered background task: it marks the action running, ensures the workspace, executes the tool, feeds the `ToolResultMessage` back into the live session, drains, and re-drives. `LoadSkill` and the web tools (`web_search`/`web_fetch`) are handled in-daemon; all other tools route to the `ToolRegistry` keyed by provider kind. There is no approval interface — tools execute automatically.
+Tool actions are dispatched immediately. `spawn_claimed_dispatch` runs `run_tool_turn` in a registered background task: it marks the action running, ensures the workspace, executes the tool, feeds the `ToolResultMessage` back into the live session, drains, and re-drives. Runtime/local tools such as `LoadSkill`, the web tools (`web_search`/`web_fetch`), and delegation tools are handled in-daemon; provider-executed registry tools route through the `ToolRegistry` keyed by provider kind as appropriate. There is no approval interface — tools execute automatically.
 
 ### Model dispatch, retries, and auth recovery
 

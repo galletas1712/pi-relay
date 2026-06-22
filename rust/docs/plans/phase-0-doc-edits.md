@@ -1,5 +1,11 @@
 # Phase 0 doc edits (apply when delegation tools land)
 
+> **Historical/superseded.** These staged edits were for the delegation-tool
+> landing and have been applied/polished in the live docs. Do not apply this
+> file as instructions; use `rust/docs/architecture.md`,
+> `rust/docs/modules/agent-daemon.md`, and `rust/docs/modules/agent-tools.md`
+> for current wording.
+
 These are the exact documentation edits for Phase 0 of
 `../workflow-orchestration.md`. They are staged here (not applied to the live
 docs) because they describe the delegation-tool surface and the

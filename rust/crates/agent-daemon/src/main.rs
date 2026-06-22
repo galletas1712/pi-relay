@@ -84,11 +84,11 @@ async fn main() -> Result<()> {
     // the same attempt-fenced CAS the live barrier uses.
     //
     // This runs AFTER the global stale-mark above, but that ordering is safe:
-    // stage terminality is transcript-boundary based (FIX C), independent of
-    // action status, so a subagent stale-marked mid-turn is still NON-terminal.
-    // The sweep recovers each subagent to a boundary first, so a resumable
-    // mid-turn child re-establishes live work (stage stays running) instead of
-    // being abandoned as a failure.
+    // stage terminality is transcript-boundary based, independent of action
+    // status, so a subagent stale-marked mid-turn is still NON-terminal. The
+    // sweep recovers each subagent to a boundary first, so a resumable mid-turn
+    // child re-establishes live work (stage stays running) instead of being
+    // abandoned as a failure.
     stage_runner::sweep_running_stages_on_boot(&state).await;
 
     let listener = TcpListener::bind(&config.bind).await?;

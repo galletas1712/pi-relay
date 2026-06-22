@@ -208,7 +208,7 @@ impl SessionDriver {
         let mut events = events;
         let activity = self.state.repo.activity(&self.session_id).await?;
         if !should_continue && activity == SessionActivity::Idle {
-            if let Some(event) = self.try_subagent_parent_idle_event().await {
+            if let Some(event) = self.try_handle_subagent_terminal_for_parent().await {
                 events.push(event);
             }
         }
@@ -349,7 +349,7 @@ impl SessionDriver {
                 .insert_event(&self.session_id, EventType::SessionIdle, json!({}))
                 .await?;
             let mut events = vec![event];
-            if let Some(event) = self.try_subagent_parent_idle_event().await {
+            if let Some(event) = self.try_handle_subagent_terminal_for_parent().await {
                 events.push(event);
             }
             publish_events(&self.state, events);
@@ -381,8 +381,8 @@ impl SessionDriver {
         Ok(false)
     }
 
-    pub(crate) async fn notify_subagent_parent_idle_if_needed(&self) {
-        if let Some(event) = self.try_subagent_parent_idle_event().await {
+    pub(crate) async fn handle_subagent_terminal_for_parent_if_needed(&self) {
+        if let Some(event) = self.try_handle_subagent_terminal_for_parent().await {
             publish_events(&self.state, vec![event]);
         }
     }
@@ -427,18 +427,18 @@ impl SessionDriver {
         }
         let activity = self.state.repo.activity(&self.session_id).await?;
         if activity == SessionActivity::Idle {
-            self.notify_subagent_parent_idle_if_needed().await;
+            self.handle_subagent_terminal_for_parent_if_needed().await;
         }
         Ok(())
     }
 
-    async fn try_subagent_parent_idle_event(&self) -> Option<EventFrame> {
+    async fn try_handle_subagent_terminal_for_parent(&self) -> Option<EventFrame> {
         let notification_key = match self.subagent_idle_notification_key().await {
             Ok(Some(notification_key)) => notification_key,
             Ok(None) => return None,
             Err(error) => {
                 eprintln!(
-                    "failed to build parent subagent idle event child={}: {}: {}",
+                    "failed to build subagent terminal notification key child={}: {}: {}",
                     self.session_id, error.code, error.message
                 );
                 return None;
@@ -447,7 +447,7 @@ impl SessionDriver {
 
         // Every parentful subagent is a stage member (the only spawn path sets a
         // stage_id). A stage member's completion is delivered as ONE stage steer,
-        // NOT a per-child idle (FIX D). Fire the once-gate WITHOUT writing a
+        // NOT a per-child idle. Fire the once-gate WITHOUT writing a
         // parent-visible SubagentIdle row (so events_after / the run board never
         // surface per-child idle), then — on that single firing — destroy the RO
         // snapshot and run the barrier. The barrier is single-flighted by the DB
@@ -489,9 +489,9 @@ impl SessionDriver {
     /// The stage barrier: when a subagent of a stage reaches its once-only
     /// terminal idle, complete the stage iff every subagent is terminal. The
     /// `finish_stage` CAS (stage-row `for update` lock + `status='running'`
-    /// fence) is the single-flight; whichever caller wins it (a concurrent
-    /// terminal child or the boot sweep) renders the handoff and steers the
-    /// parent exactly once.
+    /// fence) is the single-flight for terminal stage status and parent steer
+    /// enqueue; handoff rendering is idempotent and may happen before/around the
+    /// CAS.
     async fn try_stage_barrier(&self, stage_id: &str) {
         // `recover_if_needed` -> terminal idle -> barrier -> sibling
         // `recover_if_needed` is a recursive async cycle; box it to break the

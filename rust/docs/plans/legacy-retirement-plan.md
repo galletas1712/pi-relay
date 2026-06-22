@@ -1,5 +1,10 @@
 # Legacy subagent retirement plan (Phase 6)
 
+> **Historical/superseded.** This was a retirement plan for the legacy
+> PythonRepl-backed subagent orchestration surface. It is retained as history and
+> may describe APIs/tools that have since been removed or renamed. Use the live
+> stage/delegation docs for current behavior.
+
 Consolidated from a full read of the live code on branch `wf/phase-6-retire-legacy`.
 Goal: fully retire the legacy REPL-subagent orchestration surface while leaving the
 live `stage.*` path (runtime tools + client RPCs + barrier/handoff/steer runner +

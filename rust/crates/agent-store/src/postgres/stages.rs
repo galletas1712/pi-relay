@@ -187,7 +187,7 @@ impl PostgresAgentStore {
         Ok(())
     }
 
-    /// The stage barrier's completion CAS, atomic with the parent steer (FIX B).
+    /// The stage barrier's completion CAS, atomic with the parent steer.
     ///
     /// Single-flight via the stage row's `for update` lock; idempotent via the
     /// `status='running'` + `attempt_id` fence. When the CAS wins, the SAME
@@ -200,8 +200,10 @@ impl PostgresAgentStore {
     /// `(session_id, client_input_id)` index makes the insert a no-op).
     ///
     /// Returns whether this call won the transition (`rows_affected()==1`), so
-    /// exactly one caller renders the handoff and drives the parent. A missing
-    /// stage is a benign no-op (a late lifecycle event for a deleted stage).
+    /// exactly one caller drives the parent after the steer is queued. Handoff
+    /// rendering happens outside this transaction and is intentionally
+    /// idempotent. A missing stage is a benign no-op (a late lifecycle event for
+    /// a deleted stage).
     pub async fn finish_stage(
         &self,
         stage_id: &str,
@@ -245,16 +247,16 @@ impl PostgresAgentStore {
     /// Whether every subagent of a stage is terminal. Two fences guard against a
     /// premature completion:
     ///
-    /// 1. Expected-count fence (FIX A): the stage must have spawned its FULL set
-    ///    of subagents. A fan-out spawns its children in a loop while each child
+    /// 1. Expected-count fence: the stage must have spawned its FULL set of
+    ///    subagents. A fan-out spawns its children in a loop while each child
     ///    drives in a detached task, so subagent #1 can reach terminal before #2
     ///    is even inserted. Requiring `count(sessions where stage_id) ==
     ///    expected_subagents` keeps the barrier closed during that window.
     ///
-    /// 2. Transcript-boundary terminality (FIX C): a subagent is terminal only
-    ///    when its active leaf is a genuine turn boundary (`TurnFinished` /
-    ///    compaction summary). This is independent of action/queue status — so a
-    ///    subagent that crashed MID-TURN (boot's `mark_all_unfinished_actions_stale`
+    /// 2. Transcript-boundary terminality: a subagent is terminal only when its
+    ///    active leaf is a genuine turn boundary (`TurnFinished` / compaction
+    ///    summary). This is independent of action/queue status — so a subagent
+    ///    that crashed MID-TURN (boot's `mark_all_unfinished_actions_stale`
     ///    erased its unfinished action, and it had no queued input) is correctly
     ///    NON-terminal and stays in the stage until it is recovered to a boundary
     ///    (where it either continues or settles as a genuine terminal outcome).

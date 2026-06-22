@@ -287,10 +287,10 @@ async fn publish_subagent_parent_dispatch_failed_event(
     role_workspace: Option<&str>,
     error: &RpcError,
 ) {
-    // A stage member's failure is owned by the stage (FIX E): the stage_tools
-    // spawn-failure compensation fails the stage and the tool returns Err
-    // synchronously. Suppress the per-child idle so the parent never sees a
-    // per-child notification for a stage member (matching the live idle gate).
+    // A stage member's failure is owned by the stage: stage_tools spawn-failure
+    // compensation fails the stage and the tool returns Err synchronously.
+    // Suppress the per-child idle so the parent never sees a per-child
+    // notification for a stage member (matching the live idle gate).
     match state.repo.session_stage_id(child_session_id).await {
         Ok(Some(_)) => return,
         Ok(None) => {}

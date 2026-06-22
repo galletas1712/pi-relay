@@ -56,7 +56,7 @@ agent-vocab      shared ids, message blocks, tool calls/results,
 | `agent-session` | Durable transcript forest, model-context materialization, resume, switch, compaction, and the provider-replay lane. | [modules/agent-session.md](modules/agent-session.md) |
 | `agent-store` | Postgres-only session/transcript/queue/action/event persistence plus recovery and revision/queue projections. | [modules/agent-store.md](modules/agent-store.md) |
 | `agent-provider` | `ModelProvider` plus OpenAI/Codex (Responses) and Anthropic (Messages) adapters, prompt-cache shaping, and provider compaction. | [modules/agent-provider.md](modules/agent-provider.md) |
-| `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`grep`/`web_search`/`web_fetch`/`load_skill` tools. | [modules/agent-tools.md](modules/agent-tools.md) |
+| `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`grep`/`web_search`/`web_fetch`/`LoadSkill`/delegation tools. | [modules/agent-tools.md](modules/agent-tools.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. | [modules/agent-daemon.md](modules/agent-daemon.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt from session/workspace/tool/skill context. | [modules/agent-prompt.md](modules/agent-prompt.md) |
 
@@ -128,10 +128,10 @@ Implemented user-facing behavior:
   return). The parent parks after launching a stage and is delivered a
   parent-scoped completion **steer** pointing at a handoff directory
   (`index.json` + per-subagent final message and transcript).
-  `subagent.{spawned,running,idle}` lifecycle events drive the stage barrier.
-  Reusable patterns are **workflow skills** (`SKILL.md` + `LoadSkill`), not a
-  DSL. Web/inspector RPCs still use the `stage.*` client API. The Python REPL
-  `subagents` module remains only as a raw escape hatch. See
+  Stage subagents may emit `subagent.spawned`/`subagent.running` progress
+  events, but parent-visible completion is the stage steer/handoff, not a
+  per-child idle event. Reusable patterns are **workflow skills** (`SKILL.md` +
+  `LoadSkill`), not a DSL. Web/inspector RPCs still use the `stage.*` client API. See
   [agent-daemon](modules/agent-daemon.md).
 
 Not implemented by design:

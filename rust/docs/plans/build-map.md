@@ -1,7 +1,16 @@
 # Workflow-Orchestration Build Map
 
-Authoritative implementation map for `rust/docs/plans/workflow-orchestration.md`, consolidated from 11 verified
-code-seam reports. This file replaces the need to re-read the code. **All daemon/store/tool paths are under
+> **Historical/superseded.** This was a pre-implementation seam map for the
+> workflow-orchestration plan. It is not authoritative for the current runtime.
+> Use the live docs (`rust/docs/architecture.md`,
+> `rust/docs/modules/agent-daemon.md`, `rust/docs/modules/agent-tools.md`,
+> `rust/docs/websocket-rpc.md`) plus the installed `workflows/` and
+> `subagent-roles/` directories instead. References below to
+> `rust/docs/plans/workflow-skills/` name draft copies that have since been
+> removed after installation.
+
+Historical implementation map for `rust/docs/plans/workflow-orchestration.md`, consolidated from 11 verified
+code-seam reports. **All daemon/store/tool paths are under
 `rust/crates/`** (the spec writes them as `agent-daemon/src/...`; prefix `rust/crates/`). All cited line numbers
 verified post-rebase unless flagged as drift.
 

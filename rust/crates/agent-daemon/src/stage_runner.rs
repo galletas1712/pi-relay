@@ -3,18 +3,20 @@
 //!
 //! ```text
 //! on a subagent of stage S reaching its once-only terminal idle (or boot):
-//!   if any subagent of S is not terminal: return            # barrier not met
 //!   recover each subagent's tail to a turn boundary          # don't miss a crashed final message
-//!   finish_stage CAS (running -> done|done_with_failures)    # single-flight via the stage-row lock
-//!   if the CAS won:
-//!     render the handoff dir (index.json + per-subagent md)
-//!     enqueue ONE steer to S.parent_session_id pointing there
+//!   if any subagent of S is not terminal: return            # barrier not met
+//!   render/refresh handoff dir (index.json + per-subagent md)
+//!   finish_stage CAS (running -> done|done_with_failures)    # single-flight stage status + steer
+//!   if the CAS won: drive parent to consume the queued steer
 //! ```
 //!
-//! The single-flight and exactly-once guarantee is the DB `finish_stage` CAS
-//! (stage-row `for update` lock + `status='running'` fence), NOT the in-process
-//! `SessionDriver` mutex — so concurrent terminal children and a restart sweep
-//! steer the parent exactly once.
+//! Handoff rendering is an idempotent pure function of durable transcripts and
+//! may safely happen before/around the terminal CAS. The single-flight and
+//! exactly-once guarantee for terminal stage status and parent steer enqueue is
+//! the DB `finish_stage` CAS (stage-row `for update` lock +
+//! `status='running'` fence), NOT the in-process `SessionDriver` mutex — so
+//! concurrent terminal children and a restart sweep steer the parent exactly
+//! once.
 
 use agent_store::{Stage, StageStatus};
 use agent_vocab::TurnOutcome;
@@ -29,7 +31,7 @@ use crate::types::RpcError;
 /// lock held up the stack) and from the boot sweep. Tail recovery uses
 /// `try_acquire`, so a lock held up the stack is skipped rather than deadlocked.
 ///
-/// Ordering matters (FIX B + FIX C):
+/// Ordering matters:
 ///   recover each subagent's tail to a boundary  # mid-turn crash either resumes
 ///                                                # or settles terminal
 ///   if not all terminal: return                 # barrier not met
@@ -185,9 +187,9 @@ async fn classify_subagents(
 
 /// Boot crash sweep: complete every `running` stage whose subagents are all
 /// terminal. A crash mid-barrier leaves such a stage `running` with every
-/// subagent idle; the `finish_stage` CAS makes this complete (render handoff +
-/// steer) exactly once even if it raced a live terminal child. This COMPLETES
-/// stages — it never stale-marks them.
+/// subagent idle; idempotent handoff rendering plus the `finish_stage` CAS
+/// makes terminal status + steer enqueue happen exactly once even if it raced a
+/// live terminal child. This COMPLETES stages — it never stale-marks them.
 pub(crate) async fn sweep_running_stages_on_boot(state: &AppState) {
     let ready = match state.repo.sweep_running_stages().await {
         Ok(ready) => ready,
