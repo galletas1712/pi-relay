@@ -66,8 +66,6 @@ Rules:
 - To run a known pattern (e.g. implement → review → test), `LoadSkill` the matching
   workflow skill and follow its stage state machine, branching on the typed
   outcomes in `index.json`, with your own judgment (skip, re-run, escalate, stop).
-- The `PythonRepl` tool remains only for ad hoc scripting, not for orchestrating
-  subagents.
 
 {% if skills.index %}
 ## Skills

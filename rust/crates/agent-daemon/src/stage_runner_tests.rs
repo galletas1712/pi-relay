@@ -53,7 +53,6 @@ impl Drop for TempDir {
 }
 
 use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
-use crate::repl::ReplRegistry;
 use crate::runtime::SessionDriver;
 use crate::state::AppState;
 use crate::workspaces::WorkspaceManager;
@@ -119,7 +118,6 @@ async fn test_env() -> Option<TestEnv> {
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
-        repls: ReplRegistry::default(),
         workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
         prompt_root: cwd.path().to_path_buf(),
     };

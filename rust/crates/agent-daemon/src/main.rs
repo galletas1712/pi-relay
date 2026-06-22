@@ -6,7 +6,6 @@ mod config;
 mod handoff;
 mod model_metadata;
 mod provider_runtime;
-mod repl;
 mod rpc_views;
 mod runtime;
 mod session_start;
@@ -76,7 +75,6 @@ async fn main() -> Result<()> {
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         provider_connections: ProviderConnectionRegistry::new(),
         session_titles: SessionTitleScheduler::default(),
-        repls: repl::ReplRegistry::default(),
         workspaces,
         prompt_root,
     };
@@ -114,7 +112,6 @@ async fn main() -> Result<()> {
     }
 
     drain_dispatch_tasks(&state).await;
-    state.repls.kill_all().await;
     state.repo.close().await;
     Ok(())
 }
@@ -301,7 +298,6 @@ async fn dispatch_request(
         RpcMethod::TurnResume => turn_resume(state, params).await,
         RpcMethod::ToolsList => tools_list(state, params),
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
-        RpcMethod::ReplExec => repl::repl_exec(state, params).await,
         RpcMethod::StageStartFull => stage_tools::rpc_start_full(state, params).await,
         RpcMethod::StageStartReadonlyFanout => {
             stage_tools::rpc_start_readonly_fanout(state, params).await
@@ -535,9 +531,6 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
             .provider_connections
             .remove_session(candidate_session_id)
             .await;
-        // Reap the per-session python3 REPL child so deleting a session that ran
-        // a PythonRepl cell never leaks a live process until daemon shutdown.
-        state.repls.remove_and_kill(candidate_session_id).await;
     }
 
     Ok(json!({

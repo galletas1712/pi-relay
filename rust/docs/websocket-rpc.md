@@ -1184,44 +1184,7 @@ turns fail with `not_resumable`, non-terminal targets fail with
 whose terminal work was tool execution fail with `not_resumable` until explicit
 tool-rerun semantics exist.
 
-## REPL RPC
-
-### `repl.exec`
-
-Executes a Python code cell in a stateful per-session scripting REPL process.
-This is the websocket counterpart to the provider-visible `PythonRepl` tool.
-Python globals persist between calls for the same `session_id`; stdout/stderr are
-captured and returned with the last expression's `repr`. The REPL is a pure
-Python sandbox with no host bridge — it cannot spawn or orchestrate subagents
-(use the `stage.*` RPCs for that).
-
-Request:
-
-```json
-{
-  "session_id": "session_parent",
-  "code": "x = 41\nx + 1"
-}
-```
-
-Response:
-
-```json
-{
-  "type": "exec_result",
-  "id": 1,
-  "ok": true,
-  "stdout": "",
-  "stderr": "",
-  "result_repr": "42",
-  "result_json": 42,
-  "error": null
-}
-```
-
-The provider-visible `PythonRepl` tool reports Python exceptions as tool errors
-with stdout/stderr and traceback, while the websocket `repl.exec` RPC returns the
-raw `ok: false` REPL payload.
+## Subagent events
 
 When a subagent is spawned (as part of a stage), re-driven after being idle, or
 goes idle, the daemon emits parent-scoped `subagent.spawned`, `subagent.running`,
@@ -1237,8 +1200,8 @@ Requires a `provider` parameter (`"openai"` or `"anthropic"`/`"claude"`) and
 returns the model-visible tool definitions for that provider, because the tool
 surface is provider-shaped (e.g. OpenAI `apply_patch` vs Anthropic
 `text_editor_20250728` for editing). The registered builtins are `edit`, `bash`,
-`grep`, `web_search`, `web_fetch`, `load_skill`, and `python_repl` - there are
-no `read`/`write` tools. Each returned entry carries `name`, `description`,
+`grep`, `web_search`, `web_fetch`, `load_skill`, and the `stage_*` tools - there
+are no `read`/`write` tools. Each returned entry carries `name`, `description`,
 `input_schema`, `canonical_name`, `prompt_alias`, `execution`, and
 `kind: "local_tool"`.
 

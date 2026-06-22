@@ -303,28 +303,6 @@ fn load_skill_definition() -> ToolDefinition {
     )
 }
 
-fn python_repl_definition() -> ToolDefinition {
-    ToolDefinition::new(
-        "PythonRepl",
-        "Execute Python code in this session's stateful scripting REPL. Use it for ad-hoc computation and for keeping scripting state in Python variables across calls. To run subagents, use the stage_* tools instead.",
-        json!({
-            "type": "object",
-            "properties": {
-                "code": {
-                    "type": "string",
-                    "description": "Python code to execute. The last expression's repr is returned, and stdout/stderr are captured."
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "description": "Optional execution timeout in milliseconds for short Python snippets."
-                }
-            },
-            "required": ["code"],
-            "additionalProperties": false
-        }),
-    )
-}
-
 fn stage_start_full_definition() -> ToolDefinition {
     ToolDefinition::new(
         "stage_start_full",
@@ -445,12 +423,6 @@ impl ToolExtension for FirstPartyToolExtension {
             "LoadSkill",
             "skill_loader",
             load_skill_definition(),
-        );
-        register_runtime_tool(
-            registry,
-            "PythonRepl",
-            "python_repl",
-            python_repl_definition(),
         );
         register_runtime_tool(
             registry,
@@ -614,7 +586,6 @@ mod tests {
                 "Bash",
                 "Grep",
                 "LoadSkill",
-                "PythonRepl",
                 "stage_cancel",
                 "stage_start_full",
                 "stage_start_readonly_fanout",
@@ -629,7 +600,6 @@ mod tests {
                 "Bash",
                 "Grep",
                 "LoadSkill",
-                "PythonRepl",
                 "stage_cancel",
                 "stage_start_full",
                 "stage_start_readonly_fanout",
@@ -662,7 +632,6 @@ mod tests {
                 "Bash",
                 "Grep",
                 "LoadSkill",
-                "PythonRepl",
                 "stage_cancel",
                 "stage_start_full",
                 "stage_start_readonly_fanout",
@@ -677,7 +646,6 @@ mod tests {
                 "Bash",
                 "Grep",
                 "LoadSkill",
-                "PythonRepl",
                 "stage_cancel",
                 "stage_start_full",
                 "stage_start_readonly_fanout",
@@ -745,30 +713,6 @@ mod tests {
         assert_eq!(claude_fetch.execution, ToolExecution::LocalJson);
         assert_eq!(claude_fetch.input_schema["type"], "object");
         assert!(claude_fetch.input_schema["properties"].get("url").is_some());
-    }
-
-    #[test]
-    fn python_repl_is_a_builtin_local_json_tool_for_each_provider() {
-        let registry = ToolRegistry::with_builtin_tools();
-        let openai_repl = registry
-            .provider_tools_for_provider(ProviderKind::OpenAi)
-            .into_iter()
-            .find(|tool| tool.canonical_name == "PythonRepl")
-            .expect("OpenAI PythonRepl tool");
-        let claude_repl = registry
-            .provider_tools_for_provider(ProviderKind::Claude)
-            .into_iter()
-            .find(|tool| tool.canonical_name == "PythonRepl")
-            .expect("Claude PythonRepl tool");
-
-        assert_eq!(openai_repl.name, "PythonRepl");
-        assert_eq!(openai_repl.prompt_alias.as_deref(), Some("python_repl"));
-        assert_eq!(openai_repl.execution, ToolExecution::LocalJson);
-        assert_eq!(openai_repl.input_schema["type"], "object");
-        assert!(openai_repl.input_schema["properties"].get("code").is_some());
-        assert_eq!(claude_repl.name, "PythonRepl");
-        assert_eq!(claude_repl.prompt_alias.as_deref(), Some("python_repl"));
-        assert_eq!(claude_repl.execution, ToolExecution::LocalJson);
     }
 
     #[test]
