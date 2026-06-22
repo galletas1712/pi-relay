@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use agent_core::AgentInput;
 use agent_store::{
@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use crate::codec::from_params;
 use crate::delegation_snapshot::build_delegation_snapshot;
 use crate::handoff::{
-    delegation_dir, handoff_root, refresh_delegation_handoff_artifacts,
+    delegation_dir, extract_suggested_next, handoff_root, refresh_delegation_handoff_artifacts,
     refresh_task_prompt_artifact_if_present, render_transcript_markdown, safe_handoff_path_segment,
     task_prompt_rel, TASK_PROMPT_FILE,
 };
@@ -491,10 +491,12 @@ pub(crate) async fn cancel_core(
         return Ok(json!({ "cancelled": false }));
     }
     cancel_delegation_subagents_without_reactivation(state, &delegation.id).await;
-    let transcript_paths = write_cancelled_subagent_transcripts(state, &delegation).await?;
+    let (handoff_dir, subagents) = write_cancelled_subagent_transcripts(state, &delegation).await?;
     Ok(json!({
         "cancelled": true,
-        "transcripts": transcript_paths,
+        "delegation_id": delegation.id,
+        "handoff_dir": handoff_dir,
+        "subagents": subagents,
     }))
 }
 
@@ -527,30 +529,34 @@ async fn cancel_delegation_subagents_without_reactivation(state: &AppState, dele
 async fn write_cancelled_subagent_transcripts(
     state: &AppState,
     delegation: &Delegation,
-) -> std::result::Result<Vec<Value>, RpcError> {
+) -> std::result::Result<(String, Vec<Value>), RpcError> {
     let parent_config = state
         .repo
         .load_session_config(&delegation.parent_session_id)
         .await?;
-    let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id).join("cancelled");
+    let delegation_segment = safe_path_segment(&delegation.id, "delegation_id")?;
+    let handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation_segment);
+    let dir = handoff_dir.join("cancelled");
     let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
-    let mut transcripts = Vec::with_capacity(subagents.len());
+    let mut transcript_refs = Vec::with_capacity(subagents.len());
     for subagent in &subagents {
+        let subagent_segment = safe_path_segment(&subagent.session_id, "subagent_id")?;
         let history = state.repo.active_branch(&subagent.session_id).await?;
         let transcript = render_transcript_markdown(&history);
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(anyhow::Error::from)?;
-        let path = dir.join(format!("{}.transcript.md", subagent.session_id));
+        let transcript_file = format!("cancelled/{subagent_segment}.transcript.md");
+        let path = dir.join(format!("{subagent_segment}.transcript.md"));
         tokio::fs::write(&path, transcript.as_bytes())
             .await
             .map_err(anyhow::Error::from)?;
-        transcripts.push(json!({
+        transcript_refs.push(json!({
             "subagent_id": subagent.session_id,
-            "transcript": path.to_string_lossy(),
+            "transcript_file": transcript_file,
         }));
     }
-    Ok(transcripts)
+    Ok((handoff_dir.to_string_lossy().into_owned(), transcript_refs))
 }
 
 #[derive(Debug, Deserialize)]
@@ -974,16 +980,40 @@ pub(crate) async fn rpc_list(
             let task_prompt_file = task_prompt
                 .as_ref()
                 .map(|_| task_prompt_rel(&subagent.session_id));
-            let cancellation_transcript_file = if delegation.status == DelegationStatus::Cancelled {
-                let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
+            let (final_message_file, suggested_next) = if matches!(
+                delegation.status,
+                DelegationStatus::Done | DelegationStatus::DoneWithFailures
+            ) {
+                let relative = format!("{}/final_message.md", subagent.session_id);
                 let path = delegation_handoff_dir.join(&relative);
                 if path.exists() {
-                    Some(relative)
+                    let suggested_next = tokio::fs::read_to_string(&path)
+                        .await
+                        .ok()
+                        .as_deref()
+                        .and_then(extract_suggested_next);
+                    (Some(relative), suggested_next)
                 } else {
-                    None
+                    (None, None)
                 }
             } else {
-                None
+                (None, None)
+            };
+            let transcript_file = match delegation.status {
+                DelegationStatus::Cancelled => {
+                    let subagent_segment = safe_path_segment(&subagent.session_id, "subagent_id")?;
+                    let relative = format!("cancelled/{subagent_segment}.transcript.md");
+                    let path = delegation_handoff_dir.join(&relative);
+                    path.exists().then_some(relative)
+                }
+                DelegationStatus::Running
+                | DelegationStatus::Done
+                | DelegationStatus::DoneWithFailures => {
+                    let relative = format!("{}/transcript.md", subagent.session_id);
+                    let path = delegation_handoff_dir.join(&relative);
+                    path.exists().then_some(relative)
+                }
+                DelegationStatus::Failed => None,
             };
             subagents.push(json!({
                 "id": subagent.session_id,
@@ -995,7 +1025,9 @@ pub(crate) async fn rpc_list(
                 "task_prompt_file": task_prompt_file,
                 "steerable": delegation.status == DelegationStatus::Running
                     && subagent.subagent_type == Some(SubagentType::Full),
-                "cancellation_transcript_file": cancellation_transcript_file,
+                "suggested_next": suggested_next,
+                "final_message_file": final_message_file,
+                "transcript_file": transcript_file,
             }));
         }
         views.push(json!({
@@ -1071,6 +1103,8 @@ pub(crate) async fn run_delegation_tool(
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     const CWD: &str = "/home/u/.local/state/pi-relay/sessions/parent/cwd";

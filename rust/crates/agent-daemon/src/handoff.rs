@@ -201,7 +201,6 @@ pub(crate) fn extract_suggested_next(final_message: &str) -> Option<String> {
 pub(crate) struct SubagentArtifact {
     pub(crate) session_id: String,
     pub(crate) terminal_status: Option<&'static str>,
-    pub(crate) final_message: Option<String>,
     pub(crate) suggested_next: Option<String>,
     pub(crate) final_message_path: Option<PathBuf>,
     pub(crate) task_prompt_path: Option<PathBuf>,
@@ -306,13 +305,12 @@ pub(crate) fn handoff_root(parent_outer_cwd: &str) -> PathBuf {
 ///
 /// This writes each subagent's exhaustive `transcript.md` on every call. When
 /// `include_final_messages` is true, it also writes `final_message.md`. Returned
-/// metadata may still include final-message/suggested-next text for terminal
-/// subagents in a running delegation, but normal final-message files are only
-/// published for completed delegations. Running inspections pass `false`: their
-/// transcript files are kept current, but no normal final-message artifact is
-/// published before the completion CAS wins. Cancelled and failed delegations do
-/// not publish normal per-subagent handoff artifacts; cancellation has its own
-/// transcript-only artifact path.
+/// metadata may still include `suggested_next` for terminal subagents in a
+/// running delegation, but final-message prose is not returned to snapshots.
+/// Running inspections pass `false`: their transcript files are kept current,
+/// but no normal final-message artifact is published before the completion CAS
+/// wins. Cancelled and failed delegations do not publish normal per-subagent
+/// handoff artifacts; cancellation has its own transcript-only artifact path.
 pub(crate) async fn refresh_delegation_handoff_artifacts(
     state: &AppState,
     delegation: &Delegation,
@@ -378,7 +376,6 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         artifacts.push(SubagentArtifact {
             session_id: subagent.session_id.clone(),
             terminal_status: is_terminal.then_some(status),
-            final_message: include_final_content.then_some(final_message),
             suggested_next: include_final_content.then_some(suggested_next).flatten(),
             final_message_path,
             task_prompt_path: task_prompt.as_ref().map(|artifact| artifact.path.clone()),

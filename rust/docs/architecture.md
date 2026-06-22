@@ -128,8 +128,8 @@ Implemented user-facing behavior:
   **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
   return). The parent parks after launching a delegation and is delivered a
   parent-scoped completion **daemon observation** containing a structured
-  snapshot equivalent to `inspect_delegation`, including bounded per-subagent
-  final-message previews, `suggested_next`, and compact handoff file references.
+  snapshot equivalent to `inspect_delegation`, including per-subagent
+  `suggested_next` and compact handoff file references.
   `inspect_delegation` refreshes or recovers that same structured state
   later/running.
   Delegation subagents may emit `subagent.spawned`/`subagent.running` progress

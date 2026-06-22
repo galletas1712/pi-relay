@@ -143,9 +143,9 @@ returns rather than sent as compaction input. For top-level parent sessions, the
 daemon stores the provider summary plus a fresh
 `## Delegation state at compaction time` section. That ledger lists every
 delegation row for the parent session (running, done, done_with_failures,
-cancelled, failed) with bounded progress/subagent fields, cheap final-message
-snippets when available, and artifact paths. It deliberately does not inline
-full transcripts or refresh handoff artifacts. Running entries are
+cancelled, failed) with bounded progress/subagent fields, `suggested_next`
+control data when available, and artifact paths. It deliberately does not inline
+full transcripts or final-message prose, or refresh handoff artifacts. Running entries are
 point-in-time facts; summaries must not assume they completed before a later
 completion observation or refreshed `inspect_delegation`. Future compactions summarize
 prior summary text normally, including any older point-in-time ledgers, then

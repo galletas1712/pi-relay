@@ -6,7 +6,7 @@ use crate::handoff::{delegation_dir, extract_suggested_next};
 use crate::state::AppState;
 
 const MAX_SUBAGENTS_PER_DELEGATION: usize = 8;
-const MAX_FINAL_MESSAGE_CHARS: usize = 700;
+const MAX_SUGGESTED_NEXT_CHARS: usize = 120;
 
 /// Build the compaction-only delegation ledger for a top-level parent session.
 ///
@@ -88,7 +88,7 @@ pub(crate) async fn compaction_delegation_ledger(
 fn ledger_header() -> String {
     let mut out = String::from("## Delegation state at compaction time\n\n");
     out.push_str(
-        "Point-in-time compaction ledger for this parent session. It lists every delegation row for the parent session, including running, done, done_with_failures, cancelled, and failed statuses. Per-subagent details and final-message snippets are bounded. Full transcript contents are not inlined.\n\n",
+        "Point-in-time compaction ledger for this parent session. It lists every delegation row for the parent session, including running, done, done_with_failures, cancelled, and failed statuses. Per-subagent control-flow details and artifact file references are bounded. Full transcript and final-message contents are not inlined.\n\n",
     );
     out.push_str(
         "This section is appended after provider compaction so fresh delegation facts cross the compaction boundary. Distinguish delegations that completed, were cancelled, or failed before compaction from delegations that were still running at compaction time. A running delegation entry is only a point-in-time fact: do not assume it completed; wait for a later completion observation or call `inspect_delegation`.\n",
@@ -161,19 +161,11 @@ async fn append_subagents(
                 "; final_message_file: `{}/final_message.md`",
                 inline_code(&subagent.session_id)
             ));
-            if let Some((final_message, suggested_next)) =
-                read_bounded_final_message(&final_message_path).await
-            {
+            if let Some(suggested_next) = read_suggested_next(&final_message_path).await {
                 out.push_str(&format!(
-                    "; final_message: {}",
-                    serde_json::to_string(&final_message)?
+                    "; suggested_next: {}",
+                    serde_json::to_string(&suggested_next)?
                 ));
-                if let Some(suggested_next) = suggested_next {
-                    out.push_str(&format!(
-                        "; suggested_next: {}",
-                        serde_json::to_string(&suggested_next)?
-                    ));
-                }
             }
         }
         out.push('\n');
@@ -233,17 +225,13 @@ fn final_message_relevant(status: DelegationStatus) -> bool {
     )
 }
 
-async fn read_bounded_final_message(path: &Path) -> Option<(String, Option<String>)> {
+async fn read_suggested_next(path: &Path) -> Option<String> {
     let content = tokio::fs::read_to_string(path).await.ok()?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
     }
-    let suggested_next = bounded_suggested_next(trimmed);
-    Some((
-        truncate_chars(trimmed, MAX_FINAL_MESSAGE_CHARS),
-        suggested_next,
-    ))
+    bounded_suggested_next(trimmed)
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -257,7 +245,8 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 }
 
 fn bounded_suggested_next(final_message: &str) -> Option<String> {
-    extract_suggested_next(final_message).map(|value| truncate_chars(&value, 120))
+    extract_suggested_next(final_message)
+        .map(|value| truncate_chars(&value, MAX_SUGGESTED_NEXT_CHARS))
 }
 
 fn optional_inline_code(value: Option<&str>) -> String {
@@ -338,14 +327,8 @@ pub(crate) fn test_ledger_from_snapshots(
                 if let Some(final_message) = subagent.final_message.as_deref() {
                     let trimmed_final_message = final_message.trim();
                     if !trimmed_final_message.is_empty() {
-                        let suggested_next = bounded_suggested_next(trimmed_final_message);
-                        let final_message =
-                            truncate_chars(trimmed_final_message, MAX_FINAL_MESSAGE_CHARS);
-                        out.push_str(&format!(
-                            "; final_message: {}",
-                            serde_json::to_string(&final_message)?
-                        ));
-                        if let Some(suggested_next) = suggested_next {
+                        if let Some(suggested_next) = bounded_suggested_next(trimmed_final_message)
+                        {
                             out.push_str(&format!(
                                 "; suggested_next: {}",
                                 serde_json::to_string(&suggested_next)?
@@ -408,7 +391,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_compaction_ledger_omits_transcript_bodies_and_truncates_final_message() {
+    fn bounded_compaction_ledger_omits_transcript_and_final_message_bodies() {
         let long_final = format!(
             "{}\n\nsuggested_next: approved",
             "final-message ".repeat(100)
@@ -444,9 +427,9 @@ mod tests {
         assert!(text.contains("completed before compaction"));
         assert!(text.contains("... 2 more subagent(s) omitted"));
         assert!(text.contains("final_message_file: `child_0/final_message.md`"));
-        assert!(text.contains("suggested_next"));
-        assert!(text.contains('…'));
-        assert!(text.contains("Full transcript contents are not inlined"));
+        assert!(text.contains("suggested_next: \"approved\""));
+        assert!(text.contains("Full transcript and final-message contents are not inlined"));
+        assert!(!text.contains("final-message final-message"));
         assert!(!text.contains("## User"));
         assert!(!text.contains("## Assistant"));
         assert!(!text.contains("transcript body"));

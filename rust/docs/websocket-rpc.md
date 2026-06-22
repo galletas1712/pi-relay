@@ -1280,10 +1280,9 @@ Result:
 
 Returns one in-scope delegation as the canonical structured snapshot. The
 snapshot includes delegation metadata, progress counts, subagent roles/types,
-activity/status, steerability, terminal `final_message_preview`,
-`suggested_next` (when available), and compact handoff file references. It does
-not inline full transcript, task prompt, or final-message bodies; read handoff
-files when detail is needed.
+activity/status, steerability, `suggested_next` (when available), and compact
+handoff file references. It does not inline full transcript, task prompt, or
+final-message bodies; read handoff files when detail is needed.
 
 ```json
 {
@@ -1311,7 +1310,6 @@ Result:
       "activity": "idle",
       "status": "done",
       "steerable": false,
-      "final_message_preview": "Looks good.\n\nsuggested_next: approved",
       "suggested_next": "approved",
       "final_message_file": null,
       "transcript_file": "session_.../transcript.md",
@@ -1326,12 +1324,29 @@ Result:
 
 Interrupts all running subagents in a delegation and marks the delegation
 cancelled. Terminal delegations are left unchanged and return
-`{ "cancelled": false }`.
+`{ "cancelled": false }`. A successful cancellation returns compact
+per-subagent transcript file references relative to `handoff_dir`.
 
 ```json
 {
   "parent_session_id": "parent-session",
   "delegation_id": "delegation_..."
+}
+```
+
+Successful result:
+
+```json
+{
+  "cancelled": true,
+  "delegation_id": "delegation_...",
+  "handoff_dir": "/.../.pi-handoff/delegation_...",
+  "subagents": [
+    {
+      "subagent_id": "session_...",
+      "transcript_file": "cancelled/session_abc.transcript.md"
+    }
+  ]
 }
 ```
 
@@ -1362,7 +1377,10 @@ Result:
           "status": "idle",
           "role": "implementer",
           "subagent_type": "full",
-          "task": "Implement the requested change."
+          "task_prompt_file": "session_.../task_prompt.md",
+          "transcript_file": "session_.../transcript.md",
+          "final_message_file": "session_.../final_message.md",
+          "suggested_next": "ready_for_review"
         }
       ],
       "handoff_dir": "/.../.pi-handoff/delegation_..."
@@ -1431,8 +1449,8 @@ are progress hints only. Parent-visible delegation completion is not a per-child
 `subagent.idle`; it is one `InputPriority::Steer` daemon observation queued to
 the parent after the delegation barrier completes. The observation is stored as a
 typed `daemon_tool_observation` transcript item and is inspect-equivalent to
-`inspect_delegation`/`delegation.status`, including bounded per-subagent
-final-message previews, `suggested_next`, and artifact paths. Provider adapters
+`inspect_delegation`/`delegation.status`, including per-subagent
+`suggested_next` and artifact paths. Provider adapters
 render it as an adjacent synthetic `inspect_delegation` tool call/result pair;
 the UI renders it as a daemon/system observation card. Use
 `inspect_delegation`/`delegation.status` to refresh/recover state or inspect
