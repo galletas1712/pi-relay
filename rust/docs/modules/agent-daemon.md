@@ -36,77 +36,11 @@ workspaces/        workspace base refresh, local/git source handling, sanitizati
 rpc_views.rs       response shaping (snapshots, queue state, transcript views, server_time_ms)
 model_metadata.rs  per-model context windows + 85% auto-compaction default limit
 provider_runtime/  provider selection, model/web-tool execution, compaction, token accounting
-subagents.rs       delegation subagent spawn core: role resolution, full vs
-                   read-only workspace handling, child prompt + lifecycle events
-delegation_tools.rs     delegation tool surface (delegate_writing_task /
-                   delegate_readonly_tasks / inspect_delegation /
-                   cancel_delegation / steer_subagent) plus delegation.* web RPCs
-                   (start_full / start_readonly_fanout / status / cancel /
-                   list) + homogeneity/one-delegation-per-parent guards
-delegation_runner.rs    delegation barrier: all-terminal detect, attempt-fenced finish CAS,
-                   idempotent handoff write, one steer to the parent; boot
-                   crash sweep
-handoff.rs         renders per-subagent task_prompt.md / final_message.md /
-                   transcript.md from durable delegation/session state
+subagents.rs       parent/child subagent spawn/list: role resolution, workspace
+                   fork, git source-ref import, child prompt + lifecycle events
+repl.rs            in-process Python REPL (repl.exec / PythonRepl tool) exposing
+                   the `subagents` orchestration module over a host-call bridge
 ```
-
-Subagent work runs as **delegations** (`delegate_writing_task` /
-`delegate_readonly_tasks` / `inspect_delegation` / `cancel_delegation` /
-`steer_subagent`). Full subagents
-reuse the parent's workspace dirs in place; read-only subagents get a forked
-snapshot destroyed on return. Delegation subagents may emit
-`subagent.spawned`/`subagent.running` progress events; their terminal hook fires
-a single-flight, `attempt_id`-fenced barrier when all subagents of a delegation are
-terminal. After the DB finish CAS wins, the runner writes the handoff directory
-and then enqueues one `InputPriority::Steer` daemon observation to the parent.
-That observation includes the same structured snapshot shape as
-`inspect_delegation`, with `suggested_next` and compact handoff file
-references.
-Completion is that typed wakeup observation/handoff, not a parent-visible per-child idle event. The
-runner never decides the next delegation — the parent does, guided by workflow
-skills. Cancellation is terminal and exports transcript-only files for the
-cancelled subagents instead of running the normal completion handoff.
-
-Delegation completion wakeups are rendered as provider-neutral daemon
-observations. The durable transcript entry is a typed
-`daemon_tool_observation`, not an ordinary user message and not a fake assistant
-tool choice. It records the daemon-authored `inspect_delegation` observation
-with a stable local tool-call id, arguments, status, concise summary, and bounded
-snapshot JSON. Provider adapters translate this typed item into adjacent
-synthetic tool call/result pairs for OpenAI and Anthropic request bodies; the UI
-renders it as a daemon/system observation card. A text fallback renderer remains
-available for diagnostics and unsupported contexts.
-
-The snapshot never inlines full transcript bodies or raw subagent task prompts.
-Task prompts are materialized as per-subagent `task_prompt.md` handoff files,
-final messages are exposed through `final_message.md` file references, and
-`suggested_next` stays inline because workflows branch on it.
-
-Normal top-level parent model requests do not receive a daemon-generated
-delegation dashboard. They are transcript-driven: durable delegate tool results
-and typed wakeup observations already live in history, so the provider input stays as stable
-PI/system prompt plus transcript history.
-
-Compaction is the special case, but the live ledger is not a provider input. For
-top-level parent sessions, the provider compacts only transcript/model history
-(including any older point-in-time ledgers already present as prior summary
-text). After the provider returns, the daemon appends a fresh
-`## Delegation state at compaction time` section to the stored compaction
-summary. The ledger lists every delegation row for that parent session across
-all statuses (`running`, `done`, `done_with_failures`, `cancelled`, `failed`),
-with bounded subagent/progress details, `suggested_next` control data when
-available, and artifact paths. It does not refresh artifacts or inline
-transcript or final-message bodies. A `running` entry is a point-in-time compaction fact, not a
-final outcome; later completion observations or `inspect_delegation` provide fresh
-state. If older ledger text remains in prior summaries, the newly appended
-ledger supersedes it by being the latest section. Subagent compactions do not
-receive or append the parent ledger, sibling subagent state, or `## Current
-delegations` information; subagents summarize only their own role contract,
-delegated task, transcript/model history, and tool results/facts.
-
-The web/inspector RPC surface remains `delegation.start_full`,
-`delegation.start_readonly_fanout`, `delegation.status`, `delegation.cancel`, and `delegation.list`;
-those names are client APIs, not the provider-visible model tool names.
 
 `runtime/` keeps ordering-sensitive behavior in named phases instead of a generic
 hook/event bus: queued inputs are persisted before dispatch, model dispatch is
@@ -115,7 +49,7 @@ driver loop after its durable store update. The narrow extension precedent
 remains `ToolRegistry`/`ToolExtension`, where the variation point is real and
 does not own session durability.
 
-`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (remote/local compaction and parent-only post-compaction delegation ledger append), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery + stable prompt sections), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization). The adjacent `delegation_context.rs` builds the bounded compaction ledger for top-level parent sessions.
+`provider_runtime/` is itself split: `provider.rs`/`connections.rs` (selection + per-session connection cache), `requests.rs` (`run_model`), `auth_retry.rs` (Codex 401 retry wrapper), `compaction.rs` (remote/local compaction), `context_accounting.rs` (pre-dispatch token gate), `prompt.rs` (PI.md render + skill discovery), `skills.rs` (`LoadSkill`), `web_tools.rs` (web_search/web_fetch sidecars), `transcript.rs` (model-context normalization).
 
 ## Key types
 
@@ -154,7 +88,7 @@ Every handler that touches session state calls `SessionDriver::acquire`, which f
 
 ### Automatic tool dispatch
 
-Tool actions are dispatched immediately. `spawn_claimed_dispatch` runs `run_tool_turn` in a registered background task: it marks the action running, ensures the workspace, executes the tool, feeds the `ToolResultMessage` back into the live session, drains, and re-drives. Runtime/local tools such as `LoadSkill`, the web tools (`web_search`/`web_fetch`), and delegation tools are handled in-daemon; provider-executed registry tools route through the `ToolRegistry` keyed by provider kind as appropriate. There is no approval interface — tools execute automatically.
+Tool actions are dispatched immediately. `spawn_claimed_dispatch` runs `run_tool_turn` in a registered background task: it marks the action running, ensures the workspace, executes the tool, feeds the `ToolResultMessage` back into the live session, drains, and re-drives. `LoadSkill` and the web tools (`web_search`/`web_fetch`) are handled in-daemon; all other tools route to the `ToolRegistry` keyed by provider kind. There is no approval interface — tools execute automatically.
 
 ### Model dispatch, retries, and auth recovery
 

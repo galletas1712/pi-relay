@@ -57,10 +57,6 @@ impl PostgresAgentStore {
         Ok(frames)
     }
 
-    /// Parent-visible
-    /// `subagent.idle`. Delegation members do not call this on terminal completion;
-    /// they use `claim_subagent_idle_once` below to fire cleanup/barrier work
-    /// without surfacing a per-child idle event to the parent.
     pub async fn insert_subagent_idle_event_once(
         &self,
         parent_session_id: &str,
@@ -100,47 +96,6 @@ impl PostgresAgentStore {
             .await?;
         tx.commit().await?;
         Ok(Some(event))
-    }
-
-    /// Claim the once-only terminal-idle gate for a child WITHOUT writing a
-    /// parent-visible `SubagentIdle` row. Returns `true` exactly once per
-    /// `notification_key` (the same dedup `insert_subagent_idle_event_once`
-    /// uses), so a delegation member's barrier + RO-snapshot destroy still fire
-    /// exactly once while no per-child idle ever surfaces to the parent.
-    pub async fn claim_subagent_idle_once(
-        &self,
-        child_session_id: &str,
-        notification_key: &str,
-    ) -> Result<bool> {
-        let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("select metadata from sessions where id=$1 for update")
-            .bind(child_session_id)
-            .fetch_optional(&mut *tx)
-            .await?;
-        let Some(row) = row else {
-            tx.commit().await?;
-            return Ok(false);
-        };
-        let mut metadata: Value = row.get("metadata");
-        if metadata
-            .get("subagent_parent_idle_notification_key")
-            .and_then(Value::as_str)
-            == Some(notification_key)
-        {
-            tx.commit().await?;
-            return Ok(false);
-        }
-        ensure_payload_object(&mut metadata).insert(
-            "subagent_parent_idle_notification_key".to_string(),
-            Value::String(notification_key.to_string()),
-        );
-        sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
-            .bind(child_session_id)
-            .bind(&metadata)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
-        Ok(true)
     }
 
     pub async fn events_after(
@@ -343,15 +298,17 @@ pub(super) async fn insert_transcript_item_events_tx(
                 .await?;
         fallback_record.as_ref()
     };
-    let entry_payload = record.as_ref().map(|entry| {
-        json!({
+    let entry_payload = if let Some(entry) = record.as_ref() {
+        Some(json!({
             "id": entry.id,
             "parent_id": entry.parent_id,
             "timestamp_ms": entry.timestamp_ms,
             "sequence": entry.sequence,
             "item": entry.item,
-        })
-    });
+        }))
+    } else {
+        None
+    };
     let tree_node = record.map(tree_node_from_entry);
     let mut frames = vec![
         insert_event_with_activity_tx(

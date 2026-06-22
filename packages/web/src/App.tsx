@@ -14,7 +14,6 @@ import { randomId } from "./ids.ts";
 import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
-import { isDelegationRunning, reRunParamsForDelegation, subagentHasNonEmptyPromptFile } from "./delegationBoard.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
@@ -87,8 +86,6 @@ import type {
 	ReasoningEffort,
 	SessionSnapshot,
 	SessionSummary,
-	Delegation,
-	HandoffFileName,
 	ToolListing,
 	TranscriptEntry,
 	TranscriptTreeNode,
@@ -427,25 +424,25 @@ export function App() {
 		enabled: connection === "open",
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
-	const delegationsQuery = useQuery({
-		queryKey: queryKeys.delegations(loadedSnapshot?.session_id ?? null),
+	const subagentsQuery = useQuery({
+		queryKey: queryKeys.subagents(loadedSnapshot?.session_id ?? null),
 		queryFn: () => {
 			if (!loadedSnapshot) throw new Error("select a session first");
-			return api.listDelegations(loadedSnapshot.session_id);
+			return api.listSubagents(loadedSnapshot.session_id);
 		},
 		enabled: connection === "open" && !!loadedSnapshot,
-		// The parent PARKS (goes idle) while a delegation runs, so gate the poll
-		// on whether any delegation is actually running — not on the parent's
-		// activity — or the missed-event safety net would be off exactly when
-		// it's needed.
-		refetchInterval: (query) =>
-			(query.state.data?.delegations ?? []).some(isDelegationRunning) ? 2_000 : false,
+		refetchInterval: loadedSnapshot?.activity === "running" ? 2_000 : false,
 	});
-	const delegations = delegationsQuery.data?.delegations ?? [];
-	const delegationSubagentIds = useMemo(
-		() => delegations.flatMap((delegation) => delegation.subagents.map((subagent) => subagent.id)),
-		[delegations],
+	const subagentIds = useMemo(
+		() => subagentsQuery.data?.subagents.map((subagent) => subagent.child_session_id) ?? [],
+		[subagentsQuery.data],
 	);
+	const subagentSummariesQuery = useQuery({
+		queryKey: queryKeys.subagentSummaries(loadedSnapshot?.session_id ?? null, subagentIds),
+		queryFn: async () => Promise.all(subagentIds.map(async (sessionId) => snapshotToSummary(await api.getSession(sessionId)))),
+		enabled: connection === "open" && subagentIds.length > 0,
+	});
+	const subagentSummaries = subagentSummariesQuery.data ?? [];
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
 	const hasTranscriptEntries =
 		loadedSnapshot?.has_transcript_entries ??
@@ -887,11 +884,7 @@ export function App() {
 			if (refreshPlan.refreshList) {
 				scheduleSessionListRefresh();
 				if (loadedSnapshot?.session_id) {
-					// The run board reads the delegation.* surface; the backend emits no
-					// dedicated delegation events, so the subagent lifecycle events (and
-					// the typed completion observation landing in the parent transcript) are the
-					// signal to refresh the board. The 2s poll covers any missed event.
-					void queryClient.invalidateQueries({ queryKey: queryKeys.delegations(loadedSnapshot.session_id) });
+					void queryClient.invalidateQueries({ queryKey: queryKeys.subagents(loadedSnapshot.session_id) });
 				}
 			}
 
@@ -1066,8 +1059,8 @@ export function App() {
 		for (const session of sessions) {
 			desiredSessionIds.add(session.session_id);
 		}
-		for (const delegationSubagentId of delegationSubagentIds) {
-			desiredSessionIds.add(delegationSubagentId);
+		for (const subagentId of subagentIds) {
+			desiredSessionIds.add(subagentId);
 		}
 		if (selectedId && selectedHasEventCursor) desiredSessionIds.add(selectedId);
 		for (const sessionId of Array.from(subscribedEventSessionIds.current)) {
@@ -1103,7 +1096,7 @@ export function App() {
 		pushNotice,
 		selectedId,
 		sessions,
-		delegationSubagentIds,
+		subagentIds,
 	]);
 
 	const configureProvider = useCallback(
@@ -1542,89 +1535,6 @@ export function App() {
 		}
 	}, [api, pushNotice, queryClient, requireSelected, syncActiveBranchNow]);
 
-	const invalidateDelegations = useCallback(() => {
-		if (loadedSnapshot?.session_id) {
-			void queryClient.invalidateQueries({ queryKey: queryKeys.delegations(loadedSnapshot.session_id) });
-		}
-	}, [loadedSnapshot?.session_id, queryClient]);
-
-	const cancelDelegation = useCallback(
-		(delegationId: string) => {
-			const parentSessionId = loadedSnapshot?.session_id;
-			if (!parentSessionId) return;
-			void api
-				.cancelDelegation(parentSessionId, delegationId)
-				.then(() => invalidateDelegations())
-				.catch((error) => pushNotice("error", errorMessage(error)));
-		},
-		[api, invalidateDelegations, loadedSnapshot?.session_id, pushNotice],
-	);
-
-	// Steer the full subagent: a steer-priority message into the subagent's own
-	// session (the composer only ever sends follow_up). The daemon rejects
-	// steering a read-only subagent, so the board only offers this for the full.
-	const steerSubagent = useCallback(
-		(subagentSessionId: string) => {
-			const text = window.prompt("Steer the full subagent with:");
-			if (!text || !text.trim()) return;
-			void api
-				.steerSubagent({
-					subagentSessionId,
-					clientInputId: randomId("web_steer"),
-					content: [{ type: "text", text: text.trim() }],
-				})
-				.then(() => pushNotice("success", "steered the subagent"))
-				.catch((error) => pushNotice("error", errorMessage(error)));
-		},
-		[api, pushNotice],
-	);
-
-	const reRunDelegation = useCallback(
-		(delegation: Delegation) => {
-			const parentSessionId = loadedSnapshot?.session_id;
-			if (!parentSessionId) return;
-			void (async () => {
-				let reRun = reRunParamsForDelegation(delegation, parentSessionId);
-				if (!reRun) {
-					const subagents = await Promise.all(
-						delegation.subagents.map(async (subagent) => {
-							if (typeof subagent.task === "string" && subagent.task.trim()) return subagent;
-							if (!subagentHasNonEmptyPromptFile(subagent)) return subagent;
-							const result = await api.readHandoffFile({
-								parentSessionId,
-								delegationId: delegation.delegation_id,
-								subagentId: subagent.id,
-								file: "task_prompt.md",
-							});
-							return { ...subagent, task: result.content };
-						})
-					);
-					reRun = reRunParamsForDelegation({ ...delegation, subagents }, parentSessionId);
-				}
-				if (!reRun) {
-					pushNotice("error", "cannot re-run: original prompts are unavailable");
-					return;
-				}
-				const start =
-					reRun.kind === "full" ? api.startFullDelegation(reRun.params) : api.startReadonlyDelegationFanout(reRun.params);
-				await start;
-				invalidateDelegations();
-			})()
-				.catch((error) => pushNotice("error", errorMessage(error)));
-		},
-		[api, invalidateDelegations, loadedSnapshot?.session_id, pushNotice],
-	);
-
-	const readHandoffFile = useCallback(
-		async (delegationId: string, subagentId: string | null, file: HandoffFileName): Promise<string> => {
-			const parentSessionId = loadedSnapshot?.session_id;
-			if (!parentSessionId) throw new Error("select a session first");
-			const result = await api.readHandoffFile({ parentSessionId, delegationId, subagentId, file });
-			return result.content;
-		},
-		[api, loadedSnapshot?.session_id],
-	);
-
 	const resumeTerminalTurn = useCallback(
 		async (leafId?: string | null) => {
 			const sessionId = requireSelected();
@@ -1802,9 +1712,7 @@ export function App() {
 	);
 
 	const canStop = !!selectedId && loadedSnapshot?.activity === "running";
-	const queuedInputs = (loadedSnapshot?.queued_inputs ?? []).filter(
-		(input) => input.content_type !== "daemon_tool_observation" && input.editable !== false,
-	);
+	const queuedInputs = loadedSnapshot?.queued_inputs ?? [];
 	const handleToggleArchived = useCallback(() => {
 		setShowArchived((show) => !show);
 	}, []);
@@ -2132,15 +2040,10 @@ export function App() {
 			<aside className="inspector" data-slot="inspector" inert={inspectorInert}>
 				<Inspector
 					snapshot={loadedSnapshot}
-					delegations={delegations}
-					delegationsLoading={delegationsQuery.isLoading}
-					delegationsError={errorMessageOrNull(delegationsQuery.error)}
-					runBoard={{
-						onCancelDelegation: cancelDelegation,
-						onSteerSubagent: steerSubagent,
-						onReRunDelegation: reRunDelegation,
-						readHandoffFile,
-					}}
+					subagents={subagentsQuery.data ?? null}
+					subagentSummaries={subagentSummaries}
+					subagentsLoading={subagentsQuery.isLoading || subagentSummariesQuery.isLoading}
+					subagentsError={errorMessageOrNull(subagentsQuery.error ?? subagentSummariesQuery.error)}
 					tools={tools}
 					onSelectSession={(sessionId) => {
 						selectSession(sessionId);
@@ -2215,6 +2118,24 @@ function titleFromText(text: string): string {
 	return truncate(firstLine(text).trim() || "New session", 64);
 }
 
+function snapshotToSummary(snapshot: SessionSnapshot): SessionSummary {
+	return {
+		session_id: snapshot.session_id,
+		project_id: snapshot.project_id,
+		parent_session_id: snapshot.parent_session_id,
+		outer_cwd: snapshot.outer_cwd,
+		workspaces: snapshot.workspaces,
+		activity: snapshot.activity,
+		active_leaf_id: snapshot.active_leaf_id,
+		provider: snapshot.provider,
+		metadata: snapshot.metadata,
+		created_at: "",
+		updated_at: "",
+		last_user_message_timestamp_ms: snapshot.last_user_message_timestamp_ms,
+		has_transcript_entries: snapshot.has_transcript_entries,
+	};
+}
+
 function errorMessageOrNull(error: unknown): string | null {
 	return error === null || error === undefined ? null : errorMessage(error);
 }
@@ -2255,7 +2176,11 @@ function compactionErrorNotice(data: Record<string, unknown>): string {
 
 function subagentLabel(data: Record<string, unknown>): string {
 	const label =
-		typeof data.role === "string" && data.role.trim() ? data.role.trim() : "subagent";
+		typeof data.display_name === "string" && data.display_name.trim()
+			? data.display_name.trim()
+			: typeof data.role === "string" && data.role.trim()
+				? data.role.trim()
+				: "subagent";
 	const child = typeof data.child_session_id === "string" ? data.child_session_id.slice(0, 13) : "";
 	return child ? `${label} ${child}` : label;
 }

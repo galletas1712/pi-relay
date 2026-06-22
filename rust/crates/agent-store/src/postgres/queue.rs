@@ -6,8 +6,8 @@ use uuid::Uuid;
 
 use crate::{
     CancelQueuedInputResult, EnqueueUserInputResult, EventType, InputPriority, InputRecord,
-    PromoteQueuedInputResult, QueueMutationError, QueueState, QueuedInput, QueuedInputContent,
-    QueuedInputRecord, QueuedInputStatus, ReorderQueuedFollowUpsResult, UpdateQueuedInputResult,
+    PromoteQueuedInputResult, QueueMutationError, QueueState, QueuedInput, QueuedInputRecord,
+    QueuedInputStatus, ReorderQueuedFollowUpsResult, UpdateQueuedInputResult,
 };
 
 use super::events::insert_event_tx;
@@ -84,7 +84,7 @@ impl PostgresAgentStore {
         .bind(&id)
         .bind(session_id)
         .bind(priority.as_str())
-        .bind(serde_json::to_value(QueuedInputContent::user_message(content.clone()))?)
+        .bind(serde_json::to_value(content)?)
         .bind(client_input_id)
         .fetch_optional(&mut *tx)
         .await?;
@@ -120,7 +120,6 @@ impl PostgresAgentStore {
                     "priority": priority,
                     "client_input_id": client_input_id,
                     "content": content.content.clone(),
-                    "content_type": "user_message",
                 }),
             ),
         )
@@ -196,7 +195,7 @@ impl PostgresAgentStore {
         let Some(row) = row else {
             return Ok(None);
         };
-        let content = queued_input_content_from_value(row.get::<Value, _>("content"))?;
+        let content: UserMessage = serde_json::from_value(row.get::<Value, _>("content"))?;
         Ok(Some(QueuedInput {
             id: row.get("id"),
             priority: row_text::<InputPriority>(&row, "priority")?,
@@ -269,17 +268,16 @@ impl PostgresAgentStore {
             &mut tx,
             session_id,
             EventType::InputPromoted,
-            queue_event_payload(&queue, {
-                let content = queued_input_content_from_value(row.get::<Value, _>("content"))?;
-                let mut payload = json!({
-                "input_id": input_id,
-                "priority": InputPriority::Steer,
-                "client_input_id": row.get::<Option<String>, _>("client_input_id"),
-                "promoted_at": row.get::<Option<String>, _>("promoted_at"),
-                });
-                append_queued_content_event_fields(&mut payload, &content);
-                payload
-            }),
+            queue_event_payload(
+                &queue,
+                json!({
+                    "input_id": input_id,
+                    "priority": InputPriority::Steer,
+                    "client_input_id": row.get::<Option<String>, _>("client_input_id"),
+                    "content": row.get::<Value, _>("content"),
+                    "promoted_at": row.get::<Option<String>, _>("promoted_at"),
+                }),
+            ),
         )
         .await?;
         tx.commit().await?;
@@ -347,9 +345,8 @@ impl PostgresAgentStore {
         }
 
         let previous_content = row.get::<Value, _>("content");
-        let content_value =
-            serde_json::to_value(QueuedInputContent::user_message(content.clone()))?;
-        if previous_content == content_value || previous_content == serde_json::to_value(content)? {
+        let content_value = serde_json::to_value(content)?;
+        if previous_content == content_value {
             let queue = queue_state_tx(&mut tx, session_id).await?;
             tx.commit().await?;
             return Ok(UpdateQueuedInputResult {
@@ -375,7 +372,7 @@ impl PostgresAgentStore {
         )
         .bind(session_id)
         .bind(input_id)
-        .bind(content_value)
+        .bind(serde_json::to_value(content)?)
         .execute(&mut *tx)
         .await?;
         bump_revisions_tx(&mut tx, session_id, true, false).await?;
@@ -391,7 +388,6 @@ impl PostgresAgentStore {
                     "priority": priority,
                     "status": status,
                     "content": content.content.clone(),
-                    "content_type": "user_message",
                 }),
             ),
         )
@@ -721,7 +717,7 @@ pub(super) async fn queue_state_tx(
                     input_id: row.get("id"),
                     priority: row_text(&row, "priority")?,
                     status: row_text::<QueuedInputStatus>(&row, "status")?,
-                    content: queued_input_content_from_value(content_value)?,
+                    content: serde_json::from_value(content_value)?,
                     client_input_id: row.get("client_input_id"),
                     created_at: row.get("created_at"),
                     updated_at: row.get("updated_at"),
@@ -784,56 +780,17 @@ pub(super) async fn bump_revisions_tx(
 }
 
 pub(super) fn queued_input_value(input: &QueuedInputRecord) -> Value {
-    let (content, editable) = match &input.content {
-        QueuedInputContent::UserMessage(message) => (json!(message.content.clone()), true),
-        QueuedInputContent::DaemonToolObservation(_) => (json!([]), false),
-    };
     json!({
         "input_id": input.input_id,
         "priority": input.priority,
         "status": input.status,
-        "content": content,
-        "content_type": input.content.as_kind(),
-        "editable": editable,
+        "content": input.content.content.clone(),
         "client_input_id": input.client_input_id,
         "created_at": input.created_at,
         "updated_at": input.updated_at,
         "promoted_at": input.promoted_at,
         "follow_up_position": input.follow_up_position,
     })
-}
-
-pub(super) fn queued_input_content_from_value(value: Value) -> Result<QueuedInputContent> {
-    if value.get("type").and_then(Value::as_str).is_some() {
-        Ok(serde_json::from_value(value)?)
-    } else {
-        Ok(QueuedInputContent::user_message(serde_json::from_value(
-            value,
-        )?))
-    }
-}
-
-pub(super) fn append_queued_content_event_fields(
-    payload: &mut Value,
-    content: &QueuedInputContent,
-) {
-    let Some(object) = payload.as_object_mut() else {
-        return;
-    };
-    object.insert(
-        "content_type".to_string(),
-        Value::String(content.as_kind().to_string()),
-    );
-    match content {
-        QueuedInputContent::UserMessage(message) => {
-            object.insert("content".to_string(), json!(message.content.clone()));
-            object.insert("editable".to_string(), Value::Bool(true));
-        }
-        QueuedInputContent::DaemonToolObservation(_) => {
-            object.insert("content".to_string(), json!([]));
-            object.insert("editable".to_string(), Value::Bool(false));
-        }
-    }
 }
 
 async fn revision_mismatch_tx(

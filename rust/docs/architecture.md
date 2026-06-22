@@ -23,11 +23,9 @@ in-flight future work lives under [`plans/`](plans/).
 4. Keep providers intentionally narrow: OpenAI/Codex and Anthropic/Claude only.
 5. Keep tools separate from the agent loop so tool sets can be customized
    without changing the FSM.
-6. Support bounded parent/child subagent delegation as **delegations**: the parent
-   runs one full (writing) subagent or a parallel fan-out of read-only
-   subagents, parks, and is resumed with a daemon-authored wakeup observation.
-   No generic injected-message routing layer or event bus between arbitrary
-   sessions.
+6. Support bounded parent/child subagent delegation (spawn/list/wait/steer/
+   interrupt over forked sessions) without a generic injected-message routing
+   layer or event bus between arbitrary sessions.
 
 ## Crate Stack
 
@@ -57,7 +55,7 @@ agent-vocab      shared ids, message blocks, tool calls/results,
 | `agent-session` | Durable transcript forest, model-context materialization, resume, switch, compaction, and the provider-replay lane. | [modules/agent-session.md](modules/agent-session.md) |
 | `agent-store` | Postgres-only session/transcript/queue/action/event persistence plus recovery and revision/queue projections. | [modules/agent-store.md](modules/agent-store.md) |
 | `agent-provider` | `ModelProvider` plus OpenAI/Codex (Responses) and Anthropic (Messages) adapters, prompt-cache shaping, and provider compaction. | [modules/agent-provider.md](modules/agent-provider.md) |
-| `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`grep`/`web_search`/`web_fetch`/`LoadSkill`/delegation tools. | [modules/agent-tools.md](modules/agent-tools.md) |
+| `agent-tools` | `AgentTool`, `ToolRegistry`, and the builtin `edit`/`bash`/`grep`/`web_search`/`web_fetch`/`load_skill` tools. | [modules/agent-tools.md](modules/agent-tools.md) |
 | `agent-daemon` | `pi-agentd` websocket RPC server with runtime/provider/tool dispatch, recovery, and event publishing. | [modules/agent-daemon.md](modules/agent-daemon.md) |
 | `agent-prompt` | Renders the repo-level `PI.md` system prompt from session/workspace/tool/skill context. | [modules/agent-prompt.md](modules/agent-prompt.md) |
 
@@ -121,22 +119,12 @@ Implemented user-facing behavior:
   included by the template.
 - Real OpenAI/Codex (ChatGPT subscription transport) and Anthropic API-key
   provider paths, with prompt-cache shaping on both.
-- Subagent delegation runs as **delegations** through provider-visible delegation
-  tools (`delegate_writing_task`, `delegate_readonly_tasks`,
-  `inspect_delegation`, `cancel_delegation`, `steer_subagent`). A delegation is one **full** subagent
-  (writes the parent's workspace in place) or a parallel fan-out of
-  **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
-  return). The parent parks after launching a delegation and is delivered a
-  parent-scoped completion **daemon observation** containing a structured
-  snapshot equivalent to `inspect_delegation`, including per-subagent
-  `suggested_next` and compact handoff file references.
-  `inspect_delegation` refreshes or recovers that same structured state
-  later/running.
-  Delegation subagents may emit `subagent.spawned`/`subagent.running` progress
-  events, but parent-visible completion is the delegation wakeup observation and
-  handoff, not a per-child idle event. Reusable patterns are **workflow skills** (`SKILL.md` +
-  `LoadSkill`), not a DSL. Web/inspector RPCs use the canonical
-  `delegation.*` client API. See
+- Subagent delegation: a parent spawns child sessions by role/skill (optionally
+  with a forked context snapshot and git source-refs), then lists, waits on,
+  reads, steers, and interrupts them. Children are regular forked sessions
+  driven through the same loop. `subagent.list` plus parent-scoped
+  `subagent.{spawned,running,idle}` lifecycle events are on the wire; spawn and
+  control flow through the in-process Python REPL `subagents` module. See
   [agent-daemon](modules/agent-daemon.md).
 
 Not implemented by design:
@@ -148,11 +136,6 @@ Not implemented by design:
 - General plugin/provider marketplace.
 - Non-Postgres storage backends. The old in-memory/JSONL store layer was removed
   once the websocket path became Postgres-only.
-- Cross-subagent workspace merging. There is one durable workspace with a single
-  writer in time; read-only subagents are isolated in throwaway snapshots and
-  never merged back.
-- Daemon-executed workflow graphs/DSLs and a workflow variable store. Workflow
-  control flow lives in parent-interpreted skills.
 
 ## Removed Pieces
 

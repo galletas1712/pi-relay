@@ -17,7 +17,6 @@ use sqlx::PgPool;
 ///   Idempotency is keyed by `(session_id, client_input_id)`.
 /// - `actions`: durable model/tool/compaction/cancel work records.
 /// - `events`: ordered observable event stream for websocket replay.
-/// - `delegations`: bounded parent/child subagent delegation units.
 const SCHEMA_SQL: &str = r#"
 create table if not exists projects (
     id uuid primary key,
@@ -49,8 +48,6 @@ create table if not exists sessions (
 alter table sessions add column if not exists system_prompt text not null default '';
 
 alter table sessions add column if not exists parent_session_id text null references sessions(id) on delete set null;
-
-alter table sessions add column if not exists subagent_type text null;
 
 create index if not exists sessions_project_created_idx
     on sessions(project_id, created_at desc, id desc);
@@ -123,44 +120,6 @@ create table if not exists events (
 );
 
 create index if not exists events_session_id_idx on events(session_id, id);
-
-create table if not exists delegations (
-    id text primary key,
-    parent_session_id text not null references sessions(id) on delete cascade,
-    workflow text null,
-    label text null,
-    kind text not null,
-    status text not null,
-    attempt_id text not null,
-    created_at timestamptz not null default now(),
-    updated_at timestamptz not null default now()
-);
-
-create index if not exists delegations_parent_created_idx on delegations(parent_session_id, created_at, id);
-
-create index if not exists delegations_parent_running_idx
-    on delegations(parent_session_id)
-    where status='running';
-
-create index if not exists delegations_running_created_idx
-    on delegations(created_at, id)
-    where status='running';
-
-create index if not exists delegations_completed_repair_idx
-    on delegations(updated_at, id)
-    where status in ('done','done_with_failures');
-
--- The number of subagents the delegation will eventually spawn. The barrier
--- requires the full set to exist (and be terminal) before completing, so a
--- partial spawn (subagent #1 terminal while #2 is not yet inserted) cannot
--- complete the delegation.
-alter table delegations add column if not exists expected_subagents integer not null default 1;
-
-alter table sessions add column if not exists delegation_id text null references delegations(id);
-
-create index if not exists sessions_delegation_created_idx
-    on sessions(delegation_id, created_at, id)
-    where delegation_id is not null;
 "#;
 
 pub(super) async fn migrate(pool: &PgPool) -> Result<()> {

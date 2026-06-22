@@ -324,14 +324,11 @@ fn transcript_to_messages_for_request(
     input: &AnthropicRequestBodyInput,
 ) -> ProviderResult<Vec<Value>> {
     if !input.cache_transcript {
-        let mut messages = transcript_to_messages(&input.prompt, &input.transcript)?;
-        append_dynamic_context_message(&input.prompt, &mut messages);
-        return Ok(messages);
+        return transcript_to_messages(&input.prompt, &input.transcript);
     }
     let Some(prefix_len) = input.transcript_cache_prefix_len else {
         let mut messages = transcript_to_messages(&input.prompt, &input.transcript)?;
         add_transcript_cache_breakpoints(&mut messages);
-        append_dynamic_context_message(&input.prompt, &mut messages);
         return Ok(messages);
     };
 
@@ -340,21 +337,7 @@ fn transcript_to_messages_for_request(
     let mut messages = transcript_to_messages(&input.prompt, prefix)?;
     add_transcript_cache_breakpoints(&mut messages);
     messages.extend(transcript_to_messages(&input.prompt, suffix)?);
-    append_dynamic_context_message(&input.prompt, &mut messages);
     Ok(messages)
-}
-
-fn append_dynamic_context_message(prompt: &crate::PromptSections, messages: &mut Vec<Value>) {
-    if let Some(dynamic) = prompt
-        .dynamic_context
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        messages.push(json!({
-            "role": "user",
-            "content": [{ "type": "text", "text": dynamic }],
-        }));
-    }
 }
 
 fn client_request_id() -> String {
@@ -471,6 +454,12 @@ fn anthropic_system_blocks(
             "cache_control": cache_control_1h(),
         }));
     }
+    if let Some(dynamic) = &prompt.dynamic_context {
+        blocks.push(json!({
+            "type": "text",
+            "text": dynamic,
+        }));
+    }
     (!blocks.is_empty()).then_some(blocks)
 }
 
@@ -497,10 +486,8 @@ fn attribution_header(
 /// Deriving from `stable_prefix` instead means every pi-relay session with the
 /// same stable system prompt produces the same fingerprint and therefore the
 /// same cached prefix, enabling true cross-session reuse of the stable-system
-/// cache. We fall back to a digest of the first user text only when a caller
-/// truly supplies no stable prefix; normal daemon requests and local
-/// compaction prompts are stable, and Anthropic remote compaction is not
-/// supported.
+/// cache. We fall back to a digest of the first user text only when no stable
+/// prefix is configured (e.g. compaction calls), so the header is never empty.
 fn attribution_fingerprint(
     prompt: &crate::PromptSections,
     transcript: &[ModelTranscriptEntry],
@@ -701,27 +688,6 @@ fn transcript_to_messages(
                     }]
                 }));
             }
-            TranscriptItem::DaemonToolObservation(observation) => {
-                let tool_use_id = anthropic_daemon_tool_use_id(observation.tool_call_id.as_str());
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": [{
-                        "type": "tool_use",
-                        "id": tool_use_id,
-                        "name": anthropic_wire_tool_name(&observation.tool_name),
-                        "input": observation.args_value().unwrap_or_else(|_| json!({})),
-                    }],
-                }));
-                messages.push(json!({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": tool_use_id,
-                        "content": observation.result_text()?,
-                        "is_error": matches!(observation.status, agent_vocab::ToolResultStatus::Error | agent_vocab::ToolResultStatus::Interrupted | agent_vocab::ToolResultStatus::Crashed),
-                    }],
-                }));
-            }
             TranscriptItem::TurnStarted { .. }
             | TranscriptItem::ToolCallStarted { .. }
             | TranscriptItem::TurnFinished { .. } => {}
@@ -736,23 +702,6 @@ fn anthropic_replay_blocks(replay: &[ProviderReplayItem]) -> ProviderResult<Vec<
         .filter(|record| record.provider == ProviderKind::Claude)
         .map(|record| record.raw_value().map_err(ProviderError::Json))
         .collect()
-}
-
-fn anthropic_daemon_tool_use_id(tool_call_id: &str) -> String {
-    if tool_call_id.starts_with("toolu_") {
-        return tool_call_id.to_string();
-    }
-    let sanitized = tool_call_id
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>();
-    format!("toolu_{sanitized}")
 }
 
 fn anthropic_user_content(message: &UserMessage) -> Value {
@@ -1168,7 +1117,6 @@ fn merge_anthropic_usage(current: &mut Option<ProviderUsage>, update: ProviderUs
 mod tests {
     use super::*;
     use crate::PromptSections;
-    use agent_vocab::ToolResultMessage;
 
     fn test_tool(
         provider: ProviderKind,
@@ -1409,13 +1357,9 @@ mod tests {
             names,
             [
                 "Bash",
-                "cancel_delegation",
-                "delegate_readonly_tasks",
-                "delegate_writing_task",
                 "Grep",
-                "inspect_delegation",
                 "LoadSkill",
-                "steer_subagent",
+                "PythonRepl",
                 "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search"
@@ -1449,29 +1393,21 @@ mod tests {
 
         assert_eq!(body["tools"][0]["name"], "Bash");
         assert!(body["tools"][0].get("type").is_none());
-        assert_eq!(body["tools"][1]["name"], "cancel_delegation");
+        assert_eq!(body["tools"][1]["name"], "Grep");
         assert!(body["tools"][1].get("type").is_none());
-        assert_eq!(body["tools"][2]["name"], "delegate_readonly_tasks");
+        assert_eq!(body["tools"][2]["name"], "LoadSkill");
         assert!(body["tools"][2].get("type").is_none());
-        assert_eq!(body["tools"][3]["name"], "delegate_writing_task");
+        assert_eq!(body["tools"][3]["name"], "PythonRepl");
         assert!(body["tools"][3].get("type").is_none());
-        assert_eq!(body["tools"][4]["name"], "Grep");
-        assert!(body["tools"][4].get("type").is_none());
-        assert_eq!(body["tools"][5]["name"], "inspect_delegation");
+        assert_eq!(body["tools"][4]["type"], "text_editor_20250728");
+        assert_eq!(body["tools"][4]["name"], "str_replace_based_edit_tool");
+        assert_eq!(body["tools"][5]["name"], "web_fetch");
         assert!(body["tools"][5].get("type").is_none());
-        assert_eq!(body["tools"][6]["name"], "LoadSkill");
+        assert_eq!(body["tools"][6]["name"], "web_search");
         assert!(body["tools"][6].get("type").is_none());
-        assert_eq!(body["tools"][7]["name"], "steer_subagent");
-        assert!(body["tools"][7].get("type").is_none());
-        assert_eq!(body["tools"][8]["type"], "text_editor_20250728");
-        assert_eq!(body["tools"][8]["name"], "str_replace_based_edit_tool");
-        assert_eq!(body["tools"][9]["name"], "web_fetch");
-        assert!(body["tools"][9].get("type").is_none());
-        assert_eq!(body["tools"][10]["name"], "web_search");
-        assert!(body["tools"][10].get("type").is_none());
         // Native coding tools also carry no per-tool cache_control: the
         // stable-system breakpoint covers them via the cumulative hash.
-        for index in 0..11 {
+        for index in 0..7 {
             assert!(
                 body["tools"][index].get("cache_control").is_none(),
                 "tool {index} should not carry cache_control"
@@ -1540,42 +1476,6 @@ mod tests {
             json!({
                 "type": "ephemeral",
             })
-        );
-        assert!(body["messages"][1]["content"][0]
-            .get("cache_control")
-            .is_none());
-    }
-
-    #[test]
-    fn messages_body_tail_positions_dynamic_context_out_of_system() {
-        let body = messages_body(ModelRequest {
-            model: "claude-opus-4-7".to_string(),
-            transcript_cache_prefix_len: None,
-            prompt: PromptSections::new(
-                Some("stable rules".to_string()),
-                Some("volatile context".to_string()),
-            ),
-            transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
-            tool_profile: ProviderToolProfile::None,
-            tools: Vec::new(),
-            max_tokens: None,
-            reasoning_effort: ReasoningEffort::Medium,
-            prompt_cache_key: None,
-            session_id: None,
-            turn_id: None,
-        })
-        .expect("body renders");
-
-        assert_eq!(body["system"][1]["text"], "stable rules");
-        assert!(!body["system"].to_string().contains("volatile context"));
-        assert_eq!(body["messages"][0]["content"][0]["text"], "hello");
-        assert_eq!(
-            body["messages"][0]["content"][0]["cache_control"],
-            json!({ "type": "ephemeral" })
-        );
-        assert_eq!(
-            body["messages"][1]["content"][0]["text"],
-            "volatile context"
         );
         assert!(body["messages"][1]["content"][0]
             .get("cache_control")
@@ -1784,104 +1684,6 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
         .expect("messages render");
 
         assert_eq!(messages[0]["content"], json!([raw]));
-    }
-
-    #[test]
-    fn daemon_tool_observation_renders_as_anthropic_synthetic_tool_pair() {
-        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("call_delegation_1_attempt_1"),
-            "delegation_1",
-            Some("Delegation delegation_1 completed with status done: 1 ok, 0 failed.".to_string()),
-            json!({
-                "delegation_id": "delegation_1",
-                "status": "done",
-                "subagents": [{
-                    "id": "child_1",
-                    "transcript_file": "child_1/transcript.md",
-                }],
-            }),
-        );
-
-        let messages = transcript_to_messages(
-            &crate::PromptSections::default(),
-            &[TranscriptItem::DaemonToolObservation(observation).into()],
-        )
-        .expect("messages render");
-
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "assistant");
-        assert_eq!(messages[0]["content"][0]["type"], "tool_use");
-        assert_eq!(
-            messages[0]["content"][0]["id"],
-            "toolu_call_delegation_1_attempt_1"
-        );
-        assert_eq!(messages[0]["content"][0]["name"], "inspect_delegation");
-        assert_eq!(
-            messages[0]["content"][0]["input"]["delegation_id"],
-            "delegation_1"
-        );
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"][0]["type"], "tool_result");
-        assert_eq!(
-            messages[1]["content"][0]["tool_use_id"],
-            "toolu_call_delegation_1_attempt_1"
-        );
-        assert_eq!(messages[1]["content"][0]["is_error"], false);
-        assert!(messages[1]["content"][0]["content"]
-            .as_str()
-            .expect("json output")
-            .contains("\"delegation_id\": \"delegation_1\""));
-    }
-
-    #[test]
-    fn daemon_tool_observation_after_tool_result_does_not_split_anthropic_tool_pairs() {
-        let tool_call = ToolCall {
-            id: ToolCallId::new("toolu_1"),
-            tool_name: "read".to_string(),
-            args_json: "{\"path\":\"README.md\"}".to_string(),
-        };
-        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
-            ToolCallId::new("call_delegation_1_attempt_1"),
-            "delegation_1",
-            None,
-            json!({ "delegation_id": "delegation_1", "status": "done" }),
-        );
-
-        let messages = transcript_to_messages(
-            &crate::PromptSections::default(),
-            &[
-                TranscriptItem::AssistantMessage(AssistantMessage {
-                    items: vec![AssistantItem::ToolCall(tool_call.clone())],
-                })
-                .into(),
-                TranscriptItem::ToolResult(ToolResultMessage::success(
-                    tool_call.id,
-                    "read",
-                    "contents",
-                ))
-                .into(),
-                TranscriptItem::DaemonToolObservation(observation).into(),
-            ],
-        )
-        .expect("messages render");
-
-        assert_eq!(messages[0]["role"], "assistant");
-        assert_eq!(messages[0]["content"][0]["type"], "tool_use");
-        assert_eq!(messages[1]["role"], "user");
-        assert_eq!(messages[1]["content"][0]["type"], "tool_result");
-        assert_eq!(messages[1]["content"][0]["tool_use_id"], "toolu_1");
-        assert_eq!(messages[2]["role"], "assistant");
-        assert_eq!(messages[2]["content"][0]["type"], "tool_use");
-        assert_eq!(
-            messages[2]["content"][0]["id"],
-            "toolu_call_delegation_1_attempt_1"
-        );
-        assert_eq!(messages[3]["role"], "user");
-        assert_eq!(messages[3]["content"][0]["type"], "tool_result");
-        assert_eq!(
-            messages[3]["content"][0]["tool_use_id"],
-            "toolu_call_delegation_1_attempt_1"
-        );
     }
 
     #[test]

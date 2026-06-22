@@ -73,10 +73,7 @@ impl CompletionTarget {
                     name: result.tool_name.clone(),
                 }),
             }),
-            AgentInput::Interrupt
-            | AgentInput::Steer { .. }
-            | AgentInput::FollowUp { .. }
-            | AgentInput::DaemonObservation { .. } => None,
+            AgentInput::Interrupt | AgentInput::Steer { .. } | AgentInput::FollowUp { .. } => None,
         }
     }
 

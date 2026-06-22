@@ -60,15 +60,8 @@ transcript ────  TranscriptItem + provider_replay sidecars (replay-first
 
 `PromptSections` splits the prompt so the cacheable bytes come first and request-specific context comes after:
 
-- OpenAI renders `stable_prefix` as Responses `instructions`, then transcript history, then `dynamic_context` as a final synthetic user input when present.
-- Anthropic renders an attribution `system[0]` header, then `stable_prefix` as a `cache_control` system block. Transcript messages come next; `dynamic_context`, when present, is appended as a final uncached user message so the stable/system and transcript prefix remain cacheable.
-
-Normal daemon model requests usually leave `dynamic_context` empty. Parent
-delegation preservation is handled after provider compaction returns: the daemon
-appends `## Delegation state at compaction time` to the stored compaction
-summary for top-level parent sessions only. The compaction provider input does
-not receive live parent/sibling delegation state, and subagent compactions do
-not append it afterward.
+- OpenAI renders `stable_prefix` as Responses `instructions` and `dynamic_context` as the first `input` item (a synthetic user message), then transcript history.
+- Anthropic renders an attribution `system[0]` header, then `stable_prefix` as a `cache_control` system block, then `dynamic_context` as an uncached system suffix. There is no model-facing "dynamic context" heading; the split is purely a cache-layout detail.
 
 ### OpenAI / Codex (Responses API)
 
@@ -129,24 +122,6 @@ When replay items exist for an assistant/compaction entry, `transcript_to_messag
 
 Replay records canonicalize local client-tool names to pi-relay names (e.g. `apply_patch`/`str_replace_based_edit_tool` → `Edit`, `web_search` → `WebSearch`) but keep provider-hosted blocks (`server_tool_use`, `web_search_call`) under their native wire names so a stateless replay is byte-for-byte and the web UI can still pair hosted result blocks.
 
-Daemon-authored observations, such as delegation completion wakeups carrying an
-`inspect_delegation`-equivalent snapshot, are not provider replay and are not
-stored as fake assistant choices. The durable transcript item is
-`daemon_tool_observation`; provider adapters synthesize a tool call/result pair
-only while building a request:
-
-- OpenAI Responses receives adjacent `function_call` and
-  `function_call_output` items using the item's stable local `call_id`. The
-  synthetic call omits provider-generated-looking `id` and `status` fields.
-- Anthropic Messages receives an adjacent assistant `tool_use` message and user
-  `tool_result` message. Non-`toolu_...` internal ids are deterministically
-  adapted to Anthropic-style ids.
-
-Request-shape tests pin the adjacency rules and ensure ordinary assistant tool
-pairs are not split. The model sees an `inspect_delegation` result in the same
-shape as a real tool result, while the transcript/UI semantics remain explicit:
-the daemon authored the observation.
-
 ### Compaction: provider-native vs local summary
 
 `supports_remote_compaction()` is `true` for OpenAI, `false` for Anthropic.
@@ -170,6 +145,6 @@ Tool-name mapping is centralized: `canonical_tool_name_for_provider` maps wire �
 
 - `ReasoningEffort::default()` is `Medium`. OpenAI rejects `Max`. Anthropic rejects `None`/`Minimal`; it maps `XHigh` down to `high` unless the model is opus-4-7/4-8.
 - The single Codex **401 token-refresh retry** is *not* in this crate. The daemon (`provider_runtime/auth_retry.rs`) wraps `complete`/`compact`/`count_tokens`: on a 401 from a Codex-auth provider it refreshes credentials once, rebuilds the provider, and retries exactly once. The provider only surfaces `ProviderError::Status { status: 401 }`.
-- Registered builtin tools (from [agent-tools](./agent-tools.md)): `edit` (`apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `grep` (uniform JSON `Grep`), `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`). There are no `read`/`write` tools.
+- Registered builtin tools (from [agent-tools](./agent-tools.md)): `edit` (`apply_patch` for OpenAI, `text_editor_20250728` for Anthropic), `bash` (uniform JSON `Bash`), `grep` (uniform JSON `Grep`), `web_search`, `web_fetch`, `load_skill`. There are no `read`/`write` tools.
 - Sending OpenAI-profile tools to Anthropic (or vice versa) is a hard `ProviderError::Provider`; the profile must match the provider.
 - Wire details (RPC methods, how the daemon calls these adapters) live in [websocket-rpc](../websocket-rpc.md); the React client that drives sessions is documented in the [web UI](../../../packages/web/docs/web-ui.md) doc.

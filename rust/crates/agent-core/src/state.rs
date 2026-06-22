@@ -1,8 +1,7 @@
 use crate::action::AgentAction;
 use crate::event::{AgentEvent, TurnInput};
 use agent_vocab::{
-    ActionId, AssistantMessage, DaemonToolObservation, ToolCall, ToolResultMessage, TranscriptItem,
-    TurnId, TurnOutcome,
+    ActionId, AssistantMessage, ToolCall, ToolResultMessage, TranscriptItem, TurnId, TurnOutcome,
 };
 
 // Live control state only. Durable session history lives in TranscriptStore.
@@ -44,13 +43,6 @@ impl AgentState {
                 self.on_start_turn(turn_id, input, next_action_id)
             }
             AgentEvent::Steer { input } => self.on_steer(input, next_action_id),
-            AgentEvent::StartDaemonObservationTurn {
-                turn_id,
-                observation,
-            } => self.on_start_daemon_observation_turn(turn_id, observation, next_action_id),
-            AgentEvent::DaemonObservation { observation } => {
-                self.on_daemon_observation(observation, next_action_id)
-            }
             AgentEvent::ModelCompleted {
                 action_id,
                 turn_id,
@@ -108,48 +100,6 @@ impl AgentState {
         *self = Self::RunningModel { turn_id, action_id };
         (
             vec![input.into_transcript_item()],
-            vec![AgentAction::RequestModel { action_id, turn_id }],
-        )
-    }
-
-    fn on_start_daemon_observation_turn(
-        &mut self,
-        turn_id: TurnId,
-        observation: DaemonToolObservation,
-        next_action_id: &mut ActionId,
-    ) -> (Vec<TranscriptItem>, Vec<AgentAction>) {
-        match self {
-            Self::Idle => {
-                let action_id = ActionId::take_next(next_action_id);
-                *self = Self::RunningModel { turn_id, action_id };
-                (
-                    vec![
-                        TranscriptItem::TurnStarted { turn_id },
-                        TranscriptItem::DaemonToolObservation(observation),
-                    ],
-                    vec![AgentAction::RequestModel { action_id, turn_id }],
-                )
-            }
-            Self::RunningModel { .. }
-            | Self::RunningTools { .. }
-            | Self::ReadyToContinue { .. } => empty_transition(),
-        }
-    }
-
-    fn on_daemon_observation(
-        &mut self,
-        observation: DaemonToolObservation,
-        next_action_id: &mut ActionId,
-    ) -> (Vec<TranscriptItem>, Vec<AgentAction>) {
-        let Self::ReadyToContinue { turn_id } = self else {
-            return empty_transition();
-        };
-        let turn_id = *turn_id;
-        let action_id = ActionId::take_next(next_action_id);
-
-        *self = Self::RunningModel { turn_id, action_id };
-        (
-            vec![TranscriptItem::DaemonToolObservation(observation)],
             vec![AgentAction::RequestModel { action_id, turn_id }],
         )
     }

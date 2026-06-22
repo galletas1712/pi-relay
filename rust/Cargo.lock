@@ -26,7 +26,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sqlx",
  "thiserror",
  "time",
  "tokio",

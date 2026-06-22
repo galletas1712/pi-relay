@@ -4,7 +4,6 @@ use sqlx::Row;
 use super::PostgresAgentStore;
 
 impl PostgresAgentStore {
-    #[cfg(test)]
     pub async fn set_session_parent(
         &self,
         child_session_id: &str,
@@ -85,7 +84,7 @@ mod tests {
         async fn cleanup(self) {
             self.store.close().await;
             if let Ok(admin) = sqlx::PgPool::connect(&self.admin_url).await {
-                let _ = sqlx::query(&format!(r#"drop database if exists "{}""#, self.name))
+                let _ = sqlx::query(&format!(r#"drop database if exists \"{}\""#, self.name))
                     .execute(&admin)
                     .await;
                 admin.close().await;
@@ -103,7 +102,7 @@ mod tests {
         let admin = sqlx::PgPool::connect(&admin_url)
             .await
             .expect("connect to PI_RELAY_TEST_DATABASE_URL");
-        sqlx::query(&format!(r#"create database "{name}""#))
+        sqlx::query(&format!(r#"create database \"{name}\""#))
             .execute(&admin)
             .await
             .expect("create isolated test database");
@@ -147,10 +146,7 @@ mod tests {
                 max_tokens: None,
                 prompt_cache: None,
             },
-            // A non-null created_by keeps these activity-free sessions out of
-            // list_sessions' "empty web session" exclusion (which treats a null
-            // created_by as an unknown under SQL three-valued logic).
-            metadata: json!({ "created_by": "test" }),
+            metadata: json!({}),
         }
     }
 
@@ -160,10 +156,6 @@ mod tests {
         let project_id = Uuid::new_v4();
         let parent_session_id = "parent-session";
         let child_session_id = "child-session";
-        db.store
-            .create_project(project_id, "session links test", &[], json!({}))
-            .await
-            .expect("create project");
         db.store
             .start_session_outputs(
                 parent_session_id,
@@ -245,10 +237,6 @@ mod tests {
         let project_id = Uuid::new_v4();
         let parent_session_id = "idle-parent";
         let child_session_id = "idle-child";
-        db.store
-            .create_project(project_id, "session links test", &[], json!({}))
-            .await
-            .expect("create project");
         db.store
             .start_session_outputs(
                 parent_session_id,

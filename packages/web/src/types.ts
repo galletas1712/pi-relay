@@ -32,8 +32,6 @@ export interface SessionSummary {
 	session_id: string;
 	project_id: string | null;
 	parent_session_id?: string | null;
-	delegation_id?: string | null;
-	subagent_type?: SubagentType | null;
 	outer_cwd: string;
 	workspaces: SessionWorkspace[];
 	activity: Activity;
@@ -58,8 +56,6 @@ export interface QueuedInput {
 	priority: InputPriority;
 	status: QueuedInputStatus;
 	content: ContentBlock[];
-	content_type?: "user_message" | "daemon_tool_observation";
-	editable?: boolean;
 	client_input_id?: string | null;
 	created_at: string;
 	updated_at?: string;
@@ -79,8 +75,6 @@ export interface SessionSnapshot {
 	session_id: string;
 	project_id: string | null;
 	parent_session_id?: string | null;
-	delegation_id?: string | null;
-	subagent_type?: SubagentType | null;
 	outer_cwd: string;
 	workspaces: SessionWorkspace[];
 	activity: Activity;
@@ -120,53 +114,14 @@ export interface EventFrame {
 	data: Record<string, unknown>;
 }
 
-export type DelegationKind = "full" | "readonly_fanout";
-export type DelegationStatus = "running" | "done" | "done_with_failures" | "cancelled" | "failed";
-export type DelegationSubagentStatus = DelegationStatus | "idle" | "queued" | "done";
-export type SubagentType = "full" | "read_only";
-
-/** A subagent row inside a delegation. List responses keep `status` as live
- * session activity for board compatibility; rich `delegation.status` /
- * `inspect_delegation` responses may also carry terminal outcome fields and
- * artifact paths. */
-export interface DelegationSubagent {
-	id: string;
-	status: Activity | DelegationSubagentStatus;
-	activity?: Activity;
-	role?: string | null;
-	type?: SubagentType | null;
-	subagent_type?: SubagentType | null;
-	task?: string | null;
-	steerable?: boolean;
-	suggested_next?: string | null;
-	final_message_file?: string | null;
-	transcript_file?: string | null;
-	task_prompt_file?: string | null;
+export interface SubagentListItem {
+	child_session_id: string;
+	activity: Activity;
 }
 
-export interface Delegation {
-	delegation_id: string;
-	kind: DelegationKind;
-	status: DelegationStatus;
-	workflow?: string | null;
-	label?: string | null;
-	handoff_dir?: string;
-	subagents: DelegationSubagent[];
-}
-
-export interface DelegationListResult {
+export interface SubagentListResult {
 	parent_session_id: string;
-	delegations: Delegation[];
-}
-
-export type CancellationTranscriptFileName = `cancelled/${string}.transcript.md`;
-export type HandoffFileName = "task_prompt.md" | "final_message.md" | "transcript.md" | CancellationTranscriptFileName;
-
-export interface ReadHandoffFileResult {
-	delegation_id: string;
-	subagent_id: string | null;
-	file: HandoffFileName;
-	content: string;
+	subagents: SubagentListItem[];
 }
 
 export type SessionOverview = Omit<SessionSnapshot, "entries">;
@@ -216,15 +171,6 @@ export interface ToolResultMessage {
 	status: ToolResultStatus;
 }
 
-export interface DaemonToolObservation {
-	tool_call_id: string;
-	tool_name: string;
-	args_json: string;
-	result_json: unknown;
-	status: ToolResultStatus;
-	summary?: string | null;
-}
-
 export type TranscriptItem =
 	| { type: "turn_started"; turn_id: number }
 	| { type: "user_message"; content: ContentBlock[] }
@@ -232,7 +178,6 @@ export type TranscriptItem =
 	| { type: "tool_call_started"; turn_id: number; tool_call: ToolCall }
 	| { type: "tool_result"; tool_call_id: string; tool_name: string; output: string; status: ToolResultStatus }
 	| { type: "turn_finished"; turn_id: number; outcome: TurnOutcome }
-	| ({ type: "daemon_tool_observation" } & DaemonToolObservation)
 	| {
 			type: "compaction_summary";
 			source_session_id: string;
@@ -298,7 +243,6 @@ export interface TurnCard {
 	start_timestamp_ms: number;
 	timestamp_ms: number;
 	user_messages: TranscriptEntry[];
-	daemon_observations?: TranscriptEntry[];
 	assistant_message?: TranscriptEntry | null;
 	summary?: string | null;
 	can_resume: boolean;

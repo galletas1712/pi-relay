@@ -58,16 +58,20 @@ impl<'de> Deserialize<'de> for ProviderKind {
 }
 
 text_enum! {
-    #[derive(Default)]
     pub enum ReasoningEffort {
         None => "none",
         Minimal => "minimal",
         Low => "low",
-        #[default]
         Medium => "medium",
         High => "high",
         XHigh => "xhigh",
         Max => "max",
+    }
+}
+
+impl Default for ReasoningEffort {
+    fn default() -> Self {
+        Self::Medium
     }
 }
 

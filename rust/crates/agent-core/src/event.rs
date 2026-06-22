@@ -1,6 +1,5 @@
 use agent_vocab::{
-    ActionId, AssistantMessage, DaemonToolObservation, ToolResultMessage, TranscriptItem, TurnId,
-    UserMessage,
+    ActionId, AssistantMessage, ToolResultMessage, TranscriptItem, TurnId, UserMessage,
 };
 
 /// First transcript record for a new turn.
@@ -26,12 +25,6 @@ pub enum AgentInput {
     // Normal-priority input for the next available turn.
     FollowUp {
         content: TurnInput,
-    },
-    // Daemon-authored observation for the next available turn. The observation
-    // is model-visible but is not a human/user message and is not an
-    // assistant-chosen tool call.
-    DaemonObservation {
-        observation: DaemonToolObservation,
     },
     // Volatile model completion delivered by the caller.
     ModelCompleted {
@@ -81,10 +74,6 @@ impl AgentInput {
             content: TurnInput(content),
         }
     }
-
-    pub fn daemon_observation(observation: DaemonToolObservation) -> Self {
-        Self::DaemonObservation { observation }
-    }
 }
 
 /// Runtime input to the live agent FSM.
@@ -98,15 +87,8 @@ pub(crate) enum AgentEvent {
         turn_id: TurnId,
         input: TurnInput,
     },
-    StartDaemonObservationTurn {
-        turn_id: TurnId,
-        observation: DaemonToolObservation,
-    },
     Steer {
         input: TurnInput,
-    },
-    DaemonObservation {
-        observation: DaemonToolObservation,
     },
     ModelCompleted {
         action_id: ActionId,

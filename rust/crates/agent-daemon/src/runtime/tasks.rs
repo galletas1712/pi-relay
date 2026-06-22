@@ -8,8 +8,9 @@ pub(crate) fn abort_session_tasks(state: &AppState, session_id: &str) -> Vec<Act
     tasks.retain(|_, task| !task.handle.is_finished());
     let action_row_ids = tasks
         .iter()
-        .filter(|(_, task)| task.session_id == session_id)
-        .map(|(action_row_id, _)| action_row_id.clone())
+        .filter_map(|(action_row_id, task)| {
+            (task.session_id == session_id).then(|| action_row_id.clone())
+        })
         .collect::<Vec<_>>();
     let mut aborted = Vec::new();
     for action_row_id in action_row_ids {

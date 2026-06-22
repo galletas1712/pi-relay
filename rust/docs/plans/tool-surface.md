@@ -4,11 +4,10 @@ Status: planned. Last reviewed 2026-06-07.
 
 ## Motivation
 
-The tool surface is deliberately small and mostly provider-neutral today:
-`Bash`, `Grep`, the web wrappers, `LoadSkill`, and the delegation tools are
-uniform JSON tools, and only edit diverges to provider-native schemas. That
-keeps dispatch, caching, and replay simple, but it leaves quality on the table
-in four places:
+The tool surface is deliberately small and provider-neutral today: shell, grep,
+and the web wrappers are uniform JSON function tools, and only the edit tool
+diverges to a provider-native schema. That keeps dispatch, caching, and replay
+simple, but it leaves quality on the table in four places:
 
 - **Shell.** Bash is a stateless `bash -lc` per call. The model cannot keep a
   working directory, environment, or background process alive across calls, and
@@ -30,21 +29,15 @@ documented in [agent-tools](../modules/agent-tools.md).
 
 See [agent-tools](../modules/agent-tools.md) for the full registry. In brief:
 
-- **edit** is the only provider-native tool: OpenAI sees `apply_patch`
-  (freeform Lark grammar) and Anthropic sees `str_replace_based_edit_tool`
-  (`text_editor_20250728`), both executed by local runtimes.
-- **Bash** is one uniform JSON function/client tool for both providers, backed
-  by a stateless `bash -lc` subprocess rooted at the session `cwd`.
-- **Grep** is one uniform JSON function/client tool for both providers, backed
-  by ripgrep.
+- **edit** is the only provider-native tool: `apply_patch` (OpenAI freeform Lark
+  grammar) and `str_replace_based_edit_tool` (`text_editor_20250728` on
+  Anthropic), both executed by local runtimes.
+- **bash** is one uniform JSON function tool named `Bash` for both providers,
+  backed by a stateless `bash -lc` subprocess rooted at the session `cwd`.
+- **grep** is one uniform JSON function tool named `Grep`, backed by ripgrep.
 - **web_search** / **web_fetch** are uniform JSON local wrappers (web_search has
   no backend; web_fetch does a bounded HTTP fetch).
-- **LoadSkill** activates a named skill.
-- **Delegation tools** (`delegate_writing_task`, `delegate_readonly_tasks`,
-  `inspect_delegation`, `cancel_delegation`) are uniform JSON tools handled by
-  the stage runtime; stage completion is reported later via a daemon-authored
-  wakeup observation containing an `inspect_delegation`-equivalent bounded
-  snapshot and handoff artifact paths.
+- **load_skill** activates a named skill.
 
 Tools are registered through `ToolDescriptor` / `ProviderTool` in
 `agent-tools/src/registry.rs`, which already separates the model-visible

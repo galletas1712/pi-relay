@@ -1052,7 +1052,6 @@ fn item_type(item: &TranscriptItem) -> &'static str {
         TranscriptItem::ToolResult(_) => "tool_result",
         TranscriptItem::TurnFinished { .. } => "turn_finished",
         TranscriptItem::CompactionSummary(_) => "compaction_summary",
-        TranscriptItem::DaemonToolObservation(_) => "daemon_tool_observation",
     }
 }
 
@@ -1086,10 +1085,6 @@ fn display_hint(item: &TranscriptItem) -> Option<String> {
             format!("{outcome:?} turn boundary for turn {}", turn_id.0)
         }
         TranscriptItem::CompactionSummary(summary) => summary.summary.clone(),
-        TranscriptItem::DaemonToolObservation(observation) => observation
-            .summary
-            .clone()
-            .unwrap_or_else(|| format!("daemon observation: {}", observation.tool_name)),
     };
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -1210,9 +1205,9 @@ mod tests {
 
     use agent_session::{SessionEvent, TranscriptStorageNode};
     use agent_vocab::{
-        AssistantItem, AssistantMessage, CompactionSummary, DaemonToolObservation, ProviderConfig,
-        ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCallId, ToolResultMessage,
-        TranscriptItem, TurnId, TurnOutcome, UserMessage,
+        AssistantItem, AssistantMessage, CompactionSummary, ProviderConfig, ProviderKind,
+        ProviderReplayItem, ReasoningEffort, ToolCallId, ToolResultMessage, TranscriptItem, TurnId,
+        TurnOutcome, UserMessage,
     };
     use serde_json::json;
     use uuid::Uuid;
@@ -1328,23 +1323,6 @@ mod tests {
             TranscriptItem::TurnStarted {
                 turn_id: TurnId(turn_id),
             },
-        )
-    }
-
-    fn daemon_observation(id: &str, parent_id: Option<&str>) -> TranscriptStorageNode {
-        entry(
-            id,
-            parent_id,
-            TranscriptItem::DaemonToolObservation(DaemonToolObservation::inspect_delegation(
-                ToolCallId::new("call_delegation_1_attempt_1"),
-                "delegation_1",
-                Some("Delegation delegation_1 completed".to_string()),
-                json!({
-                    "delegation_id": "delegation_1",
-                    "status": "done",
-                    "suggested_next": "approved"
-                }),
-            )),
         )
     }
 
@@ -1794,68 +1772,6 @@ mod tests {
                 .map(|entry| entry.id.as_str()),
             Some(final_assistant.id.as_str())
         );
-
-        db.cleanup().await;
-    }
-
-    #[tokio::test]
-    async fn transcript_turns_includes_daemon_observations_in_turn_cards() {
-        let Some(db) = test_store().await else {
-            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
-            return;
-        };
-        let store = &db.store;
-        let session_id = "turn-card-daemon-observation";
-        create_session(store, session_id).await;
-
-        let entries = vec![
-            turn_started("entry_start", None, 1),
-            daemon_observation("entry_daemon", Some("entry_start")),
-            assistant_message("entry_assistant", Some("entry_daemon"), "ack"),
-            turn_finished("entry_finish", Some("entry_assistant"), 1),
-        ];
-        store
-            .persist_outputs(
-                session_id,
-                OutputBatch::new(&entries, Some("entry_finish"), &[], &[]),
-            )
-            .await
-            .expect("transcript persists");
-
-        let turns = store
-            .transcript_turns(session_id, None, None)
-            .await
-            .expect("turn cards load");
-        assert_eq!(turns.cards.len(), 1);
-        let card = &turns.cards[0];
-        assert_eq!(card.daemon_observations.len(), 1);
-        assert_eq!(card.daemon_observations[0].id, "entry_daemon");
-        match &card.daemon_observations[0].item {
-            TranscriptItem::DaemonToolObservation(observation) => {
-                assert_eq!(observation.tool_name, "inspect_delegation");
-                assert_eq!(
-                    observation.summary.as_deref(),
-                    Some("Delegation delegation_1 completed")
-                );
-            }
-            other => panic!("expected daemon observation, got {other:?}"),
-        }
-
-        let detail = store
-            .transcript_turn_detail(
-                session_id,
-                &card.id,
-                &card.active_leaf_id,
-                card.start_sequence,
-                card.end_sequence,
-                TranscriptEntryBodyMode::Ui,
-            )
-            .await
-            .expect("card detail loads");
-        assert!(detail
-            .entries
-            .iter()
-            .any(|entry| matches!(entry.item, TranscriptItem::DaemonToolObservation(_))));
 
         db.cleanup().await;
     }

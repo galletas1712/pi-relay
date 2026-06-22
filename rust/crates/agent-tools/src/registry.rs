@@ -303,130 +303,23 @@ fn load_skill_definition() -> ToolDefinition {
     )
 }
 
-fn delegate_writing_task_definition() -> ToolDefinition {
+fn python_repl_definition() -> ToolDefinition {
     ToolDefinition::new(
-        "delegate_writing_task",
-        "Launch the single full (writing) subagent for a delegation. It edits the workspace in place; there is exactly one full subagent at a time. End your turn after calling; completion arrives later as a daemon-authored wakeup observation with an inspect_delegation-equivalent bounded snapshot and artifact paths.",
+        "PythonRepl",
+        "Execute Python code in this session's stateful orchestration REPL. Use this for subagent delegation and for keeping orchestration state in Python variables. The REPL provides `subagents` as a global and as an importable module.",
         json!({
             "type": "object",
             "properties": {
-                "role": {
+                "code": {
                     "type": "string",
-                    "description": "The subagent role (a skill name), e.g. \"implementer\"."
+                    "description": "Python code to execute. The last expression's repr is returned, and stdout/stderr are captured."
                 },
-                "prompt": {
-                    "type": "string",
-                    "description": "The self-contained task. The subagent starts with fresh context and only knows what you put here plus any paths you cite."
-                },
-                "workflow": {
-                    "type": "string",
-                    "description": "Optional workflow skill name this delegation belongs to (a grouping label only)."
-                },
-                "label": {
-                    "type": "string",
-                    "description": "Optional short human-readable label for the delegation."
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Optional execution timeout in milliseconds for short Python snippets. Omit this for subagent delegation because child sessions may run for a long time."
                 }
             },
-            "required": ["role", "prompt"],
-            "additionalProperties": false
-        }),
-    )
-}
-
-fn delegate_readonly_tasks_definition() -> ToolDefinition {
-    ToolDefinition::new(
-        "delegate_readonly_tasks",
-        "Launch N read-only subagents in parallel, each in its own disposable snapshot of the workspace. Use for investigation, review, or running builds/tests; nothing they write reaches your workspace. End your turn after calling; completion arrives later as a daemon-authored wakeup observation with an inspect_delegation-equivalent bounded snapshot and artifact paths.",
-        json!({
-            "type": "object",
-            "properties": {
-                "tasks": {
-                    "type": "array",
-                    "description": "One entry per read-only subagent to run in parallel.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "role": {
-                                "type": "string",
-                                "description": "The subagent role (a skill name), e.g. \"reviewer\"."
-                            },
-                            "prompt": {
-                                "type": "string",
-                                "description": "The self-contained task for this subagent (fresh context)."
-                            }
-                        },
-                        "required": ["role", "prompt"],
-                        "additionalProperties": false
-                    }
-                },
-                "workflow": {
-                    "type": "string",
-                    "description": "Optional workflow skill name this delegation belongs to (a grouping label only)."
-                },
-                "label": {
-                    "type": "string",
-                    "description": "Optional short human-readable label for the delegation."
-                }
-            },
-            "required": ["tasks"],
-            "additionalProperties": false
-        }),
-    )
-}
-
-fn inspect_delegation_definition() -> ToolDefinition {
-    ToolDefinition::new(
-        "inspect_delegation",
-        "Inspect a delegation and its subagents, including status, progress, suggested_next, and artifact file references. Full final messages and transcripts are available through referenced handoff files, not inlined.",
-        json!({
-            "type": "object",
-            "properties": {
-                "delegation_id": {
-                    "type": "string",
-                    "description": "The delegation id returned by delegate_writing_task / delegate_readonly_tasks."
-                }
-            },
-            "required": ["delegation_id"],
-            "additionalProperties": false
-        }),
-    )
-}
-
-fn cancel_delegation_definition() -> ToolDefinition {
-    ToolDefinition::new(
-        "cancel_delegation",
-        "Cancel an in-flight delegation and all of its subagents.",
-        json!({
-            "type": "object",
-            "properties": {
-                "delegation_id": {
-                    "type": "string",
-                    "description": "The delegation id to cancel."
-                }
-            },
-            "required": ["delegation_id"],
-            "additionalProperties": false
-        }),
-    )
-}
-
-fn steer_subagent_definition() -> ToolDefinition {
-    ToolDefinition::new(
-        "steer_subagent",
-        "Send an additional instruction or correction to a running full subagent without cancelling and restarting it. The subagent id is the subagent session id shown by inspect_delegation.",
-        json!({
-            "type": "object",
-            "properties": {
-                "subagent_id": {
-                    "type": "string",
-                    "description": "The target subagent session id shown in delegation inspection."
-                },
-                "message": {
-                    "type": "string",
-                    "description": "The additional instruction, correction, or context to send to the running subagent."
-                }
-            },
-            "required": ["subagent_id", "message"],
+            "required": ["code"],
             "additionalProperties": false
         }),
     )
@@ -448,33 +341,9 @@ impl ToolExtension for FirstPartyToolExtension {
         );
         register_runtime_tool(
             registry,
-            "delegate_writing_task",
-            "delegation",
-            delegate_writing_task_definition(),
-        );
-        register_runtime_tool(
-            registry,
-            "delegate_readonly_tasks",
-            "delegation",
-            delegate_readonly_tasks_definition(),
-        );
-        register_runtime_tool(
-            registry,
-            "inspect_delegation",
-            "delegation",
-            inspect_delegation_definition(),
-        );
-        register_runtime_tool(
-            registry,
-            "cancel_delegation",
-            "delegation",
-            cancel_delegation_definition(),
-        );
-        register_runtime_tool(
-            registry,
-            "steer_subagent",
-            "delegation",
-            steer_subagent_definition(),
+            "PythonRepl",
+            "python_repl",
+            python_repl_definition(),
         );
         register_edit(registry);
         register_uniform(registry, "Bash", "shell", BashTool);
@@ -622,13 +491,9 @@ mod tests {
             [
                 "Edit",
                 "Bash",
-                "cancel_delegation",
-                "delegate_readonly_tasks",
-                "delegate_writing_task",
                 "Grep",
-                "inspect_delegation",
                 "LoadSkill",
-                "steer_subagent",
+                "PythonRepl",
                 "WebFetch",
                 "WebSearch"
             ]
@@ -637,13 +502,9 @@ mod tests {
             claude,
             [
                 "Bash",
-                "cancel_delegation",
-                "delegate_readonly_tasks",
-                "delegate_writing_task",
                 "Grep",
-                "inspect_delegation",
                 "LoadSkill",
-                "steer_subagent",
+                "PythonRepl",
                 "Edit",
                 "WebFetch",
                 "WebSearch"
@@ -670,13 +531,9 @@ mod tests {
             [
                 "apply_patch",
                 "Bash",
-                "cancel_delegation",
-                "delegate_readonly_tasks",
-                "delegate_writing_task",
                 "Grep",
-                "inspect_delegation",
                 "LoadSkill",
-                "steer_subagent",
+                "PythonRepl",
                 "web_fetch",
                 "web_search"
             ]
@@ -685,42 +542,13 @@ mod tests {
             claude,
             [
                 "Bash",
-                "cancel_delegation",
-                "delegate_readonly_tasks",
-                "delegate_writing_task",
                 "Grep",
-                "inspect_delegation",
                 "LoadSkill",
-                "steer_subagent",
+                "PythonRepl",
                 "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search"
             ]
-        );
-    }
-
-    #[test]
-    fn steer_subagent_tool_schema_is_model_facing() {
-        let registry = ToolRegistry::with_builtin_tools();
-        let tool = registry
-            .provider_tools_for_provider(ProviderKind::OpenAi)
-            .into_iter()
-            .find(|tool| tool.name == "steer_subagent")
-            .expect("steer_subagent tool");
-
-        assert_eq!(tool.canonical_name, "steer_subagent");
-        assert_eq!(tool.execution, ToolExecution::LocalJson);
-        assert_eq!(tool.input_schema["type"], "object");
-        assert_eq!(
-            tool.input_schema["required"],
-            json!(["subagent_id", "message"])
-        );
-        assert_eq!(tool.input_schema["additionalProperties"], false);
-        assert!(
-            tool.input_schema["properties"]["subagent_id"]["description"]
-                .as_str()
-                .expect("subagent_id description")
-                .contains("subagent session id")
         );
     }
 
@@ -783,6 +611,30 @@ mod tests {
     }
 
     #[test]
+    fn python_repl_is_a_builtin_local_json_tool_for_each_provider() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let openai_repl = registry
+            .provider_tools_for_provider(ProviderKind::OpenAi)
+            .into_iter()
+            .find(|tool| tool.canonical_name == "PythonRepl")
+            .expect("OpenAI PythonRepl tool");
+        let claude_repl = registry
+            .provider_tools_for_provider(ProviderKind::Claude)
+            .into_iter()
+            .find(|tool| tool.canonical_name == "PythonRepl")
+            .expect("Claude PythonRepl tool");
+
+        assert_eq!(openai_repl.name, "PythonRepl");
+        assert_eq!(openai_repl.prompt_alias.as_deref(), Some("python_repl"));
+        assert_eq!(openai_repl.execution, ToolExecution::LocalJson);
+        assert_eq!(openai_repl.input_schema["type"], "object");
+        assert!(openai_repl.input_schema["properties"].get("code").is_some());
+        assert_eq!(claude_repl.name, "PythonRepl");
+        assert_eq!(claude_repl.prompt_alias.as_deref(), Some("python_repl"));
+        assert_eq!(claude_repl.execution, ToolExecution::LocalJson);
+    }
+
+    #[test]
     fn provider_tools_carry_raw_declarations() {
         let registry = ToolRegistry::with_builtin_tools();
         let openai_edit = registry
@@ -805,40 +657,6 @@ mod tests {
             claude_edit.declaration["name"],
             "str_replace_based_edit_tool"
         );
-    }
-
-    #[test]
-    fn delegation_registry_exposes_only_new_model_facing_names() {
-        let registry = ToolRegistry::with_builtin_tools();
-        let names = registry
-            .provider_tools_for_provider(ProviderKind::OpenAi)
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect::<Vec<_>>();
-
-        for expected in [
-            "delegate_writing_task",
-            "delegate_readonly_tasks",
-            "inspect_delegation",
-            "cancel_delegation",
-            "steer_subagent",
-        ] {
-            assert!(
-                names.contains(&expected.to_string()),
-                "{expected} should be exposed"
-            );
-        }
-        for old in [
-            "stage_start_full",
-            "stage_start_readonly_fanout",
-            "stage_status",
-            "stage_cancel",
-        ] {
-            assert!(
-                !names.contains(&old.to_string()),
-                "{old} must not remain provider-visible"
-            );
-        }
     }
 
     #[test]

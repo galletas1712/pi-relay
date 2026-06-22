@@ -49,13 +49,9 @@ through it.
 
 ## Registered tools
 
-`with_builtin_tools()` registers the canonical first-party tools through
-`FirstPartyToolExtension`. They all execute inside pi-relay; some have registry
-executors and some are intercepted by the daemon runtime before registry
-execution. "Runtime-handled" means the tool is declared to the provider and
-reported by `tools.list`, but `run_tool_turn` handles the call before the
-registry executor table. The model-visible form differs only where provider
-semantics justify it.
+`with_builtin_tools()` registers seven canonical tools through
+`FirstPartyToolExtension`. Each is local-executed; the model-visible form
+differs only where provider semantics justify it.
 
 | Canonical    | OpenAI form                               | Anthropic form                                  | prompt_alias       | Executor                         |
 |--------------|-------------------------------------------|-------------------------------------------------|--------------------|----------------------------------|
@@ -65,11 +61,7 @@ semantics justify it.
 | `WebSearch`  | `web_search` (JSON function)              | `web_search` (JSON client tool)                 | `web_search`       | `WebSearchTool`                  |
 | `WebFetch`   | `web_fetch` (JSON function)               | `web_fetch` (JSON client tool)                  | `web_fetch`        | `WebFetchTool`                   |
 | `LoadSkill`  | `LoadSkill` (JSON function)               | `LoadSkill` (JSON client tool)                  | `skill_loader`     | runtime-handled (no registry executor) |
-| `delegate_writing_task` | `delegate_writing_task` (JSON function) | `delegate_writing_task` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
-| `delegate_readonly_tasks` | `delegate_readonly_tasks` (JSON function) | `delegate_readonly_tasks` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
-| `inspect_delegation` | `inspect_delegation` (JSON function) | `inspect_delegation` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
-| `cancel_delegation` | `cancel_delegation` (JSON function) | `cancel_delegation` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
-| `steer_subagent` | `steer_subagent` (JSON function) | `steer_subagent` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
+| `PythonRepl` | `PythonRepl` (JSON function)              | `PythonRepl` (JSON client tool)                 | `python_repl`      | runtime-handled (no registry executor) |
 
 There are no `read`/`write` tools. File reads go through `Edit`'s `view`
 command (Anthropic) or through `Bash` (`cat`, `sed`, `rg`, …) on OpenAI.
@@ -135,7 +127,7 @@ table.
   wired. The provider-neutral wrapper shape lets a real backend (or a
   provider-native sidecar call) drop in later without changing the model surface.
 
-### LoadSkill
+### load_skill
 
 `LoadSkill` activates an available skill by name (optionally scoped to a
 workspace dir) so its instructions are injected into model context. It is
@@ -143,40 +135,14 @@ registered as a provider tool for declaration/replay, but has no registry
 executor — the daemon runtime intercepts `tool_name == "LoadSkill"` and resolves
 it against the session's loaded-skill set and workspace skills.
 
-### delegation tools
-
-`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`,
-`cancel_delegation`, and `steer_subagent` are provider-visible JSON tools registered by
-`FirstPartyToolExtension`, but they have no registry executor. The daemon
-runtime intercepts them and dispatches to the delegation engine in
-`delegation_tools.rs`.
-`delegate_writing_task` launches the single full/writing delegation subagent;
-`delegate_readonly_tasks` launches a homogeneous fan-out of read-only
-subagents; `inspect_delegation` returns the canonical structured state/outcome
-snapshot (with task/final/transcript artifact paths, not inline full prompts or
-transcripts);
-`cancel_delegation` cancels an existing delegation; `steer_subagent` queues an
-additional instruction to a running full subagent. Delegation subagents may produce
-`subagent.spawned`/`subagent.running` progress events, but delegation completion
-arrives later as a daemon-authored parent observation containing an
-`inspect_delegation`-equivalent snapshot plus artifact paths, not as a per-child
-idle event. Provider adapters render that typed observation as a synthetic
-`inspect_delegation` tool call/result pair while keeping the transcript semantics
-daemon-authored.
-
-Their internal delegation types, handoff `delegation_id`, and web/inspector RPC methods
-(`delegation.start_full`, `delegation.start_readonly_fanout`, `delegation.status`,
-`delegation.cancel`, `delegation.list`, `delegation.read_handoff_file`) are client JSON-RPC APIs for the
-web/inspector surface, not provider-visible tool names.
-
 ## How it works
 
 ```
 model emits tool call (provider wire name, e.g. "apply_patch")
   -> daemon: ToolContext::new(session outer_cwd)   [timeout 30s]
   -> LoadSkill?  -> runtime skill loader (no registry executor)
+  -> PythonRepl? -> runtime session REPL dispatch (no registry executor)
   -> web tool?   -> runtime web dispatch (WebSearch/WebFetch)
-  -> delegation? -> runtime delegation dispatch (no registry executor)
   -> else        -> registry.execute(provider, call, ctx)
                       canonical_tool_name_for_provider() maps wire name
                       -> canonical name  (apply_patch -> Edit)

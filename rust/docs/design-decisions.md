@@ -329,61 +329,27 @@ OpenAI request path. The Codex Responses request hardcodes the low-variance
 request policy we want for personal use: `parallel_tool_calls = true`,
 `service_tier = "priority"`, and `store = false`. It intentionally omits
 `prompt_cache_retention` because pi-relay does not use the plain OpenAI API-key
-path. OpenAI prompt-cache cohort selection is explicit
-`ProviderConfig.prompt_cache.key` first, then the pi-relay session id (matching
-Codex CLI's `thread_id`/`prompt_cache_key` behavior), then a fresh UUID fallback
-for CLI/test paths that do not carry a session. The actual system prompt remains
-global.
+path. If no explicit `prompt_cache.key` is provided, the provider derives a
+stable cache cohort key from the model, stable system prompt, and sorted tool
+schema so repeated local sessions route toward the same prompt cache. The actual
+system prompt remains global.
 
-Provider requests now carry `PromptSections`: a stable prefix and optional
-dynamic context. The stable prefix is the global system prompt. Normal turns keep
-dynamic context empty and rely on transcript history for runtime facts. If
-dynamic context is used, providers place it at the tail: OpenAI Responses emits
-it after transcript input items, and Anthropic appends it as a final uncached
-user message after transcript messages. The prompt split itself does not add an
-artificial "dynamic context" heading; any heading present is owned by the
-dynamic section content.
-
-Delegation state is intentionally not injected into normal parent turns or into
-compaction provider inputs. The special case happens after compaction: once the
-provider returns a compacted summary, top-level parent compaction appends a fresh
-`## Delegation state at compaction time` ledger to the stored summary. That
-ledger lists every parent delegation row/status with bounded details and no
-transcript body inlining. Later compactions let the provider summarize whatever
-prior summary text exists, including older point-in-time ledgers, then append a
-fresh ledger again. The latest appended ledger is authoritative and supersedes
-older ledger text by position. Subagent compaction omits parent/sibling
-delegation state entirely, because subagents do not orchestrate the delegation
-tree.
-
-Delegation completion wakeups are daemon-authored observations, not
-assistant-authored decisions. The durable transcript stores them as a typed
-`daemon_tool_observation` item with an `inspect_delegation` tool name, stable
-local call id, arguments, status, summary, and bounded JSON snapshot. This keeps
-internal transcript semantics honest: the daemon observed delegation state; the
-assistant did not choose a tool call.
-
-Provider adapters render that typed item in the provider-native synthetic
-tool-call/result shape only at request construction time. OpenAI receives an
-adjacent `function_call` plus `function_call_output` pair without
-provider-generated-looking ids/status. Anthropic receives an adjacent assistant
-`tool_use` message plus user `tool_result` message with a deterministic
-`toolu_...` id. The UI renders the same item as a daemon/system observation, not
-as a user bubble and not as a model-selected tool run. Text fallback rendering is
-kept for unsupported contexts and diagnostics.
-
-Delegation snapshots avoid context-heavy payloads: raw subagent task prompts,
-final-message prose, and transcript bodies are not inlined. Long bodies are
-referenced via handoff files such as `task_prompt.md`, `final_message.md`, and
-`transcript.md`; only workflow control facts such as `suggested_next` remain
-inline.
+Provider requests now carry `PromptSections`: a stable prefix and dynamic
+context. The stable prefix is the global system prompt. The daemon appends
+dynamic runtime context after it, currently the workspace cwd, and only then
+does the provider render transcript history. OpenAI Responses renders the
+stable prefix as `instructions` and the dynamic context as the first input item.
+Anthropic renders the stable prefix as a cache-marked system block and the
+dynamic context as an uncached system suffix. The rendered prompt does not
+include an artificial "dynamic context" heading; that split is an internal
+cache-layout detail, not model-facing instruction text.
 
 Prompt caching works best when the beginning of the prompt is identical across
 requests. That means the long-lived global system prompt, stable tool
-definitions, transcript prefix, and any reusable static project instructions
-stay before volatile conversation-specific state. The daemon does not include a
-timestamp in dynamic context because that would churn the prompt for little
-value.
+definitions, and any reusable static project instructions stay before
+conversation-specific state, restored drafts, and user messages. The daemon
+does not include a timestamp in dynamic context because that would churn the
+prefix-adjacent prompt for little value.
 
 The daemon also no longer imposes a default OpenAI/Codex output-token cap.
 `provider.max_tokens` remains an optional explicit cap if a particular session
@@ -395,9 +361,9 @@ that field and Anthropic recommends a large cap for `xhigh`/`max`.
 
 Tool definitions and execution live outside `agent-core`. The core only models
 tool requests and tool results. The daemon's builtin registry currently owns the
-actual `edit`, `bash`, `grep`, `web_search`, `web_fetch`, `LoadSkill`, and
-delegation-tool behavior and always executes allowed tool calls. (`web_search`
-is registered but has no configured backend yet, so it returns an error result.)
+actual `edit`, `bash`, `grep`, `web_search`, `web_fetch`, and `load_skill`
+behavior and always executes allowed tool calls. (`web_search` is registered but
+has no configured backend yet, so it returns an error result.)
 
 This keeps core portable and makes future tool customization a daemon/runtime
 choice.

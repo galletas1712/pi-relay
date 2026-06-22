@@ -84,9 +84,9 @@ provider <-> agent-vocab <-> store / session / daemon
    +-- parses raw model output, drops thinking, emits AssistantItem::{Text,ToolCall}
 ```
 
-Every crate above vocab speaks these shapes instead of provider SDK types. Providers translate their wire formats to and from vocab (dropping thinking content on the way in); tools produce `ToolResultMessage`; the store persists `TranscriptItem` nodes, including typed `DaemonToolObservation` items for daemon-authored synthetic tool observations; the daemon serializes the same shapes over [websocket-rpc](../websocket-rpc.md).
+Every crate above vocab speaks these shapes instead of provider SDK types. Providers translate their wire formats to and from vocab (dropping thinking content on the way in); tools produce `ToolResultMessage`; the store persists `TranscriptItem` nodes; the daemon serializes the same shapes over [websocket-rpc](../websocket-rpc.md).
 
-The registered builtin tools (defined in [agent-tools](./agent-tools.md), not here) are `edit`, `bash`, `grep`, `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools (`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, `steer_subagent`). There are no `read`/`write` tools. `agent-vocab` only defines the `ToolDefinition`/`ToolCall`/`ToolResultMessage` shapes those tools are expressed in.
+The registered builtin tools (defined in [agent-tools](./agent-tools.md), not here) are `edit`, `bash`, `grep`, `web_search`, `web_fetch`, and `load_skill`. There are no `read`/`write` tools. `agent-vocab` only defines the `ToolDefinition`/`ToolCall`/`ToolResultMessage` shapes those tools are expressed in.
 
 ## Notes
 

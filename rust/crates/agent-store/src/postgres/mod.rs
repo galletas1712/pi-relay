@@ -1,7 +1,6 @@
 mod action_records;
 mod actions;
 mod compaction;
-mod delegations;
 mod events;
 mod outputs;
 mod projects;
@@ -15,8 +14,6 @@ mod sql;
 mod token_usage;
 mod transcript;
 mod turn_cards;
-
-pub use delegations::{Delegation, DelegationProgress, DelegationSubagent};
 
 use anyhow::Result;
 use sqlx::postgres::PgPoolOptions;

@@ -10,6 +10,7 @@ use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
 use crate::provider_runtime::{ProviderConnectionRegistry, SessionTitleScheduler};
+use crate::repl::ReplRegistry;
 use crate::types::RuntimeSession;
 use crate::workspaces::WorkspaceManager;
 
@@ -30,6 +31,7 @@ pub(crate) struct AppState {
     pub(crate) tools: Arc<ToolRegistry>,
     pub(crate) provider_connections: ProviderConnectionRegistry,
     pub(crate) session_titles: SessionTitleScheduler,
+    pub(crate) repls: ReplRegistry,
     pub(crate) workspaces: WorkspaceManager,
     pub(crate) prompt_root: PathBuf,
 }

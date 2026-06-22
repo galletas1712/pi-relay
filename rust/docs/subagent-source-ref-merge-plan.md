@@ -1,16 +1,5 @@
 # Subagent source-ref merge plan
 
-> **Superseded (2026-06-16).** Cross-task git source refs / daemon-side merge are
-> removed. The current design (`plans/workflow-orchestration.md`) has one durable
-> workspace with a single writer in time: the lone *full* subagent writes the
-> parent's dirs **in place** (no merge, no adoption, no rollback in v1), while
-> *read-only (RO)* subagents run in **disposable btrfs snapshots** destroyed on
-> return. Results propagate via a daemon-written **handoff directory** (each
-> subagent's `final_message.md` and full `transcript.md`) plus a typed daemon wakeup observation pointing the parent
-> at them — there is no cross-subagent diff/ref transport.
-> This document is retained only as history for the legacy REPL `subagents.*`
-> source-ref behavior; do not extend it.
-
 ## Goal
 
 Let parent sessions orchestrate implementation, testing, verification, and merge

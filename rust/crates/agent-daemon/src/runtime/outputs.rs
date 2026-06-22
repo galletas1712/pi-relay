@@ -1,22 +1,17 @@
 use agent_core::AgentInput;
 use agent_session::{SessionAction, SessionEvent, TranscriptStorageNode};
-use agent_store::{InputPriority, PersistedAction, QueuedInputContent, SessionConfig};
-use agent_vocab::{ProviderReplayItem, TranscriptItem};
+use agent_store::{InputPriority, PersistedAction, SessionConfig};
+use agent_vocab::{ProviderReplayItem, TranscriptItem, UserMessage};
 
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
 pub(crate) fn agent_input_from_queued_priority(
     priority: InputPriority,
-    content: QueuedInputContent,
+    content: UserMessage,
 ) -> AgentInput {
-    match content {
-        QueuedInputContent::UserMessage(message) => match priority {
-            InputPriority::Steer => AgentInput::steer_message(message),
-            InputPriority::FollowUp => AgentInput::follow_up_message(message),
-        },
-        QueuedInputContent::DaemonToolObservation(observation) => {
-            AgentInput::daemon_observation(observation)
-        }
+    match priority {
+        InputPriority::Steer => AgentInput::steer_message(content),
+        InputPriority::FollowUp => AgentInput::follow_up_message(content),
     }
 }
 

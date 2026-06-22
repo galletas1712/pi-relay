@@ -122,79 +122,6 @@ async fn try_btrfs_subvolume_create(target: &Path) -> Result<bool> {
     Ok(output.status.success())
 }
 
-/// Reclaim a session workspace tree, including any nested btrfs subvolumes.
-///
-/// `instantiate.rs` may turn the cwd root and each workspace dir into its own
-/// btrfs subvolume. A plain `remove_dir_all` leaks that subvolume metadata, and
-/// `btrfs subvolume delete` refuses a subvolume that still contains child
-/// subvolumes. So we walk depth-first (children before parents), attempt a
-/// subvolume delete at every directory, then `remove_dir_all` the reflink/copy
-/// remainder. When btrfs is absent the delete is a no-op (mirroring
-/// `try_btrfs_subvolume_create`) and only the `remove_dir_all` runs.
-pub(super) async fn destroy_workspace_tree(root: &Path) -> Result<()> {
-    delete_btrfs_subvolumes_depth_first(root).await?;
-    if root.exists() {
-        tokio::fs::remove_dir_all(root)
-            .await
-            .with_context(|| format!("remove workspace tree {}", root.display()))?;
-    }
-    Ok(())
-}
-
-async fn delete_btrfs_subvolumes_depth_first(root: &Path) -> Result<()> {
-    let mut stack = vec![root.to_path_buf()];
-    let mut post_order = Vec::new();
-    while let Some(dir) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&dir).await {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                return Err(error).with_context(|| format!("read workspace tree {}", dir.display()))
-            }
-        };
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .with_context(|| format!("read workspace tree {}", dir.display()))?
-        {
-            if entry
-                .file_type()
-                .await
-                .with_context(|| format!("stat {}", entry.path().display()))?
-                .is_dir()
-            {
-                stack.push(entry.path());
-            }
-        }
-        post_order.push(dir);
-    }
-    // Deepest paths last in, first out: deleting in reverse pushes children
-    // before their parents so a parent subvolume is never deleted while it
-    // still contains child subvolumes.
-    for dir in post_order.into_iter().rev() {
-        try_btrfs_subvolume_delete(&dir).await?;
-    }
-    Ok(())
-}
-
-async fn try_btrfs_subvolume_delete(target: &Path) -> Result<bool> {
-    let output = match Command::new("btrfs")
-        .arg("subvolume")
-        .arg("delete")
-        .arg(target)
-        .output()
-        .await
-    {
-        Ok(output) => output,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("try btrfs subvolume delete {}", target.display()))
-        }
-    };
-    Ok(output.status.success())
-}
-
 #[derive(Clone, Copy)]
 enum SymlinkMode {
     Sanitize,
@@ -331,33 +258,4 @@ fn copy_file_permissions(source_path: &Path, target_path: &Path) -> Result<()> {
     std::fs::set_permissions(target_path, permissions)
         .with_context(|| format!("set file permissions {}", target_path.display()))?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use uuid::Uuid;
-
-    #[tokio::test]
-    async fn destroy_workspace_tree_removes_nested_dirs() {
-        let root = std::env::temp_dir().join(format!("pi-destroy-{}", Uuid::new_v4()));
-        let nested = root.join("cwd").join("repo").join("src");
-        tokio::fs::create_dir_all(&nested).await.unwrap();
-        tokio::fs::write(nested.join("main.rs"), b"fn main() {}")
-            .await
-            .unwrap();
-        tokio::fs::write(root.join("cwd").join("README.md"), b"hi")
-            .await
-            .unwrap();
-
-        destroy_workspace_tree(&root).await.unwrap();
-        assert!(!root.exists());
-    }
-
-    #[tokio::test]
-    async fn destroy_workspace_tree_is_ok_when_missing() {
-        let root = std::env::temp_dir().join(format!("pi-destroy-missing-{}", Uuid::new_v4()));
-        destroy_workspace_tree(&root).await.unwrap();
-        assert!(!root.exists());
-    }
 }
