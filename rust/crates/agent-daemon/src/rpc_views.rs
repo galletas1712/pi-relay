@@ -100,16 +100,11 @@ pub(crate) fn queue_state(queue: QueueState) -> Value {
 }
 
 fn queued_input(input: QueuedInputRecord) -> Value {
-    let (content, editable, summary, content_type) = match input.content {
-        QueuedInputContent::UserMessage(message) => {
-            (json!(message.content), true, None, "user_message")
+    let (content, editable, content_type) = match input.content {
+        QueuedInputContent::UserMessage(message) => (json!(message.content), true, "user_message"),
+        QueuedInputContent::DaemonToolObservation(_) => {
+            (json!([]), false, "daemon_tool_observation")
         }
-        QueuedInputContent::DaemonToolObservation(observation) => (
-            json!([]),
-            false,
-            observation.summary,
-            "daemon_tool_observation",
-        ),
     };
     json!({
         "input_id": input.input_id,
@@ -118,7 +113,6 @@ fn queued_input(input: QueuedInputRecord) -> Value {
         "content": content,
         "content_type": content_type,
         "editable": editable,
-        "summary": summary,
         "client_input_id": input.client_input_id,
         "created_at": input.created_at,
         "updated_at": input.updated_at,
@@ -225,6 +219,7 @@ fn turn_card(card: TurnCardRecord) -> Value {
         "start_timestamp_ms": card.start_timestamp_ms,
         "timestamp_ms": card.timestamp_ms,
         "user_messages": transcript_entry_values(card.user_messages),
+        "daemon_observations": transcript_entry_values(card.daemon_observations),
         "assistant_message": card.assistant_message.map(transcript_entry),
         "summary": card.summary,
         "can_resume": card.can_resume,

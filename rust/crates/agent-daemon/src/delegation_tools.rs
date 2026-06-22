@@ -1,4 +1,4 @@
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use agent_core::AgentInput;
 use agent_store::{
@@ -12,7 +12,8 @@ use crate::codec::from_params;
 use crate::delegation_snapshot::build_delegation_snapshot;
 use crate::handoff::{
     delegation_dir, handoff_root, refresh_delegation_handoff_artifacts,
-    refresh_task_prompt_artifact, render_transcript_markdown, task_prompt_rel, TASK_PROMPT_FILE,
+    refresh_task_prompt_artifact_if_present, render_transcript_markdown, safe_handoff_path_segment,
+    task_prompt_rel, TASK_PROMPT_FILE,
 };
 use crate::runtime::{abort_session_tasks, publish_events, SessionDriver};
 use crate::state::AppState;
@@ -710,23 +711,7 @@ fn validate_member_subagent(
 /// thing that can ever escape the handoff subtree, so we validate the segment
 /// in isolation before it is ever joined onto the trusted base.
 fn safe_path_segment(segment: &str, field: &str) -> std::result::Result<String, RpcError> {
-    let trimmed = segment.trim();
-    let reject = || {
-        RpcError::new(
-            "invalid_params",
-            format!("{field} is not a valid path segment"),
-        )
-    };
-    if trimmed.is_empty() || trimmed.contains('\0') {
-        return Err(reject());
-    }
-    let mut components = Path::new(trimmed).components();
-    match (components.next(), components.next()) {
-        (Some(Component::Normal(name)), None) if name == std::ffi::OsStr::new(trimmed) => {
-            Ok(trimmed.to_string())
-        }
-        _ => Err(reject()),
-    }
+    safe_handoff_path_segment(segment, field)
 }
 
 /// Resolve a handoff file request to an absolute path strictly under
@@ -772,6 +757,8 @@ pub(crate) async fn read_handoff_file_core(
     let delegation =
         load_delegation_for_parent(state, parent_session_id, &params.delegation_id).await?;
     let request = parse_handoff_file_request(params.subagent_id.as_deref(), &params.file)?;
+    safe_path_segment(&delegation.id, "delegation_id")?;
+    safe_path_segment(request.subagent_id(), "subagent_id")?;
     // A read may only target a subagent that belongs to this delegation;
     // otherwise a caller could probe arbitrary `<delegation>/<segment>/` paths.
     let members = state.repo.list_delegation_subagents(&delegation.id).await?;
@@ -797,12 +784,15 @@ pub(crate) async fn read_handoff_file_core(
                         "subagent does not belong to this delegation",
                     )
                 })?;
-            refresh_task_prompt_artifact(
-                &dir,
-                subagent_id,
-                member.task.as_deref().unwrap_or_default(),
-            )
-            .await?;
+            let task_prompt =
+                refresh_task_prompt_artifact_if_present(&dir, subagent_id, member.task.as_deref())
+                    .await?;
+            if task_prompt.is_none() {
+                return Err(RpcError::new(
+                    "handoff_file_not_found",
+                    "task prompt is unavailable for this subagent",
+                ));
+            }
         } else {
             match delegation.status {
                 DelegationStatus::Running
@@ -975,25 +965,26 @@ pub(crate) async fn rpc_list(
         let subagent_rows = state.repo.list_delegation_subagents(&delegation.id).await?;
         let mut subagents = Vec::with_capacity(subagent_rows.len());
         for subagent in subagent_rows {
-            let task_prompt = refresh_task_prompt_artifact(
+            let task_prompt = refresh_task_prompt_artifact_if_present(
                 &delegation_handoff_dir,
                 &subagent.session_id,
-                subagent.task.as_deref().unwrap_or_default(),
+                subagent.task.as_deref(),
             )
             .await?;
-            let task_prompt_relative_path = task_prompt_rel(&subagent.session_id);
-            let (cancellation_transcript_path, cancellation_transcript_relative_path) =
-                if delegation.status == DelegationStatus::Cancelled {
-                    let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
-                    let path = delegation_handoff_dir.join(&relative);
-                    if path.exists() {
-                        (Some(path.to_string_lossy().into_owned()), Some(relative))
-                    } else {
-                        (None, None)
-                    }
+            let task_prompt_file = task_prompt
+                .as_ref()
+                .map(|_| task_prompt_rel(&subagent.session_id));
+            let cancellation_transcript_file = if delegation.status == DelegationStatus::Cancelled {
+                let relative = format!("cancelled/{}.transcript.md", subagent.session_id);
+                let path = delegation_handoff_dir.join(&relative);
+                if path.exists() {
+                    Some(relative)
                 } else {
-                    (None, None)
-                };
+                    None
+                }
+            } else {
+                None
+            };
             subagents.push(json!({
                 "id": subagent.session_id,
                 "status": subagent.activity,
@@ -1001,15 +992,10 @@ pub(crate) async fn rpc_list(
                 "role": subagent.role,
                 "type": subagent.subagent_type,
                 "subagent_type": subagent.subagent_type,
-                "task_prompt_path": task_prompt.path.to_string_lossy().into_owned(),
-                "task_prompt_relative_path": task_prompt_relative_path.clone(),
-                "task_prompt_file": task_prompt_relative_path,
-                "task_prompt_bytes": task_prompt.bytes,
-                "task_prompt_sha256": task_prompt.sha256,
+                "task_prompt_file": task_prompt_file,
                 "steerable": delegation.status == DelegationStatus::Running
                     && subagent.subagent_type == Some(SubagentType::Full),
-                "cancellation_transcript_path": cancellation_transcript_path,
-                "cancellation_transcript_relative_path": cancellation_transcript_relative_path,
+                "cancellation_transcript_file": cancellation_transcript_file,
             }));
         }
         views.push(json!({

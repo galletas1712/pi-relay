@@ -95,7 +95,7 @@ interface RunBoardProps extends RunBoardCallbacks {
 type OpenHandoffFile = { key: string; content: string } | { key: string; error: string };
 
 function cancellationTranscriptFile(subagent: DelegationSubagent): HandoffFileName | null {
-	const file = subagent.cancellation_transcript_relative_path;
+	const file = subagent.cancellation_transcript_file;
 	if (typeof file !== "string") return null;
 	if (!/^cancelled\/[^/]+\.transcript\.md$/.test(file)) return null;
 	return file as HandoffFileName;
@@ -144,7 +144,7 @@ function SubagentRow({
 					{displayActivity(liveActivity)}
 				</span>
 			</div>
-			{subagent.task_prompt_file || subagent.task_prompt_relative_path ? (
+			{subagent.task_prompt_file ? (
 				<div className="run-board-handoff-links">
 					<button
 						className="chip-button"

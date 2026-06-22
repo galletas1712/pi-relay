@@ -60,7 +60,6 @@ export interface QueuedInput {
 	content: ContentBlock[];
 	content_type?: "user_message" | "daemon_tool_observation";
 	editable?: boolean;
-	summary?: string | null;
 	client_input_id?: string | null;
 	created_at: string;
 	updated_at?: string;
@@ -141,21 +140,11 @@ export interface DelegationSubagent {
 	steerable?: boolean;
 	final_message?: string | null;
 	final_message_preview?: string | null;
-	final_message_bytes?: number | null;
 	suggested_next?: string | null;
-	final_message_path?: string | null;
-	final_message_relative_path?: string | null;
 	final_message_file?: string | null;
-	transcript_path?: string | null;
-	transcript_relative_path?: string | null;
 	transcript_file?: string | null;
-	task_prompt_path?: string | null;
-	task_prompt_relative_path?: string | null;
 	task_prompt_file?: string | null;
-	task_prompt_bytes?: number | null;
-	task_prompt_sha256?: string | null;
-	cancellation_transcript_path?: string | null;
-	cancellation_transcript_relative_path?: string | null;
+	cancellation_transcript_file?: string | null;
 }
 
 export interface Delegation {
@@ -312,6 +301,7 @@ export interface TurnCard {
 	start_timestamp_ms: number;
 	timestamp_ms: number;
 	user_messages: TranscriptEntry[];
+	daemon_observations?: TranscriptEntry[];
 	assistant_message?: TranscriptEntry | null;
 	summary?: string | null;
 	can_resume: boolean;

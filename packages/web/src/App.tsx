@@ -14,7 +14,7 @@ import { randomId } from "./ids.ts";
 import { Inspector, NoticeStack, Sidebar } from "./panels.tsx";
 import { approximateJsonSize, perfEnabled, perfLog, perfNow } from "./perf.ts";
 import { queryKeys } from "./queryKeys.ts";
-import { isDelegationRunning, reRunParamsForDelegation } from "./delegationBoard.ts";
+import { isDelegationRunning, reRunParamsForDelegation, subagentHasNonEmptyPromptFile } from "./delegationBoard.ts";
 import type { ConnectionStatus } from "./rpc.ts";
 import { COMMANDS, findCommand, parseSlash, type ParsedSlash } from "./slash.ts";
 import { refreshPlanForEvent } from "./sessionEvents.ts";
@@ -1589,7 +1589,7 @@ export function App() {
 					const subagents = await Promise.all(
 						delegation.subagents.map(async (subagent) => {
 							if (typeof subagent.task === "string" && subagent.task.trim()) return subagent;
-							if (!subagent.task_prompt_file) return subagent;
+							if (!subagentHasNonEmptyPromptFile(subagent)) return subagent;
 							const result = await api.readHandoffFile({
 								parentSessionId,
 								delegationId: delegation.delegation_id,

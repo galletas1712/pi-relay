@@ -210,7 +210,9 @@ compaction branches without being duplicated in action payloads.
 
 ### `queued_inputs`
 
-Durable user input queue:
+Durable input queue. Most rows are user follow-ups; daemon-authored wakeup
+observations can also be queued at steer priority so parent sessions resume
+promptly without treating the notification as a user message.
 
 ```text
 id text primary key
@@ -326,7 +328,9 @@ updated_at timestamptz not null default now()
 Child sessions link back through `sessions.delegation_id`. The
 `delegations_parent_created_idx` index supports the per-parent run-board feed.
 The completion runner uses `attempt_id` as an idempotency fence and queues a
-deterministic parent steer keyed as `delegation-steer:<delegation_id>:<attempt_id>`.
+deterministic parent daemon wakeup observation keyed as
+`delegation-steer:<delegation_id>:<attempt_id>` (the key name is retained for
+idempotency compatibility).
 
 ### `events`
 
@@ -556,10 +560,14 @@ Result shape:
 }
 ```
 
-`queued_inputs` contains live queued or consuming user inputs with `input_id`,
+`queued_inputs` contains live queued or consuming input rows with `input_id`,
 `priority`, `status`, `content`, `client_input_id`, `created_at`, `updated_at`,
-optional `promoted_at`, and optional `follow_up_position`. The web UI uses it
-for the composer-adjacent queue pane. `session_revision`,
+optional `promoted_at`, and optional `follow_up_position`. User-message rows
+carry their message content. Daemon wakeup observation rows are non-editable
+signals (`content_type = "daemon_tool_observation"`, `content = []`,
+`editable = false`); their typed transcript entry/result JSON and handoff files
+are the source of truth, not queue-event prose. The web UI uses editable
+user-message rows for the composer-adjacent queue pane. `session_revision`,
 `queue_revision`, and `transcript_revision` are monotonically increasing
 per-session counters for replacing stale cached views instead of inferring
 patches from partial events. `transcript_revision` changes when transcript rows
@@ -1272,9 +1280,10 @@ Result:
 
 Returns one in-scope delegation as the canonical structured snapshot. The
 snapshot includes delegation metadata, progress counts, subagent roles/types,
-activity/status, steerability, terminal final-message text/suggested_next (when
-available), and handoff artifact paths. It does not inline full transcript
-contents; read the `transcript.md` file when detail is needed.
+activity/status, steerability, terminal `final_message_preview`,
+`suggested_next` (when available), and compact handoff file references. It does
+not inline full transcript, task prompt, or final-message bodies; read handoff
+files when detail is needed.
 
 ```json
 {
@@ -1303,14 +1312,10 @@ Result:
       "status": "done",
       "steerable": false,
       "final_message_preview": "Looks good.\n\nsuggested_next: approved",
-      "final_message_bytes": 36,
       "suggested_next": "approved",
-      "final_message_path": null,
-      "transcript_path": "/.../.pi-handoff/delegation_.../session_.../transcript.md",
-      "task_prompt_file": "session_.../task_prompt.md",
-      "task_prompt_path": "/.../.pi-handoff/delegation_.../session_.../task_prompt.md",
-      "task_prompt_bytes": 123,
-      "task_prompt_sha256": "..."
+      "final_message_file": null,
+      "transcript_file": "session_.../transcript.md",
+      "task_prompt_file": "session_.../task_prompt.md"
     }
   ],
   "handoff_dir": "/.../.pi-handoff/delegation_..."
@@ -1550,7 +1555,7 @@ subagent.idle
 ```
 
 `subagent.idle` is listed for compatibility; delegation-member completion is
-reported by the delegation steer/handoff described above.
+reported by the delegation wakeup observation/handoff described above.
 
 No approval or awaiting-approval events are emitted.
 
@@ -1571,7 +1576,9 @@ queue projection:
 
 Clients should replace cached queue state when an event carries a newer
 `queue_revision`. They should refetch rather than trying to infer ordering from
-partial event payloads.
+partial event payloads. Event payloads are notification/invalidation signals,
+not content storage: daemon wakeup observation `input.queued` events do not
+inline prose summaries, full result JSON, final messages, or task prompts.
 
 `transcript.appended` carries the appended entry body when available, plus its
 compact `tree_node`, `active_leaf_id`, and revision counters:

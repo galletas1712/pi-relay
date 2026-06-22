@@ -141,6 +141,67 @@ describe("MessageList daemon observations", () => {
 		expect(html).toContain("status done");
 		expect(html).not.toContain("user-message");
 	});
+
+	it("renders daemon observations in the default collapsed turn-card path", () => {
+		const daemonEntry: TranscriptEntry = {
+			id: "daemon",
+			parent_id: "start",
+			timestamp_ms: 2,
+			item: {
+				type: "daemon_tool_observation",
+				tool_call_id: "call_inspect_delegation_delegation_1_attempt_1",
+				tool_name: "inspect_delegation",
+				args_json: "{\"delegation_id\":\"delegation_1\"}",
+				result_json: { delegation_id: "delegation_1", status: "done", suggested_next: "approved" },
+				status: "Success",
+				summary: "Delegation delegation_1 completed",
+			},
+		};
+		const html = renderToStaticMarkup(
+			<MessageList
+				entries={[]}
+				turnCards={[
+					{
+						card: {
+							id: "turn_1",
+							turn_id: 1,
+							status: "open",
+							outcome: null,
+							start_entry_id: "start",
+							boundary_entry_id: null,
+							active_leaf_id: "daemon",
+							start_sequence: 1,
+							end_sequence: 2,
+							start_timestamp_ms: 1,
+							timestamp_ms: 2,
+							user_messages: [],
+							daemon_observations: [daemonEntry],
+							assistant_message: null,
+							summary: null,
+							can_resume: false,
+						},
+						entries: null,
+						expanded: false,
+						isCurrent: true,
+					},
+				]}
+				activeLeafId="daemon"
+				isRunning={false}
+				serverTimeMs={null}
+				hasSession
+				sessionId="session_a"
+				entriesSessionId="session_a"
+				onExpandTurn={() => {}}
+				onCollapseTurn={() => {}}
+			/>
+		);
+
+		expect(html).toContain("system-message info");
+		expect(html).toContain("Delegation delegation_1 completed");
+		expect(html).toContain("status done");
+		expect(html).not.toContain("user-message");
+		expect(html).not.toContain("single-tool");
+	});
 });
 
 function toolCall(id: string, toolName: string): AssistantItem {

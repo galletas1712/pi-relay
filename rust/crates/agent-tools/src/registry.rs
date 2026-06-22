@@ -306,7 +306,7 @@ fn load_skill_definition() -> ToolDefinition {
 fn delegate_writing_task_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_writing_task",
-        "Launch the single full (writing) subagent for a delegation. It edits the workspace in place; there is exactly one full subagent at a time. End your turn after calling; completion arrives later as a steer with an inspect_delegation-equivalent snapshot and artifact paths.",
+        "Launch the single full (writing) subagent for a delegation. It edits the workspace in place; there is exactly one full subagent at a time. End your turn after calling; completion arrives later as a daemon-authored wakeup observation with an inspect_delegation-equivalent bounded snapshot and artifact paths.",
         json!({
             "type": "object",
             "properties": {
@@ -336,7 +336,7 @@ fn delegate_writing_task_definition() -> ToolDefinition {
 fn delegate_readonly_tasks_definition() -> ToolDefinition {
     ToolDefinition::new(
         "delegate_readonly_tasks",
-        "Launch N read-only subagents in parallel, each in its own disposable snapshot of the workspace. Use for investigation, review, or running builds/tests; nothing they write reaches your workspace. End your turn after calling; completion arrives later as a steer with an inspect_delegation-equivalent snapshot and artifact paths.",
+        "Launch N read-only subagents in parallel, each in its own disposable snapshot of the workspace. Use for investigation, review, or running builds/tests; nothing they write reaches your workspace. End your turn after calling; completion arrives later as a daemon-authored wakeup observation with an inspect_delegation-equivalent bounded snapshot and artifact paths.",
         json!({
             "type": "object",
             "properties": {

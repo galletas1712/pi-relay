@@ -9,7 +9,11 @@ export function isDelegationRunning(delegation: Delegation): boolean {
 
 function subagentHasPromptSource(subagent: DelegationSubagent, allowPromptFiles: boolean): boolean {
 	if (typeof subagent.task === "string" && subagent.task.trim()) return true;
-	return allowPromptFiles && typeof subagent.task_prompt_file === "string" && !!subagent.task_prompt_file.trim();
+	return allowPromptFiles && subagentHasNonEmptyPromptFile(subagent);
+}
+
+export function subagentHasNonEmptyPromptFile(subagent: DelegationSubagent): boolean {
+	return typeof subagent.task_prompt_file === "string" && !!subagent.task_prompt_file.trim();
 }
 
 /** The daemon writes normal per-subagent handoff files from the delegation

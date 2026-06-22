@@ -712,7 +712,7 @@ the per-session inspector.
 Add the run board as a section inside Inspector (panels.tsx:624) or a new sibling, reusing subagent data-flow.
 **1. Types** (types.ts after 125): StageKind=`"full"|"readonly_fanout"`, StageStatus=`"running"|"done"|
 "done_with_failures"|"cancelled"|"failed"`, SubagentType=`"full"|"read_only"`, StageSubagent
-{id,role?,status,suggested_next?,final_message_path?,transcript_path?,activity?}, Stage
+{id,role?,status,suggested_next?,final_message_file?,transcript_file?,activity?}, Stage
 {stage_id,parent_session_id,workflow?,label?,kind,status,handoff_dir?,subagents[],created_at?,updated_at?},
 StageListResult{parent_session_id,stages[]}. Extend SessionSummary/Snapshot with stage_id?, subagent_type?.
 **2. Facade** (agentApi.ts): listStages/getStage("stage.status")/startFullStage/startReadonlyFanout/cancelStage. The

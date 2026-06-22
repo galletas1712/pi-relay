@@ -5,12 +5,14 @@ use sqlx::{postgres::PgRow, Row};
 use uuid::Uuid;
 
 use super::events::insert_event_tx;
-use super::queue::bump_revisions_tx;
+use super::queue::{
+    append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
+};
 use super::sql::lock_session_tx;
 use super::PostgresAgentStore;
 use crate::{
     DelegationKind, DelegationStatus, EventType, InputPriority, QueuedInputContent,
-    SessionActivity, SubagentType,
+    QueuedInputStatus, SessionActivity, SubagentType,
 };
 
 /// A durable delegation row: an ordered unit of work under a parent session that
@@ -555,21 +557,22 @@ async fn enqueue_steer_content_tx(
         return Ok(());
     };
     bump_revisions_tx(tx, parent_session_id, true, false).await?;
+    let queue = queue_state_tx(tx, parent_session_id).await?;
     let input_id: String = inserted.get("id");
+    let mut payload = json!({
+        "input_id": input_id,
+        "priority": InputPriority::Steer,
+        "status": QueuedInputStatus::Queued,
+        "client_input_id": client_input_id,
+    });
+    if matches!(&content, QueuedInputContent::UserMessage(_)) {
+        append_queued_content_event_fields(&mut payload, &content);
+    }
     insert_event_tx(
         tx,
         parent_session_id,
         EventType::InputQueued,
-        json!({
-            "input_id": input_id,
-            "priority": InputPriority::Steer,
-            "client_input_id": client_input_id,
-            "content_type": content.as_kind(),
-            "content": match &content {
-                QueuedInputContent::UserMessage(message) => json!(message.content.clone()),
-                QueuedInputContent::DaemonToolObservation(_) => json!([]),
-            },
-        }),
+        queue_event_payload(&queue, payload),
     )
     .await?;
     Ok(())
