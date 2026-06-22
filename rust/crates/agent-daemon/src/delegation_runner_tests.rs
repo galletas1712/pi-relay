@@ -1877,6 +1877,14 @@ async fn barrier_steers_once_after_all_terminal_with_handoff_for_every_subagent(
     assert_eq!(wakeup_texts.len(), 1);
     let wakeup_text = &wakeup_texts[0];
     assert!(
+        wakeup_text.contains("Daemon observation: inspect_delegation"),
+        "persisted completion wakeup should identify itself as a daemon observation"
+    );
+    assert!(
+        wakeup_text.contains("not by an assistant tool call"),
+        "persisted completion wakeup must not imply the model chose inspect_delegation"
+    );
+    assert!(
         !wakeup_text.contains("index.json"),
         "completion wakeup must not instruct the parent to read index.json"
     );

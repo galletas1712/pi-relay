@@ -66,6 +66,18 @@ runner never decides the next delegation — the parent does, guided by workflow
 skills. Cancellation is terminal and exports transcript-only files for the
 cancelled subagents instead of running the normal completion handoff.
 
+Delegation completion wakeups are rendered as provider-neutral daemon
+observations. The durable transcript entry is an ordinary user-role text message
+with an explicit heading (`Daemon observation: inspect_delegation`), a note that
+the daemon authored it rather than the assistant choosing a tool call, a statement
+that it is equivalent to `inspect_delegation({ delegation_id })` at observation
+time, and the inspect snapshot JSON. It never inlines transcript bodies. The
+daemon deliberately does **not** fabricate assistant tool-call + tool-result
+pairs for wakeups: OpenAI Responses and Anthropic Messages each have strict,
+provider-specific tool-call/result shapes and adjacency expectations, and
+pi-relay only stores model-generated provider replay sidecars. A synthetic tool
+pair path should be added only behind provider-specific support/proof and tests.
+
 Normal top-level parent model requests do not receive a daemon-generated
 delegation dashboard. They are transcript-driven: durable delegate tool results
 and wakeup steers already live in history, so the provider input stays as stable

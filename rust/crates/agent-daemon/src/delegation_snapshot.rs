@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use agent_store::{Delegation, DelegationStatus, SubagentType};
+use agent_vocab::DaemonObservation;
 use serde_json::{json, Value};
 
 use crate::handoff::{delegation_dir, refresh_delegation_handoff_artifacts, SubagentArtifact};
@@ -215,12 +216,12 @@ fn snapshot_progress_count(snapshot: &Value, key: &str) -> usize {
 /// Render the terminal wakeup delivered to the parent after a delegation
 /// completes.
 ///
-/// The message deliberately carries the same JSON snapshot as
-/// `inspect_delegation`, instead of directing the parent to a manifest file.
-/// Transcript artifact paths are present in the snapshot; transcript contents
-/// are not inlined.
+/// This is represented as a daemon-authored observation rather than a
+/// fabricated assistant tool call. The message deliberately carries the same
+/// JSON snapshot as `inspect_delegation`, instead of directing the parent to a
+/// manifest file. Transcript artifact paths are present in the snapshot;
+/// transcript contents are not inlined.
 pub(crate) fn completion_wakeup_message(snapshot: &Value) -> std::result::Result<String, RpcError> {
-    let json_snapshot = serde_json::to_string_pretty(snapshot).map_err(anyhow::Error::from)?;
     let delegation_id =
         snapshot_string(snapshot, "delegation_id").unwrap_or_else(|| "<unknown>".to_string());
     let kind = match snapshot.get("kind").and_then(Value::as_str) {
@@ -236,12 +237,12 @@ pub(crate) fn completion_wakeup_message(snapshot: &Value) -> std::result::Result
     let terminal = snapshot_progress_count(snapshot, "terminal");
     let failed = snapshot_progress_count(snapshot, "failed");
     let ok = terminal.saturating_sub(failed);
-    Ok(format!(
-        "Delegation {delegation_id} ({kind}){label} completed with status {status}: {ok} ok, {failed} failed.\n\n\
-         Snapshot JSON (equivalent to inspect_delegation at wakeup time):\n\
-         ```json\n{json_snapshot}\n```\n\n\
-         Final-message and transcript artifact paths are included in the snapshot. Full transcript contents are not inlined."
-    ))
+    let summary = format!(
+        "Delegation {delegation_id} ({kind}){label} completed with status {status}: {ok} ok, {failed} failed."
+    );
+    DaemonObservation::inspect_delegation(delegation_id, Some(summary), snapshot.clone())
+        .render_text()
+        .map_err(|error| RpcError::new("observation_render_failed", error.to_string()))
 }
 
 #[cfg(test)]
@@ -286,7 +287,12 @@ mod tests {
         let message = completion_wakeup_message(&snapshot).expect("wakeup");
 
         assert!(message.contains("completed with status done"));
-        assert!(message.contains("Snapshot JSON"));
+        assert!(message.contains("Daemon observation: inspect_delegation"));
+        assert!(message.contains("not by an assistant tool call"));
+        assert!(message.contains(
+            "equivalent to `inspect_delegation({ \"delegation_id\": \"delegation_1\" })`"
+        ));
+        assert!(message.contains("Snapshot JSON follows"));
         assert!(message.contains("Full transcript contents are not inlined"));
         assert!(!message.contains("index.json"));
         assert!(!message.contains("## User"));
