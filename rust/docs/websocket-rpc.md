@@ -1395,7 +1395,7 @@ Cancellation transcript request:
 {
   "parent_session_id": "parent-session",
   "delegation_id": "delegation_...",
-  "file": "cancelled/session_....transcript.md"
+  "file": "cancelled/session_abc.transcript.md"
 }
 ```
 
@@ -1404,9 +1404,9 @@ Result:
 ```json
 {
   "delegation_id": "delegation_...",
-  "subagent_id": "session_...",
-  "file": "final_message.md",
-  "content": "..."
+  "subagent_id": "session_abc",
+  "file": "cancelled/session_abc.transcript.md",
+  "content": "# Transcript for cancelled subagent session_abc\n\n..."
 }
 ```
 
