@@ -7,9 +7,8 @@ use agent_tools::ToolContext;
 use agent_vocab::{ToolResultMessage, ToolResultStatus, TranscriptItem};
 use serde_json::json;
 
-use crate::provider_runtime::{
-    is_repl_tool_name, is_web_tool_name, load_skill_result, run_repl_tool, run_web_tool,
-};
+use crate::delegation_tools::{is_delegation_tool_name, run_delegation_tool};
+use crate::provider_runtime::{is_web_tool_name, load_skill_result, run_web_tool};
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError};
 
@@ -37,8 +36,7 @@ pub(super) async fn run_tool_turn(
             &dispatch.attempt_id,
             EventType::ToolStarted,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
     if events.is_empty() {
         return Ok(());
     }
@@ -50,14 +48,14 @@ pub(super) async fn run_tool_turn(
             &dispatch.config.outer_cwd,
             &dispatch.config.workspaces,
         )
-        .await
-        .map_err(anyhow::Error::from)?;
+        .await?;
 
     let tool_context =
         ToolContext::new(std::path::PathBuf::from(dispatch.config.outer_cwd.clone()));
     let result = if tool_call.tool_name == "LoadSkill" {
         let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
         load_skill_result(
+            &state.prompt_root,
             &tool_context.cwd,
             &dispatch.config.workspaces,
             &loaded_skills,
@@ -72,8 +70,8 @@ pub(super) async fn run_tool_turn(
             &tool_context,
         )
         .await
-    } else if is_repl_tool_name(&tool_call.tool_name) {
-        run_repl_tool(&state, &session_id, &tool_call).await
+    } else if is_delegation_tool_name(&tool_call.tool_name) {
+        run_delegation_tool(&state, &session_id, &tool_call).await
     } else {
         match state
             .tools
@@ -97,8 +95,7 @@ pub(super) async fn run_tool_turn(
     if !state
         .repo
         .action_can_complete(&session_id, &dispatch.row_id, &dispatch.attempt_id)
-        .await
-        .map_err(anyhow::Error::from)?
+        .await?
     {
         return Ok(());
     }
@@ -124,12 +121,7 @@ pub(super) async fn run_tool_turn(
         runtime.session.is_ready_to_continue()
     };
     if is_ready_to_continue {
-        if let Some(queued) = state
-            .repo
-            .take_next_queued_steer_input(&session_id)
-            .await
-            .map_err(anyhow::Error::from)?
-        {
+        if let Some(queued) = state.repo.take_next_queued_steer_input(&session_id).await? {
             let agent_input =
                 agent_input_from_queued_priority(queued.priority, queued.content.clone());
             let enqueue_result = {
@@ -140,8 +132,7 @@ pub(super) async fn run_tool_turn(
                 state
                     .repo
                     .reset_consuming_input(&session_id, &queued.id, &queued.claim_id)
-                    .await
-                    .map_err(anyhow::Error::from)?;
+                    .await?;
                 return Err(RpcError::new("invalid_input", error.to_string()));
             }
             consumed_input = Some(queued);

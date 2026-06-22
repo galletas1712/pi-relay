@@ -5,7 +5,7 @@ use sqlx::Row;
 
 use crate::{
     AcceptedInput, EventFrame, EventType, InputPriority, OutputBatch, PersistedAction,
-    SessionActivity, SessionConfig, SessionSummary, SessionWorkspace,
+    SessionActivity, SessionConfig, SessionSummary, SessionWorkspace, SubagentType,
 };
 use agent_vocab::{ProviderConfig, UserMessage};
 
@@ -201,6 +201,8 @@ impl PostgresAgentStore {
         )
     }
 
+    // Persistence entry point: each argument is a distinct session/transcript column.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_session_outputs(
         &self,
         session_id: &str,
@@ -224,10 +226,14 @@ impl PostgresAgentStore {
             content,
             client_input_id,
             None,
+            None,
+            None,
         )
         .await
     }
 
+    // Persistence entry point: each argument is a distinct session/transcript column.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_session_outputs_with_parent(
         &self,
         session_id: &str,
@@ -240,6 +246,8 @@ impl PostgresAgentStore {
         content: &UserMessage,
         client_input_id: Option<&str>,
         parent_session_id: Option<&str>,
+        subagent_type: Option<SubagentType>,
+        delegation_id: Option<&str>,
     ) -> Result<(Vec<EventFrame>, Vec<PersistedAction>)> {
         if parent_session_id == Some(session_id) {
             return Err(anyhow!(
@@ -249,8 +257,8 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         let inserted = sqlx::query(
             r#"
-                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, system_prompt, provider_config, metadata, parent_session_id)
-                values ($1, $2, $3, $4, $5::text, $6, $7, $8, $9::text)
+                insert into sessions (id, project_id, outer_cwd, workspaces, active_leaf_id, system_prompt, provider_config, metadata, parent_session_id, subagent_type, delegation_id)
+                values ($1, $2, $3, $4, $5::text, $6, $7, $8, $9::text, $10::text, $11::text)
                 on conflict (id) do nothing
                 returning id
                 "#,
@@ -264,6 +272,8 @@ impl PostgresAgentStore {
         .bind(serde_json::to_value(&config.provider)?)
         .bind(&config.metadata)
         .bind(parent_session_id)
+        .bind(subagent_type.map(|subagent_type| subagent_type.as_str()))
+        .bind(delegation_id)
         .fetch_optional(&mut *tx)
         .await?;
         if inserted.is_none() {
@@ -523,6 +533,27 @@ impl PostgresAgentStore {
             provider: serde_json::from_value(row.get("provider_config"))?,
             metadata: row.get("metadata"),
         })
+    }
+
+    pub async fn session_subagent_type(&self, session_id: &str) -> Result<Option<SubagentType>> {
+        let raw: Option<String> =
+            sqlx::query_scalar("select subagent_type from sessions where id=$1")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten();
+        raw.map(|raw| raw.parse::<SubagentType>().map_err(|error| anyhow!(error)))
+            .transpose()
+    }
+
+    pub async fn session_delegation_id(&self, session_id: &str) -> Result<Option<String>> {
+        Ok(
+            sqlx::query_scalar("select delegation_id from sessions where id=$1")
+                .bind(session_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .flatten(),
+        )
     }
 
     pub async fn activity(&self, session_id: &str) -> Result<SessionActivity> {

@@ -13,17 +13,9 @@ pub(crate) async fn clear_event_buffer_if_idle(
     state: &AppState,
     session_id: &str,
 ) -> std::result::Result<(), RpcError> {
-    let activity = state
-        .repo
-        .activity(session_id)
-        .await
-        .map_err(anyhow::Error::from)?;
+    let activity = state.repo.activity(session_id).await?;
     if activity == SessionActivity::Idle {
-        state
-            .repo
-            .clear_session_events(session_id)
-            .await
-            .map_err(anyhow::Error::from)?;
+        state.repo.clear_session_events(session_id).await?;
     }
     Ok(())
 }

@@ -4,7 +4,6 @@ mod connections;
 mod context_accounting;
 mod prompt;
 mod provider;
-mod repl_tools;
 mod requests;
 mod session_titles;
 mod sidecar;
@@ -12,13 +11,17 @@ mod skills;
 mod transcript;
 mod web_tools;
 
+#[cfg(test)]
+pub(crate) use compaction::{
+    append_delegation_ledger_to_output, local_summary_request, remote_compaction_request,
+    CompactionOutput, CompactionSummaryKind,
+};
 pub(crate) use compaction::{
     auto_limit_tokens, compaction_auto_state, compaction_config, run_compaction,
 };
 pub(crate) use connections::ProviderConnectionRegistry;
 pub(crate) use context_accounting::model_input_tokens_for_gate;
 pub(crate) use prompt::{current_pi_template, render_pi_prompt};
-pub(crate) use repl_tools::{is_repl_tool_name, run_repl_tool};
 pub(crate) use requests::{build_model_request, run_model};
 pub(crate) use session_titles::{
     schedule_session_title_refresh_for_model_turn, SessionTitleScheduler,

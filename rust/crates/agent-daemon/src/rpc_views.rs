@@ -1,9 +1,10 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_store::{
-    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputRecord, SessionSnapshot,
-    SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult, TranscriptEntryRecord,
-    TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult, TurnCardRecord,
+    ActiveBranchSync, HistoryTree, Project, QueueState, QueuedInputContent, QueuedInputRecord,
+    SessionSnapshot, SessionSummary, SwitchActiveLeafResult, TranscriptEntriesResult,
+    TranscriptEntryRecord, TranscriptTreeIndex, TranscriptTurnDetailResult, TranscriptTurnsResult,
+    TurnCardRecord,
 };
 use serde_json::{json, Value};
 
@@ -99,11 +100,19 @@ pub(crate) fn queue_state(queue: QueueState) -> Value {
 }
 
 fn queued_input(input: QueuedInputRecord) -> Value {
+    let (content, editable, content_type) = match input.content {
+        QueuedInputContent::UserMessage(message) => (json!(message.content), true, "user_message"),
+        QueuedInputContent::DaemonToolObservation(_) => {
+            (json!([]), false, "daemon_tool_observation")
+        }
+    };
     json!({
         "input_id": input.input_id,
         "priority": input.priority,
         "status": input.status,
-        "content": input.content.content,
+        "content": content,
+        "content_type": content_type,
+        "editable": editable,
         "client_input_id": input.client_input_id,
         "created_at": input.created_at,
         "updated_at": input.updated_at,
@@ -210,6 +219,7 @@ fn turn_card(card: TurnCardRecord) -> Value {
         "start_timestamp_ms": card.start_timestamp_ms,
         "timestamp_ms": card.timestamp_ms,
         "user_messages": transcript_entry_values(card.user_messages),
+        "daemon_observations": transcript_entry_values(card.daemon_observations),
         "assistant_message": card.assistant_message.map(transcript_entry),
         "summary": card.summary,
         "can_resume": card.can_resume,

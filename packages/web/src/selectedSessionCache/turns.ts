@@ -266,6 +266,7 @@ function initialTurnCard(entry: TranscriptEntry): TurnCard {
 		start_timestamp_ms: entry.timestamp_ms,
 		timestamp_ms: entry.timestamp_ms,
 		user_messages: [],
+		daemon_observations: [],
 		assistant_message: null,
 		summary: null,
 		can_resume: false,
@@ -286,6 +287,7 @@ function initialTurnCardFromCompactionResume(compactionCard: TurnCard, entry: Tr
 		start_timestamp_ms: compactionCard.start_timestamp_ms,
 		timestamp_ms: entry.timestamp_ms,
 		user_messages: [],
+		daemon_observations: [],
 		assistant_message: null,
 		summary: null,
 		can_resume: false,
@@ -318,6 +320,11 @@ function updateTurnCard(card: TurnCard, entry: TranscriptEntry): TurnCard {
 		next = {
 			...next,
 			assistant_message: entry,
+		};
+	} else if (item.type === "daemon_tool_observation") {
+		next = {
+			...next,
+			daemon_observations: appendUniqueEntry(next.daemon_observations ?? [], entry),
 		};
 	} else if (item.type === "tool_call_started") {
 		next = {

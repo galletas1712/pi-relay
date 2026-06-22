@@ -40,7 +40,7 @@ pub(crate) async fn build_model_request(
     turn_id: Option<TurnId>,
     model_context: ModelContext,
 ) -> Result<ModelRequest> {
-    let prompt = assemble_agent_prompt(state, config).await?;
+    let prompt = assemble_agent_prompt(state, config, session_id).await?;
     Ok(ModelRequest {
         model: config.provider.model.clone(),
         transcript_cache_prefix_len: None,

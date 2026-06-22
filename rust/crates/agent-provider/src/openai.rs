@@ -150,6 +150,25 @@ impl OpenAiCodexSessionState {
     }
 }
 
+fn response_daemon_tool_call_item(observation: &agent_vocab::DaemonToolObservation) -> Value {
+    json!({
+        "type": "function_call",
+        "call_id": observation.tool_call_id.as_str(),
+        "name": openai_wire_tool_name(&observation.tool_name),
+        "arguments": observation.args_json,
+    })
+}
+
+fn response_daemon_tool_result_item(
+    observation: &agent_vocab::DaemonToolObservation,
+) -> ProviderResult<Value> {
+    Ok(json!({
+        "type": "function_call_output",
+        "call_id": observation.tool_call_id.as_str(),
+        "output": observation.result_text()?,
+    }))
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct OpenAiResponseHeaders {
     upstream_request_id: Option<String>,
@@ -661,8 +680,8 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
     //      `~/codex/codex-rs/core/src/client.rs`). One bucket per pi-relay
     //      session keeps us well under OpenAI's ~15 RPM-per-shard ceiling
     //      while still maximising in-session prefix reuse.
-    //   3. Deterministic config-hash fallback for tests that don't
-    //      supply a session id.
+    //   3. Fresh UUID/test fallback supplied by `openai_session_id` when
+    //      neither the request nor provider session state has an id.
     let prompt_cache_key = request
         .prompt_cache_key
         .unwrap_or_else(|| session_id.to_string());
@@ -776,6 +795,13 @@ pub(crate) fn transcript_to_response_items(
                     openai_replay_items(&entry.provider_replay_for(ProviderKind::OpenAi))?;
                 if !replay_items.is_empty() {
                     responses.extend(replay_items);
+                    if let Some(ledger) = appended_delegation_ledger(&summary.summary) {
+                        responses.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": [{ "type": "input_text", "text": ledger }],
+                        }));
+                    }
                 } else {
                     responses.push(json!({
                         "type": "message",
@@ -806,12 +832,22 @@ pub(crate) fn transcript_to_response_items(
             TranscriptItem::ToolResult(result) => {
                 responses.push(response_tool_result_item(result));
             }
+            TranscriptItem::DaemonToolObservation(observation) => {
+                responses.push(response_daemon_tool_call_item(observation));
+                responses.push(response_daemon_tool_result_item(observation)?);
+            }
             TranscriptItem::TurnStarted { .. }
             | TranscriptItem::ToolCallStarted { .. }
             | TranscriptItem::TurnFinished { .. } => {}
         }
     }
     Ok(responses)
+}
+
+fn appended_delegation_ledger(summary: &str) -> Option<&str> {
+    const HEADING: &str = "## Delegation state at compaction time";
+    let index = summary.rfind(HEADING)?;
+    Some(summary[index..].trim()).filter(|value| !value.is_empty())
 }
 
 fn response_tool_call_item(call: &ToolCall) -> Value {
@@ -864,6 +900,7 @@ fn response_input_items(
     transcript: &[ModelTranscriptEntry],
 ) -> ProviderResult<Vec<Value>> {
     let mut items = Vec::new();
+    items.extend(transcript_to_response_items(prompt, transcript)?);
     if let Some(dynamic_context) = dynamic_context.filter(|value| !value.trim().is_empty()) {
         items.push(json!({
             "type": "message",
@@ -871,7 +908,6 @@ fn response_input_items(
             "content": [{ "type": "input_text", "text": dynamic_context }],
         }));
     }
-    items.extend(transcript_to_response_items(prompt, transcript)?);
     Ok(items)
 }
 
@@ -1419,8 +1455,8 @@ mod tests {
 
         assert_eq!(body["model"], "gpt-5.5");
         assert_eq!(body["instructions"], "stable rules");
-        assert_eq!(body["input"][0]["content"][0]["text"], "cwd: /tmp/project");
-        assert_eq!(body["input"][1]["content"][0]["text"], "hello");
+        assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["input"][1]["content"][0]["text"], "cwd: /tmp/project");
         assert_eq!(body["tools"], json!([]));
         assert_eq!(body["parallel_tool_calls"], true);
         assert_eq!(body["reasoning"]["effort"], "high");
@@ -1644,6 +1680,25 @@ mod tests {
     }
 
     #[test]
+    fn compact_parser_preserves_delegation_ledger_user_text() {
+        let response = parse_compact_response(
+            r###"{"output":[{"id":"msg_ledger","type":"message","role":"user","content":[{"type":"input_text","text":"## Delegation state at compaction time\n\n- delegation_id: `delegation_1`; status: running"}]},{"id":"msg_real","type":"message","role":"user","content":[{"type":"input_text","text":"real user fact"}]},{"id":"cmp_1","type":"compaction_summary","encrypted_content":"opaque"}]}"###,
+        )
+        .expect("compaction response should parse");
+
+        assert_eq!(response.provider_replay.len(), 3);
+        assert!(response.summary.is_none());
+        let replay_text = response
+            .provider_replay
+            .iter()
+            .map(|item| item.raw_value().expect("replay raw").to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(replay_text.contains("real user fact"));
+        assert!(replay_text.contains("Delegation state at compaction time"));
+    }
+
+    #[test]
     fn codex_auth_adds_priority_service_tier() {
         let body = responses_body(
             ModelRequest {
@@ -1714,9 +1769,9 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "read");
         assert_eq!(body["instructions"], "static system");
         assert_eq!(body["input"][0]["role"], "user");
-        assert_eq!(body["input"][0]["content"][0]["text"], "cwd: /tmp/project");
+        assert_eq!(body["input"][0]["content"][0]["text"], "hello");
         assert_eq!(body["input"][1]["role"], "user");
-        assert_eq!(body["input"][1]["content"][0]["text"], "hello");
+        assert_eq!(body["input"][1]["content"][0]["text"], "cwd: /tmp/project");
     }
 
     #[test]
@@ -1828,7 +1883,7 @@ mod tests {
     }
 
     #[test]
-    fn responses_body_keeps_dynamic_context_out_of_instructions() {
+    fn responses_body_keeps_dynamic_context_out_of_instructions_and_tail_positioned() {
         let body = responses_body(
             ModelRequest {
                 model: "gpt-5.5".to_string(),
@@ -1851,8 +1906,8 @@ mod tests {
         .expect("responses body renders");
 
         assert_eq!(body["instructions"], "stable agent rules");
-        assert_eq!(body["input"][0]["content"][0]["text"], "workspace: /tmp/pi");
-        assert_eq!(body["input"][1]["content"][0]["text"], "hello");
+        assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["input"][1]["content"][0]["text"], "workspace: /tmp/pi");
         assert_eq!(body["prompt_cache_key"], "cache-key");
     }
 
@@ -1918,15 +1973,23 @@ mod tests {
         assert_eq!(body["tools"][1]["type"], "function");
         assert_eq!(body["tools"][1]["name"], "Bash");
         assert_eq!(body["tools"][2]["type"], "function");
-        assert_eq!(body["tools"][2]["name"], "Grep");
+        assert_eq!(body["tools"][2]["name"], "cancel_delegation");
         assert_eq!(body["tools"][3]["type"], "function");
-        assert_eq!(body["tools"][3]["name"], "LoadSkill");
+        assert_eq!(body["tools"][3]["name"], "delegate_readonly_tasks");
         assert_eq!(body["tools"][4]["type"], "function");
-        assert_eq!(body["tools"][4]["name"], "PythonRepl");
+        assert_eq!(body["tools"][4]["name"], "delegate_writing_task");
         assert_eq!(body["tools"][5]["type"], "function");
-        assert_eq!(body["tools"][5]["name"], "web_fetch");
+        assert_eq!(body["tools"][5]["name"], "Grep");
         assert_eq!(body["tools"][6]["type"], "function");
-        assert_eq!(body["tools"][6]["name"], "web_search");
+        assert_eq!(body["tools"][6]["name"], "inspect_delegation");
+        assert_eq!(body["tools"][7]["type"], "function");
+        assert_eq!(body["tools"][7]["name"], "LoadSkill");
+        assert_eq!(body["tools"][8]["type"], "function");
+        assert_eq!(body["tools"][8]["name"], "steer_subagent");
+        assert_eq!(body["tools"][9]["type"], "function");
+        assert_eq!(body["tools"][9]["name"], "web_fetch");
+        assert_eq!(body["tools"][10]["type"], "function");
+        assert_eq!(body["tools"][10]["name"], "web_search");
     }
 
     #[test]
@@ -1958,6 +2021,90 @@ mod tests {
         assert_eq!(items[0]["name"], "read");
         assert_eq!(items[1]["type"], "function_call_output");
         assert_eq!(items[1]["call_id"], "call_1");
+    }
+
+    #[test]
+    fn daemon_tool_observation_renders_as_openai_synthetic_tool_pair() {
+        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
+            ToolCallId::new("call_delegation_1_attempt_1"),
+            "delegation_1",
+            Some("Delegation delegation_1 completed with status done: 1 ok, 0 failed.".to_string()),
+            json!({
+                "delegation_id": "delegation_1",
+                "status": "done",
+                "subagents": [{
+                    "id": "child_1",
+                    "transcript_file": "child_1/transcript.md",
+                }],
+            }),
+        );
+
+        let items = transcript_to_response_items(
+            &crate::PromptSections::default(),
+            &[TranscriptItem::DaemonToolObservation(observation).into()],
+        )
+        .expect("transcript should render");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "call_delegation_1_attempt_1");
+        assert_eq!(items[0]["name"], "inspect_delegation");
+        assert_eq!(
+            items[0]["arguments"],
+            "{\"delegation_id\":\"delegation_1\"}"
+        );
+        assert!(items[0].get("id").is_none());
+        assert!(items[0].get("status").is_none());
+        assert_eq!(items[1]["type"], "function_call_output");
+        assert_eq!(items[1]["call_id"], "call_delegation_1_attempt_1");
+        assert!(items[1].get("id").is_none());
+        assert!(items[1].get("status").is_none());
+        assert!(items[1]["output"]
+            .as_str()
+            .expect("json output")
+            .contains("\"delegation_id\": \"delegation_1\""));
+    }
+
+    #[test]
+    fn daemon_tool_observation_after_tool_result_keeps_openai_tool_pairs_adjacent() {
+        let tool_call = ToolCall {
+            id: ToolCallId::new("call_1"),
+            tool_name: "read".to_string(),
+            args_json: "{\"path\":\"README.md\"}".to_string(),
+        };
+        let observation = agent_vocab::DaemonToolObservation::inspect_delegation(
+            ToolCallId::new("call_delegation_1_attempt_1"),
+            "delegation_1",
+            None,
+            json!({ "delegation_id": "delegation_1", "status": "done" }),
+        );
+
+        let items = transcript_to_response_items(
+            &crate::PromptSections::default(),
+            &[
+                TranscriptItem::AssistantMessage(AssistantMessage {
+                    items: vec![AssistantItem::ToolCall(tool_call.clone())],
+                })
+                .into(),
+                TranscriptItem::ToolResult(ToolResultMessage::success(
+                    tool_call.id,
+                    "read",
+                    "contents",
+                ))
+                .into(),
+                TranscriptItem::DaemonToolObservation(observation).into(),
+            ],
+        )
+        .expect("transcript should render");
+
+        assert_eq!(items[0]["type"], "function_call");
+        assert_eq!(items[0]["call_id"], "call_1");
+        assert_eq!(items[1]["type"], "function_call_output");
+        assert_eq!(items[1]["call_id"], "call_1");
+        assert_eq!(items[2]["type"], "function_call");
+        assert_eq!(items[2]["call_id"], "call_delegation_1_attempt_1");
+        assert_eq!(items[3]["type"], "function_call_output");
+        assert_eq!(items[3]["call_id"], "call_delegation_1_attempt_1");
     }
 
     #[test]
@@ -2131,6 +2278,66 @@ data: [DONE]
         .expect("responses input renders");
 
         assert_eq!(items, vec![raw]);
+    }
+
+    #[test]
+    fn responses_input_appends_delegation_ledger_after_compaction_replay() {
+        let raw = json!({
+            "type": "compaction_summary",
+            "encrypted_content": "opaque",
+        });
+        let items = transcript_to_response_items(
+            &crate::PromptSections::default(),
+            &[ModelTranscriptEntry {
+                item: TranscriptItem::CompactionSummary(CompactionSummary::new(
+                    "session",
+                    "leaf",
+                    "provider summary\n\n## Delegation state at compaction time\n\n- delegation_id: `delegation_1`; status: running",
+                    Some(123),
+                    TurnId(3),
+                )),
+                provider_replay: vec![ProviderReplayItem::new(ProviderKind::OpenAi, &raw).unwrap()],
+            }],
+        )
+        .expect("responses input renders");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], raw);
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(
+            items[1]["content"][0]["text"],
+            "## Delegation state at compaction time\n\n- delegation_id: `delegation_1`; status: running"
+        );
+    }
+
+    #[test]
+    fn responses_input_appends_latest_delegation_ledger_after_compaction_replay() {
+        let raw = json!({
+            "type": "compaction_summary",
+            "encrypted_content": "opaque",
+        });
+        let items = transcript_to_response_items(
+            &crate::PromptSections::default(),
+            &[ModelTranscriptEntry {
+                item: TranscriptItem::CompactionSummary(CompactionSummary::new(
+                    "session",
+                    "leaf",
+                    "provider summary\n\n## Delegation state at compaction time\n\nold ledger\n\nfresh summary bridge\n\n## Delegation state at compaction time\n\nlatest ledger",
+                    Some(123),
+                    TurnId(3),
+                )),
+                provider_replay: vec![ProviderReplayItem::new(ProviderKind::OpenAi, &raw).unwrap()],
+            }],
+        )
+        .expect("responses input renders");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0], raw);
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(
+            items[1]["content"][0]["text"],
+            "## Delegation state at compaction time\n\nlatest ledger"
+        );
     }
 
     #[test]

@@ -213,6 +213,62 @@ async fn persist_turn(store: &PostgresAgentStore, session_id: &str, timestamp_ms
 }
 
 #[tokio::test]
+async fn subagent_type_round_trips_through_start_session_outputs() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(project_id, "subagent type test", &[], json!({}))
+        .await
+        .expect("project creates");
+    create_project_session(store, project_id, "session_parent").await;
+
+    for (session_id, subagent_type) in [
+        ("session_full_child", Some(crate::SubagentType::Full)),
+        ("session_ro_child", Some(crate::SubagentType::ReadOnly)),
+    ] {
+        store
+            .start_session_outputs_with_parent(
+                session_id,
+                &session_config(project_id),
+                &[],
+                None,
+                &[],
+                &[],
+                crate::InputPriority::FollowUp,
+                &UserMessage::text("go"),
+                None,
+                Some("session_parent"),
+                subagent_type,
+                None,
+            )
+            .await
+            .expect("child session starts");
+        assert_eq!(
+            store
+                .session_subagent_type(session_id)
+                .await
+                .expect("subagent type loads"),
+            subagent_type,
+        );
+    }
+
+    // A top-level session carries no subagent type.
+    assert_eq!(
+        store
+            .session_subagent_type("session_parent")
+            .await
+            .expect("parent subagent type loads"),
+        None,
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn list_sessions_sorts_by_last_user_message_timestamp() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");

@@ -93,6 +93,9 @@ active_leaf_id text null
 system_prompt text not null
 provider_config jsonb not null
 metadata jsonb not null default '{}'::jsonb
+parent_session_id text null references sessions(id) on delete set null
+subagent_type text null
+delegation_id text null references delegations(id)
 session_revision bigint not null default 0
 queue_revision bigint not null default 0
 transcript_revision bigint not null default 0
@@ -169,10 +172,15 @@ value jsonb not null
 updated_at timestamptz not null default now()
 ```
 
-The `PI.md` is the prompt composition template. It is not
-stored per session. The provider request renders that global prompt as the
-stable prefix, followed by daemon-generated dynamic context such as the current
-workspace, then transcript history.
+The `PI.md` is the prompt composition template. It is not stored per session.
+Normal provider requests use the rendered prompt as the stable prefix followed
+by transcript history; the daemon does not inject a top-level
+`## Current delegations` dashboard into ordinary turns. Parent-session
+compaction inputs also exclude live delegation dashboards. After the provider
+returns a compacted summary, the daemon appends a fresh bounded
+`## Delegation state at compaction time` ledger to the stored summary so every
+delegation row/status crosses the compaction boundary without inlining
+transcript bodies. Subagent compactions exclude parent/sibling delegation state.
 
 ### `transcript_entries`
 
@@ -202,7 +210,9 @@ compaction branches without being duplicated in action payloads.
 
 ### `queued_inputs`
 
-Durable user input queue:
+Durable input queue. Most rows are user follow-ups; daemon-authored wakeup
+observations can also be queued at steer priority so parent sessions resume
+promptly without treating the notification as a user message.
 
 ```text
 id text primary key
@@ -297,6 +307,30 @@ History operations remain transcript-driven:
 
 The old embedded `model_context` payloads have been migrated away. Model action
 recovery now requires `context_leaf_id`.
+
+### `delegations`
+
+Durable parent/child subagent delegation units:
+
+```text
+id text primary key
+parent_session_id text not null references sessions(id) on delete cascade
+workflow text null
+label text null
+kind text not null              -- full | readonly_fanout
+status text not null            -- running | done | done_with_failures | cancelled | failed
+attempt_id text not null
+expected_subagents integer not null default 1
+created_at timestamptz not null default now()
+updated_at timestamptz not null default now()
+```
+
+Child sessions link back through `sessions.delegation_id`. The
+`delegations_parent_created_idx` index supports the per-parent run-board feed.
+The completion runner uses `attempt_id` as an idempotency fence and queues a
+deterministic parent daemon wakeup observation keyed as
+`delegation-steer:<delegation_id>:<attempt_id>` (the key name is retained for
+idempotency compatibility).
 
 ### `events`
 
@@ -526,10 +560,14 @@ Result shape:
 }
 ```
 
-`queued_inputs` contains live queued or consuming user inputs with `input_id`,
+`queued_inputs` contains live queued or consuming input rows with `input_id`,
 `priority`, `status`, `content`, `client_input_id`, `created_at`, `updated_at`,
-optional `promoted_at`, and optional `follow_up_position`. The web UI uses it
-for the composer-adjacent queue pane. `session_revision`,
+optional `promoted_at`, and optional `follow_up_position`. User-message rows
+carry their message content. Daemon wakeup observation rows are non-editable
+signals (`content_type = "daemon_tool_observation"`, `content = []`,
+`editable = false`); their typed transcript entry/result JSON and handoff files
+are the source of truth, not queue-event prose. The web UI uses editable
+user-message rows for the composer-adjacent queue pane. `session_revision`,
 `queue_revision`, and `transcript_revision` are monotonically increasing
 per-session counters for replacing stale cached views instead of inferring
 patches from partial events. `transcript_revision` changes when transcript rows
@@ -1184,129 +1222,245 @@ turns fail with `not_resumable`, non-terminal targets fail with
 whose terminal work was tool execution fail with `not_resumable` until explicit
 tool-rerun semantics exist.
 
-## REPL RPC
+## Delegation RPC
 
-### `repl.exec`
+Delegations are the frontend-facing unit for bounded parent/child subagent work.
+A delegation is either one full (writing) subagent or a read-only fan-out. The
+websocket API only accepts the canonical `delegation.*` methods below.
 
-Executes a Python code cell in a stateful per-session REPL process. This is the
-websocket counterpart to the provider-visible `PythonRepl` tool. Python globals
-persist between calls for the same `session_id`; stdout/stderr are captured and
-returned with the last expression's `repr`.
+### `delegation.start_full`
 
-Request:
-
-```json
-{
-  "session_id": "session_parent",
-  "code": "review = subagents.spawn(role='reviewer', message='Review this patch')\nsubagents.wait(review)"
-}
-```
-
-Response:
+Starts one full subagent that writes in the parent workspace.
 
 ```json
 {
-  "type": "exec_result",
-  "id": 1,
-  "ok": true,
-  "stdout": "",
-  "stderr": "",
-  "result_repr": "SubagentResult(session_id='session_child', role='reviewer', text='...')",
-  "result_json": {
-    "session_id": "session_child",
-    "role": "reviewer",
-    "text": "...",
-    "activity": "idle",
-    "transcript": {}
-  },
-  "error": null
+  "parent_session_id": "parent-session",
+  "role": "implementer",
+  "prompt": "Implement the requested change.",
+  "workflow": "workflow-implement-review",
+  "label": "implement change"
 }
 ```
 
-The REPL exposes `subagents` directly; `import subagents` also works but is not required:
+Result:
 
-```python
-handle = subagents.spawn(role="reviewer", message="Review this", fork_context=False)
-workers = [
-    subagents.spawn(role="worker", message="Try approach A", fork_context=True),
-    subagents.spawn(role="worker", message="Try approach B", fork_context=True),
-]
-result = subagents.wait(handle)
-results = subagents.wait(workers)
-merge = subagents.call(
-    role="merger",
-    message="Merge the useful parts of the worker proposals.",
-    sources=results,
-)
-children = subagents.list()
-turns = subagents[handle.session_id].transcript
-handle.steer("Change direction")
-handle.interrupt()
-subagents.steer(handle, "Change direction")
-subagents.interrupt(handle.session_id)
+```json
+{
+  "delegation_id": "delegation_...",
+  "subagent_session_id": "session_..."
+}
 ```
 
-`subagents.spawn(...)` returns a `SubagentHandle` immediately after creating a
-child session. Spawn multiple children with repeated `spawn(...)` calls and keep
-the handles in a list. `subagents.wait(handle_or_handles)` is the explicit
-blocking operation: it waits until the selected child sessions are idle, then
-returns `SubagentResult` objects with final text/transcript snippets.
-If the latest terminal child turn is interrupted or crashed, `wait(...)` and
-`call(...)` raise `subagent_interrupted` or `subagent_crashed` instead of
-silently treating that terminal state as a successful result.
-`subagents.call(...)` is a convenience wrapper for spawn-then-wait and should
-only be used when the parent intentionally wants to block immediately. This
-helper does not have a subagent timeout; children may run for a long time and
-should either complete normally or be interrupted explicitly.
-Callers should retain handles for every spawned child, later `wait(...)`,
-`list()`, or read transcripts, and reconcile, steer, or interrupt those children
-before reporting final work.
-Each child runs in its own distinct session cwd/workspace clone. Parent prompts
-should describe the task and relevant files, not ask the child to operate in the
-parent cwd; child file edits do not appear in the parent workspace until they
-are explicitly inspected and merged.
-The provider-visible `PythonRepl` tool reports Python exceptions as tool errors
-with stdout/stderr and traceback, while the websocket `repl.exec` RPC returns the
-raw `ok: false` REPL payload.
+### `delegation.start_readonly_fanout`
 
-`subagents.list(parent_session_id=None)` returns a list of `SubagentHandle`
-objects (one per known child of the parent) carrying `session_id`, `role`
-(when available), and `activity`. The returned handles are immediately
-actionable: callers can `.steer(...)`, `.interrupt()`, `.wait()`, or read
-`.transcript` on them. `subagents.steer(session_id, message)` and
-`subagents.interrupt(session_id)` are top-level convenience methods that accept a
-session-id string, a `SubagentHandle`, a `SubagentResult`, or a dict containing
-`session_id`/`child_session_id`; they mirror the `handle.steer(message)` and
-`handle.interrupt()` instance methods.
+Starts one read-only subagent per task, each in a disposable snapshot.
 
-`sources=[...]` may be passed to `subagents.spawn(...)`/`subagents.call(...)` with known child
-`SubagentResult`s, `SubagentHandle`s, dicts containing `session_id`, or session-id
-strings. The daemon validates each source is a child of the current parent and
-prepares compact source metadata for the spawned child. For git workspaces, each
-source child's final worktree is made available in the new child's corresponding
-workspace as a local ref such as
-`refs/pi-relay/sources/source-1-implementer-a1b2c3d4`; local-folder workspaces
-are not merged or serialized.
+```json
+{
+  "parent_session_id": "parent-session",
+  "tasks": [
+    { "role": "reviewer", "prompt": "Review the backend changes." },
+    { "role": "tester", "prompt": "Run focused validation." }
+  ],
+  "workflow": "workflow-implement-review-test",
+  "label": "review and test"
+}
+```
 
-When a subagent is spawned, re-driven after being idle, or goes idle, the daemon
-emits parent-scoped `subagent.spawned`, `subagent.running`, and `subagent.idle`
-events. Idle notifications are de-duplicated per completed terminal child state,
-not for the child session lifetime, so a reused/steered child emits another
-running/idle cycle for its next piece of work. Parent sessions can subscribe to
-their normal event stream instead of polling `subagents.list()` to discover child
-completion.
+Result:
 
-`role` can be a built-in role (`explore`, `worker`, `reviewer`, `tester`) or the name of an
-available skill. A unique workspace-scoped skill can be addressed by name alone;
-if multiple workspace skills share a role name, pass `role_workspace` to
-disambiguate. `fork_context=False` sends only the delegated task plus the normal
-session prompt, workspace/project context, and role instructions. `fork_context=True`
-also appends a bounded textual snapshot of the parent session's active branch to
-the child initial message.
+```json
+{
+  "delegation_id": "delegation_...",
+  "subagent_session_ids": ["session_...", "session_..."]
+}
+```
 
-If a child turn crashes or is interrupted while a blocking helper is waiting, the
-helper raises an exception in the Python cell and the `repl.exec` response has
-`result.ok: false`.
+### `delegation.status`
+
+Returns one in-scope delegation as the canonical structured snapshot. The
+snapshot includes delegation metadata, progress counts, subagent roles/types,
+activity/status, steerability, `suggested_next` (when available), and compact
+handoff file references. It does not inline full transcript, task prompt, or
+final-message bodies; read handoff files when detail is needed.
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "delegation_id": "delegation_..."
+}
+```
+
+Result:
+
+```json
+{
+  "delegation_id": "delegation_...",
+  "kind": "readonly_fanout",
+  "status": "running",
+  "workflow": "implement_review",
+  "label": "review",
+  "progress": { "expected": 2, "spawned": 2, "terminal": 1, "running": 1, "failed": 0 },
+  "subagents": [
+    {
+      "id": "session_...",
+      "role": "reviewer",
+      "type": "read_only",
+      "subagent_type": "read_only",
+      "activity": "idle",
+      "status": "done",
+      "steerable": false,
+      "suggested_next": "approved",
+      "final_message_file": null,
+      "transcript_file": "session_.../transcript.md",
+      "task_prompt_file": "session_.../task_prompt.md"
+    }
+  ],
+  "handoff_dir": "/.../.pi-handoff/delegation_..."
+}
+```
+
+### `delegation.cancel`
+
+Interrupts all running subagents in a delegation and marks the delegation
+cancelled. Terminal delegations are left unchanged and return
+`{ "cancelled": false }`. A successful cancellation returns compact
+per-subagent transcript file references relative to `handoff_dir`.
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "delegation_id": "delegation_..."
+}
+```
+
+Successful result:
+
+```json
+{
+  "cancelled": true,
+  "delegation_id": "delegation_...",
+  "handoff_dir": "/.../.pi-handoff/delegation_...",
+  "subagents": [
+    {
+      "subagent_id": "session_...",
+      "transcript_file": "cancelled/session_abc.transcript.md"
+    }
+  ]
+}
+```
+
+### `delegation.list`
+
+Lists all delegations for a parent session, newest first. This is the run-board
+feed used by the web UI.
+
+```json
+{ "parent_session_id": "parent-session" }
+```
+
+Result:
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "delegations": [
+    {
+      "delegation_id": "delegation_...",
+      "kind": "full",
+      "status": "done",
+      "workflow": "workflow-implement-review",
+      "label": "implement change",
+      "subagents": [
+        {
+          "id": "session_...",
+          "status": "idle",
+          "role": "implementer",
+          "subagent_type": "full",
+          "task_prompt_file": "session_.../task_prompt.md",
+          "transcript_file": "session_.../transcript.md",
+          "final_message_file": "session_.../final_message.md",
+          "suggested_next": "ready_for_review"
+        }
+      ],
+      "handoff_dir": "/.../.pi-handoff/delegation_..."
+    }
+  ]
+}
+```
+
+### `delegation.read_handoff_file`
+
+Reads a valid delegation handoff file. Normal running/done/cancelled/failed
+delegations expose per-subagent `task_prompt.md`. Normal running/done
+delegations expose per-subagent `transcript.md`; terminal
+done/done_with_failures delegations also expose per-subagent `final_message.md`.
+Cancelled delegations expose the transcript-only cancellation artifact path
+reported by `inspect_delegation`, for example
+`cancelled/<subagent_id>.transcript.md`. The structured delegation snapshot
+comes from `delegation.status`/`inspect_delegation`, not from a handoff root
+artifact file. Raw task prompts, full final messages, and full transcript bodies
+are never inlined in delegation snapshots, daemon observations, or compaction
+ledgers; use this RPC to read an artifact body explicitly when detail is needed.
+
+Allowed `file` values are exactly:
+
+- `task_prompt.md` with matching `subagent_id`
+- `final_message.md` with matching `subagent_id`
+- `transcript.md` with matching `subagent_id`
+- `cancelled/<subagent_id>.transcript.md` (the `subagent_id` parameter is
+  optional, but if present it must match the path)
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "delegation_id": "delegation_...",
+  "subagent_id": "session_...",
+  "file": "task_prompt.md"
+}
+```
+
+Cancellation transcript request:
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "delegation_id": "delegation_...",
+  "file": "cancelled/session_abc.transcript.md"
+}
+```
+
+Result:
+
+```json
+{
+  "delegation_id": "delegation_...",
+  "subagent_id": "session_abc",
+  "file": "cancelled/session_abc.transcript.md",
+  "content": "# Transcript for cancelled subagent session_abc\n\n..."
+}
+```
+
+## Subagent events
+
+When a delegation subagent is spawned or re-driven, the daemon may emit
+parent-scoped `subagent.spawned` and `subagent.running` progress events. These
+are progress hints only. Parent-visible delegation completion is not a per-child
+`subagent.idle`; it is one `InputPriority::Steer` daemon observation queued to
+the parent after the delegation barrier completes. The observation is stored as a
+typed `daemon_tool_observation` transcript item and is inspect-equivalent to
+`inspect_delegation`/`delegation.status`, including per-subagent
+`suggested_next` and artifact paths. Provider adapters
+render it as an adjacent synthetic `inspect_delegation` tool call/result pair;
+the UI renders it as a daemon/system observation card. Use
+`inspect_delegation`/`delegation.status` to refresh/recover state or inspect
+later/running; use the per-subagent `task_prompt.md`, `final_message.md`, and
+`transcript.md` files for extra detail.
+
+`subagent.idle` remains an event type for non-delegation subagent compatibility
+(for example, defensive dispatch-failure compensation). When emitted, idle
+notifications are de-duplicated per completed terminal child state, not for the
+child session lifetime.
 
 ## Tools
 
@@ -1316,10 +1470,11 @@ Requires a `provider` parameter (`"openai"` or `"anthropic"`/`"claude"`) and
 returns the model-visible tool definitions for that provider, because the tool
 surface is provider-shaped (e.g. OpenAI `apply_patch` vs Anthropic
 `text_editor_20250728` for editing). The registered builtins are `edit`, `bash`,
-`grep`, `web_search`, `web_fetch`, `load_skill`, and `python_repl` - there are
-no `read`/`write` tools. Each returned entry carries `name`, `description`,
-`input_schema`, `canonical_name`, `prompt_alias`, `execution`, and
-`kind: "local_tool"`.
+`grep`, `web_search`, `web_fetch`, `LoadSkill`, and the delegation tools
+(`delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`,
+`cancel_delegation`, `steer_subagent`) - there are no `read`/`write` tools. Each returned entry
+carries `name`, `description`, `input_schema`, `canonical_name`, `prompt_alias`,
+`execution`, and `kind: "local_tool"`.
 
 No other tool RPC exists. Tool requests are automatic. A tool-level failure,
 such as a missing file, missing edit target, malformed args, non-zero bash exit,
@@ -1417,6 +1572,9 @@ subagent.running
 subagent.idle
 ```
 
+`subagent.idle` is listed for compatibility; delegation-member completion is
+reported by the delegation wakeup observation/handoff described above.
+
 No approval or awaiting-approval events are emitted.
 
 Queue-visible events produced by the redesigned paths (`input.accepted`,
@@ -1436,7 +1594,9 @@ queue projection:
 
 Clients should replace cached queue state when an event carries a newer
 `queue_revision`. They should refetch rather than trying to infer ordering from
-partial event payloads.
+partial event payloads. Event payloads are notification/invalidation signals,
+not content storage: daemon wakeup observation `input.queued` events do not
+inline prose summaries, full result JSON, final messages, or task prompts.
 
 `transcript.appended` carries the appended entry body when available, plus its
 compact `tree_node`, `active_leaf_id`, and revision counters:
