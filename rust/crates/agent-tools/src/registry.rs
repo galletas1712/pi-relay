@@ -325,6 +325,113 @@ fn python_repl_definition() -> ToolDefinition {
     )
 }
 
+fn stage_start_full_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "stage_start_full",
+        "Launch the single full (writing) subagent for a stage. It edits the workspace in place; there is exactly one full subagent at a time. End your turn after calling; completion arrives later as a steer pointing at the stage handoff directory.",
+        json!({
+            "type": "object",
+            "properties": {
+                "role": {
+                    "type": "string",
+                    "description": "The subagent role (a skill name), e.g. \"implementer\"."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "The self-contained task. The subagent starts with fresh context and only knows what you put here plus any paths you cite."
+                },
+                "workflow": {
+                    "type": "string",
+                    "description": "Optional workflow skill name this stage belongs to (a grouping label only)."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Optional short human-readable label for the stage."
+                }
+            },
+            "required": ["role", "prompt"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn stage_start_readonly_fanout_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "stage_start_readonly_fanout",
+        "Launch N read-only subagents in parallel, each in its own disposable snapshot of the workspace. Use for investigation, review, or running builds/tests; nothing they write reaches your workspace. End your turn after calling; completion arrives later as a steer.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tasks": {
+                    "type": "array",
+                    "description": "One entry per read-only subagent to run in parallel.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "role": {
+                                "type": "string",
+                                "description": "The subagent role (a skill name), e.g. \"reviewer\"."
+                            },
+                            "prompt": {
+                                "type": "string",
+                                "description": "The self-contained task for this subagent (fresh context)."
+                            }
+                        },
+                        "required": ["role", "prompt"],
+                        "additionalProperties": false
+                    }
+                },
+                "workflow": {
+                    "type": "string",
+                    "description": "Optional workflow skill name this stage belongs to (a grouping label only)."
+                },
+                "label": {
+                    "type": "string",
+                    "description": "Optional short human-readable label for the stage."
+                }
+            },
+            "required": ["tasks"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn stage_status_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "stage_status",
+        "Inspect a stage and its subagents (also readable via the handoff index.json once complete).",
+        json!({
+            "type": "object",
+            "properties": {
+                "stage_id": {
+                    "type": "string",
+                    "description": "The stage id returned by stage_start_full / stage_start_readonly_fanout."
+                }
+            },
+            "required": ["stage_id"],
+            "additionalProperties": false
+        }),
+    )
+}
+
+fn stage_cancel_definition() -> ToolDefinition {
+    ToolDefinition::new(
+        "stage_cancel",
+        "Cancel an in-flight stage and all of its subagents.",
+        json!({
+            "type": "object",
+            "properties": {
+                "stage_id": {
+                    "type": "string",
+                    "description": "The stage id to cancel."
+                }
+            },
+            "required": ["stage_id"],
+            "additionalProperties": false
+        }),
+    )
+}
+
 pub struct FirstPartyToolExtension;
 
 impl ToolExtension for FirstPartyToolExtension {
@@ -345,6 +452,20 @@ impl ToolExtension for FirstPartyToolExtension {
             "python_repl",
             python_repl_definition(),
         );
+        register_runtime_tool(
+            registry,
+            "stage_start_full",
+            "stage",
+            stage_start_full_definition(),
+        );
+        register_runtime_tool(
+            registry,
+            "stage_start_readonly_fanout",
+            "stage",
+            stage_start_readonly_fanout_definition(),
+        );
+        register_runtime_tool(registry, "stage_status", "stage", stage_status_definition());
+        register_runtime_tool(registry, "stage_cancel", "stage", stage_cancel_definition());
         register_edit(registry);
         register_uniform(registry, "Bash", "shell", BashTool);
         register_uniform(registry, "Grep", "workspace_search", GrepTool);
@@ -494,6 +615,10 @@ mod tests {
                 "Grep",
                 "LoadSkill",
                 "PythonRepl",
+                "stage_cancel",
+                "stage_start_full",
+                "stage_start_readonly_fanout",
+                "stage_status",
                 "WebFetch",
                 "WebSearch"
             ]
@@ -505,6 +630,10 @@ mod tests {
                 "Grep",
                 "LoadSkill",
                 "PythonRepl",
+                "stage_cancel",
+                "stage_start_full",
+                "stage_start_readonly_fanout",
+                "stage_status",
                 "Edit",
                 "WebFetch",
                 "WebSearch"
@@ -534,6 +663,10 @@ mod tests {
                 "Grep",
                 "LoadSkill",
                 "PythonRepl",
+                "stage_cancel",
+                "stage_start_full",
+                "stage_start_readonly_fanout",
+                "stage_status",
                 "web_fetch",
                 "web_search"
             ]
@@ -545,6 +678,10 @@ mod tests {
                 "Grep",
                 "LoadSkill",
                 "PythonRepl",
+                "stage_cancel",
+                "stage_start_full",
+                "stage_start_readonly_fanout",
+                "stage_status",
                 "str_replace_based_edit_tool",
                 "web_fetch",
                 "web_search"

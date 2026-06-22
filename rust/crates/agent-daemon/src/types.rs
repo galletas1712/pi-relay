@@ -75,6 +75,11 @@ pub(crate) enum RpcMethod {
     CompactionRequest,
     ReplExec,
     SubagentList,
+    StageStartFull,
+    StageStartReadonlyFanout,
+    StageStatus,
+    StageCancel,
+    StageList,
     HarnessModelComplete,
     HarnessModelFail,
 }
@@ -114,6 +119,11 @@ impl RpcMethod {
             "compaction.request" => Some(Self::CompactionRequest),
             "repl.exec" => Some(Self::ReplExec),
             "subagent.list" => Some(Self::SubagentList),
+            "stage.start_full" => Some(Self::StageStartFull),
+            "stage.start_readonly_fanout" => Some(Self::StageStartReadonlyFanout),
+            "stage.status" => Some(Self::StageStatus),
+            "stage.cancel" => Some(Self::StageCancel),
+            "stage.list" => Some(Self::StageList),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
             "harness.model.fail" => Some(Self::HarnessModelFail),
             _ => None,
@@ -194,6 +204,17 @@ mod tests {
             RpcMethod::parse("subagent.list"),
             Some(RpcMethod::SubagentList)
         );
+        assert_eq!(
+            RpcMethod::parse("stage.start_full"),
+            Some(RpcMethod::StageStartFull)
+        );
+        assert_eq!(
+            RpcMethod::parse("stage.start_readonly_fanout"),
+            Some(RpcMethod::StageStartReadonlyFanout)
+        );
+        assert_eq!(RpcMethod::parse("stage.status"), Some(RpcMethod::StageStatus));
+        assert_eq!(RpcMethod::parse("stage.cancel"), Some(RpcMethod::StageCancel));
+        assert_eq!(RpcMethod::parse("stage.list"), Some(RpcMethod::StageList));
         assert_eq!(
             RpcMethod::parse("history.switch"),
             Some(RpcMethod::HistorySwitch)

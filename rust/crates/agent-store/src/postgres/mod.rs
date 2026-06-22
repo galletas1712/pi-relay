@@ -10,10 +10,13 @@ mod schema;
 mod session_links;
 mod sessions;
 mod snapshots;
+mod stages;
 mod sql;
 mod token_usage;
 mod transcript;
 mod turn_cards;
+
+pub use stages::{Stage, StageSubagent};
 
 use anyhow::Result;
 use sqlx::postgres::PgPoolOptions;

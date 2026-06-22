@@ -9,6 +9,7 @@ mod repl;
 mod rpc_views;
 mod runtime;
 mod session_start;
+mod stage_tools;
 mod state;
 mod subagents;
 mod types;
@@ -288,6 +289,13 @@ async fn dispatch_request(
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
         RpcMethod::ReplExec => repl::repl_exec(state, params).await,
         RpcMethod::SubagentList => subagents::subagent_list(state, params).await,
+        RpcMethod::StageStartFull => stage_tools::rpc_start_full(state, params).await,
+        RpcMethod::StageStartReadonlyFanout => {
+            stage_tools::rpc_start_readonly_fanout(state, params).await
+        }
+        RpcMethod::StageStatus => stage_tools::rpc_status(state, params).await,
+        RpcMethod::StageCancel => stage_tools::rpc_cancel(state, params).await,
+        RpcMethod::StageList => stage_tools::rpc_list(state, params).await,
         RpcMethod::HarnessModelComplete => harness_model_complete(state, params).await,
         RpcMethod::HarnessModelFail => harness_model_fail(state, params).await,
     }
