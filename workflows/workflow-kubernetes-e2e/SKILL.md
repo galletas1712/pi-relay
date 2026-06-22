@@ -1,24 +1,28 @@
 ---
 name: workflow-kubernetes-e2e
-description: Run an adaptive end-to-end test against a Kubernetes cluster as a single full delegation, with cluster-safety rules. Use for operator/e2e validation where the agent must observe rollout and classify the outcome.
+description: Run an adaptive end-to-end test against a Kubernetes cluster as a read-only tester fan-out, with cluster-safety rules. Use for operator/e2e validation where the agent must observe rollout and classify the outcome.
 ---
 
 # Workflow: kubernetes e2e
 
-Run an adaptive end-to-end test against a Kubernetes cluster as a single full
-delegation. The subagent deploys/observes/collects evidence and classifies the
-result. You decide what to do with that result.
+Run an adaptive end-to-end test against a Kubernetes cluster as a read-only
+tester fan-out. The subagent deploys/observes/collects evidence in its
+disposable snapshot and classifies the result. You decide what to do with that
+result.
+Read-only here means read-only with respect to the parent workspace; the
+requested cluster actions may still change the target namespace, subject to the
+safety rules below.
 
 ## Delegations
-- tester — full subagent (runs cluster ops; writes evidence files into the
-  workspace and reports their paths). The generic `tester` role carries the
-  kubernetes specifics in its delegation prompt.
+- tester — read-only subagent (runs cluster ops from a disposable snapshot;
+  any local evidence files it writes stay in that snapshot). The generic
+  `tester` role carries the kubernetes specifics in its delegation prompt.
 
 ## Outcomes (suggested_next, in the delegation snapshot)
 - tester: pass | product_failure | environment_retry | human_needed
 
 ## Control flow
-1. tester (a full delegation; put the cluster-safety rules below in its prompt)
+1. tester (a read-only fan-out; put the cluster-safety rules below in its prompt)
 2. On its outcome:
    - pass             -> DONE
    - product_failure  -> the cluster behaved but the product is wrong: stop and
@@ -30,8 +34,8 @@ result. You decide what to do with that result.
                          decision: relay to the human and wait.
 
 ## Running the delegation (one delegation per turn, then end your turn)
-- test: delegate_writing_task({ role: "tester",
-    prompt: "<context, namespace, what to deploy/test, what 'pass' means>",
+- test: delegate_readonly_tasks({ tasks: [ { role: "tester",
+    prompt: "<context, namespace, what to deploy/test, what 'pass' means>" } ],
     workflow: "kubernetes_e2e" })
 
 The `tester` role is generic; put all kubernetes-specific guidance below in the
@@ -46,5 +50,7 @@ Cluster-safety rules to put in the tester's prompt:
 - Avoid destructive cluster-scoped operations; request human approval for
   dangerous shared-cluster actions.
 - On auth/Teleport expiry, return `human_needed` rather than guessing.
-- Collect logs/events/manifests as evidence files in the workspace and list
-  their paths in the final message (these persist because it is a full delegation).
+- Collect logs/events/manifests as evidence when useful. Prefer summarizing the
+  important evidence in the final message; any local evidence files are written
+  only inside the tester's disposable snapshot, so treat their paths as
+  non-persistent debugging aids rather than files the parent workspace can keep.
