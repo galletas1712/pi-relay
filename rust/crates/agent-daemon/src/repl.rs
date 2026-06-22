@@ -295,12 +295,12 @@ async fn handle_host_call(
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SubagentCallParams {
     role: String,
     message: String,
     #[serde(default)]
     fork_context: bool,
-    role_workspace: Option<String>,
     #[serde(default)]
     sources: Vec<Value>,
 }
@@ -310,7 +310,6 @@ struct SubagentCallSpec {
     role: String,
     message: String,
     fork_context: bool,
-    role_workspace: Option<String>,
     sources: Vec<Value>,
 }
 
@@ -344,7 +343,6 @@ async fn subagents_spawn_host(
             role: params.role,
             message: params.message,
             fork_context: params.fork_context,
-            role_workspace: params.role_workspace,
             sources: params.sources,
         },
     )
@@ -404,7 +402,6 @@ async fn subagents_call(
             role: params.role,
             message: params.message,
             fork_context: params.fork_context,
-            role_workspace: params.role_workspace,
             sources: params.sources,
         },
     )
@@ -438,13 +435,6 @@ async fn spawn_call(
     });
     if !spec.sources.is_empty() {
         params["sources"] = json!(spec.sources);
-    }
-    if let Some(role_workspace) = spec
-        .role_workspace
-        .map(|workspace| workspace.trim().to_string())
-        .filter(|workspace| !workspace.is_empty())
-    {
-        params["role_workspace"] = json!(role_workspace);
     }
     if let Some(initial_context) = initial_context {
         params["initial_context"] = json!(initial_context);
@@ -841,24 +831,22 @@ def _wait_target(target):
     return {"session_id": target, "role": None}
 
 
-def _spawn_params(role, message, fork_context=False, role_workspace=None, sources=None):
+def _spawn_params(role, message, fork_context=False, sources=None):
     params = {
         "role": role,
         "message": message,
         "fork_context": bool(fork_context),
     }
-    if role_workspace is not None:
-        params["role_workspace"] = role_workspace
     if sources is not None:
         params["sources"] = [_source_id(source) for source in sources]
     return params
 
 
 class Subagents:
-    def spawn(self, role, message, fork_context=False, role_workspace=None, sources=None):
+    def spawn(self, role, message, fork_context=False, sources=None):
         data = _host_call(
             "subagents.spawn",
-            _spawn_params(role, message, fork_context, role_workspace, sources),
+            _spawn_params(role, message, fork_context, sources),
         )
         return SubagentHandle(
             data.get("session_id"),
@@ -875,8 +863,8 @@ class Subagents:
         )]
         return results[0] if single else results
 
-    def call(self, role, message, fork_context=False, role_workspace=None, sources=None):
-        return self.spawn(role, message, fork_context, role_workspace, sources).wait()
+    def call(self, role, message, fork_context=False, sources=None):
+        return self.spawn(role, message, fork_context, sources).wait()
 
     def list(self, parent_session_id=None):
         response = _host_call("subagents.list", {"parent_session_id": parent_session_id})

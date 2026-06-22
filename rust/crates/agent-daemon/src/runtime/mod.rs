@@ -503,7 +503,6 @@ impl SessionDriver {
                 json!({
                     "child_session_id": self.session_id,
                     "role": config.metadata.get("role_name").and_then(Value::as_str),
-                    "role_workspace": config.metadata.get("role_workspace").and_then(Value::as_str),
                     "display_name": config.metadata.get("display_name").and_then(Value::as_str),
                     "outcome": outcome,
                     "summary_preview": summary_preview,

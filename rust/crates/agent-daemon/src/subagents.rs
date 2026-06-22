@@ -94,7 +94,6 @@ struct SubagentSpawnRequest {
     parent_session_id: String,
     child_session_id: Option<String>,
     role: String,
-    role_workspace: Option<String>,
     task: String,
     initial_context: Option<String>,
     sources: Vec<String>,
@@ -117,10 +116,6 @@ impl SubagentSpawnRequest {
         if role.is_empty() {
             return Err(RpcError::new("invalid_params", "role cannot be empty"));
         }
-        let role_workspace = params
-            .role_workspace
-            .map(|workspace| workspace.trim().to_string())
-            .filter(|workspace| !workspace.is_empty());
         let task = params.task.trim().to_string();
         if task.is_empty() {
             return Err(RpcError::new("invalid_params", "task cannot be empty"));
@@ -158,7 +153,6 @@ impl SubagentSpawnRequest {
             parent_session_id,
             child_session_id,
             role,
-            role_workspace,
             task,
             initial_context,
             sources,
@@ -170,11 +164,11 @@ impl SubagentSpawnRequest {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SubagentSpawnParams {
     parent_session_id: String,
     child_session_id: Option<String>,
     role: String,
-    role_workspace: Option<String>,
     task: String,
     initial_context: Option<String>,
     sources: Option<Vec<Value>>,
@@ -254,7 +248,6 @@ async fn spawn_subagent(
         &PathBuf::from(&parent_config.outer_cwd),
         &parent_config.workspaces,
         &request.role,
-        request.role_workspace.as_deref(),
     )
     .map_err(|error| RpcError::new("role_not_found", format!("{error:#}")))?;
     let source_configs = load_source_configs(state, &request.parent_session_id, &request.sources)
@@ -272,10 +265,10 @@ async fn spawn_subagent(
         .await
         .map_err(anyhow::Error::from)?;
 
+    let resolved_role_name = resolved_role_name(&role.name, role.workspace.as_deref());
     let child_metadata = subagent_metadata(
         request.metadata,
-        &role.name,
-        role.workspace.as_deref(),
+        &resolved_role_name,
         request.display_name.as_deref(),
         &request.task,
         &role.file_path,
@@ -293,7 +286,7 @@ async fn spawn_subagent(
         state,
         &child_config,
         ChildPromptRole {
-            name: &role.name,
+            name: &resolved_role_name,
             workspace: role.workspace.as_deref(),
             description: &role.description,
             content: &role.content,
@@ -338,8 +331,7 @@ async fn spawn_subagent(
         state,
         &request.parent_session_id,
         &started.session_id,
-        &role.name,
-        role.workspace.as_deref(),
+        &resolved_role_name,
         request.display_name.as_deref(),
     )
     .await
@@ -359,8 +351,7 @@ async fn spawn_subagent(
             state,
             &request.parent_session_id,
             &started.session_id,
-            &role.name,
-            role.workspace.as_deref(),
+            &resolved_role_name,
             request.display_name.as_deref(),
             &error,
         )
@@ -380,7 +371,6 @@ async fn subagent_parent_spawn_events(
     parent_session_id: &str,
     child_session_id: &str,
     role: &str,
-    role_workspace: Option<&str>,
     display_name: Option<&str>,
 ) -> std::result::Result<Vec<EventFrame>, RpcError> {
     state
@@ -393,7 +383,6 @@ async fn subagent_parent_spawn_events(
                     json!({
                         "child_session_id": child_session_id,
                         "role": role,
-                        "role_workspace": role_workspace,
                         "display_name": display_name,
                     }),
                 ),
@@ -402,7 +391,6 @@ async fn subagent_parent_spawn_events(
                     json!({
                         "child_session_id": child_session_id,
                         "role": role,
-                        "role_workspace": role_workspace,
                         "display_name": display_name,
                     }),
                 ),
@@ -425,7 +413,6 @@ pub(crate) async fn subagent_lifecycle_payload(
     Ok(json!({
         "child_session_id": child_session_id,
         "role": config.metadata.get("role_name").and_then(Value::as_str),
-        "role_workspace": config.metadata.get("role_workspace").and_then(Value::as_str),
         "display_name": config.metadata.get("display_name").and_then(Value::as_str),
     }))
 }
@@ -471,7 +458,6 @@ async fn publish_subagent_parent_dispatch_failed_event(
     parent_session_id: &str,
     child_session_id: &str,
     role: &str,
-    role_workspace: Option<&str>,
     display_name: Option<&str>,
     error: &RpcError,
 ) {
@@ -485,7 +471,6 @@ async fn publish_subagent_parent_dispatch_failed_event(
             json!({
                 "child_session_id": child_session_id,
                 "role": role,
-                "role_workspace": role_workspace,
                 "display_name": display_name,
                 "outcome": "Crashed",
                 "summary_preview": summary_preview,
@@ -579,7 +564,6 @@ async fn cleanup_failed_spawn(state: &AppState, child_session_id: &str, reason: 
 fn subagent_metadata(
     metadata: Value,
     role_name: &str,
-    role_workspace: Option<&str>,
     display_name: Option<&str>,
     task: &str,
     role_file_path: &PathBuf,
@@ -611,15 +595,19 @@ fn subagent_metadata(
     map.insert("hidden".to_string(), json!(true));
     map.insert("subagent".to_string(), json!(true));
     map.insert("role_name".to_string(), json!(role_name));
-    if let Some(role_workspace) = role_workspace {
-        map.insert("role_workspace".to_string(), json!(role_workspace));
-    }
     if let Some(display_name) = display_name {
         map.insert("display_name".to_string(), json!(display_name));
     }
     map.insert("task".to_string(), json!(task));
     map.insert("role_file_path".to_string(), json!(role_file_path));
     metadata
+}
+
+fn resolved_role_name(name: &str, workspace: Option<&str>) -> String {
+    match workspace {
+        Some(workspace) => format!("{workspace}/{name}"),
+        None => name.to_string(),
+    }
 }
 
 fn child_initial_task_message(
@@ -712,14 +700,12 @@ mod tests {
         let request = SubagentSpawnRequest::from_params(json!({
             "parent_session_id": " parent ",
             "role": " reviewer ",
-            "role_workspace": " repo ",
             "task": " Review this ",
             "initial_context": " Context ",
         }))
         .expect("request parses");
         assert_eq!(request.parent_session_id, "parent");
         assert_eq!(request.role, "reviewer");
-        assert_eq!(request.role_workspace.as_deref(), Some("repo"));
         assert_eq!(request.task, "Review this");
         assert_eq!(request.initial_context.as_deref(), Some("Context"));
 
@@ -746,11 +732,23 @@ mod tests {
     }
 
     #[test]
+    fn request_validation_rejects_role_workspace() {
+        let error = SubagentSpawnRequest::from_params(json!({
+            "parent_session_id": "parent",
+            "role": "reviewer",
+            "role_workspace": "repo",
+            "task": "Review this",
+        }))
+        .expect_err("role_workspace is rejected");
+        assert_eq!(error.code, "invalid_params");
+        assert!(error.message.contains("unknown field `role_workspace`"));
+    }
+
+    #[test]
     fn subagent_metadata_marks_session_hidden() {
         let metadata = subagent_metadata(
             json!({ "custom": true }),
-            "reviewer",
-            Some("repo"),
+            "repo/reviewer",
             Some("Review"),
             "Review this",
             &PathBuf::from("/tmp/reviewer/SKILL.md"),
@@ -764,8 +762,7 @@ mod tests {
                 "auto_title_disabled": true,
                 "hidden": true,
                 "subagent": true,
-                "role_name": "reviewer",
-                "role_workspace": "repo",
+                "role_name": "repo/reviewer",
                 "display_name": "Review",
                 "task": "Review this",
                 "role_file_path": "/tmp/reviewer/SKILL.md",

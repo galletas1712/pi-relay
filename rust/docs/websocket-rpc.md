@@ -1299,9 +1299,10 @@ completion.
 `role` can be a built-in role (`explore`, `worker`, `reviewer`, `tester`) or the
 name of an available skill. Workspace-scoped skills can be addressed with the
 same prefixed names shown in the prompt JSON, for example `repo/reviewer`.
-Unprefixed unique workspace skills and the legacy `role_workspace` field remain
-accepted for compatibility. `fork_context=False` sends only the delegated task
-plus the normal session prompt, workspace/project context, and role instructions.
+Unprefixed names resolve only built-in/global role skills; workspace-scoped role
+skills must use the prefixed `role` value. `fork_context=False` sends only the
+delegated task plus the normal session prompt, workspace/project context, and
+role instructions.
 `fork_context=True`
 also appends a bounded textual snapshot of the parent session's active branch to
 the child initial message.
