@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
-import { Folder, FolderGit2, Menu, PanelRightOpen, X } from "lucide-react";
+import { ArrowUp, Bot, Folder, FolderGit2, Menu, PanelRightOpen, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
@@ -1966,6 +1966,8 @@ export function App() {
 		: null;
 	const mobileArchived = selectedChatSession ? isArchivedSession(selectedChatSession) : false;
 	const mobileSessionStatus = selectedChatSession ? (mobileArchived ? "archived" : mobileActivity) : null;
+	const mobileSessionStatusLabel = mobileSessionStatus ? `${mobileSessionStatus} session` : null;
+	const mobileParentSessionId = loadedSnapshot?.parent_session_id ?? null;
 	const sidebarIsOverlay = panelMode !== "wide";
 	const inspectorIsOverlay = panelMode === "compact";
 	const sidebarOverlayOpen = sidebarIsOverlay && sidebarOpen;
@@ -1993,7 +1995,25 @@ export function App() {
 							{connection === "open" ? "connected" : connection}
 						</span>
 						{mobileSessionStatus ? (
-							<span className={`session-state ${mobileSessionStatus}`}>{mobileSessionStatus}</span>
+							<span
+								className={`session-status-icon ${mobileSessionStatus}`}
+								role="img"
+								aria-label={mobileSessionStatusLabel ?? undefined}
+								title={mobileSessionStatusLabel ?? undefined}
+							>
+								<Bot size={12} aria-hidden />
+							</span>
+						) : null}
+						{mobileParentSessionId ? (
+							<button
+								className="parent-session-link"
+								type="button"
+								onClick={() => selectSession(mobileParentSessionId)}
+								title={`open parent ${mobileParentSessionId}`}
+							>
+								<ArrowUp size={12} aria-hidden />
+								parent
+							</button>
 						) : null}
 					</div>
 				</div>
@@ -2076,6 +2096,7 @@ export function App() {
 				resumingTurnId={resumingTurnId}
 				onModelChange={handleModelChange}
 				onReasoningEffortChange={handleReasoningEffortChange}
+				onSelectSession={selectSession}
 				onToggleRight={handleToggleRight}
 				onNewSession={handleSidebarNew}
 				onResumeTurn={handleResumeTurn}

@@ -1,6 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { Inspector, RunBoardDelegationList, SessionRow, type RunBoardCallbacks } from "./panels.tsx";
+import { Inspector, LogHeader, RunBoardDelegationList, SessionRow, type RunBoardCallbacks } from "./panels.tsx";
 import type { SessionSnapshot, SessionSummary, Delegation, ToolListing } from "./types.ts";
 
 function delegation(overrides: Partial<Delegation> = {}): Delegation {
@@ -27,6 +27,28 @@ function delegation(overrides: Partial<Delegation> = {}): Delegation {
 		],
 		...overrides,
 	};
+}
+
+function renderLogHeader(overrides: Partial<Parameters<typeof LogHeader>[0]> = {}): string {
+	return renderToStaticMarkup(
+		<LogHeader
+			archived={false}
+			status="delegating"
+			title="UI polish"
+			parentSessionId={null}
+			modelOptions={[{ id: "gpt-test", label: "GPT test" }]}
+			modelValue="gpt-test"
+			modelDisabled={false}
+			modelDisabledTitle="Model"
+			reasoningEfforts={["minimal", "medium"]}
+			reasoningEffort="medium"
+			onModelChange={() => {}}
+			onReasoningEffortChange={() => {}}
+			rightOpen={false}
+			onToggleRight={() => {}}
+			{...overrides}
+		/>,
+	);
 }
 
 function snapshot(): SessionSnapshot {
@@ -138,6 +160,71 @@ describe("Inspector run board delegation list", () => {
 		expect(html).toContain("task 3");
 		expect(html).not.toContain("see more");
 		expect(html).not.toContain("show fewer");
+	});
+});
+
+describe("LogHeader", () => {
+	it("uses an accessible status icon instead of a visible text status pill", () => {
+		const html = renderLogHeader();
+		expect(html).toContain("session-status-icon delegating");
+		expect(html).toContain(`aria-label="delegating session"`);
+		expect(html).toContain(`title="delegating session"`);
+		expect(html).not.toContain("session-state delegating");
+		expect(html).not.toContain(">delegating</span>");
+	});
+
+	it("omits the literal no-session title text when no session is selected", () => {
+		const html = renderLogHeader({ title: null, status: null });
+		expect(html).not.toContain("No session selected");
+		expect(html).not.toContain("session-status-icon");
+	});
+
+	it("shows a parent-session control only when a parent id exists", () => {
+		const withoutParent = renderLogHeader({ parentSessionId: null });
+		expect(withoutParent).not.toContain("parent-session-link");
+
+		const withParent = renderLogHeader({ parentSessionId: "parent-session-12345" });
+		expect(withParent).toContain("parent-session-link");
+		expect(withParent).toContain("parent");
+		expect(withParent).toContain("open parent parent-session-12345");
+	});
+
+	it("keeps model and effort labels accessible but not visible text labels", () => {
+		const html = renderLogHeader();
+		expect(html).toContain(`aria-label="Model"`);
+		expect(html).toContain(`aria-label="Reasoning effort"`);
+		expect(html).toContain(`class="sr-only">Model</span>`);
+		expect(html).toContain(`class="sr-only">Reasoning effort</span>`);
+		expect(html).not.toContain(">model</span>");
+		expect(html).not.toContain(">effort</span>");
+	});
+});
+
+describe("Inspector tabs", () => {
+	it("defaults to the run-board tab and keeps debugging sections out of that panel", () => {
+		const html = renderInspector([delegation({ label: "fan-out" })]);
+		expect(html).toContain(`role="tablist"`);
+		expect(html).toContain(`aria-selected="true"`);
+		expect(html).toContain("Run board");
+		expect(html).toContain("fan-out");
+		expect(html).not.toContain("<h2>Session</h2>");
+		expect(html).not.toContain("<h2>Pending</h2>");
+		expect(html).not.toContain("<h2>Tools</h2>");
+		expect(html).not.toContain("<h2>Slash</h2>");
+	});
+
+	it("does not render no-session literal text in the right-panel empty state", () => {
+		const html = renderToStaticMarkup(
+			<Inspector
+				snapshot={null}
+				delegations={[]}
+				delegationsLoading={false}
+				delegationsError={null}
+				runBoard={callbacks()}
+				tools={[] satisfies ToolListing[]}
+			/>,
+		);
+		expect(html).not.toContain("No session selected");
 	});
 });
 

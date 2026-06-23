@@ -24,6 +24,7 @@ export interface ChatPaneProps {
 	resumingTurnId: string | null;
 	onModelChange: (value: string) => void;
 	onReasoningEffortChange: (value: ReasoningEffort) => void;
+	onSelectSession?: (sessionId: string) => void;
 	onToggleRight: () => void;
 	onNewSession: () => void;
 	onResumeTurn: (entryId: string) => void;
@@ -53,6 +54,7 @@ export const ChatPane = memo(function ChatPane({
 	resumingTurnId,
 	onModelChange,
 	onReasoningEffortChange,
+	onSelectSession,
 	onToggleRight,
 	onNewSession,
 	onResumeTurn,
@@ -80,6 +82,7 @@ export const ChatPane = memo(function ChatPane({
 				rightOpen={rightOpen}
 				onModelChange={onModelChange}
 				onReasoningEffortChange={onReasoningEffortChange}
+				onSelectSession={onSelectSession}
 				onToggleRight={onToggleRight}
 			/>
 			<MessageList
@@ -124,6 +127,7 @@ interface ChatHeaderProps {
 	rightOpen: boolean;
 	onModelChange: (value: string) => void;
 	onReasoningEffortChange: (value: ReasoningEffort) => void;
+	onSelectSession?: (sessionId: string) => void;
 	onToggleRight: () => void;
 }
 
@@ -140,6 +144,7 @@ const ChatHeader = memo(function ChatHeader({
 	rightOpen,
 	onModelChange,
 	onReasoningEffortChange,
+	onSelectSession,
 	onToggleRight
 }: ChatHeaderProps) {
 	const archived = session ? isArchivedSession(session) : false;
@@ -155,15 +160,17 @@ const ChatHeader = memo(function ChatHeader({
 			archived={archived}
 			status={session ? sessionStatusWithDelegations(snapshot?.activity ?? session.activity, hasRunningDelegations) : null}
 			title={session ? sessionTitle(session) : null}
+			parentSessionId={snapshot?.parent_session_id ?? null}
 			modelOptions={displayedModelOptions}
 			modelValue={modelValue}
 			modelDisabled={modelDisabled}
-			modelDisabledTitle={modelLocked ? "model is locked after the first transcript entry" : "model"}
+			modelDisabledTitle={modelLocked ? "Model is locked after the first transcript entry" : "Model"}
 			reasoningEfforts={displayedEfforts}
 			reasoningEffort={reasoningEffort}
 			rightOpen={rightOpen}
 			onModelChange={onModelChange}
 			onReasoningEffortChange={onReasoningEffortChange}
+			onSelectSession={onSelectSession}
 			onToggleRight={onToggleRight}
 		/>
 	);
