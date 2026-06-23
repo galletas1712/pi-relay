@@ -263,7 +263,7 @@ function firstKnownProjectId(...projectIds: (string | null | undefined)[]): stri
 }
 
 function sessionListProjectTargets(projectId: string | null): (string | null)[] {
-	return projectId === null ? [null] : [projectId, null];
+	return [projectId];
 }
 
 function cachedProjectIdForSession(queryClient: QueryClient, sessionId: string): string | null | undefined {
@@ -285,6 +285,14 @@ function backgroundSessionNeedsWarm(
 	if (cache.snapshot.active_leaf_id !== session.active_leaf_id) return true;
 	if (session.has_transcript_entries && cache.turnOrder.length === 0) return true;
 	return false;
+}
+
+function canWarmBackgroundSession(session: SessionListItem): boolean {
+	if (session.parent_session_id) return false;
+	if (session.metadata?.hidden === true) return false;
+	if (session.metadata?.archived === true) return false;
+	if (session.metadata?.subagent === true) return false;
+	return true;
 }
 
 export function App() {
@@ -646,13 +654,12 @@ export function App() {
 	);
 
 	const fetchSessionSnapshot = useCallback(
-		async (sessionId: string, includeEntries: boolean, source: string) => {
+		async (sessionId: string, source: string) => {
 			const shouldLogPerf = perfEnabled();
 			const startedAt = perfNow();
-			if (shouldLogPerf) perfLog("session.get start", { sessionId, source, includeEntries });
+			if (shouldLogPerf) perfLog("session.get start", { sessionId, source });
 			const nextSnapshot = await api.getSession(sessionId, {
-				includeEntries,
-				entryScope: includeEntries ? SELECTED_SESSION_DISPLAY_SCOPE : undefined,
+				includeEntries: false,
 			});
 			if (shouldLogPerf) {
 				const rpcMs = perfNow() - startedAt;
@@ -661,7 +668,7 @@ export function App() {
 					entries: nextSnapshot.entries?.length ?? 0,
 					approxBytes: approximateJsonSize(nextSnapshot),
 					rpcMs: Math.round(rpcMs),
-					entryScope: includeEntries ? SELECTED_SESSION_DISPLAY_SCOPE : "none",
+					entryScope: "none",
 				});
 			}
 			return nextSnapshot;
@@ -696,7 +703,7 @@ export function App() {
 	const warmBackgroundSession = useCallback(
 		async (sessionId: string) => {
 			if (selectedRef.current === sessionId) return false;
-			const snapshot = await fetchSessionSnapshot(sessionId, false, "background");
+			const snapshot = await fetchSessionSnapshot(sessionId, "background");
 			if (selectedRef.current === sessionId) return false;
 			const observedEventId = lastEventIds.current.get(snapshot.session_id) ?? 0;
 			lastEventIds.current.set(snapshot.session_id, Math.max(observedEventId, snapshot.last_event_id));
@@ -719,6 +726,7 @@ export function App() {
 		if (connection !== "open") return;
 		const candidates = allKnownSessions
 			.filter((session) => session.session_id !== selectedRef.current)
+			.filter(canWarmBackgroundSession)
 			.filter((session) =>
 				backgroundSessionNeedsWarm(
 					session,
@@ -773,7 +781,7 @@ export function App() {
 
 	const getFreshSession = useCallback(
 		async (sessionId: string) => {
-			const snapshot = await fetchSessionSnapshot(sessionId, false, "fetch");
+			const snapshot = await fetchSessionSnapshot(sessionId, "fetch");
 			commitSelectedSnapshot(snapshot);
 			let turns: TranscriptTurnsResult | null = null;
 			try {
@@ -830,7 +838,7 @@ export function App() {
 				if (!currentSnapshot) {
 					result = await getFreshSession(sessionId);
 				} else {
-					const snapshot = await fetchSessionSnapshot(sessionId, false, "refresh");
+					const snapshot = await fetchSessionSnapshot(sessionId, "refresh");
 					if (selectedRef.current !== sessionId) return null;
 					commitSelectedSnapshot(snapshot);
 					if (selectedRef.current === sessionId && snapshot.project_id !== selectedProjectRef.current) {

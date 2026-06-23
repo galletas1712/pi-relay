@@ -197,13 +197,13 @@ async fn run_model_for_action_with_retries(
         match result {
             Ok(response) => return Ok(Ok(response)),
             Err(error) => {
-                if !error.is::<agent_provider::ProviderError>() {
-                    return Err(error.into());
-                }
+                let provider_error = match error.downcast::<agent_provider::ProviderError>() {
+                    Ok(error) => error,
+                    Err(error) => return Err(error.into()),
+                };
                 if attempt >= MODEL_PROVIDER_MAX_ATTEMPTS {
-                    let error = provider_error_from_anyhow(error);
                     return Ok(Err(ModelProviderFailure {
-                        error,
+                        error: provider_error,
                         attempts: attempt,
                     }));
                 }
@@ -217,7 +217,7 @@ async fn run_model_for_action_with_retries(
                         "action attempt is no longer running",
                     ));
                 }
-                let message = provider_error_retry_diagnostic(&error);
+                let message = provider_error_retry_diagnostic(&provider_error);
                 eprintln!(
                     "model provider error for {session_id}/{} on attempt {attempt}/{MODEL_PROVIDER_MAX_ATTEMPTS}; retrying: {message}",
                     dispatch.row_id
@@ -235,13 +235,6 @@ struct ModelProviderFailure {
     attempts: usize,
 }
 
-fn provider_error_from_anyhow(error: anyhow::Error) -> agent_provider::ProviderError {
-    match error.downcast::<agent_provider::ProviderError>() {
-        Ok(error) => error,
-        Err(error) => agent_provider::ProviderError::Provider(error.to_string()),
-    }
-}
-
 fn model_failure_update_result(failure: &ModelProviderFailure) -> Value {
     let mut result = json!({ "error": failure.error.to_string() });
     if failure.attempts > 1 {
@@ -253,10 +246,9 @@ fn model_failure_update_result(failure: &ModelProviderFailure) -> Value {
     result
 }
 
-fn provider_error_retry_diagnostic(error: &anyhow::Error) -> String {
+fn provider_error_retry_diagnostic(error: &agent_provider::ProviderError) -> String {
     error
-        .downcast_ref::<agent_provider::ProviderError>()
-        .and_then(agent_provider::ProviderError::retry_diagnostic)
+        .retry_diagnostic()
         .unwrap_or_else(|| error.to_string())
 }
 
