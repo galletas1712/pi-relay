@@ -3,6 +3,9 @@
 @import "@fontsource/geist-sans/600.css";
 @import "@fontsource/geist-mono/400.css";
 @import "@fontsource/geist-mono/500.css";
+@import "@fontsource/space-grotesk/500.css";
+@import "@fontsource/space-grotesk/600.css";
+@import "@fontsource/space-grotesk/700.css";
 
 :root {
 	--radius: 8px;
@@ -26,6 +29,7 @@
 	--ring: rgb(175 58 3 / 0.45);
 	--font-sans: "Geist Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 	--font-mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, Monaco, Consolas, monospace;
+	--font-display: "Space Grotesk", var(--font-sans);
 
 	/*
 	 * Type scale + hierarchy.
@@ -33,6 +37,7 @@
 	 * One proportional ladder of integer steps (crisp; no half-pixels). Every
 	 * piece of text maps to exactly one rung with a defined role:
 	 *
+	 *   --text-3xl 26  Large display tier: the hero empty-state title.
 	 *   --text-2xl 18  Largest content heading (markdown h1).
 	 *   --text-xl  16  Dialog titles (modal <h2>) and markdown h2.
 	 *   --text-lg  15  Reading/writing surfaces: assistant + user messages,
@@ -47,8 +52,10 @@
 	 *   --text-2xs 11  Micro: pills, badges, counts, ids, status chips,
 	 *                  timestamps, and other tiny annotations.
 	 *
-	 * Fonts: UI text is always --font-sans. --font-mono is reserved strictly for
-	 * code/editor content (markdown code, file diffs, JSON tool I/O, raw <pre>).
+	 * Fonts: UI body text is always --font-sans; heading/title text uses
+	 * --font-display (Space Grotesk, falling back to --font-sans). --font-mono is
+	 * reserved strictly for code/editor content (markdown code, file diffs, JSON
+	 * tool I/O, raw <pre>).
 	 */
 	--text-2xs: 11px;
 	--text-xs: 12px;
@@ -57,6 +64,7 @@
 	--text-lg: 15px;
 	--text-xl: 16px;
 	--text-2xl: 18px;
+	--text-3xl: 26px; /* large display tier (Space Grotesk hero headings) */
 	--text-input-mobile: 17px; /* mobile inputs (>=16px avoids iOS auto-zoom) */
 
 	/*
@@ -964,8 +972,10 @@ pre {
 }
 
 .empty-state-title {
-	font-size: var(--text-2xl);
-	font-weight: 600;
+	font-family: var(--font-display);
+	font-size: var(--text-3xl);
+	font-weight: 700;
+	letter-spacing: -0.01em;
 	color: var(--foreground);
 }
 
@@ -1223,6 +1233,7 @@ pre {
 .assistant-markdown h6 {
 	margin: 1em 0 0.45em;
 	line-height: 1.35;
+	font-family: var(--font-display);
 	font-weight: 600;
 }
 
@@ -2048,6 +2059,7 @@ pre {
 
 .history-dialog-copy h2 {
 	margin: 0;
+	font-family: var(--font-display);
 	font-size: var(--text-xl);
 	font-weight: 600;
 	letter-spacing: 0;
@@ -2175,6 +2187,7 @@ pre {
 
 .rename-dialog-copy h2 {
 	margin: 0;
+	font-family: var(--font-display);
 	font-size: var(--text-xl);
 	font-weight: 600;
 	letter-spacing: 0;
@@ -3015,7 +3028,7 @@ pre {
 
 .inspect-section h2 {
 	margin: 0 0 9px;
-	font-family: var(--font-sans);
+	font-family: var(--font-display);
 	font-size: var(--text-xs);
 	font-weight: 600;
 	letter-spacing: 0;
