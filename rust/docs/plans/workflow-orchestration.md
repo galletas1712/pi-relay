@@ -302,7 +302,8 @@ outcomes each subagent reports in `inspect_delegation`.
 ## Stages
 - implementer - full subagent (writes the workspace in place)
 - reviewer    - read-only subagent(s) (review only; never write)
-- tester      - full subagent (runs the suite; reports results)
+- tester      - read-only subagent(s) (runs the suite in a disposable snapshot;
+  build/test artifacts do not reach the parent workspace)
 
 ## Outcomes (outcome, in inspect_delegation)
 - reviewer: approved | changes_requested
@@ -325,8 +326,8 @@ outcomes each subagent reports in `inspect_delegation`.
     prompt:<goal + latest review/test notes>, workflow:"implement_review_test" })
 - review:    delegate_readonly_tasks({ tasks:[{role:"reviewer",
     prompt:<what to review + acceptance criteria>}], workflow:"implement_review_test" })
-- test:      delegate_writing_task({ role:"tester",
-    prompt:<how to test>, workflow:"implement_review_test" })
+- test:      delegate_readonly_tasks({ tasks:[{role:"tester",
+    prompt:<how to test>}], workflow:"implement_review_test" })
 
 When the completion observation arrives, branch on the delivered snapshot. Read the
 relevant `final_message.md` only if you need more detail, and call

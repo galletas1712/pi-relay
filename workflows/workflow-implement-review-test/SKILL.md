@@ -13,7 +13,8 @@ snapshot.
 ## Delegations
 - implementer — full subagent (writes the workspace in place).
 - reviewer    — read-only subagent(s) (review only; never write).
-- tester      — full subagent (runs the suite; reports results).
+- tester      — read-only subagent(s) (runs the suite in a disposable snapshot;
+  build/test artifacts do not reach the parent workspace).
 
 ## Outcomes (outcome, in the delegation snapshot)
 - reviewer: approved | changes_requested
@@ -37,12 +38,13 @@ snapshot.
     prompt: "<goal + latest review/test notes>", workflow: "implement_review_test" })
 - review:    delegate_readonly_tasks({ tasks: [ { role: "reviewer",
     prompt: "<what to review + acceptance criteria>" } ], workflow: "implement_review_test" })
-- test:      delegate_writing_task({ role: "tester",
-    prompt: "<how to test: command(s), what 'pass' means>", workflow: "implement_review_test" })
+- test:      delegate_readonly_tasks({ tasks: [ { role: "tester",
+    prompt: "<how to test: command(s), what 'pass' means>" } ], workflow: "implement_review_test" })
 
 Notes:
-- The tester is a full delegation because building/running tests writes the workspace
-  (build outputs); it edits in place like the implementer.
+- The tester is a read-only delegation. Building/running tests may write build
+  outputs or logs, but only inside the tester's disposable snapshot; nothing the
+  tester writes reaches the parent workspace.
 - After launching a delegation, end your turn; you will receive a completion observation when it
   completes with an `inspect_delegation`-equivalent snapshot.
 - Subagents start fresh — carry prior control-flow facts from the delivered
