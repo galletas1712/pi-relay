@@ -1193,6 +1193,7 @@ export function App() {
 			const currentSnapshot = loadedSnapshot?.session_id === sessionId ? loadedSnapshot : null;
 			const activity = currentSnapshot?.activity ?? session.activity;
 			if (activity !== "idle") throw new Error("only idle sessions can be archived");
+			if (session.has_running_delegations ?? false) throw new Error("can't archive a session with running subagents");
 			const metadata = { ...(currentSnapshot?.metadata ?? session.metadata) };
 			if (archived) metadata.archived = true;
 			else delete metadata.archived;
@@ -1236,6 +1237,7 @@ export function App() {
 			const current = sessionId === selectedRef.current ? await refreshSelected(sessionId) : null;
 			const activity = current?.snapshot.activity ?? session.activity;
 			if (activity !== "idle") throw new Error("only idle sessions can be deleted");
+			if (session.has_running_delegations ?? false) throw new Error("can't delete a session with running subagents");
 
 			await api.deleteSession(sessionId);
 			if (selectedSyncTimer.current !== null) {

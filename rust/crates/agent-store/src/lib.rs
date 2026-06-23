@@ -317,6 +317,7 @@ pub struct SessionSummary {
     pub updated_at: String,
     pub last_user_message_timestamp_ms: Option<i64>,
     pub has_transcript_entries: bool,
+    pub has_running_delegations: bool,
 }
 
 #[derive(Debug, Clone)]
