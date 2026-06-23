@@ -10,7 +10,7 @@ use crate::types::{DispatchAction, RpcError};
 
 use super::SessionDriver;
 
-const MODEL_PROVIDER_MAX_ATTEMPTS: usize = 3;
+const MODEL_PROVIDER_MAX_ATTEMPTS: usize = 5;
 
 pub(super) async fn run_model_turn(
     state: AppState,

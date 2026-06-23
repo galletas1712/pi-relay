@@ -32,6 +32,7 @@ type StatusHandler = (status: ConnectionStatus) => void;
 
 export interface AgentApi {
 	connect(): Promise<void>;
+	reconnect(): Promise<void>;
 	close(): void;
 	isOpen(): boolean;
 	onEvent(handler: EventHandler): () => void;
@@ -303,6 +304,10 @@ class AgentApiClient implements AgentApi {
 
 	connect(): Promise<void> {
 		return this.client.connect();
+	}
+
+	reconnect(): Promise<void> {
+		return this.client.reconnect();
 	}
 
 	close(): void {

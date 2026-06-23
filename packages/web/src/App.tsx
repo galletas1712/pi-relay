@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { ArrowUp, Bot, Folder, FolderGit2, Menu, PanelRightOpen, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -99,8 +99,11 @@ import type {
 const MAX_NOTICES = 24;
 const NOTICE_TTL_MS = 4000;
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
+const SESSION_LIST_REFETCH_MS = 2000;
 const SELECTED_SESSION_REFRESH_DEBOUNCE_MS = 80;
 const FOREGROUND_RECONCILE_THROTTLE_MS = 2000;
+const FOREGROUND_RECONNECT_AFTER_MS = 5000;
+const AWAKE_HEARTBEAT_MS = 1000;
 const TRANSCRIPT_INDEX_PAGE_SIZE = 5000;
 const TRANSCRIPT_TURN_PAGE_SIZE = 50;
 const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
@@ -240,6 +243,32 @@ function projectWorkspacesFromDrafts(workspaces: WorkspaceDraft[]): ProjectWorks
 	});
 }
 
+function sessionListRefreshKey(projectId: string | null): string {
+	return projectId ?? "__host__";
+}
+
+function projectIdFromEventData(event: EventFrame): string | null | undefined {
+	const value = event.data.project_id;
+	if (typeof value === "string") return value;
+	if (value === null) return null;
+	return undefined;
+}
+
+function firstKnownProjectId(...projectIds: (string | null | undefined)[]): string | null | undefined {
+	for (const projectId of projectIds) {
+		if (projectId !== undefined) return projectId;
+	}
+	return undefined;
+}
+
+function cachedProjectIdForSession(queryClient: QueryClient, sessionId: string): string | null | undefined {
+	for (const [, sessions] of queryClient.getQueriesData<SessionSummary[]>({ queryKey: ["sessions"] })) {
+		const session = sessions?.find((candidate) => candidate.session_id === sessionId);
+		if (session) return session.project_id;
+	}
+	return undefined;
+}
+
 export function App() {
 	const api = useMemo(() => createAgentApi(), []);
 	const queryClient = useQueryClient();
@@ -280,7 +309,7 @@ export function App() {
 	});
 
 	const selectedSyncTimer = useRef<number | null>(null);
-	const sessionListRefreshTimer = useRef<number | null>(null);
+	const sessionListRefreshTimers = useRef(new Map<string, number>());
 	const composerHandleRef = useRef<ComposerHandle | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
 	const selectedProjectRef = useRef<string | null>(initialUiSelection.projectId);
@@ -292,6 +321,8 @@ export function App() {
 	const selectedRefreshInFlight = useRef(new Map<string, Promise<{ snapshot: SessionSnapshot; entries: TranscriptEntry[] } | null>>());
 	const autoLoadedTurnDetailRef = useRef<string | null>(null);
 	const lastForegroundReconcileAt = useRef(Date.now());
+	const lastAwakeAt = useRef(Date.now());
+	const foregroundReconnectInFlight = useRef<Promise<void> | null>(null);
 	const handleSessionEventRef = useRef<(event: EventFrame) => void>(() => undefined);
 
 	const pushNotice = useCallback((tone: Notice["tone"], text: string) => {
@@ -325,8 +356,23 @@ export function App() {
 		queryKey: queryKeys.sessions(selectedProjectId),
 		queryFn: () => api.listSessions(100, selectedProjectId),
 		enabled: connection === "open",
+		refetchInterval: SESSION_LIST_REFETCH_MS,
+		refetchIntervalInBackground: true,
+		refetchOnReconnect: true,
+		refetchOnWindowFocus: true,
 	});
 	const sessions = sessionsQuery.data ?? [];
+
+	useEffect(() => {
+		if (connection !== "open") return;
+		const key = sessionListRefreshKey(selectedProjectId);
+		const timer = sessionListRefreshTimers.current.get(key);
+		if (timer !== undefined) {
+			window.clearTimeout(timer);
+			sessionListRefreshTimers.current.delete(key);
+		}
+		void queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectId) });
+	}, [connection, queryClient, selectedProjectId]);
 
 	const sessionItems = useMemo(() => sortSessionsByLastUserMessage(sessions), [sessions]);
 	const selectedProject = useMemo(
@@ -493,7 +539,7 @@ export function App() {
 
 	const invalidateSessionList = useCallback(
 		(projectId = selectedProjectRef.current) => {
-			void queryClient.invalidateQueries({
+			return queryClient.invalidateQueries({
 				queryKey: queryKeys.sessions(projectId),
 			});
 		},
@@ -501,12 +547,14 @@ export function App() {
 	);
 
 	const scheduleSessionListRefresh = useCallback(
-		(delayMs = SESSION_LIST_REFRESH_DEBOUNCE_MS) => {
-			if (sessionListRefreshTimer.current !== null) return;
-			sessionListRefreshTimer.current = window.setTimeout(() => {
-				sessionListRefreshTimer.current = null;
-				invalidateSessionList();
+		(projectId = selectedProjectRef.current, delayMs = SESSION_LIST_REFRESH_DEBOUNCE_MS) => {
+			const key = sessionListRefreshKey(projectId);
+			if (sessionListRefreshTimers.current.has(key)) return;
+			const timer = window.setTimeout(() => {
+				sessionListRefreshTimers.current.delete(key);
+				void invalidateSessionList(projectId);
 			}, delayMs);
+			sessionListRefreshTimers.current.set(key, timer);
 		},
 		[invalidateSessionList],
 	);
@@ -773,31 +821,57 @@ export function App() {
 	}, [selectedId]);
 
 	const reconcileAfterForeground = useCallback(
-		() => {
+		(options: { forceReconnect?: boolean } = {}) => {
 			if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
 			const now = Date.now();
 			if (now - lastForegroundReconcileAt.current < FOREGROUND_RECONCILE_THROTTLE_MS) return;
 			lastForegroundReconcileAt.current = now;
 			const sessionId = selectedRef.current;
-			invalidateSessionList();
-			if (!sessionId) return;
-			void syncActiveBranchNow(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
+			const reconcile = () => {
+				void invalidateSessionList();
+				if (!sessionId) return;
+				void syncActiveBranchNow(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
+			};
+			if (!options.forceReconnect) {
+				reconcile();
+				return;
+			}
+			if (!foregroundReconnectInFlight.current) {
+				foregroundReconnectInFlight.current = api.reconnect().finally(() => {
+					foregroundReconnectInFlight.current = null;
+				});
+			}
+			void foregroundReconnectInFlight.current
+				.then(reconcile)
+				.catch((error) => pushNotice("error", errorMessage(error)));
 		},
-		[invalidateSessionList, pushNotice, syncActiveBranchNow],
+		[api, invalidateSessionList, pushNotice, syncActiveBranchNow],
 	);
 
 	useEffect(() => {
-		const onVisibilityChange = () => {
-			if (document.visibilityState === "visible") reconcileAfterForeground();
+		const awakeHeartbeat = window.setInterval(() => {
+			const now = Date.now();
+			if (now - lastAwakeAt.current < FOREGROUND_RECONNECT_AFTER_MS) {
+				lastAwakeAt.current = now;
+			}
+		}, AWAKE_HEARTBEAT_MS);
+		const reconcileMaybeAfterSleep = () => {
+			const sleptForMs = Date.now() - lastAwakeAt.current;
+			lastAwakeAt.current = Date.now();
+			reconcileAfterForeground({ forceReconnect: sleptForMs >= FOREGROUND_RECONNECT_AFTER_MS });
 		};
-		const onFocus = () => reconcileAfterForeground();
+		const onVisibilityChange = () => {
+			if (document.visibilityState === "visible") reconcileMaybeAfterSleep();
+		};
+		const onFocus = () => reconcileMaybeAfterSleep();
 		const onPageShow = (event: PageTransitionEvent) => {
-			if (event.persisted) reconcileAfterForeground();
+			if (event.persisted) reconcileAfterForeground({ forceReconnect: true });
 		};
 		document.addEventListener("visibilitychange", onVisibilityChange);
 		window.addEventListener("focus", onFocus);
 		window.addEventListener("pageshow", onPageShow);
 		return () => {
+			window.clearInterval(awakeHeartbeat);
 			document.removeEventListener("visibilitychange", onVisibilityChange);
 			window.removeEventListener("focus", onFocus);
 			window.removeEventListener("pageshow", onPageShow);
@@ -859,7 +933,13 @@ export function App() {
 		(event: EventFrame) => {
 			const currentSessions = queryClient.getQueryData<SessionSummary[]>(queryKeys.sessions(selectedProjectRef.current));
 			const eventSession = currentSessions?.find((session) => session.session_id === event.session_id);
-			if (eventSession && eventSession.project_id !== selectedProjectRef.current) return;
+			const eventProjectId =
+				firstKnownProjectId(
+					projectIdFromEventData(event),
+					eventSession?.project_id,
+					loadedSnapshot?.session_id === event.session_id ? loadedSnapshot.project_id : undefined,
+					cachedProjectIdForSession(queryClient, event.session_id),
+				) ?? selectedProjectRef.current;
 			const previousEventId = lastEventIds.current.get(event.session_id) ?? 0;
 			if (event.event_id <= previousEventId) return;
 
@@ -895,9 +975,9 @@ export function App() {
 			}
 			if (shouldSyncSelected) scheduleActiveBranchSync(event.session_id);
 			const activity = activityFromEvent(event);
-			patchSessionListEventSummary(queryClient, selectedProjectRef.current, event, activity);
+			patchSessionListEventSummary(queryClient, eventProjectId, event, activity);
 			if (refreshPlan.refreshList) {
-				scheduleSessionListRefresh();
+				scheduleSessionListRefresh(eventProjectId);
 				if (loadedSnapshot?.session_id) {
 					// The run board reads the delegation.* surface; the backend emits no
 					// dedicated delegation events, so the subagent lifecycle events (and
@@ -932,6 +1012,7 @@ export function App() {
 			scheduleActiveBranchSync,
 			scheduleSessionListRefresh,
 			loadedSnapshot?.session_id,
+			loadedSnapshot?.project_id,
 		],
 	);
 
@@ -958,7 +1039,8 @@ export function App() {
 			offStatus();
 			offEvent();
 			if (selectedSyncTimer.current !== null) window.clearTimeout(selectedSyncTimer.current);
-			if (sessionListRefreshTimer.current !== null) window.clearTimeout(sessionListRefreshTimer.current);
+			for (const timer of sessionListRefreshTimers.current.values()) window.clearTimeout(timer);
+			sessionListRefreshTimers.current.clear();
 			api.close();
 		};
 	}, [api, pushNotice, queryClient]);
@@ -2054,6 +2136,8 @@ export function App() {
 				showArchived={showArchived}
 				filteredSessions={filteredSessions}
 				selectedId={selectedId}
+				sessionsLoading={sessionsQuery.isLoading}
+				sessionsFetching={sessionsQuery.isFetching}
 				inert={sidebarInert}
 				onQueryChange={setQuery}
 				onToggleArchived={handleToggleArchived}

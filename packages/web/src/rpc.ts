@@ -24,12 +24,15 @@ type StatusHandler = (status: ConnectionStatus) => void;
 
 export interface RpcClient {
 	connect(): Promise<void>;
+	reconnect(): Promise<void>;
 	close(): void;
 	isOpen(): boolean;
 	onEvent(handler: EventHandler): () => void;
 	onStatus(handler: StatusHandler): () => void;
 	request<T>(method: string, params?: Record<string, unknown>): Promise<T>;
 }
+
+export const RPC_REQUEST_TIMEOUT_MS = 15_000;
 
 export class AgentRpcClient implements RpcClient {
 	private ws: WebSocket | null = null;
@@ -38,8 +41,9 @@ export class AgentRpcClient implements RpcClient {
 	private eventHandlers = new Set<EventHandler>();
 	private statusHandlers = new Set<StatusHandler>();
 	private openPromise: Promise<void> | null = null;
+	private rejectOpenPromise: ((error: Error) => void) | null = null;
 	private closedByUser = false;
-	private reconnectTimer: number | null = null;
+	private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
 	constructor(private readonly url: string) {}
 
@@ -49,7 +53,7 @@ export class AgentRpcClient implements RpcClient {
 
 		this.closedByUser = false;
 		if (this.reconnectTimer !== null) {
-			window.clearTimeout(this.reconnectTimer);
+			globalThis.clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
 		}
 		this.emitStatus("connecting");
@@ -62,6 +66,7 @@ export class AgentRpcClient implements RpcClient {
 					if (this.ws !== ws) return;
 					this.emitStatus("open");
 					this.openPromise = null;
+					this.rejectOpenPromise = null;
 					resolve();
 				},
 				{ once: true }
@@ -72,10 +77,12 @@ export class AgentRpcClient implements RpcClient {
 					if (this.ws !== ws) return;
 					this.emitStatus("error");
 					this.openPromise = null;
+					this.rejectOpenPromise = null;
 					reject(new Error(`failed to connect ${this.url}`));
 				},
 				{ once: true }
 			);
+			this.rejectOpenPromise = reject;
 		});
 
 		ws.addEventListener("message", (message) => {
@@ -85,27 +92,37 @@ export class AgentRpcClient implements RpcClient {
 			if (this.ws !== ws) return;
 			this.emitStatus("closed");
 			this.openPromise = null;
+			this.rejectOpenPromise = null;
 			this.ws = null;
-			for (const pending of this.pending.values()) {
-				pending.reject(new Error("websocket closed"));
-			}
-			this.pending.clear();
+			this.rejectPending("websocket closed");
 			if (!this.closedByUser) this.scheduleReconnect();
 		});
 
 		return this.openPromise;
 	}
 
+	reconnect(): Promise<void> {
+		this.closedByUser = false;
+		if (this.reconnectTimer !== null) {
+			globalThis.clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = null;
+		}
+		this.rejectConnecting("websocket reconnecting");
+		this.rejectPending("websocket reconnecting");
+		const ws = this.ws;
+		this.ws = null;
+		ws?.close();
+		return this.connect();
+	}
+
 	close(): void {
 		this.closedByUser = true;
 		if (this.reconnectTimer !== null) {
-			window.clearTimeout(this.reconnectTimer);
+			globalThis.clearTimeout(this.reconnectTimer);
 			this.reconnectTimer = null;
 		}
-		for (const pending of this.pending.values()) {
-			pending.reject(new Error("websocket closed"));
-		}
-		this.pending.clear();
+		this.rejectConnecting("websocket closed");
+		this.rejectPending("websocket closed");
 		const ws = this.ws;
 		this.ws = null;
 		ws?.close();
@@ -139,7 +156,7 @@ export class AgentRpcClient implements RpcClient {
 			});
 		});
 		ws.send(JSON.stringify({ id, method, params }));
-		return promise;
+		return this.withRequestTimeout(id, promise);
 	}
 
 	private handleMessage(message: MessageEvent<string>): void {
@@ -179,9 +196,52 @@ export class AgentRpcClient implements RpcClient {
 		for (const handler of this.statusHandlers) handler(status);
 	}
 
+	private rejectPending(message: string): void {
+		for (const pending of this.pending.values()) {
+			pending.reject(new Error(message));
+		}
+		this.pending.clear();
+	}
+
+	private rejectConnecting(message: string): void {
+		const reject = this.rejectOpenPromise;
+		this.openPromise = null;
+		this.rejectOpenPromise = null;
+		reject?.(new Error(message));
+	}
+
+	private withRequestTimeout<T>(id: string, promise: Promise<T>): Promise<T> {
+		return new Promise<T>((resolve, reject) => {
+			const timer = globalThis.setTimeout(() => {
+				const pending = this.pending.get(id);
+				if (!pending) return;
+				this.pending.delete(id);
+				const ws = this.ws;
+				this.ws = null;
+				ws?.close();
+				const error = new Error("websocket request timed out");
+				this.rejectPending("websocket closed");
+				pending.reject(error);
+				reject(error);
+				this.emitStatus("closed");
+				if (!this.closedByUser) this.scheduleReconnect();
+			}, RPC_REQUEST_TIMEOUT_MS);
+			promise.then(
+				(value) => {
+					globalThis.clearTimeout(timer);
+					resolve(value);
+				},
+				(error) => {
+					globalThis.clearTimeout(timer);
+					reject(error);
+				},
+			);
+		});
+	}
+
 	private scheduleReconnect(): void {
 		if (this.reconnectTimer !== null) return;
-		this.reconnectTimer = window.setTimeout(() => {
+		this.reconnectTimer = globalThis.setTimeout(() => {
 			this.reconnectTimer = null;
 			void this.connect().catch(() => {
 				if (!this.closedByUser) this.scheduleReconnect();
