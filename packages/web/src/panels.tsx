@@ -4,12 +4,14 @@ import {
 	Bot,
 	Edit3,
 	Folder,
+	Network,
 	PanelRightOpen,
 	Plus,
 	RotateCcw,
 	Search,
 	Settings,
 	Square,
+	SquarePen,
 	Trash2,
 	X
 } from "lucide-react";
@@ -106,14 +108,21 @@ function SubagentRow({
 	return (
 		<div className="run-board-subagent" role="listitem">
 			<div className="run-board-subagent-head">
-				<span className={`status-rail ${statusRailClass(status)}`} role="img" aria-label={statusLabel} title={statusLabel} />
 				<button
 					className="link-button"
 					type="button"
 					onClick={() => onSelectSession?.(subagent.id)}
 					title={`open ${subagent.id}`}
 				>
-					<Bot size={12} /> {subagent.role ?? subagent.id.slice(0, 13)}
+					<span
+						className={`run-board-status-icon ${statusRailClass(status)}`}
+						role="img"
+						aria-label={statusLabel}
+						title={statusLabel}
+					>
+						<Bot size={12} aria-hidden />
+					</span>{" "}
+					{subagent.role ?? subagent.id.slice(0, 13)}
 				</button>
 			</div>
 		</div>
@@ -133,19 +142,21 @@ function DelegationCard({
 	const running = isDelegationRunning(delegation);
 	const title = delegation.label ?? delegation.workflow ?? delegation.delegation_id.slice(0, 13);
 	const statusLabel = delegationStatusLabel(delegation.status);
+	const isFull = delegation.kind === "full";
+	const KindIcon = isFull ? SquarePen : Network;
+	const kindStatusLabel = `${isFull ? "full" : "fan-out"} delegation — ${statusLabel}`;
 	return (
 		<div className="run-board-delegation">
 			<div className="run-board-delegation-head">
 				<span
-					className={`status-rail ${statusRailClass(delegation.status)}`}
+					className={`run-board-status-icon ${statusRailClass(delegation.status)}`}
 					role="img"
-					aria-label={statusLabel}
-					title={statusLabel}
-				/>
-				<span className="run-board-delegation-title">
-					{title}
-					<span className="run-board-delegation-kind">{delegation.kind === "full" ? "full" : "fan-out"}</span>
+					aria-label={kindStatusLabel}
+					title={kindStatusLabel}
+				>
+					<KindIcon size={14} aria-hidden />
 				</span>
+				<span className="run-board-delegation-title">{title}</span>
 			</div>
 			<div className="run-board-delegation-controls">
 				{running ? (

@@ -141,25 +141,38 @@ describe("Inspector run board delegation list", () => {
 	});
 });
 
-describe("Inspector run board status rails", () => {
-	it("encodes each delegation status as a colored, accessibly-labeled rail", () => {
-		const cases: { status: Delegation["status"]; rail: string; label: string }[] = [
-			{ status: "running", rail: "running", label: "running" },
-			{ status: "done", rail: "done", label: "done" },
-			{ status: "done_with_failures", rail: "warn", label: "done with failures" },
-			{ status: "failed", rail: "failed", label: "failed" },
-			{ status: "cancelled", rail: "cancelled", label: "cancelled" },
+describe("Inspector run board status icons", () => {
+	it("encodes each delegation status as a colored, accessibly-labeled kind icon", () => {
+		const cases: { status: Delegation["status"]; icon: string; label: string }[] = [
+			{ status: "running", icon: "running", label: "running" },
+			{ status: "done", icon: "done", label: "done" },
+			{ status: "done_with_failures", icon: "warn", label: "done with failures" },
+			{ status: "failed", icon: "failed", label: "failed" },
+			{ status: "cancelled", icon: "cancelled", label: "cancelled" },
 		];
-		for (const { status, rail, label } of cases) {
-			const html = renderRunBoardList({ delegations: [delegation({ status })] });
-			expect(html, `${status} rail color`).toContain(`status-rail ${rail}`);
-			expect(html, `${status} rail aria-label`).toContain(`aria-label="${label}"`);
-			expect(html, `${status} rail title`).toContain(`title="${label}"`);
-			expect(html, `${status} rail role`).toContain('role="img"');
+		for (const { status, icon, label } of cases) {
+			// A full delegation so the accessible name carries kind + status.
+			const html = renderRunBoardList({ delegations: [delegation({ kind: "full", status })] });
+			const expected = `full delegation — ${label}`;
+			expect(html, `${status} icon color`).toContain(`run-board-status-icon ${icon}`);
+			expect(html, `${status} icon aria-label`).toContain(`aria-label="${expected}"`);
+			expect(html, `${status} icon title`).toContain(`title="${expected}"`);
+			expect(html, `${status} icon role`).toContain('role="img"');
 		}
+		// The run board no longer renders the old vertical status rail.
+		const sample = renderRunBoardList({ delegations: [delegation({ kind: "full", status: "running" })] });
+		expect(sample).not.toContain("status-rail");
 	});
 
-	it("encodes subagent status as its own rail with the human-readable status as the accessible name", () => {
+	it("encodes the delegation kind in the icon's accessible name (full vs fan-out)", () => {
+		const full = renderRunBoardList({ delegations: [delegation({ kind: "full", status: "done" })] });
+		expect(full).toContain(`aria-label="full delegation — done"`);
+
+		const fanout = renderRunBoardList({ delegations: [delegation({ kind: "readonly_fanout", status: "done" })] });
+		expect(fanout).toContain(`aria-label="fan-out delegation — done"`);
+	});
+
+	it("colors each subagent's agent icon by status with the human-readable status as its accessible name", () => {
 		const html = renderRunBoardList({
 			delegations: [
 				delegation({
@@ -173,14 +186,16 @@ describe("Inspector run board status rails", () => {
 			],
 		});
 
-		// done -> done, running -> running, queued -> neutral pending rail.
-		expect(html).toContain(`status-rail done`);
-		expect(html).toContain(`status-rail running`);
-		expect(html).toContain(`status-rail pending`);
+		// done -> done, running -> running, queued -> neutral pending icon.
+		expect(html).toContain(`run-board-status-icon done`);
+		expect(html).toContain(`run-board-status-icon running`);
+		expect(html).toContain(`run-board-status-icon pending`);
 		expect(html).toContain(`aria-label="done"`);
 		expect(html).toContain(`aria-label="running"`);
 		expect(html).toContain(`aria-label="queued"`);
 		expect(html).toContain(`title="queued"`);
+		// The vertical status rail is gone from the run board.
+		expect(html).not.toContain("status-rail");
 	});
 });
 
@@ -217,11 +232,14 @@ describe("Inspector run board streamlined content", () => {
 			}),
 		]);
 
-		// Title and kind tag survive.
+		// Title survives; the delegation kind is now carried by the status icon's
+		// accessible name rather than a text tag.
 		expect(html).toContain("fan-out");
-		expect(html).toContain("run-board-delegation-kind");
-		// Status is carried only by the rail now.
-		expect(html).toContain("status-rail running");
+		expect(html).toContain(`aria-label="fan-out delegation — running"`);
+		expect(html).not.toContain("run-board-delegation-kind");
+		// Status is carried only by the colored icon now (no vertical rail).
+		expect(html).toContain("run-board-status-icon running");
+		expect(html).not.toContain("status-rail");
 		// Removed: the activity/status pill, progress text, outcome, handoff path, artifact names.
 		expect(html).not.toContain("subagent-activity");
 		expect(html).not.toContain("run-board-progress");
@@ -246,7 +264,7 @@ describe("Inspector run board streamlined content", () => {
 		expect(html).not.toContain("run-board-file");
 	});
 
-	it("keeps a cancelled delegation's status on its rail without exposing the cancellation transcript", () => {
+	it("keeps a cancelled delegation's status on its icon without exposing the cancellation transcript", () => {
 		const cancelled = delegation({
 			status: "cancelled",
 			subagents: [
@@ -263,8 +281,9 @@ describe("Inspector run board streamlined content", () => {
 		});
 
 		const html = renderRunBoardList({ delegations: [cancelled] });
-		expect(html).toContain("status-rail cancelled");
+		expect(html).toContain("run-board-status-icon cancelled");
 		expect(html).toContain(`aria-label="cancelled"`);
+		expect(html).not.toContain("status-rail");
 		expect(html).not.toContain("cancellation transcript");
 		expect(html).not.toContain("cancelled/child-1.transcript.md");
 	});
