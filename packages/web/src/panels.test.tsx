@@ -85,7 +85,7 @@ function renderRunBoardList({
 }
 
 describe("Inspector run board delegation list", () => {
-	it("shows only the first three delegations by default and all delegations in expanded mode", () => {
+	it("shows only the three most recently launched delegations by default and all delegations in expanded mode", () => {
 		const delegations = Array.from({ length: 5 }, (_, index) =>
 			delegation({
 				delegation_id: `delegation-${index + 1}`,
@@ -107,12 +107,14 @@ describe("Inspector run board delegation list", () => {
 			}),
 		);
 
+		// Input is oldest-first (task 1..5); the board renders newest-first, so the
+		// collapsed view keeps the three most recent (task 5/4/3) and hides 1/2.
 		const collapsed = renderRunBoardList({ delegations });
-		expect(collapsed).toContain("task 1");
-		expect(collapsed).toContain("task 2");
+		expect(collapsed).toContain("task 5");
+		expect(collapsed).toContain("task 4");
 		expect(collapsed).toContain("task 3");
-		expect(collapsed).not.toContain("task 4");
-		expect(collapsed).not.toContain("task 5");
+		expect(collapsed).not.toContain("task 2");
+		expect(collapsed).not.toContain("task 1");
 		expect(collapsed).toContain("see more (2)");
 		expect(collapsed).not.toContain("show fewer");
 

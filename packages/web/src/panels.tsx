@@ -184,11 +184,15 @@ export function RunBoardDelegationList({
 	showAllDelegations: boolean;
 	onToggleShowAllDelegations: () => void;
 } & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onReRunDelegation">) {
-	const hiddenDelegationCount = Math.max(0, delegations.length - RUN_BOARD_DEFAULT_DELEGATION_COUNT);
+	// The daemon returns delegations oldest-first (ORDER BY created_at, id); show
+	// them newest-first so the most recently launched delegation is on top and
+	// the "see more" collapse hides the oldest.
+	const orderedDelegations = [...delegations].reverse();
+	const hiddenDelegationCount = Math.max(0, orderedDelegations.length - RUN_BOARD_DEFAULT_DELEGATION_COUNT);
 	const visibleDelegations =
 		showAllDelegations || hiddenDelegationCount === 0
-			? delegations
-			: delegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT);
+			? orderedDelegations
+			: orderedDelegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT);
 	return (
 		<div className="run-board">
 			{visibleDelegations.map((delegation) => (
