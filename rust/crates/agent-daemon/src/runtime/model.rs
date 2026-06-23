@@ -197,15 +197,15 @@ async fn run_model_for_action_with_retries(
         match result {
             Ok(response) => return Ok(Ok(response)),
             Err(error) => {
-                let Some(provider_error) = error.downcast_ref::<agent_provider::ProviderError>()
-                else {
+                if !error.is::<agent_provider::ProviderError>() {
                     return Err(error.into());
-                };
-                let retryable = provider_error.is_retryable_transient();
-                if attempt >= MODEL_PROVIDER_MAX_ATTEMPTS || !retryable {
+                }
+                if attempt >= MODEL_PROVIDER_MAX_ATTEMPTS {
                     let error = provider_error_from_anyhow(error);
-                    let attempts = if retryable { attempt } else { 1 };
-                    return Ok(Err(ModelProviderFailure { error, attempts }));
+                    return Ok(Err(ModelProviderFailure {
+                        error,
+                        attempts: attempt,
+                    }));
                 }
                 if !state
                     .repo
@@ -219,7 +219,7 @@ async fn run_model_for_action_with_retries(
                 }
                 let message = provider_error_retry_diagnostic(&error);
                 eprintln!(
-                    "model provider transient error for {session_id}/{} on attempt {attempt}/{MODEL_PROVIDER_MAX_ATTEMPTS}; retrying: {message}",
+                    "model provider error for {session_id}/{} on attempt {attempt}/{MODEL_PROVIDER_MAX_ATTEMPTS}; retrying: {message}",
                     dispatch.row_id
                 );
                 tokio::time::sleep(model_retry_backoff(attempt)).await;
@@ -247,10 +247,8 @@ fn model_failure_update_result(failure: &ModelProviderFailure) -> Value {
     if failure.attempts > 1 {
         result["provider_retry_attempts"] = json!(failure.attempts);
     }
-    if failure.attempts > 1 || failure.error.is_retryable_transient() {
-        if let Some(diagnostic) = failure.error.retry_diagnostic() {
-            result["provider_error_diagnostic"] = json!(diagnostic);
-        }
+    if let Some(diagnostic) = failure.error.retry_diagnostic() {
+        result["provider_error_diagnostic"] = json!(diagnostic);
     }
     result
 }

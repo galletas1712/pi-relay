@@ -13,7 +13,7 @@ See [design decisions](../design-decisions.md) for *why* the provider scope is s
 - Stream and parse provider SSE into one `AssistantMessage` (`Text` / `ToolCall` items only).
 - Capture per-item `ProviderReplayItem` sidecars so encrypted reasoning / thinking blocks replay verbatim on the next request.
 - Map provider-native tool names to/from canonical pi-relay names.
-- Classify provider errors (transient/retryable, context-overflow) for the daemon's retry and recovery logic.
+- Surface provider errors with diagnostics, including context-overflow classification for the daemon's recovery logic.
 - Estimate input tokens locally (`token_estimator`) for the runtime's pre-flight context gate.
 
 It does **not** own auth acquisition/refresh, retry loops, compaction policy, or tool execution — those live in the daemon and [agent-tools](./agent-tools.md). The provider only surfaces the typed errors and capabilities the daemon acts on.
@@ -39,10 +39,10 @@ It does **not** own auth acquisition/refresh, retry loops, compaction policy, or
 
 `ProviderUsage` carries token counts (`input`, `output`, `total`, `cache_read_input_tokens`, `cache_creation_input_tokens`) plus OpenAI debug metadata lifted off response headers (`upstream_request_id`, `cf_ray`, `server_model`, `codex_turn_state`, `reasoning_included`).
 
-`ProviderError` variants: `Http`, `Timeout`, `Transient`, `Provider`, `Status { status, message }`, `Json`. Two classifiers drive daemon behavior:
+`ProviderError` variants: `Http`, `Timeout`, `Transient`, `Provider`, `Status { status, message }`, `Json`. The daemon retries every `ProviderError` through its provider-error retry path; the provider crate does not classify status codes as retryable or non-retryable.
 
-- `is_retryable_transient()` — true for statuses `408/409/429/500/502/503/504/529` and reqwest timeout/connect/body/decode errors, but never for a context overflow.
 - `is_context_overflow()` — status `413`, or messages matching `prompt is too long` / `context_length_exceeded` / `context …(length|window|too large|exceed|maximum)`. A bare 400 is *not* treated as overflow (Anthropic `count_tokens` returns 400 for unsupported server tools).
+- `retry_diagnostic()` — returns status / timeout / reqwest diagnostic details that the daemon records after retry exhaustion.
 
 `ProviderKind` is `{ OpenAi, Claude }` only; it parses `"openai"`, `"claude"`, and `"anthropic"`. ("codex" is not a provider kind — it is the auth transport OpenAI always uses.)
 

@@ -2287,37 +2287,35 @@ data: [DONE]
     }
 
     #[test]
-    fn responses_sse_maps_transient_failed_events_to_retryable_status() {
+    fn responses_sse_maps_transient_failed_events_to_status() {
         let sse = r#"data: {"type":"response.failed","response":{"error":{"code":"rate_limit_exceeded","message":"retry later"}}}
 "#;
 
         let error = parse_responses_sse(sse, ProviderKind::OpenAi).expect_err("sse should fail");
 
-        assert!(error.is_retryable_transient());
         match &error {
             ProviderError::Status { status, message } => {
                 assert_eq!(*status, 429);
                 assert!(message.contains("rate_limit_exceeded"));
                 assert!(message.contains("retry later"));
             }
-            _ => panic!("expected retryable status error, got {error:?}"),
+            _ => panic!("expected status error, got {error:?}"),
         }
     }
 
     #[test]
-    fn responses_sse_maps_unknown_failed_events_to_retryable_transient_error() {
+    fn responses_sse_maps_unknown_failed_events_to_transient_error() {
         let sse = r#"data: {"type":"response.failed","response":{"error":{"code":"backend_restart","message":"try again"}}}
 "#;
 
         let error = parse_responses_sse(sse, ProviderKind::OpenAi).expect_err("sse should fail");
 
-        assert!(error.is_retryable_transient());
         match &error {
             ProviderError::Transient(message) => {
                 assert!(message.contains("backend_restart"));
                 assert!(message.contains("try again"));
             }
-            _ => panic!("expected retryable transient error, got {error:?}"),
+            _ => panic!("expected transient error, got {error:?}"),
         }
     }
 

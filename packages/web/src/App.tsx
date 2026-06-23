@@ -1,4 +1,4 @@
-import { useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
+import { useQueries, useQuery, useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import { ArrowUp, Bot, Folder, FolderGit2, Menu, PanelRightOpen, X } from "lucide-react";
 import ReactMarkdown from "react-markdown";
@@ -100,6 +100,7 @@ const MAX_NOTICES = 24;
 const NOTICE_TTL_MS = 4000;
 const SESSION_LIST_REFRESH_DEBOUNCE_MS = 250;
 const SESSION_LIST_REFETCH_MS = 2000;
+const BACKGROUND_SESSION_WARM_CONCURRENCY = 2;
 const SELECTED_SESSION_REFRESH_DEBOUNCE_MS = 80;
 const FOREGROUND_RECONCILE_THROTTLE_MS = 2000;
 const FOREGROUND_RECONNECT_AFTER_MS = 5000;
@@ -261,12 +262,29 @@ function firstKnownProjectId(...projectIds: (string | null | undefined)[]): stri
 	return undefined;
 }
 
+function sessionListProjectTargets(projectId: string | null): (string | null)[] {
+	return projectId === null ? [null] : [projectId, null];
+}
+
 function cachedProjectIdForSession(queryClient: QueryClient, sessionId: string): string | null | undefined {
 	for (const [, sessions] of queryClient.getQueriesData<SessionSummary[]>({ queryKey: ["sessions"] })) {
 		const session = sessions?.find((candidate) => candidate.session_id === sessionId);
 		if (session) return session.project_id;
 	}
 	return undefined;
+}
+
+function backgroundSessionNeedsWarm(
+	session: SessionListItem,
+	cache: SelectedSessionCache | null,
+	warmedUpdatedAt: string | undefined,
+): boolean {
+	if (!cache?.snapshot) return true;
+	if (warmedUpdatedAt !== session.updated_at) return true;
+	if (cache.snapshot.activity !== session.activity) return true;
+	if (cache.snapshot.active_leaf_id !== session.active_leaf_id) return true;
+	if (session.has_transcript_entries && cache.turnOrder.length === 0) return true;
+	return false;
 }
 
 export function App() {
@@ -299,9 +317,11 @@ export function App() {
 		cache: selectedCache,
 		cacheRef: selectedCacheRef,
 		drop: dropSelectedCache,
+		get: getSelectedCache,
 		replace: replaceSelectedCache,
 		reset: resetSelectedCache,
 		update: updateSelectedCache,
+		warm: warmSelectedCache,
 	} = useSelectedSessionStore(initialUiSelection.sessionId);
 	const [selectedFetchState, setSelectedFetchState] = useState<{ sessionId: string | null; loading: boolean }>({
 		sessionId: initialUiSelection.sessionId,
@@ -310,6 +330,8 @@ export function App() {
 
 	const selectedSyncTimer = useRef<number | null>(null);
 	const sessionListRefreshTimers = useRef(new Map<string, number>());
+	const backgroundWarmUpdatedAt = useRef(new Map<string, string>());
+	const backgroundWarmInFlight = useRef(new Set<string>());
 	const composerHandleRef = useRef<ComposerHandle | null>(null);
 	const nextSessionTitleRef = useRef<string | null>(null);
 	const selectedProjectRef = useRef<string | null>(initialUiSelection.projectId);
@@ -351,6 +373,18 @@ export function App() {
 		enabled: connection === "open",
 	});
 	const projects = projectsQuery.data ?? [];
+	const knownProjectIds = useMemo(
+		() => [null, ...projects.map((project) => project.project_id)],
+		[projects],
+	);
+	const knownProjectIdsRef = useRef(knownProjectIds);
+	useEffect(() => {
+		knownProjectIdsRef.current = knownProjectIds;
+	}, [knownProjectIds]);
+	const backgroundSessionProjectIds = useMemo(
+		() => knownProjectIds.filter((projectId) => projectId !== selectedProjectId),
+		[knownProjectIds, selectedProjectId],
+	);
 
 	const sessionsQuery = useQuery({
 		queryKey: queryKeys.sessions(selectedProjectId),
@@ -361,7 +395,59 @@ export function App() {
 		refetchOnReconnect: true,
 		refetchOnWindowFocus: true,
 	});
+	const backgroundSessionsQueries = useQueries({
+		queries: backgroundSessionProjectIds.map((projectId) => ({
+			queryKey: queryKeys.sessions(projectId),
+			queryFn: () => api.listSessions(100, projectId),
+			enabled: connection === "open",
+			refetchInterval: SESSION_LIST_REFETCH_MS,
+			refetchIntervalInBackground: true,
+			refetchOnReconnect: true,
+			refetchOnWindowFocus: true,
+		})),
+	});
 	const sessions = sessionsQuery.data ?? [];
+	const backgroundSessions = backgroundSessionsQueries.flatMap((query) => query.data ?? []);
+	const allKnownSessions = useMemo(
+		() => {
+			const byId = new Map<string, SessionListItem>();
+			for (const session of [...sessions, ...backgroundSessions]) byId.set(session.session_id, session);
+			return [...byId.values()];
+		},
+		[backgroundSessions, sessions],
+	);
+
+	const invalidateKnownSessionLists = useCallback(() => {
+		const projectIds = new Set<string | null>(knownProjectIdsRef.current);
+		projectIds.add(selectedProjectRef.current);
+		return Promise.all(
+			Array.from(projectIds).map((projectId) =>
+				queryClient.invalidateQueries({ queryKey: queryKeys.sessions(projectId) }),
+			),
+		);
+	}, [queryClient]);
+
+	const mergeSnapshotIntoKnownSessionLists = useCallback(
+		(snapshot: SessionSnapshot) => {
+			for (const projectId of sessionListProjectTargets(snapshot.project_id)) {
+				queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(projectId), (current) =>
+					mergeSnapshotIntoSessionList(current, snapshot),
+				);
+			}
+		},
+		[queryClient],
+	);
+
+	const removeSessionFromKnownSessionLists = useCallback(
+		(sessionId: string, projectId: string | null) => {
+			for (const targetProjectId of sessionListProjectTargets(projectId)) {
+				queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(targetProjectId), (current) =>
+					current?.filter((candidate) => candidate.session_id !== sessionId),
+				);
+			}
+		},
+		[queryClient],
+	);
 
 	useEffect(() => {
 		if (connection !== "open") return;
@@ -371,8 +457,8 @@ export function App() {
 			window.clearTimeout(timer);
 			sessionListRefreshTimers.current.delete(key);
 		}
-		void queryClient.invalidateQueries({ queryKey: queryKeys.sessions(selectedProjectId) });
-	}, [connection, queryClient, selectedProjectId]);
+		void invalidateKnownSessionLists();
+	}, [connection, invalidateKnownSessionLists, selectedProjectId]);
 
 	const sessionItems = useMemo(() => sortSessionsByLastUserMessage(sessions), [sessions]);
 	const selectedProject = useMemo(
@@ -592,11 +678,9 @@ export function App() {
 					applySelectedSnapshot(current.sessionId === snapshot.session_id ? current : emptySelectedSessionCache(snapshot.session_id), snapshot),
 				);
 			}
-			queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(snapshot.project_id), (current) =>
-				mergeSnapshotIntoSessionList(current, snapshot),
-			);
+			mergeSnapshotIntoKnownSessionLists(snapshot);
 		},
-		[queryClient],
+		[mergeSnapshotIntoKnownSessionLists],
 	);
 
 	const refreshTranscriptTurns = useCallback(
@@ -608,6 +692,55 @@ export function App() {
 		},
 		[api, updateSelectedCache],
 	);
+
+	const warmBackgroundSession = useCallback(
+		async (sessionId: string) => {
+			const snapshot = await fetchSessionSnapshot(sessionId, false, "background");
+			const observedEventId = lastEventIds.current.get(snapshot.session_id) ?? 0;
+			lastEventIds.current.set(snapshot.session_id, Math.max(observedEventId, snapshot.last_event_id));
+			mergeSnapshotIntoKnownSessionLists(snapshot);
+			warmSelectedCache(sessionId, (current) => applySelectedSnapshot(current, snapshot));
+			if (snapshot.has_transcript_entries) {
+				const turns = await api.getTranscriptTurns(sessionId, { limit: TRANSCRIPT_TURN_PAGE_SIZE });
+				const nextSnapshot = snapshotWithTranscriptTurnsMetadata(snapshot, turns);
+				warmSelectedCache(sessionId, (current) =>
+					applyTranscriptTurns(applySelectedSnapshot(current, nextSnapshot), turns),
+				);
+				return;
+			}
+		},
+		[api, fetchSessionSnapshot, mergeSnapshotIntoKnownSessionLists, warmSelectedCache],
+	);
+
+	useEffect(() => {
+		if (connection !== "open") return;
+		const candidates = allKnownSessions
+			.filter((session) => session.session_id !== selectedRef.current)
+			.filter((session) =>
+				backgroundSessionNeedsWarm(
+					session,
+					getSelectedCache(session.session_id),
+					backgroundWarmUpdatedAt.current.get(session.session_id),
+				),
+			);
+		let availableSlots = Math.max(0, BACKGROUND_SESSION_WARM_CONCURRENCY - backgroundWarmInFlight.current.size);
+		for (const session of candidates) {
+			if (availableSlots <= 0) break;
+			if (backgroundWarmInFlight.current.has(session.session_id)) continue;
+			availableSlots -= 1;
+			backgroundWarmInFlight.current.add(session.session_id);
+			void warmBackgroundSession(session.session_id)
+				.then(() => {
+					backgroundWarmUpdatedAt.current.set(session.session_id, session.updated_at);
+				})
+				.catch((error) => {
+					console.warn("background session warm failed", session.session_id, error);
+				})
+				.finally(() => {
+					backgroundWarmInFlight.current.delete(session.session_id);
+				});
+		}
+	}, [allKnownSessions, connection, getSelectedCache, warmBackgroundSession]);
 
 	const loadOlderTranscriptTurns = useCallback(
 		async () => {
@@ -828,7 +961,7 @@ export function App() {
 			lastForegroundReconcileAt.current = now;
 			const sessionId = selectedRef.current;
 			const reconcile = () => {
-				void invalidateSessionList();
+				void invalidateKnownSessionLists();
 				if (!sessionId) return;
 				void syncActiveBranchNow(sessionId).catch((error) => pushNotice("error", errorMessage(error)));
 			};
@@ -845,7 +978,7 @@ export function App() {
 				.then(reconcile)
 				.catch((error) => pushNotice("error", errorMessage(error)));
 		},
-		[api, invalidateSessionList, pushNotice, syncActiveBranchNow],
+		[api, invalidateKnownSessionLists, pushNotice, syncActiveBranchNow],
 	);
 
 	useEffect(() => {
@@ -975,9 +1108,13 @@ export function App() {
 			}
 			if (shouldSyncSelected) scheduleActiveBranchSync(event.session_id);
 			const activity = activityFromEvent(event);
-			patchSessionListEventSummary(queryClient, eventProjectId, event, activity);
+			for (const projectId of sessionListProjectTargets(eventProjectId)) {
+				patchSessionListEventSummary(queryClient, projectId, event, activity);
+			}
 			if (refreshPlan.refreshList) {
-				scheduleSessionListRefresh(eventProjectId);
+				for (const projectId of sessionListProjectTargets(eventProjectId)) {
+					scheduleSessionListRefresh(projectId);
+				}
 				if (loadedSnapshot?.session_id) {
 					// The run board reads the delegation.* surface; the backend emits no
 					// dedicated delegation events, so the subagent lifecycle events (and
@@ -1028,9 +1165,7 @@ export function App() {
 			void Promise.all([
 				queryClient.invalidateQueries({ queryKey: queryKeys.projects }),
 				queryClient.invalidateQueries({ queryKey: queryKeys.systemPromptRoot }),
-				queryClient.invalidateQueries({
-					queryKey: queryKeys.sessions(selectedProjectRef.current),
-				}),
+				invalidateKnownSessionLists(),
 			]).catch((error) => pushNotice("error", errorMessage(error)));
 		});
 		const offEvent = api.onEvent((event) => handleSessionEventRef.current(event));
@@ -1043,7 +1178,7 @@ export function App() {
 			sessionListRefreshTimers.current.clear();
 			api.close();
 		};
-	}, [api, pushNotice, queryClient]);
+	}, [api, invalidateKnownSessionLists, pushNotice, queryClient]);
 
 	useEffect(() => {
 		if (projectsQuery.error) pushNotice("error", errorMessage(projectsQuery.error));
@@ -1083,16 +1218,14 @@ export function App() {
 		if (!loadedSnapshot) return;
 		const observedEventId = lastEventIds.current.get(loadedSnapshot.session_id) ?? 0;
 		lastEventIds.current.set(loadedSnapshot.session_id, Math.max(observedEventId, loadedSnapshot.last_event_id));
-		queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(loadedSnapshot.project_id), (current) =>
-			mergeSnapshotIntoSessionList(current, loadedSnapshot),
-		);
+		mergeSnapshotIntoKnownSessionLists(loadedSnapshot);
 		// `last_event_id` is a transient replay cursor for the daemon's in-memory-ish
 		// event buffer. The daemon may clear old event rows after a session becomes
 		// idle, so a fresh `session.get` can legitimately report a smaller cursor
 		// than this tab has already observed. Revisions and explicit
 		// foreground/reconnect reconciliation drive freshness; never use the event
 		// cursor mismatch as a durable selected-session refresh trigger.
-	}, [loadedSnapshot, queryClient]);
+	}, [loadedSnapshot, mergeSnapshotIntoKnownSessionLists]);
 
 	const ensureTreeIndex = useCallback(
 		async (
@@ -1336,10 +1469,10 @@ export function App() {
 				selectedSyncTimer.current = null;
 			}
 			lastEventIds.current.delete(sessionId);
+			backgroundWarmUpdatedAt.current.delete(sessionId);
+			backgroundWarmInFlight.current.delete(sessionId);
 			dropSelectedCache(sessionId);
-			queryClient.setQueryData<SessionSummary[]>(queryKeys.sessions(selectedProjectRef.current), (current) =>
-				current?.filter((candidate) => candidate.session_id !== sessionId),
-			);
+			removeSessionFromKnownSessionLists(sessionId, session.project_id);
 			composerHandleRef.current?.clearSession(sessionId);
 
 			if (selectedRef.current === sessionId) {
@@ -1354,7 +1487,7 @@ export function App() {
 			setDeleteDialog((current) => (current?.session.session_id === sessionId ? { ...current, deleting: false } : current));
 			throw error;
 		}
-	}, [api, closeDeleteDialog, deleteDialog, dropSelectedCache, invalidateSessionList, pushNotice, queryClient, refreshSelected, selectSession]);
+	}, [api, closeDeleteDialog, deleteDialog, dropSelectedCache, invalidateSessionList, pushNotice, refreshSelected, removeSessionFromKnownSessionLists, selectSession]);
 
 	const createSession = useCallback(
 		(title?: string) => {
