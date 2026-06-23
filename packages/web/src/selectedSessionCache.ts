@@ -23,6 +23,7 @@ import type {
 	TranscriptEntry,
 	TranscriptTreeIndex,
 	TranscriptTreeNode,
+	TranscriptTurnsResult,
 } from "./types.ts";
 
 export type { SelectedSessionCache } from "./selectedSessionCache/types.ts";
@@ -91,6 +92,20 @@ export function applySelectedSnapshot(cache: SelectedSessionCache, snapshot: Ses
 		treeActiveLeafId: treeRevisionChanged ? snapshot.active_leaf_id : base.treeActiveLeafId ?? snapshot.active_leaf_id,
 		treeTranscriptRevision: treeRevisionChanged ? snapshotTranscriptRevision : base.treeTranscriptRevision,
 		treeComplete: treeRevisionChanged ? false : base.treeComplete,
+	};
+}
+
+export function snapshotWithTranscriptTurnsMetadata(
+	snapshot: SessionSnapshot,
+	turns: TranscriptTurnsResult,
+): SessionSnapshot {
+	return {
+		...snapshot,
+		active_leaf_id: turns.active_leaf_id,
+		session_revision: Math.max(snapshot.session_revision ?? 0, turns.session_revision),
+		transcript_revision: Math.max(snapshot.transcript_revision ?? 0, turns.transcript_revision),
+		has_transcript_entries:
+			!!snapshot.has_transcript_entries || turns.active_leaf_id !== null || turns.cards.length > 0,
 	};
 }
 

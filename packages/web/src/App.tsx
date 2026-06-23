@@ -40,6 +40,7 @@ import {
 	mergeSessionActivityEvent,
 	queueProjectionFromEvent,
 	selectedEntries,
+	snapshotWithTranscriptTurnsMetadata,
 	treeNodesInOrder,
 	turnCardsInOrder,
 	turnDetailEntries,
@@ -91,6 +92,7 @@ import type {
 	ToolListing,
 	TranscriptEntry,
 	TranscriptTreeNode,
+	TranscriptTurnsResult,
 	ProjectWorkspace,
 } from "./types.ts";
 
@@ -589,7 +591,14 @@ export function App() {
 		async (sessionId: string) => {
 			const snapshot = await fetchSessionSnapshot(sessionId, false, "fetch");
 			commitSelectedSnapshot(snapshot);
-			await refreshTranscriptTurns(sessionId);
+			let turns: TranscriptTurnsResult | null = null;
+			try {
+				turns = await refreshTranscriptTurns(sessionId);
+			} finally {
+				if (selectedRef.current === sessionId && selectedCacheRef.current.snapshot?.session_id !== sessionId) {
+					commitSelectedSnapshot(turns ? snapshotWithTranscriptTurnsMetadata(snapshot, turns) : snapshot);
+				}
+			}
 			if (selectedRef.current === sessionId && snapshot.project_id !== selectedProjectRef.current) {
 				selectedProjectRef.current = snapshot.project_id;
 				setSelectedProjectId(snapshot.project_id);

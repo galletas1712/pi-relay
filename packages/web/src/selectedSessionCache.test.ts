@@ -13,6 +13,7 @@ import {
 	emptySelectedSessionCache,
 	mergeSessionActivityEvent,
 	selectedEntries,
+	snapshotWithTranscriptTurnsMetadata,
 	treeNodesInOrder,
 } from "./selectedSessionCache.ts";
 import type {
@@ -24,6 +25,7 @@ import type {
 	TurnCard,
 	TranscriptTreeIndex,
 	TranscriptTreeNode,
+	TranscriptTurnsResult,
 } from "./types.ts";
 
 const sessionId = "session_1";
@@ -637,6 +639,44 @@ describe("selected session cache", () => {
 		expect(cache.turnOrder).toEqual(["entry_user"]);
 		expect(cache.turnCardsById.get("entry_user")?.user_messages).toEqual([user]);
 		expect(cache.snapshot?.session_revision).toBe(8);
+	});
+
+	it("uses fresher transcript.turns metadata when recovering a reselected cold load", () => {
+		const coldSnapshot = overview([], {
+			sessionRevision: 2,
+			transcriptRevision: 2,
+			activeLeafId: "entry_old",
+		});
+		const latestUser = entry("entry_new", "entry_start", "new", 4);
+		const turns: TranscriptTurnsResult = {
+			session_id: sessionId,
+			active_leaf_id: "entry_new",
+			session_revision: 4,
+			transcript_revision: 4,
+			before_entry_id: null,
+			next_before_entry_id: null,
+			has_more_before: false,
+			limit: 50,
+			cards: [
+				{
+					...turnCard("entry_new", 1),
+					start_entry_id: "entry_start",
+					active_leaf_id: "entry_new",
+					start_sequence: 3,
+					end_sequence: 4,
+					user_messages: [latestUser],
+				},
+			],
+		};
+		let cache = applyTranscriptTurns(emptySelectedSessionCache(sessionId), turns);
+
+		cache = applySelectedSnapshot(cache, snapshotWithTranscriptTurnsMetadata(coldSnapshot, turns));
+
+		expect(cache.snapshot?.active_leaf_id).toBe("entry_new");
+		expect(cache.snapshot?.session_revision).toBe(4);
+		expect(cache.snapshot?.transcript_revision).toBe(4);
+		expect(cache.activeBranchEntryIds).toEqual(["entry_new"]);
+		expect(cache.turnActiveLeafId).toBe("entry_new");
 	});
 
 	it("starts a new current turn card when a turn_started entry follows a completed turn", () => {

@@ -321,6 +321,16 @@ impl ProviderError {
             return false;
         }
 
+        if matches!(
+            self,
+            ProviderError::Status {
+                status: 400,
+                message
+            } if is_retryable_transient_bad_request(message)
+        ) {
+            return true;
+        }
+
         if self
             .status_code()
             .is_some_and(is_retryable_transient_status)
@@ -411,6 +421,14 @@ impl ProviderError {
 
 fn is_retryable_transient_status(status: u16) -> bool {
     matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 529)
+}
+
+fn is_retryable_transient_bad_request(message: &str) -> bool {
+    // The ChatGPT/Codex `/responses` path can intermittently return this 400
+    // for a valid request that succeeds when replayed immediately. Keep this
+    // exception intentionally narrow so deterministic schema/auth/config 400s
+    // still fail fast.
+    message.trim().eq_ignore_ascii_case("Unsupported content type")
 }
 
 fn error_source_chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
@@ -508,6 +526,12 @@ mod provider_error_tests {
             );
         }
 
+        assert!(ProviderError::Status {
+            status: 400,
+            message: "Unsupported content type".to_string(),
+        }
+        .is_retryable_transient());
+
         for status in [400, 401, 403, 404, 413, 422] {
             assert!(
                 !ProviderError::Status {
@@ -516,6 +540,21 @@ mod provider_error_tests {
                 }
                 .is_retryable_transient(),
                 "status {status} should not be retryable"
+            );
+        }
+
+        for message in [
+            "Invalid 'input[341].call_id': string too long",
+            "No tool output found for function call call_123",
+            "Unsupported value: 'minimal' is not supported with the 'gpt-5.5' model.",
+        ] {
+            assert!(
+                !ProviderError::Status {
+                    status: 400,
+                    message: message.to_string(),
+                }
+                .is_retryable_transient(),
+                "400 {message:?} should not be retryable"
             );
         }
     }
