@@ -25,6 +25,7 @@ export interface ChatPaneProps {
 	onModelChange: (value: string) => void;
 	onReasoningEffortChange: (value: ReasoningEffort) => void;
 	onToggleRight: () => void;
+	onNewSession: () => void;
 	onResumeTurn: (entryId: string) => void;
 	onExpandTurn?: (turnId: string) => void;
 	onCollapseTurn?: (turnId: string) => void;
@@ -53,6 +54,7 @@ export const ChatPane = memo(function ChatPane({
 	onModelChange,
 	onReasoningEffortChange,
 	onToggleRight,
+	onNewSession,
 	onResumeTurn,
 	onExpandTurn,
 	onCollapseTurn,
@@ -91,6 +93,7 @@ export const ChatPane = memo(function ChatPane({
 				sessionId={selectedId}
 				entriesSessionId={snapshot?.session_id ?? null}
 				loadingSession={transcriptLoading}
+				onNewSession={onNewSession}
 				onResumeTurn={onResumeTurn}
 				resumingTurnId={resumingTurnId}
 				onExpandTurn={onExpandTurn}

@@ -2086,6 +2086,7 @@ export function App() {
 				onModelChange={handleModelChange}
 				onReasoningEffortChange={handleReasoningEffortChange}
 				onToggleRight={handleToggleRight}
+				onNewSession={handleSidebarNew}
 				onResumeTurn={handleResumeTurn}
 				onExpandTurn={expandTurn}
 				onCollapseTurn={collapseTurn}

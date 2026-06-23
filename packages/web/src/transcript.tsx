@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type UIEvent } from "react";
-import { AlertTriangle, Check, ChevronDown, ChevronUp, Copy, Loader2, RotateCcw, Terminal } from "lucide-react";
+import { AlertTriangle, Check, ChevronDown, ChevronUp, Copy, Loader2, Plus, RotateCcw, Terminal } from "lucide-react";
 import rehypeRaw from "rehype-raw";
 import rehypeHighlight from "rehype-highlight";
 import ReactMarkdown from "react-markdown";
@@ -199,6 +199,7 @@ export const MessageList = memo(function MessageList({
 	sessionId,
 	entriesSessionId,
 	loadingSession = false,
+	onNewSession,
 	onResumeTurn,
 	resumingTurnId,
 	turnCards,
@@ -218,6 +219,7 @@ export const MessageList = memo(function MessageList({
 	sessionId?: string | null;
 	entriesSessionId?: string | null;
 	loadingSession?: boolean;
+	onNewSession?: () => void;
 	onResumeTurn?: (entryId: string, outcome: "Interrupted" | "Crashed") => void;
 	resumingTurnId?: string | null;
 	turnCards?: TurnCardView[] | null;
@@ -447,7 +449,14 @@ export const MessageList = memo(function MessageList({
 				<div className="message-scroll" ref={scrollRef} onScroll={handleScroll}>
 					<div className="empty-state">
 						<Terminal size={34} />
-						<span>Select or create a session</span>
+						<div className="empty-state-title">No session open</div>
+						<div className="empty-state-sub">Start a new one, or pick a session from the sidebar.</div>
+						{onNewSession ? (
+							<button type="button" className="primary-button empty-state-cta" onClick={onNewSession}>
+								<Plus size={14} />
+								New session
+							</button>
+						) : null}
 					</div>
 				</div>
 			</div>
@@ -652,11 +661,11 @@ const WorkingIndicator = memo(function WorkingIndicator({ startMs, serverTimeMs 
 		return () => window.clearInterval(interval);
 	}, [serverTimeMs, startMs]);
 	return (
-		<SystemMessage
-			tone="info"
-			text={`Working… ${formatElapsed(elapsedMs)}`}
-			loading
-		/>
+		<div className="working-indicator">
+			<span className="working-indicator-dot" aria-hidden="true" />
+			<span className="working-indicator-label">Working…</span>
+			<span className="working-indicator-elapsed">{formatElapsed(elapsedMs)}</span>
+		</div>
 	);
 });
 
