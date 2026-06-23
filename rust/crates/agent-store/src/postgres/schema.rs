@@ -96,6 +96,14 @@ create index if not exists queued_inputs_active_session_idx
     on queued_inputs(session_id)
     where status in ('queued','consuming');
 
+create index if not exists queued_inputs_non_cancelled_session_idx
+    on queued_inputs(session_id)
+    where status <> 'cancelled';
+
+create index if not exists queued_inputs_follow_up_order_idx
+    on queued_inputs(session_id, follow_up_position, created_at, id)
+    where priority='follow_up' and status='queued';
+
 create table if not exists actions (
     id text primary key,
     session_id text not null references sessions(id) on delete cascade,
