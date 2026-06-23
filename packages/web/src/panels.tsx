@@ -10,7 +10,6 @@ import {
 	Plus,
 	RotateCcw,
 	Search,
-	Settings,
 	Square,
 	SquarePen,
 	Trash2,
@@ -121,7 +120,7 @@ function SubagentRow({
 						aria-label={statusLabel}
 						title={statusLabel}
 					>
-						<Bot size={12} aria-hidden />
+						<Bot size={16} aria-hidden />
 					</span>{" "}
 					{subagent.role ?? subagent.id.slice(0, 13)}
 				</button>
@@ -155,7 +154,7 @@ function DelegationCard({
 					aria-label={kindStatusLabel}
 					title={kindStatusLabel}
 				>
-					<KindIcon size={14} aria-hidden />
+					<KindIcon size={16} aria-hidden />
 				</span>
 				<span className="run-board-delegation-title">{title}</span>
 			</div>
@@ -242,8 +241,7 @@ function RunBoard({
 	}, [parentSessionId]);
 
 	return (
-		<section className="inspect-section">
-			<h2>Run board</h2>
+		<section className="inspect-section run-board-section">
 			{parentSessionId && loading ? <p className="muted">Loading delegations…</p> : null}
 			{parentSessionId && error ? <p className="error-text">{error}</p> : null}
 			{parentSessionId && !loading && !error && delegations.length === 0 ? <p className="muted">No delegations yet.</p> : null}
@@ -727,20 +725,22 @@ export function LogHeader({
 				</span>
 			) : null}
 			{title ? (
-				<span className="log-session">
-					{title}
+				<span className="log-title-group">
+					<span className="log-session">
+						{title}
+					</span>
+					{parentSessionId ? (
+						<button
+							className="parent-session-link"
+							type="button"
+							onClick={() => onSelectSession?.(parentSessionId)}
+							title={`open parent ${parentSessionId}`}
+						>
+							<ArrowUp size={12} aria-hidden />
+							parent
+						</button>
+					) : null}
 				</span>
-			) : null}
-			{title && parentSessionId ? (
-				<button
-					className="parent-session-link"
-					type="button"
-					onClick={() => onSelectSession?.(parentSessionId)}
-					title={`open parent ${parentSessionId}`}
-				>
-					<ArrowUp size={12} aria-hidden />
-					parent
-				</button>
 			) : null}
 			<div className="log-controls">
 				<label className="header-select" title={modelDisabledTitle}>
@@ -821,14 +821,7 @@ export function Inspector({
 	const [activeTab, setActiveTab] = useState<InspectorTab>("run-board");
 	return (
 		<div className="inspector-inner">
-			<div className="inspector-head">
-				<Settings size={14} />
-				<span>Session panel</span>
-				<button className="plain-close-button inspector-close" type="button" onClick={onClose} aria-label="close inspector">
-					<X size={14} />
-				</button>
-			</div>
-			<div className="inspector-tabs" role="tablist" aria-label="session panel tabs">
+			<div className="inspector-tabs" role="tablist" aria-label="inspector tabs">
 				{INSPECTOR_TABS.map((tab) => (
 					<button
 						key={tab.id}
@@ -843,6 +836,9 @@ export function Inspector({
 						{tab.label}
 					</button>
 				))}
+				<button className="plain-close-button inspector-close" type="button" onClick={onClose} aria-label="close inspector">
+					<X size={14} />
+				</button>
 			</div>
 			{activeTab === "run-board" ? (
 				<div

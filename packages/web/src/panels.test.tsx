@@ -185,6 +185,7 @@ describe("LogHeader", () => {
 		expect(withoutParent).not.toContain("parent-session-link");
 
 		const withParent = renderLogHeader({ parentSessionId: "parent-session-12345" });
+		expect(withParent).toContain("log-title-group");
 		expect(withParent).toContain("parent-session-link");
 		expect(withParent).toContain("parent");
 		expect(withParent).toContain("open parent parent-session-12345");
@@ -205,9 +206,11 @@ describe("Inspector tabs", () => {
 	it("defaults to the run-board tab and keeps debugging sections out of that panel", () => {
 		const html = renderInspector([delegation({ label: "fan-out" })]);
 		expect(html).toContain(`role="tablist"`);
+		expect(html).toContain(`aria-label="inspector tabs"`);
 		expect(html).toContain(`aria-selected="true"`);
 		expect(html).toContain("Run board");
 		expect(html).toContain("fan-out");
+		expect(html).not.toContain("Session panel");
 		expect(html).not.toContain("<h2>Session</h2>");
 		expect(html).not.toContain("<h2>Pending</h2>");
 		expect(html).not.toContain("<h2>Tools</h2>");
