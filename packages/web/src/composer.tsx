@@ -10,6 +10,28 @@ const COMPOSER_MIN_HEIGHT_PX = 44;
 const COMPOSER_MAX_HEIGHT_PX = 180;
 
 type ComposerSubmitShortcutEvent = Pick<KeyboardEvent<HTMLTextAreaElement>, "ctrlKey" | "key" | "metaKey">;
+export type PendingSubmittedDraft = { value: string; version: number };
+export type SubmittedDraftResolution = "ignore" | "apply";
+
+export function submittedDraftStillCurrent(
+	pending: PendingSubmittedDraft | undefined,
+	currentVersion: number | undefined,
+	value: string,
+	version?: number,
+): boolean {
+	if (!pending || pending.value !== value) return false;
+	const expectedVersion = version ?? pending.version;
+	return pending.version === expectedVersion && currentVersion === expectedVersion;
+}
+
+export function resolveSubmittedDraft(
+	pending: PendingSubmittedDraft | undefined,
+	currentVersion: number | undefined,
+	value: string,
+	version?: number,
+): SubmittedDraftResolution {
+	return submittedDraftStillCurrent(pending, currentVersion, value, version) ? "apply" : "ignore";
+}
 
 export function isComposerSubmitShortcut(event: ComposerSubmitShortcutEvent): boolean {
 	return event.key === "Enter" && (event.metaKey || event.ctrlKey);
@@ -55,14 +77,12 @@ export const Composer = memo(function Composer({
 	const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
 	const selectedIdRef = useRef<string | null>(selectedId);
 	const draftsRef = useRef(loadComposerDrafts());
-	const draftRef = useRef("");
+	const draftVersionsRef = useRef(new Map<string, number>());
+	const pendingSubmittedDraftsRef = useRef(new Map<string, PendingSubmittedDraft>());
 	const initialDraft = draftsRef.current.get(composerDraftKey(selectedId)) ?? "";
+	const draftRef = useRef(initialDraft);
 	const [draft, setDraft] = useState(initialDraft);
 	const [slashIndex, setSlashIndex] = useState(0);
-
-	useEffect(() => {
-		draftRef.current = initialDraft;
-	}, [initialDraft]);
 
 	const resizeComposer = useCallback(() => {
 		const textArea = textAreaRef.current;
@@ -79,11 +99,54 @@ export const Composer = memo(function Composer({
 	const storeDraft = useCallback(
 		(sessionId: string | null, value: string) => {
 			const key = composerDraftKey(sessionId);
+			const version = (draftVersionsRef.current.get(key) ?? 0) + 1;
+			draftVersionsRef.current.set(key, version);
 			if (value.trim()) draftsRef.current.set(key, value);
 			else draftsRef.current.delete(key);
 			saveComposerDrafts(draftsRef.current);
+			return version;
 		},
 		[]
+	);
+
+	const clearSubmittedDraft = useCallback(
+		(sessionId: string | null, value: string, version: number) => {
+			const key = composerDraftKey(sessionId);
+			const pending = pendingSubmittedDraftsRef.current.get(key);
+			if (resolveSubmittedDraft(pending, draftVersionsRef.current.get(key), value, version) !== "apply") {
+				if (pending?.value === value && pending.version === version) pendingSubmittedDraftsRef.current.delete(key);
+				return;
+			}
+			pendingSubmittedDraftsRef.current.delete(key);
+			if (draftsRef.current.get(key) === value) {
+				storeDraft(sessionId, "");
+				if (selectedIdRef.current === sessionId && draftRef.current === value) {
+					draftRef.current = "";
+					setDraft("");
+				}
+			}
+		},
+		[storeDraft]
+	);
+
+	const restoreSubmittedDraft = useCallback(
+		(sessionId: string | null, value: string, version?: number) => {
+			const key = composerDraftKey(sessionId);
+			const pending = pendingSubmittedDraftsRef.current.get(key);
+			if (resolveSubmittedDraft(pending, draftVersionsRef.current.get(key), value, version) !== "apply") {
+				if (pending?.value === value && (version === undefined || pending.version === version)) {
+					pendingSubmittedDraftsRef.current.delete(key);
+				}
+				return;
+			}
+			pendingSubmittedDraftsRef.current.delete(key);
+			storeDraft(sessionId, value);
+			if (selectedIdRef.current === sessionId && !draftRef.current.trim()) {
+				draftRef.current = value;
+				setDraft(value);
+			}
+		},
+		[storeDraft]
 	);
 
 	const setDraftValue = useCallback(
@@ -107,14 +170,9 @@ export const Composer = memo(function Composer({
 			focus: () => textAreaRef.current?.focus(),
 			getValue: () => draftRef.current,
 			setValue: (value) => setDraftValue(value),
-			restoreSubmittedDraft: (sessionId, value) => {
-				storeDraft(sessionId, value);
-				if (selectedIdRef.current === sessionId && !draftRef.current.trim()) {
-					draftRef.current = value;
-					setDraft(value);
-				}
-			},
+			restoreSubmittedDraft: (sessionId, value) => restoreSubmittedDraft(sessionId, value),
 			clearSession: (sessionId) => {
+				pendingSubmittedDraftsRef.current.delete(composerDraftKey(sessionId));
 				storeDraft(sessionId, "");
 				if (selectedIdRef.current === sessionId) {
 					draftRef.current = "";
@@ -127,7 +185,7 @@ export const Composer = memo(function Composer({
 				composerHandleRef.current = null;
 			}
 		};
-	}, [composerHandleRef, setDraftValue, storeDraft]);
+	}, [composerHandleRef, restoreSubmittedDraft, setDraftValue, storeDraft]);
 
 	const slashState = useMemo<{ visible: boolean; commands: typeof COMMANDS }>(() => {
 		const prefix = matchSlashPrefix(draft);
@@ -156,12 +214,18 @@ export const Composer = memo(function Composer({
 		const text = draftRef.current.trim();
 		if (!text || sending) return;
 		const submittedSessionId = selectedIdRef.current;
-		storeDraft(submittedSessionId, "");
-		setDraftValue("");
+		const submittedVersion = storeDraft(submittedSessionId, text);
+		pendingSubmittedDraftsRef.current.set(composerDraftKey(submittedSessionId), { value: text, version: submittedVersion });
+		draftRef.current = "";
+		setDraft("");
 		requestAnimationFrame(() => textAreaRef.current?.focus());
 		const accepted = await onSubmit(text);
-		if (!accepted && !draftRef.current.trim()) setDraftValue(text);
-	}, [onSubmit, sending, setDraftValue, storeDraft]);
+		if (accepted) {
+			clearSubmittedDraft(submittedSessionId, text, submittedVersion);
+		} else {
+			restoreSubmittedDraft(submittedSessionId, text, submittedVersion);
+		}
+	}, [clearSubmittedDraft, onSubmit, restoreSubmittedDraft, sending, storeDraft]);
 
 	const onKeyDown = useCallback(
 		(event: KeyboardEvent<HTMLTextAreaElement>) => {
