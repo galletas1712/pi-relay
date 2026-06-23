@@ -88,7 +88,6 @@ import type {
 	SessionSnapshot,
 	SessionSummary,
 	Delegation,
-	HandoffFileName,
 	ToolListing,
 	TranscriptEntry,
 	TranscriptTreeNode,
@@ -1600,16 +1599,6 @@ export function App() {
 		[api, invalidateDelegations, loadedSnapshot?.session_id, pushNotice],
 	);
 
-	const readHandoffFile = useCallback(
-		async (delegationId: string, subagentId: string | null, file: HandoffFileName): Promise<string> => {
-			const parentSessionId = loadedSnapshot?.session_id;
-			if (!parentSessionId) throw new Error("select a session first");
-			const result = await api.readHandoffFile({ parentSessionId, delegationId, subagentId, file });
-			return result.content;
-		},
-		[api, loadedSnapshot?.session_id],
-	);
-
 	const resumeTerminalTurn = useCallback(
 		async (leafId?: string | null) => {
 			const sessionId = requireSelected();
@@ -2125,7 +2114,6 @@ export function App() {
 					runBoard={{
 						onCancelDelegation: cancelDelegation,
 						onReRunDelegation: reRunDelegation,
-						readHandoffFile,
 					}}
 					tools={tools}
 					onSelectSession={(sessionId) => {

@@ -31,6 +31,29 @@ export function delegationStatusLabel(status: DelegationStatus): string {
 	return DELEGATION_STATUS_LABELS[status] ?? status;
 }
 
+/** Map a delegation or subagent status to a `.status-rail` modifier class.
+ * In the run board, status is encoded ONLY by the rail color, so this is the
+ * single source of truth for that mapping. Subagent statuses add `idle`/`queued`
+ * ("waiting"), which fall back — like any unknown value — to the neutral `pending`
+ * rail (grey: waiting / not started, distinct from green `done`). The class names
+ * are CSS-safe (`warn` stands in for `done_with_failures`). */
+export function statusRailClass(status: string): string {
+	switch (status) {
+		case "running":
+			return "running";
+		case "done":
+			return "done";
+		case "done_with_failures":
+			return "warn";
+		case "failed":
+			return "failed";
+		case "cancelled":
+			return "cancelled";
+		default:
+			return "pending";
+	}
+}
+
 /** Whether a delegation can be re-run from the board. Keep this predicate in lockstep
  * with the actual reconstruction path so the UI never offers a re-run that the
  * click handler will reject. */

@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import { Inspector, RunBoardDelegationList, type RunBoardCallbacks } from "./panels.tsx";
-import type { HandoffFileName, SessionSnapshot, Delegation, ToolListing } from "./types.ts";
+import type { SessionSnapshot, Delegation, ToolListing } from "./types.ts";
 
 function delegation(overrides: Partial<Delegation> = {}): Delegation {
 	return {
@@ -50,7 +50,6 @@ function callbacks(): Omit<RunBoardCallbacks, "onSelectSession"> {
 	return {
 		onCancelDelegation: () => {},
 		onReRunDelegation: () => {},
-		readHandoffFile: (_delegationId: string, _subagentId: string | null, _file: HandoffFileName) => Promise.resolve(""),
 	};
 }
 
@@ -70,22 +69,15 @@ function renderInspector(delegations: Delegation[]): string {
 function renderRunBoardList({
 	delegations,
 	showAllDelegations = false,
-	openDebugDelegationIds = new Set<string>(),
 }: {
 	delegations: Delegation[];
 	showAllDelegations?: boolean;
-	openDebugDelegationIds?: ReadonlySet<string>;
 }): string {
 	return renderToStaticMarkup(
 		<RunBoardDelegationList
 			delegations={delegations}
 			showAllDelegations={showAllDelegations}
-			openDebugDelegationIds={openDebugDelegationIds}
-			openFile={null}
 			onToggleShowAllDelegations={() => {}}
-			onToggleDelegationDebug={() => {}}
-			onOpenFile={() => {}}
-			onCloseFile={() => {}}
 			onCancelDelegation={() => {}}
 			onReRunDelegation={() => {}}
 		/>,
@@ -147,55 +139,112 @@ describe("Inspector run board delegation list", () => {
 	});
 });
 
-describe("Inspector run board handoff details", () => {
-	it("hides handoff paths and artifact file names in the default completed-delegation render", () => {
+describe("Inspector run board status rails", () => {
+	it("encodes each delegation status as a colored, accessibly-labeled rail", () => {
+		const cases: { status: Delegation["status"]; rail: string; label: string }[] = [
+			{ status: "running", rail: "running", label: "running" },
+			{ status: "done", rail: "done", label: "done" },
+			{ status: "done_with_failures", rail: "warn", label: "done with failures" },
+			{ status: "failed", rail: "failed", label: "failed" },
+			{ status: "cancelled", rail: "cancelled", label: "cancelled" },
+		];
+		for (const { status, rail, label } of cases) {
+			const html = renderRunBoardList({ delegations: [delegation({ status })] });
+			expect(html, `${status} rail color`).toContain(`status-rail ${rail}`);
+			expect(html, `${status} rail aria-label`).toContain(`aria-label="${label}"`);
+			expect(html, `${status} rail title`).toContain(`title="${label}"`);
+			expect(html, `${status} rail role`).toContain('role="img"');
+		}
+	});
+
+	it("encodes subagent status as its own rail with the human-readable status as the accessible name", () => {
+		const html = renderRunBoardList({
+			delegations: [
+				delegation({
+					status: "running",
+					subagents: [
+						{ id: "done-child", status: "done", activity: "idle", role: "explorer", subagent_type: "read_only" },
+						{ id: "running-child", status: "running", activity: "running", role: "explorer", subagent_type: "read_only" },
+						{ id: "waiting-child", status: "queued", activity: "queued", role: "explorer", subagent_type: "read_only" },
+					],
+				}),
+			],
+		});
+
+		// done -> done, running -> running, queued -> neutral pending rail.
+		expect(html).toContain(`status-rail done`);
+		expect(html).toContain(`status-rail running`);
+		expect(html).toContain(`status-rail pending`);
+		expect(html).toContain(`aria-label="done"`);
+		expect(html).toContain(`aria-label="running"`);
+		expect(html).toContain(`aria-label="queued"`);
+		expect(html).toContain(`title="queued"`);
+	});
+});
+
+describe("Inspector run board streamlined content", () => {
+	it("drops the status pills, progress counts, suggested_next, and handoff/artifact clutter", () => {
 		const html = renderInspector([
 			delegation({
-				status: "done_with_failures",
+				status: "running",
+				kind: "readonly_fanout",
+				label: "fan-out",
+				progress: { expected: 2, spawned: 2, terminal: 1, running: 1, failed: 0 },
 				subagents: [
 					{
-						id: "child-1",
+						id: "done-child",
 						status: "done",
 						activity: "idle",
-						role: "reviewer",
+						role: "explorer",
 						subagent_type: "read_only",
-						task_prompt_file: "child-1/task_prompt.md",
-						final_message_file: "child-1/final_message.md",
-						transcript_file: "child-1/transcript.md",
-						suggested_next: "approved",
+						task_prompt_file: "done-child/task_prompt.md",
+						final_message_file: "done-child/final_message.md",
+						transcript_file: "done-child/transcript.md",
+						suggested_next: "done",
+					},
+					{
+						id: "running-child",
+						status: "running",
+						activity: "running",
+						role: "explorer",
+						subagent_type: "read_only",
+						task_prompt_file: "running-child/task_prompt.md",
+						suggested_next: null,
 					},
 				],
 			}),
 		]);
 
+		// Title and kind tag survive.
+		expect(html).toContain("fan-out");
+		expect(html).toContain("run-board-delegation-kind");
+		// Status is carried only by the rail now.
+		expect(html).toContain("status-rail running");
+		// Removed: the activity/status pill, progress text, suggested_next, handoff path, artifact names.
+		expect(html).not.toContain("subagent-activity");
+		expect(html).not.toContain("run-board-progress");
+		expect(html).not.toContain("run-board-subagent-summary");
+		expect(html).not.toContain("1/2 terminal, 1 running, 0 failed");
+		expect(html).not.toContain("suggested next");
 		expect(html).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
 		expect(html).not.toContain("/workspace/.pi-handoff/delegation-1");
 		expect(html).not.toContain("final_message.md");
 		expect(html).not.toContain("transcript.md");
 		expect(html).not.toContain("task_prompt.md");
-		expect(html).not.toContain("index.json");
-		expect(html).toContain("suggested next");
-		expect(html).toContain("approved");
-		expect(html).not.toContain("Reviewed the patch");
 	});
 
-	it("reveals artifact actions and handoff path only in debug details", () => {
-		const html = renderRunBoardList({
-			delegations: [delegation({ status: "done_with_failures" })],
-			openDebugDelegationIds: new Set(["delegation-1"]),
-		});
+	it("removes the details toggle and any artifact file viewer", () => {
+		const html = renderRunBoardList({ delegations: [delegation({ status: "done_with_failures" })] });
 
-		expect(html).toContain("handoff /workspace/.pi-handoff/delegation-1");
-		expect(html).toContain("final_message.md");
-		expect(html).toContain("transcript.md");
-		expect(html).toContain("final message");
-		expect(html).toContain("transcript");
-		expect(html).not.toContain("task_prompt.md");
-		expect(html).not.toContain("task prompt");
-		expect(html).not.toContain("index.json");
+		expect(html).not.toContain("details");
+		expect(html).not.toContain("hide details");
+		expect(html).not.toContain("run-board-debug");
+		expect(html).not.toContain("run-board-handoff-links");
+		expect(html).not.toContain("run-board-handoff-path");
+		expect(html).not.toContain("run-board-file");
 	});
 
-	it("keeps cancellation transcript debug-only while preserving status", () => {
+	it("keeps a cancelled delegation's status on its rail without exposing the cancellation transcript", () => {
 		const cancelled = delegation({
 			status: "cancelled",
 			subagents: [
@@ -211,67 +260,11 @@ describe("Inspector run board handoff details", () => {
 			],
 		});
 
-		const initial = renderRunBoardList({ delegations: [cancelled] });
-		expect(initial).toContain("cancelled");
-		expect(initial).not.toContain("handoff /workspace/.pi-handoff/delegation-1");
-		expect(initial).not.toContain("cancellation transcript");
-		expect(initial).not.toContain("cancelled/child-1.transcript.md");
-		expect(initial).not.toContain("index.json");
-
-		const debug = renderRunBoardList({
-			delegations: [cancelled],
-			openDebugDelegationIds: new Set(["delegation-1"]),
-		});
-		expect(debug).toContain("handoff /workspace/.pi-handoff/delegation-1");
-		expect(debug).toContain("cancellation transcript");
-		expect(debug).toContain("cancelled/child-1.transcript.md");
-		expect(debug).not.toContain("index.json");
-	});
-
-	it("renders compact terminal subagent status and suggested_next without inline prose", () => {
-		const html = renderRunBoardList({
-			delegations: [
-				delegation({
-					status: "running",
-					kind: "readonly_fanout",
-					label: "fan-out",
-					progress: { expected: 2, spawned: 2, terminal: 1, running: 1, failed: 0 },
-					subagents: [
-						{
-							id: "done-child",
-							status: "done",
-							activity: "idle",
-							role: "explorer",
-							subagent_type: "read_only",
-							task_prompt_file: "done-child/task_prompt.md",
-							transcript_file: null,
-							final_message_file: null,
-							suggested_next: "done",
-						},
-						{
-							id: "running-child",
-							status: "running",
-							activity: "running",
-							role: "explorer",
-							subagent_type: "read_only",
-							task_prompt_file: "running-child/task_prompt.md",
-							transcript_file: null,
-							suggested_next: null,
-						},
-					],
-				}),
-			],
-		});
-
-		expect(html).toContain("fan-out");
-		expect(html).toContain("1/2 terminal, 1 running, 0 failed");
-		expect(html).toContain("done</span>");
-		expect(html).toContain("idle</span>");
-		expect(html).toContain("suggested next");
-		expect(html).toContain("done");
-		expect(html).not.toContain("Found the answer");
-		expect(html).not.toContain("final_message.md");
-		expect(html).not.toContain("transcript.md");
+		const html = renderRunBoardList({ delegations: [cancelled] });
+		expect(html).toContain("status-rail cancelled");
+		expect(html).toContain(`aria-label="cancelled"`);
+		expect(html).not.toContain("cancellation transcript");
+		expect(html).not.toContain("cancelled/child-1.transcript.md");
 	});
 });
 
@@ -301,12 +294,17 @@ describe("Inspector run board primary controls", () => {
 		expect(html).toContain("cancel");
 		expect(html).toContain("open child-full-1");
 		expect(html).not.toContain("steer");
+		expect(html).not.toContain("suggested next");
 	});
 
-	it("keeps the re-run control for terminal re-runnable delegations", () => {
-		const html = renderInspector([delegation({ status: "done" })]);
+	it("keeps the re-run control for terminal re-runnable delegations and not while running", () => {
+		const terminal = renderInspector([delegation({ status: "done" })]);
+		expect(terminal).toContain("re-run");
+		expect(terminal).not.toContain("cancel");
+		expect(terminal).not.toContain("steer");
 
-		expect(html).toContain("re-run");
-		expect(html).not.toContain("steer");
+		const running = renderInspector([delegation({ status: "running" })]);
+		expect(running).toContain("cancel");
+		expect(running).not.toContain("re-run");
 	});
 });
