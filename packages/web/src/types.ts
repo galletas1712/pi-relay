@@ -44,6 +44,7 @@ export interface SessionSummary {
 	updated_at: string;
 	last_user_message_timestamp_ms?: number | null;
 	has_transcript_entries?: boolean;
+	has_running_delegations?: boolean;
 }
 
 export interface PendingAction {

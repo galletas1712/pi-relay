@@ -1,7 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
-import { Inspector, RunBoardDelegationList, type RunBoardCallbacks } from "./panels.tsx";
-import type { SessionSnapshot, Delegation, ToolListing } from "./types.ts";
+import { Inspector, RunBoardDelegationList, SessionRow, type RunBoardCallbacks } from "./panels.tsx";
+import type { SessionSnapshot, SessionSummary, Delegation, ToolListing } from "./types.ts";
 
 function delegation(overrides: Partial<Delegation> = {}): Delegation {
 	return {
@@ -327,5 +327,62 @@ describe("Inspector run board primary controls", () => {
 		const running = renderInspector([delegation({ status: "running" })]);
 		expect(running).toContain("cancel");
 		expect(running).not.toContain("re-run");
+	});
+});
+
+describe("SessionRow sidebar delegating state", () => {
+	function summary(overrides: Partial<SessionSummary> = {}): SessionSummary {
+		return {
+			session_id: "parent-1",
+			project_id: null,
+			outer_cwd: "/workspace",
+			workspaces: [],
+			activity: "idle",
+			active_leaf_id: null,
+			provider: { kind: "openai", model: "gpt-test" },
+			metadata: {},
+			created_at: "2024-01-01T00:00:00Z",
+			updated_at: "2024-01-01T00:00:00Z",
+			...overrides,
+		};
+	}
+
+	function renderRow(session: SessionSummary): string {
+		return renderToStaticMarkup(
+			<SessionRow
+				session={session}
+				selected={false}
+				onSelect={() => {}}
+				onRename={() => {}}
+				onArchiveToggle={() => {}}
+				onDelete={() => {}}
+			/>,
+		);
+	}
+
+	it("renders the delegating rail and disables archive/delete for an idle parent with running subagents", () => {
+		const html = renderRow(summary({ activity: "idle", has_running_delegations: true }));
+		// Third state: idle parent parked behind a running delegation.
+		expect(html).toContain("status-rail delegating");
+		expect(html).not.toContain("status-rail idle");
+		// Archive and delete are gated off while subagents run.
+		expect(html).toContain('aria-disabled="true"');
+		expect(html).toContain("only idle sessions with no running subagents can be archived");
+		expect(html).toContain("only idle sessions with no running subagents can be deleted");
+	});
+
+	it("keeps the idle rail and enables archive/delete when no delegations run", () => {
+		const html = renderRow(summary({ activity: "idle", has_running_delegations: false }));
+		expect(html).toContain("status-rail idle");
+		expect(html).not.toContain("status-rail delegating");
+		expect(html).toContain("archive session");
+		expect(html).toContain("delete session");
+		expect(html).not.toContain("no running subagents");
+	});
+
+	it("shows the running rail when the parent itself is active", () => {
+		const html = renderRow(summary({ activity: "running", has_running_delegations: false }));
+		expect(html).toContain("status-rail running");
+		expect(html).not.toContain("status-rail delegating");
 	});
 });

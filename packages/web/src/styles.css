@@ -677,6 +677,15 @@ pre {
 	background: var(--success);
 }
 
+/* `delegating` = idle parent parked behind >=1 running subagent. A 3px bar can't
+   render the dashed border the `.session-state.delegating` pill uses, so echo
+   "running but delegated" with a static segmented primary fill (distinct from
+   the solid `.running` primary and the solid `.idle` success). No pulse: many
+   rows render this at once. */
+.status-rail.delegating {
+	background: repeating-linear-gradient(180deg, var(--primary) 0 5px, color-mix(in oklch, var(--primary) 25%, transparent) 5px 9px);
+}
+
 .session-main {
 	display: flex;
 	min-width: 0;

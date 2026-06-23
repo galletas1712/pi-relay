@@ -34,6 +34,7 @@ pub(crate) fn session_summary(summary: SessionSummary) -> Value {
         "updated_at": summary.updated_at,
         "last_user_message_timestamp_ms": summary.last_user_message_timestamp_ms,
         "has_transcript_entries": summary.has_transcript_entries,
+        "has_running_delegations": summary.has_running_delegations,
     })
 }
 

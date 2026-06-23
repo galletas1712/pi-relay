@@ -20,7 +20,7 @@ import { COMMANDS } from "./slash.ts";
 import {
 	isArchivedSession,
 	projectTitle,
-	sessionDisplayActivity,
+	sessionStatusWithDelegations,
 	sessionTitle,
 	type SessionDisplayActivity,
 	type SessionStatus,
@@ -583,13 +583,14 @@ export function SessionRow({
 	onDelete: () => void;
 }) {
 	const archived = isArchivedSession(session);
-	const displayActivity = sessionDisplayActivity(session);
-	const canArchive = session.activity === "idle";
-	const canDelete = session.activity === "idle";
+	const status = sessionStatusWithDelegations(session.activity, session.has_running_delegations ?? false);
+	const idleAndQuiet = session.activity === "idle" && !(session.has_running_delegations ?? false);
+	const canArchive = idleAndQuiet;
+	const canDelete = idleAndQuiet;
 	const ArchiveIcon = archived ? ArchiveRestore : Archive;
 	return (
 		<button className={`session-row ${selected ? "selected" : ""} ${archived ? "archived" : ""}`} type="button" onClick={onSelect}>
-			<span className={`status-rail ${archived ? "archived" : displayActivity}`} />
+			<span className={`status-rail ${archived ? "archived" : status}`} />
 			<span className="session-main">
 				<span className="session-title">{sessionTitle(session)}</span>
 				<span className="session-sub">
@@ -623,7 +624,7 @@ export function SessionRow({
 					className={`session-row-action ${canArchive ? "" : "disabled"}`}
 					role="button"
 					tabIndex={canArchive ? 0 : -1}
-					title={canArchive ? (archived ? "unarchive session" : "archive session") : "only idle sessions can be archived"}
+					title={canArchive ? (archived ? "unarchive session" : "archive session") : "only idle sessions with no running subagents can be archived"}
 					aria-label={`${archived ? "unarchive" : "archive"} ${sessionTitle(session)}`}
 					aria-disabled={!canArchive}
 					onClick={(event) => {
@@ -643,7 +644,7 @@ export function SessionRow({
 					className={`session-row-action danger ${canDelete ? "" : "disabled"}`}
 					role="button"
 					tabIndex={canDelete ? 0 : -1}
-					title={canDelete ? "delete session" : "only idle sessions can be deleted"}
+					title={canDelete ? "delete session" : "only idle sessions with no running subagents can be deleted"}
 					aria-label={`delete ${sessionTitle(session)}`}
 					aria-disabled={!canDelete}
 					onClick={(event) => {
