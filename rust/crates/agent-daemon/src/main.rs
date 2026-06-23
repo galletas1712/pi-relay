@@ -1030,13 +1030,24 @@ async fn events_subscribe(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
+    let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
+    let recovered_ms = started_at.elapsed().as_millis();
     let after_event_id = params.get("after_event_id").and_then(Value::as_i64);
     subscriptions.insert(session_id.clone());
     let Some(after_event_id) = after_event_id else {
         let current = state.repo.last_event_id(&session_id).await?;
-        event_high_water.insert(session_id, current);
+        let loaded_ms = started_at.elapsed().as_millis();
+        event_high_water.insert(session_id.clone(), current);
+        if perf_logging_enabled() {
+            eprintln!(
+                "perf events.subscribe session={session_id} after_event_id=None replayed=0 acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms=0 total_ms={loaded_ms}",
+                recovered_ms.saturating_sub(acquired_ms),
+                loaded_ms.saturating_sub(recovered_ms),
+            );
+        }
         return Ok(json!({ "replayed": [] }));
     };
     event_high_water.insert(session_id.clone(), after_event_id);
@@ -1044,13 +1055,25 @@ async fn events_subscribe(
         .repo
         .events_after(&session_id, Some(after_event_id))
         .await?;
+    let loaded_ms = started_at.elapsed().as_millis();
+    let replayed_count = events.len();
     let replayed_max = events
         .iter()
         .map(|event| event.event_id)
         .max()
         .unwrap_or(after_event_id);
     event_high_water.insert(session_id.clone(), replayed_max);
-    Ok(json!({ "replayed": events }))
+    let value = json!({ "replayed": events });
+    let total_ms = started_at.elapsed().as_millis();
+    if perf_logging_enabled() {
+        eprintln!(
+            "perf events.subscribe session={session_id} after_event_id={after_event_id} replayed={replayed_count} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
+            recovered_ms.saturating_sub(acquired_ms),
+            loaded_ms.saturating_sub(recovered_ms),
+            total_ms.saturating_sub(loaded_ms),
+        );
+    }
+    Ok(value)
 }
 
 fn events_unsubscribe(
@@ -1595,8 +1618,11 @@ async fn transcript_turn_detail(
     let leaf_id = required_string(&params, "leaf_id")?;
     let start_sequence = required_i64(&params, "start_sequence")?;
     let end_sequence = required_i64(&params, "end_sequence")?;
+    let started_at = Instant::now();
     let driver = SessionDriver::acquire(state, &session_id).await;
+    let acquired_ms = started_at.elapsed().as_millis();
     driver.recover_if_needed().await?;
+    let recovered_ms = started_at.elapsed().as_millis();
     let result = state
         .repo
         .transcript_turn_detail(
@@ -1608,7 +1634,19 @@ async fn transcript_turn_detail(
             TranscriptEntryBodyMode::Ui,
         )
         .await?;
-    Ok(rpc_views::transcript_turn_detail(result))
+    let loaded_ms = started_at.elapsed().as_millis();
+    let entry_count = result.entries.len();
+    let value = rpc_views::transcript_turn_detail(result);
+    let total_ms = started_at.elapsed().as_millis();
+    if perf_logging_enabled() {
+        eprintln!(
+            "perf transcript.turn_detail session={session_id} card={card_id} leaf={leaf_id} start_sequence={start_sequence} end_sequence={end_sequence} entries={entry_count} acquire_ms={acquired_ms} recover_ms={} load_ms={} view_ms={} total_ms={total_ms}",
+            recovered_ms.saturating_sub(acquired_ms),
+            loaded_ms.saturating_sub(recovered_ms),
+            total_ms.saturating_sub(loaded_ms),
+        );
+    }
+    Ok(value)
 }
 
 async fn history_tree(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {

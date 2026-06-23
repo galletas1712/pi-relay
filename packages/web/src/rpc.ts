@@ -15,6 +15,8 @@ interface RpcResponse<T> {
 type Pending = {
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
+	method: string;
+	startedAt: number;
 };
 
 export type ConnectionStatus = "connecting" | "open" | "closed" | "error";
@@ -152,7 +154,9 @@ export class AgentRpcClient implements RpcClient {
 		const promise = new Promise<T>((resolve, reject) => {
 			this.pending.set(id, {
 				resolve: (value) => resolve(value as T),
-				reject
+				reject,
+				method,
+				startedAt: perfNow()
 			});
 		});
 		ws.send(JSON.stringify({ id, method, params }));
@@ -180,6 +184,14 @@ export class AgentRpcClient implements RpcClient {
 			const pending = this.pending.get(data.id);
 			if (!pending) return;
 			this.pending.delete(data.id);
+			if (shouldLogPerf) {
+				perfLog("rpc response", {
+					method: pending.method,
+					ok: data.ok,
+					roundtripMs: Math.round(perfNow() - pending.startedAt),
+					pending: this.pending.size,
+				});
+			}
 			if (data.ok) {
 				pending.resolve(data.result);
 			} else {

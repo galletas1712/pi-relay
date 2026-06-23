@@ -960,6 +960,18 @@ export function App() {
 				if (options.mode === "manual") setExpandedTurnIds((current) => new Set(current).add(cardId));
 				return;
 			}
+			const shouldLogPerf = perfEnabled();
+			const startedAt = perfNow();
+			if (shouldLogPerf) {
+				perfLog("transcript.turn_detail start", {
+					sessionId,
+					cardId,
+					mode: options.mode,
+					startSequence: card.start_sequence,
+					endSequence: card.end_sequence,
+					sequenceSpan: card.end_sequence - card.start_sequence + 1,
+				});
+			}
 			if (options.mode === "manual") setLoadingTurnId(cardId);
 			else setAutoLoadingTurnId(cardId);
 			try {
@@ -969,14 +981,38 @@ export function App() {
 					startSequence: card.start_sequence,
 					endSequence: card.end_sequence,
 				});
+				const rpcMs = perfNow() - startedAt;
 				if (selectedRef.current !== sessionId) return;
 				let applied = false;
+				const applyStartedAt = perfNow();
 				updateSelectedCache((current) => {
 					const detail = applyTurnDetail(current.sessionId === sessionId ? current : selectedCacheRef.current, sessionId, result.card_id, result.entries);
 					applied = detail.applied;
 					return detail.cache;
 				});
+				const applyMs = perfNow() - applyStartedAt;
 				if (applied && options.mode === "manual") setExpandedTurnIds((current) => new Set(current).add(result.card_id));
+				if (shouldLogPerf) {
+					perfLog("transcript.turn_detail end", {
+						sessionId,
+						cardId: result.card_id,
+						mode: options.mode,
+						applied,
+						entries: result.entries.length,
+						approxBytes: approximateJsonSize(result),
+						rpcMs: Math.round(rpcMs),
+						applyMs: Math.round(applyMs),
+						totalBeforePaintMs: Math.round(perfNow() - startedAt),
+					});
+					requestAnimationFrame(() => {
+						perfLog("transcript.turn_detail paint", {
+							sessionId,
+							cardId: result.card_id,
+							mode: options.mode,
+							totalMs: Math.round(perfNow() - startedAt),
+						});
+					});
+				}
 			} catch (error) {
 				if (selectedRef.current === sessionId) pushNotice("error", errorMessage(error));
 			} finally {
