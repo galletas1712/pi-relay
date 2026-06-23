@@ -674,6 +674,26 @@ pre {
 	background: var(--success);
 }
 
+.status-rail.pending {
+	background: var(--muted-foreground);
+}
+
+.status-rail.done {
+	background: var(--success);
+}
+
+.status-rail.warn {
+	background: var(--warning);
+}
+
+.status-rail.failed {
+	background: var(--destructive);
+}
+
+.status-rail.cancelled {
+	background: var(--muted-foreground);
+}
+
 .session-main {
 	display: flex;
 	min-width: 0;
@@ -3069,25 +3089,6 @@ pre {
 	gap: 4px;
 }
 
-.subagent-activity {
-	flex: 0 0 auto;
-	border: 1px solid var(--border);
-	border-radius: 999px;
-	padding: 2px 7px;
-	font-size: var(--text-2xs);
-	color: var(--muted-foreground);
-}
-
-.subagent-activity.running {
-	border-color: color-mix(in oklch, var(--primary) 40%, var(--border));
-	color: var(--primary);
-}
-
-.subagent-activity.idle {
-	border-color: color-mix(in oklch, var(--success) 40%, var(--border));
-	color: var(--success);
-}
-
 .run-board {
 	display: flex;
 	flex-direction: column;
@@ -3132,32 +3133,7 @@ pre {
 	color: var(--muted-foreground);
 }
 
-.run-board-handoff-path {
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-	color: var(--muted-foreground);
-	font-family: var(--font-mono);
-	font-size: var(--text-2xs);
-}
-
-.run-board-progress,
-.run-board-subagent-summary {
-	display: flex;
-	flex-wrap: wrap;
-	gap: 6px;
-	color: var(--muted-foreground);
-	font-size: var(--text-2xs);
-	font-variant-numeric: tabular-nums;
-}
-
-.run-board-subagent-summary strong {
-	color: var(--foreground);
-	font-weight: 500;
-}
-
-.run-board-delegation-controls,
-.run-board-handoff-links {
+.run-board-delegation-controls {
 	display: flex;
 	flex-wrap: wrap;
 	gap: 6px;
@@ -3185,12 +3161,6 @@ pre {
 .chip-button:focus-visible {
 	outline: 2px solid var(--ring);
 	outline-offset: 2px;
-}
-
-.chip-button.pressed {
-	border-color: color-mix(in oklch, var(--primary) 48%, var(--border));
-	background: color-mix(in oklch, var(--primary) 9%, transparent);
-	color: var(--primary);
 }
 
 .run-board-toggle {
@@ -3222,49 +3192,6 @@ pre {
 	display: inline-flex;
 	align-items: center;
 	gap: 4px;
-}
-
-.run-board-debug {
-	display: flex;
-	flex-direction: column;
-	gap: 3px;
-	border: 1px solid var(--border);
-	border-radius: var(--radius-sm);
-	padding: 6px;
-	background: color-mix(in oklch, var(--muted) 60%, transparent);
-}
-
-.run-board-debug-row {
-	display: grid;
-	grid-template-columns: minmax(72px, max-content) minmax(0, 1fr);
-	gap: 8px;
-	align-items: baseline;
-	font-size: var(--text-2xs);
-}
-
-.run-board-debug-row span {
-	color: var(--muted-foreground);
-}
-
-.run-board-debug-row code {
-	min-width: 0;
-	overflow: hidden;
-	text-overflow: ellipsis;
-	white-space: nowrap;
-	font-family: var(--font-mono);
-}
-
-.run-board-file {
-	max-height: 240px;
-	overflow: auto;
-	margin: 0;
-	border: 1px solid var(--border);
-	border-radius: var(--radius-sm);
-	padding: 6px 8px;
-	background: var(--muted, transparent);
-	font-size: var(--text-2xs);
-	white-space: pre-wrap;
-	word-break: break-word;
 }
 
 .link-button {
