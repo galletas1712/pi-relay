@@ -1,6 +1,7 @@
 import {
 	Archive,
 	ArchiveRestore,
+	ArrowUp,
 	Bot,
 	Edit3,
 	Folder,
@@ -243,9 +244,8 @@ function RunBoard({
 	return (
 		<section className="inspect-section">
 			<h2>Run board</h2>
-			{!parentSessionId ? <p className="muted">No session selected.</p> : null}
-			{loading ? <p className="muted">Loading delegations…</p> : null}
-			{error ? <p className="error-text">{error}</p> : null}
+			{parentSessionId && loading ? <p className="muted">Loading delegations…</p> : null}
+			{parentSessionId && error ? <p className="error-text">{error}</p> : null}
 			{parentSessionId && !loading && !error && delegations.length === 0 ? <p className="muted">No delegations yet.</p> : null}
 			{parentSessionId && delegations.length > 0 ? (
 				<RunBoardDelegationList
@@ -260,6 +260,13 @@ function RunBoard({
 		</section>
 	);
 }
+
+type InspectorTab = "run-board" | "debug";
+
+const INSPECTOR_TABS: { id: InspectorTab; label: string }[] = [
+	{ id: "run-board", label: "Run board" },
+	{ id: "debug", label: "Inspector" },
+];
 
 export interface SidebarProps {
 	counts: Record<SessionDisplayActivity, number>;
@@ -669,6 +676,7 @@ export function LogHeader({
 	archived,
 	status,
 	title,
+	parentSessionId,
 	modelOptions,
 	modelValue,
 	modelDisabled,
@@ -677,12 +685,14 @@ export function LogHeader({
 	reasoningEffort,
 	onModelChange,
 	onReasoningEffortChange,
+	onSelectSession,
 	rightOpen,
 	onToggleRight
 }: {
 	archived: boolean;
 	status: SessionStatus | null;
 	title: string | null;
+	parentSessionId?: string | null;
 	modelOptions: { id: string; label: string }[];
 	modelValue: string;
 	modelDisabled: boolean;
@@ -691,30 +701,47 @@ export function LogHeader({
 	reasoningEffort: ReasoningEffort;
 	onModelChange: (value: string) => void;
 	onReasoningEffortChange: (value: ReasoningEffort) => void;
+	onSelectSession?: (sessionId: string) => void;
 	rightOpen: boolean;
 	onToggleRight: () => void;
 }) {
+	const statusLabel = archived ? "archived session" : status ? `${status} session` : null;
 	return (
 		<div className="log-header">
 			{title ? (
-				<span className={`session-state ${archived ? "archived" : status ?? "idle"}`}>
-					{archived ? "archived" : status}
+				<span
+					className={`session-status-icon ${archived ? "archived" : status ?? "idle"}`}
+					role="img"
+					aria-label={statusLabel ?? undefined}
+					title={statusLabel ?? undefined}
+				>
+					<Bot size={14} aria-hidden />
 				</span>
 			) : null}
 			{title ? (
 				<span className="log-session">
 					{title}
 				</span>
-			) : (
-				<span className="log-session">No session selected</span>
-			)}
+			) : null}
+			{title && parentSessionId ? (
+				<button
+					className="parent-session-link"
+					type="button"
+					onClick={() => onSelectSession?.(parentSessionId)}
+					title={`open parent ${parentSessionId}`}
+				>
+					<ArrowUp size={12} aria-hidden />
+					parent
+				</button>
+			) : null}
 			<div className="log-controls">
-				<label className="header-select">
-					<span>model</span>
+				<label className="header-select" title={modelDisabledTitle}>
+					<span className="sr-only">Model</span>
 					<select
 						value={modelValue}
 						disabled={modelDisabled}
 						title={modelDisabledTitle}
+						aria-label="Model"
 						onChange={(event) => onModelChange(event.target.value)}
 					>
 						{modelOptions.map((option) => (
@@ -723,10 +750,11 @@ export function LogHeader({
 					</select>
 				</label>
 				<label className="header-select compact">
-					<span>effort</span>
+					<span className="sr-only">Reasoning effort</span>
 					<select
 						value={reasoningEffort}
-						title="reasoning effort"
+						title="Reasoning effort"
+						aria-label="Reasoning effort"
 						onChange={(event) => onReasoningEffortChange(event.target.value as ReasoningEffort)}
 					>
 						{reasoningEfforts.map((effort) => (
@@ -782,96 +810,128 @@ export function Inspector({
 	onSelectSession?: (sessionId: string) => void;
 	onClose?: () => void;
 }) {
+	const [activeTab, setActiveTab] = useState<InspectorTab>("run-board");
 	return (
 		<div className="inspector-inner">
 			<div className="inspector-head">
 				<Settings size={14} />
-				<span>inspector</span>
+				<span>Session panel</span>
 				<button className="plain-close-button inspector-close" type="button" onClick={onClose} aria-label="close inspector">
 					<X size={14} />
 				</button>
 			</div>
-			<section className="inspect-section">
-				<h2>Session</h2>
-				{snapshot ? (
-					<>
-						<div className="kv">
-							<span>activity</span>
-							<strong>{snapshot.activity}</strong>
+			<div className="inspector-tabs" role="tablist" aria-label="session panel tabs">
+				{INSPECTOR_TABS.map((tab) => (
+					<button
+						key={tab.id}
+						className={`inspector-tab ${activeTab === tab.id ? "active" : ""}`}
+						type="button"
+						role="tab"
+						id={`inspector-tab-${tab.id}`}
+						aria-selected={activeTab === tab.id}
+						aria-controls={`inspector-panel-${tab.id}`}
+						onClick={() => setActiveTab(tab.id)}
+					>
+						{tab.label}
+					</button>
+				))}
+			</div>
+			{activeTab === "run-board" ? (
+				<div
+					className="inspector-tab-panel"
+					role="tabpanel"
+					id="inspector-panel-run-board"
+					aria-labelledby="inspector-tab-run-board"
+				>
+					<RunBoard
+						parentSessionId={snapshot?.session_id ?? null}
+						delegations={delegations}
+						loading={delegationsLoading}
+						error={delegationsError}
+						onSelectSession={onSelectSession}
+						onCancelDelegation={runBoard.onCancelDelegation}
+						onReRunDelegation={runBoard.onReRunDelegation}
+					/>
+				</div>
+			) : (
+				<div
+					className="inspector-tab-panel"
+					role="tabpanel"
+					id="inspector-panel-debug"
+					aria-labelledby="inspector-tab-debug"
+				>
+					<section className="inspect-section">
+						<h2>Session</h2>
+						{snapshot ? (
+							<>
+								<div className="kv">
+									<span>activity</span>
+									<strong>{snapshot.activity}</strong>
+								</div>
+								<div className="kv">
+									<span>archived</span>
+									<strong>{snapshot.metadata.archived === true ? "yes" : "no"}</strong>
+								</div>
+								<div className="kv">
+									<span>parent</span>
+									{snapshot.parent_session_id ? (
+										<button
+											className="link-button"
+											type="button"
+											onClick={() => onSelectSession?.(snapshot.parent_session_id!)}
+											title={`open parent ${snapshot.parent_session_id}`}
+										>
+											{snapshot.parent_session_id.slice(0, 13)}
+										</button>
+									) : (
+										<strong>none</strong>
+									)}
+								</div>
+								<div className="kv">
+									<span>leaf</span>
+									<strong>{snapshot.active_leaf_id?.slice(0, 12) ?? "root"}</strong>
+								</div>
+								<div className="kv">
+									<span>metadata</span>
+									<strong>{Object.keys(snapshot.metadata).length}</strong>
+								</div>
+							</>
+						) : null}
+					</section>
+					<section className="inspect-section">
+						<h2>Pending</h2>
+						{snapshot?.pending_actions.length ? (
+							<div className="pending-list">
+								{snapshot.pending_actions.map((action) => (
+									<div className="pending-row" key={action.action_row_id}>
+										<span>{pendingActionLabel(action)}</span>
+										<code>{action.action_row_id.slice(0, 12)}</code>
+									</div>
+								))}
+							</div>
+						) : (
+							<p className="muted">No active work.</p>
+						)}
+					</section>
+					<section className="inspect-section">
+						<h2>Tools</h2>
+						<div className="tool-list">
+							{tools.map((tool) => (
+								<span key={`${tool.kind}:${tool.name}`} title={tool.description || tool.name}>{tool.name}</span>
+							))}
 						</div>
-						<div className="kv">
-							<span>archived</span>
-							<strong>{snapshot.metadata.archived === true ? "yes" : "no"}</strong>
-						</div>
-						<div className="kv">
-							<span>parent</span>
-							{snapshot.parent_session_id ? (
-								<button
-									className="link-button"
-									type="button"
-									onClick={() => onSelectSession?.(snapshot.parent_session_id!)}
-									title={`open parent ${snapshot.parent_session_id}`}
-								>
-									{snapshot.parent_session_id.slice(0, 13)}
-								</button>
-							) : (
-								<strong>none</strong>
-							)}
-						</div>
-						<div className="kv">
-							<span>leaf</span>
-							<strong>{snapshot.active_leaf_id?.slice(0, 12) ?? "root"}</strong>
-						</div>
-						<div className="kv">
-							<span>metadata</span>
-							<strong>{Object.keys(snapshot.metadata).length}</strong>
-						</div>
-					</>
-				) : (
-					<p className="muted">No session selected.</p>
-				)}
-			</section>
-			<RunBoard
-				parentSessionId={snapshot?.session_id ?? null}
-				delegations={delegations}
-				loading={delegationsLoading}
-				error={delegationsError}
-				onSelectSession={onSelectSession}
-				onCancelDelegation={runBoard.onCancelDelegation}
-				onReRunDelegation={runBoard.onReRunDelegation}
-			/>
-			<section className="inspect-section">
-				<h2>Pending</h2>
-				{snapshot?.pending_actions.length ? (
-					<div className="pending-list">
-						{snapshot.pending_actions.map((action) => (
-							<div className="pending-row" key={action.action_row_id}>
-								<span>{pendingActionLabel(action)}</span>
-								<code>{action.action_row_id.slice(0, 12)}</code>
+					</section>
+					<section className="inspect-section commands">
+						<h2>Slash</h2>
+						{COMMANDS.map((command) => (
+							<div className="command-row" key={command.name}>
+								<code>/{command.name}</code>
+								<span>{command.argumentHint ?? ""}</span>
 							</div>
 						))}
-					</div>
-				) : (
-					<p className="muted">No active work.</p>
-				)}
-			</section>
-			<section className="inspect-section">
-				<h2>Tools</h2>
-				<div className="tool-list">
-					{tools.map((tool) => (
-						<span key={`${tool.kind}:${tool.name}`} title={tool.description || tool.name}>{tool.name}</span>
-					))}
+					</section>
 				</div>
-			</section>
-			<section className="inspect-section commands">
-				<h2>Slash</h2>
-				{COMMANDS.map((command) => (
-					<div className="command-row" key={command.name}>
-						<code>/{command.name}</code>
-						<span>{command.argumentHint ?? ""}</span>
-					</div>
-				))}
-			</section>
+			)}
 		</div>
 	);
 }
