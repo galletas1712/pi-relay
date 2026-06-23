@@ -81,6 +81,9 @@ import {
 } from "./workspaceScope.ts";
 import { WorkspaceScopePicker } from "./workspaceScopePicker.tsx";
 import type {
+	Activity,
+	Delegation,
+	DelegationSubagent,
 	EventFrame,
 	Notice,
 	Project,
@@ -88,7 +91,6 @@ import type {
 	ReasoningEffort,
 	SessionSnapshot,
 	SessionSummary,
-	Delegation,
 	ToolListing,
 	TranscriptEntry,
 	TranscriptTreeNode,
@@ -293,6 +295,10 @@ function canWarmBackgroundSession(session: SessionListItem): boolean {
 	if (session.metadata?.archived === true) return false;
 	if (session.metadata?.subagent === true) return false;
 	return true;
+}
+
+function subagentStatusNeedsWarm(status: DelegationSubagent["status"], activity?: Activity): boolean {
+	return activity === "running" || activity === "queued" || status === "running" || status === "queued";
 }
 
 export function App() {
@@ -591,6 +597,23 @@ export function App() {
 		() => delegations.flatMap((delegation) => delegation.subagents.map((subagent) => subagent.id)),
 		[delegations],
 	);
+	const backgroundSubagentWarmCandidates = useMemo(
+		() =>
+			delegations.flatMap((delegation) =>
+				delegation.subagents
+					.filter((subagent) => subagent.id !== selectedId)
+					.filter((subagent) => {
+						const cache = getSelectedCache(subagent.id);
+						if (!cache?.snapshot) return true;
+						if (cache.snapshot.activity !== subagent.activity && subagent.activity) return true;
+						if (cache.snapshot.has_transcript_entries && cache.turnOrder.length === 0) return true;
+						return subagentStatusNeedsWarm(subagent.status, subagent.activity) &&
+							!backgroundWarmUpdatedAt.current.has(subagent.id);
+					})
+					.map((subagent) => subagent.id),
+			),
+		[delegations, getSelectedCache, selectedId],
+	);
 	const reasoningEfforts = reasoningEffortsForProvider(activeProvider);
 	const hasTranscriptEntries =
 		loadedSnapshot?.has_transcript_entries ??
@@ -724,7 +747,7 @@ export function App() {
 
 	useEffect(() => {
 		if (connection !== "open") return;
-		const candidates = allKnownSessions
+		const sessionCandidates = allKnownSessions
 			.filter((session) => session.session_id !== selectedRef.current)
 			.filter(canWarmBackgroundSession)
 			.filter((session) =>
@@ -734,24 +757,38 @@ export function App() {
 					backgroundWarmUpdatedAt.current.get(session.session_id),
 				),
 			);
+		const candidates = [
+			...sessionCandidates.map((session) => ({
+				id: session.session_id,
+				updatedAt: session.updated_at,
+				label: "session",
+			})),
+			...backgroundSubagentWarmCandidates.map((sessionId) => ({
+				id: sessionId,
+				updatedAt: undefined,
+				label: "subagent",
+			})),
+		];
 		let availableSlots = Math.max(0, BACKGROUND_SESSION_WARM_CONCURRENCY - backgroundWarmInFlight.current.size);
-		for (const session of candidates) {
+		for (const candidate of candidates) {
 			if (availableSlots <= 0) break;
-			if (backgroundWarmInFlight.current.has(session.session_id)) continue;
+			if (backgroundWarmInFlight.current.has(candidate.id)) continue;
 			availableSlots -= 1;
-			backgroundWarmInFlight.current.add(session.session_id);
-			void warmBackgroundSession(session.session_id)
+			backgroundWarmInFlight.current.add(candidate.id);
+			void warmBackgroundSession(candidate.id)
 				.then((warmed) => {
-					if (warmed) backgroundWarmUpdatedAt.current.set(session.session_id, session.updated_at);
+					if (!warmed) return;
+					if (candidate.updatedAt) backgroundWarmUpdatedAt.current.set(candidate.id, candidate.updatedAt);
+					else backgroundWarmUpdatedAt.current.set(candidate.id, "subagent");
 				})
 				.catch((error) => {
-					console.warn("background session warm failed", session.session_id, error);
+					console.warn(`background ${candidate.label} warm failed`, candidate.id, error);
 				})
 				.finally(() => {
-					backgroundWarmInFlight.current.delete(session.session_id);
+					backgroundWarmInFlight.current.delete(candidate.id);
 				});
 		}
-	}, [allKnownSessions, connection, getSelectedCache, warmBackgroundSession]);
+	}, [allKnownSessions, backgroundSubagentWarmCandidates, connection, getSelectedCache, warmBackgroundSession]);
 
 	const loadOlderTranscriptTurns = useCallback(
 		async () => {
@@ -1089,6 +1126,7 @@ export function App() {
 
 			const refreshPlan = refreshPlanForEvent(event);
 			lastEventIds.current.set(event.session_id, event.event_id);
+			backgroundWarmUpdatedAt.current.delete(event.session_id);
 			let shouldSyncSelected = refreshPlan.syncSelected && event.session_id === selectedRef.current;
 			if (event.session_id === selectedRef.current) {
 				const queue = queueProjectionFromEvent(event);
