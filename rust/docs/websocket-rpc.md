@@ -1280,7 +1280,7 @@ Result:
 
 Returns one in-scope delegation as the canonical structured snapshot. The
 snapshot includes delegation metadata, progress counts, subagent roles/types,
-activity/status, steerability, `suggested_next` (when available), and compact
+activity/status, steerability, `outcome` (when available), and compact
 handoff file references. It does not inline full transcript, task prompt, or
 final-message bodies; read handoff files when detail is needed.
 
@@ -1310,7 +1310,7 @@ Result:
       "activity": "idle",
       "status": "done",
       "steerable": false,
-      "suggested_next": "approved",
+      "outcome": "approved",
       "final_message_file": null,
       "transcript_file": "session_.../transcript.md",
       "task_prompt_file": "session_.../task_prompt.md"
@@ -1390,7 +1390,7 @@ Result:
           "task_prompt_file": "session_.../task_prompt.md",
           "transcript_file": "session_.../transcript.md",
           "final_message_file": "session_.../final_message.md",
-          "suggested_next": "ready_for_review"
+          "outcome": "ready_for_review"
         }
       ],
       "handoff_dir": "/.../.pi-handoff/delegation_..."
@@ -1460,7 +1460,7 @@ are progress hints only. Parent-visible delegation completion is not a per-child
 the parent after the delegation barrier completes. The observation is stored as a
 typed `daemon_tool_observation` transcript item and is inspect-equivalent to
 `inspect_delegation`/`delegation.status`, including per-subagent
-`suggested_next` and artifact paths. Provider adapters
+`outcome` and artifact paths. Provider adapters
 render it as an adjacent synthetic `inspect_delegation` tool call/result pair;
 the UI renders it as a daemon/system observation card. Use
 `inspect_delegation`/`delegation.status` to refresh/recover state or inspect

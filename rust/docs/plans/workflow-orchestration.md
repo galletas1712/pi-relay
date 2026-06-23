@@ -197,7 +197,7 @@ stays bounded no matter how large a fan-out or transcript is.
   snapshot is gone and even when the subagent crashed.
 - The parent receives the same compact structured snapshot in the completion
   wakeup observation and can refresh it later with **`inspect_delegation`**. It
-  includes per-subagent status, `suggested_next`, and compact handoff file
+  includes per-subagent status, `outcome`, and compact handoff file
   references so the parent branches without parsing prose or reading files
   first.
 - The daemon then delivers the notification by enqueuing a typed
@@ -211,7 +211,7 @@ stays bounded no matter how large a fan-out or transcript is.
   {
     ...
     "final_message_file": "child/final_message.md",
-    "suggested_next": "approved",
+    "outcome": "approved",
     "transcript_file": "child/transcript.md"
   }
   ```
@@ -284,7 +284,7 @@ delegation tool calls. There is **no `workflow.*` tool surface**; stages carry
 an optional `workflow` label only so the run board can group them.
 
 **Soft control flow, hard signals.** The skill reads like a state machine, but it
-is parent-interpreted. What keeps it crisp is the **typed `suggested_next`
+is parent-interpreted. What keeps it crisp is the **typed `outcome`
 outcomes** each subagent reports in the `inspect_delegation` snapshot (the reviewer returns
 `approved | changes_requested`; the tester returns
 `pass | bugs_found | environment_issue`) — these are the edge labels the parent
@@ -304,7 +304,7 @@ outcomes each subagent reports in `inspect_delegation`.
 - reviewer    - read-only subagent(s) (review only; never write)
 - tester      - full subagent (runs the suite; reports results)
 
-## Outcomes (suggested_next, in inspect_delegation)
+## Outcomes (outcome, in inspect_delegation)
 - reviewer: approved | changes_requested
 - tester:   pass | bugs_found | environment_issue
 
@@ -429,7 +429,7 @@ orchestration surface.
 The parent session is the user's session and stays responsive: the user can steer
 the parent while a stage runs, and the parent asks the user directly when it needs
 a decision. A full subagent that needs the human ends with
-`suggested_next = human_needed`, which appears in its handoff `final_message.md`
+`outcome = human_needed`, which appears in its handoff `final_message.md`
 and the wakeup observation; the parent relays it. To intervene in a running stage the user
 cancels it or steers the full subagent. No blocked-run table, no signal artifact.
 
@@ -600,7 +600,7 @@ Reuse the dev harness that resolves model actions deterministically
   stages, more than one full subagent, and a second concurrent stage.
 - **Continue-where-left-off:** a crashed/interrupted subagent resumes its session
   from the recovered turn boundary; no git, no rollback.
-- **Typed outcomes:** a `suggested_next` outside a workflow skill's set is recorded
+- **Typed outcomes:** an `outcome` outside a workflow skill's set is recorded
   but does not crash the parent's branching.
 
 ## Design rules

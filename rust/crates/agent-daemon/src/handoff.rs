@@ -204,18 +204,27 @@ fn non_empty_text(message: &AssistantMessage) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
-/// Extract a typed `suggested_next` edge label from a final message: if the
-/// message's last non-empty line is `suggested_next: <value>`, return the raw
-/// `<value>`. It is recorded verbatim and never validated against a workflow's
-/// outcome set, so an out-of-set value is preserved (the parent branches on it
-/// with judgment) rather than crashing the handoff.
-pub(crate) fn extract_suggested_next(final_message: &str) -> Option<String> {
+/// Extract a typed `outcome` edge label from a final message: if the message's
+/// last non-empty line is `outcome: <value>`, return the raw `<value>`. It is
+/// recorded verbatim and never validated against a workflow's outcome set, so an
+/// out-of-set value is preserved (the parent branches on it with judgment)
+/// rather than crashing the handoff.
+///
+/// Legacy fallback: historical `final_message.md` artifacts emitted the line as
+/// `suggested_next: <value>` before this field was renamed to `outcome`. If no
+/// `outcome:` line is found, a trailing `suggested_next:` line is still accepted
+/// so those older artifacts continue to parse.
+pub(crate) fn extract_outcome(final_message: &str) -> Option<String> {
     let last_line = final_message
         .lines()
         .rev()
         .map(str::trim)
         .find(|line| !line.is_empty())?;
-    let value = last_line.strip_prefix("suggested_next:")?.trim();
+    let value = last_line
+        .strip_prefix("outcome:")
+        // Legacy fallback for pre-rename artifacts.
+        .or_else(|| last_line.strip_prefix("suggested_next:"))?
+        .trim();
     (!value.is_empty()).then(|| value.to_string())
 }
 
@@ -223,7 +232,7 @@ pub(crate) fn extract_suggested_next(final_message: &str) -> Option<String> {
 pub(crate) struct SubagentArtifact {
     pub(crate) session_id: String,
     pub(crate) terminal_status: Option<&'static str>,
-    pub(crate) suggested_next: Option<String>,
+    pub(crate) outcome: Option<String>,
     pub(crate) final_message_path: Option<PathBuf>,
     pub(crate) task_prompt_path: Option<PathBuf>,
 }
@@ -327,7 +336,7 @@ pub(crate) fn handoff_root(parent_outer_cwd: &str) -> PathBuf {
 ///
 /// This writes each subagent's exhaustive `transcript.md` on every call. When
 /// `include_final_messages` is true, it also writes `final_message.md`. Returned
-/// metadata may still include `suggested_next` for terminal subagents in a
+/// metadata may still include `outcome` for terminal subagents in a
 /// running delegation, but final-message prose is not returned to snapshots.
 /// Running inspections pass `false`: their transcript files are kept current,
 /// but no normal final-message artifact is published before the completion CAS
@@ -364,7 +373,7 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         let final_message = extract_final_message(&history);
         let transcript = render_transcript_markdown(&history);
         let status = terminal_subagent_status(&history);
-        let suggested_next = extract_suggested_next(&final_message);
+        let outcome = extract_outcome(&final_message);
         let include_final_content = match delegation.status {
             DelegationStatus::Running => is_terminal,
             DelegationStatus::Done | DelegationStatus::DoneWithFailures => true,
@@ -398,7 +407,7 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         artifacts.push(SubagentArtifact {
             session_id: subagent.session_id.clone(),
             terminal_status: is_terminal.then_some(status).flatten(),
-            suggested_next: include_final_content.then_some(suggested_next).flatten(),
+            outcome: include_final_content.then_some(outcome).flatten(),
             final_message_path,
             task_prompt_path: task_prompt.as_ref().map(|artifact| artifact.path.clone()),
         });

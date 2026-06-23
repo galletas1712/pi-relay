@@ -60,7 +60,7 @@ a single-flight, `attempt_id`-fenced barrier when all subagents of a delegation 
 terminal. After the DB finish CAS wins, the runner writes the handoff directory
 and then enqueues one `InputPriority::Steer` daemon observation to the parent.
 That observation includes the same structured snapshot shape as
-`inspect_delegation`, with `suggested_next` and compact handoff file
+`inspect_delegation`, with `outcome` and compact handoff file
 references.
 Completion is that typed wakeup observation/handoff, not a parent-visible per-child idle event. The
 runner never decides the next delegation — the parent does, guided by workflow
@@ -80,7 +80,7 @@ available for diagnostics and unsupported contexts.
 The snapshot never inlines full transcript bodies or raw subagent task prompts.
 Task prompts are materialized as per-subagent `task_prompt.md` handoff files,
 final messages are exposed through `final_message.md` file references, and
-`suggested_next` stays inline because workflows branch on it.
+`outcome` stays inline because workflows branch on it.
 
 Normal top-level parent model requests do not receive a daemon-generated
 delegation dashboard. They are transcript-driven: durable delegate tool results
@@ -94,7 +94,7 @@ text). After the provider returns, the daemon appends a fresh
 `## Delegation state at compaction time` section to the stored compaction
 summary. The ledger lists every delegation row for that parent session across
 all statuses (`running`, `done`, `done_with_failures`, `cancelled`, `failed`),
-with bounded subagent/progress details, `suggested_next` control data when
+with bounded subagent/progress details, `outcome` control data when
 available, and artifact paths. It does not refresh artifacts or inline
 transcript or final-message bodies. A `running` entry is a point-in-time compaction fact, not a
 final outcome; later completion observations or `inspect_delegation` provide fresh

@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::handoff::{
-    delegation_dir, extract_final_message, extract_suggested_next,
+    delegation_dir, extract_final_message, extract_outcome,
     refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
     safe_handoff_path_segment, task_prompt_rel, terminal_subagent_status, SubagentArtifact,
 };
@@ -13,7 +13,7 @@ use crate::types::RpcError;
 
 pub(crate) struct ListSubagentState {
     pub(crate) status: String,
-    pub(crate) suggested_next: Option<String>,
+    pub(crate) outcome: Option<String>,
 }
 
 pub(crate) fn progress_view(progress: DelegationProgress) -> Value {
@@ -35,28 +35,28 @@ pub(crate) async fn list_subagent_state(
         DelegationStatus::Running => {
             let history = state.repo.active_branch(subagent_id).await?;
             let terminal_status = terminal_subagent_status(&history);
-            let suggested_next = terminal_status
-                .and_then(|_| extract_suggested_next(&extract_final_message(&history)));
+            let outcome = terminal_status
+                .and_then(|_| extract_outcome(&extract_final_message(&history)));
             Ok(ListSubagentState {
                 status: terminal_status.unwrap_or("running").to_string(),
-                suggested_next,
+                outcome,
             })
         }
         DelegationStatus::Done | DelegationStatus::DoneWithFailures => {
             let history = state.repo.active_branch(subagent_id).await?;
             let terminal_status = terminal_subagent_status(&history);
-            let suggested_next = terminal_status
-                .and_then(|_| extract_suggested_next(&extract_final_message(&history)));
+            let outcome = terminal_status
+                .and_then(|_| extract_outcome(&extract_final_message(&history)));
             Ok(ListSubagentState {
                 status: terminal_status
                     .unwrap_or_else(|| delegation_status.as_str())
                     .to_string(),
-                suggested_next,
+                outcome,
             })
         }
         DelegationStatus::Cancelled | DelegationStatus::Failed => Ok(ListSubagentState {
             status: delegation_status.as_str().to_string(),
-            suggested_next: None,
+            outcome: None,
         }),
     }
 }
@@ -133,7 +133,7 @@ async fn subagent_has_active_runtime(state: &AppState, subagent_id: &str) -> boo
 ///
 /// This is also the canonical payload for terminal parent wakeups. It refreshes
 /// artifact files that are valid for the delegation's current status, includes
-/// per-subagent `suggested_next` values when available, and reports compact
+/// per-subagent `outcome` values when available, and reports compact
 /// handoff file references without inlining transcript, task-prompt, or
 /// final-message prose.
 pub(crate) async fn build_delegation_snapshot(
@@ -165,7 +165,7 @@ pub(crate) async fn build_delegation_snapshot(
         } else if delegation.status == DelegationStatus::Running {
             running_count += 1;
         }
-        let suggested_next = artifact.and_then(|artifact| artifact.suggested_next.clone());
+        let outcome = artifact.and_then(|artifact| artifact.outcome.clone());
         let final_message_file = artifact.and_then(SubagentArtifact::final_message_rel);
         let normal_transcript_file = artifact.map(SubagentArtifact::transcript_rel);
         let task_prompt_file = if let Some(artifact) = artifact {
@@ -229,7 +229,7 @@ pub(crate) async fn build_delegation_snapshot(
             "activity": subagent.activity,
             "status": status,
             "steerable": steerable,
-            "suggested_next": suggested_next,
+            "outcome": outcome,
             "final_message_file": final_message_file,
             "transcript_file": transcript_file,
             "task_prompt_file": task_prompt_file,
@@ -344,7 +344,7 @@ mod tests {
                 "id": "child_1",
                 "status": "done",
                 "final_message_file": "child_1/final_message.md",
-                "suggested_next": "approved",
+                "outcome": "approved",
                 "task_prompt_file": "child_1/task_prompt.md",
                 "transcript_file": "child_1/transcript.md",
             }],

@@ -15,7 +15,7 @@ snapshot.
 - reviewer    — read-only subagent(s) (review only; never write).
 - tester      — full subagent (runs the suite; reports results).
 
-## Outcomes (suggested_next, in the delegation snapshot)
+## Outcomes (outcome, in the delegation snapshot)
 - reviewer: approved | changes_requested
 - tester:   pass | bugs_found | environment_issue
 
@@ -49,7 +49,7 @@ Notes:
   snapshot into the next delegation's prompt. Read transcript/final-message
   files only when more detail is needed.
 - In each subagent's prompt, REQUIRE it to end its final message with a line
-  `suggested_next: <one of the outcomes above>` — that line is what
+  `outcome: <one of the outcomes above>` — that line is what
   the delivered snapshot records and you branch on; without it the recorded
   outcome is null.
 - Do not mark DONE without a tester `pass`.
