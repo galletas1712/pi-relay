@@ -14,10 +14,6 @@
 		"inlineSourceMap": false,
 		"moduleResolution": "Node16",
 		"resolveJsonModule": true,
-		"paths": {
-			"@pi-relay/agent-core": ["./packages/agent-core/dist/index.d.ts"],
-			"@pi-relay/agent-core/*": ["./packages/agent-core/dist/*"]
-		},
 		"allowImportingTsExtensions": false,
 		"experimentalDecorators": true,
 		"emitDecoratorMetadata": true,

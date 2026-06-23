@@ -7,15 +7,11 @@
 	],
 	"scripts": {
 		"clean": "npm run clean --workspaces --if-present",
-		"build": "cd packages/tui && npm run build && cd ../.. && cd packages/ai && npm run build && cd ../.. && cd packages/tool-kit && npm run build && cd ../.. && cd packages/agent-core && npm run build && cd ../.. && cd packages/coding-agent && npm run build && cd ../.. && cd packages/extensions && npm run build && cd ../.. && cd packages/orchestrator && npm run build && cd ../.. && cd packages/app && npm run build && cd ../.. && cd packages/web && npm run build",
-		"build:deps": "cd packages/tui && npm run build && cd ../.. && cd packages/ai && npm run build && cd ../.. && cd packages/tool-kit && npm run build && cd ../.. && cd packages/agent-core && npm run build && cd ../.. && cd packages/coding-agent && npm run build && cd ../.. && cd packages/extensions && npm run build",
-		"build:app": "cd packages/app && npm run build",
+		"build": "npm run build --workspace @pi-relay/web",
 		"build:web": "cd packages/web && npm run build",
-		"dev": "cd packages/app && npm run dev",
+		"dev": "cd packages/web && npm run dev",
 		"dev:web": "cd packages/web && npm run dev",
-		"start": "node packages/app/dist/index.js",
-		"test": "npm run test --workspaces --if-present",
-		"test:e2e:live": "node scripts/phase23-live-e2e.mjs"
+		"test": "npm run test --workspaces --if-present"
 	},
 	"devDependencies": {
 		"@types/node": "^22.10.5",
