@@ -695,19 +695,22 @@ export function App() {
 
 	const warmBackgroundSession = useCallback(
 		async (sessionId: string) => {
+			if (selectedRef.current === sessionId) return false;
 			const snapshot = await fetchSessionSnapshot(sessionId, false, "background");
+			if (selectedRef.current === sessionId) return false;
 			const observedEventId = lastEventIds.current.get(snapshot.session_id) ?? 0;
 			lastEventIds.current.set(snapshot.session_id, Math.max(observedEventId, snapshot.last_event_id));
 			mergeSnapshotIntoKnownSessionLists(snapshot);
 			warmSelectedCache(sessionId, (current) => applySelectedSnapshot(current, snapshot));
 			if (snapshot.has_transcript_entries) {
 				const turns = await api.getTranscriptTurns(sessionId, { limit: TRANSCRIPT_TURN_PAGE_SIZE });
+				if (selectedRef.current === sessionId) return false;
 				const nextSnapshot = snapshotWithTranscriptTurnsMetadata(snapshot, turns);
 				warmSelectedCache(sessionId, (current) =>
 					applyTranscriptTurns(applySelectedSnapshot(current, nextSnapshot), turns),
 				);
-				return;
 			}
+			return true;
 		},
 		[api, fetchSessionSnapshot, mergeSnapshotIntoKnownSessionLists, warmSelectedCache],
 	);
@@ -730,8 +733,8 @@ export function App() {
 			availableSlots -= 1;
 			backgroundWarmInFlight.current.add(session.session_id);
 			void warmBackgroundSession(session.session_id)
-				.then(() => {
-					backgroundWarmUpdatedAt.current.set(session.session_id, session.updated_at);
+				.then((warmed) => {
+					if (warmed) backgroundWarmUpdatedAt.current.set(session.session_id, session.updated_at);
 				})
 				.catch((error) => {
 					console.warn("background session warm failed", session.session_id, error);
