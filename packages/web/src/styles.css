@@ -1016,41 +1016,6 @@ pre {
 	display: block;
 }
 
-/* Running-turn rail. The transcript's running turn (.turn-summary.current is
- * only applied while the session is actually running) carries the same primary
- * rail idiom used by the sidebar (.status-rail.running) and the mockup's
- * .turn.running::before. The 3px bar is absolutely positioned so it never
- * shifts the turn's content, and it is aligned to the left edge of the centered
- * 900px content column (max(0px, calc(50% - 450px))) so it reads as attached to
- * the running turn rather than floating at the pane edge. The previous rule here
- * set border-color on .assistant-block, which has no border, so it painted
- * nothing — it has been replaced by this real rail. */
-.turn-summary.current {
-	position: relative;
-}
-
-.turn-summary.current::before {
-	content: "";
-	position: absolute;
-	top: var(--space-1);
-	bottom: var(--space-1);
-	left: max(0px, calc(50% - 450px));
-	width: 3px;
-	border-radius: 999px;
-	background: var(--primary);
-	animation: turn-rail-pulse 1.8s ease-in-out infinite;
-}
-
-@keyframes turn-rail-pulse {
-	0%,
-	100% {
-		opacity: 0.45;
-	}
-	50% {
-		opacity: 1;
-	}
-}
-
 .turn-detail-toggle-row {
 	width: min(100%, 900px);
 	margin: 4px auto;
@@ -1482,20 +1447,15 @@ pre {
  * running-turn clock is the defining "the agent is working" moment, so it gets
  * a distinct primary-tinted, lifted strip: a leading primary dot, the label in
  * --primary, and a tabular-nums monospace elapsed clock that never jitters as
- * it ticks. Its outer box shares the same centered 900px column as transcript
- * rows; as a bordered card it carries its own token-based inner padding. The
- * dot pulse is auto-gated by the global prefers-reduced-motion block. */
+ * it ticks. It shares the same centered 900px column as transcript rows and
+ * lines up inline with them — no card chrome — so it reads as a plain working
+ * row. The dot pulse is auto-gated by the global prefers-reduced-motion block. */
 .working-indicator {
 	display: flex;
 	align-items: center;
 	gap: var(--space-2);
 	width: min(100%, 900px);
 	margin: var(--space-2) auto;
-	padding: var(--space-2) var(--space-4);
-	border: 1px solid color-mix(in oklch, var(--primary) 35%, var(--border));
-	border-radius: var(--radius);
-	background: color-mix(in oklch, var(--primary) 12%, var(--card));
-	box-shadow: var(--elev-pop);
 }
 
 .working-indicator-dot {
