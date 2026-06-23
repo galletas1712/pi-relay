@@ -663,8 +663,7 @@ const WorkingIndicator = memo(function WorkingIndicator({ startMs, serverTimeMs 
 	return (
 		<div className="working-indicator">
 			<span className="working-indicator-dot" aria-hidden="true" />
-			<span className="working-indicator-label">Working…</span>
-			<span className="working-indicator-elapsed">{formatElapsed(elapsedMs)}</span>
+			<span className="working-indicator-label">Working ({formatElapsed(elapsedMs)})…</span>
 		</div>
 	);
 });

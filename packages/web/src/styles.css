@@ -1476,6 +1476,7 @@ pre {
 	gap: var(--space-2);
 	width: min(100%, 900px);
 	margin: var(--space-2) auto;
+	padding: 0 24px;
 }
 
 .working-indicator-dot {
@@ -1490,13 +1491,6 @@ pre {
 .working-indicator-label {
 	font-size: var(--text-sm);
 	font-weight: 600;
-	color: var(--primary);
-}
-
-.working-indicator-elapsed {
-	margin-left: auto;
-	font-family: var(--font-mono);
-	font-size: var(--text-md);
 	font-variant-numeric: tabular-nums;
 	color: var(--primary);
 }
@@ -3455,7 +3449,8 @@ pre {
 	}
 
 	.message-row,
-	.system-message {
+	.system-message,
+	.working-indicator {
 		padding-left: 12px;
 		padding-right: 12px;
 	}

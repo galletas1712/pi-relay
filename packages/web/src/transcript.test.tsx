@@ -756,7 +756,7 @@ describe("MessageList Working indicator", () => {
 			/>
 		);
 
-		expect(html).toContain("Working…");
+		expect(html).toContain("Working (");
 	});
 
 	it("uses the current turn card start timestamp without loading turn detail", () => {
@@ -797,7 +797,7 @@ describe("MessageList Working indicator", () => {
 			/>
 		);
 
-		expect(html).toContain("Working…");
+		expect(html).toContain("Working (");
 		expect(html).toContain("do it");
 	});
 
@@ -855,7 +855,7 @@ describe("MessageList Working indicator", () => {
 			/>
 		);
 
-		expect(html).not.toContain("Working…");
+		expect(html).not.toContain("Working (");
 	});
 });
 
