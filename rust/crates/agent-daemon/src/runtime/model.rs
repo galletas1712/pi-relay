@@ -10,7 +10,7 @@ use crate::types::{DispatchAction, RpcError};
 
 use super::SessionDriver;
 
-const MODEL_PROVIDER_MAX_ATTEMPTS: usize = 3;
+const MODEL_PROVIDER_MAX_ATTEMPTS: usize = 5;
 
 pub(super) async fn run_model_turn(
     state: AppState,
@@ -197,15 +197,15 @@ async fn run_model_for_action_with_retries(
         match result {
             Ok(response) => return Ok(Ok(response)),
             Err(error) => {
-                let Some(provider_error) = error.downcast_ref::<agent_provider::ProviderError>()
-                else {
-                    return Err(error.into());
+                let provider_error = match error.downcast::<agent_provider::ProviderError>() {
+                    Ok(error) => error,
+                    Err(error) => return Err(error.into()),
                 };
-                let retryable = provider_error.is_retryable_transient();
-                if attempt >= MODEL_PROVIDER_MAX_ATTEMPTS || !retryable {
-                    let error = provider_error_from_anyhow(error);
-                    let attempts = if retryable { attempt } else { 1 };
-                    return Ok(Err(ModelProviderFailure { error, attempts }));
+                if attempt >= MODEL_PROVIDER_MAX_ATTEMPTS {
+                    return Ok(Err(ModelProviderFailure {
+                        error: provider_error,
+                        attempts: attempt,
+                    }));
                 }
                 if !state
                     .repo
@@ -217,9 +217,9 @@ async fn run_model_for_action_with_retries(
                         "action attempt is no longer running",
                     ));
                 }
-                let message = provider_error_retry_diagnostic(&error);
+                let message = provider_error_retry_diagnostic(&provider_error);
                 eprintln!(
-                    "model provider transient error for {session_id}/{} on attempt {attempt}/{MODEL_PROVIDER_MAX_ATTEMPTS}; retrying: {message}",
+                    "model provider error for {session_id}/{} on attempt {attempt}/{MODEL_PROVIDER_MAX_ATTEMPTS}; retrying: {message}",
                     dispatch.row_id
                 );
                 tokio::time::sleep(model_retry_backoff(attempt)).await;
@@ -235,30 +235,20 @@ struct ModelProviderFailure {
     attempts: usize,
 }
 
-fn provider_error_from_anyhow(error: anyhow::Error) -> agent_provider::ProviderError {
-    match error.downcast::<agent_provider::ProviderError>() {
-        Ok(error) => error,
-        Err(error) => agent_provider::ProviderError::Provider(error.to_string()),
-    }
-}
-
 fn model_failure_update_result(failure: &ModelProviderFailure) -> Value {
     let mut result = json!({ "error": failure.error.to_string() });
     if failure.attempts > 1 {
         result["provider_retry_attempts"] = json!(failure.attempts);
     }
-    if failure.attempts > 1 || failure.error.is_retryable_transient() {
-        if let Some(diagnostic) = failure.error.retry_diagnostic() {
-            result["provider_error_diagnostic"] = json!(diagnostic);
-        }
+    if let Some(diagnostic) = failure.error.retry_diagnostic() {
+        result["provider_error_diagnostic"] = json!(diagnostic);
     }
     result
 }
 
-fn provider_error_retry_diagnostic(error: &anyhow::Error) -> String {
+fn provider_error_retry_diagnostic(error: &agent_provider::ProviderError) -> String {
     error
-        .downcast_ref::<agent_provider::ProviderError>()
-        .and_then(agent_provider::ProviderError::retry_diagnostic)
+        .retry_diagnostic()
         .unwrap_or_else(|| error.to_string())
 }
 

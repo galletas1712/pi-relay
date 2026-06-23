@@ -162,8 +162,8 @@ Model actions are claimed atomically (`claim_pending_model_action`) before `run_
 
 Two retry layers exist:
 
-- Transient provider errors retry up to `MODEL_PROVIDER_MAX_ATTEMPTS` (3) with 250ms/1s/3s backoff, re-checking that the action can still complete between attempts.
-- A Codex 401 triggers exactly one `refresh_codex_credentials` cycle, which refreshes the ChatGPT token in `~/.codex/auth.json`, rebuilds the provider, and retries the same call once. This is the only auth fallback (see [Codex Auth Recovery](../design-decisions.md#codex-auth-recovery-is-narrow-and-explicit)).
+- Model dispatch retries every `ProviderError` up to `MODEL_PROVIDER_MAX_ATTEMPTS` (5) with 250ms/1s/3s backoff, re-checking that the action can still complete between attempts. After exhaustion, the provider diagnostic is recorded on the failed model action; context-overflow errors still feed the reactive compaction recovery path instead of becoming ordinary turn failures.
+- A Codex 401 can also trigger exactly one inner `refresh_codex_credentials` cycle inside a single provider call, refreshing the ChatGPT token in `~/.codex/auth.json`, rebuilding the provider, and retrying the same call once. This is the only auth fallback (see [Codex Auth Recovery](../design-decisions.md#codex-auth-recovery-is-narrow-and-explicit)).
 
 `MaxOutputTokens` stops are recorded as an action error with the assistant content preserved; `Complete` feeds `ModelCompleted` back into the session.
 

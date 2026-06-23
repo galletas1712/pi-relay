@@ -1750,7 +1750,7 @@ data: {"type":"content_block_start","index":1,"content_block":{"type":"text","te
     }
 
     #[test]
-    fn anthropic_sse_maps_overloaded_error_to_retryable_status() {
+    fn anthropic_sse_maps_overloaded_error_to_status() {
         let sse = r#"
 event: error
 data: {"type":"error","error":{"type":"overloaded_error","message":"server overloaded"}}
@@ -1758,14 +1758,13 @@ data: {"type":"error","error":{"type":"overloaded_error","message":"server overl
 
         let error = parse_anthropic_sse(sse).expect_err("sse should fail");
 
-        assert!(error.is_retryable_transient());
         match &error {
             ProviderError::Status { status, message } => {
                 assert_eq!(*status, 529);
                 assert!(message.contains("overloaded_error"));
                 assert!(message.contains("server overloaded"));
             }
-            _ => panic!("expected retryable status error, got {error:?}"),
+            _ => panic!("expected status error, got {error:?}"),
         }
     }
 

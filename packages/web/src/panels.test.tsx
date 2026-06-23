@@ -1,6 +1,7 @@
 import { renderToStaticMarkup } from "react-dom/server";
+import type { ComponentProps } from "react";
 import { describe, expect, it } from "vitest";
-import { Inspector, LogHeader, RunBoardDelegationList, SessionRow, type RunBoardCallbacks } from "./panels.tsx";
+import { Inspector, LogHeader, RunBoardDelegationList, Sidebar, SessionRow, type RunBoardCallbacks } from "./panels.tsx";
 import type { SessionSnapshot, SessionSummary, Delegation, ToolListing } from "./types.ts";
 
 function delegation(overrides: Partial<Delegation> = {}): Delegation {
@@ -225,6 +226,53 @@ describe("Inspector tabs", () => {
 			/>,
 		);
 		expect(html).not.toContain("No session selected");
+	});
+});
+
+describe("Sidebar session list loading states", () => {
+	function renderSidebar(overrides: Partial<ComponentProps<typeof Sidebar>> = {}): string {
+		return renderToStaticMarkup(
+			<Sidebar
+				counts={{ running: 0, idle: 0 }}
+				total={0}
+				archived={0}
+				connection="open"
+				projects={[]}
+				selectedProjectId={null}
+				query=""
+				showArchived={false}
+				filteredSessions={[]}
+				selectedId={null}
+				onQueryChange={() => {}}
+				onToggleArchived={() => {}}
+				onNew={() => {}}
+				onSelectProject={() => {}}
+				onNewProject={() => {}}
+				onEditProject={() => {}}
+				onSelectSession={() => {}}
+				onRename={() => {}}
+				onArchiveToggle={() => {}}
+				onDelete={() => {}}
+				{...overrides}
+			/>,
+		);
+	}
+
+	it("shows loading instead of no sessions while the selected project list is loading", () => {
+		const html = renderSidebar({ sessionsLoading: true });
+
+		expect(html).toContain("Loading sessions…");
+		expect(html).not.toContain("No sessions");
+		expect(html).toContain(`aria-busy="true"`);
+	});
+
+	it("shows refreshing while an empty selected project list is being refetched", () => {
+		const html = renderSidebar({ sessionsFetching: true });
+
+		expect(html).toContain("Refreshing sessions…");
+		expect(html).not.toContain("No sessions");
+		expect(html).toContain(`aria-busy="true"`);
+
 	});
 });
 

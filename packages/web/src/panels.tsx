@@ -279,6 +279,8 @@ export interface SidebarProps {
 	showArchived: boolean;
 	filteredSessions: SessionListItem[];
 	selectedId: string | null;
+	sessionsLoading?: boolean;
+	sessionsFetching?: boolean;
 	inert?: boolean;
 	onQueryChange: (query: string) => void;
 	onToggleArchived: () => void;
@@ -304,6 +306,8 @@ export const Sidebar = memo(function Sidebar({
 	showArchived,
 	filteredSessions,
 	selectedId,
+	sessionsLoading = false,
+	sessionsFetching = false,
 	inert,
 	onQueryChange,
 	onToggleArchived,
@@ -339,7 +343,7 @@ export const Sidebar = memo(function Sidebar({
 				onToggleArchived={onToggleArchived}
 				onNew={onNew}
 			/>
-			<div className="session-list" role="listbox" aria-label="sessions">
+			<div className="session-list" role="listbox" aria-label="sessions" aria-busy={sessionsLoading || sessionsFetching}>
 				{filteredSessions.map((session) => (
 					<SessionRow
 						key={session.session_id}
@@ -351,7 +355,11 @@ export const Sidebar = memo(function Sidebar({
 						onDelete={() => onDelete(session)}
 					/>
 				))}
-				{filteredSessions.length === 0 ? <div className="empty-list">No sessions</div> : null}
+				{filteredSessions.length === 0 ? (
+					<div className="empty-list">
+						{sessionsLoading ? "Loading sessions…" : sessionsFetching ? "Refreshing sessions…" : "No sessions"}
+					</div>
+				) : null}
 			</div>
 		</aside>
 	);

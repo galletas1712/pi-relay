@@ -3,8 +3,11 @@ import {
 	COMPOSER_DRAFTS_STORAGE_KEY,
 	composerDraftKey,
 	loadComposerDrafts,
+	resolveSubmittedDraft,
 	saveComposerDrafts,
+	submittedDraftStillCurrent,
 	type ComposerDraftStorage,
+	type PendingSubmittedDraft,
 } from "./composer.tsx";
 
 describe("composer draft storage", () => {
@@ -34,6 +37,34 @@ describe("composer draft storage", () => {
 		storage.setItem(COMPOSER_DRAFTS_STORAGE_KEY, "{not json");
 
 		expect(loadComposerDrafts(storage).size).toBe(0);
+	});
+});
+
+describe("submitted composer draft guards", () => {
+	const pending: PendingSubmittedDraft = { value: "run tests", version: 3 };
+
+	it("accepts a pending submitted draft only while the stored draft version still matches", () => {
+		expect(submittedDraftStillCurrent(pending, 3, "run tests", 3)).toBe(true);
+		expect(resolveSubmittedDraft(pending, 3, "run tests", 3)).toBe("apply");
+	});
+
+	it("rejects stale successes or failures after a newer non-empty draft replaced the submitted text", () => {
+		expect(submittedDraftStillCurrent(pending, 4, "run tests", 3)).toBe(false);
+		expect(resolveSubmittedDraft(pending, 4, "run tests", 3)).toBe("ignore");
+	});
+
+	it("rejects stale successes or failures after a newer empty draft cleared the submitted text", () => {
+		expect(submittedDraftStillCurrent(pending, 4, "run tests", 3)).toBe(false);
+		expect(resolveSubmittedDraft(pending, 4, "run tests", 3)).toBe("ignore");
+	});
+
+	it("rejects same-version pending markers for different submitted text", () => {
+		expect(submittedDraftStillCurrent(pending, 3, "ship it", 3)).toBe(false);
+	});
+
+	it("allows unversioned imperative restore only when the pending marker is still current", () => {
+		expect(submittedDraftStillCurrent(pending, 3, "run tests")).toBe(true);
+		expect(submittedDraftStillCurrent(pending, 4, "run tests")).toBe(false);
 	});
 });
 

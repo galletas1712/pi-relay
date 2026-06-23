@@ -10,9 +10,11 @@ export interface SelectedSessionStore {
 	cache: SelectedSessionCache;
 	cacheRef: RefObject<SelectedSessionCache>;
 	drop: (sessionId: string) => void;
+	get: (sessionId: string) => SelectedSessionCache | null;
 	replace: (cache: SelectedSessionCache) => SelectedSessionCache;
 	reset: (sessionId: string | null) => SelectedSessionCache;
 	update: (updater: SelectedSessionCacheUpdater) => SelectedSessionCache;
+	warm: (sessionId: string, updater: SelectedSessionCacheUpdater) => SelectedSessionCache;
 }
 
 export function useSelectedSessionStore(initialSessionId: string | null): SelectedSessionStore {
@@ -37,10 +39,32 @@ export function useSelectedSessionStore(initialSessionId: string | null): Select
 		if (cacheRef.current.sessionId === sessionId) replace(emptySelectedSessionCache(null));
 	}, [replace]);
 
+	const get = useCallback((sessionId: string) => {
+		if (cacheRef.current.sessionId === sessionId) return cacheRef.current;
+		return cachesRef.current.get(sessionId) ?? null;
+	}, []);
+
 	const update = useCallback(
 		(updater: SelectedSessionCacheUpdater) => replace(updater(cacheRef.current)),
 		[replace],
 	);
 
-	return { cache, cacheRef, drop, replace, reset, update };
+	const warm = useCallback(
+		(sessionId: string, updater: SelectedSessionCacheUpdater) => {
+			const current =
+				cacheRef.current.sessionId === sessionId
+					? cacheRef.current
+					: cachesRef.current.get(sessionId) ?? emptySelectedSessionCache(sessionId);
+			const next = updater(current);
+			if (next.sessionId) cachesRef.current.set(next.sessionId, next);
+			if (cacheRef.current.sessionId === next.sessionId) {
+				cacheRef.current = next;
+				setCache(next);
+			}
+			return next;
+		},
+		[],
+	);
+
+	return { cache, cacheRef, drop, get, replace, reset, update, warm };
 }

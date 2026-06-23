@@ -497,7 +497,7 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
         }
         if let Err(error) = state
             .workspaces
-            .remove_session_dir(candidate_session_id)
+            .destroy_session_workspaces(candidate_session_id)
             .await
         {
             eprintln!(

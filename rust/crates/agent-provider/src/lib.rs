@@ -316,33 +316,6 @@ impl ProviderError {
         }
     }
 
-    pub fn is_retryable_transient(&self) -> bool {
-        if self.is_context_overflow() {
-            return false;
-        }
-
-        if self
-            .status_code()
-            .is_some_and(is_retryable_transient_status)
-        {
-            return true;
-        }
-
-        match self {
-            ProviderError::Timeout(_) | ProviderError::Transient(_) => true,
-            ProviderError::Http(error) => {
-                error.is_timeout()
-                    || error.is_connect()
-                    || error.is_request()
-                    || error.is_body()
-                    || error.is_decode()
-            }
-            ProviderError::Status { .. } | ProviderError::Provider(_) | ProviderError::Json(_) => {
-                false
-            }
-        }
-    }
-
     pub fn retry_diagnostic(&self) -> Option<String> {
         match self {
             ProviderError::Http(error) => {
@@ -407,10 +380,6 @@ impl ProviderError {
                 || lower.contains("exceed")
                 || lower.contains("maximum"))
     }
-}
-
-fn is_retryable_transient_status(status: u16) -> bool {
-    matches!(status, 408 | 409 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
 fn error_source_chain(error: &(dyn std::error::Error + 'static)) -> Vec<String> {
@@ -496,56 +465,17 @@ mod provider_error_tests {
     }
 
     #[test]
-    fn retryable_transient_classifier_matches_retryable_statuses_only() {
-        for status in [408, 409, 429, 500, 502, 503, 504, 529] {
-            assert!(
-                ProviderError::Status {
-                    status,
-                    message: "transient".to_string(),
-                }
-                .is_retryable_transient(),
-                "status {status} should be retryable"
-            );
-        }
-
-        for status in [400, 401, 403, 404, 413, 422] {
-            assert!(
-                !ProviderError::Status {
-                    status,
-                    message: "not transient".to_string(),
-                }
-                .is_retryable_transient(),
-                "status {status} should not be retryable"
-            );
-        }
-    }
-
-    #[test]
-    fn retryable_transient_classifier_excludes_context_overflow() {
-        assert!(!ProviderError::Status {
-            status: 413,
-            message: "request entity too large".to_string(),
-        }
-        .is_retryable_transient());
-    }
-
-    #[test]
-    fn timeout_errors_are_retryable_transients() {
+    fn provider_errors_report_retry_diagnostics_without_retry_classification() {
         let error = ProviderError::Timeout("response headers timed out".to_string());
 
-        assert!(error.is_retryable_transient());
         assert!(!error.is_context_overflow());
         assert_eq!(
             error.retry_diagnostic(),
             Some("timeout=response headers timed out".to_string())
         );
-    }
 
-    #[test]
-    fn transient_provider_errors_are_retryable_unless_context_overflow() {
         let error = ProviderError::Transient("server disconnected".to_string());
 
-        assert!(error.is_retryable_transient());
         assert_eq!(
             error.retry_diagnostic(),
             Some("transient=server disconnected".to_string())
@@ -554,7 +484,17 @@ mod provider_error_tests {
         let error = ProviderError::Transient("context_length_exceeded".to_string());
 
         assert!(error.is_context_overflow());
-        assert!(!error.is_retryable_transient());
+        assert_eq!(
+            error.retry_diagnostic(),
+            Some("transient=context_length_exceeded".to_string())
+        );
+
+        let error = ProviderError::Status {
+            status: 401,
+            message: "unauthorized".to_string(),
+        };
+
+        assert_eq!(error.retry_diagnostic(), Some("status=401".to_string()));
     }
 
     #[test]

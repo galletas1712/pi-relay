@@ -239,10 +239,6 @@ impl WorkspaceManager {
         Ok(())
     }
 
-    pub(crate) async fn remove_session_dir(&self, session_id: &str) -> Result<()> {
-        self.destroy_session_workspaces(session_id).await
-    }
-
     pub(crate) async fn reconcile_project_bases(
         &self,
         project_id: Uuid,

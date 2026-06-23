@@ -479,11 +479,17 @@ Codex/ChatGPT credentials are not session configuration. The daemon reloads
 OpenAI, Codex, and Anthropic credential material at model-call time so a session
 can remain durable and idle while the process or auth file changes around it.
 
-The only provider retry currently implemented is a single Codex 401 recovery:
-refresh the ChatGPT token in `~/.codex/auth.json`, rebuild the Codex provider
-with that refreshed token, and retry the same request once. This mirrors the
-upstream Codex behavior without adding a generic fallback chain that would hide
-real provider failures.
+Model dispatch retries every `ProviderError` up to five attempts before the
+turn fails, preserving provider diagnostics for the user-visible error event.
+Context-overflow classification remains special: exhausted overflow errors feed
+the daemon's compaction/recovery path instead of being treated as ordinary
+provider failures.
+
+Codex 401 recovery is a separate inner auth retry inside a single provider
+call: refresh the ChatGPT token in `~/.codex/auth.json`, rebuild the Codex
+provider with that refreshed token, and retry the same request once. This
+mirrors the upstream Codex behavior without adding a broad auth fallback chain
+that would hide real credential failures.
 
 Provider errors are live session events as well as turn outcomes. A model
 failure can still close the open turn as `Crashed`, but websocket clients should
