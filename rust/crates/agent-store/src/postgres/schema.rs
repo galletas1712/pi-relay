@@ -97,6 +97,18 @@ create unique index if not exists queued_inputs_client_input_idx
     on queued_inputs(session_id, client_input_id)
     where client_input_id is not null;
 
+create index if not exists queued_inputs_active_session_idx
+    on queued_inputs(session_id, status)
+    where status in ('queued','consuming');
+
+create index if not exists queued_inputs_non_cancelled_session_idx
+    on queued_inputs(session_id)
+    where status <> 'cancelled';
+
+create index if not exists queued_inputs_follow_up_order_idx
+    on queued_inputs(session_id, follow_up_position, created_at, id)
+    where priority='follow_up' and status='queued';
+
 create table if not exists actions (
     id text primary key,
     session_id text not null references sessions(id) on delete cascade,
