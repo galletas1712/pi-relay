@@ -13,7 +13,7 @@ snapshot.
 - implementer — full subagent (writes the workspace in place).
 - reviewer    — read-only subagent(s) (review only; never write).
 
-## Outcomes (suggested_next, in the delegation snapshot)
+## Outcomes (outcome, in the delegation snapshot)
 - reviewer: approved | changes_requested
 
 ## Control flow
@@ -37,7 +37,7 @@ Notes:
   snapshot into the next delegation's prompt. Read transcript/final-message
   files only when more detail is needed.
 - In each reviewer's prompt, REQUIRE it to end its final message with a line
-  `suggested_next: approved` or `suggested_next: changes_requested` — that line
+  `outcome: approved` or `outcome: changes_requested` — that line
   is what the delivered snapshot records and you branch on.
 - While the implementer (full) runs, supervise and read; do not edit yourself.
 - A single reviewer is usually enough; fan out multiple reviewers only when you

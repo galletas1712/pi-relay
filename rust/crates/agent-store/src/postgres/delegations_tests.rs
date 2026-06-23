@@ -947,7 +947,7 @@ async fn enqueue_delegation_observation_event_uses_minimal_payload_and_queue_pro
             "status": "done",
             "subagents": [{
                 "id": "child",
-                "suggested_next": "approved",
+                "outcome": "approved",
                 "final_message_file": "child/final_message.md",
                 "transcript_file": "child/transcript.md",
             }],

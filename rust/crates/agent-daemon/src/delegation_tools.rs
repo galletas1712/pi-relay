@@ -1023,7 +1023,7 @@ pub(crate) async fn rpc_list(
                 "task_prompt_file": task_prompt_file,
                 "steerable": delegation.status == DelegationStatus::Running
                     && subagent.subagent_type == Some(SubagentType::Full),
-                "suggested_next": state_for_row.suggested_next,
+                "outcome": state_for_row.outcome,
                 "final_message_file": final_message_file,
                 "transcript_file": transcript_file,
             }));

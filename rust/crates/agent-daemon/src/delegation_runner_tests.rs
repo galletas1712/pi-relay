@@ -559,7 +559,7 @@ fn assert_list_subagent_has_only_compact_fields(subagent: &serde_json::Value) {
                     | "subagent_type"
                     | "task_prompt_file"
                     | "steerable"
-                    | "suggested_next"
+                    | "outcome"
                     | "final_message_file"
                     | "transcript_file"
             ),
@@ -660,7 +660,7 @@ async fn parent_model_context_does_not_inject_current_delegations() {
         "reviewer",
         SubagentType::ReadOnly,
         TurnOutcome::Graceful,
-        "Looks good.\n\nsuggested_next: approved",
+        "Looks good.\n\noutcome: approved",
     )
     .await;
     assert!(env
@@ -674,7 +674,7 @@ async fn parent_model_context_does_not_inject_current_delegations() {
         handoff_root(&env, &done.id)
             .join("review_done")
             .join("final_message.md"),
-        "Looks good.\n\nsuggested_next: approved",
+        "Looks good.\n\noutcome: approved",
     )
     .expect("write final message artifact");
 
@@ -815,7 +815,7 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         "reviewer",
         SubagentType::ReadOnly,
         TurnOutcome::Graceful,
-        "Looks good.\n\nsuggested_next: approved",
+        "Looks good.\n\noutcome: approved",
     )
     .await;
     assert!(env
@@ -829,7 +829,7 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         handoff_root(&env, &done.id)
             .join("review_done")
             .join("final_message.md"),
-        "Looks good.\n\nsuggested_next: approved",
+        "Looks good.\n\noutcome: approved",
     )
     .expect("write final message artifact");
 
@@ -854,7 +854,7 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         "reviewer",
         SubagentType::ReadOnly,
         TurnOutcome::Crashed,
-        "Tests failed.\n\nsuggested_next: changes_requested",
+        "Tests failed.\n\noutcome: changes_requested",
     )
     .await;
     assert!(env
@@ -873,7 +873,7 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
         handoff_root(&env, &done_with_failures.id)
             .join("review_failed")
             .join("final_message.md"),
-        "Tests failed.\n\nsuggested_next: changes_requested",
+        "Tests failed.\n\noutcome: changes_requested",
     )
     .expect("write final message artifact");
 
@@ -1009,8 +1009,8 @@ async fn parent_compaction_output_appends_complete_delegation_ledger_after_provi
     assert!(ledger.contains("status: done"));
     assert!(ledger.contains("completed before compaction"));
     assert!(ledger.contains("final_message_file: `review_done/final_message.md`"));
-    assert!(ledger.contains("suggested_next: \"approved\""));
-    assert!(!ledger.contains("\"Looks good.\\n\\nsuggested_next: approved\""));
+    assert!(ledger.contains("outcome: \"approved\""));
+    assert!(!ledger.contains("\"Looks good.\\n\\noutcome: approved\""));
     assert!(ledger.contains(&format!("delegation_id: `{}`", done_with_failures.id)));
     assert!(ledger.contains("status: done_with_failures"));
     assert!(ledger.contains("completed with failures before compaction"));
@@ -1892,7 +1892,7 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
         "reviewer",
         SubagentType::ReadOnly,
         TurnOutcome::Graceful,
-        "All good.\n\nsuggested_next: approved",
+        "All good.\n\noutcome: approved",
     )
     .await;
     let boundary_leaf = create_running_subagent(
@@ -2026,14 +2026,14 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
     assert_eq!(ok["type"], "read_only");
     assert_eq!(ok["subagent_type"], "read_only");
     assert_eq!(ok["status"], "done");
-    assert_eq!(ok["suggested_next"], "approved");
+    assert_eq!(ok["outcome"], "approved");
     let wakeup_ok = wakeup_snapshot["subagents"]
         .as_array()
         .expect("wakeup subagents array")
         .iter()
         .find(|subagent| subagent["id"] == "ok_a")
         .expect("ok_a in wakeup snapshot");
-    assert_eq!(wakeup_ok["suggested_next"], "approved");
+    assert_eq!(wakeup_ok["outcome"], "approved");
     assert_eq!(wakeup_ok["transcript_file"], "ok_a/transcript.md");
     assert_eq!(ok["steerable"], false);
     let failed = subagents
@@ -2041,7 +2041,7 @@ async fn barrier_wakes_parent_once_after_all_terminal_with_handoff_for_every_sub
         .find(|s| s["id"] == "still_running")
         .unwrap();
     assert_eq!(failed["status"], "failed");
-    assert_eq!(failed["suggested_next"], serde_json::Value::Null);
+    assert_eq!(failed["outcome"], serde_json::Value::Null);
 
     env.cleanup().await;
 }
@@ -2080,7 +2080,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         "explorer",
         SubagentType::ReadOnly,
         TurnOutcome::Graceful,
-        "Found the answer.\n\nsuggested_next: done",
+        "Found the answer.\n\noutcome: done",
     )
     .await;
     create_running_subagent(
@@ -2115,7 +2115,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .find(|subagent| subagent["id"] == "done_child")
         .unwrap();
     assert_eq!(done["status"], "done");
-    assert_eq!(done["suggested_next"], "done");
+    assert_eq!(done["outcome"], "done");
     assert_eq!(done["final_message_file"], serde_json::Value::Null);
     assert!(done.get("final_message_path").is_none());
     assert!(
@@ -2136,7 +2136,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .unwrap();
     assert_eq!(running["activity"], "idle");
     assert_eq!(running["status"], "running");
-    assert_eq!(running["suggested_next"], serde_json::Value::Null);
+    assert_eq!(running["outcome"], serde_json::Value::Null);
     assert_eq!(running["final_message_file"], serde_json::Value::Null);
     assert!(running.get("final_message_path").is_none());
     assert!(root.join("running_child").join("transcript.md").exists());
@@ -2167,7 +2167,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .unwrap();
     assert_eq!(listed_done["status"], "done");
     assert_eq!(listed_done["activity"], "idle");
-    assert_eq!(listed_done["suggested_next"], "done");
+    assert_eq!(listed_done["outcome"], "done");
     assert_eq!(listed_done["final_message_file"], serde_json::Value::Null);
     assert_eq!(listed_done["transcript_file"], "done_child/transcript.md");
     assert_list_subagent_has_only_compact_fields(listed_done);
@@ -2179,7 +2179,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .unwrap();
     assert_eq!(listed_running["status"], "running");
     assert_eq!(listed_running["activity"], "idle");
-    assert_eq!(listed_running["suggested_next"], serde_json::Value::Null);
+    assert_eq!(listed_running["outcome"], serde_json::Value::Null);
     assert_eq!(
         listed_running["transcript_file"],
         "running_child/transcript.md"
@@ -2279,7 +2279,7 @@ async fn delegation_list_treats_empty_active_branch_as_terminal_non_failed() {
         .expect("empty child");
     assert_eq!(empty["status"], "done");
     assert_eq!(empty["activity"], "idle");
-    assert_eq!(empty["suggested_next"], serde_json::Value::Null);
+    assert_eq!(empty["outcome"], serde_json::Value::Null);
     assert_eq!(empty["final_message_file"], serde_json::Value::Null);
     assert_eq!(empty["transcript_file"], serde_json::Value::Null);
     assert_list_subagent_has_only_compact_fields(empty);
@@ -2542,7 +2542,7 @@ async fn read_task_prompt_validates_subagent_segment_before_refreshing_artifact(
 }
 
 #[tokio::test]
-async fn out_of_set_suggested_next_is_recorded_verbatim() {
+async fn out_of_set_outcome_is_recorded_verbatim() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -2569,7 +2569,7 @@ async fn out_of_set_suggested_next_is_recorded_verbatim() {
         "implementer",
         SubagentType::Full,
         TurnOutcome::Graceful,
-        "Done.\nsuggested_next: ship_it_immediately",
+        "Done.\noutcome: ship_it_immediately",
     )
     .await;
 
@@ -2579,7 +2579,7 @@ async fn out_of_set_suggested_next_is_recorded_verbatim() {
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["status"], "done");
     assert_eq!(
-        snapshot["subagents"][0]["suggested_next"],
+        snapshot["subagents"][0]["outcome"],
         "ship_it_immediately"
     );
 

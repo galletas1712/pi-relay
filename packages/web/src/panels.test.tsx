@@ -22,7 +22,7 @@ function delegation(overrides: Partial<Delegation> = {}): Delegation {
 				task_prompt_file: "child-1/task_prompt.md",
 				final_message_file: "child-1/final_message.md",
 				transcript_file: "child-1/transcript.md",
-				suggested_next: "approved",
+				outcome: "approved",
 			},
 		],
 		...overrides,
@@ -101,7 +101,7 @@ describe("Inspector run board delegation list", () => {
 						task_prompt_file: `child-${index + 1}/task_prompt.md`,
 						final_message_file: `child-${index + 1}/final_message.md`,
 						transcript_file: `child-${index + 1}/transcript.md`,
-						suggested_next: "approved",
+						outcome: "approved",
 					},
 				],
 			}),
@@ -183,7 +183,7 @@ describe("Inspector run board status rails", () => {
 });
 
 describe("Inspector run board streamlined content", () => {
-	it("drops the status pills, progress counts, suggested_next, and handoff/artifact clutter", () => {
+	it("drops the status pills, progress counts, outcome, and handoff/artifact clutter", () => {
 		const html = renderInspector([
 			delegation({
 				status: "running",
@@ -200,7 +200,7 @@ describe("Inspector run board streamlined content", () => {
 						task_prompt_file: "done-child/task_prompt.md",
 						final_message_file: "done-child/final_message.md",
 						transcript_file: "done-child/transcript.md",
-						suggested_next: "done",
+						outcome: "done",
 					},
 					{
 						id: "running-child",
@@ -209,7 +209,7 @@ describe("Inspector run board streamlined content", () => {
 						role: "explorer",
 						subagent_type: "read_only",
 						task_prompt_file: "running-child/task_prompt.md",
-						suggested_next: null,
+						outcome: null,
 					},
 				],
 			}),
@@ -220,7 +220,7 @@ describe("Inspector run board streamlined content", () => {
 		expect(html).toContain("run-board-delegation-kind");
 		// Status is carried only by the rail now.
 		expect(html).toContain("status-rail running");
-		// Removed: the activity/status pill, progress text, suggested_next, handoff path, artifact names.
+		// Removed: the activity/status pill, progress text, outcome, handoff path, artifact names.
 		expect(html).not.toContain("subagent-activity");
 		expect(html).not.toContain("run-board-progress");
 		expect(html).not.toContain("run-board-subagent-summary");

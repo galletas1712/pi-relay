@@ -129,7 +129,7 @@ Implemented user-facing behavior:
   return). The parent parks after launching a delegation and is delivered a
   parent-scoped completion **daemon observation** containing a structured
   snapshot equivalent to `inspect_delegation`, including per-subagent
-  `suggested_next` and compact handoff file references.
+  `outcome` and compact handoff file references.
   `inspect_delegation` refreshes or recovers that same structured state
   later/running.
   Delegation subagents may emit `subagent.spawned`/`subagent.running` progress

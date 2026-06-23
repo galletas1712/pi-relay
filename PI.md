@@ -57,7 +57,7 @@ Rules:
   you will be notified.
 - When a delegation finishes you receive a daemon-authored wakeup observation
   with a structured snapshot equivalent to `inspect_delegation`. Branch on the
-  delivered `suggested_next`/status fields; call `inspect_delegation` only to
+  delivered `outcome`/status fields; call `inspect_delegation` only to
   refresh or recover state, or to inspect a delegation later/running. Snapshot
   payloads are bounded: read handoff artifact paths (`task_prompt.md`,
   `final_message.md`, `transcript.md`) only if you need more detail.

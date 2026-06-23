@@ -375,7 +375,7 @@ kept for unsupported contexts and diagnostics.
 Delegation snapshots avoid context-heavy payloads: raw subagent task prompts,
 final-message prose, and transcript bodies are not inlined. Long bodies are
 referenced via handoff files such as `task_prompt.md`, `final_message.md`, and
-`transcript.md`; only workflow control facts such as `suggested_next` remain
+`transcript.md`; only workflow control facts such as `outcome` remain
 inline.
 
 Prompt caching works best when the beginning of the prompt is identical across

@@ -373,7 +373,7 @@ fn delegate_readonly_tasks_definition() -> ToolDefinition {
 fn inspect_delegation_definition() -> ToolDefinition {
     ToolDefinition::new(
         "inspect_delegation",
-        "Inspect a delegation and its subagents, including status, progress, suggested_next, and artifact file references. Full final messages and transcripts are available through referenced handoff files, not inlined.",
+        "Inspect a delegation and its subagents, including status, progress, outcome, and artifact file references. Full final messages and transcripts are available through referenced handoff files, not inlined.",
         json!({
             "type": "object",
             "properties": {

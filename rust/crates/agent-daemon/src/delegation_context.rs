@@ -2,11 +2,11 @@ use std::path::Path;
 
 use agent_store::{Delegation, DelegationStatus, SessionActivity, SubagentType};
 
-use crate::handoff::{delegation_dir, extract_suggested_next};
+use crate::handoff::{delegation_dir, extract_outcome};
 use crate::state::AppState;
 
 const MAX_SUBAGENTS_PER_DELEGATION: usize = 8;
-const MAX_SUGGESTED_NEXT_CHARS: usize = 120;
+const MAX_OUTCOME_CHARS: usize = 120;
 
 /// Build the compaction-only delegation ledger for a top-level parent session.
 ///
@@ -161,10 +161,10 @@ async fn append_subagents(
                 "; final_message_file: `{}/final_message.md`",
                 inline_code(&subagent.session_id)
             ));
-            if let Some(suggested_next) = read_suggested_next(&final_message_path).await {
+            if let Some(outcome) = read_outcome(&final_message_path).await {
                 out.push_str(&format!(
-                    "; suggested_next: {}",
-                    serde_json::to_string(&suggested_next)?
+                    "; outcome: {}",
+                    serde_json::to_string(&outcome)?
                 ));
             }
         }
@@ -225,13 +225,13 @@ fn final_message_relevant(status: DelegationStatus) -> bool {
     )
 }
 
-async fn read_suggested_next(path: &Path) -> Option<String> {
+async fn read_outcome(path: &Path) -> Option<String> {
     let content = tokio::fs::read_to_string(path).await.ok()?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
     }
-    bounded_suggested_next(trimmed)
+    bounded_outcome(trimmed)
 }
 
 fn truncate_chars(value: &str, max_chars: usize) -> String {
@@ -244,9 +244,9 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
     }
 }
 
-fn bounded_suggested_next(final_message: &str) -> Option<String> {
-    extract_suggested_next(final_message)
-        .map(|value| truncate_chars(&value, MAX_SUGGESTED_NEXT_CHARS))
+fn bounded_outcome(final_message: &str) -> Option<String> {
+    extract_outcome(final_message)
+        .map(|value| truncate_chars(&value, MAX_OUTCOME_CHARS))
 }
 
 fn optional_inline_code(value: Option<&str>) -> String {
@@ -327,11 +327,11 @@ pub(crate) fn test_ledger_from_snapshots(
                 if let Some(final_message) = subagent.final_message.as_deref() {
                     let trimmed_final_message = final_message.trim();
                     if !trimmed_final_message.is_empty() {
-                        if let Some(suggested_next) = bounded_suggested_next(trimmed_final_message)
+                        if let Some(outcome) = bounded_outcome(trimmed_final_message)
                         {
                             out.push_str(&format!(
-                                "; suggested_next: {}",
-                                serde_json::to_string(&suggested_next)?
+                                "; outcome: {}",
+                                serde_json::to_string(&outcome)?
                             ));
                         }
                     }
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn bounded_compaction_ledger_omits_transcript_and_final_message_bodies() {
         let long_final = format!(
-            "{}\n\nsuggested_next: approved",
+            "{}\n\noutcome: approved",
             "final-message ".repeat(100)
         );
         let subagents = (0..10)
@@ -427,7 +427,7 @@ mod tests {
         assert!(text.contains("completed before compaction"));
         assert!(text.contains("... 2 more subagent(s) omitted"));
         assert!(text.contains("final_message_file: `child_0/final_message.md`"));
-        assert!(text.contains("suggested_next: \"approved\""));
+        assert!(text.contains("outcome: \"approved\""));
         assert!(text.contains("Full transcript and final-message contents are not inlined"));
         assert!(!text.contains("final-message final-message"));
         assert!(!text.contains("## User"));

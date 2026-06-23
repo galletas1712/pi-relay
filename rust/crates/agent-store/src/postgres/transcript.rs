@@ -1342,7 +1342,7 @@ mod tests {
                 json!({
                     "delegation_id": "delegation_1",
                     "status": "done",
-                    "suggested_next": "approved"
+                    "outcome": "approved"
                 }),
             )),
         )

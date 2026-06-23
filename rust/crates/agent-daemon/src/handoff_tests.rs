@@ -147,18 +147,33 @@ fn extract_final_message_takes_last_assistant_text() {
 }
 
 #[test]
-fn suggested_next_reads_trailing_line_verbatim() {
+fn outcome_reads_trailing_line_verbatim() {
     assert_eq!(
-        extract_suggested_next("Looks good.\n\nsuggested_next: approved"),
+        extract_outcome("Looks good.\n\noutcome: approved"),
         Some("approved".to_string())
     );
     // Out-of-set values are recorded verbatim, never validated against an enum.
     assert_eq!(
-        extract_suggested_next("done\nsuggested_next: ship_it_now"),
+        extract_outcome("done\noutcome: ship_it_now"),
         Some("ship_it_now".to_string())
     );
-    assert_eq!(extract_suggested_next("no marker here"), None);
-    assert_eq!(extract_suggested_next("suggested_next:"), None);
+    assert_eq!(extract_outcome("no marker here"), None);
+    assert_eq!(extract_outcome("outcome:"), None);
+}
+
+#[test]
+fn outcome_accepts_legacy_suggested_next_line() {
+    // Historical final_message.md artifacts emitted `suggested_next:` before the
+    // field was renamed to `outcome`; the fallback keeps them parseable.
+    assert_eq!(
+        extract_outcome("Looks good.\n\nsuggested_next: approved"),
+        Some("approved".to_string())
+    );
+    assert_eq!(
+        extract_outcome("done\nsuggested_next: ship_it_now"),
+        Some("ship_it_now".to_string())
+    );
+    assert_eq!(extract_outcome("suggested_next:"), None);
 }
 
 #[test]
