@@ -659,6 +659,9 @@ pre {
 	color: var(--accent-foreground);
 }
 
+/* `.status-rail` is the sidebar session-row activity bar. The run board no longer
+ * uses it (status there is carried by `.run-board-status-icon`), so only the
+ * sidebar's modifiers remain: `running`/`idle` here and `archived` below. */
 .status-rail {
 	width: 3px;
 	align-self: stretch;
@@ -672,26 +675,6 @@ pre {
 
 .status-rail.idle {
 	background: var(--success);
-}
-
-.status-rail.pending {
-	background: var(--muted-foreground);
-}
-
-.status-rail.done {
-	background: var(--success);
-}
-
-.status-rail.warn {
-	background: var(--warning);
-}
-
-.status-rail.failed {
-	background: var(--destructive);
-}
-
-.status-rail.cancelled {
-	background: var(--muted-foreground);
 }
 
 .session-main {
@@ -3077,14 +3060,57 @@ pre {
 	white-space: nowrap;
 }
 
-.run-board-delegation-kind {
+/* Run-board status icons: the delegation kind icon and the subagent `Bot` are
+ * tinted by status (mirrors the old `.status-rail` palette, but as `color` so it
+ * also tints the lucide stroke + the running glow's `currentColor`). idle reads as
+ * "done" green like the rail did. */
+.run-board-status-icon {
 	flex: 0 0 auto;
-	border: 1px solid var(--border);
-	border-radius: var(--radius-sm);
-	padding: 1px 6px;
-	font-size: var(--text-2xs);
-	font-family: var(--font-mono);
+	display: inline-flex;
+	align-items: center;
 	color: var(--muted-foreground);
+}
+
+.run-board-status-icon.running {
+	color: var(--primary);
+}
+
+.run-board-status-icon.done,
+.run-board-status-icon.idle {
+	color: var(--success);
+}
+
+.run-board-status-icon.warn {
+	color: var(--warning);
+}
+
+.run-board-status-icon.failed {
+	color: var(--destructive);
+}
+
+.run-board-status-icon.cancelled,
+.run-board-status-icon.pending {
+	color: var(--muted-foreground);
+}
+
+/* The one live state gets motion: a subtle opacity breathe in the icon's own
+ * color (the app's "alive" pulse, like `.working-indicator-dot`). Auto-gated by
+ * the global `prefers-reduced-motion` block. Kept gentle since several subagents
+ * can run at once. */
+.run-board-status-icon.running {
+	animation: run-board-icon-pulse 1.6s ease-in-out infinite;
+}
+
+@keyframes run-board-icon-pulse {
+	0%,
+	100% {
+		opacity: 1;
+		filter: drop-shadow(0 0 0 transparent);
+	}
+	50% {
+		opacity: 0.6;
+		filter: drop-shadow(0 0 3px currentColor);
+	}
 }
 
 .run-board-delegation-controls {
