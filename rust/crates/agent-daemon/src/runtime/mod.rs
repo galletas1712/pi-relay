@@ -34,18 +34,6 @@ pub(crate) use outputs::{
 };
 pub(crate) use tasks::{abort_session_tasks, session_has_live_tasks, take_tasks};
 
-pub(crate) async fn ensure_expected_active_leaf(
-    state: &AppState,
-    session_id: &str,
-    params: &Value,
-) -> std::result::Result<(), RpcError> {
-    if params.get("expected_active_leaf_id").is_none() {
-        return Ok(());
-    }
-    let active_leaf_id = state.repo.active_leaf_id(session_id).await?;
-    ensure_expected_active_leaf_matches(&active_leaf_id, params)
-}
-
 pub(crate) fn ensure_expected_active_leaf_matches(
     current: &Option<String>,
     params: &Value,

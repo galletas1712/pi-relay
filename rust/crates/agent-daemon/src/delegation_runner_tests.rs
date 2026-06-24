@@ -200,6 +200,82 @@ async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
         .expect("create parent");
 }
 
+#[tokio::test]
+async fn follow_up_to_idle_session_is_durably_queued_before_drive() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "durable follow-up test", &[], json!({}))
+        .await
+        .expect("create project");
+    env.state
+        .repo
+        .start_session_outputs(
+            "idle_parent",
+            &session_config(&env, project_id, json!({ "created_by": "test" })),
+            &[
+                TranscriptStorageNode {
+                    id: "idle_parent_user".to_string(),
+                    parent_id: None,
+                    timestamp_ms: 1,
+                    item: TranscriptItem::UserMessage(UserMessage::text("initial")),
+                    provider_replay: Vec::new(),
+                },
+                TranscriptStorageNode {
+                    id: "idle_parent_finish".to_string(),
+                    parent_id: Some("idle_parent_user".to_string()),
+                    timestamp_ms: 2,
+                    item: TranscriptItem::TurnFinished {
+                        turn_id: TurnId(1),
+                        outcome: TurnOutcome::Graceful,
+                    },
+                    provider_replay: Vec::new(),
+                },
+            ],
+            Some("idle_parent_finish"),
+            &[],
+            &[],
+            InputPriority::FollowUp,
+            &UserMessage::text("initial"),
+            None,
+        )
+        .await
+        .expect("create idle session");
+
+    let response = crate::input_user(
+        &env.state,
+        json!({
+            "session_id": "idle_parent",
+            "client_input_id": "client_follow_up_1",
+            "content": [{"type": "text", "text": "continue"}],
+            "expected_active_leaf_id": "idle_parent_finish",
+        }),
+    )
+    .await
+    .expect("follow-up accepted");
+    assert_eq!(response["accepted"], true);
+    assert_eq!(response["queued"], true);
+    assert!(response.get("active_branch_sync").is_none());
+
+    let record = env
+        .state
+        .repo
+        .find_client_input("idle_parent", "client_follow_up_1")
+        .await
+        .expect("find client input")
+        .expect("recorded client input");
+    assert!(matches!(
+        record.status,
+        QueuedInputStatus::Queued | QueuedInputStatus::Consuming | QueuedInputStatus::Consumed
+    ));
+
+    env.cleanup().await;
+}
+
 /// Create a delegation subagent whose durable transcript carries one assistant turn
 /// finished with `outcome`, then settle it terminal (no queued input, no
 /// unfinished action) so the all-terminal predicate sees it as done.
@@ -1638,6 +1714,7 @@ async fn cancel_delegation_returns_transcript_only_paths() {
             InputPriority::FollowUp,
             &UserMessage::text("queued work that must not run after cancellation"),
             Some("queued-before-cancel"),
+            None,
         )
         .await
         .expect("queue follow-up before cancellation");

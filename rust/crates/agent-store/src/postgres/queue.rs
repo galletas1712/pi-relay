@@ -5,9 +5,10 @@ use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::{
-    CancelQueuedInputResult, EnqueueUserInputResult, EventType, InputPriority, InputRecord,
-    PromoteQueuedInputResult, QueueMutationError, QueueState, QueuedInput, QueuedInputContent,
-    QueuedInputRecord, QueuedInputStatus, ReorderQueuedFollowUpsResult, UpdateQueuedInputResult,
+    CancelQueuedInputResult, EnqueueUserInputResult, EventType, ExpectedActiveLeafMismatch,
+    InputPriority, InputRecord, PromoteQueuedInputResult, QueueMutationError, QueueState,
+    QueuedInput, QueuedInputContent, QueuedInputRecord, QueuedInputStatus,
+    ReorderQueuedFollowUpsResult, UpdateQueuedInputResult,
 };
 
 use super::events::insert_event_tx;
@@ -38,10 +39,31 @@ impl PostgresAgentStore {
         priority: InputPriority,
         content: &UserMessage,
         client_input_id: Option<&str>,
+        expected_active_leaf_id: Option<Option<&str>>,
     ) -> Result<EnqueueUserInputResult> {
         let id = format!("input_{}", Uuid::new_v4());
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
+        if let Some(client_input_id) = client_input_id {
+            if let Some(row) = sqlx::query(
+                "select id from queued_inputs where session_id=$1 and client_input_id=$2::text",
+            )
+            .bind(session_id)
+            .bind(client_input_id)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                let input_id = row.get("id");
+                let queue = queue_state_tx(&mut tx, session_id).await?;
+                tx.commit().await?;
+                return Ok(EnqueueUserInputResult {
+                    input_id,
+                    event: None,
+                    queue: Some(queue),
+                });
+            }
+        }
+        ensure_expected_active_leaf_tx(&mut tx, session_id, expected_active_leaf_id).await?;
         let inserted = sqlx::query(
             r#"
                 insert into queued_inputs (
@@ -603,6 +625,13 @@ impl PostgresAgentStore {
             .await?)
     }
 
+    pub async fn sessions_with_active_queued_inputs(&self) -> Result<Vec<String>> {
+        let active_queue = queued_input_is_active(None);
+        let query =
+            format!("select distinct session_id from queued_inputs where {active_queue} order by session_id");
+        Ok(sqlx::query_scalar(&query).fetch_all(&self.pool).await?)
+    }
+
     pub async fn reset_abandoned_consuming_inputs(&self, session_id: &str) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
@@ -731,6 +760,29 @@ pub(super) async fn queue_state_tx(
             })
             .collect::<Result<Vec<_>>>()?,
     })
+}
+
+async fn ensure_expected_active_leaf_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    session_id: &str,
+    expected_active_leaf_id: Option<Option<&str>>,
+) -> Result<()> {
+    let Some(expected_active_leaf_id) = expected_active_leaf_id else {
+        return Ok(());
+    };
+    let current_active_leaf_id: Option<String> =
+        sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
+            .bind(session_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    if current_active_leaf_id.as_deref() != expected_active_leaf_id {
+        return Err(ExpectedActiveLeafMismatch::new(
+            current_active_leaf_id,
+            expected_active_leaf_id.map(str::to_string),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 pub(super) fn queue_state_payload(queue: &QueueState) -> Value {
@@ -1036,6 +1088,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enqueue_validates_expected_active_leaf_under_session_lock_and_lists_active_queue() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "queue-expected-leaf";
+        create_session(store, session_id).await;
+        let root = entry(
+            "entry_root",
+            None,
+            agent_vocab::TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+                session_id,
+                "source",
+                "summary",
+                None,
+                agent_vocab::TurnId(0),
+            )),
+        );
+        store
+            .recover_session(
+                session_id,
+                &[StoredTranscriptEntry {
+                    id: root.id.clone(),
+                    parent_id: root.parent_id.clone(),
+                    timestamp_ms: root.timestamp_ms,
+                    item: root.item.clone(),
+                    provider_replay: Vec::new(),
+                }],
+                Some(&root.id),
+            )
+            .await
+            .expect("seed transcript");
+
+        let stale = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::FollowUp,
+                &UserMessage::text("stale"),
+                Some("stale-client-input"),
+                Some(Some("not-the-active-leaf")),
+            )
+            .await
+            .err()
+            .expect("stale expected active leaf is rejected");
+        assert!(stale.downcast_ref::<ExpectedActiveLeafMismatch>().is_some());
+
+        let queued = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::FollowUp,
+                &UserMessage::text("matched"),
+                Some("matched-client-input"),
+                Some(Some(&root.id)),
+            )
+            .await
+            .expect("matching expected active leaf enqueues");
+        assert_eq!(queued.queue.as_ref().expect("queue").queued_inputs.len(), 1);
+        assert!(
+            store
+                .sessions_with_active_queued_inputs()
+                .await
+                .expect("queued sessions")
+                .contains(&session_id.to_string())
+        );
+
+        let replay = store
+            .enqueue_user_input(
+                session_id,
+                InputPriority::FollowUp,
+                &UserMessage::text("matched"),
+                Some("matched-client-input"),
+                Some(Some("not-the-active-leaf")),
+            )
+            .await
+            .expect("idempotent replay returns accepted input despite stale expected leaf");
+        assert_eq!(replay.input_id, queued.input_id);
+        assert!(replay.event.is_none());
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
     async fn queued_follow_ups_can_be_reordered_edited_and_cancelled() {
         let Some(db) = test_store().await else {
             eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -1051,6 +1186,7 @@ mod tests {
                 InputPriority::FollowUp,
                 &UserMessage::text("first"),
                 None,
+                None,
             )
             .await
             .expect("first input enqueues");
@@ -1060,6 +1196,7 @@ mod tests {
                 InputPriority::FollowUp,
                 &UserMessage::text("second"),
                 None,
+                None,
             )
             .await
             .expect("second input enqueues");
@@ -1068,6 +1205,7 @@ mod tests {
                 session_id,
                 InputPriority::FollowUp,
                 &UserMessage::text("third"),
+                None,
                 None,
             )
             .await
@@ -1158,6 +1296,7 @@ mod tests {
                 InputPriority::FollowUp,
                 &UserMessage::text("follow"),
                 None,
+                None,
             )
             .await
             .expect("follow-up enqueues");
@@ -1171,6 +1310,7 @@ mod tests {
                 session_id,
                 InputPriority::Steer,
                 &UserMessage::text("steer"),
+                None,
                 None,
             )
             .await
@@ -1218,6 +1358,7 @@ mod tests {
                 InputPriority::FollowUp,
                 &UserMessage::text("first"),
                 None,
+                None,
             )
             .await
             .expect("first input enqueues");
@@ -1226,6 +1367,7 @@ mod tests {
                 session_id,
                 InputPriority::FollowUp,
                 &UserMessage::text("second"),
+                None,
                 None,
             )
             .await
@@ -1242,6 +1384,7 @@ mod tests {
                 session_id,
                 InputPriority::Steer,
                 &UserMessage::text("steer"),
+                None,
                 None,
             )
             .await

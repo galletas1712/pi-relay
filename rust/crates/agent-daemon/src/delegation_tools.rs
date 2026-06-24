@@ -128,6 +128,7 @@ pub(crate) async fn steer_subagent_core(
             InputPriority::Steer,
             &UserMessage::text(message),
             Some(&client_input_id),
+            None,
         )
         .await?;
     if let Some(event) = queued.event {

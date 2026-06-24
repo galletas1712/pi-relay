@@ -48,6 +48,8 @@ const SELECTED_SESSION_REFRESH_EVENTS = new Set([
 	"subagent.idle",
 	"history.switched",
 	"history.compacted",
+	"model.error",
+	"tool.error",
 	"compaction.requested",
 	"compaction.completed",
 	"compaction.error",

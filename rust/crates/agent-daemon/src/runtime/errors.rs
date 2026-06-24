@@ -1,11 +1,14 @@
 use agent_session::{HistoryOperationError, TranscriptStoreError};
-use agent_store::QueueMutationError;
+use agent_store::{ExpectedActiveLeafMismatch, QueueMutationError};
 
 use crate::types::RpcError;
 
 pub(crate) fn map_queued_mutation_error(error: anyhow::Error) -> RpcError {
     if let Some(error) = error.downcast_ref::<QueueMutationError>() {
         return RpcError::new("input_not_found", error.to_string());
+    }
+    if let Some(error) = error.downcast_ref::<ExpectedActiveLeafMismatch>() {
+        return RpcError::new("history_changed", error.to_string());
     }
     error.into()
 }

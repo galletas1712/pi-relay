@@ -50,11 +50,9 @@ const LIST_ONLY_EVENTS = new Set([
 	"action.requested",
 	"model.requested",
 	"model.completed",
-	"model.error",
 	"tool.requested",
 	"tool.started",
 	"tool.completed",
-	"tool.error",
 	"turn.finished",
 ]);
 
@@ -68,6 +66,8 @@ const SELECTED_AND_LIST_EVENTS = new Set([
 	"subagent.idle",
 	"history.switched",
 	"history.compacted",
+	"model.error",
+	"tool.error",
 	"compaction.requested",
 	"compaction.completed",
 	"compaction.error",
