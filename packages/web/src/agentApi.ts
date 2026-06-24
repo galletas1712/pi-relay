@@ -177,14 +177,13 @@ export interface ReadHandoffFileParams {
 	file: HandoffFileName;
 }
 
-/** Steer the full subagent: a steer-priority user message into the subagent's
- * own session (the composer only ever sends follow_up). Read-only subagents are
- * rejected by the daemon; only a delegation's single full subagent is
- * steerable. */
+/** Steer a running delegation subagent through the parent-scoped delegation API.
+ * Read-only subagents use disposable workspaces, but their running
+ * conversations can be steered. */
 export interface SteerSubagentParams {
+	parentSessionId: string;
 	subagentSessionId: string;
-	clientInputId: string;
-	content: ContentBlock[];
+	message: string;
 }
 
 export interface FollowUpResult {
@@ -404,11 +403,10 @@ class AgentApiClient implements AgentApi {
 	}
 
 	steerSubagent(params: SteerSubagentParams): Promise<FollowUpResult> {
-		return this.client.request<FollowUpResult>("input.follow_up", {
-			session_id: params.subagentSessionId,
-			client_input_id: params.clientInputId,
-			priority: "steer",
-			content: params.content
+		return this.client.request<FollowUpResult>("delegation.steer_subagent", {
+			parent_session_id: params.parentSessionId,
+			subagent_id: params.subagentSessionId,
+			message: params.message
 		});
 	}
 

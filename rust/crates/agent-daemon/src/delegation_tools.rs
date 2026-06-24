@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use agent_core::AgentInput;
 use agent_store::{
     Delegation, DelegationKind, DelegationProgress, DelegationStatus, DelegationSubagent,
-    DelegationSubagentOverview, InputPriority, SubagentType,
+    DelegationSubagentOverview, SubagentType,
 };
 use agent_vocab::{ToolCall, ToolResultMessage, UserMessage};
 use serde::Deserialize;
@@ -36,11 +36,45 @@ struct StartFullParams {
     label: Option<String>,
 }
 
-async fn subagent_delegation_for_parent(
+pub(crate) struct SubagentSteerEligibility {
+    pub(crate) delegation: Delegation,
+    pub(crate) has_unfinished_actions: bool,
+}
+
+pub(crate) struct SubagentWorkState {
+    pub(crate) has_unfinished_actions: bool,
+    pub(crate) has_queued_inputs: bool,
+    pub(crate) has_active_runtime: bool,
+    pub(crate) active_leaf_is_turn_boundary: bool,
+}
+
+impl SubagentWorkState {
+    pub(crate) fn has_active_work(&self) -> bool {
+        self.has_unfinished_actions || self.has_queued_inputs || self.has_active_runtime
+    }
+
+    pub(crate) fn is_completion_terminal(&self) -> bool {
+        self.active_leaf_is_turn_boundary && !self.has_active_work()
+    }
+}
+
+pub(crate) async fn load_subagent_work_state(
     state: &AppState,
-    parent_session_id: &str,
     subagent_id: &str,
-) -> std::result::Result<Delegation, RpcError> {
+) -> std::result::Result<SubagentWorkState, RpcError> {
+    Ok(SubagentWorkState {
+        has_unfinished_actions: state.repo.has_unfinished_actions(subagent_id).await?,
+        has_queued_inputs: state.repo.has_queued_inputs(subagent_id).await?,
+        has_active_runtime: subagent_has_active_runtime(state, subagent_id).await,
+        active_leaf_is_turn_boundary: state.repo.active_leaf_is_turn_boundary(subagent_id).await?,
+    })
+}
+
+pub(crate) async fn ensure_subagent_steer_allowed(
+    state: &AppState,
+    subagent_id: &str,
+    parent_session_id: &str,
+) -> std::result::Result<SubagentSteerEligibility, RpcError> {
     let parent = state
         .repo
         .session_parent_id(subagent_id)
@@ -55,6 +89,15 @@ async fn subagent_delegation_for_parent(
             "subagent is not in scope",
         ));
     }
+    match state.repo.session_subagent_type(subagent_id).await? {
+        Some(SubagentType::Full | SubagentType::ReadOnly) => {}
+        None => {
+            return Err(RpcError::new(
+                "subagent_not_found",
+                "subagent is not in scope",
+            ))
+        }
+    }
     let delegation_id = state
         .repo
         .session_delegation_id(subagent_id)
@@ -64,7 +107,45 @@ async fn subagent_delegation_for_parent(
             RpcError::new("subagent_not_found", "subagent is not in scope")
         })?
         .ok_or_else(|| RpcError::new("subagent_not_found", "subagent is not in scope"))?;
-    load_delegation_for_parent(state, parent_session_id, &delegation_id).await
+    let delegation = state
+        .repo
+        .get_delegation(&delegation_id)
+        .await?
+        .ok_or_else(|| RpcError::new("delegation_not_found", "delegation not found"))?;
+    if delegation.parent_session_id != parent_session_id {
+        return Err(RpcError::new(
+            "subagent_not_found",
+            "subagent is not in scope",
+        ));
+    }
+    if delegation.status != DelegationStatus::Running {
+        return Err(RpcError::new(
+            "delegation_not_running",
+            "cannot steer a subagent whose delegation is terminal",
+        ));
+    }
+    let work_state = load_subagent_work_state(state, subagent_id).await?;
+    // A running delegation row can briefly race a subagent reaching its terminal
+    // transcript boundary before the barrier wins the delegation CAS. Callers
+    // hold the child SessionDriver lock while invoking this helper and while
+    // enqueueing the steer. A boundary leaf with queued/unfinished/runtime work
+    // is still active; only an idle boundary child is completion-terminal.
+    if work_state.is_completion_terminal() {
+        return Err(RpcError::new(
+            "subagent_terminal",
+            "cannot steer a subagent that is already terminal",
+        ));
+    }
+    if !work_state.has_active_work() {
+        return Err(RpcError::new(
+            "subagent_not_running",
+            "cannot steer a subagent without active work or queued input",
+        ));
+    }
+    Ok(SubagentSteerEligibility {
+        delegation,
+        has_unfinished_actions: work_state.has_unfinished_actions,
+    })
 }
 
 pub(crate) async fn steer_subagent_core(
@@ -75,68 +156,39 @@ pub(crate) async fn steer_subagent_core(
     let params: SteerSubagentParams = from_params(params)?;
     let subagent_id = trim_required(&params.subagent_id, "subagent_id")?;
     let message = trim_required(&params.message, "message")?;
-    let delegation = subagent_delegation_for_parent(state, parent_session_id, &subagent_id).await?;
-    if delegation.status != DelegationStatus::Running {
-        return Err(RpcError::new(
-            "delegation_not_running",
-            "cannot steer a subagent whose delegation is terminal",
-        ));
-    }
-    match state.repo.session_subagent_type(&subagent_id).await? {
-        Some(SubagentType::Full) => {}
-        Some(SubagentType::ReadOnly) => {
-            return Err(RpcError::new(
-                "cannot_steer_read_only_subagent",
-                "a read-only subagent cannot be steered",
-            ))
-        }
-        None => {
-            return Err(RpcError::new(
-                "subagent_not_found",
-                "subagent is not in scope",
-            ))
-        }
-    }
-    // A running delegation row can briefly race a subagent reaching its terminal
-    // transcript boundary before the barrier wins the delegation CAS. Do not
-    // enqueue a steer in that terminal window: doing so would start a new turn
-    // and reactivate a subagent that has already finished.
-    if state
-        .repo
-        .active_leaf_is_turn_boundary(&subagent_id)
-        .await?
-    {
-        return Err(RpcError::new(
-            "subagent_terminal",
-            "cannot steer a subagent that is already terminal",
-        ));
-    }
-    let has_unfinished_actions = state.repo.has_unfinished_actions(&subagent_id).await?;
-    let has_queued_inputs = state.repo.has_queued_inputs(&subagent_id).await?;
-    let has_active_runtime = subagent_has_active_runtime(state, &subagent_id).await;
-    if !has_unfinished_actions && !has_queued_inputs && !has_active_runtime {
-        return Err(RpcError::new(
-            "subagent_not_running",
-            "cannot steer a subagent without active work or queued input",
-        ));
-    }
+    // Validate parent/delegation scope before touching the child runtime. The
+    // post-recovery check below repeats the work-state predicates while holding
+    // the child driver lock, so terminality cannot be resurrected by a race.
+    ensure_subagent_steer_allowed(state, &subagent_id, parent_session_id).await?;
+    let driver = SessionDriver::acquire(state, &subagent_id).await;
+    driver.recover_if_needed().await?;
+    let eligibility = ensure_subagent_steer_allowed(state, &subagent_id, parent_session_id).await?;
 
-    let client_input_id = format!("subagent-steer:{}:{}", delegation.id, uuid::Uuid::new_v4());
+    let client_input_id = format!(
+        "subagent-steer:{}:{}",
+        eligibility.delegation.id,
+        uuid::Uuid::new_v4()
+    );
     let queued = state
         .repo
-        .enqueue_user_input(
+        .enqueue_scoped_subagent_steer(
+            parent_session_id,
+            &eligibility.delegation.id,
             &subagent_id,
-            InputPriority::Steer,
             &UserMessage::text(message),
-            Some(&client_input_id),
-            None,
+            &client_input_id,
         )
-        .await?;
+        .await?
+        .ok_or_else(|| {
+            RpcError::new(
+                "delegation_not_running",
+                "cannot steer a subagent whose delegation is terminal",
+            )
+        })?;
     if let Some(event) = queued.event {
         publish_events(state, vec![event]);
     }
-    if !has_unfinished_actions {
-        let driver = SessionDriver::acquire(state, &subagent_id).await;
+    if !eligibility.has_unfinished_actions {
         driver.drive_until_blocked().await?;
     }
     Ok(json!({
@@ -147,7 +199,12 @@ pub(crate) async fn steer_subagent_core(
 }
 
 async fn subagent_has_active_runtime(state: &AppState, subagent_id: &str) -> bool {
-    state.active.lock().await.contains_key(subagent_id)
+    let active = state.active.lock().await.get(subagent_id).cloned();
+    let Some(active) = active else {
+        return false;
+    };
+    let runtime = active.lock().await;
+    runtime.session.is_ready_to_continue()
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +239,10 @@ struct DelegationIdParams {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SteerSubagentParams {
+    /// Present for websocket `delegation.steer_subagent`, absent for the
+    /// model-facing `steer_subagent` tool.
+    #[serde(rename = "parent_session_id")]
+    _parent_session_id: Option<String>,
     subagent_id: String,
     message: String,
 }
@@ -496,8 +557,8 @@ pub(crate) async fn status_core(
 /// writes transcript-only artifacts. If completion or another cancellation wins
 /// first, this returns `{ "cancelled": false }` and leaves existing artifacts
 /// untouched. Interrupting a read-only subagent is allowed here because the
-/// whole delegation is being torn down (the per-subagent guard only blocks the
-/// model/parent from steering or interrupting an individual RO subagent).
+/// whole delegation is being torn down; per-subagent steering is allowed for
+/// running RO subagents through `steer_subagent_core`.
 pub(crate) async fn cancel_core(
     state: &AppState,
     parent_session_id: &str,
@@ -981,6 +1042,14 @@ pub(crate) async fn rpc_cancel(
     cancel_core(state, &parent_session_id, params).await
 }
 
+pub(crate) async fn rpc_steer_subagent(
+    state: &AppState,
+    params: Value,
+) -> std::result::Result<Value, RpcError> {
+    let parent_session_id = parent_session_id_from_params(&params)?;
+    steer_subagent_core(state, &parent_session_id, params).await
+}
+
 const DEFAULT_DELEGATION_LIST_LIMIT: i64 = 3;
 const MAX_DELEGATION_LIST_LIMIT: i64 = 100;
 
@@ -1007,10 +1076,15 @@ fn list_subagent_status(
     subagent: &DelegationSubagentOverview,
 ) -> String {
     match delegation_status {
-        DelegationStatus::Running => subagent
-            .terminal_status
-            .clone()
-            .unwrap_or_else(|| "running".to_string()),
+        DelegationStatus::Running => {
+            if let Some(terminal_status) = &subagent.terminal_status {
+                terminal_status.clone()
+            } else if subagent.activity != agent_store::SessionActivity::Idle {
+                subagent.activity.to_string()
+            } else {
+                "running".to_string()
+            }
+        }
         DelegationStatus::Done | DelegationStatus::DoneWithFailures => subagent
             .terminal_status
             .clone()
@@ -1062,6 +1136,12 @@ pub(crate) async fn rpc_list(
                 .has_task
                 .then(|| task_prompt_rel(&subagent.session_id));
             let status = list_subagent_status(delegation.status, &subagent);
+            let has_active_work = subagent.activity != agent_store::SessionActivity::Idle
+                || subagent_has_active_runtime(state, &subagent.session_id).await;
+            let steerable = delegation.status == DelegationStatus::Running
+                && subagent.subagent_type.is_some()
+                && subagent.terminal_status.is_none()
+                && has_active_work;
             subagents.push(json!({
                 "id": subagent.session_id,
                 "status": status,
@@ -1070,8 +1150,7 @@ pub(crate) async fn rpc_list(
                 "type": subagent.subagent_type,
                 "subagent_type": subagent.subagent_type,
                 "task_prompt_file": task_prompt_file,
-                "steerable": delegation.status == DelegationStatus::Running
-                    && subagent.subagent_type == Some(SubagentType::Full),
+                "steerable": steerable,
                 "outcome": serde_json::Value::Null,
                 "final_message_file": serde_json::Value::Null,
                 "transcript_file": serde_json::Value::Null,

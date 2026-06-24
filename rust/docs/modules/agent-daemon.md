@@ -42,7 +42,7 @@ delegation_tools.rs     delegation tool surface (delegate_writing_task /
                    delegate_readonly_tasks / inspect_delegation /
                    cancel_delegation / steer_subagent) plus delegation.* web RPCs
                    (start_full / start_readonly_fanout / status / cancel /
-                   list) + homogeneity/one-delegation-per-parent guards
+                   steer_subagent / list) + homogeneity/one-delegation-per-parent guards
 delegation_runner.rs    delegation barrier: all-terminal detect, attempt-fenced finish CAS,
                    idempotent handoff write, one steer to the parent; boot
                    crash sweep

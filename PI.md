@@ -75,7 +75,7 @@ Rules:
   knows what you put in its prompt (and any handoff/workspace paths you cite).
 - While a full subagent is running, supervise and read — do not edit the workspace
   yourself until it returns.
-- If a running full subagent needs a correction, clarification, or additional
+- If a running subagent needs a correction, clarification, or additional
   information, prefer `steer_subagent` over cancelling and restarting. Use the
   subagent session id shown by `inspect_delegation`.
 - Cancellation is terminal. Use `cancel_delegation` when you intend to abandon

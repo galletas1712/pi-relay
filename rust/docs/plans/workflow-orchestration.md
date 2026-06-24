@@ -65,7 +65,7 @@ Subagent orchestration with the smallest possible runtime:
 | On return | snapshot destroyed | edits persist as the parent's state |
 | Durable file output | none (snapshot is gone) | yes, in the workspace |
 | Result to parent | final message + transcript via handoff dir | same, plus its in-place edits |
-| Steerable/interruptible? | no (fire-and-forget) | yes |
+| Steerable/interruptible? | steerable while active; whole stage cancellable | steerable while active; whole stage cancellable |
 | Per stage | many, in parallel | exactly one |
 
 ### What makes this safe and simple
@@ -147,8 +147,10 @@ signal is the existing parent-scoped lifecycle event the barrier consumes.
   transcript, both captured to the handoff directory by the daemon (rendered from
   the session transcript in Postgres — capture does not depend on the snapshot
   still existing).
-- **Cannot be steered or interrupted individually** (fire-and-forget). A whole RO
-  stage can be cancelled.
+- **Can be steered while active** through the same subagent path as full
+  subagents; terminal/idle RO targets are rejected. Read-only means isolated from
+  the parent workspace, not immutable conversation state. A whole RO stage can be
+  cancelled.
 - Many run in parallel in one stage, each isolated.
 
 ### Full (durable)
@@ -248,8 +250,8 @@ parent calls delegate_writing_task / delegate_readonly_tasks
 A stage is terminal when all its subagents are terminal
 (`done`/`failed`/`cancelled`/`crashed`). The barrier delivers **partial results
 and failures together** in a single notification — never a stream of
-per-subagent notifications. The parent may cancel an in-flight stage; it can steer
-the single full subagent but not an individual RO subagent.
+per-subagent notifications. The parent may cancel an in-flight stage; it can
+steer active subagents while terminal/idle targets are rejected.
 
 ## Snapshots and recovery
 
@@ -414,8 +416,10 @@ cancel_delegation                -> cancel an in-flight stage
 ```
 
 Full schemas in Appendix A. Workflows have **no tools**: they are skills loaded
-with the existing `LoadSkill`. Steer/interrupt of the single full subagent reuses
-the existing subagent path; RO subagents reject steer/interrupt by type.
+with the existing `LoadSkill`. Steer/interrupt targets use the existing subagent
+path for active subagents; terminal/idle targets are rejected. RO subagents remain
+read-only with respect to the parent filesystem because they run in disposable
+workspace snapshots.
 
 System-prompt rules for the parent (Appendix B): launch at most one stage per
 turn then end your turn; never poll; never start a second stage while one runs;
@@ -432,7 +436,7 @@ the parent while a stage runs, and the parent asks the user directly when it nee
 a decision. A full subagent that needs the human ends with
 `outcome = human_needed`, which appears in its handoff `final_message.md`
 and the wakeup observation; the parent relays it. To intervene in a running stage the user
-cancels it or steers the full subagent. No blocked-run table, no signal artifact.
+cancels it or steers an active subagent. No blocked-run table, no signal artifact.
 
 ## Migration off the Python REPL
 
@@ -578,7 +582,7 @@ busy-wait/poll loop.
 
 - Run board: parent session -> stages -> subagents with status and links to their
   handoff files; show the full subagent's in-place changes. Controls: cancel
-  stage, steer the full subagent, re-run a stage.
+  stage, steer active subagents, re-run a stage.
 
 ## Testing
 
@@ -657,7 +661,8 @@ method names.
 ```
 
 Daemon-enforced errors: starting a second stage while one is running; mixing full
-and RO in one stage; more than one full subagent; steering an RO subagent.
+and RO in one stage; more than one full subagent; steering a terminal or idle
+subagent.
 Completion is **not** a tool result — it arrives later as a daemon-authored
 wakeup observation containing an `inspect_delegation`-equivalent bounded snapshot
 with handoff artifact paths. The

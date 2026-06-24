@@ -974,6 +974,15 @@ Queue snapshots in responses and events use the canonical ordering: queued
 steers first by steering/promote time, then queued follow-ups by dense
 `follow_up_position`.
 
+Raw `input.follow_up`/`session.input` with `priority: "steer"` is not a public
+subagent-control API. If the target `session_id` is a subagent, the daemon
+rejects it with `subagent_steer_requires_parent_scope`; callers must use the
+parent-scoped `steer_subagent` delegation tool/API path so the daemon can verify
+parent session, delegation membership, and running/steerable state. Internally
+accepted subagent steers are still stored as `InputPriority::Steer` rows on the
+child session. Promoting a child-session follow-up through `input.promote_queued`
+is rejected for the same reason.
+
 ### `input.promote_queued`
 
 Promotes a still-queued follow-up into the steer queue. Promotions are consumed
@@ -1283,7 +1292,11 @@ Returns one in-scope delegation as the canonical structured snapshot. The
 snapshot includes delegation metadata, progress counts, subagent roles/types,
 activity/status, steerability, `outcome` (when available), and compact
 handoff file references. It does not inline full transcript, task prompt, or
-final-message bodies; read handoff files when detail is needed.
+final-message bodies; read handoff files when detail is needed. `steerable` is
+true only when a parent-scoped `steer_subagent` request would currently be
+accepted for that child: the delegation is running, the child is a delegation
+member, the child has queued/unfinished/runtime work, and it is not
+completion-terminal.
 
 ```json
 {
@@ -1358,6 +1371,33 @@ Successful result:
       "transcript_file": "cancelled/session_abc.transcript.md"
     }
   ]
+}
+```
+
+### `delegation.steer_subagent`
+
+Parent-scoped steering for one running delegation subagent. This is the only
+public/API steering path for subagents; raw `input.follow_up` with
+`priority: "steer"` against a child session is rejected. The daemon validates
+that `parent_session_id` owns the child through a running delegation, that the
+child is a full or read-only delegation subagent, and that the child is active
+rather than completion-terminal.
+
+```json
+{
+  "parent_session_id": "parent-session",
+  "subagent_id": "session_...",
+  "message": "Please also check the retry path."
+}
+```
+
+Result:
+
+```json
+{
+  "subagent_id": "session_...",
+  "queued": true,
+  "input_id": "input_..."
 }
 ```
 

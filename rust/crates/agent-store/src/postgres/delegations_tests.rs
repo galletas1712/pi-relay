@@ -8,7 +8,7 @@ use agent_vocab::{
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::{DelegationKind, DelegationStatus, SessionConfig, SubagentType};
+use crate::{DelegationKind, DelegationStatus, OutputBatch, SessionConfig, SubagentType};
 
 use super::*;
 
@@ -1076,6 +1076,108 @@ async fn all_terminal_predicate_and_boot_sweep() {
         .await
         .expect("sweep")
         .is_empty());
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn queued_input_on_boundary_subagent_blocks_delegation_terminality() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(
+            project_id,
+            "delegations queued terminality test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    let delegation = db
+        .store
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
+        .await
+        .expect("create delegation");
+    create_delegation_subagent(
+        &db,
+        "child_a",
+        project_id,
+        "parent",
+        SubagentType::ReadOnly,
+        "reviewer",
+        &delegation.id,
+    )
+    .await;
+    create_delegation_subagent(
+        &db,
+        "child_b",
+        project_id,
+        "parent",
+        SubagentType::ReadOnly,
+        "reviewer",
+        &delegation.id,
+    )
+    .await;
+    assert!(db
+        .store
+        .delegation_subagents_all_terminal(&delegation.id)
+        .await
+        .expect("both idle boundary subagents are terminal"));
+
+    db.store
+        .enqueue_user_input(
+            "child_a",
+            crate::InputPriority::Steer,
+            &UserMessage::text("accepted queued steer must run before fan-out completes"),
+            Some("queued-steer-before-barrier"),
+            None,
+        )
+        .await
+        .expect("enqueue steer");
+    assert!(!db
+        .store
+        .delegation_subagents_all_terminal(&delegation.id)
+        .await
+        .expect("queued steer blocks terminality"));
+    assert!(db
+        .store
+        .sweep_running_delegations()
+        .await
+        .expect("sweep")
+        .is_empty());
+    let progress = db
+        .store
+        .delegation_progress(&delegation)
+        .await
+        .expect("progress with queued steer");
+    assert_eq!(progress.terminal, 1);
+    assert_eq!(progress.running, 1);
+
+    let consumed = db
+        .store
+        .take_next_queued_input("child_a")
+        .await
+        .expect("take queued steer")
+        .expect("queued steer exists");
+    db.store
+        .persist_outputs(
+            "child_a",
+            OutputBatch::new(&[], None, &[], &[]).with_consumed_input(Some(consumed)),
+        )
+        .await
+        .expect("mark steer consumed");
+    assert!(db
+        .store
+        .delegation_subagents_all_terminal(&delegation.id)
+        .await
+        .expect("terminal after steer consumed"));
+    let ready = db.store.sweep_running_delegations().await.expect("sweep");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].id, delegation.id);
 
     db.cleanup().await;
 }

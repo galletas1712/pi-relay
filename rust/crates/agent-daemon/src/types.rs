@@ -77,6 +77,7 @@ pub(crate) enum RpcMethod {
     DelegationStartReadonlyFanout,
     DelegationStatus,
     DelegationCancel,
+    DelegationSteerSubagent,
     DelegationList,
     DelegationReadHandoffFile,
     HarnessModelComplete,
@@ -120,6 +121,7 @@ impl RpcMethod {
             "delegation.start_readonly_fanout" => Some(Self::DelegationStartReadonlyFanout),
             "delegation.status" => Some(Self::DelegationStatus),
             "delegation.cancel" => Some(Self::DelegationCancel),
+            "delegation.steer_subagent" => Some(Self::DelegationSteerSubagent),
             "delegation.list" => Some(Self::DelegationList),
             "delegation.read_handoff_file" => Some(Self::DelegationReadHandoffFile),
             "harness.model.complete" => Some(Self::HarnessModelComplete),
@@ -212,6 +214,10 @@ mod tests {
         assert_eq!(
             RpcMethod::parse("delegation.cancel"),
             Some(RpcMethod::DelegationCancel)
+        );
+        assert_eq!(
+            RpcMethod::parse("delegation.steer_subagent"),
+            Some(RpcMethod::DelegationSteerSubagent)
         );
         assert_eq!(
             RpcMethod::parse("delegation.list"),

@@ -1,8 +1,9 @@
-use agent_store::{Delegation, DelegationProgress, DelegationStatus, SubagentType};
+use agent_store::{Delegation, DelegationProgress, DelegationStatus, SessionActivity};
 use agent_vocab::{DaemonToolObservation, ToolCallId};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+use crate::delegation_tools::load_subagent_work_state;
 use crate::handoff::{
     delegation_dir, refresh_delegation_handoff_artifacts, refresh_task_prompt_artifact_if_present,
     safe_handoff_path_segment, task_prompt_rel, SubagentArtifact,
@@ -18,13 +19,6 @@ pub(crate) fn progress_view(progress: DelegationProgress) -> Value {
         "running": progress.running,
         "failed": progress.failed,
     })
-}
-
-fn count_failed_subagent_artifacts(artifacts: &[SubagentArtifact]) -> usize {
-    artifacts
-        .iter()
-        .filter(|artifact| artifact.terminal_status == Some("failed"))
-        .count()
 }
 
 async fn inspectable_handoff_artifacts(
@@ -84,10 +78,6 @@ fn delegation_view(
     })
 }
 
-async fn subagent_has_active_runtime(state: &AppState, subagent_id: &str) -> bool {
-    state.active.lock().await.contains_key(subagent_id)
-}
-
 /// Build the rich delegation snapshot returned by `inspect_delegation`.
 ///
 /// This is also the canonical payload for terminal parent wakeups. It refreshes
@@ -108,23 +98,32 @@ pub(crate) async fn build_delegation_snapshot(
         delegation.status,
         DelegationStatus::Running | DelegationStatus::Done | DelegationStatus::DoneWithFailures
     );
-    let failed_count = if count_artifact_terminality {
-        count_failed_subagent_artifacts(&artifacts)
-    } else {
-        0
-    };
+    let mut failed_count = 0usize;
     let mut subagent_views = Vec::with_capacity(subagents.len());
     for subagent in subagents {
         let artifact = artifacts
             .iter()
             .find(|artifact| artifact.session_id == subagent.session_id);
-        let terminal_status = artifact.and_then(|artifact| artifact.terminal_status);
-        if count_artifact_terminality && terminal_status.is_some() {
+        let branch_terminal_status = artifact.and_then(|artifact| artifact.terminal_status);
+        let running_work_state = if delegation.status == DelegationStatus::Running {
+            Some(load_subagent_work_state(state, &subagent.session_id).await?)
+        } else {
+            None
+        };
+        let completion_terminal_status = match running_work_state.as_ref() {
+            Some(work_state) if !work_state.is_completion_terminal() => None,
+            _ => branch_terminal_status,
+        };
+        if count_artifact_terminality && completion_terminal_status.is_some() {
             terminal_count += 1;
+            if completion_terminal_status == Some("failed") {
+                failed_count += 1;
+            }
         } else if delegation.status == DelegationStatus::Running {
             running_count += 1;
         }
-        let outcome = artifact.and_then(|artifact| artifact.outcome.clone());
+        let outcome = completion_terminal_status
+            .and_then(|_| artifact.and_then(|artifact| artifact.outcome.clone()));
         let final_message_file = artifact.and_then(SubagentArtifact::final_message_rel);
         let normal_transcript_file = artifact.map(SubagentArtifact::transcript_rel);
         let task_prompt_file = if let Some(artifact) = artifact {
@@ -153,32 +152,28 @@ pub(crate) async fn build_delegation_snapshot(
             normal_transcript_file
         };
         let status = match delegation.status {
-            DelegationStatus::Running => terminal_status
-                .map(str::to_string)
-                .unwrap_or_else(|| "running".to_string()),
-            DelegationStatus::Done | DelegationStatus::DoneWithFailures => terminal_status
-                .map(str::to_string)
-                .unwrap_or_else(|| delegation.status.as_str().to_string()),
+            DelegationStatus::Running if completion_terminal_status.is_some() => {
+                completion_terminal_status.unwrap_or("running").to_string()
+            }
+            DelegationStatus::Running if subagent.activity != SessionActivity::Idle => {
+                subagent.activity.to_string()
+            }
+            DelegationStatus::Running => "running".to_string(),
+            DelegationStatus::Done | DelegationStatus::DoneWithFailures => {
+                completion_terminal_status
+                    .map(str::to_string)
+                    .unwrap_or_else(|| delegation.status.as_str().to_string())
+            }
             DelegationStatus::Cancelled | DelegationStatus::Failed => {
                 delegation.status.as_str().to_string()
             }
         };
-        let has_active_work = if delegation.status == DelegationStatus::Running
-            && subagent.subagent_type == Some(SubagentType::Full)
-            && terminal_status.is_none()
-        {
-            state
-                .repo
-                .has_unfinished_actions(&subagent.session_id)
-                .await?
-                || state.repo.has_queued_inputs(&subagent.session_id).await?
-                || subagent_has_active_runtime(state, &subagent.session_id).await
-        } else {
-            false
-        };
+        let has_active_work = running_work_state
+            .as_ref()
+            .is_some_and(|work_state| work_state.has_active_work());
         let steerable = delegation.status == DelegationStatus::Running
-            && subagent.subagent_type == Some(SubagentType::Full)
-            && terminal_status.is_none()
+            && subagent.subagent_type.is_some()
+            && completion_terminal_status.is_none()
             && has_active_work;
         subagent_views.push(json!({
             "id": subagent.session_id,
