@@ -1769,10 +1769,7 @@ async fn cancel_delegation_returns_transcript_only_paths() {
     let listed_subagent = &list["delegations"].as_array().unwrap()[0]["subagents"]
         .as_array()
         .unwrap()[0];
-    assert_eq!(
-        listed_subagent["transcript_file"],
-        "cancelled/impl_to_cancel.transcript.md"
-    );
+    assert_eq!(listed_subagent["transcript_file"], serde_json::Value::Null);
     assert!(listed_subagent
         .get("cancellation_transcript_path")
         .is_none());
@@ -2244,9 +2241,9 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .unwrap();
     assert_eq!(listed_done["status"], "done");
     assert_eq!(listed_done["activity"], "idle");
-    assert_eq!(listed_done["outcome"], "done");
+    assert_eq!(listed_done["outcome"], serde_json::Value::Null);
     assert_eq!(listed_done["final_message_file"], serde_json::Value::Null);
-    assert_eq!(listed_done["transcript_file"], "done_child/transcript.md");
+    assert_eq!(listed_done["transcript_file"], serde_json::Value::Null);
     assert_list_subagent_has_only_compact_fields(listed_done);
     let listed_running = listed["subagents"]
         .as_array()
@@ -2257,10 +2254,7 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
     assert_eq!(listed_running["status"], "running");
     assert_eq!(listed_running["activity"], "idle");
     assert_eq!(listed_running["outcome"], serde_json::Value::Null);
-    assert_eq!(
-        listed_running["transcript_file"],
-        "running_child/transcript.md"
-    );
+    assert_eq!(listed_running["transcript_file"], serde_json::Value::Null);
     assert_list_subagent_has_only_compact_fields(listed_running);
 
     // Mutate the stale artifact on disk; a later inspect must refresh it from
@@ -2655,10 +2649,7 @@ async fn out_of_set_outcome_is_recorded_verbatim() {
         .expect("barrier");
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["status"], "done");
-    assert_eq!(
-        snapshot["subagents"][0]["outcome"],
-        "ship_it_immediately"
-    );
+    assert_eq!(snapshot["subagents"][0]["outcome"], "ship_it_immediately");
 
     env.cleanup().await;
 }

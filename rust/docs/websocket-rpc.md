@@ -1363,11 +1363,12 @@ Successful result:
 
 ### `delegation.list`
 
-Lists all delegations for a parent session, newest first. This is the run-board
-feed used by the web UI.
+Lists a bounded newest-first page of delegations for a parent session. This is
+the lightweight run-board feed used by the web UI; use `delegation.status` or
+`delegation.read_handoff_file` for detail artifacts and outcomes.
 
 ```json
-{ "parent_session_id": "parent-session" }
+{ "parent_session_id": "parent-session", "limit": 3 }
 ```
 
 Result:
@@ -1375,6 +1376,8 @@ Result:
 ```json
 {
   "parent_session_id": "parent-session",
+  "limit": 3,
+  "has_more": false,
   "delegations": [
     {
       "delegation_id": "delegation_...",
@@ -1385,16 +1388,16 @@ Result:
       "subagents": [
         {
           "id": "session_...",
-          "status": "idle",
+          "status": "done",
+          "activity": "idle",
           "role": "implementer",
           "subagent_type": "full",
           "task_prompt_file": "session_.../task_prompt.md",
-          "transcript_file": "session_.../transcript.md",
-          "final_message_file": "session_.../final_message.md",
-          "outcome": "ready_for_review"
+          "transcript_file": null,
+          "final_message_file": null,
+          "outcome": null
         }
-      ],
-      "handoff_dir": "/.../.pi-handoff/delegation_..."
+      ]
     }
   ]
 }

@@ -20,6 +20,48 @@ struct TestDb {
     name: String,
 }
 
+async fn create_delegation_subagent_with_task_and_leaf(
+    db: &TestDb,
+    session_id: &str,
+    project_id: Uuid,
+    parent_session_id: &str,
+    subagent_type: SubagentType,
+    role_name: &str,
+    task: Option<&str>,
+    delegation_id: &str,
+    active_leaf: Option<TranscriptItem>,
+) {
+    let leaf = active_leaf.as_ref().map(|_| format!("{session_id}_leaf"));
+    let entries = active_leaf
+        .map(|item| {
+            vec![TranscriptStorageNode {
+                id: leaf.clone().expect("leaf id"),
+                parent_id: None,
+                timestamp_ms: 1,
+                item,
+                provider_replay: Vec::new(),
+            }]
+        })
+        .unwrap_or_default();
+    db.store
+        .start_session_outputs_with_parent(
+            session_id,
+            &session_config_with_task(project_id, Some(role_name), task),
+            &entries,
+            leaf.as_deref(),
+            &[],
+            &[],
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("go"),
+            None,
+            Some(parent_session_id),
+            Some(subagent_type),
+            Some(delegation_id),
+        )
+        .await
+        .expect("create delegation subagent");
+}
+
 impl TestDb {
     async fn cleanup(self) {
         self.store.close().await;
@@ -74,10 +116,21 @@ fn database_url_with_name(base: &str, name: &str) -> String {
 }
 
 fn session_config(project_id: Uuid, role_name: Option<&str>) -> SessionConfig {
-    let metadata = match role_name {
-        Some(role_name) => json!({ "created_by": "test", "role_name": role_name }),
-        None => json!({ "created_by": "test" }),
-    };
+    session_config_with_task(project_id, role_name, None)
+}
+
+fn session_config_with_task(
+    project_id: Uuid,
+    role_name: Option<&str>,
+    task: Option<&str>,
+) -> SessionConfig {
+    let mut metadata = json!({ "created_by": "test" });
+    if let Some(role_name) = role_name {
+        metadata["role_name"] = json!(role_name);
+    }
+    if let Some(task) = task {
+        metadata["task"] = json!(task);
+    }
     SessionConfig {
         project_id: Some(project_id),
         outer_cwd: "/tmp/pi-relay-test".to_string(),
@@ -548,6 +601,107 @@ async fn delegation_progress_is_lightweight_and_counts_terminal_failures() {
         .expect("terminal progress");
     assert_eq!(terminal_progress.running, 0);
     assert_eq!(terminal_progress.failed, 1);
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn parent_delegations_newest_is_bounded_and_subagent_overview_is_compact() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegations newest list test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+
+    let mut delegations = Vec::new();
+    for index in 0..5 {
+        let delegation = db
+            .store
+            .create_delegation(
+                "parent",
+                DelegationKind::ReadonlyFanout,
+                None,
+                Some(&format!("delegation-{index}")),
+                1,
+            )
+            .await
+            .expect("create delegation");
+        sqlx::query("update delegations set created_at = now() + ($2::int * interval '1 second') where id=$1")
+            .bind(&delegation.id)
+            .bind(index)
+            .execute(&db.store.pool)
+            .await
+            .expect("set deterministic ordering");
+        delegations.push(delegation);
+    }
+
+    let newest = db
+        .store
+        .list_parent_delegations_newest("parent", 3)
+        .await
+        .expect("list newest delegations");
+    assert_eq!(
+        newest
+            .iter()
+            .map(|delegation| delegation.label.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            Some("delegation-4"),
+            Some("delegation-3"),
+            Some("delegation-2")
+        ]
+    );
+
+    let overview_delegation = &delegations[4];
+    create_delegation_subagent_with_task_and_leaf(
+        &db,
+        "child_done",
+        project_id,
+        "parent",
+        SubagentType::ReadOnly,
+        "reviewer",
+        Some("review this"),
+        &overview_delegation.id,
+        Some(TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Graceful,
+        }),
+    )
+    .await;
+    create_delegation_subagent_with_task_and_leaf(
+        &db,
+        "child_running",
+        project_id,
+        "parent",
+        SubagentType::ReadOnly,
+        "reviewer",
+        Some("   "),
+        &overview_delegation.id,
+        Some(TranscriptItem::AssistantMessage(AssistantMessage {
+            items: Vec::new(),
+        })),
+    )
+    .await;
+
+    let overview = db
+        .store
+        .delegation_subagent_overview(&overview_delegation.id)
+        .await
+        .expect("overview");
+    assert_eq!(overview.len(), 2);
+    assert_eq!(overview[0].session_id, "child_done");
+    assert_eq!(overview[0].activity, crate::SessionActivity::Idle);
+    assert_eq!(overview[0].role.as_deref(), Some("reviewer"));
+    assert!(overview[0].has_task);
+    assert_eq!(overview[0].terminal_status.as_deref(), Some("done"));
+    assert_eq!(overview[1].session_id, "child_running");
+    assert!(!overview[1].has_task);
+    assert_eq!(overview[1].terminal_status, None);
 
     db.cleanup().await;
 }
