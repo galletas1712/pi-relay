@@ -49,7 +49,7 @@ export interface AgentApi {
 	readHandoffFile(params: ReadHandoffFileParams): Promise<ReadHandoffFileResult>;
 	steerSubagent(params: SteerSubagentParams): Promise<FollowUpResult>;
 	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse>;
-	listTools(provider: string): Promise<ToolListing[]>;
+	listTools(provider: string, sessionId?: string | null): Promise<ToolListing[]>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
 	syncActiveBranch(sessionId: string, baseLeafId: string | null): Promise<ActiveBranchSyncResponse>;
 	getTranscriptIndex(sessionId: string, options?: TranscriptIndexOptions): Promise<TranscriptTreeIndex>;
@@ -418,8 +418,11 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	async listTools(provider: string): Promise<ToolListing[]> {
-		const result = await this.client.request<{ tools: ToolListing[] }>("tools.list", { provider });
+	async listTools(provider: string, sessionId?: string | null): Promise<ToolListing[]> {
+		const result = await this.client.request<{ tools: ToolListing[] }>("tools.list", {
+			provider,
+			session_id: sessionId || undefined,
+		});
 		return result.tools;
 	}
 

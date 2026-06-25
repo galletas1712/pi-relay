@@ -162,10 +162,7 @@ async fn append_subagents(
                 inline_code(&subagent.session_id)
             ));
             if let Some(outcome) = read_outcome(&final_message_path).await {
-                out.push_str(&format!(
-                    "; outcome: {}",
-                    serde_json::to_string(&outcome)?
-                ));
+                out.push_str(&format!("; outcome: {}", serde_json::to_string(&outcome)?));
             }
         }
         out.push('\n');
@@ -245,8 +242,7 @@ fn truncate_chars(value: &str, max_chars: usize) -> String {
 }
 
 fn bounded_outcome(final_message: &str) -> Option<String> {
-    extract_outcome(final_message)
-        .map(|value| truncate_chars(&value, MAX_OUTCOME_CHARS))
+    extract_outcome(final_message).map(|value| truncate_chars(&value, MAX_OUTCOME_CHARS))
 }
 
 fn optional_inline_code(value: Option<&str>) -> String {
@@ -327,8 +323,7 @@ pub(crate) fn test_ledger_from_snapshots(
                 if let Some(final_message) = subagent.final_message.as_deref() {
                     let trimmed_final_message = final_message.trim();
                     if !trimmed_final_message.is_empty() {
-                        if let Some(outcome) = bounded_outcome(trimmed_final_message)
-                        {
+                        if let Some(outcome) = bounded_outcome(trimmed_final_message) {
                             out.push_str(&format!(
                                 "; outcome: {}",
                                 serde_json::to_string(&outcome)?
@@ -392,10 +387,7 @@ mod tests {
 
     #[test]
     fn bounded_compaction_ledger_omits_transcript_and_final_message_bodies() {
-        let long_final = format!(
-            "{}\n\noutcome: approved",
-            "final-message ".repeat(100)
-        );
+        let long_final = format!("{}\n\noutcome: approved", "final-message ".repeat(100));
         let subagents = (0..10)
             .map(|index| TestSubagent {
                 session_id: format!("child_{index}"),

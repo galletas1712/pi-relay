@@ -8,7 +8,9 @@ use agent_vocab::{ToolResultMessage, ToolResultStatus, TranscriptItem};
 use serde_json::json;
 
 use crate::delegation_tools::{is_delegation_tool_name, run_delegation_tool};
-use crate::provider_runtime::{is_web_tool_name, load_skill_result, run_web_tool};
+use crate::provider_runtime::{
+    effective_prompt_profile, is_web_tool_name, load_skill_result, run_web_tool,
+};
 use crate::state::AppState;
 use crate::types::{DispatchAction, RpcError};
 
@@ -60,6 +62,7 @@ pub(super) async fn run_tool_turn(
             &dispatch.config.workspaces,
             &loaded_skills,
             &tool_call,
+            effective_prompt_profile(&state, &dispatch.config, &session_id).await?,
         )
     } else if is_web_tool_name(&tool_call.tool_name) {
         run_web_tool(

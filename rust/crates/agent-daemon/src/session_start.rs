@@ -74,7 +74,7 @@ pub(crate) async fn session_start(
         workspaces,
         system_prompt: String::new(),
         provider: params.provider,
-        metadata: params.metadata.unwrap_or_else(|| json!({})),
+        metadata: parent_session_metadata(params.metadata.unwrap_or_else(|| json!({}))),
     };
     config.system_prompt = render_pi_prompt(state, &config)?;
 
@@ -100,6 +100,18 @@ pub(crate) async fn session_start(
         "activity": started.activity,
         "replayed": started.replayed,
     }))
+}
+
+fn parent_session_metadata(metadata: Value) -> Value {
+    let mut metadata = match metadata {
+        Value::Object(map) => Value::Object(map),
+        _ => json!({}),
+    };
+    let Value::Object(map) = &mut metadata else {
+        unreachable!("metadata was forced to an object");
+    };
+    map.insert("prompt_profile".to_string(), json!("parent"));
+    metadata
 }
 
 pub(crate) struct PreparedSessionStart {

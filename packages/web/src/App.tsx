@@ -575,9 +575,10 @@ export function App() {
 
 	const activeProvider = loadedSnapshot?.provider ?? selectedSession?.provider ?? newSessionProvider;
 	const activeProviderKind = activeProvider.kind;
+	const activeToolsSessionId = loadedSnapshot?.session_id ?? selectedChatSession?.session_id ?? null;
 	const toolsQuery = useQuery({
-		queryKey: queryKeys.tools(activeProviderKind),
-		queryFn: () => api.listTools(activeProviderKind),
+		queryKey: queryKeys.tools(activeProviderKind, activeToolsSessionId),
+		queryFn: () => api.listTools(activeProviderKind, activeToolsSessionId),
 		enabled: connection === "open",
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];

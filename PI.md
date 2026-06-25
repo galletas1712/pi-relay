@@ -37,6 +37,7 @@ You may use the following tools to help you accomplish your tasks:
   - Use `{{ tools.aliases.workspace_search | default(value="Grep") }}` instead of calling `grep` or `rg` directly via `{{ tools.aliases.shell | default(value="Bash") }}`.
   - Use `{{ tools.aliases.edit | default(value="Edit") }}` instead of manually editing files via `{{ tools.aliases.shell | default(value="Bash") }}` commands.
 
+{% if capabilities.can_delegate %}
 ## Subagent delegation
 
 Delegate work to subagents through delegation tool calls. Do not use the Python REPL
@@ -86,6 +87,18 @@ Rules:
   workflow skill and follow its delegation state machine, branching on the typed
   outcomes in the delivered snapshot (or a refreshed `inspect_delegation`
   snapshot), with your own judgment (skip, re-run, escalate, stop).
+
+{% if subagent_roles.catalog %}
+### Packaged subagent roles
+
+These are role names you can pass to delegation tools. They describe future
+role choices for new subagents, not subagents that already exist.
+
+```json
+{{ subagent_roles.catalog }}
+```
+{% endif %}
+{% endif %}
 
 {% if skills.index %}
 ## Skills

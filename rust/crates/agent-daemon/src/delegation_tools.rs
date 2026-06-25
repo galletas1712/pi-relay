@@ -1113,6 +1113,13 @@ pub(crate) async fn run_delegation_tool(
     parent_session_id: &str,
     call: &ToolCall,
 ) -> ToolResultMessage {
+    if let Err(error) = reject_if_subagent(state, parent_session_id).await {
+        return ToolResultMessage::error(
+            call.id.clone(),
+            &call.tool_name,
+            format!("{}: {}", error.code, error.message),
+        );
+    }
     let params: Value = match serde_json::from_str(&call.args_json) {
         Ok(params) => params,
         Err(error) => {

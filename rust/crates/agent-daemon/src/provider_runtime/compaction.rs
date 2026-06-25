@@ -15,7 +15,9 @@ use crate::model_metadata;
 use crate::state::AppState;
 
 use super::auth_retry::{compact_with_auth_retry, complete_with_auth_retry};
-use super::prompt::render_pi_compaction_prompt;
+use super::prompt::{
+    effective_prompt_profile, provider_tools_for_session, render_pi_compaction_prompt,
+};
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
 
@@ -323,9 +325,11 @@ pub(crate) async fn remote_compaction_request(
         prompt: PromptSections::stable(config.system_prompt.clone()),
         transcript,
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: state
-            .tools
-            .provider_tools_for_provider(config.provider.kind),
+        tools: provider_tools_for_session(
+            state,
+            config.provider.kind,
+            effective_prompt_profile(state, config, session_id).await?,
+        ),
         reasoning_effort: model_metadata::normalize_reasoning_effort(
             config.provider.kind,
             &config.provider.model,
