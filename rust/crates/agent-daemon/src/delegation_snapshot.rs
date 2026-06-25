@@ -32,7 +32,7 @@ async fn inspectable_handoff_artifacts(
     let dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
     let include_final_messages = matches!(
         delegation.status,
-        DelegationStatus::Done | DelegationStatus::DoneWithFailures
+        DelegationStatus::Running | DelegationStatus::Done | DelegationStatus::DoneWithFailures
     );
     match delegation.status {
         DelegationStatus::Running | DelegationStatus::Done | DelegationStatus::DoneWithFailures => {
@@ -124,7 +124,15 @@ pub(crate) async fn build_delegation_snapshot(
         }
         let outcome = completion_terminal_status
             .and_then(|_| artifact.and_then(|artifact| artifact.outcome.clone()));
-        let final_message_file = artifact.and_then(SubagentArtifact::final_message_rel);
+        let final_message_file = if delegation.status == DelegationStatus::Cancelled {
+            let subagent_segment = safe_handoff_path_segment(&subagent.session_id, "subagent_id")?;
+            let relative = format!("{subagent_segment}/final_message.md");
+            let path = handoff_dir_path.join(&relative);
+            path.exists().then_some(relative)
+        } else {
+            completion_terminal_status
+                .and_then(|_| artifact.and_then(SubagentArtifact::final_message_rel))
+        };
         let normal_transcript_file = artifact.map(SubagentArtifact::transcript_rel);
         let task_prompt_file = if let Some(artifact) = artifact {
             artifact.task_prompt_rel()
@@ -203,6 +211,65 @@ pub(crate) async fn build_delegation_snapshot(
     ))
 }
 
+/// Build a daemon observation delivered when one subagent in an otherwise
+/// still-running delegation reaches a terminal boundary.
+///
+/// The result payload is still inspect-equivalent for the whole delegation, so
+/// the parent can see the completed child's outcome/artifact refs AND the
+/// remaining running subagents before deciding to steer or cancel.
+pub(crate) fn subagent_wakeup_observation(
+    snapshot: &Value,
+    delegation: &Delegation,
+    subagent_id: &str,
+) -> std::result::Result<DaemonToolObservation, RpcError> {
+    let delegation_id =
+        snapshot_string(snapshot, "delegation_id").unwrap_or_else(|| "<unknown>".to_string());
+    let kind = match snapshot.get("kind").and_then(Value::as_str) {
+        Some("full") => "full subagent",
+        Some("readonly_fanout") => "read-only fan-out",
+        Some(other) => other,
+        None => "delegation",
+    };
+    let label = snapshot_string(snapshot, "label")
+        .map(|label| format!(" ({label})"))
+        .unwrap_or_default();
+    let status = snapshot_string(snapshot, "status").unwrap_or_else(|| "running".to_string());
+    let terminal = snapshot_progress_count(snapshot, "terminal");
+    let running = snapshot_progress_count(snapshot, "running");
+    let failed = snapshot_progress_count(snapshot, "failed");
+    let subagent_summary = snapshot
+        .get("subagents")
+        .and_then(Value::as_array)
+        .and_then(|subagents| {
+            subagents
+                .iter()
+                .find(|subagent| subagent["id"] == subagent_id)
+        })
+        .map(|subagent| {
+            let status = subagent
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("terminal");
+            let outcome = subagent
+                .get("outcome")
+                .and_then(Value::as_str)
+                .map(|outcome| format!(" outcome {outcome:?}"))
+                .unwrap_or_default();
+            format!("Subagent {subagent_id} finished with status {status}{outcome}.")
+        })
+        .unwrap_or_else(|| format!("Subagent {subagent_id} finished."));
+    let summary = format!(
+        "{subagent_summary} Delegation {delegation_id} ({kind}){label} is still {status}: {terminal} terminal, {running} running, {failed} failed."
+    );
+    let tool_call_id = short_delegation_subagent_observation_call_id(delegation, subagent_id);
+    Ok(DaemonToolObservation::inspect_delegation(
+        tool_call_id,
+        delegation_id,
+        Some(summary),
+        snapshot.clone(),
+    ))
+}
+
 fn snapshot_string(snapshot: &Value, key: &str) -> Option<String> {
     snapshot
         .get(key)
@@ -235,6 +302,29 @@ fn short_delegation_observation_call_id(delegation: &Delegation) -> ToolCallId {
         let _ = write!(&mut suffix, "{byte:02x}");
     }
     ToolCallId::new(format!("call_inspect_delegation_{suffix}"))
+}
+
+fn short_delegation_subagent_observation_call_id(
+    delegation: &Delegation,
+    subagent_id: &str,
+) -> ToolCallId {
+    // OpenAI Responses rejects `call_id` values longer than 64 characters. Use
+    // a deterministic digest over the durable delegation attempt and subagent
+    // id so replay/repair publishes the same synthetic tool id without
+    // depending on long UUID-bearing strings.
+    let mut hasher = Sha256::new();
+    hasher.update(delegation.id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(delegation.attempt_id.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(subagent_id.as_bytes());
+    let digest = hasher.finalize();
+    let mut suffix = String::with_capacity(32);
+    for byte in digest.iter().take(16) {
+        use std::fmt::Write as _;
+        let _ = write!(&mut suffix, "{byte:02x}");
+    }
+    ToolCallId::new(format!("call_inspect_delegation_child_{suffix}"))
 }
 
 /// Build the terminal daemon observation delivered to the parent after a
@@ -378,5 +468,71 @@ mod tests {
             first.as_str(),
             "call_inspect_delegation_delegation_6d17ff90_6e46_4c3f_88ad_d92d77350d52_62847e1a_b705_48ee_899b_b062ccdf38f6"
         );
+    }
+
+    #[test]
+    fn partial_wakeup_observation_carries_running_snapshot_and_short_call_id() {
+        let snapshot = json!({
+            "delegation_id": "delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
+            "kind": "readonly_fanout",
+            "status": "running",
+            "label": "review",
+            "progress": {
+                "expected": 3,
+                "spawned": 3,
+                "terminal": 1,
+                "running": 2,
+                "failed": 0,
+            },
+            "subagents": [{
+                "id": "child_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
+                "status": "done",
+                "final_message_file": "child/final_message.md",
+                "outcome": "approved",
+            }],
+            "handoff_dir": "/tmp/.pi-handoff/delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
+        });
+        let delegation = Delegation {
+            id: "delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52".to_string(),
+            parent_session_id: "parent".to_string(),
+            workflow: None,
+            label: Some("review".to_string()),
+            kind: agent_store::DelegationKind::ReadonlyFanout,
+            status: DelegationStatus::Running,
+            attempt_id: "62847e1a-b705-48ee-899b-b062ccdf38f6".to_string(),
+            expected_subagents: 3,
+        };
+
+        let first = subagent_wakeup_observation(
+            &snapshot,
+            &delegation,
+            "child_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
+        )
+        .expect("partial observation");
+        let second = subagent_wakeup_observation(
+            &snapshot,
+            &delegation,
+            "child_6d17ff90-6e46-4c3f-88ad-d92d77350d52",
+        )
+        .expect("partial observation");
+
+        assert_eq!(first.tool_name, "inspect_delegation");
+        assert_eq!(first.tool_call_id, second.tool_call_id);
+        assert!(first
+            .tool_call_id
+            .as_str()
+            .starts_with("call_inspect_delegation_child_"));
+        assert!(first.tool_call_id.as_str().len() <= 64);
+        assert_eq!(
+            first.args_json,
+            "{\"delegation_id\":\"delegation_6d17ff90-6e46-4c3f-88ad-d92d77350d52\"}"
+        );
+        assert_eq!(first.result_json["status"], "running");
+        assert!(first
+            .summary
+            .as_deref()
+            .unwrap()
+            .contains("Subagent child_6d17ff90-6e46-4c3f-88ad-d92d77350d52 finished"));
+        assert!(first.summary.as_deref().unwrap().contains("2 running"));
     }
 }

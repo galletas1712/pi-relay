@@ -698,6 +698,9 @@ impl SessionDriver {
             )
         };
         attach_provider_replay(&mut entries, provider_replay)?;
+        let consumed_client_input_id = consumed_input
+            .as_ref()
+            .and_then(|input| input.client_input_id.clone());
         let persisted = self
             .state
             .repo
@@ -717,6 +720,22 @@ impl SessionDriver {
             }
         };
         publish_events(&self.state, frames);
+        let future = Box::pin(
+            crate::delegation_runner::publish_next_partial_after_parent_decision(
+                &self.state,
+                &self.session_id,
+                consumed_client_input_id.as_deref(),
+            ),
+        );
+        if let Err(error) = future.await {
+            eprintln!(
+                "failed to publish next partial delegation wakeup after parent {} consumed {:?}: {}: {}",
+                self.session_id,
+                consumed_client_input_id,
+                error.code,
+                error.message
+            );
+        }
         Ok(attach_dispatch_config(persisted_actions, &config))
     }
 

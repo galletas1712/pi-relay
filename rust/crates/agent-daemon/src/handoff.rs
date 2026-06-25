@@ -335,13 +335,14 @@ pub(crate) fn handoff_root(parent_outer_cwd: &str) -> PathBuf {
 /// Refresh per-subagent handoff artifacts from durable Postgres transcripts.
 ///
 /// This writes each subagent's exhaustive `transcript.md` on every call. When
-/// `include_final_messages` is true, it also writes `final_message.md`. Returned
-/// metadata may still include `outcome` for terminal subagents in a
-/// running delegation, but final-message prose is not returned to snapshots.
-/// Running inspections pass `false`: their transcript files are kept current,
-/// but no normal final-message artifact is published before the completion CAS
-/// wins. Cancelled and failed delegations do not publish normal per-subagent
-/// handoff artifacts; cancellation has its own transcript-only artifact path.
+/// `include_final_messages` is true, it also writes `final_message.md` for
+/// subagents whose current delegation status permits final content: terminal
+/// children while a delegation is still running, or every child after
+/// done/done_with_failures. Returned metadata may include `outcome` for
+/// subagents whose final-message content is publishable, but final-message prose
+/// is not returned to snapshots. Cancelled and failed delegations do not publish
+/// normal per-subagent handoff artifacts; cancellation has its own
+/// transcript-only artifact path.
 pub(crate) async fn refresh_delegation_handoff_artifacts(
     state: &AppState,
     delegation: &Delegation,
@@ -375,7 +376,11 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
         let status = terminal_subagent_status(&history);
         let outcome = extract_outcome(&final_message);
         let include_final_content = match delegation.status {
-            DelegationStatus::Running => is_terminal,
+            DelegationStatus::Running => {
+                crate::delegation_tools::load_subagent_work_state(state, &subagent.session_id)
+                    .await?
+                    .is_completion_terminal()
+            }
             DelegationStatus::Done | DelegationStatus::DoneWithFailures => true,
             DelegationStatus::Cancelled | DelegationStatus::Failed => false,
         };
@@ -390,7 +395,8 @@ pub(crate) async fn refresh_delegation_handoff_artifacts(
             subagent.task.as_deref(),
         )
         .await?;
-        let final_message_path = if include_final_messages {
+        let should_write_final_message = include_final_messages && include_final_content;
+        let final_message_path = if should_write_final_message {
             let path = subagent_dir.join("final_message.md");
             tokio::fs::write(&path, final_message.as_bytes())
                 .await

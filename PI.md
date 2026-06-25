@@ -56,11 +56,16 @@ Rules:
 
 - Launch at most one delegation per turn, then end your turn. Do not poll or loop —
   you will be notified.
-- When a delegation finishes you receive a daemon-authored wakeup observation
-  with a structured snapshot equivalent to `inspect_delegation`. Branch on the
-  delivered `outcome`/status fields; call `inspect_delegation` only to
-  refresh or recover state, or to inspect a delegation later/running. Snapshot
-  payloads are bounded: read handoff artifact paths (`task_prompt.md`,
+- Delegation progress is delivered as daemon-authored wakeup observations with
+  structured snapshots equivalent to `inspect_delegation`. If the delivered
+  snapshot is terminal (`done`, `done_with_failures`, `cancelled`, or `failed`),
+  branch normally on the delivered `outcome`/status fields. If the delivered
+  snapshot is still `running`, decide only for that current running delegation:
+  steer a running/steerable subagent, cancel the delegation, or end your turn
+  and wait. Do not start an unrelated delegation from a running partial wakeup.
+  Call `inspect_delegation` only to refresh/recover stale state, or to inspect a
+  delegation later/running; do not poll or loop with repeated inspect calls.
+  Snapshot payloads are bounded: read handoff artifact paths (`task_prompt.md`,
   `final_message.md`, `transcript.md`) only if you need more detail.
 - Normal turns are transcript-driven: rely on durable tool results and wakeup
   observations already present in the transcript. The daemon does not inject a

@@ -1247,6 +1247,135 @@ async fn enqueue_delegation_observation_event_uses_minimal_payload_and_queue_pro
     db.cleanup().await;
 }
 
+#[tokio::test]
+async fn partial_delegation_observation_suppresses_duplicate_active_wakeups_transactionally() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegations test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    let delegation = db
+        .store
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            Some("partial race"),
+            3,
+        )
+        .await
+        .expect("create delegation");
+    let observation_a = DaemonToolObservation::inspect_delegation(
+        ToolCallId::new("call_partial_a"),
+        &delegation.id,
+        Some("child a finished".to_string()),
+        json!({
+            "delegation_id": delegation.id,
+            "status": "running",
+        }),
+    );
+    let observation_b = DaemonToolObservation::inspect_delegation(
+        ToolCallId::new("call_partial_b"),
+        &delegation.id,
+        Some("child b finished".to_string()),
+        json!({
+            "delegation_id": delegation.id,
+            "status": "running",
+        }),
+    );
+    let key_a = format!(
+        "delegation-steer:{}:{}:child_a",
+        delegation.id, delegation.attempt_id
+    );
+    let key_b = format!(
+        "delegation-steer:{}:{}:child_b",
+        delegation.id, delegation.attempt_id
+    );
+
+    let insert_a = db.store.enqueue_partial_delegation_observation_if_running(
+        "parent",
+        &delegation.id,
+        &delegation.attempt_id,
+        &observation_a,
+        &key_a,
+    );
+    let insert_b = db.store.enqueue_partial_delegation_observation_if_running(
+        "parent",
+        &delegation.id,
+        &delegation.attempt_id,
+        &observation_b,
+        &key_b,
+    );
+    let (insert_a, insert_b) = tokio::join!(insert_a, insert_b);
+    let inserted = [
+        insert_a.expect("first insert attempt"),
+        insert_b.expect("second insert attempt"),
+    ];
+    assert_eq!(
+        inserted.into_iter().filter(|inserted| *inserted).count(),
+        1,
+        "concurrent terminal children must create only one active partial wakeup"
+    );
+    let prefix = format!(
+        "delegation-steer:{}:{}:",
+        delegation.id, delegation.attempt_id
+    );
+    let active_count: i64 = sqlx::query_scalar(
+        r#"
+        select count(*)
+        from queued_inputs
+        where session_id='parent'
+          and priority='steer'
+          and status in ('queued', 'consuming')
+          and left(client_input_id, char_length($1)) = $1
+        "#,
+    )
+    .bind(&prefix)
+    .fetch_one(&db.store.pool)
+    .await
+    .expect("count active partials");
+    assert_eq!(active_count, 1);
+
+    sqlx::query(
+        r#"
+        update queued_inputs
+        set status='consuming'
+        where session_id='parent'
+          and left(client_input_id, char_length($1)) = $1
+        "#,
+    )
+    .bind(&prefix)
+    .execute(&db.store.pool)
+    .await
+    .expect("mark partial consuming");
+    let key_c = format!(
+        "delegation-steer:{}:{}:child_c",
+        delegation.id, delegation.attempt_id
+    );
+    let inserted_c = db
+        .store
+        .enqueue_partial_delegation_observation_if_running(
+            "parent",
+            &delegation.id,
+            &delegation.attempt_id,
+            &observation_b,
+            &key_c,
+        )
+        .await
+        .expect("third insert attempt");
+    assert!(
+        !inserted_c,
+        "a consuming partial is still an active parent decision point"
+    );
+
+    db.cleanup().await;
+}
+
 async fn steer_count(db: &TestDb, session_id: &str, client_input_id: &str) -> i64 {
     sqlx::query_scalar(
         "select count(*) from queued_inputs where session_id=$1 and client_input_id=$2 and priority='steer'",

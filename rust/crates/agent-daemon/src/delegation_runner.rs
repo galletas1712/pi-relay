@@ -4,9 +4,13 @@
 //! ```text
 //! on a subagent of delegation D reaching its once-only terminal idle (or boot):
 //!   recover each subagent's tail to a turn boundary          # don't miss a crashed final message
+//!   once the expected child count has spawned, enqueue at most one
+//!     active deterministic parent observation for an unreported
+//!     terminal child                                        # parent can steer/cancel remaining children
 //!   if any subagent of D is not terminal: return            # barrier not met
 //!   finish_delegation CAS (running -> done|done_with_failures)    # single-flight status claim
 //!   if the CAS won:
+//!     cancel any still-queued stale partial observations
 //!     render/refresh handoff dir (per-subagent md)
 //!     enqueue deterministic parent wakeup observation
 //!     drive parent to consume the queued wakeup
@@ -25,9 +29,11 @@
 
 use agent_store::{Delegation, DelegationStatus, QueuedInputStatus};
 
-use crate::delegation_snapshot::{build_delegation_snapshot, completion_wakeup_observation};
+use crate::delegation_snapshot::{
+    build_delegation_snapshot, completion_wakeup_observation, subagent_wakeup_observation,
+};
 use crate::handoff::terminal_subagent_status;
-use crate::runtime::SessionDriver;
+use crate::runtime::{publish_events, SessionDriver};
 use crate::state::AppState;
 use crate::types::RpcError;
 
@@ -39,9 +45,13 @@ use crate::types::RpcError;
 /// Ordering matters:
 ///   recover each subagent's tail to a boundary  # mid-turn crash either resumes
 ///                                                # or settles terminal
+///   publish at most one active partial wakeup    # parent gets a decision
+///                                                # point before fan-out ends
 ///   if not all terminal: return                 # barrier not met
 ///   finish_delegation CAS                       # claim terminal status before
 ///                                                # any normal handoff files
+///   if won: cancel stale queued partials        # no running snapshot after
+///                                                # terminal completion
 ///   if won: write handoff files                 # parent wakeup is not queued
 ///                                                # until these exist
 ///   enqueue deterministic wakeup observation     # idempotent; boot repair
@@ -68,11 +78,20 @@ pub(crate) async fn complete_delegation_if_ready(
     // delegation running.
     recover_subagent_tails(state, &delegation).await;
 
-    if !state
+    let all_terminal = state
         .repo
         .delegation_subagents_all_terminal(delegation_id)
-        .await?
-    {
+        .await?;
+    let partial_needs_drive = if all_terminal {
+        false
+    } else {
+        publish_next_terminal_subagent_observation(state, &delegation).await?
+    };
+
+    if !all_terminal {
+        if partial_needs_drive {
+            drive_parent_after_wakeup(state, &delegation.parent_session_id).await;
+        }
         return Ok(());
     }
 
@@ -90,6 +109,107 @@ pub(crate) async fn complete_delegation_if_ready(
     // the wakeup promptly; driving is idempotent and replayable, and the
     // durable queued_input is the crash backstop if this drive never runs.
     drive_parent_after_wakeup(state, &delegation.parent_session_id).await;
+    Ok(())
+}
+
+async fn publish_next_terminal_subagent_observation(
+    state: &AppState,
+    delegation: &Delegation,
+) -> std::result::Result<bool, RpcError> {
+    if !state
+        .repo
+        .delegation_spawned_expected_subagents(&delegation.id)
+        .await?
+    {
+        return Ok(false);
+    }
+
+    let subagents = state.repo.list_delegation_subagents(&delegation.id).await?;
+    let mut terminal_subagent_ids = Vec::new();
+    for subagent in &subagents {
+        let work_state =
+            crate::delegation_tools::load_subagent_work_state(state, &subagent.session_id).await?;
+        if work_state.is_completion_terminal() {
+            terminal_subagent_ids.push(subagent.session_id.clone());
+        }
+    }
+    if terminal_subagent_ids.is_empty() {
+        return Ok(false);
+    }
+
+    // Publish only one active partial wakeup per parent decision point. The
+    // transactional store insert suppresses ANY queued/consuming partial for
+    // this delegation attempt, not only the selected child id, so concurrent
+    // terminal children cannot prequeue multiple stale running snapshots.
+    for subagent_id in terminal_subagent_ids {
+        let client_input_id = delegation_subagent_wakeup_client_input_id(delegation, &subagent_id);
+        if let Some(record) = state
+            .repo
+            .find_client_input(&delegation.parent_session_id, &client_input_id)
+            .await?
+        {
+            if matches!(
+                record.status,
+                QueuedInputStatus::Queued | QueuedInputStatus::Consuming
+            ) {
+                return Ok(true);
+            }
+            continue;
+        }
+        let snapshot = build_delegation_snapshot(state, delegation).await?;
+        let observation = subagent_wakeup_observation(&snapshot, delegation, &subagent_id)?;
+        let inserted = state
+            .repo
+            .enqueue_partial_delegation_observation_if_running(
+                &delegation.parent_session_id,
+                &delegation.id,
+                &delegation.attempt_id,
+                &observation,
+                &client_input_id,
+            )
+            .await?;
+        return Ok(inserted);
+    }
+    Ok(false)
+}
+
+/// A parent consumed (or otherwise finished acting on) a partial delegation
+/// wakeup. If another sibling had already reached terminal while that partial
+/// was queued/being handled, publish exactly one next partial now so the parent
+/// gets another decision point instead of waiting until final completion or a
+/// daemon restart.
+pub(crate) async fn publish_next_partial_after_parent_decision(
+    state: &AppState,
+    parent_session_id: &str,
+    consumed_client_input_id: Option<&str>,
+) -> std::result::Result<(), RpcError> {
+    let Some(client_input_id) = consumed_client_input_id else {
+        return Ok(());
+    };
+    let Some((delegation_id, attempt_id, _subagent_id)) =
+        parse_delegation_subagent_wakeup_client_input_id(client_input_id)
+    else {
+        return Ok(());
+    };
+    let Some(delegation) = state.repo.get_delegation(delegation_id).await? else {
+        return Ok(());
+    };
+    if delegation.parent_session_id != parent_session_id
+        || delegation.attempt_id != attempt_id
+        || delegation.status != DelegationStatus::Running
+    {
+        return Ok(());
+    }
+    if state
+        .repo
+        .delegation_subagents_all_terminal(&delegation.id)
+        .await?
+    {
+        return Ok(());
+    }
+    if publish_next_terminal_subagent_observation(state, &delegation).await? {
+        drive_parent_after_wakeup(state, parent_session_id).await;
+    }
     Ok(())
 }
 
@@ -124,6 +244,17 @@ async fn publish_completed_delegation(
     delegation: &Delegation,
     status: DelegationStatus,
 ) -> std::result::Result<(), RpcError> {
+    let events = state
+        .repo
+        .cancel_queued_partial_delegation_wakeups(
+            &delegation.parent_session_id,
+            &delegation.id,
+            &delegation.attempt_id,
+            "delegation_completed",
+        )
+        .await?;
+    publish_events(state, events);
+
     let wakeup_client_input_id = delegation_wakeup_client_input_id(delegation);
     let mut completed_delegation = delegation.clone();
     completed_delegation.status = status;
@@ -144,6 +275,28 @@ fn delegation_wakeup_client_input_id(delegation: &Delegation) -> String {
     format!(
         "delegation-steer:{}:{}",
         delegation.id, delegation.attempt_id
+    )
+}
+
+fn parse_delegation_subagent_wakeup_client_input_id(
+    client_input_id: &str,
+) -> Option<(&str, &str, &str)> {
+    let remainder = client_input_id.strip_prefix("delegation-steer:")?;
+    let (delegation_id, remainder) = remainder.split_once(':')?;
+    let (attempt_id, subagent_id) = remainder.split_once(':')?;
+    if delegation_id.is_empty() || attempt_id.is_empty() || subagent_id.is_empty() {
+        return None;
+    }
+    Some((delegation_id, attempt_id, subagent_id))
+}
+
+fn delegation_subagent_wakeup_client_input_id(
+    delegation: &Delegation,
+    subagent_id: &str,
+) -> String {
+    format!(
+        "delegation-steer:{}:{}:{}",
+        delegation.id, delegation.attempt_id, subagent_id
     )
 }
 
@@ -251,6 +404,8 @@ async fn classify_subagents(
 ///    `done_with_failures`; cancelled delegations remain transcript-only and
 ///    are never reactivated.
 pub(crate) async fn sweep_running_delegations_on_boot(state: &AppState) {
+    publish_running_delegation_partial_observations_on_boot(state).await;
+
     let ready = match state.repo.sweep_running_delegations().await {
         Ok(ready) => ready,
         Err(error) => {
@@ -274,6 +429,36 @@ pub(crate) async fn sweep_running_delegations_on_boot(state: &AppState) {
     }
 
     repair_completed_delegation_publications_on_boot(state).await;
+}
+
+async fn publish_running_delegation_partial_observations_on_boot(state: &AppState) {
+    let running = match state.repo.list_running_delegations().await {
+        Ok(running) => running,
+        Err(error) => {
+            eprintln!("boot delegation sweep could not list running delegations: {error:#}");
+            return;
+        }
+    };
+    for delegation in running {
+        let Ok(all_terminal) = state
+            .repo
+            .delegation_subagents_all_terminal(&delegation.id)
+            .await
+        else {
+            continue;
+        };
+        if all_terminal {
+            continue;
+        }
+        match publish_next_terminal_subagent_observation(state, &delegation).await {
+            Ok(true) => drive_parent_after_wakeup(state, &delegation.parent_session_id).await,
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "boot delegation sweep failed to publish partial observation for delegation {}: {}: {}",
+                delegation.id, error.code, error.message
+            ),
+        }
+    }
 }
 
 async fn repair_completed_delegation_publications_on_boot(state: &AppState) {

@@ -1298,6 +1298,14 @@ accepted for that child: the delegation is running, the child is a delegation
 member, the child has queued/unfinished/runtime work, and it is not
 completion-terminal.
 
+Daemon wakeup observations also carry this same snapshot. A terminal snapshot is
+the normal completion/cancellation handoff. A still-`running` snapshot is a
+partial fan-out decision point: at most one queued/consuming partial wakeup is
+active per delegation attempt, and it appears only after the expected fan-out
+members exist. The parent should steer a running/steerable child, cancel the
+delegation, or wait; final completion cancels stale queued partial wakeups before
+publishing the terminal wakeup.
+
 ```json
 {
   "parent_session_id": "parent-session",
@@ -1325,7 +1333,7 @@ Result:
       "status": "done",
       "steerable": false,
       "outcome": "approved",
-      "final_message_file": null,
+      "final_message_file": "session_.../final_message.md",
       "transcript_file": "session_.../transcript.md",
       "task_prompt_file": "session_.../task_prompt.md"
     }

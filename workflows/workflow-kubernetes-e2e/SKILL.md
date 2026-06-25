@@ -41,8 +41,11 @@ safety rules below.
 The `tester` role is generic; put all kubernetes-specific guidance below in the
 delegation prompt, and REQUIRE the tester to end its final message with a line
 `outcome: pass | product_failure | environment_retry | human_needed`.
-When the completion observation arrives, branch on the delivered snapshot; call
-`inspect_delegation` only to refresh/recover state or inspect later/running.
+When a wakeup observation arrives, branch on the delivered snapshot. If it is
+still `running`, decide only for that current tester delegation (steer a
+running/steerable tester, cancel it, or wait); do not start another delegation
+until the current one is terminal. Call `inspect_delegation` only to
+refresh/recover state or inspect later/running.
 
 Cluster-safety rules to put in the tester's prompt:
 - Always pass an explicit `--context` and namespace; never rely on the current

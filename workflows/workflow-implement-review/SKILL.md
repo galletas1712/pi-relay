@@ -31,8 +31,11 @@ snapshot.
     prompt: "<what to review + acceptance criteria>" } ], workflow: "implement_review" })
 
 Notes:
-- After launching a delegation, end your turn; you will receive a completion observation when it
-  completes with an `inspect_delegation`-equivalent snapshot.
+- After launching a delegation, end your turn. Wakeup observations carry an
+  `inspect_delegation`-equivalent snapshot. If the snapshot is still `running`,
+  decide only for that current delegation (steer a running/steerable subagent,
+  cancel it, or wait); do not start another delegation until the current one is
+  terminal.
 - Subagents start fresh — carry prior control-flow facts from the delivered
   snapshot into the next delegation's prompt. Read transcript/final-message
   files only when more detail is needed.
