@@ -175,6 +175,16 @@ fn session_config(env: &TestEnv, project_id: Uuid, metadata: serde_json::Value) 
     }
 }
 
+fn subagent_test_metadata(role: &str, subagent_type: SubagentType) -> serde_json::Value {
+    json!({
+        "created_by": "test",
+        "subagent": true,
+        "prompt_profile": "subagent",
+        "subagent_type": subagent_type.as_str(),
+        "role_name": role,
+    })
+}
+
 /// A parent session that opts into the harness, so any model dispatch the
 /// barrier's wakeup observation triggers stops at `pending` instead of calling
 /// a provider.
@@ -325,11 +335,7 @@ async fn create_terminal_subagent(
         .repo
         .start_session_outputs_with_parent(
             session_id,
-            &session_config(
-                env,
-                project_id,
-                json!({ "created_by": "test", "role_name": role }),
-            ),
+            &session_config(env, project_id, subagent_test_metadata(role, subagent_type)),
             &entries,
             Some(&leaf),
             &[],
@@ -404,7 +410,7 @@ async fn create_running_subagent(
             &session_config(
                 env,
                 project_id,
-                json!({ "created_by": "test", "role_name": role }),
+                subagent_test_metadata(role, SubagentType::ReadOnly),
             ),
             &entries,
             Some(&mid_turn),
@@ -446,11 +452,7 @@ async fn create_empty_subagent(
         .repo
         .start_session_outputs_with_parent(
             session_id,
-            &session_config(
-                env,
-                project_id,
-                json!({ "created_by": "test", "role_name": role }),
-            ),
+            &session_config(env, project_id, subagent_test_metadata(role, subagent_type)),
             &[],
             None,
             &[],
@@ -517,11 +519,11 @@ async fn create_busy_full_subagent(
         .repo
         .start_session_outputs_with_parent(
             session_id,
-            &session_config(
-                env,
-                project_id,
-                json!({ "created_by": "test", "role_name": "implementer", "harness": true }),
-            ),
+            &session_config(env, project_id, {
+                let mut metadata = subagent_test_metadata("implementer", SubagentType::Full);
+                metadata["harness"] = json!(true);
+                metadata
+            }),
             &entries,
             Some(&active_leaf),
             &[],
@@ -785,6 +787,16 @@ async fn parent_model_context_does_not_inject_current_delegations() {
             .contains("## Current delegations"),
         "normal parent prompt must be stable PI/system prompt only"
     );
+    let parent_tool_names = request
+        .tools
+        .iter()
+        .map(|tool| tool.canonical_name.as_str())
+        .collect::<Vec<_>>();
+    assert!(parent_tool_names.contains(&"delegate_writing_task"));
+    assert!(parent_tool_names.contains(&"delegate_readonly_tasks"));
+    assert!(parent_tool_names.contains(&"inspect_delegation"));
+    assert!(parent_tool_names.contains(&"cancel_delegation"));
+    assert!(parent_tool_names.contains(&"steer_subagent"));
 
     env.cleanup().await;
 }
@@ -833,6 +845,18 @@ async fn subagent_model_context_does_not_get_parent_delegation_summary() {
         request.prompt.render_joined().as_deref(),
         Some("Subagent PI prompt")
     );
+    let subagent_tool_names = request
+        .tools
+        .iter()
+        .map(|tool| tool.canonical_name.as_str())
+        .collect::<Vec<_>>();
+    assert!(subagent_tool_names.contains(&"LoadSkill"));
+    assert!(subagent_tool_names.contains(&"Bash"));
+    assert!(!subagent_tool_names.contains(&"delegate_writing_task"));
+    assert!(!subagent_tool_names.contains(&"delegate_readonly_tasks"));
+    assert!(!subagent_tool_names.contains(&"inspect_delegation"));
+    assert!(!subagent_tool_names.contains(&"cancel_delegation"));
+    assert!(!subagent_tool_names.contains(&"steer_subagent"));
 
     env.cleanup().await;
 }
@@ -1448,6 +1472,50 @@ async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
         queued.content.as_text(),
         Some("Please also update the docs.")
     );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn model_facing_delegation_tools_reject_subagent_sessions() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "subagent delegation tool rejection",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
+
+    let tool_result = run_delegation_tool(
+        &env.state,
+        "impl_busy",
+        &ToolCall {
+            id: ToolCallId::new("call_inspect_from_subagent"),
+            tool_name: "inspect_delegation".to_string(),
+            args_json: json!({ "delegation_id": delegation.id }).to_string(),
+        },
+    )
+    .await;
+    assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Error);
+    assert!(tool_result
+        .output
+        .contains("delegations_not_allowed_for_subagent"));
 
     env.cleanup().await;
 }

@@ -85,6 +85,44 @@ impl Skill {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PromptProfile {
+    Parent,
+    Subagent,
+}
+
+impl PromptProfile {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Parent => "parent",
+            Self::Subagent => "subagent",
+        }
+    }
+
+    fn can_delegate(self) -> bool {
+        matches!(self, Self::Parent)
+    }
+
+    fn can_load_workflows(self) -> bool {
+        matches!(self, Self::Parent)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubagentRole {
+    pub name: String,
+    pub description: String,
+}
+
+impl SubagentRole {
+    pub fn new(name: impl Into<String>, description: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromptWorkspaceKind {
     Git,
     Local,
@@ -103,11 +141,13 @@ pub struct PromptWorkspace {
 
 #[derive(Debug, Clone)]
 pub struct PromptContext {
+    pub profile: PromptProfile,
     pub cwd: PathBuf,
     pub has_project: bool,
     pub workspaces: Vec<PromptWorkspace>,
     pub tools: Vec<ToolSpec>,
     pub skills: Vec<Skill>,
+    pub subagent_roles: Vec<SubagentRole>,
 }
 
 pub fn load_pi_md(repo_root: &Path) -> std::io::Result<String> {
@@ -141,6 +181,13 @@ fn template_context(ctx: &PromptContext) -> Value {
         String::new()
     };
     json!({
+        "profile": {
+            "name": ctx.profile.as_str(),
+        },
+        "capabilities": {
+            "can_delegate": ctx.profile.can_delegate(),
+            "can_load_workflows": ctx.profile.can_load_workflows(),
+        },
         "session": {
             "cwd": path_display(&ctx.cwd),
             "has_project": ctx.has_project,
@@ -156,6 +203,9 @@ fn template_context(ctx: &PromptContext) -> Value {
         },
         "skills": {
             "index": skills_index_json(&ctx.skills),
+        },
+        "subagent_roles": {
+            "catalog": subagent_role_catalog_json(&ctx.subagent_roles),
         },
     })
 }
@@ -265,6 +315,27 @@ fn skills_index_json(skills: &[Skill]) -> String {
     .expect("available skills JSON must serialize")
 }
 
+fn subagent_role_catalog_json(roles: &[SubagentRole]) -> String {
+    if roles.is_empty() {
+        return String::new();
+    }
+    let mut roles = roles.iter().collect::<Vec<_>>();
+    roles.sort_by(|left, right| left.name.cmp(&right.name));
+    let roles = roles
+        .into_iter()
+        .map(|role| {
+            json!({
+                "name": role.name,
+                "description": role.description,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&json!({
+        "packaged_subagent_roles": roles,
+    }))
+    .expect("subagent role catalog JSON must serialize")
+}
+
 fn agents_md_for_workspaces(cwd: &Path, workspaces: &[PromptWorkspace]) -> String {
     workspaces
         .iter()
@@ -314,8 +385,9 @@ mod tests {
     const TEST_PI_MD: &str = include_str!("../../../../PI.md");
     const TEST_PI_COMPACTION_MD: &str = include_str!("../../../../PI.compaction.md");
 
-    fn ctx(tools: Vec<&str>, skills: Vec<Skill>) -> PromptContext {
+    fn ctx(profile: PromptProfile, tools: Vec<&str>, skills: Vec<Skill>) -> PromptContext {
         PromptContext {
+            profile,
             cwd: PathBuf::from("/tmp/project"),
             has_project: true,
             workspaces: vec![PromptWorkspace {
@@ -340,17 +412,46 @@ mod tests {
                 })
                 .collect(),
             skills,
+            subagent_roles: vec![SubagentRole::new("reviewer", "Review artifacts.")],
         }
     }
 
     #[test]
     fn renders_repo_pi_as_static_prompt() {
-        let rendered = render_prompt(TEST_PI_MD, &ctx(vec!["Bash", "Grep", "Edit"], Vec::new()));
+        let rendered = render_prompt(
+            TEST_PI_MD,
+            &ctx(
+                PromptProfile::Parent,
+                vec!["Bash", "Grep", "Edit"],
+                Vec::new(),
+            ),
+        );
         assert!(rendered.contains("You are a helpful assitant"));
         assert!(rendered.contains("### Bash"));
         assert!(rendered.contains("### Edit"));
+        assert!(rendered.contains("## Subagent delegation"));
+        assert!(rendered.contains("Packaged subagent roles"));
+        assert!(rendered.contains("\"name\": \"reviewer\""));
         assert!(!rendered.contains("Current date"));
         assert!(!rendered.contains("Starting working directory"));
+    }
+
+    #[test]
+    fn subagent_profile_omits_parent_orchestration_sections() {
+        let rendered = render_prompt(
+            TEST_PI_MD,
+            &ctx(
+                PromptProfile::Subagent,
+                vec!["Bash", "Grep", "Edit"],
+                Vec::new(),
+            ),
+        );
+
+        assert!(rendered.contains("### Bash"));
+        assert!(!rendered.contains("## Subagent delegation"));
+        assert!(!rendered.contains("Packaged subagent roles"));
+        assert!(!rendered.contains("delegate_readonly_tasks"));
+        assert!(!rendered.contains("delegate_writing_task"));
     }
 
     #[test]
@@ -368,7 +469,11 @@ mod tests {
         );
         let rendered = render_prompt(
             TEST_PI_MD,
-            &ctx(vec!["Bash"], vec![global_skill, workspace_skill]),
+            &ctx(
+                PromptProfile::Parent,
+                vec!["Bash"],
+                vec![global_skill, workspace_skill],
+            ),
         );
         assert!(rendered.contains("\"available_skills\""));
         assert!(rendered.contains("rust-refactor"));
@@ -385,7 +490,10 @@ mod tests {
             "Use for <xml> & \"quotes\".",
             "/tmp/project/.agents/skills/quote-skill/SKILL.md",
         );
-        let rendered = render_prompt(TEST_PI_MD, &ctx(vec!["Bash"], vec![skill]));
+        let rendered = render_prompt(
+            TEST_PI_MD,
+            &ctx(PromptProfile::Parent, vec!["Bash"], vec![skill]),
+        );
         assert!(rendered.contains("\"name\": \"quote-skill\""));
         assert!(rendered.contains("\"description\": \"Use for <xml> & \\\"quotes\\\".\""));
         assert!(!rendered.contains("&lt;xml&gt;"));
@@ -395,7 +503,7 @@ mod tests {
     fn custom_template_data_can_choose_to_include_cwd() {
         let rendered = render(
             "cwd={{ session.cwd }}\nworkspaces={{ session.workspaces_markdown }}\n\n{{ tools.specs }}",
-            &ctx(vec!["Bash"], Vec::new()),
+            &ctx(PromptProfile::Parent, vec!["Bash"], Vec::new()),
         );
         assert!(rendered.contains("cwd=/tmp/project"));
         assert!(rendered.contains("starting branch: main"));
@@ -404,7 +512,7 @@ mod tests {
 
     #[test]
     fn pi_template_gates_ephemeral_workspace_copy() {
-        let mut ctx = ctx(vec!["Bash"], Vec::new());
+        let mut ctx = ctx(PromptProfile::Parent, vec!["Bash"], Vec::new());
         ctx.has_project = false;
         ctx.workspaces = Vec::new();
         ctx.cwd = PathBuf::from("/home/tester");
@@ -415,7 +523,10 @@ mod tests {
 
     #[test]
     fn renders_compaction_prompt() {
-        let rendered = render_prompt(TEST_PI_COMPACTION_MD, &ctx(vec!["Bash"], Vec::new()));
+        let rendered = render_prompt(
+            TEST_PI_COMPACTION_MD,
+            &ctx(PromptProfile::Parent, vec!["Bash"], Vec::new()),
+        );
         assert!(rendered.starts_with("Produce a concise continuation summary"));
         assert!(!rendered.contains("You are an expert coding assistant"));
     }

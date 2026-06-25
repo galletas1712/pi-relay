@@ -1,12 +1,14 @@
 use std::path::{Path, PathBuf};
 
 use agent_prompt::{
-    load_pi_compaction_md, load_pi_md, render_prompt, PromptContext, PromptWorkspace,
-    PromptWorkspaceKind, Skill, ToolSpec,
+    load_pi_compaction_md, load_pi_md, render_prompt, PromptContext, PromptProfile,
+    PromptWorkspace, PromptWorkspaceKind, Skill, SubagentRole, ToolSpec,
 };
 use agent_store::{SessionConfig, SessionWorkspace, WorkspaceKind};
+use agent_tools::ProviderTool;
 use agent_vocab::ProviderKind;
 use anyhow::{anyhow, Context};
+use serde_json::Value;
 
 use crate::state::AppState;
 
@@ -38,7 +40,9 @@ pub(super) fn render_pi_compaction_prompt(
 }
 
 pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> PromptContext {
+    let profile = prompt_profile(config);
     PromptContext {
+        profile,
         cwd: PathBuf::from(&config.outer_cwd),
         has_project: config.project_id.is_some(),
         workspaces: config
@@ -57,15 +61,72 @@ pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> Prompt
                 local_branch: workspace.local_branch.clone(),
             })
             .collect(),
-        tools: tool_specs(state, config.provider.kind),
-        skills: load_prompt_skills(&state.prompt_root, config),
+        tools: tool_specs(state, config.provider.kind, profile),
+        skills: load_prompt_skills(&state.prompt_root, config, profile),
+        subagent_roles: load_packaged_subagent_role_catalog(&state.prompt_root),
     }
 }
 
-fn tool_specs(state: &AppState, provider: ProviderKind) -> Vec<ToolSpec> {
-    state
-        .tools
-        .provider_tools_for_provider(provider)
+pub(crate) fn prompt_profile(config: &SessionConfig) -> PromptProfile {
+    if let Some(profile) = config
+        .metadata
+        .get("prompt_profile")
+        .and_then(Value::as_str)
+    {
+        return match profile {
+            "subagent" => PromptProfile::Subagent,
+            _ => PromptProfile::Parent,
+        };
+    }
+    if config
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return PromptProfile::Subagent;
+    }
+    PromptProfile::Parent
+}
+
+pub(crate) fn provider_tools_for_session(
+    state: &AppState,
+    provider: ProviderKind,
+    profile: PromptProfile,
+) -> Vec<ProviderTool> {
+    provider_tools_for_profile(state.tools.provider_tools_for_provider(provider), profile)
+}
+
+fn provider_tools_for_profile(
+    tools: Vec<ProviderTool>,
+    profile: PromptProfile,
+) -> Vec<ProviderTool> {
+    tools
+        .into_iter()
+        .filter(|tool| tool_allowed_for_profile(tool, profile))
+        .collect()
+}
+
+fn tool_allowed_for_profile(tool: &ProviderTool, profile: PromptProfile) -> bool {
+    if profile == PromptProfile::Parent {
+        return true;
+    }
+    !matches!(
+        tool.canonical_name.as_str(),
+        "delegate_writing_task"
+            | "delegate_readonly_tasks"
+            | "inspect_delegation"
+            | "cancel_delegation"
+            | "steer_subagent"
+    )
+}
+
+fn tool_specs(state: &AppState, provider: ProviderKind, profile: PromptProfile) -> Vec<ToolSpec> {
+    tool_specs_from_provider_tools(provider_tools_for_session(state, provider, profile))
+}
+
+fn tool_specs_from_provider_tools(tools: Vec<ProviderTool>) -> Vec<ToolSpec> {
+    tools
         .into_iter()
         .map(|tool| {
             ToolSpec::new(
@@ -79,11 +140,24 @@ fn tool_specs(state: &AppState, provider: ProviderKind) -> Vec<ToolSpec> {
         .collect()
 }
 
-fn load_prompt_skills(prompt_root: &Path, config: &SessionConfig) -> Vec<Skill> {
+fn load_prompt_skills(
+    prompt_root: &Path,
+    config: &SessionConfig,
+    profile: PromptProfile,
+) -> Vec<Skill> {
     let mut skills =
         load_skills_for_session_workspaces(&PathBuf::from(&config.outer_cwd), &config.workspaces);
-    skills.extend(load_global_skills_from_dir(&prompt_root.join("workflows")));
+    if profile == PromptProfile::Parent {
+        skills.extend(load_global_skills_from_dir(&prompt_root.join("workflows")));
+    }
     skills
+}
+
+fn load_packaged_subagent_role_catalog(prompt_root: &Path) -> Vec<SubagentRole> {
+    load_global_skills_from_dir(&prompt_root.join("subagent-roles"))
+        .into_iter()
+        .map(|skill| SubagentRole::new(skill.name, skill.description))
+        .collect()
 }
 
 #[derive(Debug)]
@@ -274,6 +348,7 @@ fn parse_simple_frontmatter(frontmatter: &str) -> std::collections::BTreeMap<Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agent_tools::ToolRegistry;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -434,14 +509,93 @@ mod tests {
             metadata: serde_json::Value::Null,
         };
 
-        let skills = load_prompt_skills(&prompt_root, &config);
+        let skills = load_prompt_skills(&prompt_root, &config, PromptProfile::Parent);
         assert!(skills
             .iter()
             .any(|skill| skill.workspace.is_none() && skill.name == "workflow-explore"));
         assert!(skills.iter().any(|skill| skill.name == "visible"));
         assert!(!skills.iter().any(|skill| skill.name == "explore"));
 
+        let subagent_skills = load_prompt_skills(&prompt_root, &config, PromptProfile::Subagent);
+        assert!(!subagent_skills
+            .iter()
+            .any(|skill| skill.name == "workflow-explore"));
+        assert!(subagent_skills.iter().any(|skill| skill.name == "visible"));
+
+        let roles = load_packaged_subagent_role_catalog(&prompt_root);
+        assert!(roles
+            .iter()
+            .any(|role| role.name == "explore" && role.description == "default subagent role"));
+
         std::fs::remove_dir_all(prompt_root).ok();
+    }
+
+    #[test]
+    fn provider_tool_filter_matches_prompt_tool_specs_for_profiles() {
+        let registry = ToolRegistry::with_builtin_tools();
+        let all_tools = registry.provider_tools_for_provider(ProviderKind::OpenAi);
+
+        let parent_provider_tools =
+            provider_tools_for_profile(all_tools.clone(), PromptProfile::Parent);
+        let parent_spec_names = tool_specs_from_provider_tools(parent_provider_tools.clone())
+            .into_iter()
+            .map(|tool| tool.canonical_name)
+            .collect::<Vec<_>>();
+        let parent_provider_names = parent_provider_tools
+            .into_iter()
+            .map(|tool| tool.canonical_name)
+            .collect::<Vec<_>>();
+        assert_eq!(parent_spec_names, parent_provider_names);
+        assert!(parent_spec_names.contains(&"delegate_writing_task".to_string()));
+        assert!(parent_spec_names.contains(&"delegate_readonly_tasks".to_string()));
+        assert!(parent_spec_names.contains(&"inspect_delegation".to_string()));
+        assert!(parent_spec_names.contains(&"cancel_delegation".to_string()));
+        assert!(parent_spec_names.contains(&"steer_subagent".to_string()));
+
+        let subagent_provider_tools =
+            provider_tools_for_profile(all_tools, PromptProfile::Subagent);
+        let subagent_spec_names = tool_specs_from_provider_tools(subagent_provider_tools.clone())
+            .into_iter()
+            .map(|tool| tool.canonical_name)
+            .collect::<Vec<_>>();
+        let subagent_provider_names = subagent_provider_tools
+            .into_iter()
+            .map(|tool| tool.canonical_name)
+            .collect::<Vec<_>>();
+        assert_eq!(subagent_spec_names, subagent_provider_names);
+        assert!(subagent_spec_names.contains(&"LoadSkill".to_string()));
+        assert!(!subagent_spec_names.contains(&"delegate_writing_task".to_string()));
+        assert!(!subagent_spec_names.contains(&"delegate_readonly_tasks".to_string()));
+        assert!(!subagent_spec_names.contains(&"inspect_delegation".to_string()));
+        assert!(!subagent_spec_names.contains(&"cancel_delegation".to_string()));
+        assert!(!subagent_spec_names.contains(&"steer_subagent".to_string()));
+    }
+
+    #[test]
+    fn prompt_profile_uses_explicit_profile_before_legacy_subagent_flag() {
+        let mut config = SessionConfig {
+            project_id: None,
+            outer_cwd: "/tmp".to_string(),
+            workspaces: Vec::new(),
+            system_prompt: String::new(),
+            provider: agent_vocab::ProviderConfig {
+                kind: ProviderKind::OpenAi,
+                model: "gpt-5.2".to_string(),
+                reasoning_effort: agent_vocab::ReasoningEffort::Medium,
+                max_tokens: None,
+                prompt_cache: None,
+            },
+            metadata: serde_json::json!({
+                "prompt_profile": "parent",
+                "subagent": true,
+            }),
+        };
+
+        assert_eq!(prompt_profile(&config), PromptProfile::Parent);
+        config.metadata = serde_json::json!({ "prompt_profile": "subagent" });
+        assert_eq!(prompt_profile(&config), PromptProfile::Subagent);
+        config.metadata = serde_json::json!({ "subagent": true });
+        assert_eq!(prompt_profile(&config), PromptProfile::Subagent);
     }
 
     fn write_skill(path: &Path, name: &str, description: &str) {

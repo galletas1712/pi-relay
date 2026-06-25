@@ -109,6 +109,7 @@ pub(crate) async fn spawn_subagent(
         &request.task,
         &role.file_path,
         &parent_config.metadata,
+        request.subagent_type,
     );
     let mut child_config = SessionConfig {
         project_id: parent_config.project_id,
@@ -127,6 +128,7 @@ pub(crate) async fn spawn_subagent(
             description: &role.description,
             content: &role.content,
             parent_session_id: &request.parent_session_id,
+            subagent_type: request.subagent_type,
         },
     )?;
     let task = request.task;
@@ -393,6 +395,7 @@ fn subagent_metadata(
     task: &str,
     role_file_path: &PathBuf,
     parent_metadata: &Value,
+    subagent_type: SubagentType,
 ) -> Value {
     let mut metadata = match metadata {
         Value::Object(map) => Value::Object(map),
@@ -419,6 +422,8 @@ fn subagent_metadata(
     }
     map.insert("hidden".to_string(), json!(true));
     map.insert("subagent".to_string(), json!(true));
+    map.insert("prompt_profile".to_string(), json!("subagent"));
+    map.insert("subagent_type".to_string(), json!(subagent_type.as_str()));
     map.insert("role_name".to_string(), json!(role_name));
     map.insert("task".to_string(), json!(task));
     map.insert("role_file_path".to_string(), json!(role_file_path));
@@ -440,12 +445,38 @@ Use the delegated task, role instructions, workspace/project context, and any fi
     )
 }
 
+fn subagent_workspace_semantics(subagent_type: SubagentType) -> &'static str {
+    match subagent_type {
+        SubagentType::Full => {
+            "You are a full subagent. Your filesystem edits are made in the parent workspace in place and affect what the parent will see."
+        }
+        SubagentType::ReadOnly => {
+            "You are a read-only subagent. You run in a disposable snapshot; any local writes or artifacts stay in that snapshot and do not reach the parent unless you explicitly report them."
+        }
+    }
+}
+
+fn subagent_contract_text(parent_session_id: &str, subagent_type: SubagentType) -> String {
+    let workspace_semantics = subagent_workspace_semantics(subagent_type);
+    format!(
+        "# Subagent contract\n\n\
+You are a child agent spawned by parent session `{parent_session_id}`.\n\
+The parent can inspect your transcript, send follow-up messages, interrupt you, and decide whether to merge your filesystem changes.\n\
+Keep your own context focused on the delegated task. Do not assume your changes are merged automatically.\n\
+You cannot spawn nested delegations. Do not call `delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`, or `steer_subagent`; those parent orchestration tools are unavailable to subagents.\n\
+Do not load workflow skills. Workflow skills are for parent sessions that orchestrate subagents, not for delegated subagent work.\n\
+Answer only the delegated task. Your final message/report is the durable handoff to the parent, so include the evidence, changed files, commands, risks, and follow-up work the parent needs.\n\
+{workspace_semantics}"
+    )
+}
+
 struct ChildPromptRole<'a> {
     name: &'a str,
     workspace: Option<&'a str>,
     description: &'a str,
     content: &'a str,
     parent_session_id: &'a str,
+    subagent_type: SubagentType,
 }
 
 fn child_system_prompt(
@@ -458,18 +489,13 @@ fn child_system_prompt(
         .workspace
         .map(|workspace| format!("workspace `{workspace}`"))
         .unwrap_or_else(|| "global role".to_string());
+    let contract = subagent_contract_text(role.parent_session_id, role.subagent_type);
     Ok(format!(
-        "{base}\n\n# Subagent contract\n\n\
-You are a child agent spawned by parent session `{}`.\n\
-The parent can inspect your transcript, send follow-up messages, interrupt you, and decide whether to merge your filesystem changes.\n\
-Keep your own context focused on the delegated task. Do not assume your changes are merged automatically.\n\
-Your role instructions are already included below; do not call `LoadSkill` for this same role unless you explicitly need to inspect another skill.\n\
-When you finish, report concise results and any follow-up work clearly.\n\n\
+        "{base}\n\n{contract}\n\n\
 # Subagent role\n\n\
 Role: `{}` ({workspace})\n\
 Description: {}\n\n\
 {}\n",
-        role.parent_session_id,
         role.name,
         role.description.trim(),
         role.content.trim()
@@ -488,6 +514,7 @@ mod tests {
             "Review this",
             &PathBuf::from("/tmp/reviewer/SKILL.md"),
             &json!({ "harness": true, "auto_title_disabled": true }),
+            SubagentType::ReadOnly,
         );
         assert_eq!(
             metadata,
@@ -497,6 +524,8 @@ mod tests {
                 "auto_title_disabled": true,
                 "hidden": true,
                 "subagent": true,
+                "prompt_profile": "subagent",
+                "subagent_type": "read_only",
                 "role_name": "repo/reviewer",
                 "task": "Review this",
                 "role_file_path": "/tmp/reviewer/SKILL.md",
@@ -521,5 +550,34 @@ mod tests {
         assert!(message.contains("Parent session: `parent`"));
         assert!(message.contains("Inspect the repo."));
         assert!(message.contains("A subagent runs with fresh context"));
+    }
+
+    #[test]
+    fn subagent_workspace_semantics_distinguish_full_and_read_only() {
+        let full = subagent_workspace_semantics(SubagentType::Full);
+        assert!(full.contains("full subagent"));
+        assert!(full.contains("parent workspace in place"));
+        assert!(full.contains("affect what the parent will see"));
+
+        let read_only = subagent_workspace_semantics(SubagentType::ReadOnly);
+        assert!(read_only.contains("read-only subagent"));
+        assert!(read_only.contains("disposable snapshot"));
+        assert!(read_only.contains("do not reach the parent"));
+    }
+
+    #[test]
+    fn subagent_contract_forbids_nested_delegation_and_workflow_skills() {
+        let contract = subagent_contract_text("parent-session", SubagentType::ReadOnly);
+
+        assert!(contract.contains("parent session `parent-session`"));
+        assert!(contract.contains("cannot spawn nested delegations"));
+        assert!(contract.contains("Do not call `delegate_writing_task`"));
+        assert!(contract.contains("`delegate_readonly_tasks`"));
+        assert!(contract.contains("`inspect_delegation`"));
+        assert!(contract.contains("`cancel_delegation`"));
+        assert!(contract.contains("`steer_subagent`"));
+        assert!(contract.contains("Do not load workflow skills"));
+        assert!(contract.contains("final message/report is the durable handoff"));
+        assert!(contract.contains("read-only subagent"));
     }
 }
