@@ -626,9 +626,21 @@ impl PostgresAgentStore {
     }
 
     pub async fn sessions_with_active_queued_inputs(&self) -> Result<Vec<String>> {
-        let active_queue = queued_input_is_active(None);
-        let query =
-            format!("select distinct session_id from queued_inputs where {active_queue} order by session_id");
+        let active_queue = queued_input_is_active(Some("q"));
+        let query = format!(
+            r#"
+                select distinct q.session_id
+                from queued_inputs q
+                join sessions s on s.id = q.session_id
+                left join delegations d on d.id = s.delegation_id
+                where {active_queue}
+                    and (
+                        s.parent_session_id is null
+                        or d.status = 'running'
+                    )
+                order by q.session_id
+                "#
+        );
         Ok(sqlx::query_scalar(&query).fetch_all(&self.pool).await?)
     }
 
@@ -968,7 +980,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
-    use crate::{InputPriority, OutputBatch, SessionConfig};
+    use crate::{DelegationKind, DelegationStatus, InputPriority, OutputBatch, SessionConfig};
 
     use super::*;
 
@@ -1146,13 +1158,11 @@ mod tests {
             .await
             .expect("matching expected active leaf enqueues");
         assert_eq!(queued.queue.as_ref().expect("queue").queued_inputs.len(), 1);
-        assert!(
-            store
-                .sessions_with_active_queued_inputs()
-                .await
-                .expect("queued sessions")
-                .contains(&session_id.to_string())
-        );
+        assert!(store
+            .sessions_with_active_queued_inputs()
+            .await
+            .expect("queued sessions")
+            .contains(&session_id.to_string()));
 
         let replay = store
             .enqueue_user_input(
@@ -1166,6 +1176,128 @@ mod tests {
             .expect("idempotent replay returns accepted input despite stale expected leaf");
         assert_eq!(replay.input_id, queued.input_id);
         assert!(replay.event.is_none());
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn boot_active_queue_sweep_skips_subagents_of_non_running_delegations() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let project_id = Uuid::new_v4();
+        store
+            .create_project(project_id, "boot queue sweep test", &[], json!({}))
+            .await
+            .expect("project creates");
+        let config = session_config(project_id);
+        store
+            .create_session("main_with_queue", &config)
+            .await
+            .expect("main session creates");
+        store
+            .create_session("parent", &config)
+            .await
+            .expect("parent session creates");
+
+        let running = store
+            .create_delegation("parent", DelegationKind::Full, None, Some("running"), 1)
+            .await
+            .expect("running delegation creates");
+        let cancelled = store
+            .create_delegation("parent", DelegationKind::Full, None, Some("cancelled"), 1)
+            .await
+            .expect("cancelled delegation creates");
+        store
+            .set_delegation_status(&cancelled.id, DelegationStatus::Cancelled)
+            .await
+            .expect("cancel delegation");
+        let done = store
+            .create_delegation("parent", DelegationKind::Full, None, Some("done"), 1)
+            .await
+            .expect("done delegation creates");
+        store
+            .set_delegation_status(&done.id, DelegationStatus::Done)
+            .await
+            .expect("finish delegation");
+        let failed = store
+            .create_delegation("parent", DelegationKind::Full, None, Some("failed"), 1)
+            .await
+            .expect("failed delegation creates");
+        store
+            .set_delegation_status(&failed.id, DelegationStatus::Failed)
+            .await
+            .expect("fail delegation");
+
+        for (session_id, delegation_id) in [
+            ("running_child", running.id.as_str()),
+            ("cancelled_child", cancelled.id.as_str()),
+            ("done_child", done.id.as_str()),
+            ("failed_child", failed.id.as_str()),
+        ] {
+            store
+                .start_session_outputs_with_parent(
+                    session_id,
+                    &config,
+                    &[],
+                    None,
+                    &[],
+                    &[],
+                    InputPriority::FollowUp,
+                    &UserMessage::text("start"),
+                    None,
+                    Some("parent"),
+                    Some(crate::SubagentType::Full),
+                    Some(delegation_id),
+                )
+                .await
+                .expect("subagent session creates");
+        }
+        store
+            .start_session_outputs_with_parent(
+                "legacy_child_without_delegation",
+                &config,
+                &[],
+                None,
+                &[],
+                &[],
+                InputPriority::FollowUp,
+                &UserMessage::text("start"),
+                None,
+                Some("parent"),
+                Some(crate::SubagentType::Full),
+                None,
+            )
+            .await
+            .expect("legacy subagent session creates");
+
+        for session_id in [
+            "main_with_queue",
+            "running_child",
+            "cancelled_child",
+            "done_child",
+            "failed_child",
+            "legacy_child_without_delegation",
+        ] {
+            store
+                .enqueue_user_input(
+                    session_id,
+                    InputPriority::FollowUp,
+                    &UserMessage::text("queued"),
+                    Some(&format!("{session_id}-client-input")),
+                    None,
+                )
+                .await
+                .expect("queued input enqueues");
+        }
+
+        let sessions = store
+            .sessions_with_active_queued_inputs()
+            .await
+            .expect("queued sessions load");
+        assert_eq!(sessions, vec!["main_with_queue", "running_child"]);
 
         db.cleanup().await;
     }
@@ -1418,14 +1550,10 @@ mod tests {
                     item: root.item.clone(),
                     provider_replay: Vec::new(),
                 }],
-                Some(&root.id),
+                None,
             )
             .await
             .expect("seed transcript");
-        store
-            .set_active_leaf(session_id, None)
-            .await
-            .expect("active leaf switches");
         let stale_append = store
             .persist_outputs(
                 session_id,

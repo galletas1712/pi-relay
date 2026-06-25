@@ -12,7 +12,10 @@ use agent_vocab::{ProviderConfig, UserMessage};
 use super::events::insert_event_tx;
 use super::outputs::persist_outputs_tx;
 use super::queue::bump_revisions_tx;
-use super::sql::{action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity};
+use super::sql::{
+    action_is_unfinished, ensure_no_active_work_tx, lock_session_tx, queued_input_is_active,
+    session_activity,
+};
 use super::PostgresAgentStore;
 
 fn ensure_object(value: &mut Value) -> &mut Map<String, Value> {
@@ -383,10 +386,20 @@ impl PostgresAgentStore {
     }
 
     pub async fn delete_session(&self, session_id: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        if let Err(error) = lock_session_tx(&mut tx, session_id).await {
+            if error.to_string().starts_with("session not found:") {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        ensure_no_active_work_tx(&mut tx, session_id).await?;
         let result = sqlx::query("delete from sessions where id=$1")
             .bind(session_id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 

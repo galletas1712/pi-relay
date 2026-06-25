@@ -73,3 +73,43 @@ pub(super) async fn lock_session_tx(
     }
     Ok(())
 }
+
+pub(super) async fn session_has_unfinished_actions_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let unfinished_actions = action_is_unfinished(None);
+    let query = format!(
+        "select exists(select 1 from actions where session_id=$1 and {unfinished_actions})"
+    );
+    Ok(sqlx::query_scalar(&query)
+        .bind(session_id)
+        .fetch_one(&mut **tx)
+        .await?)
+}
+
+pub(super) async fn session_has_active_queued_inputs_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> anyhow::Result<bool> {
+    let active_queue = queued_input_is_active(None);
+    let query = format!(
+        "select exists(select 1 from queued_inputs where session_id=$1 and {active_queue})"
+    );
+    Ok(sqlx::query_scalar(&query)
+        .bind(session_id)
+        .fetch_one(&mut **tx)
+        .await?)
+}
+
+pub(super) async fn ensure_no_active_work_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    if session_has_unfinished_actions_tx(tx, session_id).await?
+        || session_has_active_queued_inputs_tx(tx, session_id).await?
+    {
+        return Err(crate::SourceMutationConflict.into());
+    }
+    Ok(())
+}

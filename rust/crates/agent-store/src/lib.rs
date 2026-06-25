@@ -293,6 +293,20 @@ impl fmt::Display for ExpectedActiveLeafMismatch {
 
 impl std::error::Error for ExpectedActiveLeafMismatch {}
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceMutationConflict;
+
+impl fmt::Display for SourceMutationConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "session became busy before the source mutation was applied"
+        )
+    }
+}
+
+impl std::error::Error for SourceMutationConflict {}
+
 pub struct PromoteQueuedInputResult {
     pub input_id: String,
     pub priority: InputPriority,

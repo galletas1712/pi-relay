@@ -18,7 +18,7 @@ use crate::{
 use super::events::{insert_event_tx, insert_transcript_item_events_tx};
 use super::queue::bump_revisions_tx;
 use super::rows::{row_to_stored_entry, row_to_transcript_entry};
-use super::sql::{lock_session_tx, stale_unfinished_actions_for_session};
+use super::sql::{ensure_no_active_work_tx, lock_session_tx, stale_unfinished_actions_for_session};
 use super::turn_cards::{active_branch_turn_card_page_tx, TurnCardPage};
 use super::PostgresAgentStore;
 
@@ -692,7 +692,7 @@ impl PostgresAgentStore {
         leaf_id: Option<&str>,
     ) -> Result<Vec<EventFrame>> {
         let result = self
-            .switch_active_leaf(session_id, leaf_id, false, None, None, None)
+            .switch_active_leaf(session_id, leaf_id, false, None, None, None, None)
             .await?;
         Ok(result.events)
     }
@@ -702,6 +702,7 @@ impl PostgresAgentStore {
         session_id: &str,
         leaf_id: Option<&str>,
         return_active_branch: bool,
+        expected_active_leaf_id: Option<Option<&str>>,
         expected_transcript_revision: Option<i64>,
         expected_active_branch_entry_ids: Option<&[String]>,
         missing_body_ids: Option<&[String]>,
@@ -710,12 +711,22 @@ impl PostgresAgentStore {
             expected_active_branch_entry_ids.filter(|ids| !ids.is_empty());
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
-        let current_transcript_revision: i64 =
-            sqlx::query_scalar("select transcript_revision from sessions where id=$1")
+        let (current_active_leaf_id, current_transcript_revision): (Option<String>, i64) =
+            sqlx::query_as("select active_leaf_id, transcript_revision from sessions where id=$1")
                 .bind(session_id)
                 .fetch_optional(&mut *tx)
                 .await?
                 .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        ensure_no_active_work_tx(&mut tx, session_id).await?;
+        if let Some(expected) = expected_active_leaf_id {
+            if current_active_leaf_id.as_deref() != expected {
+                return Err(crate::ExpectedActiveLeafMismatch::new(
+                    current_active_leaf_id,
+                    expected.map(str::to_string),
+                )
+                .into());
+            }
+        }
         if let Some(expected) = expected_transcript_revision {
             if current_transcript_revision != expected {
                 return Err(anyhow!(
@@ -1540,6 +1551,7 @@ mod tests {
                 session_id,
                 Some("entry_finish"),
                 false,
+                None,
                 Some(before.transcript_revision),
                 Some(&expected_ids),
                 Some(&missing_ids),
@@ -1971,7 +1983,15 @@ mod tests {
             .expect("snapshot loads");
 
         let result = store
-            .switch_active_leaf(session_id, Some("entry_a_finish"), true, None, None, None)
+            .switch_active_leaf(
+                session_id,
+                Some("entry_a_finish"),
+                true,
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .expect("switch succeeds");
 
@@ -2000,6 +2020,83 @@ mod tests {
                 "entry_a_user",
                 "entry_a_finish",
             ]
+        );
+
+        db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn switch_active_leaf_rejects_queued_input_under_session_lock() {
+        let Some(db) = test_store().await else {
+            eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+            return;
+        };
+        let store = &db.store;
+        let session_id = "switch-active-queued-guard";
+        create_session(store, session_id).await;
+
+        store
+            .persist_outputs(
+                session_id,
+                OutputBatch::new(
+                    &[
+                        turn_started("entry_a_start", None, 1),
+                        user_message("entry_a_user", Some("entry_a_start"), "branch a"),
+                        turn_finished("entry_a_finish", Some("entry_a_user"), 1),
+                        turn_started("entry_b_start", None, 2),
+                        user_message("entry_b_user", Some("entry_b_start"), "branch b"),
+                        turn_finished("entry_b_finish", Some("entry_b_user"), 2),
+                    ],
+                    Some("entry_a_finish"),
+                    &[],
+                    &[],
+                ),
+            )
+            .await
+            .expect("transcript persists");
+        store
+            .enqueue_user_input(
+                session_id,
+                crate::InputPriority::FollowUp,
+                &UserMessage::text("accepted before switch"),
+                Some("race-client-input"),
+                Some(Some("entry_a_finish")),
+            )
+            .await
+            .expect("queued input enqueues");
+
+        let switched = store
+            .switch_active_leaf(
+                session_id,
+                Some("entry_b_finish"),
+                false,
+                Some(Some("entry_a_finish")),
+                None,
+                None,
+                None,
+            )
+            .await;
+        assert!(switched
+            .as_ref()
+            .err()
+            .and_then(|error| error.downcast_ref::<crate::SourceMutationConflict>())
+            .is_some());
+        assert_eq!(
+            store
+                .active_leaf_id(session_id)
+                .await
+                .expect("active leaf loads")
+                .as_deref(),
+            Some("entry_a_finish")
+        );
+        assert_eq!(
+            store
+                .queue_state(session_id)
+                .await
+                .expect("queue state")
+                .queued_inputs
+                .len(),
+            1
         );
 
         db.cleanup().await;

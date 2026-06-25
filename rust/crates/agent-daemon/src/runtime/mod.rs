@@ -26,7 +26,9 @@ use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
 pub(crate) use compaction::spawn_compaction;
 use dispatch::dispatch_all;
-pub(crate) use errors::{history_error_to_rpc, map_queued_mutation_error};
+pub(crate) use errors::{
+    history_error_to_rpc, map_queued_mutation_error, map_source_mutation_error,
+};
 pub(crate) use events::{clear_event_buffer_if_idle, publish_events};
 use outputs::attach_provider_replay;
 pub(crate) use outputs::{

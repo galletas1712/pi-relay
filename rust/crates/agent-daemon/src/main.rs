@@ -504,7 +504,11 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
     delete_order.push(session_id.clone());
     for candidate_session_id in &delete_order {
         state.active.lock().await.remove(candidate_session_id);
-        let deleted = state.repo.delete_session(candidate_session_id).await?;
+        let deleted = state
+            .repo
+            .delete_session(candidate_session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         if !deleted && candidate_session_id == &session_id {
             return Err(RpcError::new("session_not_found", "session not found"));
         }
@@ -1388,6 +1392,7 @@ async fn history_switch(state: &AppState, params: Value) -> std::result::Result<
     let leaf_id = params.get("leaf_id").and_then(Value::as_str);
     let active_leaf_id = state.repo.active_leaf_id(&session_id).await?;
     ensure_expected_active_leaf_matches(&active_leaf_id, &params)?;
+    let expected_active_leaf_id = parse_expected_active_leaf_id(&params)?;
     let expected_ms = started_at.elapsed().as_millis();
     if !state
         .repo
@@ -1415,12 +1420,13 @@ async fn history_switch(state: &AppState, params: Value) -> std::result::Result<
             &session_id,
             leaf_id,
             return_active_branch,
+            expected_active_leaf_id,
             expected_transcript_revision,
             active_branch_entry_ids.as_deref(),
             missing_body_ids.as_deref(),
         )
         .await
-        .map_err(history_switch_error_to_rpc)?;
+        .map_err(map_source_mutation_error)?;
     let switch_ms = started_at.elapsed().as_millis();
     let returned_body_count = result
         .active_branch_entries
@@ -1481,14 +1487,6 @@ fn optional_string_vec(
                 .map_err(|error| RpcError::new("invalid_params", error.to_string()))
         })
         .transpose()
-}
-
-fn history_switch_error_to_rpc(error: anyhow::Error) -> RpcError {
-    let message = error.to_string();
-    if message.starts_with("history_changed:") {
-        return RpcError::new("history_changed", message);
-    }
-    error.into()
 }
 
 async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
