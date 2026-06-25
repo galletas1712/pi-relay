@@ -269,6 +269,54 @@ async fn subagent_type_round_trips_through_start_session_outputs() {
 }
 
 #[tokio::test]
+async fn delete_session_rejects_active_queued_input_under_session_lock() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(project_id, "delete guard test", &[], json!({}))
+        .await
+        .expect("project creates");
+    create_project_session(store, project_id, "delete_guard").await;
+
+    store
+        .enqueue_user_input(
+            "delete_guard",
+            crate::InputPriority::FollowUp,
+            &UserMessage::text("accepted before delete"),
+            Some("delete-guard-input"),
+            None,
+        )
+        .await
+        .expect("queued input enqueues");
+
+    let deleted = store.delete_session("delete_guard").await;
+    assert!(deleted
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<crate::SourceMutationConflict>())
+        .is_some());
+    assert!(store
+        .session_exists("delete_guard")
+        .await
+        .expect("session existence loads"));
+    assert_eq!(
+        store
+            .queue_state("delete_guard")
+            .await
+            .expect("queue state loads")
+            .queued_inputs
+            .len(),
+        1
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn list_sessions_sorts_by_last_user_message_timestamp() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");

@@ -26,25 +26,15 @@ use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
 pub(crate) use compaction::spawn_compaction;
 use dispatch::dispatch_all;
-pub(crate) use errors::{history_error_to_rpc, map_queued_mutation_error};
+pub(crate) use errors::{
+    history_error_to_rpc, map_queued_mutation_error, map_source_mutation_error,
+};
 pub(crate) use events::{clear_event_buffer_if_idle, publish_events};
 use outputs::attach_provider_replay;
 pub(crate) use outputs::{
     agent_input_from_queued_priority, attach_dispatch_config, collect_runtime_outputs,
 };
 pub(crate) use tasks::{abort_session_tasks, session_has_live_tasks, take_tasks};
-
-pub(crate) async fn ensure_expected_active_leaf(
-    state: &AppState,
-    session_id: &str,
-    params: &Value,
-) -> std::result::Result<(), RpcError> {
-    if params.get("expected_active_leaf_id").is_none() {
-        return Ok(());
-    }
-    let active_leaf_id = state.repo.active_leaf_id(session_id).await?;
-    ensure_expected_active_leaf_matches(&active_leaf_id, params)
-}
 
 pub(crate) fn ensure_expected_active_leaf_matches(
     current: &Option<String>,

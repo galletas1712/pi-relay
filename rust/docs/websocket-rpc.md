@@ -869,7 +869,10 @@ cold loads and history UI.
 
 Idle-only. Params: `session_id` (and optional `expected_active_leaf_id`).
 Acquires the session driver, requires idle (no unfinished action, no queued
-input), evicts any live session, removes the row, and cascades to its transcript
+input), and re-checks that state under the store transaction that deletes the
+row. If a follow-up was accepted concurrently, deletion fails with
+`session_busy` rather than cascade-deleting accepted input. Otherwise the RPC
+evicts any live session, removes the row, and cascades to its transcript
 entries, queued inputs, actions, and events; session workspace directories are
 cleaned up. Returns `{ "session_id", "deleted": true }`. A missing session is
 `session_not_found`.
@@ -918,9 +921,10 @@ Stops streaming live events for a session on the current websocket.
 
 ### `input.follow_up`
 
-Normal user message. If the session has no unfinished actions and no queued
-inputs, the daemon feeds the message into the session immediately. If work is
-running or already queued, the daemon stores a durable queued row.
+Normal user message. The daemon first records a durable queued row and returns
+the canonical queue projection. If the session has no unfinished actions, it
+then starts a background drive to consume the row; if work is already running,
+the row remains queued until earlier work finishes.
 
 ```json
 {
@@ -933,23 +937,20 @@ running or already queued, the daemon stores a durable queued row.
 }
 ```
 
-`expected_active_leaf_id` is optional. When present, the daemon rejects idle
-acceptance with `history_changed` if the active branch moved before the message
-was accepted. When the session is already busy, the message is a durable queued
-follow-up that will materialize only after earlier work commits from the
-then-active branch; queued rows can later be edited/cancelled/reordered before
-consumption. The web UI uses this fence for restored composer drafts so a
-historical edit cannot silently send into a newer idle context.
+`expected_active_leaf_id` is optional. When present, the daemon validates it in
+the same store transaction that queues the row and rejects stale sends with
+`history_changed`. The row will materialize only after background driving
+consumes it from the then-active branch; queued rows can later be
+edited/cancelled/reordered before consumption. Idle-only source mutations such
+as `history.switch` and `session.delete` re-check for queued input in their own
+store transactions, so they fail with `session_busy` instead of redirecting or
+deleting already accepted input. The web UI uses this fence for restored
+composer drafts so a historical edit cannot silently send into a newer idle
+context.
 `client_input_id` is optional but strongly recommended for frontend sends;
 without it, retry idempotency is intentionally not provided.
 
-Idle response:
-
-```json
-{ "accepted": true, "queued": false }
-```
-
-Busy response:
+Response:
 
 ```json
 {

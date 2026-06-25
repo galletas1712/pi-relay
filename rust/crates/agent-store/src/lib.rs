@@ -262,6 +262,51 @@ pub struct EnqueueUserInputResult {
     pub queue: Option<QueueState>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedActiveLeafMismatch {
+    current: Option<String>,
+    expected: Option<String>,
+}
+
+impl ExpectedActiveLeafMismatch {
+    pub fn new(current: Option<String>, expected: Option<String>) -> Self {
+        Self { current, expected }
+    }
+
+    pub fn current(&self) -> Option<&str> {
+        self.current.as_deref()
+    }
+
+    pub fn expected(&self) -> Option<&str> {
+        self.expected.as_deref()
+    }
+}
+
+impl fmt::Display for ExpectedActiveLeafMismatch {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "session active leaf changed before the request was applied"
+        )
+    }
+}
+
+impl std::error::Error for ExpectedActiveLeafMismatch {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceMutationConflict;
+
+impl fmt::Display for SourceMutationConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "session became busy before the source mutation was applied"
+        )
+    }
+}
+
+impl std::error::Error for SourceMutationConflict {}
+
 pub struct PromoteQueuedInputResult {
     pub input_id: String,
     pub priority: InputPriority,

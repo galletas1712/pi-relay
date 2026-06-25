@@ -39,10 +39,9 @@ use std::time::Instant;
 use agent_core::AgentInput;
 use agent_session::SessionInput;
 use agent_store::{
-    AcceptedInput, ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventFrame,
-    EventType, InputPriority, PostgresAgentStore, ProjectWorkspace, QueuedInputContent,
-    QueuedInputStatus, SessionConfig, SubagentType, TranscriptEntryBodyMode, TranscriptEntryScope,
-    WorkspaceKind,
+    ActionKind, ActionStatus, ActionUpdate, CompactionTrigger, EventType, InputPriority,
+    PostgresAgentStore, ProjectWorkspace, QueuedInputStatus, SessionConfig, SubagentType,
+    TranscriptEntryBodyMode, TranscriptEntryScope, WorkspaceKind,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{ActionId, ProviderConfig, ProviderKind, TranscriptItem, TurnId, TurnOutcome};
@@ -93,6 +92,20 @@ async fn main() -> Result<()> {
     // child re-establishes live work (delegation stays running) instead of being
     // abandoned as a failure.
     delegation_runner::sweep_running_delegations_on_boot(&state).await;
+    match state.repo.sessions_with_active_queued_inputs().await {
+        Ok(session_ids) => {
+            if !session_ids.is_empty() {
+                eprintln!(
+                    "resuming {} session(s) with active queued input(s)",
+                    session_ids.len()
+                );
+            }
+            for session_id in session_ids {
+                spawn_drive_until_blocked(&state, session_id, "boot.active_queued_input");
+            }
+        }
+        Err(error) => eprintln!("failed to sweep queued inputs on boot: {error:#}"),
+    }
 
     let listener = TcpListener::bind(&config.bind).await?;
     println!("pi-agentd listening on ws://{}", config.bind);
@@ -491,7 +504,11 @@ async fn session_delete(state: &AppState, params: Value) -> std::result::Result<
     delete_order.push(session_id.clone());
     for candidate_session_id in &delete_order {
         state.active.lock().await.remove(candidate_session_id);
-        let deleted = state.repo.delete_session(candidate_session_id).await?;
+        let deleted = state
+            .repo
+            .delete_session(candidate_session_id)
+            .await
+            .map_err(map_source_mutation_error)?;
         if !deleted && candidate_session_id == &session_id {
             return Err(RpcError::new("session_not_found", "session not found"));
         }
@@ -894,6 +911,46 @@ pub(crate) struct SessionInputRequest {
     pub(crate) expected_active_leaf_id: Option<Value>,
 }
 
+fn spawn_drive_until_blocked(state: &AppState, session_id: String, reason: &'static str) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let driver = SessionDriver::acquire(&state, &session_id).await;
+        let drive_result = async {
+            driver.recover_if_needed().await?;
+            if state.repo.has_queued_inputs(&session_id).await?
+                && !state.repo.has_unfinished_actions(&session_id).await?
+            {
+                driver.drive_until_blocked().await?;
+            }
+            Ok::<(), RpcError>(())
+        }
+        .await;
+        if let Err(error) = drive_result {
+            eprintln!(
+                "background drive failed session={session_id} reason={reason}: {}: {}",
+                error.code, error.message
+            );
+            match state
+                .repo
+                .insert_event(
+                    &session_id,
+                    EventType::ModelError,
+                    json!({
+                        "error": error.message,
+                        "reason": reason,
+                    }),
+                )
+                .await
+            {
+                Ok(event) => publish_events(&state, vec![event]),
+                Err(event_error) => eprintln!(
+                    "failed to record background drive failure {session_id}: {event_error:#}"
+                ),
+            }
+        }
+    });
+}
+
 pub(crate) async fn enqueue_session_input(
     state: &AppState,
     request: SessionInputRequest,
@@ -903,29 +960,11 @@ pub(crate) async fn enqueue_session_input(
         priority,
         content,
         client_input_id,
-        base_leaf_id,
+        base_leaf_id: _base_leaf_id,
         expected_active_leaf_id,
     } = request;
-    enum InputOutcome {
-        Accepted {
-            dispatches: Vec<DispatchAction>,
-            active_branch_sync: Value,
-            publish_subagent_running: bool,
-        },
-        Queued {
-            input_id: String,
-            event: Option<EventFrame>,
-            queue: Option<Value>,
-            should_drive: bool,
-            publish_subagent_running: bool,
-        },
-    }
 
     let started_at = Instant::now();
-    let driver = SessionDriver::acquire(state, &session_id).await;
-    let acquired_ms = started_at.elapsed().as_millis();
-    driver.recover_if_needed().await?;
-    let recovered_ms = started_at.elapsed().as_millis();
     if priority == InputPriority::Steer
         && state.repo.session_parent_id(&session_id).await?.is_some()
         && state.repo.active_leaf_is_turn_boundary(&session_id).await?
@@ -939,143 +978,98 @@ pub(crate) async fn enqueue_session_input(
     if let Some(expected_active_leaf_id) = expected_active_leaf_id {
         expected_params["expected_active_leaf_id"] = expected_active_leaf_id;
     }
-    let outcome = {
-        if let Some(client_input_id) = client_input_id.as_deref() {
-            if let Some(record) = state
-                .repo
-                .find_client_input(&session_id, client_input_id)
-                .await?
-            {
-                let queue = state
-                    .repo
-                    .queue_state(&session_id)
-                    .await
-                    .map(rpc_views::queue_state)?;
-                if perf_logging_enabled() {
-                    let total_ms = started_at.elapsed().as_millis();
-                    eprintln!(
-                        "perf input.follow_up session={session_id} priority={priority} replay=true acquire_ms={acquired_ms} recover_ms={} total_ms={total_ms}",
-                        recovered_ms.saturating_sub(acquired_ms),
-                    );
-                }
-                return Ok(json!({
-                    "input_id": record.input_id,
-                    "accepted": record.status == QueuedInputStatus::Consumed,
-                    "queued": matches!(
-                        record.status,
-                        QueuedInputStatus::Queued | QueuedInputStatus::Consuming
-                    ),
-                    "replayed": true,
-                    "queue": queue,
-                }));
-            }
-        }
-        let has_running = state.repo.has_unfinished_actions(&session_id).await?;
-        let has_queued = state.repo.has_queued_inputs(&session_id).await?;
-        if has_running || has_queued {
-            let queued = state
-                .repo
-                .enqueue_user_input(&session_id, priority, &content, client_input_id.as_deref())
-                .await?;
-            InputOutcome::Queued {
-                input_id: queued.input_id,
-                event: queued.event,
-                queue: queued.queue.map(rpc_views::queue_state),
-                should_drive: !has_running,
-                publish_subagent_running: !has_running,
-            }
-        } else {
-            ensure_expected_active_leaf(state, &session_id, &expected_params).await?;
-            driver.ensure_active_loaded().await?;
-            let active = driver
-                .require_active_session("session_not_found", "session not found")
-                .await?;
-            {
-                let mut runtime = active.lock().await;
-                runtime
-                    .session
-                    .enqueue_input(agent_input_from_queued_priority(
-                        priority,
-                        QueuedInputContent::user_message(content.clone()),
-                    ))
-                    .map_err(|error| RpcError::new("invalid_input", error.to_string()))?;
-            }
-            let dispatches = driver
-                .persist_active_outputs(
-                    active,
-                    None,
-                    None,
-                    Some(AcceptedInput {
-                        priority,
-                        content: content.clone(),
-                        client_input_id: client_input_id.clone(),
-                    }),
-                    Vec::new(),
-                )
-                .await?;
-            let sync = state
-                .repo
-                .sync_active_branch(
-                    &session_id,
-                    base_leaf_id.as_deref(),
-                    TranscriptEntryBodyMode::Ui,
-                )
-                .await?;
-            let snapshot = state.repo.session_snapshot(&session_id).await?;
-            InputOutcome::Accepted {
-                dispatches,
-                active_branch_sync: rpc_views::active_branch_sync(sync, snapshot),
-                publish_subagent_running: true,
-            }
-        }
-    };
 
-    match outcome {
-        InputOutcome::Accepted {
-            dispatches,
-            active_branch_sync,
-            publish_subagent_running,
-        } => {
-            if publish_subagent_running {
+    if let Some(client_input_id) = client_input_id.as_deref() {
+        if let Some(record) = state
+            .repo
+            .find_client_input(&session_id, client_input_id)
+            .await?
+        {
+            let queue = state
+                .repo
+                .queue_state(&session_id)
+                .await
+                .map(rpc_views::queue_state)?;
+            if perf_logging_enabled() {
+                let total_ms = started_at.elapsed().as_millis();
+                eprintln!(
+                    "perf input.follow_up session={session_id} priority={priority} replay=true total_ms={total_ms}",
+                );
+            }
+            if matches!(
+                record.status,
+                QueuedInputStatus::Queued | QueuedInputStatus::Consuming
+            ) && !state.repo.has_unfinished_actions(&session_id).await?
+            {
                 subagents::publish_subagent_parent_running_if_child(state, &session_id).await;
+                spawn_drive_until_blocked(state, session_id.clone(), "input.follow_up.replay");
             }
-            driver.dispatch(dispatches).await?;
-            if perf_logging_enabled() {
-                let total_ms = started_at.elapsed().as_millis();
-                eprintln!(
-                    "perf input.follow_up session={session_id} priority={priority} queued=false acquire_ms={acquired_ms} recover_ms={} total_ms={total_ms}",
-                    recovered_ms.saturating_sub(acquired_ms),
-                );
-            }
-            Ok(
-                json!({ "accepted": true, "queued": false, "active_branch_sync": active_branch_sync }),
-            )
+            return Ok(json!({
+                "input_id": record.input_id,
+                "accepted": matches!(
+                    record.status,
+                    QueuedInputStatus::Queued
+                        | QueuedInputStatus::Consuming
+                        | QueuedInputStatus::Consumed
+                ),
+                "queued": matches!(
+                    record.status,
+                    QueuedInputStatus::Queued | QueuedInputStatus::Consuming
+                ),
+                "replayed": true,
+                "queue": queue,
+            }));
         }
-        InputOutcome::Queued {
-            input_id,
-            event,
-            queue,
-            should_drive,
-            publish_subagent_running,
-        } => {
-            if let Some(event) = event {
-                publish_events(state, vec![event]);
-            }
-            if should_drive {
-                if publish_subagent_running {
-                    subagents::publish_subagent_parent_running_if_child(state, &session_id).await;
-                }
-                driver.drive_until_blocked().await?;
-            }
-            if perf_logging_enabled() {
-                let total_ms = started_at.elapsed().as_millis();
-                eprintln!(
-                    "perf input.follow_up session={session_id} priority={priority} queued=true should_drive={should_drive} acquire_ms={acquired_ms} recover_ms={} total_ms={total_ms}",
-                    recovered_ms.saturating_sub(acquired_ms),
-                );
-            }
-            Ok(json!({ "input_id": input_id, "accepted": true, "queued": true, "queue": queue }))
-        }
+    }
+
+    let expected_active_leaf_id = parse_expected_active_leaf_id(&expected_params)?;
+    let queued = state
+        .repo
+        .enqueue_user_input(
+            &session_id,
+            priority,
+            &content,
+            client_input_id.as_deref(),
+            expected_active_leaf_id,
+        )
+        .await
+        .map_err(map_queued_mutation_error)?;
+    if let Some(event) = queued.event {
+        publish_events(state, vec![event]);
+    }
+    let has_running = state.repo.has_unfinished_actions(&session_id).await?;
+    if !has_running {
+        subagents::publish_subagent_parent_running_if_child(state, &session_id).await;
+        spawn_drive_until_blocked(state, session_id.clone(), "input.follow_up");
+    }
+    if perf_logging_enabled() {
+        let total_ms = started_at.elapsed().as_millis();
+        eprintln!(
+            "perf input.follow_up session={session_id} priority={priority} queued=true background_drive={} total_ms={total_ms}",
+            !has_running,
+        );
+    }
+    Ok(json!({
+        "input_id": queued.input_id,
+        "accepted": true,
+        "queued": true,
+        "queue": queued.queue.map(rpc_views::queue_state),
+    }))
+}
+
+fn parse_expected_active_leaf_id(
+    params: &Value,
+) -> std::result::Result<Option<Option<&str>>, RpcError> {
+    let Some(expected) = params.get("expected_active_leaf_id") else {
+        return Ok(None);
+    };
+    match expected {
+        Value::Null => Ok(Some(None)),
+        Value::String(value) => Ok(Some(Some(value.as_str()))),
+        _ => Err(RpcError::new(
+            "invalid_params",
+            "expected_active_leaf_id must be a string or null",
+        )),
     }
 }
 
@@ -1398,6 +1392,7 @@ async fn history_switch(state: &AppState, params: Value) -> std::result::Result<
     let leaf_id = params.get("leaf_id").and_then(Value::as_str);
     let active_leaf_id = state.repo.active_leaf_id(&session_id).await?;
     ensure_expected_active_leaf_matches(&active_leaf_id, &params)?;
+    let expected_active_leaf_id = parse_expected_active_leaf_id(&params)?;
     let expected_ms = started_at.elapsed().as_millis();
     if !state
         .repo
@@ -1425,12 +1420,13 @@ async fn history_switch(state: &AppState, params: Value) -> std::result::Result<
             &session_id,
             leaf_id,
             return_active_branch,
+            expected_active_leaf_id,
             expected_transcript_revision,
             active_branch_entry_ids.as_deref(),
             missing_body_ids.as_deref(),
         )
         .await
-        .map_err(history_switch_error_to_rpc)?;
+        .map_err(map_source_mutation_error)?;
     let switch_ms = started_at.elapsed().as_millis();
     let returned_body_count = result
         .active_branch_entries
@@ -1491,14 +1487,6 @@ fn optional_string_vec(
                 .map_err(|error| RpcError::new("invalid_params", error.to_string()))
         })
         .transpose()
-}
-
-fn history_switch_error_to_rpc(error: anyhow::Error) -> RpcError {
-    let message = error.to_string();
-    if message.starts_with("history_changed:") {
-        return RpcError::new("history_changed", message);
-    }
-    error.into()
 }
 
 async fn turn_resume(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
