@@ -8,7 +8,7 @@ use super::events::insert_event_tx;
 use super::queue::{
     append_queued_content_event_fields, bump_revisions_tx, queue_event_payload, queue_state_tx,
 };
-use super::sql::lock_session_tx;
+use super::sql::{action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity};
 use super::PostgresAgentStore;
 use crate::{
     DelegationKind, DelegationStatus, EventType, InputPriority, QueuedInputContent,
@@ -54,6 +54,21 @@ pub struct DelegationProgress {
     pub failed: i32,
 }
 
+/// Compact status fields for a subagent in the run-board list.
+///
+/// Unlike `delegation.status` / inspect snapshots this deliberately avoids
+/// loading the full active branch or touching handoff files. Terminality is
+/// derived from the active leaf row, matching `DelegationProgress`.
+#[derive(Debug, Clone)]
+pub struct DelegationSubagentOverview {
+    pub session_id: String,
+    pub activity: SessionActivity,
+    pub subagent_type: Option<SubagentType>,
+    pub role: Option<String>,
+    pub has_task: bool,
+    pub terminal_status: Option<String>,
+}
+
 impl PostgresAgentStore {
     /// Insert a fresh `running` delegation, minting its completion-fencing attempt
     /// id. The delegation row is created before its subagents so their
@@ -94,6 +109,93 @@ impl PostgresAgentStore {
             attempt_id,
             expected_subagents,
         })
+    }
+
+    /// Compact subagent rows for `delegation.list`.
+    ///
+    /// This is intentionally set-based: it avoids `active_branch` hydration,
+    /// per-subagent `activity()` calls, and handoff filesystem probes. The run
+    /// board only needs enough state to draw status dots, open a subagent, and
+    /// decide whether re-run can fetch a task prompt on demand.
+    pub async fn delegation_subagent_overview(
+        &self,
+        delegation_id: &str,
+    ) -> Result<Vec<DelegationSubagentOverview>> {
+        let running_actions = action_is_unfinished(Some("a"));
+        let active_queue = queued_input_is_active(Some("q"));
+        let query = format!(
+            r#"
+            select
+                s.id,
+                s.subagent_type,
+                s.metadata,
+                s.active_leaf_id,
+                te.item,
+                exists(select 1 from actions a where a.session_id=s.id and {running_actions}) as has_running_work,
+                exists(select 1 from queued_inputs q where q.session_id=s.id and {active_queue}) as has_queued_input
+            from sessions s
+            left join transcript_entries te
+                on te.session_id = s.id
+               and te.id = s.active_leaf_id
+            where s.delegation_id=$1
+            order by s.created_at, s.id
+            "#
+        );
+        let rows = sqlx::query(&query)
+            .bind(delegation_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let mut subagents = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session_id: String = row.get("id");
+            let subagent_type: Option<String> = row.get("subagent_type");
+            let subagent_type = subagent_type
+                .map(|raw| raw.parse::<SubagentType>().map_err(anyhow::Error::msg))
+                .transpose()?;
+            let metadata: Value = row.get("metadata");
+            let role = metadata
+                .get("role_name")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let has_task = metadata
+                .get("task")
+                .and_then(Value::as_str)
+                .is_some_and(|task| !task.trim().is_empty());
+            let active_leaf_id: Option<String> = row.get("active_leaf_id");
+            let terminal_status = if active_leaf_id.is_none() {
+                Some("done".to_string())
+            } else {
+                let item: Option<Value> = row.get("item");
+                if let Some(item) = item {
+                    match serde_json::from_value::<TranscriptItem>(item)? {
+                        TranscriptItem::TurnFinished { outcome, .. } => {
+                            let status = if outcome == agent_vocab::TurnOutcome::Graceful {
+                                "done"
+                            } else {
+                                "failed"
+                            };
+                            Some(status.to_string())
+                        }
+                        TranscriptItem::CompactionSummary(_) => Some("done".to_string()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            };
+            subagents.push(DelegationSubagentOverview {
+                session_id,
+                activity: session_activity(
+                    row.get::<bool, _>("has_running_work"),
+                    row.get::<bool, _>("has_queued_input"),
+                ),
+                subagent_type,
+                role,
+                has_task,
+                terminal_status,
+            });
+        }
+        Ok(subagents)
     }
 
     pub async fn get_delegation(&self, delegation_id: &str) -> Result<Option<Delegation>> {
@@ -161,9 +263,8 @@ impl PostgresAgentStore {
         self.rows_to_delegation_subagents(rows).await
     }
 
-    /// All delegations of a parent, oldest first. Backs the per-parent
-    /// `delegation.list` the run board needs (the spec only defines per-id
-    /// status).
+    /// All delegations of a parent, oldest first. Backs internal callers that
+    /// need the complete per-parent set.
     pub async fn list_parent_delegations(
         &self,
         parent_session_id: &str,
@@ -177,6 +278,32 @@ impl PostgresAgentStore {
             "#,
         )
         .bind(parent_session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(row_to_delegation).collect()
+    }
+
+    /// A bounded page of delegations for the run board, newest first.
+    ///
+    /// Fetching all historical delegations made the common selected-session
+    /// poll scale with the lifetime of the parent session even though the UI
+    /// shows the newest few rows by default.
+    pub async fn list_parent_delegations_newest(
+        &self,
+        parent_session_id: &str,
+        limit: i64,
+    ) -> Result<Vec<Delegation>> {
+        let rows = sqlx::query(
+            r#"
+            select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
+            from delegations
+            where parent_session_id=$1
+            order by created_at desc, id desc
+            limit $2
+            "#,
+        )
+        .bind(parent_session_id)
+        .bind(limit.max(0))
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(row_to_delegation).collect()

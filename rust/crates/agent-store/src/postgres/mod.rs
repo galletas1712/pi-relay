@@ -16,7 +16,9 @@ mod token_usage;
 mod transcript;
 mod turn_cards;
 
-pub use delegations::{Delegation, DelegationProgress, DelegationSubagent};
+pub use delegations::{
+    Delegation, DelegationProgress, DelegationSubagent, DelegationSubagentOverview,
+};
 
 use anyhow::Result;
 use sqlx::postgres::PgPoolOptions;

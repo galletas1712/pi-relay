@@ -81,6 +81,7 @@ function renderInspector(delegations: Delegation[]): string {
 		<Inspector
 			snapshot={snapshot()}
 			delegations={delegations}
+			hasMoreDelegations={false}
 			delegationsLoading={false}
 			delegationsError={null}
 			runBoard={callbacks()}
@@ -91,14 +92,17 @@ function renderInspector(delegations: Delegation[]): string {
 
 function renderRunBoardList({
 	delegations,
+	hasMoreDelegations = false,
 	showAllDelegations = false,
 }: {
 	delegations: Delegation[];
+	hasMoreDelegations?: boolean;
 	showAllDelegations?: boolean;
 }): string {
 	return renderToStaticMarkup(
 		<RunBoardDelegationList
 			delegations={delegations}
+			hasMoreDelegations={hasMoreDelegations}
 			showAllDelegations={showAllDelegations}
 			onToggleShowAllDelegations={() => {}}
 			onCancelDelegation={() => {}}
@@ -108,7 +112,7 @@ function renderRunBoardList({
 }
 
 describe("Inspector run board delegation list", () => {
-	it("shows only the three most recently launched delegations by default and all delegations in expanded mode", () => {
+	it("shows bounded newest-first delegations by default and all loaded delegations in expanded mode", () => {
 		const delegations = Array.from({ length: 5 }, (_, index) =>
 			delegation({
 				delegation_id: `delegation-${index + 1}`,
@@ -130,14 +134,14 @@ describe("Inspector run board delegation list", () => {
 			}),
 		);
 
-		// Input is oldest-first (task 1..5); the board renders newest-first, so the
-		// collapsed view keeps the three most recent (task 5/4/3) and hides 1/2.
+		// Input is the backend's newest-first run-board page. The collapsed view
+		// keeps the first three loaded rows and hides older loaded rows.
 		const collapsed = renderRunBoardList({ delegations });
-		expect(collapsed).toContain("task 5");
-		expect(collapsed).toContain("task 4");
+		expect(collapsed).toContain("task 1");
+		expect(collapsed).toContain("task 2");
 		expect(collapsed).toContain("task 3");
-		expect(collapsed).not.toContain("task 2");
-		expect(collapsed).not.toContain("task 1");
+		expect(collapsed).not.toContain("task 4");
+		expect(collapsed).not.toContain("task 5");
 		expect(collapsed).toContain("see more (2)");
 		expect(collapsed).not.toContain("show fewer");
 
@@ -149,6 +153,18 @@ describe("Inspector run board delegation list", () => {
 		expect(expanded).toContain("task 5");
 		expect(expanded).toContain("show fewer");
 		expect(expanded).not.toContain("see more");
+	});
+
+	it("shows the expansion control when the server reports older delegations beyond the current page", () => {
+		const html = renderRunBoardList({
+			delegations: [1, 2, 3].map((index) => delegation({ delegation_id: `delegation-${index}`, label: `task ${index}` })),
+			hasMoreDelegations: true,
+		});
+
+		expect(html).toContain("task 1");
+		expect(html).toContain("task 2");
+		expect(html).toContain("task 3");
+		expect(html).toContain("see more");
 	});
 
 	it("does not show an expansion control when there are three or fewer delegations", () => {

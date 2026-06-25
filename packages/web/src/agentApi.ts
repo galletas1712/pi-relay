@@ -42,7 +42,7 @@ export interface AgentApi {
 	updateProject(params: UpdateProjectParams): Promise<Project>;
 	deleteProject(projectId: string): Promise<DeleteProjectResult>;
 	listSessions(limit?: number, projectId?: string | null): Promise<SessionSummary[]>;
-	listDelegations(parentSessionId: string): Promise<DelegationListResult>;
+	listDelegations(parentSessionId: string, limit?: number): Promise<DelegationListResult>;
 	startFullDelegation(params: StartFullDelegationParams): Promise<StartFullDelegationResult>;
 	startReadonlyDelegationFanout(params: StartReadonlyDelegationFanoutParams): Promise<StartReadonlyDelegationFanoutResult>;
 	cancelDelegation(parentSessionId: string, delegationId: string): Promise<{ cancelled: boolean }>;
@@ -361,9 +361,10 @@ class AgentApiClient implements AgentApi {
 		return result.sessions;
 	}
 
-	listDelegations(parentSessionId: string): Promise<DelegationListResult> {
+	listDelegations(parentSessionId: string, limit?: number): Promise<DelegationListResult> {
 		return this.client.request<DelegationListResult>("delegation.list", {
-			parent_session_id: parentSessionId
+			parent_session_id: parentSessionId,
+			limit
 		});
 	}
 

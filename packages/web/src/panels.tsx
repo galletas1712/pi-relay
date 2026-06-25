@@ -84,8 +84,11 @@ export interface RunBoardCallbacks {
 interface RunBoardProps extends RunBoardCallbacks {
 	parentSessionId: string | null;
 	delegations: Delegation[];
+	hasMoreDelegations: boolean;
 	loading: boolean;
 	error: string | null;
+	showAllDelegations: boolean;
+	onToggleShowAllDelegations: () => void;
 }
 
 const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
@@ -185,6 +188,7 @@ function DelegationCard({
 
 export function RunBoardDelegationList({
 	delegations,
+	hasMoreDelegations = false,
 	showAllDelegations,
 	onToggleShowAllDelegations,
 	onSelectSession,
@@ -192,18 +196,18 @@ export function RunBoardDelegationList({
 	onReRunDelegation,
 }: {
 	delegations: Delegation[];
+	hasMoreDelegations?: boolean;
 	showAllDelegations: boolean;
 	onToggleShowAllDelegations: () => void;
 } & Pick<RunBoardCallbacks, "onSelectSession" | "onCancelDelegation" | "onReRunDelegation">) {
-	// The daemon returns delegations oldest-first (ORDER BY created_at, id); show
-	// them newest-first so the most recently launched delegation is on top and
-	// the "see more" collapse hides the oldest.
-	const orderedDelegations = [...delegations].reverse();
-	const hiddenDelegationCount = Math.max(0, orderedDelegations.length - RUN_BOARD_DEFAULT_DELEGATION_COUNT);
+	// The daemon returns a bounded newest-first page for the board. Keep a local
+	// cap as a defensive fallback when tests or cached data include extra rows.
+	const hiddenLocalCount = Math.max(0, delegations.length - RUN_BOARD_DEFAULT_DELEGATION_COUNT);
 	const visibleDelegations =
-		showAllDelegations || hiddenDelegationCount === 0
-			? orderedDelegations
-			: orderedDelegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT);
+		showAllDelegations || hiddenLocalCount === 0
+			? delegations
+			: delegations.slice(0, RUN_BOARD_DEFAULT_DELEGATION_COUNT);
+	const showToggle = hasMoreDelegations || hiddenLocalCount > 0 || showAllDelegations;
 	return (
 		<div className="run-board">
 			{visibleDelegations.map((delegation) => (
@@ -216,9 +220,9 @@ export function RunBoardDelegationList({
 					onReRunDelegation={onReRunDelegation}
 				/>
 			))}
-			{hiddenDelegationCount > 0 ? (
+			{showToggle ? (
 				<button className="chip-button run-board-toggle" type="button" onClick={onToggleShowAllDelegations}>
-					{showAllDelegations ? "show fewer" : `see more (${hiddenDelegationCount})`}
+					{showAllDelegations ? "show fewer" : `see more${hiddenLocalCount > 0 ? ` (${hiddenLocalCount})` : ""}`}
 				</button>
 			) : null}
 		</div>
@@ -228,18 +232,15 @@ export function RunBoardDelegationList({
 function RunBoard({
 	parentSessionId,
 	delegations,
+	hasMoreDelegations,
 	loading,
 	error,
+	showAllDelegations,
+	onToggleShowAllDelegations,
 	onSelectSession,
 	onCancelDelegation,
 	onReRunDelegation,
 }: RunBoardProps) {
-	const [showAllDelegations, setShowAllDelegations] = useState(false);
-
-	useEffect(() => {
-		setShowAllDelegations(false);
-	}, [parentSessionId]);
-
 	return (
 		<section className="inspect-section run-board-section">
 			{parentSessionId && loading ? <p className="muted">Loading delegations…</p> : null}
@@ -248,8 +249,9 @@ function RunBoard({
 			{parentSessionId && delegations.length > 0 ? (
 				<RunBoardDelegationList
 					delegations={delegations}
+					hasMoreDelegations={hasMoreDelegations}
 					showAllDelegations={showAllDelegations}
-					onToggleShowAllDelegations={() => setShowAllDelegations((current) => !current)}
+					onToggleShowAllDelegations={onToggleShowAllDelegations}
 					onSelectSession={onSelectSession}
 					onCancelDelegation={onCancelDelegation}
 					onReRunDelegation={onReRunDelegation}
@@ -802,8 +804,11 @@ export function NoticeStack({ notices, rightOpen }: { notices: Notice[]; rightOp
 export function Inspector({
 	snapshot,
 	delegations,
+	hasMoreDelegations = false,
 	delegationsLoading,
 	delegationsError,
+	showAllDelegations = false,
+	onToggleShowAllDelegations = () => {},
 	runBoard,
 	tools,
 	onSelectSession,
@@ -811,8 +816,11 @@ export function Inspector({
 }: {
 	snapshot: SessionSnapshot | null;
 	delegations: Delegation[];
+	hasMoreDelegations?: boolean;
 	delegationsLoading: boolean;
 	delegationsError: string | null;
+	showAllDelegations?: boolean;
+	onToggleShowAllDelegations?: () => void;
 	runBoard: Omit<RunBoardCallbacks, "onSelectSession">;
 	tools: ToolListing[];
 	onSelectSession?: (sessionId: string) => void;
@@ -850,8 +858,11 @@ export function Inspector({
 					<RunBoard
 						parentSessionId={snapshot?.session_id ?? null}
 						delegations={delegations}
+						hasMoreDelegations={hasMoreDelegations}
 						loading={delegationsLoading}
 						error={delegationsError}
+						showAllDelegations={showAllDelegations}
+						onToggleShowAllDelegations={onToggleShowAllDelegations}
 						onSelectSession={onSelectSession}
 						onCancelDelegation={runBoard.onCancelDelegation}
 						onReRunDelegation={runBoard.onReRunDelegation}

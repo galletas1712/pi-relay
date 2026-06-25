@@ -168,6 +168,8 @@ export interface Delegation {
 
 export interface DelegationListResult {
 	parent_session_id: string;
+	limit?: number;
+	has_more?: boolean;
 	delegations: Delegation[];
 }
 

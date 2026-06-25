@@ -109,10 +109,16 @@ const FOREGROUND_RECONNECT_AFTER_MS = 5000;
 const AWAKE_HEARTBEAT_MS = 1000;
 const TRANSCRIPT_INDEX_PAGE_SIZE = 5000;
 const TRANSCRIPT_TURN_PAGE_SIZE = 50;
+const RUN_BOARD_DEFAULT_DELEGATION_COUNT = 3;
+const RUN_BOARD_EXPANDED_DELEGATION_COUNT = 100;
 const SELECTED_SESSION_DISPLAY_SCOPE = "active_branch" as const;
 const SIDEBAR_CLOSE_BEFORE_SELECT_MS = 200;
 const MEDIUM_PANEL_QUERY = "(min-width: 900px)";
 const WIDE_PANEL_QUERY = "(min-width: 1280px)";
+
+function delegationQueryPrefix(parentSessionId: string) {
+	return ["delegations", parentSessionId] as const;
+}
 
 type PanelMode = "compact" | "medium" | "wide";
 
@@ -320,6 +326,7 @@ export function App() {
 	const [rightOpen, setRightOpen] = useState(() => defaultPanelState(panelModeForViewport()).rightOpen);
 	const [panelMode, setPanelMode] = useState<PanelMode>(() => panelModeForViewport());
 	const [showArchived, setShowArchived] = useState(false);
+	const [showAllDelegations, setShowAllDelegations] = useState(false);
 	const [historyDialog, setHistoryDialog] = useState<HistoryDialogState | null>(null);
 	const [exportDialog, setExportDialog] = useState<ExportDialogState | null>(null);
 	const [renameSessionId, setRenameSessionId] = useState<string | null>(null);
@@ -574,11 +581,12 @@ export function App() {
 		enabled: connection === "open",
 	});
 	const tools: ToolListing[] = toolsQuery.data ?? [];
+	const delegationListLimit = showAllDelegations ? RUN_BOARD_EXPANDED_DELEGATION_COUNT : RUN_BOARD_DEFAULT_DELEGATION_COUNT;
 	const delegationsQuery = useQuery({
-		queryKey: queryKeys.delegations(loadedSnapshot?.session_id ?? null),
+		queryKey: queryKeys.delegations(loadedSnapshot?.session_id ?? null, delegationListLimit),
 		queryFn: () => {
 			if (!loadedSnapshot) throw new Error("select a session first");
-			return api.listDelegations(loadedSnapshot.session_id);
+			return api.listDelegations(loadedSnapshot.session_id, delegationListLimit);
 		},
 		enabled: connection === "open" && !!loadedSnapshot,
 		// The parent PARKS (goes idle) while a delegation runs, so gate the poll
@@ -589,6 +597,7 @@ export function App() {
 			(query.state.data?.delegations ?? []).some(isDelegationRunning) ? 2_000 : false,
 	});
 	const delegations = delegationsQuery.data?.delegations ?? [];
+	const hasMoreDelegations = delegationsQuery.data?.has_more ?? false;
 	// `delegating` status for the selected session: the parent reports idle while
 	// its subagents are still in flight. Only known for the selected session,
 	// whose delegations are fetched above.
@@ -631,6 +640,7 @@ export function App() {
 		if (sessionId === null) nextSessionTitleRef.current = null;
 		selectedRef.current = sessionId;
 		setSelectedId(sessionId);
+		setShowAllDelegations(false);
 		selectedLoadVersion.current += 1;
 		const nextCache = resetSelectedCache(sessionId);
 		setSelectedFetchState({
@@ -645,6 +655,7 @@ export function App() {
 		selectedRef.current = sessionId;
 		setSelectedProjectId(projectId);
 		setSelectedId(sessionId);
+		setShowAllDelegations(false);
 		selectedLoadVersion.current += 1;
 		const nextCache = resetSelectedCache(sessionId);
 		setSelectedFetchState({
@@ -1169,7 +1180,7 @@ export function App() {
 					// dedicated delegation events, so the subagent lifecycle events (and
 					// the typed completion observation landing in the parent transcript) are the
 					// signal to refresh the board. The 2s poll covers any missed event.
-					void queryClient.invalidateQueries({ queryKey: queryKeys.delegations(loadedSnapshot.session_id) });
+					void queryClient.invalidateQueries({ queryKey: delegationQueryPrefix(loadedSnapshot.session_id) });
 				}
 			}
 
@@ -1822,7 +1833,7 @@ export function App() {
 
 	const invalidateDelegations = useCallback(() => {
 		if (loadedSnapshot?.session_id) {
-			void queryClient.invalidateQueries({ queryKey: queryKeys.delegations(loadedSnapshot.session_id) });
+			void queryClient.invalidateQueries({ queryKey: delegationQueryPrefix(loadedSnapshot.session_id) });
 		}
 	}, [loadedSnapshot?.session_id, queryClient]);
 
@@ -2407,8 +2418,11 @@ export function App() {
 				<Inspector
 					snapshot={loadedSnapshot}
 					delegations={delegations}
+					hasMoreDelegations={hasMoreDelegations}
 					delegationsLoading={delegationsQuery.isLoading}
 					delegationsError={errorMessageOrNull(delegationsQuery.error)}
+					showAllDelegations={showAllDelegations}
+					onToggleShowAllDelegations={() => setShowAllDelegations((current) => !current)}
 					runBoard={{
 						onCancelDelegation: cancelDelegation,
 						onReRunDelegation: reRunDelegation,

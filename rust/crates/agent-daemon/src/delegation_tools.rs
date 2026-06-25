@@ -2,14 +2,15 @@ use std::path::PathBuf;
 
 use agent_core::AgentInput;
 use agent_store::{
-    Delegation, DelegationKind, DelegationStatus, DelegationSubagent, InputPriority, SubagentType,
+    Delegation, DelegationKind, DelegationProgress, DelegationStatus, DelegationSubagent,
+    DelegationSubagentOverview, InputPriority, SubagentType,
 };
 use agent_vocab::{ToolCall, ToolResultMessage, UserMessage};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::codec::from_params;
-use crate::delegation_snapshot::{build_delegation_snapshot, list_subagent_state, progress_view};
+use crate::delegation_snapshot::{build_delegation_snapshot, progress_view};
 use crate::handoff::{
     delegation_dir, handoff_root, refresh_delegation_handoff_artifacts,
     refresh_task_prompt_artifact_if_present, render_transcript_markdown, safe_handoff_path_segment,
@@ -273,6 +274,33 @@ async fn terminate_delegation(state: &AppState, delegation_id: &str, status: Del
                 "failed to list subagents while terminating delegation {delegation_id}: {error:#}"
             )
         }
+    }
+}
+
+fn progress_from_subagent_overview(
+    delegation: &Delegation,
+    subagents: &[DelegationSubagentOverview],
+) -> DelegationProgress {
+    let spawned = subagents.len() as i32;
+    let terminal = subagents
+        .iter()
+        .filter(|subagent| subagent.terminal_status.is_some())
+        .count() as i32;
+    let failed = subagents
+        .iter()
+        .filter(|subagent| subagent.terminal_status.as_deref() == Some("failed"))
+        .count() as i32;
+    let missing = delegation.expected_subagents.saturating_sub(spawned).max(0);
+    let running = match delegation.status {
+        DelegationStatus::Running => spawned.saturating_sub(terminal) + missing,
+        _ => 0,
+    };
+    DelegationProgress {
+        expected: delegation.expected_subagents,
+        spawned,
+        terminal,
+        running,
+        failed,
     }
 }
 
@@ -953,70 +981,90 @@ pub(crate) async fn rpc_cancel(
     cancel_core(state, &parent_session_id, params).await
 }
 
-/// Per-parent delegation list for the run board: each delegation with its
-/// kind/status and its subagents' ids/status. (The model-facing tool surface
-/// has no list.)
+const DEFAULT_DELEGATION_LIST_LIMIT: i64 = 3;
+const MAX_DELEGATION_LIST_LIMIT: i64 = 100;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DelegationListParams {
+    parent_session_id: String,
+    limit: Option<i64>,
+}
+
+fn bounded_delegation_list_limit(limit: Option<i64>) -> std::result::Result<i64, RpcError> {
+    let limit = limit.unwrap_or(DEFAULT_DELEGATION_LIST_LIMIT);
+    if !(0..=MAX_DELEGATION_LIST_LIMIT).contains(&limit) {
+        return Err(RpcError::new(
+            "invalid_params",
+            format!("limit must be between 0 and {MAX_DELEGATION_LIST_LIMIT}"),
+        ));
+    }
+    Ok(limit)
+}
+
+fn list_subagent_status(
+    delegation_status: DelegationStatus,
+    subagent: &DelegationSubagentOverview,
+) -> String {
+    match delegation_status {
+        DelegationStatus::Running => subagent
+            .terminal_status
+            .clone()
+            .unwrap_or_else(|| "running".to_string()),
+        DelegationStatus::Done | DelegationStatus::DoneWithFailures => subagent
+            .terminal_status
+            .clone()
+            .unwrap_or_else(|| delegation_status.as_str().to_string()),
+        DelegationStatus::Cancelled | DelegationStatus::Failed => {
+            delegation_status.as_str().to_string()
+        }
+    }
+}
+
+/// Per-parent delegation list for the run board: a bounded newest-first page
+/// with compact subagent rows. (The model-facing tool surface has no list.)
 pub(crate) async fn rpc_list(
     state: &AppState,
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
-    let parent_session_id = parent_session_id_from_params(&params)?;
-    let parent_config = state.repo.load_session_config(&parent_session_id).await?;
-    let delegations = state
+    let params: DelegationListParams = from_params(params)?;
+    let parent_session_id = params.parent_session_id.trim();
+    if parent_session_id.is_empty() {
+        return Err(RpcError::new(
+            "invalid_params",
+            "parent_session_id cannot be empty",
+        ));
+    }
+    let limit = bounded_delegation_list_limit(params.limit)?;
+    if !state.repo.session_exists(parent_session_id).await? {
+        return Err(RpcError::new(
+            "internal_error",
+            format!("session not found: {parent_session_id}"),
+        ));
+    }
+    let mut delegations = state
         .repo
-        .list_parent_delegations(&parent_session_id)
+        .list_parent_delegations_newest(parent_session_id, limit.saturating_add(1))
         .await?;
+    let has_more = delegations.len() > limit as usize;
+    delegations.truncate(limit as usize);
     let mut views = Vec::with_capacity(delegations.len());
     for delegation in &delegations {
-        let delegation_handoff_dir = delegation_dir(&parent_config.outer_cwd, &delegation.id);
-        let subagent_rows = state.repo.list_delegation_subagents(&delegation.id).await?;
-        let progress = state.repo.delegation_progress(delegation).await?;
+        let subagent_rows = state
+            .repo
+            .delegation_subagent_overview(&delegation.id)
+            .await?;
+        let progress = progress_from_subagent_overview(delegation, &subagent_rows);
         let mut subagents = Vec::with_capacity(subagent_rows.len());
         for subagent in subagent_rows {
-            let task_prompt = refresh_task_prompt_artifact_if_present(
-                &delegation_handoff_dir,
-                &subagent.session_id,
-                subagent.task.as_deref(),
-            )
-            .await?;
-            let task_prompt_file = task_prompt
-                .as_ref()
-                .map(|_| task_prompt_rel(&subagent.session_id));
-            let final_message_file = if matches!(
-                delegation.status,
-                DelegationStatus::Done | DelegationStatus::DoneWithFailures
-            ) {
-                let relative = format!("{}/final_message.md", subagent.session_id);
-                let path = delegation_handoff_dir.join(&relative);
-                if path.exists() {
-                    Some(relative)
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
-            let transcript_file = match delegation.status {
-                DelegationStatus::Cancelled => {
-                    let subagent_segment = safe_path_segment(&subagent.session_id, "subagent_id")?;
-                    let relative = format!("cancelled/{subagent_segment}.transcript.md");
-                    let path = delegation_handoff_dir.join(&relative);
-                    path.exists().then_some(relative)
-                }
-                DelegationStatus::Running
-                | DelegationStatus::Done
-                | DelegationStatus::DoneWithFailures => {
-                    let relative = format!("{}/transcript.md", subagent.session_id);
-                    let path = delegation_handoff_dir.join(&relative);
-                    path.exists().then_some(relative)
-                }
-                DelegationStatus::Failed => None,
-            };
-            let state_for_row =
-                list_subagent_state(state, delegation.status, &subagent.session_id).await?;
+            safe_path_segment(&subagent.session_id, "subagent_id")?;
+            let task_prompt_file = subagent
+                .has_task
+                .then(|| task_prompt_rel(&subagent.session_id));
+            let status = list_subagent_status(delegation.status, &subagent);
             subagents.push(json!({
                 "id": subagent.session_id,
-                "status": state_for_row.status,
+                "status": status,
                 "activity": subagent.activity,
                 "role": subagent.role,
                 "type": subagent.subagent_type,
@@ -1024,9 +1072,9 @@ pub(crate) async fn rpc_list(
                 "task_prompt_file": task_prompt_file,
                 "steerable": delegation.status == DelegationStatus::Running
                     && subagent.subagent_type == Some(SubagentType::Full),
-                "outcome": state_for_row.outcome,
-                "final_message_file": final_message_file,
-                "transcript_file": transcript_file,
+                "outcome": serde_json::Value::Null,
+                "final_message_file": serde_json::Value::Null,
+                "transcript_file": serde_json::Value::Null,
             }));
         }
         views.push(json!({
@@ -1037,11 +1085,12 @@ pub(crate) async fn rpc_list(
             "label": delegation.label,
             "progress": progress_view(progress),
             "subagents": subagents,
-            "handoff_dir": delegation_handoff_dir.to_string_lossy().into_owned(),
         }));
     }
     Ok(json!({
         "parent_session_id": parent_session_id,
+        "limit": limit,
+        "has_more": has_more,
         "delegations": views,
     }))
 }
