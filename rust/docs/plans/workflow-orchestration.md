@@ -240,18 +240,23 @@ parent calls delegate_writing_task / delegate_readonly_tasks
      RO stage: snapshot the workspace dirs per subagent; start each in its snapshot
   -> parent parks (idle) but stays responsive to the user
   -> subagents run; as each RO subagent returns, destroy its snapshot
-  -> the daemon BLOCKS until every subagent is terminal (one barrier)
-  -> the daemon writes final_message.md + transcript.md for every subagent,
-     then enqueues ONE typed wakeup observation to the parent with the structured snapshot
-  -> parent (woken by the observation) branches on the snapshot and decides the next
-     stage, a re-run, done, or whether to read artifact files for more detail
+  -> after the expected fan-out count exists, the daemon may enqueue one active
+     partial typed wakeup for a terminal child while siblings still run
+  -> parent (woken by a running snapshot) steers a running/steerable child,
+     cancels the delegation, or waits; it does not start unrelated work
+  -> once every subagent is terminal, the daemon cancels stale queued partials,
+     writes final_message.md + transcript.md for every subagent, then enqueues
+     ONE terminal typed wakeup observation to the parent with the structured snapshot
+  -> parent (woken by a terminal snapshot) branches on the outcome/status and decides
+     the next stage, a re-run, done, or whether to read artifact files for more detail
 ```
 
 A stage is terminal when all its subagents are terminal
-(`done`/`failed`/`cancelled`/`crashed`). The barrier delivers **partial results
-and failures together** in a single notification — never a stream of
-per-subagent notifications. The parent may cancel an in-flight stage; it can
-steer active subagents while terminal/idle targets are rejected.
+(`done`/`failed`/`cancelled`/`crashed`). Partial fan-out wakeups are serialized
+parent decision points: there is at most one active queued/consuming partial per
+delegation attempt, and consuming one may publish the next already-terminal
+sibling. The parent may cancel an in-flight stage; it can steer active subagents
+while terminal/idle targets are rejected.
 
 ## Snapshots and recovery
 

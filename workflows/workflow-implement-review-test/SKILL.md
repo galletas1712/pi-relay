@@ -45,8 +45,11 @@ Notes:
 - The tester is a read-only delegation. Building/running tests may write build
   outputs or logs, but only inside the tester's disposable snapshot; nothing the
   tester writes reaches the parent workspace.
-- After launching a delegation, end your turn; you will receive a completion observation when it
-  completes with an `inspect_delegation`-equivalent snapshot.
+- After launching a delegation, end your turn. Wakeup observations carry an
+  `inspect_delegation`-equivalent snapshot. If the snapshot is still `running`,
+  decide only for that current delegation (steer a running/steerable subagent,
+  cancel it, or wait); do not start another delegation until the current one is
+  terminal.
 - Subagents start fresh — carry prior control-flow facts from the delivered
   snapshot into the next delegation's prompt. Read transcript/final-message
   files only when more detail is needed.

@@ -573,13 +573,19 @@ pub(crate) async fn cancel_core(
     if delegation.status != DelegationStatus::Running {
         return Ok(json!({ "cancelled": false }));
     }
-    let won_cancel = state
+    let (won_cancel, events) = state
         .repo
-        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
+        .cancel_running_delegation_and_queued_partials(
+            &delegation.parent_session_id,
+            &delegation.id,
+            &delegation.attempt_id,
+            "delegation_cancelled",
+        )
         .await?;
     if !won_cancel {
         return Ok(json!({ "cancelled": false }));
     }
+    publish_events(state, events);
     cancel_delegation_subagents_without_reactivation(state, &delegation.id).await;
     let (handoff_dir, subagents) = write_cancelled_subagent_transcripts(state, &delegation).await?;
     Ok(json!({
@@ -677,8 +683,10 @@ impl HandoffFileRequest<'_> {
 
 /// Resolve the closed handoff file vocabulary. Normal files live under
 /// `<subagent_id>/{task_prompt.md,final_message.md,transcript.md}`. Cancelled
-/// delegations expose only the transcript-only cancellation artifact via
-/// `cancelled/<subagent_id>.transcript.md`.
+/// delegations expose the transcript-only cancellation artifact via
+/// `cancelled/<subagent_id>.transcript.md`; a previously published terminal-child
+/// `final_message.md` may also remain readable after cancellation, but normal
+/// transcripts are not exposed.
 fn parse_handoff_file_request<'a>(
     subagent_id: Option<&'a str>,
     file: &'a str,
@@ -718,46 +726,68 @@ fn parse_handoff_file_request<'a>(
 fn read_allowed_for_status(
     status: DelegationStatus,
     request: HandoffFileRequest<'_>,
-) -> std::result::Result<bool, RpcError> {
+) -> std::result::Result<Option<bool>, RpcError> {
     match status {
         DelegationStatus::Running => match request {
             HandoffFileRequest::Normal {
                 file: TASK_PROMPT_FILE,
                 ..
-            } => Ok(true),
+            } => Ok(Some(true)),
             HandoffFileRequest::Normal {
                 file: "transcript.md",
                 ..
-            } => Ok(true),
+            } => Ok(Some(true)),
             HandoffFileRequest::Normal {
                 file: "final_message.md",
                 ..
-            } => Ok(false),
+            } => Ok(None),
             HandoffFileRequest::Normal { file, .. } => Err(RpcError::new(
                 "invalid_params",
                 format!("unsupported handoff file {file}"),
             )),
-            HandoffFileRequest::CancelledTranscript { .. } => Ok(false),
+            HandoffFileRequest::CancelledTranscript { .. } => Ok(Some(false)),
         },
         DelegationStatus::Done | DelegationStatus::DoneWithFailures => match request {
-            HandoffFileRequest::Normal { .. } => Ok(true),
-            HandoffFileRequest::CancelledTranscript { .. } => Ok(false),
+            HandoffFileRequest::Normal { .. } => Ok(Some(true)),
+            HandoffFileRequest::CancelledTranscript { .. } => Ok(Some(false)),
         },
         DelegationStatus::Cancelled => match request {
             HandoffFileRequest::Normal {
                 file: TASK_PROMPT_FILE,
                 ..
-            } => Ok(true),
-            HandoffFileRequest::CancelledTranscript { .. } => Ok(true),
-            HandoffFileRequest::Normal { .. } => Ok(false),
+            } => Ok(Some(true)),
+            HandoffFileRequest::CancelledTranscript { .. } => Ok(Some(true)),
+            HandoffFileRequest::Normal {
+                file: "final_message.md",
+                ..
+            } => Ok(Some(true)),
+            HandoffFileRequest::Normal {
+                file: "transcript.md",
+                ..
+            } => Ok(Some(false)),
+            HandoffFileRequest::Normal { .. } => Ok(Some(false)),
         },
         DelegationStatus::Failed => match request {
             HandoffFileRequest::Normal {
                 file: TASK_PROMPT_FILE,
                 ..
-            } => Ok(true),
-            _ => Ok(false),
+            } => Ok(Some(true)),
+            _ => Ok(Some(false)),
         },
+    }
+}
+
+async fn read_allowed_for_request(
+    state: &AppState,
+    delegation: &Delegation,
+    request: HandoffFileRequest<'_>,
+) -> std::result::Result<bool, RpcError> {
+    match read_allowed_for_status(delegation.status, request)? {
+        Some(allowed) => Ok(allowed),
+        None => {
+            let work_state = load_subagent_work_state(state, request.subagent_id()).await?;
+            Ok(work_state.is_completion_terminal())
+        }
     }
 }
 
@@ -860,7 +890,7 @@ pub(crate) async fn read_handoff_file_core(
     let members = state.repo.list_delegation_subagents(&delegation.id).await?;
     validate_member_subagent(request, &members)?;
 
-    if read_allowed_for_status(delegation.status, request)? {
+    if read_allowed_for_request(state, &delegation, request).await? {
         if matches!(
             request,
             HandoffFileRequest::Normal {
@@ -896,7 +926,9 @@ pub(crate) async fn read_handoff_file_core(
                 | DelegationStatus::DoneWithFailures => {
                     let include_final_messages = matches!(
                         delegation.status,
-                        DelegationStatus::Done | DelegationStatus::DoneWithFailures
+                        DelegationStatus::Running
+                            | DelegationStatus::Done
+                            | DelegationStatus::DoneWithFailures
                     );
                     refresh_delegation_handoff_artifacts(
                         state,
@@ -905,9 +937,11 @@ pub(crate) async fn read_handoff_file_core(
                     )
                     .await?;
                 }
-                // Cancelled reads are limited to the already-written transcript-only
-                // artifact. Failed delegations have no readable handoff artifacts
-                // except task prompts, handled above.
+                // Cancelled reads are limited to the explicit transcript-only
+                // cancellation artifacts plus already-written terminal-child
+                // final_message.md files. Do not refresh or expose normal
+                // transcript.md files here: running snapshots may have written
+                // stale normal transcripts before cancellation won.
                 DelegationStatus::Cancelled | DelegationStatus::Failed => {}
             }
         }

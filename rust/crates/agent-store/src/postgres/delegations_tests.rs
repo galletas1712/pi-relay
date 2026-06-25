@@ -8,7 +8,10 @@ use agent_vocab::{
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::{DelegationKind, DelegationStatus, OutputBatch, SessionConfig, SubagentType};
+use crate::{
+    DelegationKind, DelegationStatus, InputPriority, OutputBatch, QueuedInputStatus, SessionConfig,
+    SubagentType,
+};
 
 use super::*;
 
@@ -983,6 +986,446 @@ async fn cancel_running_delegation_is_attempt_fenced_and_terminal_safe() {
 }
 
 #[tokio::test]
+async fn cancel_running_delegation_atomically_cancels_queued_partial_wakeup() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegations test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    let delegation = db
+        .store
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
+        .await
+        .expect("create delegation");
+    let partial_observation = DaemonToolObservation::inspect_delegation(
+        ToolCallId::new("call_partial_atomic_cancel"),
+        &delegation.id,
+        Some("Subagent finished before cancellation".to_string()),
+        json!({
+            "delegation_id": delegation.id,
+            "status": "running",
+        }),
+    );
+    let partial_key = format!(
+        "delegation-steer:{}:{}:done_child",
+        delegation.id, delegation.attempt_id
+    );
+    assert!(db
+        .store
+        .enqueue_partial_delegation_observation_if_running(
+            "parent",
+            &delegation.id,
+            &delegation.attempt_id,
+            &partial_observation,
+            &partial_key,
+        )
+        .await
+        .expect("enqueue partial"));
+    sqlx::query(
+        r#"
+        update queued_inputs
+        set status='consuming',
+            origin=coalesce(origin, '{}'::jsonb)
+                || jsonb_build_object('claim_id', 'test-claim', 'claimed_at', now()::text)
+        where session_id='parent'
+          and client_input_id=$1
+        "#,
+    )
+    .bind(&partial_key)
+    .execute(&db.store.pool)
+    .await
+    .expect("simulate consuming partial");
+
+    // Same delegation/attempt but no trailing ':' is the terminal wakeup key,
+    // not a partial decision point; it must not be caught by partial cleanup.
+    let terminal_key = format!(
+        "delegation-steer:{}:{}",
+        delegation.id, delegation.attempt_id
+    );
+    db.store
+        .enqueue_delegation_observation("parent", &partial_observation, &terminal_key)
+        .await
+        .expect("enqueue terminal-shaped observation");
+    db.store
+        .enqueue_user_input(
+            "parent",
+            InputPriority::FollowUp,
+            &UserMessage::text("unrelated follow-up"),
+            Some("unrelated-follow-up"),
+            None,
+        )
+        .await
+        .expect("enqueue unrelated follow-up");
+
+    let (cancelled, events) = db
+        .store
+        .cancel_running_delegation_and_queued_partials(
+            "parent",
+            &delegation.id,
+            &delegation.attempt_id,
+            "delegation_cancelled",
+        )
+        .await
+        .expect("atomic cancel");
+    assert!(cancelled);
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        db.store
+            .get_delegation(&delegation.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        DelegationStatus::Cancelled
+    );
+    assert_eq!(
+        db.store
+            .find_client_input("parent", &partial_key)
+            .await
+            .expect("find partial")
+            .expect("partial row")
+            .status,
+        QueuedInputStatus::Cancelled
+    );
+    assert_eq!(
+        active_partial_wakeup_count(&db, "parent", &delegation).await,
+        0,
+        "atomic cancel must leave no queued/consuming partial for this attempt"
+    );
+    assert_eq!(
+        db.store
+            .find_client_input("parent", &terminal_key)
+            .await
+            .expect("find terminal key")
+            .expect("terminal row")
+            .status,
+        QueuedInputStatus::Queued,
+        "terminal wakeup key must not match the partial prefix"
+    );
+    assert_eq!(
+        db.store
+            .find_client_input("parent", "unrelated-follow-up")
+            .await
+            .expect("find follow-up")
+            .expect("follow-up row")
+            .status,
+        QueuedInputStatus::Queued
+    );
+
+    let next = db
+        .store
+        .take_next_queued_steer_input("parent")
+        .await
+        .expect("take next steer")
+        .expect("only terminal-shaped steer remains");
+    assert_eq!(next.client_input_id.as_deref(), Some(terminal_key.as_str()));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn boot_repair_cancels_partial_wakeup_left_after_cancel_crash_gap() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegations test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    let delegation = db
+        .store
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
+        .await
+        .expect("create delegation");
+    let partial_observation = DaemonToolObservation::inspect_delegation(
+        ToolCallId::new("call_partial_boot_repair"),
+        &delegation.id,
+        Some("Subagent finished before cancellation".to_string()),
+        json!({
+            "delegation_id": delegation.id,
+            "status": "running",
+        }),
+    );
+    let partial_key = format!(
+        "delegation-steer:{}:{}:done_child",
+        delegation.id, delegation.attempt_id
+    );
+    assert!(db
+        .store
+        .enqueue_partial_delegation_observation_if_running(
+            "parent",
+            &delegation.id,
+            &delegation.attempt_id,
+            &partial_observation,
+            &partial_key,
+        )
+        .await
+        .expect("enqueue partial"));
+
+    // Simulate the historical crash window: the cancellation status CAS
+    // committed, but the follow-up queued-partial cleanup never ran.
+    assert!(db
+        .store
+        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
+        .await
+        .expect("simulate old cancel CAS"));
+    assert_eq!(
+        db.store
+            .find_client_input("parent", &partial_key)
+            .await
+            .expect("find partial before repair")
+            .expect("partial row")
+            .status,
+        QueuedInputStatus::Queued
+    );
+    assert_eq!(
+        db.store
+            .sessions_with_active_queued_inputs()
+            .await
+            .expect("active queued sessions before repair"),
+        vec!["parent".to_string()],
+        "top-level parent would be resumed and consume the stale partial before repair"
+    );
+
+    let events = db
+        .store
+        .repair_cancelled_delegation_partial_wakeups()
+        .await
+        .expect("boot repair");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        db.store
+            .find_client_input("parent", &partial_key)
+            .await
+            .expect("find partial after repair")
+            .expect("partial row")
+            .status,
+        QueuedInputStatus::Cancelled
+    );
+    assert_eq!(
+        active_partial_wakeup_count(&db, "parent", &delegation).await,
+        0,
+        "boot repair must leave no queued/consuming partial for this attempt"
+    );
+    assert!(
+        db.store
+            .take_next_queued_steer_input("parent")
+            .await
+            .expect("take next steer after repair")
+            .is_none(),
+        "stale cancelled partial must not remain consumable"
+    );
+    assert!(
+        db.store
+            .sessions_with_active_queued_inputs()
+            .await
+            .expect("active queued sessions after repair")
+            .is_empty(),
+        "boot parent queued-input resume should not see the repaired stale partial"
+    );
+    assert!(db
+        .store
+        .repair_cancelled_delegation_partial_wakeups()
+        .await
+        .expect("boot repair is idempotent")
+        .is_empty());
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn boot_repair_only_cancels_active_partial_wakeups_for_cancelled_attempts() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegations test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    create_session(&db, "other_parent", project_id).await;
+
+    let cancelled = db
+        .store
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
+        .await
+        .expect("create cancelled delegation");
+    let running = db
+        .store
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
+        .await
+        .expect("create running delegation");
+    let other_cancelled = db
+        .store
+        .create_delegation(
+            "other_parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            None,
+            2,
+        )
+        .await
+        .expect("create other cancelled delegation");
+    let observation = DaemonToolObservation::inspect_delegation(
+        ToolCallId::new("call_partial_boot_repair_scoped"),
+        &cancelled.id,
+        Some("Subagent finished before cancellation".to_string()),
+        json!({
+            "delegation_id": cancelled.id,
+            "status": "running",
+        }),
+    );
+    let stale_key = format!(
+        "delegation-steer:{}:{}:done_child",
+        cancelled.id, cancelled.attempt_id
+    );
+    assert!(db
+        .store
+        .enqueue_partial_delegation_observation_if_running(
+            "parent",
+            &cancelled.id,
+            &cancelled.attempt_id,
+            &observation,
+            &stale_key,
+        )
+        .await
+        .expect("enqueue stale partial"));
+    let running_key = format!(
+        "delegation-steer:{}:{}:done_child",
+        running.id, running.attempt_id
+    );
+    assert!(db
+        .store
+        .enqueue_partial_delegation_observation_if_running(
+            "parent",
+            &running.id,
+            &running.attempt_id,
+            &observation,
+            &running_key,
+        )
+        .await
+        .expect("enqueue running partial"));
+    let wrong_parent_key = format!(
+        "delegation-steer:{}:{}:done_child",
+        other_cancelled.id, other_cancelled.attempt_id
+    );
+    assert!(db
+        .store
+        .enqueue_partial_delegation_observation_if_running(
+            "other_parent",
+            &other_cancelled.id,
+            &other_cancelled.attempt_id,
+            &observation,
+            &wrong_parent_key,
+        )
+        .await
+        .expect("enqueue other parent partial"));
+    db.store
+        .enqueue_delegation_observation(
+            "parent",
+            &observation,
+            &format!("delegation-steer:{}:{}", cancelled.id, cancelled.attempt_id),
+        )
+        .await
+        .expect("enqueue terminal-shaped cancelled observation");
+    db.store
+        .enqueue_user_input(
+            "parent",
+            InputPriority::FollowUp,
+            &UserMessage::text("unrelated follow-up"),
+            Some("unrelated-follow-up"),
+            None,
+        )
+        .await
+        .expect("enqueue unrelated follow-up");
+
+    assert!(db
+        .store
+        .cancel_running_delegation(&cancelled.id, &cancelled.attempt_id)
+        .await
+        .expect("cancel stale delegation"));
+    assert!(db
+        .store
+        .cancel_running_delegation(&other_cancelled.id, &other_cancelled.attempt_id)
+        .await
+        .expect("cancel other delegation"));
+
+    let events = db
+        .store
+        .repair_cancelled_delegation_partial_wakeups()
+        .await
+        .expect("boot repair");
+    assert_eq!(
+        events.len(),
+        2,
+        "one cancellation event per affected parent session"
+    );
+    assert_eq!(
+        db.store
+            .find_client_input("parent", &stale_key)
+            .await
+            .expect("find stale partial")
+            .expect("stale partial row")
+            .status,
+        QueuedInputStatus::Cancelled
+    );
+    assert_eq!(
+        db.store
+            .find_client_input("parent", &running_key)
+            .await
+            .expect("find running partial")
+            .expect("running partial row")
+            .status,
+        QueuedInputStatus::Queued,
+        "running delegation partials must not be cancelled"
+    );
+    assert_eq!(
+        db.store
+            .find_client_input("other_parent", &wrong_parent_key)
+            .await
+            .expect("find other parent partial")
+            .expect("other parent partial row")
+            .status,
+        QueuedInputStatus::Cancelled,
+        "matching stale partials on other parents are repaired independently"
+    );
+    assert_eq!(
+        db.store
+            .find_client_input(
+                "parent",
+                &format!("delegation-steer:{}:{}", cancelled.id, cancelled.attempt_id),
+            )
+            .await
+            .expect("find terminal-shaped wakeup")
+            .expect("terminal row")
+            .status,
+        QueuedInputStatus::Queued,
+        "terminal wakeup key must not match the partial key shape"
+    );
+    assert_eq!(
+        db.store
+            .find_client_input("parent", "unrelated-follow-up")
+            .await
+            .expect("find follow-up")
+            .expect("follow-up row")
+            .status,
+        QueuedInputStatus::Queued
+    );
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn all_terminal_predicate_and_boot_sweep() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -1247,6 +1690,135 @@ async fn enqueue_delegation_observation_event_uses_minimal_payload_and_queue_pro
     db.cleanup().await;
 }
 
+#[tokio::test]
+async fn partial_delegation_observation_suppresses_duplicate_active_wakeups_transactionally() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "delegations test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    let delegation = db
+        .store
+        .create_delegation(
+            "parent",
+            DelegationKind::ReadonlyFanout,
+            None,
+            Some("partial race"),
+            3,
+        )
+        .await
+        .expect("create delegation");
+    let observation_a = DaemonToolObservation::inspect_delegation(
+        ToolCallId::new("call_partial_a"),
+        &delegation.id,
+        Some("child a finished".to_string()),
+        json!({
+            "delegation_id": delegation.id,
+            "status": "running",
+        }),
+    );
+    let observation_b = DaemonToolObservation::inspect_delegation(
+        ToolCallId::new("call_partial_b"),
+        &delegation.id,
+        Some("child b finished".to_string()),
+        json!({
+            "delegation_id": delegation.id,
+            "status": "running",
+        }),
+    );
+    let key_a = format!(
+        "delegation-steer:{}:{}:child_a",
+        delegation.id, delegation.attempt_id
+    );
+    let key_b = format!(
+        "delegation-steer:{}:{}:child_b",
+        delegation.id, delegation.attempt_id
+    );
+
+    let insert_a = db.store.enqueue_partial_delegation_observation_if_running(
+        "parent",
+        &delegation.id,
+        &delegation.attempt_id,
+        &observation_a,
+        &key_a,
+    );
+    let insert_b = db.store.enqueue_partial_delegation_observation_if_running(
+        "parent",
+        &delegation.id,
+        &delegation.attempt_id,
+        &observation_b,
+        &key_b,
+    );
+    let (insert_a, insert_b) = tokio::join!(insert_a, insert_b);
+    let inserted = [
+        insert_a.expect("first insert attempt"),
+        insert_b.expect("second insert attempt"),
+    ];
+    assert_eq!(
+        inserted.into_iter().filter(|inserted| *inserted).count(),
+        1,
+        "concurrent terminal children must create only one active partial wakeup"
+    );
+    let prefix = format!(
+        "delegation-steer:{}:{}:",
+        delegation.id, delegation.attempt_id
+    );
+    let active_count: i64 = sqlx::query_scalar(
+        r#"
+        select count(*)
+        from queued_inputs
+        where session_id='parent'
+          and priority='steer'
+          and status in ('queued', 'consuming')
+          and left(client_input_id, char_length($1)) = $1
+        "#,
+    )
+    .bind(&prefix)
+    .fetch_one(&db.store.pool)
+    .await
+    .expect("count active partials");
+    assert_eq!(active_count, 1);
+
+    sqlx::query(
+        r#"
+        update queued_inputs
+        set status='consuming'
+        where session_id='parent'
+          and left(client_input_id, char_length($1)) = $1
+        "#,
+    )
+    .bind(&prefix)
+    .execute(&db.store.pool)
+    .await
+    .expect("mark partial consuming");
+    let key_c = format!(
+        "delegation-steer:{}:{}:child_c",
+        delegation.id, delegation.attempt_id
+    );
+    let inserted_c = db
+        .store
+        .enqueue_partial_delegation_observation_if_running(
+            "parent",
+            &delegation.id,
+            &delegation.attempt_id,
+            &observation_b,
+            &key_c,
+        )
+        .await
+        .expect("third insert attempt");
+    assert!(
+        !inserted_c,
+        "a consuming partial is still an active parent decision point"
+    );
+
+    db.cleanup().await;
+}
+
 async fn steer_count(db: &TestDb, session_id: &str, client_input_id: &str) -> i64 {
     sqlx::query_scalar(
         "select count(*) from queued_inputs where session_id=$1 and client_input_id=$2 and priority='steer'",
@@ -1256,4 +1828,30 @@ async fn steer_count(db: &TestDb, session_id: &str, client_input_id: &str) -> i6
     .fetch_one(&db.store.pool)
     .await
     .expect("count steers")
+}
+
+async fn active_partial_wakeup_count(
+    db: &TestDb,
+    parent_session_id: &str,
+    delegation: &Delegation,
+) -> i64 {
+    let prefix = format!(
+        "delegation-steer:{}:{}:",
+        delegation.id, delegation.attempt_id
+    );
+    sqlx::query_scalar(
+        r#"
+        select count(*)
+        from queued_inputs
+        where session_id=$1
+          and priority='steer'
+          and status in ('queued', 'consuming')
+          and left(client_input_id, char_length($2)) = $2
+        "#,
+    )
+    .bind(parent_session_id)
+    .bind(&prefix)
+    .fetch_one(&db.store.pool)
+    .await
+    .expect("count active partial wakeups")
 }
