@@ -573,22 +573,18 @@ pub(crate) async fn cancel_core(
     if delegation.status != DelegationStatus::Running {
         return Ok(json!({ "cancelled": false }));
     }
-    let won_cancel = state
+    let (won_cancel, events) = state
         .repo
-        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
-        .await?;
-    if !won_cancel {
-        return Ok(json!({ "cancelled": false }));
-    }
-    let events = state
-        .repo
-        .cancel_queued_partial_delegation_wakeups(
+        .cancel_running_delegation_and_queued_partials(
             &delegation.parent_session_id,
             &delegation.id,
             &delegation.attempt_id,
             "delegation_cancelled",
         )
         .await?;
+    if !won_cancel {
+        return Ok(json!({ "cancelled": false }));
+    }
     publish_events(state, events);
     cancel_delegation_subagents_without_reactivation(state, &delegation.id).await;
     let (handoff_dir, subagents) = write_cancelled_subagent_transcripts(state, &delegation).await?;

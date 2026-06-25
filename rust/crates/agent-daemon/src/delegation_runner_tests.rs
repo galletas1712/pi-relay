@@ -874,6 +874,36 @@ async fn parent_partial_client_input_ids(
         .collect()
 }
 
+async fn active_partial_wakeup_count(
+    env: &TestEnv,
+    parent_id: &str,
+    delegation: &Delegation,
+) -> i64 {
+    let prefix = format!(
+        "delegation-steer:{}:{}:",
+        delegation.id, delegation.attempt_id
+    );
+    env.state
+        .repo
+        .queue_state(parent_id)
+        .await
+        .expect("parent queue")
+        .queued_inputs
+        .into_iter()
+        .filter(|input| {
+            input.priority == InputPriority::Steer
+                && matches!(
+                    input.status,
+                    QueuedInputStatus::Queued | QueuedInputStatus::Consuming
+                )
+                && input
+                    .client_input_id
+                    .as_deref()
+                    .is_some_and(|client_input_id| client_input_id.starts_with(&prefix))
+        })
+        .count() as i64
+}
+
 async fn inspect_delegation_snapshot(env: &TestEnv, delegation_id: &str) -> serde_json::Value {
     status_core(
         &env.state,
@@ -3154,6 +3184,112 @@ async fn boot_sweep_repairs_partial_subagent_wakeup_for_still_running_delegation
 }
 
 #[tokio::test]
+async fn boot_sweep_cancels_stale_partial_wakeup_for_cancelled_delegation_before_parent_resume() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "partial cancel boot repair test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
+        .await
+        .expect("create delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "finished",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "Finished before cancellation.\n\noutcome: done",
+    )
+    .await;
+    create_busy_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "not_done",
+        "reviewer",
+        SubagentType::ReadOnly,
+    )
+    .await;
+
+    let parent_lock = SessionDriver::acquire(&env.state, "parent").await;
+    complete_delegation_if_ready(&env.state, &delegation.id)
+        .await
+        .expect("queue partial wakeup");
+    let partial_ids = parent_partial_client_input_ids(&env, "parent", &delegation).await;
+    assert_eq!(partial_ids.len(), 1);
+    assert!(env
+        .state
+        .repo
+        .cancel_running_delegation(&delegation.id, &delegation.attempt_id)
+        .await
+        .expect("simulate pre-atomic cancel crash gap"));
+    assert_eq!(
+        env.state
+            .repo
+            .find_client_input("parent", &partial_ids[0])
+            .await
+            .expect("find stale partial")
+            .expect("partial row")
+            .status,
+        QueuedInputStatus::Queued
+    );
+
+    sweep_running_delegations_on_boot(&env.state).await;
+    assert!(
+        parent_partial_client_input_ids(&env, "parent", &delegation)
+            .await
+            .is_empty(),
+        "boot repair must remove stale active partials for cancelled delegations"
+    );
+    assert_eq!(
+        active_partial_wakeup_count(&env, "parent", &delegation).await,
+        0,
+        "boot repair must leave no queued/consuming partial for cancelled delegations"
+    );
+    assert_eq!(
+        env.state
+            .repo
+            .find_client_input("parent", &partial_ids[0])
+            .await
+            .expect("find repaired stale partial")
+            .expect("partial row")
+            .status,
+        QueuedInputStatus::Cancelled
+    );
+    assert!(
+        env.state
+            .repo
+            .take_next_queued_steer_input("parent")
+            .await
+            .expect("parent steer queue after repair")
+            .is_none(),
+        "boot queued-input resume should not be able to consume the stale partial"
+    );
+
+    drop(parent_lock);
+    env.cleanup().await;
+}
+
+#[tokio::test]
 async fn cancelling_after_partial_wakeup_preserves_completed_child_handoff_only() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -3520,11 +3656,12 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         .unwrap();
     assert_eq!(done["status"], "done");
     assert_eq!(done["outcome"], "done");
-    assert_eq!(done["final_message_file"], serde_json::Value::Null);
-    assert!(done.get("final_message_path").is_none());
+    assert_eq!(done["final_message_file"], "done_child/final_message.md");
     assert!(
-        !root.join("done_child").join("final_message.md").exists(),
-        "normal final_message artifact waits for delegation completion"
+        std::fs::read_to_string(root.join("done_child").join("final_message.md"))
+            .expect("terminal final message artifact")
+            .contains("Found the answer."),
+        "running inspect snapshots include final-message refs for completion-terminal children"
     );
     assert!(
         std::fs::read_to_string(root.join("done_child").join("transcript.md"))
@@ -3594,11 +3731,20 @@ async fn inspect_delegation_refreshes_artifacts_from_postgres() {
         "stale local artifact",
     )
     .expect("overwrite transcript artifact");
+    std::fs::write(
+        root.join("done_child").join("final_message.md"),
+        "stale local final message",
+    )
+    .expect("overwrite final message artifact");
     let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
     assert_eq!(snapshot["progress"]["terminal"], 1);
     let refreshed = std::fs::read_to_string(root.join("done_child").join("transcript.md")).unwrap();
     assert!(refreshed.contains("Found the answer."));
     assert!(!refreshed.contains("stale local artifact"));
+    let refreshed_final =
+        std::fs::read_to_string(root.join("done_child").join("final_message.md")).unwrap();
+    assert!(refreshed_final.contains("Found the answer."));
+    assert!(!refreshed_final.contains("stale local final message"));
 
     env.cleanup().await;
 }

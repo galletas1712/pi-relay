@@ -403,6 +403,9 @@ async fn classify_subagents(
 ///    observation were published. This repair is idempotent and only covers `done` /
 ///    `done_with_failures`; cancelled delegations remain transcript-only and
 ///    are never reactivated.
+/// 3. Cancel any active partial wakeups that survived a pre-fix crash after a
+///    delegation's status had already reached `cancelled`, before the boot
+///    queued-input resume sweep can consume them on the top-level parent.
 pub(crate) async fn sweep_running_delegations_on_boot(state: &AppState) {
     publish_running_delegation_partial_observations_on_boot(state).await;
 
@@ -429,6 +432,7 @@ pub(crate) async fn sweep_running_delegations_on_boot(state: &AppState) {
     }
 
     repair_completed_delegation_publications_on_boot(state).await;
+    repair_cancelled_delegation_partial_wakeups_on_boot(state).await;
 }
 
 async fn publish_running_delegation_partial_observations_on_boot(state: &AppState) {
@@ -519,6 +523,19 @@ async fn repair_completed_delegation_publication(
         drive_parent_after_wakeup(state, &delegation.parent_session_id).await;
     }
     Ok(())
+}
+
+async fn repair_cancelled_delegation_partial_wakeups_on_boot(state: &AppState) {
+    match state
+        .repo
+        .repair_cancelled_delegation_partial_wakeups()
+        .await
+    {
+        Ok(events) => publish_events(state, events),
+        Err(error) => eprintln!(
+            "boot delegation sweep could not repair cancelled delegation partial wakeups: {error:#}"
+        ),
+    }
 }
 
 #[cfg(test)]
