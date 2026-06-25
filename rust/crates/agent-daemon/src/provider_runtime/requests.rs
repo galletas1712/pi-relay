@@ -9,7 +9,7 @@ use crate::model_metadata;
 use crate::state::AppState;
 
 use super::auth_retry::complete_with_auth_retry;
-use super::prompt::{assemble_agent_prompt, prompt_profile, provider_tools_for_session};
+use super::prompt::{assemble_agent_prompt, effective_prompt_profile, provider_tools_for_session};
 use super::provider::provider_for_config;
 use super::transcript::provider_transcript;
 
@@ -47,7 +47,11 @@ pub(crate) async fn build_model_request(
         prompt,
         transcript: provider_transcript(model_context),
         tool_profile: ProviderToolProfile::for_provider(config.provider.kind),
-        tools: provider_tools_for_session(state, config.provider.kind, prompt_profile(config)),
+        tools: provider_tools_for_session(
+            state,
+            config.provider.kind,
+            effective_prompt_profile(state, config, session_id).await?,
+        ),
         max_tokens: config.provider.max_tokens,
         reasoning_effort: model_metadata::normalize_reasoning_effort(
             config.provider.kind,

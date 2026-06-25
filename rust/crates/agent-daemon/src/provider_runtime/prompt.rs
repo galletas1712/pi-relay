@@ -68,6 +68,14 @@ pub(super) fn prompt_context(state: &AppState, config: &SessionConfig) -> Prompt
 }
 
 pub(crate) fn prompt_profile(config: &SessionConfig) -> PromptProfile {
+    if config
+        .metadata
+        .get("subagent")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        return PromptProfile::Subagent;
+    }
     if let Some(profile) = config
         .metadata
         .get("prompt_profile")
@@ -78,15 +86,23 @@ pub(crate) fn prompt_profile(config: &SessionConfig) -> PromptProfile {
             _ => PromptProfile::Parent,
         };
     }
-    if config
-        .metadata
-        .get("subagent")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        return PromptProfile::Subagent;
-    }
     PromptProfile::Parent
+}
+
+pub(crate) async fn effective_prompt_profile(
+    state: &AppState,
+    config: &SessionConfig,
+    session_id: &str,
+) -> anyhow::Result<PromptProfile> {
+    if state
+        .repo
+        .session_subagent_type(session_id)
+        .await?
+        .is_some()
+    {
+        return Ok(PromptProfile::Subagent);
+    }
+    Ok(prompt_profile(config))
 }
 
 pub(crate) fn provider_tools_for_session(
@@ -572,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_profile_uses_explicit_profile_before_legacy_subagent_flag() {
+    fn prompt_profile_subagent_flag_wins_over_parent_profile() {
         let mut config = SessionConfig {
             project_id: None,
             outer_cwd: "/tmp".to_string(),
@@ -591,7 +607,7 @@ mod tests {
             }),
         };
 
-        assert_eq!(prompt_profile(&config), PromptProfile::Parent);
+        assert_eq!(prompt_profile(&config), PromptProfile::Subagent);
         config.metadata = serde_json::json!({ "prompt_profile": "subagent" });
         assert_eq!(prompt_profile(&config), PromptProfile::Subagent);
         config.metadata = serde_json::json!({ "subagent": true });

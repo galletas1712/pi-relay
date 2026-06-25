@@ -480,6 +480,197 @@ async fn create_empty_subagent(
     assert!(history.entries.is_empty());
 }
 
+fn tool_names(result: &serde_json::Value) -> Vec<String> {
+    result["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| {
+            tool["canonical_name"]
+                .as_str()
+                .expect("canonical name")
+                .to_string()
+        })
+        .collect()
+}
+
+fn assert_delegation_tools_visible(names: &[String]) {
+    assert!(names.contains(&"delegate_writing_task".to_string()));
+    assert!(names.contains(&"delegate_readonly_tasks".to_string()));
+    assert!(names.contains(&"inspect_delegation".to_string()));
+    assert!(names.contains(&"cancel_delegation".to_string()));
+    assert!(names.contains(&"steer_subagent".to_string()));
+}
+
+fn assert_delegation_tools_hidden(names: &[String]) {
+    assert!(names.contains(&"LoadSkill".to_string()));
+    assert!(!names.contains(&"delegate_writing_task".to_string()));
+    assert!(!names.contains(&"delegate_readonly_tasks".to_string()));
+    assert!(!names.contains(&"inspect_delegation".to_string()));
+    assert!(!names.contains(&"cancel_delegation".to_string()));
+    assert!(!names.contains(&"steer_subagent".to_string()));
+}
+
+#[tokio::test]
+async fn tools_list_filters_delegation_tools_for_subagent_session() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "tools list profile test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_empty_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "impl_child",
+        "implementer",
+        SubagentType::Full,
+    )
+    .await;
+
+    let global_names = tool_names(
+        &crate::tools_list(&env.state, json!({ "provider": "openai" }))
+            .await
+            .expect("global tools list"),
+    );
+    assert_delegation_tools_visible(&global_names);
+
+    let parent_names = tool_names(
+        &crate::tools_list(
+            &env.state,
+            json!({ "provider": "openai", "session_id": "parent" }),
+        )
+        .await
+        .expect("parent tools list"),
+    );
+    assert_delegation_tools_visible(&parent_names);
+
+    let openai_subagent_names = tool_names(
+        &crate::tools_list(
+            &env.state,
+            json!({ "provider": "openai", "session_id": "impl_child" }),
+        )
+        .await
+        .expect("openai subagent tools list"),
+    );
+    assert_delegation_tools_hidden(&openai_subagent_names);
+
+    let claude_subagent_names = tool_names(
+        &crate::tools_list(
+            &env.state,
+            json!({ "provider": "claude", "session_id": "impl_child" }),
+        )
+        .await
+        .expect("claude subagent tools list"),
+    );
+    assert_delegation_tools_hidden(&claude_subagent_names);
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn structural_subagent_stays_subagent_profile_after_session_configure() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "subagent configure profile test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_empty_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "impl_child",
+        "implementer",
+        SubagentType::Full,
+    )
+    .await;
+
+    let response = crate::session_configure(
+        &env.state,
+        json!({
+            "session_id": "impl_child",
+            "metadata": {
+                "prompt_profile": "parent",
+                "subagent": false,
+                "hidden": false,
+                "role_name": "spoofed",
+                "subagent_type": "read_only",
+                "title": "configured child"
+            }
+        }),
+    )
+    .await
+    .expect("configure structural subagent");
+
+    assert_eq!(response["metadata"]["prompt_profile"], "subagent");
+    assert_eq!(response["metadata"]["subagent"], true);
+    assert_eq!(response["metadata"]["hidden"], true);
+    assert_eq!(response["metadata"]["role_name"], "implementer");
+    assert_eq!(response["metadata"]["subagent_type"], "full");
+    assert_eq!(response["metadata"]["title"], "configured child");
+
+    let mut config = env
+        .state
+        .repo
+        .load_session_config("impl_child")
+        .await
+        .expect("subagent config");
+    config.metadata = json!({ "prompt_profile": "parent" });
+    config.system_prompt = "Subagent prompt".to_string();
+    let request = build_model_request(&env.state, &config, "impl_child", None, ModelContext::new())
+        .await
+        .expect("build structurally-subagent model request");
+    let request_tool_names = request
+        .tools
+        .iter()
+        .map(|tool| tool.canonical_name.clone())
+        .collect::<Vec<_>>();
+    assert_delegation_tools_hidden(&request_tool_names);
+
+    let tools_list_names = tool_names(
+        &crate::tools_list(
+            &env.state,
+            json!({ "provider": "openai", "session_id": "impl_child" }),
+        )
+        .await
+        .expect("tools list after configure"),
+    );
+    assert_delegation_tools_hidden(&tools_list_names);
+
+    env.cleanup().await;
+}
+
 /// A full subagent with an active, unfinished model action. This keeps the
 /// session genuinely busy so a steer-priority input should be queued rather
 /// than immediately consumed into a new turn.

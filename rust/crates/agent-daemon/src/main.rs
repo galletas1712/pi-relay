@@ -24,7 +24,8 @@ use crate::codec::{
 };
 use crate::config::Config;
 use crate::provider_runtime::{
-    current_pi_template, ProviderConnectionRegistry, SessionTitleScheduler,
+    current_pi_template, effective_prompt_profile, provider_tools_for_session, PromptProfile,
+    ProviderConnectionRegistry, SessionTitleScheduler,
 };
 use crate::runtime::*;
 use crate::state::AppState;
@@ -312,7 +313,7 @@ async fn dispatch_request(
         RpcMethod::HistoryContext => history_context(state, params).await,
         RpcMethod::HistorySwitch => history_switch(state, params).await,
         RpcMethod::TurnResume => turn_resume(state, params).await,
-        RpcMethod::ToolsList => tools_list(state, params),
+        RpcMethod::ToolsList => tools_list(state, params).await,
         RpcMethod::CompactionRequest => compaction_request(state, params).await,
         RpcMethod::DelegationStartFull => delegation_tools::rpc_start_full(state, params).await,
         RpcMethod::DelegationStartReadonlyFanout => {
@@ -329,7 +330,7 @@ async fn dispatch_request(
     }
 }
 
-fn tools_list(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
+async fn tools_list(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
     let provider = required_string(&params, "provider")?;
     let provider = provider.parse::<ProviderKind>().map_err(|error| {
         RpcError::new(
@@ -337,9 +338,8 @@ fn tools_list(state: &AppState, params: Value) -> std::result::Result<Value, Rpc
             format!("invalid provider for tools.list: {error}"),
         )
     })?;
-    let tools = state
-        .tools
-        .provider_tools_for_provider(provider)
+    let profile = tools_list_profile(state, &params).await?;
+    let tools = provider_tools_for_session(state, provider, profile)
         .into_iter()
         .map(|tool| {
             json!({
@@ -354,6 +354,27 @@ fn tools_list(state: &AppState, params: Value) -> std::result::Result<Value, Rpc
         })
         .collect::<Vec<_>>();
     Ok(json!({ "tools": tools }))
+}
+
+async fn tools_list_profile(
+    state: &AppState,
+    params: &Value,
+) -> std::result::Result<PromptProfile, RpcError> {
+    if let Some(session_id) = params.get("session_id").and_then(Value::as_str) {
+        return prompt_profile_for_session(state, session_id).await;
+    }
+    Ok(match params.get("prompt_profile").and_then(Value::as_str) {
+        Some("subagent") => PromptProfile::Subagent,
+        _ => PromptProfile::Parent,
+    })
+}
+
+async fn prompt_profile_for_session(
+    state: &AppState,
+    session_id: &str,
+) -> std::result::Result<PromptProfile, RpcError> {
+    let config = state.repo.load_session_config(session_id).await?;
+    Ok(effective_prompt_profile(state, &config, session_id).await?)
 }
 
 async fn session_list(state: &AppState, params: Value) -> std::result::Result<Value, RpcError> {
@@ -584,6 +605,9 @@ async fn session_configure(
         ensure_metadata_object(&mut metadata)
             .insert("auto_title_disabled".to_string(), json!(true));
     }
+    if let Some(subagent_type) = state.repo.session_subagent_type(&session_id).await? {
+        preserve_subagent_metadata(&mut metadata, &current.metadata, subagent_type);
+    }
     let model_changed = provider_model_changed(&current.provider, &provider);
     let metadata_changed = metadata != current.metadata;
     if model_changed {
@@ -638,6 +662,19 @@ fn ensure_metadata_object(metadata: &mut Value) -> &mut serde_json::Map<String, 
     metadata
         .as_object_mut()
         .expect("metadata was forced to object")
+}
+
+fn preserve_subagent_metadata(metadata: &mut Value, current: &Value, subagent_type: SubagentType) {
+    let map = ensure_metadata_object(metadata);
+    map.insert("prompt_profile".to_string(), json!("subagent"));
+    map.insert("subagent".to_string(), json!(true));
+    map.insert("hidden".to_string(), json!(true));
+    map.insert("subagent_type".to_string(), json!(subagent_type.as_str()));
+    if let Some(value) = current.get("role_name") {
+        map.insert("role_name".to_string(), value.clone());
+    } else {
+        map.remove("role_name");
+    }
 }
 
 async fn project_list(state: &AppState) -> std::result::Result<Value, RpcError> {
