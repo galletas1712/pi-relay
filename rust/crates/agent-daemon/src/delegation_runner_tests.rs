@@ -3290,6 +3290,144 @@ async fn boot_sweep_cancels_stale_partial_wakeup_for_cancelled_delegation_before
 }
 
 #[tokio::test]
+async fn boot_sweep_repairs_cancelled_partial_before_other_delegation_drives_parent() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "partial cancel ordering boot repair test",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+
+    // Delegation A: historical crash state with a queued running-snapshot
+    // partial wakeup, then a committed pre-atomic cancellation status CAS.
+    let cancelled = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
+        .await
+        .expect("create cancelled delegation");
+    let stale_observation = DaemonToolObservation::inspect_delegation(
+        ToolCallId::new("call_partial_boot_ordering"),
+        &cancelled.id,
+        Some("Subagent finished before cancellation".to_string()),
+        json!({
+            "delegation_id": cancelled.id,
+            "status": "running",
+        }),
+    );
+    let stale_partial_key = format!(
+        "delegation-steer:{}:{}:done_child",
+        cancelled.id, cancelled.attempt_id
+    );
+    assert!(env
+        .state
+        .repo
+        .enqueue_partial_delegation_observation_if_running(
+            "parent",
+            &cancelled.id,
+            &cancelled.attempt_id,
+            &stale_observation,
+            &stale_partial_key,
+        )
+        .await
+        .expect("enqueue stale partial"));
+    assert!(env
+        .state
+        .repo
+        .cancel_running_delegation(&cancelled.id, &cancelled.attempt_id)
+        .await
+        .expect("simulate old cancel CAS"));
+
+    // Delegation B: completed-status crash gap for the same parent. Boot repair
+    // will publish its completion observation and, with the parent lock free,
+    // immediately drive the parent. If cancelled-partial repair runs late, that
+    // drive consumes A's stale partial before the repair can cancel it.
+    let completed = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create completed delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &completed.id,
+        "completed_child",
+        "implementer",
+        SubagentType::Full,
+        TurnOutcome::Graceful,
+        "completed",
+    )
+    .await;
+    assert!(env
+        .state
+        .repo
+        .finish_delegation(&completed.id, &completed.attempt_id, DelegationStatus::Done)
+        .await
+        .expect("simulate completed-status crash gap"));
+    let completed_key = delegation_wakeup_client_input_id(&completed);
+    assert!(env
+        .state
+        .repo
+        .find_client_input("parent", &completed_key)
+        .await
+        .expect("find pre-repair completed wakeup")
+        .is_none());
+
+    assert_eq!(
+        env.state
+            .repo
+            .find_client_input("parent", &stale_partial_key)
+            .await
+            .expect("find stale partial before boot")
+            .expect("stale partial row")
+            .status,
+        QueuedInputStatus::Queued
+    );
+
+    // Intentionally do NOT hold the parent driver lock during the boot sweep:
+    // B's repair is free to drive the parent, which would expose the stale A
+    // partial if A were not cancelled as the first boot-sweep operation.
+    sweep_running_delegations_on_boot(&env.state).await;
+
+    assert_eq!(
+        env.state
+            .repo
+            .find_client_input("parent", &stale_partial_key)
+            .await
+            .expect("find stale partial after boot")
+            .expect("stale partial row")
+            .status,
+        QueuedInputStatus::Cancelled,
+        "cancelled delegation A's stale partial must be repaired before B can drive the parent"
+    );
+    assert!(
+        parent_delegation_observations(&env, "parent", &cancelled.id)
+            .await
+            .is_empty(),
+        "parent must not consume the stale running snapshot for cancelled delegation A"
+    );
+    assert_eq!(
+        wakeup_observations_to_parent(&env, "parent", &completed.id).await,
+        1,
+        "completed delegation B should still publish and drive its repaired completion"
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
 async fn cancelling_after_partial_wakeup_preserves_completed_child_handoff_only() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");

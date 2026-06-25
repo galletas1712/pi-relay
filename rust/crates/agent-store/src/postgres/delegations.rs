@@ -565,12 +565,16 @@ impl PostgresAgentStore {
 
     /// Boot-time defense in depth for the cancellation crash gap that existed
     /// before `cancel_running_delegation_and_queued_partials`: if a delegation is
-    /// already `cancelled`, any active deterministic partial wakeups for
-    /// its attempt are stale and must not wake the top-level parent.
+    /// already `cancelled`, any active deterministic partial wakeups for its
+    /// attempt are stale and must not wake the top-level parent. Start from the
+    /// active queue so boot cost is proportional to stale queued/consuming
+    /// partials, not all historical cancelled delegations.
     pub async fn repair_cancelled_delegation_partial_wakeups(&self) -> Result<Vec<EventFrame>> {
-        let cancelled = self.list_cancelled_delegations().await?;
+        let stale = self
+            .list_cancelled_delegations_with_active_partial_wakeups()
+            .await?;
         let mut events = Vec::new();
-        for delegation in cancelled {
+        for delegation in stale {
             let mut tx = self.pool.begin().await?;
             lock_session_tx(&mut tx, &delegation.parent_session_id).await?;
             let input_ids = cancel_active_partial_delegation_wakeups_tx(
@@ -1045,13 +1049,38 @@ impl PostgresAgentStore {
         rows.iter().map(row_to_delegation).collect()
     }
 
-    async fn list_cancelled_delegations(&self) -> Result<Vec<Delegation>> {
+    async fn list_cancelled_delegations_with_active_partial_wakeups(
+        &self,
+    ) -> Result<Vec<Delegation>> {
         let rows = sqlx::query(
             r#"
-            select id, parent_session_id, workflow, label, kind, status, attempt_id, expected_subagents
-            from delegations
-            where status='cancelled'
-            order by updated_at, id
+            with active_partial_wakeups as (
+                select distinct
+                       q.session_id as parent_session_id,
+                       split_part(q.client_input_id, ':', 2) as delegation_id,
+                       split_part(q.client_input_id, ':', 3) as attempt_id
+                from queued_inputs q
+                where q.priority='steer'
+                  and q.status in ('queued', 'consuming')
+                  and q.content->>'type' = 'daemon_tool_observation'
+                  and q.client_input_id like 'delegation-steer:%:%:%'
+            )
+            select distinct d.id,
+                   d.parent_session_id,
+                   d.workflow,
+                   d.label,
+                   d.kind,
+                   d.status,
+                   d.attempt_id,
+                   d.expected_subagents,
+                   d.updated_at
+            from active_partial_wakeups q
+            join delegations d
+              on d.id = q.delegation_id
+             and d.parent_session_id = q.parent_session_id
+             and d.attempt_id = q.attempt_id
+             and d.status='cancelled'
+            order by d.updated_at, d.id
             "#,
         )
         .fetch_all(&self.pool)

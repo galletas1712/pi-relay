@@ -42,6 +42,7 @@ fn subagent_status(outcome: TurnOutcome) -> &'static str {
 /// The terminal `TurnOutcome` of a subagent, read from its durable transcript:
 /// the most recent `TurnFinished` marker on its active branch. A subagent with
 /// no finished turn (e.g. crashed before any boundary) is treated as crashed.
+#[cfg(test)]
 pub(crate) fn subagent_outcome(history: &HistoryTree) -> TurnOutcome {
     history
         .entries
