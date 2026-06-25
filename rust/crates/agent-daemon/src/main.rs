@@ -321,6 +321,9 @@ async fn dispatch_request(
         }
         RpcMethod::DelegationStatus => delegation_tools::rpc_status(state, params).await,
         RpcMethod::DelegationCancel => delegation_tools::rpc_cancel(state, params).await,
+        RpcMethod::DelegationSteerSubagent => {
+            delegation_tools::rpc_steer_subagent(state, params).await
+        }
         RpcMethod::DelegationList => delegation_tools::rpc_list(state, params).await,
         RpcMethod::DelegationReadHandoffFile => {
             delegation_tools::rpc_read_handoff_file(state, params).await
@@ -899,19 +902,6 @@ pub(crate) async fn input_user(
         .transpose()
         .map_err(|error| RpcError::new("invalid_params", error.to_string()))?
         .unwrap_or(InputPriority::FollowUp);
-    // Server-side guard: a read-only subagent must never be steered. The legacy
-    // client-only check is not authoritative, so reject a Steer-priority input
-    // targeting a read_only subagent here. Follow-up inputs (and the barrier's
-    // top-level parent wakeup observation, which targets a parent session) are
-    // unaffected.
-    if priority == InputPriority::Steer
-        && state.repo.session_subagent_type(&session_id).await? == Some(SubagentType::ReadOnly)
-    {
-        return Err(RpcError::new(
-            "cannot_steer_read_only_subagent",
-            "a read-only subagent cannot be steered",
-        ));
-    }
     let client_input_id = params
         .get("client_input_id")
         .and_then(Value::as_str)
@@ -1004,11 +994,10 @@ pub(crate) async fn enqueue_session_input(
     let started_at = Instant::now();
     if priority == InputPriority::Steer
         && state.repo.session_parent_id(&session_id).await?.is_some()
-        && state.repo.active_leaf_is_turn_boundary(&session_id).await?
     {
         return Err(RpcError::new(
-            "subagent_terminal",
-            "cannot steer a subagent that is already terminal",
+            "subagent_steer_requires_parent_scope",
+            "steer_subagent must be used to steer delegation subagents",
         ));
     }
     let mut expected_params = json!({});
@@ -1115,6 +1104,12 @@ async fn input_promote_queued(
     params: Value,
 ) -> std::result::Result<Value, RpcError> {
     let session_id = required_string(&params, "session_id")?;
+    if state.repo.session_parent_id(&session_id).await?.is_some() {
+        return Err(RpcError::new(
+            "subagent_steer_requires_parent_scope",
+            "steer_subagent must be used to steer delegation subagents",
+        ));
+    }
     let input_id = required_string(&params, "input_id")?;
     let driver = SessionDriver::acquire(state, &session_id).await;
     driver.recover_if_needed().await?;

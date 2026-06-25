@@ -11,8 +11,8 @@ use super::queue::{
 use super::sql::{action_is_unfinished, lock_session_tx, queued_input_is_active, session_activity};
 use super::PostgresAgentStore;
 use crate::{
-    DelegationKind, DelegationStatus, EventType, InputPriority, QueuedInputContent,
-    QueuedInputStatus, SessionActivity, SubagentType,
+    DelegationKind, DelegationStatus, EnqueueUserInputResult, EventType, InputPriority,
+    QueuedInputContent, QueuedInputStatus, SessionActivity, SubagentType,
 };
 
 /// A durable delegation row: an ordered unit of work under a parent session that
@@ -161,8 +161,12 @@ impl PostgresAgentStore {
                 .get("task")
                 .and_then(Value::as_str)
                 .is_some_and(|task| !task.trim().is_empty());
+            let has_running_work: bool = row.get("has_running_work");
+            let has_queued_input: bool = row.get("has_queued_input");
             let active_leaf_id: Option<String> = row.get("active_leaf_id");
-            let terminal_status = if active_leaf_id.is_none() {
+            let terminal_status = if has_running_work || has_queued_input {
+                None
+            } else if active_leaf_id.is_none() {
                 Some("done".to_string())
             } else {
                 let item: Option<Value> = row.get("item");
@@ -185,10 +189,7 @@ impl PostgresAgentStore {
             };
             subagents.push(DelegationSubagentOverview {
                 session_id,
-                activity: session_activity(
-                    row.get::<bool, _>("has_running_work"),
-                    row.get::<bool, _>("has_queued_input"),
-                ),
+                activity: session_activity(has_running_work, has_queued_input),
                 subagent_type,
                 role,
                 has_task,
@@ -310,28 +311,41 @@ impl PostgresAgentStore {
     }
 
     /// Compute compact progress counts for a delegation without materializing
-    /// active branches. Terminality comes from each subagent's active leaf; a
+    /// active branches. A subagent is terminal only when it has no active queue
+    /// or unfinished action and its active leaf is a turn boundary; a
     /// `TurnFinished` leaf with `Graceful` is a terminal success, other
     /// `TurnFinished` outcomes are terminal failures, and a compaction summary
     /// is terminal success.
     pub async fn delegation_progress(&self, delegation: &Delegation) -> Result<DelegationProgress> {
-        let rows = sqlx::query(
+        let unfinished_actions = action_is_unfinished(Some("a"));
+        let active_queue = queued_input_is_active(Some("q"));
+        let query = format!(
             r#"
-            select s.id, s.active_leaf_id, te.item
+            select s.id,
+                   s.active_leaf_id,
+                   te.item,
+                   exists(select 1 from actions a where a.session_id=s.id and {unfinished_actions}) as has_unfinished_actions,
+                   exists(select 1 from queued_inputs q where q.session_id=s.id and {active_queue}) as has_queued_inputs
             from sessions s
             left join transcript_entries te
                 on te.session_id = s.id
                and te.id = s.active_leaf_id
             where s.delegation_id=$1
             "#,
-        )
-        .bind(&delegation.id)
-        .fetch_all(&self.pool)
-        .await?;
+        );
+        let rows = sqlx::query(&query)
+            .bind(&delegation.id)
+            .fetch_all(&self.pool)
+            .await?;
 
         let mut terminal = 0i32;
         let mut failed = 0i32;
         for row in &rows {
+            if row.get::<bool, _>("has_unfinished_actions")
+                || row.get::<bool, _>("has_queued_inputs")
+            {
+                continue;
+            }
             let active_leaf_id: Option<String> = row.get("active_leaf_id");
             if active_leaf_id.is_none() {
                 terminal += 1;
@@ -448,16 +462,179 @@ impl PostgresAgentStore {
         attempt_id: &str,
         status: DelegationStatus,
     ) -> Result<bool> {
-        let updated = sqlx::query(
-            "update delegations set status=$3, updated_at=now() where id=$1 and attempt_id=$2 and status='running'",
+        let unfinished_actions = action_is_unfinished(Some("a"));
+        let active_queue = queued_input_is_active(Some("q"));
+        let query = format!(
+            r#"
+            update delegations
+            set status=$3, updated_at=now()
+            where id=$1
+              and attempt_id=$2
+              and status='running'
+              and not exists (
+                select 1
+                from sessions s
+                join actions a on a.session_id = s.id
+                where s.delegation_id = delegations.id
+                  and {unfinished_actions}
+              )
+              and not exists (
+                select 1
+                from sessions s
+                join queued_inputs q on q.session_id = s.id
+                where s.delegation_id = delegations.id
+                  and {active_queue}
+              )
+            "#
+        );
+        let updated = sqlx::query(&query)
+            .bind(delegation_id)
+            .bind(attempt_id)
+            .bind(status.as_str())
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        Ok(updated == 1)
+    }
+
+    /// Enqueue a steer for a delegation child while holding the delegation row
+    /// lock and child session lock. This makes the public subagent-steer path
+    /// parent/delegation scoped at the DB boundary: if cancellation/completion
+    /// wins first, the insert is rejected instead of steering a terminal child.
+    pub async fn enqueue_scoped_subagent_steer(
+        &self,
+        parent_session_id: &str,
+        delegation_id: &str,
+        subagent_id: &str,
+        content: &UserMessage,
+        client_input_id: &str,
+    ) -> Result<Option<EnqueueUserInputResult>> {
+        let mut tx = self.pool.begin().await?;
+        let Some(delegation_row) = sqlx::query(
+            r#"
+            select parent_session_id, status
+            from delegations
+            where id=$1
+            for update
+            "#,
         )
         .bind(delegation_id)
-        .bind(attempt_id)
-        .bind(status.as_str())
-        .execute(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?
-        .rows_affected();
-        Ok(updated == 1)
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let delegation_parent: String = delegation_row.get("parent_session_id");
+        let delegation_status: String = delegation_row.get("status");
+        if delegation_parent != parent_session_id || delegation_status != "running" {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        let Some(session_row) = sqlx::query(
+            r#"
+            select parent_session_id, delegation_id, subagent_type
+            from sessions
+            where id=$1
+            for update
+            "#,
+        )
+        .bind(subagent_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+        let child_parent: Option<String> = session_row.get("parent_session_id");
+        let child_delegation: Option<String> = session_row.get("delegation_id");
+        let subagent_type: Option<String> = session_row.get("subagent_type");
+        if child_parent.as_deref() != Some(parent_session_id)
+            || child_delegation.as_deref() != Some(delegation_id)
+            || !matches!(subagent_type.as_deref(), Some("full") | Some("read_only"))
+        {
+            tx.commit().await?;
+            return Ok(None);
+        }
+
+        if let Some(row) = sqlx::query(
+            "select id from queued_inputs where session_id=$1 and client_input_id=$2::text",
+        )
+        .bind(subagent_id)
+        .bind(client_input_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            let input_id = row.get("id");
+            let queue = queue_state_tx(&mut tx, subagent_id).await?;
+            tx.commit().await?;
+            return Ok(Some(EnqueueUserInputResult {
+                input_id,
+                event: None,
+                queue: Some(queue),
+            }));
+        }
+
+        let id = format!("input_{}", Uuid::new_v4());
+        let inserted = sqlx::query(
+            r#"
+            insert into queued_inputs (
+                id, session_id, priority, content, status, client_input_id, origin
+            )
+            values (
+                $1, $2, 'steer', $3, 'queued', $4,
+                jsonb_build_object('promoted_at', clock_timestamp()::text)
+            )
+            on conflict (session_id, client_input_id) where client_input_id is not null
+            do nothing
+            returning id
+            "#,
+        )
+        .bind(&id)
+        .bind(subagent_id)
+        .bind(serde_json::to_value(QueuedInputContent::user_message(
+            content.clone(),
+        ))?)
+        .bind(client_input_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let input_id = if let Some(inserted) = inserted {
+            inserted.get("id")
+        } else {
+            let row = sqlx::query(
+                "select id from queued_inputs where session_id=$1 and client_input_id=$2::text",
+            )
+            .bind(subagent_id)
+            .bind(client_input_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            row.get("id")
+        };
+        bump_revisions_tx(&mut tx, subagent_id, true, false).await?;
+        let queue = queue_state_tx(&mut tx, subagent_id).await?;
+        let event = insert_event_tx(
+            &mut tx,
+            subagent_id,
+            EventType::InputQueued,
+            queue_event_payload(
+                &queue,
+                json!({
+                    "input_id": input_id,
+                    "priority": InputPriority::Steer,
+                    "client_input_id": client_input_id,
+                    "content": content.content.clone(),
+                    "content_type": "user_message",
+                }),
+            ),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(EnqueueUserInputResult {
+            input_id,
+            event: Some(event),
+            queue: Some(queue),
+        }))
     }
 
     /// Enqueue a parent wakeup with the deterministic delegation/attempt key.
@@ -514,14 +691,17 @@ impl PostgresAgentStore {
     ///    is even inserted. Requiring `count(sessions where delegation_id) ==
     ///    expected_subagents` keeps the barrier closed during that window.
     ///
-    /// 2. Transcript-boundary terminality: a subagent is terminal only when its
-    ///    active leaf is a genuine turn boundary (`TurnFinished` / compaction
-    ///    summary). This is independent of action/queue status — so a subagent
-    ///    that crashed MID-TURN (boot's `mark_all_unfinished_actions_stale`
-    ///    erased its unfinished action, and it had no queued input) is correctly
-    ///    NON-terminal and stays in the delegation until it is recovered to a
-    ///    boundary (where it either continues or settles as a genuine terminal
-    ///    outcome).
+    /// 2. No active DB work: accepted queued steers/follow-ups and unfinished
+    ///    model/tool/compaction actions keep the child non-terminal even if its
+    ///    previous active leaf is a boundary. This closes the fan-out race where
+    ///    a queued steer is accepted while a sibling runs the barrier.
+    ///
+    /// 3. Transcript-boundary terminality: once no active DB work remains, a
+    ///    subagent is terminal only when its active leaf is a genuine turn
+    ///    boundary (`TurnFinished` / compaction summary). A subagent that crashed
+    ///    MID-TURN (boot's stale-mark erased its unfinished action, and it had no
+    ///    queued input) is correctly NON-terminal and stays in the delegation
+    ///    until it is recovered to a boundary.
     pub async fn delegation_subagents_all_terminal(&self, delegation_id: &str) -> Result<bool> {
         let session_ids: Vec<String> =
             sqlx::query_scalar("select id from sessions where delegation_id=$1")
@@ -532,6 +712,11 @@ impl PostgresAgentStore {
             return Ok(false);
         }
         for session_id in &session_ids {
+            if self.has_unfinished_actions(session_id).await?
+                || self.has_queued_inputs(session_id).await?
+            {
+                return Ok(false);
+            }
             if !self.active_leaf_is_turn_boundary(session_id).await? {
                 return Ok(false);
             }

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use agent_provider::ModelTranscriptEntry;
-use agent_session::{AgentSession, ModelContext, SessionAction, TranscriptStorageNode};
+use agent_session::{ModelContext, SessionAction, TranscriptStorageNode};
 use agent_store::{
     Delegation, DelegationKind, DelegationStatus, EventType, InputPriority, PostgresAgentStore,
     QueuedInputStatus, SessionConfig, SubagentType,
@@ -61,7 +61,6 @@ use crate::provider_runtime::{
 };
 use crate::runtime::SessionDriver;
 use crate::state::AppState;
-use crate::types::RuntimeSession;
 use crate::workspaces::WorkspaceManager;
 
 use super::{
@@ -72,6 +71,7 @@ use crate::delegation_tools::{
     cancel_core, read_handoff_file_core, rpc_list, run_delegation_tool, status_core,
     steer_subagent_core,
 };
+use crate::{enqueue_session_input, SessionInputRequest};
 
 static TEST_DB_COUNTER: AtomicU64 = AtomicU64::new(90_000);
 
@@ -681,6 +681,30 @@ async fn create_busy_full_subagent(
     delegation_id: &str,
     session_id: &str,
 ) {
+    create_busy_subagent(
+        env,
+        project_id,
+        parent_id,
+        delegation_id,
+        session_id,
+        "implementer",
+        SubagentType::Full,
+    )
+    .await;
+}
+
+/// A delegation subagent with an active, unfinished model action. This keeps the
+/// session genuinely busy so a steer-priority input should be queued rather
+/// than immediately consumed into a new turn.
+async fn create_busy_subagent(
+    env: &TestEnv,
+    project_id: Uuid,
+    parent_id: &str,
+    delegation_id: &str,
+    session_id: &str,
+    role: &str,
+    subagent_type: SubagentType,
+) {
     let active_leaf = format!("{session_id}_a");
     let entries = vec![
         TranscriptStorageNode {
@@ -711,7 +735,7 @@ async fn create_busy_full_subagent(
         .start_session_outputs_with_parent(
             session_id,
             &session_config(env, project_id, {
-                let mut metadata = subagent_test_metadata("implementer", SubagentType::Full);
+                let mut metadata = subagent_test_metadata(role, subagent_type);
                 metadata["harness"] = json!(true);
                 metadata
             }),
@@ -723,11 +747,11 @@ async fn create_busy_full_subagent(
             &UserMessage::text("keep working"),
             None,
             Some(parent_id),
-            Some(SubagentType::Full),
+            Some(subagent_type),
             Some(delegation_id),
         )
         .await
-        .expect("create busy full subagent");
+        .expect("create busy subagent");
     assert_eq!(
         env.state.repo.activity(session_id).await.expect("activity"),
         agent_store::SessionActivity::Running
@@ -1620,6 +1644,7 @@ async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
         .await
         .expect("create project");
     create_parent(&env, project_id, "parent").await;
+    create_parent(&env, project_id, "other_parent").await;
     let delegation = env
         .state
         .repo
@@ -1627,6 +1652,23 @@ async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
         .await
         .expect("create delegation");
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
+
+    let scoped_error = steer_subagent_core(
+        &env.state,
+        "other_parent",
+        json!({ "subagent_id": "impl_busy", "message": "not your child" }),
+    )
+    .await
+    .expect_err("other parent cannot steer this subagent");
+    assert_eq!(scoped_error.code, "subagent_not_found");
+    assert!(env
+        .state
+        .repo
+        .queue_state("impl_busy")
+        .await
+        .expect("queue before valid steer")
+        .queued_inputs
+        .is_empty());
 
     let tool_result = run_delegation_tool(
         &env.state,
@@ -1663,6 +1705,107 @@ async fn model_facing_steer_subagent_queues_steer_for_running_full_subagent() {
         queued.content.as_text(),
         Some("Please also update the docs.")
     );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn raw_session_input_steer_rejects_direct_subagent_target() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "raw steer rejection", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::Full, None, Some("impl"), 1)
+        .await
+        .expect("create delegation");
+    create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "impl_busy").await;
+
+    let error = enqueue_session_input(
+        &env.state,
+        SessionInputRequest {
+            session_id: "impl_busy".to_string(),
+            priority: InputPriority::Steer,
+            content: UserMessage::text("raw direct steer should fail"),
+            client_input_id: Some("raw-direct-steer".to_string()),
+            base_leaf_id: None,
+            expected_active_leaf_id: None,
+        },
+    )
+    .await
+    .expect_err("raw steer to a subagent must be rejected");
+    assert_eq!(error.code, "subagent_steer_requires_parent_scope");
+    assert!(env
+        .state
+        .repo
+        .queue_state("impl_busy")
+        .await
+        .expect("queue state")
+        .queued_inputs
+        .is_empty());
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn websocket_delegation_steer_subagent_uses_parent_scope() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "websocket steer test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
+        .await
+        .expect("create delegation");
+    create_busy_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "readonly_busy",
+        "reviewer",
+        SubagentType::ReadOnly,
+    )
+    .await;
+
+    let error = crate::delegation_tools::rpc_steer_subagent(
+        &env.state,
+        json!({ "subagent_id": "readonly_busy", "message": "missing parent" }),
+    )
+    .await
+    .expect_err("parent scope is required");
+    assert_eq!(error.code, "invalid_params");
+
+    let result = crate::delegation_tools::rpc_steer_subagent(
+        &env.state,
+        json!({
+            "parent_session_id": "parent",
+            "subagent_id": "readonly_busy",
+            "message": "Please inspect one more file."
+        }),
+    )
+    .await
+    .expect("parent-scoped websocket steer succeeds");
+    assert_eq!(result["subagent_id"], "readonly_busy");
+    assert_eq!(result["queued"], true);
 
     env.cleanup().await;
 }
@@ -1712,7 +1855,7 @@ async fn model_facing_delegation_tools_reject_subagent_sessions() {
 }
 
 #[tokio::test]
-async fn steer_subagent_rejects_read_only_subagents() {
+async fn model_facing_steer_subagent_queues_steer_for_running_read_only_subagent() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -1730,14 +1873,14 @@ async fn steer_subagent_rejects_read_only_subagents() {
         .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
         .await
         .expect("create delegation");
-    let _boundary = create_running_subagent(
+    create_busy_subagent(
         &env,
         project_id,
         "parent",
         &delegation.id,
         "readonly_running",
         "reviewer",
-        TurnOutcome::Graceful,
+        SubagentType::ReadOnly,
     )
     .await;
 
@@ -1755,18 +1898,194 @@ async fn steer_subagent_rejects_read_only_subagents() {
         },
     )
     .await;
-    assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Error);
-    assert!(tool_result
-        .output
-        .contains("cannot_steer_read_only_subagent"));
-    assert!(env
+    assert_eq!(tool_result.status, agent_vocab::ToolResultStatus::Success);
+    let output: serde_json::Value =
+        serde_json::from_str(&tool_result.output).expect("tool output JSON");
+    assert_eq!(output["subagent_id"], "readonly_running");
+    assert_eq!(output["queued"], true);
+    assert!(output["input_id"].as_str().is_some());
+
+    let queue = env
         .state
         .repo
         .queue_state("readonly_running")
         .await
-        .expect("queue state")
-        .queued_inputs
-        .is_empty());
+        .expect("queue state");
+    assert_eq!(queue.queued_inputs.len(), 1);
+    let queued = &queue.queued_inputs[0];
+    assert_eq!(queued.priority, InputPriority::Steer);
+    assert_eq!(queued.status, QueuedInputStatus::Queued);
+    assert_eq!(
+        queued.content.as_text(),
+        Some("Please check one more file.")
+    );
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn running_read_only_snapshot_reports_steerable_only_when_accepted() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "steerable snapshot test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 2)
+        .await
+        .expect("create delegation");
+    create_busy_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "readonly_busy",
+        "reviewer",
+        SubagentType::ReadOnly,
+    )
+    .await;
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "readonly_done",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "Done.",
+    )
+    .await;
+
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    let snapshot_subagents = snapshot["subagents"].as_array().expect("subagents");
+    let busy = snapshot_subagents
+        .iter()
+        .find(|subagent| subagent["id"] == "readonly_busy")
+        .expect("busy subagent");
+    assert_eq!(busy["status"], "running");
+    assert_eq!(busy["activity"], "running");
+    assert_eq!(busy["steerable"], true);
+    let done = snapshot_subagents
+        .iter()
+        .find(|subagent| subagent["id"] == "readonly_done")
+        .expect("done subagent");
+    assert_eq!(done["status"], "done");
+    assert_eq!(done["steerable"], false);
+
+    let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
+        .await
+        .expect("list delegations");
+    let listed = list["delegations"].as_array().unwrap()[0]["subagents"]
+        .as_array()
+        .expect("listed subagents");
+    let listed_busy = listed
+        .iter()
+        .find(|subagent| subagent["id"] == "readonly_busy")
+        .expect("listed busy subagent");
+    assert_eq!(listed_busy["status"], "running");
+    assert_eq!(listed_busy["steerable"], true);
+    let listed_done = listed
+        .iter()
+        .find(|subagent| subagent["id"] == "readonly_done")
+        .expect("listed done subagent");
+    assert_eq!(listed_done["status"], "done");
+    assert_eq!(listed_done["steerable"], false);
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn queued_work_on_boundary_subagent_reports_running_and_steerable() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "queued boundary snapshot test", &[], json!({}))
+        .await
+        .expect("create project");
+    create_parent(&env, project_id, "parent").await;
+    let delegation = env
+        .state
+        .repo
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
+        .await
+        .expect("create delegation");
+    create_terminal_subagent(
+        &env,
+        project_id,
+        "parent",
+        &delegation.id,
+        "readonly_boundary",
+        "reviewer",
+        SubagentType::ReadOnly,
+        TurnOutcome::Graceful,
+        "Done for now.",
+    )
+    .await;
+    env.state
+        .repo
+        .enqueue_user_input(
+            "readonly_boundary",
+            InputPriority::Steer,
+            &UserMessage::text("queued work before barrier"),
+            Some("queued-boundary-work"),
+            None,
+        )
+        .await
+        .expect("queue steer");
+
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    assert_eq!(snapshot["status"], "running");
+    assert_eq!(snapshot["progress"]["terminal"], 0);
+    assert_eq!(snapshot["progress"]["running"], 1);
+    let subagent = &snapshot["subagents"].as_array().unwrap()[0];
+    assert_eq!(subagent["status"], "queued");
+    assert_eq!(subagent["activity"], "queued");
+    assert_eq!(subagent["outcome"], serde_json::Value::Null);
+    assert_eq!(subagent["steerable"], true);
+
+    let list = rpc_list(&env.state, json!({ "parent_session_id": "parent" }))
+        .await
+        .expect("list delegations");
+    let listed = &list["delegations"].as_array().unwrap()[0]["subagents"]
+        .as_array()
+        .unwrap()[0];
+    assert_eq!(listed["status"], "queued");
+    assert_eq!(listed["activity"], "queued");
+    assert_eq!(listed["steerable"], true);
+
+    let consumed = env
+        .state
+        .repo
+        .take_next_queued_input("readonly_boundary")
+        .await
+        .expect("take queued input")
+        .expect("queued input exists");
+    env.state
+        .repo
+        .persist_outputs(
+            "readonly_boundary",
+            agent_store::OutputBatch::new(&[], None, &[], &[]).with_consumed_input(Some(consumed)),
+        )
+        .await
+        .expect("mark queued input consumed");
+    let snapshot = inspect_delegation_snapshot(&env, &delegation.id).await;
+    assert_eq!(snapshot["progress"]["terminal"], 1);
+    let subagent = &snapshot["subagents"].as_array().unwrap()[0];
+    assert_eq!(subagent["status"], "done");
+    assert_eq!(subagent["steerable"], false);
 
     env.cleanup().await;
 }
@@ -1787,13 +2106,13 @@ async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_i
     let delegation = env
         .state
         .repo
-        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .create_delegation("parent", DelegationKind::ReadonlyFanout, None, None, 1)
         .await
         .expect("create delegation");
-    let active_leaf = "impl_idle_a";
+    let active_leaf = "ro_idle_a";
     let entries = vec![
         TranscriptStorageNode {
-            id: "impl_idle_u".to_string(),
+            id: "ro_idle_u".to_string(),
             parent_id: None,
             timestamp_ms: 1,
             item: TranscriptItem::UserMessage(UserMessage::text("keep working")),
@@ -1801,7 +2120,7 @@ async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_i
         },
         TranscriptStorageNode {
             id: active_leaf.to_string(),
-            parent_id: Some("impl_idle_u".to_string()),
+            parent_id: Some("ro_idle_u".to_string()),
             timestamp_ms: 2,
             item: TranscriptItem::AssistantMessage(AssistantMessage {
                 items: vec![AssistantItem::Text("mid turn".to_string())],
@@ -1812,11 +2131,11 @@ async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_i
     env.state
         .repo
         .start_session_outputs_with_parent(
-            "impl_idle",
+            "ro_idle",
             &session_config(
                 &env,
                 project_id,
-                json!({ "created_by": "test", "role_name": "implementer" }),
+                json!({ "created_by": "test", "role_name": "reviewer" }),
             ),
             &entries,
             Some(active_leaf),
@@ -1826,7 +2145,7 @@ async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_i
             &UserMessage::text("keep working"),
             None,
             Some("parent"),
-            Some(SubagentType::Full),
+            Some(SubagentType::ReadOnly),
             Some(&delegation.id),
         )
         .await
@@ -1834,22 +2153,18 @@ async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_i
     assert!(!env
         .state
         .repo
-        .active_leaf_is_turn_boundary("impl_idle")
+        .active_leaf_is_turn_boundary("ro_idle")
         .await
         .expect("nonterminal"));
     assert_eq!(
-        env.state
-            .repo
-            .activity("impl_idle")
-            .await
-            .expect("activity"),
+        env.state.repo.activity("ro_idle").await.expect("activity"),
         agent_store::SessionActivity::Idle
     );
 
     let error = steer_subagent_core(
         &env.state,
         "parent",
-        json!({ "subagent_id": "impl_idle", "message": "one more thing" }),
+        json!({ "subagent_id": "ro_idle", "message": "one more thing" }),
     )
     .await
     .expect_err("idle nonterminal subagent rejected");
@@ -1857,7 +2172,7 @@ async fn steer_subagent_rejects_idle_nonterminal_subagent_without_reactivating_i
     assert!(env
         .state
         .repo
-        .queue_state("impl_idle")
+        .queue_state("ro_idle")
         .await
         .expect("queue")
         .queued_inputs
@@ -3646,11 +3961,11 @@ async fn terminal_delegation_member_yields_zero_parent_idle_rows() {
     env.cleanup().await;
 }
 
-/// Server-side guard: a `Steer`-priority input targeting a `read_only` subagent
-/// is rejected with `cannot_steer_read_only_subagent`, a steer to a running full
-/// subagent is accepted, and terminal subagents are not reactivated.
+/// Server-side guard: raw `session.input` with `priority=steer` is not a
+/// subagent-control surface. Parents must use the scoped `steer_subagent` tool
+/// so the daemon can verify parent/delegation membership and running state.
 #[tokio::test]
-async fn steering_a_read_only_subagent_is_rejected_server_side() {
+async fn raw_session_input_steer_to_any_subagent_is_rejected_server_side() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -3681,17 +3996,6 @@ async fn steering_a_read_only_subagent_is_rejected_server_side() {
     )
     .await;
     create_busy_full_subagent(&env, project_id, "parent", &delegation.id, "full_running").await;
-    env.state.active.lock().await.insert(
-        "full_running".to_string(),
-        Arc::new(Mutex::new(RuntimeSession {
-            session: AgentSession::new(),
-            config: session_config(
-                &env,
-                project_id,
-                json!({ "created_by": "test", "role_name": "implementer", "harness": true }),
-            ),
-        })),
-    );
 
     let steer = |session_id: &str| {
         json!({
@@ -3701,20 +4005,21 @@ async fn steering_a_read_only_subagent_is_rejected_server_side() {
         })
     };
 
-    // Steering the read-only subagent is rejected by the server guard.
+    // Raw steering the read-only subagent is rejected by the server guard.
     let rejected = crate::input_user(&env.state, steer("ro"))
         .await
-        .expect_err("steering a read_only subagent must be rejected");
-    assert_eq!(rejected.code, "cannot_steer_read_only_subagent");
+        .expect_err("raw steering a read_only subagent must be rejected");
+    assert_eq!(rejected.code, "subagent_steer_requires_parent_scope");
 
-    // Steering a genuinely running full subagent is accepted.
-    let accepted = crate::input_user(&env.state, steer("full_running"))
+    // Raw steering a genuinely running full subagent is also rejected; use the
+    // parent-scoped `steer_subagent` tool instead.
+    let rejected = crate::input_user(&env.state, steer("full_running"))
         .await
-        .expect("steering a running full subagent is allowed");
-    assert_eq!(accepted["accepted"], true);
+        .expect_err("raw steering a running full subagent must be rejected");
+    assert_eq!(rejected.code, "subagent_steer_requires_parent_scope");
 
-    // A follow-up to the read-only subagent is unaffected by the steer guard.
-    crate::input_user(
+    // A follow-up to the read-only subagent is unaffected by the raw steer guard.
+    let follow_up = crate::input_user(
         &env.state,
         json!({
             "session_id": "ro",
@@ -3724,9 +4029,17 @@ async fn steering_a_read_only_subagent_is_rejected_server_side() {
     )
     .await
     .expect("a follow-up to a read_only subagent is allowed");
+    let follow_up_input_id = follow_up["input_id"].as_str().expect("input id");
+    let rejected = crate::input_promote_queued(
+        &env.state,
+        json!({ "session_id": "ro", "input_id": follow_up_input_id }),
+    )
+    .await
+    .expect_err("raw promotion to subagent steer must be rejected");
+    assert_eq!(rejected.code, "subagent_steer_requires_parent_scope");
 
-    // A full subagent that is already terminal must not be reactivated by a
-    // steer-priority input.
+    // A terminal full subagent must not be reactivated by a raw steer-priority
+    // input either.
     create_terminal_subagent(
         &env,
         project_id,
@@ -3741,8 +4054,8 @@ async fn steering_a_read_only_subagent_is_rejected_server_side() {
     .await;
     let rejected = crate::input_user(&env.state, steer("full_terminal"))
         .await
-        .expect_err("steering a terminal full subagent must be rejected");
-    assert_eq!(rejected.code, "subagent_terminal");
+        .expect_err("raw steering a terminal full subagent must be rejected");
+    assert_eq!(rejected.code, "subagent_steer_requires_parent_scope");
 
     env.cleanup().await;
 }

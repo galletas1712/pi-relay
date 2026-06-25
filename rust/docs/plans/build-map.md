@@ -78,7 +78,8 @@ flow into child `SessionConfig` at 284-291. Add `subagent_type` enum `{ Full, Re
 Interim it can also stamp into `metadata` via `subagent_metadata`, but spec wants a column for stage querying.
 
 **Control RPCs:** the stage client APIs must promote steer/interrupt to real RPCs reusing `enqueue_session_input(InputPriority::Steer)`
-(main.rs:924) + `interrupt_session` (main.rs:1240). RO subagents reject steer/interrupt by `subagent_type`.
+(main.rs:924) + `interrupt_session` (main.rs:1240). Active subagents can be steered; terminal/idle targets are rejected. RO remains
+read-only with respect to the parent filesystem because it runs in a disposable workspace snapshot.
 
 ### gotchas
 - `fork_session_from_parent` is the ONLY fork call (subagents.rs:264). No second/conditional fork.
@@ -411,7 +412,7 @@ tools (`delegate_writing_task`, `delegate_readonly_tasks`,
 | rust/crates/agent-daemon/src/provider_runtime/prompt.rs | tool_specs / prompt_context | 59-79 | ProviderTool→ToolSpec for prompt+wire. Delegation tool names flow automatically. |
 | rust/crates/agent-daemon/src/subagents.rs | spawn_subagent / subagent_spawn_from_active_parent / SubagentSpawnRequest | 69-376 | The delegation start tools reuse this engine. Fork at 264-273 (skip for full). sources/initial_context/fork_context (147-167,625-668) = legacy spec drops. |
 | rust/crates/agent-daemon/src/subagents.rs | subagent_list / require_known_subagent | 20-67, 541-559 | Pattern for stage inspection/listing + per-parent ownership guard. |
-| rust/crates/agent-daemon/src/repl.rs | subagents_steer_host / spawn host wrapper | 434-462, 682-712 | Steer path + spawn params. RO steer/interrupt must be REJECTED by subagent_type. |
+| rust/crates/agent-daemon/src/delegation_tools.rs | steer_subagent_core / start_* delegation tools | current | Steer path + spawn params. Running full and read-only delegation subagents may be steered; terminal subagents are rejected. |
 | rust/crates/agent-store/src/postgres/session_links.rs | session_parent_id / list_child_session_ids | 35-44 | one-stage-per-parent guard + stage inspection enumeration. |
 | rust/crates/agent-store/src/postgres/sessions.rs | activity | 528 | SessionActivity (Running/Idle) for terminal detection. |
 
@@ -445,8 +446,8 @@ per subagent, tagging stage_id + subagent_type. For full, skip fork (#1). Drop l
 - Homogeneity + single-full: structural per-tool (start_full takes one scalar role/prompt; fanout forces read_only).
 - One-stage-per-parent: query `parent_has_running_stage(parent_session_id)`, reject `stage_already_running` if any
   stage row for this parent is running.
-- Reject RO steer/interrupt: in subagents_steer_host/interrupt_host (repl.rs:682-712) + any stage steer path, reject if
-  child subagent_type == read_only.
+- Permit RO steer for running delegation subagents: `steer_subagent_core` serializes with the child driver and rejects only
+  terminal/out-of-scope targets. Whole-delegation cancellation may still interrupt RO children during teardown.
 
 **Error surfacing:** model path → ToolResultMessage::error (repl_tools.rs:26-39). If also client RPCs → RpcError
 (types.rs:131-139). Recommend core logic returns Result<Value,RpcError>, run_stage_tool adapts → ToolResultMessage::error.
@@ -725,14 +726,14 @@ queryKeys.stages/stage.
 KNOWN_SESSION_EVENTS; in handleSessionEvent invalidate queryKeys.stages. **Completion is a typed daemon observation in
 the parent transcript** — existing transcript pipeline renders it; board just flips the stage row via the query refresh.
 **5. Render+controls** (panels.tsx): RunBoard modeled on SubagentsSection; per subagent row link to child session; cancel
-stage → api.cancelStage; steer full subagent → api.queueFollowUp BUT at STEER priority (new path); re-run → startFull/
+stage → api.cancelStage; steer running subagent → parent-scoped `delegation.steer_subagent`; re-run → startFull/
 fanout (confirm with backend whether re-run is a fresh stage-start RPC or turn.resume).
 **6. Inspector wiring** (App.tsx:2040-2054 + panels.tsx:624): thread stages + callbacks; board subagent session_ids must
 feed desiredSessionIds (App.tsx:1062-1064).
 
 ### gotchas
 - Composer ALWAYS submits follow_up priority (submitComposer→queueFollowUp, only 'follow_up' literal at App.tsx:1382).
-  "Steer the full subagent" needs a NEW steer-priority path — does not exist today.
+  "Steer the running subagent" needs a NEW steer-priority path — does not exist today.
 - subagent.list returns ONLY {child_session_id, activity}; role/title/model fetched per-child. Prefer embedding in
   stage status/list responses to avoid N round-trips per fan-out.
 - NO stage.* RPC registered yet — coordinate exact param/result JSON with Phase 2 builder.
@@ -756,7 +757,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 | **#1** | Skip the workspace fork for `full` subagents | `subagents.rs:264-273` (the ONLY fork call) — branch on new `subagent_type`: ReadOnly keeps `fork_session_from_parent`, Full reuses `parent_config.outer_cwd/workspaces`. Add `subagent_type` enum to `SubagentSpawnRequest`/`Params` (subagents.rs:92-184). VERIFY `ensure_session` (session_start.rs:192) is no-op against parent cwd. Full teardown must NOT delete parent workspace (cleanup_failed_spawn:561, remove_session_dir:260). |
 | **#2** | Subvolume-aware destroy path | New `destroy_workspace_tree(root)` in `workspaces/instantiate.rs` (next to try_btrfs_subvolume_create:107, depth-first + remove_dir_all fallback) + public `destroy_session_workspaces(session_id)` on WorkspaceManager (`workspaces/mod.rs`, next to remove_session_dir:260). Redirect remove_session_dir to delegate. Call at RO terminal lifecycle. Exclude `.pi-handoff` from the fork (materialize_tree_from_source_exact:29). |
 | **#3** | Durable `stages` table + `sessions.stage_id`/`subagent_type` columns + stages repo | `schema.rs:20-128` SCHEMA_SQL (create stages BEFORE alters), text_enums in `lib.rs:58-92`, new `postgres/stages.rs` (register `mod stages;` mod.rs:1-16): create_stage, list_stage_subagents, finish_stage CAS, sweep_running_stages. Set values via start_session_outputs_with_parent (sessions.rs:252) or a setter mirroring set_session_parent. Update 3 explicit reads (list_sessions:428, load_session_config:500, session_snapshot snapshots.rs:24) only if surfaced. |
-| **#4** | Delegation model-facing tools + dispatch + 3 guards | Declare in `agent-tools/src/registry.rs:335-376` (register_runtime_tool, 4 `*_definition()` fns). Intercept by name in `runtime/tool.rs:58-90` (is_stage_tool_name/run_stage_tool). Engine reuses spawn_subagent (subagents.rs:191). Guards in run_stage_tool: homogeneity/single-full (structural), one-stage-per-parent (`parent_has_running_stage`), reject RO steer/interrupt (subagent_type). Update broken registry tests (476,516). Optionally register stage.* web RPCs in RpcMethod (types.rs:82-121) for UI/tests. |
+| **#4** | Delegation model-facing tools + dispatch + 3 guards | Declare in `agent-tools/src/registry.rs:335-376` (register_runtime_tool, 4 `*_definition()` fns). Intercept by name in `runtime/tool.rs:58-90` (is_stage_tool_name/run_stage_tool). Engine reuses spawn_subagent (subagents.rs:191). Guards in run_stage_tool: homogeneity/single-full (structural), one-stage-per-parent (`parent_has_running_stage`), reject terminal/out-of-scope steer targets while permitting running read-only subagents. Update broken registry tests (476,516). Optionally register stage.* web RPCs in RpcMethod (types.rs:82-121) for UI/tests. |
 | **#5** | Handoff writer (transcript.md + final_message.md; inspect_delegation snapshot) | New module (e.g. `agent-daemon/src/handoff.rs`): `render_transcript_markdown(&HistoryTree)` + `extract_final_message(&HistoryTree)`, reading `active_branch(child)` (transcript.rs:328, Ui mode). Path `<parent.outer_cwd>/.pi-handoff/<stage_id>/<subagent>/` via load_session_config(parent).outer_cwd. Run inside the barrier (Section #6). `inspect_delegation` carries role/status/outcome/paths per subagent. |
 | **#6** | Barrier → typed daemon wakeup hook in subagent-lifecycle path | Stage runner `on_subagent_terminal`/`try_stage_barrier` on SessionDriver, called at the three try_subagent_parent_idle_event call sites (`runtime/mod.rs:211,359,420`). Barrier: lock stage row (stages.rs CAS, FOR UPDATE) → all-subagents-terminal predicate → finish_stage CAS (running→done|done_with_failures from TurnOutcome) → render handoff (#5) → ONE typed daemon observation queued at `InputPriority::Steer` to parent. SUPPRESS per-child idle notification for stage members. Wire stage_runner into AppState (state.rs:30). |
 | **#7** | Workflow skills installed + discoverable + PI.md rewrite | Copy 4 drafts to `/home/schwinns/pi-relay-wf/workflows/<name>/SKILL.md`. THREE loader edits: load_packaged_role_skills (skills.rs:153, role fallback), load_prompt_skills (prompt.rs:81, index — thread prompt_root), load_skill_output_with_home (skills.rs:62, LoadSkill — thread prompt_root). Rewrite PI.md:40-64 with Appendix B (AFTER Phases 1-3). |
@@ -784,7 +785,7 @@ feed desiredSessionIds (App.tsx:1062-1064).
 - `agent-daemon/src/runtime/tool.rs` — is_stage_tool_name/run_stage_tool arm (58-90).
 - `agent-daemon/src/` (new stages module) — run_stage_tool + 3 guards, reusing spawn_subagent.
 - Optionally `agent-daemon/src/types.rs` + `main.rs:255-293` — RpcMethod::Stage* for UI/tests.
-- `agent-daemon/src/repl.rs` — reject RO steer/interrupt (682-712).
+- `agent-daemon/src/delegation_tools.rs` — permit RO steer for running delegation subagents; keep terminal/out-of-scope guards.
 
 **Phase 3 — barrier → typed daemon wakeup observation + handoff writer**
 - `agent-daemon/src/state.rs` — stage_runner handle in AppState.

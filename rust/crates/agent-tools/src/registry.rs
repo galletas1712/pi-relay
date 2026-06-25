@@ -409,7 +409,7 @@ fn cancel_delegation_definition() -> ToolDefinition {
 fn steer_subagent_definition() -> ToolDefinition {
     ToolDefinition::new(
         "steer_subagent",
-        "Send an additional instruction or correction to a running full subagent without cancelling and restarting it. The subagent id is the subagent session id shown by inspect_delegation.",
+        "Send an additional instruction or correction to a running subagent without cancelling and restarting it. Read-only subagent workspaces are disposable, but their running conversations can still be steered. The subagent id is the subagent session id shown by inspect_delegation.",
         json!({
             "type": "object",
             "properties": {

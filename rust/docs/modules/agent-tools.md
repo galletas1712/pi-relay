@@ -159,7 +159,8 @@ subagents; `inspect_delegation` returns the canonical structured state/outcome
 snapshot (with task/final/transcript artifact paths, not inline full prompts or
 transcripts);
 `cancel_delegation` cancels an existing delegation; `steer_subagent` queues an
-additional instruction to a running full subagent. Delegation subagents may produce
+additional instruction to a running subagent. Read-only subagents have disposable
+workspaces, not immutable conversations. Delegation subagents may produce
 `subagent.spawned`/`subagent.running` progress events, but delegation completion
 arrives later as a daemon-authored parent observation containing an
 `inspect_delegation`-equivalent snapshot plus artifact paths, not as a per-child

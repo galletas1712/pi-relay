@@ -2,6 +2,7 @@ use std::path::Path;
 
 use agent_store::{Delegation, DelegationStatus, SessionActivity, SubagentType};
 
+use crate::delegation_tools::load_subagent_work_state;
 use crate::handoff::{delegation_dir, extract_outcome};
 use crate::state::AppState;
 
@@ -128,20 +129,21 @@ async fn append_subagents(
         .await?;
     let shown = subagents.len().min(MAX_SUBAGENTS_PER_DELEGATION);
     for subagent in subagents.iter().take(shown) {
-        let terminal = state
-            .repo
-            .active_leaf_is_turn_boundary(&subagent.session_id)
+        let work_state = load_subagent_work_state(state, &subagent.session_id)
             .await
-            .unwrap_or(false);
-        let status = subagent_status(delegation.status, terminal, subagent.activity);
-        let has_active_work = matches!(delegation.status, DelegationStatus::Running)
-            && subagent.subagent_type == Some(SubagentType::Full)
-            && !terminal
-            && (subagent.activity != SessionActivity::Idle
-                || subagent_has_active_runtime(state, &subagent.session_id).await);
+            .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
+        let completion_terminal = {
+            if matches!(delegation.status, DelegationStatus::Running) {
+                work_state.is_completion_terminal()
+            } else {
+                work_state.active_leaf_is_turn_boundary
+            }
+        };
+        let status = subagent_status(delegation.status, completion_terminal, subagent.activity);
+        let has_active_work = work_state.has_active_work();
         let steerable = matches!(delegation.status, DelegationStatus::Running)
-            && subagent.subagent_type == Some(SubagentType::Full)
-            && !terminal
+            && subagent.subagent_type.is_some()
+            && !completion_terminal
             && has_active_work;
         out.push_str(&format!(
             "  - subagent_id: `{}`; role: {}; type: {}; activity: {}; status: {}; steerable: {}; transcript_file: {}",
@@ -177,10 +179,6 @@ async fn append_subagents(
         ));
     }
     Ok(())
-}
-
-async fn subagent_has_active_runtime(state: &AppState, subagent_id: &str) -> bool {
-    state.active.lock().await.contains_key(subagent_id)
 }
 
 fn subagent_status(
