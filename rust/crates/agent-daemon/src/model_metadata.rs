@@ -6,8 +6,9 @@ use agent_vocab::{ProviderKind, ReasoningEffort};
 pub(crate) fn context_window(provider: ProviderKind, model: &str) -> Option<usize> {
     match provider {
         ProviderKind::OpenAi => match model {
-            "gpt-5.5" | "gpt-5.1" | "gpt-5.1-codex-max" | "gpt-5.1-codex-mini" | "gpt-5.2"
-            | "gpt-5.2-codex" | "gpt-5.3-codex" => Some(272_000),
+            "gpt-5.6-sol" | "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.5" | "gpt-5.1"
+            | "gpt-5.1-codex-max" | "gpt-5.1-codex-mini" | "gpt-5.2" | "gpt-5.2-codex"
+            | "gpt-5.3-codex" => Some(272_000),
             _ => None,
         },
         ProviderKind::Claude => match model {
@@ -32,6 +33,8 @@ pub(crate) fn default_auto_limit(provider: ProviderKind, model: &str) -> Option<
 //   gpt-5.5 ("Supported values are: 'none', 'low', 'medium', 'high', and
 //   'xhigh'."). `minimal` and `max` are rejected. Only gpt-5.5 was authorized
 //   on the probe account; the rest of the family is assumed to share this set.
+//   The announced GPT-5.6 Sol preview adds `max`; Terra/Luna stay on the common
+//   gpt-5.x set until probed otherwise.
 // Claude opus-4-7/opus-4-8 (adaptive thinking): low/medium/high/xhigh/max all
 //   accepted on the wire; `none`/`minimal` are refused. sonnet-4-5 is
 //   non-adaptive, so the Anthropic adapter drops effort entirely; its table is
@@ -42,6 +45,15 @@ const OPENAI_GPT5_EFFORTS: &[ReasoningEffort] = &[
     ReasoningEffort::Medium,
     ReasoningEffort::High,
     ReasoningEffort::XHigh,
+];
+
+const OPENAI_GPT56_SOL_EFFORTS: &[ReasoningEffort] = &[
+    ReasoningEffort::None,
+    ReasoningEffort::Low,
+    ReasoningEffort::Medium,
+    ReasoningEffort::High,
+    ReasoningEffort::XHigh,
+    ReasoningEffort::Max,
 ];
 
 const CLAUDE_ADAPTIVE_EFFORTS: &[ReasoningEffort] = &[
@@ -58,8 +70,11 @@ pub(crate) fn supported_reasoning_efforts(
 ) -> &'static [ReasoningEffort] {
     match provider {
         ProviderKind::OpenAi => match model {
-            "gpt-5.5" | "gpt-5.1" | "gpt-5.1-codex-max" | "gpt-5.1-codex-mini" | "gpt-5.2"
-            | "gpt-5.2-codex" | "gpt-5.3-codex" => OPENAI_GPT5_EFFORTS,
+            "gpt-5.6-sol" => OPENAI_GPT56_SOL_EFFORTS,
+            "gpt-5.6-terra" | "gpt-5.6-luna" | "gpt-5.5" | "gpt-5.1" | "gpt-5.1-codex-max"
+            | "gpt-5.1-codex-mini" | "gpt-5.2" | "gpt-5.2-codex" | "gpt-5.3-codex" => {
+                OPENAI_GPT5_EFFORTS
+            }
             // Unknown OpenAI model: assume the gpt-5.x family's common set.
             _ => OPENAI_GPT5_EFFORTS,
         },
@@ -120,13 +135,16 @@ mod tests {
     #[test]
     fn known_openai_models_have_defaults() {
         assert_eq!(
-            context_window(ProviderKind::OpenAi, "gpt-5.1-codex-max"),
+            context_window(ProviderKind::OpenAi, "gpt-5.6-sol"),
             Some(272_000)
         );
         assert_eq!(
-            default_auto_limit(ProviderKind::OpenAi, "gpt-5.1-codex-max"),
+            default_auto_limit(ProviderKind::OpenAi, "gpt-5.6-sol"),
             Some(231_200)
         );
+        for model in ["gpt-5.6-terra", "gpt-5.6-luna"] {
+            assert_eq!(context_window(ProviderKind::OpenAi, model), Some(272_000));
+        }
     }
 
     #[test]
@@ -169,6 +187,8 @@ mod tests {
     fn gpt5_family_shares_gpt55_support() {
         use ReasoningEffort::*;
         for model in [
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
             "gpt-5.1",
             "gpt-5.1-codex-max",
             "gpt-5.1-codex-mini",
@@ -185,6 +205,19 @@ mod tests {
                 XHigh
             );
         }
+    }
+
+    #[test]
+    fn gpt56_sol_accepts_max_reasoning() {
+        use ReasoningEffort::*;
+        assert_eq!(
+            normalize_reasoning_effort(ProviderKind::OpenAi, "gpt-5.6-sol", Max),
+            Max
+        );
+        assert_eq!(
+            normalize_reasoning_effort(ProviderKind::OpenAi, "gpt-5.6-sol", Minimal),
+            Low
+        );
     }
 
     #[test]
@@ -225,6 +258,8 @@ mod tests {
         assert!(openai.contains(&None));
         assert!(!openai.contains(&Minimal));
         assert!(!openai.contains(&Max));
+        let sol = supported_reasoning_efforts(ProviderKind::OpenAi, "gpt-5.6-sol");
+        assert!(sol.contains(&Max));
         let claude = supported_reasoning_efforts(ProviderKind::Claude, "claude-opus-4-8");
         assert!(claude.contains(&Max));
         assert!(!claude.contains(&None));

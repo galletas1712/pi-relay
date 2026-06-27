@@ -134,7 +134,7 @@ stored `outer_cwd`.
 ```json
 {
   "kind": "openai",
-  "model": "gpt-5.5",
+  "model": "gpt-5.6-sol",
   "reasoning_effort": "xhigh",
   "prompt_cache": { "key": "pi-relay-local" }
 }
@@ -158,9 +158,10 @@ OpenAI request path. `max_tokens` is optional; when omitted the daemon does not
 set an OpenAI output cap.
 
 `reasoning_effort` defaults to `medium`. OpenAI currently accepts `none`,
-`minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay. Claude accepts
-`low`, `medium`, `high`, `xhigh`, and `max`; Claude Opus 4.8 requests are sent
-with adaptive thinking and `output_config.effort`.
+`minimal`, `low`, `medium`, `high`, and `xhigh` in pi-relay; `gpt-5.6-sol` also
+accepts `max`. Claude accepts `low`, `medium`, `high`, `xhigh`, and `max`;
+Claude Opus 4.8 requests are sent with adaptive thinking and
+`output_config.effort`.
 
 ### `daemon_config`
 
@@ -440,7 +441,7 @@ the normal frontend path for a brand-new draft.
   "project_id": "f2b0e23c-1fd7-4977-9d60-f6842e25d15b",
   "provider": {
     "kind": "openai",
-    "model": "gpt-5.5",
+    "model": "gpt-5.6-sol",
     "prompt_cache": { "key": "pi-relay-local" }
   },
   "metadata": { "title": "New session", "created_by": "web" },
@@ -545,7 +546,7 @@ Result shape:
   ],
   "activity": "idle",
   "active_leaf_id": "entry_9",
-  "provider": { "kind": "openai", "model": "gpt-5.5" },
+  "provider": { "kind": "openai", "model": "gpt-5.6-sol" },
   "metadata": {},
   "pending_actions": [],
   "queued_inputs": [],
@@ -1914,7 +1915,7 @@ With `~/.codex/auth.json` or `CODEX_ACCESS_TOKEN` available:
     "session_id": "manual_real_codex",
     "provider": {
       "kind": "openai",
-      "model": "gpt-5.5",
+      "model": "gpt-5.6-sol",
       "prompt_cache": { "key": "pi-relay-real-smoke" }
     },
     "metadata": { "manual": "real-codex" }

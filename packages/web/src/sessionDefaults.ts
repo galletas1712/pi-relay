@@ -8,9 +8,19 @@ export interface ModelOption {
 
 export const MODEL_OPTIONS: ModelOption[] = [
 	{
-		id: "openai:gpt-5.5",
-		label: "OpenAI GPT-5.5",
-		provider: { kind: "openai", model: "gpt-5.5", reasoning_effort: "xhigh" }
+		id: "openai:gpt-5.6-sol",
+		label: "OpenAI GPT-5.6 Sol",
+		provider: { kind: "openai", model: "gpt-5.6-sol", reasoning_effort: "xhigh" }
+	},
+	{
+		id: "openai:gpt-5.6-terra",
+		label: "OpenAI GPT-5.6 Terra",
+		provider: { kind: "openai", model: "gpt-5.6-terra", reasoning_effort: "xhigh" }
+	},
+	{
+		id: "openai:gpt-5.6-luna",
+		label: "OpenAI GPT-5.6 Luna",
+		provider: { kind: "openai", model: "gpt-5.6-luna", reasoning_effort: "xhigh" }
 	},
 	{
 		id: "claude:claude-opus-4-8",
@@ -20,11 +30,12 @@ export const MODEL_OPTIONS: ModelOption[] = [
 ];
 
 export const OPENAI_REASONING_EFFORTS: ReasoningEffort[] = ["none", "minimal", "low", "medium", "high", "xhigh"];
+export const OPENAI_SOL_REASONING_EFFORTS: ReasoningEffort[] = [...OPENAI_REASONING_EFFORTS, "max"];
 export const CLAUDE_REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh", "max"];
 
 export const DEFAULT_PROVIDER: ProviderConfig = {
 	kind: "openai",
-	model: "gpt-5.5",
+	model: "gpt-5.6-sol",
 	reasoning_effort: "xhigh"
 };
 
@@ -51,5 +62,6 @@ export function providerFromModelKey(modelKey: string, current: ProviderConfig):
 }
 
 export function reasoningEffortsForProvider(provider: ProviderConfig): ReasoningEffort[] {
-	return provider.kind === "claude" ? CLAUDE_REASONING_EFFORTS : OPENAI_REASONING_EFFORTS;
+	if (provider.kind === "claude") return CLAUDE_REASONING_EFFORTS;
+	return provider.model === "gpt-5.6-sol" ? OPENAI_SOL_REASONING_EFFORTS : OPENAI_REASONING_EFFORTS;
 }

@@ -699,7 +699,7 @@ fn response_error_message(body: &str) -> String {
 }
 
 fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Value> {
-    let reasoning_effort = openai_reasoning_effort(request.reasoning_effort);
+    let reasoning_effort = openai_reasoning_effort(&request.model, request.reasoning_effort);
     let tool_profile = request.tool_profile;
     let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
     let tools = response_tools(tool_profile, &request_tools)?;
@@ -741,7 +741,7 @@ fn responses_body(request: ModelRequest, session_id: &str) -> ProviderResult<Val
 // `include`, `tool_choice`) out, but preserve the same request-affinity fields
 // Codex now carries into compaction (`prompt_cache_key`, `service_tier`).
 fn compact_body(request: ProviderCompactionRequest, session_id: &str) -> ProviderResult<Value> {
-    let reasoning_effort = openai_reasoning_effort(request.reasoning_effort);
+    let reasoning_effort = openai_reasoning_effort(&request.model, request.reasoning_effort);
     let tool_profile = request.tool_profile;
     let request_tools = crate::effective_provider_tools(tool_profile, request.tools);
     let tools = response_tools(tool_profile, &request_tools)?;
@@ -792,10 +792,10 @@ fn response_provider_tools(tools: &[ProviderTool]) -> Vec<Value> {
 // Map a reasoning effort to the OpenAI wire string. The daemon normalizes the
 // session effort to a model-supported value before building the request (see
 // `model_metadata::normalize_reasoning_effort`), so this should always receive a
-// value OpenAI accepts. Defensively clamp the two values gpt-5.x rejects
-// (`minimal` and `max`, confirmed by a 2026-06-17 live probe) to their nearest
-// supported neighbor rather than letting a stray value produce a 400.
-fn openai_reasoning_effort(effort: ReasoningEffort) -> &'static str {
+// value OpenAI accepts. Defensively clamp `minimal` (all current gpt-5.x) and
+// `max` (all current gpt-5.x except gpt-5.6-sol) rather than letting a stray
+// direct adapter call produce a 400.
+fn openai_reasoning_effort(model: &str, effort: ReasoningEffort) -> &'static str {
     match effort {
         ReasoningEffort::None
         | ReasoningEffort::Low
@@ -803,6 +803,7 @@ fn openai_reasoning_effort(effort: ReasoningEffort) -> &'static str {
         | ReasoningEffort::High
         | ReasoningEffort::XHigh => effort.as_str(),
         ReasoningEffort::Minimal => ReasoningEffort::Low.as_str(),
+        ReasoningEffort::Max if model == "gpt-5.6-sol" => ReasoningEffort::Max.as_str(),
         ReasoningEffort::Max => ReasoningEffort::XHigh.as_str(),
     }
 }
@@ -1803,6 +1804,52 @@ mod tests {
         assert_eq!(body["input"][0]["content"][0]["text"], "hello");
         assert_eq!(body["input"][1]["role"], "user");
         assert_eq!(body["input"][1]["content"][0]["text"], "cwd: /tmp/project");
+    }
+
+    #[test]
+    fn responses_body_sends_sol_max_reasoning() {
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.6-sol".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::default(),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Max,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            },
+            "test-session",
+        )
+        .expect("responses body renders");
+
+        assert_eq!(body["reasoning"]["effort"], "max");
+    }
+
+    #[test]
+    fn responses_body_clamps_non_sol_max_reasoning() {
+        let body = responses_body(
+            ModelRequest {
+                model: "gpt-5.6-terra".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::default(),
+                transcript: vec![TranscriptItem::UserMessage(UserMessage::text("hello")).into()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::Max,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            },
+            "test-session",
+        )
+        .expect("responses body renders");
+
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
     }
 
     #[test]

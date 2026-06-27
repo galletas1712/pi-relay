@@ -228,12 +228,12 @@ transcript revision server-side, refreshing the picker if history changed undern
 
 ## Model and reasoning controls
 
-The chat header exposes a model picker and a provider-specific reasoning-effort picker (`sessionDefaults.ts`). Two
-providers are offered: OpenAI (`gpt-5.5`) and Claude (`claude-opus-4-8`). The provider/model is locked once the session
-has any transcript history, because both providers carry provider-shaped replay state across turns. Reasoning effort is a
-per-request knob and can change during or between turns (applying to subsequently created requests). Effort options
-differ by provider: OpenAI offers `none…xhigh`; Claude offers `low…max`. Changing model/effort calls `session.configure`
-and patches the cached list/snapshot.
+The chat header exposes a model picker and a provider-specific reasoning-effort picker (`sessionDefaults.ts`). OpenAI
+offers `gpt-5.6-sol` (default), `gpt-5.6-terra`, and `gpt-5.6-luna`; Claude offers `claude-opus-4-8`. The provider/model
+is locked once the session has any transcript history, because both providers carry provider-shaped replay state across
+turns. Reasoning effort is a per-request knob and can change during or between turns (applying to subsequently created
+requests). Effort options differ by provider/model: OpenAI generally offers `none…xhigh`, `gpt-5.6-sol` also offers
+`max`, and Claude offers `low…max`. Changing model/effort calls `session.configure` and patches the cached list/snapshot.
 
 ## Notes
 
