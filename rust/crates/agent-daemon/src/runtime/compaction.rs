@@ -7,9 +7,8 @@ use agent_store::{
 use agent_vocab::TranscriptItem;
 
 use crate::provider_runtime::{
-    compaction_auto_explicitly_disabled, compaction_auto_state,
-    compaction_config_with_model_metadata, model_input_tokens_for_gate, model_metadata_for_config,
-    run_compaction,
+    compaction_auto_state, compaction_config_with_model_metadata, model_input_tokens_for_gate,
+    model_metadata_for_config, parse_compaction_policy, run_compaction,
 };
 use crate::state::{AppState, RunningTask, TaskRegistrationId};
 use crate::types::{DispatchAction, RpcError, RuntimeSession};
@@ -147,7 +146,8 @@ async fn check_compaction_eligible(
         // path rather than compacting forever.
         return None;
     }
-    if compaction_auto_explicitly_disabled(&dispatch.config) {
+    let policy = parse_compaction_policy(&dispatch.config);
+    if policy.explicitly_disables_auto() {
         return None;
     }
     let discovered = if dispatch.config.provider.kind == agent_vocab::ProviderKind::Claude {
@@ -158,7 +158,7 @@ async fn check_compaction_eligible(
     } else {
         None
     };
-    let config = compaction_config_with_model_metadata(&dispatch.config, discovered);
+    let config = compaction_config_with_model_metadata(&dispatch.config, discovered, &policy);
     if !config.auto_enabled {
         return None;
     }

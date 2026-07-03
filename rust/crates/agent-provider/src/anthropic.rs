@@ -1711,72 +1711,6 @@ fn parse_anthropic_compaction_sse(text: &str) -> ProviderResult<ProviderCompacti
     state.finish()
 }
 
-fn validate_anthropic_compaction_response(
-    response: ModelResponse,
-) -> ProviderResult<ProviderCompactionResponse> {
-    if response.stop_reason != ModelStopReason::Compaction {
-        return Err(ProviderError::native_compaction(
-            NativeCompactionErrorKind::UnexpectedStopReason,
-            format!(
-                "expected compaction stop, received {:?}",
-                response.stop_reason
-            ),
-        ));
-    }
-    let mut compaction = None;
-    for item in &response.provider_replay {
-        let block = item.raw_value()?;
-        match block.get("type").and_then(Value::as_str) {
-            Some("compaction") if compaction.is_none() => compaction = Some(block),
-            Some("compaction") => {
-                return Err(ProviderError::native_compaction(
-                    NativeCompactionErrorKind::UnexpectedContent,
-                    "response contained more than one compaction block",
-                ))
-            }
-            Some(block_type) => {
-                return Err(ProviderError::native_compaction(
-                    NativeCompactionErrorKind::UnexpectedContent,
-                    format!("response contained unexpected {block_type} content block"),
-                ))
-            }
-            None => {
-                return Err(ProviderError::native_compaction(
-                    NativeCompactionErrorKind::MalformedStream,
-                    "response contained a content block without a type",
-                ))
-            }
-        }
-    }
-    let compaction = compaction.ok_or_else(|| {
-        ProviderError::native_compaction(
-            NativeCompactionErrorKind::MissingBlock,
-            "terminal compaction response did not contain a compaction block",
-        )
-    })?;
-    validate_anthropic_compaction_block(&compaction).map_err(|error| {
-        let kind = match error {
-            AnthropicCompactionBlockError::NullContent => NativeCompactionErrorKind::NullBlock,
-            AnthropicCompactionBlockError::EmptyContent => NativeCompactionErrorKind::EmptyBlock,
-            AnthropicCompactionBlockError::WrongType
-            | AnthropicCompactionBlockError::MissingContent
-            | AnthropicCompactionBlockError::NonStringContent
-            | AnthropicCompactionBlockError::InvalidEncryptedContent => {
-                NativeCompactionErrorKind::MalformedStream
-            }
-        };
-        ProviderError::native_compaction(
-            kind,
-            format!("invalid Anthropic compaction block: {}", error.message()),
-        )
-    })?;
-    Ok(ProviderCompactionResponse {
-        summary: None,
-        provider_replay: response.provider_replay,
-        usage: response.usage,
-    })
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum AnthropicCompactionFrame {
     #[default]
@@ -2038,44 +1972,52 @@ impl AnthropicCompactionStreamState {
         }
         let block = self
             .compaction_block
-            .ok_or_else(|| Self::malformed("compaction stream did not contain a block"))?;
+            .expect("terminal compaction frame requires a constructed block");
+        validate_anthropic_compaction_block(&block).map_err(|error| {
+            let kind = match error {
+                AnthropicCompactionBlockError::NullContent => NativeCompactionErrorKind::NullBlock,
+                AnthropicCompactionBlockError::EmptyContent => {
+                    NativeCompactionErrorKind::EmptyBlock
+                }
+                AnthropicCompactionBlockError::WrongType
+                | AnthropicCompactionBlockError::MissingContent
+                | AnthropicCompactionBlockError::NonStringContent
+                | AnthropicCompactionBlockError::InvalidEncryptedContent => {
+                    NativeCompactionErrorKind::MalformedStream
+                }
+            };
+            ProviderError::native_compaction(
+                kind,
+                format!("invalid Anthropic compaction block: {}", error.message()),
+            )
+        })?;
         let replay = ProviderReplayItem::new(ProviderKind::Claude, &block)?;
-        validate_anthropic_compaction_response(ModelResponse {
-            assistant: AssistantMessage { items: Vec::new() },
+        Ok(ProviderCompactionResponse {
+            summary: None,
             provider_replay: vec![replay],
             usage: self.usage,
-            stop_reason: ModelStopReason::Compaction,
-            stop_details: None,
         })
     }
 }
 
 struct AnthropicStreamState {
-    message: Value,
     content_blocks: Vec<Option<Value>>,
     provider_replay: Vec<ProviderReplayItem>,
     items: Vec<AssistantItem>,
     usage: Option<ProviderUsage>,
     stop_reason: ModelStopReason,
     stop_details: Option<ModelStopDetails>,
-    saw_message_start: bool,
-    saw_message_stop: bool,
-    saw_malformed_sse_json: bool,
 }
 
 impl Default for AnthropicStreamState {
     fn default() -> Self {
         Self {
-            message: Value::Null,
             content_blocks: Vec::new(),
             provider_replay: Vec::new(),
             items: Vec::new(),
             usage: None,
             stop_reason: ModelStopReason::Complete,
             stop_details: None,
-            saw_message_start: false,
-            saw_message_stop: false,
-            saw_malformed_sse_json: false,
         }
     }
 }
@@ -2084,10 +2026,7 @@ impl AnthropicStreamState {
     fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
         match event {
             SseEvent::Json(event) => self.process_event(&event),
-            SseEvent::MalformedJson => {
-                self.saw_malformed_sse_json = true;
-                Ok(SseControl::Continue)
-            }
+            SseEvent::MalformedJson => Ok(SseControl::Continue),
             SseEvent::Done => Ok(SseControl::Stop),
         }
     }
@@ -2096,9 +2035,10 @@ impl AnthropicStreamState {
         reject_ordinary_compaction_event(event)?;
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
-                self.saw_message_start = true;
-                self.message = event.get("message").cloned().unwrap_or_else(|| json!({}));
-                self.usage = self.message.get("usage").and_then(anthropic_usage);
+                self.usage = event
+                    .get("message")
+                    .and_then(|message| message.get("usage"))
+                    .and_then(anthropic_usage);
                 Ok(SseControl::Continue)
             }
             Some("content_block_start") => {
@@ -2145,10 +2085,7 @@ impl AnthropicStreamState {
                 }
                 Ok(SseControl::Continue)
             }
-            Some("message_stop") => {
-                self.saw_message_stop = true;
-                Ok(SseControl::Stop)
-            }
+            Some("message_stop") => Ok(SseControl::Stop),
             Some("error") => {
                 let error_type = event.pointer("/error/type").and_then(Value::as_str);
                 let message = anthropic_error_message(

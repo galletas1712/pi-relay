@@ -1613,6 +1613,30 @@ reproduced the same five pre-existing delegation/steering fixture failures
 `d296e3f`. No live Anthropic request is part of this change; special Messages
 requests remain covered by in-process wire mocks.
 
+### Final native-compaction policy correction
+
+- Restored the pre-existing direct `/compaction` policy reader as an atomic
+  fallback only when `/compaction/config` is absent. Nested null or malformed
+  values fail closed and never merge with direct siblings. The compatibility
+  reader can be removed after persisted rows are inventoried and all
+  direct-layout rows are migrated; current producers write the nested layout.
+- The daemon now ignores store-owned `max_consecutive_failures`, carries one
+  parsed policy through the cheap explicit-disable gate and optional model
+  metadata discovery, and keeps explicit auto enrollment without a known
+  threshold available for reactive overflow recovery only. Known windows below
+  the 8K floor still disable auto-compaction.
+- Anthropic native SSE finish validates its single state-machine-owned block
+  directly and returns `ProviderCompactionResponse`; the synthetic generic
+  response revalidation and dead ordinary-stream bookkeeping are gone.
+
+Validation: formatting and strict workspace clippy pass; all 20 focused daemon
+policy tests, all 58 focused Anthropic tests, the isolated-Postgres
+unknown-model reactive-overflow regression, all non-daemon workspace tests
+(including 53 store tests), 192 web tests, and the web production build pass.
+The full serial isolated-Postgres daemon run passed 182 tests and reproduced
+only the same five documented delegation/steering `Store(NotTurnBoundary)`
+fixture failures. No billed/live provider request was run.
+
 ### Lease/watchdog blocker interleavings
 
 - Heartbeat loss or renewal error now wakes the watchdog and stops renewal

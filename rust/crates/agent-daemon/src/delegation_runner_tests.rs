@@ -353,6 +353,9 @@ async fn commit_post_compaction_dispatch_with_faults(
         .entry("post_compaction_heartbeat_interval_ms".to_string())
         .or_insert(json!(10));
     let compaction = faults.remove("compaction");
+    let provider_model = faults
+        .remove("provider_model")
+        .and_then(|value| value.as_str().map(str::to_string));
     let mut metadata = json!({
         "created_by": "test",
         "fault_injection": faults
@@ -385,12 +388,16 @@ async fn commit_post_compaction_dispatch_with_faults(
         ),
         context_leaf_id: Some(source_leaf.clone()),
     };
+    let mut config = session_config(env, project_id, metadata);
+    if let Some(provider_model) = provider_model {
+        config.provider.model = provider_model;
+    }
     let (_, actions) = env
         .state
         .repo
         .start_session_outputs(
             session_id,
-            &session_config(env, project_id, metadata),
+            &config,
             &entries,
             Some(&source_leaf),
             &[],
@@ -984,7 +991,7 @@ async fn heartbeat_loss_after_terminal_commit_still_registers_persisted_successo
 }
 
 #[tokio::test]
-async fn heartbeat_loss_after_reactive_transition_still_registers_compaction() {
+async fn unknown_model_explicit_auto_recovers_overflow_across_heartbeat_loss() {
     let Some(env) = test_env().await else {
         eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
         return;
@@ -1007,10 +1014,10 @@ async fn heartbeat_loss_after_reactive_transition_still_registers_compaction() {
             "pause_compaction_dispatch_before_provider": true,
             "model_provider_max_attempts": 1,
             "model_result": "overflow",
+            "provider_model": "unknown-reactive-only-model",
             "compaction": {
                 "config": {
                     "auto_enabled": true,
-                    "auto_limit_tokens": 100000,
                     "remote_mode": "never"
                 }
             }
