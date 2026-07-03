@@ -1,28 +1,77 @@
+use std::time::Duration;
+
 use anyhow::{anyhow, Result};
 use serde_json::json;
 use sqlx::Row;
+use uuid::Uuid;
 
 use crate::{
-    ActionKind, ActionStatus, EventFrame, EventType, PendingDispatchAction, ResumableModelAction,
-    StoredAction,
+    ActionKind, ActionStatus, ClaimedPostCompactionDispatch, CorruptPostCompactionDispatch,
+    EventFrame, EventType, PendingDispatchAction, PostCompactionDispatchClaimError,
+    PostCompactionDispatchFence, PostCompactionDispatchIntent, PostCompactionDispatchLease,
+    ResumableModelAction, StoredAction,
 };
 
-use super::action_records::model_action_context_leaf_id;
+use super::action_records::{
+    model_action_context_leaf_id, post_compaction_dispatch_context_leaf_id,
+    post_compaction_dispatch_lease, post_compaction_dispatch_lease_expires_at_ms,
+    set_post_compaction_dispatch_lease, POST_COMPACTION_DISPATCH_KEY,
+};
 use super::events::insert_event_with_activity_tx;
 use super::queue::bump_revisions_tx;
 use super::rows::row_text;
-use super::sql::{action_is_unfinished, lock_session_tx, stale_unfinished_actions_for_session};
+use super::sql::{
+    action_is_unfinished, lock_session_tx, stale_unfinished_actions,
+    stale_unfinished_actions_for_session,
+};
 use super::PostgresAgentStore;
+
+fn corrupt_post_compaction_claim(
+    status: ActionStatus,
+    marker: serde_json::Value,
+    lease: Option<PostCompactionDispatchLease>,
+    error: impl std::fmt::Display,
+) -> PostCompactionDispatchClaimError {
+    PostCompactionDispatchClaimError::Corrupt(CorruptPostCompactionDispatch::new(
+        error.to_string(),
+        PostCompactionDispatchFence::new(status, marker, lease),
+    ))
+}
+
+fn transient_post_compaction_claim(
+    error: impl Into<anyhow::Error>,
+) -> PostCompactionDispatchClaimError {
+    PostCompactionDispatchClaimError::Transient(error.into())
+}
+
+fn marker_lease_fence(marker: &serde_json::Value) -> Option<PostCompactionDispatchLease> {
+    let owner_id = marker
+        .pointer("/lease/owner_id")
+        .and_then(serde_json::Value::as_str)?;
+    let generation = marker
+        .pointer("/lease/generation")
+        .and_then(serde_json::Value::as_u64)?;
+    let context_leaf_id = marker
+        .get("context_leaf_id")
+        .and_then(serde_json::Value::as_str)?;
+    Some(PostCompactionDispatchLease {
+        owner_id: owner_id.to_string(),
+        generation,
+        context_leaf_id: context_leaf_id.to_string(),
+    })
+}
 
 impl PostgresAgentStore {
     pub async fn mark_all_unfinished_actions_stale(&self) -> Result<u64> {
-        let unfinished_actions = action_is_unfinished(None);
+        let stale_actions = stale_unfinished_actions();
         let query = format!(
             r#"
             with updated_actions as (
                 update actions
-                set status='stale', updated_at=now()
-                where {unfinished_actions}
+                set status='stale',
+                    payload=payload - '{POST_COMPACTION_DISPATCH_KEY}',
+                    updated_at=now()
+                where {stale_actions}
                 returning session_id
             ),
             updated_sessions as (
@@ -37,6 +86,323 @@ impl PostgresAgentStore {
         );
         let updated: i64 = sqlx::query_scalar(&query).fetch_one(&self.pool).await?;
         Ok(updated as u64)
+    }
+
+    pub async fn post_compaction_dispatch_session_ids(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(&format!(
+            r#"
+            select distinct session_id
+            from actions
+            where status in ('pending','running')
+                and kind='model'
+                and payload ? '{POST_COMPACTION_DISPATCH_KEY}'
+            order by session_id
+            "#
+        ))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn post_compaction_dispatch_intents(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PostCompactionDispatchIntent>> {
+        let rows = sqlx::query(&format!(
+            r#"
+            select session_id, id, attempt_id
+            from actions
+            where session_id=$1
+                and status in ('pending','running')
+                and kind='model'
+                and payload ? '{POST_COMPACTION_DISPATCH_KEY}'
+            order by created_at, id
+            "#
+        ))
+        .bind(session_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PostCompactionDispatchIntent {
+                session_id: row.get("session_id"),
+                row_id: row.get("id"),
+                attempt_id: row.get("attempt_id"),
+            })
+            .collect())
+    }
+
+    pub async fn post_compaction_dispatch_intents_all(
+        &self,
+    ) -> Result<Vec<PostCompactionDispatchIntent>> {
+        let rows = sqlx::query(&format!(
+            r#"
+            select session_id, id, attempt_id
+            from actions
+            where status in ('pending','running')
+                and kind='model'
+                and payload ? '{POST_COMPACTION_DISPATCH_KEY}'
+            order by created_at, id
+            "#
+        ))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PostCompactionDispatchIntent {
+                session_id: row.get("session_id"),
+                row_id: row.get("id"),
+                attempt_id: row.get("attempt_id"),
+            })
+            .collect())
+    }
+
+    pub async fn claim_post_compaction_model_action(
+        &self,
+        intent: &PostCompactionDispatchIntent,
+        lease_duration: Duration,
+    ) -> std::result::Result<Option<ClaimedPostCompactionDispatch>, PostCompactionDispatchClaimError>
+    {
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(transient_post_compaction_claim)?;
+        lock_session_tx(&mut tx, &intent.session_id)
+            .await
+            .map_err(transient_post_compaction_claim)?;
+        let Some(row) = sqlx::query(&format!(
+            r#"
+            select a.status, a.kind, a.action_id, a.turn_id, a.payload, s.active_leaf_id,
+                (extract(epoch from clock_timestamp()) * 1000)::bigint as now_ms
+            from actions a
+            join sessions s on s.id=a.session_id
+            where a.session_id=$1
+                and a.id=$2::text
+                and a.attempt_id=$3::text
+                and a.status in ('pending','running')
+                and a.kind='model'
+                and a.payload ? '{POST_COMPACTION_DISPATCH_KEY}'
+            for update of a
+            "#
+        ))
+        .bind(&intent.session_id)
+        .bind(&intent.row_id)
+        .bind(&intent.attempt_id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(transient_post_compaction_claim)?
+        else {
+            tx.commit().await.map_err(transient_post_compaction_claim)?;
+            return Ok(None);
+        };
+        let mut payload: serde_json::Value = row.get("payload");
+        let original_marker = payload
+            .get(POST_COMPACTION_DISPATCH_KEY)
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        let status = row_text::<ActionStatus>(&row, "status").map_err(|error| {
+            corrupt_post_compaction_claim(
+                ActionStatus::Running,
+                original_marker.clone(),
+                None,
+                error,
+            )
+        })?;
+        let corrupt = |error| {
+            corrupt_post_compaction_claim(
+                status,
+                original_marker.clone(),
+                marker_lease_fence(&original_marker),
+                error,
+            )
+        };
+        let context_leaf_id =
+            post_compaction_dispatch_context_leaf_id(&payload, &intent.row_id, &intent.attempt_id)
+                .map_err(&corrupt)?;
+        let active_leaf_id = row.get::<Option<String>, _>("active_leaf_id");
+        if active_leaf_id.as_deref() != Some(context_leaf_id.as_str()) {
+            return Err(corrupt(anyhow!(
+                "post-compaction dispatch context leaf is not the session active leaf"
+            )));
+        }
+        let now_ms = row.get::<i64, _>("now_ms");
+        let prior_lease =
+            post_compaction_dispatch_lease(&payload, &intent.row_id, &intent.attempt_id)
+                .map_err(&corrupt)?;
+        let prior_expiration =
+            post_compaction_dispatch_lease_expires_at_ms(&payload).map_err(&corrupt)?;
+        let generation = match (status, prior_lease.as_ref(), prior_expiration) {
+            (ActionStatus::Pending, None, None) => 1,
+            (ActionStatus::Running, Some(lease), Some(expires_at_ms))
+                if expires_at_ms <= now_ms =>
+            {
+                lease.generation.checked_add(1).ok_or_else(|| {
+                    corrupt(anyhow!("post-compaction dispatch generation overflow"))
+                })?
+            }
+            (ActionStatus::Running, Some(_), Some(_)) => {
+                tx.commit().await.map_err(transient_post_compaction_claim)?;
+                return Ok(None);
+            }
+            (ActionStatus::Pending, _, _) => {
+                return Err(corrupt(anyhow!(
+                    "pending post-compaction dispatch unexpectedly carries a lease"
+                )));
+            }
+            (ActionStatus::Running, _, _) => {
+                return Err(corrupt(anyhow!(
+                    "running post-compaction dispatch has no valid lease"
+                )));
+            }
+            _ => return Ok(None),
+        };
+        let lease = PostCompactionDispatchLease {
+            owner_id: Uuid::new_v4().to_string(),
+            generation,
+            context_leaf_id: context_leaf_id.clone(),
+        };
+        let duration_ms = i64::try_from(lease_duration.as_millis())
+            .map_err(|_| {
+                transient_post_compaction_claim(anyhow!(
+                    "post-compaction dispatch lease duration is too large"
+                ))
+            })?
+            .max(1);
+        let expires_at_ms = now_ms.checked_add(duration_ms).ok_or_else(|| {
+            transient_post_compaction_claim(anyhow!(
+                "post-compaction dispatch lease expiration overflow"
+            ))
+        })?;
+        set_post_compaction_dispatch_lease(&mut payload, &lease, expires_at_ms)
+            .map_err(&corrupt)?;
+        let updated = sqlx::query(
+            r#"
+            update actions
+            set status='running', payload=$4, updated_at=now()
+            where session_id=$1
+                and id=$2::text
+                and attempt_id=$3::text
+                and kind='model'
+                and status=$5::text
+            "#,
+        )
+        .bind(&intent.session_id)
+        .bind(&intent.row_id)
+        .bind(&intent.attempt_id)
+        .bind(&payload)
+        .bind(status.as_str())
+        .execute(&mut *tx)
+        .await
+        .map_err(transient_post_compaction_claim)?
+        .rows_affected();
+        if updated != 1 {
+            return Err(transient_post_compaction_claim(anyhow!(
+                "post-compaction dispatch changed while claiming its lease"
+            )));
+        }
+        bump_revisions_tx(&mut tx, &intent.session_id, false, false)
+            .await
+            .map_err(transient_post_compaction_claim)?;
+        let action_id = row.get::<i64, _>("action_id");
+        let turn_id = row
+            .get::<Option<i64>, _>("turn_id")
+            .ok_or_else(|| corrupt(anyhow!("post-compaction model action missing turn_id")))?;
+        if action_id < 0 || turn_id < 0 {
+            return Err(corrupt(anyhow!(
+                "post-compaction model action has a negative id"
+            )));
+        }
+        let model_context = self
+            .model_context_for_leaf(&intent.session_id, &context_leaf_id)
+            .await
+            .map_err(transient_post_compaction_claim)?;
+        tx.commit().await.map_err(transient_post_compaction_claim)?;
+        Ok(Some(ClaimedPostCompactionDispatch {
+            pending: PendingDispatchAction {
+                row_id: intent.row_id.clone(),
+                attempt_id: intent.attempt_id.clone(),
+                action: agent_session::SessionAction::RequestModel {
+                    action_id: agent_vocab::ActionId(action_id as u64),
+                    turn_id: agent_vocab::TurnId(turn_id as u64),
+                    model_context,
+                    context_leaf_id: Some(context_leaf_id),
+                },
+            },
+            lease,
+        }))
+    }
+
+    pub async fn renew_post_compaction_dispatch_lease(
+        &self,
+        session_id: &str,
+        action_row_id: &str,
+        attempt_id: &str,
+        lease: &PostCompactionDispatchLease,
+        lease_duration: Duration,
+    ) -> Result<bool> {
+        let duration_ms = i64::try_from(lease_duration.as_millis())
+            .map_err(|_| anyhow!("post-compaction dispatch lease duration is too large"))?
+            .max(1);
+        let updated = sqlx::query(&format!(
+            r#"
+            update actions
+            set payload=jsonb_set(
+                    payload,
+                    '{{{POST_COMPACTION_DISPATCH_KEY},lease,expires_at_ms}}',
+                    to_jsonb(
+                        (extract(epoch from clock_timestamp()) * 1000)::bigint
+                        + $7::bigint
+                    )
+                ),
+                updated_at=now()
+            where session_id=$1
+                and id=$2::text
+                and attempt_id=$3::text
+                and kind='model'
+                and status='running'
+                and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'action_row_id'=$2
+                and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'attempt_id'=$3
+                and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'context_leaf_id'=$4
+                and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'owner_id'=$5
+                and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'generation'=$6
+                and (payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint
+                    > (extract(epoch from clock_timestamp()) * 1000)::bigint
+            "#,
+        ))
+        .bind(session_id)
+        .bind(action_row_id)
+        .bind(attempt_id)
+        .bind(&lease.context_leaf_id)
+        .bind(&lease.owner_id)
+        .bind(lease.generation.to_string())
+        .bind(duration_ms)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(updated == 1)
+    }
+
+    pub async fn next_post_compaction_dispatch_lease_delay(&self) -> Result<Option<Duration>> {
+        let delay_ms: Option<i64> = sqlx::query_scalar(&format!(
+            r#"
+            select min(
+                greatest(
+                    coalesce(
+                        (payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint,
+                        0
+                    ) - (extract(epoch from clock_timestamp()) * 1000)::bigint,
+                    0
+                )
+            )
+            from actions
+            where status in ('pending','running')
+                and kind='model'
+                and payload ? '{POST_COMPACTION_DISPATCH_KEY}'
+            "#,
+        ))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(delay_ms.map(|delay_ms| Duration::from_millis(delay_ms.max(0) as u64)))
     }
 
     pub async fn mark_unfinished_actions_stale(&self, session_id: &str) -> Result<u64> {
@@ -72,18 +438,35 @@ impl PostgresAgentStore {
         action_row_id: &str,
     ) -> Result<StoredAction> {
         let row = sqlx::query(
-            "select kind, action_id, turn_id, attempt_id from actions where session_id=$1 and id=$2::text and kind='model' and status in ('pending','running')",
+            "select kind, action_id, turn_id, attempt_id, payload from actions where session_id=$1 and id=$2::text and kind='model' and status in ('pending','running')",
         )
             .bind(session_id)
             .bind(action_row_id)
             .fetch_optional(&self.pool)
             .await?
             .ok_or_else(|| anyhow!("model action not found or not active: {action_row_id}"))?;
+        let payload: serde_json::Value = row.get("payload");
+        let attempt_id: String = row.get("attempt_id");
+        let (post_compaction_dispatch_context_leaf_id, post_compaction_dispatch_lease) =
+            if payload.get(POST_COMPACTION_DISPATCH_KEY).is_some() {
+                (
+                    Some(post_compaction_dispatch_context_leaf_id(
+                        &payload,
+                        action_row_id,
+                        &attempt_id,
+                    )?),
+                    post_compaction_dispatch_lease(&payload, action_row_id, &attempt_id)?,
+                )
+            } else {
+                (None, None)
+            };
         Ok(StoredAction {
             kind: row_text::<ActionKind>(&row, "kind")?,
             action_id: row.get("action_id"),
             turn_id: row.get("turn_id"),
-            attempt_id: row.get("attempt_id"),
+            attempt_id,
+            post_compaction_dispatch_context_leaf_id,
+            post_compaction_dispatch_lease,
         })
     }
 
@@ -140,8 +523,15 @@ impl PostgresAgentStore {
         session_id: &str,
         action_row_id: &str,
         attempt_id: &str,
+        post_compaction_dispatch_lease: Option<&PostCompactionDispatchLease>,
     ) -> Result<bool> {
-        let query = r#"
+        let lease_owner = post_compaction_dispatch_lease.map(|lease| lease.owner_id.as_str());
+        let lease_generation =
+            post_compaction_dispatch_lease.map(|lease| lease.generation.to_string());
+        let lease_context =
+            post_compaction_dispatch_lease.map(|lease| lease.context_leaf_id.as_str());
+        let query = format!(
+            r#"
                 select exists(
                     select 1
                     from actions
@@ -149,12 +539,31 @@ impl PostgresAgentStore {
                         and id=$2::text
                         and attempt_id=$3::text
                         and status='running'
+                        and (
+                            (
+                                $4::text is null
+                                and not (payload ? '{POST_COMPACTION_DISPATCH_KEY}')
+                            )
+                            or (
+                                payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'action_row_id'=$2
+                                and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'attempt_id'=$3
+                                and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'context_leaf_id'=$6
+                                and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'owner_id'=$4
+                                and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'generation'=$5
+                                and (payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint
+                                    > (extract(epoch from clock_timestamp()) * 1000)::bigint
+                            )
+                        )
                 )
-                "#;
-        Ok(sqlx::query_scalar(query)
+                "#
+        );
+        Ok(sqlx::query_scalar(&query)
             .bind(session_id)
             .bind(action_row_id)
             .bind(attempt_id)
+            .bind(lease_owner)
+            .bind(lease_generation)
+            .bind(lease_context)
             .fetch_one(&self.pool)
             .await?)
     }
@@ -192,16 +601,122 @@ impl PostgresAgentStore {
         Ok(vec![event])
     }
 
-    pub async fn mark_action_stale(&self, session_id: &str, action_row_id: &str) -> Result<()> {
+    pub async fn fail_corrupt_post_compaction_model_action(
+        &self,
+        intent: &PostCompactionDispatchIntent,
+        fence: &PostCompactionDispatchFence,
+        error: &str,
+    ) -> Result<Vec<EventFrame>> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, &intent.session_id).await?;
+        let lease_owner = fence.lease.as_ref().map(|lease| lease.owner_id.as_str());
+        let lease_generation = fence
+            .lease
+            .as_ref()
+            .map(|lease| lease.generation.to_string());
+        let updated = sqlx::query(&format!(
+            r#"
+            update actions
+            set status=$6::text,
+                result=$7,
+                payload=payload - $8::text,
+                updated_at=now()
+            where session_id=$1
+                and id=$2::text
+                and attempt_id=$3::text
+                and kind='model'
+                and status=$4::text
+                and payload->'{POST_COMPACTION_DISPATCH_KEY}'=$5
+                and (
+                    $9::text is null
+                    or (
+                        payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'owner_id'=$9
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'generation'=$10
+                    )
+                )
+            "#,
+        ))
+        .bind(&intent.session_id)
+        .bind(&intent.row_id)
+        .bind(&intent.attempt_id)
+        .bind(fence.status.as_str())
+        .bind(&fence.marker)
+        .bind(ActionStatus::Error.as_str())
+        .bind(serde_json::json!({ "error": error }))
+        .bind(POST_COMPACTION_DISPATCH_KEY)
+        .bind(lease_owner)
+        .bind(lease_generation)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+        bump_revisions_tx(&mut tx, &intent.session_id, false, false).await?;
+        let event = insert_event_with_activity_tx(
+            &mut tx,
+            &intent.session_id,
+            EventType::ModelError,
+            serde_json::json!({
+                "action_row_id": intent.row_id,
+                "error": error,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(vec![event])
+    }
+
+    pub async fn mark_action_stale(
+        &self,
+        session_id: &str,
+        action_row_id: &str,
+        attempt_id: &str,
+        post_compaction_dispatch_lease: Option<&PostCompactionDispatchLease>,
+    ) -> Result<bool> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let unfinished_actions = action_is_unfinished(None);
+        let lease_owner = post_compaction_dispatch_lease.map(|lease| lease.owner_id.as_str());
+        let lease_generation =
+            post_compaction_dispatch_lease.map(|lease| lease.generation.to_string());
+        let lease_context =
+            post_compaction_dispatch_lease.map(|lease| lease.context_leaf_id.as_str());
         let query = format!(
-            "update actions set status='stale', updated_at=now() where session_id=$1 and id=$2::text and {unfinished_actions}",
+            r#"
+            update actions
+            set status='stale',
+                payload=payload - '{POST_COMPACTION_DISPATCH_KEY}',
+                updated_at=now()
+            where session_id=$1
+                and id=$2::text
+                and attempt_id=$3::text
+                and {unfinished_actions}
+                and (
+                    (
+                        $4::text is null
+                        and not (payload ? '{POST_COMPACTION_DISPATCH_KEY}')
+                    )
+                    or (
+                        payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'action_row_id'=$2
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'attempt_id'=$3
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'context_leaf_id'=$6
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'owner_id'=$4
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'generation'=$5
+                        and (payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint
+                            > (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    )
+                )
+            "#,
         );
         let updated = sqlx::query(&query)
             .bind(session_id)
             .bind(action_row_id)
+            .bind(attempt_id)
+            .bind(lease_owner)
+            .bind(lease_generation)
+            .bind(lease_context)
             .execute(&mut *tx)
             .await?
             .rows_affected();
@@ -209,21 +724,23 @@ impl PostgresAgentStore {
             bump_revisions_tx(&mut tx, session_id, false, false).await?;
         }
         tx.commit().await?;
-        Ok(())
+        Ok(updated > 0)
     }
 
     pub async fn pending_actions_for_dispatch(
         &self,
         session_id: &str,
     ) -> Result<Vec<PendingDispatchAction>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             r#"
             select session_id, id, attempt_id, kind, action_id, turn_id, payload
             from actions
-            where session_id=$1 and status='pending'
+            where session_id=$1
+                and status='pending'
+                and not (kind='model' and payload ? '{POST_COMPACTION_DISPATCH_KEY}')
             order by created_at
             "#,
-        )
+        ))
         .bind(session_id)
         .fetch_all(&self.pool)
         .await?;
@@ -232,7 +749,7 @@ impl PostgresAgentStore {
         for row in rows {
             match row_text::<ActionKind>(&row, "kind") {
                 Ok(ActionKind::Model) => {
-                    actions.push(self.pending_model_dispatch_from_row(row).await?)
+                    actions.push(self.pending_model_dispatch_from_row(row, None).await?)
                 }
                 Ok(ActionKind::Tool) => actions.push(pending_tool_dispatch_from_row(row)?),
                 Ok(ActionKind::Compaction) => {}
@@ -245,10 +762,19 @@ impl PostgresAgentStore {
     async fn pending_model_dispatch_from_row(
         &self,
         row: sqlx::postgres::PgRow,
+        context_leaf_id: Option<String>,
     ) -> Result<PendingDispatchAction> {
         let payload: serde_json::Value = row.get("payload");
-        let context_leaf_id = model_action_context_leaf_id(&payload)
+        let context_leaf_id = context_leaf_id
+            .or_else(|| model_action_context_leaf_id(&payload))
             .ok_or_else(|| anyhow!("pending model action missing context_leaf_id"))?;
+        let action_id = row.get::<i64, _>("action_id");
+        let turn_id = row
+            .get::<Option<i64>, _>("turn_id")
+            .ok_or_else(|| anyhow!("pending model action missing turn_id"))?;
+        if action_id < 0 || turn_id < 0 {
+            return Err(anyhow!("pending model action has a negative id"));
+        }
         let model_context = self
             .model_context_for_leaf(row.get("session_id"), &context_leaf_id)
             .await?;
@@ -256,8 +782,8 @@ impl PostgresAgentStore {
             row_id: row.get("id"),
             attempt_id: row.get("attempt_id"),
             action: agent_session::SessionAction::RequestModel {
-                action_id: agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64),
-                turn_id: agent_vocab::TurnId(row.get::<i64, _>("turn_id") as u64),
+                action_id: agent_vocab::ActionId(action_id as u64),
+                turn_id: agent_vocab::TurnId(turn_id as u64),
                 model_context,
                 context_leaf_id: Some(context_leaf_id),
             },
@@ -273,11 +799,12 @@ impl PostgresAgentStore {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
         let updated = sqlx::query(
-            "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and kind='model' and status='pending'",
+            "update actions set status='running', updated_at=now() where session_id=$1 and id=$2::text and attempt_id=$3::text and kind='model' and status='pending' and not (payload ? $4::text)",
         )
         .bind(session_id)
         .bind(action_row_id)
         .bind(attempt_id)
+        .bind(POST_COMPACTION_DISPATCH_KEY)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -288,33 +815,62 @@ impl PostgresAgentStore {
         Ok(updated == 1)
     }
 
-    pub async fn fail_blocked_or_pending_model_action(
+    pub async fn fail_unfinished_model_action(
         &self,
         session_id: &str,
         action_row_id: &str,
         attempt_id: &str,
+        post_compaction_dispatch_lease: Option<&PostCompactionDispatchLease>,
         error: &str,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
-        let updated = sqlx::query(
+        let lease_owner = post_compaction_dispatch_lease.map(|lease| lease.owner_id.as_str());
+        let lease_generation =
+            post_compaction_dispatch_lease.map(|lease| lease.generation.to_string());
+        let lease_context =
+            post_compaction_dispatch_lease.map(|lease| lease.context_leaf_id.as_str());
+        let updated = sqlx::query(&format!(
             r#"
             update actions
             set status=$4::text,
                 result=$5,
+                payload=payload - $6::text,
                 updated_at=now()
             where session_id=$1
                 and id=$2::text
                 and attempt_id=$3::text
                 and kind='model'
-                and status in ('pending','blocked')
+                and status in ('pending','blocked','running')
+                and (
+                    (
+                        $7::text is null
+                        and (
+                            not (payload ? '{POST_COMPACTION_DISPATCH_KEY}')
+                            or status='pending'
+                        )
+                    )
+                    or (
+                        payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'action_row_id'=$2
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'attempt_id'=$3
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'context_leaf_id'=$9
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'owner_id'=$7
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'generation'=$8
+                        and (payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint
+                            > (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    )
+                )
             "#,
-        )
+        ))
         .bind(session_id)
         .bind(action_row_id)
         .bind(attempt_id)
         .bind(ActionStatus::Error.as_str())
         .bind(serde_json::json!({ "error": error }))
+        .bind(POST_COMPACTION_DISPATCH_KEY)
+        .bind(lease_owner)
+        .bind(lease_generation)
+        .bind(lease_context)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -350,6 +906,7 @@ impl PostgresAgentStore {
             update actions
             set status=$2::text,
                 result=$3,
+                payload=payload - $4::text,
                 updated_at=now()
             where session_id=$1 and {unfinished_actions}
             "#
@@ -358,6 +915,7 @@ impl PostgresAgentStore {
             .bind(session_id)
             .bind(ActionStatus::Interrupted.as_str())
             .bind(json!({ "reason": reason }))
+            .bind(POST_COMPACTION_DISPATCH_KEY)
             .execute(&mut *tx)
             .await?
             .rows_affected();

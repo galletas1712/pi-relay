@@ -11,7 +11,9 @@ use crate::{
     QueuedInputContent,
 };
 
-use super::action_records::{action_event_matches_row, action_payload, ActionKey};
+use super::action_records::{
+    action_event_matches_row, action_payload, ActionKey, POST_COMPACTION_DISPATCH_KEY,
+};
 use super::events::{insert_event_tx, insert_session_event_tx};
 use super::queue::{bump_revisions_tx, queue_event_payload, queue_state_tx};
 use super::rows::row_text;
@@ -200,6 +202,7 @@ pub(super) async fn persist_outputs_tx(
                 update actions
                 set status='interrupted',
                     result='{{"reason":"session interrupted"}}'::jsonb,
+                    payload=payload - '{POST_COMPACTION_DISPATCH_KEY}',
                     updated_at=now()
                 where session_id=$1 and {unfinished_actions}
                 "#
@@ -323,18 +326,50 @@ async fn complete_action_tx(
 ) -> Result<()> {
     let explicit_status = update.status;
     let explicit_result = update.result.clone();
-    let select_query = r#"
+    let lease_owner = update
+        .post_compaction_dispatch_lease
+        .as_ref()
+        .map(|lease| lease.owner_id.as_str());
+    let lease_generation = update
+        .post_compaction_dispatch_lease
+        .as_ref()
+        .map(|lease| lease.generation.to_string());
+    let lease_context = update
+        .post_compaction_dispatch_lease
+        .as_ref()
+        .map(|lease| lease.context_leaf_id.as_str());
+    let select_query = format!(
+        r#"
             select kind, action_id
             from actions
             where session_id=$1
                 and id=$2::text
                 and attempt_id=$3::text
                 and status in ('pending','running')
-            "#;
-    if let Some(row) = sqlx::query(select_query)
+                and (
+                    (
+                        $4::text is null
+                        and not (payload ? '{POST_COMPACTION_DISPATCH_KEY}')
+                    )
+                    or (
+                        payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'action_row_id'=$2
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'attempt_id'=$3
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'context_leaf_id'=$6
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'owner_id'=$4
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'generation'=$5
+                        and (payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint
+                            > (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    )
+                )
+            "#
+    );
+    if let Some(row) = sqlx::query(&select_query)
         .bind(session_id)
         .bind(&update.row_id)
         .bind(&update.attempt_id)
+        .bind(lease_owner)
+        .bind(&lease_generation)
+        .bind(lease_context)
         .fetch_optional(&mut **tx)
         .await
         .context("load action row for completion")?
@@ -364,20 +399,43 @@ async fn complete_action_tx(
         }
     }
 
-    let update_query = r#"
+    let update_query = format!(
+        r#"
             update actions
-            set status=$4, result=$5, updated_at=now()
+            set status=$4,
+                result=$5,
+                payload=payload - '{POST_COMPACTION_DISPATCH_KEY}',
+                updated_at=now()
             where session_id=$1
                 and id=$2::text
                 and attempt_id=$3::text
                 and status in ('pending','running')
-            "#;
-    let updated = sqlx::query(update_query)
+                and (
+                    (
+                        $6::text is null
+                        and not (payload ? '{POST_COMPACTION_DISPATCH_KEY}')
+                    )
+                    or (
+                        payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'action_row_id'=$2
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'attempt_id'=$3
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'context_leaf_id'=$8
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'owner_id'=$6
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'generation'=$7
+                        and (payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint
+                            > (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    )
+                )
+            "#
+    );
+    let updated = sqlx::query(&update_query)
         .bind(session_id)
         .bind(&update.row_id)
         .bind(&update.attempt_id)
         .bind(update.status.as_str())
         .bind(&update.result)
+        .bind(lease_owner)
+        .bind(lease_generation)
+        .bind(lease_context)
         .execute(&mut **tx)
         .await
         .context("update completed action row")?

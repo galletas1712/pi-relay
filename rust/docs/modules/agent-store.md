@@ -182,11 +182,16 @@ full model context — recovery rebuilds context by walking
 
 `action_is_unfinished` = `status in ('pending','blocked','running')`. These
 rows are execution leases owned by the live daemon process. At startup,
-`mark_all_unfinished_actions_stale` flips every unfinished row to `stale` (and
-bumps the owning sessions' `session_revision`) before clients are accepted.
-Completion is fenced by `(id, attempt_id, status in ('pending','running'))`, so
-a late completion from a stale attempt matches zero rows and cannot mutate
-history.
+`mark_all_unfinished_actions_stale` flips abandoned rows to `stale` (and bumps
+the owning sessions' `session_revision`) before clients are accepted. The sole
+exception is an attempt-fenced post-compaction dispatch intent in `pending` or
+`running`, described below. Its payload contains the narrower durable
+owner/generation/expiration lease used for restart reclaim.
+Ordinary completion is fenced by
+`(id, attempt_id, status in ('pending','running'))`; marked post-compaction
+completion additionally requires its exact unexpired owner/generation/context
+lease. A late completion from a stale attempt or lease therefore matches zero
+rows and cannot mutate history.
 
 Recovery invariants the daemon relies on:
 
@@ -210,22 +215,68 @@ Compaction is a typed transcript root, not a transcript replacement (see
   to be a turn boundary and not already a compaction summary.
 - `block_model_action_for_compaction` (auto): transitions a `pending`/`running`
   model action to `blocked` and inserts a sibling `running` compaction action in
-  the same transaction. Scope is `Boundary` if the source context is at a turn
-  boundary, else `MidTurn` (carrying the blocked model action's row/attempt ids
-  and the turn's persisted `turn_started_at_ms`).
+  the same transaction. Because this path always owns a blocked model action,
+  its scope is `MidTurn` (carrying the blocked action's row/attempt ids and the
+  turn's persisted `turn_started_at_ms`) even when a resumed action is anchored
+  directly on a `CompactionSummary` boundary. Manual compaction remains
+  `Boundary`.
 - `complete_compaction_action`: re-checks the action is still unfinished and
   validates the source leaf. If the source leaf changed *and* a `MidTurn`
   blocked model action is no longer blocked, it marks the compaction `stale`.
   Otherwise it installs a new `CompactionSummary` root (plus any continuation
   suffix), repoints `active_leaf_id`, and for `MidTurn` scope flips the blocked
-  model action back to `pending` re-anchored on the compacted leaf, returning it
-  as a `resumed_model_action` for the daemon to dispatch.
-- `fail_compaction_action` records a `CompactionError`.
+  model action back to `pending` re-anchored on the compacted leaf. Its payload
+  receives a typed `post_compaction_dispatch` marker containing the exact
+  action row, attempt, and compacted context leaf. The same transaction marks
+  compaction complete and persists `compaction.auto_state`, including the
+  consecutive-recompaction bound, before returning the resumed action for
+  daemon dispatch.
+- `fail_compaction_action` updates auto-failure/suppression metadata,
+  terminally errors the related unfinished model action for `MidTurn`, terminally
+  errors the compaction action, and records both error events in one
+  transaction. Manual `Boundary` failure has no model action to update.
+
+The marker is a narrow payload-backed dispatch outbox/lease for the
+commit-to-spawn/register crash window. Global and per-session abandoned-action
+sweeps preserve only `pending` or `running` model rows carrying it; ordinary
+pending/running/blocked work is still marked stale. Claim takes the session and
+action row lock, verifies the exact row/attempt/context leaf and active leaf,
+then retains the marker while writing:
+
+- a new random `owner_id`;
+- `generation = 1` for pending work or the previous generation plus one for an
+  expired running lease;
+- a database-clock `expires_at_ms` 30 seconds in the future.
+
+An unexpired running lease is not claimable. The runner renews its exact
+owner/generation every 10 seconds. Completion, error, reactive re-blocking,
+interruption, and task-failure staling are owner/generation fenced; terminal
+writes remove the marker atomically. Startup validates/reclaims pending or
+expired work. The daemon keeps a watchdog armed for the process lifetime,
+sleeps to the next database-derived expiry, wakes on heartbeat/runner loss, and
+backs off/retries transient inspection or recovery failures. Renewal loss stops
+the heartbeat but leaves the runner awaited so its own already-committed
+terminal or reactive-compaction handoff can finish; replacement registration
+aborts a genuinely stale owner after expiry. Deterministic marker corruption is
+returned as a typed claim error and changed to `error` with a `model.error`
+event under an exact status/marker/owner-generation fence. SQL/pool/query/commit
+and context/runtime-load errors retain the marker for retry rather than
+terminally classifying infrastructure failure as corrupt durable data.
+
+The guarantee is at-least-once dispatch. If a process dies after a provider
+accepted the request but before Postgres records the terminal result, lease
+expiry can issue a duplicate provider call. The current provider adapters do
+not send provider idempotency keys, so exactly-once calls cannot be claimed.
+The row/attempt/owner fences do prevent stale owners from committing a second
+durable result. Remove this narrow payload protocol only when a general durable
+dispatch outbox/lease provides the same atomic intent, ownership heartbeat,
+startup reclaim, and terminal-clear behavior.
 
 Auto-compaction failure/success bookkeeping lives in session metadata under
-`compaction.auto_state` (`record_auto_compaction_failure`,
-`reset_auto_compaction_failures`, `record_compaction_success`); consecutive
-failures past `max_consecutive_failures` set `suppressed`.
+`compaction.auto_state`. Compaction terminal transitions update it in the same
+transaction as their action rows; ordinary successful model completion can
+independently call `reset_auto_compaction_failures`. Consecutive failures past
+`max_consecutive_failures` set `suppressed`.
 
 ## Transcript reads and turn cards
 

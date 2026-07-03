@@ -22,13 +22,16 @@ use crate::{
     http::send_provider_generation_request,
     sse::{read_provider_json_sse_response, SseControl, SseEvent},
     ModelProvider, ModelRequest, ModelResponse, ModelStopDetails, ModelStopReason,
-    ModelTranscriptEntry, ProviderError, ProviderModelMetadata, ProviderResult,
+    ModelTranscriptEntry, NativeCompactionErrorKind, ProviderCompactionRequest,
+    ProviderCompactionResponse, ProviderError, ProviderModelMetadata, ProviderResult,
     ProviderTokenCountRequest, ProviderTokenCountResponse, ProviderToolProfile, ProviderUsage,
 };
 
 const DEFAULT_MAX_OUTPUT_BUDGET: u32 = 64_000;
 const UNKNOWN_MODEL_MAX_OUTPUT_TOKENS: u32 = 64_000;
 const CLAUDE_CODE_BETA: &str = "claude-code-20250219";
+const COMPACTION_BETA: &str = "compact-2026-01-12";
+const COMPACTION_TRIGGER_TOKENS: usize = 50_000;
 const CLAUDE_CODE_VERSION: &str = "2.1.75";
 const CLAUDE_CODE_USER_AGENT: &str = "claude-cli/2.1.75 (external, cli)";
 const ATTRIBUTION_FINGERPRINT_SALT: &str = "59cf53e54c78";
@@ -52,6 +55,83 @@ pub struct AnthropicProvider {
     api_key: String,
     base_url: String,
     model_cache: AnthropicModelCache,
+}
+
+fn transcript_contains_anthropic_compaction(transcript: &[ModelTranscriptEntry]) -> bool {
+    transcript.iter().any(|entry| {
+        entry
+            .provider_replay_for(ProviderKind::Claude)
+            .iter()
+            .any(|item| item.raw_type().as_deref() == Some("compaction"))
+    })
+}
+
+#[cfg(test)]
+fn compaction_body(request: ProviderCompactionRequest) -> ProviderResult<Value> {
+    let metadata = static_anthropic_model_metadata(&request.model);
+    compaction_body_with_metadata(request, &metadata)
+}
+
+fn compaction_body_with_metadata(
+    request: ProviderCompactionRequest,
+    metadata: &AnthropicModelMetadata,
+) -> ProviderResult<Value> {
+    if !metadata.capabilities.native_compaction {
+        return Err(ProviderError::native_compaction(
+            NativeCompactionErrorKind::Unsupported,
+            format!(
+                "Anthropic model {} does not advertise compact_20260112 support",
+                metadata.id
+            ),
+        ));
+    }
+    let instructions = request
+        .compaction_instructions
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            ProviderError::Provider(
+                "Anthropic native compaction requires non-empty custom instructions".to_string(),
+            )
+        })?;
+    let max_tokens = metadata.max_tokens.min(DEFAULT_MAX_OUTPUT_BUDGET);
+    let mut body = anthropic_request_body(AnthropicRequestBodyInput {
+        model: request.model,
+        prompt: request.prompt,
+        transcript: request.transcript,
+        // Native compaction is a text-only sampling request. Supplying no
+        // tools avoids Anthropic's documented null compaction-block failure.
+        tool_profile: ProviderToolProfile::None,
+        tools: Vec::new(),
+        max_tokens: Some(max_tokens),
+        reasoning_effort: Some(request.reasoning_effort),
+        capabilities: metadata.capabilities,
+        cache_transcript: true,
+        transcript_cache_prefix_len: None,
+    })?;
+    body["context_management"] = json!({
+        "edits": [{
+            "type": "compact_20260112",
+            "trigger": {
+                "type": "input_tokens",
+                "value": COMPACTION_TRIGGER_TOKENS,
+            },
+            "pause_after_compaction": true,
+            "instructions": instructions,
+        }],
+    });
+    Ok(body)
+}
+
+fn anthropic_compaction_beta_header() -> String {
+    format!("{CLAUDE_CODE_BETA},{COMPACTION_BETA}")
+}
+
+fn anthropic_beta_header_for_transcript(transcript: &[ModelTranscriptEntry]) -> String {
+    if transcript_contains_anthropic_compaction(transcript) {
+        anthropic_compaction_beta_header()
+    } else {
+        anthropic_beta_header().to_string()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -302,6 +382,7 @@ struct AnthropicModelCapabilities {
     high_effort: bool,
     xhigh_effort: bool,
     max_effort: bool,
+    native_compaction: bool,
 }
 
 impl AnthropicModelCapabilities {
@@ -315,6 +396,7 @@ impl AnthropicModelCapabilities {
             high_effort: true,
             xhigh_effort: true,
             max_effort: true,
+            native_compaction: true,
         }
     }
 
@@ -349,8 +431,17 @@ struct ModelsApiModel {
 
 #[derive(Debug, Deserialize)]
 struct ModelsApiCapabilities {
+    #[serde(default)]
+    context_management: Option<ModelsApiContextManagementCapability>,
     effort: ModelsApiEffortCapability,
     thinking: ModelsApiThinkingCapability,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsApiContextManagementCapability {
+    supported: bool,
+    #[serde(default)]
+    compact_20260112: Option<ModelsApiCapability>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -409,6 +500,10 @@ fn static_anthropic_model_metadata(model: &str) -> AnthropicModelMetadata {
                 high_effort: false,
                 xhigh_effort: false,
                 max_effort: false,
+                native_compaction: matches!(
+                    normalized.as_str(),
+                    "claude-mythos-5" | "claude-mythos-preview"
+                ),
             },
         ),
     };
@@ -426,6 +521,12 @@ fn merge_models_api_metadata(
 ) -> AnthropicModelMetadata {
     let mut capabilities = fallback.capabilities;
     if let Some(discovered_capabilities) = discovered.capabilities {
+        if let Some(context_management) = discovered_capabilities.context_management {
+            capabilities.native_compaction = context_management.supported
+                && context_management
+                    .compact_20260112
+                    .is_some_and(|capability| capability.supported);
+        }
         let effort = discovered_capabilities.effort;
         capabilities.effort = effort.supported;
         capabilities.low_effort = effort.low.supported;
@@ -484,6 +585,10 @@ fn parse_anthropic_count_tokens(text: &str) -> ProviderResult<ProviderTokenCount
         })?;
     Ok(ProviderTokenCountResponse {
         input_tokens: input_tokens as usize,
+        original_input_tokens: response
+            .pointer("/context_management/original_input_tokens")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize),
     })
 }
 
@@ -596,6 +701,7 @@ impl AnthropicProvider {
 #[async_trait]
 impl ModelProvider for AnthropicProvider {
     async fn complete(&self, request: ModelRequest) -> ProviderResult<ModelResponse> {
+        let beta_header = anthropic_beta_header_for_transcript(&request.transcript);
         let session_id = request
             .session_id
             .clone()
@@ -610,7 +716,7 @@ impl ModelProvider for AnthropicProvider {
                 .header("accept", "text/event-stream")
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01")
-                .header("anthropic-beta", anthropic_beta_header())
+                .header("anthropic-beta", beta_header)
                 .header("anthropic-dangerous-direct-browser-access", "true")
                 .header("User-Agent", CLAUDE_CODE_USER_AGENT)
                 .header("x-app", "cli")
@@ -631,10 +737,46 @@ impl ModelProvider for AnthropicProvider {
         }))
     }
 
+    fn supports_remote_compaction(&self) -> bool {
+        true
+    }
+
+    async fn compact(
+        &self,
+        request: ProviderCompactionRequest,
+    ) -> ProviderResult<ProviderCompactionResponse> {
+        let session_id = request
+            .session_id
+            .clone()
+            .or_else(|| request.prompt_cache_key.clone())
+            .unwrap_or_else(|| "pi-relay".to_string());
+        let metadata = self.resolved_model_metadata(&request.model).await;
+        let body = compaction_body_with_metadata(request, &metadata)?;
+
+        let response = send_provider_generation_request(
+            self.client
+                .post(format!("{}/messages", self.base_url.trim_end_matches('/')))
+                .header("accept", "text/event-stream")
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-beta", anthropic_compaction_beta_header())
+                .header("anthropic-dangerous-direct-browser-access", "true")
+                .header("User-Agent", CLAUDE_CODE_USER_AGENT)
+                .header("x-app", "cli")
+                .header("X-Claude-Code-Session-Id", session_id)
+                .header("x-client-request-id", client_request_id())
+                .json(&body),
+            "Anthropic native compaction /messages",
+        )
+        .await?;
+        parse_anthropic_compaction_stream(response).await
+    }
+
     async fn count_tokens(
         &self,
         request: ProviderTokenCountRequest,
     ) -> ProviderResult<ProviderTokenCountResponse> {
+        let beta_header = anthropic_beta_header_for_transcript(&request.transcript);
         let session_id = request
             .session_id
             .clone()
@@ -652,7 +794,7 @@ impl ModelProvider for AnthropicProvider {
             .header("accept", "application/json")
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
-            .header("anthropic-beta", anthropic_beta_header())
+            .header("anthropic-beta", beta_header)
             .header("anthropic-dangerous-direct-browser-access", "true")
             .header("User-Agent", CLAUDE_CODE_USER_AGENT)
             .header("x-app", "cli")
@@ -712,8 +854,9 @@ fn count_tokens_body_with_metadata(
     // Keep this as close as possible to `messages_body`: Anthropic's token
     // count endpoint accepts the same input-shaping fields (system, tools,
     // thinking/output config) but does not need a generation budget.
+    let replays_compaction = transcript_contains_anthropic_compaction(&request.transcript);
     let tool_profile = request.tool_profile;
-    anthropic_request_body(AnthropicRequestBodyInput {
+    let mut body = anthropic_request_body(AnthropicRequestBodyInput {
         model: request.model,
         prompt: request.prompt,
         transcript: request.transcript,
@@ -727,7 +870,15 @@ fn count_tokens_body_with_metadata(
         capabilities: metadata.capabilities,
         cache_transcript: false,
         transcript_cache_prefix_len: None,
-    })
+    })?;
+    if replays_compaction {
+        // Counting applies an existing compaction block but, per Anthropic's
+        // contract, never triggers a new compaction.
+        body["context_management"] = json!({
+            "edits": [{ "type": "compact_20260112" }],
+        });
+    }
+    Ok(body)
 }
 
 struct AnthropicRequestBodyInput {
@@ -1125,6 +1276,11 @@ fn transcript_to_messages(
                     .push(json!({ "role": "user", "content": anthropic_user_content(message) }));
             }
             TranscriptItem::CompactionSummary(summary) => {
+                let replay =
+                    anthropic_replay_blocks(&entry.provider_replay_for(ProviderKind::Claude))?;
+                if !replay.is_empty() {
+                    messages.push(json!({ "role": "assistant", "content": replay }));
+                }
                 messages.push(json!({
                     "role": "user",
                     "content": [{ "type": "text", "text": compaction_summary_text(summary, prompt) }],
@@ -1320,11 +1476,414 @@ async fn parse_anthropic_stream(response: reqwest::Response) -> ProviderResult<M
     state.finish()
 }
 
+async fn parse_anthropic_compaction_stream(
+    response: reqwest::Response,
+) -> ProviderResult<ProviderCompactionResponse> {
+    let mut state = AnthropicCompactionStreamState::default();
+    read_provider_json_sse_response(
+        response,
+        "Anthropic native compaction response stream",
+        response_error_message,
+        |event| state.process_sse_event(event),
+    )
+    .await?;
+    state.finish()
+}
+
 #[cfg(test)]
 fn parse_anthropic_sse(text: &str) -> ProviderResult<ModelResponse> {
     let mut state = AnthropicStreamState::default();
     read_json_sse_text(text, |event| state.process_sse_event(event))?;
     state.finish()
+}
+
+#[cfg(test)]
+fn parse_anthropic_compaction_sse(text: &str) -> ProviderResult<ProviderCompactionResponse> {
+    let mut state = AnthropicCompactionStreamState::default();
+    read_json_sse_text(text, |event| state.process_sse_event(event))?;
+    state.finish()
+}
+
+#[cfg(test)]
+fn parse_anthropic_compaction_message(
+    response: &Value,
+) -> ProviderResult<ProviderCompactionResponse> {
+    let content = response
+        .get("content")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ProviderError::native_compaction(
+                NativeCompactionErrorKind::MalformedStream,
+                "non-stream response missing content array",
+            )
+        })?;
+    let provider_replay = content
+        .iter()
+        .map(|block| ProviderReplayItem::new(ProviderKind::Claude, block))
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_anthropic_compaction_response(ModelResponse {
+        assistant: AssistantMessage { items: Vec::new() },
+        provider_replay,
+        usage: response.get("usage").and_then(anthropic_usage),
+        stop_reason: anthropic_stop_reason(response),
+        stop_details: anthropic_stop_details(response.get("stop_details")),
+    })
+}
+
+fn validate_anthropic_compaction_response(
+    response: ModelResponse,
+) -> ProviderResult<ProviderCompactionResponse> {
+    if response.stop_reason != ModelStopReason::Compaction {
+        return Err(ProviderError::native_compaction(
+            NativeCompactionErrorKind::UnexpectedStopReason,
+            format!(
+                "expected compaction stop, received {:?}",
+                response.stop_reason
+            ),
+        ));
+    }
+    let mut compaction = None;
+    for item in &response.provider_replay {
+        let block = item.raw_value()?;
+        match block.get("type").and_then(Value::as_str) {
+            Some("compaction") if compaction.is_none() => compaction = Some(block),
+            Some("compaction") => {
+                return Err(ProviderError::native_compaction(
+                    NativeCompactionErrorKind::UnexpectedContent,
+                    "response contained more than one compaction block",
+                ))
+            }
+            Some(block_type) => {
+                return Err(ProviderError::native_compaction(
+                    NativeCompactionErrorKind::UnexpectedContent,
+                    format!("response contained unexpected {block_type} content block"),
+                ))
+            }
+            None => {
+                return Err(ProviderError::native_compaction(
+                    NativeCompactionErrorKind::MalformedStream,
+                    "response contained a content block without a type",
+                ))
+            }
+        }
+    }
+    let compaction = compaction.ok_or_else(|| {
+        ProviderError::native_compaction(
+            NativeCompactionErrorKind::MissingBlock,
+            "terminal compaction response did not contain a compaction block",
+        )
+    })?;
+    let content = compaction.get("content").ok_or_else(|| {
+        ProviderError::native_compaction(
+            NativeCompactionErrorKind::MalformedStream,
+            "compaction block missing content",
+        )
+    })?;
+    if content.is_null() {
+        return Err(ProviderError::native_compaction(
+            NativeCompactionErrorKind::NullBlock,
+            "compaction block content was null",
+        ));
+    }
+    let content = content.as_str().ok_or_else(|| {
+        ProviderError::native_compaction(
+            NativeCompactionErrorKind::MalformedStream,
+            "compaction block content was not a string",
+        )
+    })?;
+    if content.is_empty() {
+        return Err(ProviderError::native_compaction(
+            NativeCompactionErrorKind::EmptyBlock,
+            "compaction block content was empty",
+        ));
+    }
+    if !matches!(
+        compaction.get("encrypted_content"),
+        None | Some(Value::Null) | Some(Value::String(_))
+    ) {
+        return Err(ProviderError::native_compaction(
+            NativeCompactionErrorKind::MalformedStream,
+            "compaction block encrypted_content was not string or null",
+        ));
+    }
+    Ok(ProviderCompactionResponse {
+        summary: None,
+        provider_replay: response.provider_replay,
+        usage: response.usage,
+    })
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum AnthropicCompactionFrame {
+    #[default]
+    MessageStart,
+    ContentBlockStart,
+    ContentBlockDelta,
+    ContentBlockStop,
+    MessageDelta,
+    Terminal,
+}
+
+struct AnthropicCompactionStreamState {
+    expected: AnthropicCompactionFrame,
+    block_index: Option<usize>,
+    compaction_block: Option<Value>,
+    usage: Option<ProviderUsage>,
+    saw_compaction_stop_reason: bool,
+}
+
+impl Default for AnthropicCompactionStreamState {
+    fn default() -> Self {
+        Self {
+            expected: AnthropicCompactionFrame::MessageStart,
+            block_index: None,
+            compaction_block: None,
+            usage: None,
+            saw_compaction_stop_reason: false,
+        }
+    }
+}
+
+impl AnthropicCompactionStreamState {
+    fn malformed(message: impl Into<String>) -> ProviderError {
+        ProviderError::native_compaction(NativeCompactionErrorKind::MalformedStream, message)
+    }
+
+    fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
+        match event {
+            SseEvent::Json(event) => self.process_event(&event),
+            SseEvent::MalformedJson => Err(Self::malformed(
+                "stream contained malformed JSON event data",
+            )),
+            SseEvent::Done => Err(Self::malformed(
+                "stream used [DONE] instead of the required message_stop event",
+            )),
+        }
+    }
+
+    fn process_event(&mut self, event: &Value) -> ProviderResult<SseControl> {
+        let event_type = event
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Self::malformed("stream event missing string type"))?;
+        if event_type == "error" {
+            let error_type = event.pointer("/error/type").and_then(Value::as_str);
+            let message = anthropic_error_message(
+                error_type,
+                event
+                    .pointer("/error/message")
+                    .or_else(|| event.get("message"))
+                    .and_then(Value::as_str),
+                event,
+            );
+            return Err(anthropic_stream_provider_error(error_type, message));
+        }
+        if event_type == "ping"
+            || !matches!(
+                event_type,
+                "message_start"
+                    | "content_block_start"
+                    | "content_block_delta"
+                    | "content_block_stop"
+                    | "message_delta"
+                    | "message_stop"
+            )
+        {
+            // Anthropic may intersperse pings and add new event types. They do
+            // not advance the structural state of this deliberately strict
+            // parser.
+            return Ok(SseControl::Continue);
+        }
+        match (self.expected, event_type) {
+            (AnthropicCompactionFrame::MessageStart, "message_start") => {
+                let message = event
+                    .get("message")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| Self::malformed("message_start missing message object"))?;
+                self.usage = message.get("usage").and_then(anthropic_usage);
+                self.expected = AnthropicCompactionFrame::ContentBlockStart;
+            }
+            (AnthropicCompactionFrame::ContentBlockStart, "content_block_start") => {
+                let index = event
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .and_then(|index| usize::try_from(index).ok())
+                    .ok_or_else(|| {
+                        Self::malformed("compaction content_block_start missing valid index")
+                    })?;
+                if index != 0 {
+                    return Err(Self::malformed(format!(
+                        "sole compaction content block must use index 0, received {index}"
+                    )));
+                }
+                let block = event
+                    .get("content_block")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        Self::malformed("compaction content_block_start missing content_block")
+                    })?;
+                if block.get("type").and_then(Value::as_str) != Some("compaction") {
+                    return Err(ProviderError::native_compaction(
+                        NativeCompactionErrorKind::UnexpectedContent,
+                        "compaction stream started a non-compaction content block",
+                    ));
+                }
+                match block.get("content") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(value)) if value.is_empty() => {}
+                    Some(_) => {
+                        return Err(Self::malformed(
+                            "compaction content_block_start contained pre-populated content",
+                        ))
+                    }
+                }
+                if !matches!(
+                    block.get("encrypted_content"),
+                    None | Some(Value::Null) | Some(Value::String(_))
+                ) {
+                    return Err(Self::malformed(
+                        "compaction content_block_start encrypted_content was not string or null",
+                    ));
+                }
+                self.block_index = Some(index);
+                self.compaction_block = Some(Value::Object(block.clone()));
+                self.expected = AnthropicCompactionFrame::ContentBlockDelta;
+            }
+            (AnthropicCompactionFrame::ContentBlockDelta, "content_block_delta") => {
+                self.require_matching_index(event, "content_block_delta")?;
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| Self::malformed("compaction delta missing delta object"))?;
+                if delta.get("type").and_then(Value::as_str) != Some("compaction_delta") {
+                    return Err(Self::malformed(
+                        "compaction stream contained a non-compaction or unknown delta type",
+                    ));
+                }
+                let block = self
+                    .compaction_block
+                    .as_mut()
+                    .and_then(Value::as_object_mut)
+                    .expect("compaction block exists after content_block_start");
+                let content = delta
+                    .get("content")
+                    .ok_or_else(|| Self::malformed("compaction_delta missing required content"))?;
+                if !matches!(content, Value::Null | Value::String(_)) {
+                    return Err(Self::malformed(
+                        "compaction_delta content was not string or null",
+                    ));
+                }
+                block.insert("content".to_string(), content.clone());
+                if let Some(encrypted_content) = delta.get("encrypted_content") {
+                    if !matches!(encrypted_content, Value::Null | Value::String(_)) {
+                        return Err(Self::malformed(
+                            "compaction_delta encrypted_content was not string or null",
+                        ));
+                    }
+                    block.insert("encrypted_content".to_string(), encrypted_content.clone());
+                }
+                for (field, value) in delta {
+                    if !matches!(field.as_str(), "type" | "content" | "encrypted_content") {
+                        block.insert(field.clone(), value.clone());
+                    }
+                }
+                self.expected = AnthropicCompactionFrame::ContentBlockStop;
+            }
+            (AnthropicCompactionFrame::ContentBlockStop, "content_block_stop") => {
+                self.require_matching_index(event, "content_block_stop")?;
+                self.expected = AnthropicCompactionFrame::MessageDelta;
+            }
+            (AnthropicCompactionFrame::MessageDelta, "message_delta") => {
+                let delta = event
+                    .get("delta")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| Self::malformed("message_delta missing delta object"))?;
+                match delta.get("stop_reason") {
+                    None | Some(Value::Null) => {}
+                    Some(Value::String(reason))
+                        if reason == "compaction" && !self.saw_compaction_stop_reason =>
+                    {
+                        self.saw_compaction_stop_reason = true;
+                    }
+                    Some(Value::String(reason)) => {
+                        return Err(ProviderError::native_compaction(
+                            NativeCompactionErrorKind::UnexpectedStopReason,
+                            format!(
+                                "conflicting or duplicate message_delta stop_reason {reason:?}"
+                            ),
+                        ))
+                    }
+                    Some(other) => {
+                        return Err(Self::malformed(format!(
+                            "message_delta stop_reason was not string or null: {other}"
+                        )))
+                    }
+                }
+                if let Some(usage) = event.get("usage").and_then(anthropic_usage) {
+                    merge_anthropic_usage(&mut self.usage, usage);
+                }
+            }
+            (AnthropicCompactionFrame::MessageDelta, "message_stop")
+                if self.saw_compaction_stop_reason =>
+            {
+                self.expected = AnthropicCompactionFrame::Terminal;
+            }
+            (AnthropicCompactionFrame::MessageDelta, "message_stop") => {
+                return Err(ProviderError::native_compaction(
+                    NativeCompactionErrorKind::UnexpectedStopReason,
+                    "compaction stream ended without stop_reason compaction",
+                ))
+            }
+            (AnthropicCompactionFrame::Terminal, _) => {
+                return Err(Self::malformed(format!(
+                    "stream contained trailing {event_type} after message_stop"
+                )))
+            }
+            (expected, actual) => {
+                return Err(Self::malformed(format!(
+                    "expected {expected:?}, received {actual}"
+                )))
+            }
+        }
+        // Unlike ordinary generation, consume through EOF so trailing frames
+        // after message_stop cannot be hidden by early termination.
+        Ok(SseControl::Continue)
+    }
+
+    fn require_matching_index(&self, event: &Value, event_type: &str) -> ProviderResult<()> {
+        let index = event
+            .get("index")
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or_else(|| Self::malformed(format!("{event_type} missing valid index")))?;
+        if Some(index) != self.block_index {
+            return Err(Self::malformed(format!(
+                "{event_type} index {index} did not match content_block_start index {:?}",
+                self.block_index
+            )));
+        }
+        Ok(())
+    }
+
+    fn finish(self) -> ProviderResult<ProviderCompactionResponse> {
+        if self.expected != AnthropicCompactionFrame::Terminal {
+            return Err(Self::malformed(format!(
+                "truncated compaction stream; expected {:?}",
+                self.expected
+            )));
+        }
+        let block = self
+            .compaction_block
+            .ok_or_else(|| Self::malformed("compaction stream did not contain a block"))?;
+        let replay = ProviderReplayItem::new(ProviderKind::Claude, &block)?;
+        validate_anthropic_compaction_response(ModelResponse {
+            assistant: AssistantMessage { items: Vec::new() },
+            provider_replay: vec![replay],
+            usage: self.usage,
+            stop_reason: ModelStopReason::Compaction,
+            stop_details: None,
+        })
+    }
 }
 
 struct AnthropicStreamState {
@@ -1335,6 +1894,9 @@ struct AnthropicStreamState {
     usage: Option<ProviderUsage>,
     stop_reason: ModelStopReason,
     stop_details: Option<ModelStopDetails>,
+    saw_message_start: bool,
+    saw_message_stop: bool,
+    saw_malformed_sse_json: bool,
 }
 
 impl Default for AnthropicStreamState {
@@ -1347,6 +1909,9 @@ impl Default for AnthropicStreamState {
             usage: None,
             stop_reason: ModelStopReason::Complete,
             stop_details: None,
+            saw_message_start: false,
+            saw_message_stop: false,
+            saw_malformed_sse_json: false,
         }
     }
 }
@@ -1355,6 +1920,10 @@ impl AnthropicStreamState {
     fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
         match event {
             SseEvent::Json(event) => self.process_event(&event),
+            SseEvent::MalformedJson => {
+                self.saw_malformed_sse_json = true;
+                Ok(SseControl::Continue)
+            }
             SseEvent::Done => Ok(SseControl::Stop),
         }
     }
@@ -1362,6 +1931,7 @@ impl AnthropicStreamState {
     fn process_event(&mut self, event: &Value) -> ProviderResult<SseControl> {
         match event.get("type").and_then(Value::as_str) {
             Some("message_start") => {
+                self.saw_message_start = true;
                 self.message = event.get("message").cloned().unwrap_or_else(|| json!({}));
                 self.usage = self.message.get("usage").and_then(anthropic_usage);
                 Ok(SseControl::Continue)
@@ -1406,11 +1976,17 @@ impl AnthropicStreamState {
                         self.stop_details =
                             anthropic_stop_details(event.pointer("/delta/stop_details"));
                     }
+                    Some("compaction") => {
+                        self.stop_reason = ModelStopReason::Compaction;
+                    }
                     _ => {}
                 }
                 Ok(SseControl::Continue)
             }
-            Some("message_stop") => Ok(SseControl::Stop),
+            Some("message_stop") => {
+                self.saw_message_stop = true;
+                Ok(SseControl::Stop)
+            }
             Some("error") => {
                 let error_type = event.pointer("/error/type").and_then(Value::as_str);
                 let message = anthropic_error_message(
@@ -1453,6 +2029,9 @@ impl AnthropicStreamState {
                 if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
                     block["signature"] = Value::String(signature.to_string());
                 }
+            }
+            Some("compaction_delta") => {
+                append_json_string_field(block, "content", delta.get("content"));
             }
             Some("citations_delta") | None => {}
             Some(_) => {}
@@ -1511,6 +2090,10 @@ fn normalize_stream_content_start(block: &Value) -> Value {
             block["thinking"] = Value::String(String::new());
             block["signature"] = Value::String(String::new());
         }
+        // Preserve null here. A valid compaction_delta replaces it with the
+        // complete summary; no delta leaves the provider's documented
+        // null-block failure visible to strict compact-call validation.
+        Some("compaction") => {}
         _ => {}
     }
     block
@@ -1592,6 +2175,7 @@ fn anthropic_stop_reason(response: &Value) -> ModelStopReason {
     match response.get("stop_reason").and_then(Value::as_str) {
         Some("max_tokens") => ModelStopReason::MaxOutputTokens,
         Some("refusal") => ModelStopReason::Refusal,
+        Some("compaction") => ModelStopReason::Compaction,
         _ => ModelStopReason::Complete,
     }
 }
@@ -1634,16 +2218,23 @@ fn anthropic_provider_replay_display(block: &Value) -> Option<ReplayDisplay> {
 }
 
 fn anthropic_usage(value: &Value) -> Option<ProviderUsage> {
+    let input_tokens = value
+        .get("input_tokens")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
+    let output_tokens = value
+        .get("output_tokens")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize);
     Some(ProviderUsage {
-        input_tokens: value
-            .get("input_tokens")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
-        output_tokens: value
-            .get("output_tokens")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize),
-        total_tokens: None,
+        input_tokens,
+        output_tokens,
+        // Anthropic top-level counts explicitly exclude compaction
+        // iterations. Preserve that normalized meaning and retain billable
+        // per-iteration detail only in raw_provider_usage.
+        total_tokens: input_tokens
+            .zip(output_tokens)
+            .map(|(input, output)| input.saturating_add(output)),
         cache_read_input_tokens: value
             .get("cache_read_input_tokens")
             .and_then(Value::as_u64)
@@ -1652,6 +2243,7 @@ fn anthropic_usage(value: &Value) -> Option<ProviderUsage> {
             .get("cache_creation_input_tokens")
             .and_then(Value::as_u64)
             .map(|value| value as usize),
+        raw_provider_usage: Some(value.clone()),
         ..ProviderUsage::default()
     })
 }
@@ -1669,6 +2261,57 @@ fn merge_anthropic_usage(current: &mut Option<ProviderUsage>, update: ProviderUs
     }
     if update.cache_creation_input_tokens.unwrap_or_default() > 0 {
         current.cache_creation_input_tokens = update.cache_creation_input_tokens;
+    }
+    current.total_tokens = current
+        .input_tokens
+        .zip(current.output_tokens)
+        .map(|(input, output)| input.saturating_add(output));
+    if let Some(update) = update.raw_provider_usage {
+        merge_json_object(&mut current.raw_provider_usage, update);
+    }
+    if let Some(raw) = current
+        .raw_provider_usage
+        .as_mut()
+        .and_then(Value::as_object_mut)
+    {
+        for (key, value) in [
+            ("input_tokens", current.input_tokens),
+            ("output_tokens", current.output_tokens),
+            ("cache_read_input_tokens", current.cache_read_input_tokens),
+            (
+                "cache_creation_input_tokens",
+                current.cache_creation_input_tokens,
+            ),
+        ] {
+            if let Some(value) = value {
+                raw.insert(key.to_string(), json!(value));
+            }
+        }
+    }
+}
+
+fn merge_json_object(current: &mut Option<Value>, update: Value) {
+    let current = current.get_or_insert_with(|| json!({}));
+    merge_json_value(current, update);
+}
+
+fn merge_json_value(current: &mut Value, update: Value) {
+    match update {
+        Value::Object(update) => {
+            let Some(current) = current.as_object_mut() else {
+                *current = Value::Object(update);
+                return;
+            };
+            for (key, update) in update {
+                match current.get_mut(&key) {
+                    Some(value) => merge_json_value(value, update),
+                    None => {
+                        current.insert(key, update);
+                    }
+                }
+            }
+        }
+        update => *current = update,
     }
 }
 
@@ -1690,6 +2333,108 @@ mod tests {
 
     fn first_party_tools(provider: ProviderKind) -> Vec<ProviderTool> {
         agent_tools::ToolRegistry::with_builtin_tools().provider_tools_for_provider(provider)
+    }
+
+    fn test_compaction_request(transcript: Vec<ModelTranscriptEntry>) -> ProviderCompactionRequest {
+        ProviderCompactionRequest {
+            model: "claude-opus-4-8".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript,
+            tool_profile: ProviderToolProfile::AnthropicCoding,
+            tools: first_party_tools(ProviderKind::Claude),
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+            session_id: Some("session-1".to_string()),
+            compaction_instructions: Some(
+                "Preserve actionable state. Do not call tools; respond with summary text only."
+                    .to_string(),
+            ),
+        }
+    }
+
+    fn native_compaction_error_kind(error: &ProviderError) -> NativeCompactionErrorKind {
+        match error {
+            ProviderError::NativeCompaction { kind, .. } => *kind,
+            other => panic!("expected typed native compaction error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn compaction_body_uses_paused_minimum_trigger_and_no_tools() {
+        let body = compaction_body(test_compaction_request(vec![TranscriptItem::UserMessage(
+            UserMessage::text("history"),
+        )
+        .into()]))
+        .expect("compaction body renders");
+
+        assert_eq!(body["model"], "claude-opus-4-8");
+        assert_eq!(body["stream"], true);
+        assert_eq!(
+            body["context_management"]["edits"],
+            json!([{
+                "type": "compact_20260112",
+                "trigger": {
+                    "type": "input_tokens",
+                    "value": 50_000,
+                },
+                "pause_after_compaction": true,
+                "instructions": "Preserve actionable state. Do not call tools; respond with summary text only.",
+            }])
+        );
+        assert!(body.get("tools").is_none());
+        assert!(body.get("tool_choice").is_none());
+        assert_eq!(body["thinking"]["type"], "adaptive");
+        assert_eq!(body["output_config"]["effort"], "high");
+    }
+
+    #[test]
+    fn compaction_capability_is_model_specific_and_typed() {
+        for supported in [
+            "claude-fable-5",
+            "claude-mythos-5",
+            "claude-mythos-preview",
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-sonnet-5",
+            "claude-sonnet-4-6",
+        ] {
+            assert!(
+                static_anthropic_model_metadata(supported)
+                    .capabilities
+                    .native_compaction,
+                "{supported}"
+            );
+        }
+
+        for unsupported in ["claude-sonnet-4-5", "claude-unknown"] {
+            let mut request = test_compaction_request(vec![TranscriptItem::UserMessage(
+                UserMessage::text("history"),
+            )
+            .into()]);
+            request.model = unsupported.to_string();
+            let error = compaction_body(request).expect_err("unsupported model must fail locally");
+            assert_eq!(
+                native_compaction_error_kind(&error),
+                NativeCompactionErrorKind::Unsupported,
+                "{unsupported}"
+            );
+        }
+
+        let fallback = static_anthropic_model_metadata("claude-opus-4-8");
+        let discovered: ModelsApiModel = serde_json::from_value(json!({
+            "id": "claude-opus-4-8",
+            "max_input_tokens": 1_000_000,
+            "max_tokens": 128_000,
+            "capabilities": models_api_capabilities(json!({ "supported": true }))
+        }))
+        .unwrap();
+        assert!(
+            !merge_models_api_metadata(fallback, discovered)
+                .capabilities
+                .native_compaction,
+            "known Models API unsupported capability overrides the static list"
+        );
     }
 
     #[test]
@@ -1882,6 +2627,117 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn compact_wire_request_scopes_beta_to_special_messages_call() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("model request accepted");
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            loop {
+                let read = socket.read(&mut buffer).await.expect("model request reads");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).expect("model request is utf8");
+            assert!(request.starts_with("GET /v1/models/claude-opus-4-8 HTTP/1.1\r\n"));
+            assert!(!request.to_ascii_lowercase().contains("anthropic-beta:"));
+            let mut capabilities = models_api_capabilities(json!({ "supported": true }));
+            capabilities["context_management"] = json!({
+                "compact_20260112": { "supported": true },
+                "supported": true
+            });
+            let model = json!({
+                "id": "claude-opus-4-8",
+                "max_input_tokens": 1_000_000,
+                "max_tokens": 128_000,
+                "capabilities": capabilities
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{model}",
+                model.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("model response writes");
+
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .expect("compaction request accepted");
+            let mut request = Vec::new();
+            loop {
+                let read = socket
+                    .read(&mut buffer)
+                    .await
+                    .expect("compaction request reads");
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let request = String::from_utf8(request).expect("compaction request is utf8");
+            assert!(request.starts_with("POST /v1/messages HTTP/1.1\r\n"));
+            let lower = request.to_ascii_lowercase();
+            let beta = lower
+                .lines()
+                .find(|line| line.starts_with("anthropic-beta:"))
+                .expect("compaction beta header present");
+            assert!(beta.contains(CLAUDE_CODE_BETA));
+            assert!(beta.contains(COMPACTION_BETA));
+
+            let sse = concat!(
+                "event: message_start\n",
+                "data: {\"type\":\"message_start\",\"message\":{\"content\":[],\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"iterations\":[]}}}\n\n",
+                "event: content_block_start\n",
+                "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"compaction\",\"content\":null,\"encrypted_content\":null}}\n\n",
+                "event: content_block_delta\n",
+                "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"compaction_delta\",\"content\":\"wire summary\",\"encrypted_content\":\"wire opaque\"}}\n\n",
+                "event: content_block_stop\n",
+                "data: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+                "event: message_delta\n",
+                "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"compaction\"},\"usage\":{\"input_tokens\":0,\"output_tokens\":0,\"iterations\":[{\"type\":\"compaction\",\"input_tokens\":60000,\"output_tokens\":10}]}}\n\n",
+                "event: message_stop\n",
+                "data: {\"type\":\"message_stop\"}\n\n"
+            );
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                sse.len()
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("compaction response writes");
+        });
+
+        let mut provider = AnthropicProvider::new_with_client(reqwest::Client::new(), "test-key");
+        provider.base_url = base_url;
+        let response = provider
+            .compact(test_compaction_request(vec![TranscriptItem::UserMessage(
+                UserMessage::text("history"),
+            )
+            .into()]))
+            .await
+            .expect("wire compaction succeeds");
+        server.await.expect("server completes");
+
+        assert_eq!(
+            response.provider_replay[0].raw_value().unwrap()["content"],
+            "wire summary"
+        );
+        assert_eq!(
+            response.provider_replay[0].raw_value().unwrap()["encrypted_content"],
+            "wire opaque"
+        );
+    }
+
     fn test_model_metadata(id: &str, max_tokens: u32) -> AnthropicModelMetadata {
         let mut metadata = static_anthropic_model_metadata(id);
         metadata.max_tokens = max_tokens;
@@ -1952,6 +2808,8 @@ mod tests {
     fn beta_header_keeps_identity_only_and_drops_ga_feature_betas() {
         let header = anthropic_beta_header();
         assert_eq!(header, CLAUDE_CODE_BETA);
+        assert!(!header.contains(COMPACTION_BETA));
+        assert!(anthropic_compaction_beta_header().contains(COMPACTION_BETA));
         for stale in [
             "effort-",
             "extended-cache-ttl-",
@@ -1961,6 +2819,34 @@ mod tests {
         ] {
             assert!(!header.contains(stale));
         }
+    }
+
+    #[test]
+    fn compaction_beta_header_follows_transcript_replay_state() {
+        let ordinary = vec![TranscriptItem::UserMessage(UserMessage::text("ordinary turn")).into()];
+        assert_eq!(
+            anthropic_beta_header_for_transcript(&ordinary),
+            CLAUDE_CODE_BETA
+        );
+
+        let block = json!({
+            "type": "compaction",
+            "content": "opaque summary",
+        });
+        let checkpoint = vec![ModelTranscriptEntry {
+            item: TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+                "session-1",
+                "leaf-1",
+                "Provider-native compaction checkpoint.",
+                Some(80_000),
+                agent_vocab::TurnId(7),
+            )),
+            provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &block).unwrap()],
+        }];
+        assert!(
+            anthropic_beta_header_for_transcript(&checkpoint).contains(COMPACTION_BETA),
+            "replaying provider compaction state requires the matching beta"
+        );
     }
 
     #[tokio::test]
@@ -2600,6 +3486,81 @@ mod tests {
     }
 
     #[test]
+    fn compaction_checkpoint_replays_exact_block_and_counting_applies_it() {
+        let raw = json!({
+            "type": "compaction",
+            "content": "opaque summary",
+            "provider_extension": {
+                "must_survive": ["byte", "for", "byte"]
+            }
+        });
+        let entry = ModelTranscriptEntry {
+            item: TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+                "session-1",
+                "leaf-1",
+                "Provider-native compaction checkpoint.\n\nFresh delegation ledger.",
+                Some(80_000),
+                agent_vocab::TurnId(7),
+            )),
+            provider_replay: vec![ProviderReplayItem::new(ProviderKind::Claude, &raw).unwrap()],
+        };
+
+        let ordinary = messages_body(ModelRequest {
+            model: "claude-opus-4-8".to_string(),
+            transcript_cache_prefix_len: None,
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![entry.clone()],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: Some(1024),
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+            session_id: None,
+            turn_id: None,
+        })
+        .expect("ordinary replay body renders");
+
+        assert_eq!(ordinary["messages"][0]["role"], "assistant");
+        assert_eq!(ordinary["messages"][0]["content"][0], raw);
+        assert!(ordinary["messages"][0]["content"][0]
+            .get("cache_control")
+            .is_none());
+        assert_eq!(ordinary["messages"][1]["role"], "user");
+        assert!(ordinary["messages"][1]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Fresh delegation ledger."));
+        // Ordinary continuation only replays provider state; it must not
+        // silently enable automatic compaction/continuation.
+        assert!(ordinary.get("context_management").is_none());
+
+        let count = count_tokens_body(ProviderTokenCountRequest {
+            model: "claude-opus-4-8".to_string(),
+            prompt: PromptSections::stable("stable rules"),
+            transcript: vec![entry],
+            tool_profile: ProviderToolProfile::None,
+            tools: Vec::new(),
+            max_tokens: None,
+            reasoning_effort: ReasoningEffort::High,
+            prompt_cache_key: None,
+            session_id: None,
+        })
+        .expect("count replay body renders");
+        assert_eq!(count["messages"][0]["content"][0], raw);
+        assert_eq!(
+            count["context_management"]["edits"],
+            json!([{ "type": "compact_20260112" }])
+        );
+
+        let parsed = parse_anthropic_count_tokens(
+            r#"{"input_tokens":23456,"context_management":{"original_input_tokens":187654}}"#,
+        )
+        .expect("count response parses");
+        assert_eq!(parsed.input_tokens, 23_456);
+        assert_eq!(parsed.original_input_tokens, Some(187_654));
+    }
+
+    #[test]
     fn messages_body_sorts_tools_for_cache_stability() {
         let body = messages_body(ModelRequest {
             model: "claude-opus-4-7".to_string(),
@@ -2894,9 +3855,790 @@ mod tests {
 
         assert_eq!(usage.input_tokens, Some(100));
         assert_eq!(usage.output_tokens, Some(20));
-        assert_eq!(usage.total_tokens, None);
+        assert_eq!(usage.total_tokens, Some(120));
         assert_eq!(usage.cache_read_input_tokens, Some(75));
         assert_eq!(usage.cache_creation_input_tokens, Some(25));
+        assert_eq!(
+            usage
+                .raw_provider_usage
+                .as_ref()
+                .and_then(|usage| usage.get("input_tokens"))
+                .and_then(Value::as_u64),
+            Some(100)
+        );
+    }
+
+    #[test]
+    fn anthropic_usage_keeps_iterations_without_double_counting_normalized_total() {
+        let raw = json!({
+            "input_tokens": 23_000,
+            "output_tokens": 1_000,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 11,
+                "ephemeral_1h_input_tokens": 22
+            },
+            "output_tokens_details": {
+                "thinking_tokens": 333
+            },
+            "iterations": [
+                {
+                    "type": "compaction",
+                    "input_tokens": 180_000,
+                    "output_tokens": 3_500,
+                    "cache_creation": {
+                        "ephemeral_5m_input_tokens": 44
+                    },
+                    "output_tokens_details": {
+                        "thinking_tokens": 555
+                    }
+                },
+                {
+                    "type": "message",
+                    "input_tokens": 23_000,
+                    "output_tokens": 1_000
+                }
+            ]
+        });
+
+        let usage = anthropic_usage(&raw).expect("usage parses");
+
+        // Top-level counts exclude compaction; normalized accounting must not
+        // add the 183,500 compaction tokens a second time.
+        assert_eq!(usage.input_tokens, Some(23_000));
+        assert_eq!(usage.output_tokens, Some(1_000));
+        assert_eq!(usage.total_tokens, Some(24_000));
+        assert_eq!(usage.raw_provider_usage, Some(raw));
+    }
+
+    #[test]
+    fn anthropic_usage_merges_nested_stream_details_and_final_iterations() {
+        let mut usage = anthropic_usage(&json!({
+            "input_tokens": 60_000,
+            "output_tokens": 0,
+            "cache_creation": {
+                "ephemeral_5m_input_tokens": 11,
+                "ephemeral_1h_input_tokens": 22
+            },
+            "iterations": []
+        }));
+        merge_anthropic_usage(
+            &mut usage,
+            anthropic_usage(&json!({
+                "input_tokens": 0,
+                "output_tokens": 1_000,
+                "cache_creation": {
+                    "ephemeral_5m_input_tokens": 33
+                },
+                "output_tokens_details": {
+                    "thinking_tokens": 444
+                },
+                "iterations": [
+                    {
+                        "type": "compaction",
+                        "input_tokens": 180_000,
+                        "output_tokens": 3_500
+                    },
+                    {
+                        "type": "message",
+                        "input_tokens": 60_000,
+                        "output_tokens": 1_000
+                    }
+                ]
+            }))
+            .expect("usage update parses"),
+        );
+
+        let usage = usage.expect("usage remains present");
+        assert_eq!(usage.total_tokens, Some(61_000));
+        let raw = usage.raw_provider_usage.expect("raw usage remains present");
+        assert_eq!(raw.get("input_tokens"), Some(&json!(60_000)));
+        assert_eq!(raw.get("output_tokens"), Some(&json!(1_000)));
+        assert_eq!(
+            raw.pointer("/cache_creation/ephemeral_5m_input_tokens"),
+            Some(&json!(33))
+        );
+        assert_eq!(
+            raw.pointer("/cache_creation/ephemeral_1h_input_tokens"),
+            Some(&json!(22))
+        );
+        assert_eq!(
+            raw.pointer("/output_tokens_details/thinking_tokens"),
+            Some(&json!(444))
+        );
+        assert_eq!(
+            raw.get("iterations")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn compaction_nonstream_parser_requires_nonempty_compaction_block() {
+        for encrypted_content in [Some(json!("opaque ciphertext")), Some(Value::Null), None] {
+            let mut block = json!({
+                "type": "compaction",
+                "content": "opaque provider summary",
+                "future_field": { "preserve": true }
+            });
+            if let Some(value) = encrypted_content {
+                block
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("encrypted_content".to_string(), value);
+            }
+            let valid = json!({
+                "content": [block],
+                "stop_reason": "compaction",
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "iterations": [{
+                        "type": "compaction",
+                        "input_tokens": 180000,
+                        "output_tokens": 3500
+                    }]
+                }
+            });
+            let parsed = parse_anthropic_compaction_message(&valid)
+                .expect("valid compaction response parses");
+            assert_eq!(parsed.summary, None);
+            assert_eq!(
+                parsed.provider_replay[0].raw_value().unwrap(),
+                valid["content"][0]
+            );
+            assert_eq!(
+                parsed
+                    .usage
+                    .as_ref()
+                    .and_then(|usage| usage.raw_provider_usage.as_ref())
+                    .and_then(|usage| usage.get("iterations")),
+                valid["usage"].get("iterations")
+            );
+        }
+
+        let whitespace = json!({
+            "content": [{ "type": "compaction", "content": " " }],
+            "stop_reason": "compaction"
+        });
+        assert_eq!(
+            parse_anthropic_compaction_message(&whitespace)
+                .expect("non-empty whitespace content is valid")
+                .provider_replay[0]
+                .raw_value()
+                .unwrap()["content"],
+            " "
+        );
+
+        let cases = [
+            (
+                json!({"content": [], "stop_reason": "compaction"}),
+                NativeCompactionErrorKind::MissingBlock,
+            ),
+            (
+                json!({
+                    "content": [{"type": "compaction", "content": null}],
+                    "stop_reason": "compaction"
+                }),
+                NativeCompactionErrorKind::NullBlock,
+            ),
+            (
+                json!({
+                    "content": [{"type": "compaction", "content": ""}],
+                    "stop_reason": "compaction"
+                }),
+                NativeCompactionErrorKind::EmptyBlock,
+            ),
+            (
+                json!({
+                    "content": [{
+                        "type": "compaction",
+                        "content": "summary",
+                        "encrypted_content": { "invalid": true }
+                    }],
+                    "stop_reason": "compaction"
+                }),
+                NativeCompactionErrorKind::MalformedStream,
+            ),
+            (
+                json!({
+                    "content": [{"type": "text", "text": "ordinary answer"}],
+                    "stop_reason": "end_turn"
+                }),
+                NativeCompactionErrorKind::UnexpectedStopReason,
+            ),
+            (
+                json!({
+                    "content": [{"type": "tool_use", "id": "toolu_1"}],
+                    "stop_reason": "tool_use"
+                }),
+                NativeCompactionErrorKind::UnexpectedStopReason,
+            ),
+            (
+                json!({
+                    "content": [{"type": "compaction", "content": "partial"}],
+                    "stop_reason": "max_tokens"
+                }),
+                NativeCompactionErrorKind::UnexpectedStopReason,
+            ),
+            (
+                json!({
+                    "content": [{"type": "compaction", "content": "partial"}],
+                    "stop_reason": "refusal"
+                }),
+                NativeCompactionErrorKind::UnexpectedStopReason,
+            ),
+        ];
+        for (response, expected) in cases {
+            let error = parse_anthropic_compaction_message(&response)
+                .expect_err("invalid native compaction response must fail");
+            assert_eq!(native_compaction_error_kind(&error), expected);
+        }
+    }
+
+    fn valid_compaction_sse_events() -> Vec<Value> {
+        vec![
+            json!({
+                "type": "message_start",
+                "message": {
+                    "id": "msg_compact",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-opus-4-8",
+                    "content": [],
+                    "stop_reason": null,
+                    "usage": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "iterations": []
+                    }
+                }
+            }),
+            json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "compaction",
+                    "content": null,
+                    "encrypted_content": null,
+                    "provider_extension": { "must_survive": true }
+                }
+            }),
+            json!({
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {
+                    "type": "compaction_delta",
+                    "content": "opaque streamed summary",
+                    "encrypted_content": "opaque+/= ciphertext exactly",
+                    "delta_extension": ["also", "preserved"]
+                }
+            }),
+            json!({ "type": "content_block_stop", "index": 0 }),
+            json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": "compaction",
+                    "stop_sequence": null
+                },
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "iterations": [{
+                        "type": "compaction",
+                        "input_tokens": 180000,
+                        "output_tokens": 3500
+                    }]
+                }
+            }),
+            json!({ "type": "message_stop" }),
+        ]
+    }
+
+    fn compaction_sse(events: &[Value]) -> String {
+        events
+            .iter()
+            .map(|event| format!("data: {event}\n\n"))
+            .collect()
+    }
+
+    #[test]
+    fn streamed_compaction_round_trips_all_encrypted_metadata_shapes_through_requests() {
+        for (name, encrypted_content) in [
+            ("string", Some(json!("opaque+/= ciphertext exactly"))),
+            ("explicit null", Some(Value::Null)),
+            ("omitted", None),
+        ] {
+            let mut events = valid_compaction_sse_events();
+            match encrypted_content.as_ref() {
+                Some(value) => {
+                    events[1]["content_block"]
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("encrypted_content".to_string(), Value::Null);
+                    events[2]["delta"]
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("encrypted_content".to_string(), value.clone());
+                }
+                None => {
+                    events[1]["content_block"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("encrypted_content");
+                    events[2]["delta"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("encrypted_content");
+                }
+            }
+            let response = parse_anthropic_compaction_sse(&compaction_sse(&events))
+                .unwrap_or_else(|error| panic!("{name} compaction response parses: {error}"));
+            let mut expected = json!({
+                "type": "compaction",
+                "content": "opaque streamed summary",
+                "provider_extension": { "must_survive": true },
+                "delta_extension": ["also", "preserved"]
+            });
+            if let Some(value) = encrypted_content {
+                expected
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("encrypted_content".to_string(), value);
+            }
+            assert_eq!(
+                response.provider_replay[0].raw_value().unwrap(),
+                expected,
+                "{name}"
+            );
+            let usage = response.usage.expect("usage retained");
+            assert_eq!(usage.total_tokens, Some(0), "{name}");
+            assert_eq!(
+                usage
+                    .raw_provider_usage
+                    .as_ref()
+                    .and_then(|raw| raw.pointer("/iterations/0/output_tokens")),
+                Some(&json!(3500)),
+                "{name}"
+            );
+
+            // Simulate the durable provider_replay JSONB round trip before
+            // building either kind of subsequent Anthropic request.
+            let persisted = serde_json::to_string(&response.provider_replay).unwrap();
+            let restored: Vec<ProviderReplayItem> = serde_json::from_str(&persisted).unwrap();
+            let entry = ModelTranscriptEntry {
+                item: TranscriptItem::CompactionSummary(agent_vocab::CompactionSummary::new(
+                    "session-1",
+                    "leaf-1",
+                    "visible checkpoint",
+                    Some(180_000),
+                    agent_vocab::TurnId(7),
+                )),
+                provider_replay: restored,
+            };
+
+            let ordinary = messages_body(ModelRequest {
+                model: "claude-opus-4-8".to_string(),
+                transcript_cache_prefix_len: None,
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![entry.clone()],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: Some(1024),
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+                turn_id: None,
+            })
+            .expect("ordinary continuation body renders");
+            let count = count_tokens_body(ProviderTokenCountRequest {
+                model: "claude-opus-4-8".to_string(),
+                prompt: PromptSections::stable("stable rules"),
+                transcript: vec![entry],
+                tool_profile: ProviderToolProfile::None,
+                tools: Vec::new(),
+                max_tokens: None,
+                reasoning_effort: ReasoningEffort::High,
+                prompt_cache_key: None,
+                session_id: None,
+            })
+            .expect("count_tokens body renders");
+
+            for body in [&ordinary, &count] {
+                let replayed = &body["messages"][0]["content"][0];
+                assert_eq!(replayed, &expected, "{name}");
+                assert!(
+                    replayed.get("cache_control").is_none(),
+                    "provider-returned replay must not be decorated"
+                );
+            }
+        }
+
+        let mut whitespace = valid_compaction_sse_events();
+        whitespace[2]["delta"]["content"] = json!(" ");
+        assert_eq!(
+            parse_anthropic_compaction_sse(&compaction_sse(&whitespace))
+                .expect("non-empty whitespace content is valid")
+                .provider_replay[0]
+                .raw_value()
+                .unwrap()["content"],
+            " "
+        );
+    }
+
+    #[test]
+    fn compaction_sse_ignores_ping_and_future_events_and_merges_message_deltas() {
+        let mut events = valid_compaction_sse_events();
+        events.insert(1, json!({ "type": "ping" }));
+        events.insert(3, json!({ "type": "future_progress", "opaque": true }));
+        events[6]["delta"]["stop_reason"] = Value::Null;
+        events[6]["usage"] = json!({
+            "output_tokens": 0,
+            "future_usage": { "first": true }
+        });
+        events.insert(
+            7,
+            json!({
+                "type": "message_delta",
+                "delta": { "stop_reason": "compaction" },
+                "usage": {
+                    "output_tokens": 0,
+                    "iterations": [{
+                        "type": "compaction",
+                        "input_tokens": 180000,
+                        "output_tokens": 3500
+                    }],
+                    "future_usage": { "second": true }
+                }
+            }),
+        );
+        events.insert(8, json!({ "type": "ping" }));
+
+        let response = parse_anthropic_compaction_sse(&compaction_sse(&events))
+            .expect("forward-compatible stream parses");
+        let raw = response
+            .usage
+            .and_then(|usage| usage.raw_provider_usage)
+            .expect("usage is merged");
+        assert_eq!(raw.pointer("/future_usage/first"), Some(&json!(true)));
+        assert_eq!(raw.pointer("/future_usage/second"), Some(&json!(true)));
+        assert_eq!(
+            raw.pointer("/iterations/0/input_tokens"),
+            Some(&json!(180000))
+        );
+    }
+
+    #[test]
+    fn compaction_sse_rejects_malformed_frame_sequences() {
+        let valid = valid_compaction_sse_events();
+        let mut cases: Vec<(&str, Vec<Value>, NativeCompactionErrorKind)> = Vec::new();
+
+        let mut events = valid.clone();
+        events.remove(0);
+        cases.push((
+            "missing message_start",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[1]["index"] = json!(7);
+        cases.push((
+            "start index is not zero",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events.insert(1, valid[0].clone());
+        cases.push((
+            "duplicate message_start",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[0].as_object_mut().unwrap().remove("message");
+        cases.push((
+            "message_start missing message",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+
+        let mut events = valid.clone();
+        events.swap(1, 2);
+        cases.push((
+            "delta before start",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events.insert(2, valid[1].clone());
+        cases.push((
+            "duplicate content start",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[1].as_object_mut().unwrap().remove("index");
+        cases.push((
+            "start missing index",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[1].as_object_mut().unwrap().remove("content_block");
+        cases.push((
+            "start missing block",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[1]["content_block"] = json!({ "type": "text", "text": "" });
+        cases.push((
+            "unexpected content block",
+            events,
+            NativeCompactionErrorKind::UnexpectedContent,
+        ));
+        let mut events = valid.clone();
+        events[1]["content_block"]["content"] = json!("already populated");
+        cases.push((
+            "pre-populated start content",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[1]["content_block"]["encrypted_content"] = json!({ "invalid": true });
+        cases.push((
+            "start encrypted content wrong type",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+
+        let mut events = valid.clone();
+        events.remove(2);
+        cases.push((
+            "missing compaction delta",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events.insert(3, valid[2].clone());
+        cases.push((
+            "duplicate compaction delta",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[2].as_object_mut().unwrap().remove("index");
+        cases.push((
+            "delta missing index",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[2]["index"] = json!(8);
+        cases.push((
+            "delta wrong index",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[2].as_object_mut().unwrap().remove("delta");
+        cases.push((
+            "delta missing object",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[2]["delta"]["type"] = json!("text_delta");
+        cases.push((
+            "wrong delta type",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[2]["delta"]["type"] = json!("future_delta");
+        cases.push((
+            "unknown delta type",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[2]["delta"]
+            .as_object_mut()
+            .unwrap()
+            .remove("content");
+        cases.push((
+            "delta missing content",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[2]["delta"]["content"] = json!(["not", "a", "string"]);
+        cases.push((
+            "delta content wrong type",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[2]["delta"]["content"] = Value::Null;
+        cases.push((
+            "delta content null",
+            events,
+            NativeCompactionErrorKind::NullBlock,
+        ));
+        let mut events = valid.clone();
+        events[2]["delta"]["content"] = json!("");
+        cases.push((
+            "delta content empty",
+            events,
+            NativeCompactionErrorKind::EmptyBlock,
+        ));
+        let mut events = valid.clone();
+        events[2]["delta"]["encrypted_content"] = json!({ "invalid": true });
+        cases.push((
+            "delta encrypted content wrong type",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+
+        let mut events = valid.clone();
+        events.remove(3);
+        cases.push((
+            "missing block stop",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events.insert(4, valid[3].clone());
+        cases.push((
+            "duplicate block stop",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[3].as_object_mut().unwrap().remove("index");
+        cases.push((
+            "stop missing index",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[3]["index"] = json!(8);
+        cases.push((
+            "stop wrong index",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events.insert(4, valid[1].clone());
+        cases.push((
+            "multiple compaction blocks",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events.insert(
+            4,
+            json!({
+                "type": "content_block_start",
+                "index": 8,
+                "content_block": { "type": "text", "text": "" }
+            }),
+        );
+        cases.push((
+            "mixed content blocks",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+
+        let mut events = valid.clone();
+        events.remove(4);
+        cases.push((
+            "missing message_delta",
+            events,
+            NativeCompactionErrorKind::UnexpectedStopReason,
+        ));
+        let mut events = valid.clone();
+        events[4].as_object_mut().unwrap().remove("delta");
+        cases.push((
+            "message_delta missing delta",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events[4]["delta"]
+            .as_object_mut()
+            .unwrap()
+            .remove("stop_reason");
+        cases.push((
+            "missing stop reason",
+            events,
+            NativeCompactionErrorKind::UnexpectedStopReason,
+        ));
+        let mut events = valid.clone();
+        events[4]["delta"]["stop_reason"] = json!("end_turn");
+        cases.push((
+            "wrong stop reason",
+            events,
+            NativeCompactionErrorKind::UnexpectedStopReason,
+        ));
+        let mut events = valid.clone();
+        events.insert(5, valid[4].clone());
+        cases.push((
+            "duplicate terminal stop reason",
+            events,
+            NativeCompactionErrorKind::UnexpectedStopReason,
+        ));
+
+        let mut events = valid.clone();
+        events.pop();
+        cases.push((
+            "missing message_stop",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events.push(json!({ "type": "message_stop" }));
+        cases.push((
+            "duplicate message_stop",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        let mut events = valid.clone();
+        events.push(json!({
+            "type": "content_block_start",
+            "index": 8,
+            "content_block": { "type": "text", "text": "trailing" }
+        }));
+        cases.push((
+            "trailing content after terminal",
+            events,
+            NativeCompactionErrorKind::MalformedStream,
+        ));
+        for (name, events, expected) in cases {
+            let error = parse_anthropic_compaction_sse(&compaction_sse(&events)).expect_err(name);
+            assert_eq!(native_compaction_error_kind(&error), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn compaction_sse_rejects_malformed_json_and_done_sentinel() {
+        for (name, sse) in [
+            (
+                "malformed JSON",
+                "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: {not-json}\n\n",
+            ),
+            (
+                "done sentinel",
+                "data: {\"type\":\"message_start\",\"message\":{}}\n\ndata: [DONE]\n\n",
+            ),
+        ] {
+            let error = parse_anthropic_compaction_sse(sse).expect_err(name);
+            assert_eq!(
+                native_compaction_error_kind(&error),
+                NativeCompactionErrorKind::MalformedStream,
+                "{name}"
+            );
+        }
     }
 
     #[test]

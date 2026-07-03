@@ -158,7 +158,16 @@ Tool actions are dispatched immediately. `spawn_claimed_dispatch` runs `run_tool
 
 ### Model dispatch, retries, and auth recovery
 
-Model actions are claimed atomically (`claim_pending_model_action`) before `run_model_turn` runs, so a single action is never executed twice. `run_model` assembles the prompt, builds the request from `SessionConfig`, picks a provider, and completes through `complete_with_auth_retry`. Provider connections are cached per `(session_id, provider)` in `ProviderConnectionRegistry`; OpenAI always routes through the ChatGPT/Codex subscription transport, Claude through the Anthropic API-key adapter.
+Ordinary model actions are claimed atomically (`claim_pending_model_action`)
+before `run_model_turn` runs. The narrower post-compaction resume path uses the
+durable lease described below instead: a unique owner/generation is registered
+in the retained intent before provider work starts, and completion is fenced by
+that lease. `run_model` assembles the prompt, builds the request from
+`SessionConfig`, picks a provider, and completes through
+`complete_with_auth_retry`. Provider connections are cached per
+`(session_id, provider)` in `ProviderConnectionRegistry`; OpenAI always routes
+through the ChatGPT/Codex subscription transport, Claude through the Anthropic
+API-key adapter.
 
 Two retry layers exist:
 
@@ -180,9 +189,85 @@ RequestModel ready to dispatch
             └─ tokens >= auto_limit -> block action, spawn compaction job
 ```
 
-Compaction runs as its own background task (`run_compaction_job`). On success it records the new compacted root, marks the provider connection compacted (bumping the OpenAI window generation), and resumes the blocked model action from the compacted root. A reactive path also fires: if the provider rejects a running request with a context-overflow error, `recover_model_context_overflow_with_compaction` blocks the running action and spawns a mid-turn compaction instead of failing the turn.
+Compaction runs as its own background task (`run_compaction_job`). On success
+it records the new compacted root, marks the provider connection compacted
+(bumping the OpenAI window generation), and resumes the blocked model action
+from the compacted root. The success transaction also leaves an attempt-fenced
+durable dispatch intent on that exact pending action. Claim retains that intent
+and atomically assigns a unique owner, incrementing generation, and a 30-second
+lease; the registered runner renews it every 10 seconds. Daemon startup
+preserves marked pending and running rows, validates the row/attempt/compacted
+leaf, reconstructs the runtime even though `CompactionSummary` is a transcript
+boundary, and claims pending or expired work. An unexpired lease is not
+concurrently dispatched. A process-lifetime watchdog remains armed while the
+daemon runs, normally sleeping until the next database-derived lease expiry;
+heartbeat loss/error and leased-runner exit wake it immediately, and transient
+database/recovery errors use bounded backoff instead of terminating recovery.
+Heartbeat loss stops renewal but does not cancel the model future: the same
+runner may just have atomically completed or entered reactive compaction and
+must still register that durable successor. If ownership was actually lost, a
+replacement registration after expiry aborts the old handle. Completion/error
+is fenced by owner/generation and clears the intent in the same transaction.
+Only typed structural marker corruption terminally records a model error;
+SQL/pool/query/commit/context/runtime-load failures retain the marker for
+watchdog retry. Harness sessions use the same lease but retain manual completion
+ownership instead of starting an internal provider runner.
 
-The circuit breaker lives in compaction auto-state on session metadata. Each auto-compaction failure increments a consecutive-failure counter and records the failing leaf id; the eligibility check skips a leaf that just failed, skips when `suppressed`, and a successful model response (any usage) resets the failure counter. This prevents an endless compact/retry/overflow loop on a context that cannot be shrunk.
+The in-process task registry uses an opaque registration id for each runner.
+Installing a replacement generation explicitly aborts the old registered
+handle, and runner cleanup removes the row entry only when that id still owns
+it. A late generation-one exit therefore cannot unregister or classify a
+generation-two runner. Shutdown and registration share one lock: shutdown marks
+the state closing and drains dispatch runners/watchdog atomically with respect
+to registration, while a rejected handle never crosses its provider start
+barrier. A concurrently claimed durable lease remains for next-boot recovery.
+
+This protocol is **at least once**, not exactly once. A crash after the provider
+accepted a request but before the terminal Postgres commit can cause another
+call after lease expiry. Neither the OpenAI/Codex nor Anthropic adapter supplies
+a provider idempotency key for these model requests, so pi-relay cannot
+eliminate that duplicate-call/cost window; the row/attempt/owner fences only
+prevent duplicate durable completion. Replace this narrow payload-backed
+protocol only after a general durable dispatch outbox/lease covers the same
+claim, heartbeat, startup reclaim, and terminal-clear transitions.
+
+A reactive path also fires: if the provider rejects a running request with a
+context-overflow error, `recover_model_context_overflow_with_compaction` blocks
+the running action and spawns a mid-turn compaction instead of failing the turn.
+A compaction that blocks a concrete model action remains `MidTurn` even when its
+source leaf is itself a `CompactionSummary`; the scope records the blocked
+row/attempt so both completion and failure must resume or terminally fail it.
+
+Remote compaction policy is provider-specific. OpenAI keeps its existing native-compaction default. Claude remains local by default, including legacy web rows whose old metadata says only `remote_mode = "auto"` and new web sessions, which store `remote_mode = "never"` plus a null enrollment marker. To opt a Claude session into the current native beta, an operator must set both fields in persisted/session-configured metadata:
+
+```json
+{
+  "compaction": {
+    "config": {
+      "remote_mode": "auto",
+      "anthropic_native_compaction": "compact_20260112"
+    }
+  }
+}
+```
+
+Use `always` instead of `auto` only when native failures should be visible
+rather than locally recovered. Claude `auto` logs and falls back to local
+summary on unsupported-model, provider, malformed-stream, unexpected-stop, or
+invalid-block failures; `always` propagates them. Null, unknown, wrong-type, or
+otherwise malformed Claude config fails closed to `never`, while an explicit
+`never` remains authoritative even if a sibling field is malformed. OpenAI's
+legacy whole-object serde fallback and Auto-to-Always normalization remain
+unchanged: a malformed legacy OpenAI sibling discards the complete config
+object, so even a sibling `remote_mode = "never"` falls back to Auto and
+resolves to Always; the Claude-only enrollment field remains an ignored unknown
+field for OpenAI. The transcript-group trimming/retry loop handles clear native
+context-overflow failures before `auto` considers local fallback. A manual or
+early compaction below Anthropic's 50K minimum cannot produce a native block,
+so `auto` intentionally falls back to local summary and `always` intentionally
+fails.
+
+The circuit breaker lives in compaction auto-state on session metadata. Each auto-compaction failure increments a consecutive-failure counter and records the failing leaf id; the eligibility check skips a leaf that just failed, skips when `suppressed`, and a successful ordinary model completion (including a max-output response with usage, but not refusal or an unexpected compaction stop) resets the failure counter. Compaction success commits the updated breaker/recompaction state with checkpoint installation and blocked-model resumption; failure commits failure metadata while terminally failing both blocked model and compaction actions. One immediate recompaction is allowed after a successful compacted request still overflows. If the request still overflows after a second successful compaction, recovery falls through to the ordinary terminal model-error path instead of starting an infinite loop. After success commits, the daemon reloads the compacted runtime and persisted config before claiming the pending model action. An installation/config/workspace/claim error compensates by terminally failing the unfinished action. After a successful claim, the daemon verifies that spawn synchronously registered a runner and applies the same fenced compensation if it did not; if another path already owns that exact lease generation, the live-runner check avoids a same-generation concurrent dispatch or false failure. Task-wrapper errors evict the stale live projection and re-run durable recovery after unregistering the compaction task. This prevents both endless compact/retry/overflow cycles and stranded blocked, pending, or unowned running model actions.
 
 ### Reconnect event replay
 

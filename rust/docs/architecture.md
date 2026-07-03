@@ -85,9 +85,12 @@ agent-store (append, bump revisions, emit events) --> websocket subscribers
 ```
 
 Postgres is committed before follow-on provider/tool work is dispatched, so a
-crash leaves either a recoverable open tail or replayable events. Long provider,
-tool, and compaction I/O runs outside the per-session row lock and reconverges
-through the action `attempt_id` fence. The mechanics live in
+crash leaves either a recoverable open tail, replayable events, or the narrow
+leased post-compaction dispatch intent. That intent is reclaimed at least once;
+a crash after provider acceptance can duplicate the external call because the
+provider requests have no idempotency key. Long provider, tool, and compaction
+I/O runs outside the per-session row lock and reconverges through action
+attempt/dispatch-owner fences. The mechanics live in
 [agent-store](modules/agent-store.md) and [agent-daemon](modules/agent-daemon.md).
 
 ## Feature Audit
@@ -110,8 +113,9 @@ Implemented user-facing behavior:
 - Turn-level interrupt; idle-only retry/continue (`turn.resume`) for terminal
   model turns; idle-only active-branch switch; idle-only `session.delete`.
 - Manual and automatic compaction; OpenAI uses provider-native compaction,
-  Anthropic uses a local text summary. Compaction is a typed transcript root,
-  not a session boundary.
+  while Anthropic defaults to a local text summary and requires a versioned
+  `compact_20260112` opt-in for its provider-native beta pilot. Compaction is a
+  typed transcript root, not a session boundary.
 - Turn-oriented selected-session loading: collapsed turn cards plus lazy
   per-turn detail, so normal loads do not scale with transcript size, and raw
   `provider_replay` never reaches any UI/RPC response.

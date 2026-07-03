@@ -77,3 +77,16 @@ export function reasoningEffortsForProvider(provider: ProviderConfig): Reasoning
 	if (provider.kind === "claude") return CLAUDE_REASONING_EFFORTS;
 	return provider.model === "gpt-5.6-sol" ? OPENAI_SOL_REASONING_EFFORTS : OPENAI_REASONING_EFFORTS;
 }
+
+export function newSessionCompactionConfig(provider: ProviderConfig) {
+	// Anthropic native compaction is an opt-in beta pilot. OpenAI retains its
+	// existing provider-native default. New Claude sessions explicitly store
+	// `never` and a null version marker; operators must set both remote_mode and
+	// anthropic_native_compaction="compact_20260112" to enroll an existing row.
+	return {
+		auto_enabled: true,
+		remote_mode: provider.kind === "claude" ? "never" as const : "auto" as const,
+		...(provider.kind === "claude" ? { anthropic_native_compaction: null } : {}),
+		max_consecutive_failures: 3,
+	};
+}

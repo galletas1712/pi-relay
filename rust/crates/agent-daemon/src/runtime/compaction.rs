@@ -4,19 +4,22 @@ use agent_store::{
     ActionKind, ActionStatus, CompactionCompletion, CompactionJob, CompactionScope,
     CompactionTrigger, SessionConfig,
 };
-use agent_vocab::{ProviderReplayItem, TranscriptItem};
+use agent_vocab::TranscriptItem;
 
 use crate::provider_runtime::{
     auto_limit_tokens, compaction_auto_explicitly_disabled, compaction_auto_state,
     compaction_config_with_model_metadata, model_input_tokens_for_gate, model_metadata_for_config,
     run_compaction,
 };
-use crate::state::{AppState, RunningTask};
-use crate::types::{DispatchAction, RpcError};
+use crate::state::{AppState, RunningTask, TaskRegistrationId};
+use crate::types::{DispatchAction, RpcError, RuntimeSession};
 
 use super::dispatch::spawn_model_dispatch;
 use super::events::publish_events;
-use super::tasks::{prune_finished_tasks, register_task, unregister_task};
+use super::tasks::{
+    action_has_live_task_for_lease, prune_finished_tasks, register_task, unregister_task,
+    TaskRegistrationRejected,
+};
 use super::{history_error_to_rpc, session_uses_harness, SessionDriver};
 
 impl SessionDriver {
@@ -49,7 +52,6 @@ impl SessionDriver {
         ) {
             return Ok(true);
         }
-
         let tokens = match model_input_tokens_for_gate(
             &self.state,
             &dispatch.config,
@@ -87,6 +89,26 @@ impl SessionDriver {
     }
 }
 
+async fn pause_after_reactive_compaction_transition_for_test(_dispatch: &DispatchAction) {
+    #[cfg(test)]
+    if let Some(milliseconds) = _dispatch
+        .config
+        .metadata
+        .pointer("/fault_injection/pause_after_reactive_compaction_transition_ms")
+        .and_then(serde_json::Value::as_u64)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(milliseconds)).await;
+    }
+}
+
+fn recompaction_limit_reached(
+    auto_state: &crate::provider_runtime::CompactionAutoState,
+    source_leaf_id: &str,
+) -> bool {
+    auto_state.last_success_root_id.as_deref() == Some(source_leaf_id)
+        && auto_state.consecutive_recompactions >= 1
+}
+
 /// Two callsites (`gate_model_dispatch` and
 /// `recover_model_context_overflow_with_compaction`) need the same set of
 /// eligibility guards before they're allowed to dispatch compaction. This
@@ -116,6 +138,13 @@ async fn check_compaction_eligible(
     let source_leaf_id = context_leaf_id.as_deref()?;
     let auto_state = compaction_auto_state(&dispatch.config);
     if auto_state.suppressed || auto_state.last_failure_leaf_id.as_deref() == Some(source_leaf_id) {
+        return None;
+    }
+    if recompaction_limit_reached(&auto_state, source_leaf_id) {
+        // One immediate recompaction is allowed in case a provider-generated
+        // summary still does not fit. A third overflow after two successful
+        // checkpoints must fall through to the normal terminal model-error
+        // path rather than compacting forever.
         return None;
     }
     if compaction_auto_explicitly_disabled(&dispatch.config) {
@@ -186,6 +215,7 @@ async fn block_and_spawn_auto_compaction(
             &dispatch.row_id,
             &dispatch.attempt_id,
             expected_status,
+            dispatch.post_compaction_dispatch_lease.as_ref(),
             trigger,
             tokens_before,
             limit,
@@ -195,13 +225,54 @@ async fn block_and_spawn_auto_compaction(
     if matches!(created.job.scope, CompactionScope::Boundary { .. }) {
         state.active.lock().await.remove(session_id);
     }
-    spawn_compaction(
+    pause_after_reactive_compaction_transition_for_test(dispatch).await;
+    if spawn_compaction(
         state,
         session_id.to_string(),
         created.job,
         dispatch.config.clone(),
-    );
+    )
+    .is_err()
+    {
+        // The durable block/compaction transition already committed. Shutdown
+        // must not terminally compensate it; boot recovery owns the row.
+        return Ok(());
+    }
     Ok(())
+}
+
+async fn compensate_resumed_action(
+    state: &AppState,
+    driver: &SessionDriver,
+    session_id: &str,
+    resumed: &agent_store::PersistedAction,
+    post_compaction_dispatch_lease: Option<&agent_store::PostCompactionDispatchLease>,
+    error: String,
+) -> std::result::Result<(), RpcError> {
+    if post_compaction_dispatch_lease
+        .is_some_and(|lease| action_has_live_task_for_lease(state, &resumed.row_id, lease))
+    {
+        return Ok(());
+    }
+    let events = state
+        .repo
+        .fail_unfinished_model_action(
+            session_id,
+            &resumed.row_id,
+            &resumed.attempt_id,
+            post_compaction_dispatch_lease,
+            &error,
+        )
+        .await?;
+    let compensated = !events.is_empty();
+    publish_events(state, events);
+    if compensated {
+        state.active.lock().await.remove(session_id);
+        driver.recover_if_needed().await?;
+        Err(RpcError::new("compaction_resume_failed", error))
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn spawn_compaction(
@@ -209,21 +280,39 @@ pub(crate) fn spawn_compaction(
     session_id: String,
     job: CompactionJob,
     config: SessionConfig,
-) {
+) -> Result<(), TaskRegistrationRejected> {
     prune_finished_tasks(state);
     let action_row_id = job.action_row_id.clone();
     let task_state = state.clone();
     let task_session_id = session_id.clone();
     let task_action_row_id = action_row_id.clone();
+    let registration_id = TaskRegistrationId::new();
+    let task_registration_id = registration_id.clone();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel();
     let handle = tokio::spawn(async move {
+        if start_rx.await.is_err() {
+            return;
+        }
         let action_row_id = job.action_row_id.clone();
         let result = run_compaction_job(task_state.clone(), session_id.clone(), job, config).await;
-        unregister_task(&task_state, &action_row_id);
+        if !unregister_task(&task_state, &action_row_id, &task_registration_id) {
+            return;
+        }
         if let Err(error) = result {
             eprintln!(
                 "compaction task failed {session_id}: {}: {}",
                 error.code, error.message
             );
+            // The durable transition may already have committed. Never leave a
+            // stale live projection suppressing recovery when the task exits.
+            task_state.active.lock().await.remove(&session_id);
+            let driver = SessionDriver::acquire(&task_state, &session_id).await;
+            if let Err(recovery_error) = driver.recover_if_needed().await {
+                eprintln!(
+                    "compaction task recovery failed {session_id}: {}: {}",
+                    recovery_error.code, recovery_error.message
+                );
+            }
         }
     });
     register_task(
@@ -231,10 +320,14 @@ pub(crate) fn spawn_compaction(
         RunningTask {
             session_id: task_session_id,
             action_row_id: task_action_row_id,
+            registration_id,
+            post_compaction_dispatch_lease: None,
             kind: ActionKind::Compaction,
             handle,
         },
-    );
+        start_tx,
+    )?;
+    Ok(())
 }
 
 async fn run_compaction_job(
@@ -243,8 +336,17 @@ async fn run_compaction_job(
     job: CompactionJob,
     config: SessionConfig,
 ) -> std::result::Result<(), RpcError> {
+    #[cfg(test)]
+    if config
+        .metadata
+        .pointer("/fault_injection/pause_compaction_dispatch_before_provider")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true)
+    {
+        std::future::pending::<()>().await;
+    }
     let result = run_compaction(&state, &config, &session_id, job.compaction_context.clone()).await;
-    let (events, resumed) = match result {
+    let (events, resumed, failure) = match result {
         Ok(output) => {
             let continuation_suffix = continuation_suffix_for_scope(&job)?;
             let completion = CompactionCompletion {
@@ -262,65 +364,146 @@ async fn run_compaction_job(
                 .await?;
             if result.new_root_id.is_some() {
                 state
-                    .repo
-                    .record_compaction_success(
-                        &session_id,
-                        result.new_root_id.as_deref(),
-                        matches!(job.trigger, CompactionTrigger::Manual),
-                    )
-                    .await?;
-                state
                     .provider_connections
                     .mark_compacted(&session_id, config.provider.kind, job.last_turn_id.0)
                     .await;
-                if matches!(job.scope, CompactionScope::MidTurn { .. }) {
-                    install_runtime_compaction_checkpoint(
-                        &state,
-                        &session_id,
-                        &job,
-                        String::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    )
-                    .await?;
-                }
             }
-            (result.events, result.resumed_model_action)
+            (result.events, result.resumed_model_action, None)
         }
         Err(error) => {
             let error = error.to_string();
-            if matches!(job.trigger, CompactionTrigger::Auto { .. }) {
-                state
-                    .repo
-                    .record_auto_compaction_failure(
-                        &session_id,
-                        &config,
-                        &job.source_leaf_id,
-                        &error,
-                    )
-                    .await?;
-            }
-            fail_blocked_model_for_compaction_error(&state, &session_id, &job, &error).await?;
-            (state.repo.fail_compaction_action(&job, error).await?, None)
+            let events = state
+                .repo
+                .fail_compaction_action(&job, &config, error.clone())
+                .await?;
+            let committed = !events.is_empty();
+            (events, None, committed.then_some(error))
         }
     };
+    let transitioned = !events.is_empty() || resumed.is_some();
     publish_events(&state, events);
+    if !transitioned {
+        return Ok(());
+    }
 
     let driver = SessionDriver::acquire(&state, &session_id).await;
+    if let Some(error) = failure {
+        apply_compaction_failure_to_runtime(&state, &driver, &session_id, &job, &error).await?;
+    }
     if let Some(resumed) = resumed {
-        let dispatch = DispatchAction {
-            row_id: resumed.row_id,
-            attempt_id: resumed.attempt_id,
-            action: resumed.action,
-            config: config.clone(),
-        };
-        if state
-            .repo
-            .claim_pending_model_action(&session_id, &dispatch.row_id, &dispatch.attempt_id)
-            .await?
+        super::ensure_post_compaction_dispatch_recovery(&state);
+        let resumed_config = match install_runtime_compaction_checkpoint(&state, &session_id, &job)
+            .await
         {
-            spawn_model_dispatch(state.clone(), session_id.clone(), dispatch, true);
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!(
+                        "failed to install committed compaction checkpoint/config {session_id}/{}; retaining marker for recovery: {}",
+                        resumed.row_id, error.message
+                    );
+                state.active.lock().await.remove(&session_id);
+                state.post_compaction_recovery_notify.notify_one();
+                return Ok(());
+            }
+        };
+        let dispatch = DispatchAction {
+            row_id: resumed.row_id.clone(),
+            attempt_id: resumed.attempt_id.clone(),
+            post_compaction_dispatch_lease: None,
+            action: resumed.action.clone(),
+            config: resumed_config,
+        };
+        // Harness sessions deliberately expose pending model actions to the
+        // development RPC instead of owning an internal runner.
+        if session_uses_harness(&dispatch.config) {
+            return Ok(());
         }
+        let intent = agent_store::PostCompactionDispatchIntent {
+            session_id: session_id.clone(),
+            row_id: dispatch.row_id.clone(),
+            attempt_id: dispatch.attempt_id.clone(),
+        };
+        let claimed = match state
+            .repo
+            .claim_post_compaction_model_action(
+                &intent,
+                agent_store::POST_COMPACTION_DISPATCH_LEASE_DURATION,
+            )
+            .await
+        {
+            Ok(claimed) => claimed,
+            Err(agent_store::PostCompactionDispatchClaimError::Corrupt(error)) => {
+                let message = format!(
+                    "failed to reconstruct model action after compaction: {}",
+                    error.message()
+                );
+                let events = state
+                    .repo
+                    .fail_corrupt_post_compaction_model_action(&intent, error.fence(), &message)
+                    .await?;
+                publish_events(&state, events);
+                state.active.lock().await.remove(&session_id);
+                driver.recover_if_needed().await?;
+                return Err(RpcError::new("compaction_resume_failed", message));
+            }
+            Err(agent_store::PostCompactionDispatchClaimError::Transient(error)) => {
+                eprintln!(
+                    "failed to claim model action after compaction {session_id}/{}; retaining marker for recovery: {error:#}",
+                    resumed.row_id
+                );
+                state.post_compaction_recovery_notify.notify_one();
+                return Ok(());
+            }
+        };
+        let Some(claimed) = claimed else {
+            return compensate_resumed_action(
+                &state,
+                &driver,
+                &session_id,
+                &resumed,
+                None,
+                "resumed model action was no longer pending after compaction".to_string(),
+            )
+            .await;
+        };
+        let dispatch = DispatchAction {
+            row_id: claimed.pending.row_id,
+            attempt_id: claimed.pending.attempt_id,
+            post_compaction_dispatch_lease: Some(claimed.lease),
+            action: claimed.pending.action,
+            config: dispatch.config,
+        };
+        let lease = dispatch.post_compaction_dispatch_lease.clone();
+        let registration_id =
+            spawn_model_dispatch(state.clone(), session_id.clone(), dispatch, true).await;
+        if matches!(registration_id, Err(TaskRegistrationRejected)) {
+            // Shutdown owns the runner barrier now. Keep the exact durable
+            // lease for expiry/recovery on the next boot.
+            return Ok(());
+        }
+        if !registration_id
+            .ok()
+            .flatten()
+            .as_ref()
+            .is_some_and(|registration_id| {
+                super::tasks::task_registration_is_live(&state, &resumed.row_id, registration_id)
+            })
+        {
+            return compensate_resumed_action(
+                &state,
+                &driver,
+                &session_id,
+                &resumed,
+                lease.as_ref(),
+                "failed to register resumed model runner after compaction".to_string(),
+            )
+            .await;
+        }
+        // A successful claim has a synchronously registered runner; a failed
+        // claim is reconciled above without dispatching a duplicate.
+        // Do not let unrelated queue driving compensate an action that now has
+        // a registered runner.
+        return Ok(());
     }
     driver.drive_until_blocked().await?;
     Ok(())
@@ -345,18 +528,15 @@ async fn install_runtime_compaction_checkpoint(
     state: &AppState,
     session_id: &str,
     job: &CompactionJob,
-    _summary: String,
-    _provider_replay: Vec<ProviderReplayItem>,
-    _suffix_nodes: Vec<TranscriptStorageNode>,
-) -> std::result::Result<(), RpcError> {
-    let Some(active) = state.active.lock().await.get(session_id).cloned() else {
-        return Ok(());
-    };
+) -> std::result::Result<SessionConfig, RpcError> {
     let stored = state.repo.load_stored_session(session_id).await?;
-    let session = AgentSession::from_stored_session_preserving_open_turn(stored)
+    let config = state.repo.load_session_config(session_id).await?;
+    state
+        .workspaces
+        .ensure_session(session_id, &config.outer_cwd, &config.workspaces)
+        .await?;
+    let mut session = AgentSession::from_stored_session_preserving_open_turn(stored)
         .map_err(history_error_to_rpc)?;
-    let mut runtime = active.lock().await;
-    runtime.session = session;
     if let CompactionScope::MidTurn {
         turn_id,
         blocked_model_action_id,
@@ -364,24 +544,36 @@ async fn install_runtime_compaction_checkpoint(
     } = &job.scope
     {
         let action_id = *blocked_model_action_id;
-        let active_leaf_id = runtime
-            .session
+        let active_leaf_id = session
             .transcript_store()
             .active_leaf_id()
             .map(str::to_string)
             .ok_or_else(|| {
                 RpcError::new("invalid_compaction", "compaction produced no active leaf")
             })?;
-        runtime
-            .session
+        session
             .restore_compacted_runtime(&active_leaf_id, *turn_id, action_id)
             .map_err(history_error_to_rpc)?;
     }
-    Ok(())
+    if let Some(active) = state.active.lock().await.get(session_id).cloned() {
+        let mut runtime = active.lock().await;
+        runtime.session = session;
+        runtime.config = config.clone();
+    } else {
+        state.active.lock().await.insert(
+            session_id.to_string(),
+            std::sync::Arc::new(tokio::sync::Mutex::new(RuntimeSession {
+                session,
+                config: config.clone(),
+            })),
+        );
+    }
+    Ok(config)
 }
 
-async fn fail_blocked_model_for_compaction_error(
+async fn apply_compaction_failure_to_runtime(
     state: &AppState,
+    driver: &SessionDriver,
     session_id: &str,
     job: &CompactionJob,
     error: &str,
@@ -389,29 +581,17 @@ async fn fail_blocked_model_for_compaction_error(
     let CompactionScope::MidTurn {
         turn_id,
         blocked_model_action_id,
-        blocked_model_action_row_id,
-        blocked_model_attempt_id,
         ..
     } = &job.scope
     else {
         return Ok(());
     };
     let model_error = format!("compaction failed before model dispatch: {error}");
-    let events = state
-        .repo
-        .fail_blocked_or_pending_model_action(
-            session_id,
-            blocked_model_action_row_id,
-            blocked_model_attempt_id,
-            &model_error,
-        )
-        .await?;
-    publish_events(state, events);
     let Some(active) = state.active.lock().await.get(session_id).cloned() else {
+        driver.recover_if_needed().await?;
         return Ok(());
     };
     let action_id = *blocked_model_action_id;
-    let driver = SessionDriver::acquire(state, session_id).await;
     let dispatches = driver
         .apply_agent_input(
             active,
@@ -496,5 +676,20 @@ mod tests {
             continuation_suffix_for_scope(&mid_turn_job_with_open_suffix()).expect("suffix builds");
 
         assert!(suffix.is_empty());
+    }
+
+    #[test]
+    fn repeated_successful_recompaction_is_bounded() {
+        let state = crate::provider_runtime::CompactionAutoState {
+            last_success_root_id: Some("current-compaction-root".to_string()),
+            consecutive_recompactions: 1,
+            ..Default::default()
+        };
+
+        assert!(recompaction_limit_reached(
+            &state,
+            "current-compaction-root"
+        ));
+        assert!(!recompaction_limit_reached(&state, "older-root"));
     }
 }

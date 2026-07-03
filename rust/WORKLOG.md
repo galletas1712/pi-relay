@@ -1436,3 +1436,151 @@ paths. Changes made from that review:
   (5 tests, including 3 env-gated cancellation tests),
   `cargo test --manifest-path rust/Cargo.toml -p agent-daemon` (4 tests), and
   `cargo check --manifest-path rust/Cargo.toml`.
+
+### Anthropic Native Compaction Pilot
+
+- Added opt-in Anthropic server-side compaction through the existing
+  `ModelProvider::compact` seam. The adapter sends a special streaming
+  `/messages` request with beta `compact-2026-01-12`,
+  `compact_20260112`, a 50K trigger, `pause_after_compaction`, replacement PI
+  compaction instructions, and no tools.
+- Strictly parse streamed `compaction_delta` with one index-zero
+  start/delta/stop sequence, an eventual `stop_reason: "compaction"`, and final
+  `message_stop`, while transparently ignoring pings and unknown future event
+  types and accepting multiple usage/message deltas. Missing,
+  duplicate/conflicting terminal reasons, wrong-index, wrong-type,
+  mixed/multiple-block, trailing, malformed, and truncated known frames fail
+  closed without changing the intentionally permissive ordinary parser. A
+  successful block requires non-null/non-empty string `content`; opaque
+  `encrypted_content` remains exactly string, explicit null, or absent. Those
+  fields and extension fields are stored as provider replay on the checkpoint
+  root and replayed unchanged on later Messages/count-token calls. The daemon's
+  fresh delegation ledger stays outside that opaque block as the following
+  synthetic user summary.
+- Added the explicit enrollment marker
+  `anthropic_native_compaction = "compact_20260112"`. Claude `auto`/`always`
+  requires that marker and wholly valid compaction metadata; old web
+  `remote_mode = "auto"` rows, malformed config, and new Claude web sessions
+  remain local. OpenAI's legacy policy is unchanged.
+- Validate Anthropic native compaction against a static supported-model list
+  and Models API `context_management` capability when advertised.
+  Unknown/unsupported models return typed `unsupported`, causing Claude
+  `auto` local fallback and `always` visible failure.
+- Preserve active-action lifecycle independently from transcript-root shape:
+  reactive overflow compactions are always mid-turn, including immediately
+  after a prior compaction. One successful immediate recompaction is allowed;
+  another overflow then terminally follows the ordinary error path instead of
+  looping or leaving a blocked action stranded.
+- Commit success metadata with checkpoint installation, compaction completion,
+  and blocked-model resumption in one Postgres transaction. Failure likewise
+  commits breaker metadata and terminally fails both model and compaction
+  actions atomically. Mid-turn success also writes an attempt-fenced
+  `post_compaction_dispatch` intent into the resumed model action's payload in
+  that transaction. Claim retains the intent while atomically assigning a
+  random owner, incremented generation, and database-clock 30-second lease;
+  registered runners renew every 10 seconds. Startup stale marking preserves
+  only marked pending/running model rows, reconstructs the exact compacted
+  leaf/runtime, claims pending or expired ownership, and schedules retry at the
+  expiry of an unexpired lease. Terminal completion/error removes the marker in
+  the same owner/generation-fenced transaction; reactive re-block, interruption,
+  and task-failure staling are fenced as well. Corrupt or unreconstructable
+  markers terminally fail with a visible model error. The same-process path
+  reloads the committed checkpoint/config before claiming resumed work and
+  verifies synchronous task registration. This is at-least-once dispatch:
+  process death after provider acceptance but before terminal commit can cause
+  another provider call after expiry. Current OpenAI/Codex and Anthropic model
+  requests expose no provider idempotency key, so exactly-once calls are not
+  claimed. Replace this narrow payload protocol only after a general durable
+  dispatch outbox/lease covers atomic intent, heartbeat, startup reclaim, and
+  terminal clear.
+- Retain Anthropic's complete raw usage object alongside normalized top-level
+  counts. This preserves compaction/message iterations, cache-creation TTL
+  detail, and thinking-token detail without adding compaction iterations to
+  top-level totals that explicitly exclude them.
+- Token counting applies existing compaction state, reports effective
+  `input_tokens`, and retains `context_management.original_input_tokens`.
+
+#### Temporary fallbacks and removal criteria (PR-description copy)
+
+The numeric gates below are proposed minimums: model/policy owners must agree
+to the stated failure threshold (and provider SLO where applicable) before a
+fallback is removed. `always` remains strict regardless of Auto telemetry.
+Before any 30-day or sample-count observation window starts, structured,
+centralized telemetry must be deployed and validated with dimensions for
+model/policy, input-token bucket, typed category/result, post-retry outcome,
+retry count, and latency. Historical attempts/days before that prerequisite do
+not count. Current stderr diagnostics and persisted local-fallback success
+results are operational breadcrumbs, not fallback-removal evidence.
+
+| Temporary behavior | Trigger | Why it exists | Remove when | Proof/observability |
+| --- | --- | --- | --- | --- |
+| Claude defaults to local and requires `anthropic_native_compaction = "compact_20260112"` with `remote_mode = "auto"`/`"always"` | Missing/version-mismatched marker, legacy web `auto`, new web session, or malformed Claude compaction metadata | The Anthropic feature is beta and legacy `auto` predates native support, so it is not consent | The beta/API version is approved as the Claude default **and** persisted legacy rows have an explicit reviewed migration; a future API version requires a new marker or migration | Exact legacy-web, malformed-config, explicit-never, and web-default tests; native attempts emit `attempting provider-native compaction` |
+| Claude `auto` falls back for unsupported model/capability | Static model policy rejects the model, or Models API explicitly omits native `context_management` | Native compaction is not valid for that model/policy | Per supported model/policy, remove only after the telemetry prerequisite is validated, then 30 consecutive days and at least 1,000 eligible attempts show fewer than 0.5% typed `unsupported` results, with model-policy owners approving capability coverage | Future centralized telemetry must count typed `NativeCompactionError::Unsupported` by model/policy and post-retry outcome; capability and policy tests remain required. `always` stays strict and exposes the error |
+| Claude `auto` falls back for below-50K/early request | Manual/early request cannot reach Anthropic's 50K trigger and returns no compaction stop/block | Anthropic has no force-below-minimum operation | Remove only after Anthropic documents and integration tests a force/manual operation; after validated telemetry deployment, observe each supported model/policy for 30 days and at least 500 below-50K attempts with fewer than 1% failure before disabling local fallback | Future centralized telemetry must record model/policy, input-token bucket, typed unexpected-stop/no-block result, retry count, post-retry outcome, and latency; request-shape tests pin 50K. `always` stays strict |
+| Claude `auto` falls back for transient provider failure | Transport error, 408/409/429, or 5xx after existing bounded retry/trim handling | Availability failures should not make Auto unusable | For each supported model/policy, after validated telemetry deployment require a 30-day window with at least 1,000 native attempts and fewer than 1% post-retry transient failures, plus an agreed provider SLO, before removing fallback | Future centralized telemetry must classify typed transport/HTTP results and report model/policy, token bucket, retry count, post-retry rate/outcome, and latency. `always` stays strict and propagates the final failure |
+| Claude `auto` falls back for malformed/protocol failure | Malformed/truncated SSE, invalid framing/index/type, conflicting/unexpected stop, or missing/null/empty/wrong-type compaction content | Invalid native output cannot become a checkpoint | For each supported model/policy, after validated telemetry deployment require 30 consecutive days and at least 1,000 native attempts with fewer than 0.1% protocol failures, no unresolved data-integrity incident, and parser-owner approval | Future centralized telemetry must add typed parser/protocol categories with model/policy, token bucket, retry count, post-retry outcome, and latency; sampled redacted fixtures also require an approved collection path. `always` stays strict and exposes the typed failure |
+| Remote context-overflow trimming/retry remains before fallback | Native compact call returns a clearly classified context overflow | Existing large transcripts can exceed the endpoint/model limit before compaction executes | Native compaction accepts all supported full-window inputs or the API provides a guaranteed pre-compaction path | Group-trimming unit tests prove compaction-root/newer-history preservation; the full network overflow → trim → retry → fallback sequence is not integration-tested |
+| `always` exposes native failures | Any native failure under explicitly marked `remote_mode = "always"` | Operators selecting strict native behavior need failures visible, not silently converted to local output | Never by default; remove only if the config mode itself is removed | Injected production policy seam proves Claude Auto local fallback and Always typed-error propagation |
+| Compaction beta header follows replayed compaction state | Special compact request and later Messages/count-token requests containing a compaction block | Anthropic requires the beta to interpret the opaque block; ordinary pre-compaction calls should not be enrolled | Anthropic makes compaction and replay GA without a beta header | Wire/body tests prove model discovery and ordinary calls omit it while compact/replay paths carry it |
+
+Validation: `cargo fmt --all -- --check`, `cargo test --workspace` (442 tests
+across the Rust targets, including 101 provider and 180 daemon tests),
+`cargo clippy --workspace --all-targets -- -A clippy::too-many-arguments
+-D warnings`, `npm run test --workspace @pi-relay/web` (192 tests),
+`npm run build --workspace @pi-relay/web`, and `git diff --check` pass. The
+serial real-Postgres store suite passes; focused real-Postgres regressions cover
+expired leased-claim recovery after complete volatile-state recreation, live
+lease duplicate suppression, simultaneous boot recovery across two independent
+stores/states, heartbeat-loss recovery without process restart, transient
+scheduler database-error retry, terminal marker cleanup, corrupt-intent
+terminal recovery, generation-aware task compare-remove, and ordinary
+compaction/refusal stops with a genuinely live model action. The full serial
+daemon Postgres suite retains five pre-existing delegation/steering fixture
+failures also present before these final compaction fixes. No live Anthropic
+request is part of this change; special Messages requests remain covered by
+in-process wire mocks. The five unrelated daemon failures were also reproduced
+individually from detached baseline `d296e3f`.
+
+### Lease/watchdog blocker interleavings
+
+- Heartbeat loss or renewal error now wakes the watchdog and stops renewal
+  without selecting away/dropping the leased model future. This preserves the
+  same runner's post-commit terminal-successor or reactive-compaction handoff.
+  If ownership was truly lost or the provider hangs, expiry recovery claims a
+  newer generation and compare-replacement registration aborts the old handle;
+  all durable commits remain exact owner/generation fenced.
+- Task registration and shutdown now share one registration lock. Registration
+  explicitly rejects and aborts a spawned handle before its oneshot provider
+  start barrier when shutdown has won; shutdown sets `shutting_down` and drains
+  dispatch/compaction handles, provider sidecars/background drivers, and the
+  process watchdog while holding the same gate. Recovery checks shutdown before
+  inspection and again at registration. A lease claimed concurrently with
+  shutdown is retained for expiry/next boot instead of being terminally
+  compensated.
+- `claim_post_compaction_model_action` now returns typed structural corruption
+  separately from transient infrastructure/context-load errors. Only typed
+  corruption is terminally compensated. The compensation CAS matches exact
+  session/row/attempt/status and the full marker snapshot (plus owner/generation
+  when present), so a stale recovery cannot fail a newer claimed generation.
+  SQL/pool/query/commit/context/runtime-install/load failures retain their
+  marker/lease for watchdog retry. Immediate post-compaction claim failure uses
+  the same classification.
+- Added deterministic real-Postgres regressions for terminal successor and
+  reactive-compaction commit-to-local-follow-up heartbeat races; shutdown during
+  recovery claim/register and existing-runner successor spawn; transient
+  per-intent context-load failure followed by autonomous watchdog retry; and a
+  stale corruption compensation racing a real generation-two reclaim.
+
+Validation for this pass: `cargo fmt --all -- --check`, `cargo check --workspace
+--all-targets`, ordinary `cargo clippy --workspace --all-targets`,
+`git diff --check`, all six new focused real-Postgres races plus the existing
+lease/watchdog/concurrent-state/corruption regressions, serial
+`cargo test -p agent-store -- --test-threads=1` with
+`PI_RELAY_TEST_DATABASE_URL` (53 passed), and `cargo test --workspace` without
+the optional database URL all pass. The full serial daemon Postgres run is 175
+passed / the same five pre-existing delegation/steering fixture failures
+already documented above. Strict `cargo clippy --workspace --all-targets -- -D
+warnings` remains blocked only by the three pre-existing
+`clippy::too_many_arguments` warnings in store transcript/delegation test code;
+ordinary clippy completes with those warnings and no new warning from this
+pass.

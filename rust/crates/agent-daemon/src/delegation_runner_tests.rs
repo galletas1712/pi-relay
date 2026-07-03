@@ -7,22 +7,24 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
-use agent_provider::ModelTranscriptEntry;
+use agent_provider::{ModelResponse, ModelStopDetails, ModelStopReason, ModelTranscriptEntry};
 use agent_session::{ModelContext, SessionAction, TranscriptStorageNode};
 use agent_store::{
-    Delegation, DelegationKind, DelegationStatus, EventType, InputPriority, OutputBatch,
-    PostgresAgentStore, QueuedInputStatus, SessionConfig, SubagentType,
+    ActionStatus, CompactionCompletion, CompactionScope, CompactionTrigger, Delegation,
+    DelegationKind, DelegationStatus, EventType, InputPriority, OutputBatch, PostgresAgentStore,
+    QueuedInputStatus, SessionConfig, SubagentType, TranscriptEntryBodyMode, TranscriptEntryScope,
 };
 use agent_tools::ToolRegistry;
 use agent_vocab::{
     ActionId, AssistantItem, AssistantMessage, CompactionSummary, DaemonToolObservation,
-    ProviderConfig, ProviderKind, ReasoningEffort, ToolCall, ToolCallId, TranscriptItem, TurnId,
-    TurnOutcome, UserMessage,
+    ProviderConfig, ProviderKind, ProviderReplayItem, ReasoningEffort, ToolCall, ToolCallId,
+    TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 use serde_json::json;
+use sqlx::Row;
 use tokio::sync::{broadcast, Mutex};
 use uuid::Uuid;
 
@@ -59,8 +61,14 @@ use crate::provider_runtime::{
     remote_compaction_request, CompactionOutput, CompactionSummaryKind, ProviderConnectionRegistry,
     SessionTitleScheduler,
 };
-use crate::runtime::SessionDriver;
+use crate::runtime::{
+    apply_model_response, recover_post_compaction_dispatches_on_boot, take_tasks, SessionDriver,
+};
+use crate::session_start::{
+    start_prepared_session, PreparedSessionDispatchMode, PreparedSessionStart,
+};
 use crate::state::AppState;
+use crate::types::DispatchAction;
 use crate::workspaces::WorkspaceManager;
 
 use super::{
@@ -85,6 +93,9 @@ struct TestEnv {
 
 impl TestEnv {
     async fn cleanup(self) {
+        for handle in take_tasks(&self.state) {
+            handle.abort();
+        }
         self.state.repo.close().await;
         if let Ok(admin) = sqlx::PgPool::connect(&self.admin_url).await {
             let _ = sqlx::query(&format!(r#"drop database if exists "{}""#, self.name))
@@ -131,6 +142,12 @@ async fn test_env() -> Option<TestEnv> {
         active: Arc::new(Mutex::new(HashMap::new())),
         session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
         tasks: Arc::new(StdMutex::new(HashMap::new())),
+        auxiliary_tasks: Arc::new(StdMutex::new(Vec::new())),
+        task_registration_lock: Arc::new(StdMutex::new(())),
+        post_compaction_recovery_scheduled: Arc::new(AtomicBool::new(false)),
+        post_compaction_recovery_notify: Arc::new(tokio::sync::Notify::new()),
+        post_compaction_recovery_task: Arc::new(StdMutex::new(None)),
+        shutting_down: Arc::new(AtomicBool::new(false)),
         events,
         tools: Arc::new(ToolRegistry::with_builtin_tools()),
         provider_connections: ProviderConnectionRegistry::new(),
@@ -156,6 +173,98 @@ fn database_url_with_name(base: &str, name: &str) -> String {
         return format!("{base}_{name}");
     };
     format!("{root}/{name}{query}")
+}
+
+fn test_app_state(
+    store: PostgresAgentStore,
+    state_dir: &TempDir,
+    prompt_root: PathBuf,
+) -> AppState {
+    let (events, _rx) = broadcast::channel(1024);
+    AppState {
+        repo: Arc::new(store),
+        active: Arc::new(Mutex::new(HashMap::new())),
+        session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
+        tasks: Arc::new(StdMutex::new(HashMap::new())),
+        auxiliary_tasks: Arc::new(StdMutex::new(Vec::new())),
+        task_registration_lock: Arc::new(StdMutex::new(())),
+        post_compaction_recovery_scheduled: Arc::new(AtomicBool::new(false)),
+        post_compaction_recovery_notify: Arc::new(tokio::sync::Notify::new()),
+        post_compaction_recovery_task: Arc::new(StdMutex::new(None)),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        events,
+        tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        provider_connections: ProviderConnectionRegistry::new(),
+        session_titles: SessionTitleScheduler::default(),
+        workspaces: WorkspaceManager::for_tests(state_dir.path().to_path_buf()),
+        prompt_root,
+    }
+}
+
+async fn expire_post_compaction_lease(
+    database_url: &str,
+    session_id: &str,
+    action_row_id: &str,
+    attempt_id: &str,
+) {
+    let pool = sqlx::PgPool::connect(database_url)
+        .await
+        .expect("connect fault-injection pool");
+    sqlx::query(
+        r#"
+        update actions
+        set payload=jsonb_set(
+            payload,
+            '{post_compaction_dispatch,lease,expires_at_ms}',
+            '1'::jsonb
+        )
+        where session_id=$1 and id=$2 and attempt_id=$3
+        "#,
+    )
+    .bind(session_id)
+    .bind(action_row_id)
+    .bind(attempt_id)
+    .execute(&pool)
+    .await
+    .expect("expire crashed owner lease");
+    pool.close().await;
+}
+
+async fn install_compaction_metadata_fault(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        create function reject_compaction_metadata_update() returns trigger
+        language plpgsql as $$
+        begin
+            raise exception 'injected compaction metadata failure';
+        end
+        $$
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("create fault function");
+    sqlx::query(
+        r#"
+        create trigger reject_compaction_metadata_update
+        before update of metadata on sessions
+        for each row execute function reject_compaction_metadata_update()
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("create fault trigger");
+}
+
+async fn remove_compaction_metadata_fault(pool: &sqlx::PgPool) {
+    sqlx::query("drop trigger reject_compaction_metadata_update on sessions")
+        .execute(pool)
+        .await
+        .expect("drop fault trigger");
+    sqlx::query("drop function reject_compaction_metadata_update()")
+        .execute(pool)
+        .await
+        .expect("drop fault function");
 }
 
 fn session_config(env: &TestEnv, project_id: Uuid, metadata: serde_json::Value) -> SessionConfig {
@@ -208,6 +317,1821 @@ async fn create_parent(env: &TestEnv, project_id: Uuid, parent_id: &str) {
         )
         .await
         .expect("create parent");
+}
+
+fn successful_compaction(summary: &str) -> CompactionCompletion {
+    CompactionCompletion {
+        summary: summary.to_string(),
+        summary_kind: "provider_text".to_string(),
+        provider_replay: Vec::new(),
+        remote: false,
+        provider: ProviderKind::OpenAi,
+        usage: None,
+        continuation_suffix: Vec::new(),
+    }
+}
+
+async fn commit_post_compaction_dispatch(
+    env: &TestEnv,
+    project_id: Uuid,
+    session_id: &str,
+) -> (agent_store::PersistedAction, String) {
+    commit_post_compaction_dispatch_with_faults(env, project_id, session_id, json!({})).await
+}
+
+async fn commit_post_compaction_dispatch_with_faults(
+    env: &TestEnv,
+    project_id: Uuid,
+    session_id: &str,
+    faults: serde_json::Value,
+) -> (agent_store::PersistedAction, String) {
+    let mut faults = faults.as_object().cloned().unwrap_or_default();
+    faults
+        .entry("pause_model_dispatch_before_provider".to_string())
+        .or_insert(json!(true));
+    faults
+        .entry("post_compaction_heartbeat_interval_ms".to_string())
+        .or_insert(json!(10));
+    let compaction = faults.remove("compaction");
+    let mut metadata = json!({
+        "created_by": "test",
+        "fault_injection": faults
+    });
+    if let Some(compaction) = compaction {
+        metadata["compaction"] = compaction;
+    }
+    let entries = vec![
+        TranscriptStorageNode {
+            id: format!("{session_id}_turn"),
+            parent_id: None,
+            timestamp_ms: 1_700_000_000_000,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: format!("{session_id}_user"),
+            parent_id: Some(format!("{session_id}_turn")),
+            timestamp_ms: 1_700_000_000_001,
+            item: TranscriptItem::UserMessage(UserMessage::text("large request")),
+            provider_replay: Vec::new(),
+        },
+    ];
+    let source_leaf = entries[1].id.clone();
+    let action = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::from_transcript_items(
+            entries.iter().map(|entry| entry.item.clone()).collect(),
+        ),
+        context_leaf_id: Some(source_leaf.clone()),
+    };
+    let (_, actions) = env
+        .state
+        .repo
+        .start_session_outputs(
+            session_id,
+            &session_config(env, project_id, metadata),
+            &entries,
+            Some(&source_leaf),
+            &[],
+            &[action],
+            InputPriority::FollowUp,
+            &UserMessage::text("large request"),
+            None,
+        )
+        .await
+        .expect("session starts");
+    let model = actions.into_iter().next().expect("model action persists");
+    assert!(env
+        .state
+        .repo
+        .claim_pending_model_action(session_id, &model.row_id, &model.attempt_id)
+        .await
+        .expect("initial model claims"));
+    let compaction = env
+        .state
+        .repo
+        .block_model_action_for_compaction(
+            session_id,
+            &model.row_id,
+            &model.attempt_id,
+            ActionStatus::Running,
+            None,
+            CompactionTrigger::Auto {
+                reason: "provider overflow".to_string(),
+            },
+            None,
+            Some(100_000),
+        )
+        .await
+        .expect("overflow blocks model");
+    let completed = env
+        .state
+        .repo
+        .complete_compaction_action(
+            &compaction.job,
+            successful_compaction("restart-safe summary"),
+        )
+        .await
+        .expect("compaction success transaction commits");
+    let resumed = completed
+        .resumed_model_action
+        .expect("success transaction persists resumed model");
+    let compacted_leaf = completed
+        .active_leaf_id
+        .expect("success transaction installs compacted leaf");
+    (resumed, compacted_leaf)
+}
+
+#[tokio::test]
+async fn expired_post_compaction_claim_is_reclaimed_after_real_boot_state_recreation() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "post-compaction boot recovery", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "post_compaction_boot_recovery";
+    let (resumed, compacted_leaf) =
+        commit_post_compaction_dispatch(&env, project_id, session_id).await;
+    let ordinary_session_id = "ordinary_pending_boot_action";
+    start_prepared_session(
+        &env.state,
+        PreparedSessionStart {
+            session_id: ordinary_session_id.to_string(),
+            config: session_config(
+                &env,
+                project_id,
+                json!({ "created_by": "test", "harness": true }),
+            ),
+            priority: InputPriority::FollowUp,
+            content: UserMessage::text("ordinary pending work"),
+            client_input_id: None,
+            parent_session_id: None,
+            subagent_type: None,
+            delegation_id: None,
+            dispatch_mode: PreparedSessionDispatchMode::Deferred,
+        },
+    )
+    .await
+    .expect("ordinary pending session starts");
+
+    let intent = agent_store::PostCompactionDispatchIntent {
+        session_id: session_id.to_string(),
+        row_id: resumed.row_id.clone(),
+        attempt_id: resumed.attempt_id.clone(),
+    };
+    let crashed_claim = env
+        .state
+        .repo
+        .claim_post_compaction_model_action(&intent, std::time::Duration::from_secs(30))
+        .await
+        .expect("fault injection commits pending-to-running lease")
+        .expect("pending intent claims");
+    assert_eq!(crashed_claim.lease.generation, 1);
+    assert_eq!(crashed_claim.lease.context_leaf_id, compacted_leaf);
+    assert!(
+        env.state
+            .repo
+            .claim_post_compaction_model_action(&intent, std::time::Duration::from_secs(30))
+            .await
+            .expect("repeat live-lease claim is a clean no-op")
+            .is_none(),
+        "an unexpired owner cannot be claimed concurrently"
+    );
+
+    let database_url = database_url_with_name(&env.admin_url, &env.name);
+    expire_post_compaction_lease(
+        &database_url,
+        session_id,
+        &resumed.row_id,
+        &resumed.attempt_id,
+    )
+    .await;
+
+    // This is the injected crash point: the lease commit above is durable, but
+    // no spawn/register happened. Discard every volatile runtime/store object
+    // and construct the state a new daemon process would own.
+    env.state.repo.close().await;
+    let restarted_store = PostgresAgentStore::connect(&database_url)
+        .await
+        .expect("restart opens a new store");
+    restarted_store.migrate().await.expect("restart migrates");
+    let restarted_state_dir = TempDir::new("restart-state");
+    let (events, _rx) = broadcast::channel(1024);
+    let restarted_state = AppState {
+        repo: Arc::new(restarted_store),
+        active: Arc::new(Mutex::new(HashMap::new())),
+        session_driver_locks: Arc::new(Mutex::new(HashMap::new())),
+        tasks: Arc::new(StdMutex::new(HashMap::new())),
+        auxiliary_tasks: Arc::new(StdMutex::new(Vec::new())),
+        task_registration_lock: Arc::new(StdMutex::new(())),
+        post_compaction_recovery_scheduled: Arc::new(AtomicBool::new(false)),
+        post_compaction_recovery_notify: Arc::new(tokio::sync::Notify::new()),
+        post_compaction_recovery_task: Arc::new(StdMutex::new(None)),
+        shutting_down: Arc::new(AtomicBool::new(false)),
+        events,
+        tools: Arc::new(ToolRegistry::with_builtin_tools()),
+        provider_connections: ProviderConnectionRegistry::new(),
+        session_titles: SessionTitleScheduler::default(),
+        workspaces: WorkspaceManager::for_tests(restarted_state_dir.path().to_path_buf()),
+        prompt_root: env.cwd.path().to_path_buf(),
+    };
+
+    restarted_state
+        .repo
+        .mark_all_unfinished_actions_stale()
+        .await
+        .expect("production boot stale sweep runs");
+    let after_sweep = restarted_state
+        .repo
+        .session_snapshot(session_id)
+        .await
+        .unwrap();
+    let leased = after_sweep
+        .pending_actions
+        .iter()
+        .find(|action| action.action_row_id == resumed.row_id)
+        .expect("expired leased intent survives the narrow stale-sweep exception");
+    assert_eq!(leased.status, ActionStatus::Running);
+    assert_eq!(
+        leased
+            .payload
+            .pointer("/post_compaction_dispatch/lease/generation"),
+        Some(&json!(1))
+    );
+    let ordinary_after_sweep = restarted_state
+        .repo
+        .find_resumable_model_action(ordinary_session_id, TurnId(1))
+        .await
+        .expect("ordinary stale action loads")
+        .expect("ordinary pending action was terminalized");
+    assert_eq!(ordinary_after_sweep.status, ActionStatus::Stale);
+
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&restarted_state)
+            .await
+            .expect("boot recovery succeeds"),
+        1,
+        "production recovery reclaims and registers the expired exact attempt"
+    );
+    let active = restarted_state.active.lock().await.get(session_id).cloned();
+    assert!(
+        active.is_some(),
+        "boot recovery restores the live outstanding model runtime"
+    );
+    assert!(
+        restarted_state
+            .repo
+            .load_harness_model_action(session_id, &resumed.row_id)
+            .await
+            .expect("reclaimed model action remains observable")
+            .post_compaction_dispatch_lease
+            .as_ref()
+            .is_some_and(|lease| {
+                lease.generation == 2
+                    && lease.owner_id != crashed_claim.lease.owner_id
+                    && lease.context_leaf_id == compacted_leaf
+            }),
+        "reclaim installs a new fenced generation on the same row/attempt/leaf"
+    );
+    assert_eq!(
+        restarted_state
+            .tasks
+            .lock()
+            .expect("task registry lock")
+            .len(),
+        1,
+        "the non-harness production spawn path registered exactly one runner"
+    );
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&restarted_state)
+            .await
+            .expect("repeat recovery succeeds"),
+        0,
+        "an unexpired live lease is not concurrently redispatched"
+    );
+    assert_eq!(
+        restarted_state
+            .tasks
+            .lock()
+            .expect("task registry lock")
+            .len(),
+        1,
+        "repeat recovery does not register a duplicate runner"
+    );
+
+    let reclaimed = restarted_state
+        .repo
+        .load_harness_model_action(session_id, &resumed.row_id)
+        .await
+        .expect("load reclaimed action");
+    let reclaimed_lease = reclaimed
+        .post_compaction_dispatch_lease
+        .expect("reclaimed action has lease");
+    for handle in take_tasks(&restarted_state) {
+        handle.abort();
+    }
+    let driver = SessionDriver::acquire(&restarted_state, session_id).await;
+    let active = driver
+        .active_session()
+        .await
+        .expect("recovered runtime remains active");
+    let SessionAction::RequestModel {
+        action_id, turn_id, ..
+    } = crashed_claim.pending.action.clone()
+    else {
+        unreachable!()
+    };
+    let terminal_dispatch = DispatchAction {
+        row_id: resumed.row_id.clone(),
+        attempt_id: resumed.attempt_id.clone(),
+        post_compaction_dispatch_lease: Some(reclaimed_lease),
+        action: crashed_claim.pending.action,
+        config: restarted_state
+            .repo
+            .load_session_config(session_id)
+            .await
+            .expect("load recovered config"),
+    };
+    apply_model_response(
+        &restarted_state,
+        session_id,
+        &driver,
+        active,
+        &terminal_dispatch,
+        action_id,
+        turn_id,
+        ModelResponse {
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::Text("recovered completion".to_string())],
+            },
+            provider_replay: Vec::new(),
+            usage: None,
+            stop_reason: ModelStopReason::Complete,
+            stop_details: None,
+        },
+    )
+    .await
+    .expect("ordinary terminal completion commits");
+    let terminal_pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect terminal assertion pool");
+    let terminal = sqlx::query(
+        "select status, result, payload from actions where session_id=$1 and id=$2 and attempt_id=$3",
+    )
+    .bind(session_id)
+    .bind(&resumed.row_id)
+    .bind(&resumed.attempt_id)
+    .fetch_one(&terminal_pool)
+    .await
+    .expect("terminal action remains observable");
+    assert_eq!(terminal.get::<String, _>("status"), "completed");
+    assert_eq!(
+        terminal
+            .get::<serde_json::Value, _>("result")
+            .get("stop_reason")
+            .and_then(serde_json::Value::as_str),
+        Some("complete")
+    );
+    assert!(
+        terminal
+            .get::<serde_json::Value, _>("payload")
+            .get("post_compaction_dispatch")
+            .is_none(),
+        "ordinary terminal completion atomically clears the retained recovery intent"
+    );
+    terminal_pool.close().await;
+    restarted_state.repo.close().await;
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn overlapping_boot_recovery_claims_one_runner_across_independent_states() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "overlapping boot recovery", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "overlapping_post_compaction_boot_recovery";
+    let (resumed, compacted_leaf) =
+        commit_post_compaction_dispatch(&env, project_id, session_id).await;
+    let intent = agent_store::PostCompactionDispatchIntent {
+        session_id: session_id.to_string(),
+        row_id: resumed.row_id.clone(),
+        attempt_id: resumed.attempt_id.clone(),
+    };
+    let expired_claim = env
+        .state
+        .repo
+        .claim_post_compaction_model_action(&intent, std::time::Duration::from_secs(30))
+        .await
+        .expect("generation one claims")
+        .expect("generation one exists");
+    assert_eq!(expired_claim.lease.generation, 1);
+
+    let database_url = database_url_with_name(&env.admin_url, &env.name);
+    expire_post_compaction_lease(
+        &database_url,
+        session_id,
+        &resumed.row_id,
+        &resumed.attempt_id,
+    )
+    .await;
+    env.state.repo.close().await;
+
+    let store_a = PostgresAgentStore::connect(&database_url)
+        .await
+        .expect("first daemon store connects");
+    let store_b = PostgresAgentStore::connect(&database_url)
+        .await
+        .expect("second daemon store connects");
+    let state_dir_a = TempDir::new("overlap-a");
+    let state_dir_b = TempDir::new("overlap-b");
+    let state_a = test_app_state(store_a, &state_dir_a, env.cwd.path().to_path_buf());
+    let state_b = test_app_state(store_b, &state_dir_b, env.cwd.path().to_path_buf());
+    state_a
+        .repo
+        .mark_all_unfinished_actions_stale()
+        .await
+        .expect("production stale sweep preserves marked action");
+
+    let (recovered_a, recovered_b) = tokio::join!(
+        recover_post_compaction_dispatches_on_boot(&state_a),
+        recover_post_compaction_dispatches_on_boot(&state_b)
+    );
+    let mut recovered = [
+        recovered_a.expect("first recovery succeeds"),
+        recovered_b.expect("second recovery succeeds"),
+    ];
+    recovered.sort_unstable();
+    assert_eq!(recovered, [0, 1]);
+
+    let reclaimed = state_a
+        .repo
+        .load_harness_model_action(session_id, &resumed.row_id)
+        .await
+        .expect("reclaimed action loads");
+    let lease = reclaimed
+        .post_compaction_dispatch_lease
+        .expect("generation two lease persists");
+    assert_eq!(lease.generation, 2);
+    assert_ne!(lease.owner_id, expired_claim.lease.owner_id);
+    assert_eq!(lease.context_leaf_id, compacted_leaf);
+    let registered_a = state_a
+        .tasks
+        .lock()
+        .expect("first task registry lock")
+        .len();
+    let registered_b = state_b
+        .tasks
+        .lock()
+        .expect("second task registry lock")
+        .len();
+    assert_eq!(
+        registered_a + registered_b,
+        1,
+        "the lease CAS allows one paused pre-provider runner across both daemons"
+    );
+    assert_eq!(
+        state_a
+            .repo
+            .load_session_config(session_id)
+            .await
+            .expect("load pause fault")
+            .metadata
+            .pointer("/fault_injection/pause_model_dispatch_before_provider"),
+        Some(&json!(true)),
+        "the only registered runner is stopped before any provider call"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    assert_eq!(
+        state_a
+            .tasks
+            .lock()
+            .expect("first task registry lock")
+            .len()
+            + state_b
+                .tasks
+                .lock()
+                .expect("second task registry lock")
+                .len(),
+        1,
+        "the pre-provider pause keeps one winner and cannot issue a duplicate provider call"
+    );
+
+    for handle in take_tasks(&state_a).into_iter().chain(take_tasks(&state_b)) {
+        handle.abort();
+    }
+    state_a.repo.close().await;
+    state_b.repo.close().await;
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn lost_lease_runner_exit_rearms_recovery_without_process_restart() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "same-process lease recovery", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "same_process_post_compaction_recovery";
+    let (resumed, _) = commit_post_compaction_dispatch(&env, project_id, session_id).await;
+
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .expect("initial recovery claims generation one"),
+        1
+    );
+    let first_lease = env
+        .state
+        .repo
+        .load_harness_model_action(session_id, &resumed.row_id)
+        .await
+        .expect("generation one action loads")
+        .post_compaction_dispatch_lease
+        .expect("generation one lease persists");
+    assert_eq!(first_lease.generation, 1);
+    let database_url = database_url_with_name(&env.admin_url, &env.name);
+    expire_post_compaction_lease(
+        &database_url,
+        session_id,
+        &resumed.row_id,
+        &resumed.attempt_id,
+    )
+    .await;
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let action = env
+                .state
+                .repo
+                .load_harness_model_action(session_id, &resumed.row_id)
+                .await
+                .expect("action remains observable");
+            if action
+                .post_compaction_dispatch_lease
+                .as_ref()
+                .is_some_and(|lease| {
+                    lease.generation == 2 && lease.owner_id != first_lease.owner_id
+                })
+                && env.state.tasks.lock().expect("task registry lock").len() == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("heartbeat loss wakes watchdog and generation two registers");
+
+    assert!(
+        env.state.active.lock().await.contains_key(session_id),
+        "same-process recovery retains a reconstructed live runtime"
+    );
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn heartbeat_loss_after_terminal_commit_still_registers_persisted_successor() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "heartbeat terminal handoff", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "heartbeat_terminal_handoff";
+    let (resumed, _) = commit_post_compaction_dispatch_with_faults(
+        &env,
+        project_id,
+        session_id,
+        json!({
+            "pause_model_dispatch_before_provider": false,
+            "post_compaction_heartbeat_interval_ms": 5,
+            "pause_after_model_transition_ms": 100,
+            "pause_tool_dispatch_before_run": true,
+            "model_result": "tool"
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .expect("recovery claims model"),
+        1
+    );
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = env.state.repo.session_snapshot(session_id).await.unwrap();
+            let completed_source = snapshot.pending_actions.iter().all(|action| {
+                action.action_row_id != resumed.row_id || action.status == ActionStatus::Completed
+            });
+            let tool_registered = env
+                .state
+                .tasks
+                .lock()
+                .expect("task registry lock")
+                .values()
+                .any(|task| task.kind == agent_store::ActionKind::Tool);
+            if completed_source && tool_registered {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("terminal commit survives false renewal and registers tool successor");
+
+    let pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+        .await
+        .expect("connect assertion pool");
+    let marker_count: i64 = sqlx::query_scalar(
+        "select count(*)::bigint from actions where session_id=$1 and payload ? 'post_compaction_dispatch'",
+    )
+    .bind(session_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count markers");
+    assert_eq!(marker_count, 0, "terminal commit clears the exact marker");
+    assert!(
+        crate::runtime::runner_start_count(session_id, "tool") >= 1,
+        "successor crosses a tracked start barrier"
+    );
+    pool.close().await;
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn heartbeat_loss_after_reactive_transition_still_registers_compaction() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "heartbeat compaction handoff", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "heartbeat_compaction_handoff";
+    let (resumed, _) = commit_post_compaction_dispatch_with_faults(
+        &env,
+        project_id,
+        session_id,
+        json!({
+            "pause_model_dispatch_before_provider": false,
+            "post_compaction_heartbeat_interval_ms": 5,
+            "pause_after_reactive_compaction_transition_ms": 100,
+            "pause_compaction_dispatch_before_provider": true,
+            "model_provider_max_attempts": 1,
+            "model_result": "overflow",
+            "compaction": {
+                "config": {
+                    "auto_enabled": true,
+                    "auto_limit_tokens": 100000,
+                    "remote_mode": "never"
+                }
+            }
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .expect("recovery claims model"),
+        1
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = env.state.repo.session_snapshot(session_id).await.unwrap();
+            let blocked = snapshot.pending_actions.iter().any(|action| {
+                action.action_row_id == resumed.row_id && action.status == ActionStatus::Blocked
+            });
+            let compaction_registered = env
+                .state
+                .tasks
+                .lock()
+                .expect("task registry lock")
+                .values()
+                .any(|task| task.kind == agent_store::ActionKind::Compaction);
+            if blocked && compaction_registered {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("reactive transition survives false renewal and registers compaction");
+    let snapshot = env.state.repo.session_snapshot(session_id).await.unwrap();
+    assert!(
+        snapshot
+            .pending_actions
+            .iter()
+            .any(|action| action.kind == agent_store::ActionKind::Compaction
+                && action.status == ActionStatus::Running),
+        "durable running compaction is not stranded without its local runner"
+    );
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn shutdown_rejects_recovery_runner_between_claim_and_register() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "shutdown recovery registration", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "shutdown_recovery_registration";
+    let (resumed, _) = commit_post_compaction_dispatch_with_faults(
+        &env,
+        project_id,
+        session_id,
+        json!({
+            "pause_model_dispatch_before_provider": false,
+            "pause_recovery_before_register_ms": 150,
+            "model_result": "complete"
+        }),
+    )
+    .await;
+
+    let recovery_state = env.state.clone();
+    let recovery =
+        tokio::spawn(
+            async move { recover_post_compaction_dispatches_on_boot(&recovery_state).await },
+        );
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let action = env
+                .state
+                .repo
+                .load_harness_model_action(session_id, &resumed.row_id)
+                .await
+                .expect("claimed action remains visible");
+            if action.post_compaction_dispatch_lease.is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("recovery reaches claimed pre-registration pause");
+
+    let handles = take_tasks(&env.state);
+    for handle in handles {
+        handle.await.ok();
+    }
+    recovery
+        .await
+        .expect("recovery task joins")
+        .expect("shutdown rejection is recoverable");
+    assert!(
+        env.state
+            .tasks
+            .lock()
+            .expect("task registry lock")
+            .is_empty(),
+        "drain leaves no untracked runner"
+    );
+    assert!(
+        env.state
+            .auxiliary_tasks
+            .lock()
+            .expect("auxiliary task registry lock")
+            .is_empty(),
+        "drain leaves no untracked auxiliary task"
+    );
+    assert!(
+        env.state
+            .post_compaction_recovery_task
+            .lock()
+            .expect("recovery task registry lock")
+            .is_none(),
+        "drain leaves no untracked watchdog"
+    );
+    assert_eq!(
+        crate::provider_runtime::injected_provider_start_count(session_id),
+        0,
+        "shutdown rejection occurs before provider I/O"
+    );
+    let action = env
+        .state
+        .repo
+        .load_harness_model_action(session_id, &resumed.row_id)
+        .await
+        .expect("claimed durable action remains");
+    assert!(
+        action.post_compaction_dispatch_lease.is_some(),
+        "claimed lease is retained for expiry and next-boot recovery"
+    );
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn shutdown_rejects_successor_runner_from_existing_task() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "shutdown successor registration",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    let session_id = "shutdown_successor_registration";
+    let (_resumed, _) = commit_post_compaction_dispatch_with_faults(
+        &env,
+        project_id,
+        session_id,
+        json!({
+            "pause_model_dispatch_before_provider": false,
+            "pause_after_model_transition_ms": 150,
+            "model_result": "tool"
+        }),
+    )
+    .await;
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .expect("recovery starts source runner"),
+        1
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let snapshot = env.state.repo.session_snapshot(session_id).await.unwrap();
+            if snapshot.pending_actions.iter().any(|action| {
+                action.kind == agent_store::ActionKind::Tool
+                    && action.status == ActionStatus::Pending
+            }) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("source commits successor before local dispatch");
+
+    let handles = take_tasks(&env.state);
+    for mut handle in handles {
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut handle)
+            .await
+            .expect("drained source task finishes")
+            .ok();
+    }
+    assert_eq!(
+        crate::runtime::runner_start_count(session_id, "tool"),
+        0,
+        "successor cannot cross its start barrier after shutdown"
+    );
+    assert!(
+        env.state
+            .tasks
+            .lock()
+            .expect("task registry lock")
+            .is_empty(),
+        "main drain cannot miss a late successor handle"
+    );
+    assert!(
+        env.state
+            .auxiliary_tasks
+            .lock()
+            .expect("auxiliary task registry lock")
+            .is_empty(),
+        "main drain cannot miss a late auxiliary handle"
+    );
+    assert!(
+        env.state
+            .post_compaction_recovery_task
+            .lock()
+            .expect("recovery task registry lock")
+            .is_none(),
+        "main drain cannot miss the watchdog handle"
+    );
+    let snapshot = env.state.repo.session_snapshot(session_id).await.unwrap();
+    assert!(
+        snapshot.pending_actions.iter().any(|action| {
+            action.kind == agent_store::ActionKind::Tool && action.status == ActionStatus::Pending
+        }),
+        "shutdown leaves the unclaimed durable successor recoverable"
+    );
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn watchdog_retries_after_transient_recovery_database_error() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "transient recovery error", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "transient_post_compaction_recovery_error";
+    let (resumed, _) = commit_post_compaction_dispatch(&env, project_id, session_id).await;
+    let database_url = database_url_with_name(&env.admin_url, &env.name);
+    let fault_pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect scheduler fault pool");
+    sqlx::query("alter table actions rename to actions_scheduler_fault")
+        .execute(&fault_pool)
+        .await
+        .expect("hide actions table");
+
+    assert!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .is_err(),
+        "the production boot sweep observes the transient database error"
+    );
+    assert!(
+        env.state
+            .post_compaction_recovery_scheduled
+            .load(Ordering::Acquire),
+        "the watchdog is armed before the fallible initial sweep"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(
+        env.state
+            .post_compaction_recovery_task
+            .lock()
+            .expect("watchdog task lock")
+            .as_ref()
+            .is_some_and(|task| !task.is_finished()),
+        "the watchdog survives failed database inspection/recovery cycles"
+    );
+
+    sqlx::query("alter table actions_scheduler_fault rename to actions")
+        .execute(&fault_pool)
+        .await
+        .expect("restore actions table");
+    fault_pool.close().await;
+    env.state.post_compaction_recovery_notify.notify_one();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let action = env
+                .state
+                .repo
+                .load_harness_model_action(session_id, &resumed.row_id)
+                .await
+                .expect("action loads after database recovery");
+            if action
+                .post_compaction_dispatch_lease
+                .as_ref()
+                .is_some_and(|lease| lease.generation == 1)
+                && env.state.tasks.lock().expect("task registry lock").len() == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watchdog survives the transient error and recovers the marker");
+
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn watchdog_retries_transient_per_intent_claim_failure_without_compensation() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "transient intent load failure", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "transient_intent_load_failure";
+    let (resumed, _) = commit_post_compaction_dispatch(&env, project_id, session_id).await;
+    let pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+        .await
+        .expect("connect fault pool");
+    sqlx::query("alter table transcript_entries rename to transcript_entries_intent_fault")
+        .execute(&pool)
+        .await
+        .expect("install load fault");
+
+    assert!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .is_err(),
+        "per-intent context load error propagates as transient"
+    );
+    let during_fault = env
+        .state
+        .repo
+        .load_harness_model_action(session_id, &resumed.row_id)
+        .await
+        .expect("marker remains after transient error");
+    assert!(
+        during_fault
+            .post_compaction_dispatch_context_leaf_id
+            .is_some(),
+        "transient failure cannot terminally remove the marker"
+    );
+    sqlx::query("alter table transcript_entries_intent_fault rename to transcript_entries")
+        .execute(&pool)
+        .await
+        .expect("remove load fault");
+    pool.close().await;
+    env.state.post_compaction_recovery_notify.notify_one();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let action = env
+                .state
+                .repo
+                .load_harness_model_action(session_id, &resumed.row_id)
+                .await
+                .expect("action loads after fault removal");
+            if action
+                .post_compaction_dispatch_lease
+                .as_ref()
+                .is_some_and(|lease| lease.generation == 1)
+                && env.state.tasks.lock().expect("task registry lock").len() == 1
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("watchdog autonomously retries the retained marker");
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn stale_corruption_compensation_cannot_fail_newer_generation() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "stale corruption fence", &[], json!({}))
+        .await
+        .expect("create project");
+    let session_id = "stale_corruption_fence";
+    let (resumed, _) = commit_post_compaction_dispatch(&env, project_id, session_id).await;
+    let intent = agent_store::PostCompactionDispatchIntent {
+        session_id: session_id.to_string(),
+        row_id: resumed.row_id.clone(),
+        attempt_id: resumed.attempt_id.clone(),
+    };
+    let pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+        .await
+        .expect("connect assertion pool");
+    let first = env
+        .state
+        .repo
+        .claim_post_compaction_model_action(
+            &intent,
+            agent_store::POST_COMPACTION_DISPATCH_LEASE_DURATION,
+        )
+        .await
+        .expect("generation one claim succeeds")
+        .expect("generation one exists");
+    assert_eq!(first.lease.generation, 1);
+    sqlx::query(
+        r#"
+        update actions
+        set payload=jsonb_set(
+                jsonb_set(
+                    payload,
+                    '{post_compaction_dispatch,kind}',
+                    '"corrupt-kind"'::jsonb
+                ),
+                '{post_compaction_dispatch,lease,expires_at_ms}',
+                '1'::jsonb
+            )
+        where session_id=$1 and id=$2 and attempt_id=$3
+        "#,
+    )
+    .bind(session_id)
+    .bind(&resumed.row_id)
+    .bind(&resumed.attempt_id)
+    .execute(&pool)
+    .await
+    .expect("install deterministic marker corruption");
+    let corrupt = match env
+        .state
+        .repo
+        .claim_post_compaction_model_action(
+            &intent,
+            agent_store::POST_COMPACTION_DISPATCH_LEASE_DURATION,
+        )
+        .await
+    {
+        Err(agent_store::PostCompactionDispatchClaimError::Corrupt(error)) => error,
+        other => panic!("expected typed corruption, got {other:?}"),
+    };
+
+    sqlx::query(
+        r#"
+        update actions
+        set payload=jsonb_set(
+            payload,
+            '{post_compaction_dispatch,kind}',
+            '"resume_model_v1"'::jsonb
+        )
+        where session_id=$1 and id=$2 and attempt_id=$3
+        "#,
+    )
+    .bind(session_id)
+    .bind(&resumed.row_id)
+    .bind(&resumed.attempt_id)
+    .execute(&pool)
+    .await
+    .expect("repair marker for newer claim");
+    let newer = env
+        .state
+        .repo
+        .claim_post_compaction_model_action(
+            &intent,
+            agent_store::POST_COMPACTION_DISPATCH_LEASE_DURATION,
+        )
+        .await
+        .expect("generation two claim succeeds")
+        .expect("expired generation one is reclaimed");
+    assert_eq!(newer.lease.generation, 2);
+    assert_ne!(newer.lease.owner_id, first.lease.owner_id);
+    let events = env
+        .state
+        .repo
+        .fail_corrupt_post_compaction_model_action(&intent, corrupt.fence(), corrupt.message())
+        .await
+        .expect("stale compensation is a clean no-op");
+    assert!(events.is_empty());
+    let row = sqlx::query(
+        "select status, payload from actions where session_id=$1 and id=$2 and attempt_id=$3",
+    )
+    .bind(session_id)
+    .bind(&resumed.row_id)
+    .bind(&resumed.attempt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load newer generation");
+    assert_eq!(row.get::<String, _>("status"), "running");
+    assert_eq!(
+        row.get::<serde_json::Value, _>("payload")
+            .pointer("/post_compaction_dispatch/lease/generation"),
+        Some(&json!(2)),
+        "stale corruption compensation cannot terminally fail newer ownership"
+    );
+    pool.close().await;
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn corrupt_post_compaction_dispatch_is_terminally_observable_on_boot() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(
+            project_id,
+            "corrupt post-compaction boot recovery",
+            &[],
+            json!({}),
+        )
+        .await
+        .expect("create project");
+    let session_id = "corrupt_post_compaction_boot_recovery";
+    let (resumed, _) = commit_post_compaction_dispatch(&env, project_id, session_id).await;
+    let pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+        .await
+        .expect("connect assertion pool");
+    sqlx::query(
+        r#"
+        update actions
+        set payload=jsonb_set(
+            payload,
+            '{post_compaction_dispatch,attempt_id}',
+            '"corrupt-attempt"'::jsonb
+        )
+        where session_id=$1 and id=$2 and attempt_id=$3
+        "#,
+    )
+    .bind(session_id)
+    .bind(&resumed.row_id)
+    .bind(&resumed.attempt_id)
+    .execute(&pool)
+    .await
+    .expect("corrupt committed marker");
+
+    env.state
+        .repo
+        .mark_all_unfinished_actions_stale()
+        .await
+        .expect("production boot stale sweep runs");
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .expect("terminal recovery succeeds"),
+        0,
+        "corrupt intent is terminal recovery, not a dispatch"
+    );
+    let row = sqlx::query(
+        "select status, result from actions where session_id=$1 and id=$2 and attempt_id=$3",
+    )
+    .bind(session_id)
+    .bind(&resumed.row_id)
+    .bind(&resumed.attempt_id)
+    .fetch_one(&pool)
+    .await
+    .expect("load terminal action");
+    assert_eq!(row.get::<String, _>("status"), "error");
+    let result = row.get::<serde_json::Value, _>("result");
+    assert!(
+        result
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|error| error.contains("marker attempt does not match")),
+        "terminal result explains corrupt reconstruction: {result}"
+    );
+    let error_events: i64 = sqlx::query_scalar(
+        r#"
+        select count(*)::bigint
+        from events
+        where session_id=$1
+            and type='model.error'
+            and payload->>'action_row_id'=$2
+        "#,
+    )
+    .bind(session_id)
+    .bind(&resumed.row_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count recovery error events");
+    assert_eq!(error_events, 1);
+    assert_eq!(
+        recover_post_compaction_dispatches_on_boot(&env.state)
+            .await
+            .expect("repeat terminal recovery succeeds"),
+        0,
+        "terminal corrupt intent remains idempotent"
+    );
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn immediate_post_compaction_overflow_never_strands_blocked_model_action() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "post-compaction overflow", &[], json!({}))
+        .await
+        .expect("create project");
+
+    for second_compaction_succeeds in [true, false] {
+        let session_id = if second_compaction_succeeds {
+            "post_compaction_overflow_success"
+        } else {
+            "post_compaction_overflow_failure"
+        };
+        let entries = vec![
+            TranscriptStorageNode {
+                id: format!("{session_id}_turn"),
+                parent_id: None,
+                timestamp_ms: 1_700_000_000_000,
+                item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+                provider_replay: Vec::new(),
+            },
+            TranscriptStorageNode {
+                id: format!("{session_id}_user"),
+                parent_id: Some(format!("{session_id}_turn")),
+                timestamp_ms: 1_700_000_000_001,
+                item: TranscriptItem::UserMessage(UserMessage::text("large request")),
+                provider_replay: Vec::new(),
+            },
+        ];
+        let source_leaf = entries[1].id.clone();
+        let model_context = ModelContext::from_transcript_items(
+            entries.iter().map(|entry| entry.item.clone()).collect(),
+        );
+        let action = SessionAction::RequestModel {
+            action_id: ActionId(1),
+            turn_id: TurnId(1),
+            model_context,
+            context_leaf_id: Some(source_leaf.clone()),
+        };
+        let (_, actions) = env
+            .state
+            .repo
+            .start_session_outputs(
+                session_id,
+                &session_config(&env, project_id, json!({ "created_by": "test" })),
+                &entries,
+                Some(&source_leaf),
+                &[],
+                &[action],
+                InputPriority::FollowUp,
+                &UserMessage::text("large request"),
+                None,
+            )
+            .await
+            .expect("session starts");
+        let model = actions.into_iter().next().expect("model action persists");
+        assert!(env
+            .state
+            .repo
+            .claim_pending_model_action(session_id, &model.row_id, &model.attempt_id)
+            .await
+            .expect("initial model claims"));
+
+        let first = env
+            .state
+            .repo
+            .block_model_action_for_compaction(
+                session_id,
+                &model.row_id,
+                &model.attempt_id,
+                ActionStatus::Running,
+                None,
+                CompactionTrigger::Auto {
+                    reason: "first overflow".to_string(),
+                },
+                None,
+                Some(100_000),
+            )
+            .await
+            .expect("first overflow blocks model");
+        let first_result = env
+            .state
+            .repo
+            .complete_compaction_action(&first.job, successful_compaction("first summary"))
+            .await
+            .expect("first compaction completes");
+        let resumed = first_result
+            .resumed_model_action
+            .expect("first compaction resumes model");
+        let first_claim = env
+            .state
+            .repo
+            .claim_post_compaction_model_action(
+                &agent_store::PostCompactionDispatchIntent {
+                    session_id: session_id.to_string(),
+                    row_id: resumed.row_id.clone(),
+                    attempt_id: resumed.attempt_id.clone(),
+                },
+                agent_store::POST_COMPACTION_DISPATCH_LEASE_DURATION,
+            )
+            .await
+            .expect("resumed model claim succeeds")
+            .expect("resumed model claims");
+
+        let second = env
+            .state
+            .repo
+            .block_model_action_for_compaction(
+                session_id,
+                &resumed.row_id,
+                &resumed.attempt_id,
+                ActionStatus::Running,
+                Some(&first_claim.lease),
+                CompactionTrigger::Auto {
+                    reason: "immediate overflow after first compaction".to_string(),
+                },
+                None,
+                Some(100_000),
+            )
+            .await
+            .expect("second overflow blocks model");
+        assert!(
+            matches!(second.job.scope, CompactionScope::MidTurn { .. }),
+            "a CompactionSummary root must not erase the blocked-action lifecycle"
+        );
+
+        if second_compaction_succeeds {
+            let fault_pool =
+                sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+                    .await
+                    .expect("connect fault injector");
+            install_compaction_metadata_fault(&fault_pool).await;
+            let injected_failure = env
+                .state
+                .repo
+                .complete_compaction_action(
+                    &second.job,
+                    successful_compaction("rolled back second summary"),
+                )
+                .await;
+            assert!(
+                injected_failure.is_err(),
+                "metadata fault rolls back the whole completion"
+            );
+            let rolled_back = env.state.repo.session_snapshot(session_id).await.unwrap();
+            assert_eq!(
+                rolled_back.active_leaf_id.as_deref(),
+                Some(second.job.source_leaf_id.as_str())
+            );
+            assert!(rolled_back.pending_actions.iter().any(|action| {
+                action.action_row_id == resumed.row_id && action.status == ActionStatus::Blocked
+            }));
+            assert!(rolled_back.pending_actions.iter().any(|action| {
+                action.action_row_id == second.job.action_row_id
+                    && action.status == ActionStatus::Running
+            }));
+            assert_eq!(
+                rolled_back
+                    .metadata
+                    .pointer("/compaction/auto_state/consecutive_recompactions"),
+                Some(&json!(0))
+            );
+            remove_compaction_metadata_fault(&fault_pool).await;
+            fault_pool.close().await;
+
+            let second_result = env
+                .state
+                .repo
+                .complete_compaction_action(&second.job, successful_compaction("second summary"))
+                .await
+                .expect("second compaction completes");
+            assert!(
+                second_result.resumed_model_action.is_some(),
+                "successful second compaction must resume the blocked model"
+            );
+            let snapshot = env.state.repo.session_snapshot(session_id).await.unwrap();
+            assert!(snapshot.pending_actions.iter().any(|action| {
+                action.action_row_id == resumed.row_id && action.status == ActionStatus::Pending
+            }));
+            assert_eq!(
+                snapshot
+                    .metadata
+                    .pointer("/compaction/auto_state/consecutive_recompactions"),
+                Some(&json!(1)),
+                "the immediate recompaction bound commits with action resumption"
+            );
+            assert_eq!(
+                snapshot
+                    .metadata
+                    .pointer("/compaction/auto_state/last_success_root_id")
+                    .and_then(serde_json::Value::as_str),
+                second_result.new_root_id.as_deref(),
+            );
+
+            // Simulate a daemon restart/config reload through a fresh pool.
+            let reloaded_store =
+                PostgresAgentStore::connect(&database_url_with_name(&env.admin_url, &env.name))
+                    .await
+                    .expect("reconnect test database");
+            let reloaded = reloaded_store
+                .load_session_config(session_id)
+                .await
+                .expect("reload session config after recompaction");
+            assert_eq!(
+                reloaded
+                    .metadata
+                    .pointer("/compaction/auto_state/consecutive_recompactions"),
+                Some(&json!(1))
+            );
+            reloaded_store.close().await;
+        } else {
+            let fault_pool =
+                sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+                    .await
+                    .expect("connect fault injector");
+            install_compaction_metadata_fault(&fault_pool).await;
+            let injected_failure = env
+                .state
+                .repo
+                .fail_compaction_action(
+                    &second.job,
+                    &session_config(&env, project_id, json!({ "created_by": "test" })),
+                    "rolled back compaction failure".to_string(),
+                )
+                .await;
+            assert!(
+                injected_failure.is_err(),
+                "metadata fault rolls back the whole failure transition"
+            );
+            let rolled_back = env.state.repo.session_snapshot(session_id).await.unwrap();
+            assert!(rolled_back.pending_actions.iter().any(|action| {
+                action.action_row_id == resumed.row_id && action.status == ActionStatus::Blocked
+            }));
+            assert!(rolled_back.pending_actions.iter().any(|action| {
+                action.action_row_id == second.job.action_row_id
+                    && action.status == ActionStatus::Running
+            }));
+            assert_eq!(
+                rolled_back
+                    .metadata
+                    .pointer("/compaction/auto_state/last_failure"),
+                Some(&serde_json::Value::Null)
+            );
+            remove_compaction_metadata_fault(&fault_pool).await;
+            fault_pool.close().await;
+
+            env.state
+                .repo
+                .fail_compaction_action(
+                    &second.job,
+                    &session_config(&env, project_id, json!({ "created_by": "test" })),
+                    "second compaction failed".to_string(),
+                )
+                .await
+                .expect("failure transaction completes");
+            let snapshot = env.state.repo.session_snapshot(session_id).await.unwrap();
+            assert_eq!(
+                snapshot
+                    .metadata
+                    .pointer("/compaction/auto_state/consecutive_failures"),
+                Some(&json!(1))
+            );
+            assert_eq!(
+                snapshot
+                    .metadata
+                    .pointer("/compaction/auto_state/last_failure_leaf_id"),
+                Some(&json!(second.job.source_leaf_id))
+            );
+            assert!(
+                env.state
+                    .repo
+                    .find_resumable_model_action(session_id, TurnId(1))
+                    .await
+                    .expect("resumable status loads")
+                    .is_some(),
+                "failed second compaction must terminally fail the blocked model"
+            );
+            assert!(
+                !env.state
+                    .repo
+                    .has_unfinished_actions(session_id)
+                    .await
+                    .unwrap(),
+                "no blocked model action may remain stranded"
+            );
+        }
+    }
+    env.cleanup().await;
+}
+
+#[tokio::test]
+async fn unexpected_ordinary_turn_stops_discard_partial_content_and_replay() {
+    let Some(env) = test_env().await else {
+        eprintln!("skipping; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    env.state
+        .repo
+        .create_project(project_id, "unexpected ordinary stops", &[], json!({}))
+        .await
+        .expect("create project");
+    let pool = sqlx::PgPool::connect(&database_url_with_name(&env.admin_url, &env.name))
+        .await
+        .expect("connect action-result assertion pool");
+
+    for stop_reason in [ModelStopReason::Compaction, ModelStopReason::Refusal] {
+        let label = match stop_reason {
+            ModelStopReason::Compaction => "compaction",
+            ModelStopReason::Refusal => "refusal",
+            _ => unreachable!(),
+        };
+        let session_id = format!("unexpected_ordinary_{label}");
+        let config = session_config(
+            &env,
+            project_id,
+            json!({ "created_by": "test", "harness": true }),
+        );
+        let started = start_prepared_session(
+            &env.state,
+            PreparedSessionStart {
+                session_id: session_id.clone(),
+                config,
+                priority: InputPriority::FollowUp,
+                content: UserMessage::text("ordinary request"),
+                client_input_id: None,
+                parent_session_id: None,
+                subagent_type: None,
+                delegation_id: None,
+                dispatch_mode: PreparedSessionDispatchMode::Deferred,
+            },
+        )
+        .await
+        .expect("live session starts");
+        let persisted = started
+            .dispatches
+            .into_iter()
+            .next()
+            .expect("live runtime emits a model action");
+        assert!(env
+            .state
+            .repo
+            .claim_pending_model_action(&session_id, &persisted.row_id, &persisted.attempt_id,)
+            .await
+            .expect("model claims"));
+
+        let driver = SessionDriver::acquire(&env.state, &session_id).await;
+        let active = driver
+            .active_session()
+            .await
+            .expect("session start retains the live runtime");
+        let SessionAction::RequestModel {
+            action_id, turn_id, ..
+        } = persisted.action.clone()
+        else {
+            unreachable!()
+        };
+        let replay = ProviderReplayItem::new(
+            ProviderKind::Claude,
+            &json!({
+                "type": "compaction",
+                "content": "partial secret",
+                "encrypted_content": "opaque-secret"
+            }),
+        )
+        .expect("valid replay");
+        let dispatch = DispatchAction {
+            row_id: persisted.row_id,
+            attempt_id: persisted.attempt_id,
+            post_compaction_dispatch_lease: None,
+            action: persisted.action,
+            config: session_config(
+                &env,
+                project_id,
+                json!({ "created_by": "test", "harness": true }),
+            ),
+        };
+        apply_model_response(
+            &env.state,
+            &session_id,
+            &driver,
+            active,
+            &dispatch,
+            action_id,
+            turn_id,
+            ModelResponse {
+                assistant: AssistantMessage {
+                    items: vec![AssistantItem::Text("partial assistant output".to_string())],
+                },
+                provider_replay: vec![replay],
+                usage: None,
+                stop_reason,
+                stop_details: (stop_reason == ModelStopReason::Refusal).then(|| ModelStopDetails {
+                    category: Some("policy".to_string()),
+                    explanation: Some("declined".to_string()),
+                }),
+            },
+        )
+        .await
+        .expect("unexpected stop persists failure");
+
+        let transcript = env
+            .state
+            .repo
+            .transcript_entries_for_scope(
+                &session_id,
+                TranscriptEntryScope::ActiveBranch,
+                TranscriptEntryBodyMode::Full,
+            )
+            .await
+            .expect("transcript loads");
+        assert!(
+            transcript
+                .iter()
+                .all(|entry| !matches!(entry.item, TranscriptItem::AssistantMessage(_))),
+            "partial {label} assistant output must not persist"
+        );
+        assert!(
+            transcript
+                .iter()
+                .all(|entry| entry.provider_replay.is_empty()),
+            "partial {label} replay must not persist"
+        );
+        assert!(matches!(
+            transcript.last().map(|entry| &entry.item),
+            Some(TranscriptItem::TurnFinished {
+                outcome: TurnOutcome::Crashed,
+                ..
+            })
+        ));
+        let resumable = env
+            .state
+            .repo
+            .find_resumable_model_action(&session_id, turn_id)
+            .await
+            .expect("terminal model action loads")
+            .expect("unexpected stop terminalizes the action");
+        assert_eq!(resumable.status, ActionStatus::Error);
+        let expected_error = match stop_reason {
+            ModelStopReason::Compaction => {
+                "unexpected provider compaction stop during an ordinary model turn"
+            }
+            ModelStopReason::Refusal => "provider refused the request (policy): declined",
+            _ => unreachable!(),
+        };
+        let result: serde_json::Value = sqlx::query_scalar(
+            "select result from actions where session_id=$1 and id=$2 and attempt_id=$3",
+        )
+        .bind(&session_id)
+        .bind(&dispatch.row_id)
+        .bind(&dispatch.attempt_id)
+        .fetch_one(&pool)
+        .await
+        .expect("load exact terminal action result");
+        assert_eq!(
+            result
+                .get("stop_reason")
+                .and_then(serde_json::Value::as_str),
+            Some(label)
+        );
+        assert_eq!(
+            result.get("error").and_then(serde_json::Value::as_str),
+            Some(expected_error)
+        );
+        if stop_reason == ModelStopReason::Refusal {
+            assert_eq!(
+                result
+                    .pointer("/stop_details/category")
+                    .and_then(serde_json::Value::as_str),
+                Some("policy")
+            );
+            assert_eq!(
+                result
+                    .pointer("/stop_details/explanation")
+                    .and_then(serde_json::Value::as_str),
+                Some("declined")
+            );
+        } else {
+            assert_eq!(result.get("stop_details"), Some(&serde_json::Value::Null));
+        }
+        assert!(
+            env.state
+                .repo
+                .events_after(&session_id, None)
+                .await
+                .expect("events load")
+                .iter()
+                .any(|event| {
+                    event.event == EventType::ModelError
+                        && event
+                            .data
+                            .get("error")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|error| error.contains(expected_error))
+                }),
+            "unexpected {label} stop records its terminal provider error"
+        );
+        assert!(
+            !env.state
+                .repo
+                .has_unfinished_actions(&session_id)
+                .await
+                .expect("unfinished action check"),
+            "unexpected {label} stop must leave no live action"
+        );
+    }
+    pool.close().await;
+
+    env.cleanup().await;
 }
 
 #[tokio::test]

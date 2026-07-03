@@ -28,9 +28,85 @@ pub(crate) async fn run_model(
     turn_id: TurnId,
     model_context: ModelContext,
 ) -> Result<ModelResponse> {
+    #[cfg(test)]
+    if let Some(result) = injected_model_result(config, session_id) {
+        return result;
+    }
     let request =
         build_model_request(state, config, session_id, Some(turn_id), model_context).await?;
     complete_model_request(state, config, session_id, request).await
+}
+
+#[cfg(test)]
+fn injected_model_result(
+    config: &SessionConfig,
+    session_id: &str,
+) -> Option<Result<ModelResponse>> {
+    use agent_provider::{ModelStopReason, ProviderError};
+    use agent_vocab::{AssistantItem, AssistantMessage, ToolCall, ToolCallId};
+
+    let result = config
+        .metadata
+        .pointer("/fault_injection/model_result")
+        .and_then(serde_json::Value::as_str)?;
+    record_injected_provider_start(session_id);
+    Some(match result {
+        "complete" => Ok(ModelResponse {
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::Text("injected completion".to_string())],
+            },
+            provider_replay: Vec::new(),
+            usage: None,
+            stop_reason: ModelStopReason::Complete,
+            stop_details: None,
+        }),
+        "tool" => Ok(ModelResponse {
+            assistant: AssistantMessage {
+                items: vec![AssistantItem::ToolCall(ToolCall {
+                    id: ToolCallId::from_u64(1),
+                    tool_name: "Bash".to_string(),
+                    args_json: r#"{"command":"true"}"#.to_string(),
+                })],
+            },
+            provider_replay: Vec::new(),
+            usage: None,
+            stop_reason: ModelStopReason::Complete,
+            stop_details: None,
+        }),
+        "overflow" => Err(ProviderError::Status {
+            status: 400,
+            message: "context_length_exceeded: injected overflow".to_string(),
+        }
+        .into()),
+        other => panic!("unsupported injected model result {other}"),
+    })
+}
+
+#[cfg(test)]
+fn injected_provider_starts() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>>
+{
+    static STARTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    STARTS.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn record_injected_provider_start(session_id: &str) {
+    *injected_provider_starts()
+        .lock()
+        .expect("injected provider counter lock poisoned")
+        .entry(session_id.to_string())
+        .or_default() += 1;
+}
+
+#[cfg(test)]
+pub(crate) fn injected_provider_start_count(session_id: &str) -> usize {
+    injected_provider_starts()
+        .lock()
+        .expect("injected provider counter lock poisoned")
+        .get(session_id)
+        .copied()
+        .unwrap_or_default()
 }
 
 pub(crate) async fn build_model_request(

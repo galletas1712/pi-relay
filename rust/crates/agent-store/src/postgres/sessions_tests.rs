@@ -2,8 +2,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_session::TranscriptStorageNode;
 use agent_vocab::{
-    AssistantItem, AssistantMessage, ProviderConfig, ProviderKind, ReasoningEffort, TranscriptItem,
-    TurnId, TurnOutcome, UserMessage,
+    AssistantItem, AssistantMessage, ProviderConfig, ProviderKind, ProviderReplayItem,
+    ReasoningEffort, TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 use serde_json::json;
 use uuid::Uuid;
@@ -88,6 +88,93 @@ fn session_config(project_id: Uuid) -> SessionConfig {
         },
         metadata: json!({}),
     }
+}
+
+#[test]
+fn compaction_auto_state_transitions_are_deterministic() {
+    let metadata = json!({
+        "unrelated": { "preserved": true },
+        "compaction": {
+            "config": { "max_consecutive_failures": 2 },
+            "auto_state": {
+                "consecutive_failures": 1,
+                "last_success_root_id": "root-1",
+                "consecutive_recompactions": 0
+            }
+        }
+    });
+    let failed =
+        next_auto_compaction_failure_metadata(metadata, 99, "root-1", "provider unavailable");
+    assert_eq!(
+        failed.pointer("/compaction/auto_state/consecutive_failures"),
+        Some(&json!(2))
+    );
+    assert_eq!(
+        failed.pointer("/compaction/auto_state/suppressed"),
+        Some(&json!(true))
+    );
+    assert_eq!(
+        failed.pointer("/compaction/auto_state/last_failure_leaf_id"),
+        Some(&json!("root-1"))
+    );
+    assert_eq!(failed.pointer("/unrelated/preserved"), Some(&json!(true)));
+
+    let first_recompaction = next_compaction_success_metadata(failed, "root-1", "root-2", false);
+    assert_eq!(
+        first_recompaction.pointer("/compaction/auto_state/consecutive_recompactions"),
+        Some(&json!(1))
+    );
+    assert_eq!(
+        first_recompaction.pointer("/compaction/auto_state/consecutive_failures"),
+        Some(&json!(0))
+    );
+    assert_eq!(
+        first_recompaction.pointer("/compaction/auto_state/last_success_root_id"),
+        Some(&json!("root-2"))
+    );
+
+    let manual = next_compaction_success_metadata(first_recompaction, "root-2", "root-3", true);
+    assert_eq!(
+        manual.pointer("/compaction/auto_state/consecutive_recompactions"),
+        Some(&json!(0)),
+        "manual boundary compaction starts a fresh automatic chain"
+    );
+}
+
+#[test]
+fn compaction_auto_state_counters_saturate() {
+    let failed = next_auto_compaction_failure_metadata(
+        json!({
+            "compaction": {
+                "auto_state": { "consecutive_failures": u64::MAX }
+            }
+        }),
+        usize::MAX,
+        "leaf",
+        "failure",
+    );
+    assert_eq!(
+        failed.pointer("/compaction/auto_state/consecutive_failures"),
+        Some(&json!(u64::MAX))
+    );
+
+    let succeeded = next_compaction_success_metadata(
+        json!({
+            "compaction": {
+                "auto_state": {
+                    "last_success_root_id": "leaf",
+                    "consecutive_recompactions": u64::MAX
+                }
+            }
+        }),
+        "leaf",
+        "new-root",
+        false,
+    );
+    assert_eq!(
+        succeeded.pointer("/compaction/auto_state/consecutive_recompactions"),
+        Some(&json!(u64::MAX))
+    );
 }
 
 fn entry(
@@ -210,6 +297,76 @@ async fn persist_turn(store: &PostgresAgentStore, session_id: &str, timestamp_ms
         )
         .await
         .expect("turn persists");
+}
+
+#[tokio::test]
+async fn compaction_provider_replay_round_trips_nullable_and_omitted_encrypted_content() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let store = &db.store;
+    let project_id = Uuid::new_v4();
+    store
+        .create_project(project_id, "compaction replay test", &[], json!({}))
+        .await
+        .expect("project creates");
+
+    for (label, encrypted_content) in [
+        ("string", Some(json!("opaque+/= ciphertext"))),
+        ("null", Some(serde_json::Value::Null)),
+        ("omitted", None),
+    ] {
+        let session_id = format!("compaction_replay_{label}");
+        create_project_session(store, project_id, &session_id).await;
+        persist_turn(store, &session_id, 1_700_000_000_000, "compact me").await;
+        let created = store
+            .create_compaction_action(&session_id, crate::CompactionTrigger::Manual)
+            .await
+            .expect("manual compaction action creates");
+        let mut block = json!({
+            "type": "compaction",
+            "content": "opaque summary",
+            "provider_extension": { "preserve": true }
+        });
+        if let Some(value) = encrypted_content {
+            block
+                .as_object_mut()
+                .unwrap()
+                .insert("encrypted_content".to_string(), value);
+        }
+        let replay = ProviderReplayItem::new(ProviderKind::Claude, &block)
+            .expect("provider replay item creates");
+        store
+            .complete_compaction_action(
+                &created.job,
+                crate::CompactionCompletion {
+                    summary: String::new(),
+                    summary_kind: "provider_native".to_string(),
+                    provider_replay: vec![replay],
+                    remote: true,
+                    provider: ProviderKind::Claude,
+                    usage: None,
+                    continuation_suffix: Vec::new(),
+                },
+            )
+            .await
+            .expect("compaction completes");
+
+        let stored = store
+            .load_stored_session(&session_id)
+            .await
+            .expect("compacted session reloads");
+        let checkpoint = stored.entries.last().expect("checkpoint persists");
+        assert_eq!(checkpoint.provider_replay.len(), 1, "{label}");
+        assert_eq!(
+            checkpoint.provider_replay[0].raw_value().unwrap(),
+            block,
+            "{label}"
+        );
+    }
+
+    db.cleanup().await;
 }
 
 #[tokio::test]

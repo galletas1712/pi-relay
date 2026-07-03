@@ -1024,6 +1024,7 @@ impl ResponsesStreamState {
     fn process_sse_event(&mut self, event: SseEvent) -> ProviderResult<SseControl> {
         match event {
             SseEvent::Json(event) => self.process_event(&event),
+            SseEvent::MalformedJson => Ok(SseControl::Continue),
             SseEvent::Done => Ok(SseControl::Stop),
         }
     }
@@ -1481,6 +1482,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::High,
                 prompt_cache_key: None,
                 session_id: Some("session-1".to_string()),
+                compaction_instructions: None,
             },
             "session-1",
         )
@@ -1516,6 +1518,7 @@ mod tests {
                 reasoning_effort: ReasoningEffort::Medium,
                 prompt_cache_key: Some("explicit-compact-cohort".to_string()),
                 session_id: Some("session-1".to_string()),
+                compaction_instructions: None,
             },
             "session-1",
         )

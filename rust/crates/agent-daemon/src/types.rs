@@ -1,5 +1,5 @@
 use agent_session::{AgentSession, SessionAction};
-use agent_store::SessionConfig;
+use agent_store::{PostCompactionDispatchLease, SessionConfig};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -37,6 +37,7 @@ pub(crate) struct RuntimeSession {
 pub(crate) struct DispatchAction {
     pub(crate) row_id: String,
     pub(crate) attempt_id: String,
+    pub(crate) post_compaction_dispatch_lease: Option<PostCompactionDispatchLease>,
     pub(crate) action: SessionAction,
     pub(crate) config: SessionConfig,
 }

@@ -9,6 +9,7 @@ const PROVIDER_SSE_STREAM_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SseEvent {
     Json(Value),
+    MalformedJson,
     Done,
 }
 
@@ -110,8 +111,10 @@ fn process_sse_frame(
         Some(SseFrame::Json(data)) => {
             let Ok(event) = serde_json::from_str::<Value>(&data) else {
                 // Match the legacy TS parser, which skips malformed SSE data
-                // chunks rather than failing the whole stream.
-                return Ok(SseControl::Continue);
+                // chunks for ordinary generation. Callers with stricter
+                // terminal contracts (native compaction) can reject this
+                // explicit marker.
+                return on_event(SseEvent::MalformedJson);
             };
             on_event(SseEvent::Json(event))
         }

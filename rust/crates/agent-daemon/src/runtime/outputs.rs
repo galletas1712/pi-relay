@@ -77,6 +77,7 @@ pub(crate) fn attach_dispatch_config(
         .map(|action| DispatchAction {
             row_id: action.row_id,
             attempt_id: action.attempt_id,
+            post_compaction_dispatch_lease: None,
             action: action.action,
             config: config.clone(),
         })

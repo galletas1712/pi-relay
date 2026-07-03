@@ -13,12 +13,18 @@ use crate::{
     PersistedAction,
 };
 
-use super::action_records::{model_action_context_leaf_id, model_action_payload};
+use super::action_records::{
+    model_action_context_leaf_id, post_compaction_model_action_payload,
+    POST_COMPACTION_DISPATCH_KEY,
+};
 use super::events::{
     insert_event_tx, insert_event_with_activity_tx, insert_transcript_item_events_tx,
 };
 use super::queue::bump_revisions_tx;
 use super::rows::row_to_stored_entry;
+use super::sessions::{
+    next_auto_compaction_failure_metadata, next_compaction_success_metadata, session_metadata_tx,
+};
 use super::sql::{action_is_unfinished, lock_session_tx};
 use super::transcript::{
     branch_entries_to_leaf, insert_stored_entry_tx, model_context_from_entries,
@@ -38,13 +44,19 @@ impl PostgresAgentStore {
         model_action_row_id: &str,
         model_attempt_id: &str,
         expected_status: ActionStatus,
+        post_compaction_dispatch_lease: Option<&crate::PostCompactionDispatchLease>,
         trigger: CompactionTrigger,
         tokens_before: Option<usize>,
         auto_limit_tokens: Option<usize>,
     ) -> Result<CreateCompactionResult> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, session_id).await?;
-        let row = sqlx::query(
+        let lease_owner = post_compaction_dispatch_lease.map(|lease| lease.owner_id.as_str());
+        let lease_generation =
+            post_compaction_dispatch_lease.map(|lease| lease.generation.to_string());
+        let lease_context =
+            post_compaction_dispatch_lease.map(|lease| lease.context_leaf_id.as_str());
+        let row = sqlx::query(&format!(
             r#"
             select action_id, turn_id, payload
             from actions
@@ -53,14 +65,32 @@ impl PostgresAgentStore {
                 and attempt_id=$3::text
                 and kind=$4::text
                 and status=$5::text
+                and (
+                    (
+                        $6::text is null
+                        and not (payload ? '{POST_COMPACTION_DISPATCH_KEY}')
+                    )
+                    or (
+                        payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'action_row_id'=$2
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'attempt_id'=$3
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'context_leaf_id'=$8
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'owner_id'=$6
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'generation'=$7
+                        and (payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint
+                            > (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    )
+                )
             for update
-            "#,
-        )
+            "#
+        ))
         .bind(session_id)
         .bind(model_action_row_id)
         .bind(model_attempt_id)
         .bind(ActionKind::Model.as_str())
         .bind(expected_status.as_str())
+        .bind(lease_owner)
+        .bind(&lease_generation)
+        .bind(lease_context)
         .fetch_optional(&mut *tx)
         .await?
         .ok_or_else(|| {
@@ -83,31 +113,27 @@ impl PostgresAgentStore {
         }
         let action_id = agent_vocab::ActionId(row.get::<i64, _>("action_id") as u64);
         let turn_id = TurnId(row.get::<i64, _>("turn_id") as u64);
-        let scope = if model_context.is_turn_boundary() {
-            CompactionScope::Boundary {
-                source_leaf_id: source_leaf_id.clone(),
-            }
-        } else {
-            CompactionScope::MidTurn {
-                source_leaf_id: source_leaf_id.clone(),
-                turn_id,
-                blocked_model_action_id: action_id,
-                blocked_model_action_row_id: model_action_row_id.to_string(),
-                blocked_model_attempt_id: model_attempt_id.to_string(),
-            }
+        // This entry point always blocks a concrete active model action. Keep
+        // that lifecycle fact in the scope even when its current context root
+        // is a CompactionSummary (which is structurally a turn boundary).
+        // Otherwise an immediate post-compaction overflow would be mislabeled
+        // Boundary and neither success nor failure would unblock the action.
+        let scope = CompactionScope::MidTurn {
+            source_leaf_id: source_leaf_id.clone(),
+            turn_id,
+            blocked_model_action_id: action_id,
+            blocked_model_action_row_id: model_action_row_id.to_string(),
+            blocked_model_attempt_id: model_attempt_id.to_string(),
         };
         let last_turn_id = model_context.last_turn_id();
-        let turn_started_at_ms = match &scope {
-            CompactionScope::MidTurn { turn_id, .. } => Some(
-                turn_started_at_ms_for_turn(&source_entries, *turn_id).ok_or_else(|| {
-                    anyhow!(
-                        "mid-turn compaction source is missing turn_started for turn {}",
-                        turn_id.0
-                    )
-                })?,
-            ),
-            CompactionScope::Boundary { .. } => None,
-        };
+        let turn_started_at_ms = Some(
+            turn_started_at_ms_for_turn(&source_entries, turn_id).ok_or_else(|| {
+                anyhow!(
+                    "blocking compaction source is missing turn_started for turn {}",
+                    turn_id.0
+                )
+            })?,
+        );
         let trigger_name = trigger.as_str();
         let reason = trigger.reason().map(str::to_string);
         let action_row_id = format!("action_{}", Uuid::new_v4());
@@ -133,25 +159,45 @@ impl PostgresAgentStore {
             "context_tokens": tokens_before,
             "auto_limit_tokens": auto_limit_tokens,
         });
-        let updated = sqlx::query(
+        let updated = sqlx::query(&format!(
             r#"
             update actions
             set status=$4::text,
                 result=$5,
+                payload=payload - $7::text,
                 updated_at=now()
             where session_id=$1
                 and id=$2::text
                 and attempt_id=$3::text
                 and kind='model'
                 and status=$6::text
+                and (
+                    (
+                        $8::text is null
+                        and not (payload ? '{POST_COMPACTION_DISPATCH_KEY}')
+                    )
+                    or (
+                        payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'action_row_id'=$2
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'attempt_id'=$3
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->>'context_leaf_id'=$10
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'owner_id'=$8
+                        and payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'generation'=$9
+                        and (payload->'{POST_COMPACTION_DISPATCH_KEY}'->'lease'->>'expires_at_ms')::bigint
+                            > (extract(epoch from clock_timestamp()) * 1000)::bigint
+                    )
+                )
             "#,
-        )
+        ))
         .bind(session_id)
         .bind(model_action_row_id)
         .bind(model_attempt_id)
         .bind(ActionStatus::Blocked.as_str())
         .bind(&block_result)
         .bind(expected_status.as_str())
+        .bind(POST_COMPACTION_DISPATCH_KEY)
+        .bind(lease_owner)
+        .bind(&lease_generation)
+        .bind(lease_context)
         .execute(&mut *tx)
         .await?
         .rows_affected();
@@ -427,12 +473,14 @@ impl PostgresAgentStore {
             }
             CompactionScope::Boundary { .. } => false,
         };
-        if source_leaf_changed && !blocked_model_still_blocked {
+        if !blocked_model_still_blocked
+            && (source_leaf_changed || matches!(job.scope, CompactionScope::MidTurn { .. }))
+        {
             let events = self
                 .mark_compaction_stale_tx(
                     &mut tx,
                     job,
-                    "source leaf changed before compaction completed and blocked model action is no longer blocked",
+                    "compaction can no longer install because its source changed or its model action is no longer blocked",
                 )
                 .await?;
             tx.commit().await?;
@@ -487,7 +535,11 @@ impl PostgresAgentStore {
             ..
         } = &job.scope
         {
-            let payload = model_action_payload(Some(&installed_active_leaf_id));
+            let payload = post_compaction_model_action_payload(
+                &installed_active_leaf_id,
+                blocked_model_action_row_id,
+                blocked_model_attempt_id,
+            );
             let updated = sqlx::query(
                 r#"
                 update actions
@@ -532,6 +584,10 @@ impl PostgresAgentStore {
                         action: session_action_from_model_row(row, new_model_context)?,
                     });
                 }
+            } else {
+                return Err(anyhow!(
+                    "blocked model action was not resumed: {blocked_model_action_row_id}"
+                ));
             }
         }
 
@@ -573,6 +629,18 @@ impl PostgresAgentStore {
                 job.action_row_id
             ));
         }
+
+        let metadata = next_compaction_success_metadata(
+            session_metadata_tx(&mut tx, &job.source_session_id).await?,
+            &job.source_leaf_id,
+            &new_root_id,
+            matches!(job.trigger, CompactionTrigger::Manual),
+        );
+        sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
+            .bind(&job.source_session_id)
+            .bind(metadata)
+            .execute(&mut *tx)
+            .await?;
 
         bump_revisions_tx(&mut tx, &job.source_session_id, false, true).await?;
         let mut events = Vec::new();
@@ -641,13 +709,103 @@ impl PostgresAgentStore {
     pub async fn fail_compaction_action(
         &self,
         job: &CompactionJob,
+        config: &crate::SessionConfig,
         error: String,
     ) -> Result<Vec<EventFrame>> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, &job.source_session_id).await?;
-        let events = self
-            .finish_compaction_error_tx(&mut tx, job, ActionStatus::Error, error)
-            .await?;
+        let unfinished_actions = action_is_unfinished(None);
+        let action_query = format!(
+            r#"
+            select 1
+            from actions
+            where session_id=$1 and id=$2::text and attempt_id=$3::text
+                and kind=$4::text and {unfinished_actions}
+            for update
+            "#
+        );
+        if sqlx::query(&action_query)
+            .bind(&job.source_session_id)
+            .bind(&job.action_row_id)
+            .bind(&job.attempt_id)
+            .bind(ActionKind::Compaction.as_str())
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_none()
+        {
+            tx.commit().await?;
+            return Ok(Vec::new());
+        }
+
+        if matches!(job.trigger, CompactionTrigger::Auto { .. }) {
+            let metadata = next_auto_compaction_failure_metadata(
+                session_metadata_tx(&mut tx, &job.source_session_id).await?,
+                config
+                    .metadata
+                    .pointer("/compaction/config/max_consecutive_failures")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize)
+                    .unwrap_or(3),
+                &job.source_leaf_id,
+                &error,
+            );
+            sqlx::query("update sessions set metadata=$2, updated_at=now() where id=$1")
+                .bind(&job.source_session_id)
+                .bind(metadata)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        let mut events = Vec::new();
+        if let CompactionScope::MidTurn {
+            blocked_model_action_row_id,
+            blocked_model_attempt_id,
+            ..
+        } = &job.scope
+        {
+            let model_error = format!("compaction failed before model dispatch: {error}");
+            let updated = sqlx::query(
+                r#"
+                update actions
+                set status=$4::text,
+                    result=$5,
+                    payload=payload - $6::text,
+                    updated_at=now()
+                where session_id=$1
+                    and id=$2::text
+                    and attempt_id=$3::text
+                    and kind='model'
+                    and status in ('pending','blocked','running')
+                "#,
+            )
+            .bind(&job.source_session_id)
+            .bind(blocked_model_action_row_id)
+            .bind(blocked_model_attempt_id)
+            .bind(ActionStatus::Error.as_str())
+            .bind(json!({ "error": model_error }))
+            .bind(POST_COMPACTION_DISPATCH_KEY)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if updated == 1 {
+                events.push(
+                    insert_event_with_activity_tx(
+                        &mut tx,
+                        &job.source_session_id,
+                        EventType::ModelError,
+                        json!({
+                            "action_row_id": blocked_model_action_row_id,
+                            "error": model_error,
+                        }),
+                    )
+                    .await?,
+                );
+            }
+        }
+        events.extend(
+            self.finish_compaction_error_tx(&mut tx, job, ActionStatus::Error, error)
+                .await?,
+        );
         tx.commit().await?;
         Ok(events)
     }

@@ -97,7 +97,7 @@ pub(super) async fn run_tool_turn(
     let driver = SessionDriver::acquire(&state, &session_id).await;
     if !state
         .repo
-        .action_can_complete(&session_id, &dispatch.row_id, &dispatch.attempt_id)
+        .action_can_complete(&session_id, &dispatch.row_id, &dispatch.attempt_id, None)
         .await?
     {
         return Ok(());
@@ -151,6 +151,7 @@ pub(super) async fn run_tool_turn(
             Some(ActionUpdate {
                 row_id: dispatch.row_id,
                 attempt_id: dispatch.attempt_id,
+                post_compaction_dispatch_lease: None,
                 status,
                 result: serde_json::to_value(&result).unwrap_or_else(|_| json!({})),
             }),

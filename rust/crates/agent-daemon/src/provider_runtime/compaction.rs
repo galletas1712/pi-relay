@@ -6,6 +6,7 @@ use agent_session::ModelContext;
 use agent_store::SessionConfig;
 use agent_vocab::{ProviderKind, ProviderReplayItem, TranscriptItem, UserMessage};
 use anyhow::{anyhow, Result};
+use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -49,6 +50,7 @@ impl CompactionSummaryKind {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct CompactionOutput {
     pub summary: String,
     pub summary_kind: CompactionSummaryKind,
@@ -64,6 +66,12 @@ pub(crate) enum RemoteCompactionMode {
     Auto,
     Always,
     Never,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AnthropicNativeCompactionVersion {
+    #[serde(rename = "compact_20260112")]
+    Compact20260112,
 }
 
 fn default_remote_compaction_mode() -> RemoteCompactionMode {
@@ -82,6 +90,8 @@ fn default_auto_compaction_max_failures() -> usize {
 pub(crate) struct CompactionConfig {
     #[serde(default = "default_remote_compaction_mode")]
     pub remote_mode: RemoteCompactionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anthropic_native_compaction: Option<AnthropicNativeCompactionVersion>,
     #[serde(default = "default_auto_compaction_enabled")]
     pub auto_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -96,6 +106,7 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             remote_mode: default_remote_compaction_mode(),
+            anthropic_native_compaction: None,
             auto_enabled: default_auto_compaction_enabled(),
             context_window: None,
             auto_limit_tokens: None,
@@ -116,6 +127,8 @@ pub(crate) struct CompactionAutoState {
     pub last_failure_leaf_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_success_root_id: Option<String>,
+    #[serde(default)]
+    pub consecutive_recompactions: usize,
 }
 
 pub(crate) fn compaction_config(config: &SessionConfig) -> CompactionConfig {
@@ -133,8 +146,23 @@ pub(crate) fn resolve_compaction_config(
     config: &SessionConfig,
     discovered: Option<ProviderModelMetadata>,
 ) -> CompactionConfig {
-    let metadata_configured = config.metadata.pointer("/compaction/config").is_some()
-        || config.metadata.get("compaction").is_some();
+    let remote_mode_value = config
+        .metadata
+        .pointer("/compaction/config/remote_mode")
+        .or_else(|| config.metadata.pointer("/compaction/remote_mode"));
+    let remote_mode = remote_mode_value
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let anthropic_native_compaction = config
+        .metadata
+        .pointer("/compaction/config/anthropic_native_compaction")
+        .or_else(|| {
+            config
+                .metadata
+                .pointer("/compaction/anthropic_native_compaction")
+        })
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
     let auto_enabled_configured = config
         .metadata
         .pointer("/compaction/config/auto_enabled")
@@ -161,13 +189,28 @@ pub(crate) fn resolve_compaction_config(
             .pointer("/compaction/auto_limit_tokens")
             .is_some_and(|value| !value.is_null());
 
-    let mut resolved: CompactionConfig = config
+    let config_value = config
         .metadata
         .pointer("/compaction/config")
         .cloned()
-        .or_else(|| config.metadata.get("compaction").cloned())
-        .and_then(|value| serde_json::from_value(value).ok())
-        .unwrap_or_default();
+        .or_else(|| config.metadata.get("compaction").cloned());
+    let parsed_config = config_value
+        .map(|mut value| {
+            if config.provider.kind == ProviderKind::OpenAi {
+                // This Claude-only field did not exist in d296e3f. Preserve
+                // OpenAI's legacy unknown-field behavior even when its value
+                // is malformed, while known legacy siblings still deserialize
+                // atomically as one object.
+                if let Some(object) = value.as_object_mut() {
+                    object.remove("anthropic_native_compaction");
+                }
+            }
+            value
+        })
+        .map(serde_json::from_value::<CompactionConfig>)
+        .transpose();
+    let config_is_valid = parsed_config.as_ref().is_ok_and(|value| value.is_some());
+    let mut resolved = parsed_config.ok().flatten().unwrap_or_default();
 
     let default_window = discovered
         .and_then(|metadata| metadata.max_input_tokens)
@@ -187,19 +230,37 @@ pub(crate) fn resolve_compaction_config(
             });
     }
 
-    if !metadata_configured {
-        resolved.remote_mode = match config.provider.kind {
-            ProviderKind::OpenAi => RemoteCompactionMode::Always,
-            ProviderKind::Claude => RemoteCompactionMode::Never,
-        };
-    } else if matches!(config.provider.kind, ProviderKind::OpenAi)
-        && resolved.remote_mode == RemoteCompactionMode::Auto
-    {
-        // OpenAI/Codex provider-native compaction is the safe default: do not
-        // silently hide remote parser/provider failures behind local summary
-        // fallback unless the operator explicitly sets remote_mode="never".
-        resolved.remote_mode = RemoteCompactionMode::Always;
-    }
+    resolved.anthropic_native_compaction = match config.provider.kind {
+        ProviderKind::Claude => anthropic_native_compaction,
+        ProviderKind::OpenAi => None,
+    };
+    resolved.remote_mode = match config.provider.kind {
+        ProviderKind::Claude => match remote_mode {
+            // Never is independently authoritative even if another config
+            // field is malformed. Auto/Always require both a wholly valid
+            // config object and the versioned native-beta enrollment marker.
+            Some(RemoteCompactionMode::Never) => RemoteCompactionMode::Never,
+            Some(mode @ (RemoteCompactionMode::Auto | RemoteCompactionMode::Always))
+                if config_is_valid
+                    && anthropic_native_compaction
+                        == Some(AnthropicNativeCompactionVersion::Compact20260112) =>
+            {
+                mode
+            }
+            Some(RemoteCompactionMode::Auto | RemoteCompactionMode::Always) | None => {
+                RemoteCompactionMode::Never
+            }
+        },
+        ProviderKind::OpenAi => match resolved.remote_mode {
+            // Preserve the legacy whole-object serde fallback exactly:
+            // malformed siblings discard the entire object to Default::Auto,
+            // and Auto is then normalized to Always for OpenAI/Codex.
+            RemoteCompactionMode::Never => RemoteCompactionMode::Never,
+            RemoteCompactionMode::Auto | RemoteCompactionMode::Always => {
+                RemoteCompactionMode::Always
+            }
+        },
+    };
 
     if !auto_enabled_configured {
         resolved.auto_enabled =
@@ -254,40 +315,88 @@ pub(crate) async fn run_compaction(
 ) -> Result<CompactionOutput> {
     let compaction_config = compaction_config(config);
     let remote_mode = compaction_config.remote_mode;
-    if remote_mode == RemoteCompactionMode::Always && config.provider.kind != ProviderKind::OpenAi {
-        return Err(anyhow!(
-            "remote compaction unsupported for provider {}",
-            config.provider.kind
-        ));
-    }
     let credentials = Credentials::load();
     let provider = provider_for_config(state, config, &credentials, session_id).await?;
+    let runner = LiveCompactionRunner {
+        state,
+        config,
+        session_id,
+        supports_remote: provider.provider.supports_remote_compaction(),
+    };
+    let output = run_compaction_with_runner(
+        config.provider.kind,
+        remote_mode,
+        session_id,
+        model_context,
+        &runner,
+    )
+    .await?;
+    append_delegation_ledger_to_output(state, session_id, output).await
+}
 
-    if remote_mode != RemoteCompactionMode::Never && provider.provider.supports_remote_compaction()
-    {
-        match run_remote_compaction_with_trimming(state, config, session_id, model_context.clone())
+#[async_trait]
+trait CompactionRunner: Send + Sync {
+    fn supports_remote(&self) -> bool;
+    async fn run_remote(&self, model_context: ModelContext) -> Result<CompactionOutput>;
+    async fn run_local(&self, model_context: ModelContext) -> Result<CompactionOutput>;
+}
+
+struct LiveCompactionRunner<'a> {
+    state: &'a AppState,
+    config: &'a SessionConfig,
+    session_id: &'a str,
+    supports_remote: bool,
+}
+
+#[async_trait]
+impl CompactionRunner for LiveCompactionRunner<'_> {
+    fn supports_remote(&self) -> bool {
+        self.supports_remote
+    }
+
+    async fn run_remote(&self, model_context: ModelContext) -> Result<CompactionOutput> {
+        run_remote_compaction_with_trimming(self.state, self.config, self.session_id, model_context)
             .await
-        {
-            Ok(output) => {
-                return append_delegation_ledger_to_output(state, session_id, output).await
-            }
-            Err(error)
-                if remote_mode == RemoteCompactionMode::Auto
-                    && config.provider.kind != ProviderKind::OpenAi =>
-            {
-                eprintln!("remote compaction failed for {session_id}; falling back to local summary: {error}");
+    }
+
+    async fn run_local(&self, model_context: ModelContext) -> Result<CompactionOutput> {
+        run_local_summary_compaction(self.state, self.config, self.session_id, model_context).await
+    }
+}
+
+async fn run_compaction_with_runner(
+    provider: ProviderKind,
+    remote_mode: RemoteCompactionMode,
+    session_id: &str,
+    model_context: ModelContext,
+    runner: &dyn CompactionRunner,
+) -> Result<CompactionOutput> {
+    if remote_mode != RemoteCompactionMode::Never && runner.supports_remote() {
+        eprintln!(
+            "attempting provider-native compaction for {session_id} with {}",
+            provider
+        );
+        match runner.run_remote(model_context.clone()).await {
+            Ok(output) => return Ok(output),
+            Err(error) if should_fallback_after_remote_failure(provider, remote_mode) => {
+                eprintln!(
+                    "provider-native compaction failed for {session_id}; falling back to local summary (provider={provider}, reason={error})"
+                );
             }
             Err(error) => return Err(error),
         }
     } else if remote_mode == RemoteCompactionMode::Always {
         return Err(anyhow!(
             "remote compaction unsupported for provider {}",
-            config.provider.kind
+            provider
         ));
+    } else if remote_mode == RemoteCompactionMode::Auto {
+        eprintln!(
+            "provider-native compaction unavailable for {session_id}; falling back to local summary (provider={provider}, reason=provider does not advertise remote compaction support)"
+        );
     }
 
-    let output = run_local_summary_compaction(state, config, session_id, model_context).await?;
-    append_delegation_ledger_to_output(state, session_id, output).await
+    runner.run_local(model_context).await
 }
 
 async fn run_remote_compaction_with_trimming(
@@ -359,6 +468,14 @@ pub(crate) async fn remote_compaction_request(
     session_id: &str,
     transcript: Vec<ModelTranscriptEntry>,
 ) -> Result<ProviderCompactionRequest> {
+    let compaction_instructions = if config.provider.kind == ProviderKind::Claude {
+        Some(format!(
+            "{}\n\nDo not call any tools while writing this summary. Respond with summary text only.",
+            render_pi_compaction_prompt(state, config)?
+        ))
+    } else {
+        None
+    };
     Ok(ProviderCompactionRequest {
         model: config.provider.model.clone(),
         // Compaction uses the stable prompt plus transcript/model history. Any
@@ -380,7 +497,15 @@ pub(crate) async fn remote_compaction_request(
         ),
         prompt_cache_key: config.provider.prompt_cache_key().map(str::to_string),
         session_id: Some(session_id.to_string()),
+        compaction_instructions,
     })
+}
+
+fn should_fallback_after_remote_failure(
+    provider: ProviderKind,
+    remote_mode: RemoteCompactionMode,
+) -> bool {
+    remote_mode == RemoteCompactionMode::Auto && provider != ProviderKind::OpenAi
 }
 
 pub(crate) async fn append_delegation_ledger_to_output(
@@ -600,6 +725,10 @@ fn trim_oldest_complete_group(groups: &mut Vec<TranscriptGroup>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     fn test_config(kind: ProviderKind, model: &str, metadata: Value) -> SessionConfig {
         SessionConfig {
@@ -618,6 +747,83 @@ mod tests {
         }
     }
 
+    struct TestCompactionRunner {
+        remote_error: String,
+        remote_calls: Arc<AtomicUsize>,
+        local_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl CompactionRunner for TestCompactionRunner {
+        fn supports_remote(&self) -> bool {
+            true
+        }
+
+        async fn run_remote(&self, _model_context: ModelContext) -> Result<CompactionOutput> {
+            self.remote_calls.fetch_add(1, Ordering::Relaxed);
+            Err(anyhow::Error::new(
+                agent_provider::ProviderError::native_compaction(
+                    agent_provider::NativeCompactionErrorKind::Unsupported,
+                    self.remote_error.clone(),
+                ),
+            ))
+        }
+
+        async fn run_local(&self, _model_context: ModelContext) -> Result<CompactionOutput> {
+            self.local_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(CompactionOutput {
+                summary: "local fallback".to_string(),
+                summary_kind: CompactionSummaryKind::ProviderText,
+                provider_replay: Vec::new(),
+                remote: false,
+                provider: ProviderKind::Claude,
+                usage: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_compaction_auto_falls_back_but_always_exposes_native_error() {
+        for (mode, expect_fallback) in [
+            (RemoteCompactionMode::Auto, true),
+            (RemoteCompactionMode::Always, false),
+        ] {
+            let remote_calls = Arc::new(AtomicUsize::new(0));
+            let local_calls = Arc::new(AtomicUsize::new(0));
+            let runner = TestCompactionRunner {
+                remote_error: "model is unsupported".to_string(),
+                remote_calls: remote_calls.clone(),
+                local_calls: local_calls.clone(),
+            };
+            let result = run_compaction_with_runner(
+                ProviderKind::Claude,
+                mode,
+                "test-session",
+                ModelContext::default(),
+                &runner,
+            )
+            .await;
+
+            assert_eq!(remote_calls.load(Ordering::Relaxed), 1);
+            if expect_fallback {
+                let output = result.expect("Auto uses local fallback");
+                assert!(!output.remote);
+                assert_eq!(output.summary, "local fallback");
+                assert_eq!(local_calls.load(Ordering::Relaxed), 1);
+            } else {
+                let error = result.expect_err("Always exposes native error");
+                assert!(matches!(
+                    error.downcast_ref::<agent_provider::ProviderError>(),
+                    Some(agent_provider::ProviderError::NativeCompaction {
+                        kind: agent_provider::NativeCompactionErrorKind::Unsupported,
+                        ..
+                    })
+                ));
+                assert_eq!(local_calls.load(Ordering::Relaxed), 0);
+            }
+        }
+    }
+
     #[test]
     fn resolved_compaction_config_uses_known_rust_defaults() {
         let config = test_config(
@@ -631,6 +837,312 @@ mod tests {
         assert_eq!(resolved.context_window, Some(272_000));
         assert_eq!(resolved.auto_limit_tokens, Some(231_200));
         assert_eq!(resolved.remote_mode, RemoteCompactionMode::Always);
+    }
+
+    #[test]
+    fn claude_remote_compaction_remains_opt_in_and_auto_falls_back() {
+        let default = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-5",
+            serde_json::json!({}),
+        );
+        assert_eq!(
+            resolve_compaction_config(&default, None).remote_mode,
+            RemoteCompactionMode::Never
+        );
+        let limits_only = test_config(
+            ProviderKind::Claude,
+            "claude-sonnet-5",
+            serde_json::json!({
+                "compaction": {
+                    "config": {
+                        "auto_enabled": true,
+                        "auto_limit_tokens": 100_000
+                    }
+                }
+            }),
+        );
+        assert_eq!(
+            resolve_compaction_config(&limits_only, None).remote_mode,
+            RemoteCompactionMode::Never,
+            "non-policy compaction settings must not enroll Claude in the beta"
+        );
+        for (configured, expected) in [
+            ("auto", RemoteCompactionMode::Auto),
+            ("always", RemoteCompactionMode::Always),
+        ] {
+            let explicit = test_config(
+                ProviderKind::Claude,
+                "claude-sonnet-5",
+                serde_json::json!({
+                    "compaction": {
+                        "config": {
+                            "remote_mode": configured,
+                            "anthropic_native_compaction": "compact_20260112"
+                        }
+                    }
+                }),
+            );
+            assert_eq!(
+                resolve_compaction_config(&explicit, None).remote_mode,
+                expected
+            );
+        }
+
+        assert!(should_fallback_after_remote_failure(
+            ProviderKind::Claude,
+            RemoteCompactionMode::Auto
+        ));
+        assert!(!should_fallback_after_remote_failure(
+            ProviderKind::Claude,
+            RemoteCompactionMode::Always
+        ));
+        assert!(!should_fallback_after_remote_failure(
+            ProviderKind::OpenAi,
+            RemoteCompactionMode::Auto
+        ));
+    }
+
+    #[test]
+    fn legacy_web_claude_auto_metadata_does_not_enroll_native_compaction() {
+        let legacy = test_config(
+            ProviderKind::Claude,
+            "claude-opus-4-8",
+            serde_json::json!({
+                "title": "Legacy web session",
+                "created_by": "web",
+                "compaction": {
+                    "config": {
+                        "auto_enabled": true,
+                        "remote_mode": "auto",
+                        "max_consecutive_failures": 3
+                    }
+                }
+            }),
+        );
+
+        let resolved = resolve_compaction_config(&legacy, None);
+
+        assert_eq!(resolved.remote_mode, RemoteCompactionMode::Never);
+        assert_eq!(resolved.anthropic_native_compaction, None);
+    }
+
+    #[test]
+    fn claude_remote_policy_fails_closed_for_malformed_metadata() {
+        let cases = [
+            (
+                "null remote mode",
+                serde_json::json!({
+                    "remote_mode": null,
+                    "anthropic_native_compaction": "compact_20260112"
+                }),
+            ),
+            (
+                "unknown remote mode",
+                serde_json::json!({
+                    "remote_mode": "sometimes",
+                    "anthropic_native_compaction": "compact_20260112"
+                }),
+            ),
+            (
+                "wrong remote mode type",
+                serde_json::json!({
+                    "remote_mode": 1,
+                    "anthropic_native_compaction": "compact_20260112"
+                }),
+            ),
+            (
+                "missing version marker",
+                serde_json::json!({ "remote_mode": "auto" }),
+            ),
+            (
+                "unknown version marker",
+                serde_json::json!({
+                    "remote_mode": "always",
+                    "anthropic_native_compaction": "future_version"
+                }),
+            ),
+            (
+                "malformed sibling",
+                serde_json::json!({
+                    "remote_mode": "auto",
+                    "anthropic_native_compaction": "compact_20260112",
+                    "auto_limit_tokens": "not a number"
+                }),
+            ),
+            (
+                "explicit never with malformed sibling",
+                serde_json::json!({
+                    "remote_mode": "never",
+                    "anthropic_native_compaction": "compact_20260112",
+                    "auto_limit_tokens": "not a number"
+                }),
+            ),
+        ];
+
+        for (name, compaction_config) in cases {
+            let config = test_config(
+                ProviderKind::Claude,
+                "claude-opus-4-8",
+                serde_json::json!({
+                    "compaction": {
+                        "config": compaction_config
+                    }
+                }),
+            );
+            assert_eq!(
+                resolve_compaction_config(&config, None).remote_mode,
+                RemoteCompactionMode::Never,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_legacy_remote_policy_behavior_is_preserved() {
+        for (name, config_value, expected) in [
+            (
+                "missing",
+                serde_json::json!({}),
+                RemoteCompactionMode::Always,
+            ),
+            (
+                "legacy auto",
+                serde_json::json!({ "remote_mode": "auto" }),
+                RemoteCompactionMode::Always,
+            ),
+            (
+                "malformed",
+                serde_json::json!({ "remote_mode": null }),
+                RemoteCompactionMode::Always,
+            ),
+            (
+                "explicit never with malformed sibling",
+                serde_json::json!({
+                    "remote_mode": "never",
+                    "auto_limit_tokens": "not a number"
+                }),
+                RemoteCompactionMode::Always,
+            ),
+            (
+                "explicit never ignores malformed Claude-only marker",
+                serde_json::json!({
+                    "remote_mode": "never",
+                    "anthropic_native_compaction": { "malformed": true }
+                }),
+                RemoteCompactionMode::Never,
+            ),
+        ] {
+            let config = test_config(
+                ProviderKind::OpenAi,
+                "gpt-5.6-sol",
+                serde_json::json!({ "compaction": { "config": config_value } }),
+            );
+            assert_eq!(
+                resolve_compaction_config(&config, None).remote_mode,
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_compaction_output_preserves_checkpoint_replay_and_raw_usage() {
+        let block = serde_json::json!({
+            "type": "compaction",
+            "content": "opaque Anthropic summary",
+            "provider_extension": { "preserve": true }
+        });
+        let replay = ProviderReplayItem::new(ProviderKind::Claude, &block).unwrap();
+        let raw_usage = serde_json::json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "iterations": [{
+                "type": "compaction",
+                "input_tokens": 180000,
+                "output_tokens": 3500
+            }]
+        });
+        let output = remote_compaction_output(
+            ProviderKind::Claude,
+            ProviderCompactionResponse {
+                summary: None,
+                provider_replay: vec![replay],
+                usage: Some(agent_provider::ProviderUsage {
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    total_tokens: Some(0),
+                    raw_provider_usage: Some(raw_usage.clone()),
+                    ..agent_provider::ProviderUsage::default()
+                }),
+            },
+        );
+
+        assert!(output.remote);
+        assert_eq!(output.summary_kind, CompactionSummaryKind::Generic);
+        assert_eq!(output.provider_replay[0].raw_value().unwrap(), block);
+        let serialized_replay =
+            serde_json::to_string(&output.provider_replay).expect("provider replay serializes");
+        let restored_replay: Vec<ProviderReplayItem> =
+            serde_json::from_str(&serialized_replay).expect("provider replay deserializes");
+        assert_eq!(restored_replay[0].raw_value().unwrap(), block);
+        assert_eq!(
+            output
+                .usage
+                .as_ref()
+                .and_then(|usage| usage.get("raw_provider_usage")),
+            Some(&raw_usage)
+        );
+    }
+
+    #[test]
+    fn remote_retry_trimming_keeps_compaction_root_and_newer_history() {
+        let entry = |item| ModelTranscriptEntry {
+            item,
+            provider_replay: Vec::new(),
+        };
+        let mut groups = transcript_groups(vec![
+            entry(TranscriptItem::CompactionSummary(
+                agent_vocab::CompactionSummary::new(
+                    "session",
+                    "old-leaf",
+                    "prior checkpoint",
+                    None,
+                    agent_vocab::TurnId(1),
+                ),
+            )),
+            entry(TranscriptItem::TurnStarted {
+                turn_id: agent_vocab::TurnId(2),
+            }),
+            entry(TranscriptItem::UserMessage(UserMessage::text("old turn"))),
+            entry(TranscriptItem::TurnFinished {
+                turn_id: agent_vocab::TurnId(2),
+                outcome: agent_vocab::TurnOutcome::Graceful,
+            }),
+            entry(TranscriptItem::TurnStarted {
+                turn_id: agent_vocab::TurnId(3),
+            }),
+            entry(TranscriptItem::UserMessage(UserMessage::text("new turn"))),
+            entry(TranscriptItem::TurnFinished {
+                turn_id: agent_vocab::TurnId(3),
+                outcome: agent_vocab::TurnOutcome::Graceful,
+            }),
+        ]);
+
+        assert!(trim_oldest_complete_group(&mut groups));
+        let remaining = entries_from_groups(&groups);
+        assert!(matches!(
+            remaining.first().map(|entry| &entry.item),
+            Some(TranscriptItem::CompactionSummary(_))
+        ));
+        let visible = remaining
+            .iter()
+            .filter_map(|entry| match &entry.item {
+                TranscriptItem::UserMessage(message) => message.as_text(),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible, vec!["new turn"]);
     }
 
     #[test]
@@ -703,7 +1215,8 @@ mod tests {
                         "auto_enabled": true,
                         "context_window": 123,
                         "auto_limit_tokens": 77,
-                        "remote_mode": "auto"
+                        "remote_mode": "auto",
+                        "anthropic_native_compaction": "compact_20260112"
                     }
                 }
             }),
@@ -714,6 +1227,10 @@ mod tests {
         assert_eq!(resolved.context_window, Some(123));
         assert_eq!(resolved.auto_limit_tokens, Some(77));
         assert_eq!(resolved.remote_mode, RemoteCompactionMode::Auto);
+        assert_eq!(
+            resolved.anthropic_native_compaction,
+            Some(AnthropicNativeCompactionVersion::Compact20260112)
+        );
 
         let discovered = resolve_compaction_config(
             &config,

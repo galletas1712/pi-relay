@@ -19,7 +19,7 @@ pub(crate) use compaction::{
 };
 pub(crate) use compaction::{
     auto_limit_tokens, compaction_auto_explicitly_disabled, compaction_auto_state,
-    compaction_config_with_model_metadata, run_compaction,
+    compaction_config_with_model_metadata, run_compaction, CompactionAutoState,
 };
 pub(crate) use connections::ProviderConnectionRegistry;
 pub(crate) use context_accounting::model_input_tokens_for_gate;
@@ -27,6 +27,8 @@ pub(crate) use prompt::{
     current_pi_template, effective_prompt_profile, provider_tools_for_session, render_pi_prompt,
 };
 pub(crate) use provider::model_metadata_for_config;
+#[cfg(test)]
+pub(crate) use requests::injected_provider_start_count;
 pub(crate) use requests::{build_model_request, run_model};
 pub(crate) use session_titles::{
     schedule_session_title_refresh_for_model_turn, SessionTitleScheduler,

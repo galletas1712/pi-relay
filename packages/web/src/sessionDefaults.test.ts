@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	DEFAULT_PROVIDER,
 	MODEL_OPTIONS,
+	newSessionCompactionConfig,
 	providerFromModelKey,
 	reasoningEffortsForProvider,
 } from "./sessionDefaults.ts";
@@ -49,5 +50,19 @@ describe("session defaults", () => {
 		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.6-sol" })).toContain("max");
 		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.6-terra" })).not.toContain("max");
 		expect(reasoningEffortsForProvider({ kind: "openai", model: "gpt-5.6-luna" })).not.toContain("max");
+	});
+
+	it("keeps Anthropic native compaction opt-in", () => {
+		expect(newSessionCompactionConfig({ kind: "claude", model: "claude-sonnet-5" })).toEqual({
+			auto_enabled: true,
+			remote_mode: "never",
+			anthropic_native_compaction: null,
+			max_consecutive_failures: 3,
+		});
+		expect(newSessionCompactionConfig({ kind: "openai", model: "gpt-5.6-sol" })).toEqual({
+			auto_enabled: true,
+			remote_mode: "auto",
+			max_consecutive_failures: 3,
+		});
 	});
 });

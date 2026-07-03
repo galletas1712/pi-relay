@@ -53,7 +53,12 @@ pub(super) async fn run_model_turn(
     let driver = SessionDriver::acquire(&state, &session_id).await;
     if !state
         .repo
-        .action_can_complete(&session_id, &dispatch.row_id, &dispatch.attempt_id)
+        .action_can_complete(
+            &session_id,
+            &dispatch.row_id,
+            &dispatch.attempt_id,
+            dispatch.post_compaction_dispatch_lease.as_ref(),
+        )
         .await?
     {
         return Ok(());
@@ -64,87 +69,17 @@ pub(super) async fn run_model_turn(
         .ok_or_else(|| RpcError::new("stale_action", "session is not active"))?;
     let dispatches = match result {
         Ok(response) => {
-            if response.usage.is_some()
-                && response.stop_reason != agent_provider::ModelStopReason::Refusal
-            {
-                state
-                    .repo
-                    .reset_auto_compaction_failures(&session_id)
-                    .await?;
-            }
-            let stop_reason = response.stop_reason;
-            let error = model_response_error(&response);
-            let action_status = if stop_reason == agent_provider::ModelStopReason::Complete {
-                ActionStatus::Completed
-            } else {
-                ActionStatus::Error
-            };
-            let action_update = Some(ActionUpdate {
-                row_id: dispatch.row_id.clone(),
-                attempt_id: dispatch.attempt_id,
-                status: action_status,
-                result: json!({
-                    "source": "provider",
-                    "usage": response.usage,
-                    "stop_reason": stop_reason,
-                    "stop_details": response.stop_details,
-                    "error": error,
-                }),
-            });
-            let provider_replay = response.provider_replay;
-            match stop_reason {
-                agent_provider::ModelStopReason::Complete => {
-                    let dispatches = driver
-                        .apply_session_input(
-                            active,
-                            SessionInput::ModelCompleted {
-                                action_id,
-                                turn_id,
-                                assistant: response.assistant,
-                            },
-                            action_update,
-                            provider_replay,
-                        )
-                        .await?;
-                    dispatches
-                }
-                agent_provider::ModelStopReason::MaxOutputTokens => {
-                    driver
-                        .apply_session_input(
-                            active,
-                            SessionInput::ModelMaxOutputTokens {
-                                action_id,
-                                turn_id,
-                                assistant: response.assistant,
-                                provider_replay,
-                                error: error.unwrap_or_else(|| {
-                                    "provider response hit max_output_tokens".to_string()
-                                }),
-                            },
-                            action_update,
-                            Vec::new(),
-                        )
-                        .await?
-                }
-                agent_provider::ModelStopReason::Refusal => {
-                    let error = error.unwrap_or_else(|| "provider refused the request".to_string());
-                    eprintln!(
-                        "model provider refusal for {session_id}/{}: {error}",
-                        dispatch.row_id
-                    );
-                    driver
-                        .apply_agent_input(
-                            active,
-                            AgentInput::ModelFailed {
-                                action_id,
-                                turn_id,
-                                error,
-                            },
-                            action_update,
-                        )
-                        .await?
-                }
-            }
+            apply_model_response(
+                &state,
+                &session_id,
+                &driver,
+                active,
+                &dispatch,
+                action_id,
+                turn_id,
+                response,
+            )
+            .await?
         }
         Err(error) => {
             if super::compaction::recover_model_context_overflow_with_compaction(
@@ -168,8 +103,11 @@ pub(super) async fn run_model_turn(
                         error: message.clone(),
                     },
                     Some(ActionUpdate {
-                        row_id: dispatch.row_id,
-                        attempt_id: dispatch.attempt_id,
+                        row_id: dispatch.row_id.clone(),
+                        attempt_id: dispatch.attempt_id.clone(),
+                        post_compaction_dispatch_lease: dispatch
+                            .post_compaction_dispatch_lease
+                            .clone(),
                         status: ActionStatus::Error,
                         result: update_result,
                     }),
@@ -177,9 +115,147 @@ pub(super) async fn run_model_turn(
                 .await?
         }
     };
+    pause_after_model_transition_for_test(&dispatch).await;
     driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
     Ok(())
+}
+
+fn model_provider_max_attempts_for_test(_config: &agent_store::SessionConfig) -> usize {
+    #[cfg(test)]
+    if let Some(attempts) = _config
+        .metadata
+        .pointer("/fault_injection/model_provider_max_attempts")
+        .and_then(serde_json::Value::as_u64)
+    {
+        return usize::try_from(attempts).unwrap_or(1).max(1);
+    }
+    MODEL_PROVIDER_MAX_ATTEMPTS
+}
+
+async fn pause_after_model_transition_for_test(_dispatch: &DispatchAction) {
+    #[cfg(test)]
+    if let Some(milliseconds) = _dispatch
+        .config
+        .metadata
+        .pointer("/fault_injection/pause_after_model_transition_ms")
+        .and_then(serde_json::Value::as_u64)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(milliseconds)).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn apply_model_response(
+    state: &AppState,
+    session_id: &str,
+    driver: &SessionDriver,
+    active: std::sync::Arc<tokio::sync::Mutex<crate::types::RuntimeSession>>,
+    dispatch: &DispatchAction,
+    action_id: agent_vocab::ActionId,
+    turn_id: TurnId,
+    response: agent_provider::ModelResponse,
+) -> std::result::Result<Vec<DispatchAction>, RpcError> {
+    if response.usage.is_some()
+        && matches!(
+            response.stop_reason,
+            agent_provider::ModelStopReason::Complete
+                | agent_provider::ModelStopReason::MaxOutputTokens
+        )
+    {
+        state
+            .repo
+            .reset_auto_compaction_failures(session_id)
+            .await?;
+    }
+    let stop_reason = response.stop_reason;
+    let error = model_response_error(&response);
+    let action_status = if stop_reason == agent_provider::ModelStopReason::Complete {
+        ActionStatus::Completed
+    } else {
+        ActionStatus::Error
+    };
+    let action_update = Some(ActionUpdate {
+        row_id: dispatch.row_id.clone(),
+        attempt_id: dispatch.attempt_id.clone(),
+        post_compaction_dispatch_lease: dispatch.post_compaction_dispatch_lease.clone(),
+        status: action_status,
+        result: json!({
+            "source": "provider",
+            "usage": response.usage,
+            "stop_reason": stop_reason,
+            "stop_details": response.stop_details,
+            "error": error,
+        }),
+    });
+    let provider_replay = response.provider_replay;
+    match stop_reason {
+        agent_provider::ModelStopReason::Complete => {
+            driver
+                .apply_session_input(
+                    active,
+                    SessionInput::ModelCompleted {
+                        action_id,
+                        turn_id,
+                        assistant: response.assistant,
+                    },
+                    action_update,
+                    provider_replay,
+                )
+                .await
+        }
+        agent_provider::ModelStopReason::MaxOutputTokens => {
+            driver
+                .apply_session_input(
+                    active,
+                    SessionInput::ModelMaxOutputTokens {
+                        action_id,
+                        turn_id,
+                        assistant: response.assistant,
+                        provider_replay,
+                        error: error.unwrap_or_else(|| {
+                            "provider response hit max_output_tokens".to_string()
+                        }),
+                    },
+                    action_update,
+                    Vec::new(),
+                )
+                .await
+        }
+        agent_provider::ModelStopReason::Compaction => {
+            let error =
+                "unexpected provider compaction stop during an ordinary model turn".to_string();
+            driver
+                .apply_agent_input(
+                    active,
+                    AgentInput::ModelFailed {
+                        action_id,
+                        turn_id,
+                        error,
+                    },
+                    action_update,
+                )
+                .await
+        }
+        agent_provider::ModelStopReason::Refusal => {
+            let error = error.unwrap_or_else(|| "provider refused the request".to_string());
+            eprintln!(
+                "model provider refusal for {session_id}/{}: {error}",
+                dispatch.row_id
+            );
+            driver
+                .apply_agent_input(
+                    active,
+                    AgentInput::ModelFailed {
+                        action_id,
+                        turn_id,
+                        error,
+                    },
+                    action_update,
+                )
+                .await
+        }
+    }
 }
 
 fn model_response_error(response: &agent_provider::ModelResponse) -> Option<String> {
@@ -189,6 +265,9 @@ fn model_response_error(response: &agent_provider::ModelResponse) -> Option<Stri
             Some("provider response hit max_output_tokens".to_string())
         }
         agent_provider::ModelStopReason::Refusal => response.refusal_error(),
+        agent_provider::ModelStopReason::Compaction => {
+            Some("unexpected provider compaction stop during an ordinary model turn".to_string())
+        }
     }
 }
 
@@ -202,11 +281,17 @@ async fn run_model_for_action_with_retries(
     std::result::Result<agent_provider::ModelResponse, ModelProviderFailure>,
     RpcError,
 > {
-    for attempt in 1..=MODEL_PROVIDER_MAX_ATTEMPTS {
+    let max_attempts = model_provider_max_attempts_for_test(&dispatch.config);
+    for attempt in 1..=max_attempts {
         if attempt > 1
             && !state
                 .repo
-                .action_can_complete(session_id, &dispatch.row_id, &dispatch.attempt_id)
+                .action_can_complete(
+                    session_id,
+                    &dispatch.row_id,
+                    &dispatch.attempt_id,
+                    dispatch.post_compaction_dispatch_lease.as_ref(),
+                )
                 .await?
         {
             return Err(RpcError::new(
@@ -229,7 +314,7 @@ async fn run_model_for_action_with_retries(
                     Ok(error) => error,
                     Err(error) => return Err(error.into()),
                 };
-                if attempt >= MODEL_PROVIDER_MAX_ATTEMPTS {
+                if attempt >= max_attempts {
                     return Ok(Err(ModelProviderFailure {
                         error: provider_error,
                         attempts: attempt,
@@ -237,7 +322,12 @@ async fn run_model_for_action_with_retries(
                 }
                 if !state
                     .repo
-                    .action_can_complete(session_id, &dispatch.row_id, &dispatch.attempt_id)
+                    .action_can_complete(
+                        session_id,
+                        &dispatch.row_id,
+                        &dispatch.attempt_id,
+                        dispatch.post_compaction_dispatch_lease.as_ref(),
+                    )
                     .await?
                 {
                     return Err(RpcError::new(
