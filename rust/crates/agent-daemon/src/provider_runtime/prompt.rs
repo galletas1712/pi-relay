@@ -134,6 +134,7 @@ fn tool_allowed_for_profile(tool: &ProviderTool, profile: PromptProfile) -> bool
             | "inspect_delegation"
             | "cancel_delegation"
             | "steer_subagent"
+            | "interrupt_subagent"
     )
 }
 
@@ -567,6 +568,7 @@ mod tests {
         assert!(parent_spec_names.contains(&"inspect_delegation".to_string()));
         assert!(parent_spec_names.contains(&"cancel_delegation".to_string()));
         assert!(parent_spec_names.contains(&"steer_subagent".to_string()));
+        assert!(parent_spec_names.contains(&"interrupt_subagent".to_string()));
 
         let subagent_provider_tools =
             provider_tools_for_profile(all_tools, PromptProfile::Subagent);
@@ -585,6 +587,7 @@ mod tests {
         assert!(!subagent_spec_names.contains(&"inspect_delegation".to_string()));
         assert!(!subagent_spec_names.contains(&"cancel_delegation".to_string()));
         assert!(!subagent_spec_names.contains(&"steer_subagent".to_string()));
+        assert!(!subagent_spec_names.contains(&"interrupt_subagent".to_string()));
     }
 
     #[test]

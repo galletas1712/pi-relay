@@ -67,14 +67,35 @@ Messages both carry provider-shaped replay state across turns; reasoning effort
 is still a per-request knob and can be changed during a running turn. The change
 applies to later provider requests, not one already in flight.
 
-Normal composer text is always `input.follow_up`, even while the agent is
-running. Queued follow-ups appear in a small pane above the composer. Each
+Normal composer text in a selected top-level session is `input.follow_up`, even
+while the agent is running. In a selected delegation child it is instead a
+parent-scoped `delegation.steer_subagent`; slash commands remain commands in
+both cases. Queued follow-ups appear in a small pane above the composer. Each
 queued follow-up has a row-level steer control; pressing it promotes that row
-to the steer queue, ordered by promotion time. Each queued follow-up can also be
-edited, cancelled, and reordered from the queue pane; the web UI wires
-`input.update_queued`, `input.cancel_queued`, and `input.reorder_queued_follow_ups`.
-Steers stay pinned on top and are not reorderable. Active turns are interrupted
-with a stop button beside the composer, not with a slash command.
+to the steer queue, ordered by promotion time. Each queued follow-up can also
+be edited, cancelled, and reordered from the queue pane; the web UI wires
+`input.update_queued`, `input.cancel_queued`, and
+`input.reorder_queued_follow_ups`. Steers stay pinned on top and are not
+reorderable. Active turns are interrupted with a stop button beside the
+composer, not with a slash command.
+
+Composer submission captures the selected session id once. App routing and
+per-session draft resolution use that immutable id and a stable per-submission
+client input/control id; they do not reread selection after an async boundary.
+If the matching snapshot disappeared, the send fails and the text is restored
+under the captured draft instead of being retargeted.
+
+Stop is exact-session control: selecting a root stops that root only, and
+selecting a child stops that child only. It does not cascade between
+parent/children or cancel a delegation. Whole-delegation cancellation is a
+separate run-board/model operation. Parent models can also steer one child
+without interruption (the backward-compatible default), atomically request an
+interrupt-and-steer, or call `interrupt_subagent` for exact-child
+interrupt-only control. Both interrupting forms use a durable
+parent/delegation/child-scoped ledger, fence the complete active turn attempt
+set, and distinguish acceptance (`pending_interrupt`) from application
+(`interrupt_applied`) and task settlement (`ready`). Interrupt-only ledger rows
+cannot be consumed as model text.
 
 Slash autocomplete is intentionally shallow: it only appears while typing the
 command name. Enter on a partial command accepts the highlighted completion and

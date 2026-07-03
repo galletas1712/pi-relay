@@ -82,9 +82,15 @@ Rules:
   yourself until it returns.
 - If a running subagent needs a correction, clarification, or additional
   information, prefer `steer_subagent` over cancelling and restarting. Use the
-  subagent session id shown by `inspect_delegation`.
+  subagent session id shown by `inspect_delegation`. The default steer is
+  noninterrupting; pass `interrupt: true` only when the current child work
+  should be stopped before the durable instruction is driven. Use
+  `interrupt_subagent` to durably stop exactly one captured child generation
+  without adding an instruction; replaying that tool call does not stop newer
+  child work.
 - Cancellation is terminal. Use `cancel_delegation` when you intend to abandon
-  the current subagent/delegation. Cancellation does not roll back workspace
+  the whole current delegation, not as a substitute for exact-child interrupt.
+  Cancellation does not roll back workspace
   edits or remote-state side effects; inspect the transcript-only paths returned
   by cancellation before deciding follow-up work.
 - Never mix RO and full work in one delegation.

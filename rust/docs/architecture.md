@@ -123,7 +123,8 @@ Implemented user-facing behavior:
   provider paths, with prompt-cache shaping on both.
 - Subagent delegation runs as **delegations** through provider-visible delegation
   tools (`delegate_writing_task`, `delegate_readonly_tasks`,
-  `inspect_delegation`, `cancel_delegation`, `steer_subagent`). A delegation is one **full** subagent
+  `inspect_delegation`, `cancel_delegation`, `steer_subagent`,
+  `interrupt_subagent`). A delegation is one **full** subagent
   (writes the parent's workspace in place) or a parallel fan-out of
   **read-only** subagents (each in a disposable btrfs snapshot, destroyed on
   return). The parent parks after launching a delegation and is delivered a

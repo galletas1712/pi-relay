@@ -70,6 +70,7 @@ semantics justify it.
 | `inspect_delegation` | `inspect_delegation` (JSON function) | `inspect_delegation` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 | `cancel_delegation` | `cancel_delegation` (JSON function) | `cancel_delegation` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 | `steer_subagent` | `steer_subagent` (JSON function) | `steer_subagent` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
+| `interrupt_subagent` | `interrupt_subagent` (JSON function) | `interrupt_subagent` (JSON client tool) | `delegation` | runtime-handled (no registry executor) |
 
 There are no `read`/`write` tools. File reads go through `Edit`'s `view`
 command (Anthropic) or through `Bash` (`cat`, `sed`, `rg`, …) on OpenAI.
@@ -149,7 +150,8 @@ it against the session's loaded-skill set and workspace skills.
 ### delegation tools
 
 `delegate_writing_task`, `delegate_readonly_tasks`, `inspect_delegation`,
-`cancel_delegation`, and `steer_subagent` are provider-visible JSON tools registered by
+`cancel_delegation`, `steer_subagent`, and `interrupt_subagent` are
+provider-visible JSON tools registered by
 `FirstPartyToolExtension`, but they have no registry executor. The daemon
 runtime intercepts them and dispatches to the delegation engine in
 `delegation_tools.rs`.
@@ -158,8 +160,19 @@ runtime intercepts them and dispatches to the delegation engine in
 subagents; `inspect_delegation` returns the canonical structured state/outcome
 snapshot (with task/final/transcript artifact paths, not inline full prompts or
 transcripts);
-`cancel_delegation` cancels an existing delegation; `steer_subagent` queues an
-additional instruction to a running subagent. Read-only subagents have disposable
+`cancel_delegation` cancels an existing whole delegation; `steer_subagent`
+queues an additional instruction to one running subagent without interruption
+by default. With `interrupt: true`, its durable control row blocks the child
+mailbox until the captured action generation and an interrupted boundary are
+committed with phase `interrupt_applied`; exact-child live/boot reconciliation
+then settles runtime tasks, marks it `ready`, and drives the steer.
+The generation fence includes every unfinished attempt for the active turn, so
+parallel tools are settled together and newer attempts are untouched.
+`interrupt_subagent` interrupts exactly one child without adding text. It uses a
+distinct durable interrupt-only ledger row, the same phases/generation fence,
+and a model tool-call-derived replay ID; `ready` settles the marker without
+dispatching it as a steer. Read-only
+subagents have disposable
 workspaces, not immutable conversations. Delegation subagents may produce
 `subagent.spawned`/`subagent.running` progress events, but delegation completion
 arrives later as a daemon-authored parent observation containing an

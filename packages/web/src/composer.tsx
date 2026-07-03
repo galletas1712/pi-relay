@@ -1,5 +1,7 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent, type RefObject } from "react";
 import { ArrowDown, ArrowUp, Check, Edit3, Loader2, Send, ShipWheel, Square, Trash2, X } from "lucide-react";
+import type { ComposerSubmission } from "./composerRouting.ts";
+import { randomId } from "./ids.ts";
 import { COMMANDS, filterCommands, matchSlashPrefix, type SlashCommandInfo } from "./slash.ts";
 import { contentBlocksToText, firstLine, truncate } from "./text.ts";
 import type { QueuedInput } from "./types.ts";
@@ -10,7 +12,12 @@ const COMPOSER_MIN_HEIGHT_PX = 44;
 const COMPOSER_MAX_HEIGHT_PX = 180;
 
 type ComposerSubmitShortcutEvent = Pick<KeyboardEvent<HTMLTextAreaElement>, "ctrlKey" | "key" | "metaKey">;
-export type PendingSubmittedDraft = { value: string; version: number };
+export type PendingSubmittedDraft = {
+	value: string;
+	version: number;
+	clientControlId: string;
+	newSessionId: string;
+};
 export type SubmittedDraftResolution = "ignore" | "apply";
 
 export function submittedDraftStillCurrent(
@@ -37,6 +44,23 @@ export function isComposerSubmitShortcut(event: ComposerSubmitShortcutEvent): bo
 	return event.key === "Enter" && (event.metaKey || event.ctrlKey);
 }
 
+export function submissionIdsForDraft(
+	pending: PendingSubmittedDraft | undefined,
+	text: string,
+	createId: (prefix: string) => string = randomId,
+): Pick<PendingSubmittedDraft, "clientControlId" | "newSessionId"> {
+	if (pending?.value === text) {
+		return {
+			clientControlId: pending.clientControlId,
+			newSessionId: pending.newSessionId,
+		};
+	}
+	return {
+		clientControlId: createId("web_control"),
+		newSessionId: createId("session"),
+	};
+}
+
 export interface ComposerHandle {
 	focus(): void;
 	getValue(): string;
@@ -49,6 +73,7 @@ export type ComposerDraftStorage = Pick<Storage, "getItem" | "setItem" | "remove
 
 export const Composer = memo(function Composer({
 	selectedId,
+	selectedIsSubagent,
 	composerHandleRef,
 	sending,
 	canStop,
@@ -62,12 +87,13 @@ export const Composer = memo(function Composer({
 	onMoveQueued,
 }: {
 	selectedId: string | null;
+	selectedIsSubagent: boolean;
 	composerHandleRef: RefObject<ComposerHandle | null>;
 	sending: boolean;
 	canStop: boolean;
 	stopping: boolean;
 	queuedInputs: QueuedInput[];
-	onSubmit: (text: string) => Promise<boolean> | boolean;
+	onSubmit: (submission: ComposerSubmission) => Promise<boolean> | boolean;
 	onStop: () => void;
 	onPromoteQueued: (inputId: string) => void;
 	onUpdateQueued: (inputId: string, text: string) => void;
@@ -139,8 +165,11 @@ export const Composer = memo(function Composer({
 				}
 				return;
 			}
-			pendingSubmittedDraftsRef.current.delete(key);
-			storeDraft(sessionId, value);
+			const restoredVersion = storeDraft(sessionId, value);
+			pendingSubmittedDraftsRef.current.set(key, {
+				...pending!,
+				version: restoredVersion,
+			});
 			if (selectedIdRef.current === sessionId && !draftRef.current.trim()) {
 				draftRef.current = value;
 				setDraft(value);
@@ -151,6 +180,11 @@ export const Composer = memo(function Composer({
 
 	const setDraftValue = useCallback(
 		(value: string) => {
+			const key = composerDraftKey(selectedIdRef.current);
+			const pending = pendingSubmittedDraftsRef.current.get(key);
+			if (pending && pending.value !== value.trim()) {
+				pendingSubmittedDraftsRef.current.delete(key);
+			}
 			draftRef.current = value;
 			setDraft(value);
 			storeDraft(selectedIdRef.current, value);
@@ -158,7 +192,7 @@ export const Composer = memo(function Composer({
 		[storeDraft]
 	);
 
-	useEffect(() => {
+	useLayoutEffect(() => {
 		selectedIdRef.current = selectedId;
 		const nextDraft = draftsRef.current.get(composerDraftKey(selectedId)) ?? "";
 		draftRef.current = nextDraft;
@@ -214,12 +248,25 @@ export const Composer = memo(function Composer({
 		const text = draftRef.current.trim();
 		if (!text || sending) return;
 		const submittedSessionId = selectedIdRef.current;
+		const key = composerDraftKey(submittedSessionId);
+		const previous = pendingSubmittedDraftsRef.current.get(key);
+		const { clientControlId, newSessionId } = submissionIdsForDraft(previous, text);
 		const submittedVersion = storeDraft(submittedSessionId, text);
-		pendingSubmittedDraftsRef.current.set(composerDraftKey(submittedSessionId), { value: text, version: submittedVersion });
+		pendingSubmittedDraftsRef.current.set(key, {
+			value: text,
+			version: submittedVersion,
+			clientControlId,
+			newSessionId,
+		});
 		draftRef.current = "";
 		setDraft("");
 		requestAnimationFrame(() => textAreaRef.current?.focus());
-		const accepted = await onSubmit(text);
+		const accepted = await onSubmit({
+			sessionId: submittedSessionId,
+			text,
+			clientControlId,
+			newSessionId,
+		});
 		if (accepted) {
 			clearSubmittedDraft(submittedSessionId, text, submittedVersion);
 		} else {
@@ -285,7 +332,13 @@ export const Composer = memo(function Composer({
 				value={draft}
 				onChange={(event) => setDraftValue(event.target.value)}
 				onKeyDown={onKeyDown}
-				placeholder={selectedId ? "Message the session or type /" : "Create or select a session"}
+				placeholder={
+					selectedIsSubagent
+						? "Steer this subagent or type /"
+						: selectedId
+							? "Follow up with this session or type /"
+							: "Create or select a session"
+				}
 				className="composer"
 				rows={1}
 				enterKeyHint="enter"

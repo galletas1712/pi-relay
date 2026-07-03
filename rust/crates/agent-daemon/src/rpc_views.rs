@@ -106,6 +106,7 @@ fn queued_input(input: QueuedInputRecord) -> Value {
         QueuedInputContent::DaemonToolObservation(_) => {
             (json!([]), false, "daemon_tool_observation")
         }
+        QueuedInputContent::SubagentControl => (json!([]), false, "subagent_control"),
     };
     json!({
         "input_id": input.input_id,

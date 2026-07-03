@@ -61,10 +61,6 @@ async fn main() -> Result<()> {
     let config = Config::from_env_and_args()?;
     let repo = Arc::new(PostgresAgentStore::connect(&config.database_url).await?);
     repo.migrate().await?;
-    let stale_actions = repo.mark_all_unfinished_actions_stale().await?;
-    if stale_actions > 0 {
-        eprintln!("marked {stale_actions} abandoned action(s) stale");
-    }
 
     let (events, _) = broadcast::channel(1024);
     let workspaces = WorkspaceManager::from_default_state_dir()?;
@@ -80,7 +76,48 @@ async fn main() -> Result<()> {
         session_titles: SessionTitleScheduler::default(),
         workspaces,
         prompt_root,
+        #[cfg(test)]
+        pause_subagent_control_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        #[cfg(test)]
+        subagent_control_committed: Arc::new(tokio::sync::Notify::new()),
+        #[cfg(test)]
+        fail_subagent_control_reload_after_commit: Arc::new(std::sync::atomic::AtomicBool::new(
+            false,
+        )),
     };
+
+    // Combined controls capture an exact unfinished child action generation.
+    // Reconcile them before the general abandoned-action stale mark erases that
+    // generation fence. Each worker runs under the exact child's SessionDriver;
+    // failures remain discoverable by the periodic reconciler below.
+    match state
+        .repo
+        .sessions_with_recoverable_subagent_controls()
+        .await
+    {
+        Ok(session_ids) => {
+            if !session_ids.is_empty() {
+                eprintln!(
+                    "reconciling {} session(s) with recoverable subagent control(s) before stale marking",
+                    session_ids.len()
+                );
+            }
+            for session_id in session_ids {
+                let driver = SessionDriver::acquire(&state, &session_id).await;
+                if let Err(error) = driver.reconcile_pending_subagent_controls().await {
+                    eprintln!(
+                        "boot combined-control reconciliation failed session={session_id}: {}: {}",
+                        error.code, error.message
+                    );
+                }
+            }
+        }
+        Err(error) => eprintln!("failed to sweep recoverable subagent controls on boot: {error:#}"),
+    }
+    let stale_actions = state.repo.mark_all_unfinished_actions_stale().await?;
+    if stale_actions > 0 {
+        eprintln!("marked {stale_actions} abandoned action(s) stale");
+    }
 
     // Complete any delegation that crashed mid-barrier: a `running` delegation whose
     // subagents are all terminal is finished (handoff + wakeup observation)
@@ -93,6 +130,7 @@ async fn main() -> Result<()> {
     // child re-establishes live work (delegation stays running) instead of being
     // abandoned as a failure.
     delegation_runner::sweep_running_delegations_on_boot(&state).await;
+    spawn_pending_subagent_control_sweeper(&state);
     match state.repo.sessions_with_active_queued_inputs().await {
         Ok(session_ids) => {
             if !session_ids.is_empty() {
@@ -130,6 +168,114 @@ async fn main() -> Result<()> {
 
     drain_dispatch_tasks(&state).await;
     state.repo.close().await;
+    Ok(())
+}
+
+fn spawn_pending_subagent_control_sweeper(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut failures = HashMap::<String, (u32, Instant)>::new();
+        let mut query_failure = (0_u32, Instant::now());
+        loop {
+            interval.tick().await;
+            match state
+                .repo
+                .sessions_with_recoverable_subagent_controls()
+                .await
+            {
+                Ok(session_ids) => {
+                    query_failure = (0, Instant::now());
+                    let pending = session_ids.iter().cloned().collect::<BTreeSet<_>>();
+                    failures.retain(|session_id, _| pending.contains(session_id));
+                    for session_id in session_ids {
+                        let Some(result) =
+                            reconcile_recoverable_subagent_control_session(&state, &session_id)
+                                .await
+                        else {
+                            continue;
+                        };
+                        match result {
+                            Ok(()) => {
+                                failures.remove(&session_id);
+                            }
+                            Err(error) => {
+                                let now = Instant::now();
+                                let (count, next_report) =
+                                    failures.entry(session_id.clone()).or_insert((0, now));
+                                *count = count.saturating_add(1);
+                                if now >= *next_report {
+                                    eprintln!(
+                                        "pending-control sweep failed session={session_id} attempt={count}: {}: {}",
+                                        error.code, error.message
+                                    );
+                                    let delay =
+                                        1_u64.checked_shl((*count).min(6)).unwrap_or(64).min(60);
+                                    *next_report = now + Duration::from_secs(delay);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    let now = Instant::now();
+                    query_failure.0 = query_failure.0.saturating_add(1);
+                    if now >= query_failure.1 {
+                        eprintln!(
+                            "failed to discover recoverable subagent controls attempt={}: {error:#}",
+                            query_failure.0
+                        );
+                        let delay = 1_u64
+                            .checked_shl(query_failure.0.min(6))
+                            .unwrap_or(64)
+                            .min(60);
+                        query_failure.1 = now + Duration::from_secs(delay);
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Reconcile one session discovered by the bounded live control query. A held
+/// driver is skipped rather than queued behind, so ticks and replay nudges
+/// coalesce around the current owner.
+async fn reconcile_recoverable_subagent_control_session(
+    state: &AppState,
+    session_id: &str,
+) -> Option<std::result::Result<(), RpcError>> {
+    let driver = SessionDriver::try_acquire(state, session_id).await?;
+    Some(
+        async {
+            driver.reconcile_pending_subagent_controls().await?;
+            driver.recover_if_needed().await?;
+            if state.repo.has_queued_inputs(session_id).await?
+                && !state.repo.has_unfinished_actions(session_id).await?
+            {
+                driver.drive_until_blocked().await?;
+            }
+            Ok(())
+        }
+        .await,
+    )
+}
+
+#[cfg(test)]
+async fn sweep_pending_subagent_controls_once(
+    state: &AppState,
+) -> std::result::Result<(), RpcError> {
+    for session_id in state
+        .repo
+        .sessions_with_recoverable_subagent_controls()
+        .await?
+    {
+        if let Some(result) =
+            reconcile_recoverable_subagent_control_session(state, &session_id).await
+        {
+            result?;
+        }
+    }
     Ok(())
 }
 
@@ -938,11 +1084,16 @@ pub(crate) struct SessionInputRequest {
     pub(crate) expected_active_leaf_id: Option<Value>,
 }
 
-fn spawn_drive_until_blocked(state: &AppState, session_id: String, reason: &'static str) {
+pub(crate) fn spawn_drive_until_blocked(
+    state: &AppState,
+    session_id: String,
+    reason: &'static str,
+) {
     let state = state.clone();
     tokio::spawn(async move {
         let driver = SessionDriver::acquire(&state, &session_id).await;
         let drive_result = async {
+            driver.reconcile_pending_subagent_controls().await?;
             driver.recover_if_needed().await?;
             if state.repo.has_queued_inputs(&session_id).await?
                 && !state.repo.has_unfinished_actions(&session_id).await?
@@ -974,6 +1125,38 @@ fn spawn_drive_until_blocked(state: &AppState, session_id: String, reason: &'sta
                     "failed to record background drive failure {session_id}: {event_error:#}"
                 ),
             }
+        }
+    });
+}
+
+/// Best-effort control recovery nudge that never queues behind another owner.
+/// Periodic reconciliation remains the durable retry path when the lock is busy.
+pub(crate) fn spawn_try_drive_until_blocked(
+    state: &AppState,
+    session_id: String,
+    reason: &'static str,
+) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        let Some(driver) = SessionDriver::try_acquire(&state, &session_id).await else {
+            return;
+        };
+        let drive_result = async {
+            driver.reconcile_pending_subagent_controls().await?;
+            driver.recover_if_needed().await?;
+            if state.repo.has_queued_inputs(&session_id).await?
+                && !state.repo.has_unfinished_actions(&session_id).await?
+            {
+                driver.drive_until_blocked().await?;
+            }
+            Ok::<(), RpcError>(())
+        }
+        .await;
+        if let Err(error) = drive_result {
+            eprintln!(
+                "background nonwaiting drive failed session={session_id} reason={reason}: {}: {}",
+                error.code, error.message
+            );
         }
     });
 }
@@ -1238,6 +1421,21 @@ pub(crate) async fn interrupt_session(
 ) -> std::result::Result<Value, RpcError> {
     let driver = SessionDriver::acquire(state, session_id).await;
     driver.recover_if_needed().await?;
+    interrupt_session_with_driver(state, session_id, &driver, None).await
+}
+
+/// Canonical exact-session interrupt with an already-held driver.
+///
+/// Parent-scoped child controls call this form so they cannot deadlock by
+/// reacquiring the same child driver. It intentionally contains no
+/// parent/delegation traversal: task abort, durable interruption, and queue
+/// driving all target `session_id` exactly.
+pub(crate) async fn interrupt_session_with_driver(
+    state: &AppState,
+    session_id: &str,
+    driver: &SessionDriver,
+    _control_input_id: Option<&str>,
+) -> std::result::Result<Value, RpcError> {
     let active = driver.active_session().await;
     let Some(active) = active else {
         let events = state
@@ -1245,6 +1443,8 @@ pub(crate) async fn interrupt_session(
             .cancel_unfinished_session_work(session_id, "session interrupted")
             .await?;
         if !events.is_empty() {
+            // Durable action interruption must be followed by exact task abort
+            // even if combined-control bookkeeping later fails.
             let aborted_tasks = abort_session_tasks(state, session_id);
             publish_events(state, events);
             driver.drive_until_blocked().await?;
@@ -1262,10 +1462,19 @@ pub(crate) async fn interrupt_session(
         clear_event_buffer_if_idle(state, session_id).await?;
         return Ok(json!({ "ignored": true }));
     };
-    let aborted_tasks = abort_session_tasks(state, session_id);
     let dispatches = driver
         .apply_agent_input(active, AgentInput::Interrupt, None)
         .await?;
+    let events = state
+        .repo
+        .cancel_unfinished_session_work(session_id, "session interrupted")
+        .await?;
+    // The driver lock prevents the task's completion handler from persisting
+    // concurrently, so make the interrupt boundary durable before aborting the
+    // exact session's runtime futures. Bookkeeping for a combined control must
+    // not be able to skip that abort.
+    let aborted_tasks = abort_session_tasks(state, session_id);
+    publish_events(state, events);
     driver.dispatch(dispatches).await?;
     driver.drive_until_blocked().await?;
     Ok(json!({ "interrupted": true, "aborted_task_kinds": aborted_tasks }))

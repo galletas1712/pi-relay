@@ -1,10 +1,18 @@
 use agent_store::ActionKind;
+use std::collections::HashMap;
 use tokio::task::JoinHandle;
 
 use crate::state::{AppState, RunningTask};
 
 pub(crate) fn abort_session_tasks(state: &AppState, session_id: &str) -> Vec<ActionKind> {
     let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
+    abort_matching_tasks(&mut tasks, session_id)
+}
+
+fn abort_matching_tasks(
+    tasks: &mut HashMap<String, RunningTask>,
+    session_id: &str,
+) -> Vec<ActionKind> {
     tasks.retain(|_, task| !task.handle.is_finished());
     let action_row_ids = tasks
         .iter()
@@ -51,4 +59,43 @@ pub(super) fn unregister_task(state: &AppState, action_row_id: &str) {
 pub(super) fn prune_finished_tasks(state: &AppState) {
     let mut tasks = state.tasks.lock().expect("task registry lock poisoned");
     tasks.retain(|_, task| !task.handle.is_finished());
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::pending;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn abort_matching_tasks_is_exact_session_scoped() {
+        let mut tasks = HashMap::new();
+        for (row_id, session_id, kind) in [
+            ("parent-action", "parent", ActionKind::Model),
+            ("child-a-action", "child-a", ActionKind::Tool),
+            ("child-b-action", "child-b", ActionKind::Compaction),
+        ] {
+            tasks.insert(
+                row_id.to_string(),
+                RunningTask {
+                    session_id: session_id.to_string(),
+                    action_row_id: row_id.to_string(),
+                    kind,
+                    handle: tokio::spawn(pending()),
+                },
+            );
+        }
+
+        assert_eq!(
+            abort_matching_tasks(&mut tasks, "child-a"),
+            vec![ActionKind::Tool]
+        );
+        assert!(!tasks.contains_key("child-a-action"));
+        assert!(tasks.contains_key("parent-action"));
+        assert!(tasks.contains_key("child-b-action"));
+
+        for (_, task) in tasks {
+            task.handle.abort();
+        }
+    }
 }

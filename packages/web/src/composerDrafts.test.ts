@@ -5,12 +5,20 @@ import {
 	loadComposerDrafts,
 	resolveSubmittedDraft,
 	saveComposerDrafts,
+	submissionIdsForDraft,
 	submittedDraftStillCurrent,
 	type ComposerDraftStorage,
 	type PendingSubmittedDraft,
 } from "./composer.tsx";
 
 describe("composer draft storage", () => {
+	const pending: PendingSubmittedDraft = {
+		value: "run tests",
+		version: 3,
+		clientControlId: "web_control_stable",
+		newSessionId: "session_stable",
+	};
+
 	it("persists non-empty drafts by session key", () => {
 		const storage = memoryStorage();
 		const drafts = new Map([
@@ -38,10 +46,32 @@ describe("composer draft storage", () => {
 
 		expect(loadComposerDrafts(storage).size).toBe(0);
 	});
+
+	it("reuses both durable IDs when unchanged text is retried after an uncertain response", () => {
+		expect(submissionIdsForDraft(pending, "run tests", () => "new-id")).toEqual({
+			clientControlId: "web_control_stable",
+			newSessionId: "session_stable",
+		});
+	});
+
+	it("replaces both IDs after a deliberate edit", () => {
+		let next = 0;
+		expect(
+			submissionIdsForDraft(pending, "run all tests", (prefix) => `${prefix}_${++next}`),
+		).toEqual({
+			clientControlId: "web_control_1",
+			newSessionId: "session_2",
+		});
+	});
 });
 
 describe("submitted composer draft guards", () => {
-	const pending: PendingSubmittedDraft = { value: "run tests", version: 3 };
+	const pending: PendingSubmittedDraft = {
+		value: "run tests",
+		version: 3,
+		clientControlId: "web_control_stable",
+		newSessionId: "session_stable",
+	};
 
 	it("accepts a pending submitted draft only while the stored draft version still matches", () => {
 		expect(submittedDraftStillCurrent(pending, 3, "run tests", 3)).toBe(true);

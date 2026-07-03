@@ -89,6 +89,34 @@ impl SessionDriver {
         }
     }
 
+    async fn load_interrupted_control_runtime(
+        &self,
+    ) -> std::result::Result<Arc<Mutex<RuntimeSession>>, RpcError> {
+        let config = self
+            .state
+            .repo
+            .load_session_config(&self.session_id)
+            .await?;
+        self.state
+            .workspaces
+            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
+            .await?;
+        let stored = self
+            .state
+            .repo
+            .load_stored_session(&self.session_id)
+            .await?;
+        let session = AgentSession::from_stored_session_interrupted(stored)
+            .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
+        let active = Arc::new(Mutex::new(RuntimeSession { session, config }));
+        self.state
+            .active
+            .lock()
+            .await
+            .insert(self.session_id.clone(), active.clone());
+        Ok(active)
+    }
+
     /// Acquire only if the session's driver lock is free. Returns `None` if it
     /// is already held (the session is being driven or recovered elsewhere on
     /// the stack), letting the delegation barrier recover sibling tails without
@@ -143,7 +171,123 @@ impl SessionDriver {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) async fn ensure_active_loaded_preserving_open_turn(
+        &self,
+    ) -> std::result::Result<(), RpcError> {
+        if self
+            .state
+            .active
+            .lock()
+            .await
+            .contains_key(&self.session_id)
+        {
+            return Ok(());
+        }
+        let config = self
+            .state
+            .repo
+            .load_session_config(&self.session_id)
+            .await?;
+        self.state
+            .workspaces
+            .ensure_session(&self.session_id, &config.outer_cwd, &config.workspaces)
+            .await?;
+        let stored = self
+            .state
+            .repo
+            .load_stored_session(&self.session_id)
+            .await?;
+        let session = AgentSession::from_stored_session_preserving_open_turn(stored)
+            .map_err(|error| RpcError::new("invalid_transcript", format!("{error:?}")))?;
+        self.state.active.lock().await.insert(
+            self.session_id.clone(),
+            Arc::new(Mutex::new(RuntimeSession { session, config })),
+        );
+        Ok(())
+    }
+
+    /// Resolve all durable combined controls before ordinary recovery or queue
+    /// driving can claim their messages.
+    ///
+    /// The interrupt transcript/action update and `interrupt_applied` phase
+    /// commit atomically. Runtime task abortion then occurs while the row still
+    /// blocks the mailbox; `ready` is persisted only afterwards. A crash in the
+    /// middle therefore resumes from an unambiguous phase.
+    pub(crate) async fn reconcile_pending_subagent_controls(
+        &self,
+    ) -> std::result::Result<(), RpcError> {
+        // This driver is the sole queue owner for the exact child. Normalize
+        // any claim left by a crashed/older daemon before advancing phases;
+        // phase writes intentionally require `queued` so they cannot race a
+        // live consumer.
+        self.state
+            .repo
+            .reset_abandoned_consuming_inputs(&self.session_id)
+            .await?;
+        loop {
+            let Some(control) = self
+                .state
+                .repo
+                .next_pending_subagent_control(&self.session_id)
+                .await?
+            else {
+                return Ok(());
+            };
+            if control.phase == agent_store::SubagentControlPhase::PendingInterrupt {
+                match self
+                    .state
+                    .repo
+                    .apply_subagent_control_interrupt_at_boundary(
+                        &self.session_id,
+                        &control.input_id,
+                    )
+                    .await?
+                {
+                    agent_store::SubagentBoundaryInterruptResult::Applied { .. } => {
+                        abort_session_tasks(&self.state, &self.session_id);
+                        self.state
+                            .repo
+                            .mark_subagent_control_ready(&self.session_id, &control.input_id)
+                            .await?;
+                        continue;
+                    }
+                    agent_store::SubagentBoundaryInterruptResult::GenerationAdvanced => continue,
+                    agent_store::SubagentBoundaryInterruptResult::NotAtBoundary => {}
+                }
+                if !self
+                    .state
+                    .repo
+                    .subagent_control_target_is_current(&self.session_id, &control)
+                    .await?
+                {
+                    self.state
+                        .repo
+                        .skip_stale_subagent_control_interrupt(&self.session_id, &control.input_id)
+                        .await?;
+                    continue;
+                }
+                let active = self.load_interrupted_control_runtime().await?;
+                self.persist_active_outputs_with_control(
+                    active,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    Some(&control.input_id),
+                )
+                .await?;
+            }
+            abort_session_tasks(&self.state, &self.session_id);
+            self.state
+                .repo
+                .mark_subagent_control_ready(&self.session_id, &control.input_id)
+                .await?;
+        }
+    }
+
     pub(crate) async fn recover_if_needed(&self) -> std::result::Result<(), RpcError> {
+        self.reconcile_pending_subagent_controls().await?;
         if self
             .state
             .active
@@ -686,6 +830,26 @@ impl SessionDriver {
         accepted_input: Option<AcceptedInput>,
         provider_replay: Vec<ProviderReplayItem>,
     ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
+        self.persist_active_outputs_with_control(
+            active,
+            action_update,
+            consumed_input,
+            accepted_input,
+            provider_replay,
+            None,
+        )
+        .await
+    }
+
+    async fn persist_active_outputs_with_control(
+        &self,
+        active: Arc<Mutex<RuntimeSession>>,
+        action_update: Option<ActionUpdate>,
+        consumed_input: Option<QueuedInput>,
+        accepted_input: Option<AcceptedInput>,
+        provider_replay: Vec<ProviderReplayItem>,
+        control_interrupt_input_id: Option<&str>,
+    ) -> std::result::Result<Vec<DispatchAction>, RpcError> {
         let (mut entries, events, actions, active_leaf_id, config) = {
             let mut runtime = active.lock().await;
             let (entries, events, actions, active_leaf_id) = collect_runtime_outputs(&mut runtime);
@@ -701,16 +865,17 @@ impl SessionDriver {
         let consumed_client_input_id = consumed_input
             .as_ref()
             .and_then(|input| input.client_input_id.clone());
+        let mut batch = OutputBatch::new(&entries, active_leaf_id.as_deref(), &events, &actions)
+            .with_action_update(action_update)
+            .with_consumed_input(consumed_input)
+            .with_accepted_input(accepted_input);
+        if let Some(input_id) = control_interrupt_input_id {
+            batch = batch.with_control_interrupt(input_id);
+        }
         let persisted = self
             .state
             .repo
-            .persist_outputs(
-                &self.session_id,
-                OutputBatch::new(&entries, active_leaf_id.as_deref(), &events, &actions)
-                    .with_action_update(action_update)
-                    .with_consumed_input(consumed_input)
-                    .with_accepted_input(accepted_input),
-            )
+            .persist_outputs(&self.session_id, batch)
             .await;
         let (frames, persisted_actions) = match persisted {
             Ok(persisted) => persisted,

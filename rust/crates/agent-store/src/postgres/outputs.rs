@@ -45,6 +45,7 @@ pub(super) async fn persist_outputs_tx(
         action_update,
         consumed_input,
         accepted_input,
+        control_interrupt_input_id,
     } = batch;
     let had_action_update = action_update.is_some();
     let had_accepted_input = accepted_input.is_some();
@@ -121,7 +122,20 @@ pub(super) async fn persist_outputs_tx(
                             and id=(
                                 select id
                                 from queued_inputs
-                                where session_id=$2::text and status='queued'
+                                where session_id=$2::text
+                                  and status='queued'
+                                  and not (
+                                      coalesce((origin->>'control_interrupt')::boolean, false)
+                                      and coalesce(origin->>'control_phase', 'pending_interrupt') <> 'ready'
+                                  )
+                                  and not exists (
+                                      select 1
+                                      from queued_inputs blocked
+                                      where blocked.session_id=$2::text
+                                        and blocked.status in ('queued', 'consuming')
+                                        and coalesce((blocked.origin->>'control_interrupt')::boolean, false)
+                                        and blocked.origin->>'control_phase' in ('pending_interrupt', 'interrupt_applied')
+                                  )
                                 order by {QUEUED_INPUT_DISPATCH_ORDER}
                                 limit 1
                             )
@@ -190,6 +204,151 @@ pub(super) async fn persist_outputs_tx(
         complete_action_tx(tx, session_id, &mut update, session_events).await?;
     }
 
+    if let Some(input_id) = control_interrupt_input_id {
+        let unfinished_actions = action_is_unfinished(Some("a"));
+        let mark_interrupt_applied = format!(
+            r#"
+            update queued_inputs
+            set origin=origin || jsonb_build_object(
+                    'control_phase', 'interrupt_applied',
+                    'control_interrupted', true,
+                    'control_interrupt_outcome', 'interrupted',
+                    'control_interrupt_applied_at', clock_timestamp()::text
+                ),
+                updated_at=now()
+            where session_id=$1
+              and id=$2
+              and status='queued'
+              and priority='steer'
+              and origin->>'control_kind' in (
+                  'scoped_subagent_steer',
+                  'scoped_subagent_interrupt'
+              )
+              and coalesce((origin->>'control_interrupt')::boolean, false)
+              and origin->>'control_phase'='pending_interrupt'
+              and (
+                  (origin->>'target_active_leaf_id') is not distinct from $3::text
+                  or (
+                      jsonb_array_length(
+                          coalesce(
+                              origin->'target_action_attempt_ids',
+                              case
+                                  when origin->>'target_action_attempt_id' is not null
+                                  then jsonb_build_array(origin->>'target_action_attempt_id')
+                                  else '[]'::jsonb
+                              end
+                          )
+                      ) > 0
+                      and exists (
+                          select 1
+                          from actions captured_current
+                          where captured_current.session_id=$1
+                            and captured_current.status in ('pending', 'blocked', 'running')
+                            and captured_current.turn_id is not distinct from
+                                nullif(origin->>'target_turn_id', '')::bigint
+                            and exists (
+                                select 1
+                                from jsonb_array_elements_text(
+                                    coalesce(
+                                        origin->'target_action_attempt_ids',
+                                        case
+                                            when origin->>'target_action_attempt_id' is not null
+                                            then jsonb_build_array(origin->>'target_action_attempt_id')
+                                            else '[]'::jsonb
+                                        end
+                                    )
+                                ) captured(attempt_id)
+                                where captured.attempt_id=captured_current.attempt_id
+                            )
+                      )
+                  )
+              )
+              and exists (
+                  select 1
+                  from transcript_entries boundary
+                  where boundary.session_id=$1
+                    and boundary.id=$4
+                    and boundary.item->>'type'='turn_finished'
+                    and boundary.item->>'outcome'='Interrupted'
+              )
+              and not exists (
+                  select 1
+                  from actions a
+                  where a.session_id=$1
+                    and {unfinished_actions}
+                    and (
+                        a.turn_id is distinct from
+                            nullif(origin->>'target_turn_id', '')::bigint
+                        or not exists (
+                            select 1
+                            from jsonb_array_elements_text(
+                                coalesce(
+                                    origin->'target_action_attempt_ids',
+                                    case
+                                        when origin->>'target_action_attempt_id' is not null
+                                        then jsonb_build_array(origin->>'target_action_attempt_id')
+                                        else '[]'::jsonb
+                                    end
+                                )
+                            ) captured(attempt_id)
+                            where captured.attempt_id=a.attempt_id
+                        )
+                    )
+              )
+            "#
+        );
+        let updated = sqlx::query(&mark_interrupt_applied)
+            .bind(session_id)
+            .bind(input_id)
+            .bind(current_active_leaf_id.as_deref())
+            .bind(active_leaf_id)
+            .execute(&mut **tx)
+            .await?
+            .rows_affected();
+        if updated != 1 {
+            return Err(anyhow!(
+                "subagent control interrupt phase update affected {updated} rows for {input_id}"
+            ));
+        }
+        let interrupt_target_action = format!(
+            r#"
+            update actions a
+            set status='interrupted',
+                result=jsonb_build_object(
+                    'reason', 'combined subagent control',
+                    'control_input_id', $2::text
+                ),
+                updated_at=now()
+            from queued_inputs q
+            where a.session_id=$1
+              and q.session_id=$1
+              and q.id=$2
+              and exists (
+                  select 1
+                  from jsonb_array_elements_text(
+                      coalesce(
+                          q.origin->'target_action_attempt_ids',
+                          case
+                              when q.origin->>'target_action_attempt_id' is not null
+                              then jsonb_build_array(q.origin->>'target_action_attempt_id')
+                              else '[]'::jsonb
+                          end
+                      )
+                  ) captured(attempt_id)
+                  where captured.attempt_id=a.attempt_id
+              )
+              and a.turn_id is not distinct from
+                  nullif(q.origin->>'target_turn_id', '')::bigint
+              and {unfinished_actions}
+            "#
+        );
+        sqlx::query(&interrupt_target_action)
+            .bind(session_id)
+            .bind(input_id)
+            .execute(&mut **tx)
+            .await?;
+    }
+
     let mut action_rows = HashMap::<ActionKey, String>::new();
     let mut dispatch = Vec::new();
     for action in actions {
@@ -247,7 +406,8 @@ pub(super) async fn persist_outputs_tx(
         || had_accepted_input
         || had_action_update
         || had_actions
-        || had_session_events;
+        || had_session_events
+        || control_interrupt_input_id.is_some();
     if session_changed {
         bump_revisions_tx(tx, session_id, queue_changed, transcript_changed).await?;
     }

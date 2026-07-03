@@ -168,14 +168,140 @@ The app subscribes to events for every visible session via `events.subscribe`, r
 
 ## Composer, queue, and slash commands
 
-The composer (`composer.tsx`) always sends ordinary text as `input.follow_up`, even while the agent is running. Cmd/Ctrl+Enter
-sends; Enter inserts a newline. There is no local "message queued" or pending-bubble shadow row — transcript rows render
-only from canonical daemon projections; the send button spinner is the only local in-flight indication.
+The composer (`composer.tsx`) routes ordinary text according to the selected
+transcript:
 
-Submit routing (`submitComposer`): a leading `/` runs a slash command; otherwise, if a session is selected the text is
-queued via `queueUserInput`, and if none is selected `startNewSession` calls `session.start` and selects the new durable
-session. Selection is immediate imperative state (`selectedRef`) so the next keystroke targets the just-created session,
-not the one selected a render earlier.
+- no selection calls `session.start`;
+- a selected top-level/root session calls `input.follow_up`;
+- a selected subagent calls the parent-scoped
+  `delegation.steer_subagent`, using the loaded snapshot's
+  `parent_session_id`, its `session_id`, and the submitted text.
+
+The placeholder identifies the selected mode ("Follow up" or "Steer this
+subagent"). Cmd/Ctrl+Enter sends; Enter inserts a newline. There is no local
+"message queued" or pending-bubble shadow row — transcript rows render only
+from canonical daemon projections; the send button spinner is the only local
+in-flight indication. Successful follow-ups and steers are silent, matching the
+ordinary-send UX.
+
+Submit routing lives in `composerRouting.ts`, with pure routing tests and App
+wiring that looks up the cache by the captured session id. There is no browser
+integration harness for this path. The helper trims the message once and checks
+for a leading slash first, so slash commands remain commands in every
+transcript. At submit time `Composer` captures an immutable session id, a
+`client_control_id`, and a proposed new-session id. App routing, draft
+restoration, and RPC dispatch use those captured values rather than rereading
+the current selection. App trusts only a loaded snapshot whose `session_id`
+exactly matches the submitted id. If that snapshot is no longer available,
+submission fails through the normal notice path and restores the text under the
+captured session's draft key. It never redirects text to a newer selection.
+
+The daemon's canonical creation model makes this routing unambiguous:
+top-level `session.start` stores no `parent_session_id`, while the delegation
+spawn path stores `parent_session_id`, `subagent_type`, and `delegation_id`
+together. Thus a daemon-created snapshot with `parent_session_id` is a
+subagent. The UI uses only that direct relationship; it does not infer children
+from roles, ID prefixes, or a delegation-list page. The scoped daemon RPC still
+revalidates all three child fields, delegation membership/status, and live work
+state. For backward compatibility, a raw ordinary-priority `input.follow_up`
+can still target a child. It is not used by the selected-child composer and
+does not perform parent/delegation control validation. Raw
+`priority = "steer"` input to a child remains rejected; parent-scoped steering
+must use `delegation.steer_subagent`.
+
+RPC rejection (terminal child, non-running child, wrong membership, or a
+completion race) is shown by the normal error notice and makes
+`submitComposer` return `false`. `Composer` then restores the submitted text
+through its existing per-session/version-guarded draft path. If selection
+changes while an accepted request is in flight, the captured child still owns
+the request and draft resolution; stale cache reducers no-op, and a failure is
+stored back under that child's draft key rather than appearing in the new
+selection.
+
+### Subagent steer and interrupt lifecycle
+
+Textbox steering is an additional producer for the existing delegation
+mailbox, not a replacement for parent/model control. The model-facing
+`steer_subagent` tool and web `delegation.steer_subagent` RPC both call the same
+daemon `steer_subagent_core`, which writes through
+`enqueue_scoped_subagent_steer`. Every accepted instruction is one durable
+`queued_inputs` row on the child with `priority = steer`; there is no
+browser-specific or producer-specific queue. Concurrent parent/model and user
+steers serialize on the same delegation/child database locks. Both may be
+accepted with distinct `input_id`s, and the mailbox processes them in canonical
+steer order (promotion/creation time and ID tie-break), ahead of follow-ups;
+neither producer receives extra priority.
+
+A successful response includes `accepted: true`, `input_id`, current `queued`
+state, `replayed`, durable `phase`, `interrupted`, `interrupt_outcome`, and
+`drive_status`. It acknowledges a committed mailbox row, not necessarily an
+applied interrupt or consumed message. `interrupted` is `null` while an
+interrupt remains `pending_interrupt`; it becomes truthful once the durable
+phase advances. If immediate reconciliation or driving fails after commit, the
+RPC still reports acceptance with `drive_status: "failed"` and `drive_error`,
+and the daemon records a model-error event. It does not turn a durable
+acceptance into an apparent rejection.
+
+Completion and scoped controls take the delegation lock in the same order and
+recheck terminal/readiness state after locking. If completion or cancellation
+wins first, a new control is rejected. If a scoped steer commits first, the
+active mailbox row prevents completion until it is consumed or cancelled.
+Distinct concurrent producer messages have distinct rows and cannot overwrite
+one another.
+
+Steer and interrupt have three deliberately separate forms:
+
+- **Steer** does not abort an in-flight model or tool (including a long polling
+  loop). It waits durably and is injected at the next continuation point; tool
+  completion explicitly checks the steer mailbox before the next model step.
+  Omitting `interrupt` (or passing `false`) preserves the original
+  `steer_subagent(subagent_id, message)` behavior.
+- **Interrupt and steer** passes `interrupt: true`. The committed row starts in
+  `pending_interrupt` and blocks generic consumption of every row in that
+  child's mailbox. Under the exact-child `SessionDriver`, reconciliation
+  atomically persists the interrupted transcript boundary, interrupts the
+  complete captured set of unfinished attempts for the active turn, and
+  advances the row to `interrupt_applied`.
+  It then aborts only that child's registered runtime tasks, advances the row
+  to `ready`, and allows ordinary mailbox driving to consume the steer. The
+  instruction is durable before the old work becomes terminal-visible.
+- **Interrupt only** is available to the parent model as
+  `interrupt_subagent(subagent_id)`. It uses a distinct durable
+  `scoped_subagent_interrupt` ledger row with the same phases and generation
+  fence. Its ready row settles without enqueueing or consuming text.
+
+The selected transcript's Stop button calls `input.interrupt` with the captured
+selected session id. Stopping a parent interrupts only that parent; stopping a
+child interrupts only that exact child, not its parent, siblings, or delegation.
+Whole-delegation cancellation remains the separate run-board
+`delegation.cancel`/model `cancel_delegation` operation. Its status transition
+atomically cancels active child mailbox rows (including pending combined
+controls), then exact-child runtime cancellation interrupts remaining child
+work. A cancelled control reports phase `cancelled`; cancellation does not roll
+back external tool side effects.
+
+Detached exact-child workers, a periodic live sweep, and a boot sweep recover
+`pending_interrupt` and `interrupt_applied` rows independently of the parent
+tool/RPC future. A crash after `interrupt_applied` resumes task settlement and
+does not append another interrupted boundary. Each control is fenced to the
+active leaf, active turn, and complete deterministic set of unfinished attempts
+captured at enqueue. A completed parallel sibling does not hide remaining
+captured work; an unfinished attempt outside that set means the generation
+advanced, so reconciliation records
+`interrupt_outcome: "generation_advanced"`, reports `interrupted: false`, and
+never blindly interrupts the newer turn.
+
+The web retains one stable control/input id while unchanged text is restored
+after an uncertain response; a deliberate edit or a definite success clears or
+replaces it. New-session submissions also retain the proposed session id, so a
+retry targets the same `session.start`; the daemon treats an existing requested
+session id as a replay. Model-facing controls derive their id from the durable
+tool-call id. A matching steer retry does not enqueue text twice; a matching
+interrupt-only retry returns its prior durable state and cannot stop a newer
+generation. This is practical ledger idempotency, not an exactly-once guarantee:
+a deliberate new submission/control creates a new id, a response can still be
+lost after commit, and external tool or network side effects remain
+non-transactional and cannot be rolled back.
 
 ### Workspace scope picker
 
@@ -205,6 +331,8 @@ promote/edit is a benign no-op, not an error.
 
 Composer text is persisted per session in `localStorage` under `piRelayComposerDrafts:v1`, keyed by `session_id`
 (new-session text uses a fixed key). Switching sessions swaps the visible draft; a failed send restores the typed text.
+Submission IDs are retained in memory with the pending draft for an unchanged
+retry, but are not persisted across a full page reload.
 There are no browser-local *session* drafts — only Postgres-backed sessions appear in the sidebar, and starting a new
 chat is purely composer state. UI selection (`piRelayUiResume:v1`) and transcript scroll position are the other
 `localStorage`-backed UI state.

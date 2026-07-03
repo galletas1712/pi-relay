@@ -326,6 +326,12 @@ created_at timestamptz not null default now()
 updated_at timestamptz not null default now()
 ```
 
+Migration creates `sessions.delegation_id` before inspecting child links, then
+idempotently repairs legacy/default-one delegation rows to their actual linked
+child count when that count is greater than one. Intentional values greater
+than one are preserved and the positive-count constraint is enforced before
+the completion fence is used.
+
 Child sessions link back through `sessions.delegation_id`. The
 `delegations_parent_created_idx` index supports the per-parent run-board feed.
 The completion runner uses `attempt_id` as an idempotency fence and queues a
@@ -975,14 +981,15 @@ Queue snapshots in responses and events use the canonical ordering: queued
 steers first by steering/promote time, then queued follow-ups by dense
 `follow_up_position`.
 
-Raw `input.follow_up`/`session.input` with `priority: "steer"` is not a public
-subagent-control API. If the target `session_id` is a subagent, the daemon
-rejects it with `subagent_steer_requires_parent_scope`; callers must use the
-parent-scoped `steer_subagent` delegation tool/API path so the daemon can verify
-parent session, delegation membership, and running/steerable state. Internally
-accepted subagent steers are still stored as `InputPriority::Steer` rows on the
-child session. Promoting a child-session follow-up through `input.promote_queued`
-is rejected for the same reason.
+For backward compatibility, raw ordinary-priority
+`input.follow_up`/`session.input` can target a subagent. It is an ordinary child
+follow-up and does not provide parent/delegation control validation. Raw
+`priority = "steer"` input to a child is rejected with
+`subagent_steer_requires_parent_scope`; callers must use parent-scoped
+`delegation.steer_subagent`/`steer_subagent` for a validated child steer.
+Internally accepted scoped steers are stored as `InputPriority::Steer` rows on
+the child. Promoting a child-session follow-up through
+`input.promote_queued` is rejected for the same reason.
 
 ### `input.promote_queued`
 
@@ -1144,11 +1151,17 @@ not bump `queue_revision` or emit `input.reordered`.
 
 ### `input.interrupt`
 
-Interrupts current work. The daemon marks unfinished action rows for the session
+Interrupts current work for exactly the supplied `session_id`; it never walks
+parent, child, sibling, or delegation relationships. The daemon marks
+unfinished action rows for that session
 `interrupted`, aborts registered model/tool/compaction task handles on a
 best-effort basis, emits `session.work_cancelled`, and resumes normal queue
 driving. If the session is idle, the daemon emits `input.ignored` and returns
 `{ "ignored": true }`.
+
+Consequently, the web Stop button on a selected root interrupts only that root,
+and Stop on a selected delegation child interrupts only that child. Use
+`delegation.cancel`/`cancel_delegation` to cancel a whole delegation.
 
 Content blocks use `agent-vocab`:
 
@@ -1385,18 +1398,20 @@ Successful result:
 
 ### `delegation.steer_subagent`
 
-Parent-scoped steering for one running delegation subagent. This is the only
-public/API steering path for subagents; raw `input.follow_up` with
-`priority: "steer"` against a child session is rejected. The daemon validates
+Parent-scoped steering for one running delegation subagent. The daemon validates
 that `parent_session_id` owns the child through a running delegation, that the
 child is a full or read-only delegation subagent, and that the child is active
-rather than completion-terminal.
+rather than completion-terminal. Omitted `interrupt` defaults to `false`, which
+preserves the original noninterrupting steer behavior. `client_control_id` is
+optional but recommended for retries.
 
 ```json
 {
   "parent_session_id": "parent-session",
   "subagent_id": "session_...",
-  "message": "Please also check the retry path."
+  "message": "Please also check the retry path.",
+  "interrupt": false,
+  "client_control_id": "web_control_..."
 }
 ```
 
@@ -1405,10 +1420,85 @@ Result:
 ```json
 {
   "subagent_id": "session_...",
+  "accepted": true,
   "queued": true,
-  "input_id": "input_..."
+  "input_id": "input_...",
+  "replayed": false,
+  "phase": "ready",
+  "interrupted": false,
+  "interrupt_outcome": null,
+  "drive_status": "started",
+  "drive_error": null
 }
 ```
+
+With `interrupt: true`, this is one combined daemon control, not two public RPC
+calls. Its durable phases are:
+
+1. `pending_interrupt`: the committed row blocks generic consumption of every
+   row in the child mailbox.
+2. `interrupt_applied`: for an open turn, one transaction appends the
+   interrupted boundary, settles every still-unfinished action attempt captured
+   for the active turn/generation, and advances the control phase. If the
+   captured leaf is already a durable boundary, reconciliation leaves that leaf
+   unchanged: it atomically interrupts the captured boundary-hosted action
+   generation, or records `already_between_turns` with `interrupted: false` when
+   there was no action to interrupt.
+3. `ready`: after exact-child runtime tasks are aborted, the steer is eligible
+   for ordinary mailbox consumption.
+4. `cancelled`: whole-delegation cancellation settled the control without
+   consuming its steer.
+
+An exact-child worker reconciles those phases independently of the requesting
+parent task. Fresh acceptance installs a detached owner before any subsequent
+await; replay nudges and the periodic live sweep use nonblocking driver
+acquisition, and the sweep also discovers ready scoped steers with no unfinished
+action owner. Boot recovery uses the same `SessionDriver` path. A crash in
+`interrupt_applied` resumes task settlement rather than applying another
+interrupt. The control records the active leaf, turn, and deterministic complete
+set of unfinished action-attempt IDs present at enqueue. A sibling attempt may
+finish before reconciliation: remaining captured siblings are still
+interrupted. Any unfinished attempt outside the captured turn/set proves the
+generation advanced, records `interrupt_outcome: "generation_advanced"`, and
+is never interrupted.
+
+`interrupt_subagent` uses the same phases with control kind
+`scoped_subagent_interrupt`. Its `ready` transition also settles the ledger row
+as consumed; the marker is excluded from queue claims and never becomes a user
+message or steer. Replaying the same durable ID returns its prior phase/outcome
+and therefore cannot interrupt a newer generation. Model calls always replace
+provider-supplied IDs with `tool-call:<tool_call_id>` at runtime.
+
+Scoped steer/control and completion lock the delegation row first and perform a
+fresh state check under that lock. Completion/cancellation-first rejects a new
+control; control-first leaves an active mailbox row that prevents completion
+until the row settles. Distinct accepted steers remain distinct equal-priority
+mailbox rows and do not overwrite one another.
+
+Retries with the same `client_control_id`, child, message, and interrupt mode
+return the original `input_id` with `replayed: true`; reusing the id for a
+different control returns `client_control_id_conflict`. Model tool calls derive
+the id from their tool-call id and overwrite any provider-supplied hidden ID.
+`accepted: true` means the mailbox row committed. It does not alone mean the
+interrupt was applied or the text was consumed: `phase` and `drive_status`
+report that progress, and `interrupted` is `null` while the interrupt outcome is
+still pending. After a durable acceptance, a reconciliation/drive failure is
+returned as `accepted: true`, `drive_status: "failed"`, and a diagnostic
+`drive_error`, rather than as a rejection that invites duplicate text.
+
+Completion, scoped control, and cancellation serialize on the delegation row.
+Completion/cancellation-first rejects a new control; control-first leaves an
+active row that prevents completion. Whole-delegation cancellation atomically
+marks active child queue rows and controls cancelled before exact-child runtime
+cancellation, so terminal delegation projections do not retain active mailbox
+work. Exact-session `input.interrupt`, exact-child `interrupt_subagent`, and
+whole-delegation cancellation remain separate scopes.
+
+This ledger is practical at-least-once retry protection, not a claim of global
+exactly-once execution. A caller that deliberately creates a new id creates a
+new control; a response can be lost after commit, but retrying the same id
+returns the durable prior state. External tool/network side effects that
+occurred before interruption remain non-transactional and are not rolled back.
 
 ### `delegation.list`
 
@@ -1537,7 +1627,7 @@ session profile; if omitted, parent/global behavior is preserved. Parent/default
 sessions see the registered builtins (`edit`, `bash`, `grep`, `web_search`,
 `web_fetch`, `LoadSkill`) plus delegation tools (`delegate_writing_task`,
 `delegate_readonly_tasks`, `inspect_delegation`, `cancel_delegation`,
-`steer_subagent`). Structurally subagent sessions get the filtered subagent
+`steer_subagent`, `interrupt_subagent`). Structurally subagent sessions get the filtered subagent
 surface without delegation tools. `prompt_profile` may be supplied only as a
 fallback when no `session_id` is available. There are no `read`/`write` tools.
 Each returned entry carries `name`, `description`, `input_schema`,

@@ -47,7 +47,7 @@ export interface AgentApi {
 	startReadonlyDelegationFanout(params: StartReadonlyDelegationFanoutParams): Promise<StartReadonlyDelegationFanoutResult>;
 	cancelDelegation(parentSessionId: string, delegationId: string): Promise<{ cancelled: boolean }>;
 	readHandoffFile(params: ReadHandoffFileParams): Promise<ReadHandoffFileResult>;
-	steerSubagent(params: SteerSubagentParams): Promise<FollowUpResult>;
+	steerSubagent(params: SteerSubagentParams): Promise<SteerSubagentResult>;
 	getSystemPrompt(sessionId: string): Promise<SystemPromptResponse>;
 	listTools(provider: string, sessionId?: string | null): Promise<ToolListing[]>;
 	getSession(sessionId: string, options?: GetSessionOptions): Promise<SessionSnapshot>;
@@ -184,6 +184,21 @@ export interface SteerSubagentParams {
 	parentSessionId: string;
 	subagentSessionId: string;
 	message: string;
+	clientControlId?: string;
+	interrupt?: boolean;
+}
+
+export interface SteerSubagentResult {
+	subagent_id: string;
+	accepted: true;
+	queued: boolean;
+	input_id: string;
+	replayed?: boolean;
+	phase: "pending_interrupt" | "interrupt_applied" | "ready" | "cancelled";
+	interrupted: boolean | null;
+	interrupt_outcome?: string | null;
+	drive_status: "pending" | "started" | "settled" | "cancelled" | "failed";
+	drive_error?: string | null;
 }
 
 export interface FollowUpResult {
@@ -402,11 +417,13 @@ class AgentApiClient implements AgentApi {
 		});
 	}
 
-	steerSubagent(params: SteerSubagentParams): Promise<FollowUpResult> {
-		return this.client.request<FollowUpResult>("delegation.steer_subagent", {
+	steerSubagent(params: SteerSubagentParams): Promise<SteerSubagentResult> {
+		return this.client.request<SteerSubagentResult>("delegation.steer_subagent", {
 			parent_session_id: params.parentSessionId,
 			subagent_id: params.subagentSessionId,
-			message: params.message
+			message: params.message,
+			client_control_id: params.clientControlId,
+			interrupt: params.interrupt,
 		});
 	}
 

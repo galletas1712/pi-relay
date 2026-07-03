@@ -1,16 +1,16 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use agent_session::TranscriptStorageNode;
+use agent_session::{ModelContext, SessionAction, TranscriptStorageNode};
 use agent_vocab::{
-    AssistantMessage, DaemonToolObservation, ProviderConfig, ProviderKind, ReasoningEffort,
-    ToolCallId, TranscriptItem, TurnId, TurnOutcome, UserMessage,
+    ActionId, AssistantItem, AssistantMessage, DaemonToolObservation, ProviderConfig, ProviderKind,
+    ReasoningEffort, ToolCallId, TranscriptItem, TurnId, TurnOutcome, UserMessage,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::{
     DelegationKind, DelegationStatus, InputPriority, OutputBatch, QueuedInputStatus, SessionConfig,
-    SubagentType,
+    SubagentControlPhase, SubagentType,
 };
 
 use super::*;
@@ -23,6 +23,7 @@ struct TestDb {
     name: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_delegation_subagent_with_task_and_leaf(
     db: &TestDb,
     session_id: &str,
@@ -195,6 +196,7 @@ async fn create_delegation_subagent(
         .expect("create delegation subagent");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_delegation_subagent_with_leaf(
     db: &TestDb,
     session_id: &str,
@@ -271,6 +273,15 @@ async fn create_delegation_persists_kind_status_and_attempt() {
     assert_eq!(loaded.label.as_deref(), Some("review fan-out"));
     assert_eq!(loaded.status, DelegationStatus::Running);
 
+    let zero_expected = db
+        .store
+        .create_delegation("parent", DelegationKind::Full, None, None, 0)
+        .await
+        .expect_err("a delegation must promise at least one subagent");
+    assert!(zero_expected
+        .to_string()
+        .contains("expected_subagents must be greater than zero"));
+
     db.cleanup().await;
 }
 
@@ -312,6 +323,185 @@ async fn migration_creates_delegation_ledger_query_indexes() {
     );
 
     db.cleanup().await;
+}
+
+#[tokio::test]
+async fn migration_backfills_legacy_default_one_fanout_and_is_idempotent() {
+    let Some(admin_url) = std::env::var("PI_RELAY_TEST_DATABASE_URL").ok() else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let name = format!(
+        "pi_relay_legacy_migration_test_{}_{}",
+        std::process::id(),
+        TEST_DB_COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let admin = sqlx::PgPool::connect(&admin_url)
+        .await
+        .expect("connect test admin");
+    sqlx::query(&format!(r#"create database "{name}""#))
+        .execute(&admin)
+        .await
+        .expect("create legacy database");
+    admin.close().await;
+    let database_url = database_url_with_name(&admin_url, &name);
+    let pool = sqlx::PgPool::connect(&database_url)
+        .await
+        .expect("connect legacy database");
+    sqlx::raw_sql(
+        r#"
+        create table projects (
+            id uuid primary key,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now(),
+            name text not null,
+            workspaces jsonb not null default '[]'::jsonb,
+            metadata jsonb not null default '{}'::jsonb
+        );
+        create table sessions (
+            id text primary key,
+            project_id uuid null references projects(id),
+            outer_cwd text not null,
+            workspaces jsonb not null default '[]'::jsonb,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now(),
+            active_leaf_id text null,
+            system_prompt text not null,
+            provider_config jsonb not null,
+            metadata jsonb not null default '{}'::jsonb,
+            parent_session_id text null references sessions(id) on delete set null,
+            last_user_message_timestamp_ms bigint null,
+            session_revision bigint not null default 0,
+            queue_revision bigint not null default 0,
+            transcript_revision bigint not null default 0,
+            subagent_type text null
+        );
+        create table delegations (
+            id text primary key,
+            parent_session_id text not null references sessions(id) on delete cascade,
+            workflow text null,
+            label text null,
+            kind text not null,
+            status text not null,
+            attempt_id text not null,
+            created_at timestamptz not null default now(),
+            updated_at timestamptz not null default now()
+        );
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("create pre-column schema");
+    let provider = serde_json::to_value(session_config(Uuid::nil(), None).provider)
+        .expect("serialize provider");
+    for (session_id, parent_id, subagent_type) in [
+        ("legacy_parent", None, None),
+        ("intentional_parent", None, None),
+        ("legacy_a", Some("legacy_parent"), Some("read_only")),
+        ("legacy_b", Some("legacy_parent"), Some("read_only")),
+        ("legacy_c", Some("legacy_parent"), Some("read_only")),
+    ] {
+        sqlx::query(
+            r#"
+            insert into sessions (
+                id, outer_cwd, system_prompt, provider_config,
+                parent_session_id, subagent_type
+            )
+            values ($1, '/tmp/legacy', '', $2, $3, $4)
+            "#,
+        )
+        .bind(session_id)
+        .bind(&provider)
+        .bind(parent_id)
+        .bind(subagent_type)
+        .execute(&pool)
+        .await
+        .expect("insert legacy session");
+    }
+    sqlx::query(
+        r#"
+        insert into delegations (
+            id, parent_session_id, kind, status, attempt_id
+        )
+        values
+            ('legacy_fanout', 'legacy_parent', 'readonly_fanout', 'running', 'legacy-attempt'),
+            ('intentional_count', 'intentional_parent', 'readonly_fanout', 'done', 'intentional-attempt')
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("insert legacy delegation");
+    sqlx::query(
+        "alter table sessions add column delegation_id text null references delegations(id)",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy link migration");
+    sqlx::query(
+        "update sessions set delegation_id='legacy_fanout' where id like 'legacy_%' and id<>'legacy_parent'",
+    )
+    .execute(&pool)
+    .await
+    .expect("link legacy children");
+    sqlx::query("alter table delegations add column expected_subagents integer not null default 1")
+        .execute(&pool)
+        .await
+        .expect("simulate legacy default-one column addition");
+    sqlx::query("update delegations set expected_subagents=7 where id='intentional_count'")
+        .execute(&pool)
+        .await
+        .expect("seed intentional fan-out count");
+
+    let store = PostgresAgentStore::connect(&database_url)
+        .await
+        .expect("connect store");
+    store.migrate().await.expect("first migration");
+    store.migrate().await.expect("idempotent migration");
+    let expected: i32 =
+        sqlx::query_scalar("select expected_subagents from delegations where id='legacy_fanout'")
+            .fetch_one(&pool)
+            .await
+            .expect("load repaired count");
+    assert_eq!(expected, 3);
+    let intentional_expected: i32 = sqlx::query_scalar(
+        "select expected_subagents from delegations where id='intentional_count'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("load preserved intentional count");
+    assert_eq!(
+        intentional_expected, 7,
+        "migration repair must not overwrite an intentional count greater than one"
+    );
+    let delegation = store
+        .get_delegation("legacy_fanout")
+        .await
+        .expect("load repaired delegation")
+        .expect("delegation exists");
+    assert_eq!(delegation.expected_subagents, 3);
+    assert!(
+        store
+            .delegation_subagents_all_terminal("legacy_fanout")
+            .await
+            .expect("completion fence remains live"),
+        "the repaired exact-count fence must recognize all three terminal legacy children"
+    );
+    assert!(
+        store
+            .finish_delegation("legacy_fanout", "legacy-attempt", DelegationStatus::Done,)
+            .await
+            .expect("finish repaired legacy fanout"),
+        "the legacy running fan-out must not remain stranded behind expected=1"
+    );
+
+    store.close().await;
+    pool.close().await;
+    if let Ok(admin) = sqlx::PgPool::connect(&admin_url).await {
+        let _ = sqlx::query(&format!(r#"drop database if exists "{}""#, name))
+            .execute(&admin)
+            .await;
+        admin.close().await;
+    }
 }
 
 #[tokio::test]
@@ -808,6 +998,16 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
         .create_delegation("parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create delegation");
+    create_delegation_subagent(
+        &db,
+        "finish_child",
+        project_id,
+        "parent",
+        SubagentType::Full,
+        "implementer",
+        &delegation.id,
+    )
+    .await;
     // The real attempt id wins exactly once; a replay is a no-op.
     assert!(db
         .store
@@ -877,6 +1077,370 @@ async fn finish_delegation_cas_is_attempt_fenced_and_idempotent() {
 }
 
 #[tokio::test]
+async fn completion_and_scoped_steer_have_one_invariant_safe_winner() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "completion steer race", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    let delegation = db
+        .store
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+    create_delegation_subagent(
+        &db,
+        "race_child",
+        project_id,
+        "parent",
+        SubagentType::Full,
+        "implementer",
+        &delegation.id,
+    )
+    .await;
+
+    let race_message = UserMessage::text("race steer");
+    let (finished, steered) = tokio::join!(
+        db.store.finish_delegation(
+            &delegation.id,
+            &delegation.attempt_id,
+            DelegationStatus::Done,
+        ),
+        db.store.enqueue_scoped_subagent_steer(
+            "parent",
+            &delegation.id,
+            "race_child",
+            &race_message,
+            "race-control",
+            false,
+        ),
+    );
+    let finished = finished.expect("finish race");
+    let steered = steered.expect("steer race");
+    assert_ne!(
+        finished,
+        steered.is_some(),
+        "completion and active steer cannot both win or both lose"
+    );
+
+    let current = db
+        .store
+        .get_delegation(&delegation.id)
+        .await
+        .expect("load delegation")
+        .expect("delegation exists");
+    let has_queue = db
+        .store
+        .has_queued_inputs("race_child")
+        .await
+        .expect("queue state");
+    if finished {
+        assert_eq!(current.status, DelegationStatus::Done);
+        assert!(
+            !has_queue,
+            "completed delegation cannot coexist with active steer"
+        );
+    } else {
+        assert_eq!(current.status, DelegationStatus::Running);
+        assert!(has_queue, "accepted steer keeps delegation running");
+    }
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn combined_control_phases_block_mailbox_and_fence_newer_action_generation() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "combined control phases", &[], json!({}))
+        .await
+        .expect("create project");
+    create_session(&db, "parent", project_id).await;
+    let delegation = db
+        .store
+        .create_delegation("parent", DelegationKind::Full, None, None, 1)
+        .await
+        .expect("create delegation");
+    let active_leaf = "control_child_assistant";
+    let entries = vec![
+        TranscriptStorageNode {
+            id: "control_child_start".to_string(),
+            parent_id: None,
+            timestamp_ms: 1,
+            item: TranscriptItem::TurnStarted { turn_id: TurnId(1) },
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: "control_child_user".to_string(),
+            parent_id: Some("control_child_start".to_string()),
+            timestamp_ms: 2,
+            item: TranscriptItem::UserMessage(UserMessage::text("work")),
+            provider_replay: Vec::new(),
+        },
+        TranscriptStorageNode {
+            id: active_leaf.to_string(),
+            parent_id: Some("control_child_user".to_string()),
+            timestamp_ms: 3,
+            item: TranscriptItem::AssistantMessage(AssistantMessage {
+                items: vec![AssistantItem::Text("working".to_string())],
+            }),
+            provider_replay: Vec::new(),
+        },
+    ];
+    let first_action = SessionAction::RequestModel {
+        action_id: ActionId(1),
+        turn_id: TurnId(1),
+        model_context: ModelContext::new(),
+        context_leaf_id: Some(active_leaf.to_string()),
+    };
+    db.store
+        .start_session_outputs_with_parent(
+            "control_child",
+            &session_config(project_id, Some("implementer")),
+            &entries,
+            Some(active_leaf),
+            &[],
+            &[first_action],
+            InputPriority::FollowUp,
+            &UserMessage::text("work"),
+            None,
+            Some("parent"),
+            Some(SubagentType::Full),
+            Some(&delegation.id),
+        )
+        .await
+        .expect("create busy child");
+    db.store
+        .enqueue_user_input(
+            "control_child",
+            InputPriority::FollowUp,
+            &UserMessage::text("ordinary queued work"),
+            Some("ordinary-after-control"),
+            None,
+        )
+        .await
+        .expect("enqueue ordinary work");
+
+    let message = UserMessage::text("interrupt then steer");
+    let client_input_id = format!("subagent-control:{}:phase-test", delegation.id);
+    let queued = db
+        .store
+        .enqueue_scoped_subagent_steer(
+            "parent",
+            &delegation.id,
+            "control_child",
+            &message,
+            &client_input_id,
+            true,
+        )
+        .await
+        .expect("enqueue combined control")
+        .expect("running delegation accepts control");
+    assert_eq!(
+        queued.control_phase,
+        Some(SubagentControlPhase::PendingInterrupt)
+    );
+    assert!(db
+        .store
+        .sessions_with_recoverable_subagent_controls()
+        .await
+        .expect("pending sessions")
+        .contains(&"control_child".to_string()));
+    assert_eq!(
+        db.store
+            .mark_all_unfinished_actions_stale()
+            .await
+            .expect("boot stale sweep"),
+        0,
+        "boot must leave a pending control's fenced action to its exact-child reconciler"
+    );
+    assert!(db
+        .store
+        .has_unfinished_actions("control_child")
+        .await
+        .expect("fenced action remains current"));
+    assert!(
+        db.store
+            .take_next_queued_input("control_child")
+            .await
+            .expect("generic queue read")
+            .is_none(),
+        "an unapplied combined control blocks every mailbox row"
+    );
+
+    let interrupted_leaf = "control_child_interrupted";
+    let interrupted_entry = TranscriptStorageNode {
+        id: interrupted_leaf.to_string(),
+        parent_id: Some(active_leaf.to_string()),
+        timestamp_ms: 4,
+        item: TranscriptItem::TurnFinished {
+            turn_id: TurnId(1),
+            outcome: TurnOutcome::Interrupted,
+        },
+        provider_replay: Vec::new(),
+    };
+    db.store
+        .persist_outputs(
+            "control_child",
+            OutputBatch::new(&[interrupted_entry], Some(interrupted_leaf), &[], &[])
+                .with_control_interrupt(&queued.input_id),
+        )
+        .await
+        .expect("interrupt and phase persist atomically");
+    let applied = db
+        .store
+        .get_subagent_control_by_input_id("control_child", &queued.input_id)
+        .await
+        .expect("load applied control")
+        .expect("control exists");
+    assert_eq!(applied.phase, SubagentControlPhase::InterruptApplied);
+    assert!(applied.interrupted);
+    assert_eq!(applied.interrupt_outcome.as_deref(), Some("interrupted"));
+    assert!(!db
+        .store
+        .has_unfinished_actions("control_child")
+        .await
+        .expect("first generation interrupted"));
+    assert!(
+        db.store
+            .take_next_queued_input("control_child")
+            .await
+            .expect("queue read after interrupt commit")
+            .is_none(),
+        "interrupt_applied remains blocked until volatile task settlement"
+    );
+
+    db.store
+        .mark_subagent_control_ready("control_child", &queued.input_id)
+        .await
+        .expect("mark ready");
+    let ready = db
+        .store
+        .take_next_queued_input("control_child")
+        .await
+        .expect("take ready control")
+        .expect("ready combined control is consumable");
+    assert_eq!(ready.id, queued.input_id);
+    db.store
+        .persist_outputs(
+            "control_child",
+            OutputBatch::new(&[], Some(interrupted_leaf), &[], &[])
+                .with_consumed_input(Some(ready)),
+        )
+        .await
+        .expect("consume ready control");
+
+    // Capture an idle generation, then start newer work before reconciliation.
+    // Neither the precheck nor the transactional phase CAS may interrupt it.
+    let stale = db
+        .store
+        .enqueue_scoped_subagent_steer(
+            "parent",
+            &delegation.id,
+            "control_child",
+            &UserMessage::text("stale interrupt"),
+            &format!("subagent-control:{}:stale-generation", delegation.id),
+            true,
+        )
+        .await
+        .expect("enqueue stale candidate")
+        .expect("running delegation accepts control");
+    let newer_action = SessionAction::RequestModel {
+        action_id: ActionId(2),
+        turn_id: TurnId(1),
+        model_context: ModelContext::new(),
+        context_leaf_id: Some(interrupted_leaf.to_string()),
+    };
+    db.store
+        .persist_outputs(
+            "control_child",
+            OutputBatch::new(&[], Some(interrupted_leaf), &[], &[newer_action]),
+        )
+        .await
+        .expect("start newer generation");
+    let stale_record = db
+        .store
+        .get_subagent_control_by_input_id("control_child", &stale.input_id)
+        .await
+        .expect("load stale control")
+        .expect("stale control exists");
+    assert!(!db
+        .store
+        .subagent_control_target_is_current("control_child", &stale_record)
+        .await
+        .expect("generation comparison"));
+    assert!(
+        db.store
+            .persist_outputs(
+                "control_child",
+                OutputBatch::new(&[], Some(interrupted_leaf), &[], &[])
+                    .with_control_interrupt(&stale.input_id),
+            )
+            .await
+            .is_err(),
+        "atomic phase CAS rejects a newer action generation"
+    );
+    assert!(db
+        .store
+        .has_unfinished_actions("control_child")
+        .await
+        .expect("newer generation remains running"));
+    db.store
+        .skip_stale_subagent_control_interrupt("control_child", &stale.input_id)
+        .await
+        .expect("settle stale control without interrupt");
+    let skipped = db
+        .store
+        .get_subagent_control_by_input_id("control_child", &stale.input_id)
+        .await
+        .expect("load skipped control")
+        .expect("skipped control exists");
+    assert_eq!(skipped.phase, SubagentControlPhase::Ready);
+    assert!(!skipped.interrupted);
+    assert_eq!(
+        skipped.interrupt_outcome.as_deref(),
+        Some("generation_advanced")
+    );
+
+    let raw_collision = format!("subagent-control:{}:raw-collision", delegation.id);
+    db.store
+        .enqueue_user_input(
+            "control_child",
+            InputPriority::FollowUp,
+            &UserMessage::text("same content"),
+            Some(&raw_collision),
+            None,
+        )
+        .await
+        .expect("enqueue raw colliding follow-up");
+    let conflict = db
+        .store
+        .enqueue_scoped_subagent_steer(
+            "parent",
+            &delegation.id,
+            "control_child",
+            &UserMessage::text("same content"),
+            &raw_collision,
+            false,
+        )
+        .await
+        .err()
+        .expect("raw follow-up never replays as scoped steer");
+    assert!(conflict.to_string().contains("client_control_id_conflict"));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
 async fn cancel_running_delegation_is_attempt_fenced_and_terminal_safe() {
     let Some(db) = test_store().await else {
         eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
@@ -933,6 +1497,16 @@ async fn cancel_running_delegation_is_attempt_fenced_and_terminal_safe() {
         .create_delegation("parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create done delegation");
+    create_delegation_subagent(
+        &db,
+        "done_child",
+        project_id,
+        "parent",
+        SubagentType::Full,
+        "implementer",
+        &done.id,
+    )
+    .await;
     assert!(db
         .store
         .finish_delegation(&done.id, &done.attempt_id, DelegationStatus::Done)
@@ -958,6 +1532,16 @@ async fn cancel_running_delegation_is_attempt_fenced_and_terminal_safe() {
         .create_delegation("parent", DelegationKind::Full, None, None, 1)
         .await
         .expect("create done_with_failures delegation");
+    create_delegation_subagent(
+        &db,
+        "failed_child",
+        project_id,
+        "parent",
+        SubagentType::Full,
+        "implementer",
+        &failed.id,
+    )
+    .await;
     assert!(db
         .store
         .finish_delegation(
@@ -1124,6 +1708,158 @@ async fn cancel_running_delegation_atomically_cancels_queued_partial_wakeup() {
         .expect("take next steer")
         .expect("only terminal-shaped steer remains");
     assert_eq!(next.client_input_id.as_deref(), Some(terminal_key.as_str()));
+
+    db.cleanup().await;
+}
+
+#[tokio::test]
+async fn cancellation_and_boundary_control_reconciliation_do_not_deadlock() {
+    let Some(db) = test_store().await else {
+        eprintln!("skipping postgres test; PI_RELAY_TEST_DATABASE_URL is not set");
+        return;
+    };
+    let project_id = Uuid::new_v4();
+    db.store
+        .create_project(project_id, "cancellation lock order", &[], json!({}))
+        .await
+        .expect("create project");
+
+    for iteration in 0..12 {
+        let parent_id = format!("lock_parent_{iteration:02}");
+        let child_id = format!("lock_child_{iteration:02}");
+        create_session(&db, &parent_id, project_id).await;
+        let delegation = db
+            .store
+            .create_delegation(&parent_id, DelegationKind::Full, None, None, 1)
+            .await
+            .expect("create running delegation");
+        create_delegation_subagent_with_task_and_leaf(
+            &db,
+            &child_id,
+            project_id,
+            &parent_id,
+            SubagentType::Full,
+            "implementer",
+            Some("race cancellation"),
+            &delegation.id,
+            Some(TranscriptItem::TurnFinished {
+                turn_id: TurnId(1),
+                outcome: TurnOutcome::Graceful,
+            }),
+        )
+        .await;
+        db.store
+            .enqueue_user_input(
+                &child_id,
+                InputPriority::FollowUp,
+                &UserMessage::text("ordinary queued work"),
+                Some(&format!("ordinary-{iteration}")),
+                None,
+            )
+            .await
+            .expect("queue child work");
+        let action_id = format!("boundary_action_{iteration:02}");
+        let attempt_id = format!("boundary_attempt_{iteration:02}");
+        sqlx::query(
+            r#"
+            insert into actions (
+                id, session_id, turn_id, action_id, attempt_id, kind, status, payload
+            )
+            values ($1, $2, null, 0, $3, 'compaction', 'running', '{}'::jsonb)
+            "#,
+        )
+        .bind(&action_id)
+        .bind(&child_id)
+        .bind(&attempt_id)
+        .execute(&db.store.pool)
+        .await
+        .expect("seed boundary-hosted action");
+        let queued = db
+            .store
+            .enqueue_scoped_subagent_interrupt(
+                &parent_id,
+                &delegation.id,
+                &child_id,
+                &format!("subagent-control:{}:lock-race", delegation.id),
+            )
+            .await
+            .expect("enqueue interrupt")
+            .expect("running delegation accepts interrupt");
+
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let cancel_barrier = barrier.clone();
+        let reconcile_barrier = barrier.clone();
+        let cancel = async {
+            cancel_barrier.wait().await;
+            db.store
+                .cancel_running_delegation_and_queued_partials(
+                    &parent_id,
+                    &delegation.id,
+                    &delegation.attempt_id,
+                    "lock_order_test",
+                )
+                .await
+        };
+        let reconcile = async {
+            reconcile_barrier.wait().await;
+            let result = db
+                .store
+                .apply_subagent_control_interrupt_at_boundary(&child_id, &queued.input_id)
+                .await;
+            if matches!(result, Ok(SubagentBoundaryInterruptResult::Applied { .. })) {
+                let _ = db
+                    .store
+                    .mark_subagent_control_ready(&child_id, &queued.input_id)
+                    .await;
+            }
+            result
+        };
+        let (cancel_result, reconcile_result) =
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(cancel, reconcile)
+            })
+            .await
+            .expect("cancellation/reconciliation race must not deadlock");
+        let (_, _) = cancel_result.expect("cancellation transaction remains usable");
+        if let Err(error) = &reconcile_result {
+            assert!(
+                !error.to_string().contains("deadlock detected"),
+                "legal cancellation loss must not be a SQL deadlock: {error:#}"
+            );
+        }
+
+        assert_eq!(
+            db.store
+                .get_delegation(&delegation.id)
+                .await
+                .expect("load cancelled delegation")
+                .expect("delegation remains durable")
+                .status,
+            DelegationStatus::Cancelled
+        );
+        let control = db
+            .store
+            .get_subagent_control_by_input_id(&child_id, &queued.input_id)
+            .await
+            .expect("load control after race")
+            .expect("control ledger remains durable");
+        assert!(matches!(
+            control.status,
+            QueuedInputStatus::Cancelled | QueuedInputStatus::Consumed
+        ));
+        assert!(matches!(
+            control.phase,
+            SubagentControlPhase::Cancelled | SubagentControlPhase::Ready
+        ));
+        assert!(
+            !db.store
+                .sessions_with_recoverable_subagent_controls()
+                .await
+                .expect("discover pending controls")
+                .contains(&child_id),
+            "neither legal winner may leave a mailbox-blocking control"
+        );
+    }
 
     db.cleanup().await;
 }

@@ -12,7 +12,8 @@ use super::sql::{action_is_unfinished, lock_session_tx, queued_input_is_active, 
 use super::PostgresAgentStore;
 use crate::{
     DelegationKind, DelegationStatus, EnqueueUserInputResult, EventFrame, EventType, InputPriority,
-    QueuedInputContent, QueuedInputStatus, SessionActivity, SubagentType,
+    QueuedInputContent, QueuedInputStatus, SessionActivity, SubagentBoundaryInterruptResult,
+    SubagentControlKind, SubagentControlPhase, SubagentControlRecord, SubagentType,
 };
 
 /// A durable delegation row: an ordered unit of work under a parent session that
@@ -69,6 +70,16 @@ pub struct DelegationSubagentOverview {
     pub terminal_status: Option<String>,
 }
 
+struct ScopedSubagentControlRequest<'a> {
+    parent_session_id: &'a str,
+    delegation_id: &'a str,
+    subagent_id: &'a str,
+    client_input_id: &'a str,
+    kind: SubagentControlKind,
+    content: Option<&'a UserMessage>,
+    interrupt: bool,
+}
+
 impl PostgresAgentStore {
     /// Insert a fresh `running` delegation, minting its completion-fencing attempt
     /// id. The delegation row is created before its subagents so their
@@ -81,6 +92,9 @@ impl PostgresAgentStore {
         label: Option<&str>,
         expected_subagents: i32,
     ) -> Result<Delegation> {
+        if expected_subagents <= 0 {
+            anyhow::bail!("expected_subagents must be greater than zero");
+        }
         let id = format!("delegation_{}", Uuid::new_v4());
         let attempt_id = Uuid::new_v4().to_string();
         sqlx::query(
@@ -463,6 +477,23 @@ impl PostgresAgentStore {
     ) -> Result<(bool, Vec<EventFrame>)> {
         let mut tx = self.pool.begin().await?;
         lock_session_tx(&mut tx, parent_session_id).await?;
+        let status = sqlx::query_scalar::<_, String>(
+            r#"
+            select status
+            from delegations
+            where id=$1 and parent_session_id=$2 and attempt_id=$3
+            for update
+            "#,
+        )
+        .bind(delegation_id)
+        .bind(parent_session_id)
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if status.as_deref() != Some(DelegationStatus::Running.as_str()) {
+            tx.commit().await?;
+            return Ok((false, Vec::new()));
+        }
         let updated = sqlx::query(
             r#"
             update delegations
@@ -483,6 +514,85 @@ impl PostgresAgentStore {
             tx.commit().await?;
             return Ok((false, Vec::new()));
         }
+        let mut events = Vec::new();
+
+        // A terminal delegation has no active child mailbox. Keep the global
+        // session -> queue-row order used by output/control reconciliation:
+        // after the parent/delegation scope locks, lock every child session in
+        // deterministic order before touching any child queue row.
+        let child_ids = sqlx::query_scalar::<_, String>(
+            r#"
+            select id
+            from sessions
+            where delegation_id=$1
+            order by id
+            for update
+            "#,
+        )
+        .bind(delegation_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let child_input_rows = sqlx::query(
+            r#"
+            update queued_inputs q
+            set status='cancelled',
+                follow_up_position=null,
+                updated_at=now(),
+                origin=coalesce(q.origin, '{}'::jsonb)
+                    || jsonb_build_object(
+                        'control_phase',
+                            case
+                                when q.origin->>'control_kind' in (
+                                    'scoped_subagent_steer',
+                                    'scoped_subagent_interrupt'
+                                )
+                                then 'cancelled'
+                                else coalesce(q.origin->>'control_phase', 'cancelled')
+                            end,
+                        'cancelled_at', clock_timestamp()::text,
+                        'cancel_reason', $2
+                    )
+            from sessions s
+            where q.session_id=s.id
+              and s.delegation_id=$1
+              and q.status in ('queued', 'consuming')
+            returning q.session_id, q.id
+            "#,
+        )
+        .bind(delegation_id)
+        .bind(reason)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !child_input_rows.is_empty() {
+            for child_id in child_ids {
+                let child_input_ids = child_input_rows
+                    .iter()
+                    .filter(|row| row.get::<String, _>("session_id") == child_id)
+                    .map(|row| row.get::<String, _>("id"))
+                    .collect::<Vec<_>>();
+                if child_input_ids.is_empty() {
+                    continue;
+                }
+                bump_revisions_tx(&mut tx, &child_id, true, false).await?;
+                let queue = queue_state_tx(&mut tx, &child_id).await?;
+                events.push(
+                    insert_event_tx(
+                        &mut tx,
+                        &child_id,
+                        EventType::InputCancelled,
+                        queue_event_payload(
+                            &queue,
+                            json!({
+                                "input_ids": child_input_ids,
+                                "reason": reason,
+                                "delegation_id": delegation_id,
+                            }),
+                        ),
+                    )
+                    .await?,
+                );
+            }
+        }
 
         let input_ids = cancel_active_partial_delegation_wakeups_tx(
             &mut tx,
@@ -492,15 +602,17 @@ impl PostgresAgentStore {
             reason,
         )
         .await?;
-        let events = partial_wakeup_cancellation_events_tx(
-            &mut tx,
-            parent_session_id,
-            delegation_id,
-            attempt_id,
-            reason,
-            input_ids,
-        )
-        .await?;
+        events.extend(
+            partial_wakeup_cancellation_events_tx(
+                &mut tx,
+                parent_session_id,
+                delegation_id,
+                attempt_id,
+                reason,
+                input_ids,
+            )
+            .await?,
+        );
         tx.commit().await?;
         Ok((true, events))
     }
@@ -621,38 +733,83 @@ impl PostgresAgentStore {
         attempt_id: &str,
         status: DelegationStatus,
     ) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let Some(expected_subagents) = sqlx::query_scalar::<_, i32>(
+            r#"
+            select expected_subagents
+            from delegations
+            where id=$1 and attempt_id=$2 and status='running'
+            for update
+            "#,
+        )
+        .bind(delegation_id)
+        .bind(attempt_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+
+        // This statement runs after the delegation row lock is acquired. A
+        // scoped child control also locks the delegation before its child
+        // session, so either completion wins and the control rejects, or the
+        // control commits and this fresh check observes its active state.
         let unfinished_actions = action_is_unfinished(Some("a"));
         let active_queue = queued_input_is_active(Some("q"));
         let query = format!(
             r#"
-            update delegations
-            set status=$3, updated_at=now()
-            where id=$1
-              and attempt_id=$2
-              and status='running'
-              and not exists (
-                select 1
-                from sessions s
-                join actions a on a.session_id = s.id
-                where s.delegation_id = delegations.id
-                  and {unfinished_actions}
-              )
-              and not exists (
-                select 1
-                from sessions s
-                join queued_inputs q on q.session_id = s.id
-                where s.delegation_id = delegations.id
-                  and {active_queue}
-              )
+            select
+                count(*) = $2
+                and coalesce(bool_and(
+                    not exists (
+                        select 1
+                        from actions a
+                        where a.session_id = s.id and {unfinished_actions}
+                    )
+                    and not exists (
+                        select 1
+                        from queued_inputs q
+                        where q.session_id = s.id and {active_queue}
+                    )
+                    and (
+                        s.active_leaf_id is null
+                        or exists (
+                            select 1
+                            from transcript_entries t
+                            where t.session_id = s.id
+                              and t.id = s.active_leaf_id
+                              and t.item->>'type' in ('turn_finished', 'compaction_summary')
+                        )
+                    )
+                ), false)
+            from sessions s
+            where s.delegation_id=$1
             "#
         );
-        let updated = sqlx::query(&query)
+        let ready: bool = sqlx::query_scalar(&query)
             .bind(delegation_id)
-            .bind(attempt_id)
-            .bind(status.as_str())
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+            .bind(i64::from(expected_subagents))
+            .fetch_one(&mut *tx)
+            .await?;
+        if !ready {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let updated = sqlx::query(
+            r#"
+            update delegations
+            set status=$3, updated_at=now()
+            where id=$1 and attempt_id=$2 and status='running'
+            "#,
+        )
+        .bind(delegation_id)
+        .bind(attempt_id)
+        .bind(status.as_str())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
         Ok(updated == 1)
     }
 
@@ -667,7 +824,54 @@ impl PostgresAgentStore {
         subagent_id: &str,
         content: &UserMessage,
         client_input_id: &str,
+        control_interrupt: bool,
     ) -> Result<Option<EnqueueUserInputResult>> {
+        self.enqueue_scoped_subagent_control(ScopedSubagentControlRequest {
+            parent_session_id,
+            delegation_id,
+            subagent_id,
+            client_input_id,
+            kind: SubagentControlKind::Steer,
+            content: Some(content),
+            interrupt: control_interrupt,
+        })
+        .await
+    }
+
+    /// Enqueue a durable exact-child interrupt ledger record. Unlike a steer,
+    /// this row carries no user message and is never dispatchable to the model.
+    pub async fn enqueue_scoped_subagent_interrupt(
+        &self,
+        parent_session_id: &str,
+        delegation_id: &str,
+        subagent_id: &str,
+        client_input_id: &str,
+    ) -> Result<Option<EnqueueUserInputResult>> {
+        self.enqueue_scoped_subagent_control(ScopedSubagentControlRequest {
+            parent_session_id,
+            delegation_id,
+            subagent_id,
+            client_input_id,
+            kind: SubagentControlKind::Interrupt,
+            content: None,
+            interrupt: true,
+        })
+        .await
+    }
+
+    async fn enqueue_scoped_subagent_control(
+        &self,
+        request: ScopedSubagentControlRequest<'_>,
+    ) -> Result<Option<EnqueueUserInputResult>> {
+        let ScopedSubagentControlRequest {
+            parent_session_id,
+            delegation_id,
+            subagent_id,
+            client_input_id,
+            kind: control_kind,
+            content,
+            interrupt: control_interrupt,
+        } = request;
         let mut tx = self.pool.begin().await?;
         let Some(delegation_row) = sqlx::query(
             r#"
@@ -686,17 +890,63 @@ impl PostgresAgentStore {
         };
         let delegation_parent: String = delegation_row.get("parent_session_id");
         let delegation_status: String = delegation_row.get("status");
-        if delegation_parent != parent_session_id || delegation_status != "running" {
+        if delegation_parent != parent_session_id {
             tx.commit().await?;
             return Ok(None);
         }
 
+        let reused_by_other_child: bool = sqlx::query_scalar(
+            r#"
+            select exists(
+                select 1
+                from queued_inputs q
+                join sessions s on s.id=q.session_id
+                where s.delegation_id=$1
+                  and q.client_input_id=$2
+                  and q.session_id<>$3
+            )
+            "#,
+        )
+        .bind(delegation_id)
+        .bind(client_input_id)
+        .bind(subagent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if reused_by_other_child {
+            anyhow::bail!(
+                "client_control_id_conflict: client_control_id was already used for a different subagent control"
+            );
+        }
+
         let Some(session_row) = sqlx::query(
             r#"
-            select parent_session_id, delegation_id, subagent_type
-            from sessions
-            where id=$1
-            for update
+            select s.parent_session_id,
+                   s.delegation_id,
+                   s.subagent_type,
+                   s.active_leaf_id,
+                   generation.turn_id as target_turn_id,
+                   coalesce(generation.attempt_ids, '[]'::jsonb) as target_action_attempt_ids
+            from sessions s
+            left join lateral (
+                select newest.turn_id,
+                       (
+                           select jsonb_agg(a.attempt_id order by a.created_at, a.id)
+                           from actions a
+                           where a.session_id=s.id
+                             and a.status in ('pending', 'blocked', 'running')
+                             and a.turn_id is not distinct from newest.turn_id
+                       ) as attempt_ids
+                from (
+                    select a.turn_id
+                    from actions a
+                    where a.session_id=s.id
+                      and a.status in ('pending', 'blocked', 'running')
+                    order by a.created_at desc, a.id desc
+                    limit 1
+                ) newest
+            ) generation on true
+            where s.id=$1
+            for update of s
             "#,
         )
         .bind(subagent_id)
@@ -709,6 +959,9 @@ impl PostgresAgentStore {
         let child_parent: Option<String> = session_row.get("parent_session_id");
         let child_delegation: Option<String> = session_row.get("delegation_id");
         let subagent_type: Option<String> = session_row.get("subagent_type");
+        let target_active_leaf_id: Option<String> = session_row.get("active_leaf_id");
+        let target_turn_id: Option<i64> = session_row.get("target_turn_id");
+        let target_action_attempt_ids: Value = session_row.get("target_action_attempt_ids");
         if child_parent.as_deref() != Some(parent_session_id)
             || child_delegation.as_deref() != Some(delegation_id)
             || !matches!(subagent_type.as_deref(), Some("full") | Some("read_only"))
@@ -718,13 +971,61 @@ impl PostgresAgentStore {
         }
 
         if let Some(row) = sqlx::query(
-            "select id from queued_inputs where session_id=$1 and client_input_id=$2::text",
+            r#"
+            select id, priority, content, status,
+                   coalesce((origin->>'control_interrupt')::boolean, false) as control_interrupt,
+                   origin->>'control_phase' as control_phase,
+                   coalesce((origin->>'control_interrupted')::boolean, false) as control_interrupted,
+                   origin->>'control_interrupt_outcome' as control_interrupt_outcome,
+                   origin->>'control_kind' as control_kind,
+                   origin->>'delegation_id' as control_delegation_id,
+                   origin->>'parent_session_id' as control_parent_session_id,
+                   origin->>'subagent_id' as control_subagent_id,
+                   nullif(origin->>'target_turn_id', '')::bigint as target_turn_id,
+                   origin->>'target_active_leaf_id' as target_active_leaf_id,
+                   coalesce(origin->'target_action_attempt_ids', '[]'::jsonb)
+                       as target_action_attempt_ids
+            from queued_inputs
+            where session_id=$1 and client_input_id=$2::text
+            "#,
         )
         .bind(subagent_id)
         .bind(client_input_id)
         .fetch_optional(&mut *tx)
         .await?
         {
+            let existing_content: QueuedInputContent =
+                serde_json::from_value(row.get::<Value, _>("content"))?;
+            let existing_interrupt: bool = row.get("control_interrupt");
+            let priority = super::rows::row_text::<InputPriority>(&row, "priority")?;
+            let existing_control_kind: Option<String> = row.get("control_kind");
+            let control_delegation_id: Option<String> = row.get("control_delegation_id");
+            let control_parent_session_id: Option<String> = row.get("control_parent_session_id");
+            let control_subagent_id: Option<String> = row.get("control_subagent_id");
+            let status = super::rows::row_text::<QueuedInputStatus>(&row, "status")?;
+            let requested_content = content
+                .cloned()
+                .map(QueuedInputContent::user_message)
+                .unwrap_or(QueuedInputContent::SubagentControl);
+            if priority != InputPriority::Steer
+                || existing_control_kind.as_deref() != Some(control_kind.as_str())
+                || control_delegation_id.as_deref() != Some(delegation_id)
+                || control_parent_session_id.as_deref() != Some(parent_session_id)
+                || control_subagent_id.as_deref() != Some(subagent_id)
+                || existing_content != requested_content
+                || existing_interrupt != control_interrupt
+            {
+                anyhow::bail!(
+                    "client_control_id_conflict: client_control_id was already used for a different subagent control"
+                );
+            }
+            let control_phase = row
+                .get::<Option<String>, _>("control_phase")
+                .ok_or_else(|| anyhow::anyhow!("scoped subagent control is missing its phase"))?
+                .parse::<SubagentControlPhase>()
+                .map_err(anyhow::Error::msg)?;
+            let control_interrupt_applied =
+                control_phase != SubagentControlPhase::PendingInterrupt;
             let input_id = row.get("id");
             let queue = queue_state_tx(&mut tx, subagent_id).await?;
             tx.commit().await?;
@@ -732,7 +1033,17 @@ impl PostgresAgentStore {
                 input_id,
                 event: None,
                 queue: Some(queue),
+                replayed: true,
+                status,
+                control_interrupt_applied,
+                delegation_running: delegation_status == "running",
+                control_phase: Some(control_phase),
+                control_interrupt_outcome: row.get("control_interrupt_outcome"),
             }));
+        }
+        if delegation_status != "running" {
+            tx.commit().await?;
+            return Ok(None);
         }
 
         let id = format!("input_{}", Uuid::new_v4());
@@ -743,7 +1054,19 @@ impl PostgresAgentStore {
             )
             values (
                 $1, $2, 'steer', $3, 'queued', $4,
-                jsonb_build_object('promoted_at', clock_timestamp()::text)
+                jsonb_build_object(
+                    'promoted_at', clock_timestamp()::text,
+                    'control_kind', $11::text,
+                    'delegation_id', $6::text,
+                    'parent_session_id', $7::text,
+                    'subagent_id', $2::text,
+                    'control_interrupt', $5,
+                    'control_phase',
+                        case when $5 then 'pending_interrupt' else 'ready' end,
+                    'target_active_leaf_id', $8::text,
+                    'target_turn_id', $9::bigint,
+                    'target_action_attempt_ids', $10::jsonb
+                )
             )
             on conflict (session_id, client_input_id) where client_input_id is not null
             do nothing
@@ -752,48 +1075,585 @@ impl PostgresAgentStore {
         )
         .bind(&id)
         .bind(subagent_id)
-        .bind(serde_json::to_value(QueuedInputContent::user_message(
-            content.clone(),
-        ))?)
+        .bind(serde_json::to_value(
+            content
+                .cloned()
+                .map(QueuedInputContent::user_message)
+                .unwrap_or(QueuedInputContent::SubagentControl),
+        )?)
         .bind(client_input_id)
+        .bind(control_interrupt)
+        .bind(delegation_id)
+        .bind(parent_session_id)
+        .bind(target_active_leaf_id)
+        .bind(target_turn_id)
+        .bind(target_action_attempt_ids)
+        .bind(control_kind.as_str())
         .fetch_optional(&mut *tx)
         .await?;
         let input_id = if let Some(inserted) = inserted {
             inserted.get("id")
         } else {
-            let row = sqlx::query(
-                "select id from queued_inputs where session_id=$1 and client_input_id=$2::text",
-            )
-            .bind(subagent_id)
-            .bind(client_input_id)
-            .fetch_one(&mut *tx)
-            .await?;
-            row.get("id")
+            anyhow::bail!(
+                "client_control_id_conflict: client_control_id was concurrently used for a different input"
+            );
         };
         bump_revisions_tx(&mut tx, subagent_id, true, false).await?;
         let queue = queue_state_tx(&mut tx, subagent_id).await?;
-        let event = insert_event_tx(
-            &mut tx,
-            subagent_id,
-            EventType::InputQueued,
-            queue_event_payload(
-                &queue,
-                json!({
-                    "input_id": input_id,
-                    "priority": InputPriority::Steer,
-                    "client_input_id": client_input_id,
-                    "content": content.content.clone(),
-                    "content_type": "user_message",
-                }),
-            ),
-        )
-        .await?;
+        let event = if let Some(content) = content {
+            Some(
+                insert_event_tx(
+                    &mut tx,
+                    subagent_id,
+                    EventType::InputQueued,
+                    queue_event_payload(
+                        &queue,
+                        json!({
+                            "input_id": input_id,
+                            "priority": InputPriority::Steer,
+                            "client_input_id": client_input_id,
+                            "content": content.content.clone(),
+                            "content_type": "user_message",
+                        }),
+                    ),
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
         tx.commit().await?;
         Ok(Some(EnqueueUserInputResult {
             input_id,
-            event: Some(event),
+            event,
             queue: Some(queue),
+            replayed: false,
+            status: QueuedInputStatus::Queued,
+            control_interrupt_applied: false,
+            delegation_running: true,
+            control_phase: Some(if control_interrupt {
+                SubagentControlPhase::PendingInterrupt
+            } else {
+                SubagentControlPhase::Ready
+            }),
+            control_interrupt_outcome: None,
         }))
+    }
+
+    pub async fn get_scoped_subagent_control(
+        &self,
+        subagent_id: &str,
+        client_input_id: &str,
+        parent_session_id: &str,
+        delegation_id: &str,
+        content: &UserMessage,
+        interrupt: bool,
+    ) -> Result<Option<SubagentControlRecord>> {
+        self.get_scoped_subagent_control_matching(ScopedSubagentControlRequest {
+            parent_session_id,
+            delegation_id,
+            subagent_id,
+            client_input_id,
+            kind: SubagentControlKind::Steer,
+            content: Some(content),
+            interrupt,
+        })
+        .await
+    }
+
+    pub async fn get_scoped_subagent_interrupt(
+        &self,
+        subagent_id: &str,
+        client_input_id: &str,
+        parent_session_id: &str,
+        delegation_id: &str,
+    ) -> Result<Option<SubagentControlRecord>> {
+        self.get_scoped_subagent_control_matching(ScopedSubagentControlRequest {
+            parent_session_id,
+            delegation_id,
+            subagent_id,
+            client_input_id,
+            kind: SubagentControlKind::Interrupt,
+            content: None,
+            interrupt: true,
+        })
+        .await
+    }
+
+    async fn get_scoped_subagent_control_matching(
+        &self,
+        request: ScopedSubagentControlRequest<'_>,
+    ) -> Result<Option<SubagentControlRecord>> {
+        let ScopedSubagentControlRequest {
+            parent_session_id,
+            delegation_id,
+            subagent_id,
+            client_input_id,
+            kind: control_kind,
+            content,
+            interrupt,
+        } = request;
+        let Some(row) = sqlx::query(
+            r#"
+            select q.id,
+                   q.priority,
+                   q.content,
+                   q.status,
+                   q.origin,
+                   d.status as delegation_status
+            from queued_inputs q
+            join sessions s on s.id=q.session_id
+            join delegations d on d.id=s.delegation_id
+            where q.session_id=$1 and q.client_input_id=$2
+            "#,
+        )
+        .bind(subagent_id)
+        .bind(client_input_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let priority = super::rows::row_text::<InputPriority>(&row, "priority")?;
+        let existing_content: QueuedInputContent =
+            serde_json::from_value(row.get::<Value, _>("content"))?;
+        let origin: Value = row.get("origin");
+        let expected_content = content
+            .cloned()
+            .map(QueuedInputContent::user_message)
+            .unwrap_or(QueuedInputContent::SubagentControl);
+        let matches = priority == InputPriority::Steer
+            && existing_content == expected_content
+            && origin.get("control_kind").and_then(Value::as_str) == Some(control_kind.as_str())
+            && origin.get("delegation_id").and_then(Value::as_str) == Some(delegation_id)
+            && origin.get("parent_session_id").and_then(Value::as_str) == Some(parent_session_id)
+            && origin.get("subagent_id").and_then(Value::as_str) == Some(subagent_id)
+            && origin
+                .get("control_interrupt")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                == interrupt;
+        if !matches {
+            anyhow::bail!(
+                "client_control_id_conflict: client_control_id was already used for a different subagent control"
+            );
+        }
+        Ok(Some(control_record_from_row(&row, &origin)?))
+    }
+
+    pub async fn get_subagent_control_by_input_id(
+        &self,
+        subagent_id: &str,
+        input_id: &str,
+    ) -> Result<Option<SubagentControlRecord>> {
+        let Some(row) = sqlx::query(
+            r#"
+            select q.id, q.status, q.origin, d.status as delegation_status
+            from queued_inputs q
+            join sessions s on s.id=q.session_id
+            join delegations d on d.id=s.delegation_id
+            where q.session_id=$1
+              and q.id=$2
+              and q.priority='steer'
+              and q.origin->>'control_kind' in (
+                  'scoped_subagent_steer',
+                  'scoped_subagent_interrupt'
+              )
+            "#,
+        )
+        .bind(subagent_id)
+        .bind(input_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let origin: Value = row.get("origin");
+        Ok(Some(control_record_from_row(&row, &origin)?))
+    }
+
+    /// Sessions needing bounded live control recovery: interrupt phases always,
+    /// plus ready scoped steers that have no unfinished action owner.
+    pub async fn sessions_with_recoverable_subagent_controls(&self) -> Result<Vec<String>> {
+        let unfinished_actions = action_is_unfinished(Some("a"));
+        Ok(sqlx::query_scalar(&format!(
+            r#"
+            select distinct q.session_id
+            from queued_inputs q
+            join sessions s on s.id=q.session_id
+            join delegations d on d.id=s.delegation_id
+            where q.status in ('queued', 'consuming')
+              and q.priority='steer'
+              and q.origin->>'control_kind' in (
+                  'scoped_subagent_steer',
+                  'scoped_subagent_interrupt'
+              )
+              and (
+                  q.origin->>'control_phase' in ('pending_interrupt', 'interrupt_applied')
+                  or (
+                      q.origin->>'control_kind'='scoped_subagent_steer'
+                      and q.origin->>'control_phase'='ready'
+                      and not exists (
+                          select 1
+                          from actions a
+                          where a.session_id=q.session_id
+                            and {unfinished_actions}
+                      )
+                  )
+              )
+              and d.status='running'
+            order by q.session_id
+            limit 100
+            "#
+        ))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    pub async fn next_pending_subagent_control(
+        &self,
+        subagent_id: &str,
+    ) -> Result<Option<SubagentControlRecord>> {
+        let Some(row) = sqlx::query(
+            r#"
+            select q.id, q.status, q.origin, d.status as delegation_status
+            from queued_inputs q
+            join sessions s on s.id=q.session_id
+            join delegations d on d.id=s.delegation_id
+            where q.session_id=$1
+              and q.status in ('queued', 'consuming')
+              and q.priority='steer'
+              and q.origin->>'control_kind' in (
+                  'scoped_subagent_steer',
+                  'scoped_subagent_interrupt'
+              )
+              and q.origin->>'control_phase' in ('pending_interrupt', 'interrupt_applied')
+              and d.status='running'
+            order by q.created_at, q.id
+            limit 1
+            "#,
+        )
+        .bind(subagent_id)
+        .fetch_optional(&self.pool)
+        .await?
+        else {
+            return Ok(None);
+        };
+        let origin: Value = row.get("origin");
+        Ok(Some(control_record_from_row(&row, &origin)?))
+    }
+
+    pub async fn subagent_control_target_is_current(
+        &self,
+        subagent_id: &str,
+        control: &SubagentControlRecord,
+    ) -> Result<bool> {
+        let row = sqlx::query(
+            r#"
+            select s.active_leaf_id
+            from sessions s
+            where s.id=$1
+            "#,
+        )
+        .bind(subagent_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let active_leaf_id: Option<String> = row.get("active_leaf_id");
+        let unfinished_actions = sqlx::query(
+            r#"
+            select attempt_id, turn_id
+            from actions
+            where session_id=$1
+              and status in ('pending', 'blocked', 'running')
+            order by created_at, id
+            "#,
+        )
+        .bind(subagent_id)
+        .fetch_all(&self.pool)
+        .await?;
+        if control.target_action_attempt_ids.is_empty() {
+            return Ok(
+                active_leaf_id == control.target_active_leaf_id && unfinished_actions.is_empty()
+            );
+        }
+        Ok(!unfinished_actions.is_empty()
+            && unfinished_actions.iter().all(|action| {
+                let attempt_id: String = action.get("attempt_id");
+                let turn_id: Option<i64> = action.get("turn_id");
+                turn_id == control.target_turn_id
+                    && control
+                        .target_action_attempt_ids
+                        .iter()
+                        .any(|captured| captured == &attempt_id)
+            }))
+    }
+
+    pub async fn mark_subagent_control_ready(
+        &self,
+        subagent_id: &str,
+        input_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, subagent_id).await?;
+        let updated = sqlx::query(
+            r#"
+            update queued_inputs
+            set origin=origin || jsonb_build_object(
+                    'control_phase', 'ready',
+                    'control_ready_at', clock_timestamp()::text
+                ),
+                status=case
+                    when origin->>'control_kind'='scoped_subagent_interrupt'
+                    then 'consumed'
+                    else status
+                end,
+                updated_at=now()
+            where session_id=$1
+              and id=$2
+              and status='queued'
+              and priority='steer'
+              and origin->>'control_kind' in (
+                  'scoped_subagent_steer',
+                  'scoped_subagent_interrupt'
+              )
+              and origin->>'control_phase'='interrupt_applied'
+            "#,
+        )
+        .bind(subagent_id)
+        .bind(input_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            anyhow::bail!(
+                "subagent control ready phase update affected {updated} rows for {input_id}"
+            );
+        }
+        bump_revisions_tx(&mut tx, subagent_id, true, false).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn skip_stale_subagent_control_interrupt(
+        &self,
+        subagent_id: &str,
+        input_id: &str,
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, subagent_id).await?;
+        let updated = sqlx::query(
+            r#"
+            update queued_inputs
+            set origin=origin || jsonb_build_object(
+                    'control_phase', 'ready',
+                    'control_interrupted', false,
+                    'control_interrupt_outcome', 'generation_advanced',
+                    'control_interrupt_applied_at', clock_timestamp()::text,
+                    'control_ready_at', clock_timestamp()::text
+                ),
+                status=case
+                    when origin->>'control_kind'='scoped_subagent_interrupt'
+                    then 'consumed'
+                    else status
+                end,
+                updated_at=now()
+            where session_id=$1
+              and id=$2
+              and status='queued'
+              and priority='steer'
+              and origin->>'control_kind' in (
+                  'scoped_subagent_steer',
+                  'scoped_subagent_interrupt'
+              )
+              and origin->>'control_phase'='pending_interrupt'
+            "#,
+        )
+        .bind(subagent_id)
+        .bind(input_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            anyhow::bail!(
+                "stale subagent control phase update affected {updated} rows for {input_id}"
+            );
+        }
+        bump_revisions_tx(&mut tx, subagent_id, true, false).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Apply a pending interrupt without synthesizing transcript output when
+    /// the captured child generation is already hosted at a durable boundary.
+    ///
+    /// The child session is locked before its control queue row, matching
+    /// ordinary output persistence. The complete unfinished action generation
+    /// and the phase update commit atomically. `interrupt_applied` remains a
+    /// durable task-abort checkpoint; the daemon advances it to `ready` only
+    /// after volatile task ownership has been cancelled.
+    pub async fn apply_subagent_control_interrupt_at_boundary(
+        &self,
+        subagent_id: &str,
+        input_id: &str,
+    ) -> Result<SubagentBoundaryInterruptResult> {
+        let mut tx = self.pool.begin().await?;
+        lock_session_tx(&mut tx, subagent_id).await?;
+        let active_leaf_id: Option<String> =
+            sqlx::query_scalar("select active_leaf_id from sessions where id=$1")
+                .bind(subagent_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        let at_boundary = match active_leaf_id.as_deref() {
+            None => true,
+            Some(active_leaf_id) => {
+                sqlx::query_scalar::<_, bool>(
+                    r#"
+                    select exists(
+                        select 1
+                        from transcript_entries
+                        where session_id=$1
+                          and id=$2
+                          and item->>'type' in ('turn_finished', 'compaction_summary')
+                    )
+                    "#,
+                )
+                .bind(subagent_id)
+                .bind(active_leaf_id)
+                .fetch_one(&mut *tx)
+                .await?
+            }
+        };
+        if !at_boundary {
+            tx.commit().await?;
+            return Ok(SubagentBoundaryInterruptResult::NotAtBoundary);
+        }
+
+        let row = sqlx::query(
+            r#"
+            select origin
+            from queued_inputs
+            where session_id=$1
+              and id=$2
+              and status='queued'
+              and priority='steer'
+              and origin->>'control_kind' in (
+                  'scoped_subagent_steer',
+                  'scoped_subagent_interrupt'
+              )
+              and coalesce((origin->>'control_interrupt')::boolean, false)
+              and origin->>'control_phase'='pending_interrupt'
+            for update
+            "#,
+        )
+        .bind(subagent_id)
+        .bind(input_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            anyhow::bail!(
+                "subagent boundary interrupt phase update found no pending row for {input_id}"
+            );
+        };
+        let origin: Value = row.get("origin");
+        let target_active_leaf_id = origin
+            .get("target_active_leaf_id")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let target_turn_id = origin.get("target_turn_id").and_then(Value::as_i64);
+        let target_attempt_ids = control_target_action_attempt_ids(&origin)?;
+        let unfinished_rows = sqlx::query(
+            r#"
+            select attempt_id, turn_id
+            from actions
+            where session_id=$1
+              and status in ('pending', 'blocked', 'running')
+            order by created_at, id
+            for update
+            "#,
+        )
+        .bind(subagent_id)
+        .fetch_all(&mut *tx)
+        .await?;
+        let target_is_current = if target_attempt_ids.is_empty() {
+            active_leaf_id == target_active_leaf_id && unfinished_rows.is_empty()
+        } else {
+            !unfinished_rows.is_empty()
+                && unfinished_rows.iter().all(|action| {
+                    let attempt_id: String = action.get("attempt_id");
+                    let turn_id: Option<i64> = action.get("turn_id");
+                    turn_id == target_turn_id && target_attempt_ids.contains(&attempt_id)
+                })
+        };
+        if !target_is_current {
+            settle_stale_subagent_control_tx(&mut tx, subagent_id, input_id).await?;
+            bump_revisions_tx(&mut tx, subagent_id, true, false).await?;
+            tx.commit().await?;
+            return Ok(SubagentBoundaryInterruptResult::GenerationAdvanced);
+        }
+
+        let interrupted = if target_attempt_ids.is_empty() {
+            false
+        } else {
+            sqlx::query(
+                r#"
+                update actions
+                set status='interrupted',
+                    result=jsonb_build_object(
+                        'reason', 'subagent control at turn boundary',
+                        'control_input_id', $2::text
+                    ),
+                    updated_at=now()
+                where session_id=$1
+                  and status in ('pending', 'blocked', 'running')
+                  and turn_id is not distinct from $3::bigint
+                  and attempt_id=any($4::text[])
+                "#,
+            )
+            .bind(subagent_id)
+            .bind(input_id)
+            .bind(target_turn_id)
+            .bind(&target_attempt_ids)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                > 0
+        };
+        let outcome = if interrupted {
+            "interrupted"
+        } else {
+            "already_between_turns"
+        };
+        let updated = sqlx::query(
+            r#"
+            update queued_inputs
+            set origin=origin || jsonb_build_object(
+                    'control_phase', 'interrupt_applied',
+                    'control_interrupted', $3::boolean,
+                    'control_interrupt_outcome', $4::text,
+                    'control_interrupt_applied_at', clock_timestamp()::text
+                ),
+                updated_at=now()
+            where session_id=$1
+              and id=$2
+              and status='queued'
+              and origin->>'control_phase'='pending_interrupt'
+            "#,
+        )
+        .bind(subagent_id)
+        .bind(input_id)
+        .bind(interrupted)
+        .bind(outcome)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            anyhow::bail!(
+                "subagent boundary interrupt phase update affected {updated} rows for {input_id}"
+            );
+        }
+        bump_revisions_tx(&mut tx, subagent_id, true, false).await?;
+        tx.commit().await?;
+        Ok(SubagentBoundaryInterruptResult::Applied { interrupted })
     }
 
     /// Enqueue a parent wakeup with the deterministic delegation/attempt key.
@@ -1246,6 +2106,114 @@ fn row_to_delegation(row: &sqlx::postgres::PgRow) -> Result<Delegation> {
         attempt_id: row.get("attempt_id"),
         expected_subagents: row.get("expected_subagents"),
     })
+}
+
+fn control_record_from_row(row: &PgRow, origin: &Value) -> Result<SubagentControlRecord> {
+    let phase = origin
+        .get("control_phase")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("scoped subagent control is missing its phase"))?
+        .parse::<SubagentControlPhase>()
+        .map_err(anyhow::Error::msg)?;
+    let kind = origin
+        .get("control_kind")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("scoped subagent control is missing its kind"))?
+        .parse::<SubagentControlKind>()
+        .map_err(anyhow::Error::msg)?;
+    let target_action_attempt_ids = control_target_action_attempt_ids(origin)?;
+    Ok(SubagentControlRecord {
+        input_id: row.get("id"),
+        status: super::rows::row_text::<QueuedInputStatus>(row, "status")?,
+        kind,
+        phase,
+        interrupt: origin
+            .get("control_interrupt")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        interrupted: origin
+            .get("control_interrupted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        interrupt_outcome: origin
+            .get("control_interrupt_outcome")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        target_active_leaf_id: origin
+            .get("target_active_leaf_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        target_turn_id: origin.get("target_turn_id").and_then(Value::as_i64),
+        target_action_attempt_ids,
+        delegation_running: row.get::<String, _>("delegation_status")
+            == DelegationStatus::Running.as_str(),
+    })
+}
+
+fn control_target_action_attempt_ids(origin: &Value) -> Result<Vec<String>> {
+    if let Some(attempt_ids) = origin
+        .get("target_action_attempt_ids")
+        .and_then(Value::as_array)
+    {
+        attempt_ids
+            .iter()
+            .map(|attempt_id| {
+                attempt_id
+                    .as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| anyhow::anyhow!("control attempt id must be a string"))
+            })
+            .collect::<Result<Vec<_>>>()
+    } else {
+        Ok(origin
+            .get("target_action_attempt_id")
+            .and_then(Value::as_str)
+            .map(|attempt_id| vec![attempt_id.to_string()])
+            .unwrap_or_default())
+    }
+}
+
+async fn settle_stale_subagent_control_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    subagent_id: &str,
+    input_id: &str,
+) -> Result<()> {
+    let updated = sqlx::query(
+        r#"
+        update queued_inputs
+        set origin=origin || jsonb_build_object(
+                'control_phase', 'ready',
+                'control_interrupted', false,
+                'control_interrupt_outcome', 'generation_advanced',
+                'control_interrupt_applied_at', clock_timestamp()::text,
+                'control_ready_at', clock_timestamp()::text
+            ),
+            status=case
+                when origin->>'control_kind'='scoped_subagent_interrupt'
+                then 'consumed'
+                else status
+            end,
+            updated_at=now()
+        where session_id=$1
+          and id=$2
+          and status='queued'
+          and priority='steer'
+          and origin->>'control_kind' in (
+              'scoped_subagent_steer',
+              'scoped_subagent_interrupt'
+          )
+          and origin->>'control_phase'='pending_interrupt'
+        "#,
+    )
+    .bind(subagent_id)
+    .bind(input_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected();
+    if updated != 1 {
+        anyhow::bail!("stale subagent control phase update affected {updated} rows for {input_id}");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

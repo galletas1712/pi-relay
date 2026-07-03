@@ -46,7 +46,7 @@ impl PostgresAgentStore {
         lock_session_tx(&mut tx, session_id).await?;
         if let Some(client_input_id) = client_input_id {
             if let Some(row) = sqlx::query(
-                "select id from queued_inputs where session_id=$1 and client_input_id=$2::text",
+                "select id, status from queued_inputs where session_id=$1 and client_input_id=$2::text",
             )
             .bind(session_id)
             .bind(client_input_id)
@@ -60,6 +60,12 @@ impl PostgresAgentStore {
                     input_id,
                     event: None,
                     queue: Some(queue),
+                    replayed: true,
+                    status: row_text::<QueuedInputStatus>(&row, "status")?,
+                    control_interrupt_applied: false,
+                    delegation_running: true,
+                    control_phase: None,
+                    control_interrupt_outcome: None,
                 });
             }
         }
@@ -112,7 +118,7 @@ impl PostgresAgentStore {
         .await?;
         let Some(inserted) = inserted else {
             let row = sqlx::query(
-                "select id from queued_inputs where session_id=$1 and client_input_id=$2::text",
+                "select id, status from queued_inputs where session_id=$1 and client_input_id=$2::text",
             )
             .bind(session_id)
             .bind(client_input_id)
@@ -125,6 +131,12 @@ impl PostgresAgentStore {
                 input_id,
                 event: None,
                 queue: Some(queue),
+                replayed: true,
+                status: row_text::<QueuedInputStatus>(&row, "status")?,
+                control_interrupt_applied: false,
+                delegation_running: true,
+                control_phase: None,
+                control_interrupt_outcome: None,
             });
         };
 
@@ -152,6 +164,12 @@ impl PostgresAgentStore {
             input_id,
             event: Some(event),
             queue: Some(queue),
+            replayed: false,
+            status: QueuedInputStatus::Queued,
+            control_interrupt_applied: false,
+            delegation_running: true,
+            control_phase: None,
+            control_interrupt_outcome: None,
         })
     }
 
@@ -205,6 +223,19 @@ impl PostgresAgentStore {
                 from queued_inputs
                 where session_id=$1
                     and {editable_queue}
+                    and coalesce(origin->>'control_kind', '') <> 'scoped_subagent_interrupt'
+                    and not (
+                        coalesce((origin->>'control_interrupt')::boolean, false)
+                        and coalesce(origin->>'control_phase', 'pending_interrupt') <> 'ready'
+                    )
+                    and not exists (
+                        select 1
+                        from queued_inputs blocked
+                        where blocked.session_id=$1
+                          and blocked.status in ('queued', 'consuming')
+                          and coalesce((blocked.origin->>'control_interrupt')::boolean, false)
+                          and blocked.origin->>'control_phase' in ('pending_interrupt', 'interrupt_applied')
+                    )
                     and ($2::text is null or priority=$2::text)
                 order by {QUEUED_INPUT_DISPATCH_ORDER}
                 limit 1
@@ -850,7 +881,9 @@ pub(super) async fn bump_revisions_tx(
 pub(super) fn queued_input_value(input: &QueuedInputRecord) -> Value {
     let (content, editable) = match &input.content {
         QueuedInputContent::UserMessage(message) => (json!(message.content.clone()), true),
-        QueuedInputContent::DaemonToolObservation(_) => (json!([]), false),
+        QueuedInputContent::DaemonToolObservation(_) | QueuedInputContent::SubagentControl => {
+            (json!([]), false)
+        }
     };
     json!({
         "input_id": input.input_id,
@@ -894,6 +927,10 @@ pub(super) fn append_queued_content_event_fields(
             object.insert("editable".to_string(), Value::Bool(true));
         }
         QueuedInputContent::DaemonToolObservation(_) => {
+            object.insert("content".to_string(), json!([]));
+            object.insert("editable".to_string(), Value::Bool(false));
+        }
+        QueuedInputContent::SubagentControl => {
             object.insert("content".to_string(), json!([]));
             object.insert("editable".to_string(), Value::Bool(false));
         }
