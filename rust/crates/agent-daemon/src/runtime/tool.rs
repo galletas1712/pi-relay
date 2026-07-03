@@ -54,7 +54,7 @@ pub(super) async fn run_tool_turn(
 
     let tool_context =
         ToolContext::new(std::path::PathBuf::from(dispatch.config.outer_cwd.clone()));
-    let result = if tool_call.tool_name == "LoadSkill" {
+    let mut result = if tool_call.tool_name == "LoadSkill" {
         let loaded_skills = loaded_skills_for_session(&state, &session_id).await;
         load_skill_result(
             &state.prompt_root,
@@ -89,6 +89,7 @@ pub(super) async fn run_tool_turn(
             ),
         }
     };
+    escape_nul_in_tool_result(&mut result);
     let status = if matches!(result.status, ToolResultStatus::Success) {
         ActionStatus::Completed
     } else {
@@ -164,6 +165,13 @@ pub(super) async fn run_tool_turn(
     Ok(())
 }
 
+fn escape_nul_in_tool_result(result: &mut ToolResultMessage) {
+    // Rust strings and JSON permit U+0000, but PostgreSQL JSONB does not.
+    if result.output.contains('\0') {
+        result.output = result.output.replace('\0', "\\x00");
+    }
+}
+
 async fn loaded_skills_for_session(state: &AppState, session_id: &str) -> BTreeSet<String> {
     let Some(active) = state.active.lock().await.get(session_id).cloned() else {
         return BTreeSet::new();
@@ -202,7 +210,35 @@ fn loaded_skill_identifier_json(output: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use agent_tools::{ToolContext, ToolRegistry};
+    use agent_vocab::{ProviderKind, ToolCall, ToolCallId};
+
     use super::*;
+
+    #[tokio::test]
+    async fn escapes_nul_emitted_by_bash() {
+        let call = ToolCall {
+            id: ToolCallId::new("call_1"),
+            tool_name: "Bash".to_string(),
+            args_json: serde_json::json!({ "command": "printf 'before\\0after'" }).to_string(),
+        };
+        let mut result = ToolRegistry::with_builtin_tools()
+            .execute(
+                ProviderKind::OpenAi,
+                &call,
+                &ToolContext::new(std::env::temp_dir()),
+            )
+            .await
+            .expect("bash execution succeeds");
+
+        escape_nul_in_tool_result(&mut result);
+
+        assert!(result.output.contains(r"before\x00after"));
+        assert!(!result.output.contains('\0'));
+        assert!(!serde_json::to_string(&result)
+            .expect("serialize tool result")
+            .contains(r"\u0000"));
+    }
 
     #[test]
     fn loaded_skill_identifier_accepts_json_output() {
